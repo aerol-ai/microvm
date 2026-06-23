@@ -3,6 +3,7 @@ package firecracker
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -79,6 +80,44 @@ func TestChrootFilePath_JailerInPlaceIsNoop(t *testing.T) {
 	// The file must be untouched (same bytes, still present).
 	if b, err := os.ReadFile(inPlace); err != nil || string(b) != "rootfs" {
 		t.Errorf("in-place file disturbed: bytes=%q err=%v", string(b), err)
+	}
+}
+
+// TestChrootFilePath_JailerChownsToJailerIdentity is the regression guard for
+// the cold-boot drive failure (cluster-hetero UC-24/88):
+//
+//	PUT /drives/rootfs -> 400: ... Error manipulating the backing file:
+//	Permission denied (os error 13) rootfs.ext4
+//
+// The jailer drops firecracker to JailerUID:JailerGID before it opens the root
+// drive read-write, but the rootfs is built into the chroot as root, so the
+// jailed process can't open it. The staged file must be chowned to the jailer
+// identity. A non-root test can only chown to its own uid/gid, so we set the
+// jailer identity to exactly that and assert ownership lands on the staged file.
+func TestChrootFilePath_JailerChownsToJailerIdentity(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid == 0 {
+		t.Skip("running as root: the uid!=0 chown guard is exercised by the non-root CI path")
+	}
+	d := &Driver{cfg: Config{UseJailer: true, JailerUID: uid, JailerGID: gid}}
+	runDir := t.TempDir()
+	src := filepath.Join(t.TempDir(), "rootfs-src")
+	if err := os.WriteFile(src, []byte("rootfs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.chrootFilePath(runDir, src, rootfsFileName); err != nil {
+		t.Fatalf("chrootFilePath: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(runDir, rootfsFileName))
+	if err != nil {
+		t.Fatalf("stat staged rootfs: %v", err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no syscall.Stat_t on this platform")
+	}
+	if int(st.Uid) != uid || int(st.Gid) != gid {
+		t.Errorf("staged rootfs owned by %d:%d, want jailer identity %d:%d", st.Uid, st.Gid, uid, gid)
 	}
 }
 

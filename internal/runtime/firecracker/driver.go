@@ -1569,6 +1569,16 @@ func (d *Driver) ClearNetworkBlockEgress(_ string) error {
 // runDir/destName (the rootfs and overlay are built in place) staging is a
 // no-op. In direct mode there is no chroot, so srcAbs is returned unchanged and
 // nothing is staged.
+//
+// The staged file is then chowned to JailerUID:JailerGID. The jailer drops
+// privilege to that uid/gid before firecracker opens the drives, and the root
+// drive is opened read-write (not read_only), so a root-owned rootfs.ext4 — the
+// shape mkfs/the OCI builder produces — fails with "Permission denied (os error
+// 13)". The kernel happens to work without this because boot-source opens it
+// read-only, but we chown uniformly so every chroot file is owned by the
+// process that will open it. All sandboxes share one jailer uid/gid, so
+// chowning a hardlinked shared template/kernel inode to that uid is consistent
+// across sandboxes.
 func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error) {
 	if !d.cfg.UseJailer {
 		return srcAbs, nil
@@ -1580,6 +1590,17 @@ func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error)
 		_ = os.Remove(dst)
 		if err := linkOrCopyRootfs(srcAbs, dst); err != nil {
 			return "", err
+		}
+	}
+	// Only chown when the jailer actually drops to a non-root identity.
+	// JailerUID/GID of 0 means no privilege drop (root opens the drives as
+	// root, no EPERM possible), so the chown is both unnecessary and — for the
+	// non-root unit-test process — itself a guaranteed EPERM. Skipping it on 0
+	// keeps the direct-spawn-shaped tests green while still chowning on every
+	// real production host (which runs the jailer as a dedicated uid/gid).
+	if d.cfg.JailerUID != 0 || d.cfg.JailerGID != 0 {
+		if err := os.Chown(dst, d.cfg.JailerUID, d.cfg.JailerGID); err != nil {
+			return "", fmt.Errorf("chown %s to jailer %d:%d: %w", destName, d.cfg.JailerUID, d.cfg.JailerGID, err)
 		}
 	}
 	return destName, nil
