@@ -967,7 +967,6 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 			BackendType: "File",
 			BackendPath: snap.SnapshotMemoryPath,
 		},
-		VsockOverride:       &firecracker.VsockOverride{UDSPath: hostVsockUDSName},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
 	}); err != nil {

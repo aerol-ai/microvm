@@ -67,11 +67,6 @@ func TestWarmSpawn_HappyPath(t *testing.T) {
 		f.client.snapshotLoad.MemBackend.BackendType != "File" {
 		t.Errorf("LoadSnapshot.MemBackend wrong: %+v", f.client.snapshotLoad.MemBackend)
 	}
-	if f.client.snapshotLoad.VsockOverride == nil ||
-		f.client.snapshotLoad.VsockOverride.UDSPath != hostVsockUDSName {
-		t.Errorf("LoadSnapshot.VsockOverride = %+v, want uds_path=%q",
-			f.client.snapshotLoad.VsockOverride, hostVsockUDSName)
-	}
 
 	// No Action(Resume): the pool will resume after PATCHing
 	// per-sandbox TAP+overlay. Anything in actions[] here that isn't a

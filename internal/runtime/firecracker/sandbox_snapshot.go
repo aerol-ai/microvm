@@ -456,7 +456,6 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 			BackendType: "File",
 			BackendPath: memPath,
 		},
-		VsockOverride:       &firecracker.VsockOverride{UDSPath: hostVsockUDSName},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
 	}); err != nil {

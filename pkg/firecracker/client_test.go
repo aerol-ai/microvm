@@ -260,7 +260,6 @@ func TestWrapperMethods_RequestShape(t *testing.T) {
 			body: SnapshotLoad{
 				SnapshotPath:        "/tmp/vm.snap",
 				MemBackend:          &MemoryBackend{BackendType: "File", BackendPath: "/tmp/vm.mem"},
-				VsockOverride:       &VsockOverride{UDSPath: "vsock.sock"},
 				EnableDiffSnapshots: true,
 				ResumeVM:            false,
 			},
@@ -268,7 +267,6 @@ func TestWrapperMethods_RequestShape(t *testing.T) {
 				return c.LoadSnapshot(ctx, SnapshotLoad{
 					SnapshotPath:        "/tmp/vm.snap",
 					MemBackend:          &MemoryBackend{BackendType: "File", BackendPath: "/tmp/vm.mem"},
-					VsockOverride:       &VsockOverride{UDSPath: "vsock.sock"},
 					EnableDiffSnapshots: true,
 					ResumeVM:            false,
 				})
