@@ -39,6 +39,12 @@ func TestColdBootInjectFiles_PutsAgentInGuest(t *testing.T) {
 	}
 }
 
+func TestShellSingleQuote(t *testing.T) {
+	if got := shellSingleQuote("tok'123"); got != `'tok'\''123'` {
+		t.Fatalf("shellSingleQuote escaped token as %q", got)
+	}
+}
+
 // TestColdBootInjectFiles_NoBinaryIsNil: with no toolbox binary configured
 // the injector returns nil so the caller cold-boots an agent-less guest
 // (and warns) rather than panicking on an empty HostPath.

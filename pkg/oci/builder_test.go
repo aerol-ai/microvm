@@ -313,6 +313,57 @@ func TestInjectFiles_ClampsEscape(t *testing.T) {
 	}
 }
 
+// TestInjectFiles_RejectsSymlinkRedirect guards the critical boundary:
+// injected bytes are host-trusted data written into an untrusted image tree,
+// so the image must not be able to redirect the write through a symlink.
+func TestInjectFiles_RejectsSymlinkRedirect(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "rootfs")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(root, "usr/local"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "usr/local/bin")); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("toolboxd"), GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+	})
+	if err == nil {
+		t.Fatal("expected symlink-parent rejection")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "toolboxd")); statErr == nil {
+		t.Fatal("injected file followed symlink outside rootfs")
+	}
+}
+
+func TestInjectFiles_RejectsSymlinkDestination(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "rootfs")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(root, "usr/local/bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "toolboxd"), filepath.Join(root, "usr/local/bin/toolboxd")); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("toolboxd"), GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+	})
+	if err == nil {
+		t.Fatal("expected symlink-destination rejection")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "toolboxd")); statErr == nil {
+		t.Fatal("injected file followed symlink destination outside rootfs")
+	}
+}
+
 // TestBuild_StageFailure_SurfacesTail confirms a non-zero exit from any
 // stage carries the binary's stderr in the returned error. Operators
 // staring at a failed sandbox create need this; without it the only

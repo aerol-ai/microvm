@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"strings"
 )
 
 // toolboxdInitScript is the PID-1 shim baked into every cold-boot rootfs.
@@ -41,15 +42,19 @@ func coldBootInjectFiles(toolboxBinaryPath, toolboxToken string) []InjectFile {
 	if toolboxBinaryPath == "" {
 		return nil
 	}
-	// Single-quote the token defensively even though tokens are
-	// host-generated hex/base64 — keeps a future token format from
+	// Shell-quote the token defensively even though tokens are
+	// host-generated hex today — keeps a future token format from
 	// breaking the `.`-sourced env file.
-	env := fmt.Sprintf("SB_TOOLBOX_TOKEN='%s'\nSB_TOOLBOX_PORT='%d'\n", toolboxToken, guestToolboxPort)
+	env := fmt.Sprintf("SB_TOOLBOX_TOKEN=%s\nSB_TOOLBOX_PORT='%d'\n", shellSingleQuote(toolboxToken), guestToolboxPort)
 	return []InjectFile{
 		{HostPath: toolboxBinaryPath, GuestPath: guestToolboxPath, Mode: 0o755},
 		{Content: toolboxdInitScript, GuestPath: guestInitPath, Mode: 0o755},
 		{Content: []byte(env), GuestPath: guestEnvPath, Mode: 0o600},
 	}
+}
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // coldBootArgs builds the kernel command line for a cold-boot guest that
