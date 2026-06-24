@@ -195,6 +195,15 @@ func TestCreate_WarmHit(t *testing.T) {
 		t.Errorf("LoadSnapshot was called on warm-hit Create path: %+v", f.client.snapshotLoad)
 	}
 
+	// The per-sandbox host TAP MUST have been realized on the warm-hit
+	// path — WarmSpawn skips it, so the Acquire side owns it. Without
+	// this Ensure, Action(Resume) would point the guest's eth0 at a
+	// host_dev_name that does not exist. Exactly one Ensure, no Remove
+	// (the sandbox now owns the device; Destroy removes it later).
+	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 0 {
+		t.Errorf("warm-hit tap ensure=%d remove=%d, want 1/0", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	}
+
 	// PATCH NetworkInterface MUST have been called with the per-sandbox
 	// TAP name (mapped from the pool's preloaded slot.TapName via the
 	// fake tap pool's Allocate).
@@ -291,6 +300,53 @@ func TestCreate_WarmRollbackOnPatchFailure(t *testing.T) {
 		t.Error("warm handle Shutdown was not called on PATCH failure; firecracker process would leak")
 	}
 	handle.mu.Unlock()
+
+	// The host TAP was Ensured just before the PATCH, so the rollback
+	// MUST Remove it — otherwise a `ip link` device leaks on every
+	// failed warm create. ensure=1/remove=1 is the matched pair.
+	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 1 {
+		t.Errorf("warm rollback tap ensure=%d remove=%d, want 1/1", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	}
+}
+
+// TestCreate_WarmRollbackOnTapEnsureFailure asserts the rollback when
+// the host-TAP realization itself fails on the warm path: the create
+// must surface the error, tear down the warm handle + pool slot, and
+// MUST NOT call Remove (there is no device to delete — mirrors the
+// cold path's "no Remove when Ensure failed" discipline).
+func TestCreate_WarmRollbackOnTapEnsureFailure(t *testing.T) {
+	f := newDriverFixture(t)
+	pool, handle := stageWarmFixture(t, f)
+	stageWarmTemplate(t, f, false)
+	f.tapHost.ensureErr = errors.New("synthetic tap ensure failure")
+
+	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image:      "alpine:3.20",
+		CPU:        1,
+		MemoryMB:   128,
+		DiskGB:     1,
+		TemplateID: "tpl-warm",
+	}, "sb-warm-tap-fail", "tok", nil)
+	if err == nil {
+		t.Fatal("Create returned nil on injected tap Ensure failure")
+	}
+
+	// Pool slot released + handle shut down so the warm VMM doesn't leak.
+	pool.mu.Lock()
+	if len(pool.releaseCalls) == 0 {
+		t.Error("warm pool Release was not called on tap Ensure failure; slot would leak as 'allocated'")
+	}
+	pool.mu.Unlock()
+	handle.mu.Lock()
+	if handle.shutdowns == 0 {
+		t.Error("warm handle Shutdown was not called on tap Ensure failure; firecracker process would leak")
+	}
+	handle.mu.Unlock()
+
+	// Ensure was attempted once and failed; Remove MUST be skipped.
+	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 0 {
+		t.Errorf("warm tap-ensure-failure ensure=%d remove=%d, want 1/0", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	}
 }
 
 // TestCreate_WarmEligibilityNoTemplate asserts the warm path is

@@ -123,6 +123,12 @@ func (d *Driver) tryAcquireWarm(
 	// flag-and-defer pattern mirrors the cold-spawn path's pool/tap/vmm
 	// cleanup.
 	committed := false
+	// tapEnsured gates the host-TAP rollback below: we only `ip link
+	// delete` a device this path actually brought up. The host TAP is
+	// realized lazily (just before the network PATCH), so an error in the
+	// overlay/rootfs staging above it must not Remove a device that was
+	// never Ensured.
+	tapEnsured := false
 	defer func() {
 		if committed {
 			return
@@ -138,6 +144,16 @@ func (d *Driver) tryAcquireWarm(
 		if sErr := handle.Shutdown(context.Background(), 3*time.Second); sErr != nil {
 			d.logger.Warn("firecracker create: warm acquire rollback (handle shutdown)",
 				"sandbox_id", sandboxID, "slot_id", slot.ID, "error", sErr)
+		}
+		// Drop the host TAP last — after handle.Shutdown has brought the
+		// firecracker process down. `ip link delete` on a TAP still
+		// owned by a running VMM fails EBUSY (the same ordering Destroy
+		// relies on in driver.go).
+		if tapEnsured {
+			if rmErr := d.tapHost.Remove(context.Background(), tapSlot.TapName); rmErr != nil {
+				d.logger.Warn("firecracker create: warm acquire rollback (tap remove)",
+					"sandbox_id", sandboxID, "tap", tapSlot.TapName, "error", rmErr)
+			}
 		}
 	}()
 
@@ -183,6 +199,20 @@ func (d *Driver) tryAcquireWarm(
 	}); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm patch rootfs drive: %w", err)
 	}
+
+	// Bring this sandbox's host TAP up before pointing the guest's eth0
+	// at it. WarmSpawn deliberately skips host-TAP realization: the
+	// snapshot's eth0 references the defunct template-build TAP, and
+	// firecracker only validates the device at Resume, not at snapshot
+	// load (see warmspawn.go). The cold path realizes the TAP at its
+	// Step 4 in driver.go; the warm path returns before reaching that
+	// step, so without this Ensure the Action(Resume) below points
+	// host_dev_name at a device that was never created and the create
+	// fails. Idempotent — a retried create re-Ensures the same slot.
+	if err := d.tapHost.Ensure(ctx, *tapSlot); err != nil {
+		return nil, false, fmt.Errorf("firecracker runtime: warm tap host ensure %s: %w", tapSlot.TapName, err)
+	}
+	tapEnsured = true
 
 	// PATCH NetworkInterface: the snapshot's eth0 references the
 	// defunct template-build TAP. Swap it for this sandbox's TAP.
