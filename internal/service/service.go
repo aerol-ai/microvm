@@ -1227,6 +1227,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 
 	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
+		// UpsertSandboxRoute is non-atomic in domain mode: it installs the
+		// main route and then a per-custom-domain leaf route in a loop, so a
+		// failure on a later leaf can leave the main route + earlier leaves
+		// installed. deleteSandboxPublicRoutes (not DeleteSandboxRoute) tears
+		// down the main route AND every custom-domain leaf — 404 per leaf is
+		// a no-op, so it's safe on a partial install.
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -1235,7 +1242,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	sandbox.OwnerRef = ownerRef
 	if err := s.store.Create(ctx, sandbox); err != nil {
-		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -1248,7 +1255,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			_ = s.docker.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
@@ -1267,7 +1274,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			_ = s.docker.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
@@ -1279,7 +1286,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		// Same rollback chain as a mount-persist failure. ErrCustomDomainConflict
 		// flows through unchanged so the API layer can map it to 409.
 		_ = s.store.Delete(ctx, sandbox.ID)
-		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -1487,6 +1494,10 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	}
 
 	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
+		// deleteSandboxPublicRoutes (not DeleteSandboxRoute) so a non-atomic
+		// partial UpsertSandboxRoute — main route + per-custom-domain leaves —
+		// is fully torn down. See the docker path for the rationale.
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
@@ -1496,7 +1507,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// refreshed the account mapping before dispatching here.
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 	if err := s.store.Create(ctx, sandbox); err != nil {
-		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
@@ -1504,7 +1515,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		_ = s.store.Delete(ctx, sandbox.ID)
-		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
@@ -1877,9 +1888,11 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
-	if s.caddy != nil {
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-	}
+	// deleteSandboxPublicRoutes (not DeleteSandboxRoute) so the per-custom-domain
+	// leaf routes installed by UpsertSandboxRoute are torn down too. store.Delete
+	// below cascades the custom_domain DB rows, but the caddy routes are separate
+	// state and would otherwise be orphaned on every destroy. nil-caddy safe.
+	_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
 	rt, err := s.runtimeForSandbox(sandbox)
 	if err != nil {
 		return err

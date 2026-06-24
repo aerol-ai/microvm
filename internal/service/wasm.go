@@ -196,13 +196,20 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 
 	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
+		// deleteSandboxPublicRoutes (not DeleteSandboxRoute) tears down the
+		// main route AND every per-custom-domain leaf. WASM is doubly exposed
+		// here: routes get installed both via syncSandboxPublicRoute's
+		// UpsertSandboxRoute loop and via syncWasmCustomDomainRoutes below,
+		// and both key on IngressCustomDomainHTTPRouteID — so the leaf delete
+		// covers both. 404 per leaf is a no-op, safe on a partial install.
+		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
 		_ = s.wasm.Destroy(ctx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
 	}
 	if err := s.store.Create(ctx, sandbox); err != nil {
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
 		_ = s.wasm.Destroy(ctx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -211,7 +218,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
 			_ = s.wasm.Destroy(ctx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
@@ -220,7 +227,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	}
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		_ = s.store.Delete(ctx, sandbox.ID)
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
 		_ = s.wasm.Destroy(ctx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -230,7 +237,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		storedCD, getErr := s.store.Get(ctx, sandbox.ID)
 		if getErr != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
 			_ = s.wasm.Destroy(ctx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
@@ -238,7 +245,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		}
 		if err := s.syncWasmCustomDomainRoutes(ctx, storedCD); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(ctx, storedCD)
 			_ = s.wasm.Destroy(ctx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
