@@ -134,7 +134,7 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 		guestCID = slot.VsockCID
 	}
 
-	if err := d.sendVsockOp(ctx, guestCID, "pre_snapshot", nil); err != nil {
+	if err := d.sendVsockOp(ctx, filepath.Join(handle.RunDir(), hostVsockUDSName), guestCID, "pre_snapshot", nil); err != nil {
 		d.logger.Warn("firecracker stop: pre_snapshot send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	}
@@ -375,6 +375,10 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 		}
 	}()
 
+	if err := os.MkdirAll(handle.RunDir(), 0o755); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: create runDir %s: %w", sandboxID, handle.RunDir(), err)
+	}
+
 	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
 	if err := copyFile(snapshotRootfs, rootfsPath); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: stage rootfs from %s: %w", sandboxID, dir, err)
@@ -415,11 +419,12 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionResume}); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: action Resume: %w", sandboxID, err)
 	}
-	if err := d.vsockHandshake(ctx, manifest.VsockCID); err != nil {
+	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
+	if err := d.vsockHandshake(ctx, vsockPath, manifest.VsockCID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: vsock handshake: %w", sandboxID, err)
 	}
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-	if err := d.sendVsockOp(postCtx, manifest.VsockCID, "post_resume", map[string]any{
+	if err := d.sendVsockOp(postCtx, vsockPath, manifest.VsockCID, "post_resume", map[string]any{
 		"wallclock_unix_ns": time.Now().UnixNano(),
 	}); err != nil {
 		d.logger.Warn("firecracker start: post_resume send failed (continuing)",

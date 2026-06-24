@@ -58,3 +58,45 @@ func TestCreate_CreatesRunDirBeforeStaging(t *testing.T) {
 		t.Fatalf("runDir not created by driver before staging: %v", err)
 	}
 }
+
+func TestSnapshotTemplate_CreatesRunDirBeforeStaging(t *testing.T) {
+	f := newDriverFixture(t)
+
+	chrootRoot := filepath.Join(t.TempDir(), "jailer", "firecracker", "tpl-snap-tpl-rundir", "root")
+	f.driver.SetSpawner(func(_ Config, sandboxID string) (VMMHandle, error) {
+		f.vmm.id = sandboxID
+		f.vmm.runDir = chrootRoot // intentionally not created — mimics the jailer chroot
+		f.vmm.apiSocket = filepath.Join(chrootRoot, "api.sock")
+		return f.vmm, nil
+	})
+
+	if _, err := os.Stat(chrootRoot); !os.IsNotExist(err) {
+		t.Fatalf("precondition: chrootRoot must not exist yet, stat err = %v", err)
+	}
+
+	tplDir := t.TempDir()
+	rootfs := filepath.Join(tplDir, rootfsFileName)
+	if err := os.WriteFile(rootfs, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("write rootfs: %v", err)
+	}
+
+	_, err := f.driver.SnapshotTemplate(context.Background(), TemplateSnapshotRequest{
+		TemplateID:    "tpl-rundir",
+		RootfsPath:    rootfs,
+		OutMemoryPath: filepath.Join(tplDir, "snapshot.memory"),
+		OutStatePath:  filepath.Join(tplDir, "snapshot.state"),
+		GuestCID:      200,
+		MemoryMB:      512,
+		VCPU:          1,
+	})
+	if err != nil {
+		t.Fatalf("SnapshotTemplate with non-existent runDir: %v (regression: driver must MkdirAll runDir before staging)", err)
+	}
+
+	if _, err := os.Stat(chrootRoot); err != nil {
+		t.Fatalf("runDir not created by driver before staging: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(chrootRoot, rootfsFileName)); err != nil || string(got) != "rootfs" {
+		t.Fatalf("staged rootfs = %q, %v", got, err)
+	}
+}

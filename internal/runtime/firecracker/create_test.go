@@ -166,7 +166,8 @@ type fakeVsockDialer struct {
 	// attempt. The snapshot-load path dials the template's reserved CID
 	// rather than the per-sandbox slot CID; without this we can't tell
 	// the driver actually routed the handshake to the right place.
-	lastCID uint32
+	lastCID        uint32
+	lastSocketPath string
 	// retryUntil >0 means return err for the first `retryUntil-1` Dial
 	// calls (simulating the post-InstanceStart race) and succeed on
 	// the `retryUntil`th. Lets us assert the driver's retry loop.
@@ -184,10 +185,11 @@ func newFakeVsockDialer() *fakeVsockDialer {
 	return &fakeVsockDialer{guestRespOk: true}
 }
 
-func (d *fakeVsockDialer) Dial(_ context.Context, cid, _ uint32) (io.ReadWriteCloser, error) {
+func (d *fakeVsockDialer) Dial(_ context.Context, socketPath string, cid, _ uint32) (io.ReadWriteCloser, error) {
 	d.mu.Lock()
 	d.dials++
 	d.lastCID = cid
+	d.lastSocketPath = socketPath
 	if d.retryUntil > 0 && d.dials < d.retryUntil {
 		d.mu.Unlock()
 		return nil, errors.New("vsock: connection refused (fake)")

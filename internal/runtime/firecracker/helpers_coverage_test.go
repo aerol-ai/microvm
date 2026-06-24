@@ -102,7 +102,7 @@ func TestNonLinuxStubsAndWarmDestroyHandle(t *testing.T) {
 		if dialer == nil {
 			t.Fatal("NewLinuxVsockDialer() returned nil")
 		}
-		conn, err := dialer.Dial(context.Background(), 3, 52)
+		conn, err := dialer.Dial(context.Background(), filepath.Join(t.TempDir(), "missing.sock"), 3, 52)
 		if conn != nil || err == nil {
 			t.Fatalf("Dial() = (%v,%v), want nil + error", conn, err)
 		}

@@ -250,14 +250,15 @@ func (d *Driver) tryAcquireWarm(
 	// from SnapshotInputs.VsockCID), so slot.VsockCID is what we
 	// dial. Dialing tapSlot.VsockCID would race the guest, which is
 	// listening on the snapshot's CID baked in at template build.
-	if err := d.vsockHandshake(ctx, slot.VsockCID); err != nil {
+	vsockPath := filepath.Join(slot.RunDir, hostVsockUDSName)
+	if err := d.vsockHandshake(ctx, vsockPath, slot.VsockCID); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm vsock handshake: %w", err)
 	}
 
 	// post_resume reseed (RNG + wallclock). Best-effort; same shape
 	// as the cold snapshot-load path.
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-	if err := d.sendVsockOp(postCtx, slot.VsockCID, "post_resume", map[string]any{
+	if err := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", map[string]any{
 		"wallclock_unix_ns": time.Now().UnixNano(),
 	}); err != nil {
 		d.logger.Warn("firecracker create: warm post_resume send failed (continuing)",

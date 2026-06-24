@@ -206,12 +206,12 @@ func TestSendVsockOp_Errors_Extra(t *testing.T) {
 	fakeVsock := newFakeVsockDialer()
 	fakeVsock.err = os.ErrPermission
 	d.vsockDial = fakeVsock
-	if err := d.sendVsockOp(context.Background(), 3, "test", nil); err == nil || !strings.Contains(err.Error(), "dial cid=3") {
+	if err := d.sendVsockOp(context.Background(), "/tmp/vsock.sock", 3, "test", nil); err == nil || !strings.Contains(err.Error(), "dial cid=3") {
 		t.Errorf("expected dial error, got %v", err)
 	}
 
 	// Unmarshalable data
-	if err := d.sendVsockOp(context.Background(), 3, "test", make(chan int)); err == nil || !strings.Contains(err.Error(), "marshal data") {
+	if err := d.sendVsockOp(context.Background(), "/tmp/vsock.sock", 3, "test", make(chan int)); err == nil || !strings.Contains(err.Error(), "marshal data") {
 		t.Errorf("expected marshal data error, got %v", err)
 	}
 }

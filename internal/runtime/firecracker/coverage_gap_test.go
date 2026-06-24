@@ -343,7 +343,7 @@ type stubVsockDialer struct {
 	idx   int
 }
 
-func (d *stubVsockDialer) Dial(_ context.Context, _, _ uint32) (io.ReadWriteCloser, error) {
+func (d *stubVsockDialer) Dial(_ context.Context, _ string, _, _ uint32) (io.ReadWriteCloser, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.err != nil {
@@ -364,22 +364,22 @@ func TestVsockHandshake_ErrorPaths(t *testing.T) {
 			{reply: []byte(`{"ok":true}`)}, // unused
 		},
 	}}
-	if err := d.vsockHandshake(context.Background(), 3); err == nil || !strings.Contains(err.Error(), "vsock write") {
+	if err := d.vsockHandshake(context.Background(), "/tmp/vsock.sock", 3); err == nil || !strings.Contains(err.Error(), "vsock write") {
 		t.Fatalf("write error: got %v", err)
 	}
 
 	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{readErr: io.EOF}}}
-	if err := d.vsockHandshake(context.Background(), 3); err == nil || !strings.Contains(err.Error(), "vsock read") {
+	if err := d.vsockHandshake(context.Background(), "/tmp/vsock.sock", 3); err == nil || !strings.Contains(err.Error(), "vsock read") {
 		t.Fatalf("read error: got %v", err)
 	}
 
 	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{reply: []byte("not-json\n")}}}
-	if err := d.vsockHandshake(context.Background(), 3); err == nil || !strings.Contains(err.Error(), "vsock decode") {
+	if err := d.vsockHandshake(context.Background(), "/tmp/vsock.sock", 3); err == nil || !strings.Contains(err.Error(), "vsock decode") {
 		t.Fatalf("decode error: got %v", err)
 	}
 
 	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{reply: []byte(`{"ok":false}` + "\n")}}}
-	if err := d.vsockHandshake(context.Background(), 3); err == nil || !strings.Contains(err.Error(), "guest returned ok=false") {
+	if err := d.vsockHandshake(context.Background(), "/tmp/vsock.sock", 3); err == nil || !strings.Contains(err.Error(), "guest returned ok=false") {
 		t.Fatalf("ok=false empty error: got %v", err)
 	}
 
@@ -387,26 +387,26 @@ func TestVsockHandshake_ErrorPaths(t *testing.T) {
 	defer cancel()
 	time.Sleep(2 * time.Millisecond)
 	d.vsockDial = &stubVsockDialer{err: errors.New("dial refused")}
-	if err := d.vsockHandshake(shortCtx, 3); err == nil {
+	if err := d.vsockHandshake(shortCtx, "/tmp/vsock.sock", 3); err == nil {
 		t.Fatal("expected deadline exceeded on short ctx")
 	}
 }
 
 func TestSendVsockOp_WithPayload(t *testing.T) {
 	d := &Driver{vsockDial: &stubVsockDialer{conns: []*errVsockConn{{reply: []byte("ignored\n")}}}}
-	if err := d.sendVsockOp(context.Background(), 3, "pre_snapshot", map[string]string{"phase": "stop"}); err != nil {
+	if err := d.sendVsockOp(context.Background(), "/tmp/vsock.sock", 3, "pre_snapshot", map[string]string{"phase": "stop"}); err != nil {
 		t.Fatalf("sendVsockOp: %v", err)
 	}
 }
 
 func TestSendVsockOp_DialAndWriteErrors(t *testing.T) {
 	d := &Driver{vsockDial: &stubVsockDialer{err: errors.New("dial down")}}
-	if err := d.sendVsockOp(context.Background(), 3, "ping", nil); err == nil || !strings.Contains(err.Error(), "dial cid") {
+	if err := d.sendVsockOp(context.Background(), "/tmp/vsock.sock", 3, "ping", nil); err == nil || !strings.Contains(err.Error(), "dial cid") {
 		t.Fatalf("dial error: got %v", err)
 	}
 
 	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{writeErr: errors.New("write down")}}}
-	if err := d.sendVsockOp(context.Background(), 3, "ping", nil); err == nil || !strings.Contains(err.Error(), "write") {
+	if err := d.sendVsockOp(context.Background(), "/tmp/vsock.sock", 3, "ping", nil); err == nil || !strings.Contains(err.Error(), "write") {
 		t.Fatalf("write error: got %v", err)
 	}
 }
