@@ -25,6 +25,7 @@ package firecracker
 import (
 	"context"
 	"io"
+	"os"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/firecracker"
@@ -52,6 +53,19 @@ type RootfsBuildRequest struct {
 	OutPath    string
 	MinSizeMiB int
 	Tag        string
+	// InjectFiles mirrors pkg/oci.BuildRequest.InjectFiles. The cold-boot
+	// path uses it to bake the in-guest agent + init shim + per-sandbox
+	// token into a stock OCI image.
+	InjectFiles []InjectFile
+}
+
+// InjectFile mirrors pkg/oci.InjectFile. Exactly one of HostPath/Content
+// supplies the bytes; GuestPath is the absolute in-guest destination.
+type InjectFile struct {
+	HostPath  string
+	Content   []byte
+	GuestPath string
+	Mode      os.FileMode
 }
 
 // RootfsResult is the seam-side mirror of pkg/oci.Result. The driver

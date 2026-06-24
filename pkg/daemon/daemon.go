@@ -1505,11 +1505,21 @@ type firecrackerRootfsAdapter struct {
 }
 
 func (a *firecrackerRootfsAdapter) Build(ctx context.Context, req fcruntime.RootfsBuildRequest) (*fcruntime.RootfsResult, error) {
+	inject := make([]oci.InjectFile, len(req.InjectFiles))
+	for i, f := range req.InjectFiles {
+		inject[i] = oci.InjectFile{
+			HostPath:  f.HostPath,
+			Content:   f.Content,
+			GuestPath: f.GuestPath,
+			Mode:      f.Mode,
+		}
+	}
 	res, err := a.inner.Build(ctx, oci.BuildRequest{
-		ImageRef:   req.ImageRef,
-		OutPath:    req.OutPath,
-		MinSizeMiB: req.MinSizeMiB,
-		Tag:        req.Tag,
+		ImageRef:    req.ImageRef,
+		OutPath:     req.OutPath,
+		MinSizeMiB:  req.MinSizeMiB,
+		Tag:         req.Tag,
+		InjectFiles: inject,
 	})
 	if err != nil {
 		return nil, err

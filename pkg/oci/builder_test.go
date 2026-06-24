@@ -245,6 +245,125 @@ func TestExt4SizeMiB(t *testing.T) {
 	}
 }
 
+// TestBuild_InjectFiles bakes host-provided files into the rootfs before
+// mkfs — the mechanism the Firecracker cold-boot path uses to put the
+// agent + init shim into a stock OCI image. We assert the files land in
+// bundle/rootfs at the right path/mode/content (the fake mkfs's -d source
+// is exactly that tree, so this proves they'd be captured into the ext4).
+func TestBuild_InjectFiles(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	hostBin := filepath.Join(t.TempDir(), "toolboxd")
+	if err := os.WriteFile(hostBin, []byte("ELF-ish"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	res, err := b.Build(context.Background(), BuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+		InjectFiles: []InjectFile{
+			{HostPath: hostBin, GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+			{Content: []byte("SB_TOOLBOX_TOKEN='abc'\n"), GuestPath: "/etc/toolboxd.env", Mode: 0o600},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer res.CleanupDir()
+	root := filepath.Join(res.StagingDir, "bundle", "rootfs")
+
+	bin := filepath.Join(root, "usr/local/bin/toolboxd")
+	gotBin, err := os.ReadFile(bin)
+	if err != nil || string(gotBin) != "ELF-ish" {
+		t.Fatalf("injected binary content=%q err=%v", gotBin, err)
+	}
+	if fi, _ := os.Stat(bin); fi.Mode().Perm() != 0o755 {
+		t.Errorf("injected binary mode = %v, want 0755", fi.Mode().Perm())
+	}
+	env := filepath.Join(root, "etc/toolboxd.env")
+	if gotEnv, _ := os.ReadFile(env); string(gotEnv) != "SB_TOOLBOX_TOKEN='abc'\n" {
+		t.Errorf("injected env content = %q", gotEnv)
+	}
+	if fi, _ := os.Stat(env); fi.Mode().Perm() != 0o600 {
+		t.Errorf("injected env mode = %v, want 0600", fi.Mode().Perm())
+	}
+}
+
+// TestInjectFiles_ClampsEscape guards path hygiene: a GuestPath that tries
+// to climb out of the rootfs (via ..) is clamped to the rootfs (absolute,
+// .. collapsed) and never scribbles on the host tree. The sibling temp dir
+// stands in for "the host filesystem above the rootfs".
+func TestInjectFiles_ClampsEscape(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "rootfs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := injectFiles(root, []InjectFile{
+		{Content: []byte("x"), GuestPath: "../../etc/passwd", Mode: 0o644},
+	}); err != nil {
+		t.Fatalf("injectFiles: %v", err)
+	}
+	// Must land inside the rootfs (clamped), not above it.
+	if _, err := os.Stat(filepath.Join(root, "etc/passwd")); err != nil {
+		t.Errorf("clamped file not inside rootfs: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "etc/passwd")); err == nil {
+		t.Error("escape NOT prevented: file written above rootfs")
+	}
+}
+
+// TestInjectFiles_RejectsSymlinkRedirect guards the critical boundary:
+// injected bytes are host-trusted data written into an untrusted image tree,
+// so the image must not be able to redirect the write through a symlink.
+func TestInjectFiles_RejectsSymlinkRedirect(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "rootfs")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(root, "usr/local"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "usr/local/bin")); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("toolboxd"), GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+	})
+	if err == nil {
+		t.Fatal("expected symlink-parent rejection")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "toolboxd")); statErr == nil {
+		t.Fatal("injected file followed symlink outside rootfs")
+	}
+}
+
+func TestInjectFiles_RejectsSymlinkDestination(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "rootfs")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(root, "usr/local/bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "toolboxd"), filepath.Join(root, "usr/local/bin/toolboxd")); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("toolboxd"), GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+	})
+	if err == nil {
+		t.Fatal("expected symlink-destination rejection")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "toolboxd")); statErr == nil {
+		t.Fatal("injected file followed symlink destination outside rootfs")
+	}
+}
+
 // TestBuild_StageFailure_SurfacesTail confirms a non-zero exit from any
 // stage carries the binary's stderr in the returned error. Operators
 // staring at a failed sandbox create need this; without it the only
@@ -358,5 +477,160 @@ func TestCappedBuffer_Overflow(t *testing.T) {
 	got := b.String()
 	if !strings.HasPrefix(got, "ABCD\n[... ") {
 		t.Errorf("head-keep broke: %q", got)
+	}
+}
+
+func TestInjectFiles_ValidationAndDefaults(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectFiles(root, []InjectFile{{Content: []byte("x"), GuestPath: ""}}); err == nil {
+		t.Fatal("expected error for empty GuestPath")
+	}
+	if err := injectFiles(root, []InjectFile{{Content: []byte("x"), GuestPath: "/"}}); err == nil {
+		t.Fatal("expected error for root GuestPath")
+	}
+
+	if err := injectFiles(root, []InjectFile{{Content: []byte("plain"), GuestPath: "/etc/default-mode"}}); err != nil {
+		t.Fatalf("injectFiles default mode: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(root, "etc/default-mode"))
+	if err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("default mode = %v err=%v, want 0644", fi.Mode().Perm(), err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing-bin")
+	if err := injectFiles(root, []InjectFile{{HostPath: missing, GuestPath: "/bin/missing", Mode: 0o755}}); err == nil {
+		t.Fatal("expected error for unreadable HostPath")
+	}
+}
+
+func TestInjectFiles_ParentNotDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr"), []byte("file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("x"), GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("injectFiles = %v, want parent-not-directory error", err)
+	}
+}
+
+func TestInjectFiles_DestinationIsDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.MkdirAll(filepath.Join(root, "opt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("x"), GuestPath: "/opt", Mode: 0o644},
+	})
+	if err == nil {
+		t.Fatal("expected error when destination path is a directory")
+	}
+}
+
+func TestBuild_InjectFailureCleansStaging(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	_, err := b.Build(context.Background(), BuildRequest{
+		ImageRef:    "docker://alpine:3.20",
+		OutPath:     out,
+		InjectFiles: []InjectFile{{Content: []byte("x"), GuestPath: ""}},
+	})
+	if err == nil {
+		t.Fatal("expected inject validation error")
+	}
+	entries, _ := os.ReadDir(cfg.WorkDir)
+	if len(entries) != 0 {
+		t.Fatalf("staging dir not cleaned up after inject failure: %d entries in %q", len(entries), cfg.WorkDir)
+	}
+}
+
+func TestBuild_WorkDirErrors(t *testing.T) {
+	cfg, _ := happyConfig(t)
+
+	t.Run("mkdir workdir fails", func(t *testing.T) {
+		base := t.TempDir()
+		cfg.WorkDir = filepath.Join(base, "blocked", "work")
+		if err := os.WriteFile(filepath.Join(base, "blocked"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := New(cfg)
+		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
+		if err == nil || !strings.Contains(err.Error(), "mkdir workdir") {
+			t.Fatalf("Build = %v, want mkdir workdir error", err)
+		}
+	})
+
+	t.Run("mkdtemp fails", func(t *testing.T) {
+		work := filepath.Join(t.TempDir(), "nowrite")
+		if err := os.Mkdir(work, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(work, 0o755) })
+		cfg.WorkDir = work
+		b, _ := New(cfg)
+		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
+		if err == nil || !strings.Contains(err.Error(), "mkdtemp") {
+			t.Fatalf("Build = %v, want mkdtemp error", err)
+		}
+	})
+}
+
+func TestRunMkfs_MissingRootfs(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	missing := filepath.Join(t.TempDir(), "missing-rootfs")
+	err := b.runMkfs(context.Background(), missing, filepath.Join(t.TempDir(), "out.ext4"), 0)
+	if err == nil || !strings.Contains(err.Error(), "size rootfs") {
+		t.Fatalf("runMkfs = %v, want size rootfs error", err)
+	}
+}
+
+func TestExt4SizeMiB_WalkError(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "root")
+	sub := filepath.Join(src, "blocked")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o755) })
+
+	if _, err := ext4SizeMiB(src, 0); err == nil {
+		t.Fatal("expected walk error for unreadable subdirectory")
+	}
+}
+
+func TestBuild_DefaultTag(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	res, err := b.Build(context.Background(), BuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer res.CleanupDir()
+	if _, err := os.Stat(filepath.Join(res.StagingDir, "bundle", "rootfs", "etc", "oci-meta")); err != nil {
+		t.Fatalf("umoci did not run with default latest tag: %v", err)
+	}
+	meta, _ := os.ReadFile(filepath.Join(res.StagingDir, "bundle", "rootfs", "etc", "oci-meta"))
+	if !strings.Contains(string(meta), "img=") {
+		t.Fatalf("unexpected oci-meta: %q", meta)
 	}
 }

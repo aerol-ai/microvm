@@ -117,6 +117,29 @@ type BuildRequest struct {
 	// transport sometimes needs the tag explicitly when the source ref
 	// doesn't carry one.
 	Tag string
+	// InjectFiles are host-provided files written into the unpacked rootfs
+	// AFTER umoci and BEFORE mkfs, so they become part of the ext4 image.
+	// The Firecracker cold-boot path uses this to bake the in-guest agent
+	// (toolboxd), its init shim, and the per-sandbox token into an
+	// otherwise-stock OCI image — a plain image has no agent, so without
+	// this the guest boots with nothing listening on vsock (see
+	// internal/runtime/firecracker cold-boot agent injection). Empty for
+	// template builds, which expect the operator's image to already carry
+	// an init that brings the agent up.
+	InjectFiles []InjectFile
+}
+
+// InjectFile is one file to write into the rootfs before mkfs. Exactly one
+// of HostPath or Content supplies the bytes: HostPath copies an existing
+// host file (e.g. the toolboxd binary), Content writes inline bytes (e.g. a
+// generated init script or a per-sandbox env file). GuestPath is the
+// absolute path inside the guest ("/usr/local/bin/toolboxd"); parent dirs
+// are created. Mode is the file mode applied to the written file.
+type InjectFile struct {
+	HostPath  string
+	Content   []byte
+	GuestPath string
+	Mode      os.FileMode
 }
 
 // Result reports a finished build. RootfsPath is OutPath echoed back for
@@ -175,8 +198,16 @@ func (b *Builder) Build(ctx context.Context, req BuildRequest) (*Result, error) 
 		_ = os.RemoveAll(staging)
 		return nil, err
 	}
-	// Stage 3: mkfs.ext4 -d <bundle>/rootfs -F <out>
+	// Stage 2.5: inject host-provided files (the in-guest agent + init)
+	// into the unpacked rootfs so they land inside the ext4 image. Must
+	// run after umoci (the tree exists) and before mkfs (the tree is
+	// snapshotted into the image).
 	rootfsSrc := filepath.Join(bundleDir, "rootfs")
+	if err := injectFiles(rootfsSrc, req.InjectFiles); err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, err
+	}
+	// Stage 3: mkfs.ext4 -d <bundle>/rootfs -F <out>
 	if err := b.runMkfs(ctx, rootfsSrc, req.OutPath, req.MinSizeMiB); err != nil {
 		_ = os.RemoveAll(staging)
 		return nil, err
@@ -220,6 +251,99 @@ func (b *Builder) runUmoci(ctx context.Context, ociDir, tag, bundleDir string) e
 		bundleDir,
 	}
 	return runStage(ctx, "umoci", b.cfg.UmociBin, args)
+}
+
+// injectFiles writes each requested file into the unpacked rootfs at
+// rootfsSrc. GuestPath is treated as absolute-in-guest, so it is joined
+// under rootfsSrc after trimming the leading slash; parent directories
+// are created without following symlinks. A GuestPath that escapes the
+// rootfs via .. is clamped back under rootfs; existing symlinks in the
+// destination path are rejected so an untrusted image cannot redirect an
+// injected host file outside the unpacked rootfs tree.
+func injectFiles(rootfsSrc string, files []InjectFile) error {
+	for _, f := range files {
+		if f.GuestPath == "" {
+			return errors.New("oci: inject file with empty GuestPath")
+		}
+		dst, err := prepareInjectDestination(rootfsSrc, f.GuestPath)
+		if err != nil {
+			return err
+		}
+		mode := f.Mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		var data []byte
+		if f.HostPath != "" {
+			b, err := os.ReadFile(f.HostPath)
+			if err != nil {
+				return fmt.Errorf("oci: inject read %s: %w", f.HostPath, err)
+			}
+			data = b
+		} else {
+			data = f.Content
+		}
+		if err := writeInjectFile(dst, data, mode); err != nil {
+			return fmt.Errorf("oci: inject write %s: %w", dst, err)
+		}
+	}
+	return nil
+}
+
+func prepareInjectDestination(rootfsSrc, guestPath string) (string, error) {
+	root, err := filepath.Abs(rootfsSrc)
+	if err != nil {
+		return "", fmt.Errorf("oci: inject rootfs path %s: %w", rootfsSrc, err)
+	}
+	rel := strings.TrimPrefix(filepath.Clean("/"+guestPath), "/")
+	if rel == "." || rel == "" {
+		return "", fmt.Errorf("oci: inject path %q resolves to rootfs root", guestPath)
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	dir := root
+	for _, part := range parts[:len(parts)-1] {
+		dir = filepath.Join(dir, part)
+		info, err := os.Lstat(dir)
+		switch {
+		case err == nil:
+			if info.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("oci: inject parent %s is a symlink", dir)
+			}
+			if !info.IsDir() {
+				return "", fmt.Errorf("oci: inject parent %s is not a directory", dir)
+			}
+		case os.IsNotExist(err):
+			if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
+				return "", fmt.Errorf("oci: inject mkdir %s: %w", dir, err)
+			}
+		default:
+			return "", fmt.Errorf("oci: inject stat %s: %w", dir, err)
+		}
+	}
+	dst := filepath.Join(root, rel)
+	if info, err := os.Lstat(dst); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("oci: inject destination %s is a symlink", dst)
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("oci: inject stat %s: %w", dst, err)
+	}
+	return dst, nil
+}
+
+func writeInjectFile(dst string, data []byte, mode os.FileMode) error {
+	file, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	// OpenFile honors umask; force the requested mode (the agent must
+	// be executable regardless of the daemon's umask).
+	return os.Chmod(dst, mode)
 }
 
 // runMkfs wraps stage 3. -d copies a directory in as the initial

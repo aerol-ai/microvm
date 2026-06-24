@@ -218,6 +218,15 @@ type Config struct {
 	// (carries host wall clock to the guest for clock+RNG resync).
 	// Mirrors internal/config.Config.FirecrackerSnapshotPostResumeTimeout.
 	PostResumeTimeout time.Duration
+	// ToolboxBinaryPath is the host path to the toolboxd agent binary,
+	// baked into every cold-boot rootfs so the guest has something
+	// listening on vsock (the Create readiness handshake) and HTTP (exec /
+	// files / sessions). Mirrors internal/config.Config.ToolboxBinaryPath.
+	// When empty, cold-boot still works but the guest comes up with no
+	// agent — Create's vsock handshake will then time out, so production
+	// daemons must set it. The template/snapshot path does NOT use this
+	// (those images carry their own init + agent).
+	ToolboxBinaryPath string
 }
 
 // FromDaemonConfig copies the Firecracker-relevant fields out of the full
@@ -240,6 +249,7 @@ func FromDaemonConfig(c config.Config) Config {
 		OverlayMkfs:          c.FirecrackerOverlayMkfs,
 		Mkfs4Bin:             c.FirecrackerMkfs4Bin,
 		PostResumeTimeout:    c.FirecrackerSnapshotPostResumeTimeout,
+		ToolboxBinaryPath:    c.ToolboxBinaryPath,
 	}
 }
 
@@ -613,6 +623,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 				"sandbox_id", allocID, "template_id", req.TemplateID, "src", src.RootfsPath)
 		}
 	} else {
+		// Bake the in-guest agent (toolboxd) + its PID-1 init shim + the
+		// per-sandbox token into the otherwise-stock OCI rootfs. Without
+		// this the guest boots with nothing on vsock and Create's readiness
+		// handshake times out (a plain image carries no agent). Empty when
+		// no toolbox binary is configured — see coldBootInjectFiles.
+		inject := coldBootInjectFiles(d.cfg.ToolboxBinaryPath, toolboxToken)
+		if inject == nil {
+			d.logger.Warn("firecracker cold-boot: no toolbox binary configured; guest will boot without an agent and the vsock handshake will fail",
+				"sandbox_id", allocID)
+		}
 		rootfsResult, err := d.rootfs.Build(ctx, RootfsBuildRequest{
 			ImageRef: ociImageRefFor(req.Image),
 			OutPath:  rootfsPath,
@@ -620,8 +640,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			// the OCI builder rounds up to the larger of the image and
 			// this floor. Zero (the wire default) means "use whatever the
 			// unpacked rootfs needs".
-			MinSizeMiB: req.DiskGB * 1024,
-			Tag:        "latest",
+			MinSizeMiB:  req.DiskGB * 1024,
+			Tag:         "latest",
+			InjectFiles: inject,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("firecracker runtime: rootfs build: %w", err)
@@ -841,9 +862,14 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage rootfs: %w", err)
 	}
+	// Cold-boot args: base + kernel IP autoconfig (so eth0 is up for the
+	// agent's HTTP server) + init=toolboxd-init when the agent was injected
+	// into the rootfs. The injection condition mirrors coldBootInjectFiles
+	// exactly (both key off a configured toolbox binary), so the init=
+	// override is present iff the shim is actually in the image.
 	if err := client.PutBootSource(ctx, firecracker.BootSource{
 		KernelImagePath: kernelAPIPath,
-		BootArgs:        defaultBootArgs(),
+		BootArgs:        coldBootArgs(slot, d.cfg.ToolboxBinaryPath != ""),
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutBootSource: %w", err)
 	}
