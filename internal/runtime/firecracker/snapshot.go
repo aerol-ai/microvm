@@ -155,6 +155,14 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 		}
 	}()
 
+	// In jailer mode handle.RunDir() is the chroot root, which does not exist
+	// until the jailer starts unless the daemon creates it first. Snapshot
+	// capture stages the template rootfs before Start, so mirror Create's
+	// pre-staging mkdir here.
+	if err := os.MkdirAll(handle.RunDir(), 0o755); err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: create runDir %s: %w", handle.RunDir(), err)
+	}
+
 	// Step 3: stage the template's rootfs into the VMM's runDir. The
 	// jailer chroot covers the runDir, so the rootfs MUST live inside
 	// it; hard-link first, copy on EXDEV.
@@ -269,7 +277,8 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 
 	// Step 8: wait for the in-guest toolbox. Same handshake Create does
 	// — the snapshot is only worth capturing once the agent is up.
-	if err := d.vsockHandshake(ctx, req.GuestCID); err != nil {
+	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
+	if err := d.vsockHandshake(ctx, vsockPath, req.GuestCID); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: vsock handshake: %w", err)
 	}
 
@@ -278,7 +287,7 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	// here. We log a failed send rather than aborting because a missing
 	// ack would leave us with no snapshot for an otherwise-healthy
 	// template build.
-	if err := d.sendVsockOp(ctx, req.GuestCID, "pre_snapshot", nil); err != nil {
+	if err := d.sendVsockOp(ctx, vsockPath, req.GuestCID, "pre_snapshot", nil); err != nil {
 		d.logger.Warn("firecracker snapshot: pre_snapshot send failed (continuing)",
 			"template_id", req.TemplateID, "error", err)
 	}
@@ -358,16 +367,16 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	}, nil
 }
 
-// sendVsockOp opens a fresh AF_VSOCK connection to the in-guest toolbox
-// and writes one line of JSON ({"op":"<op>","data":<data>}). Used for
-// the best-effort pre_snapshot / post_resume signals —
-// vsockHandshake already proved the listener is up, so a failure here
-// is "the agent didn't ack in time", not "agent unreachable". We do
-// read the response so the connection stays well-formed (the toolbox
-// writes ack-then-EOF), but we surface only the error path; the ack
-// body itself is ignored. Passing data=nil omits the data field via
-// json's "omitempty" on a *json.RawMessage built from the marshal.
-func (d *Driver) sendVsockOp(ctx context.Context, guestCID uint32, op string, data any) error {
+// sendVsockOp opens a fresh Firecracker host-side vsock proxy connection to
+// the in-guest toolbox and writes one line of JSON
+// ({"op":"<op>","data":<data>}). Used for the best-effort pre_snapshot /
+// post_resume signals — vsockHandshake already proved the listener is up, so a
+// failure here is "the agent didn't ack in time", not "agent unreachable". We
+// do read the response so the connection stays well-formed (the toolbox writes
+// ack-then-EOF), but we surface only the error path; the ack body itself is
+// ignored. Passing data=nil omits the data field via json's "omitempty" on a
+// *json.RawMessage built from the marshal.
+func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID uint32, op string, data any) error {
 	payload := struct {
 		Op   string          `json:"op"`
 		Data json.RawMessage `json:"data,omitempty"`
@@ -385,7 +394,7 @@ func (d *Driver) sendVsockOp(ctx context.Context, guestCID uint32, op string, da
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	conn, err := d.vsockDial.Dial(dialCtx, guestCID, defaultVsockPort)
+	conn, err := d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
 	if err != nil {
 		return fmt.Errorf("dial cid=%d: %w", guestCID, err)
 	}

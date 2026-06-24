@@ -101,6 +101,13 @@ type Vsock struct {
 	UDSPath  string `json:"uds_path"`
 }
 
+// VsockOverride lets snapshot-load rebind the restored virtio-vsock device to
+// a fresh host UDS path. Firecracker stores the original UDS in the snapshot
+// state, so clones must be explicit about where the restored VMM should listen.
+type VsockOverride struct {
+	UDSPath string `json:"uds_path"`
+}
+
 // Logger attaches a file-backed logger. Optional; useful for capturing
 // Firecracker's own diagnostic output (boot errors, snapshot fault messages)
 // alongside the VMM process group's stderr.
@@ -146,6 +153,7 @@ type SnapshotCreate struct {
 type SnapshotLoad struct {
 	SnapshotPath        string         `json:"snapshot_path"`
 	MemBackend          *MemoryBackend `json:"mem_backend,omitempty"`
+	VsockOverride       *VsockOverride `json:"vsock_override,omitempty"`
 	EnableDiffSnapshots bool           `json:"enable_diff_snapshots,omitempty"`
 	ResumeVM            bool           `json:"resume_vm,omitempty"`
 }

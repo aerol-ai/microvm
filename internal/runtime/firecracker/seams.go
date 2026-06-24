@@ -5,8 +5,8 @@ package firecracker
 //
 //   - cmd/sandboxd/main.go can inject one production implementation per
 //     seam at boot (the adapters there are a few lines each — most are
-//     passthroughs to pkg/oci.Builder, internal/network/tap.Host, and an
-//     AF_VSOCK dialer).
+//     passthroughs to pkg/oci.Builder, internal/network/tap.Host, and a
+//     Firecracker host-side vsock proxy dialer).
 //
 //   - the test binary can swap in fakes that don't need root, don't need
 //     subprocess access, and don't need a Linux kernel. Driver.Create's
@@ -111,15 +111,16 @@ type TapHost interface {
 	Remove(ctx context.Context, tapName string) error
 }
 
-// VsockDialer is the seam for opening AF_VSOCK from the host into the
-// guest. The driver's post-InstanceStart readiness check dials
-// (CID=guest-cid, port=defaultVsockPort) and Pings the toolbox. The
-// dial deadline is enforced by ctx.
+// VsockDialer is the seam for opening Firecracker's host-side vsock proxy into
+// the guest. The driver's post-InstanceStart readiness check connects to the
+// VMM's configured host UDS, asks Firecracker to forward to
+// (CID=guest-cid, port=defaultVsockPort), and Pings the toolbox. The dial
+// deadline is enforced by ctx.
 //
-// Production impl is Linux-only (vsock_dial_linux.go); the darwin stub
-// returns "AF_VSOCK is Linux-only" so the driver compiles on a dev box.
+// Production impl is Linux-only in daemon builds, but it uses Firecracker's
+// AF_UNIX proxy protocol rather than opening a host AF_VSOCK socket directly.
 type VsockDialer interface {
-	Dial(ctx context.Context, cid, port uint32) (io.ReadWriteCloser, error)
+	Dial(ctx context.Context, socketPath string, cid, port uint32) (io.ReadWriteCloser, error)
 }
 
 // VMMHandle is the subset of *vmm the driver uses. Interface form lets
@@ -193,9 +194,8 @@ type VMMClient interface {
 const defaultVsockPort uint32 = 1024
 
 // hostVsockUDSName is the filename used for the host-side vsock UDS
-// firecracker binds inside the runDir. firecracker writes per-port
-// sockets at <name>_<port>, but our dialer uses AF_VSOCK directly and
-// never opens these files — they're for socat-style debugging.
+// firecracker binds inside the runDir. Host-initiated connections open
+// <runDir>/vsock.sock and send Firecracker's "CONNECT <port>\n" command.
 const hostVsockUDSName = "vsock.sock"
 
 // rootfsFileName is the filename of the rootfs.ext4 inside the per-

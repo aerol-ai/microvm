@@ -300,9 +300,9 @@ func (d *Driver) SetRootfsBuilder(b RootfsBuilder) { d.rootfs = b }
 // impl is *internal/network/tap.Host; tests inject a recording fake.
 func (d *Driver) SetTapHost(h TapHost) { d.tapHost = h }
 
-// SetVsockDialer injects the host-side AF_VSOCK dialer. Production
-// impl is the Linux-only NewLinuxVsockDialer(); tests inject a fake
-// that returns an in-memory io.ReadWriteCloser pair.
+// SetVsockDialer injects the host-side Firecracker vsock proxy dialer.
+// Production impl is the Linux-only NewLinuxVsockDialer(); tests inject a
+// fake that returns an in-memory io.ReadWriteCloser pair.
 func (d *Driver) SetVsockDialer(v VsockDialer) { d.vsockDial = v }
 
 // SetSpawner overrides the default VMM spawn function. Tests use
@@ -420,8 +420,8 @@ func methodNotImplemented(method string) error {
 // 3 SQLite writes (pool allocation), 1 OCI subprocess pipeline (the
 // dominant cost — skopeo+umoci+mkfs.ext4 can be tens of seconds on a
 // large image), 3 `ip` shell-outs, 1 firecracker subprocess spawn,
-// 6 HTTP-over-UDS calls, and 1 AF_VSOCK dial. The OCI pipeline is the
-// only stage with multi-second worst-case latency; per the plan, Phase
+// 6 HTTP-over-UDS calls, and 1 Firecracker vsock proxy dial. The OCI pipeline
+// is the only stage with multi-second worst-case latency; per the plan, Phase
 // 2 caches the rootfs and skips this stage when a template hit lands.
 func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	// All seams are required for a real Create. Distinct error messages
@@ -767,7 +767,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if snapshotLoadPath {
 		handshakeCID = snapshotInfo.SnapshotVsockCID
 	}
-	if err := d.vsockHandshake(ctx, handshakeCID); err != nil {
+	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
+	if err := d.vsockHandshake(ctx, vsockPath, handshakeCID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: vsock handshake: %w", err)
 	}
 
@@ -782,7 +783,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// has nothing to resync (kernel just initialized) so skip.
 	if snapshotLoadPath {
 		postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-		err := d.sendVsockOp(postCtx, handshakeCID, "post_resume", map[string]any{
+		err := d.sendVsockOp(postCtx, vsockPath, handshakeCID, "post_resume", map[string]any{
 			"wallclock_unix_ns": time.Now().UnixNano(),
 		})
 		cancel()
@@ -966,6 +967,7 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 			BackendType: "File",
 			BackendPath: snap.SnapshotMemoryPath,
 		},
+		VsockOverride:       &firecracker.VsockOverride{UDSPath: hostVsockUDSName},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
 	}); err != nil {
@@ -1003,11 +1005,11 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	return nil
 }
 
-// vsockHandshake dials the in-guest toolbox over AF_VSOCK and exchanges
-// a Ping/Ok. The handshake is the canonical proof that the guest
-// booted far enough to bring the toolbox up — without this, a guest
-// that crashed during init would still register as "Running" because
-// the firecracker process is alive.
+// vsockHandshake dials the in-guest toolbox through Firecracker's host-side
+// vsock proxy and exchanges a Ping/Ok. The handshake is the canonical proof
+// that the guest booted far enough to bring the toolbox up — without this, a
+// guest that crashed during init would still register as "Running" because the
+// firecracker process is alive.
 //
 // Protocol wire shape mirrors cmd/toolboxd/vsock.go:
 //   - send: {"op":"ping"}\n
@@ -1017,7 +1019,7 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 // (or its own deadline if ctx has none). Cold-boot is usually under
 // 500ms but the headroom keeps a slow host (CI under load) from
 // flaking.
-func (d *Driver) vsockHandshake(ctx context.Context, guestCID uint32) error {
+func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID uint32) error {
 	deadline := 5 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(dl); remaining > 0 && remaining < deadline {
@@ -1035,7 +1037,7 @@ func (d *Driver) vsockHandshake(ctx context.Context, guestCID uint32) error {
 		err  error
 	)
 	for {
-		conn, err = d.vsockDial.Dial(dialCtx, guestCID, defaultVsockPort)
+		conn, err = d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
 		if err == nil {
 			break
 		}

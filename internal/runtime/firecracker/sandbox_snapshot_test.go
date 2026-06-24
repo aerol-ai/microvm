@@ -67,6 +67,11 @@ func TestStopStartSnapshotLifecycle(t *testing.T) {
 	if f.client.snapshotLoad.SnapshotPath != filepath.Join(dir, sandboxSnapshotStateFileName) {
 		t.Fatalf("LoadSnapshot path = %q, want snapshot state in %s", f.client.snapshotLoad.SnapshotPath, dir)
 	}
+	if f.client.snapshotLoad.VsockOverride == nil ||
+		f.client.snapshotLoad.VsockOverride.UDSPath != hostVsockUDSName {
+		t.Fatalf("LoadSnapshot.VsockOverride = %+v, want uds_path=%q",
+			f.client.snapshotLoad.VsockOverride, hostVsockUDSName)
+	}
 	if patch, ok := f.client.drivePatches[rootDriveID]; !ok || patch.PathOnHost == "" {
 		t.Fatalf("Start did not patch rootfs drive: %+v", f.client.drivePatches)
 	}

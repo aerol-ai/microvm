@@ -190,6 +190,7 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 			BackendType: "File",
 			BackendPath: req.SnapshotMemoryPath,
 		},
+		VsockOverride:       &firecracker.VsockOverride{UDSPath: hostVsockUDSName},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
 	}); err != nil {
