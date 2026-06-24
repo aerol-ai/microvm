@@ -117,6 +117,29 @@ type BuildRequest struct {
 	// transport sometimes needs the tag explicitly when the source ref
 	// doesn't carry one.
 	Tag string
+	// InjectFiles are host-provided files written into the unpacked rootfs
+	// AFTER umoci and BEFORE mkfs, so they become part of the ext4 image.
+	// The Firecracker cold-boot path uses this to bake the in-guest agent
+	// (toolboxd), its init shim, and the per-sandbox token into an
+	// otherwise-stock OCI image — a plain image has no agent, so without
+	// this the guest boots with nothing listening on vsock (see
+	// internal/runtime/firecracker cold-boot agent injection). Empty for
+	// template builds, which expect the operator's image to already carry
+	// an init that brings the agent up.
+	InjectFiles []InjectFile
+}
+
+// InjectFile is one file to write into the rootfs before mkfs. Exactly one
+// of HostPath or Content supplies the bytes: HostPath copies an existing
+// host file (e.g. the toolboxd binary), Content writes inline bytes (e.g. a
+// generated init script or a per-sandbox env file). GuestPath is the
+// absolute path inside the guest ("/usr/local/bin/toolboxd"); parent dirs
+// are created. Mode is the file mode applied to the written file.
+type InjectFile struct {
+	HostPath  string
+	Content   []byte
+	GuestPath string
+	Mode      os.FileMode
 }
 
 // Result reports a finished build. RootfsPath is OutPath echoed back for
@@ -175,8 +198,16 @@ func (b *Builder) Build(ctx context.Context, req BuildRequest) (*Result, error) 
 		_ = os.RemoveAll(staging)
 		return nil, err
 	}
-	// Stage 3: mkfs.ext4 -d <bundle>/rootfs -F <out>
+	// Stage 2.5: inject host-provided files (the in-guest agent + init)
+	// into the unpacked rootfs so they land inside the ext4 image. Must
+	// run after umoci (the tree exists) and before mkfs (the tree is
+	// snapshotted into the image).
 	rootfsSrc := filepath.Join(bundleDir, "rootfs")
+	if err := injectFiles(rootfsSrc, req.InjectFiles); err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, err
+	}
+	// Stage 3: mkfs.ext4 -d <bundle>/rootfs -F <out>
 	if err := b.runMkfs(ctx, rootfsSrc, req.OutPath, req.MinSizeMiB); err != nil {
 		_ = os.RemoveAll(staging)
 		return nil, err
@@ -220,6 +251,52 @@ func (b *Builder) runUmoci(ctx context.Context, ociDir, tag, bundleDir string) e
 		bundleDir,
 	}
 	return runStage(ctx, "umoci", b.cfg.UmociBin, args)
+}
+
+// injectFiles writes each requested file into the unpacked rootfs at
+// rootfsSrc. GuestPath is treated as absolute-in-guest, so it is joined
+// under rootfsSrc after trimming the leading slash; parent directories
+// are created. A GuestPath that escapes the rootfs (via .. or an
+// absolute symlink target) is rejected — these files are trusted host
+// inputs, but cheap path hygiene keeps a mistake from scribbling on the
+// host tree.
+func injectFiles(rootfsSrc string, files []InjectFile) error {
+	for _, f := range files {
+		if f.GuestPath == "" {
+			return errors.New("oci: inject file with empty GuestPath")
+		}
+		rel := strings.TrimPrefix(filepath.Clean("/"+f.GuestPath), "/")
+		dst := filepath.Join(rootfsSrc, rel)
+		if !strings.HasPrefix(dst, filepath.Clean(rootfsSrc)+string(os.PathSeparator)) {
+			return fmt.Errorf("oci: inject path %q escapes rootfs", f.GuestPath)
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return fmt.Errorf("oci: inject mkdir %s: %w", filepath.Dir(dst), err)
+		}
+		mode := f.Mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		var data []byte
+		if f.HostPath != "" {
+			b, err := os.ReadFile(f.HostPath)
+			if err != nil {
+				return fmt.Errorf("oci: inject read %s: %w", f.HostPath, err)
+			}
+			data = b
+		} else {
+			data = f.Content
+		}
+		if err := os.WriteFile(dst, data, mode); err != nil {
+			return fmt.Errorf("oci: inject write %s: %w", dst, err)
+		}
+		// WriteFile honors umask; force the requested mode (the agent must
+		// be executable regardless of the daemon's umask).
+		if err := os.Chmod(dst, mode); err != nil {
+			return fmt.Errorf("oci: inject chmod %s: %w", dst, err)
+		}
+	}
+	return nil
 }
 
 // runMkfs wraps stage 3. -d copies a directory in as the initial

@@ -245,6 +245,74 @@ func TestExt4SizeMiB(t *testing.T) {
 	}
 }
 
+// TestBuild_InjectFiles bakes host-provided files into the rootfs before
+// mkfs — the mechanism the Firecracker cold-boot path uses to put the
+// agent + init shim into a stock OCI image. We assert the files land in
+// bundle/rootfs at the right path/mode/content (the fake mkfs's -d source
+// is exactly that tree, so this proves they'd be captured into the ext4).
+func TestBuild_InjectFiles(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	hostBin := filepath.Join(t.TempDir(), "toolboxd")
+	if err := os.WriteFile(hostBin, []byte("ELF-ish"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	res, err := b.Build(context.Background(), BuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+		InjectFiles: []InjectFile{
+			{HostPath: hostBin, GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+			{Content: []byte("SB_TOOLBOX_TOKEN='abc'\n"), GuestPath: "/etc/toolboxd.env", Mode: 0o600},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer res.CleanupDir()
+	root := filepath.Join(res.StagingDir, "bundle", "rootfs")
+
+	bin := filepath.Join(root, "usr/local/bin/toolboxd")
+	gotBin, err := os.ReadFile(bin)
+	if err != nil || string(gotBin) != "ELF-ish" {
+		t.Fatalf("injected binary content=%q err=%v", gotBin, err)
+	}
+	if fi, _ := os.Stat(bin); fi.Mode().Perm() != 0o755 {
+		t.Errorf("injected binary mode = %v, want 0755", fi.Mode().Perm())
+	}
+	env := filepath.Join(root, "etc/toolboxd.env")
+	if gotEnv, _ := os.ReadFile(env); string(gotEnv) != "SB_TOOLBOX_TOKEN='abc'\n" {
+		t.Errorf("injected env content = %q", gotEnv)
+	}
+	if fi, _ := os.Stat(env); fi.Mode().Perm() != 0o600 {
+		t.Errorf("injected env mode = %v, want 0600", fi.Mode().Perm())
+	}
+}
+
+// TestInjectFiles_ClampsEscape guards path hygiene: a GuestPath that tries
+// to climb out of the rootfs (via ..) is clamped to the rootfs (absolute,
+// .. collapsed) and never scribbles on the host tree. The sibling temp dir
+// stands in for "the host filesystem above the rootfs".
+func TestInjectFiles_ClampsEscape(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "rootfs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := injectFiles(root, []InjectFile{
+		{Content: []byte("x"), GuestPath: "../../etc/passwd", Mode: 0o644},
+	}); err != nil {
+		t.Fatalf("injectFiles: %v", err)
+	}
+	// Must land inside the rootfs (clamped), not above it.
+	if _, err := os.Stat(filepath.Join(root, "etc/passwd")); err != nil {
+		t.Errorf("clamped file not inside rootfs: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "etc/passwd")); err == nil {
+		t.Error("escape NOT prevented: file written above rootfs")
+	}
+}
+
 // TestBuild_StageFailure_SurfacesTail confirms a non-zero exit from any
 // stage carries the binary's stderr in the returned error. Operators
 // staring at a failed sandbox create need this; without it the only
