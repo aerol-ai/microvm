@@ -391,6 +391,97 @@ func TestRun_NetstatsBootstrapErrorIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestRun_SSHGatewayWithCluster(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	raftPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeTCPPort(t)
+
+	t.Setenv("SB_ENABLE_SSH_GATEWAY", "true")
+	t.Setenv("SB_ENABLE_CLUSTER", "true")
+	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_DATA_DIR", filepath.Join(paths.rootDir, "raft"))
+	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
+
+	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRun_ClusterWorkerWithFirecracker(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	raftPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeTCPPort(t)
+
+	t.Setenv("SB_ENABLE_CLUSTER", "true")
+	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_DATA_DIR", filepath.Join(paths.rootDir, "raft"))
+	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
+	t.Setenv("SB_ENABLE_FIRECRACKER", "true")
+	t.Setenv("SB_FIRECRACKER_BINARY", "/bin/true")
+	t.Setenv("SB_JAILER_BINARY", "/bin/true")
+	t.Setenv("SB_FIRECRACKER_KERNEL", paths.firecrackerKernel)
+	t.Setenv("SB_FIRECRACKER_RUN_DIR", paths.firecrackerRunDir)
+	t.Setenv("SB_FIRECRACKER_TEMPLATES_DIR", paths.templatesDir)
+	t.Setenv("SB_FIRECRACKER_USE_JAILER", "false")
+	t.Setenv("SB_FIRECRACKER_TAP_BASE_CIDR", "172.19.0.0/30")
+	t.Setenv("SB_FIRECRACKER_TAP_POOL_SIZE", "1")
+	t.Setenv("SB_FIRECRACKER_SKOPEO_BIN", "/bin/true")
+	t.Setenv("SB_FIRECRACKER_UMOCI_BIN", "/bin/true")
+	t.Setenv("SB_FIRECRACKER_MKFS_BIN", "/bin/true")
+
+	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRun_PlatformVolumesS3(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	t.Setenv("SB_PLATFORM_VOLUMES_ENABLED", "true")
+	t.Setenv("SB_PLATFORM_VOLUMES_BACKEND", "s3")
+	t.Setenv("SB_PLATFORM_VOLUMES_S3_BUCKET", "test-bucket")
+	t.Setenv("SB_PLATFORM_VOLUMES_RECLAIM_INTERVAL", "1h")
+	t.Setenv("SB_PLATFORM_VOLUMES_RECLAIM_MOUNT_ROOT", filepath.Join(paths.rootDir, "volume-reclaim"))
+
+	if err := runWithAutoCancel(t, 150*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRun_FirecrackerTapSeedFailure(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	t.Setenv("SB_ENABLE_FIRECRACKER", "true")
+	t.Setenv("SB_FIRECRACKER_BINARY", "/bin/true")
+	t.Setenv("SB_JAILER_BINARY", "/bin/true")
+	t.Setenv("SB_FIRECRACKER_KERNEL", paths.firecrackerKernel)
+	t.Setenv("SB_FIRECRACKER_RUN_DIR", paths.firecrackerRunDir)
+	t.Setenv("SB_FIRECRACKER_USE_JAILER", "false")
+	t.Setenv("SB_FIRECRACKER_TAP_BASE_CIDR", "172.19.0.0/30")
+	t.Setenv("SB_FIRECRACKER_TAP_POOL_SIZE", "999999")
+	t.Setenv("SB_FIRECRACKER_SKOPEO_BIN", "/bin/true")
+	t.Setenv("SB_FIRECRACKER_UMOCI_BIN", "/bin/true")
+	t.Setenv("SB_FIRECRACKER_MKFS_BIN", "/bin/true")
+
+	err := Run(context.Background(), testLogger(), nil)
+	if err == nil {
+		t.Fatal("Run returned nil error, want firecracker tap pool seed failure")
+	}
+	if !strings.Contains(err.Error(), "firecracker tap pool seed") {
+		t.Fatalf("Run error = %v, want tap pool seed wrapper", err)
+	}
+}
+
 func TestStartAutoImportReconciler_ImporterBuildError(t *testing.T) {
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)

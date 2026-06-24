@@ -85,11 +85,31 @@ func TestNetmaskFromCIDR(t *testing.T) {
 		{"172.16.0.0/30", "255.255.255.252"},
 		{"10.0.0.0/24", "255.255.255.0"},
 		{"192.168.1.0/16", "255.255.0.0"},
+		{"2001:db8::/32", ""},
 		{"bogus", ""},
 		{"", ""},
 	} {
 		if got := netmaskFromCIDR(tc.cidr); got != tc.want {
 			t.Errorf("netmaskFromCIDR(%q) = %q, want %q", tc.cidr, got, tc.want)
+		}
+	}
+}
+
+func TestKernelIPArg(t *testing.T) {
+	full := &TapSlot{GuestIP: "172.16.0.2", HostIP: "172.16.0.1", CIDR: "172.16.0.0/30"}
+	want := "ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off"
+	if got := kernelIPArg(full); got != want {
+		t.Fatalf("kernelIPArg(full) = %q, want %q", got, want)
+	}
+	for _, slot := range []*TapSlot{
+		nil,
+		{},
+		{GuestIP: "172.16.0.2"},
+		{GuestIP: "172.16.0.2", HostIP: "172.16.0.1"},
+		{GuestIP: "172.16.0.2", HostIP: "172.16.0.1", CIDR: "not-a-cidr"},
+	} {
+		if got := kernelIPArg(slot); got != "" {
+			t.Errorf("kernelIPArg(%+v) = %q, want empty", slot, got)
 		}
 	}
 }

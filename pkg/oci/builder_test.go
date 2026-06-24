@@ -479,3 +479,158 @@ func TestCappedBuffer_Overflow(t *testing.T) {
 		t.Errorf("head-keep broke: %q", got)
 	}
 }
+
+func TestInjectFiles_ValidationAndDefaults(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectFiles(root, []InjectFile{{Content: []byte("x"), GuestPath: ""}}); err == nil {
+		t.Fatal("expected error for empty GuestPath")
+	}
+	if err := injectFiles(root, []InjectFile{{Content: []byte("x"), GuestPath: "/"}}); err == nil {
+		t.Fatal("expected error for root GuestPath")
+	}
+
+	if err := injectFiles(root, []InjectFile{{Content: []byte("plain"), GuestPath: "/etc/default-mode"}}); err != nil {
+		t.Fatalf("injectFiles default mode: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(root, "etc/default-mode"))
+	if err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("default mode = %v err=%v, want 0644", fi.Mode().Perm(), err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing-bin")
+	if err := injectFiles(root, []InjectFile{{HostPath: missing, GuestPath: "/bin/missing", Mode: 0o755}}); err == nil {
+		t.Fatal("expected error for unreadable HostPath")
+	}
+}
+
+func TestInjectFiles_ParentNotDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr"), []byte("file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("x"), GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("injectFiles = %v, want parent-not-directory error", err)
+	}
+}
+
+func TestInjectFiles_DestinationIsDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.MkdirAll(filepath.Join(root, "opt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := injectFiles(root, []InjectFile{
+		{Content: []byte("x"), GuestPath: "/opt", Mode: 0o644},
+	})
+	if err == nil {
+		t.Fatal("expected error when destination path is a directory")
+	}
+}
+
+func TestBuild_InjectFailureCleansStaging(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	_, err := b.Build(context.Background(), BuildRequest{
+		ImageRef:    "docker://alpine:3.20",
+		OutPath:     out,
+		InjectFiles: []InjectFile{{Content: []byte("x"), GuestPath: ""}},
+	})
+	if err == nil {
+		t.Fatal("expected inject validation error")
+	}
+	entries, _ := os.ReadDir(cfg.WorkDir)
+	if len(entries) != 0 {
+		t.Fatalf("staging dir not cleaned up after inject failure: %d entries in %q", len(entries), cfg.WorkDir)
+	}
+}
+
+func TestBuild_WorkDirErrors(t *testing.T) {
+	cfg, _ := happyConfig(t)
+
+	t.Run("mkdir workdir fails", func(t *testing.T) {
+		base := t.TempDir()
+		cfg.WorkDir = filepath.Join(base, "blocked", "work")
+		if err := os.WriteFile(filepath.Join(base, "blocked"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := New(cfg)
+		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
+		if err == nil || !strings.Contains(err.Error(), "mkdir workdir") {
+			t.Fatalf("Build = %v, want mkdir workdir error", err)
+		}
+	})
+
+	t.Run("mkdtemp fails", func(t *testing.T) {
+		work := filepath.Join(t.TempDir(), "nowrite")
+		if err := os.Mkdir(work, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(work, 0o755) })
+		cfg.WorkDir = work
+		b, _ := New(cfg)
+		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
+		if err == nil || !strings.Contains(err.Error(), "mkdtemp") {
+			t.Fatalf("Build = %v, want mkdtemp error", err)
+		}
+	})
+}
+
+func TestRunMkfs_MissingRootfs(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	missing := filepath.Join(t.TempDir(), "missing-rootfs")
+	err := b.runMkfs(context.Background(), missing, filepath.Join(t.TempDir(), "out.ext4"), 0)
+	if err == nil || !strings.Contains(err.Error(), "size rootfs") {
+		t.Fatalf("runMkfs = %v, want size rootfs error", err)
+	}
+}
+
+func TestExt4SizeMiB_WalkError(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "root")
+	sub := filepath.Join(src, "blocked")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o755) })
+
+	if _, err := ext4SizeMiB(src, 0); err == nil {
+		t.Fatal("expected walk error for unreadable subdirectory")
+	}
+}
+
+func TestBuild_DefaultTag(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	res, err := b.Build(context.Background(), BuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer res.CleanupDir()
+	if _, err := os.Stat(filepath.Join(res.StagingDir, "bundle", "rootfs", "etc", "oci-meta")); err != nil {
+		t.Fatalf("umoci did not run with default latest tag: %v", err)
+	}
+	meta, _ := os.ReadFile(filepath.Join(res.StagingDir, "bundle", "rootfs", "etc", "oci-meta"))
+	if !strings.Contains(string(meta), "img=") {
+		t.Fatalf("unexpected oci-meta: %q", meta)
+	}
+}

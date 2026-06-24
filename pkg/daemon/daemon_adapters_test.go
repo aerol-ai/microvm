@@ -266,6 +266,37 @@ func TestFirecrackerRootfsAdapter_BuildSuccess(t *testing.T) {
 	}
 }
 
+func TestFirecrackerRootfsAdapter_BuildWithInjectFiles(t *testing.T) {
+	cfg, work := ociHappyConfig(t)
+	builder, err := oci.New(cfg)
+	if err != nil {
+		t.Fatalf("oci.New: %v", err)
+	}
+	hostBin := filepath.Join(t.TempDir(), "toolboxd")
+	if err := os.WriteFile(hostBin, []byte("ELF-ish"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &firecrackerRootfsAdapter{inner: builder}
+	out := filepath.Join(work, "rootfs-inject.ext4")
+	res, err := a.Build(context.Background(), fcruntime.RootfsBuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+		InjectFiles: []fcruntime.InjectFile{
+			{HostPath: hostBin, GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
+			{Content: []byte("SB_TOOLBOX_TOKEN='tok'\n"), GuestPath: "/etc/toolboxd.env", Mode: 0o600},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if res == nil || res.RootfsPath != out {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if err := res.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+}
+
 func TestTemplateBuilderAdapter_BuildSuccess(t *testing.T) {
 	cfg, work := ociHappyConfig(t)
 	builder, err := oci.New(cfg)
