@@ -112,6 +112,7 @@ func TestSnapshotTemplate_JailerStagesAPIPaths(t *testing.T) {
 		f.vmm.id = sandboxID
 		f.vmm.runDir = chrootRoot
 		f.vmm.apiSocket = filepath.Join(chrootRoot, "api.sock")
+		f.client.snapshotBase = chrootRoot
 		return f.vmm, nil
 	})
 
@@ -121,11 +122,13 @@ func TestSnapshotTemplate_JailerStagesAPIPaths(t *testing.T) {
 		t.Fatalf("write rootfs: %v", err)
 	}
 
+	memOut := filepath.Join(tplDir, "snapshot.memory")
+	stateOut := filepath.Join(tplDir, "snapshot.state")
 	_, err := f.driver.SnapshotTemplate(context.Background(), TemplateSnapshotRequest{
 		TemplateID:    "tpl-jail",
 		RootfsPath:    rootfs,
-		OutMemoryPath: filepath.Join(tplDir, "snapshot.memory"),
-		OutStatePath:  filepath.Join(tplDir, "snapshot.state"),
+		OutMemoryPath: memOut,
+		OutStatePath:  stateOut,
 		GuestCID:      200,
 		MemoryMB:      512,
 		VCPU:          1,
@@ -151,5 +154,17 @@ func TestSnapshotTemplate_JailerStagesAPIPaths(t *testing.T) {
 	}
 	if overlay := f.client.drives[overlayDriveID]; overlay.PathOnHost != overlayFileName {
 		t.Fatalf("overlay drive path = %q, want %q", overlay.PathOnHost, overlayFileName)
+	}
+	if f.client.snapshotCreate == nil {
+		t.Fatal("CreateSnapshot was not called")
+	}
+	if f.client.snapshotCreate.MemFilePath != sandboxSnapshotMemoryFileName ||
+		f.client.snapshotCreate.SnapshotPath != sandboxSnapshotStateFileName {
+		t.Fatalf("snapshot create paths = %+v, want chroot-relative snapshot files", f.client.snapshotCreate)
+	}
+	for _, path := range []string{memOut, stateOut} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("snapshot artifact %s was not copied out of chroot: %v", path, err)
+		}
 	}
 }

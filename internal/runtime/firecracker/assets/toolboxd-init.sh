@@ -51,12 +51,16 @@ configure_network() {
 	[ -n "${SB_TOOLBOX_PREFIX_LEN:-}" ] || return 0
 
 	iface=""
-	for dev in /sys/class/net/*; do
-		[ -e "$dev" ] || continue
-		name=${dev##*/}
-		[ "$name" = "lo" ] && continue
-		iface=$name
-		break
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		for dev in /sys/class/net/*; do
+			[ -e "$dev" ] || continue
+			name=${dev##*/}
+			[ "$name" = "lo" ] && continue
+			iface=$name
+			break
+		done
+		[ -n "$iface" ] && break
+		sleep 0.1
 	done
 	[ -n "$iface" ] || return 0
 

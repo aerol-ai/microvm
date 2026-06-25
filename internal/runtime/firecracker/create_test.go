@@ -319,6 +319,7 @@ type fakeClient struct {
 
 	snapshotCreate *firecracker.SnapshotCreate
 	snapshotLoad   *firecracker.SnapshotLoad
+	snapshotBase   string
 
 	// drivePatches records each PatchDrive call (snapshot-load + overlay
 	// path swap). Keyed by drive_id so a test can assert the post-load
@@ -433,6 +434,9 @@ func (c *fakeClient) CreateSnapshot(_ context.Context, req firecracker.SnapshotC
 			if path == "" {
 				continue
 			}
+			if !filepath.IsAbs(path) && c.snapshotBase != "" {
+				path = filepath.Join(c.snapshotBase, path)
+			}
 			if err := os.WriteFile(path, []byte("fake-snapshot-"+filepath.Base(path)), 0o600); err != nil {
 				return err
 			}
@@ -515,6 +519,7 @@ func newDriverFixture(t *testing.T) *driverFixture {
 		vmm.id = sandboxID
 		vmm.runDir = sandboxRun
 		vmm.apiSocket = filepath.Join(sandboxRun, "api.sock")
+		client.snapshotBase = sandboxRun
 		return vmm, nil
 	})
 	d.SetClientFactory(func(_ string) VMMClient { return client })

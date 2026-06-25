@@ -211,12 +211,8 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 
 	tmpMem := filepath.Join(tmpDir, sandboxSnapshotMemoryFileName)
 	tmpState := filepath.Join(tmpDir, sandboxSnapshotStateFileName)
-	if err := client.CreateSnapshot(ctx, firecracker.SnapshotCreate{
-		SnapshotType: "Full",
-		SnapshotPath: tmpState,
-		MemFilePath:  tmpMem,
-	}); err != nil {
-		return fmt.Errorf("firecracker runtime: stop %s: CreateSnapshot: %w", sandboxID, err)
+	if err := d.createSnapshotArtifacts(ctx, client, handle.RunDir(), tmpMem, tmpState); err != nil {
+		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
 	}
 
 	srcRootfs := filepath.Join(handle.RunDir(), rootfsFileName)

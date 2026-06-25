@@ -314,17 +314,13 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	// Step 11: write the snapshot. SnapshotType=Full because there is
 	// no base snapshot to diff against. Diff snapshots are a Phase 4+
 	// optimization (per-clone deltas above the shared template state).
-	if err := client.CreateSnapshot(ctx, firecracker.SnapshotCreate{
-		SnapshotType: "Full",
-		SnapshotPath: req.OutStatePath,
-		MemFilePath:  req.OutMemoryPath,
-	}); err != nil {
+	if err := d.createSnapshotArtifacts(ctx, client, handle.RunDir(), req.OutMemoryPath, req.OutStatePath); err != nil {
 		// On failure, drop any partial artifact files — better to have
 		// no snapshot.memory than a half-written one that integrity
 		// verification would reject hours later.
 		_ = os.Remove(req.OutMemoryPath)
 		_ = os.Remove(req.OutStatePath)
-		return nil, fmt.Errorf("firecracker snapshot: CreateSnapshot: %w", err)
+		return nil, fmt.Errorf("firecracker snapshot: %w", err)
 	}
 
 	// Step 12: tear the transient VMM down. We Shutdown rather than
@@ -417,6 +413,40 @@ func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID ui
 	// Discard the ack. A short read budget keeps a hung guest from
 	// pinning the snapshot pipeline.
 	_, _ = io.CopyN(io.Discard, conn, 256)
+	return nil
+}
+
+func (d *Driver) createSnapshotArtifacts(ctx context.Context, client VMMClient, runDir, outMemPath, outStatePath string) error {
+	memAPIPath := outMemPath
+	stateAPIPath := outStatePath
+	memHostPath := outMemPath
+	stateHostPath := outStatePath
+
+	if d.cfg.UseJailer {
+		memHostPath = filepath.Join(runDir, sandboxSnapshotMemoryFileName)
+		stateHostPath = filepath.Join(runDir, sandboxSnapshotStateFileName)
+		memAPIPath = sandboxSnapshotMemoryFileName
+		stateAPIPath = sandboxSnapshotStateFileName
+		_ = os.Remove(memHostPath)
+		_ = os.Remove(stateHostPath)
+	}
+
+	if err := client.CreateSnapshot(ctx, firecracker.SnapshotCreate{
+		SnapshotType: "Full",
+		SnapshotPath: stateAPIPath,
+		MemFilePath:  memAPIPath,
+	}); err != nil {
+		return fmt.Errorf("CreateSnapshot: %w", err)
+	}
+	if !d.cfg.UseJailer {
+		return nil
+	}
+	if err := copyFile(memHostPath, outMemPath); err != nil {
+		return fmt.Errorf("copy snapshot memory out of jailer chroot: %w", err)
+	}
+	if err := copyFile(stateHostPath, outStatePath); err != nil {
+		return fmt.Errorf("copy snapshot state out of jailer chroot: %w", err)
+	}
 	return nil
 }
 
