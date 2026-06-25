@@ -224,6 +224,31 @@ func TestCreate_WarmHit(t *testing.T) {
 	}
 }
 
+func TestCreate_WarmHit_JailerUsesRelativeDrivePatchPaths(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.UseJailer = true
+	stageWarmFixture(t, f)
+	stageWarmTemplate(t, f, true)
+
+	if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image:         "alpine:3.20",
+		CPU:           1,
+		MemoryMB:      128,
+		DiskGB:        1,
+		TemplateID:    "tpl-warm",
+		OverlaySizeGB: 1,
+	}, "sb-warm-jail", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if patch := f.client.drivePatches[rootDriveID]; patch.PathOnHost != rootfsFileName {
+		t.Fatalf("root drive patch path = %q, want %q", patch.PathOnHost, rootfsFileName)
+	}
+	if patch := f.client.drivePatches[overlayDriveID]; patch.PathOnHost != overlayFileName {
+		t.Fatalf("overlay drive patch path = %q, want %q", patch.PathOnHost, overlayFileName)
+	}
+}
+
 // TestCreate_WarmMissFallsBackToColdSpawn asserts the contract: when
 // the pool returns ErrNoLoadedSlot, Create proceeds with the existing
 // snapshot-load path and the user-visible outcome is unchanged. A

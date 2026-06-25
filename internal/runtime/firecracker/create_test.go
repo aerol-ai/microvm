@@ -175,9 +175,9 @@ type fakeVsockDialer struct {
 	// writes records every line written through any returned conn, so
 	// post_resume payload-shape assertions can grep the captured JSON.
 	writes [][]byte
-	// errOnDialIdx >0 makes Dial fail on the Nth call (1-based) only —
-	// the snapshot-load post_resume test uses this to assert Create
-	// does not fail when the post_resume send fails.
+	// errOnDialIdx >0 makes Dial fail on the Nth call (1-based) only.
+	// Post-boot/post-resume sends are best-effort, so tests use this
+	// to assert Create does not fail when that follow-up dial fails.
 	errOnDialIdx int
 }
 
@@ -507,7 +507,7 @@ func newDriverFixture(t *testing.T) *driverFixture {
 		KernelImage:       kernel,
 		RunDir:            runDir,
 		OverlayEnabled:    true,
-		PostResumeTimeout: 2 * time.Second,
+		PostResumeTimeout: 20 * time.Millisecond,
 	}, nil)
 	d.SetPool(pool)
 	d.SetRootfsBuilder(rootfs)
@@ -577,9 +577,9 @@ func TestCreate_HappyPath(t *testing.T) {
 	if !f.vmm.started || !f.vmm.waited || f.vmm.shutdown {
 		t.Errorf("vmm started=%v waited=%v shutdown=%v; want true/true/false", f.vmm.started, f.vmm.waited, f.vmm.shutdown)
 	}
-	// Vsock handshake ran exactly once.
-	if f.vsock.dials != 1 {
-		t.Errorf("vsock dials = %d, want 1", f.vsock.dials)
+	// Vsock handshake plus best-effort post-boot network reconfigure.
+	if f.vsock.dials != 2 {
+		t.Errorf("vsock dials = %d, want 2", f.vsock.dials)
 	}
 	// REST: machine config, boot source, drive, nic, vsock, action all set.
 	if f.client.mc == nil || f.client.mc.VcpuCount != 2 || f.client.mc.MemSizeMib != 256 {

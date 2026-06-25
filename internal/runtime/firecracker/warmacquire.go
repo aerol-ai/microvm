@@ -193,9 +193,13 @@ func (d *Driver) tryAcquireWarm(
 	if err := linkOrCopyRootfs(snap.RootfsPath, warmRootfsPath); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm stage rootfs: %w", err)
 	}
+	warmRootfsAPIPath, err := d.chrootFilePath(slot.RunDir, warmRootfsPath, rootfsFileName)
+	if err != nil {
+		return nil, false, fmt.Errorf("firecracker runtime: warm stage rootfs for API: %w", err)
+	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
-		PathOnHost: warmRootfsPath,
+		PathOnHost: warmRootfsAPIPath,
 	}); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm patch rootfs drive: %w", err)
 	}
@@ -230,9 +234,13 @@ func (d *Driver) tryAcquireWarm(
 	// The snapshot baked in the template's placeholder overlay; we
 	// swap to this sandbox's per-sandbox file before Resume.
 	if warmOverlayPath != "" {
+		warmOverlayAPIPath, err := d.chrootFilePath(slot.RunDir, warmOverlayPath, overlayFileName)
+		if err != nil {
+			return nil, false, fmt.Errorf("firecracker runtime: warm stage overlay for API: %w", err)
+		}
 		if err := client.PatchDrive(ctx, overlayDriveID, firecracker.DrivePatch{
 			DriveID:    overlayDriveID,
-			PathOnHost: warmOverlayPath,
+			PathOnHost: warmOverlayAPIPath,
 		}); err != nil {
 			return nil, false, fmt.Errorf("firecracker runtime: warm patch overlay drive: %w", err)
 		}
@@ -254,6 +262,11 @@ func (d *Driver) tryAcquireWarm(
 	if err := d.vsockHandshake(ctx, vsockPath, slot.VsockCID); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm vsock handshake: %w", err)
 	}
+	d.logger.Info("firecracker create: warm vsock handshake complete",
+		"sandbox_id", sandboxID,
+		"vsock_cid", slot.VsockCID,
+		"guest_ip", tapSlot.GuestIP,
+		"tap", tapSlot.TapName)
 
 	// post_resume reseed (RNG + wallclock). Best-effort; same shape
 	// as the cold snapshot-load path.
@@ -261,8 +274,16 @@ func (d *Driver) tryAcquireWarm(
 	if err := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", postResumeData(tapSlot)); err != nil {
 		d.logger.Warn("firecracker create: warm post_resume send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
+	} else {
+		d.logger.Info("firecracker create: warm post_resume acked",
+			"sandbox_id", sandboxID,
+			"vsock_cid", slot.VsockCID,
+			"guest_ip", tapSlot.GuestIP,
+			"gateway_ip", tapSlot.HostIP,
+			"tap", tapSlot.TapName)
 	}
 	cancel()
+	d.probeToolboxTCP(ctx, "warm_acquire", sandboxID, tapSlot, true)
 
 	// Register the warm handle + client into the driver's map so
 	// Destroy finds them. The handle is the SpawnedHandle from the

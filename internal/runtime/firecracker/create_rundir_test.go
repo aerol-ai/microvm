@@ -168,3 +168,64 @@ func TestSnapshotTemplate_JailerStagesAPIPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestCreate_SnapshotLoadPath_JailerStagesAPIPaths(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.UseJailer = true
+
+	chrootRoot := filepath.Join(t.TempDir(), "jailer", "firecracker", "sb-snap-load-jail", "root")
+	f.driver.SetSpawner(func(_ Config, sandboxID string) (VMMHandle, error) {
+		f.vmm.id = sandboxID
+		f.vmm.runDir = chrootRoot
+		f.vmm.apiSocket = filepath.Join(chrootRoot, "api.sock")
+		return f.vmm, nil
+	})
+
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, rootfsFileName)
+	if err := os.WriteFile(templateRootfs, []byte("template-rootfs"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+	snapMem := filepath.Join(tplDir, sandboxSnapshotMemoryFileName)
+	snapState := filepath.Join(tplDir, sandboxSnapshotStateFileName)
+	for _, path := range []string{snapMem, snapState} {
+		if err := os.WriteFile(path, []byte("snapshot-"+filepath.Base(path)), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	f.driver.SetTemplateResolver(&fakeTemplateResolver{
+		rootfsPath:         templateRootfs,
+		hasSnapshot:        true,
+		snapshotMemoryPath: snapMem,
+		snapshotStatePath:  snapState,
+		snapshotVsockCID:   200,
+	})
+
+	if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		TemplateID: "tpl-snap-jail",
+		CPU:        1,
+		MemoryMB:   128,
+		DiskGB:     1,
+	}, "sb-snap-load-jail", "tok", nil); err != nil {
+		t.Fatalf("Create snapshot-load (jailer): %v", err)
+	}
+
+	if f.client.snapshotLoad == nil {
+		t.Fatal("LoadSnapshot was not called")
+	}
+	if f.client.snapshotLoad.SnapshotPath != sandboxSnapshotStateFileName {
+		t.Fatalf("LoadSnapshot.SnapshotPath = %q, want %q", f.client.snapshotLoad.SnapshotPath, sandboxSnapshotStateFileName)
+	}
+	if f.client.snapshotLoad.MemBackend == nil ||
+		f.client.snapshotLoad.MemBackend.BackendPath != sandboxSnapshotMemoryFileName {
+		t.Fatalf("LoadSnapshot.MemBackend = %+v, want chroot-relative snapshot memory", f.client.snapshotLoad.MemBackend)
+	}
+	if patch := f.client.drivePatches[rootDriveID]; patch.PathOnHost != rootfsFileName {
+		t.Fatalf("root drive patch path = %q, want %q", patch.PathOnHost, rootfsFileName)
+	}
+	for _, name := range []string{rootfsFileName, sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName} {
+		if _, err := os.Stat(filepath.Join(chrootRoot, name)); err != nil {
+			t.Fatalf("%s not staged into chroot: %v", name, err)
+		}
+	}
+}

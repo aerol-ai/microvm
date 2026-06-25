@@ -95,6 +95,57 @@ func TestWarmSpawn_HappyPath(t *testing.T) {
 	}
 }
 
+func TestWarmSpawn_JailerStagesSnapshotLoadPaths(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.UseJailer = true
+
+	chrootRoot := filepath.Join(t.TempDir(), "jailer", "firecracker", "vmms-warm-jail", "root")
+	if err := os.MkdirAll(chrootRoot, 0o755); err != nil {
+		t.Fatalf("mkdir chroot: %v", err)
+	}
+	f.driver.SetSpawner(func(_ Config, slotID string) (VMMHandle, error) {
+		f.vmm.id = slotID
+		f.vmm.runDir = chrootRoot
+		f.vmm.apiSocket = filepath.Join(chrootRoot, "api.sock")
+		return f.vmm, nil
+	})
+
+	tplDir := t.TempDir()
+	snapMem := filepath.Join(tplDir, sandboxSnapshotMemoryFileName)
+	snapState := filepath.Join(tplDir, sandboxSnapshotStateFileName)
+	for _, path := range []string{snapMem, snapState} {
+		if err := os.WriteFile(path, []byte("snapshot-"+filepath.Base(path)), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
+		SlotID:             "vmms-warm-jail",
+		TemplateID:         "tpl-snap",
+		SnapshotMemoryPath: snapMem,
+		SnapshotStatePath:  snapState,
+		VsockCID:           200,
+	}); err != nil {
+		t.Fatalf("WarmSpawn (jailer): %v", err)
+	}
+
+	if f.client.snapshotLoad == nil {
+		t.Fatal("LoadSnapshot was not called")
+	}
+	if f.client.snapshotLoad.SnapshotPath != sandboxSnapshotStateFileName {
+		t.Fatalf("LoadSnapshot.SnapshotPath = %q, want %q", f.client.snapshotLoad.SnapshotPath, sandboxSnapshotStateFileName)
+	}
+	if f.client.snapshotLoad.MemBackend == nil ||
+		f.client.snapshotLoad.MemBackend.BackendPath != sandboxSnapshotMemoryFileName {
+		t.Fatalf("LoadSnapshot.MemBackend = %+v, want chroot-relative snapshot memory", f.client.snapshotLoad.MemBackend)
+	}
+	for _, name := range []string{sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName} {
+		if _, err := os.Stat(filepath.Join(chrootRoot, name)); err != nil {
+			t.Fatalf("%s not staged into warm chroot: %v", name, err)
+		}
+	}
+}
+
 // TestWarmSpawn_CleansUpOnLoadFailure asserts the cleanup contract
 // spawner.go promises the pool: a failed WarmSpawn leaks no
 // firecracker process and no rundir. The pool's GC sweep depends on

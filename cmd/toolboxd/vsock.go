@@ -257,9 +257,16 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 			h.logger.Warn("vsock post_resume: clock resync failed", "error", err)
 		}
 	}
+	networkConfigured := false
 	if data.Network != nil {
 		if err := h.quiesce.ConfigureNetwork(*data.Network); err != nil {
-			h.logger.Warn("vsock post_resume: network reconfigure failed", "error", err)
+			h.logger.Warn("vsock post_resume: network reconfigure failed",
+				"guest_ip", data.Network.GuestIP,
+				"gateway_ip", data.Network.GatewayIP,
+				"prefix_len", data.Network.PrefixLen,
+				"error", err)
+		} else {
+			networkConfigured = true
 		}
 	}
 	if err := h.quiesce.ReseedRandom(); err != nil {
@@ -279,7 +286,17 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 	if h.cloneGen != nil {
 		h.cloneGen.Bump(data.WallclockUnixNs)
 	}
-	h.logger.Info("vsock: post_resume complete",
-		"wallclock_set", data.WallclockUnixNs > 0)
+	logFields := []any{
+		"wallclock_set", data.WallclockUnixNs > 0,
+		"network_requested", data.Network != nil,
+		"network_configured", networkConfigured,
+	}
+	if data.Network != nil {
+		logFields = append(logFields,
+			"guest_ip", data.Network.GuestIP,
+			"gateway_ip", data.Network.GatewayIP,
+			"prefix_len", data.Network.PrefixLen)
+	}
+	h.logger.Info("vsock: post_resume complete", logFields...)
 	return nil
 }

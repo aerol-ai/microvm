@@ -51,7 +51,7 @@ configure_network() {
 	[ -n "${SB_TOOLBOX_PREFIX_LEN:-}" ] || return 0
 
 	iface=""
-	for _ in 1 2 3 4 5 6 7 8 9 10; do
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
 		for dev in /sys/class/net/*; do
 			[ -e "$dev" ] || continue
 			name=${dev##*/}
@@ -71,7 +71,7 @@ configure_network() {
 	if [ -n "$ip_cmd" ]; then
 		"$ip_cmd" link set lo up 2>/dev/null || true
 		"$ip_cmd" link set "$iface" up 2>/dev/null || true
-		"$ip_cmd" addr add "$SB_TOOLBOX_GUEST_IP/$SB_TOOLBOX_PREFIX_LEN" dev "$iface" 2>/dev/null || true
+		"$ip_cmd" addr replace "$SB_TOOLBOX_GUEST_IP/$SB_TOOLBOX_PREFIX_LEN" dev "$iface" 2>/dev/null || true
 		"$ip_cmd" route replace default via "$SB_TOOLBOX_GATEWAY_IP" dev "$iface" 2>/dev/null || true
 	elif [ -n "$ifconfig_cmd" ]; then
 		"$ifconfig_cmd" lo up 2>/dev/null || true

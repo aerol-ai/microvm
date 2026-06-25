@@ -55,6 +55,7 @@ func TestTemplateLifecycle(t *testing.T) {
 		defer ccancel()
 		_ = c.SDK().DeleteTemplate(cctx, tmpl.ID)
 	})
+	waitTemplateReady(t, c, tmpl.ID)
 
 	// UC-48 — list includes it and get returns it.
 	t.Run("UC-48-list-get", func(t *testing.T) {
@@ -83,6 +84,7 @@ func TestTemplateLifecycle(t *testing.T) {
 		if _, err := c.SDK().RebuildTemplate(ctx, tmpl.ID); err != nil {
 			t.Fatalf("rebuild template: %v", err)
 		}
+		waitTemplateReady(t, c, tmpl.ID)
 	})
 
 	// UC-50 — delete; a subsequent get fails.
