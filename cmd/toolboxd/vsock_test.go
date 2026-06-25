@@ -243,8 +243,10 @@ type fakeQuiesceOps struct {
 	mu            sync.Mutex
 	reseedCalls   int
 	wallclockArgs []int64
+	networkArgs   []guestNetworkConfig
 	reseedErr     error
 	wallclockErr  error
+	networkErr    error
 }
 
 func (f *fakeQuiesceOps) ReseedRandom() error {
@@ -259,6 +261,13 @@ func (f *fakeQuiesceOps) SetWallclock(ns int64) error {
 	defer f.mu.Unlock()
 	f.wallclockArgs = append(f.wallclockArgs, ns)
 	return f.wallclockErr
+}
+
+func (f *fakeQuiesceOps) ConfigureNetwork(cfg guestNetworkConfig) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.networkArgs = append(f.networkArgs, cfg)
+	return f.networkErr
 }
 
 // fakeSessionFlusher records FlushRecording calls; List returns
@@ -320,17 +329,17 @@ func TestQuiesceHandler_PreSnapshot_FlushesEverySession(t *testing.T) {
 	}
 }
 
-// TestQuiesceHandler_PostResume_ResyncsClockAndRNG asserts that a
-// well-formed post_resume payload with wallclock_unix_ns calls
-// SetWallclock then ReseedRandom. The RNG reseed is unconditional —
-// every clone resumes with the template's entropy pool, so reseed is
-// not gated on the wallclock field's presence.
-func TestQuiesceHandler_PostResume_ResyncsClockAndRNG(t *testing.T) {
+// TestQuiesceHandler_PostResume_ResyncsClockRNGAndNetwork asserts that a
+// well-formed post_resume payload with wallclock_unix_ns and network data calls
+// SetWallclock, ConfigureNetwork, then ReseedRandom. The RNG reseed is
+// unconditional — every clone resumes with the template's entropy pool, so
+// reseed is not gated on the wallclock field's presence.
+func TestQuiesceHandler_PostResume_ResyncsClockRNGAndNetwork(t *testing.T) {
 	q := &fakeQuiesceOps{}
 	h := newQuiesceHandler(nil, nil, nil)
 	h.quiesce = q
 
-	raw := json.RawMessage(`{"wallclock_unix_ns":1700000000000000000}`)
+	raw := json.RawMessage(`{"wallclock_unix_ns":1700000000000000000,"network":{"guest_ip":"172.16.0.6","gateway_ip":"172.16.0.5","netmask":"255.255.255.252","prefix_len":30}}`)
 	if err := h.OnPostResume(context.Background(), raw); err != nil {
 		t.Fatalf("OnPostResume: %v", err)
 	}
@@ -341,6 +350,9 @@ func TestQuiesceHandler_PostResume_ResyncsClockAndRNG(t *testing.T) {
 	}
 	if len(q.wallclockArgs) != 1 || q.wallclockArgs[0] != 1700000000000000000 {
 		t.Errorf("wallclockArgs = %v, want [1700000000000000000]", q.wallclockArgs)
+	}
+	if len(q.networkArgs) != 1 || q.networkArgs[0].GuestIP != "172.16.0.6" || q.networkArgs[0].GatewayIP != "172.16.0.5" || q.networkArgs[0].PrefixLen != 30 {
+		t.Errorf("networkArgs = %+v, want guest/gateway/prefix from payload", q.networkArgs)
 	}
 }
 
@@ -386,11 +398,12 @@ func TestQuiesceHandler_PostResume_QuiesceErrorIsNonFatal(t *testing.T) {
 	q := &fakeQuiesceOps{
 		reseedErr:    errors.New("entropy pool unavailable"),
 		wallclockErr: errors.New("CAP_SYS_TIME denied"),
+		networkErr:   errors.New("ip tool unavailable"),
 	}
 	h := newQuiesceHandler(nil, nil, nil)
 	h.quiesce = q
 	if err := h.OnPostResume(context.Background(),
-		json.RawMessage(`{"wallclock_unix_ns":12345}`)); err != nil {
+		json.RawMessage(`{"wallclock_unix_ns":12345,"network":{"guest_ip":"172.16.0.6","gateway_ip":"172.16.0.5","prefix_len":30}}`)); err != nil {
 		t.Errorf("OnPostResume returned %v; want nil despite quiesce errors", err)
 	}
 }

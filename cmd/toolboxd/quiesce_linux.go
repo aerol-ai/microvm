@@ -24,6 +24,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -110,6 +112,91 @@ func (linuxQuiesceOps) SetWallclock(unixNs int64) error {
 		return fmt.Errorf("clock_settime: %w", err)
 	}
 	return nil
+}
+
+func (linuxQuiesceOps) ConfigureNetwork(cfg guestNetworkConfig) error {
+	if cfg.GuestIP == "" || cfg.GatewayIP == "" || cfg.PrefixLen <= 0 {
+		return fmt.Errorf("incomplete network config: %+v", cfg)
+	}
+	iface, err := firstNonLoopbackInterface()
+	if err != nil {
+		return err
+	}
+
+	if ipBin, err := lookNetworkBinary("ip"); err == nil {
+		_ = runNetworkCmd(ipBin, "link", "set", "lo", "up")
+		_ = runNetworkCmd(ipBin, "link", "set", iface, "up")
+		addr := fmt.Sprintf("%s/%d", cfg.GuestIP, cfg.PrefixLen)
+		if err := runNetworkCmdIgnoreExists(ipBin, "addr", "add", addr, "dev", iface); err != nil {
+			return err
+		}
+		_ = runNetworkCmd(ipBin, "route", "replace", "default", "via", cfg.GatewayIP, "dev", iface)
+		return nil
+	}
+
+	ifconfigBin, err := lookNetworkBinary("ifconfig")
+	if err != nil {
+		return fmt.Errorf("no ip or ifconfig binary found")
+	}
+	_ = runNetworkCmd(ifconfigBin, "lo", "up")
+	if cfg.Netmask != "" {
+		if err := runNetworkCmd(ifconfigBin, iface, cfg.GuestIP, "netmask", cfg.Netmask, "up"); err != nil {
+			return err
+		}
+	} else if err := runNetworkCmd(ifconfigBin, iface, cfg.GuestIP, "up"); err != nil {
+		return err
+	}
+	if routeBin, err := lookNetworkBinary("route"); err == nil {
+		_ = runNetworkCmdIgnoreExists(routeBin, "add", "default", "gw", cfg.GatewayIP, iface)
+	}
+	return nil
+}
+
+func firstNonLoopbackInterface() (string, error) {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return "", fmt.Errorf("read /sys/class/net: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name != "" && name != "lo" {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no non-loopback interface found")
+}
+
+func runNetworkCmd(name string, args ...string) error {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %s: %w (%s)", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func runNetworkCmdIgnoreExists(name string, args ...string) error {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	text := strings.TrimSpace(string(out))
+	if strings.Contains(strings.ToLower(text), "exists") {
+		return nil
+	}
+	return fmt.Errorf("%s %s: %w (%s)", name, strings.Join(args, " "), err, text)
+}
+
+func lookNetworkBinary(name string) (string, error) {
+	if p, err := exec.LookPath(name); err == nil {
+		return p, nil
+	}
+	for _, dir := range []string{"/sbin", "/bin", "/usr/sbin", "/usr/bin"} {
+		p := dir + "/" + name
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found", name)
 }
 
 // newQuiesceOps returns the platform-specific quiesce implementation.

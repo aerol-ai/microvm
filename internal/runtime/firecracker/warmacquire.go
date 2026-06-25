@@ -258,9 +258,7 @@ func (d *Driver) tryAcquireWarm(
 	// post_resume reseed (RNG + wallclock). Best-effort; same shape
 	// as the cold snapshot-load path.
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-	if err := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", map[string]any{
-		"wallclock_unix_ns": time.Now().UnixNano(),
-	}); err != nil {
+	if err := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", postResumeData(tapSlot)); err != nil {
 		d.logger.Warn("firecracker create: warm post_resume send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	}

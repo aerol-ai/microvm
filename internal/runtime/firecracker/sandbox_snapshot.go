@@ -424,9 +424,7 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 		return nil, fmt.Errorf("firecracker runtime: start %s: vsock handshake: %w", sandboxID, err)
 	}
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-	if err := d.sendVsockOp(postCtx, vsockPath, manifest.VsockCID, "post_resume", map[string]any{
-		"wallclock_unix_ns": time.Now().UnixNano(),
-	}); err != nil {
+	if err := d.sendVsockOp(postCtx, vsockPath, manifest.VsockCID, "post_resume", postResumeData(slot)); err != nil {
 		d.logger.Warn("firecracker start: post_resume send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	}

@@ -224,8 +224,9 @@ type Config struct {
 	// files / sessions). Mirrors internal/config.Config.ToolboxBinaryPath.
 	// When empty, cold-boot still works but the guest comes up with no
 	// agent — Create's vsock handshake will then time out, so production
-	// daemons must set it. The template/snapshot path does NOT use this
-	// (those images carry their own init + agent).
+	// daemons must set it. The template builder adapter also uses this
+	// binary so templates built from stock OCI images can be snapshotted
+	// after the same toolbox readiness handshake.
 	ToolboxBinaryPath string
 }
 
@@ -628,7 +629,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// this the guest boots with nothing on vsock and Create's readiness
 		// handshake times out (a plain image carries no agent). Empty when
 		// no toolbox binary is configured — see coldBootInjectFiles.
-		inject := coldBootInjectFiles(d.cfg.ToolboxBinaryPath, toolboxToken)
+		inject := coldBootInjectFiles(d.cfg.ToolboxBinaryPath, toolboxToken, slot)
 		if inject == nil {
 			d.logger.Warn("firecracker cold-boot: no toolbox binary configured; guest will boot without an agent and the vsock handshake will fail",
 				"sandbox_id", allocID)
@@ -783,9 +784,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// has nothing to resync (kernel just initialized) so skip.
 	if snapshotLoadPath {
 		postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-		err := d.sendVsockOp(postCtx, vsockPath, handshakeCID, "post_resume", map[string]any{
-			"wallclock_unix_ns": time.Now().UnixNano(),
-		})
+		err := d.sendVsockOp(postCtx, vsockPath, handshakeCID, "post_resume", postResumeData(slot))
 		cancel()
 		if err != nil {
 			d.logger.Warn("firecracker create: post_resume send failed (continuing)",
@@ -1151,6 +1150,16 @@ func macFromSlot(slot *TapSlot) string {
 		byte(slot.VsockCID>>16),
 		byte(slot.VsockCID>>8),
 		byte(slot.VsockCID))
+}
+
+func postResumeData(slot *TapSlot) map[string]any {
+	data := map[string]any{
+		"wallclock_unix_ns": time.Now().UnixNano(),
+	}
+	if network := toolboxNetworkPayload(slot); network != nil {
+		data["network"] = network
+	}
+	return data
 }
 
 // ociImageRefFor expands a bare Docker-style image reference into a

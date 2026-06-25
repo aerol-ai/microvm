@@ -174,6 +174,14 @@ func dispatchVsock(ctx context.Context, msg VsockMessage, handler VsockHandler) 
 type quiesceOps interface {
 	ReseedRandom() error
 	SetWallclock(unixNs int64) error
+	ConfigureNetwork(guestNetworkConfig) error
+}
+
+type guestNetworkConfig struct {
+	GuestIP   string `json:"guest_ip"`
+	GatewayIP string `json:"gateway_ip"`
+	Netmask   string `json:"netmask"`
+	PrefixLen int    `json:"prefix_len"`
 }
 
 // sessionFlusher is the subset of behaviour the quiesce handler needs
@@ -236,7 +244,8 @@ func (h *quiesceHandler) OnPreSnapshot(ctx context.Context, _ json.RawMessage) e
 
 func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
-		WallclockUnixNs int64 `json:"wallclock_unix_ns"`
+		WallclockUnixNs int64               `json:"wallclock_unix_ns"`
+		Network         *guestNetworkConfig `json:"network,omitempty"`
 	}
 	if len(raw) > 0 {
 		// Tolerate a missing/malformed payload — the RNG reseed is
@@ -246,6 +255,11 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 	if data.WallclockUnixNs > 0 {
 		if err := h.quiesce.SetWallclock(data.WallclockUnixNs); err != nil {
 			h.logger.Warn("vsock post_resume: clock resync failed", "error", err)
+		}
+	}
+	if data.Network != nil {
+		if err := h.quiesce.ConfigureNetwork(*data.Network); err != nil {
+			h.logger.Warn("vsock post_resume: network reconfigure failed", "error", err)
 		}
 	}
 	if err := h.quiesce.ReseedRandom(); err != nil {
