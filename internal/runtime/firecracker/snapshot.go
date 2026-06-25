@@ -215,9 +215,17 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: PutMachineConfig: %w", err)
 	}
+	kernelAPIPath, err := d.chrootFilePath(handle.RunDir(), d.cfg.KernelImage, kernelFileName)
+	if err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: stage kernel: %w", err)
+	}
+	rootfsAPIPath, err := d.chrootFilePath(handle.RunDir(), rootfsPath, rootfsFileName)
+	if err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: stage rootfs for API: %w", err)
+	}
 	if err := client.PutBootSource(ctx, firecracker.BootSource{
-		KernelImagePath: d.cfg.KernelImage,
-		BootArgs:        defaultBootArgs(),
+		KernelImagePath: kernelAPIPath,
+		BootArgs:        coldBootArgs(slot, d.cfg.ToolboxBinaryPath != ""),
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: PutBootSource: %w", err)
 	}
@@ -230,7 +238,7 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	// with toolboxd, so it doesn't need to write to rootfs either.
 	if err := client.PutDrive(ctx, rootDriveID, firecracker.Drive{
 		DriveID:      rootDriveID,
-		PathOnHost:   rootfsPath,
+		PathOnHost:   rootfsAPIPath,
 		IsRootDevice: true,
 		IsReadOnly:   true,
 		CacheType:    "Writeback",
@@ -248,9 +256,13 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	if err := allocateSparse(placeholderPath, overlayPlaceholderBytes); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: overlay placeholder: %w", err)
 	}
+	placeholderAPIPath, err := d.chrootFilePath(handle.RunDir(), placeholderPath, overlayFileName)
+	if err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: stage overlay placeholder for API: %w", err)
+	}
 	if err := client.PutDrive(ctx, overlayDriveID, firecracker.Drive{
 		DriveID:    overlayDriveID,
-		PathOnHost: placeholderPath,
+		PathOnHost: placeholderAPIPath,
 		IsReadOnly: false,
 		CacheType:  "Writeback",
 	}); err != nil {

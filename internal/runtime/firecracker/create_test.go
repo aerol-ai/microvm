@@ -1443,6 +1443,12 @@ func TestCreate_SnapshotLoadPath_SendsPostResume(t *testing.T) {
 		Op   string `json:"op"`
 		Data struct {
 			WallclockUnixNs int64 `json:"wallclock_unix_ns"`
+			Network         struct {
+				GuestIP   string `json:"guest_ip"`
+				GatewayIP string `json:"gateway_ip"`
+				Netmask   string `json:"netmask"`
+				PrefixLen int    `json:"prefix_len"`
+			} `json:"network"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(postLine, &decoded); err != nil {
@@ -1453,6 +1459,12 @@ func TestCreate_SnapshotLoadPath_SendsPostResume(t *testing.T) {
 	}
 	if decoded.Data.WallclockUnixNs <= 0 {
 		t.Errorf("WallclockUnixNs = %d, want > 0", decoded.Data.WallclockUnixNs)
+	}
+	if decoded.Data.Network.GuestIP != "172.16.0.2" ||
+		decoded.Data.Network.GatewayIP != "172.16.0.1" ||
+		decoded.Data.Network.Netmask != "255.255.255.252" ||
+		decoded.Data.Network.PrefixLen != 30 {
+		t.Errorf("post_resume network = %+v, want slot network", decoded.Data.Network)
 	}
 }
 

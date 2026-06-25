@@ -17,6 +17,9 @@ func TestNonLinuxStubs(t *testing.T) {
 	if err := q.SetWallclock(123); err == nil {
 		t.Fatal("SetWallclock expected error on non-linux stub")
 	}
+	if err := q.ConfigureNetwork(guestNetworkConfig{GuestIP: "172.16.0.2", GatewayIP: "172.16.0.1", PrefixLen: 30}); err == nil {
+		t.Fatal("ConfigureNetwork expected error on non-linux stub")
+	}
 
 	vs, err := newVsockServer(1024, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err == nil || vs != nil {

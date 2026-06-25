@@ -339,7 +339,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// constraints. templateResolverAdapter lets the driver look up
 		// the template's rootfs path through the service layer without
 		// the runtime package importing internal/service.
-		svc.SetTemplateBuilder(&templateBuilderAdapter{inner: ociBuilder})
+		svc.SetTemplateBuilder(&templateBuilderAdapter{inner: ociBuilder, toolboxBinaryPath: cfg.ToolboxBinaryPath})
 		fcDriver.SetTemplateResolver(&templateResolverAdapter{svc: svc})
 		// Phase 3 snapshot pipeline: the snapshotter is the driver
 		// itself (it owns the transient VMM seams); the CID allocator
@@ -1567,15 +1567,26 @@ func adaptTapSlot(s *tap.Slot) *fcruntime.TapSlot {
 // the translation lives at the wiring layer where both packages are
 // already in scope.
 type templateBuilderAdapter struct {
-	inner *oci.Builder
+	inner             *oci.Builder
+	toolboxBinaryPath string
 }
 
 func (a *templateBuilderAdapter) Build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
+	var inject []oci.InjectFile
+	for _, f := range fcruntime.ColdBootInjectFiles(a.toolboxBinaryPath, "", nil) {
+		inject = append(inject, oci.InjectFile{
+			HostPath:  f.HostPath,
+			Content:   f.Content,
+			GuestPath: f.GuestPath,
+			Mode:      f.Mode,
+		})
+	}
 	res, err := a.inner.Build(ctx, oci.BuildRequest{
-		ImageRef:   req.ImageRef,
-		OutPath:    req.OutPath,
-		MinSizeMiB: req.MinSizeMiB,
-		Tag:        req.Tag,
+		ImageRef:    req.ImageRef,
+		OutPath:     req.OutPath,
+		MinSizeMiB:  req.MinSizeMiB,
+		Tag:         req.Tag,
+		InjectFiles: inject,
 	})
 	if err != nil {
 		return nil, err

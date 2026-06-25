@@ -30,6 +30,15 @@ const (
 	guestToolboxPort = 2280
 )
 
+// ColdBootInjectFiles returns the files to bake into a Firecracker rootfs so
+// the guest comes up running the agent. It is exported for the daemon's
+// template builder adapter: templates built from stock OCI images need the
+// same injected agent/init as one-off cold boots before SnapshotTemplate can
+// capture a ready guest.
+func ColdBootInjectFiles(toolboxBinaryPath, toolboxToken string, slot *TapSlot) []InjectFile {
+	return coldBootInjectFiles(toolboxBinaryPath, toolboxToken, slot)
+}
+
 // coldBootInjectFiles returns the files to bake into a cold-boot rootfs so
 // the guest comes up running the agent. Returns nil when no toolbox binary
 // is configured — the caller then cold-boots an agent-less guest (Create's
@@ -38,7 +47,7 @@ const (
 //
 // The token is per-sandbox, so these files are regenerated on every
 // cold-boot Create (cold-boot already builds a fresh rootfs per sandbox).
-func coldBootInjectFiles(toolboxBinaryPath, toolboxToken string) []InjectFile {
+func coldBootInjectFiles(toolboxBinaryPath, toolboxToken string, slot *TapSlot) []InjectFile {
 	if toolboxBinaryPath == "" {
 		return nil
 	}
@@ -46,6 +55,7 @@ func coldBootInjectFiles(toolboxBinaryPath, toolboxToken string) []InjectFile {
 	// host-generated hex today — keeps a future token format from
 	// breaking the `.`-sourced env file.
 	env := fmt.Sprintf("SB_TOOLBOX_TOKEN=%s\nSB_TOOLBOX_PORT='%d'\n", shellSingleQuote(toolboxToken), guestToolboxPort)
+	env += toolboxNetworkEnv(slot)
 	return []InjectFile{
 		{HostPath: toolboxBinaryPath, GuestPath: guestToolboxPath, Mode: 0o755},
 		{Content: toolboxdInitScript, GuestPath: guestInitPath, Mode: 0o755},
@@ -100,6 +110,57 @@ func kernelIPArg(slot *TapSlot) string {
 	return fmt.Sprintf("ip=%s::%s:%s::%s:off", slot.GuestIP, slot.HostIP, mask, primaryIfaceID)
 }
 
+func toolboxNetworkEnv(slot *TapSlot) string {
+	cfg, ok := guestNetworkConfig(slot)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(
+		"SB_TOOLBOX_GUEST_IP=%s\nSB_TOOLBOX_GATEWAY_IP=%s\nSB_TOOLBOX_NETMASK=%s\nSB_TOOLBOX_PREFIX_LEN='%d'\n",
+		shellSingleQuote(cfg.GuestIP),
+		shellSingleQuote(cfg.GatewayIP),
+		shellSingleQuote(cfg.Netmask),
+		cfg.PrefixLen,
+	)
+}
+
+func toolboxNetworkPayload(slot *TapSlot) map[string]any {
+	cfg, ok := guestNetworkConfig(slot)
+	if !ok {
+		return nil
+	}
+	return map[string]any{
+		"guest_ip":   cfg.GuestIP,
+		"gateway_ip": cfg.GatewayIP,
+		"netmask":    cfg.Netmask,
+		"prefix_len": cfg.PrefixLen,
+	}
+}
+
+type guestNetworkDetails struct {
+	GuestIP   string
+	GatewayIP string
+	Netmask   string
+	PrefixLen int
+}
+
+func guestNetworkConfig(slot *TapSlot) (guestNetworkDetails, bool) {
+	if slot == nil || slot.GuestIP == "" || slot.HostIP == "" || slot.CIDR == "" {
+		return guestNetworkDetails{}, false
+	}
+	mask := netmaskFromCIDR(slot.CIDR)
+	prefix := prefixLenFromCIDR(slot.CIDR)
+	if mask == "" || prefix < 0 {
+		return guestNetworkDetails{}, false
+	}
+	return guestNetworkDetails{
+		GuestIP:   slot.GuestIP,
+		GatewayIP: slot.HostIP,
+		Netmask:   mask,
+		PrefixLen: prefix,
+	}, true
+}
+
 // netmaskFromCIDR turns "172.16.0.2/30" into dotted "255.255.255.252".
 // Returns "" on a malformed or non-IPv4 CIDR — the caller then drops the
 // ip= clause rather than booting with a bogus mask.
@@ -113,4 +174,16 @@ func netmaskFromCIDR(cidr string) string {
 		return ""
 	}
 	return fmt.Sprintf("%d.%d.%d.%d", m[0], m[1], m[2], m[3])
+}
+
+func prefixLenFromCIDR(cidr string) int {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil || ipnet == nil {
+		return -1
+	}
+	ones, bits := ipnet.Mask.Size()
+	if bits != 32 {
+		return -1
+	}
+	return ones
 }

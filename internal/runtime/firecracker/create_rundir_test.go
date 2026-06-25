@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -98,5 +99,57 @@ func TestSnapshotTemplate_CreatesRunDirBeforeStaging(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(chrootRoot, rootfsFileName)); err != nil || string(got) != "rootfs" {
 		t.Fatalf("staged rootfs = %q, %v", got, err)
+	}
+}
+
+func TestSnapshotTemplate_JailerStagesAPIPaths(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.UseJailer = true
+	f.driver.cfg.ToolboxBinaryPath = "/opt/aerolvm/toolboxd"
+
+	chrootRoot := filepath.Join(t.TempDir(), "jailer", "firecracker", "tpl-snap-tpl-jail", "root")
+	f.driver.SetSpawner(func(_ Config, sandboxID string) (VMMHandle, error) {
+		f.vmm.id = sandboxID
+		f.vmm.runDir = chrootRoot
+		f.vmm.apiSocket = filepath.Join(chrootRoot, "api.sock")
+		return f.vmm, nil
+	})
+
+	tplDir := t.TempDir()
+	rootfs := filepath.Join(tplDir, rootfsFileName)
+	if err := os.WriteFile(rootfs, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("write rootfs: %v", err)
+	}
+
+	_, err := f.driver.SnapshotTemplate(context.Background(), TemplateSnapshotRequest{
+		TemplateID:    "tpl-jail",
+		RootfsPath:    rootfs,
+		OutMemoryPath: filepath.Join(tplDir, "snapshot.memory"),
+		OutStatePath:  filepath.Join(tplDir, "snapshot.state"),
+		GuestCID:      200,
+		MemoryMB:      512,
+		VCPU:          1,
+	})
+	if err != nil {
+		t.Fatalf("SnapshotTemplate (jailer): %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(chrootRoot, kernelFileName)); err != nil {
+		t.Fatalf("kernel not staged into chroot: %v", err)
+	}
+	if f.client.bs == nil || f.client.bs.KernelImagePath != kernelFileName {
+		t.Fatalf("boot source kernel path = %+v, want %q", f.client.bs, kernelFileName)
+	}
+	if !strings.Contains(f.client.bs.BootArgs, "init="+guestInitPath) {
+		t.Fatalf("snapshot boot args missing toolbox init: %q", f.client.bs.BootArgs)
+	}
+	if !strings.Contains(f.client.bs.BootArgs, "ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off") {
+		t.Fatalf("snapshot boot args missing TAP ip config: %q", f.client.bs.BootArgs)
+	}
+	if root := f.client.drives[rootDriveID]; root.PathOnHost != rootfsFileName {
+		t.Fatalf("root drive path = %q, want %q", root.PathOnHost, rootfsFileName)
+	}
+	if overlay := f.client.drives[overlayDriveID]; overlay.PathOnHost != overlayFileName {
+		t.Fatalf("overlay drive path = %q, want %q", overlay.PathOnHost, overlayFileName)
 	}
 }
