@@ -65,7 +65,12 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		if s.logger != nil {
-			s.logger.Warn("toolbox proxy failed", "error", err, "sandbox_id", sandboxID, "path", path)
+			s.logger.Warn("toolbox proxy failed",
+				"error", err,
+				"sandbox_id", sandboxID,
+				"runtime", sandbox.Runtime,
+				"target", endpoint.URL,
+				"path", path)
 		}
 		http.Error(w, "toolbox unavailable", http.StatusBadGateway)
 	}

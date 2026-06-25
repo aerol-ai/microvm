@@ -1741,6 +1741,7 @@ func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([
 			SnapshotStatePath:  t.SnapshotStatePath,
 			SnapshotChecksum:   t.SnapshotChecksum,
 			VsockCID:           t.SnapshotVsockCID,
+			HasOverlay:         t.HasOverlay,
 		})
 	}
 	return out, nil

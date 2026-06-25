@@ -118,6 +118,10 @@ func TestWarmSpawn_JailerStagesSnapshotLoadPaths(t *testing.T) {
 			t.Fatalf("write %s: %v", path, err)
 		}
 	}
+	f.client.loadSnapshotHook = func() error {
+		_, err := os.Stat(filepath.Join(chrootRoot, overlayFileName))
+		return err
+	}
 
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID:             "vmms-warm-jail",
@@ -125,6 +129,7 @@ func TestWarmSpawn_JailerStagesSnapshotLoadPaths(t *testing.T) {
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		VsockCID:           200,
+		HasOverlay:         true,
 	}); err != nil {
 		t.Fatalf("WarmSpawn (jailer): %v", err)
 	}
@@ -139,7 +144,7 @@ func TestWarmSpawn_JailerStagesSnapshotLoadPaths(t *testing.T) {
 		f.client.snapshotLoad.MemBackend.BackendPath != sandboxSnapshotMemoryFileName {
 		t.Fatalf("LoadSnapshot.MemBackend = %+v, want chroot-relative snapshot memory", f.client.snapshotLoad.MemBackend)
 	}
-	for _, name := range []string{sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName} {
+	for _, name := range []string{sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName, overlayFileName} {
 		if _, err := os.Stat(filepath.Join(chrootRoot, name)); err != nil {
 			t.Fatalf("%s not staged into warm chroot: %v", name, err)
 		}
@@ -245,6 +250,10 @@ func TestPoolSpawner_DelegatesToWarmSpawn(t *testing.T) {
 	// is the single source of truth that adding a method to
 	// vmm.Spawner breaks the build here, not at main.go wiring time.
 	var _ vmmpool.Spawner = NewPoolSpawner(f.driver)
+	f.client.loadSnapshotHook = func() error {
+		_, err := os.Stat(filepath.Join(f.vmm.runDir, overlayFileName))
+		return err
+	}
 
 	adapter := NewPoolSpawner(f.driver)
 	handle, err := adapter.Spawn(context.Background(), "vmms-adapt-001", vmmpool.SnapshotInputs{
@@ -252,6 +261,7 @@ func TestPoolSpawner_DelegatesToWarmSpawn(t *testing.T) {
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		VsockCID:           200,
+		HasOverlay:         true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)

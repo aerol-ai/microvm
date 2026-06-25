@@ -72,6 +72,7 @@ type TemplateWarmInput struct {
 	SnapshotStatePath  string
 	SnapshotChecksum   string
 	VsockCID           uint32
+	HasOverlay         bool
 }
 
 // RefillConfig is the timing knobs the refill loop reads on
@@ -271,6 +272,7 @@ func (p *Pool) spawnOne(parentCtx context.Context, tpl TemplateWarmInput, spawne
 		SnapshotStatePath:  tpl.SnapshotStatePath,
 		SnapshotChecksum:   tpl.SnapshotChecksum,
 		VsockCID:           tpl.VsockCID,
+		HasOverlay:         tpl.HasOverlay,
 	})
 	recordSpawnLatency(time.Since(spawnStart))
 	if err != nil {

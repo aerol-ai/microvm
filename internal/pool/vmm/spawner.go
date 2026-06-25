@@ -39,6 +39,7 @@ type SnapshotInputs struct {
 	SnapshotStatePath  string
 	SnapshotChecksum   string
 	VsockCID           uint32
+	HasOverlay         bool
 }
 
 // SpawnedHandle is the subset of a *firecracker.vmm the pool consumes

@@ -977,6 +977,13 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
+	var overlayAPIPath string
+	if overlayPath != "" {
+		overlayAPIPath, err = d.chrootFilePath(runDir, overlayPath, overlayFileName)
+		if err != nil {
+			return fmt.Errorf("firecracker runtime: stage snapshot overlay: %w", err)
+		}
+	}
 	if err := client.LoadSnapshot(ctx, firecracker.SnapshotLoad{
 		SnapshotPath: snapshotStatePath,
 		MemBackend: &firecracker.MemoryBackend{
@@ -1014,10 +1021,6 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	// request when snap.HasOverlay=false, so a missing placeholder
 	// here is a corrupted template, not a user error.
 	if overlayPath != "" {
-		overlayAPIPath, err := d.chrootFilePath(runDir, overlayPath, overlayFileName)
-		if err != nil {
-			return fmt.Errorf("firecracker runtime: stage snapshot overlay: %w", err)
-		}
 		if err := client.PatchDrive(ctx, overlayDriveID, firecracker.DrivePatch{
 			DriveID:    overlayDriveID,
 			PathOnHost: overlayAPIPath,
@@ -1442,9 +1445,11 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 	d.mu.Lock()
 	ids := make([]string, 0, len(d.clients))
 	clients := make([]VMMClient, 0, len(d.clients))
+	handles := make([]VMMHandle, 0, len(d.clients))
 	for id, c := range d.clients {
 		ids = append(ids, id)
 		clients = append(clients, c)
+		handles = append(handles, d.vmms[id])
 	}
 	d.mu.Unlock()
 
@@ -1456,7 +1461,11 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 			// reconcile uses this as a snapshot, and a transient API
 			// blip shouldn't mark every sandbox as unknown.
 			d.logger.Warn("firecracker list_managed: inspect failed",
-				"sandbox_id", id, "error", err)
+				"sandbox_id", id,
+				"error", err,
+				"vmm_pid", handlePID(handles[i]),
+				"run_dir", handleRunDir(handles[i]),
+				"stderr_tail", handleStderrTail(handles[i]))
 			continue
 		}
 		out[id] = &models.SandboxRuntimeState{
@@ -1465,6 +1474,27 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 		}
 	}
 	return out, nil
+}
+
+func handlePID(handle VMMHandle) int {
+	if handle == nil {
+		return 0
+	}
+	return handle.Pid()
+}
+
+func handleRunDir(handle VMMHandle) string {
+	if handle == nil {
+		return ""
+	}
+	return handle.RunDir()
+}
+
+func handleStderrTail(handle VMMHandle) string {
+	if handle == nil {
+		return ""
+	}
+	return handle.StderrTail()
 }
 
 // statusFromInstanceState maps Firecracker's self-reported VMM state

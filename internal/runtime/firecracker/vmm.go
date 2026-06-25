@@ -196,6 +196,25 @@ func (v *vmm) Start(ctx context.Context) error {
 
 	go func() {
 		v.waitErr = cmd.Wait()
+		attrs := []any{
+			"sandbox_id", v.sandboxID,
+			"pid", cmd.Process.Pid,
+			"run_dir", v.runDir,
+			"stderr_tail", v.stderr.String(),
+		}
+		if v.waitErr != nil {
+			logger := v.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Warn("firecracker vmm process exited", append(attrs, "error", v.waitErr)...)
+		} else {
+			logger := v.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Info("firecracker vmm process exited", attrs...)
+		}
 		close(v.waitCh)
 	}()
 	return nil
