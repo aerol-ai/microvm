@@ -2,7 +2,7 @@
 // HTTP-over-Unix-socket REST API. It is intentionally small: a *Client
 // owns a single VMM's API socket and exposes one Go method per Firecracker
 // resource (machine-config, boot-source, drives, net-ifaces, vsock,
-// actions, snapshot/{create,load}).
+// actions, vm state, snapshot/{create,load}).
 //
 // The package has no daemon-side state of its own. Lifecycle ownership —
 // spawning the `firecracker` (or `jailer`-wrapped) process, knowing where
@@ -160,18 +160,23 @@ func (c *Client) PutLogger(ctx context.Context, lg Logger) error {
 	return c.do(ctx, http.MethodPut, "/logger", lg, nil)
 }
 
-// Action issues a single action against the VMM. The action_type values
-// the daemon uses today are InstanceStart (cold boot), Resume (after
-// snapshot load with resume_vm=false), and Pause.
+// Action issues a single action against the VMM. Firecracker v1.15 keeps
+// InstanceStart on /actions; Paused/Resumed transitions use PatchVM instead.
 func (c *Client) Action(ctx context.Context, a Action) error {
 	return c.do(ctx, http.MethodPut, "/actions", a, nil)
 }
 
-// CreateSnapshot pauses the VMM (callers should issue Action Pause first if
-// the VM is running) and writes a memory file + state file to the paths in
-// req. SnapshotType=Full is the only option supported at template-build
-// time; Diff is taken automatically by enable_diff_snapshots on load and
-// does not flow through this call.
+// PatchVM updates the microVM running state. Firecracker accepts Paused and
+// Resumed here; sending those values to /actions is rejected by v1.15.
+func (c *Client) PatchVM(ctx context.Context, vm VM) error {
+	return c.do(ctx, http.MethodPatch, "/vm", vm, nil)
+}
+
+// CreateSnapshot writes a memory file + state file to the paths in req.
+// Callers should put the VM in the Paused state first. SnapshotType=Full is
+// the only option supported at template-build time; Diff is taken
+// automatically by enable_diff_snapshots on load and does not flow through
+// this call.
 func (c *Client) CreateSnapshot(ctx context.Context, req SnapshotCreate) error {
 	return c.do(ctx, http.MethodPut, "/snapshot/create", req, nil)
 }
@@ -181,7 +186,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, req SnapshotCreate) error {
 // base for the clone; per-clone writes land in a dirty bitmap and do not
 // disturb the base — the property the whole plan rests on. With
 // ResumeVM=true, the action implicitly resumes execution; otherwise the
-// caller must issue Action Resume after attaching per-clone drives/TAP.
+// caller must PATCH /vm state=Resumed after attaching per-clone drives/TAP.
 func (c *Client) LoadSnapshot(ctx context.Context, req SnapshotLoad) error {
 	return c.do(ctx, http.MethodPut, "/snapshot/load", req, nil)
 }

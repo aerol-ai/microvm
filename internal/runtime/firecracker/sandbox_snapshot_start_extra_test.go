@@ -98,15 +98,15 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 		t.Errorf("expected tap ensure error, got %v", err)
 	}
 
-	// Action resume fail
+	// Patch VM Resumed fail
 	fakeTap.ensureErr = nil
 	client := newFakeClient()
-	client.actionErr = errors.New("resume error")
+	client.patchVMErr = errors.New("resume error")
 	d.SetClientFactory(func(socketPath string) VMMClient {
 		return client
 	})
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "action Resume") {
-		t.Errorf("expected action resume error, got %v", err)
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "patch VM Resumed") {
+		t.Errorf("expected patch VM Resumed error, got %v", err)
 	}
 }
 
@@ -136,14 +136,14 @@ func TestStopToSandboxSnapshot_ExtraCoverage(t *testing.T) {
 
 	d.pool.Allocate(context.Background(), sbID, time.Now())
 
-	// Action Pause fail
-	client.actionErr = errors.New("pause error")
-	if err := d.stopToSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "action Pause") {
-		t.Errorf("expected pause error, got %v", err)
+	// Patch VM Paused fail
+	client.patchVMErr = errors.New("pause error")
+	if err := d.stopToSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "patch VM Paused") {
+		t.Errorf("expected patch VM Paused error, got %v", err)
 	}
 
 	// writeSandboxSnapshot fail (CreateSnapshot error)
-	client.actionErr = nil
+	client.patchVMErr = nil
 	client.snapshotCreateErr = errors.New("snapshot create error")
 	if err := d.stopToSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "CreateSnapshot") {
 		t.Errorf("expected snapshot create error, got %v", err)

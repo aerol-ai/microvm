@@ -111,8 +111,9 @@ func (h *Host) exec(ctx context.Context, args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-// Ensure creates the TAP device, assigns the host-side /30 IP, and
-// brings the link up. Each step is idempotent on its own; the
+// Ensure creates the TAP device, assigns the host-side /30 IP, brings
+// the link up, and pins the guest's L2 neighbor entry. Each step is
+// idempotent on its own; the
 // composition is idempotent overall because each step recognizes the
 // "already in desired state" output and treats it as success.
 //
@@ -123,8 +124,10 @@ func (h *Host) exec(ctx context.Context, args ...string) ([]byte, error) {
 //  2. `ip addr add` next — putting the IP on first means the link is
 //     usable the moment step 3 makes it up. Reverse order would race
 //     against the guest's DHCP/static-IP probe.
-//  3. `ip link set ... up` last — flipping IFF_UP is what the guest's
+//  3. `ip link set ... up` — flipping IFF_UP is what the guest's
 //     virtio-net device sees.
+//  4. `ip neigh replace` last — host-to-guest connects should not depend
+//     on ARP discovery during Firecracker's early boot window.
 //
 // Rollback on partial failure: if step 2 or 3 fails we DO NOT call
 // Remove. The caller is expected to call Remove from its
@@ -181,6 +184,17 @@ func (h *Host) Ensure(ctx context.Context, slot Slot) error {
 	if out, err := h.exec(ctx, "link", "set", slot.TapName, "up"); err != nil {
 		return fmt.Errorf("tap host: link set %s up: %w (%s)", slot.TapName, err, strings.TrimSpace(string(out)))
 	}
+
+	// Step 4: pin host -> guest L2 resolution when the slot carries a
+	// guest endpoint. The runtime gives Firecracker the same deterministic
+	// MAC, so this turns the first toolbox proxy dial into a direct route
+	// instead of waiting for ARP to discover a quiet guest.
+	if slot.GuestIP != "" && slot.VsockCID >= 3 {
+		mac := guestMACFromSlot(slot)
+		if out, err := h.exec(ctx, "neigh", "replace", slot.GuestIP, "lladdr", mac, "dev", slot.TapName, "nud", "permanent"); err != nil {
+			return fmt.Errorf("tap host: neigh replace %s dev %s: %w (%s)", slot.GuestIP, slot.TapName, err, strings.TrimSpace(string(out)))
+		}
+	}
 	return nil
 }
 
@@ -215,6 +229,12 @@ func hostAddrCIDR(hostIP, cidr string) (string, error) {
 		return "", fmt.Errorf("malformed CIDR %q", cidr)
 	}
 	return hostIP + cidr[slash:], nil
+}
+
+func guestMACFromSlot(slot Slot) string {
+	cid := slot.VsockCID
+	return fmt.Sprintf("02:00:00:%02x:%02x:%02x",
+		byte(cid>>16), byte(cid>>8), byte(cid))
 }
 
 // looksLikeExists matches the `ip` output for an idempotent "already

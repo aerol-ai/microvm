@@ -17,7 +17,7 @@ package firecracker
 //   - PutNetworkInterface vs PatchDrive: the cold-boot path uses Put
 //     before InstanceStart; the snapshot-load path uses Patch between
 //     LoadSnapshot and Resume. The warm path is structurally the
-//     snapshot-load path with the Load step pre-done — same PATCH+Resume
+//     snapshot-load path with the Load step pre-done -- same PATCH+Resume
 //     contract.
 //
 // Failure-path consistency (pr-review.md §4): every resource acquired
@@ -185,8 +185,8 @@ func (d *Driver) tryAcquireWarm(
 	}
 
 	// Construct a REST client against the warm slot's live API socket.
-	// The pool already loaded the snapshot; this client only issues
-	// PATCH + Action(Resume).
+	// The pool already loaded the snapshot; this client only issues the
+	// per-sandbox rebind PATCHes and PATCH /vm state=Resumed.
 	client := d.newClient(slot.APISocket)
 
 	warmRootfsPath := filepath.Join(slot.RunDir, rootfsFileName)
@@ -206,7 +206,7 @@ func (d *Driver) tryAcquireWarm(
 	// firecracker only validates the device at Resume, not at snapshot
 	// load (see warmspawn.go). The cold path realizes the TAP at its
 	// Step 4 in driver.go; the warm path returns before reaching that
-	// step, so without this Ensure the Action(Resume) below points
+	// step, so without this Ensure the VM resume below points
 	// host_dev_name at a device that was never created and the create
 	// fails. Idempotent — a retried create re-Ensures the same slot.
 	if err := d.tapHost.Ensure(ctx, *tapSlot); err != nil {
@@ -241,8 +241,8 @@ func (d *Driver) tryAcquireWarm(
 	// Resume the VMM. From the guest's perspective this is the first
 	// instruction after the snapshot was taken — vCPUs start ticking
 	// against the new TAP+overlay.
-	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionResume}); err != nil {
-		return nil, false, fmt.Errorf("firecracker runtime: warm action Resume: %w", err)
+	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
+		return nil, false, fmt.Errorf("firecracker runtime: warm patch VM Resumed: %w", err)
 	}
 
 	// Vsock handshake — dial the snapshot's reserved CID. The pool

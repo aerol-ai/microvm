@@ -15,7 +15,7 @@ import (
 // TestWarmSpawn_HappyPath asserts the WarmSpawn primitive walks the
 // spawn → start → wait-socket → LoadSnapshot sequence and returns a
 // handle whose VMM is NOT resumed. The pool's Acquire path resumes the
-// slot — a regression where WarmSpawn issues Action(Resume) on its own
+// slot -- a regression where WarmSpawn resumes the VM on its own
 // would put the slot in 'Running' the moment it's loaded, defeating
 // the whole "pause and PATCH per-sandbox state before resume" model
 // PR-A built the snapshot capture path around.
@@ -68,7 +68,7 @@ func TestWarmSpawn_HappyPath(t *testing.T) {
 		t.Errorf("LoadSnapshot.MemBackend wrong: %+v", f.client.snapshotLoad.MemBackend)
 	}
 
-	// No Action(Resume): the pool will resume after PATCHing
+	// No VM resume: the pool will resume after PATCHing
 	// per-sandbox TAP+overlay. Anything in actions[] here that isn't a
 	// known warm-spawn step is a regression.
 	for _, a := range f.client.actions {

@@ -11,7 +11,7 @@ import (
 // on x86 and via FDT on aarch64; a guest kernel with CONFIG_VMGENID reseeds the
 // CRNG from it on snapshot restore *before userspace runs*, which is the only
 // mechanism that closes the entropy window the post_resume reseed cannot (the
-// guest is live between Action(Resume) and the post_resume ack — see Hazard 2 /
+// guest is live between PATCH /vm state=Resumed and the post_resume ack -- see Hazard 2 /
 // "Entropy window" in the Snapshot Clone Correctness doc). Passing acpi=off on
 // x86 would silently kill that pre-userspace reseed. This test fails loudly if
 // a future edit to baseBootArgs breaks the arch-appropriate vmgenid delivery path.

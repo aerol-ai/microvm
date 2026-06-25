@@ -44,10 +44,11 @@ func newHostWithRun(r *recordingRun) *Host {
 	return &Host{IPCmd: "/test/ip", run: r.fn}
 }
 
-// TestEnsure_HappyPath confirms the three-step sequence (tuntap add,
-// addr add, link set up) runs in order with the expected argv. The test
-// pins the argv shape because operators reading log lines rely on it;
-// reordering or changing the words breaks runbook copy-paste.
+// TestEnsure_HappyPath confirms the four-step sequence (tuntap add,
+// addr add, link set up, static neighbor) runs in order with the
+// expected argv. The test pins the argv shape because operators
+// reading log lines rely on it; reordering or changing the words
+// breaks runbook copy-paste.
 func TestEnsure_HappyPath(t *testing.T) {
 	r := &recordingRun{}
 	h := newHostWithRun(r)
@@ -62,13 +63,14 @@ func TestEnsure_HappyPath(t *testing.T) {
 	if err := h.Ensure(context.Background(), slot); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if len(r.calls) != 3 {
-		t.Fatalf("expected 3 ip calls, got %d (%+v)", len(r.calls), r.calls)
+	if len(r.calls) != 4 {
+		t.Fatalf("expected 4 ip calls, got %d (%+v)", len(r.calls), r.calls)
 	}
 	want := [][]string{
 		{"tuntap", "add", "fctap-1", "mode", "tap"},
 		{"addr", "add", "172.16.0.1/30", "dev", "fctap-1"},
 		{"link", "set", "fctap-1", "up"},
+		{"neigh", "replace", "172.16.0.2", "lladdr", "02:00:00:00:00:03", "dev", "fctap-1", "nud", "permanent"},
 	}
 	for i, w := range want {
 		if !equalStrings(r.calls[i].args, w) {
@@ -99,6 +101,32 @@ func TestEnsure_IdempotentOnAlreadyExists(t *testing.T) {
 	}
 	if len(r.calls) != 3 {
 		t.Errorf("expected 3 calls (idempotent steps still ran), got %d", len(r.calls))
+	}
+}
+
+func TestEnsure_NeighborFailureBubbles(t *testing.T) {
+	r := &recordingRun{
+		plan: []runReply{
+			{},
+			{},
+			{},
+			{out: []byte("RTNETLINK answers: Operation not permitted"), err: errors.New("exit 1")},
+		},
+	}
+	h := newHostWithRun(r)
+	slot := Slot{
+		TapName:  "fctap-neigh",
+		CIDR:     "172.16.0.0/30",
+		HostIP:   "172.16.0.1",
+		GuestIP:  "172.16.0.2",
+		VsockCID: 257,
+	}
+	err := h.Ensure(context.Background(), slot)
+	if err == nil {
+		t.Fatal("expected neighbor failure to bubble")
+	}
+	if !contains(err.Error(), "neigh replace 172.16.0.2 dev fctap-neigh") {
+		t.Errorf("error should mention neighbor command; got %v", err)
 	}
 }
 
@@ -176,6 +204,12 @@ func TestHostHelpers(t *testing.T) {
 		}
 		if len(r.calls) != 1 || r.calls[0].name != "/test/ip" {
 			t.Fatalf("calls = %+v, want one /test/ip invocation", r.calls)
+		}
+	})
+
+	t.Run("guest_mac_from_slot", func(t *testing.T) {
+		if got := guestMACFromSlot(Slot{VsockCID: 0x010203}); got != "02:00:00:01:02:03" {
+			t.Fatalf("guestMACFromSlot() = %q, want 02:00:00:01:02:03", got)
 		}
 	})
 }

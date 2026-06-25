@@ -304,11 +304,11 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 			"template_id", req.TemplateID, "error", err)
 	}
 
-	// Step 10: pause. Firecracker requires Pause before CreateSnapshot;
+	// Step 10: pause. Firecracker requires Paused before CreateSnapshot;
 	// resuming after a snapshot is the caller's choice (we don't —
 	// we shut the VMM down).
-	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionPause}); err != nil {
-		return nil, fmt.Errorf("firecracker snapshot: action Pause: %w", err)
+	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStatePaused}); err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: patch VM Paused: %w", err)
 	}
 
 	// Step 11: write the snapshot. SnapshotType=Full because there is
@@ -328,7 +328,7 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	}
 
 	// Step 12: tear the transient VMM down. We Shutdown rather than
-	// Action(Resume) because the snapshot is captured — anything the
+	// PATCH /vm state=Resumed because the snapshot is captured -- anything the
 	// VMM does after this is wasted CPU. handle.Shutdown signals the
 	// firecracker process, which exits and releases its TAP grip;
 	// then tapHost.Remove can succeed.

@@ -239,9 +239,18 @@ func TestWrapperMethods_RequestShape(t *testing.T) {
 			name:   "action",
 			method: http.MethodPut,
 			path:   "/actions",
-			body:   Action{ActionType: ActionPause},
+			body:   Action{ActionType: ActionInstanceStart},
 			invoke: func(ctx context.Context, c *Client) error {
-				return c.Action(ctx, Action{ActionType: ActionPause})
+				return c.Action(ctx, Action{ActionType: ActionInstanceStart})
+			},
+		},
+		{
+			name:   "patch-vm",
+			method: http.MethodPatch,
+			path:   "/vm",
+			body:   VM{State: VMStatePaused},
+			invoke: func(ctx context.Context, c *Client) error {
+				return c.PatchVM(ctx, VM{State: VMStatePaused})
 			},
 		},
 		{

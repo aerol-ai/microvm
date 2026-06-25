@@ -406,7 +406,7 @@ func methodNotImplemented(method string) error {
 // in-VM toolbox to handshake over vsock, return the runtime state.
 //
 // Phase 3+ path (snapshot clone): pull a paused VMM from the warm pool,
-// PATCH the per-sandbox overlay and TAP onto it, issue Action Resume,
+// PATCH the per-sandbox overlay and TAP onto it, PATCH /vm state=Resumed,
 // return.
 //
 // Cleanup contract — pr-review.md §4: every failure path between an
@@ -743,8 +743,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// when execution actually begins — a Phase 4 (PR-B) hook to PATCH
 	// per-sandbox state before resume slots in here.
 	if snapshotLoadPath {
-		if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionResume}); err != nil {
-			return nil, fmt.Errorf("firecracker runtime: action Resume: %w", err)
+		if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: patch VM Resumed: %w", err)
 		}
 	} else {
 		if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
@@ -1113,7 +1113,7 @@ func vcpuFromRequest(cpu float64) int {
 // (vmgenid) through ACPI, and a guest kernel built with CONFIG_VMGENID uses
 // that device to reseed its CRNG synchronously on snapshot restore — before
 // userspace runs — which is the only thing that closes the entropy window
-// between Action(Resume) and the post_resume reseed (see
+// between PATCH /vm state=Resumed and the post_resume reseed (see
 // plans/snapshot-clone-rng-userspace.md Phase C and Hazard 2 of the
 // Snapshot Clone Correctness doc). pci=off is fine — ACPI is a separate bus
 // — but acpi=off would silently disable that pre-userspace reseed. The

@@ -76,8 +76,8 @@ func TestStopStartSnapshotLifecycle(t *testing.T) {
 	if patch, ok := f.client.networkPatches[primaryIfaceID]; !ok || patch.HostDevName != "fctap-test" {
 		t.Fatalf("Start network patch = %+v, want fctap-test", f.client.networkPatches)
 	}
-	if got := f.client.actions[len(f.client.actions)-1]; got != firecracker.ActionResume {
-		t.Fatalf("last action = %q, want Resume", got)
+	if got := f.client.vmStates[len(f.client.vmStates)-1]; got != firecracker.VMStateResumed {
+		t.Fatalf("last VM state = %q, want Resumed", got)
 	}
 }
 
@@ -100,7 +100,7 @@ func TestStopSnapshotFailureResumesRunningVMM(t *testing.T) {
 	if f.vmm.shutdown {
 		t.Fatal("Stop shut down VMM after failed snapshot")
 	}
-	if got := f.client.actions[len(f.client.actions)-1]; got != firecracker.ActionResume {
-		t.Fatalf("last action after failed Stop = %q, want Resume rollback", got)
+	if got := f.client.vmStates[len(f.client.vmStates)-1]; got != firecracker.VMStateResumed {
+		t.Fatalf("last VM state after failed Stop = %q, want Resumed rollback", got)
 	}
 }

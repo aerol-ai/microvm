@@ -16,8 +16,8 @@ import (
 // TestSnapshotTemplate_HappyPath is the Phase 3 capture-path regression
 // test: SnapshotTemplate must drive the transient VMM through the exact
 // REST sequence firecracker requires
-// (machine-config → boot-source → drive → nic → vsock → InstanceStart →
-// Pause → CreateSnapshot), then write artifacts whose checksum it
+// (machine-config -> boot-source -> drive -> nic -> vsock -> InstanceStart ->
+// Paused -> CreateSnapshot), then write artifacts whose checksum it
 // returns to the service layer. A change to the wire ordering would
 // hand firecracker a 400 on real hardware; the fakeClient is permissive
 // enough that only the recorded order catches it.
@@ -58,7 +58,7 @@ func TestSnapshotTemplate_HappyPath(t *testing.T) {
 		"PutNetworkInterface:" + primaryIfaceID,
 		"PutVsock",
 		"Action:" + firecracker.ActionInstanceStart,
-		"Action:" + firecracker.ActionPause,
+		"PatchVM:" + firecracker.VMStatePaused,
 		"CreateSnapshot",
 	}
 	if len(f.client.restOrder) != len(want) {

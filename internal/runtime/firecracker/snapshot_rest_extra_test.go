@@ -29,21 +29,13 @@ func TestSnapshotTemplate_RESTErrors_Extra(t *testing.T) {
 		{"PutNetworkInterface", func(c *fakeClient) { c.nicErr = os.ErrPermission }, "PutNetworkInterface"},
 		{"PutVsock", func(c *fakeClient) { c.vsockErr = os.ErrPermission }, "PutVsock"},
 		{"Action InstanceStart", func(c *fakeClient) { c.actionErr = os.ErrPermission }, "action InstanceStart"},
-		{"Action Pause", func(c *fakeClient) {
-			c.actionErr = os.ErrPermission
-			// Wait, the client records actions. If we fail on Pause, it shouldn't fail on InstanceStart.
-			// Let's use a custom error or just not fail Action InstanceStart.
-		}, "action Pause"},
+		{"Patch VM Paused", func(c *fakeClient) { c.patchVMErr = os.ErrPermission }, "patch VM Paused"},
 		{"CreateSnapshot", func(c *fakeClient) { c.snapshotCreateErr = os.ErrPermission }, "CreateSnapshot"},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newFakeClient()
-			if tc.name == "Action Pause" {
-				// fakeClient Action doesn't distinguish between start and pause for errors unless we do something hacky.
-				// Actually, we can skip Action Pause if it's too hard to mock specifically, or we can just mock it.
-			}
 			tc.setup(client)
 			d.SetClientFactory(func(_ string) VMMClient { return client })
 
@@ -57,22 +49,8 @@ func TestSnapshotTemplate_RESTErrors_Extra(t *testing.T) {
 			// Write dummy rootfs
 			os.WriteFile(req.RootfsPath, []byte("data"), 0644)
 
-			// For "Action Pause", Action InstanceStart comes first.
-			if tc.name == "Action Pause" {
-				d.SetClientFactory(func(_ string) VMMClient {
-					c := newFakeClient()
-					c.actionErr = os.ErrPermission
-					// We'll just let it fail at InstanceStart instead, or use a custom client
-					return c
-				})
-			}
-
 			_, err := d.SnapshotTemplate(context.Background(), req)
 			if err == nil || !strings.Contains(err.Error(), tc.errStr) {
-				if tc.name == "Action Pause" {
-					// It's ok if it fails at InstanceStart instead
-					return
-				}
 				t.Errorf("expected %q error, got %v", tc.errStr, err)
 			}
 		})

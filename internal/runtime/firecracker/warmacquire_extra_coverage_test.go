@@ -126,12 +126,12 @@ func TestTryAcquireWarm_ExtraCoverage(t *testing.T) {
 		}
 	})
 
-	// Action Resume error
-	t.Run("ActionResumeErr", func(t *testing.T) {
+	// Patch VM Resumed error
+	t.Run("PatchVMResumedErr", func(t *testing.T) {
 		f := newDriverFixture(t)
 		stageWarmFixture(t, f)
 		stageWarmTemplate(t, f, false)
-		f.client.actionErr = errors.New("action resume error")
+		f.client.patchVMErr = errors.New("patch vm resumed error")
 
 		_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 			Image:      "alpine:3.20",

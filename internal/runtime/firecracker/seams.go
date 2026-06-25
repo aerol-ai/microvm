@@ -172,12 +172,13 @@ type VMMClient interface {
 	PutNetworkInterface(ctx context.Context, ifaceID string, iface firecracker.NetworkInterface) error
 	PutVsock(ctx context.Context, v firecracker.Vsock) error
 	Action(ctx context.Context, a firecracker.Action) error
+	PatchVM(ctx context.Context, vm firecracker.VM) error
 	InstanceInfo(ctx context.Context) (*firecracker.InstanceInfo, error)
 	CreateSnapshot(ctx context.Context, req firecracker.SnapshotCreate) error
 	LoadSnapshot(ctx context.Context, req firecracker.SnapshotLoad) error
 	// PatchDrive is the snapshot-load + overlay seam (Phase 3 PR-B).
 	// Firecracker accepts a PATCH of `path_on_host` between LoadSnapshot
-	// and Action(Resume); the driver uses it to swap the template's
+	// and PATCH /vm state=Resumed; the driver uses it to swap the template's
 	// placeholder overlay (1 MiB scratch file from snapshot capture
 	// time) for the clone's own per-sandbox overlay.ext4 before the VM
 	// resumes. Drive geometry (read-only flag, cache type) is

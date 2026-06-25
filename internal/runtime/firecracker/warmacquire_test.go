@@ -135,7 +135,7 @@ func stageWarmTemplate(t *testing.T, f *driverFixture, hasOverlay bool) {
 // template with a warm pool slot ready skips cold-spawn entirely:
 // no spawn handle is allocated (the warm slot's API socket is used),
 // PatchNetworkInterface PATCHes the per-sandbox TAP onto the loaded
-// snapshot, and Action(Resume) is the only Action call (no
+// snapshot, and PatchVM(Resumed) is the only state transition (no
 // InstanceStart, which would mean the driver mistakenly cold-booted).
 //
 // This is the headline boot-path-latency win the Phase 4 plan calls
@@ -197,7 +197,7 @@ func TestCreate_WarmHit(t *testing.T) {
 
 	// The per-sandbox host TAP MUST have been realized on the warm-hit
 	// path — WarmSpawn skips it, so the Acquire side owns it. Without
-	// this Ensure, Action(Resume) would point the guest's eth0 at a
+	// this Ensure, VM resume would point the guest's eth0 at a
 	// host_dev_name that does not exist. Exactly one Ensure, no Remove
 	// (the sandbox now owns the device; Destroy removes it later).
 	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 0 {
@@ -215,9 +215,12 @@ func TestCreate_WarmHit(t *testing.T) {
 		t.Errorf("PATCH NetworkInterface had empty HostDevName")
 	}
 
-	// Action(Resume) was the lone Action call — no InstanceStart.
-	if len(f.client.actions) != 1 || f.client.actions[0] != firecracker.ActionResume {
-		t.Errorf("actions = %v, want [Resume]", f.client.actions)
+	// PatchVM(Resumed) was the lone VM state transition -- no InstanceStart action.
+	if len(f.client.vmStates) != 1 || f.client.vmStates[0] != firecracker.VMStateResumed {
+		t.Errorf("vmStates = %v, want [Resumed]", f.client.vmStates)
+	}
+	if len(f.client.actions) != 0 {
+		t.Errorf("actions = %v, want none", f.client.actions)
 	}
 }
 

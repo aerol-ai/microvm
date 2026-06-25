@@ -160,7 +160,7 @@ func TestSnapshotTemplate_Errors_Extra(t *testing.T) {
 	d.vsockDial = newFakeVsockDialer()
 
 	// CreateSnapshot fails
-	client.actionErr = nil // so Pause works
+	client.patchVMErr = nil // so Paused works
 
 	client.snapshotCreateErr = os.ErrPermission
 	if _, err := d.SnapshotTemplate(context.Background(), reqValid); err == nil || !strings.Contains(err.Error(), "CreateSnapshot") {

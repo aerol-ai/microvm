@@ -5,7 +5,7 @@ package firecracker
 // snapshot artifacts, and leave the VMM paused (ResumeVM=false). The
 // returned handle is what the warm-VMM pool stores so a later sandbox
 // create can claim it, PATCH per-sandbox TAP+overlay onto it, and
-// issue Action(Resume) — that's where the <100ms boot-time win comes
+// PATCH /vm state=Resumed -- that's where the <100ms boot-time win comes
 // from.
 //
 // Cleanup contract: WarmSpawn is responsible for tearing down the
@@ -19,7 +19,7 @@ package firecracker
 // captures the network interface's host_dev_name pointing at the
 // template-build TAP (which was torn down at the end of
 // SnapshotTemplate). Firecracker's LoadSnapshot accepts the missing
-// TAP reference because device validation happens at Action(Resume),
+// TAP reference because device validation happens when the VM resumes,
 // not at load. The pool slot's per-sandbox TAP is allocated by the
 // Acquire-side code in Driver.Create just before the PATCH+Resume
 // hand-off.
@@ -100,7 +100,7 @@ type WarmHandle interface {
 //     references the 1 MiB placeholder used at capture time; the
 //     Acquire path PATCHes the drive's path_on_host before Resume.
 //
-//   - Issuing Action(Resume) and the vsock handshake.
+//   - Issuing PATCH /vm state=Resumed and the vsock handshake.
 func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandle, error) {
 	if d.cfg.KernelImage == "" {
 		return nil, fmt.Errorf("firecracker warm-spawn: KernelImage not configured (SB_FIRECRACKER_KERNEL): %w",

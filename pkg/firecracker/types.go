@@ -8,7 +8,7 @@ package firecracker
 
 // InstanceInfo is the GET / response. The runtime driver uses State to
 // distinguish "Not started" / "Running" / "Paused" without re-deriving from
-// process signals — useful as a sanity check before issuing Action Resume.
+// process signals -- useful as a sanity check before issuing VMStateResumed.
 type InstanceInfo struct {
 	ID    string `json:"id"`
 	State string `json:"state"`
@@ -111,19 +111,29 @@ type Logger struct {
 	// production runs. Surface them in tests if needed.
 }
 
-// Action types Firecracker accepts on PUT /actions. We intentionally
-// declare only the ones the daemon issues; the swagger lists a few more
-// (FlushMetrics, SendCtrlAltDel) that we don't drive today.
+// Action types Firecracker accepts on PUT /actions. Pause and Resume are
+// intentionally not here: Firecracker v1.15 exposes those through PATCH /vm,
+// not the action endpoint.
 const (
 	ActionInstanceStart = "InstanceStart"
-	ActionResume        = "Resume"
-	ActionPause         = "Pause"
 )
 
 // Action is the PUT /actions body. ActionType is one of the constants
 // above.
 type Action struct {
 	ActionType string `json:"action_type"`
+}
+
+// VM states accepted by PATCH /vm. Firecracker uses this endpoint for
+// Paused/Resumed transitions, especially around snapshot create/load.
+const (
+	VMStatePaused  = "Paused"
+	VMStateResumed = "Resumed"
+)
+
+// VM is the PATCH /vm body.
+type VM struct {
+	State string `json:"state"`
 }
 
 // SnapshotCreate is the PUT /snapshot/create body. SnapshotType=Full is
@@ -142,7 +152,7 @@ type SnapshotCreate struct {
 // the load-time flag that gives us per-clone CoW: the memory file stays
 // mmap'd read-only and per-VMM writes go to a dirty bitmap. ResumeVM=false
 // keeps the clone paused so the daemon can rebind the per-sandbox overlay
-// and TAP before issuing Action Resume.
+// and TAP before issuing PATCH /vm state=Resumed.
 type SnapshotLoad struct {
 	SnapshotPath        string         `json:"snapshot_path"`
 	MemBackend          *MemoryBackend `json:"mem_backend,omitempty"`
