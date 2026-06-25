@@ -419,12 +419,25 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 	if err := d.vsockHandshake(ctx, vsockPath, manifest.VsockCID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: vsock handshake: %w", sandboxID, err)
 	}
+	d.logger.Info("firecracker start: vsock handshake complete",
+		"sandbox_id", sandboxID,
+		"vsock_cid", manifest.VsockCID,
+		"guest_ip", slot.GuestIP,
+		"tap", slot.TapName)
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
 	if err := d.sendVsockOp(postCtx, vsockPath, manifest.VsockCID, "post_resume", postResumeData(slot)); err != nil {
 		d.logger.Warn("firecracker start: post_resume send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
+	} else {
+		d.logger.Info("firecracker start: post_resume acked",
+			"sandbox_id", sandboxID,
+			"vsock_cid", manifest.VsockCID,
+			"guest_ip", slot.GuestIP,
+			"gateway_ip", slot.HostIP,
+			"tap", slot.TapName)
 	}
 	cancel()
+	d.probeToolboxTCP(ctx, "start", sandboxID, slot, true)
 
 	d.mu.Lock()
 	d.clients[sandboxID] = client
@@ -444,27 +457,40 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 }
 
 func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMMClient, manifest *sandboxSnapshotManifest, memPath, statePath, rootfsPath string, slot *TapSlot, overlayPath string) error {
+	runDir := filepath.Dir(rootfsPath)
+	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(runDir, memPath, statePath)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
+	}
 	if err := client.LoadSnapshot(ctx, firecracker.SnapshotLoad{
-		SnapshotPath: statePath,
+		SnapshotPath: snapshotStatePath,
 		MemBackend: &firecracker.MemoryBackend{
 			BackendType: "File",
-			BackendPath: memPath,
+			BackendPath: snapshotMemoryPath,
 		},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
+	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
-		PathOnHost: rootfsPath,
+		PathOnHost: rootfsAPIPath,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PatchDrive rootfs: %w", err)
 	}
 	if manifest.HasOverlay {
+		overlayAPIPath, err := d.chrootFilePath(runDir, overlayPath, overlayFileName)
+		if err != nil {
+			return fmt.Errorf("firecracker runtime: stage snapshot overlay: %w", err)
+		}
 		if err := client.PatchDrive(ctx, overlayDriveID, firecracker.DrivePatch{
 			DriveID:    overlayDriveID,
-			PathOnHost: overlayPath,
+			PathOnHost: overlayAPIPath,
 		}); err != nil {
 			return fmt.Errorf("firecracker runtime: PatchDrive overlay: %w", err)
 		}

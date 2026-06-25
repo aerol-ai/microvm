@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -772,25 +773,36 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err := d.vsockHandshake(ctx, vsockPath, handshakeCID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: vsock handshake: %w", err)
 	}
+	d.logger.Info("firecracker create: vsock handshake complete",
+		"sandbox_id", allocID,
+		"snapshot_load", snapshotLoadPath,
+		"vsock_cid", handshakeCID,
+		"guest_ip", slot.GuestIP,
+		"tap", slot.TapName)
 
-	// Step 8b: post-resume quiesce signal (snapshot-load path only).
-	// The clone resumed with the template's RNG entropy pool and
-	// wall clock — both observably wrong (two clones would draw the
-	// same getrandom bytes; logs and TLS handshakes show a backwards
-	// time jump). Tell the in-guest toolboxd to reseed the kernel
-	// RNG and set CLOCK_REALTIME from the host now. Best-effort:
-	// a failed ack here means the guest is using stale entropy/clock,
-	// not that the clone is broken, so we log-and-continue. Cold-boot
-	// has nothing to resync (kernel just initialized) so skip.
-	if snapshotLoadPath {
-		postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-		err := d.sendVsockOp(postCtx, vsockPath, handshakeCID, "post_resume", postResumeData(slot))
-		cancel()
-		if err != nil {
-			d.logger.Warn("firecracker create: post_resume send failed (continuing)",
-				"sandbox_id", allocID, "error", err)
-		}
+	// Step 8b: post-boot/post-resume quiesce signal. Snapshot clones
+	// resumed with the template's RNG entropy pool and wall clock, so
+	// toolboxd reseeds and sets CLOCK_REALTIME. Cold boots do not need
+	// the entropy fix, but the same message also re-applies the static
+	// TAP address after toolboxd is definitely running, which closes
+	// the boot-time race where PID 1 starts before the virtio-net
+	// device is fully visible.
+	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
+	postErr := d.sendVsockOp(postCtx, vsockPath, handshakeCID, "post_resume", postResumeData(slot))
+	cancel()
+	if postErr != nil {
+		d.logger.Warn("firecracker create: post_resume send failed (continuing)",
+			"sandbox_id", allocID, "snapshot_load", snapshotLoadPath, "error", postErr)
+	} else {
+		d.logger.Info("firecracker create: post_resume acked",
+			"sandbox_id", allocID,
+			"snapshot_load", snapshotLoadPath,
+			"vsock_cid", handshakeCID,
+			"guest_ip", slot.GuestIP,
+			"gateway_ip", slot.HostIP,
+			"tap", slot.TapName)
 	}
+	d.probeToolboxTCP(ctx, "create", allocID, slot, snapshotLoadPath)
 
 	// All steps succeeded. Register the client + handle so Destroy can
 	// find them. Order matters: the map writes happen AFTER we flip
@@ -960,20 +972,29 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 			return fmt.Errorf("firecracker runtime: snapshot integrity: %w", err)
 		}
 	}
+	runDir := filepath.Dir(rootfsPath)
+	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(runDir, snap.SnapshotMemoryPath, snap.SnapshotStatePath)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
+	}
 	if err := client.LoadSnapshot(ctx, firecracker.SnapshotLoad{
-		SnapshotPath: snap.SnapshotStatePath,
+		SnapshotPath: snapshotStatePath,
 		MemBackend: &firecracker.MemoryBackend{
 			BackendType: "File",
-			BackendPath: snap.SnapshotMemoryPath,
+			BackendPath: snapshotMemoryPath,
 		},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
+	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
-		PathOnHost: rootfsPath,
+		PathOnHost: rootfsAPIPath,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PatchDrive rootfs: %w", err)
 	}
@@ -993,14 +1014,77 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	// request when snap.HasOverlay=false, so a missing placeholder
 	// here is a corrupted template, not a user error.
 	if overlayPath != "" {
+		overlayAPIPath, err := d.chrootFilePath(runDir, overlayPath, overlayFileName)
+		if err != nil {
+			return fmt.Errorf("firecracker runtime: stage snapshot overlay: %w", err)
+		}
 		if err := client.PatchDrive(ctx, overlayDriveID, firecracker.DrivePatch{
 			DriveID:    overlayDriveID,
-			PathOnHost: overlayPath,
+			PathOnHost: overlayAPIPath,
 		}); err != nil {
 			return fmt.Errorf("firecracker runtime: PatchDrive overlay: %w", err)
 		}
 	}
 	return nil
+}
+
+func (d *Driver) stageSnapshotLoadPaths(runDir, memoryPath, statePath string) (memoryAPIPath, stateAPIPath string, err error) {
+	memoryAPIPath, err = d.chrootFilePath(runDir, memoryPath, sandboxSnapshotMemoryFileName)
+	if err != nil {
+		return "", "", fmt.Errorf("stage snapshot memory: %w", err)
+	}
+	stateAPIPath, err = d.chrootFilePath(runDir, statePath, sandboxSnapshotStateFileName)
+	if err != nil {
+		return "", "", fmt.Errorf("stage snapshot state: %w", err)
+	}
+	return memoryAPIPath, stateAPIPath, nil
+}
+
+func (d *Driver) probeToolboxTCP(ctx context.Context, operation, sandboxID string, slot *TapSlot, snapshotLoad bool) {
+	if slot == nil || slot.GuestIP == "" {
+		return
+	}
+	timeout := d.cfg.PostResumeTimeout
+	if timeout <= 0 {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	addr := net.JoinHostPort(slot.GuestIP, strconv.Itoa(guestToolboxPort))
+	attempts := 0
+	var lastErr error
+	for {
+		attempts++
+		dialCtx, dialCancel := context.WithTimeout(probeCtx, 200*time.Millisecond)
+		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+		dialCancel()
+		if err == nil {
+			_ = conn.Close()
+			d.logger.Info("firecracker: toolbox tcp reachable after vsock readiness",
+				"operation", operation,
+				"sandbox_id", sandboxID,
+				"snapshot_load", snapshotLoad,
+				"addr", addr,
+				"attempts", attempts,
+				"tap", slot.TapName)
+			return
+		}
+		lastErr = err
+		select {
+		case <-probeCtx.Done():
+			d.logger.Warn("firecracker: toolbox tcp not reachable after vsock readiness",
+				"operation", operation,
+				"sandbox_id", sandboxID,
+				"snapshot_load", snapshotLoad,
+				"addr", addr,
+				"attempts", attempts,
+				"tap", slot.TapName,
+				"error", lastErr)
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // vsockHandshake dials the in-guest toolbox through Firecracker's host-side

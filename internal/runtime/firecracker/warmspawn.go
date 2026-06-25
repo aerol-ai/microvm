@@ -184,11 +184,15 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	// paused so the Acquire code can PATCH per-sandbox state on top
 	// of the snapshot's references before issuing Resume.
 	client := d.newClient(handle.APISocket())
+	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(handle.RunDir(), req.SnapshotMemoryPath, req.SnapshotStatePath)
+	if err != nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: stage snapshot load artifacts: %w", err)
+	}
 	if err := client.LoadSnapshot(ctx, firecracker.SnapshotLoad{
-		SnapshotPath: req.SnapshotStatePath,
+		SnapshotPath: snapshotStatePath,
 		MemBackend: &firecracker.MemoryBackend{
 			BackendType: "File",
-			BackendPath: req.SnapshotMemoryPath,
+			BackendPath: snapshotMemoryPath,
 		},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,

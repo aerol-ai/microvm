@@ -81,6 +81,57 @@ func TestStopStartSnapshotLifecycle(t *testing.T) {
 	}
 }
 
+func TestConfigureSandboxSnapshotRestore_JailerStagesAPIPaths(t *testing.T) {
+	d := &Driver{cfg: Config{UseJailer: true}}
+	client := newFakeClient()
+	runDir := t.TempDir()
+
+	srcDir := t.TempDir()
+	memPath := filepath.Join(srcDir, sandboxSnapshotMemoryFileName)
+	statePath := filepath.Join(srcDir, sandboxSnapshotStateFileName)
+	for _, path := range []string{memPath, statePath} {
+		if err := os.WriteFile(path, []byte("snapshot-"+filepath.Base(path)), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	rootfsPath := filepath.Join(runDir, rootfsFileName)
+	overlayPath := filepath.Join(runDir, overlayFileName)
+	for _, path := range []string{rootfsPath, overlayPath} {
+		if err := os.WriteFile(path, []byte("drive-"+filepath.Base(path)), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	err := d.configureSandboxSnapshotRestore(context.Background(), client, &sandboxSnapshotManifest{
+		HasOverlay: true,
+	}, memPath, statePath, rootfsPath, &TapSlot{TapName: "fctap0"}, overlayPath)
+	if err != nil {
+		t.Fatalf("configureSandboxSnapshotRestore: %v", err)
+	}
+
+	if client.snapshotLoad == nil {
+		t.Fatal("LoadSnapshot was not called")
+	}
+	if client.snapshotLoad.SnapshotPath != sandboxSnapshotStateFileName {
+		t.Fatalf("LoadSnapshot.SnapshotPath = %q, want %q", client.snapshotLoad.SnapshotPath, sandboxSnapshotStateFileName)
+	}
+	if client.snapshotLoad.MemBackend == nil ||
+		client.snapshotLoad.MemBackend.BackendPath != sandboxSnapshotMemoryFileName {
+		t.Fatalf("LoadSnapshot.MemBackend = %+v, want chroot-relative snapshot memory", client.snapshotLoad.MemBackend)
+	}
+	if patch := client.drivePatches[rootDriveID]; patch.PathOnHost != rootfsFileName {
+		t.Fatalf("root drive patch path = %q, want %q", patch.PathOnHost, rootfsFileName)
+	}
+	if patch := client.drivePatches[overlayDriveID]; patch.PathOnHost != overlayFileName {
+		t.Fatalf("overlay drive patch path = %q, want %q", patch.PathOnHost, overlayFileName)
+	}
+	for _, name := range []string{sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName} {
+		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
+			t.Fatalf("%s not staged into restore chroot: %v", name, err)
+		}
+	}
+}
+
 func TestStopSnapshotFailureResumesRunningVMM(t *testing.T) {
 	f := newDriverFixture(t)
 	ctx := context.Background()

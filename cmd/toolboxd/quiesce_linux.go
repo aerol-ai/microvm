@@ -127,7 +127,7 @@ func (linuxQuiesceOps) ConfigureNetwork(cfg guestNetworkConfig) error {
 		_ = runNetworkCmd(ipBin, "link", "set", "lo", "up")
 		_ = runNetworkCmd(ipBin, "link", "set", iface, "up")
 		addr := fmt.Sprintf("%s/%d", cfg.GuestIP, cfg.PrefixLen)
-		if err := runNetworkCmdIgnoreExists(ipBin, "addr", "add", addr, "dev", iface); err != nil {
+		if err := runNetworkCmd(ipBin, "addr", "replace", addr, "dev", iface); err != nil {
 			return err
 		}
 		_ = runNetworkCmd(ipBin, "route", "replace", "default", "via", cfg.GatewayIP, "dev", iface)
