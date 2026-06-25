@@ -141,13 +141,13 @@ func (d *Driver) stopToSandboxSnapshot(ctx context.Context, sandboxID string) er
 
 	paused := false
 	vmmStopped := false
-	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionPause}); err != nil {
-		return fmt.Errorf("firecracker runtime: stop %s: action Pause: %w", sandboxID, err)
+	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStatePaused}); err != nil {
+		return fmt.Errorf("firecracker runtime: stop %s: patch VM Paused: %w", sandboxID, err)
 	}
 	paused = true
 	defer func() {
 		if paused && !vmmStopped {
-			if err := client.Action(context.Background(), firecracker.Action{ActionType: firecracker.ActionResume}); err != nil {
+			if err := client.PatchVM(context.Background(), firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
 				d.logger.Warn("firecracker stop: resume after failed snapshot failed",
 					"sandbox_id", sandboxID, "error", err)
 			}
@@ -416,8 +416,8 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 	if err := d.configureSandboxSnapshotRestore(ctx, client, manifest, memPath, statePath, rootfsPath, slot, overlayPath); err != nil {
 		return nil, err
 	}
-	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionResume}); err != nil {
-		return nil, fmt.Errorf("firecracker runtime: start %s: action Resume: %w", sandboxID, err)
+	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: patch VM Resumed: %w", sandboxID, err)
 	}
 	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
 	if err := d.vsockHandshake(ctx, vsockPath, manifest.VsockCID); err != nil {

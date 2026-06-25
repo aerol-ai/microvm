@@ -173,12 +173,12 @@ func TestStartFromSandboxSnapshot_ExtraErrors(t *testing.T) {
 		t.Errorf("expected LoadSnapshot error, got %v", err)
 	}
 
-	// Action Resume fails
+	// Patch VM Resumed fails
 	client = newFakeClient()
-	client.actionErr = os.ErrPermission
+	client.patchVMErr = os.ErrPermission
 	d.SetClientFactory(func(_ string) VMMClient { return client })
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "action Resume") {
-		t.Errorf("expected action Resume error, got %v", err)
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "patch VM Resumed") {
+		t.Errorf("expected patch VM Resumed error, got %v", err)
 	}
 
 	// vsockHandshake fails

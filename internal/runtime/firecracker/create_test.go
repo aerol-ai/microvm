@@ -314,6 +314,7 @@ type fakeClient struct {
 	nics     map[string]firecracker.NetworkInterface
 	vsock    *firecracker.Vsock
 	actions  []string
+	vmStates []string
 	instance *firecracker.InstanceInfo
 
 	snapshotCreate *firecracker.SnapshotCreate
@@ -326,10 +327,10 @@ type fakeClient struct {
 	drivePatches   map[string]firecracker.DrivePatch
 	networkPatches map[string]firecracker.NetworkInterfacePatch
 
-	// restOrder captures every PUT / Action / Snapshot call in the order
+	// restOrder captures every PUT / Action / PatchVM / Snapshot call in the order
 	// the driver issued them. Order is load-bearing for firecracker:
 	// machine-config + boot-source MUST land before drives + nics, and
-	// CreateSnapshot is only valid after Action(Pause). The snapshot
+	// CreateSnapshot is only valid after PATCH /vm Paused. The snapshot
 	// test asserts the full sequence; the cold-boot tests usually just
 	// assert end-state, but the slice is cheap and harmless to share.
 	restOrder []string
@@ -342,6 +343,7 @@ type fakeClient struct {
 	nicErr            error
 	vsockErr          error
 	actionErr         error
+	patchVMErr        error
 	snapshotCreateErr error
 	snapshotLoadErr   error
 }
@@ -402,6 +404,14 @@ func (c *fakeClient) Action(_ context.Context, a firecracker.Action) error {
 	c.actions = append(c.actions, a.ActionType)
 	c.restOrder = append(c.restOrder, "Action:"+a.ActionType)
 	return c.actionErr
+}
+
+func (c *fakeClient) PatchVM(_ context.Context, vm firecracker.VM) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.vmStates = append(c.vmStates, vm.State)
+	c.restOrder = append(c.restOrder, "PatchVM:"+vm.State)
+	return c.patchVMErr
 }
 
 func (c *fakeClient) InstanceInfo(_ context.Context) (*firecracker.InstanceInfo, error) {
@@ -950,7 +960,7 @@ func TestCreate_TemplateResolveErrorReleasesSlot(t *testing.T) {
 // resolver returns HasSnapshot=true, so the driver MUST skip
 // configureVMM (no PutMachineConfig, no PutBootSource, no PutDrive,
 // no PutNetworkInterface, no PutVsock) and instead issue LoadSnapshot
-// + PATCH rebinding + Action(Resume). The vsock handshake must dial the template's
+// + PATCH rebinding + PATCH /vm state=Resumed. The vsock handshake must dial the template's
 // reserved CID (baked into the snapshot at build time), NOT the
 // per-sandbox slot CID — a regression there silently hangs the
 // handshake until deadline because the guest is listening on the
@@ -1055,10 +1065,13 @@ func TestCreate_SnapshotLoadPath(t *testing.T) {
 		t.Errorf("PatchNetworkInterface = %+v, want fctap-test", f.client.networkPatches[primaryIfaceID])
 	}
 
-	// Resume only, never InstanceStart. The action list is the wire
-	// trace; assert ordering and content.
-	if len(f.client.actions) != 1 || f.client.actions[0] != firecracker.ActionResume {
-		t.Errorf("actions = %v, want [Resume] on snapshot-load path", f.client.actions)
+	// Resume only, never InstanceStart. PatchVM is the state-transition
+	// wire trace; assert ordering and content.
+	if len(f.client.vmStates) != 1 || f.client.vmStates[0] != firecracker.VMStateResumed {
+		t.Errorf("vmStates = %v, want [Resumed] on snapshot-load path", f.client.vmStates)
+	}
+	if len(f.client.actions) != 0 {
+		t.Errorf("actions = %v, want none on snapshot-load path", f.client.actions)
 	}
 
 	// The vsock handshake MUST dial the template's CID, not the
@@ -1233,7 +1246,7 @@ func TestCreate_ColdBoot_WithoutOverlay(t *testing.T) {
 // TestCreate_SnapshotLoadPath_WithOverlay asserts that the
 // snapshot-load path allocates a per-sandbox overlay file and
 // PATCHes the overlay drive to that path between LoadSnapshot and
-// Action(Resume). The PATCH order matters: Firecracker accepts
+// PATCH /vm state=Resumed. The PATCH order matters: Firecracker accepts
 // PathOnHost mutations on a loaded-but-paused VMM, but only before
 // Resume. A regression that PATCHed after Resume would either be
 // rejected by the API or be silently late (the guest's first write
@@ -1289,7 +1302,7 @@ func TestCreate_SnapshotLoadPath_WithOverlay(t *testing.T) {
 		t.Errorf("overlay file size = %d, want %d", info.Size(), int64(2)<<30)
 	}
 
-	// Order: LoadSnapshot → PatchDrive → Resume. Any rearrangement
+	// Order: LoadSnapshot -> PatchDrive -> Resume. Any rearrangement
 	// here is an outage (PATCH-after-Resume is rejected;
 	// Resume-before-PATCH silently corrupts).
 	var loadIdx, patchIdx, resumeIdx int = -1, -1, -1
@@ -1299,7 +1312,7 @@ func TestCreate_SnapshotLoadPath_WithOverlay(t *testing.T) {
 			loadIdx = i
 		case "PatchDrive:" + overlayDriveID:
 			patchIdx = i
-		case "Action:" + firecracker.ActionResume:
+		case "PatchVM:" + firecracker.VMStateResumed:
 			resumeIdx = i
 		}
 	}
