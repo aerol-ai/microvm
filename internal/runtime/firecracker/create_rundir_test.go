@@ -229,3 +229,39 @@ func TestCreate_SnapshotLoadPath_JailerStagesAPIPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigureVMMForLoad_JailerStagesOverlayBeforeLoadSnapshot(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.UseJailer = true
+
+	runDir := t.TempDir()
+	rootfsPath := filepath.Join(runDir, rootfsFileName)
+	if err := os.WriteFile(rootfsPath, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("write rootfs: %v", err)
+	}
+	tplDir := t.TempDir()
+	snapMem := filepath.Join(tplDir, sandboxSnapshotMemoryFileName)
+	snapState := filepath.Join(tplDir, sandboxSnapshotStateFileName)
+	overlayPath := filepath.Join(tplDir, overlayFileName)
+	for _, path := range []string{snapMem, snapState, overlayPath} {
+		if err := os.WriteFile(path, []byte("artifact-"+filepath.Base(path)), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	client := newFakeClient()
+	client.loadSnapshotHook = func() error {
+		_, err := os.Stat(filepath.Join(runDir, overlayFileName))
+		return err
+	}
+	err := f.driver.configureVMMForLoad(context.Background(), client, &TemplateResolution{
+		SnapshotMemoryPath: snapMem,
+		SnapshotStatePath:  snapState,
+	}, rootfsPath, &TapSlot{TapName: "fctap0"}, overlayPath)
+	if err != nil {
+		t.Fatalf("configureVMMForLoad: %v", err)
+	}
+	if patch := client.drivePatches[overlayDriveID]; patch.PathOnHost != overlayFileName {
+		t.Fatalf("overlay drive patch path = %q, want %q", patch.PathOnHost, overlayFileName)
+	}
+}

@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/firecracker"
@@ -47,6 +48,7 @@ type WarmSpawnRequest struct {
 	SnapshotStatePath  string
 	SnapshotChecksum   string
 	VsockCID           uint32
+	HasOverlay         bool
 }
 
 // WarmHandle is the runtime-side handle the pool stores after a
@@ -187,6 +189,15 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(handle.RunDir(), req.SnapshotMemoryPath, req.SnapshotStatePath)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker warm-spawn: stage snapshot load artifacts: %w", err)
+	}
+	if req.HasOverlay {
+		overlayPath := filepath.Join(handle.RunDir(), overlayFileName)
+		if err := allocateSparse(overlayPath, overlayPlaceholderBytes); err != nil {
+			return nil, fmt.Errorf("firecracker warm-spawn: overlay placeholder alloc: %w", err)
+		}
+		if _, err := d.chrootFilePath(handle.RunDir(), overlayPath, overlayFileName); err != nil {
+			return nil, fmt.Errorf("firecracker warm-spawn: stage overlay placeholder: %w", err)
+		}
 	}
 	if err := client.LoadSnapshot(ctx, firecracker.SnapshotLoad{
 		SnapshotPath: snapshotStatePath,

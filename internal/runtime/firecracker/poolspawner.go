@@ -55,6 +55,7 @@ func (s *PoolSpawner) Spawn(ctx context.Context, slotID string, inputs vmmpool.S
 		SnapshotStatePath:  inputs.SnapshotStatePath,
 		SnapshotChecksum:   inputs.SnapshotChecksum,
 		VsockCID:           inputs.VsockCID,
+		HasOverlay:         inputs.HasOverlay,
 	})
 	if err != nil {
 		return nil, err

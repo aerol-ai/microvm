@@ -317,9 +317,10 @@ type fakeClient struct {
 	vmStates []string
 	instance *firecracker.InstanceInfo
 
-	snapshotCreate *firecracker.SnapshotCreate
-	snapshotLoad   *firecracker.SnapshotLoad
-	snapshotBase   string
+	snapshotCreate   *firecracker.SnapshotCreate
+	snapshotLoad     *firecracker.SnapshotLoad
+	snapshotBase     string
+	loadSnapshotHook func() error
 
 	// drivePatches records each PatchDrive call (snapshot-load + overlay
 	// path swap). Keyed by drive_id so a test can assert the post-load
@@ -447,10 +448,17 @@ func (c *fakeClient) CreateSnapshot(_ context.Context, req firecracker.SnapshotC
 
 func (c *fakeClient) LoadSnapshot(_ context.Context, req firecracker.SnapshotLoad) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.snapshotLoad = &req
 	c.restOrder = append(c.restOrder, "LoadSnapshot")
-	return c.snapshotLoadErr
+	err := c.snapshotLoadErr
+	hook := c.loadSnapshotHook
+	c.mu.Unlock()
+	if hook != nil {
+		if hErr := hook(); hErr != nil {
+			return hErr
+		}
+	}
+	return err
 }
 
 func (c *fakeClient) PatchDrive(_ context.Context, id string, patch firecracker.DrivePatch) error {

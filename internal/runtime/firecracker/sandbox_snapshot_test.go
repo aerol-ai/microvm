@@ -95,11 +95,15 @@ func TestConfigureSandboxSnapshotRestore_JailerStagesAPIPaths(t *testing.T) {
 		}
 	}
 	rootfsPath := filepath.Join(runDir, rootfsFileName)
-	overlayPath := filepath.Join(runDir, overlayFileName)
+	overlayPath := filepath.Join(t.TempDir(), overlayFileName)
 	for _, path := range []string{rootfsPath, overlayPath} {
 		if err := os.WriteFile(path, []byte("drive-"+filepath.Base(path)), 0o600); err != nil {
 			t.Fatalf("write %s: %v", path, err)
 		}
+	}
+	client.loadSnapshotHook = func() error {
+		_, err := os.Stat(filepath.Join(runDir, overlayFileName))
+		return err
 	}
 
 	err := d.configureSandboxSnapshotRestore(context.Background(), client, &sandboxSnapshotManifest{
@@ -125,7 +129,7 @@ func TestConfigureSandboxSnapshotRestore_JailerStagesAPIPaths(t *testing.T) {
 	if patch := client.drivePatches[overlayDriveID]; patch.PathOnHost != overlayFileName {
 		t.Fatalf("overlay drive patch path = %q, want %q", patch.PathOnHost, overlayFileName)
 	}
-	for _, name := range []string{sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName} {
+	for _, name := range []string{sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName, overlayFileName} {
 		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
 			t.Fatalf("%s not staged into restore chroot: %v", name, err)
 		}

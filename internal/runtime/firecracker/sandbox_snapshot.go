@@ -462,6 +462,13 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
+	var overlayAPIPath string
+	if manifest.HasOverlay {
+		overlayAPIPath, err = d.chrootFilePath(runDir, overlayPath, overlayFileName)
+		if err != nil {
+			return fmt.Errorf("firecracker runtime: stage snapshot overlay: %w", err)
+		}
+	}
 	if err := client.LoadSnapshot(ctx, firecracker.SnapshotLoad{
 		SnapshotPath: snapshotStatePath,
 		MemBackend: &firecracker.MemoryBackend{
@@ -484,10 +491,6 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 		return fmt.Errorf("firecracker runtime: PatchDrive rootfs: %w", err)
 	}
 	if manifest.HasOverlay {
-		overlayAPIPath, err := d.chrootFilePath(runDir, overlayPath, overlayFileName)
-		if err != nil {
-			return fmt.Errorf("firecracker runtime: stage snapshot overlay: %w", err)
-		}
 		if err := client.PatchDrive(ctx, overlayDriveID, firecracker.DrivePatch{
 			DriveID:    overlayDriveID,
 			PathOnHost: overlayAPIPath,
