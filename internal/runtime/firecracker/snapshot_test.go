@@ -99,6 +99,12 @@ func TestSnapshotTemplate_HappyPath(t *testing.T) {
 	if f.client.vsock == nil || uint32(f.client.vsock.GuestCID) != guestCID {
 		t.Errorf("PutVsock.GuestCID = %v, want %d", f.client.vsock, guestCID)
 	}
+	if nic, ok := f.client.nics[primaryIfaceID]; !ok || nic.GuestMAC != macFromCID(guestCID) {
+		t.Errorf("PutNetworkInterface.GuestMAC = %+v, want %q", nic, macFromCID(guestCID))
+	}
+	if f.tapHost.lastSlot.GuestMAC != macFromCID(guestCID) {
+		t.Errorf("tap ensure GuestMAC = %q, want template MAC %q", f.tapHost.lastSlot.GuestMAC, macFromCID(guestCID))
+	}
 
 	// CreateSnapshot request shape.
 	if f.client.snapshotCreate == nil {

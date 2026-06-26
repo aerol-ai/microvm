@@ -387,7 +387,11 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 		}
 	}
 
-	if err := d.tapHost.Ensure(ctx, *slot); err != nil {
+	hostSlot := *slot
+	if manifest.VsockCID >= 3 {
+		hostSlot.GuestMAC = macFromCID(manifest.VsockCID)
+	}
+	if err := d.tapHost.Ensure(ctx, hostSlot); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: tap host ensure %s: %w", sandboxID, slot.TapName, err)
 	}
 	tapCommitted := false

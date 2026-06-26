@@ -125,6 +125,7 @@ type fakeTapHost struct {
 	ensureErr   error
 	removeErr   error
 	lastTap     string
+	lastSlot    TapSlot
 }
 
 func (h *fakeTapHost) Ensure(_ context.Context, slot TapSlot) error {
@@ -132,6 +133,7 @@ func (h *fakeTapHost) Ensure(_ context.Context, slot TapSlot) error {
 	defer h.mu.Unlock()
 	h.ensureCalls++
 	h.lastTap = slot.TapName
+	h.lastSlot = slot
 	if h.ensureErr != nil {
 		err := h.ensureErr
 		h.ensureErr = nil
@@ -1108,6 +1110,9 @@ func TestCreate_SnapshotLoadPath(t *testing.T) {
 	}
 	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 0 {
 		t.Errorf("tap ensure=%d remove=%d, want 1/0 on success", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	}
+	if f.tapHost.lastSlot.GuestMAC != macFromCID(templateCID) {
+		t.Errorf("tap ensure GuestMAC = %q, want template MAC %q", f.tapHost.lastSlot.GuestMAC, macFromCID(templateCID))
 	}
 	if !f.vmm.started || f.vmm.shutdown {
 		t.Errorf("vmm started=%v shutdown=%v, want true/false", f.vmm.started, f.vmm.shutdown)

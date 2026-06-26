@@ -130,6 +130,27 @@ func TestEnsure_NeighborFailureBubbles(t *testing.T) {
 	}
 }
 
+func TestEnsure_UsesExplicitGuestMACForNeighbor(t *testing.T) {
+	r := &recordingRun{}
+	h := newHostWithRun(r)
+	slot := Slot{
+		TapName:  "fctap-snap",
+		CIDR:     "172.16.0.40/30",
+		HostIP:   "172.16.0.41",
+		GuestIP:  "172.16.0.42",
+		VsockCID: 13,
+		GuestMAC: "02:00:00:00:00:03",
+	}
+	if err := h.Ensure(context.Background(), slot); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	got := r.calls[len(r.calls)-1].args
+	want := []string{"neigh", "replace", "172.16.0.42", "lladdr", "02:00:00:00:00:03", "dev", "fctap-snap", "nud", "permanent"}
+	if !equalStrings(got, want) {
+		t.Fatalf("neighbor argv = %v, want %v", got, want)
+	}
+}
+
 // TestEnsure_AddrAddFailureBubbles confirms a non-idempotent addr-add
 // failure surfaces verbatim — operator needs the `ip` output to diagnose
 // (most commonly: missing CAP_NET_ADMIN on the daemon).

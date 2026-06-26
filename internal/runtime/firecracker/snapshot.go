@@ -172,8 +172,12 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	}
 
 	// Step 4: bring up the host-side TAP. Same flag-and-defer release
-	// pattern as Create's tap step.
-	if err := d.tapHost.Ensure(ctx, *slot); err != nil {
+	// pattern as Create's tap step. The template snapshot's NIC MAC is
+	// derived from the reserved snapshot CID, not the temporary build
+	// slot CID, because clones restore this NIC identity unchanged.
+	templateSlot := *slot
+	templateSlot.GuestMAC = macFromCID(req.GuestCID)
+	if err := d.tapHost.Ensure(ctx, templateSlot); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: tap ensure %s: %w", slot.TapName, err)
 	}
 	tapRemoved := false
@@ -271,7 +275,7 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	if err := client.PutNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterface{
 		IfaceID:     primaryIfaceID,
 		HostDevName: slot.TapName,
-		GuestMAC:    macFromSlot(slot),
+		GuestMAC:    macFromCID(req.GuestCID),
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: PutNetworkInterface: %w", err)
 	}
