@@ -212,9 +212,9 @@ func TestWrapperMethods_RequestShape(t *testing.T) {
 			name:   "patch-network-interface",
 			method: http.MethodPatch,
 			path:   "/network-interfaces/eth0",
-			body:   NetworkInterfacePatch{IfaceID: "eth0", HostDevName: "tap1"},
+			body:   NetworkInterfacePatch{IfaceID: "eth0"},
 			invoke: func(ctx context.Context, c *Client) error {
-				return c.PatchNetworkInterface(ctx, "eth0", NetworkInterfacePatch{IfaceID: "eth0", HostDevName: "tap1"})
+				return c.PatchNetworkInterface(ctx, "eth0", NetworkInterfacePatch{IfaceID: "eth0"})
 			},
 		},
 		{
@@ -271,6 +271,7 @@ func TestWrapperMethods_RequestShape(t *testing.T) {
 				MemBackend:          &MemoryBackend{BackendType: "File", BackendPath: "/tmp/vm.mem"},
 				EnableDiffSnapshots: true,
 				ResumeVM:            false,
+				NetworkOverrides:    []NetworkOverride{{IfaceID: "eth0", HostDevName: "tap1"}},
 			},
 			invoke: func(ctx context.Context, c *Client) error {
 				return c.LoadSnapshot(ctx, SnapshotLoad{
@@ -278,6 +279,7 @@ func TestWrapperMethods_RequestShape(t *testing.T) {
 					MemBackend:          &MemoryBackend{BackendType: "File", BackendPath: "/tmp/vm.mem"},
 					EnableDiffSnapshots: true,
 					ResumeVM:            false,
+					NetworkOverrides:    []NetworkOverride{{IfaceID: "eth0", HostDevName: "tap1"}},
 				})
 			},
 		},

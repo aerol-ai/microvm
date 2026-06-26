@@ -477,6 +477,10 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 		},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
+		NetworkOverrides: []firecracker.NetworkOverride{{
+			IfaceID:     primaryIfaceID,
+			HostDevName: slot.TapName,
+		}},
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
@@ -497,12 +501,6 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 		}); err != nil {
 			return fmt.Errorf("firecracker runtime: PatchDrive overlay: %w", err)
 		}
-	}
-	if err := client.PatchNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterfacePatch{
-		IfaceID:     primaryIfaceID,
-		HostDevName: slot.TapName,
-	}); err != nil {
-		return fmt.Errorf("firecracker runtime: PatchNetworkInterface: %w", err)
 	}
 	return nil
 }

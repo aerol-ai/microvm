@@ -94,12 +94,6 @@ func TestConfigureSandboxSnapshotRestore_Extra_2(t *testing.T) {
 	}
 	client.drivePatchErr = nil
 
-	// PatchNetworkInterface fails
-	client.networkPatchErr = os.ErrPermission
-	err = d.configureSandboxSnapshotRestore(context.Background(), client, &sandboxSnapshotManifest{}, "mem", "state", "rootfs", &TapSlot{}, "")
-	if err == nil || !strings.Contains(err.Error(), "PatchNetworkInterface") {
-		t.Errorf("expected PatchNetworkInterface error, got %v", err)
-	}
 }
 
 func TestCopyFile_Errors_Extra(t *testing.T) {

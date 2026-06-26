@@ -132,16 +132,14 @@ func (c *Client) PatchDrive(ctx context.Context, driveID string, patch DrivePatc
 	return c.do(ctx, http.MethodPatch, "/drives/"+driveID, patch, nil)
 }
 
-// PutNetworkInterface attaches a TAP device by iface_id. Like PutDrive,
-// this is also used post-snapshot-load to swap the per-sandbox TAP onto a
-// resumed clone.
+// PutNetworkInterface attaches a TAP device by iface_id during cold boot.
 func (c *Client) PutNetworkInterface(ctx context.Context, ifaceID string, iface NetworkInterface) error {
 	return c.do(ctx, http.MethodPut, "/network-interfaces/"+ifaceID, iface, nil)
 }
 
 // PatchNetworkInterface updates a subset of network-interface fields on a
-// VMM after snapshot/load. The mutable field today is host_dev_name — the
-// TAP swap on each clone.
+// VMM after snapshot/load. Firecracker v1.15 does not accept host_dev_name
+// here; snapshot restore TAP rebinding must be sent in SnapshotLoad.
 func (c *Client) PatchNetworkInterface(ctx context.Context, ifaceID string, patch NetworkInterfacePatch) error {
 	return c.do(ctx, http.MethodPatch, "/network-interfaces/"+ifaceID, patch, nil)
 }
@@ -186,7 +184,8 @@ func (c *Client) CreateSnapshot(ctx context.Context, req SnapshotCreate) error {
 // base for the clone; per-clone writes land in a dirty bitmap and do not
 // disturb the base — the property the whole plan rests on. With
 // ResumeVM=true, the action implicitly resumes execution; otherwise the
-// caller must PATCH /vm state=Resumed after attaching per-clone drives/TAP.
+// caller must PATCH /vm state=Resumed after attaching per-clone drives. TAP
+// rebinding for restored snapshots is supplied in network_overrides.
 func (c *Client) LoadSnapshot(ctx context.Context, req SnapshotLoad) error {
 	return c.do(ctx, http.MethodPut, "/snapshot/load", req, nil)
 }

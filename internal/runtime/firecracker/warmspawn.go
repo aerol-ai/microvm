@@ -4,9 +4,10 @@ package firecracker
 // a firecracker process, issue LoadSnapshot against a template's
 // snapshot artifacts, and leave the VMM paused (ResumeVM=false). The
 // returned handle is what the warm-VMM pool stores so a later sandbox
-// create can claim it, PATCH per-sandbox TAP+overlay onto it, and
-// PATCH /vm state=Resumed -- that's where the <100ms boot-time win comes
-// from.
+// create can claim it, PATCH per-sandbox state onto it, and PATCH /vm
+// state=Resumed. Firecracker v1.15 requires TAP rebinding in
+// LoadSnapshot.network_overrides, so this pool remains disabled by default
+// until the warm path is redesigned around load-time TAP ownership.
 //
 // Cleanup contract: WarmSpawn is responsible for tearing down the
 // firecracker process on any failure path after spawn. Success returns
@@ -18,11 +19,9 @@ package firecracker
 // Why no host TAP at WarmSpawn time: the template's snapshot state
 // captures the network interface's host_dev_name pointing at the
 // template-build TAP (which was torn down at the end of
-// SnapshotTemplate). Firecracker's LoadSnapshot accepts the missing
-// TAP reference because device validation happens when the VM resumes,
-// not at load. The pool slot's per-sandbox TAP is allocated by the
-// Acquire-side code in Driver.Create just before the PATCH+Resume
-// hand-off.
+// SnapshotTemplate). Firecracker v1.15 no longer lets Acquire patch
+// host_dev_name after load, so this path is not suitable for production
+// until the warm slot owns a valid load-time network override.
 
 import (
 	"context"
@@ -93,10 +92,9 @@ type WarmHandle interface {
 //
 // Acquire-side responsibilities (NOT done here):
 //
-//   - Allocating the per-sandbox TAP slot. The pool slot's snapshot
-//     state references the template-build TAP (which no longer
-//     exists); the Acquire path PATCHes the network interface to
-//     the per-sandbox TAP before Resume.
+//   - Allocating the per-sandbox TAP slot. On Firecracker v1.15 this
+//     must happen before LoadSnapshot, so the current warm path remains
+//     disabled by default.
 //
 //   - Allocating the per-sandbox overlay file. The snapshot state
 //     references the 1 MiB placeholder used at capture time; the
