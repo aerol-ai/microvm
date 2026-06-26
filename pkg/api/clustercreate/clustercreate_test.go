@@ -576,6 +576,115 @@ func TestCapacityRequestFromCreateIncludesModuleAndBuiltImageRuntime(t *testing.
 	}
 }
 
+func TestDiskGBForCapacityClustercreate(t *testing.T) {
+	if got := diskGBForCapacity(10, models.RuntimeDocker, 5); got != 10 {
+		t.Fatalf("docker disk = %d, want 10", got)
+	}
+	if got := diskGBForCapacity(10, models.RuntimeFirecracker, 5); got != 15 {
+		t.Fatalf("firecracker overlay disk = %d, want 15", got)
+	}
+}
+
+func TestClusterCreateSelfCanOwnSandboxClustercreate(t *testing.T) {
+	if !clusterCreateSelfCanOwnSandbox(nil) {
+		t.Fatal("nil cluster should default true")
+	}
+	stub := &clusterStub{
+		Noop: cluster.NewNoop("server-a", "", ""),
+		members: []cluster.Member{
+			{NodeID: "server-a", Role: config.NodeRoleServer},
+		},
+	}
+	if clusterCreateSelfCanOwnSandbox(stub) {
+		t.Fatal("server should not own sandboxes")
+	}
+}
+
+func TestPrepareLocalImageCoverageBranches(t *testing.T) {
+	t.Run("forwarded_local_image_without_reservation", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("worker-b", "http://worker-b", "")}
+		svc := testServiceWithCluster(stub)
+		r := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
+		r.Header.Set(HeaderTarget, "worker-b")
+		decision, ok := Prepare(httptest.NewRecorder(), r, svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, nil, PrepareOptions{})
+		if !ok || decision.ReservationID != "" {
+			t.Fatalf("ok=%v reservation=%q, want local forward accept", ok, decision.ReservationID)
+		}
+	})
+
+	t.Run("non_worker_placement_self_drained", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:         cluster.NewNoop("server-a", "http://server-a", ""),
+			selectTarget: cluster.PlacementTarget{NodeID: "server-a", IsSelf: true},
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+			},
+			drained: true,
+		}
+		svc := testServiceWithCluster(stub)
+		var status int
+		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		if ok || status != http.StatusServiceUnavailable {
+			t.Fatalf("ok=%v status=%d, want 503", ok, status)
+		}
+	})
+
+	t.Run("non_worker_placement_empty_urls", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:         cluster.NewNoop("server-a", "http://server-a", ""),
+			selectTarget: cluster.PlacementTarget{NodeID: "worker-b", IsSelf: false},
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+				{NodeID: "worker-b", Role: config.NodeRoleWorker},
+			},
+		}
+		svc := testServiceWithCluster(stub)
+		var status int
+		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		if ok || status != http.StatusServiceUnavailable {
+			t.Fatalf("ok=%v status=%d, want 503", ok, status)
+		}
+	})
+
+	t.Run("non_worker_placement_generic_error", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:      cluster.NewNoop("server-a", "http://server-a", ""),
+			selectErr: errors.New("boom"),
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+			},
+		}
+		svc := testServiceWithCluster(stub)
+		var status int
+		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		if ok || status != http.StatusInternalServerError {
+			t.Fatalf("ok=%v status=%d, want 500", ok, status)
+		}
+	})
+
+	t.Run("non_worker_server_role_in_members", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop: cluster.NewNoop("server-a", "http://server-a", ""),
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+			},
+		}
+		svc := testServiceWithCluster(stub)
+		if clusterCreateSelfCanOwnSandbox(stub) {
+			t.Fatal("expected server role to block self ownership")
+		}
+		_ = svc
+	})
+}
+
 func TestPrepare_ReservePaths(t *testing.T) {
 	baseReq := models.CreateSandboxRequest{
 		Image: "private.example.com/app:latest",
