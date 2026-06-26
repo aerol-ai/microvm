@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -154,6 +155,14 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return
 		}
+		// Local-only image creates cannot use the reservation-first flow: the
+		// image tag is expected to exist on the selected worker already. A
+		// cluster router may still forward these off an ingress/server node, so
+		// accept a target-pinned request without X-Cluster-Create-ID.
+		if service.ImageRequiresLocalPlacement(req) {
+			h.createSandboxOnSelectedNode(w, r, req, "")
+			return
+		}
 		// Reservation-first: a forwarded create MUST carry the ID the router
 		// minted before opReserve, so CreateSandboxWithID + RecordPlacement
 		// promote run against the same row. A missing header means the request
@@ -190,11 +199,43 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	r.ContentLength = int64(len(normalizedRaw))
 
 	if service.ImageRequiresLocalPlacement(req) {
-		if c.IsNodeDrained(c.SelfNodeID()) {
-			apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+		if clusterSelfCanOwnSandbox(c) {
+			if c.IsNodeDrained(c.SelfNodeID()) {
+				apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				return
+			}
+			h.createSandboxOnSelectedNode(w, r, req, "")
 			return
 		}
-		h.createSandboxOnSelectedNode(w, r, req, "")
+		target, err := c.SelectPlacement(capacityRequestFromCreate(req))
+		if err != nil {
+			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
+				if errors.Is(err, cluster.ErrInvalidTopology) {
+					w.Header().Set("Retry-After", "300")
+				} else {
+					w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+				}
+				apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
+			apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
+			return
+		}
+		if target.IsSelf {
+			if c.IsNodeDrained(c.SelfNodeID()) {
+				apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				return
+			}
+			h.createSandboxOnSelectedNode(w, r, req, "")
+			return
+		}
+		if strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") && h.deps.Logger != nil {
+			h.deps.Logger.Info("cluster create: forwarding built local image to selected worker",
+				"image", req.Image, "target", target.NodeID)
+		}
+		r.Header.Set(clusterCreateTargetHeader, target.NodeID)
+		r.Header.Del(clusterCreateIDHeader)
+		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 		return
 	}
 
@@ -1448,12 +1489,19 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	if templateID != "" && runtimeName == "" {
 		runtimeName = models.RuntimeFirecracker
 	}
+	if runtimeName == "" {
+		runtimeName = models.RuntimeDocker
+	}
 	out := capacity.Request{
 		CPU:        cpu,
 		MemoryMB:   mem,
 		DiskGB:     diskGBForCapacity(disk, runtimeName, req.OverlaySizeGB),
 		Runtime:    runtimeName,
 		TemplateID: templateID,
+		ModuleRef:  models.ModuleRefForCreate(req),
+	}
+	if runtimeName == models.RuntimeWasm {
+		out.MemoryMB += 8
 	}
 	// GPUs == nil means "no GPU"; a non-nil GPURequest with Count <= 0 is
 	// the documented "default 1" path (see GPURequest.Count comment in

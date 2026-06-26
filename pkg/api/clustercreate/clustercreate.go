@@ -52,6 +52,9 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return Decision{}, false
 		}
+		if service.ImageRequiresLocalPlacement(req) {
+			return Decision{}, true
+		}
 		sandboxID := strings.TrimSpace(r.Header.Get(HeaderID))
 		if sandboxID == "" {
 			writeError(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
@@ -69,11 +72,42 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{}, false
 	}
 	if service.ImageRequiresLocalPlacement(req) {
-		if c.IsNodeDrained(c.SelfNodeID()) {
+		if clusterCreateSelfCanOwnSandbox(c) {
+			if c.IsNodeDrained(c.SelfNodeID()) {
+				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				return Decision{}, false
+			}
+			return Decision{}, true
+		}
+		target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
+		if err != nil {
+			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
+				if errors.Is(err, cluster.ErrInvalidTopology) {
+					w.Header().Set("Retry-After", "300")
+				} else {
+					w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+				}
+				writeError(w, http.StatusServiceUnavailable, err.Error())
+				return Decision{}, false
+			}
+			writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
+			return Decision{}, false
+		}
+		if target.IsSelf {
+			if c.IsNodeDrained(c.SelfNodeID()) {
+				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				return Decision{}, false
+			}
+			return Decision{}, true
+		}
+		if target.APIURL == "" && target.InternalURL == "" {
 			writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 			return Decision{}, false
 		}
-		return Decision{}, true
+		r.Header.Set(HeaderTarget, target.NodeID)
+		r.Header.Del(HeaderID)
+		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+		return Decision{}, false
 	}
 
 	target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
@@ -266,7 +300,25 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	if disk <= 0 {
 		disk = models.DefaultDiskGB
 	}
-	out := capacity.Request{CPU: cpu, MemoryMB: mem, DiskGB: disk, Runtime: req.Runtime}
+	runtimeName := strings.TrimSpace(req.Runtime)
+	templateID := strings.TrimSpace(req.TemplateID)
+	if templateID != "" && runtimeName == "" {
+		runtimeName = models.RuntimeFirecracker
+	}
+	if runtimeName == "" {
+		runtimeName = models.RuntimeDocker
+	}
+	out := capacity.Request{
+		CPU:        cpu,
+		MemoryMB:   mem,
+		DiskGB:     diskGBForCapacity(disk, runtimeName, req.OverlaySizeGB),
+		Runtime:    runtimeName,
+		TemplateID: templateID,
+		ModuleRef:  models.ModuleRefForCreate(req),
+	}
+	if runtimeName == models.RuntimeWasm {
+		out.MemoryMB += 8
+	}
 	if req.GPUs != nil {
 		want := req.GPUs.Count
 		if want <= 0 {
@@ -276,6 +328,26 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		out.GPUVendor = string(req.GPUs.Vendor)
 	}
 	return out
+}
+
+func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
+	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+		return base + overlaySizeGB
+	}
+	return base
+}
+
+func clusterCreateSelfCanOwnSandbox(c cluster.Client) bool {
+	if c == nil {
+		return true
+	}
+	selfID := c.SelfNodeID()
+	for _, m := range c.Members() {
+		if m.NodeID == selfID {
+			return cluster.CanOwnSandboxRole(m.Role)
+		}
+	}
+	return true
 }
 
 func rollbackCreate(ctx context.Context, svc *service.Service, c cluster.Client, logger *slog.Logger, sandboxID, reservationID string) {

@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -40,6 +41,7 @@ type clusterStub struct {
 	selectErr    error
 	selectReqs   []capacity.Request
 	drained      bool
+	members      []cluster.Member
 
 	reserveErr   error
 	reserveCalls []reserveCall
@@ -96,6 +98,13 @@ func (s *clusterStub) SelectPlacement(req capacity.Request) (cluster.PlacementTa
 
 func (s *clusterStub) IsNodeDrained(_ string) bool {
 	return s.drained
+}
+
+func (s *clusterStub) Members() []cluster.Member {
+	if s.members != nil {
+		return s.members
+	}
+	return s.Noop.Members()
 }
 
 func (s *clusterStub) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, secrets cluster.PlacementSecrets, ttl time.Duration) error {
@@ -481,6 +490,36 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("local_only_image_routes_from_non_worker", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:         cluster.NewNoop("server-a", "http://server-a", ""),
+			selectTarget: cluster.PlacementTarget{NodeID: "worker-b", APIURL: "http://worker-b", IsSelf: false},
+			members: []cluster.Member{
+				{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
+				{NodeID: "worker-b", APIURL: "http://worker-b", Alive: true, Role: config.NodeRoleWorker},
+			},
+		}
+		svc := testServiceWithCluster(stub)
+		decision, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, nil, PrepareOptions{})
+		if ok {
+			t.Fatal("Prepare returned ok=true, want false after forwarding")
+		}
+		if decision.ReservationID != "" {
+			t.Fatalf("ReservationID = %q, want empty", decision.ReservationID)
+		}
+		if stub.forwards != 1 {
+			t.Fatalf("ForwardHTTP calls = %d, want 1", stub.forwards)
+		}
+		if len(stub.reserveCalls) != 0 {
+			t.Fatalf("ReserveOnTarget calls = %d, want 0 for local-only image", len(stub.reserveCalls))
+		}
+		if len(stub.selectReqs) != 1 || stub.selectReqs[0].Runtime != models.RuntimeDocker {
+			t.Fatalf("placement request = %+v, want docker runtime", stub.selectReqs)
+		}
+	})
+
 	t.Run("select_placement_error_shapes", func(t *testing.T) {
 		tests := []struct {
 			name           string
@@ -513,6 +552,136 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 				}
 			})
 		}
+	})
+}
+
+func TestCapacityRequestFromCreateIncludesModuleAndBuiltImageRuntime(t *testing.T) {
+	def := CapacityRequestFromCreate(models.CreateSandboxRequest{})
+	if def.Runtime != models.RuntimeDocker {
+		t.Fatalf("default runtime = %q, want docker", def.Runtime)
+	}
+
+	wasm := CapacityRequestFromCreate(models.CreateSandboxRequest{
+		Runtime:   models.RuntimeWasm,
+		ModuleRef: "python",
+		MemoryMB:  128,
+	})
+	if wasm.ModuleRef != "python" || wasm.MemoryMB != 136 {
+		t.Fatalf("wasm capacity request = %+v, want module ref and overhead", wasm)
+	}
+
+	built := CapacityRequestFromCreate(models.CreateSandboxRequest{Image: docker.BuiltImageNamespace + "/abc:latest"})
+	if built.Runtime != models.RuntimeDocker {
+		t.Fatalf("built image runtime = %q, want docker", built.Runtime)
+	}
+}
+
+func TestDiskGBForCapacityClustercreate(t *testing.T) {
+	if got := diskGBForCapacity(10, models.RuntimeDocker, 5); got != 10 {
+		t.Fatalf("docker disk = %d, want 10", got)
+	}
+	if got := diskGBForCapacity(10, models.RuntimeFirecracker, 5); got != 15 {
+		t.Fatalf("firecracker overlay disk = %d, want 15", got)
+	}
+}
+
+func TestClusterCreateSelfCanOwnSandboxClustercreate(t *testing.T) {
+	if !clusterCreateSelfCanOwnSandbox(nil) {
+		t.Fatal("nil cluster should default true")
+	}
+	stub := &clusterStub{
+		Noop: cluster.NewNoop("server-a", "", ""),
+		members: []cluster.Member{
+			{NodeID: "server-a", Role: config.NodeRoleServer},
+		},
+	}
+	if clusterCreateSelfCanOwnSandbox(stub) {
+		t.Fatal("server should not own sandboxes")
+	}
+}
+
+func TestPrepareLocalImageCoverageBranches(t *testing.T) {
+	t.Run("forwarded_local_image_without_reservation", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("worker-b", "http://worker-b", "")}
+		svc := testServiceWithCluster(stub)
+		r := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
+		r.Header.Set(HeaderTarget, "worker-b")
+		decision, ok := Prepare(httptest.NewRecorder(), r, svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, nil, PrepareOptions{})
+		if !ok || decision.ReservationID != "" {
+			t.Fatalf("ok=%v reservation=%q, want local forward accept", ok, decision.ReservationID)
+		}
+	})
+
+	t.Run("non_worker_placement_self_drained", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:         cluster.NewNoop("server-a", "http://server-a", ""),
+			selectTarget: cluster.PlacementTarget{NodeID: "server-a", IsSelf: true},
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+			},
+			drained: true,
+		}
+		svc := testServiceWithCluster(stub)
+		var status int
+		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		if ok || status != http.StatusServiceUnavailable {
+			t.Fatalf("ok=%v status=%d, want 503", ok, status)
+		}
+	})
+
+	t.Run("non_worker_placement_empty_urls", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:         cluster.NewNoop("server-a", "http://server-a", ""),
+			selectTarget: cluster.PlacementTarget{NodeID: "worker-b", IsSelf: false},
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+				{NodeID: "worker-b", Role: config.NodeRoleWorker},
+			},
+		}
+		svc := testServiceWithCluster(stub)
+		var status int
+		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		if ok || status != http.StatusServiceUnavailable {
+			t.Fatalf("ok=%v status=%d, want 503", ok, status)
+		}
+	})
+
+	t.Run("non_worker_placement_generic_error", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:      cluster.NewNoop("server-a", "http://server-a", ""),
+			selectErr: errors.New("boom"),
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+			},
+		}
+		svc := testServiceWithCluster(stub)
+		var status int
+		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
+			Image: docker.BuiltImageNamespace + "/abc:latest",
+		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		if ok || status != http.StatusInternalServerError {
+			t.Fatalf("ok=%v status=%d, want 500", ok, status)
+		}
+	})
+
+	t.Run("non_worker_server_role_in_members", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop: cluster.NewNoop("server-a", "http://server-a", ""),
+			members: []cluster.Member{
+				{NodeID: "server-a", Role: config.NodeRoleServer},
+			},
+		}
+		svc := testServiceWithCluster(stub)
+		if clusterCreateSelfCanOwnSandbox(stub) {
+			t.Fatal("expected server role to block self ownership")
+		}
+		_ = svc
 	})
 }
 

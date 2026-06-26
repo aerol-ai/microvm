@@ -60,7 +60,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 
 	mux.Handle("GET "+PathPrefix+"/capacity", d.Auth(http.HandlerFunc(h.capacity)))
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Auth(http.HandlerFunc(h.reconcile)))
-	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.buildImage)))
+	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.clusterBuildImageWrap)))
 
 	// POST /sandboxes is special: placement happens in the wrapper before any
 	// local handler runs. The wrapper falls through to createSandbox when this
@@ -109,17 +109,16 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
-	// Phase 2). No clusterForwardWrap — templates are per-host artifacts;
-	// cross-node placement awareness is Phase 6 territory.
-	mux.Handle("POST "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.createTemplate)))
-	mux.Handle("GET "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.listTemplates)))
-	mux.Handle("GET "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.getTemplate)))
-	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.deleteTemplate)))
+	// Phase 2). Templates are per-worker artifacts, so the wrapper routes
+	// creates to a Firecracker-capable worker and fans per-id operations to
+	// those workers when the caller hits an ingress/server node.
+	mux.Handle("POST "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.clusterCreateTemplateWrap)))
+	mux.Handle("GET "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.clusterListTemplatesWrap)))
+	mux.Handle("GET "+PathPrefix+"/templates/{id}", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.getTemplate))))
+	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.deleteTemplate))))
 	// Operator-triggered snapshot rebuild (Phase 6 follow-up). Idempotent
-	// under concurrent retry — see RequestTemplateRebuild for the CAS
-	// gate. No clusterForwardWrap: templates are per-host artifacts and
-	// a rebuild only makes sense on the node that owns the rootfs.
-	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", d.Auth(http.HandlerFunc(h.rebuildTemplate)))
+	// under concurrent retry — see RequestTemplateRebuild for the CAS gate.
+	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.rebuildTemplate))))
 
 	// WASM module catalogue (plans/wasm-runtime.md). Per-host like templates.
 	mux.Handle("POST "+PathPrefix+"/wasm-modules", d.Auth(http.HandlerFunc(h.createWasmModule)))

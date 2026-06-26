@@ -283,6 +283,13 @@ func TestCapacityRequestFromSpecPopulatesAllAxes(t *testing.T) {
 	}
 }
 
+func TestCapacityRequestFromSpecDefaultsRuntimeToDocker(t *testing.T) {
+	got := capacityRequestFromSpec(&models.CreateSandboxRequest{})
+	if got.Runtime != models.RuntimeDocker {
+		t.Fatalf("Runtime = %q, want docker", got.Runtime)
+	}
+}
+
 // TestCapacityRequestFromSpecGPUCountDefaults pins the documented GPU.Count
 // semantics: 0 means "default 1", -1 ("all") is normalized to 1 for
 // placement scoring (we can't gossip "all" cleanly, and any GPU host with
@@ -527,5 +534,135 @@ func runtimeWorker(prefix string, i int, runtimes []string) Member {
 			SupportedRuntimes: runtimes,
 			CanAdmit:          true,
 		},
+	}
+}
+
+// heteroPlacementCluster builds an offline *Cluster whose gossip view mirrors
+// the cluster-hetero integration topology: a dedicated control-plane server and
+// ingress (neither may own a sandbox) plus one worker per specialized runtime.
+// It is the offline guard for the routing bugs behind the cluster-hetero
+// failures (the WASM/template/built-image creates that landed on the wrong
+// node): a create for runtime X must be placed on a worker that advertises X,
+// never on a differently-specialized worker. Returns the cluster plus the
+// runtime->worker-node-id map so tests assert exact placement.
+func heteroPlacementCluster() (*Cluster, map[string]string) {
+	workers := map[string]string{
+		models.RuntimeDocker:      "docker-worker-0",
+		models.RuntimeWasm:        "wasm-worker-0",
+		models.RuntimeFirecracker: "fc-worker-0",
+		models.RuntimeGvisor:      "gvisor-worker-0",
+	}
+	members := []Member{
+		{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
+		{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleIngress},
+		runtimeWorker("docker-worker-", 0, []string{models.RuntimeDocker}),
+		runtimeWorker("wasm-worker-", 0, []string{models.RuntimeWasm}),
+		runtimeWorker("fc-worker-", 0, []string{models.RuntimeFirecracker}),
+		// A gVisor worker also runs the docker base runtime (mirrors
+		// supportedRuntimesForConfig), so it advertises both.
+		runtimeWorker("gvisor-worker-", 0, []string{models.RuntimeDocker, models.RuntimeGvisor}),
+	}
+	index := newGossipMemberIndex()
+	index.replace(members)
+	c := &Cluster{
+		nodeID: "server-a",
+		apiURL: "http://server-a",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: index},
+	}
+	return c, workers
+}
+
+// TestSelectPlacementHeteroRoutesSpecializedRuntimeToCapableWorker pins the core
+// hetero scheduler invariant: a create that names a specialized runtime is
+// placed only on the worker that runs it. With exactly one capable worker the
+// candidate set is a singleton, so every power-of-two draw must pick it; the
+// loop catches a regression that wrongly widened the candidate set (the failure
+// mode that sent WASM/Firecracker creates to the wrong node in cluster-hetero).
+func TestSelectPlacementHeteroRoutesSpecializedRuntimeToCapableWorker(t *testing.T) {
+	c, workers := heteroPlacementCluster()
+	for _, runtimeName := range []string{models.RuntimeWasm, models.RuntimeFirecracker, models.RuntimeGvisor} {
+		want := workers[runtimeName]
+		for i := 0; i < 100; i++ {
+			target, err := c.SelectPlacement(capacity.Request{CPU: 1, MemoryMB: 100, Runtime: runtimeName})
+			if err != nil {
+				t.Fatalf("runtime %q: SelectPlacement iter %d: %v", runtimeName, i, err)
+			}
+			if target.NodeID != want {
+				t.Fatalf("runtime %q placed on %q, want %q (regression: create routed to a worker that does not run this runtime)",
+					runtimeName, target.NodeID, want)
+			}
+		}
+	}
+}
+
+// TestSelectPlacementHeteroDockerStaysOffSpecializedWorkers asserts a docker
+// create only lands on a docker-capable worker, never on the wasm- or
+// firecracker-only worker.
+func TestSelectPlacementHeteroDockerStaysOffSpecializedWorkers(t *testing.T) {
+	c, workers := heteroPlacementCluster()
+	allowed := map[string]bool{
+		workers[models.RuntimeDocker]: true,
+		workers[models.RuntimeGvisor]: true, // gvisor worker also runs docker
+	}
+	for i := 0; i < 200; i++ {
+		target, err := c.SelectPlacement(capacity.Request{CPU: 1, MemoryMB: 100, Runtime: models.RuntimeDocker})
+		if err != nil {
+			t.Fatalf("SelectPlacement iter %d: %v", i, err)
+		}
+		if !allowed[target.NodeID] {
+			t.Fatalf("docker create placed on %q, want a docker-capable worker %v", target.NodeID, allowed)
+		}
+	}
+}
+
+// TestSelectPlacementHeteroUnspecifiedRuntimeStaysOffSpecializedWorkers is the
+// offline guard for the cluster-hetero default-runtime routing bug: a create
+// that omits runtime must not reach a wasm- or firecracker-only worker (neither
+// can run a plain container image). capacityRequestFromSpec defaults an empty
+// runtime to docker; this pins that default and the placement filter together,
+// end to end — the exact path that previously let an unspecified create land on
+// a specialized worker and fail.
+func TestSelectPlacementHeteroUnspecifiedRuntimeStaysOffSpecializedWorkers(t *testing.T) {
+	c, workers := heteroPlacementCluster()
+	forbidden := map[string]bool{
+		workers[models.RuntimeWasm]:        true,
+		workers[models.RuntimeFirecracker]: true,
+	}
+	req := capacityRequestFromSpec(&models.CreateSandboxRequest{CPU: 1, MemoryMB: 100})
+	if req.Runtime != models.RuntimeDocker {
+		t.Fatalf("capacityRequestFromSpec defaulted runtime to %q, want docker", req.Runtime)
+	}
+	for i := 0; i < 200; i++ {
+		target, err := c.SelectPlacement(req)
+		if err != nil {
+			t.Fatalf("SelectPlacement iter %d: %v", i, err)
+		}
+		if forbidden[target.NodeID] {
+			t.Fatalf("unspecified-runtime create placed on specialized worker %q (regression: an omitted runtime reached a wasm/firecracker-only node)", target.NodeID)
+		}
+	}
+}
+
+// TestSelectPlacementRejectsRuntimeWithNoCapableWorker pins the "503, don't
+// misplace" contract: when no live worker advertises the requested runtime,
+// SelectPlacement returns ErrNoPlacementTarget rather than silently forwarding
+// to an incapable node (which would 5xx at create time after a wasted hop).
+func TestSelectPlacementRejectsRuntimeWithNoCapableWorker(t *testing.T) {
+	members := []Member{
+		{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
+		runtimeWorker("docker-worker-", 0, []string{models.RuntimeDocker}),
+	}
+	index := newGossipMemberIndex()
+	index.replace(members)
+	c := &Cluster{
+		nodeID: "server-a",
+		apiURL: "http://server-a",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: index},
+	}
+
+	if _, err := c.SelectPlacement(capacity.Request{CPU: 1, MemoryMB: 100, Runtime: models.RuntimeWasm}); !errors.Is(err, ErrNoPlacementTarget) {
+		t.Fatalf("SelectPlacement for wasm with no wasm worker = %v, want ErrNoPlacementTarget", err)
 	}
 }

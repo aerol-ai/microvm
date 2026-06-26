@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -29,6 +30,7 @@ type createForwardCluster struct {
 	forwardedPeer      string
 	forwardedTarget    string
 	forwardedCreateID  string
+	forwardedBody      string
 	selectPlacementHit int
 	selectRequests     []capacity.Request
 	selectErr          error
@@ -36,6 +38,8 @@ type createForwardCluster struct {
 	reserveErr   error
 	reserveCalls []reserveCall
 	cancelCalls  []string
+	members      []cluster.Member
+	drained      map[string]bool
 }
 
 type reserveCall struct {
@@ -65,6 +69,17 @@ func (c *createForwardCluster) CancelReservation(_ context.Context, sandboxID st
 	return nil
 }
 
+func (c *createForwardCluster) Members() []cluster.Member {
+	if c.members != nil {
+		return c.members
+	}
+	return c.Noop.Members()
+}
+
+func (c *createForwardCluster) IsNodeDrained(nodeID string) bool {
+	return c.drained != nil && c.drained[nodeID]
+}
+
 func (c *createForwardCluster) ForwardHTTP(target cluster.Endpoint, w http.ResponseWriter, r *http.Request) {
 	// Prefer the internal channel for assertion purposes (matches the
 	// production preference order) so tests that exercise the mTLS path can
@@ -78,6 +93,9 @@ func (c *createForwardCluster) ForwardHTTP(target cluster.Endpoint, w http.Respo
 	}
 	c.forwardedTarget = r.Header.Get(clusterCreateTargetHeader)
 	c.forwardedCreateID = r.Header.Get(clusterCreateIDHeader)
+	if body, err := io.ReadAll(r.Body); err == nil {
+		c.forwardedBody = string(body)
+	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -163,6 +181,47 @@ func TestClusterCreateWrapTemplateIDImpliesFirecrackerPlacement(t *testing.T) {
 	}
 }
 
+func TestCapacityRequestFromCreateIncludesWasmModuleRef(t *testing.T) {
+	got := capacityRequestFromCreate(models.CreateSandboxRequest{
+		Runtime:   models.RuntimeWasm,
+		ModuleRef: "python",
+		MemoryMB:  128,
+	})
+
+	if got.Runtime != models.RuntimeWasm || got.ModuleRef != "python" {
+		t.Fatalf("placement runtime/module = %q/%q, want wasm/python", got.Runtime, got.ModuleRef)
+	}
+	if got.MemoryMB != 136 {
+		t.Fatalf("placement MemoryMB = %d, want request memory plus wasm overhead", got.MemoryMB)
+	}
+}
+
+func TestCapacityRequestFromCreateTreatsBuiltImagesAsDocker(t *testing.T) {
+	got := capacityRequestFromCreate(models.CreateSandboxRequest{Image: docker.BuiltImageNamespace + "/abc:latest"})
+	if got.Runtime != models.RuntimeDocker {
+		t.Fatalf("placement Runtime = %q, want docker for built local image", got.Runtime)
+	}
+}
+
+func TestNormalizeCreateRuntimeForPlacementPreservesHostDefault(t *testing.T) {
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+	if err := normalizeCreateRuntimeForPlacement(&req); err != nil {
+		t.Fatalf("normalizeCreateRuntimeForPlacement: %v", err)
+	}
+	if req.Runtime != "" {
+		t.Fatalf("Runtime = %q, want empty so the selected worker applies its configured default", req.Runtime)
+	}
+	// The two halves of the gvisor-by-default design must hold together: the
+	// forwarded runtime stays empty (above) AND placement still filters by docker
+	// (here). A "fix" that drops both defaults would reintroduce the misrouting
+	// bug — an omitted-runtime create scoring onto a wasm/firecracker-only
+	// worker. A gvisor node advertises "docker" too, so docker filtering keeps the
+	// create on a container-capable worker without forcing its runtime.
+	if got := capacityRequestFromCreate(req); got.Runtime != models.RuntimeDocker {
+		t.Fatalf("placement filter runtime = %q, want docker", got.Runtime)
+	}
+}
+
 func TestClusterCreateWrapRejectsTemplateIDWithDockerRuntimeBeforePlacement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
@@ -188,6 +247,35 @@ func TestClusterCreateWrapRejectsTemplateIDWithDockerRuntimeBeforePlacement(t *t
 	}
 	if !strings.Contains(rr.Body.String(), "template_id requires runtime") {
 		t.Fatalf("body = %q, want template_id runtime validation", rr.Body.String())
+	}
+}
+
+func TestClusterCreateWrapForwardsUnspecifiedRuntimeUnchanged(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("router", "http://router", ""),
+		target: cluster.PlacementTarget{NodeID: "worker-gvisor", APIURL: "http://worker-gvisor:21212", IsSelf: false},
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine:3.20"}`))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	if len(fakeCluster.selectRequests) != 1 || fakeCluster.selectRequests[0].Runtime != models.RuntimeDocker {
+		t.Fatalf("placement request = %+v, want docker filter for omitted runtime", fakeCluster.selectRequests)
+	}
+	var forwarded models.CreateSandboxRequest
+	if err := json.Unmarshal([]byte(fakeCluster.forwardedBody), &forwarded); err != nil {
+		t.Fatalf("decode forwarded body %q: %v", fakeCluster.forwardedBody, err)
+	}
+	if forwarded.Runtime != "" {
+		t.Fatalf("forwarded Runtime = %q, want empty so worker default is preserved", forwarded.Runtime)
 	}
 }
 
@@ -363,6 +451,48 @@ func TestClusterCreateWrapKeepsLocalOnlyImagesOnReceivingNode(t *testing.T) {
 	}
 	if fakeCluster.forwardedPeer != "" {
 		t.Fatalf("ForwardHTTP fired with peer %q; local-only image must not be forwarded", fakeCluster.forwardedPeer)
+	}
+}
+
+func TestClusterCreateWrapRoutesLocalOnlyImageOffNonWorkerNode(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("server-a", "http://server-a", ""),
+		target: cluster.PlacementTarget{NodeID: "worker-b", APIURL: "http://worker-b:21212", IsSelf: false},
+		members: []cluster.Member{
+			{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
+			{NodeID: "worker-b", APIURL: "http://worker-b:21212", Alive: true, Role: config.NodeRoleWorker},
+		},
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	body := `{"image":"` + docker.BuiltImageNamespace + `/abc:latest"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	if fakeCluster.selectPlacementHit != 1 {
+		t.Fatalf("SelectPlacement calls = %d, want 1", fakeCluster.selectPlacementHit)
+	}
+	if fakeCluster.forwardedPeer != "http://worker-b:21212" {
+		t.Fatalf("forwarded peer = %q, want worker-b", fakeCluster.forwardedPeer)
+	}
+	if fakeCluster.forwardedTarget != "worker-b" {
+		t.Fatalf("%s = %q, want worker-b", clusterCreateTargetHeader, fakeCluster.forwardedTarget)
+	}
+	if fakeCluster.forwardedCreateID != "" {
+		t.Fatalf("%s = %q, want empty for local-only image forward", clusterCreateIDHeader, fakeCluster.forwardedCreateID)
+	}
+	if len(fakeCluster.reserveCalls) != 0 {
+		t.Fatalf("ReserveOnTarget calls = %d, want 0 for local-only image", len(fakeCluster.reserveCalls))
+	}
+	if len(fakeCluster.selectRequests) != 1 || fakeCluster.selectRequests[0].Runtime != models.RuntimeDocker {
+		t.Fatalf("placement request = %+v, want docker runtime", fakeCluster.selectRequests)
 	}
 }
 

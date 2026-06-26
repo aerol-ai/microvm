@@ -39,6 +39,9 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	if templateID != "" && runtimeName == "" {
 		runtimeName = models.RuntimeFirecracker
 	}
+	if runtimeName == "" {
+		runtimeName = models.RuntimeDocker
+	}
 	out := capacity.Request{
 		CPU:        cpu,
 		MemoryMB:   mem,

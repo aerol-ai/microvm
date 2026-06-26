@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -84,6 +86,178 @@ func newTemplateV1TestEnv(t *testing.T) *templateV1Env {
 		Auth:    func(h http.Handler) http.Handler { return h },
 	})
 	return &templateV1Env{svc: svc, store: st, builder: builder, handler: mux}
+}
+
+func TestClusterCreateTemplateWrapRoutesToFirecrackerWorker(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("server-a", "http://server-a", ""),
+		target: cluster.PlacementTarget{NodeID: "worker-fc", APIURL: "http://worker-fc:21212", IsSelf: false},
+	}
+	svc.AttachCluster(fakeCluster)
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Service: svc,
+		Logger:  logger,
+		Auth:    func(h http.Handler) http.Handler { return h },
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/templates", strings.NewReader(`{"image":"docker://alpine:3.20"}`))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	if fakeCluster.forwardedPeer != "http://worker-fc:21212" {
+		t.Fatalf("forwarded peer = %q, want firecracker worker", fakeCluster.forwardedPeer)
+	}
+	if len(fakeCluster.selectRequests) != 1 || fakeCluster.selectRequests[0].Runtime != models.RuntimeFirecracker {
+		t.Fatalf("placement request = %+v, want firecracker runtime", fakeCluster.selectRequests)
+	}
+}
+
+func TestClusterListTemplatesWrapMergesAndDedupesPeers(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	now := time.Now().UTC()
+	local := &models.Template{
+		ID: "tpl-shared", Image: "docker://local",
+		Status: models.TemplateStatusReady, RootfsPath: filepath.Join(t.TempDir(), "rootfs.ext4"),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := env.store.CreateTemplate(context.Background(), local); err != nil {
+		t.Fatalf("CreateTemplate local: %v", err)
+	}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(clusterTemplateForwardedHeader); got != "1" {
+			t.Fatalf("%s = %q, want 1", clusterTemplateForwardedHeader, got)
+		}
+		rows := []*models.Template{
+			{ID: "tpl-shared", Image: "docker://peer-dupe", Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now},
+			{ID: "tpl-peer", Image: "docker://peer", Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now},
+		}
+		_ = json.NewEncoder(w).Encode(rows)
+	}))
+	defer peer.Close()
+	env.svc.AttachCluster(templateMembersCluster("server-a", peer.URL))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/templates", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var rows []*models.Template
+	if err := json.NewDecoder(rr.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("templates = %+v, want local duplicate plus one peer row", rows)
+	}
+	byID := map[string]*models.Template{}
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	if byID["tpl-shared"].Image != "docker://local" {
+		t.Fatalf("dedupe kept image %q, want local row", byID["tpl-shared"].Image)
+	}
+	if byID["tpl-peer"] == nil {
+		t.Fatalf("merged rows missing peer template: %+v", rows)
+	}
+}
+
+func TestClusterTemplateItemWrapRoutesPeerGetDeleteAndRebuild(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	now := time.Now().UTC()
+	seen := map[string]bool{}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(clusterTemplateForwardedHeader); got != "1" {
+			t.Fatalf("%s = %q, want 1", clusterTemplateForwardedHeader, got)
+		}
+		seen[r.Method+" "+r.URL.Path] = true
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/templates/tpl-remote":
+			_ = json.NewEncoder(w).Encode(&models.Template{ID: "tpl-remote", Image: "docker://peer", Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/templates/tpl-remote":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/templates/tpl-remote/rebuild":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(&models.Template{ID: "tpl-remote", Status: models.TemplateStatusPending, CreatedAt: now, UpdatedAt: now})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer peer.Close()
+	env.svc.AttachCluster(templateMembersCluster("server-a", peer.URL))
+
+	cases := []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{method: http.MethodGet, path: "/v1/templates/tpl-remote", want: http.StatusOK},
+		{method: http.MethodDelete, path: "/v1/templates/tpl-remote", want: http.StatusNoContent},
+		{method: http.MethodPost, path: "/v1/templates/tpl-remote/rebuild", want: http.StatusAccepted},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		rr := httptest.NewRecorder()
+		env.handler.ServeHTTP(rr, req)
+		if rr.Code != tc.want {
+			t.Fatalf("%s %s status = %d, want %d: %s", tc.method, tc.path, rr.Code, tc.want, rr.Body.String())
+		}
+		if !seen[tc.method+" "+tc.path] {
+			t.Fatalf("peer did not see %s %s", tc.method, tc.path)
+		}
+	}
+}
+
+func TestClusterTemplateItemWrapFallsBackLocalAfterPeer404(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	now := time.Now().UTC()
+	tpl := &models.Template{
+		ID: "tpl-local", Image: "docker://local",
+		Status: models.TemplateStatusReady, RootfsPath: filepath.Join(t.TempDir(), "rootfs.ext4"),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := env.store.CreateTemplate(context.Background(), tpl); err != nil {
+		t.Fatalf("CreateTemplate local: %v", err)
+	}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer peer.Close()
+	env.svc.AttachCluster(templateMembersCluster("server-a", peer.URL))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/templates/tpl-local", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var got models.Template
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.ID != "tpl-local" {
+		t.Fatalf("template ID = %q, want tpl-local", got.ID)
+	}
+}
+
+func templateMembersCluster(selfID, peerURL string) cluster.Client {
+	return &membersStubCluster{
+		Noop: cluster.NewNoop(selfID, "http://"+selfID, ""),
+		members: []cluster.Member{
+			{NodeID: selfID, APIURL: "http://" + selfID, Alive: true, Role: config.NodeRoleServer},
+			{
+				NodeID: "worker-fc", APIURL: peerURL, Alive: true, Role: config.NodeRoleWorker,
+				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}},
+			},
+		},
+	}
 }
 
 // TestV1CreateTemplate_Returns202 is the canonical happy path: POST
