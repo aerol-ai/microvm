@@ -194,6 +194,40 @@ func TestVMM_StartWaitSocketShutdown(t *testing.T) {
 	}
 }
 
+func TestVMM_RequestContextCancelDoesNotKillProcess(t *testing.T) {
+	dir := t.TempDir()
+	fcBin := writeFakeFirecracker(t, dir, fakeOpts{})
+	cfg := Config{FirecrackerBinary: fcBin, RunDir: dir}
+
+	v, err := newVMM(cfg, "sandbox-ctx", nil)
+	if err != nil {
+		t.Fatalf("newVMM: %v", err)
+	}
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	if err := v.Start(reqCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := v.WaitSocket(reqCtx, 45*time.Second); err != nil {
+		t.Fatalf("WaitSocket: %v (tail: %s)", err, v.StderrTail())
+	}
+
+	cancelReq()
+	select {
+	case <-v.waitCh:
+		t.Fatalf("VMM exited after request context cancellation: %v", v.waitErr)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := v.Shutdown(ctx, 2*time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := v.Wait(); err != nil {
+		t.Fatalf("Wait after Shutdown: %v", err)
+	}
+}
+
 func TestVMM_StartTwiceIsError(t *testing.T) {
 	dir := t.TempDir()
 	fcBin := writeFakeFirecracker(t, dir, fakeOpts{})

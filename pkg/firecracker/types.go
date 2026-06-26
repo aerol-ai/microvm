@@ -84,8 +84,10 @@ type NetworkInterface struct {
 	GuestMAC    string `json:"guest_mac,omitempty"`
 }
 
-// NetworkInterfacePatch is the PATCH /network-interfaces/{id} body. Used
-// post-snapshot-load to rebind a per-sandbox TAP onto a resumed clone.
+// NetworkInterfacePatch is the PATCH /network-interfaces/{id} body. Firecracker
+// v1.15 rejects host_dev_name on this endpoint, so current snapshot restore
+// rebinding must use SnapshotLoad.NetworkOverrides. HostDevName remains here
+// only for older API compatibility and tests that exercise the raw client.
 type NetworkInterfacePatch struct {
 	IfaceID     string `json:"iface_id"`
 	HostDevName string `json:"host_dev_name,omitempty"`
@@ -152,12 +154,22 @@ type SnapshotCreate struct {
 // the load-time flag that gives us per-clone CoW: the memory file stays
 // mmap'd read-only and per-VMM writes go to a dirty bitmap. ResumeVM=false
 // keeps the clone paused so the daemon can rebind the per-sandbox overlay
-// and TAP before issuing PATCH /vm state=Resumed.
+// before issuing PATCH /vm state=Resumed. Per-sandbox TAP rebinding is part
+// of the load request itself via NetworkOverrides.
 type SnapshotLoad struct {
-	SnapshotPath        string         `json:"snapshot_path"`
-	MemBackend          *MemoryBackend `json:"mem_backend,omitempty"`
-	EnableDiffSnapshots bool           `json:"enable_diff_snapshots,omitempty"`
-	ResumeVM            bool           `json:"resume_vm,omitempty"`
+	SnapshotPath        string            `json:"snapshot_path"`
+	MemBackend          *MemoryBackend    `json:"mem_backend,omitempty"`
+	EnableDiffSnapshots bool              `json:"enable_diff_snapshots,omitempty"`
+	ResumeVM            bool              `json:"resume_vm,omitempty"`
+	NetworkOverrides    []NetworkOverride `json:"network_overrides,omitempty"`
+}
+
+// NetworkOverride is one entry in SnapshotLoad.network_overrides. Firecracker
+// applies these while restoring device state from the snapshot, before the VM
+// is resumed.
+type NetworkOverride struct {
+	IfaceID     string `json:"iface_id"`
+	HostDevName string `json:"host_dev_name"`
 }
 
 // MemoryBackend selects how Firecracker loads the snapshot memory file.

@@ -73,8 +73,13 @@ func TestStopStartSnapshotLifecycle(t *testing.T) {
 	if patch, ok := f.client.drivePatches[overlayDriveID]; !ok || patch.PathOnHost == "" {
 		t.Fatalf("Start did not patch overlay drive: %+v", f.client.drivePatches)
 	}
-	if patch, ok := f.client.networkPatches[primaryIfaceID]; !ok || patch.HostDevName != "fctap-test" {
-		t.Fatalf("Start network patch = %+v, want fctap-test", f.client.networkPatches)
+	if got := f.client.snapshotLoad.NetworkOverrides; len(got) != 1 ||
+		got[0].IfaceID != primaryIfaceID ||
+		got[0].HostDevName != "fctap-test" {
+		t.Fatalf("Start network overrides = %+v, want eth0 -> fctap-test", got)
+	}
+	if len(f.client.networkPatches) != 0 {
+		t.Fatalf("Start patched network interface on snapshot restore: %+v", f.client.networkPatches)
 	}
 	if got := f.client.vmStates[len(f.client.vmStates)-1]; got != firecracker.VMStateResumed {
 		t.Fatalf("last VM state = %q, want Resumed", got)
@@ -128,6 +133,11 @@ func TestConfigureSandboxSnapshotRestore_JailerStagesAPIPaths(t *testing.T) {
 	}
 	if patch := client.drivePatches[overlayDriveID]; patch.PathOnHost != overlayFileName {
 		t.Fatalf("overlay drive patch path = %q, want %q", patch.PathOnHost, overlayFileName)
+	}
+	if got := client.snapshotLoad.NetworkOverrides; len(got) != 1 ||
+		got[0].IfaceID != primaryIfaceID ||
+		got[0].HostDevName != "fctap0" {
+		t.Fatalf("network overrides = %+v, want eth0 -> fctap0", got)
 	}
 	for _, name := range []string{sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName, overlayFileName} {
 		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {

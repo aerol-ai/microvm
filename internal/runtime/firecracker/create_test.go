@@ -1051,6 +1051,11 @@ func TestCreate_SnapshotLoadPath(t *testing.T) {
 	if f.client.snapshotLoad.ResumeVM {
 		t.Error("LoadSnapshot.ResumeVM = true; driver must Resume explicitly so PR-B can hook PATCH-then-Resume")
 	}
+	if got := f.client.snapshotLoad.NetworkOverrides; len(got) != 1 ||
+		got[0].IfaceID != primaryIfaceID ||
+		got[0].HostDevName != "fctap-test" {
+		t.Errorf("LoadSnapshot.NetworkOverrides = %+v, want eth0 -> fctap-test", got)
+	}
 
 	// configureVMM MUST NOT have run — every one of its REST calls
 	// must be absent. A regression here would re-do cold-boot setup
@@ -1074,8 +1079,8 @@ func TestCreate_SnapshotLoadPath(t *testing.T) {
 	if patch, ok := f.client.drivePatches[rootDriveID]; !ok || filepath.Base(patch.PathOnHost) != rootfsFileName {
 		t.Errorf("PatchDrive rootfs = %+v, want staged rootfs path", f.client.drivePatches[rootDriveID])
 	}
-	if patch, ok := f.client.networkPatches[primaryIfaceID]; !ok || patch.HostDevName != "fctap-test" {
-		t.Errorf("PatchNetworkInterface = %+v, want fctap-test", f.client.networkPatches[primaryIfaceID])
+	if len(f.client.networkPatches) != 0 {
+		t.Errorf("PatchNetworkInterface called on snapshot-load path: %+v", f.client.networkPatches)
 	}
 
 	// Resume only, never InstanceStart. PatchVM is the state-transition

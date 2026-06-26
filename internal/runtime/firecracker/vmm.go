@@ -175,7 +175,14 @@ func (v *vmm) Start(ctx context.Context) error {
 		binary = v.cfg.JailerBinary
 		args = v.jailerArgv()
 	}
-	cmd := exec.CommandContext(ctx, binary, args...)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// The VMM outlives the request that created it. Use ctx only as a
+	// pre-spawn cancellation check; tying the child to CommandContext
+	// would SIGKILL Firecracker as soon as the HTTP create request
+	// completes.
+	cmd := exec.Command(binary, args...)
 	cmd.Dir = v.runDir
 	v.stderr = newCappedBuffer(stderrTailCap)
 	// Merge stdout + stderr into one capped buffer. Firecracker writes its

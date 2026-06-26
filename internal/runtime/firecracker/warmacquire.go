@@ -15,10 +15,11 @@ package firecracker
 //   - LoadSnapshot: skipped. The pool already issued it.
 //
 //   - PutNetworkInterface vs PatchDrive: the cold-boot path uses Put
-//     before InstanceStart; the snapshot-load path uses Patch between
-//     LoadSnapshot and Resume. The warm path is structurally the
-//     snapshot-load path with the Load step pre-done -- same PATCH+Resume
-//     contract.
+//     before InstanceStart; the snapshot-load path supplies TAP
+//     rebinding in LoadSnapshot.network_overrides and patches drive
+//     paths before Resume. The warm path predates that Firecracker
+//     v1.15 contract and remains gated behind the disabled-by-default
+//     pool flag.
 //
 // Failure-path consistency (pr-review.md §4): every resource acquired
 // in this file (TAP slot, host TAP, overlay file, registry entries) is
@@ -219,10 +220,11 @@ func (d *Driver) tryAcquireWarm(
 	tapEnsured = true
 
 	// PATCH NetworkInterface: the snapshot's eth0 references the
-	// defunct template-build TAP. Swap it for this sandbox's TAP.
-	// Firecracker accepts the PATCH between LoadSnapshot and Resume
-	// (the device's mac/iface_id are inherited from the snapshot
-	// state; only host_dev_name is mutable post-load).
+	// defunct template-build TAP. This legacy warm-pool path is not
+	// used by the single-node-fc integration run (the pool is disabled
+	// by default). Firecracker v1.15 requires host_dev_name rebinding
+	// in LoadSnapshot.network_overrides, so the warm pool needs a
+	// separate redesign before it can be enabled on that API version.
 	if err := client.PatchNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterfacePatch{
 		IfaceID:     primaryIfaceID,
 		HostDevName: tapSlot.TapName,

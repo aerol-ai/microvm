@@ -942,9 +942,11 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 // configureVMMForLoad is the snapshot-load sibling of configureVMM.
 // Per the firecracker docs, the ONLY pre-LoadSnapshot REST call allowed
 // is PutLogger (optional, debug-only); machine config, boot source, drives,
-// network interfaces, and vsock come from the snapshot state file. After load
-// and before Resume, we PATCH the mutable host paths/devices the snapshot
-// captured from the template build: rootfs, TAP, and optional overlay.
+// network interfaces, and vsock come from the snapshot state file. The TAP
+// host device must be overridden in LoadSnapshot.network_overrides because
+// Firecracker v1.15 rejects host_dev_name on PATCH /network-interfaces.
+// After load and before Resume, we PATCH mutable drive paths captured from
+// the template build: rootfs and optional overlay.
 //
 // Integrity verification happens here, on the host, before the load
 // request is issued. A mismatch surfaces immediately as an error
@@ -992,6 +994,10 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 		},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
+		NetworkOverrides: []firecracker.NetworkOverride{{
+			IfaceID:     primaryIfaceID,
+			HostDevName: slot.TapName,
+		}},
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
@@ -1004,12 +1010,6 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 		PathOnHost: rootfsAPIPath,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PatchDrive rootfs: %w", err)
-	}
-	if err := client.PatchNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterfacePatch{
-		IfaceID:     primaryIfaceID,
-		HostDevName: slot.TapName,
-	}); err != nil {
-		return fmt.Errorf("firecracker runtime: PatchNetworkInterface: %w", err)
 	}
 	// Per-sandbox overlay swap. Firecracker's snapshot state captured
 	// the overlay placeholder (1 MiB scratch from the template

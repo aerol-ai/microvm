@@ -51,9 +51,4 @@ func TestConfigureSandboxSnapshotRestore_Extra(t *testing.T) {
 	}
 
 	client.drivePatchErr = nil
-	client.networkPatchErr = os.ErrPermission
-	err = d.configureSandboxSnapshotRestore(context.Background(), client, &sandboxSnapshotManifest{}, "", "", "", &TapSlot{}, "")
-	if err == nil || !strings.Contains(err.Error(), "PatchNetworkInterface") {
-		t.Errorf("expected PatchNetworkInterface error, got %v", err)
-	}
 }

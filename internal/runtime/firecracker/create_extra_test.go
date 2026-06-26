@@ -48,7 +48,6 @@ func TestCreate_LoadSnapshot_ExtraRESTErrors(t *testing.T) {
 	}{
 		{"LoadSnapshot", func(c *fakeClient) { c.snapshotLoadErr = os.ErrPermission }, "LoadSnapshot"},
 		{"PatchDrive root", func(c *fakeClient) { c.drivePatchErr = os.ErrPermission }, "PatchDrive rootfs"},
-		{"PatchNetworkInterface", func(c *fakeClient) { c.networkPatchErr = os.ErrPermission }, "PatchNetworkInterface"},
 		{"Patch VM Resumed", func(c *fakeClient) { c.patchVMErr = os.ErrPermission }, "patch VM Resumed"},
 	}
 

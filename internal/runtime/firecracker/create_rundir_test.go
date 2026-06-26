@@ -264,4 +264,9 @@ func TestConfigureVMMForLoad_JailerStagesOverlayBeforeLoadSnapshot(t *testing.T)
 	if patch := client.drivePatches[overlayDriveID]; patch.PathOnHost != overlayFileName {
 		t.Fatalf("overlay drive patch path = %q, want %q", patch.PathOnHost, overlayFileName)
 	}
+	if got := client.snapshotLoad.NetworkOverrides; len(got) != 1 ||
+		got[0].IfaceID != primaryIfaceID ||
+		got[0].HostDevName != "fctap0" {
+		t.Fatalf("network overrides = %+v, want eth0 -> fctap0", got)
+	}
 }
