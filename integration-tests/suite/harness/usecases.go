@@ -219,10 +219,10 @@ var Registry = []UseCase{
 	// UC-90: a runtime create must be PLACED on a worker that advertises that
 	// runtime in gossip (not merely "a create happened to succeed").
 	{ID: "UC-90", Title: "Runtime create places on a capability-matching worker", Requires: []Capability{CapCluster}, Implemented: true},
-	// UC-91: a create that omits runtime must resolve to one deterministic
-	// effective runtime cluster-wide — guards a silent default change (e.g. a
-	// gVisor-default deployment quietly downgraded to runc) across the router.
-	{ID: "UC-91", Title: "Unspecified-runtime create has a deterministic effective runtime", Requires: []Capability{CapCluster}, Implemented: true},
+	// UC-91: a create that omits runtime must run under the placement worker's
+	// own configured default (e.g. gvisor), never be silently forced to docker
+	// by the router. Guards the gvisor-by-default isolation contract.
+	{ID: "UC-91", Title: "Unspecified-runtime create is honored, not forced to docker", Requires: []Capability{CapCluster}, Implemented: true},
 	// UC-92: CreateWithImage through a non-worker ingress. The local
 	// aerolvm-build/* image must reach the worker the create is placed on.
 	{ID: "UC-92", Title: "CreateWithImage through a non-worker ingress reaches a docker worker", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},

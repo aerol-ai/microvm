@@ -211,6 +211,15 @@ func TestNormalizeCreateRuntimeForPlacementPreservesHostDefault(t *testing.T) {
 	if req.Runtime != "" {
 		t.Fatalf("Runtime = %q, want empty so the selected worker applies its configured default", req.Runtime)
 	}
+	// The two halves of the gvisor-by-default design must hold together: the
+	// forwarded runtime stays empty (above) AND placement still filters by docker
+	// (here). A "fix" that drops both defaults would reintroduce the misrouting
+	// bug — an omitted-runtime create scoring onto a wasm/firecracker-only
+	// worker. A gvisor node advertises "docker" too, so docker filtering keeps the
+	// create on a container-capable worker without forcing its runtime.
+	if got := capacityRequestFromCreate(req); got.Runtime != models.RuntimeDocker {
+		t.Fatalf("placement filter runtime = %q, want docker", got.Runtime)
+	}
 }
 
 func TestClusterCreateWrapRejectsTemplateIDWithDockerRuntimeBeforePlacement(t *testing.T) {

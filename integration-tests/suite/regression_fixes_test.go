@@ -314,42 +314,46 @@ func TestClusterPlacesRuntimeOnCapableWorker(t *testing.T) {
 	}
 }
 
-// UC-91 — a create that omits runtime must resolve to a single, deterministic
-// effective runtime cluster-wide. The hetero routing layer normalizes an
-// omitted runtime before placement; this pins the result so it cannot silently
-// change — e.g. a gVisor-default deployment quietly downgraded to plain runc,
-// or an omitted create resolving as docker on one node and gvisor on another.
-// The expected value is docker unless AEROL_DEFAULT_RUNTIME overrides it; on a
-// deployment whose operator default is gVisor, set that env so this guards the
-// operator's isolation choice rather than masking a downgrade.
-func TestUnspecifiedRuntimeEffectiveRuntimeDeterministic(t *testing.T) {
+// UC-91 — a create that omits runtime must run under the placement worker's own
+// configured default, never be silently forced to docker by the router. This is
+// the gvisor-by-default isolation contract: the router leaves an omitted runtime
+// empty so the selected worker applies its cfg.Runtime (e.g. gvisor). An omitted
+// runtime is therefore placement-dependent in a heterogeneous cluster (it may
+// run as docker on a docker worker or gvisor on a gvisor worker) — so this does
+// NOT assert a single cluster-wide value. It asserts (a) the effective runtime
+// is one the owner node actually runs, and (b) when the deployment pins a
+// default via AEROL_DEFAULT_RUNTIME (e.g. a gvisor-by-default cluster), the
+// omitted runtime equals it rather than being downgraded to docker.
+func TestUnspecifiedRuntimeHonoredNotForced(t *testing.T) {
 	harness.Require(t, sc, "UC-91")
 	c := client(t)
+	members := fetchMembers(t, c)
 
-	want := os.Getenv("AEROL_DEFAULT_RUNTIME")
-	if want == "" {
-		want = "docker"
-	}
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t)})
+	waitRunning(t, sb)
 
-	// Two omitted-runtime creates must resolve to the same effective runtime and
-	// to the documented default — proving the result is deterministic and not a
-	// function of which worker placement happened to pick.
-	var got []string
-	for i := 0; i < 2; i++ {
-		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t)})
-		waitRunning(t, sb)
-		rt := resolveEffectiveRuntime(t, c, sb.ID)
-		if rt == "" {
-			t.Fatalf("sandbox %s reported no effective runtime", sb.ID)
-		}
-		got = append(got, rt)
+	owner := resolvePlacementOwner(t, c, sb.ID)
+	if owner == "" {
+		t.Fatalf("sandbox %s never got a placement owner", sb.ID)
 	}
-	if got[0] != got[1] {
-		t.Fatalf("omitted-runtime creates resolved to different runtimes %q and %q (regression: effective runtime depends on placement)", got[0], got[1])
+	effective := resolveEffectiveRuntime(t, c, sb.ID)
+	if effective == "" {
+		t.Fatalf("sandbox %s reported no effective runtime", sb.ID)
 	}
-	if got[0] != want {
-		t.Fatalf("omitted-runtime effective runtime = %q, want %q (set AEROL_DEFAULT_RUNTIME if the deployment default changed; regression: the cluster default-runtime decision changed silently)", got[0], want)
+	// The effective runtime must be one the owner node actually runs — an omitted
+	// runtime resolves to the worker's own default, never to something the
+	// placement node isn't configured for.
+	if !nodeAdvertisesRuntime(members, owner, effective) {
+		t.Fatalf("omitted-runtime sandbox runs %q on %q, which advertises no such runtime (regression: runtime not honored by the placement node)", effective, owner)
 	}
+	// When the deployment pins a cluster-wide default (a gvisor-by-default
+	// cluster sets AEROL_DEFAULT_RUNTIME=gvisor), an omitted runtime MUST equal
+	// it — the guard that the operator's isolation default is not silently
+	// forced to docker by the router.
+	if want := os.Getenv("AEROL_DEFAULT_RUNTIME"); want != "" && effective != want {
+		t.Fatalf("omitted-runtime effective runtime = %q, want %q (regression: operator default-runtime silently overridden to docker)", effective, want)
+	}
+	t.Logf("omitted-runtime create ran as %q on %s (honored node default)", effective, owner)
 }
 
 // resolveEffectiveRuntime reads the runtime the sandbox actually runs under.
