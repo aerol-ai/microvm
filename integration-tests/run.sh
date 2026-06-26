@@ -311,6 +311,11 @@ run_one() {
   [[ "$caps_wasm" == "true" ]] && wasm_ref="${AEROL_WASM_MODULE_REF:-python}"
 
   mkdir -p "${HERE}/reports"
+  # A successful run does not collect a failure-log artifact, so clear any
+  # stale copy from an earlier failed attempt before this scenario starts.
+  # Otherwise a green report can sit next to old red diagnostics and send the
+  # operator chasing a fixed issue.
+  rm -f "${HERE}/reports/${scenario}-failure-logs.txt"
   local json_out="${sdir}/test.json"
   if [[ "$inconclusive" == "1" ]]; then
     echo "scenario ${scenario}: infra not ready (spot reclaim / propagation) — marking inconclusive" >&2
