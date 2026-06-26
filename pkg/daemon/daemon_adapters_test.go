@@ -86,9 +86,9 @@ func TestAdaptTapSlot(t *testing.T) {
 		t.Fatalf("adaptTapSlot(nil) = %+v, want nil", got)
 	}
 
-	in := &tap.Slot{TapName: "fctap1", CIDR: "172.16.0.0/30", HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 33}
+	in := &tap.Slot{TapName: "fctap1", CIDR: "172.16.0.0/30", HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 33, GuestMAC: "02:00:00:00:00:03"}
 	got := adaptTapSlot(in)
-	if got == nil || got.TapName != in.TapName || got.CIDR != in.CIDR || got.HostIP != in.HostIP || got.GuestIP != in.GuestIP || got.VsockCID != in.VsockCID {
+	if got == nil || got.TapName != in.TapName || got.CIDR != in.CIDR || got.HostIP != in.HostIP || got.GuestIP != in.GuestIP || got.VsockCID != in.VsockCID || got.GuestMAC != in.GuestMAC {
 		t.Fatalf("adaptTapSlot mismatch: got=%+v in=%+v", got, in)
 	}
 }

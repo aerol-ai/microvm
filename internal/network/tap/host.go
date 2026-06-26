@@ -186,11 +186,15 @@ func (h *Host) Ensure(ctx context.Context, slot Slot) error {
 	}
 
 	// Step 4: pin host -> guest L2 resolution when the slot carries a
-	// guest endpoint. The runtime gives Firecracker the same deterministic
-	// MAC, so this turns the first toolbox proxy dial into a direct route
-	// instead of waiting for ARP to discover a quiet guest.
-	if slot.GuestIP != "" && slot.VsockCID >= 3 {
-		mac := guestMACFromSlot(slot)
+	// guest endpoint. Cold boots derive the deterministic MAC from the
+	// slot CID. Snapshot restores can override GuestMAC because the
+	// guest NIC MAC is frozen in the snapshot while the host TAP/IP slot
+	// changes per clone.
+	if slot.GuestIP != "" && (slot.VsockCID >= 3 || slot.GuestMAC != "") {
+		mac := slot.GuestMAC
+		if mac == "" {
+			mac = guestMACFromSlot(slot)
+		}
 		if out, err := h.exec(ctx, "neigh", "replace", slot.GuestIP, "lladdr", mac, "dev", slot.TapName, "nud", "permanent"); err != nil {
 			return fmt.Errorf("tap host: neigh replace %s dev %s: %w (%s)", slot.GuestIP, slot.TapName, err, strings.TrimSpace(string(out)))
 		}

@@ -145,13 +145,15 @@ type TapPool interface {
 
 // TapSlot mirrors internal/network/tap.Slot. Re-declared here to keep
 // the import-cycle wall up; main.go's adapter converts between the two
-// shapes.
+// shapes. GuestMAC is optional and is set only when snapshot restore needs
+// the host neighbor entry to match a MAC frozen in snapshot state.
 type TapSlot struct {
 	TapName  string
 	CIDR     string
 	HostIP   string
 	GuestIP  string
 	VsockCID uint32
+	GuestMAC string
 }
 
 // Config is the subset of internal/config.Config the driver actually uses.
@@ -663,7 +665,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// Step 4: bring the host-side TAP up. After this point, error
 	// returns must call tapHost.Remove. The flag-and-defer pattern
 	// mirrors the pool-release one above.
-	if err := d.tapHost.Ensure(ctx, *slot); err != nil {
+	hostSlot := *slot
+	if snapshotLoadPath && snapshotInfo != nil && snapshotInfo.SnapshotVsockCID >= 3 {
+		// Snapshot restore preserves the guest NIC MAC captured in the
+		// template. network_overrides moves that NIC to this clone's TAP,
+		// but it does not rewrite guest_mac, so the host neighbor entry
+		// must target the frozen template MAC rather than this clone's
+		// allocated slot MAC.
+		hostSlot.GuestMAC = macFromCID(snapshotInfo.SnapshotVsockCID)
+	}
+	if err := d.tapHost.Ensure(ctx, hostSlot); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: tap host ensure %s: %w", slot.TapName, err)
 	}
 	tapRemoved := false
@@ -1233,10 +1244,14 @@ func defaultBootArgs() string {
 // final 4 bytes gives stable, collision-free MACs. The first byte
 // (0x02) sets the locally-administered bit per IEEE 802.
 func macFromSlot(slot *TapSlot) string {
+	return macFromCID(slot.VsockCID)
+}
+
+func macFromCID(cid uint32) string {
 	return fmt.Sprintf("02:00:00:%02x:%02x:%02x",
-		byte(slot.VsockCID>>16),
-		byte(slot.VsockCID>>8),
-		byte(slot.VsockCID))
+		byte(cid>>16),
+		byte(cid>>8),
+		byte(cid))
 }
 
 func postResumeData(slot *TapSlot) map[string]any {

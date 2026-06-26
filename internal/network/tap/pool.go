@@ -148,13 +148,15 @@ func addOffset(base net.IP, delta uint32) net.IP {
 // store.FirecrackerTapSlot but lives in this package so callers (the
 // Firecracker driver) depend on the policy layer's type, not the
 // store's. SandboxID is always non-empty here — a Slot returned by the
-// pool is always claimed.
+// pool is always claimed. GuestMAC is an optional host-neighbor override
+// used by snapshot restores whose guest NIC MAC is frozen in snapshot state.
 type Slot struct {
 	TapName  string
 	CIDR     string
 	HostIP   string
 	GuestIP  string
 	VsockCID uint32
+	GuestMAC string
 }
 
 // Allocate claims a slot for sandboxID. Idempotent (re-Allocate for the

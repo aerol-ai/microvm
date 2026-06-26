@@ -1541,6 +1541,7 @@ func (a *firecrackerTapHostAdapter) Ensure(ctx context.Context, slot fcruntime.T
 		HostIP:   slot.HostIP,
 		GuestIP:  slot.GuestIP,
 		VsockCID: slot.VsockCID,
+		GuestMAC: slot.GuestMAC,
 	})
 }
 
@@ -1558,6 +1559,7 @@ func adaptTapSlot(s *tap.Slot) *fcruntime.TapSlot {
 		HostIP:   s.HostIP,
 		GuestIP:  s.GuestIP,
 		VsockCID: s.VsockCID,
+		GuestMAC: s.GuestMAC,
 	}
 }
 
