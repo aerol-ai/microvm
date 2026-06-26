@@ -240,4 +240,17 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.GetClusterSecret(ctx, "sb")
 	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb")
 	_, _ = st.GetMounts(ctx, "sb")
+
+	_ = st.DeleteAllWasmStateKV(ctx, "sb")
+	_, _ = st.ListWasmCheckpointPushes(ctx, "sb")
+	_ = st.DeleteWasmCheckpointPush(ctx, 1)
+	_ = st.DeleteAllWasmCheckpointPushes(ctx, "sb")
+	_ = st.UpdateWasmRegistryPush(ctx, "sb", "ref", "dig")
+	_, _ = st.ListReadyWasmModuleRefs(ctx)
+	_, _ = st.ListWasmModulesOlderThan(ctx, time.Now())
+	_, _ = st.IsWasmDigestCatalogued(ctx, "dig")
+	_, _ = st.GetWasmModule(ctx, "id")
+	_, _ = st.ListWasmModules(ctx)
+	_ = st.DeleteWasmModule(ctx, "id")
+	_ = st.CompareCloneGeneration(ctx, "sb", "gen")
 }
