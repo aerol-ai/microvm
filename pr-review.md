@@ -69,6 +69,227 @@ These two areas are particularly fragile and have produced live incidents (PR #1
 - Any change to `EnsureLayer4` / `EnsureLayer4Ready` / the `l4Ready` latch requires a regression test in `internal/service/layer4_bootstrap_test.go` AND a call-out.
 - Do not collapse the three-state `ReserveHostPortResult` (`Reserved` / `Existing` / neither) back into a `bool`. The middle state is what prevents pool walks on PK collisions.
 
+## 7. Cluster placement, forwarding & per-host artifacts
+
+Cluster mode runs Raft placement state, SWIM gossip, and cross-node HTTP forwarding.
+This area is as fragile as the TCP host-port pool (see `CLAUDE.md` Hard rules §6).
+
+**Reviewer asks:** does this PR change who runs a sandbox, where an artifact is
+built, or how a request is forwarded? If yes, document split-brain / misdirect
+behavior, single-node no-op, and leader-change replay safety.
+
+### Rules (all cluster-touching PRs)
+
+- **Role gate.** Only `worker` and `mixed` nodes may own sandboxes
+  (`cluster.CanOwnSandboxRole`). Ingress/server nodes may route but must not
+  assume they can execute creates locally.
+- **Per-host artifacts.** Built images (`aerolvm-build/*`), Firecracker template
+  rootfs, and similar node-local blobs must be built or probed on nodes that can
+  run them. API entrypoints that cannot own sandboxes must forward or fan out —
+  not pin work to self.
+- **Local-only create contract.** When `service.ImageRequiresLocalPlacement` is
+  true, create skips the reservation-first flow: forward with
+  `X-Cluster-Create-Target` only (no `X-Cluster-Create-ID`). The target worker
+  runs `createSandboxOnSelectedNode` directly.
+- **Loop guards.** Cross-node wrappers MUST set a private header
+  (`X-Cluster-Image-Build-Fanout`, `X-Cluster-Template-Forwarded`, etc.) on
+  forwarded requests so the receiver executes locally and does not re-fanout.
+- **Runtime in placement vs body.** Placement scoring may infer a default
+  runtime (e.g. `docker` for built images) for `SelectPlacement` filters, but
+  must not rewrite an omitted `runtime` on the forwarded create body — the
+  selected worker applies its configured default (e.g. gVisor).
+- **Regression tests.** Changes to placement selection, create forwarding,
+  build/template fanout, or `capacityRequestFromCreate` need a test next to the
+  file changed (`placement_test.go`, `clustercreate_test.go`,
+  `cluster_handler_test.go`, `build_test.go`, `template_test.go`).
+- **Single-node / cluster-off.** All wrappers must no-op when `EnableCluster` is
+  false or `cluster.Client` is nil (`cluster.NewNoop`).
+
+### 7.1 Reference implementation — B7 local-only built images & per-host routing (PR #253)
+
+**Plan:** [`plans/b7-built-image-placement.md`](plans/b7-built-image-placement.md)
+(parent: [`plans/cluster-hetero-failures-fix.md`](plans/cluster-hetero-failures-fix.md),
+integration UC-74). **Branch:** `self-node-placement`.
+
+#### What was solved
+
+| Symptom | Root cause | Fix |
+|---------|------------|-----|
+| UC-74 `CreateWithImage` → `cluster: no worker placement target available` on role-separated clusters | `POST /v1/images/build` ran on ingress/server; image existed only there; `ImageRequiresLocalPlacement` pinned create to self; `CanOwnSandboxRole(server)` is false | Build fans out to Docker workers; local-image create uses placement + forward to a worker |
+| Template API unusable from ingress (B3 ticket) | Templates are per-worker rootfs; routes had no cluster wrappers | Create routes via Firecracker placement; list merges peers; get/delete/rebuild probe peers then fall back local |
+| Placement under-filtered for built images / WASM | `capacityRequestFromCreate` omitted runtime, module ref, WASM overhead | Align scoring with `internal/cluster/placement.go` (default `docker`, `ModuleRef`, +8MB WASM, overlay disk) |
+
+Before (broken on ingress/server):
+
+```
+CreateWithImage
+  → build on ingress (image only on non-worker)
+  → create pinned to self (ImageRequiresLocalPlacement)
+  → CanOwnSandboxRole(server) == false
+  → ErrNoPlacementTarget
+```
+
+After:
+
+```
+CreateWithImage
+  → build fans out to all Docker-capable workers (content-addressed tag on each)
+  → create: SelectPlacement(runtime=docker) → forward to worker
+  → worker creates without reservation ID
+```
+
+#### Decisions taken
+
+The B7 plan evaluated three options. **What shipped is Option A (build on
+workers), extended with replicate-to-all-workers fanout** — not Option B (AOCR
+push after build), which remains the long-term recommendation in the plan for
+durable, reusable images.
+
+| Decision | Rationale |
+|----------|-----------|
+| **Fan out build to every alive Docker worker** (not single placement pick) | `CreateWithImage` is two independent SDK calls with no sticky worker field. Replicating the content-addressed tag to all Docker workers lets the second call's `SelectPlacement` succeed on any worker without threading build-node metadata through the API. |
+| **Skip fanout when self can own sandboxes** (`clusterSelfCanOwnSandbox`) | Single-node and mixed-role clusters keep the old local build path; no extra HTTP on the hot path. |
+| **Skip fanout for `push` / `context_hashes` builds** | Those paths have explicit distribution semantics; fanout would be wrong. |
+| **Local-image create: no reservation ID** | Image must already exist on the target; reservation-first would reserve on router then forward to a node that cannot see the router's local image. |
+| **Template cluster wrappers in same PR** | Same class of bug (per-host artifact on ingress); unblocks B3 without AOCR. List is best-effort merge (peer failures warn + continue); item routes probe peers then local fallback. |
+| **Do not inject `runtime` into forwarded create body** | Preserves worker-specific defaults (gVisor cluster-hetero fix); placement filter uses inferred `docker` only for scoring. |
+
+Option B (AOCR distribution after build) is **not** superseded — it remains the
+better fix for image durability and cross-create reuse. Option A fanout is the
+minimal cluster-correctness fix that unblocks UC-74 without AOCR dependency.
+
+#### Impact
+
+| Surface | Who is affected | Behavior change |
+|---------|-----------------|-----------------|
+| `POST /v1/images/build` | Clients hitting ingress/server in role-separated clusters | Extra N−1 peer HTTP builds (N = Docker-capable workers) before response; 502 on first peer failure |
+| `POST /v1/sandboxes` with `aerolvm-build/*` | Same | Router does `SelectPlacement` + forward instead of local create; worker path unchanged |
+| `POST /v1/sandboxes` (normal) | Unchanged | Still reservation-first |
+| Template CRUD from ingress | Operators / SDKs using templates in cluster mode | Create forwarded to FC worker; list is union of peers; get/delete/rebuild hit peers first |
+| Worker `CreateSandbox` | No added work on worker boot path | Forwarded local-image create uses existing `createSandboxOnSelectedNode` |
+| Single-node / `EnableCluster=false` | No impact | Wrappers no-op |
+| Integration harness | WASM scenarios | Ignores stale `AEROL_WASM_MODULE_REF=aocr.aerol.ai/cluster/*/snapshots/*` |
+
+**Latency:** ingress-only overhead on `CreateWithImage` — O(workers) build
+fanout (bounded by cluster size) plus one placement + forward on create. Worker
+boot path itself is unchanged.
+
+#### Implementation map
+
+| Component | File(s) | Mechanism |
+|-----------|---------|-----------|
+| Image build fanout | `pkg/api/v1/build.go`, `routes.go` | `clusterBuildImageWrap`; header `X-Cluster-Image-Build-Fanout: 1` |
+| Local-image create (facade) | `pkg/api/clustercreate/clustercreate.go` | `clusterCreateSelfCanOwnSandbox`; placement + `ForwardHTTP` without `HeaderID` |
+| Local-image create (v1) | `pkg/api/v1/cluster_handler.go` | Mirror of clustercreate branch; accepts target-pinned forward without `X-Cluster-Create-ID` |
+| Shared helpers | `pkg/api/v1/cluster_helpers.go` | `clusterSelfCanOwnSandbox`, `clusterMemberSupportsRuntime`, `clusterPeerURL` |
+| Placement scoring | `pkg/api/clustercreate/clustercreate.go`, `pkg/api/v1/cluster_handler.go`, `internal/cluster/placement.go` | `CapacityRequestFromCreate` / `capacityRequestFromSpec` defaults |
+| Template cluster | `pkg/api/v1/template.go`, `routes.go` | `clusterCreateTemplateWrap`, `clusterListTemplatesWrap`, `clusterTemplateItemWrap`; header `X-Cluster-Template-Forwarded: 1` |
+| Classification (unchanged) | `internal/service/image_distribution.go` | `ImageRequiresLocalPlacement` still true for `aerolvm-build/*` |
+
+Key invariant preserved: **`ImageRequiresLocalPlacement` still means the image
+must exist on the node that runs the sandbox** — we changed *which* node that
+is, not the local-only contract.
+
+#### End-to-end flow (operator / SDK view)
+
+```mermaid
+flowchart TB
+    subgraph sdk["SDK CreateWithImage"]
+        S1["1. BuildImage"]
+        S2["2. Create sandbox"]
+    end
+
+    subgraph ingress["Ingress or server node"]
+        BW["clusterBuildImageWrap"]
+        CP["clustercreate.Prepare"]
+    end
+
+    subgraph workers["Docker workers"]
+        W1["worker-docker A"]
+        W2["worker-docker B"]
+    end
+
+    S1 --> BW
+    BW --> RoleQ{"Can this node own sandboxes?"}
+    RoleQ -->|yes mixed or worker| LocalB["buildImage locally"]
+    RoleQ -->|no server or ingress| Fanout["Fan out build to all Docker workers"]
+    Fanout --> W1
+    Fanout --> W2
+    Fanout --> Tag["Same aerolvm-build tag on each worker"]
+
+    S2 --> CP
+    CP --> LocalQ{"local-only built image?"}
+    LocalQ -->|no| Normal["Reservation-first placement unchanged"]
+    LocalQ -->|yes| OwnQ{"Can this node own sandboxes?"}
+    OwnQ -->|yes| SelfC["Create on self"]
+    OwnQ -->|no| Place["SelectPlacement with runtime docker"]
+    Place --> Fwd["Forward with X-Cluster-Create-Target"]
+    Fwd --> WorkerC["Worker creates without reservation ID"]
+    Tag -.-> WorkerC
+```
+
+#### Template API flow (cluster mode)
+
+```mermaid
+flowchart LR
+    TC["POST /templates"] --> PFC["SelectPlacement firecracker"]
+    PFC --> TF["Forward to FC worker"]
+
+    TL["GET /templates"] --> LM["List local"]
+    LM --> PM["Fan out to FC peers"]
+    PM --> MD["Merge and dedupe by template ID"]
+
+    TI["GET, DELETE, rebuild /templates/id"] --> PR["Probe FC peers"]
+    PR -->|found| Ret["Return peer response"]
+    PR -->|404 on all peers| FB["Fallback to local handler"]
+```
+
+#### pr-review axes for this change
+
+**Idempotency (§1)**
+
+- Build: content-addressed tag is deterministic; fanout replays the same tag on
+  each worker. `X-Cluster-Image-Build-Fanout: 1` prevents re-fanout loops.
+- Local-image create: no reservation on forward; worker create idempotency is
+  unchanged (name conflict, etc.). Misdirect guard: `X-Cluster-Create-Target` must
+  match self → 421.
+- Template list: read-only merge; duplicate IDs deduped (local row wins).
+
+**Sandbox boot / `CreateSandbox` latency (§2)**
+
+- **Worker path:** N/A — no new work on `CreateSandbox` at the worker.
+- **Ingress path (documented):** build fanout adds O(Docker workers) HTTP
+  round-trips before create; create adds one `SelectPlacement` + one forward
+  (no `ReserveOnTarget`). Fires only when self cannot own sandboxes.
+
+**Bootstrap (§3)**
+
+- N/A — no daemon-start lazy bootstrap added.
+
+**Failure-path consistency (§4)**
+
+- N/A — no new multi-step caddy + store write. Partial build fanout failure
+  returns 502; client retries build. Template list tolerates peer failures.
+
+**Mount inputs (§5)**
+
+- N/A.
+
+**TCP host-port pool & L4 (§6)**
+
+- N/A.
+
+**Cluster correctness**
+
+- Split-brain / wrong target: forwarded creates require target header == self.
+- FSM unchanged; no new Raft ops for local-image path.
+- Single-node: all wrappers no-op when cluster disabled or self can own.
+- Regression tests: `clustercreate_test.go`, `build_test.go`,
+  `cluster_handler_test.go`, `template_test.go`, `placement_test.go`.
+
+**Live verification:** `make integration-cluster-hetero` — UC-74
+(CreateWithImage built-image graph).
+
 ## PR description template
 
 Lives at [`.github/pull_request_template.md`](./.github/pull_request_template.md). GitHub auto-fills new PRs with it. Authors must answer every section; "N/A — <one-line reason>" is valid, empty is not.

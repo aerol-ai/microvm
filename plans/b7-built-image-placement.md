@@ -1,9 +1,16 @@
 # B7 — Local-only built images can't be placed in a cluster (UC-74)
 
-Status: ticketed · Severity: P2 (feature broken in cluster mode, no data risk) ·
+Status: **implemented (Option A fanout)** in PR [#253](https://github.com/aerol-ai/microvm/pull/253)
+(`self-node-placement`) · documented in [`pr-review.md` §7.1](../pr-review.md) ·
+Severity: P2 (feature broken in cluster mode, no data risk) ·
 Area: `internal/cluster` placement + `internal/service` image distribution +
 `pkg/api/v1` build · Source: cluster-hetero integration scenario, UC-74
 ("Create with built image graph"). Parent: `plans/cluster-hetero-failures-fix.md`.
+
+> **Shipped vs recommended:** Option B (AOCR distribution) remains the long-term
+> recommendation below. PR #253 shipped Option A extended with
+> replicate-to-all-Docker-workers build fanout plus placement-forward create —
+> see `pr-review.md` §7.1 for rationale.
 
 ## 1. Symptom
 
