@@ -208,6 +208,27 @@ var Registry = []UseCase{
 	// The bug gated it on IsWorker() only, so the public :2220 (which DNS points
 	// at the ingress) refused every connection.
 	{ID: "UC-89", Title: "SSH gateway listens on the ingress public host", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
+
+	// UC-90..93 guard the cluster-hetero ROUTING fix pass: a request that lands
+	// on a node which can't serve it locally (templates, locally-built images,
+	// a specialized runtime) must be routed to a capable worker rather than run
+	// in place and fail. The cheap offline guard is the SelectPlacement hetero
+	// matrix in internal/cluster/placement_test.go; these are the live
+	// end-to-end confirmations on the 8-node cluster-hetero scenario.
+	//
+	// UC-90: a runtime create must be PLACED on a worker that advertises that
+	// runtime in gossip (not merely "a create happened to succeed").
+	{ID: "UC-90", Title: "Runtime create places on a capability-matching worker", Requires: []Capability{CapCluster}, Implemented: true},
+	// UC-91: a create that omits runtime must resolve to one deterministic
+	// effective runtime cluster-wide — guards a silent default change (e.g. a
+	// gVisor-default deployment quietly downgraded to runc) across the router.
+	{ID: "UC-91", Title: "Unspecified-runtime create has a deterministic effective runtime", Requires: []Capability{CapCluster}, Implemented: true},
+	// UC-92: CreateWithImage through a non-worker ingress. The local
+	// aerolvm-build/* image must reach the worker the create is placed on.
+	{ID: "UC-92", Title: "CreateWithImage through a non-worker ingress reaches a docker worker", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	// UC-93: the firecracker template lifecycle must work when the API entry
+	// node is not the firecracker worker (templates are per-worker artifacts).
+	{ID: "UC-93", Title: "Firecracker template lifecycle works through a non-FC entry node", Requires: []Capability{CapCluster, CapFirecracker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
