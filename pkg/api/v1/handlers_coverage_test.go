@@ -326,6 +326,9 @@ func TestCapacityRequestFromCreateDefaults(t *testing.T) {
 	if got.CPU != models.DefaultCPU || got.MemoryMB != models.DefaultMemoryMB || got.DiskGB != models.DefaultDiskGB {
 		t.Fatalf("defaults = %+v, want cpu/mem/disk defaults", got)
 	}
+	if got.Runtime != models.RuntimeDocker {
+		t.Fatalf("default runtime = %q, want docker", got.Runtime)
+	}
 	req := models.CreateSandboxRequest{
 		TemplateID: "tpl-1",
 		GPUs:       &models.GPURequest{Count: 0, Vendor: models.GPUVendorNVIDIA},

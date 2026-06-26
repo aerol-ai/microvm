@@ -4,13 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type fakeImageBuilder struct {
@@ -101,6 +108,147 @@ func TestBuildImageReturnsContentAddressedTag(t *testing.T) {
 	}
 	if len(builder.builds) != 1 || builder.builds[0].Tag != wantTag {
 		t.Fatalf("unexpected build calls: %+v", builder.builds)
+	}
+}
+
+func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
+	dockerfile := "FROM alpine\nRUN echo hi"
+	var remoteSeen bool
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteSeen = true
+		if got := r.Header.Get(clusterImageBuildFanoutHeader); got != "1" {
+			t.Fatalf("%s = %q, want 1", clusterImageBuildFanoutHeader, got)
+		}
+		var req buildImageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode remote request: %v", err)
+		}
+		apiResp := buildImageResponse{Image: docker.BuildTagFor(req.DockerfileContent, nil)}
+		_ = json.NewEncoder(w).Encode(apiResp)
+	}))
+	defer remote.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&membersStubCluster{
+		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		members: []cluster.Member{
+			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
+			{
+				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
+			},
+			{
+				NodeID: "worker-fc", APIURL: "http://fc.invalid", Alive: true, Role: config.NodeRoleWorker,
+				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}},
+			},
+		},
+	})
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Service: svc,
+		Logger:  logger,
+		Auth:    func(h http.Handler) http.Handler { return h },
+	})
+
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
+	}
+	if !remoteSeen {
+		t.Fatal("remote docker worker did not receive build fanout")
+	}
+	var resp buildImageResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if want := docker.BuildTagFor(dockerfile, nil); resp.Image != want {
+		t.Fatalf("Image = %q, want %q", resp.Image, want)
+	}
+}
+
+func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
+	dockerfile := "FROM alpine\nRUN echo local"
+	var remoteSeen bool
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteSeen = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer remote.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleMixed}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&membersStubCluster{
+		Noop: cluster.NewNoop("mixed-a", "http://mixed-a", ""),
+		members: []cluster.Member{
+			{NodeID: "mixed-a", APIURL: "http://mixed-a", Alive: true, Role: config.NodeRoleMixed},
+			{
+				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
+			},
+		},
+	})
+	builder := &fakeImageBuilder{}
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Service: svc,
+		Logger:  logger,
+		Builder: builder,
+		Auth:    func(h http.Handler) http.Handler { return h },
+	})
+
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
+	}
+	if remoteSeen {
+		t.Fatal("remote worker received build fanout even though this node can own the follow-up create")
+	}
+	if len(builder.builds) != 1 {
+		t.Fatalf("local build calls = %d, want 1", len(builder.builds))
+	}
+}
+
+func TestClusterBuildImageWrapReturnsBadGatewayWhenPeerBuildFails(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "remote build failed", http.StatusInternalServerError)
+	}))
+	defer remote.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&membersStubCluster{
+		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		members: []cluster.Member{
+			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
+			{
+				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
+			},
+		},
+	})
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Service: svc,
+		Logger:  logger,
+		Auth:    func(h http.Handler) http.Handler { return h },
+	})
+
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine"})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusBadGateway, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "worker-docker") || !strings.Contains(rr.Body.String(), "remote build failed") {
+		t.Fatalf("body = %q, want worker id and peer error", rr.Body.String())
 	}
 }
 

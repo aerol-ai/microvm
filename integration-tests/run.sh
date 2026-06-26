@@ -309,6 +309,10 @@ run_one() {
   # module by alias; default to python (override by exporting the env var).
   local wasm_ref=""
   [[ "$caps_wasm" == "true" ]] && wasm_ref="${AEROL_WASM_MODULE_REF:-python}"
+  if [[ "$caps_wasm" == "true" && "$wasm_ref" == aocr.aerol.ai/cluster/*/snapshots/* ]]; then
+    echo "scenario ${scenario}: ignoring stale snapshot image ref in AEROL_WASM_MODULE_REF=${wasm_ref}; using staged wasm module alias 'python'" >&2
+    wasm_ref="python"
+  fi
 
   mkdir -p "${HERE}/reports"
   # A successful run does not collect a failure-log artifact, so clear any

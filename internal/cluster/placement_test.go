@@ -283,6 +283,13 @@ func TestCapacityRequestFromSpecPopulatesAllAxes(t *testing.T) {
 	}
 }
 
+func TestCapacityRequestFromSpecDefaultsRuntimeToDocker(t *testing.T) {
+	got := capacityRequestFromSpec(&models.CreateSandboxRequest{})
+	if got.Runtime != models.RuntimeDocker {
+		t.Fatalf("Runtime = %q, want docker", got.Runtime)
+	}
+}
+
 // TestCapacityRequestFromSpecGPUCountDefaults pins the documented GPU.Count
 // semantics: 0 means "default 1", -1 ("all") is normalized to 1 for
 // placement scoring (we can't gossip "all" cleanly, and any GPU host with
