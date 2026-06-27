@@ -129,6 +129,14 @@ on_demand_tfvar() {
   [[ "$METAL_ON_DEMAND" == "1" ]] && echo "true" || echo "false"
 }
 
+is_stale_wasm_snapshot_ref() {
+  local ref="${1:-}"
+  # WASM runtime tests use a staged module alias such as "python". A snapshot
+  # image ref from the Docker snapshot UCs is not a WASM module and always fails
+  # module resolution if it leaks in from the operator's shell environment.
+  [[ "$ref" == *"/cluster/"*"/snapshots"* || "$ref" == "cluster/"*"/snapshots"* ]]
+}
+
 run_one() {
   local scenario="$1"
   local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
@@ -309,7 +317,7 @@ run_one() {
   # module by alias; default to python (override by exporting the env var).
   local wasm_ref=""
   [[ "$caps_wasm" == "true" ]] && wasm_ref="${AEROL_WASM_MODULE_REF:-python}"
-  if [[ "$caps_wasm" == "true" && "$wasm_ref" == aocr.aerol.ai/cluster/*/snapshots/* ]]; then
+  if [[ "$caps_wasm" == "true" ]] && is_stale_wasm_snapshot_ref "$wasm_ref"; then
     echo "scenario ${scenario}: ignoring stale snapshot image ref in AEROL_WASM_MODULE_REF=${wasm_ref}; using staged wasm module alias 'python'" >&2
     wasm_ref="python"
   fi

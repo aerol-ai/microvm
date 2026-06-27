@@ -33,5 +33,25 @@ func stagedWasmModuleRefOrDefault(t testing.TB) string {
 
 func staleSnapshotModuleRef(ref string) bool {
 	ref = strings.TrimSpace(ref)
-	return strings.Contains(ref, "/cluster/") && strings.Contains(ref, "/snapshots/")
+	return (strings.Contains(ref, "/cluster/") || strings.HasPrefix(ref, "cluster/")) &&
+		strings.Contains(ref, "/snapshots")
+}
+
+func TestStaleSnapshotModuleRef(t *testing.T) {
+	cases := []string{
+		"aocr.aerol.ai/cluster/prod-aerolvm-us-east-1/snapshots/python:latest--ttl-1h",
+		"oci://aocr.aerol.ai/cluster/prod-aerolvm-us-east-1/snapshots/python:latest--ttl-1h",
+		"cluster/prod-aerolvm-us-east-1/snapshots/python:latest--ttl-1h",
+	}
+	for _, ref := range cases {
+		if !staleSnapshotModuleRef(ref) {
+			t.Fatalf("staleSnapshotModuleRef(%q) = false, want true", ref)
+		}
+	}
+
+	for _, ref := range []string{"python", "aocr.aerol.ai/wasm/std/python:3.12"} {
+		if staleSnapshotModuleRef(ref) {
+			t.Fatalf("staleSnapshotModuleRef(%q) = true, want false", ref)
+		}
+	}
 }
