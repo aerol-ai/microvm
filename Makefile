@@ -103,15 +103,16 @@ integration-cluster-hetero-safe:
 # Create benchmark (UC-94 create latency + UC-95 fleet density). Provisions
 # cluster-hetero, runs the suite WITH the benchmark turned on (AEROL_BENCH=1 is
 # the master switch — the bench is dormant otherwise), writes the JSON artifact,
-# and tears down. Override the artifact path with BENCH_OUT=, or pass `keep` to
-# leave the cluster up for repeat runs. See integration-tests/README.md.
+# and tears down. Benchmark runs skip disruptive failover tests by default so
+# `keep` leaves a usable cluster for repeat bench-only runs. Override the artifact
+# path with BENCH_OUT=. See integration-tests/README.md.
 #   make integration-benchmark
 #   make integration-benchmark keep
 #   make integration-benchmark BENCH_OUT=/tmp/bench.json
 BENCH_OUT ?= integration-tests/reports/cluster-hetero-bench.json
 integration-benchmark:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(BENCH_OUT) \
-		integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
+		integration-tests/run.sh cluster-hetero --no-disruptive $(RUN_FLAGS)
 
 # Re-run UC-94/UC-95 only against a cluster left up with `keep` (no reprovision).
 #   make integration-benchmark-only
@@ -144,7 +145,7 @@ integration-all:
 #   make integration-collect-logs                       # cluster-hetero
 #   make integration-collect-logs SCENARIO=cluster-3-mixed
 integration-collect-logs:
-	integration-tests/run.sh $(or $(SCENARIO),cluster-hetero) --collect-logs-only
+	integration-tests/run.sh --collect-logs-only '$(or $(SCENARIO),cluster-hetero)'
 
 # Full teardown of a scenario brought up with `keep` — runs terraform destroy
 # (VPC, S3, IAM, instances) and clears the isolated state. This is the REAL
@@ -153,7 +154,7 @@ integration-collect-logs:
 #   make integration-destroy
 #   make integration-destroy SCENARIO=cluster-3-mixed
 integration-destroy:
-	integration-tests/run.sh $(or $(SCENARIO),cluster-hetero) --destroy-only
+	integration-tests/run.sh --destroy-only '$(or $(SCENARIO),cluster-hetero)'
 
 # Cost safety net: terminate leaked itest instances past their ttl. Faster than
 # integration-destroy but instance-only — leaves VPC/S3/IAM + TF state behind.

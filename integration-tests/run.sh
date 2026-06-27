@@ -63,6 +63,12 @@ for arg in "$@"; do
   esac
 done
 [[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only]" >&2; exit 2; }
+# Reject shell metacharacters so a polluted SCENARIO env (or make injection)
+# cannot turn one run.sh invocation into multiple shell commands.
+if [[ "$SCENARIO" == *[$';#&|<>']* ]] || [[ "$SCENARIO" == *$'\n'* ]]; then
+  echo "scenario name contains unsafe shell characters (refusing: ${SCENARIO})" >&2
+  exit 2
+fi
 
 DOMAINS_FILE="${HERE}/scenarios/domains.yml"
 CONFIG_CLUSTER="${REPO_ROOT}/config/cluster.yml"
@@ -77,6 +83,12 @@ PROD_TFVARS="${REPO_ROOT}/config/terraform.tfvars"
 tf_varfile_args() {
   local scenario="$1"
   printf -- '-var-file=%s -var-file=%s' "$PROD_TFVARS" "${HERE}/scenarios/${scenario}.tfvars"
+}
+
+# on_demand_tfvar maps the --metal-on-demand flag to the force_on_demand TF var
+# (flips firecracker bare-metal nodes off spot; cheap t3 spot nodes unaffected).
+on_demand_tfvar() {
+  [[ "$METAL_ON_DEMAND" == "1" ]] && echo "true" || echo "false"
 }
 
 teardown() {
@@ -101,6 +113,13 @@ teardown() {
     -var="force_on_demand=$(on_demand_tfvar)" || \
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
 }
+
+if [[ "$DESTROY_ONLY" == "1" ]]; then
+  # Fast path: teardown() returns early when KEEP=1; force a real destroy here.
+  KEEP=0
+  teardown "$SCENARIO"
+  exit 0
+fi
 
 # lease_domain picks a RANDOM test domain from the pool, never repeating the
 # previous run's pick. Reusing one name re-requests the same cert set and trips
@@ -128,12 +147,6 @@ lease_domain() {
   mkdir -p "$(dirname "$lease_file")"
   echo "$idx" > "$lease_file"
   yq -r ".itest.domains[$idx]" "$DOMAINS_FILE"
-}
-
-# on_demand_tfvar maps the --metal-on-demand flag to the force_on_demand TF var
-# (flips firecracker bare-metal nodes off spot; cheap t3 spot nodes unaffected).
-on_demand_tfvar() {
-  [[ "$METAL_ON_DEMAND" == "1" ]] && echo "true" || echo "false"
 }
 
 # allow_disruptive_for decides AEROL_ALLOW_DISRUPTIVE for the suite. cluster-hetero
@@ -390,6 +403,10 @@ run_one() {
   fi
   if [[ "${AEROL_BENCH:-}" == "1" ]]; then
     echo "benchmark enabled (UC-94/UC-95); artifact=${bench_out:-logs only}" >&2
+    if [[ -n "$bench_out" ]]; then
+      mkdir -p "$(dirname "$bench_out")"
+      rm -f "$bench_out"
+    fi
   fi
   set +e
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
@@ -547,6 +564,7 @@ run_bench_only() {
     bench_out="${REPO_ROOT}/${bench_out}"
   fi
   mkdir -p "$(dirname "$bench_out")" "${HERE}/reports"
+  rm -f "$bench_out"
 
   echo "=== bench-only against ${base_url} (artifact=${bench_out}) ===" >&2
   if ! wait_for_health "$base_url" "$pat"; then
@@ -580,11 +598,7 @@ run_bench_only() {
   fi
 }
 
-if [[ "$DESTROY_ONLY" == "1" ]]; then
-  # teardown() returns early when KEEP=1; force a real destroy here.
-  KEEP=0
-  teardown "$SCENARIO"
-elif [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
+if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
   collect_logs_only "$SCENARIO"
 elif [[ "$BENCH_ONLY" == "1" ]]; then
   run_bench_only "$SCENARIO"
