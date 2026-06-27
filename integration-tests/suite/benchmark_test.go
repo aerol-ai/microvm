@@ -45,6 +45,20 @@ var benchRuntimes = []struct {
 	{"wasm", harness.CapWasm},
 }
 
+// requireBenchEnabled is a second gate on top of the CapBenchmark capability.
+// The capability keeps UC-94/UC-95 in the coverage matrix on cluster-hetero,
+// but the benchmark is slow and the density probe provisions sandboxes until
+// the fleet rejects — far too costly to run on every hetero pass. So it stays
+// dormant unless the operator sets AEROL_BENCH=1, in which case it runs as part
+// of the normal orchestrated suite (run.sh passes the parent env through). When
+// disabled it t.Skips with that reason, which the report shows as a (n/a) skip.
+func requireBenchEnabled(t *testing.T) {
+	t.Helper()
+	if os.Getenv("AEROL_BENCH") != "1" {
+		t.Skip("benchmark disabled: set AEROL_BENCH=1 to run UC-94/UC-95 (slow; provisions many sandboxes)")
+	}
+}
+
 // benchEnvInt reads a positive integer tunable from env, falling back to def.
 func benchEnvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
@@ -219,6 +233,7 @@ func writeBenchArtifact(t *testing.T, rep benchReport) {
 // Create() round-trip and the full create→running time, then report p50/p90/p99.
 func TestBenchCreateLatency(t *testing.T) {
 	harness.Require(t, sc, "UC-94")
+	requireBenchEnabled(t)
 	c := client(t)
 	samples := benchEnvInt("AEROL_BENCH_SAMPLES", 10)
 
@@ -312,6 +327,7 @@ func meanMS(durs []time.Duration) int64 {
 // signal. A safety cap (AEROL_BENCH_MAX) bounds cost if admission never trips.
 func TestBenchDensity(t *testing.T) {
 	harness.Require(t, sc, "UC-95")
+	requireBenchEnabled(t)
 	c := client(t)
 	maxSandboxes := benchEnvInt("AEROL_BENCH_MAX", 200)
 

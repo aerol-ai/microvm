@@ -3,7 +3,7 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
-	integration-cluster-hetero integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
+	integration-cluster-hetero integration-benchmark integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -93,6 +93,19 @@ integration-cluster-hetero:
 	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
 	# so --metal-on-demand is unnecessary here. Pass FLAGS=--keep to debug.
 	integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
+
+# Create benchmark (UC-94 create latency + UC-95 fleet density). Provisions
+# cluster-hetero, runs the suite WITH the benchmark turned on (AEROL_BENCH=1 is
+# the master switch — the bench is dormant otherwise), writes the JSON artifact,
+# and tears down. Override the artifact path with BENCH_OUT=, or pass `keep` to
+# leave the cluster up for repeat runs. See integration-tests/README.md.
+#   make integration-benchmark
+#   make integration-benchmark keep
+#   make integration-benchmark BENCH_OUT=/tmp/bench.json
+BENCH_OUT ?= integration-tests/reports/cluster-hetero-bench.json
+integration-benchmark:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(BENCH_OUT) \
+		integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
 
 # Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
 # exercises the firecracker use cases (UC-24/47-50) without the full hetero

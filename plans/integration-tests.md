@@ -186,6 +186,23 @@ signal.
 - **UC-65** Concurrent duplicate create (N goroutines, same id) → exactly one sandbox.
 - **UC-66** `GET .../mounts` lists configured external-storage mounts.
 
+### I. Performance / capacity benchmarks (opt-in, `cluster-hetero` only)
+- **UC-94** Benchmark: per-runtime sandbox **create latency**. Times the
+  `Create()` round-trip and create→`started` over `AEROL_BENCH_SAMPLES` samples
+  per runtime; reports p50/p90/p99 + mean.
+- **UC-95** Benchmark: fleet **density to capacity rejection**. Creates docker
+  sandboxes until admission returns `capacity exceeded`, reports the count, then
+  tears them down (`AEROL_BENCH_MAX` safety cap).
+
+Both are gated on a dedicated `benchmark` capability (`harness.CapBenchmark`)
+advertised only by `cluster-hetero` — the lone scenario carrying every runtime —
+so they're opt-in and skip (not-applicable) everywhere else. Results stamp the
+machine config parsed from the scenario `*.tfvars` (per-node `instance_type`,
+role, `with_*` flags) so a latency is read against the hardware it ran on, and
+optionally write a JSON artifact to `AEROL_BENCH_OUT`. See
+[`../integration-tests/README.md`](../integration-tests/README.md#create-benchmark-uc-94--uc-95)
+for the run recipe + env knobs.
+
 ### Test hygiene contract (review issue 2 — RESOLVED)
 
 Because every UC runs against **one shared deployment on small workers**, the
