@@ -260,6 +260,7 @@ func TestBenchCreateLatency(t *testing.T) {
 			}
 			if br.runtime == "wasm" {
 				opts.Image = wasmRef
+				opts.ModuleRef = wasmRef
 			} else {
 				opts.Image = harness.DefaultImage
 			}

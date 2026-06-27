@@ -284,7 +284,8 @@ func TestClusterPlacesRuntimeOnCapableWorker(t *testing.T) {
 			opts := sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Runtime: rc.runtime}
 			if rc.runtime == "wasm" {
 				// WASM resolves an image/module ref, not a container image.
-				opts.Image = stagedWasmModuleRefOrDefault(t)
+				opts.ModuleRef = stagedWasmModuleRefOrDefault(t)
+				opts.Image = opts.ModuleRef
 			}
 			sb := c.NewSandbox(t, opts)
 			waitRunning(t, sb)

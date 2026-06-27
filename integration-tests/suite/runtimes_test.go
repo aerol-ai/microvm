@@ -58,9 +58,10 @@ func TestRuntimeWasm(t *testing.T) {
 	}
 	c := client(t)
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Name:    harness.UniqueName(sc, t),
-		Runtime: "wasm",
-		Image:   ref,
+		Name:      harness.UniqueName(sc, t),
+		Runtime:   "wasm",
+		Image:     ref,
+		ModuleRef: ref,
 	})
 	waitRunning(t, sb)
 }

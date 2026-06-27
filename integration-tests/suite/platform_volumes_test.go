@@ -170,7 +170,7 @@ func expectPlatformVolumeRuntimeRejected(t *testing.T, runtime, image string) {
 	c := client(t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+	opts := sdktypes.CreateSandboxOptions{
 		Image:   image,
 		Name:    harness.UniqueName(sc, t),
 		Runtime: runtime,
@@ -178,7 +178,11 @@ func expectPlatformVolumeRuntimeRejected(t *testing.T, runtime, image string) {
 			Name: volumeName(t),
 			Path: "/vol",
 		}},
-	})
+	}
+	if runtime == sdktypes.RuntimeWasm {
+		opts.ModuleRef = image
+	}
+	sb, err := c.SDK().Create(ctx, opts)
 	if err == nil {
 		_ = c.SDK().Destroy(ctx, sb.ID)
 		t.Fatalf("create with runtime=%s and platform volume succeeded; expected rejection", runtime)
