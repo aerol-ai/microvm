@@ -450,10 +450,13 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	if len(cfg.BootstrapPeers) > 0 {
 		joined, err := ml.Join(cfg.BootstrapPeers)
 		if err != nil {
-			_ = ml.Shutdown()
-			return nil, fmt.Errorf("gossip setup: join %v: %w", cfg.BootstrapPeers, err)
-		}
-		if logger != nil {
+			if logger != nil {
+				logger.Warn("cluster gossip initial bootstrap join failed; will retry in background",
+					"peers", cfg.BootstrapPeers,
+					"error", err,
+				)
+			}
+		} else if logger != nil {
 			logger.Info("cluster gossip joined peers", "joined", joined, "peers", cfg.BootstrapPeers)
 		}
 	} else if logger != nil {

@@ -67,6 +67,37 @@ func TestSetupGossipInvalidSecretKey(t *testing.T) {
 	}
 }
 
+func TestSetupGossipContinuesWhenInitialBootstrapJoinFails(t *testing.T) {
+	cfg := gossipSetupConfig{
+		NodeID:         "join-retry-node",
+		BindAddr:       "127.0.0.1:0",
+		BootstrapPeers: []string{"127.0.0.1:1"},
+		GossipInterval: time.Hour,
+		APIURL:         "http://127.0.0.1:21212",
+		Role:           config.NodeRoleWorker,
+		AdvertiseAddr:  "",
+		DataPlaneHost:  "127.0.0.1",
+		RaftAddr:       "",
+		InternalURL:    "",
+		PublicHost:     "",
+		Events:         nil,
+	}
+
+	gn, err := setupGossip(cfg, nil, slog.Default())
+	if err != nil {
+		t.Fatalf("setupGossip returned fatal error for transient bootstrap join failure: %v", err)
+	}
+	defer gn.Close()
+
+	members := gn.members()
+	if len(members) != 1 || members[0].NodeID != "join-retry-node" || !members[0].Alive {
+		t.Fatalf("members after failed initial join = %+v, want live self member", members)
+	}
+	if len(gn.bootstrapPeers) != 1 || gn.bootstrapPeers[0] != "127.0.0.1:1" {
+		t.Fatalf("bootstrap peers = %v, want retained peer for background retry", gn.bootstrapPeers)
+	}
+}
+
 func TestGossipRefreshLoopExitsOnCancel(t *testing.T) {
 	// We just want to ensure runRefreshLoop doesn't block forever and handles context correctly
 	gn := &gossipNode{
