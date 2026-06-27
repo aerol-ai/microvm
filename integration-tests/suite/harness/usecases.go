@@ -50,6 +50,14 @@ const (
 	// scenario configured S3 or NFS. Where the feature is off, the UCs skip
 	// (not-applicable) rather than fail against a 412.
 	CapPlatformVolumes Capability = "platform-volumes"
+	// CapBenchmark gates the create-benchmark UCs (UC-94/UC-95). It is
+	// deliberately separate from the runtime capabilities: the benchmark is
+	// slow and provisions many sandboxes (the density probe runs until the
+	// fleet rejects on capacity), so it must be opt-in even on a scenario that
+	// otherwise has every runtime. Only scenarios that explicitly advertise it
+	// — currently cluster-hetero — run the benchmark; everywhere else the UCs
+	// skip (not-applicable) instead of inflating cost on a normal pass.
+	CapBenchmark Capability = "benchmark"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -229,6 +237,13 @@ var Registry = []UseCase{
 	// UC-93: the firecracker template lifecycle must work when the API entry
 	// node is not the firecracker worker (templates are per-worker artifacts).
 	{ID: "UC-93", Title: "Firecracker template lifecycle works through a non-FC entry node", Requires: []Capability{CapCluster, CapFirecracker}, Implemented: true},
+	// F. Performance / capacity benchmarks (opt-in via CapBenchmark).
+	// UC-94 measures per-runtime sandbox create latency (API-return + time to
+	// running) over a sample, reporting p50/p90/p99. UC-95 probes effective
+	// fleet density by creating sandboxes until the API rejects on capacity,
+	// then tears them all down. Both reuse the hetero cluster substrate.
+	{ID: "UC-94", Title: "Benchmark: per-runtime sandbox create latency", Requires: []Capability{CapCluster, CapBenchmark}, Implemented: true},
+	{ID: "UC-95", Title: "Benchmark: fleet density to capacity rejection", Requires: []Capability{CapCluster, CapBenchmark}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
