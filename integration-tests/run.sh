@@ -401,7 +401,7 @@ run_one() {
     AEROL_BENCH="${AEROL_BENCH:-}" \
     AEROL_BENCH_OUT="${bench_out}" \
     AEROL_WASM_MODULE_REF="${wasm_ref}" \
-    go test -tags=integration -count=1 -json ./integration-tests/suite/... > "$json_out"
+    go test -tags=integration -count=1 -timeout=60m -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
 
@@ -533,8 +533,9 @@ run_bench_only() {
     exit 2
   fi
 
-  local caps_wasm
+  local caps_wasm expected_members
   caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
+  expected_members=$(yq -r '.expected_members // ""' "$caps_file")
   local wasm_ref=""
   [[ "$caps_wasm" == "true" ]] && wasm_ref="${AEROL_WASM_MODULE_REF:-python}"
   if [[ "$caps_wasm" == "true" ]] && is_stale_wasm_snapshot_ref "$wasm_ref"; then
@@ -561,6 +562,7 @@ run_bench_only() {
   AEROL_SCENARIO="$scenario" \
   AEROL_CAPS="${caps_file}" \
   AEROL_DOMAIN="${leased}" \
+  AEROL_EXPECTED_MEMBERS="${expected_members}" \
   AEROL_WASM_MODULE_REF="${wasm_ref}" \
     go test -tags=integration -count=1 -timeout=60m -v \
       -run 'TestBench' \

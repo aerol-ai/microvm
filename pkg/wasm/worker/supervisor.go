@@ -79,8 +79,16 @@ func (s *Supervisor) Ensure(ctx context.Context, sandboxID, socketPath string) e
 }
 
 func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 	_ = os.Remove(socketPath)
-	cmd, err := s.spawn(ctx, socketPath)
+	cmd, err := s.spawn(context.WithoutCancel(ctx), socketPath)
 	if err != nil {
 		return err
 	}

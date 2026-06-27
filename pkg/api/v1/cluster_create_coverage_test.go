@@ -194,6 +194,9 @@ func TestCreateSandboxOnSelectedNode_PromoteSuccess(t *testing.T) {
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
 	}
+	if st := rr.Header().Get("Server-Timing"); !strings.Contains(st, "create;dur=") {
+		t.Fatalf("Server-Timing = %q, want create duration", st)
+	}
 	if rt.lastCreateID != "sb-reserved" {
 		t.Fatalf("create id = %q, want sb-reserved", rt.lastCreateID)
 	}

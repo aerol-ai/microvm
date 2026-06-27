@@ -159,6 +159,37 @@ func TestSupervisorSpawnerWarmSuccess(t *testing.T) {
 	_ = sup.Stop("slot-ok")
 }
 
+func TestSupervisorSpawnerWarmContextCancelDoesNotRespawnLoadedSlot(t *testing.T) {
+	wasmBytes := []byte{
+		0x00, 0x61, 0x73, 0x6d,
+		0x01, 0x00, 0x00, 0x00,
+	}
+	modFile := filepath.Join(t.TempDir(), "noop.wasm")
+	if err := os.WriteFile(modFile, wasmBytes, 0o600); err != nil {
+		t.Fatalf("write wasm: %v", err)
+	}
+
+	socketPath := filepath.Join(os.TempDir(), "pool_warm_cancel.sock")
+	t.Cleanup(func() { os.Remove(socketPath) })
+
+	sup := worker.NewSupervisor(spawnInProcessServer(t))
+	ss := NewSupervisorSpawner(sup)
+	ss.PingWait = 3 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := ss.Warm(ctx, "slot-cancel", socketPath, modFile); err != nil {
+		cancel()
+		t.Fatalf("Warm: %v", err)
+	}
+	cancel()
+	t.Cleanup(func() { _ = sup.Stop("slot-cancel") })
+
+	time.Sleep(100 * time.Millisecond)
+	if got := sup.SpawnCount("slot-cancel"); got != 1 {
+		t.Fatalf("spawn count after warm context cancel = %d, want 1", got)
+	}
+}
+
 // TestSupervisorSpawnerShutdownWithSupervisor verifies the happy-path Shutdown
 // via a real Supervisor.
 func TestSupervisorSpawnerShutdownWithSupervisor(t *testing.T) {

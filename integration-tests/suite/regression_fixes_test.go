@@ -37,10 +37,14 @@ import (
 // that depends on it.
 type capacityView struct {
 	Members []struct {
-		NodeID   string `json:"node_id"`
-		NodeName string `json:"node_name"`
-		Role     string `json:"role"`
-		Capacity struct {
+		NodeID        string `json:"node_id"`
+		NodeName      string `json:"node_name"`
+		Role          string `json:"role"`
+		Alive         bool   `json:"alive"`
+		Drained       bool   `json:"drained"`
+		CapacityStale bool   `json:"capacity_stale"`
+		Capacity      struct {
+			CanAdmit          bool     `json:"can_admit"`
 			SupportedRuntimes []string `json:"supported_runtimes"`
 		} `json:"capacity"`
 	} `json:"members"`
