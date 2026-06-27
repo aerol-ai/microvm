@@ -4,6 +4,7 @@
 #
 # Usage:
 #   integration-tests/run.sh <scenario> [--keep] [--prod-tls] [--metal-on-demand]
+#   integration-tests/run.sh <scenario> [--no-disruptive]  # skip node-kill UCs
 #   integration-tests/run.sh all       [flags]
 #
 # Scenarios: single-node | local-mode | cluster-3-mixed | cluster-hetero |
@@ -26,6 +27,7 @@ PROVISION="${HERE}/lib/provision.sh"
 KEEP=0
 PROD_TLS=0
 METAL_ON_DEMAND=0
+NO_DISRUPTIVE=0
 COLLECT_LOGS_ONLY=0
 DESTROY_ONLY=0
 SCENARIO=""
@@ -42,6 +44,7 @@ for arg in "$@"; do
     --keep) KEEP=1 ;;
     --prod-tls) PROD_TLS=1 ;;
     --metal-on-demand) METAL_ON_DEMAND=1 ;;
+    --no-disruptive) NO_DISRUPTIVE=1 ;;
     # Collect logs from an ALREADY-RUNNING scenario (provisioned earlier with
     # --keep) and exit. No apply, no suite, no teardown — just dump every node's
     # forensics into reports/<scenario>-failure-logs.txt. Use this to iterate on
@@ -127,6 +130,22 @@ lease_domain() {
 # (flips firecracker bare-metal nodes off spot; cheap t3 spot nodes unaffected).
 on_demand_tfvar() {
   [[ "$METAL_ON_DEMAND" == "1" ]] && echo "true" || echo "false"
+}
+
+# allow_disruptive_for decides AEROL_ALLOW_DISRUPTIVE for the suite. cluster-hetero
+# enables node-kill / failover fault injection by default; other scenarios stay
+# off unless the operator exported AEROL_ALLOW_DISRUPTIVE already.
+allow_disruptive_for() {
+  local scenario="$1"
+  if [[ -n "${AEROL_ALLOW_DISRUPTIVE:-}" ]]; then
+    echo "$AEROL_ALLOW_DISRUPTIVE"
+    return
+  fi
+  if [[ "$scenario" == "cluster-hetero" && "$NO_DISRUPTIVE" != "1" ]]; then
+    echo "1"
+    return
+  fi
+  echo "0"
 }
 
 is_stale_wasm_snapshot_ref() {
@@ -342,11 +361,18 @@ run_one() {
   fi
 
   echo "=== running suite against ${base_url} ==="
+  local allow_disruptive
+  allow_disruptive=$(allow_disruptive_for "$scenario")
+  if [[ "$allow_disruptive" == "1" ]]; then
+    echo "disruptive fault-injection tests enabled (UC-58b on cluster-hetero)" >&2
+  fi
   set +e
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
+    AEROL_INTEGRATION_TARGETS="${targets}" \
+    AEROL_ALLOW_DISRUPTIVE="${allow_disruptive}" \
     AEROL_WASM_MODULE_REF="${wasm_ref}" \
     go test -tags=integration -count=1 -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?

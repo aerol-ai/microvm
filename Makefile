@@ -3,7 +3,7 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
-	integration-cluster-hetero integration-benchmark integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
+	integration-cluster-hetero integration-cluster-hetero-safe integration-benchmark integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -57,9 +57,10 @@ clean:
 # The explicit form still works if you prefer it:
 #   make integration-cluster-hetero FLAGS=--keep
 # Supported words: keep (leave infra up), prod-tls (real Let's Encrypt),
-# metal-on-demand (force firecracker bare-metal off spot).
+# metal-on-demand (force firecracker bare-metal off spot),
+# no-disruptive (skip node-kill UCs on cluster-hetero).
 FLAGS ?=
-INTEGRATION_FLAG_WORDS := keep prod-tls metal-on-demand
+INTEGRATION_FLAG_WORDS := keep prod-tls metal-on-demand no-disruptive
 RUN_EXTRA := $(filter $(INTEGRATION_FLAG_WORDS),$(MAKECMDGOALS))
 RUN_FLAGS := $(strip $(FLAGS) $(patsubst %,--%,$(RUN_EXTRA)))
 # Swallow the bare flag-words as no-op goals so `make` doesn't try to build them
@@ -91,8 +92,13 @@ integration-cluster-mixed-wasm:
 integration-cluster-hetero:
 	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):
 	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
-	# so --metal-on-demand is unnecessary here. Pass FLAGS=--keep to debug.
+	# so --metal-on-demand is unnecessary here. Disruptive failover tests
+	# (UC-58b) run by default; use integration-cluster-hetero-safe to skip them.
 	integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
+
+# Same as integration-cluster-hetero but skips node-kill / failover fault injection.
+integration-cluster-hetero-safe:
+	integration-tests/run.sh cluster-hetero --no-disruptive $(RUN_FLAGS)
 
 # Create benchmark (UC-94 create latency + UC-95 fleet density). Provisions
 # cluster-hetero, runs the suite WITH the benchmark turned on (AEROL_BENCH=1 is

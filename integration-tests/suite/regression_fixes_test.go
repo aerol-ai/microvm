@@ -38,6 +38,7 @@ import (
 type capacityView struct {
 	Members []struct {
 		NodeID   string `json:"node_id"`
+		NodeName string `json:"node_name"`
 		Role     string `json:"role"`
 		Capacity struct {
 			SupportedRuntimes []string `json:"supported_runtimes"`

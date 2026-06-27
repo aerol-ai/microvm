@@ -51,12 +51,13 @@ output "integration_targets" {
     seed_ip    = aws_instance.seed.public_ip
     nodes = [
       for n, inst in local.all_instances : {
-        name       = n
-        role       = local.nodes_resolved[n].role
-        seed       = n == local.seed_name
-        public_ip  = inst.public_ip
-        private_ip = inst.private_ip
-        spot       = local.nodes_resolved[n].spot
+        name        = n
+        role        = local.nodes_resolved[n].role
+        seed        = n == local.seed_name
+        public_ip   = inst.public_ip
+        private_ip  = inst.private_ip
+        instance_id = inst.id
+        spot        = local.nodes_resolved[n].spot
       }
     ]
   }

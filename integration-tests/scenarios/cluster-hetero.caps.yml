@@ -1,18 +1,18 @@
-# Heterogeneous 8-node cluster: dedicated server/ingress/worker roles with
-# docker, gVisor, WASM, and Firecracker (x86 bare metal) workers.
+# Heterogeneous 8-node cluster: dedicated server/ingress roles plus four
+# multi-runtime workers (docker + gVisor + WASM on x/y/w; z also has FC host
+# wiring). Firecracker create UCs are skipped here — live FC coverage is in
+# single-node-fc, single-node-fc-arm64, and cluster-arm64.
 name: cluster-hetero
 capabilities:
   - docker
   - platform-volumes
-  - firecracker
   - gvisor
   - wasm
   - domain
   - cluster
   # Opt the create-benchmark UCs (UC-94/UC-95) in on this scenario only: it is
-  # the one cluster carrying every runtime, so a per-runtime create-latency +
-  # density benchmark is meaningful here. The benchmark is slow and provisions
-  # many sandboxes, so no other scenario advertises it.
+  # the one cluster carrying docker/gvisor/wasm together, so a per-runtime
+  # create-latency + density benchmark is meaningful here.
   - benchmark
 
 expected_members: 8

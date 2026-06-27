@@ -259,28 +259,6 @@ func TestDrainAndUncordon(t *testing.T) {
 	_ = c.PostJSON(ctx, "/v1/cluster/nodes/"+target+"/uncordon", nil, nil)
 }
 
-// UC-58 — Owner failover: a replica serves after the owner dies. This requires
-// killing a node, which the API can't do — it's driven by the infra layer. We
-// gate it behind AEROL_ALLOW_DISRUPTIVE so a normal run reports it skipped
-// (not-applicable) rather than failing.
-func TestOwnerFailover(t *testing.T) {
-	harness.Require(t, sc, "UC-58")
-	if os.Getenv("AEROL_ALLOW_DISRUPTIVE") != "1" {
-		t.Skip("disruptive (requires node kill); set AEROL_ALLOW_DISRUPTIVE=1 to run")
-	}
-	t.Skip("driven by infra fault injection; see plans/integration-tests.md Phase 2 follow-up")
-}
-
-// UC-58b — Recreate-via-failover preserves sandbox identity. Same disruptive
-// gating as UC-58.
-func TestRecreateViaFailover(t *testing.T) {
-	harness.Require(t, sc, "UC-58b")
-	if os.Getenv("AEROL_ALLOW_DISRUPTIVE") != "1" {
-		t.Skip("disruptive (requires node kill); set AEROL_ALLOW_DISRUPTIVE=1 to run")
-	}
-	t.Skip("driven by infra fault injection; see plans/integration-tests.md Phase 2 follow-up")
-}
-
 // UC-59 — WASM live-migrate across nodes. Needs a wasm workload and a migrate
 // trigger; gated on a staged module ref.
 func TestWasmLiveMigrate(t *testing.T) {
