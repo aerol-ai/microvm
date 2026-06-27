@@ -244,6 +244,8 @@ locals {
     enabled            = try(local.cluster_ops.wasm.enabled, false) ? "true" : "false"
     modules_dir        = try(local.cluster_ops.wasm.modules_dir, "/var/lib/sandboxd/wasm/modules")
     cache_dir          = try(local.cluster_ops.wasm.cache_dir, "")
+    pool_enabled       = try(local.cluster_ops.wasm.pool.enabled, false) ? "true" : "false"
+    pool_depth_default = tostring(try(local.cluster_ops.wasm.pool.depth_default, 0))
     registry_allowlist = try(local.cluster_ops.wasm.registry_allowlist, "")
     pull_timeout       = try(local.cluster_ops.wasm.pull_timeout, "60s")
     push_host          = try(local.cluster_ops.wasm.push_host, "")

@@ -52,8 +52,11 @@ sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
   firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
-  serially, timing the `Create()` round-trip and the full create→`started`
-  time, and reports p50/p90/p99 + mean.
+  serially, reporting p50/p90/p99 + mean for three timings: **api** (the
+  `Create()` client round-trip), **server** (the API's own `Server-Timing`
+  header for the create — client↔cluster network excluded), and **running**
+  (create→`started`). `api − server` is that network overhead, so you can tell a
+  slow create from a slow link.
 - **UC-95 — fleet density:** creates docker sandboxes until the fleet rejects on
   capacity (HTTP 503 `capacity exceeded`), reports how many landed, then tears
   them all down. `AEROL_BENCH_MAX` bounds cost if admission never trips.
@@ -77,18 +80,17 @@ AEROL_BENCH_OUT=integration-tests/reports/cluster-hetero-bench.json \
 ```
 
 To iterate without re-provisioning, bring the cluster up once with `keep`, then
-re-run only the bench against it (the env that `run.sh` set for the suite —
-`AEROL_BASE_URL`, `AEROL_PAT`, `AEROL_CAPS`, `AEROL_WASM_MODULE_REF` — must be
-exported in your shell):
+re-run only UC-94/UC-95 with `make integration-benchmark-only` — it reads the API
+URL + PAT from TF state and forces `AEROL_BENCH=1`, so nothing to export:
 
 ```bash
-make integration-cluster-hetero keep        # provision, leave it up
+make integration-cluster-hetero keep         # provision, leave it up
+make integration-benchmark-only              # re-run just the bench against it
 
-AEROL_BENCH=1 \
-AEROL_BENCH_OUT=integration-tests/reports/cluster-hetero-bench.json \
-  go test -tags=integration -v -timeout 60m \
-    -run 'TestBenchCreateLatency|TestBenchDensity' \
-    ./integration-tests/suite/...
+# Narrow the UC-94 sweep — firecracker cold-boots are slow; skip them to finish:
+AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
+# …or isolate one runtime:
+AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-only
 
 make integration-destroy                     # tear the kept cluster down
 ```
@@ -96,14 +98,26 @@ make integration-destroy                     # tear the kept cluster down
 Percentiles + the density ceiling also print as `bench[...]` log lines (captured
 by `go test -json`); the `AEROL_BENCH_OUT` JSON adds the machine block.
 
+**WASM warm pool.** wasm scenarios boot with the warm-worker pool on
+(`wasm.pool.enabled`, depth `AEROL_WASM_POOL_DEPTH`, default `2`) so creates skip
+the cold module compile — CPython-on-wasm is ~10s cold on a t3. Depth is baked
+into **node boot env**, so a cluster brought up before this change shows cold
+numbers until re-provisioned. The bench's serial burst drains a shallow pool, so
+for an all-warm wasm reading keep `AEROL_BENCH_SAMPLES` ≤ depth (e.g.
+`AEROL_BENCH_RUNTIMES=wasm AEROL_BENCH_SAMPLES=2`). Raise the depth only on
+`cluster-hetero` (worker-z is bare metal) — `depth × standard-modules` warm
+workers won't fit on a t3.medium.
+
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `AEROL_BENCH` | *(unset)* | **master switch** — must be `1` or the bench skips |
+| `AEROL_BENCH_RUNTIMES` | *(all advertised)* | comma list narrowing the UC-94 sweep, e.g. `docker,gvisor,wasm` (skip firecracker) or `firecracker` (isolate) |
 | `AEROL_BENCH_SAMPLES` | `10` | sandboxes timed per runtime (UC-94) |
 | `AEROL_BENCH_MAX` | `200` | safety cap on the density probe (UC-95) |
 | `AEROL_BENCH_OUT` | *(unset)* | path to write the JSON artifact; logs only if unset |
 | `AEROL_BENCH_TFVARS` | `../scenarios/<scenario>.tfvars` | override the machine-config source |
 | `AEROL_WASM_MODULE_REF` | *(unset)* | staged `.wasm` ref; wasm latency skips without it |
+| `AEROL_WASM_POOL_DEPTH` | `2` | warm wasm workers per module digest (provision-time; `0` when wasm off) |
 
 ## What runs where
 

@@ -1,11 +1,17 @@
 # Heterogeneous 8-node cluster: dedicated server/ingress roles plus four
-# multi-runtime workers (docker + gVisor + WASM on x/y/w; z also has FC host
-# wiring). Firecracker create UCs are skipped here — live FC coverage is in
-# single-node-fc, single-node-fc-arm64, and cluster-arm64.
+# multi-runtime workers — docker + gVisor + WASM on worker-x/y/w, and worker-z
+# (c5.metal) additionally runs Firecracker. FC create/template/exec UCs and the
+# Firecracker benchmark row exercise worker-z. Firecracker is the only runtime
+# with a single host here (worker-z is the lone bare-metal box; a second x86
+# *.metal is blocked on the metal vCPU quota), so it has no failover peer — the
+# disruptive recreate-via-failover UC (UC-58b) deliberately stays on docker, and
+# live FC *failover* coverage is deferred to cluster-arm64 (see
+# plans/arm64-firecracker-hosts.md).
 name: cluster-hetero
 capabilities:
   - docker
   - platform-volumes
+  - firecracker
   - gvisor
   - wasm
   - domain

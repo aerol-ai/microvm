@@ -9,9 +9,11 @@
 #       worker-z     — docker + gVisor + WASM + Firecracker (KVM bare metal)
 #
 # Failover/disruptive tests kill worker-x and expect recreate-policy sandboxes
-# to land on worker-y or worker-z (worker-w is an extra placement peer). Firecracker create UCs are skipped
-# here (caps.yml omits the firecracker capability) — see single-node-fc and
-# cluster-arm64 for live FC coverage.
+# to land on worker-y or worker-z (worker-w is an extra placement peer). FC
+# create/template/exec UCs run against worker-z, but firecracker has no failover
+# peer here — worker-z is the only bare-metal host and a second x86 *.metal is
+# blocked on the metal vCPU quota — so the recreate-via-failover UC (UC-58b)
+# stays on docker. FC failover coverage is deferred to cluster-arm64.
 #
 # Cost control is by instance sizing (servers/ingress are t3.small). Every node
 # runs On-Demand (spot = false): the bare-metal firecracker box alone exceeds the

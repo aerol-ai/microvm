@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -19,22 +20,36 @@ const DefaultImage = "alpine:3.20"
 // resource-hygiene helpers (unique naming + guaranteed cleanup). Using the
 // real SDK is deliberate: the suite doubles as Go-SDK integration coverage.
 type Client struct {
-	sc  *Scenario
-	sdk *microvm.Client
+	sc     *Scenario
+	sdk    *microvm.Client
+	timing *serverTimingTransport
 }
 
 // NewClient builds a Client for the scenario. Fails the test immediately if the
 // SDK can't be constructed — there's no point continuing without an API client.
 func NewClient(t *testing.T, sc *Scenario) *Client {
 	t.Helper()
+	// Wrap the SDK's transport so we can read the server's self-reported create
+	// duration (Server-Timing) without touching any create call. Transparent: it
+	// only observes the response header, never alters the request or response.
+	timing := &serverTimingTransport{base: http.DefaultTransport}
 	sdk, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
-		APIUrl:   sc.BaseURL,
-		PATToken: sc.PAT,
+		APIUrl:     sc.BaseURL,
+		PATToken:   sc.PAT,
+		HTTPClient: &http.Client{Transport: timing},
 	})
 	if err != nil {
 		t.Fatalf("build SDK client: %v", err)
 	}
-	return &Client{sc: sc, sdk: sdk}
+	return &Client{sc: sc, sdk: sdk, timing: timing}
+}
+
+// LastServerCreateMS returns the server-reported create duration (ms) from the
+// most recent create's Server-Timing header, then clears it. ok is false when
+// the last create carried no such header (e.g. an older server). This lets a
+// benchmark measure server-side create time, excluding client<->cluster network.
+func (c *Client) LastServerCreateMS() (float64, bool) {
+	return c.timing.takeCreateMS()
 }
 
 // SDK exposes the underlying client for use cases that need a method this

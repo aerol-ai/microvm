@@ -1,0 +1,66 @@
+package harness
+
+import (
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// serverTimingTransport is a transparent http.RoundTripper that records the
+// server-reported create duration from the Server-Timing response header of a
+// create (POST .../sandboxes). It lets a benchmark read how long the server
+// spent creating a sandbox, independent of the client<->cluster network time.
+// It never alters the request or response — it only observes the header.
+type serverTimingTransport struct {
+	base http.RoundTripper
+
+	mu     sync.Mutex
+	lastMS float64
+	have   bool
+}
+
+func (t *serverTimingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	// A create is the only POST whose path ends in "/sandboxes" (stop/start/etc.
+	// have a longer suffix; list is a GET), so this uniquely tags create calls.
+	if err == nil && resp != nil && req.Method == http.MethodPost &&
+		strings.HasSuffix(req.URL.Path, "/sandboxes") && resp.StatusCode/100 == 2 {
+		if ms, ok := parseServerTimingCreate(resp.Header.Get("Server-Timing")); ok {
+			t.mu.Lock()
+			t.lastMS, t.have = ms, true
+			t.mu.Unlock()
+		}
+	}
+	return resp, err
+}
+
+// takeCreateMS returns the most recent create duration (ms) and clears it, so a
+// missing header on the next create reads as absent rather than reusing a stale
+// value. Callers are serial (one create at a time), so last-write wins cleanly.
+func (t *serverTimingTransport) takeCreateMS() (float64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ms, ok := t.lastMS, t.have
+	t.have = false
+	return ms, ok
+}
+
+// parseServerTimingCreate pulls the "create" metric's dur (milliseconds) out of
+// a Server-Timing header value like "create;dur=1234.5".
+func parseServerTimingCreate(header string) (float64, bool) {
+	for _, metric := range strings.Split(header, ",") {
+		fields := strings.Split(metric, ";")
+		if strings.TrimSpace(fields[0]) != "create" {
+			continue // a different Server-Timing metric (db, total, …)
+		}
+		for _, attr := range fields[1:] {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(attr), "dur="); ok {
+				if ms, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					return ms, true
+				}
+			}
+		}
+	}
+	return 0, false
+}

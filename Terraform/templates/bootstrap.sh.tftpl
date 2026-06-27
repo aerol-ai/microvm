@@ -591,6 +591,8 @@ cat >> /tmp/aerolvm-ops.env <<'EOF'
 SB_ENABLE_WASM=${wasm_cfg.enabled}
 SB_WASM_MODULES_DIR=${wasm_cfg.modules_dir}
 SB_WASM_CACHE_DIR=${wasm_cfg.cache_dir}
+SB_WASM_POOL_ENABLED=${wasm_cfg.pool_enabled}
+SB_WASM_POOL_DEPTH_DEFAULT=${wasm_cfg.pool_depth_default}
 SB_WASM_REGISTRY_ALLOWLIST=${wasm_cfg.registry_allowlist}
 SB_WASM_PULL_TIMEOUT=${wasm_cfg.pull_timeout}
 SB_WASM_REGISTRY_PUSH_HOST=${wasm_cfg.push_host}

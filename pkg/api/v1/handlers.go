@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
@@ -39,7 +40,13 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	// Time the create server-side and report it as a Server-Timing metric so a
+	// client (e.g. the create benchmark) can separate the real create cost from
+	// the client<->cluster network round-trip. Set the header before
+	// WriteJSON/WriteError — response headers must land before the status line.
+	createStart := time.Now()
 	response, err := h.deps.Service.CreateSandbox(r.Context(), req)
+	w.Header().Set("Server-Timing", "create;dur="+strconv.FormatFloat(float64(time.Since(createStart).Microseconds())/1000, 'f', 1, 64))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			apihttp.WriteError(w, http.StatusGatewayTimeout, "sandbox create exceeded timeout")
