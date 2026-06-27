@@ -59,6 +59,23 @@ func requireBenchEnabled(t *testing.T) {
 	}
 }
 
+// benchRuntimeAllowed reports whether rt should be swept. AEROL_BENCH_RUNTIMES
+// (comma-separated, e.g. "docker,wasm") narrows the sweep — to isolate one
+// runtime or skip firecracker's slow cold-boots so a run actually finishes.
+// Empty = every runtime the scenario advertises.
+func benchRuntimeAllowed(rt string) bool {
+	filter := strings.TrimSpace(os.Getenv("AEROL_BENCH_RUNTIMES"))
+	if filter == "" {
+		return true
+	}
+	for _, want := range strings.Split(filter, ",") {
+		if strings.EqualFold(strings.TrimSpace(want), rt) {
+			return true
+		}
+	}
+	return false
+}
+
 // benchEnvInt reads a positive integer tunable from env, falling back to def.
 func benchEnvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
@@ -246,6 +263,9 @@ func TestBenchCreateLatency(t *testing.T) {
 		if !sc.Has(br.cap) {
 			continue // scenario lacks this runtime; nothing to time
 		}
+		if !benchRuntimeAllowed(br.runtime) {
+			continue // narrowed out by AEROL_BENCH_RUNTIMES
+		}
 		wasmRef := ""
 		if br.runtime == "wasm" {
 			wasmRef = stagedWasmModuleRef(t)
@@ -337,6 +357,9 @@ func meanMS(durs []time.Duration) int64 {
 func TestBenchDensity(t *testing.T) {
 	harness.Require(t, sc, "UC-95")
 	requireBenchEnabled(t)
+	if !benchRuntimeAllowed("docker") {
+		t.Skip("AEROL_BENCH_RUNTIMES excludes docker; density probe is docker-only")
+	}
 	c := client(t)
 	maxSandboxes := benchEnvInt("AEROL_BENCH_MAX", 200)
 

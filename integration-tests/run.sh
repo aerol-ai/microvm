@@ -205,11 +205,22 @@ run_one() {
   # wasm.enabled follows the scenario's wasm capability so the wasm worker can
   # actually run modules (the wasm-runtime UCs still gate on a staged module
   # ref via AEROL_WASM_MODULE_REF; this just turns the runtime on).
+  # When wasm runs we also turn on the warm-worker pool so creates skip the cold
+  # module compile (CPython-on-wasm is ~10s cold on a t3). depth_default is per
+  # module digest; AEROL_WASM_POOL_DEPTH raises it to cover a benchmark's serial
+  # sample burst. Pool stays off (depth 0) when wasm is off.
+  local wasm_pool_enabled="false" wasm_pool_depth=0
+  if [[ "$caps_wasm" == "true" ]]; then
+    wasm_pool_enabled="true"
+    wasm_pool_depth="${AEROL_WASM_POOL_DEPTH:-2}"
+  fi
   # Upstream auto-import (pulling private prod images through AOCR hooks) and
   # the fleet control plane are prod-only side effects we always neutralize.
   yq '.auto_import.enabled = false
       | .fleet_control_plane.enabled = false
       | .wasm.enabled = '"$caps_wasm"'
+      | .wasm.pool.enabled = '"$wasm_pool_enabled"'
+      | .wasm.pool.depth_default = '"$wasm_pool_depth"'
       | .platform_volumes.enabled = '"$caps_platform_volumes"'
       | .platform_volumes.backend = "s3"
       | .platform_volumes.s3_bucket = ""

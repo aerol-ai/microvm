@@ -116,6 +116,8 @@
       SB_ENABLE_WASM: "{{ wasm.enabled | default(false) | bool | string | lower }}"
       SB_WASM_MODULES_DIR: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}"
       SB_WASM_CACHE_DIR: "{{ wasm.cache_dir | default('') }}"
+      SB_WASM_POOL_ENABLED: "{{ wasm.pool.enabled | default(false) | bool | string | lower }}"
+      SB_WASM_POOL_DEPTH_DEFAULT: "{{ wasm.pool.depth_default | default(0) | int }}"
       SB_WASM_REGISTRY_ALLOWLIST: "{{ wasm.registry_allowlist | default('') }}"
       SB_WASM_PULL_TIMEOUT: "{{ wasm.pull_timeout | default('60s') }}"
       SB_WASM_REGISTRY_PUSH_HOST: "{{ wasm.push_host | default('') }}"
