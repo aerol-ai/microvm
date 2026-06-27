@@ -29,6 +29,7 @@ PROD_TLS=0
 METAL_ON_DEMAND=0
 NO_DISRUPTIVE=0
 COLLECT_LOGS_ONLY=0
+BENCH_ONLY=0
 DESTROY_ONLY=0
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
@@ -50,6 +51,9 @@ for arg in "$@"; do
     # forensics into reports/<scenario>-failure-logs.txt. Use this to iterate on
     # a stuck cluster without paying another bring-up.
     --collect-logs-only) COLLECT_LOGS_ONLY=1 ;;
+    # Re-run UC-94/UC-95 against a cluster already provisioned with --keep.
+    # Reads integration_targets from TF state; does not apply or destroy.
+    --bench-only) BENCH_ONLY=1 ;;
     # Full terraform destroy of a scenario kept up with --keep (VPC, S3, IAM,
     # instances — everything, and clears the TF state). Unlike integration-reap
     # (which only terminates EC2 instances), this is the real cleanup.
@@ -58,7 +62,7 @@ for arg in "$@"; do
     *) SCENARIO="$arg" ;;
   esac
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--collect-logs-only] [--destroy-only]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only]" >&2; exit 2; }
 
 DOMAINS_FILE="${HERE}/scenarios/domains.yml"
 CONFIG_CLUSTER="${REPO_ROOT}/config/cluster.yml"
@@ -366,6 +370,16 @@ run_one() {
   if [[ "$allow_disruptive" == "1" ]]; then
     echo "disruptive fault-injection tests enabled (UC-58b on cluster-hetero)" >&2
   fi
+  # go test runs with cwd = the package dir (integration-tests/suite), so bench
+  # artifact paths from the Makefile must be absolute or WriteFile lands under
+  # suite/integration-tests/reports/... and fails with ENOENT.
+  local bench_out="${AEROL_BENCH_OUT:-}"
+  if [[ -n "$bench_out" && "$bench_out" != /* ]]; then
+    bench_out="${REPO_ROOT}/${bench_out}"
+  fi
+  if [[ "${AEROL_BENCH:-}" == "1" ]]; then
+    echo "benchmark enabled (UC-94/UC-95); artifact=${bench_out:-logs only}" >&2
+  fi
   set +e
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
@@ -373,6 +387,8 @@ run_one() {
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
     AEROL_INTEGRATION_TARGETS="${targets}" \
     AEROL_ALLOW_DISRUPTIVE="${allow_disruptive}" \
+    AEROL_BENCH="${AEROL_BENCH:-}" \
+    AEROL_BENCH_OUT="${bench_out}" \
     AEROL_WASM_MODULE_REF="${wasm_ref}" \
     go test -tags=integration -count=1 -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
@@ -479,12 +495,86 @@ collect_logs_only() {
   echo "logs written to ${HERE}/reports/${scenario}-failure-logs.txt" >&2
 }
 
+# run_bench_only re-runs UC-94/UC-95 against an already-provisioned scenario
+# (brought up with --keep). Loads API URL + domain from TF state so the operator
+# does not have to hand-export AEROL_BASE_URL / AEROL_CAPS / AEROL_PAT.
+run_bench_only() {
+  local scenario="$1"
+  local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  local caps_file="${HERE}/scenarios/${scenario}.caps.yml"
+  if [[ ! -d "$sdir" ]]; then
+    echo "no TF state at ${sdir} — run 'make integration-${scenario} keep' (or integration-benchmark keep) first" >&2
+    exit 2
+  fi
+  if [[ ! -f "$caps_file" ]]; then
+    echo "scenario ${scenario}: missing ${caps_file}" >&2
+    exit 2
+  fi
+
+  local targets pat base_url leased
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+    || { echo "could not read integration_targets from ${sdir} — is the cluster still up?" >&2; exit 2; }
+  pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
+  base_url=$(echo "$targets" | jq -r '.base_url // empty')
+  leased=$(echo "$targets" | jq -r '.domain // empty')
+  if [[ -z "$base_url" ]]; then
+    echo "integration_targets has no base_url — is this a local-mode scenario?" >&2
+    exit 2
+  fi
+
+  local caps_wasm
+  caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
+  local wasm_ref=""
+  [[ "$caps_wasm" == "true" ]] && wasm_ref="${AEROL_WASM_MODULE_REF:-python}"
+  if [[ "$caps_wasm" == "true" ]] && is_stale_wasm_snapshot_ref "$wasm_ref"; then
+    wasm_ref="python"
+  fi
+
+  local bench_out="${AEROL_BENCH_OUT:-integration-tests/reports/${scenario}-bench.json}"
+  if [[ "$bench_out" != /* ]]; then
+    bench_out="${REPO_ROOT}/${bench_out}"
+  fi
+  mkdir -p "$(dirname "$bench_out")" "${HERE}/reports"
+
+  echo "=== bench-only against ${base_url} (artifact=${bench_out}) ===" >&2
+  if ! wait_for_health "$base_url" "$pat"; then
+    echo "scenario ${scenario}: API not healthy at ${base_url}" >&2
+    exit 2
+  fi
+
+  set +e
+  AEROL_BENCH=1 \
+  AEROL_BENCH_OUT="${bench_out}" \
+  AEROL_BASE_URL="$base_url" \
+  AEROL_PAT="$pat" \
+  AEROL_SCENARIO="$scenario" \
+  AEROL_CAPS="${caps_file}" \
+  AEROL_DOMAIN="${leased}" \
+  AEROL_WASM_MODULE_REF="${wasm_ref}" \
+    go test -tags=integration -count=1 -timeout=60m -v \
+      -run 'TestBench' \
+      ./integration-tests/suite/...
+  local test_rc=$?
+  set -e
+  if [[ "$test_rc" != "0" ]]; then
+    exit "$test_rc"
+  fi
+  if [[ -f "$bench_out" ]]; then
+    echo "bench artifact: ${bench_out}" >&2
+  else
+    echo "bench tests finished but artifact missing at ${bench_out}" >&2
+    exit 2
+  fi
+}
+
 if [[ "$DESTROY_ONLY" == "1" ]]; then
   # teardown() returns early when KEEP=1; force a real destroy here.
   KEEP=0
   teardown "$SCENARIO"
 elif [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
   collect_logs_only "$SCENARIO"
+elif [[ "$BENCH_ONLY" == "1" ]]; then
+  run_bench_only "$SCENARIO"
 elif [[ "$SCENARIO" == "all" ]]; then
   for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-wasm cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64; do
     ( run_one "$s" )

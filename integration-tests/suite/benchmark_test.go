@@ -223,6 +223,10 @@ func writeBenchArtifact(t *testing.T, rep benchReport) {
 		t.Logf("bench: marshal artifact: %v", err)
 		return
 	}
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		t.Logf("bench: mkdir %s: %v", filepath.Dir(out), err)
+		return
+	}
 	if err := os.WriteFile(out, blob, 0o644); err != nil {
 		t.Logf("bench: write artifact %s: %v", out, err)
 	}
