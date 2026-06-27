@@ -316,6 +316,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 //     opPlace transitions State=Reserved → Placed atomically while keeping
 //     secret material out of Raft.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
+	createStart := time.Now()
 	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -357,6 +358,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 			}
 			rbCancel()
 		}
+		setCreateServerTiming(w, createStart)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -386,6 +388,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 			}
 		}
 		rbCancel()
+		setCreateServerTiming(w, createStart)
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: store secret ref: "+sealErr.Error())
 		return
 	}
@@ -416,13 +419,16 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		// this should only fire on the self-wins path (the reserve step
 		// already validated name uniqueness for the forward path).
 		if errors.Is(promoteErr, cluster.ErrNameConflict) {
+			setCreateServerTiming(w, createStart)
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return
 		}
+		setCreateServerTiming(w, createStart)
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: placement commit failed: "+promoteErr.Error())
 		return
 	}
 
+	setCreateServerTiming(w, createStart)
 	apihttp.WriteJSON(w, http.StatusCreated, resp)
 }
 

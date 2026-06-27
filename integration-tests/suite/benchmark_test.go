@@ -5,6 +5,7 @@ package suite
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -43,6 +44,11 @@ var benchRuntimes = []struct {
 	{"firecracker", harness.CapFirecracker},
 	{"gvisor", harness.CapGvisor},
 	{"wasm", harness.CapWasm},
+}
+
+type benchRuntimeSpec struct {
+	runtime string
+	wasmRef string
 }
 
 // requireBenchEnabled is a second gate on top of the CapBenchmark capability.
@@ -84,6 +90,173 @@ func benchEnvInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+func selectedBenchRuntimes(t *testing.T) []benchRuntimeSpec {
+	t.Helper()
+	var selected []benchRuntimeSpec
+	for _, br := range benchRuntimes {
+		if !sc.Has(br.cap) || !benchRuntimeAllowed(br.runtime) {
+			continue
+		}
+		spec := benchRuntimeSpec{runtime: br.runtime}
+		if br.runtime == "wasm" {
+			spec.wasmRef = stagedWasmModuleRef(t)
+			if spec.wasmRef == "" {
+				t.Logf("bench: skipping wasm latency (AEROL_WASM_MODULE_REF unset)")
+				continue
+			}
+		}
+		selected = append(selected, spec)
+	}
+	return selected
+}
+
+func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSandboxOptions {
+	t.Helper()
+	opts := sdktypes.CreateSandboxOptions{
+		Name:    harness.UniqueName(sc, t),
+		Runtime: spec.runtime,
+	}
+	if spec.runtime == "wasm" {
+		opts.Image = spec.wasmRef
+		opts.ModuleRef = spec.wasmRef
+	} else {
+		opts.Image = harness.DefaultImage
+	}
+	return opts
+}
+
+func waitBenchmarkReady(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) {
+	t.Helper()
+	if !sc.Has(harness.CapCluster) {
+		return
+	}
+	want, exact := expectedMembers()
+	timeout := time.Duration(benchEnvInt("AEROL_BENCH_READY_SECONDS", 300)) * time.Second
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		leader, leaderErr := benchClusterLeader(c)
+		members, err := benchClusterMembers(c)
+		if err != nil {
+			last = err.Error()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if leaderErr != nil {
+			last = "leader: " + leaderErr.Error()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if leader == "" {
+			last = "leader not elected"
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if exact && len(members.Members) != want {
+			last = fmt.Sprintf("members=%d want=%d", len(members.Members), want)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if !exact && len(members.Members) < want {
+			last = fmt.Sprintf("members=%d want>=%d", len(members.Members), want)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if missing := missingBenchRuntimeTargets(members, runtimes); len(missing) > 0 {
+			last = "runtime targets not ready: " + strings.Join(missing, ",")
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		return
+	}
+	t.Fatalf("benchmark prerequisites not ready within %s: %s", timeout, last)
+}
+
+func benchClusterLeader(c *harness.Client) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var resp struct {
+		Leader string `json:"leader"`
+	}
+	if err := c.GetJSON(ctx, "/v1/cluster/leader", &resp); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(resp.Leader), nil
+}
+
+func benchClusterMembers(c *harness.Client) (capacityView, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var members capacityView
+	if err := c.GetJSON(ctx, "/v1/cluster/members", &members); err != nil {
+		return capacityView{}, err
+	}
+	return members, nil
+}
+
+func missingBenchRuntimeTargets(members capacityView, runtimes []benchRuntimeSpec) []string {
+	var missing []string
+	for _, spec := range runtimes {
+		if !benchHasRuntimeTarget(members, spec.runtime) {
+			missing = append(missing, spec.runtime)
+		}
+	}
+	return missing
+}
+
+func benchHasRuntimeTarget(members capacityView, runtime string) bool {
+	for _, m := range members.Members {
+		if !m.Alive || m.Drained || m.CapacityStale || !benchCanOwnSandbox(m.Role) || !m.Capacity.CanAdmit {
+			continue
+		}
+		for _, rt := range m.Capacity.SupportedRuntimes {
+			if rt == runtime {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func benchCanOwnSandbox(role string) bool {
+	role = strings.TrimSpace(role)
+	if role == "" {
+		return true
+	}
+	for _, part := range strings.Split(role, ",") {
+		switch strings.ToLower(strings.TrimSpace(part)) {
+		case "worker", "mixed":
+			return true
+		}
+	}
+	return false
+}
+
+func warmBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) {
+	t.Helper()
+	for _, spec := range runtimes {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		sb, err := c.SDK().Create(ctx, benchCreateOptions(t, spec))
+		cancel()
+		if err != nil {
+			t.Fatalf("bench[%s] warmup create failed after readiness: %v", spec.runtime, err)
+		}
+		destroy := true
+		id := sb.ID
+		defer func() {
+			if destroy {
+				destroyBest(c, id)
+			}
+		}()
+		if !waitRunningTimed(t, sb) {
+			t.Fatalf("bench[%s] warmup sandbox %s did not reach started", spec.runtime, id)
+		}
+		destroyBest(c, id)
+		destroy = false
+		_, _ = c.LastServerCreateMS()
+	}
 }
 
 // percentile returns the p-th percentile (0..100) of durs using nearest-rank.
@@ -266,37 +439,19 @@ func TestBenchCreateLatency(t *testing.T) {
 	requireBenchEnabled(t)
 	c := client(t)
 	samples := benchEnvInt("AEROL_BENCH_SAMPLES", 10)
+	runtimes := selectedBenchRuntimes(t)
+	if len(runtimes) == 0 {
+		t.Skip("no benchmark runtimes selected")
+	}
+	waitBenchmarkReady(t, c, runtimes)
+	warmBenchmarkRuntimes(t, c, runtimes)
 
 	var report benchReport
-	for _, br := range benchRuntimes {
-		if !sc.Has(br.cap) {
-			continue // scenario lacks this runtime; nothing to time
-		}
-		if !benchRuntimeAllowed(br.runtime) {
-			continue // narrowed out by AEROL_BENCH_RUNTIMES
-		}
-		wasmRef := ""
-		if br.runtime == "wasm" {
-			wasmRef = stagedWasmModuleRef(t)
-			if wasmRef == "" {
-				t.Logf("bench: skipping wasm latency (AEROL_WASM_MODULE_REF unset)")
-				continue
-			}
-		}
-
+	for _, br := range runtimes {
 		var apiD, runD, serverD []time.Duration
 		failures := 0
 		for i := 0; i < samples; i++ {
-			opts := sdktypes.CreateSandboxOptions{
-				Name:    harness.UniqueName(sc, t),
-				Runtime: br.runtime,
-			}
-			if br.runtime == "wasm" {
-				opts.Image = wasmRef
-				opts.ModuleRef = wasmRef
-			} else {
-				opts.Image = harness.DefaultImage
-			}
+			opts := benchCreateOptions(t, br)
 
 			start := time.Now()
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -383,6 +538,9 @@ func TestBenchDensity(t *testing.T) {
 		t.Skip("AEROL_BENCH_RUNTIMES excludes docker; density probe is docker-only")
 	}
 	c := client(t)
+	dockerBench := []benchRuntimeSpec{{runtime: "docker"}}
+	waitBenchmarkReady(t, c, dockerBench)
+	warmBenchmarkRuntimes(t, c, dockerBench)
 	maxSandboxes := benchEnvInt("AEROL_BENCH_MAX", 200)
 
 	ds := densityStats{Runtime: "docker"}

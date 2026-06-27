@@ -34,6 +34,10 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, h.deps.Service.Capacity())
 }
 
+func setCreateServerTiming(w http.ResponseWriter, start time.Time) {
+	w.Header().Set("Server-Timing", "create;dur="+strconv.FormatFloat(float64(time.Since(start).Microseconds())/1000, 'f', 1, 64))
+}
+
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateSandboxRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
@@ -46,7 +50,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	// WriteJSON/WriteError — response headers must land before the status line.
 	createStart := time.Now()
 	response, err := h.deps.Service.CreateSandbox(r.Context(), req)
-	w.Header().Set("Server-Timing", "create;dur="+strconv.FormatFloat(float64(time.Since(createStart).Microseconds())/1000, 'f', 1, 64))
+	setCreateServerTiming(w, createStart)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			apihttp.WriteError(w, http.StatusGatewayTimeout, "sandbox create exceeded timeout")
