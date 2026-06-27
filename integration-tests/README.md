@@ -52,8 +52,11 @@ sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
   firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
-  serially, timing the `Create()` round-trip and the full create→`started`
-  time, and reports p50/p90/p99 + mean.
+  serially, reporting p50/p90/p99 + mean for three timings: **api** (the
+  `Create()` client round-trip), **server** (the API's own `Server-Timing`
+  header for the create — client↔cluster network excluded), and **running**
+  (create→`started`). `api − server` is that network overhead, so you can tell a
+  slow create from a slow link.
 - **UC-95 — fleet density:** creates docker sandboxes until the fleet rejects on
   capacity (HTTP 503 `capacity exceeded`), reports how many landed, then tears
   them all down. `AEROL_BENCH_MAX` bounds cost if admission never trips.

@@ -114,6 +114,15 @@ type latencyStats struct {
 	Runp50MS  int64  `json:"run_p50_ms"`
 	Runp90MS  int64  `json:"run_p90_ms"`
 	Runp99MS  int64  `json:"run_p99_ms"`
+	// Server-side create time from the API's Server-Timing header — the create
+	// cost with the client<->cluster network round-trip excluded. The gap
+	// (api - server) is that network overhead. Zero when the server sends no
+	// header (older build); ServerSamples counts the creates that carried one.
+	ServerSamples int   `json:"server_samples"`
+	ServerMeanMS  int64 `json:"server_mean_ms"`
+	Serverp50MS   int64 `json:"server_p50_ms"`
+	Serverp90MS   int64 `json:"server_p90_ms"`
+	Serverp99MS   int64 `json:"server_p99_ms"`
 }
 
 // benchReport is the full JSON artifact (UC-94 + UC-95 combined).
@@ -275,7 +284,7 @@ func TestBenchCreateLatency(t *testing.T) {
 			}
 		}
 
-		var apiD, runD []time.Duration
+		var apiD, runD, serverD []time.Duration
 		failures := 0
 		for i := 0; i < samples; i++ {
 			opts := sdktypes.CreateSandboxOptions{
@@ -309,23 +318,29 @@ func TestBenchCreateLatency(t *testing.T) {
 				failures++
 			}
 			apiD = append(apiD, apiElapsed)
+			// Server-reported create time (Server-Timing header) — same create,
+			// minus the client<->cluster network. Absent on an older server.
+			if ms, ok := c.LastServerCreateMS(); ok {
+				serverD = append(serverD, time.Duration(ms*float64(time.Millisecond)))
+			}
 		}
 
 		if len(apiD) == 0 {
 			t.Errorf("bench[%s]: every create sample failed", br.runtime)
 			continue
 		}
-		ls := summarize(br.runtime, samples, failures, apiD, runD)
+		ls := summarize(br.runtime, samples, failures, apiD, runD, serverD)
 		report.Latency = append(report.Latency, ls)
-		t.Logf("bench[%s] api p50=%dms p90=%dms p99=%dms | running p50=%dms p90=%dms p99=%dms (%d ok, %d fail)",
+		t.Logf("bench[%s] api p50=%dms p90=%dms p99=%dms | server p50=%dms p90=%dms p99=%dms | running p50=%dms p90=%dms p99=%dms (%d ok, %d fail)",
 			br.runtime, ls.APIp50MS, ls.APIp90MS, ls.APIp99MS,
+			ls.Serverp50MS, ls.Serverp90MS, ls.Serverp99MS,
 			ls.Runp50MS, ls.Runp90MS, ls.Runp99MS, len(apiD), failures)
 	}
 	writeBenchArtifact(t, report)
 }
 
 // summarize folds raw samples into a latencyStats row.
-func summarize(rt string, samples, failures int, apiD, runD []time.Duration) latencyStats {
+func summarize(rt string, samples, failures int, apiD, runD, serverD []time.Duration) latencyStats {
 	ls := latencyStats{Runtime: rt, Samples: samples, Failures: failures}
 	if len(apiD) > 0 {
 		ls.APIMeanMS = meanMS(apiD)
@@ -338,6 +353,13 @@ func summarize(rt string, samples, failures int, apiD, runD []time.Duration) lat
 		ls.Runp50MS = percentile(runD, 50).Milliseconds()
 		ls.Runp90MS = percentile(runD, 90).Milliseconds()
 		ls.Runp99MS = percentile(runD, 99).Milliseconds()
+	}
+	if len(serverD) > 0 {
+		ls.ServerSamples = len(serverD)
+		ls.ServerMeanMS = meanMS(serverD)
+		ls.Serverp50MS = percentile(serverD, 50).Milliseconds()
+		ls.Serverp90MS = percentile(serverD, 90).Milliseconds()
+		ls.Serverp99MS = percentile(serverD, 99).Milliseconds()
 	}
 	return ls
 }

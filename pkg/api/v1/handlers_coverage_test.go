@@ -33,6 +33,11 @@ func TestHandlers_CreateSandbox_Success(t *testing.T) {
 	if rt.createCalls != 1 {
 		t.Fatalf("createCalls = %d, want 1", rt.createCalls)
 	}
+	// The create handler reports its server-side duration as a Server-Timing
+	// metric so a client can subtract network time (used by the create benchmark).
+	if st := rr.Header().Get("Server-Timing"); !strings.Contains(st, "create;dur=") {
+		t.Fatalf("Server-Timing = %q, want a create;dur= metric", st)
+	}
 }
 
 func TestHandlers_ListSandboxes_StoreError(t *testing.T) {

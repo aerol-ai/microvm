@@ -1,0 +1,108 @@
+package harness
+
+import (
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+func TestParseServerTimingCreate(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		wantMS float64
+		wantOK bool
+	}{
+		{"simple float", "create;dur=1234.5", 1234.5, true},
+		{"integer dur", "create;dur=42", 42, true},
+		{"among other metrics", "db;dur=3, create;dur=900.25, total;dur=950", 900.25, true},
+		{"desc before dur", `create;desc="sandbox";dur=12`, 12, true},
+		{"surrounding spaces", "  create ; dur=7.5 ", 7.5, true},
+		{"no create metric", "db;dur=3, total;dur=10", 0, false},
+		{"create without dur", "create;desc=x", 0, false},
+		{"name prefix is not a match", "created;dur=5", 0, false},
+		{"empty header", "", 0, false},
+		{"unparseable dur", "create;dur=abc", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ms, ok := parseServerTimingCreate(tt.header)
+			if ok != tt.wantOK {
+				t.Fatalf("parseServerTimingCreate(%q) ok = %v, want %v", tt.header, ok, tt.wantOK)
+			}
+			if ok && ms != tt.wantMS {
+				t.Fatalf("parseServerTimingCreate(%q) ms = %v, want %v", tt.header, ms, tt.wantMS)
+			}
+		})
+	}
+}
+
+// stubRoundTripper returns a canned response (status code + optional
+// Server-Timing header) so the transport can be exercised without a server.
+type stubRoundTripper struct {
+	header string
+	code   int
+}
+
+func (s stubRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	h := make(http.Header)
+	if s.header != "" {
+		h.Set("Server-Timing", s.header)
+	}
+	return &http.Response{
+		StatusCode: s.code,
+		Header:     h,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    req,
+	}, nil
+}
+
+func newReq(t *testing.T, method, url string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	return req
+}
+
+// TestServerTimingTransportRecordsCreate verifies the transport captures the
+// create duration from a 2xx POST .../sandboxes and that takeCreateMS consumes
+// it (so a later create with no header reads absent, not stale).
+func TestServerTimingTransportRecordsCreate(t *testing.T) {
+	tr := &serverTimingTransport{base: stubRoundTripper{header: "create;dur=321.5", code: 201}}
+	if _, err := tr.RoundTrip(newReq(t, http.MethodPost, "https://x/v1/sandboxes")); err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	ms, ok := tr.takeCreateMS()
+	if !ok || ms != 321.5 {
+		t.Fatalf("takeCreateMS() = (%v, %v), want (321.5, true)", ms, ok)
+	}
+	if _, ok := tr.takeCreateMS(); ok {
+		t.Fatal("takeCreateMS() should be empty after consumption")
+	}
+}
+
+// TestServerTimingTransportIgnoresNonCreate confirms a GET (list) and a non-2xx
+// response never record, even with a Server-Timing header present.
+func TestServerTimingTransportIgnoresNonCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		method string
+		code   int
+	}{
+		{"list GET", http.MethodGet, 200},
+		{"failed create", http.MethodPost, 500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &serverTimingTransport{base: stubRoundTripper{header: "create;dur=99", code: tc.code}}
+			if _, err := tr.RoundTrip(newReq(t, tc.method, "https://x/v1/sandboxes")); err != nil {
+				t.Fatalf("round trip: %v", err)
+			}
+			if _, ok := tr.takeCreateMS(); ok {
+				t.Fatalf("%s: should not have recorded a create time", tc.name)
+			}
+		})
+	}
+}
