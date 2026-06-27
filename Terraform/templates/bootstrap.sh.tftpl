@@ -488,9 +488,11 @@ EOF
 # 3b. AOCR (Phase 4 F17-F21) — authenticated mirror + auto-import.
 #
 # Wrap key and cluster PAT are file-sourced so they never appear in
-# `systemctl show sandboxd` env dumps or process listings. Install both at
-# 0600 under /etc/sandboxd/secrets/ (matches the paths the sandboxd
-# config defaults expect and that the Ansible configure-ops playbook uses).
+# `systemctl show sandboxd` env dumps or process listings. Install under
+# /etc/sandboxd/secrets/ (matches the paths the sandboxd config defaults expect
+# and that the Ansible configure-ops playbook uses). The cluster PAT remains
+# 0600; the upstream wrap key is read-only (0400) because the loader rejects
+# writable key files so accidental rotation/editing cannot happen in place.
 ###############################################################################
 sudo install -d -m 0700 -o root -g root /etc/sandboxd/secrets
 
@@ -503,7 +505,7 @@ cat > /etc/sandboxd/secrets/upstream-wrap.key <<'EOF'
 ${aocr_upstream_wrap_key}
 EOF
 sudo chown root:root /etc/sandboxd/secrets/upstream-wrap.key
-sudo chmod 0600 /etc/sandboxd/secrets/upstream-wrap.key
+sudo chmod 0400 /etc/sandboxd/secrets/upstream-wrap.key
 %{ endif ~}
 
 %{ if aocr_cluster_pat != "" ~}
