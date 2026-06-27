@@ -4,7 +4,6 @@ package suite
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -53,7 +52,7 @@ func TestRuntimeGvisor(t *testing.T) {
 // UC-26 — WASM-runtime sandbox runs. The "image" is a staged module ref.
 func TestRuntimeWasm(t *testing.T) {
 	harness.Require(t, sc, "UC-26")
-	ref := os.Getenv("AEROL_WASM_MODULE_REF")
+	ref := stagedWasmModuleRef(t)
 	if ref == "" {
 		t.Skip("AEROL_WASM_MODULE_REF not set (oci ref of a staged .wasm)")
 	}

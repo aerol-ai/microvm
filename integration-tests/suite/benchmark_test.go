@@ -242,9 +242,13 @@ func TestBenchCreateLatency(t *testing.T) {
 		if !sc.Has(br.cap) {
 			continue // scenario lacks this runtime; nothing to time
 		}
-		if br.runtime == "wasm" && os.Getenv("AEROL_WASM_MODULE_REF") == "" {
-			t.Logf("bench: skipping wasm latency (AEROL_WASM_MODULE_REF unset)")
-			continue
+		wasmRef := ""
+		if br.runtime == "wasm" {
+			wasmRef = stagedWasmModuleRef(t)
+			if wasmRef == "" {
+				t.Logf("bench: skipping wasm latency (AEROL_WASM_MODULE_REF unset)")
+				continue
+			}
 		}
 
 		var apiD, runD []time.Duration
@@ -255,7 +259,7 @@ func TestBenchCreateLatency(t *testing.T) {
 				Runtime: br.runtime,
 			}
 			if br.runtime == "wasm" {
-				opts.Image = os.Getenv("AEROL_WASM_MODULE_REF")
+				opts.Image = wasmRef
 			} else {
 				opts.Image = harness.DefaultImage
 			}

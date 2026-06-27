@@ -216,15 +216,6 @@ var heteroRuntimeCaps = []struct {
 	{harness.CapGvisor, "gvisor"},
 }
 
-// wasmModuleRef is the staged WASM module alias a wasm create resolves against.
-// Defaults to the standard "python" alias; AEROL_WASM_MODULE_REF overrides it.
-func wasmModuleRef() string {
-	if v := os.Getenv("AEROL_WASM_MODULE_REF"); v != "" {
-		return v
-	}
-	return "python"
-}
-
 // resolvePlacementOwner polls /v1/cluster/placements/{id} until an owner node is
 // recorded (the FSM commit lands a moment after create returns).
 func resolvePlacementOwner(t *testing.T, c *harness.Client, sandboxID string) string {
@@ -293,7 +284,7 @@ func TestClusterPlacesRuntimeOnCapableWorker(t *testing.T) {
 			opts := sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Runtime: rc.runtime}
 			if rc.runtime == "wasm" {
 				// WASM resolves an image/module ref, not a container image.
-				opts.Image = wasmModuleRef()
+				opts.Image = stagedWasmModuleRefOrDefault(t)
 			}
 			sb := c.NewSandbox(t, opts)
 			waitRunning(t, sb)

@@ -5,7 +5,6 @@ package suite
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -194,7 +193,7 @@ func expectPlatformVolumeRuntimeRejected(t *testing.T, runtime, image string) {
 // must be rejected instead of creating a sandbox where /vol never appears.
 func TestPlatformVolumeWasmRuntimeRejected(t *testing.T) {
 	harness.Require(t, sc, "UC-85")
-	ref := os.Getenv("AEROL_WASM_MODULE_REF")
+	ref := stagedWasmModuleRef(t)
 	if ref == "" {
 		t.Skip("AEROL_WASM_MODULE_REF not set")
 	}
