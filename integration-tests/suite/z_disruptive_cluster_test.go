@@ -81,6 +81,12 @@ func TestRecreateViaFailover(t *testing.T) {
 		t.Fatalf("drain worker-w (%s): %v", extraDrainedNodeID, err)
 	}
 
+	// Must stay on docker. Recreate-via-failover needs >=2 workers advertising
+	// the runtime so the sandbox can land on a peer after worker-x dies; docker
+	// runs on all four workers. Do NOT switch this to firecracker: only worker-z
+	// is bare metal, so an FC sandbox has no failover peer on hetero (a second
+	// x86 *.metal is blocked on the metal vCPU quota). FC failover lives in
+	// cluster-arm64 instead.
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
 		Name:     harness.UniqueName(sc, t),
 		Runtime:  "docker",
