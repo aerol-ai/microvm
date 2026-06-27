@@ -3,7 +3,7 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
-	integration-cluster-hetero integration-cluster-hetero-safe integration-benchmark integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
+	integration-cluster-hetero integration-cluster-hetero-safe integration-benchmark integration-benchmark-only integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -112,6 +112,13 @@ BENCH_OUT ?= integration-tests/reports/cluster-hetero-bench.json
 integration-benchmark:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(BENCH_OUT) \
 		integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
+
+# Re-run UC-94/UC-95 only against a cluster left up with `keep` (no reprovision).
+#   make integration-benchmark-only
+#   make integration-benchmark-only BENCH_OUT=/tmp/bench.json
+integration-benchmark-only:
+	AEROL_BENCH_OUT=$(BENCH_OUT) \
+		integration-tests/run.sh cluster-hetero --bench-only
 
 # Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
 # exercises the firecracker use cases (UC-24/47-50) without the full hetero
