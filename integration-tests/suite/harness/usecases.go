@@ -247,6 +247,7 @@ var Registry = []UseCase{
 	{ID: "UC-96", Title: "Docker create readiness delivered via unix-socket push", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 	{ID: "UC-96b", Title: "Docker socket push works for non-root container images", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 	{ID: "UC-96c", Title: "Docker socket push works under gVisor runtime", Requires: []Capability{CapCluster, CapDocker, CapGvisor}, Implemented: true},
+	{ID: "UC-96d", Title: "Socket-ready signal implies a genuinely serving agent (exec succeeds)", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

@@ -19,6 +19,7 @@ import (
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -33,11 +34,23 @@ type apiRecordingRuntime struct {
 	destroyErr   error
 	createCalls  int
 	lastCreateID string
+	// timingSource, when set, makes Create populate the docker.CreateTiming
+	// recorder carried on ctx — mimicking what the real docker runtime does so
+	// handler tests can assert the create→readiness Server-Timing attribution
+	// is threaded through service.CreateSandbox.
+	timingSource string
 }
 
-func (r *apiRecordingRuntime) Create(_ context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (r *apiRecordingRuntime) Create(ctx context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	r.createCalls++
 	r.lastCreateID = sandboxID
+	if r.timingSource != "" {
+		if tm := docker.CreateTimingFrom(ctx); tm != nil {
+			tm.RuntimeWaitMS = 12.5
+			tm.ToolboxWaitMS = 34.0
+			tm.Source = r.timingSource
+		}
+	}
 	if r.createErr != nil {
 		return nil, r.createErr
 	}

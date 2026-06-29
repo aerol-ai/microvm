@@ -93,6 +93,46 @@ func TestDockerReadinessSocketPushGvisor(t *testing.T) {
 	}
 }
 
+// UC-96d — a socket-attributed create must mean the agent is genuinely
+// serving, not merely that toolboxd dialed the socket. toolboxd announces only
+// after its HTTP listener is bound (dial-after-listener contract), so an exec
+// issued immediately after create returns must succeed without a readiness
+// race. This guards against a false-ready regression where the push fires
+// before the agent can answer.
+func TestDockerReadinessSocketImpliesServingAgent(t *testing.T) {
+	harness.Require(t, sc, "UC-96d")
+	c := client(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+		Image: harness.DefaultImage,
+		Name:  harness.UniqueName(sc, t),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = c.SDK().Destroy(context.Background(), sb.ID)
+	})
+
+	source, ok := c.LastCreateReadinessSource()
+	if !ok || source != "socket" {
+		t.Fatalf("readiness source = %q ok=%v, want socket", source, ok)
+	}
+
+	// No waitRunning: the socket-ready signal must already imply a serving
+	// agent. Exec straight away — a false-ready push would surface here as a
+	// connection refused / 503 from the toolbox proxy.
+	res, err := sb.Exec(ctx, sdktypes.ExecRequest{Command: "echo uc96d-ready"})
+	if err != nil {
+		t.Fatalf("exec right after socket-ready create: %v", err)
+	}
+	if !strings.Contains(res.Stdout, "uc96d-ready") {
+		t.Fatalf("exec stdout = %q, want uc96d-ready", res.Stdout)
+	}
+}
+
 // UC-97 is covered by pkg/docker unit tests (push disabled → health poll).
 // Non-cluster scenarios (local-mode, single-node) exercise the fallback on
 // live infra because EnableCluster=false keeps the push path off.
