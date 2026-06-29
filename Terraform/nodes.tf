@@ -126,6 +126,7 @@ resource "aws_instance" "seed" {
     aws_region                               = var.aws_region
     seed_private_ip                          = ""
     install_script_url                       = var.install_script_url
+    caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
     cluster_join_script_url                  = var.cluster_join_script_url
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
@@ -304,6 +305,7 @@ resource "aws_instance" "joiner" {
     aws_region                               = var.aws_region
     seed_private_ip                          = aws_instance.seed.private_ip
     install_script_url                       = var.install_script_url
+    caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
     cluster_join_script_url                  = var.cluster_join_script_url
     seed_wait_max_seconds                    = var.seed_wait_max_seconds

@@ -29,7 +29,8 @@
 #   firecracker_vmm_pool_refill_interval, firecracker_rss_sampler_interval,
 #   firecracker_rss_watermark_ratio,
 #   bundle_bucket, aws_region, seed_private_ip,
-#   install_script_url, cluster_init_script_url, cluster_join_script_url,
+#   install_script_url, caddy_binary_url,
+#   cluster_init_script_url, cluster_join_script_url,
 #   seed_wait_max_seconds, extra_user_data
 #
 # Order of operations matches the scripts' contracts:
@@ -46,6 +47,20 @@ echo "[bootstrap] node=${node_name} role=${role} seed=${is_seed}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y curl jq awscli openssl ca-certificates
+
+curl_download() {
+  local url="$1"
+  shift
+  curl -fsSL \
+    --retry 5 \
+    --retry-delay 2 \
+    --retry-connrefused \
+    --connect-timeout 20 \
+    --max-time 300 \
+    --speed-limit 1024 \
+    --speed-time 30 \
+    "$url" "$@"
+}
 
 %{ if aocr_enabled && aocr_mirror_host != "" ~}
 ###############################################################################
@@ -93,7 +108,7 @@ fi
 # install.sh runs in IP/path mode with no TLS, and the cluster's public URLs
 # fall back to http://<ip>/<id>/.
 ###############################################################################
-curl -fsSL '${install_script_url}' -o /tmp/install.sh
+curl_download '${install_script_url}' -o /tmp/install.sh
 chmod +x /tmp/install.sh
 
 INSTALL_ARGS=(--pat-token '${pat_token}' --node-name '${node_name}')
@@ -116,6 +131,9 @@ fi
 if [ -n '${acme_email}' ]; then
   INSTALL_ARGS+=(--acme-email '${acme_email}')
 fi
+%{ if caddy_binary_url != "" ~}
+INSTALL_ARGS+=(--caddy-binary-url '${caddy_binary_url}')
+%{ endif ~}
 %{ if with_gvisor ~}
 INSTALL_ARGS+=(--with-gvisor)
 %{ endif ~}
@@ -165,7 +183,7 @@ sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 ###############################################################################
 GOSSIP_KEY="$(openssl rand -base64 32)"
 
-curl -fsSL '${cluster_init_script_url}' -o /tmp/cluster-init.sh
+curl_download '${cluster_init_script_url}' -o /tmp/cluster-init.sh
 chmod +x /tmp/cluster-init.sh
 sudo /tmp/cluster-init.sh \
   --role '${role}' \
@@ -213,7 +231,7 @@ aws --region '${aws_region}' s3 cp \
     "s3://${bundle_bucket}/aerolvm-tls-bundle.tar.gz" /tmp/aerolvm-tls-bundle.tar.gz
 GOSSIP_KEY="$(cat /tmp/gossip-key.txt)"
 
-curl -fsSL '${cluster_join_script_url}' -o /tmp/cluster-join.sh
+curl_download '${cluster_join_script_url}' -o /tmp/cluster-join.sh
 chmod +x /tmp/cluster-join.sh
 sudo /tmp/cluster-join.sh \
   --role '${role}' \
@@ -321,10 +339,8 @@ if [ '${firecracker_auto_install}' = 'true' ] && [ -z '${firecracker_binary_url}
   FC_TARBALL="firecracker-$${FC_VERSION}-$${FC_ARCH}.tgz"
   FC_WORKDIR="$(mktemp -d)"
   trap 'rm -rf "$${FC_WORKDIR}"' EXIT
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused \
-    "$${FC_RELEASE_BASE}/$${FC_TARBALL}" -o "$${FC_WORKDIR}/$${FC_TARBALL}"
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused \
-    "$${FC_RELEASE_BASE}/$${FC_TARBALL}.sha256.txt" -o "$${FC_WORKDIR}/$${FC_TARBALL}.sha256.txt"
+  curl_download "$${FC_RELEASE_BASE}/$${FC_TARBALL}" -o "$${FC_WORKDIR}/$${FC_TARBALL}"
+  curl_download "$${FC_RELEASE_BASE}/$${FC_TARBALL}.sha256.txt" -o "$${FC_WORKDIR}/$${FC_TARBALL}.sha256.txt"
   (cd "$${FC_WORKDIR}" && sha256sum -c "$${FC_TARBALL}.sha256.txt")
   tar -xzf "$${FC_WORKDIR}/$${FC_TARBALL}" -C "$${FC_WORKDIR}"
   install -m 0755 \
@@ -344,34 +360,32 @@ if [ '${firecracker_auto_install}' = 'true' ] && [ -z '${firecracker_kernel_url}
   KERNEL_CI='${firecracker_kernel_ci_version}'
   KERNEL_VER='${firecracker_kernel_version}'
   KERNEL_BASE="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$${KERNEL_CI}/$${FC_ARCH}"
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused \
-    "$${KERNEL_BASE}/vmlinux-$${KERNEL_VER}" -o /tmp/vmlinux
+  curl_download "$${KERNEL_BASE}/vmlinux-$${KERNEL_VER}" -o /tmp/vmlinux
   install -m 0644 /tmp/vmlinux '${firecracker_kernel_path}'
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused \
-    "$${KERNEL_BASE}/vmlinux-$${KERNEL_VER}.config" -o /tmp/vmlinux.config
+  curl_download "$${KERNEL_BASE}/vmlinux-$${KERNEL_VER}.config" -o /tmp/vmlinux.config
   install -m 0644 /tmp/vmlinux.config '${firecracker_kernel_path}.config'
 fi
 
 if [ -n '${firecracker_binary_url}' ]; then
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_binary_url}' -o /tmp/firecracker.bin
+  curl_download '${firecracker_binary_url}' -o /tmp/firecracker.bin
   install -m 0755 /tmp/firecracker.bin '${firecracker_binary_path}'
 fi
 
 if [ -n '${firecracker_jailer_url}' ]; then
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_jailer_url}' -o /tmp/jailer.bin
+  curl_download '${firecracker_jailer_url}' -o /tmp/jailer.bin
   install -m 0755 /tmp/jailer.bin '${firecracker_jailer_path}'
 fi
 
 if [ -n '${firecracker_kernel_url}' ]; then
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_kernel_url}' -o /tmp/vmlinux
+  curl_download '${firecracker_kernel_url}' -o /tmp/vmlinux
   install -m 0644 /tmp/vmlinux '${firecracker_kernel_path}'
 fi
 
 if [ -n '${firecracker_kernel_config_url}' ]; then
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_kernel_config_url}' -o /tmp/vmlinux.config
+  curl_download '${firecracker_kernel_config_url}' -o /tmp/vmlinux.config
   install -m 0644 /tmp/vmlinux.config '${firecracker_kernel_path}.config'
 elif [ -n '${firecracker_kernel_url}' ]; then
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_kernel_url}.config' -o /tmp/vmlinux.config
+  curl_download '${firecracker_kernel_url}.config' -o /tmp/vmlinux.config
   install -m 0644 /tmp/vmlinux.config '${firecracker_kernel_path}.config'
 fi
 
