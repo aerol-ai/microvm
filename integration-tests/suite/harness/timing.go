@@ -15,9 +15,11 @@ import (
 type serverTimingTransport struct {
 	base http.RoundTripper
 
-	mu     sync.Mutex
-	lastMS float64
-	have   bool
+	mu            sync.Mutex
+	lastMS        float64
+	have          bool
+	lastReadiness string
+	haveReadiness bool
 }
 
 func (t *serverTimingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -29,6 +31,11 @@ func (t *serverTimingTransport) RoundTrip(req *http.Request) (*http.Response, er
 		if ms, ok := parseServerTimingCreate(resp.Header.Get("Server-Timing")); ok {
 			t.mu.Lock()
 			t.lastMS, t.have = ms, true
+			t.mu.Unlock()
+		}
+		if src, ok := parseServerTimingReadinessSource(resp.Header.Get("Server-Timing")); ok {
+			t.mu.Lock()
+			t.lastReadiness, t.haveReadiness = src, true
 			t.mu.Unlock()
 		}
 	}
@@ -44,6 +51,35 @@ func (t *serverTimingTransport) takeCreateMS() (float64, bool) {
 	ms, ok := t.lastMS, t.have
 	t.have = false
 	return ms, ok
+}
+
+// takeCreateReadinessSource returns the readiness source from the most recent
+// create's Server-Timing header (readiness;desc=socket|health).
+func (t *serverTimingTransport) takeCreateReadinessSource() (string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	src, ok := t.lastReadiness, t.haveReadiness
+	t.haveReadiness = false
+	return src, ok
+}
+
+// parseServerTimingReadinessSource extracts readiness;desc=<source>.
+func parseServerTimingReadinessSource(header string) (string, bool) {
+	for _, metric := range strings.Split(header, ",") {
+		fields := strings.Split(metric, ";")
+		if strings.TrimSpace(fields[0]) != "readiness" {
+			continue
+		}
+		for _, attr := range fields[1:] {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(attr), "desc="); ok {
+				v = strings.TrimSpace(v)
+				if v != "" {
+					return v, true
+				}
+			}
+		}
+	}
+	return "", false
 }
 
 // parseServerTimingCreate pulls the "create" metric's dur (milliseconds) out of

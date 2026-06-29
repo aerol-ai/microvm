@@ -60,6 +60,10 @@ type Client struct {
 	networkRules       *netrules.Manager
 	waitTimeout        time.Duration
 	toolboxWaitTimeout time.Duration
+	readyEnabled       bool
+	readyDir           string
+	readinessPollInit  time.Duration
+	readinessPollMax   time.Duration
 	pullMu             sync.Mutex
 	pulls              map[string]*imagePull
 	pullSlots          chan struct{}
@@ -126,6 +130,10 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		networkRules:       rules,
 		waitTimeout:        cfg.DockerRuntimeWaitTimeout,
 		toolboxWaitTimeout: cfg.ToolboxWaitTimeout,
+		readyEnabled:       cfg.DockerReadySocketEffective(),
+		readyDir:           cfg.DockerReadySocketDir(),
+		readinessPollInit:  cfg.DockerReadinessPollInitial,
+		readinessPollMax:   cfg.DockerReadinessPollMax,
 		pulls:              make(map[string]*imagePull),
 		pullSlots:          pullSlots,
 		pullBackoff:        cfg.ImagePullFailureBackoff,
@@ -407,6 +415,35 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	binds := []string{
 		fmt.Sprintf("%s:%s:ro", c.toolboxBinaryPath, c.toolboxMountPath),
 	}
+
+	var readyListener *ReadyListener
+	var readyListenerClosed bool
+	defer func() {
+		if readyListener != nil && !readyListenerClosed {
+			_ = readyListener.Close()
+		}
+	}()
+
+	if c.readyEnabled {
+		readyNonce, err := mintReadyNonce()
+		if err != nil {
+			return nil, fmt.Errorf("mint ready nonce: %w", err)
+		}
+		readyListener, err = NewReadyListener(c.readyDir, sandboxID, toolboxToken, readyNonce)
+		if err != nil {
+			return nil, fmt.Errorf("ready listener: %w", err)
+		}
+		binds = append(binds, readyListener.BindSpec())
+		envValues = append(envValues, readyListener.EnvVars()...)
+		sort.Strings(envValues)
+		// envValues was sized to len(req.Env)+3, so appending the two ready
+		// vars reallocates the backing array — the slice already stored under
+		// createRequest["Env"] still points at the pre-append array. Re-store
+		// the grown slice or toolboxd never sees SB_READY_SOCKET/NONCE and the
+		// push silently degrades to health-poll on every create.
+		createRequest["Env"] = envValues
+	}
+
 	for _, m := range hostMounts {
 		entry := fmt.Sprintf("%s:%s", m.HostPath, m.ContainerPath)
 		if m.ReadOnly {
@@ -520,10 +557,35 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 
-	runtime, err := c.waitForRuntime(ctx, created.ID)
+	runtimeWaitStart := time.Now()
+	containerIP, inspect, err := c.waitForContainerRunning(ctx, created.ID)
+	runtimeWait := time.Since(runtimeWaitStart)
 	if err != nil {
 		_ = c.removeContainer(ctx, created.ID, true)
 		return nil, err
+	}
+
+	toolboxWaitStart := time.Now()
+	toolboxSource, err := c.waitForToolboxReady(ctx, containerIP, readyListener)
+	toolboxWait := time.Since(toolboxWaitStart)
+	if timing := CreateTimingFrom(ctx); timing != nil {
+		timing.record(runtimeWait, toolboxWait, toolboxSource)
+	}
+	if err != nil {
+		_ = c.removeContainer(ctx, created.ID, true)
+		return nil, err
+	}
+	if readyListener != nil {
+		readyListenerClosed = true
+		_ = readyListener.Close()
+		readyListener = nil
+	}
+
+	runtime := &SandboxRuntime{
+		SandboxID:   sandboxIDFromContainerName(inspect.Name),
+		ContainerID: inspect.ID,
+		ContainerIP: containerIP,
+		Status:      models.SandboxStatusStarted,
 	}
 
 	if req.NetworkBlockAll {
@@ -578,6 +640,7 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil {
 		return nil
 	}
+	RemoveReadySocketsForSandbox(c.readyDir, sandbox.ID)
 	containerRef := strings.TrimSpace(sandbox.ContainerID)
 	if containerRef == "" {
 		return errors.New("sandbox container ID is not available")
@@ -1033,36 +1096,117 @@ func IsLocalOnlyImageRef(imageRef string) bool {
 }
 
 func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
-	deadline := time.Now().Add(c.waitTimeout)
-	for time.Now().Before(deadline) {
-		inspect, err := c.inspectContainer(ctx, containerRef)
-		if err != nil {
-			return nil, fmt.Errorf("inspect container: %w", err)
-		}
-
-		containerIP := getContainerIP(inspect, c.network)
-		if inspect.State != nil && inspect.State.Running && containerIP != "" {
-			if err := c.waitForToolbox(ctx, containerIP); err != nil {
-				return nil, err
-			}
-			return &SandboxRuntime{
-				SandboxID:   sandboxIDFromContainerName(inspect.Name),
-				ContainerID: inspect.ID,
-				ContainerIP: containerIP,
-				Status:      models.SandboxStatusStarted,
-			}, nil
-		}
-
-		time.Sleep(300 * time.Millisecond)
+	containerIP, inspect, err := c.waitForContainerRunning(ctx, containerRef)
+	if err != nil {
+		return nil, err
 	}
-
-	return nil, fmt.Errorf("timed out waiting for sandbox runtime: %s", containerRef)
+	if _, err := c.waitForToolboxReady(ctx, containerIP, nil); err != nil {
+		return nil, err
+	}
+	return &SandboxRuntime{
+		SandboxID:   sandboxIDFromContainerName(inspect.Name),
+		ContainerID: inspect.ID,
+		ContainerIP: containerIP,
+		Status:      models.SandboxStatusStarted,
+	}, nil
 }
 
-func (c *Client) waitForToolbox(ctx context.Context, containerIP string) error {
+func (c *Client) waitForContainerRunning(ctx context.Context, containerRef string) (string, containerInspect, error) {
+	deadline := time.Now().Add(c.waitTimeout)
+	sleep := c.readinessPollInterval()
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return "", containerInspect{}, err
+		}
+		inspect, err := c.inspectContainer(ctx, containerRef)
+		if err != nil {
+			return "", containerInspect{}, fmt.Errorf("inspect container: %w", err)
+		}
+		containerIP := getContainerIP(inspect, c.network)
+		if inspect.State != nil && inspect.State.Running && containerIP != "" {
+			return containerIP, inspect, nil
+		}
+		time.Sleep(sleep())
+	}
+	return "", containerInspect{}, fmt.Errorf("timed out waiting for sandbox runtime: %s", containerRef)
+}
+
+func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, listener *ReadyListener) (string, error) {
+	if listener == nil {
+		// Push disabled (non-cluster) — plain health poll. Deliberately do not
+		// touch readySocketFallbackHealth: there was no socket to fall back
+		// from, and counting disabled-path creates here would make the metric
+		// useless for spotting real socket losses (old toolbox image, gVisor
+		// without host-uds) in cluster mode.
+		if err := c.pollToolboxHealth(ctx, containerIP); err != nil {
+			return "", err
+		}
+		return "health", nil
+	}
+
+	start := time.Now()
+	raceCtx, cancel := context.WithTimeout(ctx, c.toolboxWaitTimeout)
+	defer cancel()
+
+	type result struct {
+		source string
+		err    error
+	}
+	ch := make(chan result, 2)
+
+	go func() {
+		err := listener.Wait(raceCtx)
+		select {
+		case ch <- result{source: "socket", err: err}:
+		case <-raceCtx.Done():
+		}
+	}()
+
+	go func() {
+		timer := time.NewTimer(readyHealthPollGrace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-raceCtx.Done():
+			return
+		}
+		err := c.pollToolboxHealth(raceCtx, containerIP)
+		select {
+		case ch <- result{source: "health", err: err}:
+		case <-raceCtx.Done():
+		}
+	}()
+
+	res := <-ch
+	cancel()
+	// Drain the loser so its goroutine can exit without leaking a dial.
+	go func() {
+		select {
+		case <-ch:
+		case <-time.After(c.toolboxWaitTimeout):
+		}
+	}()
+
+	if res.err != nil {
+		return "", res.err
+	}
+	waitMS := time.Since(start).Milliseconds()
+	if res.source == "socket" {
+		recordReadySocketHit(waitMS)
+	} else {
+		recordReadySocketFallback(waitMS)
+	}
+	return res.source, nil
+}
+
+func (c *Client) pollToolboxHealth(ctx context.Context, containerIP string) error {
 	target := fmt.Sprintf("http://%s:%d/health", containerIP, c.toolboxPort)
 	deadline := time.Now().Add(c.toolboxWaitTimeout)
+	sleep := c.readinessPollInterval()
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
 			return err
@@ -1074,9 +1218,36 @@ func (c *Client) waitForToolbox(ctx context.Context, containerIP string) error {
 				return nil
 			}
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(sleep())
 	}
 	return fmt.Errorf("toolbox did not become healthy on %s", target)
+}
+
+func (c *Client) readinessPollInterval() func() time.Duration {
+	initial := c.readinessPollInit
+	if initial <= 0 {
+		initial = 20 * time.Millisecond
+	}
+	maximum := c.readinessPollMax
+	if maximum < initial {
+		maximum = 300 * time.Millisecond
+	}
+	cur := initial
+	return func() time.Duration {
+		d := cur
+		if cur < maximum {
+			cur *= 2
+			if cur > maximum {
+				cur = maximum
+			}
+		}
+		return d
+	}
+}
+
+func (c *Client) waitForToolbox(ctx context.Context, containerIP string) error {
+	_, err := c.waitForToolboxReady(ctx, containerIP, nil)
+	return err
 }
 
 func (c *Client) inspectContainer(ctx context.Context, id string) (containerInspect, error) {

@@ -155,6 +155,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err != nil {
 		return fmt.Errorf("create docker client: %w", err)
 	}
+	if cfg.DockerReadySocketEffective() {
+		readyDir := cfg.DockerReadySocketDir()
+		if err := docker.EnsureReadyDir(readyDir); err != nil {
+			return fmt.Errorf("ready socket dir: %w", err)
+		}
+		if err := docker.SweepOrphanReadySockets(readyDir); err != nil {
+			logger.Warn("ready socket sweep failed", "error", err)
+		}
+	}
 	configureMirror(logger, cfg, dockerClient)
 	configureAOCRPullAuth(logger, cfg, dockerClient)
 

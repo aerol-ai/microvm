@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -45,7 +46,8 @@ var (
 	startReaperFn            = startReaper
 	startUserCommandFn       = startUserCommand
 	forwardShutdownSignalsFn = forwardShutdownSignals
-	serveHTTPFn              = func(srv *http.Server) error { return srv.ListenAndServe() }
+	serveHTTPFn              = func(srv *http.Server, ln net.Listener) error { return srv.Serve(ln) }
+	netListenFn              = func(network, addr string) (net.Listener, error) { return net.Listen(network, addr) }
 	newVsockServerFn         = func(port uint32, handler VsockHandler, logger *slog.Logger) (vsockServerAPI, error) {
 		return newVsockServer(port, handler, logger)
 	}
@@ -113,9 +115,12 @@ func main() {
 		envd:         newEnvdCompat(),
 		cloneGen:     clonegen.New(envString("SB_CLONE_GEN_PATH", clonegen.DefaultPath), logger),
 	}
+	readySocket := strings.TrimSpace(os.Getenv("SB_READY_SOCKET"))
+	readyNonce := strings.TrimSpace(os.Getenv("SB_READY_NONCE"))
 	// Evict the token from the process env table so child processes spawned
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
 	os.Unsetenv("SB_TOOLBOX_TOKEN")
+	scrubReadyEnv()
 
 	startReaperFn(logger)
 
@@ -138,10 +143,19 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", srv.port)
 	httpServer := &http.Server{
-		Addr:              addr,
 		Handler:           srv.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	ln, err := netListenFn("tcp", addr)
+	if err != nil {
+		logger.Error("toolboxd listen failed", "error", err)
+		os.Exit(1)
+	}
+
+	// Push readiness only after the HTTP listener is accepting — same contract
+	// as /health 200 when create returns started.
+	announceReady(logger, srv.sandboxID, srv.authToken, readyNonce, readySocket)
 
 	go forwardShutdownSignalsFn(logger, httpServer)
 
@@ -169,7 +183,7 @@ func main() {
 	}
 
 	logger.Info("toolboxd listening", "addr", addr, "sandbox_id", srv.sandboxID, "version", version.Version)
-	if err := serveHTTPFn(httpServer); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := serveHTTPFn(httpServer, ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("toolboxd failed", "error", err)
 		os.Exit(1)
 	}

@@ -307,6 +307,9 @@ type Config struct {
 	HTTPClientTimeout           time.Duration
 	DockerRuntimeWaitTimeout    time.Duration
 	ToolboxWaitTimeout          time.Duration
+	DockerReadySocketEnabled    bool
+	DockerReadinessPollInitial  time.Duration
+	DockerReadinessPollMax      time.Duration
 	ReconcileInterval           time.Duration
 	NetstatsPollInterval        time.Duration
 	UploadMaxBytes              int64
@@ -1245,21 +1248,24 @@ func Load() (Config, error) {
 			NFSExport:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_EXPORT")),
 			NFSOptions:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_OPTIONS")),
 		},
-		LogLevel:                 strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
-		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
-		HTTPClientTimeout:        getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
-		DockerRuntimeWaitTimeout: getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
-		ToolboxWaitTimeout:       getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
-		ReconcileInterval:        getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
-		NetstatsPollInterval:     getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
-		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
-		OTELMetricsEnabled:       getEnvBool("SB_OTEL_METRICS_ENABLED", false),
-		OTELMetricsEndpoint:      firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
-		OTELMetricsInterval:      getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
-		OTELTracesEnabled:        getEnvBool("SB_OTEL_TRACES_ENABLED", false),
-		OTELTracesEndpoint:       firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
-		OTELTracesSampleRatio:    getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
-		OTELServiceName:          getEnv("OTEL_SERVICE_NAME", "sandboxd"),
+		LogLevel:                   strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
+		ShutdownTimeout:            getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
+		HTTPClientTimeout:          getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
+		DockerRuntimeWaitTimeout:   getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
+		ToolboxWaitTimeout:         getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
+		DockerReadySocketEnabled:   getEnvBool("SB_DOCKER_READY_SOCKET_ENABLED", true),
+		DockerReadinessPollInitial: getEnvDuration("SB_DOCKER_READINESS_POLL_INITIAL", 20*time.Millisecond),
+		DockerReadinessPollMax:     getEnvDuration("SB_DOCKER_READINESS_POLL_MAX", 300*time.Millisecond),
+		ReconcileInterval:          getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
+		NetstatsPollInterval:       getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
+		UploadMaxBytes:             int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		OTELMetricsEnabled:         getEnvBool("SB_OTEL_METRICS_ENABLED", false),
+		OTELMetricsEndpoint:        firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
+		OTELMetricsInterval:        getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		OTELTracesEnabled:          getEnvBool("SB_OTEL_TRACES_ENABLED", false),
+		OTELTracesEndpoint:         firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+		OTELTracesSampleRatio:      getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
+		OTELServiceName:            getEnv("OTEL_SERVICE_NAME", "sandboxd"),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
@@ -1507,6 +1513,12 @@ func Load() (Config, error) {
 
 	if cfg.ToolboxMountPath == "" || !strings.HasPrefix(cfg.ToolboxMountPath, "/") {
 		return Config{}, fmt.Errorf("SB_TOOLBOX_MOUNT_PATH must be an absolute path")
+	}
+	if cfg.DockerReadinessPollInitial <= 0 {
+		return Config{}, errors.New("SB_DOCKER_READINESS_POLL_INITIAL must be > 0")
+	}
+	if cfg.DockerReadinessPollMax < cfg.DockerReadinessPollInitial {
+		return Config{}, errors.New("SB_DOCKER_READINESS_POLL_MAX must be >= SB_DOCKER_READINESS_POLL_INITIAL")
 	}
 
 	if cfg.Domain == "" && cfg.PublicHost == "" {
@@ -1916,6 +1928,22 @@ func (c Config) CreateSandboxTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(c.CreateSandboxTimeoutSeconds) * time.Second
+}
+
+// DockerReadySocketEffective is true only on cluster deployments where sandboxd
+// controls the host layout. Self-install and single-node hosts keep the safer
+// health-poll path even when SB_DOCKER_READY_SOCKET_ENABLED defaults true.
+func (c Config) DockerReadySocketEffective() bool {
+	return c.DockerReadySocketEnabled && c.EnableCluster
+}
+
+// DockerReadySocketDir is the host directory for per-create readiness sockets.
+func (c Config) DockerReadySocketDir() string {
+	base := strings.TrimSpace(c.MountsCredentialsRuntimeDir)
+	if base == "" {
+		base = "/run/sandboxd"
+	}
+	return filepath.Join(base, "docker", "ready")
 }
 
 func getEnv(key, fallback string) string {
