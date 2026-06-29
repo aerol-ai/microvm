@@ -1,7 +1,21 @@
 # Docker readiness via Unix-socket push ("vsock for Docker")
 
-Status: **Proposed** — design plan, not yet implemented.
-Owner: TBD. Boot-path change → must follow `/touch-create-sandbox` + `pr-review.md`.
+Status: **Implemented** — landed in [PR #271](https://github.com/aerol-ai/microvm/pull/271) (`docker-socket` branch). Live integration verification (UC-96/96b/96c on `cluster-hetero`) and operator docs are still pending before merge.
+
+## Implementation status (2026-06-30)
+
+| Area | State |
+|------|--------|
+| Core code (`readyproto`, `readysock`, Create race, toolboxd dial, config gate, Server-Timing) | ✅ Shipped |
+| Unit tests | ✅ Shipped (`go test ./pkg/readyproto/... ./pkg/docker/... ./cmd/toolboxd/... ./internal/config/...`) |
+| Integration tests (UC-96 / 96b / 96c written) | ⏳ Not yet run on live AWS |
+| UC-97 fallback | ✅ Unit test (`TestCreate_FallbackWhenPushDisabled`) + non-cluster integration (`TestDockerReadinessFallbackOnNonCluster`) |
+| gVisor `install.sh` `--host-uds=open` | ✅ Code shipped; ⏳ UC-96c + security sign-off pending |
+| Docs (`integration-tests/README.md`, `packaging/`, gVisor operator docs) | ⏳ Pending (T11) |
+| `readyproto` fuzz | ⏳ Pending (T9, P2) |
+| Benchmark `toolbox_wait` regression | ⏳ Optional, not done |
+
+Boot-path change → followed `/touch-create-sandbox` + `pr-review.md` in PR description.
 
 ## Problem
 
@@ -53,8 +67,8 @@ Correctness / robustness
    (push is immune to IP-assignment lag after `/containers/start`).
 8. Removes false-"healthy" flaps where `/health` returns 200 before the agent
    has finished initialising — the agent itself decides when to announce ready.
-9. Detects a wedged / never-ready toolbox more cleanly: a single-shot accept
-   with a deadline instead of an ambiguous repeated poll.
+9. Detects a wedged / never-ready toolbox via accept-until-valid deadline
+   (invalid connects rejected; valid handshake or timeout).
 10. Provides a precise, attributable readiness timestamp for Server-Timing and
     metrics (the agent reports exactly when it came up).
 11. Fences stale readiness on snapshot-clone / recreate paths via a
@@ -72,16 +86,25 @@ Network / isolation
 Architecture / security / ops
 16. Unifies the readiness model across runtimes (Docker now out-of-band push,
     like Firecracker vsock and WASM socket) — one mental model, less special-casing.
-17. Gives gVisor sandboxes the same fast readiness for free (they ride the
-    docker client path).
+17. gVisor can use the same push path when `runsc` runs with `--host-uds=open`
+    (`install.sh`); otherwise fallback poll only (same backoff win).
 18. Avoids exposing any host-facing readiness *network* endpoint to untrusted
     sandboxes (the failure mode of a webhook approach).
 19. Backward compatible: toolbox images built before this change still come up
     via the existing `/health` poll fallback (no flag-day).
-20. Establishes a reusable per-sandbox host↔container control channel that
-    future features can extend (push quiesce/shutdown to Docker sandboxes,
-    capability advertisement, agent-version negotiation) with **no** new
-    network surface.
+20. Establishes a **one-shot** per-create host↔container readiness channel (not a
+    reusable bidirectional control plane without further auth/lifetime design).
+
+### As-implemented claim notes
+
+Eng review softened several bullets above; shipped behavior matches the locked
+decisions section:
+
+- **#9** — accept-until-valid (invalid connects are rejected, channel stays open).
+- **#13** — not a unique win: health poll already completed before egress rules apply.
+- **#17** — gVisor needs `runsc --host-uds=open`; otherwise fallback poll only.
+- **#19** — toolboxd is bind-mounted from the host; fallback is defense-in-depth.
+- **#20** — one-shot readiness only; listener closes after success or create ends.
 
 ---
 
@@ -92,16 +115,18 @@ Architecture / security / ops
 ```
 HOST (sandboxd)                                  CONTAINER (toolboxd, PID 1)
 ──────────────                                   ──────────────────────────
-1. create  <dir>/<sandboxID>.sock, listen()
+1. create <dir>/<sandboxID>.<nonce>.sock, listen()
 2. bind-mount that ONE socket file ──────────►   /run/aerol/ready.sock  (rw)
-   set env SB_READY_SOCKET=/run/aerol/ready.sock
+   set env SB_READY_SOCKET=/run/aerol/ready.sock, SB_READY_NONCE=<nonce>
 3. /containers/create, /containers/start
-4. inspect once → container IP (tight retry
-   only if not Running yet)                      5. on boot, FIRST action:
-6. Accept() blocks (deadline = toolboxWaitTimeout)   dial unix:/run/aerol/ready.sock
-7. read 1 JSON line, verify token+nonce ◄────────    write {ready, token, nonce, ...}
-8. close listener, unlink socket → ready             then continue (HTTP/vsock listen)
+4. inspect (backoff) until Running + IP         5. HTTP listener binds (tcp)
+6. race: Accept() vs grace-delayed /health       6. goroutine dials ready.sock
+7. read JSON line, verify token+nonce ◄────────    write {ready, token, nonce, ...}
+8. close listener, unlink socket → ready
 ```
+
+**Ready semantics (decision #4):** toolboxd dials **after** its HTTP listener is
+accepting — same guarantee as `/health` 200 when create returns `started`.
 
 Host **listens** (not the guest) so there is nothing for the host to poll: the
 socket exists before the container starts, and `Accept()` returns the moment
@@ -132,16 +157,16 @@ The host runs the socket-accept **and** the existing `/health` poll
 ### Metrics (expvar, mirroring pool metrics convention)
 
 `docker_ready_socket_hit`, `docker_ready_socket_fallback_health`,
-`docker_ready_socket_timeout`, plus a `ready_wait_ms` histogram — gives the
-integration assertion hook and dashboards.
+`docker_ready_socket_timeout`, `docker_ready_socket_invalid_attempts`, plus
+`ready_wait_ms` (atomic last successful wait — not a histogram). Integration
+assertions use per-create `Server-Timing` (`readiness;desc=socket|health`), not
+global expvar deltas (flaky under concurrency).
 
 ### Config knobs (`internal/config`)
 
-- `SB_DOCKER_READY_SOCKET_ENABLED` (default `true`) — master switch; off =
-  pure legacy behavior.
-- `SB_DOCKER_READY_SOCKET_DIR` (default `<runtime-dir>/docker/ready`).
-- Plus the fallback poll's backoff knobs (`SB_DOCKER_READINESS_POLL_INITIAL`,
-  `_MAX`) carried over from the tight-poll plan.
+- `SB_DOCKER_READY_SOCKET_ENABLED` (default `true`) — kill switch; effective only when `EnableCluster=true`.
+- Socket dir **derived** at runtime: `{MountsCredentialsRuntimeDir}/docker/ready` via `Config.DockerReadySocketDir()` (no separate `SB_DOCKER_READY_SOCKET_DIR` env).
+- Fallback poll backoff: `SB_DOCKER_READINESS_POLL_INITIAL` (default `20ms`), `SB_DOCKER_READINESS_POLL_MAX` (default `300ms`).
 
 The existing `SB_DOCKER_WAIT_TIMEOUT` / `SB_TOOLBOX_WAIT_TIMEOUT` (30s) stay as
 the outer deadline, unchanged.
@@ -154,12 +179,15 @@ the outer deadline, unchanged.
 |---|---|
 | `pkg/readyproto/readyproto.go` | Shared wire shape (`ReadySignal` struct, `Event` constant, a bounded newline-JSON `Encode`/`Decode`). Imported by **both** the host (`pkg/docker`) and the guest (`cmd/toolboxd`), mirroring how the vsock protocol shape is isolated from its socket layer. |
 | `pkg/readyproto/readyproto_test.go` | Encode/decode round-trip, oversize-line rejection, malformed-JSON rejection, unknown-field tolerance. |
-| `pkg/docker/readysock.go` | Host side: `readyListener` — create+listen (unlink-before-bind), `Accept` with deadline, token/nonce verification (constant-time), bounded reader, single-shot, cleanup (`Close`+unlink). Plus `bindSpec()`/`envFor()` helpers the Create path uses to wire the bind and env. |
-| `pkg/docker/readysock_test.go` | Unit tests (see test section). |
-| `pkg/docker/readysock_metrics.go` | expvar counters/histogram for the readiness channel. |
-| `cmd/toolboxd/readyclient.go` | Guest side: `announceReady()` — read `SB_READY_SOCKET`/`SB_TOOLBOX_TOKEN`/nonce env, dial the unix socket with a short deadline, write one `ReadySignal` line, close. Best-effort; never fatal. Portable (plain unix socket; no AF_VSOCK, builds on all platforms). |
-| `cmd/toolboxd/readyclient_test.go` | Unit tests for the dialer. |
-| `integration-tests/suite/docker_readiness_test.go` | New UC tests (UC-96/UC-97) — see integration section. |
+| `pkg/docker/readysock.go` | Host side: `ReadyListener` — accept-until-valid, `0666` socket, token/nonce verification, bounded reader, cleanup. |
+| `pkg/docker/readysock_test.go` | Unit tests (`//go:build linux` — unix socket bind requires Linux). |
+| `pkg/docker/readysock_metrics.go` | expvar counters + `ready_wait_ms` atomic. |
+| `pkg/docker/create_timing.go` | `CreateTiming` context recorder for Server-Timing sub-phases. |
+| `pkg/docker/ready_create_test.go` | Create-path wiring, socket-wins race, fallback-disabled, slow-ready backoff. |
+| `cmd/toolboxd/readyclient_linux.go` | Guest dialer (`announceReady`, `dialReadySocket`). |
+| `cmd/toolboxd/readyclient_other.go` | No-op stub for non-Linux builds. |
+| `cmd/toolboxd/readyclient_test.go` | Dialer unit tests (`//go:build linux`). |
+| `integration-tests/suite/docker_readiness_test.go` | UC-96 / 96b / 96c + non-cluster fallback assertion. |
 | `plans/docker-readiness-unix-socket-push.md` | This document. |
 
 ## Files MODIFIED
@@ -167,14 +195,17 @@ the outer deadline, unchanged.
 | File | Change |
 |---|---|
 | `pkg/docker/client.go` | `Create`: (a) before `/containers/create`, construct the `readyListener` and append its bind to `binds` + its env to `envValues`; (b) after `/containers/start`, keep one `inspect` for the container IP, then **race** `readyListener.Accept()` against the (backoff) `waitForToolbox`; (c) on every failure path, `readyListener.Close()` + unlink (LIFO with the existing cleanup); (d) `Destroy`/`removeContainer` also unlink any stale socket. New struct fields (`readyDir`, `readyEnabled`) + `New()` wiring. `waitForToolbox`/`waitForRuntime` get the adaptive backoff. |
-| `cmd/toolboxd/main.go` | Call `announceReady(logger)` early in boot — after env is read, *before* `serveHTTPFn` blocks (it can run in a goroutine so it never delays the HTTP/vsock listeners). |
-| `internal/config/config.go` | Add `DockerReadySocketEnabled`, `DockerReadySocketDir`, `DockerReadinessPollInitial`, `DockerReadinessPollMax` with `getEnv*` defaults and validation (`initial>0`, `max>=initial`, dir non-empty when enabled). |
-| `pkg/daemon/` (boot wiring) | Pass the resolved ready-socket dir/enable into the docker client constructor; ensure the dir is created (0700, sandboxd-owned) at boot and swept on startup for orphans. |
-| `pkg/docker/client_test.go` | Extend the existing `roundTripFunc` fake + `newTestClient` so create-path tests assert the new bind + `SB_READY_SOCKET` env are present, and inject a temp ready dir. |
-| `integration-tests/suite/harness/usecases.go` | Register `UC-96` (push readiness) and `UC-97` (legacy fallback) in `Registry`. |
-| `integration-tests/suite/benchmark_test.go` | Optional: assert the Server-Timing `toolbox_wait` phase is near-zero when the push path is active, so a regression to polling is caught by the bench. |
-| `pkg/api/v1/handlers.go` | (From the tight-poll plan) extend `setCreateServerTiming` to emit the `runtime_wait` / `toolbox_wait` sub-phases used by the assertion above. |
-| `packaging/` + docs env table | Document the new `SB_DOCKER_READY_SOCKET_*` vars. |
+| `cmd/toolboxd/main.go` | `announceReady()` after HTTP `Listen`, before `Serve`; scrub `SB_READY_*` env. |
+| `internal/config/config.go` | `DockerReadySocketEnabled`, poll backoff knobs, `DockerReadySocketEffective()`, `DockerReadySocketDir()`. |
+| `pkg/daemon/daemon.go` | `EnsureReadyDir` + `SweepOrphanReadySockets` at boot when push enabled. |
+| `pkg/api/v1/handlers.go` | Server-Timing: `runtime_wait`, `toolbox_wait`, `readiness;desc=`. |
+| `pkg/api/v1/cluster_handler.go` | Pass `nil` timing on cluster placement path (worker returns timing when hit directly). |
+| `integration-tests/suite/harness/usecases.go` | UC-96, UC-96b, UC-96c registered. |
+| `integration-tests/suite/harness/timing.go` | `parseServerTimingReadinessSource`, `LastCreateReadinessSource`. |
+| `scripts/install.sh` | gVisor `runtimeArgs: ["--host-uds=open"]` (all three `register_gvisor_runtime` branches). |
+| `integration-tests/README.md` | ⏳ Document UC-96* and env knobs (T11). |
+| `packaging/` env table | ⏳ Document knobs (T11). |
+| `integration-tests/suite/benchmark_test.go` | Optional: `toolbox_wait` regression — not implemented. |
 
 > Note on the runtime seam: `pkg/docker/client.go` is the Docker
 > `runtime.Runtime` implementation, so no `internal/runtime/docker` driver
@@ -199,24 +230,19 @@ A host-owned socket bind-mounted into an **untrusted** container is sensitive
    carries the per-sandbox `SB_TOOLBOX_TOKEN` (already injected, high-entropy);
    the host verifies it with `subtle.ConstantTimeCompare` and rejects mismatches.
 
-3. **Socket file permissions vs. non-root container user.** The container's
-   `toolboxd` (entrypoint, runs first) must be able to connect, but nothing
-   else on the host should. → Socket created `0660`, sandboxd-owned, inside a
-   `0700` dir; the host-side confidentiality rests on the dir mode + mount
-   isolation, integrity on the token. Where userns/UID-mapping prevents connect,
-   fall to `0666` *on the bind-mounted node only* — safe because the node is
-   reachable solely from inside that one container. Documented explicitly; no
-   silent world-writable host path.
+3. **Socket file permissions vs. non-root container user.** → Socket created
+   **`0666`** on the bind-mounted node (decision #2); integrity gate is the
+   per-sandbox token. Parent dir stays `0700`, sandboxd-owned; only the socket
+   inode is mounted into the container.
 
-4. **Connection-flood DoS (fd/goroutine exhaustion).** Untrusted code could
-   open many connections. → The listener is **single-shot**: after the first
-   *valid* ready (or the deadline) it `Close()`s and stops accepting. Small
-   listen backlog; one accept goroutine per sandbox, bounded by the create's
-   own lifetime.
+4. **Connection-flood DoS (fd/goroutine exhaustion).** → **Accept-until-valid**
+   (decision #1) with a bounded `max-invalid-attempts` cap and per-conn read
+   deadline. Listener lifetime is bounded by the create's `toolboxWaitTimeout`;
+   one accept goroutine per in-flight create.
 
 5. **Slow-loris / connect-but-never-send.** → Every accepted conn gets a short
-   read deadline (e.g. 2s); single-shot accept means a stalled connection
-   cannot hold the channel open past the create deadline.
+   read deadline (2s); invalid/slow connects are dropped and the listener keeps
+   accepting until a valid handshake or the outer deadline.
 
 6. **Oversized / malformed payload (parser OOM).** → `bufio` reader with a hard
    line cap (e.g. 4 KiB) via `io.LimitReader`; one newline-delimited line; JSON
@@ -302,53 +328,44 @@ the expvar counters (hit / fallback / timeout increment correctly).
 
 ### Modified
 
-`pkg/docker/client_test.go`
-- the create-path tests assert the new **bind** (`<dir>/<id>.sock:/run/aerol/ready.sock`)
-  and **`SB_READY_SOCKET` env** are present in the `/containers/create` body;
-- a test that drives the **race**: fake the container as ready via the socket
-  and assert `waitForToolbox`'s health poll is *not* what completed the create
-  (i.e. push wins); and the inverse (socket silent → health poll completes it);
-- inject a `t.TempDir()` ready dir so tests never touch a real runtime dir.
+`pkg/docker/ready_create_test.go` (new file, not `client_test.go`):
+- create-path bind + `SB_READY_SOCKET` / `SB_READY_NONCE` env assertions;
+- socket-wins race (`TestCreate_SocketPushWinsOverHealthPoll`);
+- push-disabled fallback (`TestCreate_FallbackWhenPushDisabled`);
+- slow-ready backoff (`TestPollToolboxHealth_SlowReadyStillSucceeds`).
 
-`pkg/docker` coverage: keep the package at the ~85% bar (`/maintain-coverage`).
+`readysock_test.go` is `//go:build linux` (unix bind requires Linux hosts).
 
 ---
 
 ## Integration test updates
 
-Register two UCs in `integration-tests/suite/harness/usecases.go`:
+Registered in `integration-tests/suite/harness/usecases.go`:
 
 ```go
-{ID: "UC-96", Title: "Docker create readiness delivered via unix-socket push", Requires: []Capability{CapDocker}, Implemented: true},
-{ID: "UC-97", Title: "Docker create falls back to health poll when push absent", Requires: []Capability{CapDocker}, Implemented: true},
+{ID: "UC-96",  Title: "Docker create readiness delivered via unix-socket push", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+{ID: "UC-96b", Title: "Docker socket push works for non-root container images", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+{ID: "UC-96c", Title: "Docker socket push works under gVisor runtime",         Requires: []Capability{CapCluster, CapDocker, CapGvisor}, Implemented: true},
 ```
 
-`integration-tests/suite/docker_readiness_test.go` (behind the existing
-`integration` build tag, run via the orchestrated suite):
+`integration-tests/suite/docker_readiness_test.go` (behind `integration` build tag):
 
-- **UC-96 (push path):** create a Docker sandbox against a live node; assert it
-  reaches `started`; then read the node's metrics/`Server-Timing` and assert the
-  readiness came through the **socket** channel (`docker_ready_socket_hit`
-  incremented and/or the `toolbox_wait` Server-Timing phase is near-zero). This
-  is the regression guard that proves push is actually active, not silently
-  falling back.
-- **UC-97 (fallback path):** create a sandbox from an image whose toolbox does
-  **not** dial (a pinned older toolbox, or a config toggle
-  `SB_DOCKER_READY_SOCKET_ENABLED=false`); assert it still reaches `started`
-  via the health poll (`docker_ready_socket_fallback_health` incremented). This
-  guarantees the backward-compatibility promise (use case #19) is exercised on
-  real infra.
-- **Latency tie-in:** the existing `TestBenchCreateLatency` (UC-94) already
-  measures docker server-side time; once this lands it should drop materially.
-  Optionally tighten the bench to assert `toolbox_wait` ≈ 0 on the push path so
-  a regression to polling shows up as a failing assertion, not just a slower
-  number.
+- **UC-96 / 96b / 96c:** create on `cluster-hetero`; assert `readiness;desc=socket`
+  via `Client.LastCreateReadinessSource()` (per-create Server-Timing, not expvar).
+- **Fallback (UC-97 equivalent):** `TestDockerReadinessFallbackOnNonCluster` on
+  `local-mode` / `single-node` scenarios asserts `readiness;desc=health` (push
+  gated off by `EnableCluster=false`). Plus unit test `TestCreate_FallbackWhenPushDisabled`.
 
-`integration-tests/README.md`: document the two new UCs and the
-`SB_DOCKER_READY_SOCKET_*` knobs in the env table.
+**Not asserted:** `toolbox_wait ≈ 0` on push path — a correct agent still has real
+init time; only the *source* matters.
 
-No live-AWS-specific wiring is required beyond the standard harness; these run
-on any scenario advertising `CapDocker`.
+**Verify on live infra:**
+```bash
+make integration-cluster-hetero   # UC-96, 96b, 96c
+go test -tags=integration ./integration-tests/suite/ -run Readiness
+```
+
+`integration-tests/README.md`: ⏳ document UC-96* and env knobs (T11).
 
 ---
 
@@ -357,8 +374,9 @@ on any scenario advertising `CapDocker`.
 - **Boot-path change** → run `/touch-create-sandbox`, read `pr-review.md`, and
   the PR description must call out the create-latency impact (improvement, with
   before/after from the Server-Timing sub-phases), the idempotency story
-  (readiness is single-shot + retry-safe; a retried create re-mints a nonce and
-  re-listens), and the failure-path cleanup (listener `Close()`+unlink in LIFO).
+  (readiness is accept-until-valid + retry-safe; a retried create re-mints a
+  nonce and re-listens), and the failure-path cleanup (listener `Close()`+unlink
+  in deferred LIFO).
 - **Security review** required (new host↔container channel) — the section above
   is the checklist to walk in review.
 - **Default on** (`SB_DOCKER_READY_SOCKET_ENABLED=true`) with the health-poll
@@ -421,35 +439,11 @@ attribution comes from the per-phase timing even though bundled.
    before the API serves and cause post-create connection-refused races — a
    regression hidden behind a faster metric.
 
-5. **gVisor — needs `--host-uds=open`; NOT free, and off by default today.**
-   Root cause (not just "virtualized AF_UNIX"): `runsc` gates host unix-socket
-   passthrough behind `--host-uds` (default `none`). A gVisor sandbox can only
-   `connect()` to a bind-mounted host socket when runsc runs with
-   `--host-uds=open` (or `all`). **AerolVM's installer does not set it** —
-   `scripts/install.sh` `register_gvisor_runtime` writes
-   `{"runtimes":{"runsc":{"path":...}}}` with no `runtimeArgs`, so the default
-   `none` applies and the push would silently fall back to the poll on every
-   gVisor create. Sharing `pkg/docker/client.go` does **not** make it "free" —
-   same Go code, different runtime *policy*. Resolution:
-   - Drop use case #17's "for free" claim.
-   - Add **UC-96c on cluster-hetero** (which has a gVisor-capable node): create
-     under `runsc`, assert the push channel actually delivered (per-sandbox
-     `Server-Timing source`), not fallback.
-   - **If UC-96c is green with the flag**, add `"runtimeArgs":["--host-uds=open"]`
-     to the runsc entry in `register_gvisor_runtime` (`scripts/install.sh`) +
-     the Terraform/Ansible install path, and document it. Use `open`
-     (connect-only), **not** `all` (which also permits the sandbox to *create*
-     host sockets — broader than we need).
-   - **Security note (review item):** `--host-uds=open` is a deliberate,
-     fleet-wide relaxation of gVisor isolation — every gVisor sandbox gains the
-     capability to connect to host UDSes that are bind-mounted into it. Exposure
-     is bounded to exactly what we mount (the one readiness socket node); we
-     mount nothing else host-UDS-wise. This must be an explicit security-review
-     decision, not a silent flip.
-   - Fallback guarantees correctness regardless of the flag, so this is a
-     latency/claim issue, never a correctness one. If the security team rejects
-     relaxing `host-uds`, gVisor stays fallback-only (still gets the backoff
-     win) and use case #17 is dropped, not deferred.
+5. **gVisor — needs `--host-uds=open`.** `runsc` gates host UDS passthrough
+   behind `--host-uds` (default `none`). **Shipped:** `scripts/install.sh`
+   `register_gvisor_runtime` sets `"runtimeArgs":["--host-uds=open"]` in all
+   three merge branches. **Pending:** UC-96c on live `cluster-hetero` + security
+   sign-off (isolation relaxation is fleet-wide).
 
 6. **Bind-mount topology — scope to local Linux runc dockerd.** Rootless Docker,
    strict SELinux/AppArmor (:z/:Z), userns-remap, Docker Desktop, and remote
@@ -582,75 +576,36 @@ parallel worktrees. Merge all. Then S6. **Conflict flag:** S2 and S5 both touch
 `pkg/docker/` — keep them in one lane (sequential), do not parallelize.
 
 ## Implementation Tasks
-Synthesized from this review's findings. Each derives from a specific finding.
 
-- [ ] **T1 (P1, human: ~3h / CC: ~25min)** — readysock — accept-until-valid listener
-  - Surfaced by: Codex tension #8 — single-shot is exploitable
-  - Files: `pkg/docker/readysock.go`, `pkg/readyproto/readyproto.go`
-  - Verify: `go test ./pkg/docker/ -run ReadySock`
-- [ ] **T2 (P1, human: ~2h / CC: ~15min)** — readysock/toolboxd — 0666 socket + mandatory token+nonce (constant-time)
-  - Surfaced by: Architecture #1 + Codex token/nonce
-  - Files: `pkg/docker/readysock.go`, `cmd/toolboxd/readyclient.go`
-  - Verify: `go test ./pkg/docker/... ./cmd/toolboxd/...`
-- [ ] **T3 (P1, human: ~4h / CC: ~30min)** — docker Create — race (grace-delayed poll, shared ctx) + explicit cleanup + gen-keyed sweep
-  - Surfaced by: Architecture #2, #3; Codex sweep-race
-  - Files: `pkg/docker/client.go`, `pkg/daemon/`
-  - Verify: `go test ./pkg/docker/ -run Create`
-- [ ] **T4 (P1, human: ~2h / CC: ~15min)** — toolboxd — dial after HTTP listener up, goroutine + bounded timeout, never fatal
-  - Surfaced by: Codex tension #10 + PID1 timing
-  - Files: `cmd/toolboxd/main.go`, `cmd/toolboxd/readyclient.go`
-  - Verify: `go test ./cmd/toolboxd/...`
-- [ ] **T5 (P1, human: ~2h / CC: ~15min)** — docker — adaptive backoff + REGRESSION test (slow-ready container still succeeds)
-  - Surfaced by: Test review IRON RULE (modifies path every create uses)
-  - Files: `pkg/docker/client.go`, `pkg/docker/client_test.go`
-  - Verify: `go test ./pkg/docker/ -run WaitFor`
-- [ ] **T6 (P1, human: ~45min / CC: ~8min)** — config — 3 knobs + validation, derive socket dir, gate effective-enable on `EnableCluster`
-  - Surfaced by: Code Quality #2 + decision #10 (off in local/self-install)
-  - Files: `internal/config/config.go`
-  - Detail: effective enable = `getEnvBool("SB_DOCKER_READY_SOCKET_ENABLED", true) && cfg.EnableCluster`; add a config test asserting non-cluster → disabled even with the knob true, and cluster+knob-false → disabled.
-  - Verify: `go test ./internal/config/...`
-- [ ] **T7 (P1, human: ~1h / CC: ~10min)** — api — Server-Timing sub-phases (runtime_wait/toolbox_wait/source)
-  - Surfaced by: Phase-1 measure-first (Codex "wrong bottleneck")
-  - Files: `pkg/api/v1/handlers.go`, `pkg/docker/client.go`
-  - Verify: `go test ./pkg/api/v1/...`
-- [ ] **T8 (P1, human: ~3h / CC: ~25min)** — integration — UC-96 / UC-96b (non-root) / UC-96c (gVisor) / UC-97 (fallback), assert per-sandbox Server-Timing source
-  - Surfaced by: Test review (silent-fallback) + Codex gVisor + metric-flakiness
-  - Files: `integration-tests/suite/docker_readiness_test.go`, `integration-tests/suite/harness/usecases.go`
-  - Verify: `go test -tags=integration ./integration-tests/suite/ -run Readiness`
-- [ ] **T9 (P2, human: ~1h / CC: ~10min)** — readyproto — bounded decode + fuzz
-  - Surfaced by: Security #6/#12
-  - Files: `pkg/readyproto/readyproto.go`, `pkg/readyproto/readyproto_test.go`
-  - Verify: `go test ./pkg/readyproto/...`
-- [ ] **T10 (P2, human: ~1h / CC: ~10min)** — metrics — expvar counters with per-sandbox attribution
-  - Surfaced by: Codex metric-flakiness
-  - Files: `pkg/docker/readysock_metrics.go`
-  - Verify: `go test ./pkg/docker/ -run Metrics`
-- [ ] **T11 (P2, human: ~1h / CC: ~10min)** — docs — env table, NOT-in-scope topologies, soften use-case claims #13/#17/#20
-  - Surfaced by: Codex claim corrections
-  - Files: `integration-tests/README.md`, `packaging/`, this plan
-  - Verify: manual
-- [ ] **T12 (P3, human: ~30min / CC: ~5min)** — toolboxd — build-tag guard if CI cross-compiles to non-Linux
-  - Surfaced by: Codex non-Linux builds
-  - Files: `cmd/toolboxd/readyclient_linux.go` / `_other.go`
-  - Verify: `GOOS=darwin go build ./cmd/toolboxd/`
-- [ ] **T13 (P2, human: ~1h / CC: ~15min, GATED on UC-96c green)** — install — add `runtimeArgs:["--host-uds=open"]` to the runsc daemon.json entry
-  - Surfaced by: user — gVisor connect needs runsc `--host-uds=open`; default install omits it
-  - Files: `scripts/install.sh` `register_gvisor_runtime` — **single source**; Terraform (`--with-gvisor` → install.sh) and Ansible (asserts install.sh ran) both route through it, so this one function is the only code change. BUT it has **three spots** that hard-set the runsc entry and ALL must add `runtimeArgs`: the `desired=` printf (~:1206), the `jq` merge (~:1214), and the `python3` fallback (~:1216) — miss the python branch and no-jq hosts silently omit the flag. Plus docs: `README.md` gVisor row, `docs/.../single-node-setup.md`, `setup/arch.md`.
-  - Verify: `UC-96c` push delivered under gVisor on cluster-hetero; `docker info` / `cat /etc/docker/daemon.json` shows runsc with the arg; re-run installer is idempotent (the diff-check at ~:1237 detects the new arg and restarts docker once).
-  - Note: security-review gate — `open` not `all`; isolation-relaxation decision must be signed off. Do NOT land before UC-96c proves it's needed and sufficient.
+Status as of 2026-06-30 ([PR #271](https://github.com/aerol-ai/microvm/pull/271)).
+
+- [x] **T1** — accept-until-valid listener (`readysock.go`, `readyproto/`)
+- [x] **T2** — `0666` + token/nonce (`readysock.go`, `readyclient_linux.go`)
+- [x] **T3** — Create race + cleanup + nonce-keyed sweep (`client.go`, `daemon.go`)
+- [x] **T4** — dial after HTTP listen (`main.go`, `readyclient_linux.go`)
+- [x] **T5** — adaptive backoff + slow-ready test (`ready_create_test.go`)
+- [x] **T6** — config gate + validation (`config.go`, `docker_ready_socket_test.go`)
+- [x] **T7** — Server-Timing sub-phases (`handlers.go`, `create_timing.go`)
+- [ ] **T8** — integration **verified on live AWS** (tests written; run `make integration-cluster-hetero`)
+- [ ] **T9** — `FuzzDecode` (bounded unit tests ✅)
+- [x] **T10** — expvar counters; per-create attribution via Server-Timing
+- [ ] **T11** — operator docs (`integration-tests/README.md`, `packaging/`, gVisor docs)
+- [x] **T12** — `readyclient_linux.go` / `readyclient_other.go`
+- [x] **T13 code** — `install.sh` all three `register_gvisor_runtime` branches
+- [ ] **T13 verify** — UC-96c green + security sign-off on `--host-uds=open`
 
 ## Propagation map (where each change actually lands)
 
 The repo has multiple install/provision paths; this maps each change to every
 place it must reach so nothing is updated in one path and missed in another.
 
-| Change | Single source? | Reaches Terraform | Reaches Ansible | Reaches integration tests | Action |
+| Change | Single source? | Reaches Terraform | Reaches Ansible | Reaches integration tests | Status |
 |---|---|---|---|---|---|
-| gVisor `--host-uds=open` | **Yes** — `install.sh register_gvisor_runtime` (only `daemon.json` runsc writer) | ✅ via `--with-gvisor`→install.sh | ✅ relies on install.sh, no own registration | ✅ via the prod TF module | Edit the one function (3 spots: printf/jq/python) — T13 |
-| `SB_DOCKER_READY_SOCKET_ENABLED` (gated `AND EnableCluster`) + backoff knobs | **config.go**, effective = default `true` AND `cfg.EnableCluster` | ✅ on in cluster bootstraps (EnableCluster=true), off otherwise | ✅ same | ✅ on for cluster-* scenarios, off for local-mode/single-node | One config.go line; no template edits. Self-install/local/single-node are non-cluster → OFF automatically |
-| New `SB_READY_SOCKET` / `SB_READY_NONCE` env | host-side, set per-create by `pkg/docker/client.go` | n/a (not an operator env) | n/a | n/a | Injected by the daemon at create time, never in any `.env` template |
-| New UCs (96/96b/96c/97) | `harness/usecases.go` Registry | n/a | n/a | ✅ cluster-hetero already has docker + gVisor nodes | Register in usecases.go — T8 |
-| Docs (env table, gVisor flag, NOT-in-scope) | per-file | — | — | `integration-tests/README.md` | T11 + T13 |
+| gVisor `--host-uds=open` | **Yes** — `install.sh register_gvisor_runtime` | ✅ via `--with-gvisor` | ✅ via install.sh | UC-96c on cluster-hetero | Code ✅; live verify ⏳ |
+| Ready-socket knobs + `EnableCluster` gate | **config.go** | ✅ cluster bootstraps | ✅ same | non-cluster → fallback | ✅ |
+| `SB_READY_SOCKET` / `SB_READY_NONCE` env | per-create in `client.go` | n/a | n/a | n/a | ✅ |
+| UC-96 / 96b / 96c | `usecases.go` + `docker_readiness_test.go` | n/a | n/a | cluster-hetero | Written ✅; run ⏳ |
+| Operator docs | per-file | — | — | `integration-tests/README.md` | ⏳ T11 |
 
 **UC-97 (fallback path) — make it a unit test, not an env-toggled integration
 test.** The plan originally suggested toggling `SB_DOCKER_READY_SOCKET_ENABLED=false`
@@ -667,8 +622,8 @@ so it's always current.)
 **Bonus from decision #10:** because the push is gated on `EnableCluster`, the
 non-cluster integration scenarios (`local-mode`, `single-node`) now exercise the
 OFF/fallback path on real infra **for free** — a Docker create there must still
-reach `started` via the poll, with `docker_ready_socket_*` untouched. Add that
-assertion to the existing single-node lifecycle UC rather than a new scenario.
+reach `started` via the poll. **Shipped:** `TestDockerReadinessFallbackOnNonCluster`
+in `docker_readiness_test.go` asserts `readiness;desc=health` on non-cluster scenarios.
 
 **Kill-switch surfacing — deliberately deferred (YAGNI).** Keeping
 `SB_DOCKER_READY_SOCKET_ENABLED` config.go-default-on (not surfaced in
@@ -691,6 +646,6 @@ listed in NOT in scope.
 
 - **CODEX:** outside voice surfaced 5 issues the inside review missed — single-shot accept is exploitable, gVisor passthrough unverified, ready-semantics timing, bind-mount portability, backoff-bundling scope. All resolved via decisions #1, #5, #4, #6, scope-bundle. Remaining Codex points folded as hardening (nonce lifecycle, PID1 timeout, per-sandbox metric attribution, sweep generation-keying, claim corrections).
 - **CROSS-MODEL:** Claude + Codex converged on measure-first (Phase-1 instrumentation), 0666 caution, inspect/NetworkBlockAll claim weakness, and metric-as-assertion flakiness. Codex's single-shot-exploit catch was the highest-value addition; Claude's "toolboxd is bind-mounted from host" context collapsed Codex's compat-matrix concern.
-- **VERDICT:** ENG CLEARED — ready to implement. All 11 findings + 5 cross-model forks folded into the plan; the one critical gap (boot-sweep racing a live create) has a mandated fix (generation/nonce-keyed paths + test). Scope confirmed: full socket-push, one bundled PR.
+- **VERDICT:** ENG CLEARED → **implemented in PR #271**. Remaining before merge: live UC-96c (gVisor + `--host-uds=open`), security sign-off on gVisor UDS relaxation, operator docs (T11).
 
-NO UNRESOLVED DECISIONS
+**Open items (not unresolved design decisions):** T8 live run, T9 fuzz, T11 docs, T13 verify + security gate, optional benchmark assertion.
