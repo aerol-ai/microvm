@@ -406,6 +406,16 @@ type densityStats struct {
 	SafetyCapHit  bool   `json:"safety_cap_hit"` // hit AEROL_BENCH_MAX before any rejection
 }
 
+func mergeBenchReports(base, update benchReport) benchReport {
+	if update.Latency != nil {
+		base.Latency = update.Latency
+	}
+	if update.Density != nil {
+		base.Density = update.Density
+	}
+	return base
+}
+
 // writeBenchArtifact persists the report when AEROL_BENCH_OUT is set. Failure to
 // write is logged, never fatal: the t.Logf numbers are the source of record.
 func writeBenchArtifact(t *testing.T, rep benchReport) {
@@ -414,9 +424,22 @@ func writeBenchArtifact(t *testing.T, rep benchReport) {
 	if out == "" {
 		return
 	}
+	if raw, err := os.ReadFile(out); err == nil && strings.TrimSpace(string(raw)) != "" {
+		var existing benchReport
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			t.Logf("bench: read existing artifact %s: %v", out, err)
+		} else {
+			rep = mergeBenchReports(existing, rep)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Logf("bench: read existing artifact %s: %v", out, err)
+	}
+
 	rep.Scenario = sc.Name
 	rep.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	rep.Machine = loadMachineConfig(t)
+	if machine := loadMachineConfig(t); machine != nil {
+		rep.Machine = machine
+	}
 	blob, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		t.Logf("bench: marshal artifact: %v", err)
