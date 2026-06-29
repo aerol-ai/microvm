@@ -87,7 +87,7 @@ URL + PAT from TF state and forces `AEROL_BENCH=1`, so nothing to export:
 make integration-cluster-hetero keep         # provision, leave it up
 make integration-benchmark-only              # re-run just the bench against it
 
-# Narrow the UC-94 sweep — firecracker cold-boots are slow; skip them to finish:
+# Narrow the UC-94 sweep:
 AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
 # …or isolate one runtime:
 AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-only
@@ -98,15 +98,17 @@ make integration-destroy                     # tear the kept cluster down
 Percentiles + the density ceiling also print as `bench[...]` log lines (captured
 by `go test -json`); the `AEROL_BENCH_OUT` JSON adds the machine block.
 
-**WASM warm pool.** wasm scenarios boot with the warm-worker pool on
-(`wasm.pool.enabled`, depth `AEROL_WASM_POOL_DEPTH`, default `2`) so creates skip
-the cold module compile — CPython-on-wasm is ~10s cold on a t3. Depth is baked
-into **node boot env**, so a cluster brought up before this change shows cold
-numbers until re-provisioned. The bench's serial burst drains a shallow pool, so
-for an all-warm wasm reading keep `AEROL_BENCH_SAMPLES` ≤ depth (e.g.
-`AEROL_BENCH_RUNTIMES=wasm AEROL_BENCH_SAMPLES=2`). Raise the depth only on
-`cluster-hetero` (worker-z is bare metal) — `depth × standard-modules` warm
-workers won't fit on a t3.medium.
+**WASM warm pool.** wasm scenarios boot with the warm-worker pool on so creates
+skip the cold module compile — CPython-on-wasm is ~10s cold on a t3. Benchmark
+provisions default the pool depth to `AEROL_BENCH_SAMPLES` (or
+`AEROL_WASM_POOL_DEPTH` when explicitly set); non-benchmark wasm scenarios keep
+depth `2`. Depth is baked into **node boot env**, so a cluster brought up before
+this change shows cold numbers until re-provisioned.
+
+**Firecracker benchmark path.** UC-94 creates one Firecracker template before
+timing and measures sandbox clones with `template_id`, not plain OCI image cold
+boots. Override the template source with `AEROL_BENCH_FC_TEMPLATE_IMAGE` when
+you need a different base image.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
@@ -116,8 +118,9 @@ workers won't fit on a t3.medium.
 | `AEROL_BENCH_MAX` | `200` | safety cap on the density probe (UC-95) |
 | `AEROL_BENCH_OUT` | *(unset)* | path to write the JSON artifact; logs only if unset |
 | `AEROL_BENCH_TFVARS` | `../scenarios/<scenario>.tfvars` | override the machine-config source |
+| `AEROL_BENCH_FC_TEMPLATE_IMAGE` | `docker://alpine:3.20` | Firecracker template image used for UC-94 clone latency |
 | `AEROL_WASM_MODULE_REF` | *(unset)* | staged `.wasm` ref; wasm latency skips without it |
-| `AEROL_WASM_POOL_DEPTH` | `2` | warm wasm workers per module digest (provision-time; `0` when wasm off) |
+| `AEROL_WASM_POOL_DEPTH` | `AEROL_BENCH_SAMPLES` for benchmark provisions, otherwise `2` | warm wasm workers per module digest (provision-time; `0` when wasm off) |
 
 ## What runs where
 

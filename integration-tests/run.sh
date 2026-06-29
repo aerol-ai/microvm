@@ -173,6 +173,34 @@ is_stale_wasm_snapshot_ref() {
   [[ "$ref" == *"/cluster/"*"/snapshots"* || "$ref" == "cluster/"*"/snapshots"* ]]
 }
 
+print_bench_artifact_summary() {
+  local bench_out="$1"
+  [[ -f "$bench_out" ]] || return 0
+
+  echo "benchmark summary:" >&2
+  if ! jq -r '
+    if ((.latency // []) | length) > 0 then
+      "latency:",
+      (.latency[] |
+        "  \(.runtime): " +
+        "api p50=\(.api_p50_ms)ms p90=\(.api_p90_ms)ms p99=\(.api_p99_ms)ms | " +
+        "server p50=\(.server_p50_ms)ms p90=\(.server_p90_ms)ms p99=\(.server_p99_ms)ms | " +
+        "running p50=\(.run_p50_ms)ms p90=\(.run_p90_ms)ms p99=\(.run_p99_ms)ms | " +
+        "samples=\(.samples) failures=\(.failures)")
+    else
+      "latency: <missing>"
+    end,
+    if .density then
+      "density: created=\(.density.created) running=\(.density.running) stopped_on_cap=\(.density.stopped_on_cap) safety_cap_hit=\(.density.safety_cap_hit)" +
+      (if ((.density.stopped_reason // "") | length) > 0 then " reason=\(.density.stopped_reason)" else "" end)
+    else
+      "density: <missing>"
+    end
+  ' "$bench_out" >&2; then
+    echo "benchmark summary unavailable: could not parse ${bench_out}" >&2
+  fi
+}
+
 run_one() {
   local scenario="$1"
   local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
@@ -220,12 +248,20 @@ run_one() {
   # ref via AEROL_WASM_MODULE_REF; this just turns the runtime on).
   # When wasm runs we also turn on the warm-worker pool so creates skip the cold
   # module compile (CPython-on-wasm is ~10s cold on a t3). depth_default is per
-  # module digest; AEROL_WASM_POOL_DEPTH raises it to cover a benchmark's serial
-  # sample burst. Pool stays off (depth 0) when wasm is off.
+  # module digest. Benchmark provisions size the default to the serial sample
+  # count so `make integration-benchmark keep` measures warm creates without an
+  # extra operator override; non-benchmark wasm scenarios keep the shallow pool.
   local wasm_pool_enabled="false" wasm_pool_depth=0
   if [[ "$caps_wasm" == "true" ]]; then
+    local wasm_pool_default_depth=2
+    if [[ "${AEROL_BENCH:-}" == "1" ]]; then
+      local bench_samples="${AEROL_BENCH_SAMPLES:-10}"
+      if [[ "$bench_samples" =~ ^[0-9]+$ && "$bench_samples" -gt 0 ]]; then
+        wasm_pool_default_depth="$bench_samples"
+      fi
+    fi
     wasm_pool_enabled="true"
-    wasm_pool_depth="${AEROL_WASM_POOL_DEPTH:-2}"
+    wasm_pool_depth="${AEROL_WASM_POOL_DEPTH:-$wasm_pool_default_depth}"
   fi
   # Upstream auto-import (pulling private prod images through AOCR hooks) and
   # the fleet control plane are prod-only side effects we always neutralize.
@@ -432,6 +468,9 @@ run_one() {
 
   AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" \
     -json "$json_out" -out "${HERE}/reports"
+  if [[ "${AEROL_BENCH:-}" == "1" && -n "$bench_out" ]]; then
+    print_bench_artifact_summary "$bench_out"
+  fi
 }
 
 # collect_failure_logs dumps sandboxd + caddy journals/status from every node
@@ -592,6 +631,7 @@ run_bench_only() {
   fi
   if [[ -f "$bench_out" ]]; then
     echo "bench artifact: ${bench_out}" >&2
+    print_bench_artifact_summary "$bench_out"
   else
     echo "bench tests finished but artifact missing at ${bench_out}" >&2
     exit 2

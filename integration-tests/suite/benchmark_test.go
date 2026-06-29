@@ -47,8 +47,9 @@ var benchRuntimes = []struct {
 }
 
 type benchRuntimeSpec struct {
-	runtime string
-	wasmRef string
+	runtime    string
+	wasmRef    string
+	templateID string
 }
 
 // requireBenchEnabled is a second gate on top of the CapBenchmark capability.
@@ -118,10 +119,17 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 		Name:    harness.UniqueName(sc, t),
 		Runtime: spec.runtime,
 	}
-	if spec.runtime == "wasm" {
+	switch spec.runtime {
+	case "wasm":
 		opts.Image = spec.wasmRef
 		opts.ModuleRef = spec.wasmRef
-	} else {
+	case "firecracker":
+		if spec.templateID != "" {
+			opts.TemplateID = spec.templateID
+		} else {
+			opts.Image = harness.DefaultImage
+		}
+	default:
 		opts.Image = harness.DefaultImage
 	}
 	return opts
@@ -259,6 +267,40 @@ func warmBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRunt
 	}
 }
 
+func prepareBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) []benchRuntimeSpec {
+	t.Helper()
+	prepared := append([]benchRuntimeSpec(nil), runtimes...)
+	for i := range prepared {
+		if prepared[i].runtime == "firecracker" {
+			prepared[i].templateID = createBenchmarkFirecrackerTemplate(t, c)
+		}
+	}
+	return prepared
+}
+
+func createBenchmarkFirecrackerTemplate(t *testing.T, c *harness.Client) string {
+	t.Helper()
+	image := strings.TrimSpace(os.Getenv("AEROL_BENCH_FC_TEMPLATE_IMAGE"))
+	if image == "" {
+		image = "docker://" + harness.DefaultImage
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
+	tmpl, err := c.SDK().CreateTemplate(ctx, sdktypes.CreateTemplateOptions{Image: image})
+	cancel()
+	if err != nil {
+		t.Fatalf("bench[firecracker] create template: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().DeleteTemplate(cctx, tmpl.ID)
+	})
+	t.Logf("bench[firecracker] waiting for template %s (%s)", tmpl.ID, image)
+	waitTemplateReady(t, c, tmpl.ID)
+	t.Logf("bench[firecracker] template %s ready; measuring snapshot clones", tmpl.ID)
+	return tmpl.ID
+}
+
 // percentile returns the p-th percentile (0..100) of durs using nearest-rank.
 // durs must be non-empty; callers guarantee a sample exists before reporting.
 func percentile(durs []time.Duration, p float64) time.Duration {
@@ -306,6 +348,8 @@ type benchReport struct {
 	Latency   []latencyStats `json:"latency,omitempty"`
 	Density   *densityStats  `json:"density,omitempty"`
 }
+
+var benchArtifactMu sync.Mutex
 
 // machineConfig is the hardware the numbers were measured on, copied from the
 // scenario's tfvars so a result is self-describing — a create latency is
@@ -424,6 +468,8 @@ func writeBenchArtifact(t *testing.T, rep benchReport) {
 	if out == "" {
 		return
 	}
+	benchArtifactMu.Lock()
+	defer benchArtifactMu.Unlock()
 	if raw, err := os.ReadFile(out); err == nil && strings.TrimSpace(string(raw)) != "" {
 		var existing benchReport
 		if err := json.Unmarshal(raw, &existing); err != nil {
@@ -449,8 +495,24 @@ func writeBenchArtifact(t *testing.T, rep benchReport) {
 		t.Logf("bench: mkdir %s: %v", filepath.Dir(out), err)
 		return
 	}
-	if err := os.WriteFile(out, blob, 0o644); err != nil {
-		t.Logf("bench: write artifact %s: %v", out, err)
+	tmp, err := os.CreateTemp(filepath.Dir(out), ".bench-*.json")
+	if err != nil {
+		t.Logf("bench: create temp artifact %s: %v", out, err)
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(blob); err != nil {
+		_ = tmp.Close()
+		t.Logf("bench: write temp artifact %s: %v", tmpName, err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		t.Logf("bench: close temp artifact %s: %v", tmpName, err)
+		return
+	}
+	if err := os.Rename(tmpName, out); err != nil {
+		t.Logf("bench: publish artifact %s: %v", out, err)
 	}
 }
 
@@ -467,6 +529,7 @@ func TestBenchCreateLatency(t *testing.T) {
 		t.Skip("no benchmark runtimes selected")
 	}
 	waitBenchmarkReady(t, c, runtimes)
+	runtimes = prepareBenchmarkRuntimes(t, c, runtimes)
 	warmBenchmarkRuntimes(t, c, runtimes)
 
 	var report benchReport
