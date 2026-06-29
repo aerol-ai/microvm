@@ -10,6 +10,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -34,8 +35,22 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, h.deps.Service.Capacity())
 }
 
-func setCreateServerTiming(w http.ResponseWriter, start time.Time) {
-	w.Header().Set("Server-Timing", "create;dur="+strconv.FormatFloat(float64(time.Since(start).Microseconds())/1000, 'f', 1, 64))
+func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docker.CreateTiming) {
+	parts := []string{
+		"create;dur=" + strconv.FormatFloat(float64(time.Since(start).Microseconds())/1000, 'f', 1, 64),
+	}
+	if timing != nil {
+		if timing.RuntimeWaitMS > 0 || timing.Source != "" {
+			parts = append(parts, "runtime_wait;dur="+strconv.FormatFloat(timing.RuntimeWaitMS, 'f', 1, 64))
+		}
+		if timing.ToolboxWaitMS > 0 || timing.Source != "" {
+			parts = append(parts, "toolbox_wait;dur="+strconv.FormatFloat(timing.ToolboxWaitMS, 'f', 1, 64))
+		}
+		if timing.Source != "" {
+			parts = append(parts, "readiness;desc="+timing.Source)
+		}
+	}
+	w.Header().Set("Server-Timing", strings.Join(parts, ", "))
 }
 
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
@@ -49,8 +64,9 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	// the client<->cluster network round-trip. Set the header before
 	// WriteJSON/WriteError — response headers must land before the status line.
 	createStart := time.Now()
-	response, err := h.deps.Service.CreateSandbox(r.Context(), req)
-	setCreateServerTiming(w, createStart)
+	ctx, createTiming := docker.WithCreateTiming(r.Context())
+	response, err := h.deps.Service.CreateSandbox(ctx, req)
+	setCreateServerTiming(w, createStart, createTiming)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			apihttp.WriteError(w, http.StatusGatewayTimeout, "sandbox create exceeded timeout")

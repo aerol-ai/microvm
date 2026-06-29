@@ -244,6 +244,9 @@ var Registry = []UseCase{
 	// then tears them all down. Both reuse the hetero cluster substrate.
 	{ID: "UC-94", Title: "Benchmark: per-runtime sandbox create latency", Requires: []Capability{CapCluster, CapBenchmark}, Implemented: true},
 	{ID: "UC-95", Title: "Benchmark: fleet density to capacity rejection", Requires: []Capability{CapCluster, CapBenchmark}, Implemented: true},
+	{ID: "UC-96", Title: "Docker create readiness delivered via unix-socket push", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	{ID: "UC-96b", Title: "Docker socket push works for non-root container images", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	{ID: "UC-96c", Title: "Docker socket push works under gVisor runtime", Requires: []Capability{CapCluster, CapDocker, CapGvisor}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

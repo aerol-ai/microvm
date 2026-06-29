@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -123,6 +124,7 @@ func TestMainStartupBranchesWithStubs(t *testing.T) {
 	oldStartUserCommandFn := startUserCommandFn
 	oldForwardShutdownSignalsFn := forwardShutdownSignalsFn
 	oldServeHTTPFn := serveHTTPFn
+	oldNetListenFn := netListenFn
 	oldNewVsockServerFn := newVsockServerFn
 	t.Cleanup(func() {
 		os.Args = oldArgs
@@ -131,6 +133,7 @@ func TestMainStartupBranchesWithStubs(t *testing.T) {
 		startUserCommandFn = oldStartUserCommandFn
 		forwardShutdownSignalsFn = oldForwardShutdownSignalsFn
 		serveHTTPFn = oldServeHTTPFn
+		netListenFn = oldNetListenFn
 		newVsockServerFn = oldNewVsockServerFn
 	})
 
@@ -146,7 +149,10 @@ func TestMainStartupBranchesWithStubs(t *testing.T) {
 		}
 	}
 	forwardShutdownSignalsFn = func(*slog.Logger, *http.Server) {}
-	serveHTTPFn = func(*http.Server) error { return http.ErrServerClosed }
+	netListenFn = func(network, addr string) (net.Listener, error) {
+		return net.Listen(network, addr)
+	}
+	serveHTTPFn = func(*http.Server, net.Listener) error { return http.ErrServerClosed }
 	fakeVsock := &fakeVsockServer{served: make(chan struct{}), closed: make(chan struct{})}
 	newVsockServerFn = func(uint32, VsockHandler, *slog.Logger) (vsockServerAPI, error) {
 		return fakeVsock, nil

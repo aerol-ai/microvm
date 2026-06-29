@@ -106,3 +106,10 @@ func TestServerTimingTransportIgnoresNonCreate(t *testing.T) {
 		})
 	}
 }
+
+func TestParseServerTimingReadinessSource(t *testing.T) {
+	src, ok := parseServerTimingReadinessSource(`create;dur=1, readiness;desc=socket, runtime_wait;dur=2`)
+	if !ok || src != "socket" {
+		t.Fatalf("got (%q, %v)", src, ok)
+	}
+}

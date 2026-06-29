@@ -52,6 +52,11 @@ func (c *Client) LastServerCreateMS() (float64, bool) {
 	return c.timing.takeCreateMS()
 }
 
+// LastCreateReadinessSource returns readiness;desc= from the latest create.
+func (c *Client) LastCreateReadinessSource() (string, bool) {
+	return c.timing.takeCreateReadinessSource()
+}
+
 // SDK exposes the underlying client for use cases that need a method this
 // wrapper doesn't surface yet.
 func (c *Client) SDK() *microvm.Client { return c.sdk }
