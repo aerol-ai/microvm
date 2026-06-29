@@ -436,6 +436,12 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		binds = append(binds, readyListener.BindSpec())
 		envValues = append(envValues, readyListener.EnvVars()...)
 		sort.Strings(envValues)
+		// envValues was sized to len(req.Env)+3, so appending the two ready
+		// vars reallocates the backing array — the slice already stored under
+		// createRequest["Env"] still points at the pre-append array. Re-store
+		// the grown slice or toolboxd never sees SB_READY_SOCKET/NONCE and the
+		// push silently degrades to health-poll on every create.
+		createRequest["Env"] = envValues
 	}
 
 	for _, m := range hostMounts {
@@ -1127,14 +1133,18 @@ func (c *Client) waitForContainerRunning(ctx context.Context, containerRef strin
 
 func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, listener *ReadyListener) (string, error) {
 	if listener == nil {
-		err := c.pollToolboxHealth(ctx, containerIP)
-		if err != nil {
+		// Push disabled (non-cluster) — plain health poll. Deliberately do not
+		// touch readySocketFallbackHealth: there was no socket to fall back
+		// from, and counting disabled-path creates here would make the metric
+		// useless for spotting real socket losses (old toolbox image, gVisor
+		// without host-uds) in cluster mode.
+		if err := c.pollToolboxHealth(ctx, containerIP); err != nil {
 			return "", err
 		}
-		recordReadySocketFallback(0)
 		return "health", nil
 	}
 
+	start := time.Now()
 	raceCtx, cancel := context.WithTimeout(ctx, c.toolboxWaitTimeout)
 	defer cancel()
 
@@ -1180,7 +1190,7 @@ func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, li
 	if res.err != nil {
 		return "", res.err
 	}
-	waitMS := int64(0)
+	waitMS := time.Since(start).Milliseconds()
 	if res.source == "socket" {
 		recordReadySocketHit(waitMS)
 	} else {

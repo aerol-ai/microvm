@@ -335,16 +335,23 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Thread a CreateTiming recorder so the docker create path can attribute
+	// readiness (socket vs health) on this — the only path where the readiness
+	// socket runs, since the feature is gated on EnableCluster. The plain
+	// createSandbox handler does the same; without it the cluster create
+	// response carries only create;dur= and UC-96 attribution is lost.
+	createCtx, createTiming := docker.WithCreateTiming(r.Context())
+
 	var (
 		resp *models.CreateSandboxResponse
 		err  error
 	)
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
-		resp, err = h.deps.Service.CreateSandboxWithID(r.Context(), req, reservationID)
+		resp, err = h.deps.Service.CreateSandboxWithID(createCtx, req, reservationID)
 	} else {
 		service.RecordCreateReservationState("self_local")
-		resp, err = h.deps.Service.CreateSandbox(r.Context(), req)
+		resp, err = h.deps.Service.CreateSandbox(createCtx, req)
 	}
 	if err != nil {
 		// Local create failed — release the reservation so the leader's GC
@@ -358,7 +365,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 			}
 			rbCancel()
 		}
-		setCreateServerTiming(w, createStart, nil)
+		setCreateServerTiming(w, createStart, createTiming)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -388,7 +395,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 			}
 		}
 		rbCancel()
-		setCreateServerTiming(w, createStart, nil)
+		setCreateServerTiming(w, createStart, createTiming)
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: store secret ref: "+sealErr.Error())
 		return
 	}
@@ -419,16 +426,16 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		// this should only fire on the self-wins path (the reserve step
 		// already validated name uniqueness for the forward path).
 		if errors.Is(promoteErr, cluster.ErrNameConflict) {
-			setCreateServerTiming(w, createStart, nil)
+			setCreateServerTiming(w, createStart, createTiming)
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return
 		}
-		setCreateServerTiming(w, createStart, nil)
+		setCreateServerTiming(w, createStart, createTiming)
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: placement commit failed: "+promoteErr.Error())
 		return
 	}
 
-	setCreateServerTiming(w, createStart, nil)
+	setCreateServerTiming(w, createStart, createTiming)
 	apihttp.WriteJSON(w, http.StatusCreated, resp)
 }
 
