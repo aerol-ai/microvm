@@ -186,6 +186,26 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/toolboxd_${{ matrix.suffix }} ./cmd/toolboxd
           chmod 0755 dist/toolboxd_${{ matrix.suffix }}
 
+      - name: Build custom Caddy (Linux only)
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
+            "$(go env GOPATH)/bin/xcaddy" build \
+            --output dist/caddy_${{ matrix.suffix }} \
+            --with github.com/mholt/caddy-l4 \
+            --with github.com/caddy-dns/cloudflare \
+            --with github.com/ss098/certmagic-s3
+          chmod 0755 dist/caddy_${{ matrix.suffix }}
+          if [[ "${{ matrix.goarch }}" == "amd64" ]]; then
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'layer4'
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'layer4.handlers.proxy'
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'dns.providers.cloudflare'
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'caddy.storage.s3'
+          fi
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:

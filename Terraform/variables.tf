@@ -498,6 +498,12 @@ variable "install_script_url" {
   default     = "https://github.com/aerol-ai/microvm/releases/latest/download/install.sh"
 }
 
+variable "caddy_binary_url" {
+  description = "Optional URL of a prebuilt custom Caddy binary containing caddy-l4, caddy-dns/cloudflare, and certmagic-s3. When empty, install.sh uses the matching release asset if present and then falls back to Caddy's build service."
+  type        = string
+  default     = ""
+}
+
 variable "cluster_init_script_url" {
   description = "URL of cluster-init.sh."
   type        = string

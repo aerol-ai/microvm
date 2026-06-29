@@ -17,12 +17,22 @@ DNS_PROVIDER=""
 DNS_API_TOKEN=""
 ACME_EMAIL=""
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
+CADDY_BINARY_URL=""
+CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
 RUNSC_PATH=""
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 LOCAL_MODE="false"
 NODE_NAME=""
+
+# Bound every bootstrap download. Without low-speed and total timeouts, a dead
+# CDN/GitHub connection can sit at 0 bytes forever and leave cloud-init running
+# with no sandboxd.service installed.
+DOWNLOAD_CONNECT_TIMEOUT="${AEROL_DOWNLOAD_CONNECT_TIMEOUT:-20}"
+DOWNLOAD_MAX_TIME="${AEROL_DOWNLOAD_MAX_TIME:-300}"
+DOWNLOAD_LOW_SPEED_LIMIT="${AEROL_DOWNLOAD_LOW_SPEED_LIMIT:-1024}"
+DOWNLOAD_LOW_SPEED_TIME="${AEROL_DOWNLOAD_LOW_SPEED_TIME:-30}"
 
 # Shared Caddy cert storage (S3). All default empty / off; the feature is
 # off unless --caddy-storage-s3 is passed. When enabled, every node points
@@ -51,6 +61,11 @@ Options:
   --sandboxd-url <url>         Download URL for sandboxd binary
   --toolboxd-url <url>         Download URL for toolboxd binary
   --checksums-url <url>        Download URL for release checksums file
+  --caddy-binary-url <url>     Download URL for a prebuilt custom Caddy binary
+                               containing caddy-l4, caddy-dns/cloudflare, and
+                               certmagic-s3. Defaults to the matching GitHub
+                               release asset when available, then falls back to
+                               Caddy's build service.
   --install-prefix <dir>       Binary install directory (default: /usr/local/bin)
   --idle-timeout-min <minutes> Idle auto-stop timeout in minutes
   --build-from-source          Build binaries from the current checkout
@@ -207,10 +222,12 @@ resolve_release_urls() {
 		SANDBOXD_URL="${SANDBOXD_URL:-${release_base}/latest/download/sandboxd_${platform}}"
 		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/latest/download/toolboxd_${platform}}"
 		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/latest/download/checksums.txt}"
+		CADDY_BINARY_URL="${CADDY_BINARY_URL:-${release_base}/latest/download/caddy_${platform}}"
 	else
 		SANDBOXD_URL="${SANDBOXD_URL:-${release_base}/download/${VERSION}/sandboxd_${platform}}"
 		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/download/${VERSION}/toolboxd_${platform}}"
 		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
+		CADDY_BINARY_URL="${CADDY_BINARY_URL:-${release_base}/download/${VERSION}/caddy_${platform}}"
 	fi
 }
 
@@ -218,7 +235,22 @@ download_asset() {
 	local url="$1"
 	local output="$2"
 
-	curl -fL --retry 5 --retry-delay 2 --retry-connrefused "$url" -o "$output"
+	curl_download "$url" -o "$output"
+}
+
+curl_download() {
+	local url="$1"
+	shift
+
+	curl -fL \
+		--retry 5 \
+		--retry-delay 2 \
+		--retry-connrefused \
+		--connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" \
+		--max-time "$DOWNLOAD_MAX_TIME" \
+		--speed-limit "$DOWNLOAD_LOW_SPEED_LIMIT" \
+		--speed-time "$DOWNLOAD_LOW_SPEED_TIME" \
+		"$url" "$@"
 }
 
 verify_downloads() {
@@ -281,6 +313,11 @@ while [[ $# -gt 0 ]]; do
 		--checksums-url)
 			CHECKSUMS_URL="$2"
 			BUILD_FROM_SOURCE="false"
+			shift 2
+			;;
+		--caddy-binary-url)
+			CADDY_BINARY_URL="$2"
+			CADDY_BINARY_URL_EXPLICIT="true"
 			shift 2
 			;;
 		--install-prefix)
@@ -520,7 +557,7 @@ install_packages() {
 			if [[ -n "$arch_suffix" ]]; then
 				local tmp_deb
 				tmp_deb="$(mktemp --suffix=.deb)"
-				if curl -fsSL "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
+				if curl_download "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
 					apt-get install -y "$tmp_deb" || \
 						echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
 				else
@@ -532,8 +569,8 @@ install_packages() {
 		ensure_docker
 		if ! command -v caddy >/dev/null 2>&1; then
 			apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
-			curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-			curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+			curl_download 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+			curl_download 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o /etc/apt/sources.list.d/caddy-stable.list
 			apt-get update
 			apt-get install -y caddy
 		fi
@@ -546,6 +583,42 @@ install_packages() {
 	fi
 }
 
+verify_custom_caddy_binary() {
+	local tmp_binary="$1"
+	local source_label="$2"
+	shift 2
+	local required_modules=("$@")
+
+	if [[ ! -s "$tmp_binary" ]]; then
+		echo "${source_label} returned an empty binary" >&2
+		return 1
+	fi
+
+	if ! file "$tmp_binary" 2>/dev/null | grep -q ELF; then
+		echo "${source_label} did not return an ELF binary; first bytes:" >&2
+		head -c 200 "$tmp_binary" >&2 || true
+		echo "" >&2
+		return 1
+	fi
+
+	chmod +x "$tmp_binary"
+
+	# Verify every requested module is actually compiled in. Without this the
+	# Caddyfile / admin API calls we make later would fail at runtime with a
+	# cryptic "loading module 'X'" error long after install.sh exits.
+	local module
+	local present
+	present="$("$tmp_binary" list-modules 2>/dev/null || true)"
+	for module in "${required_modules[@]}"; do
+		if ! grep -q "^${module}\$" <<<"$present"; then
+			echo "${source_label} does not include required module: ${module}" >&2
+			echo "Modules present (filtered):" >&2
+			grep -E "^(layer4|dns\.providers|caddy\.storage)" <<<"$present" >&2 || true
+			return 1
+		fi
+	done
+}
+
 install_custom_caddy() {
 	# Replace the apt-installed Caddy binary with a custom build that includes
 	# every plugin AerolVM needs. caddy-l4 is always required so sandboxes can
@@ -553,8 +626,9 @@ install_custom_caddy() {
 	# layer4 admin API. caddy-dns/$DNS_PROVIDER is added when --dns-provider
 	# is set so DNS-01 wildcard TLS works.
 	#
-	# Caddy's official build server returns a single static binary with the
-	# requested modules baked in; no Go toolchain needed on the host.
+	# Prefer the pinned release artifact. The live Caddy build service is a
+	# fallback only; if it stalls at 0 bytes, bounded curl timeouts fail
+	# bootstrap cleanly instead of leaving cloud-init running forever.
 	local provider="${1:-}"
 	local arch_tag
 	local arch_extra=""
@@ -577,6 +651,34 @@ install_custom_caddy() {
 		caddy_path="/usr/bin/caddy"
 	fi
 
+	local required_modules=("layer4" "layer4.handlers.proxy")
+	if [[ -n "$provider" ]]; then
+		required_modules+=("dns.providers.${provider}")
+	fi
+	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+		# The ss098 module registers under caddy.storage.s3.
+		required_modules+=("caddy.storage.s3")
+	fi
+
+	local tmp_binary
+	if [[ -n "$CADDY_BINARY_URL" ]]; then
+		tmp_binary="$(mktemp)"
+		echo "Downloading prebuilt custom Caddy from ${CADDY_BINARY_URL}"
+		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary" \
+			&& verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
+			systemctl stop caddy >/dev/null 2>&1 || true
+			install -m 0755 "$tmp_binary" "$caddy_path"
+			rm -f "$tmp_binary"
+			return
+		fi
+		rm -f "$tmp_binary"
+		if [[ "$CADDY_BINARY_URL_EXPLICIT" == "true" ]]; then
+			echo "Failed to install custom Caddy from explicit --caddy-binary-url: ${CADDY_BINARY_URL}" >&2
+			exit 1
+		fi
+		echo "Prebuilt custom Caddy release asset unavailable; falling back to Caddy build service" >&2
+	fi
+
 	# Caddy build server accepts repeated &p= for additional modules.
 	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/mholt/caddy-l4"
 	if [[ -n "$provider" ]]; then
@@ -590,54 +692,18 @@ install_custom_caddy() {
 		download_url="${download_url}&p=github.com/ss098/certmagic-s3"
 	fi
 
-	local tmp_binary
 	tmp_binary="$(mktemp)"
 
-	if ! curl -fL --retry 5 --retry-delay 2 --retry-connrefused "$download_url" -o "$tmp_binary"; then
+	if ! curl_download "$download_url" -o "$tmp_binary"; then
 		rm -f "$tmp_binary"
 		echo "Failed to download custom Caddy build from ${download_url}" >&2
 		exit 1
 	fi
 
-	if [[ ! -s "$tmp_binary" ]]; then
-		rm -f "$tmp_binary"
-		echo "Caddy build server returned an empty binary" >&2
-		exit 1
-	fi
-
-	if ! file "$tmp_binary" 2>/dev/null | grep -q ELF; then
-		echo "Caddy build server did not return an ELF binary; first bytes:" >&2
-		head -c 200 "$tmp_binary" >&2 || true
-		echo "" >&2
+	if ! verify_custom_caddy_binary "$tmp_binary" "Caddy build server" "${required_modules[@]}"; then
 		rm -f "$tmp_binary"
 		exit 1
 	fi
-
-	chmod +x "$tmp_binary"
-
-	# Verify every requested module is actually compiled in. Without this the
-	# Caddyfile / admin API calls we make later would fail at runtime with a
-	# cryptic "loading module 'X'" error long after install.sh exits.
-	local required_modules=("layer4" "layer4.handlers.proxy")
-	if [[ -n "$provider" ]]; then
-		required_modules+=("dns.providers.${provider}")
-	fi
-	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
-		# The ss098 module registers under caddy.storage.s3.
-		required_modules+=("caddy.storage.s3")
-	fi
-	local module
-	local present
-	present="$("$tmp_binary" list-modules 2>/dev/null || true)"
-	for module in "${required_modules[@]}"; do
-		if ! grep -q "^${module}\$" <<<"$present"; then
-			echo "Downloaded Caddy does not include required module: ${module}" >&2
-			echo "Modules present (filtered):" >&2
-			grep -E "^(layer4|dns\.providers|caddy\.storage)" <<<"$present" >&2 || true
-			rm -f "$tmp_binary"
-			exit 1
-		fi
-	done
 
 	systemctl stop caddy >/dev/null 2>&1 || true
 	install -m 0755 "$tmp_binary" "$caddy_path"
@@ -989,14 +1055,14 @@ install_nvidia_gpu() {
 
 	local keyring="/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
 	if [[ ! -f "$keyring" ]]; then
-		curl -fsSL "https://nvidia.github.io/libnvidia-container/gpgkey" \
+		curl_download "https://nvidia.github.io/libnvidia-container/gpgkey" \
 			| gpg --dearmor -o "$keyring"
 	fi
 
 	# nvidia-container-toolkit.list uses plain https:// refs; rewrite to
 	# include the signed-by pointer so apt can verify the packages.
 	if [[ ! -f /etc/apt/sources.list.d/nvidia-container-toolkit.list ]]; then
-		curl -fsSL "https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list" \
+		curl_download "https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list" \
 			| sed "s#deb https://#deb [signed-by=${keyring}] https://#g" \
 			> /etc/apt/sources.list.d/nvidia-container-toolkit.list
 		apt-get update
@@ -1040,7 +1106,7 @@ install_amd_gpu() {
 	# documents and handles kernel module + ROCm library installation together.
 	local tmp_deb
 	tmp_deb="$(mktemp --suffix=.deb)"
-	if curl -fsSL \
+	if curl_download \
 		"https://repo.radeon.com/amdgpu-install/latest/ubuntu/${dist_codename}/amdgpu-install_latest_all.deb" \
 		-o "$tmp_deb" 2>/dev/null; then
 		apt-get install -y "$tmp_deb"
@@ -1052,7 +1118,7 @@ install_amd_gpu() {
 		rm -f "$tmp_deb"
 		echo "amdgpu-install package unavailable for '${dist_codename}'; falling back to direct ROCm apt repo" >&2
 		local keyring="/usr/share/keyrings/rocm-archive-keyring.gpg"
-		curl -fsSL "https://repo.radeon.com/rocm/rocm.gpg.key" | gpg --dearmor -o "$keyring"
+		curl_download "https://repo.radeon.com/rocm/rocm.gpg.key" | gpg --dearmor -o "$keyring"
 		echo "deb [arch=amd64 signed-by=${keyring}] https://repo.radeon.com/rocm/apt/latest ${dist_codename} main" \
 			> /etc/apt/sources.list.d/rocm.list
 		apt-get update
@@ -1091,11 +1157,11 @@ install_runsc_binary() {
 	trap "rm -rf '$tmp_dir'" RETURN
 
 	echo "Downloading runsc for ${arch} from ${base}"
-	if ! curl -fL --retry 5 --retry-delay 2 "${base}/runsc" -o "${tmp_dir}/runsc"; then
+	if ! curl_download "${base}/runsc" -o "${tmp_dir}/runsc"; then
 		echo "--with-gvisor: failed to download runsc from ${base}/runsc" >&2
 		exit 1
 	fi
-	if ! curl -fL --retry 5 --retry-delay 2 "${base}/runsc.sha512" -o "${tmp_dir}/runsc.sha512"; then
+	if ! curl_download "${base}/runsc.sha512" -o "${tmp_dir}/runsc.sha512"; then
 		echo "--with-gvisor: failed to download runsc.sha512 from ${base}/runsc.sha512" >&2
 		exit 1
 	fi
