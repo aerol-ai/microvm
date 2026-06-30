@@ -194,16 +194,24 @@ stage_wasm_modules() {
     return 1
   fi
 
-  # Resolve the per-node IP set: domain scenarios stage every node so a sandbox
-  # can be placed anywhere; IP/local scenarios have only the seed.
+  # Resolve the per-node IP set. Domain scenarios only stage worker-capable
+  # nodes: pure ingress/server roles do not own sandboxes, and restarting them
+  # for module staging can destabilize health/gossip during bootstrap.
   local ips=()
   if [[ "$caps_domain" == "true" ]]; then
     while IFS= read -r ip; do [[ -n "$ip" ]] && ips+=("$ip"); done \
-      < <(echo "$targets" | jq -r '.nodes[].public_ip')
+      < <(echo "$targets" | jq -r '
+        .nodes[]
+        | select(
+            ((.role // "mixed") | ascii_downcase | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $roles
+            | ($roles | any(. == "worker" or . == "mixed"))
+          )
+        | .public_ip
+      ')
   else
     ips+=("$(echo "$targets" | jq -r '.seed_ip')")
   fi
-  [[ "${#ips[@]}" -gt 0 ]] || { echo "stage_wasm: no node IPs in targets" >&2; return 1; }
+  [[ "${#ips[@]}" -gt 0 ]] || { echo "stage_wasm: no worker-capable node IPs in targets" >&2; return 1; }
 
   local n
   n=$(yq -r '.standard_modules | length' "${fxdir}/modules.yml")

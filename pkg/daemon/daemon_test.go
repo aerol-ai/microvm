@@ -157,6 +157,9 @@ func TestSupportedRuntimesForConfig(t *testing.T) {
 	}{
 		{name: "docker_only_default", cfg: config.Config{}, want: []string{models.RuntimeDocker}},
 		{name: "wasm_enabled_advertises_wasm", cfg: config.Config{EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeWasm}},
+		{name: "wasm_enabled_worker_advertises_wasm", cfg: config.Config{EnableWasm: true, NodeRole: config.NodeRoleWorker}, want: []string{models.RuntimeDocker, models.RuntimeWasm}},
+		{name: "wasm_enabled_ingress_does_not_advertise_wasm", cfg: config.Config{EnableWasm: true, NodeRole: config.NodeRoleIngress}, want: []string{models.RuntimeDocker}},
+		{name: "wasm_enabled_server_does_not_advertise_wasm", cfg: config.Config{EnableWasm: true, NodeRole: config.NodeRoleServer}, want: []string{models.RuntimeDocker}},
 		{name: "firecracker_enabled_advertises_fc", cfg: config.Config{EnableFirecracker: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
 		{name: "both_enabled", cfg: config.Config{EnableFirecracker: true, EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker, models.RuntimeWasm}},
 		{name: "explicit_host_runtimes_override", cfg: config.Config{HostSupportedRuntimes: []string{models.RuntimeGvisor}, EnableWasm: true}, want: []string{models.RuntimeGvisor, models.RuntimeWasm}},

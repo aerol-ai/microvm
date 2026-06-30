@@ -305,20 +305,14 @@ run_one() {
   # wasm.enabled follows the scenario's wasm capability so the wasm worker can
   # actually run modules (the wasm-runtime UCs still gate on a staged module
   # ref via AEROL_WASM_MODULE_REF; this just turns the runtime on).
-  # When wasm runs we also turn on the warm-worker pool so creates skip the cold
-  # module compile (CPython-on-wasm is ~10s cold on a t3). depth_default is per
-  # module digest. Benchmark provisions size the default to the serial sample
-  # count so `make integration-benchmark keep` measures warm creates without an
-  # extra operator override; non-benchmark wasm scenarios keep the shallow pool.
+  # When wasm runs we also turn on a shallow warm-worker pool so creates can
+  # skip cold module compile without overloading small cluster nodes. The depth
+  # is per module digest; raising it to the benchmark sample count multiplies
+  # across every staged language runtime and can prevent the cluster from
+  # reaching readiness. Operators can still override with AEROL_WASM_POOL_DEPTH.
   local wasm_pool_enabled="false" wasm_pool_depth=0
   if [[ "$caps_wasm" == "true" ]]; then
     local wasm_pool_default_depth=2
-    if [[ "${AEROL_BENCH:-}" == "1" ]]; then
-      local bench_samples="${AEROL_BENCH_SAMPLES:-10}"
-      if [[ "$bench_samples" =~ ^[0-9]+$ && "$bench_samples" -gt 0 ]]; then
-        wasm_pool_default_depth="$bench_samples"
-      fi
-    fi
     wasm_pool_enabled="true"
     wasm_pool_depth="${AEROL_WASM_POOL_DEPTH:-$wasm_pool_default_depth}"
   fi

@@ -389,6 +389,21 @@ func TestHealthReportsFirecrackerCapabilityDegraded(t *testing.T) {
 	}
 }
 
+func TestHealthSkipsWasmProbeOnNonWorkerRole(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.cfg.NodeRole = config.NodeRoleIngress
+
+	health, err := svc.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() error = %v", err)
+	}
+	if health.Status != "ok" || health.Wasm != "skipped on non-worker node" {
+		t.Fatalf("health = %+v, want ok with skipped wasm probe", health)
+	}
+}
+
 func TestStartSandboxReleasesAdmissionWhenMountLoadFails(t *testing.T) {
 	ctx := context.Background()
 	rt := &recordingRuntime{}

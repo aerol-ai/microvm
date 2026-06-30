@@ -787,9 +787,10 @@ func IngressCustomDomainHTTPRouteID(sandboxID, hostname string) string {
 // at those paths only, leaving any pre-existing wildcard policy and other
 // automation knobs untouched.
 //
-//   - PUT /config/apps/tls/automation/on_demand → rate limit + ask URL.
-//     Replacing the leaf on every boot makes config-driven changes to
-//     SB_TLS_ON_DEMAND_* take effect without a manual Caddy reload.
+//   - PUT /config/apps/tls/automation/on_demand → ask URL. Replacing the leaf on
+//     every boot makes handler URL changes take effect without a manual Caddy
+//     reload. The daemon-side ACME budget performs issuance throttling; the
+//     deployed Caddy schema rejects the older `rate_limit` field here.
 //   - POST /config/apps/tls/automation/policies (with a catch-all policy
 //     {on_demand: true, issuers: [acme]}) only when no on-demand policy is
 //     present yet. Discovered by checking pathExists on automation/policies
@@ -815,13 +816,7 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 		return errors.New("burst and interval must be > 0")
 	}
 
-	onDemand := map[string]any{
-		"rate_limit": map[string]any{
-			"interval": interval.String(),
-			"burst":    burst,
-		},
-		"ask": askURL,
-	}
+	onDemand := map[string]any{"ask": askURL}
 	onDemandBody, err := json.Marshal(onDemand)
 	if err != nil {
 		return fmt.Errorf("marshal on-demand block: %w", err)
