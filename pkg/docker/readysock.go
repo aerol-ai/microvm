@@ -29,7 +29,12 @@ const (
 	maxInvalidReadyAttempts = 16
 )
 
-var activeReadySockets sync.Map // path -> struct{}
+var (
+	activeReadySockets sync.Map // path -> struct{}
+	parkedReadySockets sync.Map // path -> net.Listener
+)
+
+const maxUnixSocketPathLen = 107 // sun_path includes trailing NUL on Linux.
 
 // validateReadySandboxID mirrors the daemon's sandbox ID charset because the
 // ID is embedded in a host filesystem path.
@@ -95,7 +100,10 @@ func NewReadyListener(dir, sandboxID, token, nonce string) (*ReadyListener, erro
 		return nil, fmt.Errorf("mkdir ready dir: %w", err)
 	}
 
-	hostPath := filepath.Join(dir, sandboxID+"."+nonce+".sock")
+	hostPath := readySocketHostPath(dir, sandboxID, nonce)
+	if len(hostPath) > maxUnixSocketPathLen {
+		return nil, fmt.Errorf("ready socket path exceeds %d bytes: %s", maxUnixSocketPathLen, hostPath)
+	}
 	if err := os.Remove(hostPath); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("unlink stale ready socket: %w", err)
 	}
@@ -210,10 +218,9 @@ func (l *ReadyListener) readAndVerify(conn net.Conn) error {
 	return nil
 }
 
-// Close shuts down the listener but deliberately leaves the socket file in
-// place. Docker persists bind mounts across stop/start, so the host-side bind
-// source must remain present for the container lifetime. Destroy removes the
-// sandbox-keyed socket after the container is gone.
+// Close shuts down the readiness accept loop. The kernel unlinks the socket
+// path when the listener fd closes; call ParkBindSource afterward when Docker
+// must keep bind-mounting the path across stop/start.
 func (l *ReadyListener) Close() error {
 	if l == nil {
 		return nil
@@ -234,6 +241,43 @@ func (l *ReadyListener) Close() error {
 		l.listener = nil
 	}
 	return err
+}
+
+// ParkBindSource re-listens on the host path so the bind-mount source inode
+// survives listener shutdown. Docker validates bind sources on container start.
+func (l *ReadyListener) ParkBindSource() error {
+	if l == nil || strings.TrimSpace(l.hostPath) == "" {
+		return nil
+	}
+	if _, loaded := parkedReadySockets.Load(l.hostPath); loaded {
+		return nil
+	}
+	if err := os.Remove(l.hostPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("unlink stale ready socket before park: %w", err)
+	}
+	ln, err := net.Listen("unix", l.hostPath)
+	if err != nil {
+		return fmt.Errorf("park ready socket: %w", err)
+	}
+	if err := os.Chmod(l.hostPath, 0o666); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(l.hostPath)
+		return fmt.Errorf("chmod parked ready socket: %w", err)
+	}
+	parkedReadySockets.Store(l.hostPath, ln)
+	return nil
+}
+
+func readySocketHostPath(dir, sandboxID, nonce string) string {
+	return filepath.Join(dir, sandboxID+"."+nonce+".sock")
+}
+
+func closeParkedReadySocket(path string) {
+	if v, ok := parkedReadySockets.LoadAndDelete(path); ok {
+		if ln, ok := v.(net.Listener); ok {
+			_ = ln.Close()
+		}
+	}
 }
 
 // EnsureReadyDir creates the sandboxd-owned ready-socket parent directory.
@@ -274,6 +318,9 @@ func SweepOrphanReadySocketsExcept(dir string, keep map[string]struct{}) error {
 		if _, active := activeReadySockets.Load(path); active {
 			continue
 		}
+		if _, parked := parkedReadySockets.Load(path); parked {
+			continue
+		}
 		if _, ok := keep[path]; ok {
 			continue
 		}
@@ -292,6 +339,7 @@ func RemoveReadySocketsForSandbox(dir, sandboxID string) {
 		if _, active := activeReadySockets.Load(path); active {
 			continue
 		}
+		closeParkedReadySocket(path)
 		_ = os.Remove(path)
 	}
 }

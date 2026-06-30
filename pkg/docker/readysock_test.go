@@ -97,7 +97,7 @@ func TestReadyListenerNeverConnectTimesOut(t *testing.T) {
 }
 
 func TestReadyListenerCloseLeavesBindSourceForDockerRestart(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortReadyTestDir(t)
 	ln, err := NewReadyListener(dir, "sb", "tok", "n1")
 	if err != nil {
 		t.Fatal(err)
@@ -106,8 +106,11 @@ func TestReadyListenerCloseLeavesBindSourceForDockerRestart(t *testing.T) {
 	if err := ln.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	if err := ln.ParkBindSource(); err != nil {
+		t.Fatalf("park: %v", err)
+	}
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("socket bind source missing after close: %v", err)
+		t.Fatalf("socket bind source missing after park: %v", err)
 	}
 	if err := ln.Close(); err != nil {
 		t.Fatalf("double close: %v", err)
@@ -116,6 +119,16 @@ func TestReadyListenerCloseLeavesBindSourceForDockerRestart(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("socket still present after sandbox cleanup: %v", err)
 	}
+}
+
+func shortReadyTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 func TestSweepOrphanReadySocketsSkipsActive(t *testing.T) {
