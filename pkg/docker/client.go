@@ -584,6 +584,9 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if readyListener != nil {
 		readyListenerClosed = true
 		_ = readyListener.Close()
+		if err := readyListener.ParkBindSource(); err != nil {
+			c.logger.Warn("park ready socket bind source failed", "sandbox_id", sandboxID, "error", err)
+		}
 		readyListener = nil
 	}
 

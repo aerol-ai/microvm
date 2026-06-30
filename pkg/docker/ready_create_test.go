@@ -40,9 +40,19 @@ func fakeCreateDaemon(t *testing.T) *fakeDaemon {
 	}
 }
 
+func shortReadyDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestCreate_WiresReadySocketWhenEnabled(t *testing.T) {
 	requireLinuxUnix(t)
-	readyDir := t.TempDir()
+	readyDir := shortReadyDir(t)
 	var captured map[string]any
 	d := fakeCreateDaemon(t)
 	base := d.transport()
@@ -96,7 +106,7 @@ func TestCreate_WiresReadySocketWhenEnabled(t *testing.T) {
 
 func TestCreate_RetainsReadySocketBindSourceForRestart(t *testing.T) {
 	requireLinuxUnix(t)
-	readyDir := t.TempDir()
+	readyDir := shortReadyDir(t)
 	d := fakeCreateDaemon(t)
 	c := newCreateClient(t, d, true, func(c *Client) {
 		c.readyEnabled = true
@@ -121,7 +131,7 @@ func TestCreate_RetainsReadySocketBindSourceForRestart(t *testing.T) {
 
 func TestCreate_RemovesReadySocketOnStartFailure(t *testing.T) {
 	requireLinuxUnix(t)
-	readyDir := t.TempDir()
+	readyDir := shortReadyDir(t)
 	d := fakeCreateDaemon(t)
 	d.start = func() *http.Response { return textResponse(http.StatusInternalServerError, "boom") }
 	c := newCreateClient(t, d, true, func(c *Client) {
