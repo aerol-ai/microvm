@@ -1203,7 +1203,7 @@ register_gvisor_runtime() {
 	mkdir -p /etc/docker
 	local daemon_json="/etc/docker/daemon.json"
 	local desired
-	desired="$(printf '{"runtimes":{"runsc":{"path":"%s","runtimeArgs":["--host-uds=open"]}}}' "$runsc_bin")"
+	desired="$(printf '{"runtimes":{"runsc":{"path":"%s"}}}' "$runsc_bin")"
 
 	# Merge our runtimes.runsc entry into any existing daemon.json instead of
 	# replacing the file. jq does this cleanly when present; a Python fallback
@@ -1211,7 +1211,7 @@ register_gvisor_runtime() {
 	local merged
 	if [[ -s "$daemon_json" ]]; then
 		if command -v jq >/dev/null 2>&1; then
-			merged="$(jq --arg path "$runsc_bin" '.runtimes = (.runtimes // {}) | .runtimes.runsc = {"path": $path, "runtimeArgs": ["--host-uds=open"]}' "$daemon_json")"
+			merged="$(jq --arg path "$runsc_bin" '.runtimes = (.runtimes // {}) | .runtimes.runsc = {"path": $path}' "$daemon_json")"
 		elif command -v python3 >/dev/null 2>&1; then
 			merged="$(RUNSC_PATH="$runsc_bin" python3 - <<'PY'
 import json, os, sys
@@ -1219,7 +1219,7 @@ path = "/etc/docker/daemon.json"
 with open(path) as f:
     cfg = json.load(f)
 cfg.setdefault("runtimes", {})
-cfg["runtimes"]["runsc"] = {"path": os.environ["RUNSC_PATH"], "runtimeArgs": ["--host-uds=open"]}
+cfg["runtimes"]["runsc"] = {"path": os.environ["RUNSC_PATH"]}
 print(json.dumps(cfg, indent=2))
 PY
 )"
