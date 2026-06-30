@@ -418,9 +418,14 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	var readyListener *ReadyListener
 	var readyListenerClosed bool
+	var readySocketCreated bool
+	var keepReadySocket bool
 	defer func() {
 		if readyListener != nil && !readyListenerClosed {
 			_ = readyListener.Close()
+		}
+		if readySocketCreated && !keepReadySocket {
+			RemoveReadySocketsForSandbox(c.readyDir, sandboxID)
 		}
 	}()
 
@@ -433,6 +438,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if err != nil {
 			return nil, fmt.Errorf("ready listener: %w", err)
 		}
+		readySocketCreated = true
 		binds = append(binds, readyListener.BindSpec())
 		envValues = append(envValues, readyListener.EnvVars()...)
 		sort.Strings(envValues)
@@ -613,6 +619,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	runtime.SandboxID = sandboxID
+	keepReadySocket = true
 	return runtime, nil
 }
 
@@ -646,6 +653,85 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return errors.New("sandbox container ID is not available")
 	}
 	return c.removeContainer(ctx, containerRef, true)
+}
+
+// SweepOrphanReadySockets removes ready sockets not referenced by existing
+// managed Docker containers. Docker persists bind mounts across stop/start, so
+// deleting a stopped container's ready-socket source would make docker start
+// fail before toolboxd can boot.
+func (c *Client) SweepOrphanReadySockets(ctx context.Context) error {
+	if strings.TrimSpace(c.readyDir) == "" {
+		return nil
+	}
+	keep, err := c.readySocketBindSources(ctx)
+	if err != nil {
+		return err
+	}
+	return SweepOrphanReadySocketsExcept(c.readyDir, keep)
+}
+
+func (c *Client) readySocketBindSources(ctx context.Context) (map[string]struct{}, error) {
+	query := queryValues(map[string]string{"all": "1"})
+	var containers []containerSummary
+	if err := c.doJSON(ctx, http.MethodGet, "/containers/json", query, nil, nil, &containers); err != nil {
+		return nil, fmt.Errorf("list managed containers for ready sockets: %w", err)
+	}
+	keep := map[string]struct{}{}
+	for _, summary := range containers {
+		if summary.Labels[managedLabelKey] != "true" {
+			continue
+		}
+		inspect, err := c.inspectContainer(ctx, summary.ID)
+		if err != nil {
+			return nil, fmt.Errorf("inspect managed container %s for ready sockets: %w", summary.ID, err)
+		}
+		for _, src := range readySocketBindSourcesFromInspect(inspect) {
+			if c.readySocketPathOwnedByDir(src) {
+				keep[src] = struct{}{}
+			}
+		}
+	}
+	return keep, nil
+}
+
+func (c *Client) readySocketPathOwnedByDir(path string) bool {
+	dir := filepath.Clean(strings.TrimSpace(c.readyDir))
+	path = filepath.Clean(strings.TrimSpace(path))
+	if dir == "." || path == "." {
+		return false
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != "" && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func readySocketBindSourcesFromInspect(inspect containerInspect) []string {
+	var out []string
+	for _, bind := range inspect.HostConfig.Binds {
+		if src, ok := readySocketSourceFromBind(bind); ok {
+			out = append(out, src)
+		}
+	}
+	for _, mount := range inspect.Mounts {
+		if mount.Destination == GuestReadySocketPath && strings.TrimSpace(mount.Source) != "" {
+			out = append(out, strings.TrimSpace(mount.Source))
+		}
+	}
+	return out
+}
+
+func readySocketSourceFromBind(bind string) (string, bool) {
+	parts := strings.Split(bind, ":")
+	if len(parts) < 2 || parts[1] != GuestReadySocketPath {
+		return "", false
+	}
+	src := strings.TrimSpace(parts[0])
+	if src == "" {
+		return "", false
+	}
+	return src, true
 }
 
 func (c *Client) CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error) {
@@ -1370,6 +1456,13 @@ type containerInspect struct {
 			IPAddress string `json:"IPAddress"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
+	HostConfig struct {
+		Binds []string `json:"Binds"`
+	} `json:"HostConfig"`
+	Mounts []struct {
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+	} `json:"Mounts"`
 }
 
 type containerSummary struct {

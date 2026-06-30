@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -123,5 +124,31 @@ func TestCreate_DisabledDoesNotRecordFallbackMetric(t *testing.T) {
 	}
 	if delta := readySocketFallbackHealth.Value() - before; delta != 0 {
 		t.Fatalf("fallback metric moved by %d on disabled path, want 0", delta)
+	}
+}
+
+func TestReadySocketBindSourcesFromInspect(t *testing.T) {
+	dir := t.TempDir()
+	fromBind := filepath.Join(dir, "sb-bind.n.sock")
+	fromMount := filepath.Join(dir, "sb-mount.n.sock")
+	var inspect containerInspect
+	inspect.HostConfig.Binds = []string{
+		fromBind + ":" + GuestReadySocketPath + ":rw",
+		filepath.Join(dir, "other.sock") + ":/tmp/other.sock:rw",
+	}
+	inspect.Mounts = append(inspect.Mounts, struct {
+		Source      string "json:\"Source\""
+		Destination string "json:\"Destination\""
+	}{Source: fromMount, Destination: GuestReadySocketPath})
+
+	got := readySocketBindSourcesFromInspect(inspect)
+	want := map[string]bool{fromBind: true, fromMount: true}
+	if len(got) != len(want) {
+		t.Fatalf("sources = %v, want %v", got, want)
+	}
+	for _, src := range got {
+		if !want[src] {
+			t.Fatalf("unexpected source %q in %v", src, got)
+		}
 	}
 }

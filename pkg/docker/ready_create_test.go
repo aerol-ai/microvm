@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -90,6 +91,53 @@ func TestCreate_WiresReadySocketWhenEnabled(t *testing.T) {
 	}
 	if !hasSocket || !hasNonce {
 		t.Fatalf("env missing ready vars: socket=%v nonce=%v env=%v", hasSocket, hasNonce, envs)
+	}
+}
+
+func TestCreate_RetainsReadySocketBindSourceForRestart(t *testing.T) {
+	requireLinuxUnix(t)
+	readyDir := t.TempDir()
+	d := fakeCreateDaemon(t)
+	c := newCreateClient(t, d, true, func(c *Client) {
+		c.readyEnabled = true
+		c.readyDir = readyDir
+	})
+
+	if _, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "img"}, "sb-restart", "tok", nil); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(readyDir, "sb-restart.*.sock"))
+	if err != nil {
+		t.Fatalf("glob ready socket: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("ready socket bind source count = %d, want 1 (%v)", len(matches), matches)
+	}
+	RemoveReadySocketsForSandbox(readyDir, "sb-restart")
+	if _, err := os.Stat(matches[0]); !os.IsNotExist(err) {
+		t.Fatalf("ready socket survived sandbox cleanup: %v", err)
+	}
+}
+
+func TestCreate_RemovesReadySocketOnStartFailure(t *testing.T) {
+	requireLinuxUnix(t)
+	readyDir := t.TempDir()
+	d := fakeCreateDaemon(t)
+	d.start = func() *http.Response { return textResponse(http.StatusInternalServerError, "boom") }
+	c := newCreateClient(t, d, true, func(c *Client) {
+		c.readyEnabled = true
+		c.readyDir = readyDir
+	})
+
+	if _, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "img"}, "sb-fail", "tok", nil); err == nil {
+		t.Fatal("create expected start failure")
+	}
+	matches, err := filepath.Glob(filepath.Join(readyDir, "sb-fail.*.sock"))
+	if err != nil {
+		t.Fatalf("glob ready socket: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("failed create leaked ready socket bind source: %v", matches)
 	}
 }
 
