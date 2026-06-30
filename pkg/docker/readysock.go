@@ -210,7 +210,10 @@ func (l *ReadyListener) readAndVerify(conn net.Conn) error {
 	return nil
 }
 
-// Close shuts down the listener and unlinks the socket file.
+// Close shuts down the listener but deliberately leaves the socket file in
+// place. Docker persists bind mounts across stop/start, so the host-side bind
+// source must remain present for the container lifetime. Destroy removes the
+// sandbox-keyed socket after the container is gone.
 func (l *ReadyListener) Close() error {
 	if l == nil {
 		return nil
@@ -230,13 +233,6 @@ func (l *ReadyListener) Close() error {
 		err = l.listener.Close()
 		l.listener = nil
 	}
-	if l.hostPath != "" {
-		if rmErr := os.Remove(l.hostPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			if err == nil {
-				err = rmErr
-			}
-		}
-	}
 	return err
 }
 
@@ -252,6 +248,13 @@ func EnsureReadyDir(dir string) error {
 // SweepOrphanReadySockets removes stale socket files from a prior crash.
 // Paths registered by live creates (activeReadySockets) are skipped.
 func SweepOrphanReadySockets(dir string) error {
+	return SweepOrphanReadySocketsExcept(dir, nil)
+}
+
+// SweepOrphanReadySocketsExcept removes stale socket files while preserving
+// paths still referenced by Docker bind mounts. A stopped container cannot
+// restart if its persisted bind source disappears.
+func SweepOrphanReadySocketsExcept(dir string, keep map[string]struct{}) error {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return nil
@@ -269,6 +272,9 @@ func SweepOrphanReadySockets(dir string) error {
 		}
 		path := filepath.Join(dir, ent.Name())
 		if _, active := activeReadySockets.Load(path); active {
+			continue
+		}
+		if _, ok := keep[path]; ok {
 			continue
 		}
 		_ = os.Remove(path)

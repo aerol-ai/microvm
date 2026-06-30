@@ -160,7 +160,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if err := docker.EnsureReadyDir(readyDir); err != nil {
 			return fmt.Errorf("ready socket dir: %w", err)
 		}
-		if err := docker.SweepOrphanReadySockets(readyDir); err != nil {
+		if err := dockerClient.SweepOrphanReadySockets(ctx); err != nil {
 			logger.Warn("ready socket sweep failed", "error", err)
 		}
 	}

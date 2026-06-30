@@ -33,6 +33,9 @@ DOWNLOAD_CONNECT_TIMEOUT="${AEROL_DOWNLOAD_CONNECT_TIMEOUT:-20}"
 DOWNLOAD_MAX_TIME="${AEROL_DOWNLOAD_MAX_TIME:-300}"
 DOWNLOAD_LOW_SPEED_LIMIT="${AEROL_DOWNLOAD_LOW_SPEED_LIMIT:-1024}"
 DOWNLOAD_LOW_SPEED_TIME="${AEROL_DOWNLOAD_LOW_SPEED_TIME:-30}"
+DOWNLOAD_RETRY="${AEROL_DOWNLOAD_RETRY:-60}"
+DOWNLOAD_RETRY_DELAY="${AEROL_DOWNLOAD_RETRY_DELAY:-5}"
+DOWNLOAD_RETRY_MAX_TIME="${AEROL_DOWNLOAD_RETRY_MAX_TIME:-900}"
 
 # Shared Caddy cert storage (S3). All default empty / off; the feature is
 # off unless --caddy-storage-s3 is passed. When enabled, every node points
@@ -243,8 +246,10 @@ curl_download() {
 	shift
 
 	curl -fL \
-		--retry 5 \
-		--retry-delay 2 \
+		--retry "$DOWNLOAD_RETRY" \
+		--retry-delay "$DOWNLOAD_RETRY_DELAY" \
+		--retry-all-errors \
+		--retry-max-time "$DOWNLOAD_RETRY_MAX_TIME" \
 		--retry-connrefused \
 		--connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" \
 		--max-time "$DOWNLOAD_MAX_TIME" \

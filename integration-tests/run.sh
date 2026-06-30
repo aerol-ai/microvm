@@ -201,6 +201,64 @@ print_bench_artifact_summary() {
   fi
 }
 
+tfvar_string_from_files() {
+  local name="$1"
+  shift
+  local file value=""
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    local found
+    found=$(sed -nE 's/^[[:space:]]*'"${name}"'[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$file" | tail -n 1)
+    if [[ -n "$found" ]]; then
+      value="$found"
+    fi
+  done
+  echo "$value"
+}
+
+wait_for_download_url() {
+  local url="$1" label="$2" timeout="${3:-900}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local code="000"
+
+  while (( $(date +%s) < deadline )); do
+    code=$(curl -sSL -o /dev/null -w '%{http_code}' \
+      --connect-timeout 10 \
+      --max-time 30 \
+      "$url" 2>/dev/null || true)
+    code="${code:-000}"
+    if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]; then
+      echo "bootstrap asset ready: ${label}"
+      return 0
+    fi
+    echo "waiting for bootstrap asset ${label} (${code})" >&2
+    sleep 10
+  done
+
+  echo "bootstrap asset ${label} not ready after ${timeout}s: ${url} (last HTTP ${code})" >&2
+  return 1
+}
+
+wait_for_bootstrap_assets() {
+  local tfvars_file="$1"
+  local timeout="${AEROL_BOOTSTRAP_ASSET_WAIT_TIMEOUT:-900}"
+  local default_base="https://github.com/aerol-ai/microvm/releases/latest/download"
+  local install_url cluster_init_url cluster_join_url
+
+  install_url=$(tfvar_string_from_files install_script_url "$PROD_TFVARS" "$tfvars_file")
+  cluster_init_url=$(tfvar_string_from_files cluster_init_script_url "$PROD_TFVARS" "$tfvars_file")
+  cluster_join_url=$(tfvar_string_from_files cluster_join_script_url "$PROD_TFVARS" "$tfvars_file")
+
+  install_url="${install_url:-${default_base}/install.sh}"
+  cluster_init_url="${cluster_init_url:-${default_base}/cluster-init.sh}"
+  cluster_join_url="${cluster_join_url:-${default_base}/cluster-join.sh}"
+
+  echo "=== checking bootstrap assets ==="
+  wait_for_download_url "$install_url" "install.sh" "$timeout"
+  wait_for_download_url "$cluster_init_url" "cluster-init.sh" "$timeout"
+  wait_for_download_url "$cluster_join_url" "cluster-join.sh" "$timeout"
+}
+
 run_one() {
   local scenario="$1"
   local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
@@ -238,6 +296,7 @@ run_one() {
 
   # SAFETY GATE — before any apply.
   bash "$PROVISION" check-safety "$state_key" "${leased:-none.itest.invalid}" "$prod_domain" "$cluster_name"
+  wait_for_bootstrap_assets "$tfvars_file"
 
   # Config overlay: start from prod config, neutralize prod-only side effects,
   # set the leased domain. Secrets are symlinked (never copied).

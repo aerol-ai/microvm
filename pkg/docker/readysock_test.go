@@ -96,7 +96,7 @@ func TestReadyListenerNeverConnectTimesOut(t *testing.T) {
 	}
 }
 
-func TestReadyListenerCloseUnlinks(t *testing.T) {
+func TestReadyListenerCloseLeavesBindSourceForDockerRestart(t *testing.T) {
 	dir := t.TempDir()
 	ln, err := NewReadyListener(dir, "sb", "tok", "n1")
 	if err != nil {
@@ -106,11 +106,15 @@ func TestReadyListenerCloseUnlinks(t *testing.T) {
 	if err := ln.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("socket still present after close: %v", err)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("socket bind source missing after close: %v", err)
 	}
 	if err := ln.Close(); err != nil {
 		t.Fatalf("double close: %v", err)
+	}
+	RemoveReadySocketsForSandbox(dir, "sb")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("socket still present after sandbox cleanup: %v", err)
 	}
 }
 
@@ -134,6 +138,27 @@ func TestSweepOrphanReadySocketsSkipsActive(t *testing.T) {
 	}
 	if _, err := os.Stat(ln.HostSocketPath()); err != nil {
 		t.Fatalf("active socket removed: %v", err)
+	}
+}
+
+func TestSweepOrphanReadySocketsPreservesDockerBindSources(t *testing.T) {
+	dir := t.TempDir()
+	kept := filepath.Join(dir, "sb-stopped.nonce.sock")
+	orphan := filepath.Join(dir, "sb-dead.old.sock")
+	for _, path := range []string{kept, orphan} {
+		if err := os.WriteFile(path, nil, 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := SweepOrphanReadySocketsExcept(dir, map[string]struct{}{kept: {}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Fatalf("docker bind source removed: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan not removed: %v", err)
 	}
 }
 
