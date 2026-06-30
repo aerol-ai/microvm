@@ -116,3 +116,57 @@ func TestEnsureLayer4ReadyDisabledCaddyLatchesImmediately(t *testing.T) {
 		t.Fatal("disabled caddy still latches ready (no work to redo)")
 	}
 }
+
+func TestRepairLayer4ReadyBypassesSuccessLatch(t *testing.T) {
+	var repairPosts atomic.Int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/config/apps/layer4", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected method %s on %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"servers":{}}`)
+	})
+	mux.HandleFunc("/config/apps/layer4/servers/tls-mux", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"listen":[":443"],"routes":[{"@id":"sandbox-abc-ingress-sni","match":[{"tls":{"sni":["abc.sandbox.example.com"]}}],"handle":[{"handler":"proxy","upstreams":[{"dial":["10.0.0.9:443"]}]}]}]}`)
+		case http.MethodPost:
+			repairPosts.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected method %s on %s", r.Method, r.URL.Path)
+		}
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	caddyClient := caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		EnableCaddy:       true,
+		HTTPClientTimeout: time.Second,
+		L4TLSListen:       ":443",
+		L4TLSFallback:     "127.0.0.1:8443",
+	})
+	svc := &Service{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy:  caddyClient,
+		cfg: config.Config{
+			L4TLSListen:   ":443",
+			L4TLSFallback: "127.0.0.1:8443",
+		},
+	}
+	svc.l4Ready.Store(true)
+
+	if err := svc.RepairLayer4Ready(context.Background()); err != nil {
+		t.Fatalf("RepairLayer4Ready: %v", err)
+	}
+	if got := repairPosts.Load(); got != 1 {
+		t.Fatalf("repair posts = %d, want 1", got)
+	}
+	if !svc.l4Ready.Load() {
+		t.Fatal("repair should keep the ready latch true after success")
+	}
+}

@@ -778,6 +778,42 @@ func TestL4Cases(t *testing.T) {
 			},
 		},
 		{
+			name: "ensure_layer4_repairs_existing_tls_mux_without_fallback",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				fake.l4Servers[tlsMuxServerID] = map[string]any{
+					"listen": []any{":443"},
+					"routes": []any{
+						map[string]any{
+							"@id": "sandbox-abc-port-443-tls",
+							"match": []any{map[string]any{
+								"tls": map[string]any{"sni": []any{"abc-443.sandbox.example.com"}},
+							}},
+							"handle": []any{map[string]any{
+								"handler":   "proxy",
+								"upstreams": []any{map[string]any{"dial": []any{"10.0.0.9:443"}}},
+							}},
+						},
+					},
+				}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureLayer4(context.Background(), ":443", "127.0.0.1:8443"); err != nil {
+					t.Fatalf("EnsureLayer4() error = %v", err)
+				}
+				server := fake.l4Servers[tlsMuxServerID]
+				routes, _ := server["routes"].([]any)
+				if len(routes) != 2 {
+					t.Fatalf("routes len = %d, want 2: %#v", len(routes), routes)
+				}
+				first := firstL4Route(t, server)
+				assertRouteField(t, first, "@id", "sandbox-abc-port-443-tls")
+				last := lastL4Route(t, server)
+				assertRouteField(t, last, "@id", tlsFallbackRouteID)
+				assertL4Dial(t, last, "127.0.0.1:8443")
+			},
+		},
+		{
 			name: "ensure_layer4_rejects_listen_without_fallback",
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
@@ -1356,6 +1392,19 @@ func firstL4Route(t *testing.T, server map[string]any) map[string]any {
 	route, _ := routes[0].(map[string]any)
 	if route == nil {
 		t.Fatalf("first route not an object: %#v", routes[0])
+	}
+	return route
+}
+
+func lastL4Route(t *testing.T, server map[string]any) map[string]any {
+	t.Helper()
+	routes, ok := server["routes"].([]any)
+	if !ok || len(routes) == 0 {
+		t.Fatalf("server has no routes: %#v", server)
+	}
+	route, _ := routes[len(routes)-1].(map[string]any)
+	if route == nil {
+		t.Fatalf("last route not an object: %#v", routes[len(routes)-1])
 	}
 	return route
 }
