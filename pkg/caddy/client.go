@@ -946,41 +946,100 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string
 		return nil
 	}
 	muxPath := fmt.Sprintf("/config/apps/layer4/servers/%s", tlsMuxServerID)
-	exists, err = c.pathExists(ctx, muxPath)
+	server, exists, err := c.getConfigMap(ctx, muxPath)
 	if err != nil {
 		return err
 	}
-	if exists {
-		return nil
+	needsPut := true
+	if !exists {
+		server = newTLSMuxServer(tlsListen, tlsFallback)
+	} else {
+		server, needsPut = ensureTLSMuxFallback(server, tlsListen, tlsFallback)
 	}
-	// The fallback route has no match clause and sits at the END of the
-	// routes array; per-sandbox SNI routes inserted via UpsertTLSSNIRoute go
-	// to routes/0, so they always win over the fallback. Only connections
-	// whose SNI doesn't match any sandbox subdomain hit the proxy below.
-	server := map[string]any{
-		"listen": []string{tlsListen},
-		"routes": []any{
-			map[string]any{
-				"@id": tlsFallbackRouteID,
-				"handle": []map[string]any{{
-					"handler":   "proxy",
-					"upstreams": []map[string]any{{"dial": []string{tlsFallback}}},
-				}},
-			},
-		},
+	if !needsPut {
+		return nil
 	}
 	body, err := json.Marshal(server)
 	if err != nil {
 		return fmt.Errorf("marshal tls mux server: %w", err)
 	}
-	status, err := c.sendJSON(ctx, http.MethodPut, c.baseURL+muxPath, body)
+	method := http.MethodPut
+	action := "create"
+	if exists {
+		method = http.MethodPost
+		action = "update"
+	}
+	status, err := c.sendJSON(ctx, method, c.baseURL+muxPath, body)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("create tls mux server failed: %d", status)
+		return fmt.Errorf("%s tls mux server failed: %d", action, status)
 	}
 	return nil
+}
+
+func newTLSMuxServer(tlsListen, tlsFallback string) map[string]any {
+	return map[string]any{
+		"listen": []string{tlsListen},
+		"routes": []any{tlsMuxFallbackRoute(tlsFallback)},
+	}
+}
+
+func ensureTLSMuxFallback(server map[string]any, tlsListen, tlsFallback string) (map[string]any, bool) {
+	before, _ := json.Marshal(server)
+
+	server["listen"] = []string{tlsListen}
+	routes := l4RouteSlice(server["routes"])
+	filtered := make([]any, 0, len(routes)+1)
+	for _, route := range routes {
+		routeMap, _ := route.(map[string]any)
+		if routeMap != nil && isTLSMuxFallbackRoute(routeMap) {
+			continue
+		}
+		filtered = append(filtered, route)
+	}
+	// The fallback route has no match clause and sits at the END of the
+	// routes array; per-sandbox SNI routes inserted via UpsertTLSSNIRoute go
+	// to routes/0, so they always win over the fallback. Only connections
+	// whose SNI doesn't match any sandbox subdomain hit the proxy below.
+	server["routes"] = append(filtered, tlsMuxFallbackRoute(tlsFallback))
+
+	after, _ := json.Marshal(server)
+	return server, !bytes.Equal(before, after)
+}
+
+func l4RouteSlice(v any) []any {
+	switch routes := v.(type) {
+	case []any:
+		return routes
+	case []map[string]any:
+		out := make([]any, 0, len(routes))
+		for _, route := range routes {
+			out = append(out, route)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func isTLSMuxFallbackRoute(route map[string]any) bool {
+	if id, _ := route["@id"].(string); id == tlsFallbackRouteID {
+		return true
+	}
+	_, hasMatch := route["match"]
+	return !hasMatch
+}
+
+func tlsMuxFallbackRoute(tlsFallback string) map[string]any {
+	return map[string]any{
+		"@id": tlsFallbackRouteID,
+		"handle": []map[string]any{{
+			"handler":   "proxy",
+			"upstreams": []map[string]any{{"dial": []string{tlsFallback}}},
+		}},
+	}
 }
 
 // UpsertTCPRoute creates (or replaces) the layer4 server bound to hostPort.
@@ -1406,4 +1465,34 @@ func (c *Client) pathExists(ctx context.Context, path string) (bool, error) {
 		return false, fmt.Errorf("read %s body: %w", path, err)
 	}
 	return strings.TrimSpace(string(body)) != "null", nil
+}
+
+func (c *Client) getConfigMap(ctx context.Context, path string) (map[string]any, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("get %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if resp.StatusCode >= 400 {
+		return nil, false, fmt.Errorf("get %s failed: %d", path, resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false, fmt.Errorf("read %s body: %w", path, err)
+	}
+	if strings.TrimSpace(string(body)) == "null" {
+		return nil, false, nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, false, fmt.Errorf("decode %s: %w", path, err)
+	}
+	return out, out != nil, nil
 }

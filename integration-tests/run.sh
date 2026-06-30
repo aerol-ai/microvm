@@ -106,12 +106,15 @@ teardown() {
   fi
   echo "teardown: destroying ${scenario}"
   # shellcheck disable=SC2046
-  TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
+  if TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
     terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
-    -var="force_on_demand=$(on_demand_tfvar)" || \
+    -var="force_on_demand=$(on_demand_tfvar)"; then
+    rm -f "${REPO_ROOT}/integration-tests/.tf/${scenario}/.leased-domain"
+  else
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
+  fi
 }
 
 if [[ "$DESTROY_ONLY" == "1" ]]; then
@@ -121,15 +124,12 @@ if [[ "$DESTROY_ONLY" == "1" ]]; then
   exit 0
 fi
 
-# lease_domain picks a RANDOM test domain from the pool, never repeating the
-# previous run's pick. Reusing one name re-requests the same cert set and trips
-# Let's Encrypt's duplicate-certificate limit (5 identical sets/week); random
-# selection spreads runs across the pool so each gets a fresh quota, and the
-# "exclude last" rule guarantees we never hit the same FQDN twice in a row (the
-# one case that actually accumulates against the duplicate limit). The persisted
-# lease file under .tf/ (gitignored) only remembers the last index for that
-# exclusion. With a single-domain pool there's nothing to rotate to, so it
-# degrades to always returning that one.
+# lease_domain picks a RANDOM test domain from the pool for fresh runs, never
+# repeating the previous fresh pick. Reusing one name re-requests the same cert
+# set and trips Let's Encrypt's duplicate-certificate limit (5 identical
+# sets/week); random selection spreads fresh infra across the pool. Kept runs
+# must not rotate, though: changing the domain of an existing cluster rewrites
+# DNS, Caddy, and bootstrap user-data and can leave the kept state half-mutated.
 lease_domain() {
   local n last idx
   local lease_file="${REPO_ROOT}/integration-tests/.tf/.domain-lease"
@@ -147,6 +147,65 @@ lease_domain() {
   mkdir -p "$(dirname "$lease_file")"
   echo "$idx" > "$lease_file"
   yq -r ".itest.domains[$idx]" "$DOMAINS_FILE"
+}
+
+terraform_state_domain() {
+  local scenario="$1" sdir domain
+  sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  [[ -d "$sdir" ]] || return 1
+  domain=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+    output -json integration_targets 2>/dev/null | jq -r '.domain // empty' 2>/dev/null) || return 1
+  [[ -n "$domain" && "$domain" != "null" ]] || return 1
+  echo "$domain"
+}
+
+scenario_overlay_domain() {
+  local scenario="$1" file domain
+  file="${REPO_ROOT}/integration-tests/.tf/${scenario}/config/cluster.yml"
+  [[ -f "$file" ]] || return 1
+  domain=$(yq -r '.ingress.domain_name // ""' "$file" 2>/dev/null) || return 1
+  [[ -n "$domain" && "$domain" != "null" ]] || return 1
+  echo "$domain"
+}
+
+lease_domain_for_scenario() {
+  local scenario="$1" sdir pin domain state_domain overlay_domain
+  sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  pin="${sdir}/.leased-domain"
+
+  if [[ "$KEEP" == "1" ]]; then
+    if [[ -s "$pin" ]]; then
+      domain=$(tr -d '[:space:]' < "$pin")
+      if [[ -n "$domain" ]]; then
+        echo "$domain"
+        return 0
+      fi
+    fi
+    state_domain=$(terraform_state_domain "$scenario" || true)
+    overlay_domain=$(scenario_overlay_domain "$scenario" || true)
+    if [[ -n "$state_domain" && -n "$overlay_domain" && "$state_domain" != "$overlay_domain" ]]; then
+      echo "scenario ${scenario}: kept domain mismatch: terraform output=${state_domain}, generated config=${overlay_domain}" >&2
+      echo "scenario ${scenario}: previous --keep apply likely stopped mid-domain rotation; refusing to pick one automatically" >&2
+      return 1
+    fi
+    if [[ -n "$state_domain" ]]; then
+      mkdir -p "$sdir"
+      printf '%s\n' "$state_domain" > "$pin"
+      echo "$state_domain"
+      return 0
+    fi
+    if [[ -n "$overlay_domain" ]]; then
+      mkdir -p "$sdir"
+      printf '%s\n' "$overlay_domain" > "$pin"
+      echo "$overlay_domain"
+      return 0
+    fi
+  fi
+
+  domain=$(lease_domain)
+  mkdir -p "$sdir"
+  printf '%s\n' "$domain" > "$pin"
+  echo "$domain"
 }
 
 # allow_disruptive_for decides AEROL_ALLOW_DISRUPTIVE for the suite. cluster-hetero
@@ -289,7 +348,7 @@ run_one() {
   caps_cluster=$(yq -r '.capabilities | contains(["cluster"])' "$caps_file")
   caps_platform_volumes=$(yq -r '.capabilities | contains(["platform-volumes"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
-    leased=$(lease_domain)
+    leased=$(lease_domain_for_scenario "$scenario")
   else
     leased="" # local-mode: no domain
   fi
@@ -448,6 +507,9 @@ run_one() {
   # AEROL_EXPECTED_MEMBERS so the cluster UCs assert an exact node count.
   local expected_members
   expected_members=$(yq -r '.expected_members // ""' "$caps_file")
+  if [[ "$inconclusive" != "1" && "$caps_cluster" == "true" && -n "$expected_members" ]]; then
+    wait_for_members "$base_url" "$pat" "$expected_members" || inconclusive=1
+  fi
 
   # For wasm-capable scenarios the runtime UC references a staged standard
   # module by alias; default to python (override by exporting the env var).
@@ -662,6 +724,9 @@ run_bench_only() {
   if ! wait_for_health "$base_url" "$pat"; then
     echo "scenario ${scenario}: API not healthy at ${base_url}" >&2
     exit 2
+  fi
+  if [[ -n "$expected_members" ]]; then
+    wait_for_members "$base_url" "$pat" "$expected_members" || exit 2
   fi
 
   set +e

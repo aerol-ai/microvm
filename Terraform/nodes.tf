@@ -372,8 +372,12 @@ resource "aws_instance" "joiner" {
     each.value.tags,
   )
 
+  # Joiners bootstrap against the seed private IP. If the seed is replaced, the
+  # joiners need a planned replacement too instead of a provider-discovered
+  # user_data replacement during apply.
   lifecycle {
-    ignore_changes = [ami]
+    ignore_changes       = [ami]
+    replace_triggered_by = [aws_instance.seed]
   }
 }
 

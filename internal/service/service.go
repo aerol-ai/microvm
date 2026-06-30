@@ -2534,12 +2534,20 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 // expose call instead of surfacing as a confusing "layer4 app missing"
 // error from caddy.
 func (s *Service) EnsureLayer4Ready(ctx context.Context) error {
-	if s.l4Ready.Load() {
+	return s.ensureLayer4Ready(ctx, false)
+}
+
+func (s *Service) RepairLayer4Ready(ctx context.Context) error {
+	return s.ensureLayer4Ready(ctx, true)
+}
+
+func (s *Service) ensureLayer4Ready(ctx context.Context, force bool) error {
+	if !force && s.l4Ready.Load() {
 		return nil
 	}
 	s.l4Mu.Lock()
 	defer s.l4Mu.Unlock()
-	if s.l4Ready.Load() {
+	if !force && s.l4Ready.Load() {
 		return nil
 	}
 	if err := s.caddy.EnsureLayer4(ctx, s.cfg.L4TLSListen, s.cfg.L4TLSFallback); err != nil {
@@ -4502,7 +4510,7 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	var firstErr error
 	desired, needL4 := s.buildClusterIngressIntents(placements, self)
 	if needL4 {
-		if err := s.EnsureLayer4Ready(ctx); err != nil {
+		if err := s.RepairLayer4Ready(ctx); err != nil {
 			return err
 		}
 	}

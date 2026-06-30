@@ -48,6 +48,7 @@ var benchRuntimes = []struct {
 
 type benchRuntimeSpec struct {
 	runtime    string
+	image      string
 	wasmRef    string
 	templateID string
 }
@@ -124,10 +125,12 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 		opts.Image = spec.wasmRef
 		opts.ModuleRef = spec.wasmRef
 	case "firecracker":
+		opts.Image = spec.image
+		if opts.Image == "" {
+			opts.Image = harness.DefaultImage
+		}
 		if spec.templateID != "" {
 			opts.TemplateID = spec.templateID
-		} else {
-			opts.Image = harness.DefaultImage
 		}
 	default:
 		opts.Image = harness.DefaultImage
@@ -272,17 +275,23 @@ func prepareBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchR
 	prepared := append([]benchRuntimeSpec(nil), runtimes...)
 	for i := range prepared {
 		if prepared[i].runtime == "firecracker" {
-			prepared[i].templateID = createBenchmarkFirecrackerTemplate(t, c)
+			templateID, image := createBenchmarkFirecrackerTemplate(t, c)
+			prepared[i].templateID = templateID
+			prepared[i].image = image
 		}
 	}
 	return prepared
 }
 
-func createBenchmarkFirecrackerTemplate(t *testing.T, c *harness.Client) string {
+func createBenchmarkFirecrackerTemplate(t *testing.T, c *harness.Client) (string, string) {
 	t.Helper()
 	image := strings.TrimSpace(os.Getenv("AEROL_BENCH_FC_TEMPLATE_IMAGE"))
 	if image == "" {
 		image = "docker://" + harness.DefaultImage
+	}
+	createImage := strings.TrimPrefix(image, "docker://")
+	if createImage == "" {
+		createImage = harness.DefaultImage
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
 	tmpl, err := c.SDK().CreateTemplate(ctx, sdktypes.CreateTemplateOptions{Image: image})
@@ -298,7 +307,7 @@ func createBenchmarkFirecrackerTemplate(t *testing.T, c *harness.Client) string 
 	t.Logf("bench[firecracker] waiting for template %s (%s)", tmpl.ID, image)
 	waitTemplateReady(t, c, tmpl.ID)
 	t.Logf("bench[firecracker] template %s ready; measuring snapshot clones", tmpl.ID)
-	return tmpl.ID
+	return tmpl.ID, createImage
 }
 
 // percentile returns the p-th percentile (0..100) of durs using nearest-rank.

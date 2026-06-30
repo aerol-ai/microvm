@@ -157,8 +157,9 @@ func TestRunIngressOpsAt10KCompletesAll(t *testing.T) {
 // small artificial delay forces concurrent ops to actually overlap so the
 // runIngressOps concurrency cap is observable instead of vacuously true on
 // a fast loopback. The handler accepts whatever shape the reconciler sends
-// (PATCH /id/*, DELETE /id/*, PUT /config/.../routes/0, PUT/DELETE
-// /config/apps/layer4/servers/*) so a real caddy.Client can drive it.
+// (PATCH /id/*, DELETE /id/*, PUT /config/.../routes/0, the L4 app probe,
+// and PUT/DELETE /config/apps/layer4/servers/*) so a real caddy.Client can
+// drive it.
 type countingCaddyFake struct {
 	mu              sync.Mutex
 	totalCalls      int64
@@ -201,6 +202,9 @@ func (f *countingCaddyFake) handler() http.Handler {
 			// empty config has none.
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"apps":{"http":{"servers":{"srv0":{"routes":[]}}},"layer4":{"servers":{"tls-mux":{"listen":[":443"],"routes":[]}}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/layer4":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"servers":{}}`))
 		case r.Method == http.MethodPatch && len(r.URL.Path) > len("/id/") && r.URL.Path[:4] == "/id/":
 			id := r.URL.Path[4:]
 			f.mu.Lock()
@@ -286,12 +290,6 @@ func TestReconcileClusterIngressFailoverStormBoundedBurst(t *testing.T) {
 		store:  st,
 		caddy:  caddyClient,
 	}
-	// Skip the caddy-l4 bootstrap path — this test exercises the per-tick
-	// ingress write loop, not the L4 app handshake (covered in
-	// layer4_bootstrap_test.go). Without this the first reconcile would
-	// 400 on GET /config/apps/layer4 which our minimal fake doesn't model.
-	svc.l4Ready.Store(true)
-
 	// Healthy: 50 placements owned by node-A; we're "self" (router/peer).
 	// Each carries one HTTP port and one TCP port, matching makeScalePlacements
 	// shape so the per-port ingress branches all get exercised.

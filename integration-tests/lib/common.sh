@@ -306,16 +306,18 @@ wait_for_tls() {
 wait_for_members() {
   local base="$1" pat="$2" expected="$3" timeout="${4:-300}"
   local deadline=$(( $(date +%s) + timeout ))
+  local last=0
   while (( $(date +%s) < deadline )); do
     local n
-    n=$(curl -s -H "Authorization: Bearer ${pat}" "${base}/v1/cluster/members" \
-      | jq 'length' 2>/dev/null || echo 0)
+    n=$(curl -sS --max-time 10 -H "Authorization: Bearer ${pat}" "${base}/v1/cluster/members" 2>/dev/null \
+      | jq -r 'if type == "array" then length else (.members // [] | length) end' 2>/dev/null || echo 0)
+    last="$n"
     if [[ "$n" == "$expected" ]]; then
       echo "cluster: ${n} members"
       return 0
     fi
     sleep 5
   done
-  echo "cluster: expected ${expected} members, never reached" >&2
+  echo "cluster: expected ${expected} members, never reached (last ${last})" >&2
   return 1
 }
