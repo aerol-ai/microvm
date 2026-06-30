@@ -3212,14 +3212,18 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 
 	wasmStatus := "disabled"
 	if s.cfg.EnableWasm {
-		switch rt := s.wasm.(type) {
-		case nil:
-			wasmStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeWasm)
-		default:
-			if err := rt.Ping(ctx); err != nil {
-				wasmStatus = err.Error()
-			} else {
-				wasmStatus = "ok"
+		if !s.cfg.IsWorker() {
+			wasmStatus = "skipped on non-worker node"
+		} else {
+			switch rt := s.wasm.(type) {
+			case nil:
+				wasmStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeWasm)
+			default:
+				if err := rt.Ping(ctx); err != nil {
+					wasmStatus = err.Error()
+				} else {
+					wasmStatus = "ok"
+				}
 			}
 		}
 	}
@@ -3231,7 +3235,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	if s.cfg.EnableFirecracker && firecrackerStatus != "ok" {
 		status = "degraded"
 	}
-	if s.cfg.EnableWasm && wasmStatus != "ok" {
+	if s.cfg.EnableWasm && s.cfg.IsWorker() && wasmStatus != "ok" {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.

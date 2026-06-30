@@ -156,13 +156,12 @@ type Config struct {
 	// CustomDomainVerifyValuePrefix sets the required prefix value for
 	// the TXT record, followed by the sandbox ID. Defaults to "aerol-verify=".
 	CustomDomainVerifyValuePrefix string
-	// TLSOnDemandBurst is the Caddy on-demand TLS policy's per-interval
-	// burst (matches the JSON shape `rate_limit.burst`). Bounds simultaneous
-	// ACME orders Caddy will start before throttling. Default 5; the
-	// daemon-wide ACME budget (acme_budget.go) is the second layer.
+	// TLSOnDemandBurst is the daemon-side on-demand TLS issuance budget burst.
+	// It is enforced by the TLS ask handler before Caddy starts an ACME order.
+	// Default 5.
 	TLSOnDemandBurst int
-	// TLSOnDemandInterval is the Caddy on-demand TLS policy's refill
-	// interval (`rate_limit.interval`). Default 1m.
+	// TLSOnDemandInterval is the daemon-side on-demand TLS issuance budget
+	// refill interval. Default 1m.
 	TLSOnDemandInterval time.Duration
 	// ACMEDaemonBudgetFraction is the high-water mark on the daemon-wide
 	// ACME issuance bucket — when usage crosses this fraction of Let's

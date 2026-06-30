@@ -179,12 +179,8 @@ func TestEnsureOnDemandTLS_FreshCaddy(t *testing.T) {
 	if got := srv.onDemand["ask"]; got != "http://127.0.0.1:21213/internal/tls-ask" {
 		t.Fatalf("ask = %v", got)
 	}
-	rl, _ := srv.onDemand["rate_limit"].(map[string]any)
-	if rl["burst"].(float64) != 5 {
-		t.Fatalf("burst = %v", rl["burst"])
-	}
-	if rl["interval"] != "1m0s" {
-		t.Fatalf("interval = %v", rl["interval"])
+	if _, ok := srv.onDemand["rate_limit"]; ok {
+		t.Fatalf("rate_limit must not be written; deployed Caddy rejects that field: %v", srv.onDemand)
 	}
 
 	// Catch-all policy appended.
@@ -203,7 +199,7 @@ func TestEnsureOnDemandTLS_Idempotent(t *testing.T) {
 	defer srv.Close()
 	client := &Client{enabled: true, baseURL: srv.URL, httpClient: srv.Client}
 
-	if err := client.EnsureOnDemandTLS(context.Background(), "http://x/ask", 3, 2*time.Minute); err != nil {
+	if err := client.EnsureOnDemandTLS(context.Background(), "http://x/ask-old", 3, 2*time.Minute); err != nil {
 		t.Fatalf("first call error = %v", err)
 	}
 	if err := client.EnsureOnDemandTLS(context.Background(), "http://x/ask", 7, 30*time.Second); err != nil {
@@ -212,9 +208,8 @@ func TestEnsureOnDemandTLS_Idempotent(t *testing.T) {
 	if len(srv.policies) != 1 {
 		t.Fatalf("policy duplicated on second call: %d", len(srv.policies))
 	}
-	rl := srv.onDemand["rate_limit"].(map[string]any)
-	if rl["burst"].(float64) != 7 {
-		t.Fatalf("second call did not replace on_demand leaf: %v", rl)
+	if got := srv.onDemand["ask"]; got != "http://x/ask" {
+		t.Fatalf("second call did not replace on_demand leaf: %v", srv.onDemand)
 	}
 }
 

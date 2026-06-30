@@ -420,7 +420,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 
-	if cfg.EnableWasm {
+	if cfg.EnableWasm && cfg.IsWorker() {
 		wasmPool := wireWasmRuntime(ctx, cfg, logger, svc, db)
 		if wasmPool != nil {
 			defer func() {
@@ -429,6 +429,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				}
 			}()
 		}
+	} else if cfg.EnableWasm {
+		logger.Info("wasm runtime skipped on non-worker node", "node_role", cfg.NodeRole)
 	}
 
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
@@ -483,7 +485,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				})
 			}
 		}
-		if cfg.EnableWasm {
+		if cfg.EnableWasm && cfg.IsWorker() {
 			if withModules, ok := clusterClient.(interface {
 				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
 			}); ok {
@@ -809,8 +811,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				logger.Warn("failed to install caddy on-demand TLS policy; will retry on next reconcile",
 					"error", err, "ask_url", askURL)
 			} else {
-				logger.Info("caddy on-demand TLS policy installed",
-					"ask_url", askURL, "burst", cfg.TLSOnDemandBurst, "interval", cfg.TLSOnDemandInterval)
+				logger.Info("caddy on-demand TLS policy installed", "ask_url", askURL)
 			}
 		}
 		ingressServer = &http.Server{
@@ -844,7 +845,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
-	if cfg.EnableWasm {
+	if cfg.EnableWasm && cfg.IsWorker() {
 		if err := svc.DrainWasmSandboxes(shutdownCtx); err != nil {
 			logger.Warn("wasm drain checkpoint failed", "error", err)
 		}
@@ -1439,7 +1440,7 @@ func supportedRuntimesForConfig(cfg config.Config) []string {
 	if cfg.EnableFirecracker {
 		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeFirecracker)
 	}
-	if cfg.EnableWasm {
+	if cfg.EnableWasm && cfg.IsWorker() {
 		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeWasm)
 	}
 	return runtimes
