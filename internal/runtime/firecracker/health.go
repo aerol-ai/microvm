@@ -53,6 +53,7 @@ func (d *Driver) SetTemplateHealthNotifier(n TemplateHealthNotifier) {
 // (the next Create going through service.createFirecrackerSandbox)
 // would have produced anyway.
 func (d *Driver) notifyCorrupt(ctx context.Context, templateID, reason string) {
+	d.invalidateSnapshotVerifyCacheForTemplate(templateID)
 	if d.healthNotifier == nil || templateID == "" {
 		return
 	}

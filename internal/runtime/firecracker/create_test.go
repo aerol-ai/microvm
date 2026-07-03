@@ -843,6 +843,7 @@ func (r *fakeTemplateResolver) Resolve(_ context.Context, id string) (*TemplateR
 		return nil, r.resolveErr
 	}
 	return &TemplateResolution{
+		TemplateID:         id,
 		RootfsPath:         r.rootfsPath,
 		HasSnapshot:        r.hasSnapshot,
 		HasOverlay:         r.hasOverlay,

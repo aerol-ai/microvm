@@ -170,7 +170,7 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	// template — the lister filters on status=ready and only the
 	// service-side MarkSnapshotCorrupt moves the row out of ready.
 	if d.cfg.SnapshotVerifyOnLoad && req.SnapshotChecksum != "" {
-		if err := verifySnapshotChecksum(req.SnapshotMemoryPath, req.SnapshotStatePath, req.SnapshotChecksum); err != nil {
+		if err := d.verifySnapshotForLoad(req.TemplateID, req.SnapshotMemoryPath, req.SnapshotStatePath, req.SnapshotChecksum); err != nil {
 			if errors.Is(err, models.ErrSnapshotCorrupt) {
 				d.notifyCorrupt(ctx, req.TemplateID, err.Error())
 			}

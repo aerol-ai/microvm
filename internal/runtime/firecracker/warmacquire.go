@@ -285,7 +285,7 @@ func (d *Driver) tryAcquireWarm(
 			"tap", tapSlot.TapName)
 	}
 	cancel()
-	d.probeToolboxTCP(ctx, "warm_acquire", sandboxID, tapSlot, true)
+	d.scheduleToolboxTCPProbe("warm_acquire", sandboxID, tapSlot, true)
 
 	// Register the warm handle + client into the driver's map so
 	// Destroy finds them. The handle is the SpawnedHandle from the

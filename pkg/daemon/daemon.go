@@ -1656,6 +1656,7 @@ func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcru
 		return nil, fmt.Errorf("template %q: ensure local: %w", id, err)
 	}
 	return &fcruntime.TemplateResolution{
+		TemplateID:         t.ID,
 		RootfsPath:         t.RootfsPath,
 		HasSnapshot:        t.HasSnapshot,
 		HasOverlay:         t.HasOverlay,

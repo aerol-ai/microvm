@@ -118,6 +118,14 @@ type Driver struct {
 	// client); tests inject a fake that records REST calls without
 	// needing a real socket.
 	newClient vmmClientFactory
+	// snapshotVerifier is the hash seam used by the load-time integrity
+	// cache. Production uses verifySnapshotChecksum; tests replace it to
+	// count hash invocations without timing a large file read.
+	snapshotVerifier snapshotVerifierFunc
+	// toolboxTCPProbe is the log-only TCP reachability probe. Create
+	// schedules it out of band; tests replace it to assert the request
+	// path no longer waits for the probe tail.
+	toolboxTCPProbe toolboxTCPProbeFunc
 
 	mu       sync.Mutex
 	clients  map[string]VMMClient // sandbox-id -> API client
@@ -130,6 +138,10 @@ type Driver struct {
 	// without adding signal.
 	runtimeHealth string
 	healthReady   bool
+
+	verifyMu          sync.Mutex
+	verifiedSnapshots map[snapshotVerifyKey]*snapshotVerifyEntry
+	verifiedTemplates map[string]snapshotVerifyKey
 }
 
 // TapPool is the interface Driver depends on for network allocation.
@@ -203,6 +215,11 @@ type Config struct {
 	// load-cost of a known-good snapshot. Mirrors
 	// internal/config.Config.FirecrackerSnapshotVerifyOnLoad.
 	SnapshotVerifyOnLoad bool
+	// SnapshotVerifyMode controls whether a verified snapshot is re-hashed
+	// on every LoadSnapshot ("always") or once per daemon boot and file
+	// identity ("once", default). Only consulted when SnapshotVerifyOnLoad
+	// is true and the template has a persisted checksum.
+	SnapshotVerifyMode string
 	// OverlayEnabled is the daemon-wide opt-out for the per-sandbox
 	// writable overlay drive. Mirrors
 	// internal/config.Config.FirecrackerOverlayEnabled. When false,
@@ -249,6 +266,7 @@ func FromDaemonConfig(c config.Config) Config {
 		JailerUID:            c.JailerUID,
 		JailerGID:            c.JailerGID,
 		SnapshotVerifyOnLoad: c.FirecrackerSnapshotVerifyOnLoad,
+		SnapshotVerifyMode:   c.FirecrackerSnapshotVerifyMode,
 		OverlayEnabled:       c.FirecrackerOverlayEnabled,
 		OverlayMkfs:          c.FirecrackerOverlayMkfs,
 		Mkfs4Bin:             c.FirecrackerMkfs4Bin,
@@ -284,6 +302,8 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 	d.newClient = func(socketPath string) VMMClient {
 		return firecracker.New(socketPath)
 	}
+	d.snapshotVerifier = verifySnapshotChecksum
+	d.toolboxTCPProbe = d.probeToolboxTCP
 	return d
 }
 
@@ -376,6 +396,7 @@ type TemplateResolver interface {
 // required; SnapshotChecksum is optional (used for integrity
 // verification when SnapshotVerifyOnLoad is on).
 type TemplateResolution struct {
+	TemplateID         string
 	RootfsPath         string
 	SnapshotMemoryPath string
 	SnapshotStatePath  string
@@ -813,7 +834,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			"gateway_ip", slot.HostIP,
 			"tap", slot.TapName)
 	}
-	d.probeToolboxTCP(ctx, "create", allocID, slot, snapshotLoadPath)
+	d.scheduleToolboxTCPProbe("create", allocID, slot, snapshotLoadPath)
 
 	// All steps succeeded. Register the client + handle so Destroy can
 	// find them. Order matters: the map writes happen AFTER we flip
@@ -981,7 +1002,7 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 		return fmt.Errorf("firecracker runtime: configureVMMForLoad called with nil tap slot")
 	}
 	if d.cfg.SnapshotVerifyOnLoad && snap.SnapshotChecksum != "" {
-		if err := verifySnapshotChecksum(snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum); err != nil {
+		if err := d.verifySnapshotForLoad(snap.TemplateID, snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum); err != nil {
 			return fmt.Errorf("firecracker runtime: snapshot integrity: %w", err)
 		}
 	}

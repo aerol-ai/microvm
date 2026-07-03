@@ -74,6 +74,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_ACME_DAEMON_BUDGET_FRACTION",
 			"SB_ACME_DAEMON_BUDGET_WINDOW",
 			"SB_ACME_DAEMON_BUDGET_CAPACITY",
+			"SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -167,6 +168,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.HTTPWakeMaxBuffer != 8*1024*1024 {
 					t.Fatalf("expected default HTTPWakeMaxBuffer=8MiB, got %d", cfg.HTTPWakeMaxBuffer)
+				}
+				if cfg.FirecrackerSnapshotVerifyMode != "once" {
+					t.Fatalf("expected default FirecrackerSnapshotVerifyMode=once, got %q", cfg.FirecrackerSnapshotVerifyMode)
 				}
 			},
 		},
@@ -317,6 +321,18 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			name: "rejects_unknown_firecracker_snapshot_verify_mode",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE", "sometimes")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE") {
+					t.Fatalf("expected snapshot verify mode error, got %v", err)
+				}
+			},
+		},
+		{
 			name: "normalizes_domain_and_public_host",
 			run: func(t *testing.T) {
 				clearEnv(t)
@@ -371,6 +387,7 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("OTEL_SERVICE_NAME", "sandboxd-prod")
 				t.Setenv("SB_IMAGE_PULL_MAX_CONCURRENT", "8")
 				t.Setenv("SB_IMAGE_PULL_FAILURE_BACKOFF", "2m")
+				t.Setenv("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE", "ALWAYS")
 				cfg, err := Load()
 				if err != nil {
 					t.Fatalf("Load() error = %v", err)
@@ -398,6 +415,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.ImagePullMaxConcurrent != 8 || cfg.ImagePullFailureBackoff != 2*time.Minute {
 					t.Fatalf("unexpected image pull overrides: %+v", cfg)
+				}
+				if cfg.FirecrackerSnapshotVerifyMode != "always" {
+					t.Fatalf("expected FirecrackerSnapshotVerifyMode=always, got %q", cfg.FirecrackerSnapshotVerifyMode)
 				}
 			},
 		},

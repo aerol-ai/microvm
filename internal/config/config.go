@@ -621,6 +621,12 @@ type Config struct {
 	// memory damage hours later. Bypass only for benchmarking the raw
 	// load path. SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD.
 	FirecrackerSnapshotVerifyOnLoad bool
+	// FirecrackerSnapshotVerifyMode controls the load-time checksum
+	// cadence when verification is enabled. "once" (default) verifies a
+	// template once per daemon boot and file identity; "always" preserves
+	// the previous per-create re-hash behavior for paranoid operators.
+	// SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE.
+	FirecrackerSnapshotVerifyMode string
 
 	// FirecrackerOverlayEnabled is the daemon-wide opt-out for the
 	// per-sandbox writable overlay drive (Phase 3 PR-B). Default true.
@@ -1404,6 +1410,7 @@ func Load() (Config, error) {
 		FirecrackerTemplateMemoryMB:         getEnvInt("SB_FIRECRACKER_TEMPLATE_MEMORY_MB", 512),
 		FirecrackerTemplateVCPU:             getEnvInt("SB_FIRECRACKER_TEMPLATE_VCPU", 1),
 		FirecrackerSnapshotVerifyOnLoad:     getEnvBool("SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD", true),
+		FirecrackerSnapshotVerifyMode:       strings.ToLower(getEnv("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE", "once")),
 
 		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
 		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),
@@ -1449,6 +1456,9 @@ func Load() (Config, error) {
 	}
 	if cfg.ImagePullFailureBackoff < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
+	}
+	if cfg.FirecrackerSnapshotVerifyMode != "once" && cfg.FirecrackerSnapshotVerifyMode != "always" {
+		return Config{}, errors.New("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE must be either once or always")
 	}
 	if cfg.AutoImportEnabled {
 		if cfg.AutoImportHooksBaseURL == "" {
