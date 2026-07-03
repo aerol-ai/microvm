@@ -275,6 +275,48 @@ func TestGC_ReapsAgedReleasedRows(t *testing.T) {
 	}
 }
 
+func TestGC_ReleasesWarmTapOwnerBeforeDeletingRow(t *testing.T) {
+	ctx := context.Background()
+	p, st := newTestPool(t)
+	now := time.Now().UTC()
+
+	if err := st.SeedFirecrackerTapSlot(ctx, store.FirecrackerTapSlot{
+		TapName:  "fctap0",
+		CIDR:     "172.16.0.0/30",
+		HostIP:   "172.16.0.1",
+		GuestIP:  "172.16.0.2",
+		VsockCID: 3,
+	}, now); err != nil {
+		t.Fatalf("seed tap: %v", err)
+	}
+	if _, err := st.AllocateFirecrackerTapSlot(ctx, "vmms-old", now); err != nil {
+		t.Fatalf("allocate warm tap: %v", err)
+	}
+	if err := p.RecordSpawning(ctx, "vmms-old", "tpl-a", now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordFailed(ctx, "vmms-old", "retired", now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	p.runGCOnce(ctx, time.Hour)
+
+	tapSlot, err := st.GetFirecrackerTapSlotBySandbox(ctx, "vmms-old")
+	if err != nil {
+		t.Fatalf("get tap after GC: %v", err)
+	}
+	if tapSlot != nil {
+		t.Fatalf("warm tap still owned after GC: %+v", tapSlot)
+	}
+	vmmSlot, err := st.GetFirecrackerVMMSlotByID(ctx, "vmms-old")
+	if err != nil {
+		t.Fatalf("get vmm slot after GC: %v", err)
+	}
+	if vmmSlot != nil {
+		t.Fatalf("released VMM slot still present after GC: %+v", vmmSlot)
+	}
+}
+
 func TestRun_NilSpawnerIsNoOp(t *testing.T) {
 	// Run with a nil Spawner returns immediately without panicking.
 	// This is the "pool disabled" config path.

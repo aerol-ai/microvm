@@ -187,6 +187,17 @@ func (p *Pool) Release(ctx context.Context, sandboxID string) error {
 	return p.st.ReleaseFirecrackerTapSlot(ctx, sandboxID)
 }
 
+// Transfer re-keys a claimed slot from fromID to toID. Used by the
+// Firecracker warm-VMM pool: warm slots allocate TAPs under their pool slot id,
+// then a create transfers that same TAP to the sandbox id on warm hit.
+func (p *Pool) Transfer(ctx context.Context, fromID, toID string, now time.Time) (*Slot, error) {
+	raw, err := p.st.TransferFirecrackerTapSlot(ctx, fromID, toID, now)
+	if err != nil || raw == nil {
+		return nil, err
+	}
+	return slotFromStore(raw), nil
+}
+
 // Stats reports current occupancy. Used by /healthz and the admission
 // controller — a near-empty pool blocks new Firecracker creates upstream
 // of the failing Allocate call.

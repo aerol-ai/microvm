@@ -472,6 +472,15 @@ func (p *Pool) ReapReleased(ctx context.Context, cutoff time.Time) (int, error) 
 				continue
 			}
 		}
+		// WarmSpawn allocates a Firecracker TAP slot under the warm VMM
+		// slot id before LoadSnapshot. The handle's Shutdown releases it on
+		// the normal in-memory path; this store-level release covers daemon
+		// restart/orphan cases where the VMM row survived but the handle map
+		// did not. Idempotent for slots already transferred to a sandbox or
+		// already released.
+		if err := p.st.ReleaseFirecrackerTapSlot(ctx, sl.ID); err != nil {
+			return deleted, fmt.Errorf("vmm pool reap (release tap %s): %w", sl.ID, err)
+		}
 		if err := p.st.DeleteFirecrackerVMMSlot(ctx, sl.ID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				// Someone else (a racing reap, the GC tests) dropped

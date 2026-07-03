@@ -59,6 +59,11 @@ func TestWarmSpawn_HappyPath(t *testing.T) {
 	if !f.client.snapshotLoad.EnableDiffSnapshots {
 		t.Error("LoadSnapshot.EnableDiffSnapshots=false; warm-spawn must enable diff snapshots")
 	}
+	if len(f.client.snapshotLoad.NetworkOverrides) != 1 ||
+		f.client.snapshotLoad.NetworkOverrides[0].IfaceID != primaryIfaceID ||
+		f.client.snapshotLoad.NetworkOverrides[0].HostDevName != "fctap-test" {
+		t.Fatalf("LoadSnapshot.NetworkOverrides = %+v, want eth0 -> fctap-test", f.client.snapshotLoad.NetworkOverrides)
+	}
 	if f.client.snapshotLoad.SnapshotPath != snapState {
 		t.Errorf("LoadSnapshot.SnapshotPath = %q, want %q", f.client.snapshotLoad.SnapshotPath, snapState)
 	}
@@ -83,6 +88,12 @@ func TestWarmSpawn_HappyPath(t *testing.T) {
 	}
 	if f.vmm.shutdown {
 		t.Error("warm-spawn shut down the VMM on success path; the handle is the pool's to own")
+	}
+	if f.tapHost.ensureCalls != 1 || f.tapHost.lastSlot.GuestMAC != macFromCID(200) {
+		t.Fatalf("tap ensure calls=%d slot=%+v, want one ensure with template MAC", f.tapHost.ensureCalls, f.tapHost.lastSlot)
+	}
+	if f.pool.release != 0 || f.tapHost.removeCalls != 0 {
+		t.Fatalf("success cleanup release/remove = %d/%d, want 0/0", f.pool.release, f.tapHost.removeCalls)
 	}
 
 	// Returned handle exposes the API socket + RunDir for the pool to
@@ -185,6 +196,12 @@ func TestWarmSpawn_CleansUpOnLoadFailure(t *testing.T) {
 	}
 	if !f.vmm.cleaned {
 		t.Error("WarmSpawn did not clean up the rundir on LoadSnapshot failure")
+	}
+	if f.tapHost.removeCalls != 1 {
+		t.Errorf("WarmSpawn tap remove calls = %d, want 1 on LoadSnapshot failure", f.tapHost.removeCalls)
+	}
+	if f.pool.release != 1 {
+		t.Errorf("WarmSpawn tap pool release calls = %d, want 1 on LoadSnapshot failure", f.pool.release)
 	}
 }
 

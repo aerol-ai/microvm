@@ -151,6 +151,7 @@ type Driver struct {
 // real *tap.Pool, which satisfies the interface structurally.
 type TapPool interface {
 	Allocate(ctx context.Context, sandboxID string, now time.Time) (*TapSlot, error)
+	Transfer(ctx context.Context, fromID, toID string, now time.Time) (*TapSlot, error)
 	Release(ctx context.Context, sandboxID string) error
 	Get(ctx context.Context, sandboxID string) (*TapSlot, error)
 }
@@ -502,7 +503,34 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: overlay drive disabled on this daemon (SB_FIRECRACKER_OVERLAY_ENABLED=false)")
 	}
 
-	// Step 1: allocate the network slot.
+	// Step 1: Phase 4 warm-VMM pool fast path. Resolve the template
+	// early (before cold-spawn) so a pool hit avoids spending the
+	// firecracker process + LoadSnapshot wall-clock — that's the
+	// ~150ms+ this whole pool exists to skip. Warm slots already own
+	// their TAP at LoadSnapshot time, so a hit must run before the cold
+	// path allocates a second TAP for this sandbox. On a miss (no
+	// template, no snapshot, no pool slot) we fall through to the
+	// cold-spawn path unchanged.
+	//
+	// Template resolution is the only work we move earlier; the rest
+	// of Create still expects to resolve+stage inside its existing
+	// structure, so we keep the resolved snapshotInfo handy and reuse
+	// it below rather than re-resolving.
+	var earlySnap *TemplateResolution
+	if req.TemplateID != "" && d.templates != nil {
+		var err error
+		earlySnap, err = d.templates.Resolve(ctx, req.TemplateID)
+		if err != nil {
+			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
+		}
+	}
+	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, nil, ""); err != nil {
+		return nil, err
+	} else if hit {
+		return state, nil
+	}
+
+	// Step 1b: allocate the network slot for the cold-spawn path.
 	slot, err := d.pool.Allocate(ctx, allocID, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("firecracker runtime: tap allocate: %w", err)
@@ -519,33 +547,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.logger.Info("firecracker create: allocated network slot",
 		"sandbox_id", allocID, "tap", slot.TapName,
 		"guest_ip", slot.GuestIP, "vsock_cid", slot.VsockCID)
-
-	// Step 1b: Phase 4 warm-VMM pool fast path. Resolve the template
-	// early (before cold-spawn) so a pool hit avoids spending the
-	// firecracker process + LoadSnapshot wall-clock — that's the
-	// ~150ms+ this whole pool exists to skip. On a miss (no template,
-	// no snapshot, no pool slot) we fall through to the cold-spawn
-	// path unchanged.
-	//
-	// Template resolution is the only step we move earlier; the rest
-	// of Create still expects to resolve+stage inside its existing
-	// structure, so we keep the resolved snapshotInfo handy and reuse
-	// it below rather than re-resolving.
-	var earlySnap *TemplateResolution
-	if req.TemplateID != "" && d.templates != nil {
-		earlySnap, err = d.templates.Resolve(ctx, req.TemplateID)
-		if err != nil {
-			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
-		}
-	}
-	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, slot, ""); err != nil {
-		return nil, err
-	} else if hit {
-		// Warm path committed the TAP slot to the sandbox; suppress
-		// the deferred TAP release.
-		released = true
-		return state, nil
-	}
 
 	// Step 2: spawn the VMM. We spawn but do NOT yet Start — the rootfs must
 	// be in place inside the runDir before firecracker boots.
@@ -1148,11 +1149,13 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 
 	// The first connect after InstanceStart often races the guest's
 	// vsock listener coming up. Retry on connection refused / EAGAIN
-	// for up to the deadline. 50ms cadence matches WaitSocket.
+	// for up to the deadline; capped backoff avoids rounding the common
+	// fast path up to the old fixed 50ms cadence.
 	var (
 		conn io.ReadWriteCloser
 		err  error
 	)
+	delay := vsockPollInitial
 	for {
 		conn, err = d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
 		if err == nil {
@@ -1166,8 +1169,9 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 		select {
 		case <-dialCtx.Done():
 			return fmt.Errorf("vsock dial cid=%d port=%d: %w (last error: %v)", guestCID, defaultVsockPort, dialCtx.Err(), err)
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(delay):
 		}
+		delay = nextRetryDelay(delay, vsockPollMax)
 	}
 	defer conn.Close()
 

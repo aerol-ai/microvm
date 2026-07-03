@@ -696,7 +696,7 @@ func TestCreate_WarmRollbackReleaseError(t *testing.T) {
 	pool, _ := stageWarmFixture(t, f)
 	stageWarmTemplate(t, f, false)
 	pool.releaseErr = os.ErrPermission
-	f.client.networkPatchErr = errors.New("patch nic failed")
+	f.client.drivePatchErr = errors.New("patch drive failed")
 
 	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 		Image:      "alpine:3.20",
@@ -900,7 +900,7 @@ func TestCreate_WarmRollbackShutdownWarn(t *testing.T) {
 	_, handle := stageWarmFixture(t, f)
 	stageWarmTemplate(t, f, false)
 	handle.shutdownErr = os.ErrPermission
-	f.client.networkPatchErr = errors.New("patch nic failed")
+	f.client.drivePatchErr = errors.New("patch drive failed")
 
 	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 		Image:      "alpine:3.20",

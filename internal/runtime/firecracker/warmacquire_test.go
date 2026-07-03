@@ -98,6 +98,15 @@ func stageWarmFixture(t *testing.T, f *driverFixture) (*fakeWarmPool, *fakeSpawn
 	}
 	pool := &fakeWarmPool{slot: slot, handle: handle}
 	f.driver.SetWarmPool(pool)
+	f.pool.mu.Lock()
+	f.pool.slots[slot.ID] = &TapSlot{
+		TapName:  "fctap-warm",
+		CIDR:     "172.16.0.4/30",
+		HostIP:   "172.16.0.5",
+		GuestIP:  "172.16.0.6",
+		VsockCID: 4,
+	}
+	f.pool.mu.Unlock()
 	// Make the REST client factory route warm-path Resume/PATCH calls
 	// to the same fake client the test fixture already inspects.
 	f.driver.SetClientFactory(func(_ string) VMMClient { return f.client })
@@ -195,24 +204,18 @@ func TestCreate_WarmHit(t *testing.T) {
 		t.Errorf("LoadSnapshot was called on warm-hit Create path: %+v", f.client.snapshotLoad)
 	}
 
-	// The per-sandbox host TAP MUST have been realized on the warm-hit
-	// path — WarmSpawn skips it, so the Acquire side owns it. Without
-	// this Ensure, VM resume would point the guest's eth0 at a
-	// host_dev_name that does not exist. Exactly one Ensure, no Remove
-	// (the sandbox now owns the device; Destroy removes it later).
-	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 0 {
-		t.Errorf("warm-hit tap ensure=%d remove=%d, want 1/0", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	// The TAP was already realized during WarmSpawn. Acquire only
+	// transfers ownership from the warm slot id to the sandbox id.
+	if f.tapHost.ensureCalls != 0 || f.tapHost.removeCalls != 0 {
+		t.Errorf("warm-hit tap ensure=%d remove=%d, want 0/0", f.tapHost.ensureCalls, f.tapHost.removeCalls)
 	}
-
-	// PATCH NetworkInterface MUST have been called with the per-sandbox
-	// TAP name (mapped from the pool's preloaded slot.TapName via the
-	// fake tap pool's Allocate).
-	nic, ok := f.client.networkPatches[primaryIfaceID]
-	if !ok {
-		t.Fatal("PATCH NetworkInterface was not called on warm-hit path")
+	f.pool.mu.Lock()
+	if len(f.pool.transfers) != 1 || f.pool.transfers[0].from != "vmms-warm-fixture" || f.pool.transfers[0].to != "sb-warm-hit" {
+		t.Fatalf("tap transfers = %+v, want vmms-warm-fixture -> sb-warm-hit", f.pool.transfers)
 	}
-	if nic.HostDevName == "" {
-		t.Errorf("PATCH NetworkInterface had empty HostDevName")
+	f.pool.mu.Unlock()
+	if len(f.client.networkPatches) != 0 {
+		t.Fatalf("PATCH NetworkInterface calls = %+v, want none", f.client.networkPatches)
 	}
 
 	// PatchVM(Resumed) was the lone VM state transition -- no InstanceStart action.
@@ -296,7 +299,7 @@ func TestCreate_WarmMissFallsBackToColdSpawn(t *testing.T) {
 }
 
 // TestCreate_WarmRollbackOnPatchFailure asserts the cleanup contract
-// (pr-review.md §4) on the warm path: if PATCH NetworkInterface fails
+// (pr-review.md §4) on the warm path: if PATCH Drive fails
 // after AcquireWithHandle succeeded, the pool slot MUST be released
 // (row → 'released') and the handle MUST be Shutdown so the daemon
 // doesn't end up holding a slot the sandbox never claimed.
@@ -304,7 +307,7 @@ func TestCreate_WarmRollbackOnPatchFailure(t *testing.T) {
 	f := newDriverFixture(t)
 	pool, handle := stageWarmFixture(t, f)
 	stageWarmTemplate(t, f, false)
-	f.client.networkPatchErr = errors.New("synthetic PATCH NIC failure")
+	f.client.drivePatchErr = errors.New("synthetic PATCH drive failure")
 
 	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 		Image:      "alpine:3.20",
@@ -314,7 +317,7 @@ func TestCreate_WarmRollbackOnPatchFailure(t *testing.T) {
 		TemplateID: "tpl-warm",
 	}, "sb-warm-rollback", "tok", nil)
 	if err == nil {
-		t.Fatal("Create returned nil on injected PATCH NIC failure")
+		t.Fatal("Create returned nil on injected PATCH drive failure")
 	}
 
 	pool.mu.Lock()
@@ -329,24 +332,22 @@ func TestCreate_WarmRollbackOnPatchFailure(t *testing.T) {
 	}
 	handle.mu.Unlock()
 
-	// The host TAP was Ensured just before the PATCH, so the rollback
-	// MUST Remove it — otherwise a `ip link` device leaks on every
-	// failed warm create. ensure=1/remove=1 is the matched pair.
-	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 1 {
-		t.Errorf("warm rollback tap ensure=%d remove=%d, want 1/1", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	// Acquire no longer realizes or network-patches the TAP; WarmSpawn
+	// owns host TAP setup, and handle shutdown owns teardown.
+	if f.tapHost.ensureCalls != 0 || f.tapHost.removeCalls != 0 {
+		t.Errorf("warm rollback tap ensure=%d remove=%d, want 0/0", f.tapHost.ensureCalls, f.tapHost.removeCalls)
 	}
 }
 
-// TestCreate_WarmRollbackOnTapEnsureFailure asserts the rollback when
-// the host-TAP realization itself fails on the warm path: the create
-// must surface the error, tear down the warm handle + pool slot, and
-// MUST NOT call Remove (there is no device to delete — mirrors the
-// cold path's "no Remove when Ensure failed" discipline).
-func TestCreate_WarmRollbackOnTapEnsureFailure(t *testing.T) {
+// TestCreate_WarmRollbackOnTapTransferFailure asserts the rollback when
+// the pre-loaded warm TAP cannot be transferred to the sandbox id.
+func TestCreate_WarmRollbackOnTapTransferFailure(t *testing.T) {
 	f := newDriverFixture(t)
 	pool, handle := stageWarmFixture(t, f)
 	stageWarmTemplate(t, f, false)
-	f.tapHost.ensureErr = errors.New("synthetic tap ensure failure")
+	f.pool.mu.Lock()
+	delete(f.pool.slots, "vmms-warm-fixture")
+	f.pool.mu.Unlock()
 
 	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 		Image:      "alpine:3.20",
@@ -356,24 +357,23 @@ func TestCreate_WarmRollbackOnTapEnsureFailure(t *testing.T) {
 		TemplateID: "tpl-warm",
 	}, "sb-warm-tap-fail", "tok", nil)
 	if err == nil {
-		t.Fatal("Create returned nil on injected tap Ensure failure")
+		t.Fatal("Create returned nil on injected tap Transfer failure")
 	}
 
 	// Pool slot released + handle shut down so the warm VMM doesn't leak.
 	pool.mu.Lock()
 	if len(pool.releaseCalls) == 0 {
-		t.Error("warm pool Release was not called on tap Ensure failure; slot would leak as 'allocated'")
+		t.Error("warm pool Release was not called on tap Transfer failure; slot would leak as 'allocated'")
 	}
 	pool.mu.Unlock()
 	handle.mu.Lock()
 	if handle.shutdowns == 0 {
-		t.Error("warm handle Shutdown was not called on tap Ensure failure; firecracker process would leak")
+		t.Error("warm handle Shutdown was not called on tap Transfer failure; firecracker process would leak")
 	}
 	handle.mu.Unlock()
 
-	// Ensure was attempted once and failed; Remove MUST be skipped.
-	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 0 {
-		t.Errorf("warm tap-ensure-failure ensure=%d remove=%d, want 1/0", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	if f.tapHost.ensureCalls != 0 || f.tapHost.removeCalls != 0 {
+		t.Errorf("warm tap-transfer-failure ensure=%d remove=%d, want 0/0", f.tapHost.ensureCalls, f.tapHost.removeCalls)
 	}
 }
 

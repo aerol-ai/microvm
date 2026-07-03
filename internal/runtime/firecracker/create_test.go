@@ -28,6 +28,12 @@ type fakePool struct {
 	relErr    error // injected on next Release
 	getErr    error // injected on next Get
 	lastAlloc string
+	transfers []transferCall
+}
+
+type transferCall struct {
+	from string
+	to   string
 }
 
 func newFakePool() *fakePool {
@@ -66,6 +72,22 @@ func (p *fakePool) Release(_ context.Context, sandboxID string) error {
 	}
 	delete(p.slots, sandboxID)
 	return nil
+}
+
+func (p *fakePool) Transfer(_ context.Context, fromID, toID string, _ time.Time) (*TapSlot, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.transfers = append(p.transfers, transferCall{from: fromID, to: toID})
+	if existing, ok := p.slots[toID]; ok {
+		return existing, nil
+	}
+	slot, ok := p.slots[fromID]
+	if !ok {
+		return nil, errors.New("fake transfer source missing")
+	}
+	delete(p.slots, fromID)
+	p.slots[toID] = slot
+	return slot, nil
 }
 
 func (p *fakePool) Get(_ context.Context, sandboxID string) (*TapSlot, error) {
@@ -949,11 +971,11 @@ func TestCreate_TemplateRequiresResolver(t *testing.T) {
 	}
 }
 
-// TestCreate_TemplateResolveErrorReleasesSlot mirrors the rootfs-
-// build-failure cleanup contract for the template path: a resolver
-// error (template not ready, deleted, etc.) must release the pool slot
-// and clean up the VMM. Otherwise a flaky resolver drains the pool.
-func TestCreate_TemplateResolveErrorReleasesSlot(t *testing.T) {
+// TestCreate_TemplateResolveErrorDoesNotAllocateSlot mirrors the warm-first
+// ordering: template resolution happens before cold TAP allocation, so a
+// resolver error (template not ready, deleted, etc.) fails without touching the
+// finite TAP pool.
+func TestCreate_TemplateResolveErrorDoesNotAllocateSlot(t *testing.T) {
 	f := newDriverFixture(t)
 	resolver := &fakeTemplateResolver{resolveErr: errors.New("template tpl-x is pending, not ready")}
 	f.driver.SetTemplateResolver(resolver)
@@ -964,8 +986,8 @@ func TestCreate_TemplateResolveErrorReleasesSlot(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected resolver error")
 	}
-	if f.pool.alloc != 1 || f.pool.release != 1 {
-		t.Errorf("pool alloc=%d release=%d, want 1/1", f.pool.alloc, f.pool.release)
+	if f.pool.alloc != 0 || f.pool.release != 0 {
+		t.Errorf("pool alloc=%d release=%d, want 0/0", f.pool.alloc, f.pool.release)
 	}
 	if f.rootfs.builds != 0 {
 		t.Errorf("rootfs.Build called %d times on template error; want 0", f.rootfs.builds)

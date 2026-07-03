@@ -193,6 +193,93 @@ func TestAllocate_PoolExhausted(t *testing.T) {
 	}
 }
 
+func TestTransfer_RekeysOwner(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 2}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	warm, err := p.Allocate(ctx, "vmms-warm", now)
+	if err != nil {
+		t.Fatalf("allocate warm: %v", err)
+	}
+	got, err := p.Transfer(ctx, "vmms-warm", "sb-claimed", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("transfer: %v", err)
+	}
+	if got.TapName != warm.TapName || got.GuestIP != warm.GuestIP || got.VsockCID != warm.VsockCID {
+		t.Fatalf("transferred slot = %+v, want same identity as %+v", got, warm)
+	}
+	if old, err := p.Get(ctx, "vmms-warm"); err != nil || old != nil {
+		t.Fatalf("old owner get = %+v err=%v, want nil nil", old, err)
+	}
+	if claimed, err := p.Get(ctx, "sb-claimed"); err != nil || claimed == nil || claimed.TapName != warm.TapName {
+		t.Fatalf("new owner get = %+v err=%v, want %s", claimed, err, warm.TapName)
+	}
+}
+
+func TestTransfer_TargetAlreadyHasSlot(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 2}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := p.Allocate(ctx, "vmms-warm", now); err != nil {
+		t.Fatalf("allocate warm: %v", err)
+	}
+	target, err := p.Allocate(ctx, "sb-target", now)
+	if err != nil {
+		t.Fatalf("allocate target: %v", err)
+	}
+	if _, err := p.Transfer(ctx, "vmms-warm", "sb-target", now); err == nil {
+		t.Fatal("expected conflict transferring onto an existing different target slot")
+	}
+	if got, err := p.Get(ctx, "sb-target"); err != nil || got == nil || got.TapName != target.TapName {
+		t.Fatalf("target changed after failed transfer: %+v err=%v", got, err)
+	}
+}
+
+func TestTransfer_SourceMissing(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 1}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := p.Transfer(ctx, "missing", "sb-target", now); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("transfer missing source err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestTransfer_RetryIsIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 1}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	first, err := p.Allocate(ctx, "vmms-warm", now)
+	if err != nil {
+		t.Fatalf("allocate warm: %v", err)
+	}
+	if _, err := p.Transfer(ctx, "vmms-warm", "sb-target", now); err != nil {
+		t.Fatalf("first transfer: %v", err)
+	}
+	again, err := p.Transfer(ctx, "vmms-warm", "sb-target", now)
+	if err != nil {
+		t.Fatalf("retry transfer: %v", err)
+	}
+	if again.TapName != first.TapName {
+		t.Fatalf("retry returned %s, want %s", again.TapName, first.TapName)
+	}
+}
+
 // newTestSandbox inserts a row into sandboxes so the firecracker_tap_pool
 // allocate doesn't break referential expectations. The pool table does
 // NOT carry a FOREIGN KEY on sandbox_id (the table seeds before any
