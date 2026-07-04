@@ -58,7 +58,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
-	github.com/miekg/dns v1.1.68
+	github.com/miekg/dns v1.1.72
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
