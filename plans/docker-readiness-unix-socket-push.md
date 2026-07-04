@@ -10,7 +10,7 @@ Status: **Implemented** — landed in [PR #271](https://github.com/aerol-ai/micr
 | Unit tests | ✅ Shipped (`go test ./pkg/readyproto/... ./pkg/docker/... ./cmd/toolboxd/... ./internal/config/...`) |
 | Integration tests (UC-96 / 96b / 96c written) | ⏳ Not yet run on live AWS |
 | UC-97 fallback | ✅ Unit test (`TestCreate_FallbackWhenPushDisabled`) + non-cluster integration (`TestDockerReadinessFallbackOnNonCluster`) |
-| gVisor `install.sh` `--host-uds=open` | ✅ Code shipped; ⏳ UC-96c + security sign-off pending |
+| gVisor `--host-uds=open` (cluster-init/join) | ✅ Code shipped (cluster-only gate; off on standalone hosts); ⏳ UC-96c + security sign-off pending |
 | Docs (`integration-tests/README.md`, `packaging/`, gVisor operator docs) | ⏳ Pending (T11) |
 | `readyproto` fuzz | ⏳ Pending (T9, P2) |
 | Benchmark `toolbox_wait` regression | ⏳ Optional, not done |
@@ -202,7 +202,7 @@ the outer deadline, unchanged.
 | `pkg/api/v1/cluster_handler.go` | Pass `nil` timing on cluster placement path (worker returns timing when hit directly). |
 | `integration-tests/suite/harness/usecases.go` | UC-96, UC-96b, UC-96c registered. |
 | `integration-tests/suite/harness/timing.go` | `parseServerTimingReadinessSource`, `LastCreateReadinessSource`. |
-| `scripts/install.sh` | gVisor `runtimeArgs: ["--host-uds=open"]` (all three `register_gvisor_runtime` branches). |
+| `scripts/cluster-init.sh`, `scripts/cluster-join.sh` | `ensure_gvisor_host_uds` appends gVisor `runtimeArgs: ["--host-uds=open"]` on cluster nodes only (idempotent; no-op without gVisor). `install.sh` deliberately leaves runsc at `--host-uds=none`. |
 | `integration-tests/README.md` | ⏳ Document UC-96* and env knobs (T11). |
 | `packaging/` env table | ⏳ Document knobs (T11). |
 | `integration-tests/suite/benchmark_test.go` | Optional: `toolbox_wait` regression — not implemented. |
@@ -440,10 +440,16 @@ attribution comes from the per-phase timing even though bundled.
    regression hidden behind a faster metric.
 
 5. **gVisor — needs `--host-uds=open`.** `runsc` gates host UDS passthrough
-   behind `--host-uds` (default `none`). **Shipped:** `scripts/install.sh`
-   `register_gvisor_runtime` sets `"runtimeArgs":["--host-uds=open"]` in all
-   three merge branches. **Pending:** UC-96c on live `cluster-hetero` + security
-   sign-off (isolation relaxation is fleet-wide).
+   behind `--host-uds` (default `none`). The relaxation is fleet-wide (every
+   runsc sandbox on the host), so it is enabled **only on cluster nodes**, by
+   `scripts/cluster-init.sh` / `scripts/cluster-join.sh` (`ensure_gvisor_host_uds`)
+   rather than `install.sh` — install.sh runs before the node is in a cluster
+   and must not relax isolation on standalone gVisor hosts that never run the
+   socket. The cluster scripts append `--host-uds=open` to the registered
+   `runsc` runtimeArgs idempotently (no-op when gVisor isn't installed or the
+   arg is already present), so the relaxation is scoped to cluster+gVisor.
+   Without it the push path degrades to health polling (UC-97). **Pending:**
+   UC-96c on live `cluster-hetero` + security sign-off.
 
 6. **Bind-mount topology — scope to local Linux runc dockerd.** Rootless Docker,
    strict SELinux/AppArmor (:z/:Z), userns-remap, Docker Desktop, and remote
@@ -545,7 +551,7 @@ attribution comes from the per-phase timing even though bundled.
 | Codepath | Realistic failure | Test? | Error handling | User-visible? |
 |---|---|---|---|---|
 | `readyListener.Accept` | malicious in-container connect floods bad tokens | yes (cap test) | invalid-attempt cap + deadline | no (push just degrades to poll) |
-| `readyListener.Accept` | gVisor blocks the connect (runsc `--host-uds` defaults to `none`) | yes (UC-96c) | grace-delayed poll wins | no (slower create only, until install adds `--host-uds=open`) |
+| `readyListener.Accept` | gVisor blocks the connect (runsc `--host-uds` defaults to `none`) | yes (UC-96c) | grace-delayed poll wins | no (slower create only, until cluster-init/join adds `--host-uds=open`) |
 | `announceReady` dial | dial blocks during PID1 boot | yes (unit) | goroutine + bounded timeout, never fatal | no |
 | socket bind | stale socket from crashed sandbox blocks `Listen` | yes (unit) | unlink-before-listen + gen-keyed sweep | no |
 | boot sweep | sweep races a live create's socket | **must test** | generation/nonce-keyed paths | **CRITICAL if unkeyed — would kill a live create** |
@@ -591,7 +597,7 @@ Status as of 2026-06-30 ([PR #271](https://github.com/aerol-ai/microvm/pull/271)
 - [x] **T10** — expvar counters; per-create attribution via Server-Timing
 - [ ] **T11** — operator docs (`integration-tests/README.md`, `packaging/`, gVisor docs)
 - [x] **T12** — `readyclient_linux.go` / `readyclient_other.go`
-- [x] **T13 code** — `install.sh` all three `register_gvisor_runtime` branches
+- [x] **T13 code** — `ensure_gvisor_host_uds` in `cluster-init.sh` + `cluster-join.sh` (cluster-only gate; `install.sh` left at `--host-uds=none`)
 - [ ] **T13 verify** — UC-96c green + security sign-off on `--host-uds=open`
 
 ## Propagation map (where each change actually lands)
@@ -601,7 +607,7 @@ place it must reach so nothing is updated in one path and missed in another.
 
 | Change | Single source? | Reaches Terraform | Reaches Ansible | Reaches integration tests | Status |
 |---|---|---|---|---|---|
-| gVisor `--host-uds=open` | **Yes** — `install.sh register_gvisor_runtime` | ✅ via `--with-gvisor` | ✅ via install.sh | UC-96c on cluster-hetero | Code ✅; live verify ⏳ |
+| gVisor `--host-uds=open` | **Yes** — `ensure_gvisor_host_uds` in `cluster-init.sh`/`cluster-join.sh` (cluster-only) | ✅ Terraform bootstrap always runs cluster-init/join | ✅ same scripts | UC-96c on cluster-hetero | Code ✅; live verify ⏳ |
 | Ready-socket knobs + `EnableCluster` gate | **config.go** | ✅ cluster bootstraps | ✅ same | non-cluster → fallback | ✅ |
 | `SB_READY_SOCKET` / `SB_READY_NONCE` env | per-create in `client.go` | n/a | n/a | n/a | ✅ |
 | UC-96 / 96b / 96c | `usecases.go` + `docker_readiness_test.go` | n/a | n/a | cluster-hetero | Written ✅; run ⏳ |

@@ -1241,14 +1241,13 @@ func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, li
 		source string
 		err    error
 	}
+	// Buffered for exactly two senders, and both goroutines send exactly once,
+	// so a send never blocks even after we stop reading on the first success —
+	// the loser drains into the buffer and exits. No leak, no drain goroutine.
 	ch := make(chan result, 2)
 
 	go func() {
-		err := listener.Wait(raceCtx)
-		select {
-		case ch <- result{source: "socket", err: err}:
-		case <-raceCtx.Done():
-		}
+		ch <- result{source: "socket", err: listener.Wait(raceCtx)}
 	}()
 
 	go func() {
@@ -1256,36 +1255,43 @@ func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, li
 		defer timer.Stop()
 		select {
 		case <-timer.C:
+			ch <- result{source: "health", err: c.pollToolboxHealth(raceCtx, containerIP)}
 		case <-raceCtx.Done():
-			return
-		}
-		err := c.pollToolboxHealth(raceCtx, containerIP)
-		select {
-		case ch <- result{source: "health", err: err}:
-		case <-raceCtx.Done():
+			ch <- result{source: "health", err: raceCtx.Err()}
 		}
 	}()
 
-	res := <-ch
-	cancel()
-	// Drain the loser so its goroutine can exit without leaking a dial.
-	go func() {
-		select {
-		case <-ch:
-		case <-time.After(c.toolboxWaitTimeout):
+	// Take the first path that SUCCEEDS; a failure on one path is not fatal
+	// while the other may still win. This is what makes the health poll a true
+	// safety net: it backstops not just a silent socket (old toolbox image, or
+	// gVisor without --host-uds=open) but also an *erroring* one — an
+	// in-container process tripping maxInvalidReadyAttempts (or any other
+	// listener error) must not be able to fail the create of a healthy sandbox.
+	var socketErr, healthErr error
+	for i := 0; i < 2; i++ {
+		res := <-ch
+		if res.err == nil {
+			cancel() // stop the loser; its buffered send still completes.
+			waitMS := time.Since(start).Milliseconds()
+			if res.source == "socket" {
+				recordReadySocketHit(waitMS)
+			} else {
+				recordReadySocketFallback(waitMS)
+			}
+			return res.source, nil
 		}
-	}()
-
-	if res.err != nil {
-		return "", res.err
+		if res.source == "socket" {
+			socketErr = res.err
+		} else {
+			healthErr = res.err
+		}
 	}
-	waitMS := time.Since(start).Milliseconds()
-	if res.source == "socket" {
-		recordReadySocketHit(waitMS)
-	} else {
-		recordReadySocketFallback(waitMS)
+	// Both paths failed. Prefer the health error: it reflects the actual
+	// readiness probe rather than socket-channel noise.
+	if healthErr != nil {
+		return "", healthErr
 	}
-	return res.source, nil
+	return "", socketErr
 }
 
 func (c *Client) pollToolboxHealth(ctx context.Context, containerIP string) error {

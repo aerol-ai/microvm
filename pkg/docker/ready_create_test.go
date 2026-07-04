@@ -217,6 +217,84 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	}
 }
 
+// TestCreate_SocketErrorFallsBackToHealth is the regression guard for the race
+// fix: an in-container process spamming the ready socket with invalid frames
+// trips listener.Wait's maxInvalidReadyAttempts and returns an error. That
+// error must NOT win the race and fail the create — the health poll is the
+// safety net and the (healthy) sandbox must still come up via "health".
+// Pre-fix, the socket error short-circuited the create.
+func TestCreate_SocketErrorFallsBackToHealth(t *testing.T) {
+	requireLinuxUnix(t)
+	readyDir := t.TempDir()
+
+	// Slow-but-eventually-ready health endpoint: 503 until a few polls in, then
+	// 200. This guarantees the socket error (fast invalid spam) lands before
+	// the health success, so we exercise the "socket errored first" path.
+	var mu sync.Mutex
+	var hits int
+	ip, port, closeFn := toolboxServer(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		if n >= 3 {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
+	t.Cleanup(closeFn)
+
+	d := fakeCreateDaemon(t)
+	c := newCreateClient(t, d, false, func(c *Client) {
+		c.readyEnabled = true
+		c.readyDir = readyDir
+		c.toolboxPort = port
+		c.readinessPollInit = 5 * time.Millisecond
+		c.readinessPollMax = 10 * time.Millisecond
+		c.toolboxWaitTimeout = 2 * time.Second
+	})
+	d.containerGet = func() *http.Response {
+		return textResponse(http.StatusOK, inspectBody("cid", "/sb-err", ip, true, "running", 7))
+	}
+
+	// Spam invalid frames (wrong nonce) until the listener trips its invalid cap.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			matches, _ := filepath.Glob(filepath.Join(readyDir, "sb-err.*.sock"))
+			if len(matches) == 0 {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			for i := 0; i < maxInvalidReadyAttempts+2; i++ {
+				conn, err := net.Dial("unix", matches[0])
+				if err != nil {
+					return
+				}
+				_ = readyproto.Encode(conn, readyproto.ReadySignal{
+					Event: readyproto.EventReady, SandboxID: "sb-err", Token: "tok", Nonce: "wrong-nonce",
+				})
+				_ = conn.Close()
+			}
+			return
+		}
+	}()
+
+	ctx, timing := WithCreateTiming(context.Background())
+	_, err := c.Create(ctx, models.CreateSandboxRequest{Image: "img"}, "sb-err", "tok", nil)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("create must survive a socket error via health fallback: %v", err)
+	}
+	if timing.Source != "health" {
+		t.Fatalf("source = %q, want health (socket errored, health backstopped)", timing.Source)
+	}
+}
+
 func TestCreate_FallbackWhenPushDisabled(t *testing.T) {
 	d := fakeCreateDaemon(t)
 	c := newCreateClient(t, d, true, func(c *Client) {

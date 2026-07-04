@@ -470,6 +470,57 @@ cat > /etc/systemd/system/sandboxd.service.d/cluster.conf <<'EOF'
 EnvironmentFile=/etc/sandboxd/cluster.env
 EOF
 
+# gVisor host-UDS: prerequisite for the cluster Docker push-readiness socket
+# (toolboxd dials a host unix socket bind-mounted into the sandbox; under runsc
+# that connect is blocked unless --host-uds=open is set). We enable it HERE, not
+# in install.sh, on purpose: install.sh runs before the node is in a cluster and
+# must not relax gVisor isolation on standalone hosts that never run the socket.
+# By the time cluster-init runs we KNOW this is a cluster node, so the relaxation
+# is correctly scoped to cluster+gVisor. No-op when gVisor isn't registered, and
+# idempotent (we check for the arg semantically, so a re-run never bounces
+# docker). Best-effort: a failure degrades the socket to health polling, it must
+# not fail the cluster join.
+ensure_gvisor_host_uds() {
+	local daemon_json="/etc/docker/daemon.json"
+	command -v docker >/dev/null 2>&1 || return 0
+	[[ -s "$daemon_json" ]] || return 0
+
+	local merged=""
+	if command -v jq >/dev/null 2>&1; then
+		# Only rewrite when runsc is registered AND host-uds is absent. index()
+		# returns null when missing; this keeps re-runs idempotent regardless of
+		# how the existing daemon.json happens to be formatted.
+		if [[ "$(jq -r '((.runtimes.runsc | type) == "object") and (((.runtimes.runsc.runtimeArgs // []) | index("--host-uds=open")) == null)' "$daemon_json" 2>/dev/null)" != "true" ]]; then
+			return 0
+		fi
+		merged="$(jq '.runtimes.runsc.runtimeArgs = ((.runtimes.runsc.runtimeArgs // []) + ["--host-uds=open"])' "$daemon_json")" || return 0
+	elif command -v python3 >/dev/null 2>&1; then
+		merged="$(python3 - "$daemon_json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+rs = cfg.get("runtimes", {}).get("runsc")
+if not isinstance(rs, dict):
+    sys.exit(3)  # gVisor not registered -> no-op
+args = rs.get("runtimeArgs", [])
+if "--host-uds=open" in args:
+    sys.exit(3)  # already enabled -> idempotent no-op
+args.append("--host-uds=open")
+rs["runtimeArgs"] = args
+print(json.dumps(cfg, indent=2))
+PY
+)" || return 0  # exit 3 (no-op) or any error -> leave daemon.json untouched
+	else
+		echo "[cluster-init] no jq/python3 to enable runsc --host-uds=open; readiness socket will fall back to health polling" >&2
+		return 0
+	fi
+
+	[[ -n "$merged" ]] || return 0
+	printf '%s\n' "$merged" > "$daemon_json"
+	echo "[cluster-init] enabled runsc --host-uds=open for the cluster readiness socket; restarting docker"
+	systemctl restart docker || echo "[cluster-init] docker restart failed; readiness socket will fall back to health polling" >&2
+}
+
 restart_sandboxd_with_diagnostics() {
 	echo "[cluster-init] restarting sandboxd with cluster mode enabled"
 	if ! systemctl restart sandboxd; then
@@ -505,6 +556,7 @@ restart_sandboxd_with_diagnostics() {
 	fi
 }
 
+ensure_gvisor_host_uds
 systemctl daemon-reload
 restart_sandboxd_with_diagnostics
 
