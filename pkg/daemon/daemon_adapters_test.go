@@ -208,6 +208,30 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 	}
 }
 
+func TestFirecrackerWarmPoolDepthCapsByTapBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured int
+		tapSize    int
+		want       int
+		wantCapped bool
+	}{
+		{name: "under budget", configured: 4, tapSize: 64, want: 4},
+		{name: "at budget", configured: 8, tapSize: 64, want: 8},
+		{name: "over budget", configured: 16, tapSize: 64, want: 8, wantCapped: true},
+		{name: "tiny tap pool disables warm depth", configured: 1, tapSize: 4, want: 0, wantCapped: true},
+		{name: "negative configured clamps to zero", configured: -1, tapSize: 64, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, capped := firecrackerWarmPoolDepth(tc.configured, tc.tapSize)
+			if got != tc.want || capped != tc.wantCapped {
+				t.Fatalf("firecrackerWarmPoolDepth(%d,%d) = (%d,%v), want (%d,%v)",
+					tc.configured, tc.tapSize, got, capped, tc.want, tc.wantCapped)
+			}
+		})
+	}
+}
+
 func TestTemplateResolverAdapter_Resolve(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)

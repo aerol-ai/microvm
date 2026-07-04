@@ -57,6 +57,14 @@ func (c *Client) LastCreateReadinessSource() (string, bool) {
 	return c.timing.takeCreateReadinessSource()
 }
 
+// LastServerCreateStages returns every <name>;dur= Server-Timing pair from
+// the most recent create (create, runtime_wait, fc_verify, fc_driver, …),
+// then clears it. ok is false when the last create carried no header. The
+// bench folds these into the per-stage breakdown of the JSON artifact.
+func (c *Client) LastServerCreateStages() (map[string]float64, bool) {
+	return c.timing.takeCreateStages()
+}
+
 // SDK exposes the underlying client for use cases that need a method this
 // wrapper doesn't surface yet.
 func (c *Client) SDK() *microvm.Client { return c.sdk }

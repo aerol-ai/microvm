@@ -4129,6 +4129,72 @@ func (s *Store) ReleaseFirecrackerTapSlot(ctx context.Context, sandboxID string)
 	return nil
 }
 
+// TransferFirecrackerTapSlot re-keys an allocated TAP slot from one owner id
+// to another without changing the TAP name, IPs, or vsock CID. The warm-VMM
+// pool uses this when a parked slot id becomes a real sandbox id. Retrying the
+// same transfer is idempotent once toID owns the slot; trying to overwrite a
+// different target slot fails before the UPDATE hits the partial unique index.
+func (s *Store) TransferFirecrackerTapSlot(ctx context.Context, fromID, toID string, now time.Time) (*FirecrackerTapSlot, error) {
+	if fromID == "" || toID == "" {
+		return nil, errors.New("transfer firecracker tap slot: from_id/to_id are required")
+	}
+	if fromID == toID {
+		return s.GetFirecrackerTapSlotBySandbox(ctx, toID)
+	}
+	target, err := s.GetFirecrackerTapSlotBySandbox(ctx, toID)
+	if err != nil {
+		return nil, err
+	}
+	source, err := s.GetFirecrackerTapSlotBySandbox(ctx, fromID)
+	if err != nil {
+		return nil, err
+	}
+	if target != nil {
+		if source == nil || target.TapName == source.TapName {
+			return target, nil
+		}
+		return nil, fmt.Errorf("transfer firecracker tap slot: target %q already owns %s", toID, target.TapName)
+	}
+	if source == nil {
+		// The two reads above are not atomic: a concurrent duplicate of
+		// this same transfer may have committed between them, leaving a
+		// stale target=nil alongside source=nil. Re-read the target so
+		// the losing duplicate returns the moved slot (idempotent)
+		// instead of a spurious not-found.
+		target, err = s.GetFirecrackerTapSlotBySandbox(ctx, toID)
+		if err != nil {
+			return nil, err
+		}
+		if target != nil {
+			return target, nil
+		}
+		return nil, ErrNotFound
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_tap_pool
+		SET sandbox_id = ?, allocated_at = ?
+		WHERE sandbox_id = ?
+	`, toID, now.UTC(), fromID)
+	if err != nil {
+		return nil, fmt.Errorf("transfer firecracker tap slot: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("transfer firecracker tap slot (affected): %w", err)
+	}
+	if n == 0 {
+		if target, err := s.GetFirecrackerTapSlotBySandbox(ctx, toID); err != nil {
+			return nil, err
+		} else if target != nil {
+			return target, nil
+		}
+		return nil, ErrNotFound
+	}
+	source.SandboxID = toID
+	source.AllocatedAt = now.UTC()
+	return source, nil
+}
+
 // GetFirecrackerTapSlotBySandbox returns the slot currently owned by
 // sandboxID, or nil if it owns none. Used by both the idempotent
 // allocate path and the runtime driver's Inspect/Destroy paths.

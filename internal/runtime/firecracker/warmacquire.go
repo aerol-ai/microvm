@@ -14,18 +14,16 @@ package firecracker
 //
 //   - LoadSnapshot: skipped. The pool already issued it.
 //
-//   - PutNetworkInterface vs PatchDrive: the cold-boot path uses Put
-//     before InstanceStart; the snapshot-load path supplies TAP
-//     rebinding in LoadSnapshot.network_overrides and patches drive
-//     paths before Resume. The warm path predates that Firecracker
-//     v1.15 contract and remains gated behind the disabled-by-default
-//     pool flag.
+//   - Network rebinding: skipped. WarmSpawn already supplied
+//     LoadSnapshot.network_overrides against a real TAP owned by the warm
+//     slot; Acquire only transfers that TAP owner to the sandbox id.
 //
 // Failure-path consistency (pr-review.md §4): every resource acquired
-// in this file (TAP slot, host TAP, overlay file, registry entries) is
-// cleaned up in LIFO order on error. The pool slot's row is moved back
-// to 'released' so the GC sweep tears the VMM down — there is no path
-// here that leaves a slot stuck in 'allocated' without a sandbox owner.
+// in this file (warm VMM slot, transferred TAP owner, overlay file,
+// registry entries) is cleaned up in LIFO order on error. The pool slot's row
+// is moved to 'released' and the handle is shut down so the TAP is removed and
+// released — there is no path here that leaves a slot stuck in 'allocated'
+// without a sandbox owner.
 
 import (
 	"context"
@@ -37,6 +35,7 @@ import (
 	"time"
 
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -53,6 +52,10 @@ import (
 type WarmPool interface {
 	AcquireWithHandle(ctx context.Context, templateID, sandboxID string, now time.Time) (*vmmpool.Slot, vmmpool.SpawnedHandle, error)
 	Release(ctx context.Context, sandboxID string, now time.Time) error
+}
+
+type warmTapOwnerSetter interface {
+	setTapOwner(owner string)
 }
 
 // SetWarmPool injects the warm-VMM pool. Called once by main.go after
@@ -119,17 +122,37 @@ func (d *Driver) tryAcquireWarm(
 		"slot_id", slot.ID, "api_socket", slot.APISocket,
 		"vsock_cid", slot.VsockCID)
 
+	transferredSlot, err := d.pool.Transfer(ctx, slot.ID, sandboxID, time.Now().UTC())
+	if err == nil && transferredSlot == nil {
+		// Defensive: the TapPool contract returns a slot on success, but a
+		// nil/nil answer must still roll back — returning without cleanup
+		// here would leak the claimed warm slot AND its paused VMM.
+		err = errors.New("transfer returned no slot")
+	}
+	if err != nil {
+		if relErr := d.warmPool.Release(context.Background(), sandboxID, time.Now().UTC()); relErr != nil {
+			d.logger.Warn("firecracker create: warm acquire rollback after tap transfer failure (pool release)",
+				"sandbox_id", sandboxID, "slot_id", slot.ID, "error", relErr)
+		}
+		if sErr := handle.Shutdown(context.Background(), 3*time.Second); sErr != nil {
+			d.logger.Warn("firecracker create: warm acquire rollback after tap transfer failure (handle shutdown)",
+				"sandbox_id", sandboxID, "slot_id", slot.ID, "error", sErr)
+		}
+		return nil, false, fmt.Errorf("firecracker runtime: warm tap transfer %s -> %s: %w", slot.ID, sandboxID, err)
+	}
+	tapSlot = transferredSlot
+	if setter, ok := handle.(warmTapOwnerSetter); ok {
+		setter.setTapOwner(sandboxID)
+	}
+	d.logger.Info("firecracker create: warm tap transferred",
+		"sandbox_id", sandboxID, "slot_id", slot.ID, "tap", tapSlot.TapName,
+		"guest_ip", tapSlot.GuestIP)
+
 	// From here on, any error must release the slot (move row to
 	// 'released' so GC drops it AND the handle is Shutdown). The
 	// flag-and-defer pattern mirrors the cold-spawn path's pool/tap/vmm
 	// cleanup.
 	committed := false
-	// tapEnsured gates the host-TAP rollback below: we only `ip link
-	// delete` a device this path actually brought up. The host TAP is
-	// realized lazily (just before the network PATCH), so an error in the
-	// overlay/rootfs staging above it must not Remove a device that was
-	// never Ensured.
-	tapEnsured := false
 	defer func() {
 		if committed {
 			return
@@ -145,16 +168,6 @@ func (d *Driver) tryAcquireWarm(
 		if sErr := handle.Shutdown(context.Background(), 3*time.Second); sErr != nil {
 			d.logger.Warn("firecracker create: warm acquire rollback (handle shutdown)",
 				"sandbox_id", sandboxID, "slot_id", slot.ID, "error", sErr)
-		}
-		// Drop the host TAP last — after handle.Shutdown has brought the
-		// firecracker process down. `ip link delete` on a TAP still
-		// owned by a running VMM fails EBUSY (the same ordering Destroy
-		// relies on in driver.go).
-		if tapEnsured {
-			if rmErr := d.tapHost.Remove(context.Background(), tapSlot.TapName); rmErr != nil {
-				d.logger.Warn("firecracker create: warm acquire rollback (tap remove)",
-					"sandbox_id", sandboxID, "tap", tapSlot.TapName, "error", rmErr)
-			}
 		}
 	}()
 
@@ -205,33 +218,6 @@ func (d *Driver) tryAcquireWarm(
 		return nil, false, fmt.Errorf("firecracker runtime: warm patch rootfs drive: %w", err)
 	}
 
-	// Bring this sandbox's host TAP up before pointing the guest's eth0
-	// at it. WarmSpawn deliberately skips host-TAP realization: the
-	// snapshot's eth0 references the defunct template-build TAP, and
-	// firecracker only validates the device at Resume, not at snapshot
-	// load (see warmspawn.go). The cold path realizes the TAP at its
-	// Step 4 in driver.go; the warm path returns before reaching that
-	// step, so without this Ensure the VM resume below points
-	// host_dev_name at a device that was never created and the create
-	// fails. Idempotent — a retried create re-Ensures the same slot.
-	if err := d.tapHost.Ensure(ctx, *tapSlot); err != nil {
-		return nil, false, fmt.Errorf("firecracker runtime: warm tap host ensure %s: %w", tapSlot.TapName, err)
-	}
-	tapEnsured = true
-
-	// PATCH NetworkInterface: the snapshot's eth0 references the
-	// defunct template-build TAP. This legacy warm-pool path is not
-	// used by the single-node-fc integration run (the pool is disabled
-	// by default). Firecracker v1.15 requires host_dev_name rebinding
-	// in LoadSnapshot.network_overrides, so the warm pool needs a
-	// separate redesign before it can be enabled on that API version.
-	if err := client.PatchNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterfacePatch{
-		IfaceID:     primaryIfaceID,
-		HostDevName: tapSlot.TapName,
-	}); err != nil {
-		return nil, false, fmt.Errorf("firecracker runtime: warm patch network interface: %w", err)
-	}
-
 	// PATCH overlay drive: same shape as the cold snapshot-load path.
 	// The snapshot baked in the template's placeholder overlay; we
 	// swap to this sandbox's per-sandbox file before Resume.
@@ -251,9 +237,12 @@ func (d *Driver) tryAcquireWarm(
 	// Resume the VMM. From the guest's perspective this is the first
 	// instruction after the snapshot was taken — vCPUs start ticking
 	// against the new TAP+overlay.
+	timing := createtiming.From(ctx)
+	resumeStart := time.Now()
 	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm patch VM Resumed: %w", err)
 	}
+	timing.RecordStage("fc_resume", time.Since(resumeStart))
 
 	// Vsock handshake — dial the snapshot's reserved CID. The pool
 	// slot's vsock_cid IS the snapshot's CID (RecordLoaded copies it
@@ -261,9 +250,11 @@ func (d *Driver) tryAcquireWarm(
 	// dial. Dialing tapSlot.VsockCID would race the guest, which is
 	// listening on the snapshot's CID baked in at template build.
 	vsockPath := filepath.Join(slot.RunDir, hostVsockUDSName)
+	handshakeStart := time.Now()
 	if err := d.vsockHandshake(ctx, vsockPath, slot.VsockCID); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm vsock handshake: %w", err)
 	}
+	timing.RecordStage("fc_handshake", time.Since(handshakeStart))
 	d.logger.Info("firecracker create: warm vsock handshake complete",
 		"sandbox_id", sandboxID,
 		"vsock_cid", slot.VsockCID,
@@ -273,7 +264,10 @@ func (d *Driver) tryAcquireWarm(
 	// post_resume reseed (RNG + wallclock). Best-effort; same shape
 	// as the cold snapshot-load path.
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-	if err := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", postResumeData(tapSlot)); err != nil {
+	postResumeStart := time.Now()
+	postResumeErr := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", postResumeData(tapSlot))
+	timing.RecordStage("fc_post_resume", time.Since(postResumeStart))
+	if err := postResumeErr; err != nil {
 		d.logger.Warn("firecracker create: warm post_resume send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	} else {
@@ -285,7 +279,7 @@ func (d *Driver) tryAcquireWarm(
 			"tap", tapSlot.TapName)
 	}
 	cancel()
-	d.probeToolboxTCP(ctx, "warm_acquire", sandboxID, tapSlot, true)
+	d.scheduleToolboxTCPProbe("warm_acquire", sandboxID, tapSlot, true)
 
 	// Register the warm handle + client into the driver's map so
 	// Destroy finds them. The handle is the SpawnedHandle from the

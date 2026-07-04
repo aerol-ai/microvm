@@ -16,6 +16,9 @@ type fakePoolGetErr struct {
 func (p *fakePoolGetErr) Allocate(ctx context.Context, sandboxID string, now time.Time) (*TapSlot, error) {
 	return nil, p.err
 }
+func (p *fakePoolGetErr) Transfer(ctx context.Context, fromID, toID string, now time.Time) (*TapSlot, error) {
+	return nil, p.err
+}
 func (p *fakePoolGetErr) Release(ctx context.Context, sandboxID string) error {
 	return p.err
 }

@@ -20,6 +20,8 @@ type serverTimingTransport struct {
 	have          bool
 	lastReadiness string
 	haveReadiness bool
+	lastStages    map[string]float64
+	haveStages    bool
 }
 
 func (t *serverTimingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -36,6 +38,11 @@ func (t *serverTimingTransport) RoundTrip(req *http.Request) (*http.Response, er
 		if src, ok := parseServerTimingReadinessSource(resp.Header.Get("Server-Timing")); ok {
 			t.mu.Lock()
 			t.lastReadiness, t.haveReadiness = src, true
+			t.mu.Unlock()
+		}
+		if stages := parseServerTimingStages(resp.Header.Get("Server-Timing")); len(stages) > 0 {
+			t.mu.Lock()
+			t.lastStages, t.haveStages = stages, true
 			t.mu.Unlock()
 		}
 	}
@@ -61,6 +68,46 @@ func (t *serverTimingTransport) takeCreateReadinessSource() (string, bool) {
 	src, ok := t.lastReadiness, t.haveReadiness
 	t.haveReadiness = false
 	return src, ok
+}
+
+// takeCreateStages returns every <name>;dur= pair from the most recent
+// create's Server-Timing header (create, runtime_wait, fc_* …) and clears
+// it. The per-stage breakdown is Phase 0 of
+// plans/firecracker-create-latency.md — the bench aggregates these into
+// the latency[].stages block of the JSON artifact.
+func (t *serverTimingTransport) takeCreateStages() (map[string]float64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stages, ok := t.lastStages, t.haveStages
+	t.lastStages, t.haveStages = nil, false
+	return stages, ok
+}
+
+// parseServerTimingStages extracts every metric with a dur= attribute into
+// a name→milliseconds map. Metrics without dur (e.g. readiness;desc=…)
+// are skipped. Extra attributes on a dur-carrying metric are ignored —
+// the presence of the fc_warm key alone marks a warm-pool hit, so the
+// bench needs no desc parsing.
+func parseServerTimingStages(header string) map[string]float64 {
+	var stages map[string]float64
+	for _, metric := range strings.Split(header, ",") {
+		fields := strings.Split(metric, ";")
+		name := strings.TrimSpace(fields[0])
+		if name == "" {
+			continue
+		}
+		for _, attr := range fields[1:] {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(attr), "dur="); ok {
+				if ms, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					if stages == nil {
+						stages = make(map[string]float64)
+					}
+					stages[name] = ms
+				}
+			}
+		}
+	}
+	return stages
 }
 
 // parseServerTimingReadinessSource extracts readiness;desc=<source>.

@@ -1,0 +1,16 @@
+# 3× mixed cluster with Firecracker on the seed bare-metal node. Same Raft +
+# forwarding + shared Caddy cert topology as cluster-3-mixed, but the seed is
+# c5.metal with with_firecracker=true so FC create/template/exec UCs and the
+# benchmark row exercise placement + cross-node forwarding through a real
+# multi-node cluster with domain/TLS — without standing up cluster-hetero.
+name: cluster-3-mixed-fc
+capabilities:
+  - docker
+  - platform-volumes
+  - firecracker
+  - domain
+  - cluster
+  # Opt UC-94/UC-95 in here (docker + firecracker latency; docker density).
+  - benchmark
+
+expected_members: 3

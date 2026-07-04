@@ -27,6 +27,7 @@ func TestFromDaemonConfig(t *testing.T) {
 		JailerUID:                       1000,
 		JailerGID:                       1001,
 		FirecrackerSnapshotVerifyOnLoad: true,
+		FirecrackerSnapshotVerifyMode:   "always",
 		FirecrackerOverlayEnabled:       true,
 		FirecrackerMkfs4Bin:             "/sbin/mkfs.ext4",
 	}
@@ -37,7 +38,7 @@ func TestFromDaemonConfig(t *testing.T) {
 		got.TemplatesDir != c.FirecrackerTemplatesDir ||
 		!got.UseJailer ||
 		got.JailerUID != 1000 || got.JailerGID != 1001 ||
-		!got.SnapshotVerifyOnLoad || !got.OverlayEnabled {
+		!got.SnapshotVerifyOnLoad || got.SnapshotVerifyMode != "always" || !got.OverlayEnabled {
 		t.Fatalf("FromDaemonConfig mismatch: %+v", got)
 	}
 }

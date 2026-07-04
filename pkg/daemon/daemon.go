@@ -394,7 +394,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// processes.
 		if cfg.FirecrackerVMMPoolEnabled {
 			vmmPool := vmmpool.New(db, logger)
-			vmmPool.SetDefaultDepth(cfg.FirecrackerVMMPoolDepthDefault)
+			warmDepth, capped := firecrackerWarmPoolDepth(cfg.FirecrackerVMMPoolDepthDefault, cfg.FirecrackerTapPoolSize)
+			if capped {
+				logger.Warn("firecracker vmm pool depth capped by TAP pool budget",
+					"configured_depth", cfg.FirecrackerVMMPoolDepthDefault,
+					"effective_depth", warmDepth,
+					"tap_pool_size", cfg.FirecrackerTapPoolSize)
+			}
+			vmmPool.SetDefaultDepth(warmDepth)
 			fcDriver.SetWarmPool(vmmPool)
 			lister := &vmmTemplateListerAdapter{svc: svc}
 			spawner := fcruntime.NewPoolSpawner(fcDriver)
@@ -413,7 +420,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				}
 			}()
 			logger.Info("firecracker vmm pool enabled",
-				"depth_default", cfg.FirecrackerVMMPoolDepthDefault,
+				"depth_default", warmDepth,
 				"refill_interval", cfg.FirecrackerVMMPoolRefillInterval,
 				"gc_interval", cfg.FirecrackerVMMPoolGCInterval,
 				"gc_ttl", cfg.FirecrackerVMMPoolGCTTL)
@@ -1494,6 +1501,28 @@ func (a *firecrackerPoolAdapter) Allocate(ctx context.Context, sandboxID string,
 	return adaptTapSlot(s), nil
 }
 
+func firecrackerWarmPoolDepth(configuredDepth, tapPoolSize int) (int, bool) {
+	if configuredDepth < 0 {
+		configuredDepth = 0
+	}
+	maxDepth := tapPoolSize / 8
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
+	if configuredDepth > maxDepth {
+		return maxDepth, true
+	}
+	return configuredDepth, false
+}
+
+func (a *firecrackerPoolAdapter) Transfer(ctx context.Context, fromID, toID string, now time.Time) (*fcruntime.TapSlot, error) {
+	s, err := a.inner.Transfer(ctx, fromID, toID, now)
+	if err != nil {
+		return nil, err
+	}
+	return adaptTapSlot(s), nil
+}
+
 func (a *firecrackerPoolAdapter) Release(ctx context.Context, sandboxID string) error {
 	return a.inner.Release(ctx, sandboxID)
 }
@@ -1656,6 +1685,7 @@ func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcru
 		return nil, fmt.Errorf("template %q: ensure local: %w", id, err)
 	}
 	return &fcruntime.TemplateResolution{
+		TemplateID:         t.ID,
 		RootfsPath:         t.RootfsPath,
 		HasSnapshot:        t.HasSnapshot,
 		HasOverlay:         t.HasOverlay,

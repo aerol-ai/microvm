@@ -245,6 +245,48 @@ func TestRefill_ConsidersExistingNonReleased(t *testing.T) {
 	}
 }
 
+func TestRefill_SkipsWhenTapFreeBelowWarmReserve(t *testing.T) {
+	ctx := context.Background()
+	p, st := newTestPool(t)
+	now := time.Now().UTC()
+	seedTestTapSlots(t, st, 8)
+	for i := 0; i < 3; i++ {
+		if _, err := st.AllocateFirecrackerTapSlot(ctx, fmt.Sprintf("sb-active-%d", i), now); err != nil {
+			t.Fatalf("allocate active tap %d: %v", i, err)
+		}
+	}
+	p.SetDepth("tpl-a", 3)
+	spawner := &fakeSpawner{}
+	lister := &fakeLister{templates: []TemplateWarmInput{{TemplateID: "tpl-a", VsockCID: 3}}}
+	var busy atomic.Bool
+	p.runRefillOnce(ctx, lister, spawner, 5*time.Second, &busy)
+
+	if got := len(spawner.Calls()); got != 0 {
+		t.Fatalf("spawn calls = %d, want 0 when free taps are below 2x warm depth", got)
+	}
+}
+
+func TestRefill_AllowsWhenTapFreeMeetsWarmReserve(t *testing.T) {
+	ctx := context.Background()
+	p, st := newTestPool(t)
+	now := time.Now().UTC()
+	seedTestTapSlots(t, st, 8)
+	for i := 0; i < 2; i++ {
+		if _, err := st.AllocateFirecrackerTapSlot(ctx, fmt.Sprintf("sb-active-%d", i), now); err != nil {
+			t.Fatalf("allocate active tap %d: %v", i, err)
+		}
+	}
+	p.SetDepth("tpl-a", 3)
+	spawner := &fakeSpawner{}
+	lister := &fakeLister{templates: []TemplateWarmInput{{TemplateID: "tpl-a", VsockCID: 3}}}
+	var busy atomic.Bool
+	p.runRefillOnce(ctx, lister, spawner, 5*time.Second, &busy)
+
+	if got := len(spawner.Calls()); got != 3 {
+		t.Fatalf("spawn calls = %d, want 3 when free taps meet 2x warm depth", got)
+	}
+}
+
 func TestGC_ReapsAgedReleasedRows(t *testing.T) {
 	ctx := context.Background()
 	p, _ := newTestPool(t)
@@ -272,6 +314,66 @@ func TestGC_ReapsAgedReleasedRows(t *testing.T) {
 	}
 	if stats.Released != 1 {
 		t.Fatalf("after GC stats = %+v, want released=1 (vmms-new survives)", stats)
+	}
+}
+
+func seedTestTapSlots(t *testing.T, st *store.Store, n int) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for i := 0; i < n; i++ {
+		base := i * 4
+		if err := st.SeedFirecrackerTapSlot(ctx, store.FirecrackerTapSlot{
+			TapName:  fmt.Sprintf("fctap%d", i),
+			CIDR:     fmt.Sprintf("172.16.0.%d/30", base),
+			HostIP:   fmt.Sprintf("172.16.0.%d", base+1),
+			GuestIP:  fmt.Sprintf("172.16.0.%d", base+2),
+			VsockCID: uint32(3 + i),
+		}, now); err != nil {
+			t.Fatalf("seed tap slot %d: %v", i, err)
+		}
+	}
+}
+
+func TestGC_ReleasesWarmTapOwnerBeforeDeletingRow(t *testing.T) {
+	ctx := context.Background()
+	p, st := newTestPool(t)
+	now := time.Now().UTC()
+
+	if err := st.SeedFirecrackerTapSlot(ctx, store.FirecrackerTapSlot{
+		TapName:  "fctap0",
+		CIDR:     "172.16.0.0/30",
+		HostIP:   "172.16.0.1",
+		GuestIP:  "172.16.0.2",
+		VsockCID: 3,
+	}, now); err != nil {
+		t.Fatalf("seed tap: %v", err)
+	}
+	if _, err := st.AllocateFirecrackerTapSlot(ctx, "vmms-old", now); err != nil {
+		t.Fatalf("allocate warm tap: %v", err)
+	}
+	if err := p.RecordSpawning(ctx, "vmms-old", "tpl-a", now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordFailed(ctx, "vmms-old", "retired", now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	p.runGCOnce(ctx, time.Hour)
+
+	tapSlot, err := st.GetFirecrackerTapSlotBySandbox(ctx, "vmms-old")
+	if err != nil {
+		t.Fatalf("get tap after GC: %v", err)
+	}
+	if tapSlot != nil {
+		t.Fatalf("warm tap still owned after GC: %+v", tapSlot)
+	}
+	vmmSlot, err := st.GetFirecrackerVMMSlotByID(ctx, "vmms-old")
+	if err != nil {
+		t.Fatalf("get vmm slot after GC: %v", err)
+	}
+	if vmmSlot != nil {
+		t.Fatalf("released VMM slot still present after GC: %+v", vmmSlot)
 	}
 }
 

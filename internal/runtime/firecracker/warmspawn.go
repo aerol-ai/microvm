@@ -6,8 +6,8 @@ package firecracker
 // returned handle is what the warm-VMM pool stores so a later sandbox
 // create can claim it, PATCH per-sandbox state onto it, and PATCH /vm
 // state=Resumed. Firecracker v1.15 requires TAP rebinding in
-// LoadSnapshot.network_overrides, so this pool remains disabled by default
-// until the warm path is redesigned around load-time TAP ownership.
+// LoadSnapshot.network_overrides, so warm slots own a real TAP before the
+// snapshot is loaded and transfer that TAP to the claiming sandbox on acquire.
 //
 // Cleanup contract: WarmSpawn is responsible for tearing down the
 // firecracker process on any failure path after spawn. Success returns
@@ -16,18 +16,12 @@ package firecracker
 // VMMHandle is the structural match for the *firecracker.vmm we
 // produce here.
 //
-// Why no host TAP at WarmSpawn time: the template's snapshot state
-// captures the network interface's host_dev_name pointing at the
-// template-build TAP (which was torn down at the end of
-// SnapshotTemplate). Firecracker v1.15 no longer lets Acquire patch
-// host_dev_name after load, so this path is not suitable for production
-// until the warm slot owns a valid load-time network override.
-
 import (
 	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/firecracker"
@@ -80,10 +74,13 @@ type WarmHandle interface {
 //
 //  1. Allocate a slot rundir via the same spawn seam Create uses
 //     (creates the dir, returns a non-started handle).
-//  2. Start the VMM process and wait for its API socket.
-//  3. Optionally verify the snapshot checksums (SnapshotVerifyOnLoad).
-//  4. LoadSnapshot with EnableDiffSnapshots=true, ResumeVM=false.
-//  5. Return the handle without resuming — the Acquire code resumes.
+//  2. Allocate and realize a TAP slot under the warm slot id.
+//  3. Start the VMM process and wait for its API socket.
+//  4. Optionally verify the snapshot checksums (SnapshotVerifyOnLoad).
+//  5. LoadSnapshot with EnableDiffSnapshots=true, ResumeVM=false,
+//     rebinding eth0 to the warm TAP via network_overrides.
+//  6. Return the handle without resuming — the Acquire code transfers
+//     the TAP owner and resumes.
 //
 // On any failure between Start and the final return, the spawned
 // firecracker process is torn down and the rundir cleaned up so the
@@ -92,9 +89,7 @@ type WarmHandle interface {
 //
 // Acquire-side responsibilities (NOT done here):
 //
-//   - Allocating the per-sandbox TAP slot. On Firecracker v1.15 this
-//     must happen before LoadSnapshot, so the current warm path remains
-//     disabled by default.
+//   - Transferring the warm slot's TAP owner from slot id to sandbox id.
 //
 //   - Allocating the per-sandbox overlay file. The snapshot state
 //     references the 1 MiB placeholder used at capture time; the
@@ -121,6 +116,43 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 		// would be unreachable.
 		return nil, fmt.Errorf("firecracker warm-spawn: VsockCID=%d is reserved (must be >= 3)", req.VsockCID)
 	}
+	if d.pool == nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: TAP pool not registered (main.go must call SetPool): %w",
+			models.ErrRuntimeNotImplemented)
+	}
+	if d.tapHost == nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: TAP host manager not registered (main.go must call SetTapHost): %w",
+			models.ErrRuntimeNotImplemented)
+	}
+
+	tapSlot, err := d.pool.Allocate(ctx, req.SlotID, time.Now().UTC())
+	if err != nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: tap allocate: %w", err)
+	}
+	tapReleased := false
+	defer func() {
+		if !tapReleased {
+			if relErr := d.pool.Release(context.Background(), req.SlotID); relErr != nil {
+				d.logger.Warn("firecracker warm-spawn: tap release after error failed",
+					"slot_id", req.SlotID, "tap", tapSlot.TapName, "error", relErr)
+			}
+		}
+	}()
+
+	hostSlot := *tapSlot
+	hostSlot.GuestMAC = macFromCID(req.VsockCID)
+	if err := d.tapHost.Ensure(ctx, hostSlot); err != nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: tap host ensure %s: %w", tapSlot.TapName, err)
+	}
+	tapRemoved := false
+	defer func() {
+		if !tapRemoved {
+			if rmErr := d.tapHost.Remove(context.Background(), tapSlot.TapName); rmErr != nil {
+				d.logger.Warn("firecracker warm-spawn: tap remove after error failed",
+					"slot_id", req.SlotID, "tap", tapSlot.TapName, "error", rmErr)
+			}
+		}
+	}()
 
 	// Step 1: spawn the VMM (creates the runDir we'll later use as
 	// the overlay backing store + as the slot's identity in `ps`).
@@ -170,7 +202,7 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	// template — the lister filters on status=ready and only the
 	// service-side MarkSnapshotCorrupt moves the row out of ready.
 	if d.cfg.SnapshotVerifyOnLoad && req.SnapshotChecksum != "" {
-		if err := verifySnapshotChecksum(req.SnapshotMemoryPath, req.SnapshotStatePath, req.SnapshotChecksum); err != nil {
+		if err := d.verifySnapshotForLoad(req.TemplateID, req.SnapshotMemoryPath, req.SnapshotStatePath, req.SnapshotChecksum); err != nil {
 			if errors.Is(err, models.ErrSnapshotCorrupt) {
 				d.notifyCorrupt(ctx, req.TemplateID, err.Error())
 			}
@@ -205,13 +237,18 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 		},
 		EnableDiffSnapshots: true,
 		ResumeVM:            false,
+		NetworkOverrides: []firecracker.NetworkOverride{{
+			IfaceID:     primaryIfaceID,
+			HostDevName: tapSlot.TapName,
+		}},
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker warm-spawn: LoadSnapshot: %w", err)
 	}
 
 	d.logger.Info("firecracker warm-spawn: paused VMM ready",
 		"slot_id", req.SlotID, "template_id", req.TemplateID,
-		"api_socket", handle.APISocket(), "vsock_cid", req.VsockCID)
+		"api_socket", handle.APISocket(), "vsock_cid", req.VsockCID,
+		"tap", tapSlot.TapName)
 
 	// Phase 5: register the warm slot with the RSS sampler under its
 	// slot ID. The slot's firecracker process counts toward host memory
@@ -222,7 +259,9 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	d.rssRegister(req.SlotID, handle.Pid())
 
 	cleanupNeeded = false
-	return &warmHandle{handle: handle, driver: d, slotID: req.SlotID}, nil
+	tapRemoved = true
+	tapReleased = true
+	return &warmHandle{handle: handle, driver: d, slotID: req.SlotID, tapName: tapSlot.TapName, tapOwner: req.SlotID}, nil
 }
 
 // warmHandle wraps a VMMHandle and exposes only the narrow surface
@@ -238,20 +277,47 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 // eventual Shutdown's Unregister(slotID) is a no-op (the sampler
 // treats unknown ids as a no-op).
 type warmHandle struct {
-	handle VMMHandle
-	driver *Driver
-	slotID string
+	handle  VMMHandle
+	driver  *Driver
+	slotID  string
+	tapName string
+
+	ownerMu  sync.Mutex
+	tapOwner string
 }
 
 func (w *warmHandle) APISocket() string { return w.handle.APISocket() }
 func (w *warmHandle) RunDir() string    { return w.handle.RunDir() }
 func (w *warmHandle) Pid() int          { return w.handle.Pid() }
+func (w *warmHandle) setTapOwner(owner string) {
+	w.ownerMu.Lock()
+	w.tapOwner = owner
+	w.ownerMu.Unlock()
+}
 func (w *warmHandle) Shutdown(ctx context.Context, grace time.Duration) error {
 	if w.driver != nil {
 		w.driver.rssUnregister(w.slotID)
 	}
 	if err := w.handle.Shutdown(ctx, grace); err != nil {
 		return err
+	}
+	if w.driver != nil && w.driver.tapHost != nil && w.tapName != "" {
+		if err := w.driver.tapHost.Remove(ctx, w.tapName); err != nil {
+			w.driver.logger.Warn("firecracker warm-spawn: tap remove on shutdown failed",
+				"slot_id", w.slotID, "tap", w.tapName, "error", err)
+		}
+	}
+	if w.driver != nil && w.driver.pool != nil {
+		w.ownerMu.Lock()
+		owner := w.tapOwner
+		w.ownerMu.Unlock()
+		if owner == "" {
+			owner = w.slotID
+		}
+		if err := w.driver.pool.Release(ctx, owner); err != nil {
+			w.driver.logger.Warn("firecracker warm-spawn: tap release on shutdown failed",
+				"slot_id", w.slotID, "tap_owner", owner, "error", err)
+		}
 	}
 	// Drop the runDir too — the pool's GC sweep deletes the row, but
 	// the on-disk firecracker chroot would persist until manual

@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -118,6 +119,14 @@ type Driver struct {
 	// client); tests inject a fake that records REST calls without
 	// needing a real socket.
 	newClient vmmClientFactory
+	// snapshotVerifier is the hash seam used by the load-time integrity
+	// cache. Production uses verifySnapshotChecksum; tests replace it to
+	// count hash invocations without timing a large file read.
+	snapshotVerifier snapshotVerifierFunc
+	// toolboxTCPProbe is the log-only TCP reachability probe. Create
+	// schedules it out of band; tests replace it to assert the request
+	// path no longer waits for the probe tail.
+	toolboxTCPProbe toolboxTCPProbeFunc
 
 	mu       sync.Mutex
 	clients  map[string]VMMClient // sandbox-id -> API client
@@ -130,6 +139,10 @@ type Driver struct {
 	// without adding signal.
 	runtimeHealth string
 	healthReady   bool
+
+	verifyMu          sync.Mutex
+	verifiedSnapshots map[snapshotVerifyKey]*snapshotVerifyEntry
+	verifiedTemplates map[string]snapshotVerifyKey
 }
 
 // TapPool is the interface Driver depends on for network allocation.
@@ -139,6 +152,7 @@ type Driver struct {
 // real *tap.Pool, which satisfies the interface structurally.
 type TapPool interface {
 	Allocate(ctx context.Context, sandboxID string, now time.Time) (*TapSlot, error)
+	Transfer(ctx context.Context, fromID, toID string, now time.Time) (*TapSlot, error)
 	Release(ctx context.Context, sandboxID string) error
 	Get(ctx context.Context, sandboxID string) (*TapSlot, error)
 }
@@ -203,6 +217,11 @@ type Config struct {
 	// load-cost of a known-good snapshot. Mirrors
 	// internal/config.Config.FirecrackerSnapshotVerifyOnLoad.
 	SnapshotVerifyOnLoad bool
+	// SnapshotVerifyMode controls whether a verified snapshot is re-hashed
+	// on every LoadSnapshot ("always") or once per daemon boot and file
+	// identity ("once", default). Only consulted when SnapshotVerifyOnLoad
+	// is true and the template has a persisted checksum.
+	SnapshotVerifyMode string
 	// OverlayEnabled is the daemon-wide opt-out for the per-sandbox
 	// writable overlay drive. Mirrors
 	// internal/config.Config.FirecrackerOverlayEnabled. When false,
@@ -249,6 +268,7 @@ func FromDaemonConfig(c config.Config) Config {
 		JailerUID:            c.JailerUID,
 		JailerGID:            c.JailerGID,
 		SnapshotVerifyOnLoad: c.FirecrackerSnapshotVerifyOnLoad,
+		SnapshotVerifyMode:   c.FirecrackerSnapshotVerifyMode,
 		OverlayEnabled:       c.FirecrackerOverlayEnabled,
 		OverlayMkfs:          c.FirecrackerOverlayMkfs,
 		Mkfs4Bin:             c.FirecrackerMkfs4Bin,
@@ -284,6 +304,8 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 	d.newClient = func(socketPath string) VMMClient {
 		return firecracker.New(socketPath)
 	}
+	d.snapshotVerifier = verifySnapshotChecksum
+	d.toolboxTCPProbe = d.probeToolboxTCP
 	return d
 }
 
@@ -376,6 +398,7 @@ type TemplateResolver interface {
 // required; SnapshotChecksum is optional (used for integrity
 // verification when SnapshotVerifyOnLoad is on).
 type TemplateResolution struct {
+	TemplateID         string
 	RootfsPath         string
 	SnapshotMemoryPath string
 	SnapshotStatePath  string
@@ -468,6 +491,19 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: %w", err)
 	}
 
+	// Phase 0 (plans/firecracker-create-latency.md): per-stage boot
+	// attribution. The recorder rides the request context (nil-safe
+	// methods — a bare driver test without a recorder records nothing);
+	// the v1 handler surfaces the stages as Server-Timing entries so
+	// the bench can break the create total down without guessing.
+	// fc_driver is recorded on error paths too: a failed create's cost
+	// is exactly what an operator debugging latency wants to see.
+	timing := createtiming.From(ctx)
+	driverStart := time.Now()
+	defer func() {
+		timing.RecordStage("fc_driver", time.Since(driverStart))
+	}()
+
 	// Step 0: overlay-request sanity. Both the daemon-wide opt-out and
 	// the wire-level upper bound are checked before any allocation so a
 	// bad request fails fast and never leaks a slot. The upper bound
@@ -481,8 +517,42 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: overlay drive disabled on this daemon (SB_FIRECRACKER_OVERLAY_ENABLED=false)")
 	}
 
-	// Step 1: allocate the network slot.
+	// Step 1: Phase 4 warm-VMM pool fast path. Resolve the template
+	// early (before cold-spawn) so a pool hit avoids spending the
+	// firecracker process + LoadSnapshot wall-clock — that's the
+	// ~150ms+ this whole pool exists to skip. Warm slots already own
+	// their TAP at LoadSnapshot time, so a hit must run before the cold
+	// path allocates a second TAP for this sandbox. On a miss (no
+	// template, no snapshot, no pool slot) we fall through to the
+	// cold-spawn path unchanged.
+	//
+	// Template resolution is the only work we move earlier; the rest
+	// of Create still expects to resolve+stage inside its existing
+	// structure, so we keep the resolved snapshotInfo handy and reuse
+	// it below rather than re-resolving.
+	var earlySnap *TemplateResolution
+	if req.TemplateID != "" && d.templates != nil {
+		var err error
+		earlySnap, err = d.templates.Resolve(ctx, req.TemplateID)
+		if err != nil {
+			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
+		}
+	}
+	warmStart := time.Now()
+	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, nil, ""); err != nil {
+		return nil, err
+	} else if hit {
+		// UC-98's warm-hit marker: fc_warm carries both the acquire
+		// duration and desc=hit so the bench can split warm vs cold
+		// samples from the header alone.
+		timing.RecordStageDesc("fc_warm", time.Since(warmStart), "hit")
+		return state, nil
+	}
+
+	// Step 1b: allocate the network slot for the cold-spawn path.
+	tapAllocStart := time.Now()
 	slot, err := d.pool.Allocate(ctx, allocID, time.Now())
+	timing.RecordStage("fc_tap_alloc", time.Since(tapAllocStart))
 	if err != nil {
 		return nil, fmt.Errorf("firecracker runtime: tap allocate: %w", err)
 	}
@@ -498,33 +568,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.logger.Info("firecracker create: allocated network slot",
 		"sandbox_id", allocID, "tap", slot.TapName,
 		"guest_ip", slot.GuestIP, "vsock_cid", slot.VsockCID)
-
-	// Step 1b: Phase 4 warm-VMM pool fast path. Resolve the template
-	// early (before cold-spawn) so a pool hit avoids spending the
-	// firecracker process + LoadSnapshot wall-clock — that's the
-	// ~150ms+ this whole pool exists to skip. On a miss (no template,
-	// no snapshot, no pool slot) we fall through to the cold-spawn
-	// path unchanged.
-	//
-	// Template resolution is the only step we move earlier; the rest
-	// of Create still expects to resolve+stage inside its existing
-	// structure, so we keep the resolved snapshotInfo handy and reuse
-	// it below rather than re-resolving.
-	var earlySnap *TemplateResolution
-	if req.TemplateID != "" && d.templates != nil {
-		earlySnap, err = d.templates.Resolve(ctx, req.TemplateID)
-		if err != nil {
-			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
-		}
-	}
-	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, slot, ""); err != nil {
-		return nil, err
-	} else if hit {
-		// Warm path committed the TAP slot to the sandbox; suppress
-		// the deferred TAP release.
-		released = true
-		return state, nil
-	}
 
 	// Step 2: spawn the VMM. We spawn but do NOT yet Start — the rootfs must
 	// be in place inside the runDir before firecracker boots.
@@ -588,6 +631,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		snapshotLoadPath bool
 		snapshotInfo     *TemplateResolution
 	)
+	rootfsStart := time.Now()
 	if req.TemplateID != "" {
 		if d.templates == nil {
 			return nil, fmt.Errorf("firecracker runtime: template resolver not registered (main.go must call SetTemplateResolver): %w",
@@ -662,6 +706,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}()
 	}
 
+	timing.RecordStage("fc_rootfs", time.Since(rootfsStart))
+
 	// Step 4: bring the host-side TAP up. After this point, error
 	// returns must call tapHost.Remove. The flag-and-defer pattern
 	// mirrors the pool-release one above.
@@ -674,9 +720,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// allocated slot MAC.
 		hostSlot.GuestMAC = macFromCID(snapshotInfo.SnapshotVsockCID)
 	}
+	tapEnsureStart := time.Now()
 	if err := d.tapHost.Ensure(ctx, hostSlot); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: tap host ensure %s: %w", slot.TapName, err)
 	}
+	timing.RecordStage("fc_tap_ensure", time.Since(tapEnsureStart))
 	tapRemoved := false
 	defer func() {
 		if !released && !tapRemoved {
@@ -688,6 +736,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}()
 
 	// Step 5: start the VMM process and wait for the API socket.
+	spawnStart := time.Now()
 	if err := handle.Start(ctx); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: vmm start: %w", err)
 	}
@@ -700,6 +749,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: wait api socket: %w (stderr: %s)",
 			err, handle.StderrTail())
 	}
+	timing.RecordStage("fc_spawn", time.Since(spawnStart))
 
 	// Step 5b: per-sandbox overlay file. Allocated unconditionally when
 	// the request asks for one — both cold-boot (PutDrive overlay) and
@@ -740,13 +790,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// restored from the snapshot state file.
 	client := d.newClient(handle.APISocket())
 	if snapshotLoadPath {
+		// fc_verify + fc_load are recorded inside configureVMMForLoad.
 		if err := d.configureVMMForLoad(ctx, client, snapshotInfo, rootfsPath, slot, overlayPath); err != nil {
 			return nil, err
 		}
 	} else {
+		configureStart := time.Now()
 		if err := d.configureVMM(ctx, client, req, rootfsPath, slot, overlayPath); err != nil {
 			return nil, err
 		}
+		timing.RecordStage("fc_configure", time.Since(configureStart))
 	}
 
 	// Step 7: Resume the restored VMM (snapshot-load) OR InstanceStart
@@ -754,6 +807,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// VMM paused (ResumeVM=false) so the driver retains control over
 	// when execution actually begins — a Phase 4 (PR-B) hook to PATCH
 	// per-sandbox state before resume slots in here.
+	resumeStart := time.Now()
 	if snapshotLoadPath {
 		if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: patch VM Resumed: %w", err)
@@ -763,6 +817,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("firecracker runtime: action InstanceStart: %w", err)
 		}
 	}
+	timing.RecordStage("fc_resume", time.Since(resumeStart))
 
 	// Step 8: vsock handshake. The toolbox-in-guest listens on
 	// (cid=<guestCID>, port=1024); we dial from the host. A failed
@@ -781,9 +836,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		handshakeCID = snapshotInfo.SnapshotVsockCID
 	}
 	vsockPath := filepath.Join(handle.RunDir(), hostVsockUDSName)
+	handshakeStart := time.Now()
 	if err := d.vsockHandshake(ctx, vsockPath, handshakeCID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: vsock handshake: %w", err)
 	}
+	timing.RecordStage("fc_handshake", time.Since(handshakeStart))
 	d.logger.Info("firecracker create: vsock handshake complete",
 		"sandbox_id", allocID,
 		"snapshot_load", snapshotLoadPath,
@@ -799,7 +856,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// the boot-time race where PID 1 starts before the virtio-net
 	// device is fully visible.
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
+	postResumeStart := time.Now()
 	postErr := d.sendVsockOp(postCtx, vsockPath, handshakeCID, "post_resume", postResumeData(slot))
+	timing.RecordStage("fc_post_resume", time.Since(postResumeStart))
 	cancel()
 	if postErr != nil {
 		d.logger.Warn("firecracker create: post_resume send failed (continuing)",
@@ -813,7 +872,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			"gateway_ip", slot.HostIP,
 			"tap", slot.TapName)
 	}
-	d.probeToolboxTCP(ctx, "create", allocID, slot, snapshotLoadPath)
+	d.scheduleToolboxTCPProbe("create", allocID, slot, snapshotLoadPath)
 
 	// All steps succeeded. Register the client + handle so Destroy can
 	// find them. Order matters: the map writes happen AFTER we flip
@@ -980,11 +1039,19 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	if slot == nil {
 		return fmt.Errorf("firecracker runtime: configureVMMForLoad called with nil tap slot")
 	}
+	timing := createtiming.From(ctx)
 	if d.cfg.SnapshotVerifyOnLoad && snap.SnapshotChecksum != "" {
-		if err := verifySnapshotChecksum(snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum); err != nil {
+		verifyStart := time.Now()
+		err := d.verifySnapshotForLoad(snap.TemplateID, snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum)
+		timing.RecordStage("fc_verify", time.Since(verifyStart))
+		if err != nil {
 			return fmt.Errorf("firecracker runtime: snapshot integrity: %w", err)
 		}
 	}
+	loadStart := time.Now()
+	defer func() {
+		timing.RecordStage("fc_load", time.Since(loadStart))
+	}()
 	runDir := filepath.Dir(rootfsPath)
 	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(runDir, snap.SnapshotMemoryPath, snap.SnapshotStatePath)
 	if err != nil {
@@ -1127,11 +1194,13 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 
 	// The first connect after InstanceStart often races the guest's
 	// vsock listener coming up. Retry on connection refused / EAGAIN
-	// for up to the deadline. 50ms cadence matches WaitSocket.
+	// for up to the deadline; capped backoff avoids rounding the common
+	// fast path up to the old fixed 50ms cadence.
 	var (
 		conn io.ReadWriteCloser
 		err  error
 	)
+	delay := vsockPollInitial
 	for {
 		conn, err = d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
 		if err == nil {
@@ -1145,8 +1214,9 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 		select {
 		case <-dialCtx.Done():
 			return fmt.Errorf("vsock dial cid=%d port=%d: %w (last error: %v)", guestCID, defaultVsockPort, dialCtx.Err(), err)
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(delay):
 		}
+		delay = nextRetryDelay(delay, vsockPollMax)
 	}
 	defer conn.Close()
 

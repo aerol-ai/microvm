@@ -3,7 +3,9 @@ package tap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -191,6 +193,185 @@ func TestAllocate_PoolExhausted(t *testing.T) {
 	if !errors.Is(err, store.ErrNoFreeFirecrackerTapSlot) {
 		t.Fatalf("expected ErrNoFreeFirecrackerTapSlot, got %v", err)
 	}
+}
+
+func TestTransfer_RekeysOwner(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 2}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	warm, err := p.Allocate(ctx, "vmms-warm", now)
+	if err != nil {
+		t.Fatalf("allocate warm: %v", err)
+	}
+	got, err := p.Transfer(ctx, "vmms-warm", "sb-claimed", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("transfer: %v", err)
+	}
+	if got.TapName != warm.TapName || got.GuestIP != warm.GuestIP || got.VsockCID != warm.VsockCID {
+		t.Fatalf("transferred slot = %+v, want same identity as %+v", got, warm)
+	}
+	if old, err := p.Get(ctx, "vmms-warm"); err != nil || old != nil {
+		t.Fatalf("old owner get = %+v err=%v, want nil nil", old, err)
+	}
+	if claimed, err := p.Get(ctx, "sb-claimed"); err != nil || claimed == nil || claimed.TapName != warm.TapName {
+		t.Fatalf("new owner get = %+v err=%v, want %s", claimed, err, warm.TapName)
+	}
+}
+
+func TestTransfer_TargetAlreadyHasSlot(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 2}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := p.Allocate(ctx, "vmms-warm", now); err != nil {
+		t.Fatalf("allocate warm: %v", err)
+	}
+	target, err := p.Allocate(ctx, "sb-target", now)
+	if err != nil {
+		t.Fatalf("allocate target: %v", err)
+	}
+	if _, err := p.Transfer(ctx, "vmms-warm", "sb-target", now); err == nil {
+		t.Fatal("expected conflict transferring onto an existing different target slot")
+	}
+	if got, err := p.Get(ctx, "sb-target"); err != nil || got == nil || got.TapName != target.TapName {
+		t.Fatalf("target changed after failed transfer: %+v err=%v", got, err)
+	}
+}
+
+func TestTransfer_SourceMissing(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 1}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := p.Transfer(ctx, "missing", "sb-target", now); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("transfer missing source err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestTransfer_RetryIsIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	p := New(st)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 1}, now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	first, err := p.Allocate(ctx, "vmms-warm", now)
+	if err != nil {
+		t.Fatalf("allocate warm: %v", err)
+	}
+	if _, err := p.Transfer(ctx, "vmms-warm", "sb-target", now); err != nil {
+		t.Fatalf("first transfer: %v", err)
+	}
+	again, err := p.Transfer(ctx, "vmms-warm", "sb-target", now)
+	if err != nil {
+		t.Fatalf("retry transfer: %v", err)
+	}
+	if again.TapName != first.TapName {
+		t.Fatalf("retry returned %s, want %s", again.TapName, first.TapName)
+	}
+}
+
+// TestTransfer_ConcurrentDuplicate is the fragile-area idempotency
+// regression (pr-review.md rule #1): racing Transfers of one slot must
+// resolve to exactly one owner with no partial state. The ownership
+// change is a single atomic UPDATE keyed on the source id, so of N
+// racers to distinct targets exactly one wins; duplicates retrying the
+// SAME target must all succeed idempotently.
+func TestTransfer_ConcurrentDuplicate(t *testing.T) {
+	t.Run("same target", func(t *testing.T) {
+		st := newTestStore(t)
+		p := New(st)
+		ctx := context.Background()
+		now := time.Now().UTC()
+		if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 2}, now); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		warm, err := p.Allocate(ctx, "vmms-warm", now)
+		if err != nil {
+			t.Fatalf("allocate warm: %v", err)
+		}
+
+		const racers = 8
+		var wg sync.WaitGroup
+		results := make([]*Slot, racers)
+		errs := make([]error, racers)
+		for i := 0; i < racers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				results[i], errs[i] = p.Transfer(ctx, "vmms-warm", "sb-claimed", now)
+			}(i)
+		}
+		wg.Wait()
+
+		for i := 0; i < racers; i++ {
+			if errs[i] != nil {
+				t.Fatalf("racer %d: duplicate transfer must be idempotent, got %v", i, errs[i])
+			}
+			if results[i] == nil || results[i].TapName != warm.TapName {
+				t.Fatalf("racer %d: slot = %+v, want %s", i, results[i], warm.TapName)
+			}
+		}
+		if old, err := p.Get(ctx, "vmms-warm"); err != nil || old != nil {
+			t.Fatalf("old owner get = %+v err=%v, want nil nil", old, err)
+		}
+	})
+
+	t.Run("distinct targets", func(t *testing.T) {
+		st := newTestStore(t)
+		p := New(st)
+		ctx := context.Background()
+		now := time.Now().UTC()
+		if err := p.Seed(ctx, SeedConfig{BaseCIDR: "172.16.0.0/24", PoolSize: 2}, now); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		warm, err := p.Allocate(ctx, "vmms-warm", now)
+		if err != nil {
+			t.Fatalf("allocate warm: %v", err)
+		}
+
+		const racers = 4
+		var wg sync.WaitGroup
+		errs := make([]error, racers)
+		targets := make([]string, racers)
+		for i := 0; i < racers; i++ {
+			targets[i] = fmt.Sprintf("sb-racer-%d", i)
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, errs[i] = p.Transfer(ctx, "vmms-warm", targets[i], now)
+			}(i)
+		}
+		wg.Wait()
+
+		wins := 0
+		for i := 0; i < racers; i++ {
+			if errs[i] == nil {
+				wins++
+				got, err := p.Get(ctx, targets[i])
+				if err != nil || got == nil || got.TapName != warm.TapName {
+					t.Fatalf("winner %s get = %+v err=%v, want %s", targets[i], got, err, warm.TapName)
+				}
+			}
+		}
+		if wins != 1 {
+			t.Fatalf("winners = %d, want exactly 1", wins)
+		}
+		if old, err := p.Get(ctx, "vmms-warm"); err != nil || old != nil {
+			t.Fatalf("old owner get = %+v err=%v, want nil nil", old, err)
+		}
+	})
 }
 
 // newTestSandbox inserts a row into sandboxes so the firecracker_tap_pool

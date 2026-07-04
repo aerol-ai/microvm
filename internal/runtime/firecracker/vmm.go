@@ -241,8 +241,8 @@ func (v *vmm) buildArgs() []string {
 // to surface to the operator. A zero timeout means defaultSocketWait.
 //
 // Why poll rather than inotify: the file appears within milliseconds on a
-// healthy boot; a 20 ms poll is cheaper than wiring inotify and works the
-// same on Linux and macOS for the dev path.
+// healthy boot; capped backoff keeps the common case responsive without
+// spinning if the process never binds.
 func (v *vmm) WaitSocket(ctx context.Context, timeout time.Duration) error {
 	if !v.started {
 		return errors.New("vmm: WaitSocket called before Start")
@@ -251,6 +251,7 @@ func (v *vmm) WaitSocket(ctx context.Context, timeout time.Duration) error {
 		timeout = defaultSocketWait
 	}
 	deadline := time.Now().Add(timeout)
+	delay := socketPollInitial
 	for {
 		// Check process exit BEFORE the Stat. Under heavy parallelism
 		// (lots of subprocess tests running concurrently) the goroutine
@@ -273,8 +274,9 @@ func (v *vmm) WaitSocket(ctx context.Context, timeout time.Duration) error {
 				v.waitErr, v.stderr.String())
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(delay):
 		}
+		delay = nextRetryDelay(delay, socketPollMax)
 		if time.Now().After(deadline) {
 			return fmt.Errorf("vmm: API socket %s did not appear within %s", v.apiSocket, timeout)
 		}
