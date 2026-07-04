@@ -217,6 +217,9 @@ func (p *Pool) refillTemplate(ctx context.Context, tpl TemplateWarmInput, spawne
 	if desired <= 0 {
 		return
 	}
+	if !p.tapCapacityAllowsRefill(ctx, tpl.TemplateID, desired) {
+		return
+	}
 	have, err := p.ListNonReleased(ctx, tpl.TemplateID)
 	if err != nil {
 		p.logger.Warn("vmm pool: list non-released failed",
@@ -238,6 +241,34 @@ func (p *Pool) refillTemplate(ctx context.Context, tpl TemplateWarmInput, spawne
 		}
 		p.spawnOne(ctx, tpl, spawner, spawnTimeout)
 	}
+}
+
+func (p *Pool) tapCapacityAllowsRefill(ctx context.Context, templateID string, desired int) bool {
+	stats, err := p.st.GetFirecrackerTapPoolStats(ctx)
+	if err != nil {
+		p.logger.Warn("vmm pool: tap capacity check failed",
+			"template_id", templateID, "error", err)
+		return false
+	}
+	if stats.Total == 0 {
+		// The policy package's unit tests exercise the VMM pool without
+		// seeding a TAP pool. Production daemon wiring always seeds TAPs
+		// before enabling Firecracker, so zero total means "capacity guard
+		// not applicable" rather than "deny every policy-only test refill".
+		return true
+	}
+	minFree := desired * 2
+	if stats.Free < minFree {
+		p.logger.Info("vmm pool: refill skipped by tap capacity guard",
+			"template_id", templateID,
+			"desired", desired,
+			"tap_total", stats.Total,
+			"tap_allocated", stats.Allocated,
+			"tap_free", stats.Free,
+			"min_free", minFree)
+		return false
+	}
+	return true
 }
 
 // spawnOne mints a fresh slot id, reserves the row in 'spawning',

@@ -1,7 +1,7 @@
 # Firecracker snapshot-clone create latency: 3.45s → sub-700ms
 
-Status: **In progress** (updated 2026-07-04). Phases 0 (code), 1, 2, 3a, 3b
-and the 3c static cap are code-complete on
+Status: **In progress** (updated 2026-07-04). Phases 0 (code), 1, 2, 3a, 3b,
+and 3c are code-complete on
 `feat/firecracker-create-latency-phase1`; the E1 experiment, the UC-98
 integration scenarios, and every benchmark gate below are still open — no
 latency number in this document has been re-measured yet.
@@ -20,7 +20,7 @@ call-outs in every PR description per `pr-review.md` §2.
 | 2 — poll-cadence trims | done | `retry.go`; WaitSocket 2→20ms, vsock 5→50ms, backoff-sequence test. |
 | 3a — TAP `Transfer` | done | Atomic single-`UPDATE` re-key in `store.go`; idempotent-retry + concurrent-duplicate regression tests in `tap/pool_test.go`. |
 | 3b — warm pool v1.15 redesign | done | WarmSpawn owns TAP + `network_overrides` at load; Acquire transfers ownership, zero `PatchNetworkInterface`. Pool still **off by default** (ship-dark, per this plan). |
-| 3c — sizing guards | partial | Boot-time depth cap `min(configured, tap_pool_size/8)` in `pkg/daemon`. The dynamic refill guard (refuse when free TAP slots < 2× pool size) is NOT implemented. |
+| 3c — sizing guards | done | Boot-time depth cap `min(configured, tap_pool_size/8)` in `pkg/daemon`; refill-time TAP capacity guard skips warming when free TAP slots are below `2 × desired warm depth`. |
 | UC-98/98b/98c/98d | not started | Require Phase 0's warm-hit marker + a cluster-hetero run. |
 
 **Deviation from the 3a design (call out in the PR):** rollback after a
