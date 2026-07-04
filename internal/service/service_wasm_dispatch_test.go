@@ -253,10 +253,12 @@ func TestWasmCreateSandboxCustomDomainsPersistOnCreate(t *testing.T) {
 	svc.admitter = nil
 	svc.SetWasmRuntime(rt)
 
+	allowPublic := true
 	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-		ModuleRef:     "hello.wasm",
-		Runtime:       models.RuntimeWasm,
-		CustomDomains: []string{"api.external.test", "www.external.test"},
+		ModuleRef:          "hello.wasm",
+		Runtime:            models.RuntimeWasm,
+		CustomDomains:      []string{"api.external.test", "www.external.test"},
+		AllowPublicTraffic: &allowPublic,
 	}, "sb-wasm-custom-domains")
 	if err != nil {
 		t.Fatalf("CreateSandboxWithID() error = %v", err)
@@ -422,9 +424,11 @@ func TestWasmCreateSandboxRollbackBranches(t *testing.T) {
 			HTTPClientTimeout: time.Second,
 		})
 
+		allowPublic := true
 		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
-			Image:   "demo.wasm",
-			Runtime: models.RuntimeWasm,
+			Image:              "demo.wasm",
+			Runtime:            models.RuntimeWasm,
+			AllowPublicTraffic: &allowPublic,
 		})
 		if err == nil || !strings.Contains(err.Error(), "patch caddy route failed") {
 			t.Fatalf("CreateSandbox() error = %v, want caddy failure", err)
@@ -450,10 +454,12 @@ func TestWasmCreateSandboxRollbackBranches(t *testing.T) {
 			Noop: cluster.NewNoop("self", "http://self", "sandbox.test"),
 		})
 
+		allowDomains := true
 		_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-			Image:         "demo.wasm",
-			Runtime:       models.RuntimeWasm,
-			CustomDomains: []string{"api.example.com", "www.example.com"},
+			Image:              "demo.wasm",
+			Runtime:            models.RuntimeWasm,
+			CustomDomains:      []string{"api.example.com", "www.example.com"},
+			AllowPublicTraffic: &allowDomains,
 		}, "sb-wasm-domains")
 		if err == nil {
 			t.Fatal("expected custom-domain conflict")

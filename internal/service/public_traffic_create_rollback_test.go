@@ -122,9 +122,11 @@ func TestCreateSandboxRollbackDeletesCustomDomainLeafRoutes(t *testing.T) {
 	const host = "api.external.test"
 
 	// Seed sandbox claims the custom domain and installs its main + leaf routes.
+	allowPublic := true
 	if _, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-		Image:         "alpine:3.20",
-		CustomDomains: []string{host},
+		Image:              "alpine:3.20",
+		CustomDomains:      []string{host},
+		AllowPublicTraffic: &allowPublic,
 	}, "sb-keep"); err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
@@ -139,8 +141,9 @@ func TestCreateSandboxRollbackDeletesCustomDomainLeafRoutes(t *testing.T) {
 	// then trips the custom-domain conflict at persistCustomDomainsOnCreate, which
 	// runs the post-route rollback chain.
 	_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-		Image:         "alpine:3.20",
-		CustomDomains: []string{host},
+		Image:              "alpine:3.20",
+		CustomDomains:      []string{host},
+		AllowPublicTraffic: &allowPublic,
 	}, "sb-roll")
 	if err == nil || !errors.Is(err, storepkg.ErrCustomDomainConflict) {
 		t.Fatalf("CreateSandboxWithID() error = %v, want custom domain conflict", err)

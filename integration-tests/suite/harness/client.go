@@ -106,6 +106,14 @@ func (c *Client) NewSandbox(t *testing.T, opts sdktypes.CreateSandboxOptions) *m
 	if opts.Image == "" {
 		opts.Image = DefaultImage
 	}
+	// The server create default is private (no <id>.<domain> route, expose
+	// refused). The suite's UCs exercise public reachability, so the harness
+	// opts in unless a test sets the flag itself; a privacy-default UC should
+	// call c.SDK().Create directly with the flag omitted.
+	if opts.AllowPublicTraffic == nil {
+		public := true
+		opts.AllowPublicTraffic = &public
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 

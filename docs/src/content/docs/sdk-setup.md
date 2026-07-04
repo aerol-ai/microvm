@@ -60,7 +60,7 @@ client = MicroVM(
 )
 
 sandbox = client.create(image='ubuntu:22.04')
-print(sandbox['public_url'])
+print(sandbox['id'])
 sandbox.destroy()
 ```
 

@@ -799,6 +799,15 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 	if err != nil {
 		return fmt.Errorf("recreate %s: %w", id, err)
 	}
+	// A replicated spec written before the private-by-default flip carries a
+	// nil flag, and store-backed rows always materialize the tri-state — so a
+	// nil here can only be a legacy replica from when public WAS the default.
+	// Pin it to true so failover never silently changes a sandbox's
+	// reachability; createSandbox would otherwise normalize nil to private.
+	if merged.AllowPublicTraffic == nil {
+		public := true
+		merged.AllowPublicTraffic = &public
+	}
 	if _, err := s.CreateSandboxWithID(ctx, merged, id); err != nil {
 		return err
 	}
@@ -934,6 +943,20 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 	if err := NormalizeCreateFailover(&req); err != nil {
 		return nil, err
+	}
+	// Private-by-default: a create that doesn't opt in with
+	// allow_public_traffic=true gets no public ingress route (and ExposePort
+	// refuses). The default is pinned to an explicit false HERE, not inside
+	// allowPublicTrafficEnabled, because nil must keep meaning "public" for
+	// store rows written before the default flipped. Unconditional on purpose:
+	// cluster-mode creates arrive via CreateSandboxWithID (reserved ID), so an
+	// idOverride guard would silently exempt every cluster create. The one
+	// caller that must NOT re-interpret a legacy nil — the failover recreate
+	// replaying a pre-flag replicated spec — pins it to true in
+	// RecreateSandbox before calling in.
+	if req.AllowPublicTraffic == nil {
+		private := false
+		req.AllowPublicTraffic = &private
 	}
 	if req.Image == "" && strings.TrimSpace(req.ModuleRef) == "" {
 		return nil, errors.New("image is required")
@@ -1226,18 +1249,24 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
-		// UpsertSandboxRoute is non-atomic in domain mode: it installs the
-		// main route and then a per-custom-domain leaf route in a loop, so a
-		// failure on a later leaf can leave the main route + earlier leaves
-		// installed. deleteSandboxPublicRoutes (not DeleteSandboxRoute) tears
-		// down the main route AND every custom-domain leaf — 404 per leaf is
-		// a no-op, so it's safe on a partial install.
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.docker.Destroy(cleanupCtx, sandbox)
-		cleanupMounts()
-		releaseAdmission()
-		return nil, err
+	// Private sandboxes skip caddy entirely on the boot path: a fresh create
+	// has no route to install, and the defensive delete inside
+	// syncSandboxPublicRoute is redundant here — crash residue is swept by
+	// the reconcile pass (cleanupPublicTrafficDisabledIngressState).
+	if sandboxAllowsPublicTraffic(sandbox) {
+		if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
+			// UpsertSandboxRoute is non-atomic in domain mode: it installs the
+			// main route and then a per-custom-domain leaf route in a loop, so a
+			// failure on a later leaf can leave the main route + earlier leaves
+			// installed. deleteSandboxPublicRoutes (not DeleteSandboxRoute) tears
+			// down the main route AND every custom-domain leaf — 404 per leaf is
+			// a no-op, so it's safe on a partial install.
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.docker.Destroy(cleanupCtx, sandbox)
+			cleanupMounts()
+			releaseAdmission()
+			return nil, err
+		}
 	}
 
 	sandbox.OwnerRef = ownerRef
@@ -1493,14 +1522,17 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 	}
 
-	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
-		// deleteSandboxPublicRoutes (not DeleteSandboxRoute) so a non-atomic
-		// partial UpsertSandboxRoute — main route + per-custom-domain leaves —
-		// is fully torn down. See the docker path for the rationale.
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
-		releaseAdmission()
-		return nil, err
+	// Private sandboxes skip caddy on the boot path; see the docker path.
+	if sandboxAllowsPublicTraffic(sandbox) {
+		if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
+			// deleteSandboxPublicRoutes (not DeleteSandboxRoute) so a non-atomic
+			// partial UpsertSandboxRoute — main route + per-custom-domain leaves —
+			// is fully torn down. See the docker path for the rationale.
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.firecracker.Destroy(cleanupCtx, sandbox)
+			releaseAdmission()
+			return nil, err
+		}
 	}
 
 	// Same owner attribution as the docker path; createSandbox already

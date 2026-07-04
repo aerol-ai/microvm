@@ -580,6 +580,13 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		allowPublicTraffic = cloneBoolPtr(req.Network.AllowPublicTraffic)
 		maskRequestHost = strings.TrimSpace(req.Network.MaskRequestHost)
 	}
+	// E2B sandboxes are publicly addressable by contract (getHost / per-port
+	// URLs), so the facade opts in explicitly when the client didn't say
+	// otherwise — the core create default is private (no public route).
+	if allowPublicTraffic == nil {
+		public := true
+		allowPublicTraffic = &public
+	}
 
 	secure := true
 	if req.Secure != nil {

@@ -378,10 +378,12 @@ func TestFirecrackerDispatch_CustomDomainsPersistOnCreate(t *testing.T) {
 	svc.admitter = nil
 	svc.SetFirecrackerRuntime(rt)
 
+	allowPublic := true
 	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
-		Image:         "alpine:3.20",
-		Runtime:       models.RuntimeFirecracker,
-		CustomDomains: []string{"api.external.test", "www.external.test"},
+		Image:              "alpine:3.20",
+		Runtime:            models.RuntimeFirecracker,
+		CustomDomains:      []string{"api.external.test", "www.external.test"},
+		AllowPublicTraffic: &allowPublic,
 	})
 	if err != nil {
 		t.Fatalf("CreateSandbox() error = %v", err)
@@ -450,9 +452,11 @@ func TestFirecrackerDispatch_RollsBackWhenCaddyUpsertFails(t *testing.T) {
 		HTTPClientTimeout: time.Second,
 	})
 
+	allowPublic := true
 	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
-		Image:   "alpine:3.20",
-		Runtime: models.RuntimeFirecracker,
+		Image:              "alpine:3.20",
+		Runtime:            models.RuntimeFirecracker,
+		AllowPublicTraffic: &allowPublic,
 	})
 	if err == nil || !strings.Contains(err.Error(), "patch caddy route failed") {
 		t.Fatalf("expected caddy failure, got %v", err)
@@ -483,10 +487,12 @@ func TestFirecrackerDispatch_RollsBackWhenCustomDomainPersistenceFails(t *testin
 		Noop: cluster.NewNoop("self", "http://self", "sandbox.test"),
 	})
 
+	allowDomains := true
 	resp, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
-		Image:         "alpine:3.20",
-		Runtime:       models.RuntimeFirecracker,
-		CustomDomains: []string{"api.example.com", "www.example.com"},
+		Image:              "alpine:3.20",
+		Runtime:            models.RuntimeFirecracker,
+		CustomDomains:      []string{"api.example.com", "www.example.com"},
+		AllowPublicTraffic: &allowDomains,
 	}, "sb-fc-domains")
 	t.Logf("custom-domain create error: %v", err)
 	if err == nil {

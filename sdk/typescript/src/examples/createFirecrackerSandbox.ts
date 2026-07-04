@@ -33,6 +33,7 @@ async function main() {
     runtime: "firecracker",
     cpu: 2,
     memoryMB: 1024,
+    allowPublicTraffic: true,
   });
 
   console.log(`Sandbox created successfully!`);

@@ -1995,6 +1995,13 @@ mod tests {
     }
 
     #[test]
+    fn create_options_omits_allow_public_traffic_when_unset() {
+        let opts = minimal_create_options();
+        let value = serde_json::to_value(&opts).expect("serialize create options");
+        assert!(value.get("allow_public_traffic").is_none());
+    }
+
+    #[test]
     fn create_options_serializes_selective_egress() {
         let mut opts = minimal_create_options();
         opts.network_allow_out = Some(vec!["1.1.1.0/24".to_string(), "8.8.8.8/32".to_string()]);

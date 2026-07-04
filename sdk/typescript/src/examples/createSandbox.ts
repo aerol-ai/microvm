@@ -76,6 +76,7 @@ async function main(): Promise<void> {
 		memoryMB: options.memoryMB,
 		diskGB: options.diskGB,
 		env: options.env,
+		allowPublicTraffic: true,
 		containerCommand: keepAliveCommand,
 	});
 

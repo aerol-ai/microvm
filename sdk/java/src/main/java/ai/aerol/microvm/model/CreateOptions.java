@@ -23,7 +23,7 @@ public class CreateOptions {
     /** Egress blocklist of CIDRs; sandbox may reach anything except these. Mutually exclusive with networkAllowOut. */
     @JsonProperty("network_deny_out")
     public List<String> networkDenyOut;
-    /** Whether the sandbox may be exposed publicly. Null/true allow it; false makes exposePort fail. */
+    /** Whether the sandbox may be exposed publicly. Omitted defaults to private; true opts in; false permanently refuses exposePort. */
     @JsonProperty("allow_public_traffic")
     public Boolean allowPublicTraffic;
     /** Rewrite the upstream Host header on ingress to exposed HTTP ports to this value

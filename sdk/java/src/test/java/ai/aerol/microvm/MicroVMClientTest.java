@@ -365,6 +365,38 @@ class MicroVMClientTest {
     }
 
     @Test
+    void createOmitsAllowPublicTrafficWhenUnset() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-private-default",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "public_url", "",
+                "cpu", 1,
+                "memory_mb", 1024,
+                "disk_gb", 10,
+                "os_user", "root",
+                "network_block_all", false,
+                "toolbox_enabled", true,
+                "exposed_ports", List.of(),
+                "created_at", "2026-05-24T10:00:00Z",
+                "updated_at", "2026-05-24T10:00:00Z",
+                "last_active_at", "2026-05-24T10:00:00Z"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            assertNull(requestBody.get().get("allow_public_traffic"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void createRoundTripsServerlessLifecycleFlag() throws Exception {
         AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
         HttpServer server = startServer(exchange -> {

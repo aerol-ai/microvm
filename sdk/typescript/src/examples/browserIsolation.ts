@@ -36,6 +36,7 @@ async function main(): Promise<void> {
 		memoryMB: options.memoryMB,
 		diskGB: options.diskGB,
 		osUser: "root",
+		allowPublicTraffic: true,
 		containerCommand: keepAliveCommand,
 		runtime: options.runtime,
 	});

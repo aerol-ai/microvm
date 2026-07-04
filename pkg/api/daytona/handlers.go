@@ -145,13 +145,14 @@ func (h *handlers) clusterPlacementRequest(ctx context.Context, req createSandbo
 		}
 	}
 	out := models.CreateSandboxRequest{
-		Image:           "daytona-create",
-		CPU:             float64(int32Value(req.Cpu, 0)),
-		MemoryMB:        int(int32Value(req.Memory, 0)) * 1024,
-		DiskGB:          int(int32Value(req.Disk, 0)),
-		Name:            trimmedString(req.Name),
-		Tags:            cloneStringMap(mapValue(req.Labels)),
-		NetworkBlockAll: boolValue(req.NetworkBlockAll),
+		Image:              "daytona-create",
+		CPU:                float64(int32Value(req.Cpu, 0)),
+		MemoryMB:           int(int32Value(req.Memory, 0)) * 1024,
+		DiskGB:             int(int32Value(req.Disk, 0)),
+		Name:               trimmedString(req.Name),
+		Tags:               cloneStringMap(mapValue(req.Labels)),
+		NetworkBlockAll:    boolValue(req.NetworkBlockAll),
+		AllowPublicTraffic: daytonaPublicFlag(req.Public),
 	}
 	out.Image = image
 	if !distribution.IsZero() {
@@ -872,7 +873,7 @@ func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, m
 		User:                user,
 		Env:                 cloneStringMap(sandbox.Env),
 		Labels:              labels,
-		Public:              true,
+		Public:              sandbox.AllowPublicTraffic == nil || *sandbox.AllowPublicTraffic,
 		NetworkBlockAll:     sandbox.NetworkBlockAll,
 		NetworkAllowList:    cloneStringPtr(meta.NetworkAllowList),
 		Target:              meta.Target,
@@ -1018,6 +1019,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		wasmReq.NetworkBlockAll = boolValue(req.NetworkBlockAll)
 		wasmReq.Name = trimmedString(req.Name)
 		wasmReq.Tags = cloneStringMap(mapValue(req.Labels))
+		wasmReq.AllowPublicTraffic = daytonaPublicFlag(req.Public)
 		if !lifecycle.IsZero() {
 			wasmReq.Lifecycle = &lifecycle
 		}
@@ -1030,21 +1032,33 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	}
 
 	serviceReq := models.CreateSandboxRequest{
-		Image:           image,
-		CPU:             float64(int32Value(req.Cpu, 0)),
-		MemoryMB:        int(int32Value(req.Memory, 0)) * 1024,
-		DiskGB:          int(int32Value(req.Disk, 0)),
-		Env:             cloneStringMap(mapValue(req.Env)),
-		OSUser:          trimmedString(req.User),
-		NetworkBlockAll: boolValue(req.NetworkBlockAll),
-		Name:            trimmedString(req.Name),
-		Tags:            cloneStringMap(mapValue(req.Labels)),
-		PlatformVolumes: platformVolumes,
+		Image:              image,
+		CPU:                float64(int32Value(req.Cpu, 0)),
+		MemoryMB:           int(int32Value(req.Memory, 0)) * 1024,
+		DiskGB:             int(int32Value(req.Disk, 0)),
+		Env:                cloneStringMap(mapValue(req.Env)),
+		OSUser:             trimmedString(req.User),
+		NetworkBlockAll:    boolValue(req.NetworkBlockAll),
+		Name:               trimmedString(req.Name),
+		Tags:               cloneStringMap(mapValue(req.Labels)),
+		PlatformVolumes:    platformVolumes,
+		AllowPublicTraffic: daytonaPublicFlag(req.Public),
 	}
 	if !lifecycle.IsZero() {
 		serviceReq.Lifecycle = &lifecycle
 	}
 	return serviceReq, freshlyBuilt, nil
+}
+
+// daytonaPublicFlag maps the Daytona create "public" field onto the core
+// allow_public_traffic flag. Daytona's platform default is public preview
+// links, so an omitted field opts in; an explicit public=false maps to a
+// fully private sandbox — stricter than Daytona (which still serves
+// token-authenticated previews), because AerolVM has no auth-gated public
+// route.
+func daytonaPublicFlag(public *bool) *bool {
+	v := public == nil || *public
+	return &v
 }
 
 // resolveDaytonaVolumes turns the Daytona attach-at-create shape

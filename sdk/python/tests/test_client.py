@@ -341,6 +341,12 @@ class ClientTests(unittest.TestCase):
         _, _, payload = client.calls[0]
         self.assertEqual(payload["allow_public_traffic"], False)
 
+    def test_create_omits_allow_public_traffic_when_unset(self):
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04"})
+        _, _, payload = client.calls[0]
+        self.assertNotIn("allow_public_traffic", payload)
+
     def test_create_serializes_mask_request_host(self):
         client = RecordingMicroVM()
         client.create({"image": "ubuntu:22.04", "maskRequestHost": "localhost"})

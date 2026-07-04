@@ -33,13 +33,14 @@ The sandbox keeps its ID, public URL, environment, mounts, and disk across stop 
 
 ## Enable per-sandbox
 
-`stopIfIdleFor` is required when `serverless: true`. The server rejects the request otherwise.
+`stopIfIdleFor` is required when `serverless: true`. The server rejects the request otherwise. Serverless wake rides the sandbox's **public** endpoints, so the sandbox must be created with `allowPublicTraffic: true` — a private sandbox (the default) has no public routes to wake through.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
       image: 'ghcr.io/me/my-http-app:latest',
+      allowPublicTraffic: true, // wake rides the public URL — required
       lifecycle: {
         stopIfIdleFor: 5 * 60 * 1_000_000_000, // 5 minutes
         serverless: true,
@@ -52,6 +53,7 @@ The sandbox keeps its ID, public URL, environment, mounts, and disk across stop 
     ```python
     sandbox = client.create({
         'image': 'ghcr.io/me/my-http-app:latest',
+        'allowPublicTraffic': True,  # wake rides the public URL — required
         'lifecycle': {
             'stopIfIdleFor': 5 * 60 * 1_000_000_000,
             'serverless': True,
@@ -62,8 +64,10 @@ The sandbox keeps its ID, public URL, environment, mounts, and disk across stop 
   </TabItem>
   <TabItem label="Go">
     ```go
+    public := true // wake rides the public URL — required
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ghcr.io/me/my-http-app:latest",
+        Image:              "ghcr.io/me/my-http-app:latest",
+        AllowPublicTraffic: &public,
         Lifecycle: &sdktypes.Lifecycle{
             StopIfIdleFor: 5 * time.Minute,
             Serverless:    true,
@@ -79,6 +83,7 @@ The sandbox keeps its ID, public URL, environment, mounts, and disk across stop 
     ```rust
     let sandbox = client.create(CreateOptions {
         image: "ghcr.io/me/my-http-app:latest".to_string(),
+        allow_public_traffic: Some(true), // wake rides the public URL — required
         lifecycle: Some(Lifecycle {
             stop_if_idle_for: 300_000_000_000,
             serverless: true,
@@ -94,6 +99,7 @@ The sandbox keeps its ID, public URL, environment, mounts, and disk across stop 
     Sandbox sandbox = client.create(
         new CreateOptions()
             .setImage("ghcr.io/me/my-http-app:latest")
+            .setAllowPublicTraffic(true) // wake rides the public URL — required
             .setLifecycle(new Lifecycle()
                 .setStopIfIdleFor(300_000_000_000L)
                 .setServerless(Boolean.TRUE))

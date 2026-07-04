@@ -858,10 +858,12 @@ func TestCreateSandboxWithCustomDomainsPersistsRows(t *testing.T) {
 	svc.cfg.EnableCustomDomains = true
 	svc.cfg.Domain = "sandbox.test"
 
+	allowPublic := true
 	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-		Image:         "alpine:3.20",
-		Name:          "custom-domains",
-		CustomDomains: []string{"api.external.test", "www.external.test"},
+		Image:              "alpine:3.20",
+		Name:               "custom-domains",
+		CustomDomains:      []string{"api.external.test", "www.external.test"},
+		AllowPublicTraffic: &allowPublic,
 	}, "sb-custom-domains")
 	if err != nil {
 		t.Fatalf("CreateSandboxWithID() error = %v", err)
@@ -910,7 +912,8 @@ func TestExposeAndUnexposePortProtocols(t *testing.T) {
 	}
 	svc.caddy = caddy.New(svc.cfg)
 
-	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-ports")
+	allowPublic := true
+	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", AllowPublicTraffic: &allowPublic}, "sb-ports")
 	if err != nil {
 		t.Fatalf("CreateSandboxWithID() error = %v", err)
 	}
