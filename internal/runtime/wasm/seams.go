@@ -28,7 +28,7 @@ type WorkerSupervisorSpawnCounter interface {
 type WorkerClient interface {
 	Ping(sandboxID string) error
 	InstanceLoaded(ctx context.Context, sandboxID string) (bool, error)
-	LoadModule(sandboxID, path string) error
+	LoadModule(sandboxID, path string, memoryMB int) error
 	Instantiate(sandboxID string, caps wasmengine.Capabilities) error
 	Invoke(sandboxID, export string) error
 	Exec(sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error)
@@ -62,8 +62,8 @@ func (a workerClientAdapter) InstanceLoaded(ctx context.Context, sandboxID strin
 	return a.client.InstanceLoaded(ctx, sandboxID)
 }
 
-func (a workerClientAdapter) LoadModule(sandboxID, path string) error {
-	return a.client.LoadModule(sandboxID, path)
+func (a workerClientAdapter) LoadModule(sandboxID, path string, memoryMB int) error {
+	return a.client.LoadModule(sandboxID, path, memoryMB)
 }
 
 func (a workerClientAdapter) Instantiate(sandboxID string, caps wasmengine.Capabilities) error {

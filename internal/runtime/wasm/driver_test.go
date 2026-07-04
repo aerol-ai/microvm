@@ -49,7 +49,7 @@ func (c *recordingWorkerClient) Ping(string) error { return nil }
 func (c *recordingWorkerClient) InstanceLoaded(context.Context, string) (bool, error) {
 	return true, nil
 }
-func (c *recordingWorkerClient) LoadModule(_, path string) error {
+func (c *recordingWorkerClient) LoadModule(_, path string, _ int) error {
 	c.loadPath = path
 	return nil
 }
@@ -225,7 +225,7 @@ type fakeWarmPool struct {
 
 func (p *fakeWarmPool) NoteModule(string, string) {}
 
-func (p *fakeWarmPool) Acquire(_ context.Context, _, _ string) (*wasmpool.Slot, error) {
+func (p *fakeWarmPool) Acquire(_ context.Context, _, _ string, _ int) (*wasmpool.Slot, error) {
 	if p.slot == nil {
 		return nil, wasmpool.ErrNoSlot
 	}
@@ -252,6 +252,7 @@ func TestCreateWarmPathSkipsEnsureAndLoad(t *testing.T) {
 		ModulePath:   modPath,
 		SocketPath:   warmSock,
 		WorkerKey:    "pool-1",
+		MemoryMB:     256,
 	}})
 
 	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-warm", "tok", nil); err != nil {

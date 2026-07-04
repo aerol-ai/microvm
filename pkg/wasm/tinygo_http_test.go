@@ -69,7 +69,7 @@ func TestTinygoHTTPModuleRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = e.Close(ctx) }()
-	if err := e.LoadModule(ctx, modPath); err != nil {
+	if err := e.LoadModule(ctx, modPath, LoadOptions{}); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 	caps := Capabilities{

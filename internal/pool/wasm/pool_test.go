@@ -11,7 +11,7 @@ type fakeSpawner struct {
 	warmed []string
 }
 
-func (f *fakeSpawner) Warm(_ context.Context, slotID, socketPath, modulePath string) error {
+func (f *fakeSpawner) Warm(_ context.Context, slotID, socketPath, modulePath string, _ int) error {
 	f.warmed = append(f.warmed, slotID+":"+modulePath)
 	return nil
 }
@@ -23,7 +23,7 @@ func TestPoolAcquireMissAndHit(t *testing.T) {
 	p.SetDefaultDepth(1)
 	p.NoteModule("digest-a", "/tmp/mod.wasm")
 
-	_, err := p.Acquire(context.Background(), "digest-a", "/tmp/mod.wasm")
+	_, err := p.Acquire(context.Background(), "digest-a", "/tmp/mod.wasm", 0)
 	if !errors.Is(err, ErrNoSlot) {
 		t.Fatalf("first acquire: %v", err)
 	}
@@ -37,10 +37,11 @@ func TestPoolAcquireMissAndHit(t *testing.T) {
 		ModulePath:   "/tmp/mod.wasm",
 		SocketPath:   filepath.Join(t.TempDir(), "worker.sock"),
 		WorkerKey:    "pool-1",
+		MemoryMB:     0,
 	}
 	p.RecordLoaded(slot)
 
-	got, err := p.Acquire(context.Background(), "digest-a", "/tmp/mod.wasm")
+	got, err := p.Acquire(context.Background(), "digest-a", "/tmp/mod.wasm", 0)
 	if err != nil {
 		t.Fatalf("second acquire: %v", err)
 	}

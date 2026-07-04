@@ -17,7 +17,7 @@ type errSpawner struct {
 	shutdownCalled []string
 }
 
-func (e *errSpawner) Warm(_ context.Context, _, _, _ string) error { return e.warmErr }
+func (e *errSpawner) Warm(_ context.Context, _, _, _ string, _ int) error { return e.warmErr }
 func (e *errSpawner) Shutdown(slotID string) error {
 	e.shutdownCalled = append(e.shutdownCalled, slotID)
 	return e.shutdownErr
@@ -261,21 +261,21 @@ func TestAcquireOrMiss(t *testing.T) {
 	ctx := context.Background()
 
 	// nil pool => (nil, false, nil)
-	slot, ok, err := AcquireOrMiss(ctx, nil, "d1", "/mod.wasm")
+	slot, ok, err := AcquireOrMiss(ctx, nil, "d1", "/mod.wasm", 0)
 	if slot != nil || ok || err != nil {
 		t.Fatalf("nil pool: got (%v, %v, %v)", slot, ok, err)
 	}
 
 	// Pool with no warm slot => (nil, false, nil)
 	p := New(t.TempDir(), nil)
-	slot, ok, err = AcquireOrMiss(ctx, p, "d1", "/mod.wasm")
+	slot, ok, err = AcquireOrMiss(ctx, p, "d1", "/mod.wasm", 0)
 	if slot != nil || ok || err != nil {
 		t.Fatalf("miss: got (%v, %v, %v)", slot, ok, err)
 	}
 
 	// Pool with a warm slot => (slot, true, nil)
 	p.RecordLoaded(&Slot{ID: "s1", ModuleDigest: "d1"})
-	slot, ok, err = AcquireOrMiss(ctx, p, "d1", "/mod.wasm")
+	slot, ok, err = AcquireOrMiss(ctx, p, "d1", "/mod.wasm", 0)
 	if slot == nil || !ok || err != nil {
 		t.Fatalf("hit: got (%v, %v, %v)", slot, ok, err)
 	}
@@ -283,7 +283,7 @@ func TestAcquireOrMiss(t *testing.T) {
 
 func TestAcquireEmptyDigest(t *testing.T) {
 	p := New(t.TempDir(), nil)
-	_, err := p.Acquire(context.Background(), "", "/mod.wasm")
+	_, err := p.Acquire(context.Background(), "", "/mod.wasm", 0)
 	if !errors.Is(err, ErrNoSlot) {
 		t.Fatalf("empty digest: got %v, want ErrNoSlot", err)
 	}
@@ -499,14 +499,14 @@ func TestNewSupervisorSpawner(t *testing.T) {
 func TestSupervisorSpawnerWarmNilSupervisor(t *testing.T) {
 	// nil receiver
 	var s *SupervisorSpawner
-	err := s.Warm(context.Background(), "slot1", "/tmp/w.sock", "/mod.wasm")
+	err := s.Warm(context.Background(), "slot1", "/tmp/w.sock", "/mod.wasm", 0)
 	if err == nil {
 		t.Fatal("expected error for nil spawner")
 	}
 
 	// non-nil but supervisor field is nil
 	s2 := &SupervisorSpawner{}
-	err = s2.Warm(context.Background(), "slot1", "/tmp/w.sock", "/mod.wasm")
+	err = s2.Warm(context.Background(), "slot1", "/tmp/w.sock", "/mod.wasm", 0)
 	if err == nil {
 		t.Fatal("expected error when supervisor field is nil")
 	}

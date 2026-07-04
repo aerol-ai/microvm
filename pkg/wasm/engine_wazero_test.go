@@ -34,7 +34,7 @@ func TestWazeroEngine_Lifecycle(t *testing.T) {
 	defer eng.Close(ctx)
 
 	// Test LoadModule
-	if err := eng.LoadModule(ctx, wasmPath); err != nil {
+	if err := eng.LoadModule(ctx, wasmPath, LoadOptions{MemoryMB: 10}); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 

@@ -433,6 +433,13 @@ type Config struct {
 	// WasmPoolRefillInterval is how often the refill loop tops up the pool.
 	// SB_WASM_POOL_REFILL_INTERVAL.
 	WasmPoolRefillInterval time.Duration
+	// WasmModuleDigestMode controls per-resolve module hashing: once (default) or always.
+	// SB_WASM_MODULE_DIGEST_MODE.
+	WasmModuleDigestMode string
+	// WasmCompileCacheDir is the shared wazero compilation cache directory.
+	// Default <WasmCacheDir>/wazero-compile. Empty disables the cache.
+	// SB_WASM_COMPILE_CACHE_DIR.
+	WasmCompileCacheDir string
 	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
 	// SB_WASM_DRAIN_TIMEOUT.
 	WasmDrainTimeout time.Duration
@@ -1383,6 +1390,8 @@ func Load() (Config, error) {
 		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
 		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
 		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
+		WasmModuleDigestMode:    strings.ToLower(getEnv("SB_WASM_MODULE_DIGEST_MODE", "once")),
+		WasmCompileCacheDir:     getEnv("SB_WASM_COMPILE_CACHE_DIR", ""),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
@@ -1635,6 +1644,9 @@ func Load() (Config, error) {
 		case "", "wazero", "wasmtime":
 		default:
 			return Config{}, fmt.Errorf("SB_WASM_ENGINE=%q: want wazero or wasmtime", cfg.WasmEngine)
+		}
+		if cfg.WasmModuleDigestMode != "once" && cfg.WasmModuleDigestMode != "always" {
+			return Config{}, errors.New("SB_WASM_MODULE_DIGEST_MODE must be either once or always")
 		}
 	}
 

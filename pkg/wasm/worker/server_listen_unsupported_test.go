@@ -17,7 +17,7 @@ import (
 // the wasmtime backend, which cannot yet host a wasip1 TCP listener.
 type noListenEngine struct{}
 
-func (noListenEngine) LoadModule(context.Context, string) error { return nil }
+func (noListenEngine) LoadModule(context.Context, string, wasmengine.LoadOptions) error { return nil }
 func (noListenEngine) Instantiate(context.Context, wasmengine.Capabilities) error {
 	return nil
 }

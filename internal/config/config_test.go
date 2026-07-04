@@ -321,6 +321,19 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			name: "rejects_unknown_wasm_module_digest_mode",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_WASM", "true")
+				t.Setenv("SB_WASM_MODULE_DIGEST_MODE", "sometimes")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_WASM_MODULE_DIGEST_MODE") {
+					t.Fatalf("expected wasm digest mode error, got %v", err)
+				}
+			},
+		},
+		{
 			name: "rejects_unknown_firecracker_snapshot_verify_mode",
 			run: func(t *testing.T) {
 				clearEnv(t)

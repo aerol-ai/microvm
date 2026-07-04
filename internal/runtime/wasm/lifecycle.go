@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
@@ -115,7 +116,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		return nil, err
 	}
 	d.noteWorkerSpawnCount(inst)
-	if err := client.LoadModule(sandboxID, inst.modulePath); err != nil {
+	if err := client.LoadModule(sandboxID, inst.modulePath, inst.memoryMB); err != nil {
 		return nil, fmt.Errorf("load module: %w", err)
 	}
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
@@ -293,11 +294,6 @@ func ctxDone(ctx context.Context, deadline time.Time) bool {
 	return time.Now().After(deadline)
 }
 
-func sleepBrief(ctx context.Context) {
-	t := time.NewTimer(25 * time.Millisecond)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-	}
+func sleepBrief(ctx context.Context, attempt int) {
+	worker.ReadyPollSleep(ctx, attempt)
 }

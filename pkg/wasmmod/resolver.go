@@ -2,11 +2,7 @@ package wasmmod
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -14,12 +10,28 @@ import (
 // Resolver maps a module reference to a local .wasm path under modulesDir.
 type Resolver struct {
 	ModulesDir string
+	// DigestMode controls per-resolve hashing: once (default) or always.
+	DigestMode string
+	cache      *digestCache
 }
 
 // NewResolver constructs a resolver. modulesDir is the host cache root
 // (SB_WASM_MODULES_DIR).
 func NewResolver(modulesDir string) *Resolver {
-	return &Resolver{ModulesDir: modulesDir}
+	return &Resolver{
+		ModulesDir: modulesDir,
+		DigestMode: moduleDigestModeOnce,
+		cache:      newDigestCache(moduleDigestModeOnce),
+	}
+}
+
+// SetDigestMode switches verify-once vs always-hash behavior (SB_WASM_MODULE_DIGEST_MODE).
+func (r *Resolver) SetDigestMode(mode string) {
+	if r == nil {
+		return
+	}
+	r.DigestMode = mode
+	r.cache = newDigestCache(mode)
 }
 
 // Resolve turns ref into a local file path. Phase 2 accepts:
@@ -38,7 +50,7 @@ func (r *Resolver) Resolve(_ context.Context, ref string) (*ResolvedModule, erro
 	if err := ValidateFile(path); err != nil {
 		return nil, err
 	}
-	digest, size, err := fileDigest(path)
+	digest, size, err := r.digestFor(path)
 	if err != nil {
 		return nil, err
 	}
@@ -63,16 +75,16 @@ func (r *Resolver) resolvePath(ref string) (string, error) {
 	return filepath.Join(r.ModulesDir, ref), nil
 }
 
-func fileDigest(path string) (hexDigest string, size int64, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", 0, err
+func (r *Resolver) digestFor(path string) (hexDigest string, size int64, err error) {
+	if r != nil && r.cache != nil {
+		return r.cache.digestFor(path)
 	}
-	defer f.Close()
-	h := sha256.New()
-	n, err := io.Copy(h, f)
-	if err != nil {
-		return "", 0, err
+	return fileDigest(path)
+}
+
+// InvalidateDigestCache drops verify-once entries for path after module delete/replace.
+func (r *Resolver) InvalidateDigestCache(path string) {
+	if r != nil && r.cache != nil {
+		r.cache.dropPath(path)
 	}
-	return hex.EncodeToString(h.Sum(nil)), n, nil
 }

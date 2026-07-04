@@ -151,7 +151,7 @@ func TestClient_MoreMethods(t *testing.T) {
 			name: "LoadModule_OK",
 			run: func(c *Client) error {
 				c.dial = mockDialer(t, Envelope{Type: MsgOK})
-				return c.LoadModule(sb, "path/to/module")
+				return c.LoadModule(sb, "path/to/module", 0)
 			},
 		},
 		{
@@ -159,7 +159,7 @@ func TestClient_MoreMethods(t *testing.T) {
 			run: func(c *Client) error {
 				payload, _ := encodePayload(errorPayload{Message: "boom"})
 				c.dial = mockDialer(t, Envelope{Type: MsgError, Payload: payload})
-				return c.LoadModule(sb, "path/to/module")
+				return c.LoadModule(sb, "path/to/module", 0)
 			},
 			wantErr: true,
 		},

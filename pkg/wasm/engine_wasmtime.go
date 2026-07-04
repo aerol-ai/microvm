@@ -37,7 +37,7 @@ func newWasmtimeEngine(_ context.Context) (Engine, error) {
 	return &wasmtimeEngine{engine: engine}, nil
 }
 
-func (e *wasmtimeEngine) LoadModule(_ context.Context, path string) error {
+func (e *wasmtimeEngine) LoadModule(_ context.Context, path string, _ LoadOptions) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read module: %w", err)

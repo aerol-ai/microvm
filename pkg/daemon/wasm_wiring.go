@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// resolution) and the service (CreateWasmModule registration), so allowlist
 	// + validation + content-addressed pull happen in exactly one place.
 	resolver := wasmmod.NewModuleResolver(cfg.WasmModulesDir, cfg.WasmCacheDir)
+	resolver.SetDigestMode(cfg.WasmModuleDigestMode)
 	resolver.Reserved = cfg.WasmStandardModules
 	resolver.Allowlist = make(map[string]struct{}, len(cfg.WasmRegistryAllowlist))
 	for _, h := range cfg.WasmRegistryAllowlist {
@@ -71,12 +73,21 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	if eng := strings.TrimSpace(cfg.WasmEngine); eng != "" && eng != "wazero" {
 		_ = os.Setenv("AEROL_WASM_ENGINE", eng)
 	}
+	if dir := effectiveWasmCompileCacheDir(cfg); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			logger.Warn("wasm compile cache dir not created", "dir", dir, "error", err)
+		} else {
+			_ = os.Setenv("AEROL_WASM_COMPILE_CACHE_DIR", dir)
+		}
+	}
 
 	var pool *wasmpool.Pool
 	if cfg.WasmPoolEnabled {
 		pool = wasmpool.New(cfg.WasmRunDir, logger)
 		pool.SetDefaultDepth(cfg.WasmPoolDepthDefault)
+		pool.SetDefaultMemoryMB(cfg.WasmDefaultMemoryMB)
 		spawner := wasmpool.NewSupervisorSpawner(supervisor)
+		spawner.MemoryMB = cfg.WasmDefaultMemoryMB
 		driver.SetWarmPool(pool)
 		refillCfg := wasmpool.RefillConfig{
 			RefillInterval: cfg.WasmPoolRefillInterval,
@@ -105,6 +116,20 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		wasmWiringTestHook(resolver)
 	}
 	return pool
+}
+
+// effectiveWasmCompileCacheDir returns the wazero compile cache path. When
+// SB_WASM_COMPILE_CACHE_DIR is unset, default to <cache>/wazero-compile; when
+// explicitly set to empty, disable the cache.
+func effectiveWasmCompileCacheDir(cfg config.Config) string {
+	if _, set := os.LookupEnv("SB_WASM_COMPILE_CACHE_DIR"); set {
+		return strings.TrimSpace(cfg.WasmCompileCacheDir)
+	}
+	cacheDir := cfg.WasmCacheDir
+	if cacheDir == "" {
+		cacheDir = filepath.Join(cfg.WasmModulesDir, "cache")
+	}
+	return filepath.Join(cacheDir, "wazero-compile")
 }
 
 // wasmWiringTestHook is invoked at the end of wireWasmRuntime so tests can

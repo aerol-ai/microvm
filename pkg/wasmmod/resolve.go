@@ -76,11 +76,18 @@ func NewModuleResolver(modulesDir, cacheDir string) *ModuleResolver {
 		cacheDir = filepath.Join(modulesDir, "cache")
 	}
 	return &ModuleResolver{
-		file:      &Resolver{ModulesDir: modulesDir},
+		file:      NewResolver(modulesDir),
 		CacheDir:  cacheDir,
 		Reserved:  map[string]string{},
 		Allowlist: map[string]struct{}{},
 		MaxBytes:  maxModuleBytes,
+	}
+}
+
+// SetDigestMode switches verify-once vs always-hash for local file resolves.
+func (r *ModuleResolver) SetDigestMode(mode string) {
+	if r != nil && r.file != nil {
+		r.file.SetDigestMode(mode)
 	}
 }
 

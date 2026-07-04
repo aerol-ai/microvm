@@ -17,6 +17,11 @@ import (
 	"github.com/tetratelabs/wazero/sys"
 )
 
+// compileModule is the wazero compile seam for latency regression tests.
+var compileModule = func(r wazero.Runtime, ctx context.Context, b []byte) (wazero.CompiledModule, error) {
+	return r.CompileModule(ctx, b)
+}
+
 type wazeroEngine struct {
 	runtime     wazero.Runtime
 	compiled    wazero.CompiledModule
@@ -54,6 +59,13 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 	if pages > 0 {
 		cfg = cfg.WithMemoryLimitPages(pages)
 	}
+	if dir := wazeroCompileCacheDir(); dir != "" {
+		cache, err := wazero.NewCompilationCacheWithDir(dir)
+		if err != nil {
+			return fmt.Errorf("compilation cache: %w", err)
+		}
+		cfg = cfg.WithCompilationCache(cache)
+	}
 	r := wazero.NewRuntimeWithConfig(ctx, cfg)
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
 		_ = r.Close(ctx)
@@ -63,13 +75,17 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 	e.wasiCompat = false
 	e.memoryPages = pages
 	if len(e.moduleBytes) > 0 {
-		compiled, err := r.CompileModule(ctx, e.moduleBytes)
+		compiled, err := compileModule(r, ctx, e.moduleBytes)
 		if err != nil {
 			return fmt.Errorf("compile module: %w", err)
 		}
 		e.compiled = compiled
 	}
 	return nil
+}
+
+func wazeroCompileCacheDir() string {
+	return strings.TrimSpace(os.Getenv("AEROL_WASM_COMPILE_CACHE_DIR"))
 }
 
 func (e *wazeroEngine) ensureWasiCompatHosts(ctx context.Context) error {
@@ -97,7 +113,7 @@ func (e *wazeroEngine) ensureMemoryLimit(ctx context.Context, memoryMB int) erro
 	return e.initRuntime(ctx, memoryMB)
 }
 
-func (e *wazeroEngine) LoadModule(ctx context.Context, path string) error {
+func (e *wazeroEngine) LoadModule(ctx context.Context, path string, opts LoadOptions) error {
 	if e.module != nil {
 		_ = e.module.Close(ctx)
 		e.module = nil
@@ -106,15 +122,22 @@ func (e *wazeroEngine) LoadModule(ctx context.Context, path string) error {
 		_ = e.compiled.Close(ctx)
 		e.compiled = nil
 	}
+	// Drop stale bytes before initRuntime — it recompiles moduleBytes when
+	// rebuilding the runtime (ensureMemoryLimit path), and a failed prior load
+	// must not poison the next path.
+	e.moduleBytes = nil
+	if err := e.initRuntime(ctx, opts.MemoryMB); err != nil {
+		return err
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	e.moduleBytes = append([]byte(nil), b...)
-	compiled, err := e.runtime.CompileModule(ctx, b)
+	compiled, err := compileModule(e.runtime, ctx, b)
 	if err != nil {
 		return fmt.Errorf("compile module: %w", err)
 	}
+	e.moduleBytes = append([]byte(nil), b...)
 	e.compiled = compiled
 	return nil
 }

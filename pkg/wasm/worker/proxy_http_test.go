@@ -70,7 +70,7 @@ func TestProxyHTTPForwardsToGuestBackend(t *testing.T) {
 
 	sandboxID := "sb-proxy"
 	modPath := writeMinimalModule(t, t.TempDir())
-	if err := client.LoadModule(sandboxID, modPath); err != nil {
+	if err := client.LoadModule(sandboxID, modPath, 0); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -131,7 +131,7 @@ func TestSetListenPortDisabled(t *testing.T) {
 
 	sandboxID := "sb-listen"
 	modPath := writeMinimalModule(t, t.TempDir())
-	if err := client.LoadModule(sandboxID, modPath); err != nil {
+	if err := client.LoadModule(sandboxID, modPath, 0); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 	if err := client.Instantiate(sandboxID, wasmengine.Capabilities{
