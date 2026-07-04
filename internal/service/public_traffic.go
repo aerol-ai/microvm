@@ -41,6 +41,47 @@ func (s *Service) syncSandboxPublicRoute(ctx context.Context, sandbox *models.Sa
 	return s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
 }
 
+// enableSandboxPublicTraffic flips a private sandbox to public in place:
+// installs the root <id>.<domain> route, persists flag + public_url in one
+// store write, and mirrors the flip into the FSM-replicated spec so a
+// failover recreate keeps the sandbox public even if every port is later
+// unexposed. expose_port is the only caller — asking for a public port IS
+// the opt-in (there is no standalone flag-update endpoint).
+//
+// Caddy-first on purpose: a crash between the route install and the store
+// write leaves a route for a still-private row, which the reconcile sweep
+// (cleanupPublicTrafficDisabledIngressState) removes; the reverse order
+// would leave a stored-public sandbox with a dead public_url and no repair
+// pass. On a store failure the route is rolled back so caddy and the store
+// never disagree past this function. Safe under concurrent duplicates: the
+// route install is an upsert and the store write is an absolute SET.
+func (s *Service) enableSandboxPublicTraffic(ctx context.Context, sandbox *models.Sandbox) error {
+	if sandbox == nil || sandbox.ID == "" || sandboxAllowsPublicTraffic(sandbox) {
+		return nil
+	}
+	public := true
+	sandbox.AllowPublicTraffic = &public
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
+		private := false
+		sandbox.AllowPublicTraffic = &private
+		return err
+	}
+	publicURL := s.sandboxPublicURL(sandbox.ID, sandbox.AllowPublicTraffic)
+	if s.store != nil {
+		if err := s.store.SetAllowPublicTraffic(ctx, sandbox.ID, true, publicURL); err != nil {
+			_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
+			private := false
+			sandbox.AllowPublicTraffic = &private
+			return err
+		}
+	}
+	sandbox.PublicURL = publicURL
+	s.replicateSpecPatch(ctx, sandbox.ID, func(spec *models.CreateSandboxRequest) {
+		spec.AllowPublicTraffic = &public
+	})
+	return nil
+}
+
 func (s *Service) deleteSandboxPublicRoutes(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil || sandbox.ID == "" || s == nil || s.caddy == nil {
 		return nil

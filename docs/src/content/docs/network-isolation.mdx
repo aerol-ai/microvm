@@ -282,9 +282,12 @@ The policy is persisted with the sandbox and reapplied automatically across stop
 
 ## Public Exposure Is Opt-In
 
-The options above control **outbound** traffic. Inbound public reachability is a separate, create-time decision — and the default is **private**: a sandbox created without **`allowPublicTraffic`** gets no `<sandbox-id>.<domain>` ingress route, has an empty `public_url`, and `exposePort` returns an error. The platform's own access paths (the toolbox `exec`/file proxy and the SSH gateway) always work, since they do not route through the public ingress.
+The options above control **outbound** traffic. Inbound public reachability is a separate decision — and the default is **private**: a sandbox created without **`allowPublicTraffic`** boots with no `<sandbox-id>.<domain>` ingress route and an empty `public_url`. The platform's own access paths (the toolbox `exec`/file proxy and the SSH gateway) always work, since they do not route through the public ingress.
 
-Set `allowPublicTraffic` to `true` at create time to opt in to public exposure:
+There are two ways to opt in to public exposure:
+
+1. **Call `exposePort`.** Asking for a public port *is* the consent: the first `exposePort` on a private sandbox flips it to public — the flag is persisted, the `<sandbox-id>.<domain>` route is installed, `public_url` becomes live — and then the port route goes in. No extra step needed.
+2. **Set `allowPublicTraffic: true` at create time** if you want the sandbox URL live from boot, before any port is exposed:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -293,7 +296,7 @@ Set `allowPublicTraffic` to `true` at create time to opt in to public exposure:
       image: 'ubuntu:22.04',
       allowPublicTraffic: true,
     })
-    // sandbox.exposePort(80) now works and returns a public URL.
+    // sandbox.publicUrl is live from boot, before any exposePort call.
     ```
   </TabItem>
   <TabItem label="Python">
@@ -333,7 +336,7 @@ Set `allowPublicTraffic` to `true` at create time to opt in to public exposure:
   </TabItem>
 </Tabs>
 
-Because AerolVM has no auth-gated public route, "no public traffic" is enforced by **refusing exposure** rather than by serving a private URL. Omitting the field (or setting it to `false`) keeps the sandbox private; custom domains likewise require the opt-in. Private creates also skip the ingress proxy entirely on the boot path, which shaves the route-install round trips off create latency.
+The opt-in is one-way and sandbox-wide: once a port has been exposed, the sandbox is public (flag, root route, and `public_url`) and stays public even if every port is later unexposed. **Custom domains alone do not flip a private sandbox** — attaching a domain to a sandbox you kept private returns an error, so a domain can never silently publish it; expose a port (or create with the flag) first. Private creates also skip the ingress proxy entirely on the boot path, which shaves the route-install round trips off create latency.
 
 The Daytona compatibility facade maps its `public` field onto this flag (omitted means `true`, matching Daytona's platform default), and the E2B facade opts in by default for the same reason — E2B sandboxes are publicly addressable by contract.
 

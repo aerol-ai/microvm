@@ -7,7 +7,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 Every sandbox+port can get a public URL that routes to the sandbox's API endpoint.
 
 :::note
-Public exposure is **opt-in at create time**: the sandbox must have been created with `allowPublicTraffic: true`, otherwise `exposePort` returns an error and no public URL exists. See [Network Isolation](/network-isolation/) for the create-time flag in all five SDKs.
+Sandboxes are **private by default** — no public URL exists until you opt in. Calling `exposePort` is the opt-in: the first call on a private sandbox flips it to public, installs the sandbox's `<sandbox-id>.<domain>` route, and then publishes the port. To have the sandbox URL live from boot instead, create with `allowPublicTraffic: true` — see [Network Isolation](/network-isolation/) for the flag in all five SDKs.
 :::
 
 ## Expose a Port

@@ -34,7 +34,7 @@ created ──► running ──► stopped ──► running
 ## Create
 
 :::note
-Sandboxes are **private by default**: omitting `allowPublicTraffic` gives no public ingress URL and `exposePort` returns an error. Set `allowPublicTraffic: true` to opt in — see [Network Isolation](/network-isolation/).
+Sandboxes are **private by default**: omitting `allowPublicTraffic` gives no public ingress URL at boot. The first `exposePort` call opts the sandbox in (flips it public and installs its routes); set `allowPublicTraffic: true` at create to have the URL live from boot instead — see [Network Isolation](/network-isolation/).
 :::
 
 <Tabs syncKey="lang">

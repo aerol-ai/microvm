@@ -23,7 +23,7 @@ gVisor works on **any standard server** - there are no bare-metal or special har
 
 ## Create a gVisor sandbox
 
-Pass `runtime: "gvisor"` in the create request. Public exposure is opt-in — set `allowPublicTraffic: true` when you need a public URL or `exposePort`; see [Network Isolation](/network-isolation/).
+Pass `runtime: "gvisor"` in the create request. Public exposure is opt-in — `exposePort` flips the sandbox public on first use, or set `allowPublicTraffic: true` at create for a boot-time public URL; see [Network Isolation](/network-isolation/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

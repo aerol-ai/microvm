@@ -14,7 +14,7 @@ Use Firecracker when:
 
 ## Create a Firecracker sandbox
 
-Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the image and builds a Firecracker-compatible rootfs from it. Public exposure is opt-in — set `allowPublicTraffic: true` when you need a public URL or `exposePort`; see [Network Isolation](/network-isolation/).
+Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the image and builds a Firecracker-compatible rootfs from it. Public exposure is opt-in — `exposePort` flips the sandbox public on first use, or set `allowPublicTraffic: true` at create for a boot-time public URL; see [Network Isolation](/network-isolation/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

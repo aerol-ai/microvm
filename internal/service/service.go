@@ -55,10 +55,14 @@ const allocatorRandomAttempts = 16
 // contract behind the client's back.
 var ErrPreferredHostPortUnavailable = errors.New("preferred host port unavailable on this node; exposure parked")
 
-// ErrPublicTrafficDisabled is returned when the sandbox was created with
-// allow_public_traffic=false and the caller asks for a public ingress route.
-// The sandbox stays reachable through the toolbox proxy and SSH gateway.
-var ErrPublicTrafficDisabled = errors.New("public traffic is disabled for this sandbox; expose is not available")
+// ErrPublicTrafficDisabled is returned when a still-private sandbox
+// (allow_public_traffic=false) is asked for a custom-domain route. It is NOT
+// returned by expose_port — expose is the opt-in lever that flips the
+// sandbox public (enableSandboxPublicTraffic); custom domains alone stay
+// refused so that attaching a domain never silently publishes a sandbox the
+// caller kept private. The sandbox stays reachable through the toolbox proxy
+// and SSH gateway.
+var ErrPublicTrafficDisabled = errors.New("public traffic is disabled for this sandbox; pass allow_public_traffic=true at create or expose a port to opt in")
 
 const clusterIngressReconcileInterval = 5 * time.Second
 
@@ -2373,14 +2377,6 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	if err != nil {
 		return models.ExposePortResponse{}, err
 	}
-	// A sandbox created with allow_public_traffic=false must never get a public
-	// route. AerolVM has no auth-gated public route, so the only honest way to
-	// enforce "no public traffic" is to refuse exposure outright — the sandbox
-	// stays reachable through the toolbox proxy and SSH gateway, which do not
-	// route through the public ingress. Nil/true keep the default (allowed).
-	if sandbox.AllowPublicTraffic != nil && !*sandbox.AllowPublicTraffic {
-		return models.ExposePortResponse{}, ErrPublicTrafficDisabled
-	}
 	if port <= 0 || port > 65535 {
 		return models.ExposePortResponse{}, errors.New("invalid port")
 	}
@@ -2410,6 +2406,20 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		}
 		if existingProto != canonicalProto {
 			return models.ExposePortResponse{}, fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existingProto)
+		}
+	}
+	// expose_port is the opt-in lever for a sandbox created private: there is
+	// no standalone flag-update endpoint, so asking for a public port IS the
+	// consent to public exposure. The flip runs after every reject path above
+	// (a call that fails validation must not mutate the sandbox) and before
+	// the port route goes in, so a successful expose always leaves a fully
+	// public sandbox: flag, public_url, and root route. Deliberately not
+	// rolled back if a later port-route step fails — the flip is an
+	// idempotent prerequisite and the expose retry completes it, same stance
+	// as EnsureLayer4Ready rather than un-publishing on a transient error.
+	if !sandboxAllowsPublicTraffic(sandbox) {
+		if err := s.enableSandboxPublicTraffic(ctx, sandbox); err != nil {
+			return models.ExposePortResponse{}, err
 		}
 	}
 	// Probe the container port before routing traffic to it. Skipped on
