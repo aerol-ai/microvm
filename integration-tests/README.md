@@ -32,6 +32,7 @@ make integration-local                  # local-mode (--local install on a throw
 integration-tests/run.sh single-node --keep        # leave infra up for debugging
 integration-tests/run.sh single-node --prod-tls    # use real Let's Encrypt instead of staging
 make integration-cluster-hetero           # 8-node heterogeneous cluster (x86 fc)
+make integration-cluster-mixed-fc         # 3× mixed cluster, FC on seed c5.metal
 make integration-single-fc                # single-node-fc (x86 firecracker, c5.metal)
 make integration-arm64                    # arm64 firecracker single + cluster scenarios
 make integration-arm64-single             # single-node-fc-arm64 (Graviton metal)
@@ -46,9 +47,10 @@ Reports land in `integration-tests/reports/` (`<scenario>.md`, `<scenario>.json`
 
 `suite/benchmark_test.go` is an **opt-in** benchmark that reuses the live
 deployment to measure sandbox creation. It only runs where the scenario
-advertises the `benchmark` capability — currently **`cluster-hetero`**, the one
-cluster carrying every runtime — because it is slow and provisions many
-sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
+advertises the `benchmark` capability — **`cluster-hetero`** (every runtime) and
+**`cluster-3-mixed-fc`** (docker + firecracker in a 3-node mixed cluster) —
+because it is slow and provisions many sandboxes. Everywhere else UC-94/UC-95
+skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
   firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
@@ -73,26 +75,37 @@ runs inside the normal orchestrated suite, which provisions and tears down for
 you (`run.sh` passes the parent environment through to `go test`):
 
 ```bash
-# Full run: provision cluster-hetero, run the suite WITH the benchmark, teardown.
+# Full hetero run (docker + firecracker + gvisor + wasm):
+make integration-benchmark
+
+# Firecracker-focused 3× mixed cluster (docker + firecracker only; cheaper):
+make integration-benchmark-fc
+
+# Manual env form (hetero):
 AEROL_BENCH=1 \
 AEROL_BENCH_OUT=integration-tests/reports/cluster-hetero-bench.json \
   make integration-cluster-hetero
 ```
 
 To iterate without re-provisioning, bring the cluster up once with `keep`, then
-re-run only UC-94/UC-95 with `make integration-benchmark-only` — it reads the API
-URL + PAT from TF state and forces `AEROL_BENCH=1`, so nothing to export:
+re-run only UC-94/UC-95 with `make integration-benchmark-only` (hetero) or
+`make integration-benchmark-fc-only` (mixed-fc) — they read the API URL + PAT
+from TF state and force `AEROL_BENCH=1`, so nothing to export:
 
 ```bash
 make integration-cluster-hetero keep         # provision, leave it up
 make integration-benchmark-only              # re-run just the bench against it
 
+make integration-cluster-mixed-fc keep       # 3× mixed FC cluster
+make integration-benchmark-fc-only         # re-run UC-94/UC-95 against it
+
 # Narrow the UC-94 sweep:
 AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
-# …or isolate one runtime:
-AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-only
+# …or isolate firecracker latency (UC-95 skips when docker is excluded):
+AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-fc-only
 
 make integration-destroy                     # tear the kept cluster down
+make integration-destroy SCENARIO=cluster-3-mixed-fc
 ```
 
 Percentiles + the density ceiling also print as `bench[...]` log lines (captured

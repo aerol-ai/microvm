@@ -3,7 +3,9 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
-	integration-cluster-hetero integration-cluster-hetero-safe integration-benchmark integration-benchmark-only integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
+	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
+	integration-benchmark integration-benchmark-only integration-benchmark-fc integration-benchmark-fc-only \
+	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -89,6 +91,12 @@ integration-cluster-mixed:
 integration-cluster-mixed-wasm:
 	integration-tests/run.sh cluster-3-mixed-wasm $(RUN_FLAGS)
 
+# 3× mixed cluster with Firecracker on the seed c5.metal node — same domain/TLS,
+# Raft, forwarding, and shared Caddy cert shape as integration-cluster-mixed, but
+# exercises firecracker placement through a multi-node cluster (cheaper than hetero).
+integration-cluster-mixed-fc:
+	integration-tests/run.sh cluster-3-mixed-fc $(RUN_FLAGS)
+
 integration-cluster-hetero:
 	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):
 	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
@@ -120,6 +128,23 @@ integration-benchmark:
 integration-benchmark-only:
 	AEROL_BENCH_OUT=$(BENCH_OUT) \
 		integration-tests/run.sh cluster-hetero --bench-only
+
+# Firecracker-focused benchmark on the 3× mixed-fc cluster: provisions
+# cluster-3-mixed-fc with domain/TLS, runs the full suite with UC-94 (docker +
+# firecracker latency) and UC-95 (docker density). Narrow UC-94 to firecracker
+# only with AEROL_BENCH_RUNTIMES=firecracker (UC-95 will skip in that case).
+#   make integration-benchmark-fc
+#   make integration-benchmark-fc keep
+#   make integration-benchmark-fc FC_BENCH_OUT=/tmp/fc-bench.json
+FC_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-fc-bench.json
+integration-benchmark-fc:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(FC_BENCH_OUT) \
+		integration-tests/run.sh cluster-3-mixed-fc --no-disruptive $(RUN_FLAGS)
+
+# Re-run UC-94/UC-95 only against a cluster-3-mixed-fc left up with `keep`.
+integration-benchmark-fc-only:
+	AEROL_BENCH_OUT=$(FC_BENCH_OUT) \
+		integration-tests/run.sh cluster-3-mixed-fc --bench-only
 
 # Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
 # exercises the firecracker use cases (UC-24/47-50) without the full hetero
