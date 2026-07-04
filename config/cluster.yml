@@ -123,11 +123,12 @@ wasm:
   # Warm-worker pool (Phase 5): pre-spawns workers with the standard modules
   # already loaded + compiled, so a create acquires a ready worker instead of
   # paying the cold compile — which for CPython-on-wasm is ~10s on a small node.
-  # Off by default: warm workers hold RAM. Turn on for perf/benchmark fleets.
+  # On by default (matches sandboxd SB_WASM_POOL_* defaults). Disable on
+  # memory-constrained nodes via pool.enabled: false.
   # depth_default = warm slots kept per module digest.
   pool:
-    enabled: false
-    depth_default: 0
+    enabled: true
+    depth_default: 2
   registry_allowlist: "aocr.aerol.ai"
   pull_timeout: "60s"
   push_host: ""

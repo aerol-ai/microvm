@@ -424,7 +424,9 @@ type Config struct {
 	// WasmDefaultTimeout is the default wall-clock budget for guest invocations.
 	// SB_WASM_DEFAULT_TIMEOUT.
 	WasmDefaultTimeout time.Duration
-	// WasmPoolEnabled gates the in-memory warm-worker pool (Phase 5).
+	// WasmPoolEnabled gates the in-memory warm-worker pool (Phase 5). Default on:
+	// warm workers are the primary WASM create latency path; disable explicitly
+	// on memory-constrained nodes via SB_WASM_POOL_ENABLED=false.
 	// SB_WASM_POOL_ENABLED.
 	WasmPoolEnabled bool
 	// WasmPoolDepthDefault is the target number of warm workers per module digest.
@@ -1387,8 +1389,8 @@ func Load() (Config, error) {
 		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),
 		WasmCacheGCTTL:          getEnvDuration("SB_WASM_CACHE_GC_TTL", 24*time.Hour),
 		WasmCacheMaxBytes:       getEnvInt64("SB_WASM_CACHE_MAX_BYTES", 0),
-		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
-		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
+		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", true),
+		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 2),
 		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
 		WasmModuleDigestMode:    strings.ToLower(getEnv("SB_WASM_MODULE_DIGEST_MODE", "once")),
 		WasmCompileCacheDir:     getEnv("SB_WASM_COMPILE_CACHE_DIR", ""),

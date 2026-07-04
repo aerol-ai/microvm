@@ -172,6 +172,12 @@ func TestLoadCases(t *testing.T) {
 				if cfg.FirecrackerSnapshotVerifyMode != "once" {
 					t.Fatalf("expected default FirecrackerSnapshotVerifyMode=once, got %q", cfg.FirecrackerSnapshotVerifyMode)
 				}
+				if !cfg.WasmPoolEnabled {
+					t.Fatalf("expected default WasmPoolEnabled=true, got false")
+				}
+				if cfg.WasmPoolDepthDefault != 2 {
+					t.Fatalf("expected default WasmPoolDepthDefault=2, got %d", cfg.WasmPoolDepthDefault)
+				}
 			},
 		},
 		{
