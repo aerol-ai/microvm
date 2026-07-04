@@ -4156,6 +4156,18 @@ func (s *Store) TransferFirecrackerTapSlot(ctx context.Context, fromID, toID str
 		return nil, fmt.Errorf("transfer firecracker tap slot: target %q already owns %s", toID, target.TapName)
 	}
 	if source == nil {
+		// The two reads above are not atomic: a concurrent duplicate of
+		// this same transfer may have committed between them, leaving a
+		// stale target=nil alongside source=nil. Re-read the target so
+		// the losing duplicate returns the moved slot (idempotent)
+		// instead of a spurious not-found.
+		target, err = s.GetFirecrackerTapSlotBySandbox(ctx, toID)
+		if err != nil {
+			return nil, err
+		}
+		if target != nil {
+			return target, nil
+		}
 		return nil, ErrNotFound
 	}
 	res, err := s.db.ExecContext(ctx, `

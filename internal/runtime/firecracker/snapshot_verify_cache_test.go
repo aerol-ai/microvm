@@ -170,6 +170,56 @@ func TestVerifyCache_ModeAlways(t *testing.T) {
 	}
 }
 
+// TestVerifyCache_WarmSpawnShares drives BOTH production call sites —
+// WarmSpawn (the pool's refill goroutine) and a snapshot-load Create
+// (configureVMMForLoad) — against one template and asserts they share
+// a single cache entry: one hash total. Guards against the two call
+// sites drifting onto separate caches (or one dropping the cache).
+func TestVerifyCache_WarmSpawnShares(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.SnapshotVerifyOnLoad = true
+	var calls int32
+	f.driver.snapshotVerifier = func(_, _, _ string) error {
+		atomic.AddInt32(&calls, 1)
+		return nil
+	}
+
+	tplDir := t.TempDir()
+	rootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := writeFile(rootfs, []byte("ROOTFS")); err != nil {
+		t.Fatalf("write rootfs: %v", err)
+	}
+	memPath, statePath, checksum := writeVerifyCacheFiles(t, tplDir, "mem", "state")
+	f.driver.SetTemplateResolver(&fakeTemplateResolver{
+		rootfsPath:         rootfs,
+		hasSnapshot:        true,
+		snapshotMemoryPath: memPath,
+		snapshotStatePath:  statePath,
+		snapshotChecksum:   checksum,
+		snapshotVsockCID:   200,
+	})
+
+	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
+		SlotID:             "vmms-warm-share",
+		TemplateID:         "tpl-share",
+		SnapshotMemoryPath: memPath,
+		SnapshotStatePath:  statePath,
+		SnapshotChecksum:   checksum,
+		VsockCID:           200,
+	}); err != nil {
+		t.Fatalf("WarmSpawn: %v", err)
+	}
+	if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image: "alpine:3.20", CPU: 1, MemoryMB: 128, TemplateID: "tpl-share",
+	}, "sb-verify-share", "tok", nil); err != nil {
+		t.Fatalf("Create snapshot-load: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("verifier calls = %d, want 1 shared across WarmSpawn and Create", got)
+	}
+}
+
 func TestVerifyCache_DisabledSkipsEntirely(t *testing.T) {
 	memPath, statePath, checksum := writeVerifyCacheFiles(t, t.TempDir(), "mem", "state")
 	d := New(Config{SnapshotVerifyOnLoad: false}, nil)

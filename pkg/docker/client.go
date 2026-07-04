@@ -575,7 +575,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	toolboxSource, err := c.waitForToolboxReady(ctx, containerIP, readyListener)
 	toolboxWait := time.Since(toolboxWaitStart)
 	if timing := CreateTimingFrom(ctx); timing != nil {
-		timing.record(runtimeWait, toolboxWait, toolboxSource)
+		timing.RecordDockerWaits(runtimeWait, toolboxWait, toolboxSource)
 	}
 	if err != nil {
 		_ = c.removeContainer(ctx, created.ID, true)

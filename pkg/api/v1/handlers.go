@@ -49,6 +49,16 @@ func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docke
 		if timing.Source != "" {
 			parts = append(parts, "readiness;desc="+timing.Source)
 		}
+		// Firecracker per-stage boot attribution (Phase 0,
+		// plans/firecracker-create-latency.md). Absent stages are simply
+		// not rendered — a docker create carries no fc_* entries.
+		for _, st := range timing.Stages() {
+			entry := st.Name + ";dur=" + strconv.FormatFloat(st.DurMS, 'f', 1, 64)
+			if st.Desc != "" {
+				entry += ";desc=" + st.Desc
+			}
+			parts = append(parts, entry)
+		}
 	}
 	w.Header().Set("Server-Timing", strings.Join(parts, ", "))
 }

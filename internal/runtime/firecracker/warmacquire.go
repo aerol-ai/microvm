@@ -35,6 +35,7 @@ import (
 	"time"
 
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -122,6 +123,12 @@ func (d *Driver) tryAcquireWarm(
 		"vsock_cid", slot.VsockCID)
 
 	transferredSlot, err := d.pool.Transfer(ctx, slot.ID, sandboxID, time.Now().UTC())
+	if err == nil && transferredSlot == nil {
+		// Defensive: the TapPool contract returns a slot on success, but a
+		// nil/nil answer must still roll back — returning without cleanup
+		// here would leak the claimed warm slot AND its paused VMM.
+		err = errors.New("transfer returned no slot")
+	}
 	if err != nil {
 		if relErr := d.warmPool.Release(context.Background(), sandboxID, time.Now().UTC()); relErr != nil {
 			d.logger.Warn("firecracker create: warm acquire rollback after tap transfer failure (pool release)",
@@ -132,9 +139,6 @@ func (d *Driver) tryAcquireWarm(
 				"sandbox_id", sandboxID, "slot_id", slot.ID, "error", sErr)
 		}
 		return nil, false, fmt.Errorf("firecracker runtime: warm tap transfer %s -> %s: %w", slot.ID, sandboxID, err)
-	}
-	if transferredSlot == nil {
-		return nil, false, fmt.Errorf("firecracker runtime: warm tap transfer %s -> %s returned nil slot", slot.ID, sandboxID)
 	}
 	tapSlot = transferredSlot
 	if setter, ok := handle.(warmTapOwnerSetter); ok {
@@ -233,9 +237,12 @@ func (d *Driver) tryAcquireWarm(
 	// Resume the VMM. From the guest's perspective this is the first
 	// instruction after the snapshot was taken — vCPUs start ticking
 	// against the new TAP+overlay.
+	timing := createtiming.From(ctx)
+	resumeStart := time.Now()
 	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm patch VM Resumed: %w", err)
 	}
+	timing.RecordStage("fc_resume", time.Since(resumeStart))
 
 	// Vsock handshake — dial the snapshot's reserved CID. The pool
 	// slot's vsock_cid IS the snapshot's CID (RecordLoaded copies it
@@ -243,9 +250,11 @@ func (d *Driver) tryAcquireWarm(
 	// dial. Dialing tapSlot.VsockCID would race the guest, which is
 	// listening on the snapshot's CID baked in at template build.
 	vsockPath := filepath.Join(slot.RunDir, hostVsockUDSName)
+	handshakeStart := time.Now()
 	if err := d.vsockHandshake(ctx, vsockPath, slot.VsockCID); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm vsock handshake: %w", err)
 	}
+	timing.RecordStage("fc_handshake", time.Since(handshakeStart))
 	d.logger.Info("firecracker create: warm vsock handshake complete",
 		"sandbox_id", sandboxID,
 		"vsock_cid", slot.VsockCID,
@@ -255,7 +264,10 @@ func (d *Driver) tryAcquireWarm(
 	// post_resume reseed (RNG + wallclock). Best-effort; same shape
 	// as the cold snapshot-load path.
 	postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-	if err := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", postResumeData(tapSlot)); err != nil {
+	postResumeStart := time.Now()
+	postResumeErr := d.sendVsockOp(postCtx, vsockPath, slot.VsockCID, "post_resume", postResumeData(tapSlot))
+	timing.RecordStage("fc_post_resume", time.Since(postResumeStart))
+	if err := postResumeErr; err != nil {
 		d.logger.Warn("firecracker create: warm post_resume send failed (continuing)",
 			"sandbox_id", sandboxID, "error", err)
 	} else {

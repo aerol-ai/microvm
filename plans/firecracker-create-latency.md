@@ -1,11 +1,54 @@
 # Firecracker snapshot-clone create latency: 3.45s → sub-700ms
 
-Status: **Proposed** (2026-07-04). Not started.
+Status: **In progress** (updated 2026-07-04). Phases 0 (code), 1, 2, 3a, 3b
+and the 3c static cap are code-complete on
+`feat/firecracker-create-latency-phase1`; the E1 experiment, the UC-98
+integration scenarios, and every benchmark gate below are still open — no
+latency number in this document has been re-measured yet.
 
 Owner rules that apply: this plan changes `CreateSandbox` callees
 (`/touch-create-sandbox`), the TAP allocator and warm-VMM pool (fragile areas —
 regression tests mandatory next to the file), and needs boot-path latency
 call-outs in every PR description per `pr-review.md` §2.
+
+## Implementation status (2026-07-04)
+
+| Phase | State | Notes |
+|---|---|---|
+| 0 — instrumentation | code done, **E1 + bench run open** | Recorder moved to `pkg/createtiming` (docker keeps aliases); `fc_*` stages recorded in `Driver.Create` (cold, snapshot-load, warm) and surfaced via `setCreateServerTiming`; harness parses all `<name>;dur=` pairs into `latency[].stages` (mean/p50). The warm-hit marker (`fc_warm;dur=…;desc=hit`) landed here too. E1 and the stage-sum exit criterion still need an operator bench run. See deviations below. |
+| 1 — verify-once cache + async probe | done | `snapshot_verify_cache.go`, `toolbox_probe.go` + full test table incl. `TestVerifyCache_WarmSpawnShares`. |
+| 2 — poll-cadence trims | done | `retry.go`; WaitSocket 2→20ms, vsock 5→50ms, backoff-sequence test. |
+| 3a — TAP `Transfer` | done | Atomic single-`UPDATE` re-key in `store.go`; idempotent-retry + concurrent-duplicate regression tests in `tap/pool_test.go`. |
+| 3b — warm pool v1.15 redesign | done | WarmSpawn owns TAP + `network_overrides` at load; Acquire transfers ownership, zero `PatchNetworkInterface`. Pool still **off by default** (ship-dark, per this plan). |
+| 3c — sizing guards | partial | Boot-time depth cap `min(configured, tap_pool_size/8)` in `pkg/daemon`. The dynamic refill guard (refuse when free TAP slots < 2× pool size) is NOT implemented. |
+| UC-98/98b/98c/98d | not started | Require Phase 0's warm-hit marker + a cluster-hetero run. |
+
+**Deviation from the 3a design (call out in the PR):** rollback after a
+failed warm acquire *releases* the transferred TAP row (via
+`warmHandle.Shutdown`) instead of transferring it back to the slot id.
+Simpler and leak-free — Destroy/rollback double-release is idempotent —
+but a failed warm create burns the parked slot's TAP + VMM instead of
+returning them to the pool; the refill loop replaces the slot on its
+next tick. `TestTransfer_RollbackShape` is therefore superseded by
+`TestCreate_WarmRollbackOnTapTransferFailure` +
+`TestAcquire_ConcurrentDuplicateCreate`.
+
+**Deviations from the Phase 0 design (call out in the PR):**
+
+- `fc_tcp_probe` is **not** recorded: Phase 1 moved the TCP probe off the
+  create path onto a detached goroutine, so there is no boot-path duration
+  to attribute — the header would always report a meaningless ~0ms.
+- Three stages were added beyond the planned list so the per-stage p50s can
+  actually sum to the `create` total (the Phase 0 exit criterion):
+  `fc_rootfs` (template stage / OCI build), `fc_tap_ensure` (host `ip`
+  realization), and `fc_configure` (cold-boot REST config, the counterpart
+  of the snapshot path's `fc_load`).
+- The warm-hit marker (`fc_warm;dur=…;desc=hit`) shipped with Phase 0
+  instead of waiting for UC-98; the warm path also records
+  `fc_resume`/`fc_handshake`/`fc_post_resume` so warm hits are attributable
+  without a separate stage set.
+- `fc_driver` is recorded on failed creates too (the handler already sets
+  Server-Timing on error responses), so slow failures are visible.
 
 ---
 

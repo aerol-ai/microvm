@@ -347,6 +347,20 @@ type latencyStats struct {
 	Serverp50MS   int64 `json:"server_p50_ms"`
 	Serverp90MS   int64 `json:"server_p90_ms"`
 	Serverp99MS   int64 `json:"server_p99_ms"`
+	// Stages is the per-stage Server-Timing breakdown (Phase 0 of
+	// plans/firecracker-create-latency.md): one entry per <name>;dur=
+	// metric the server reported (fc_verify, fc_spawn, fc_driver, …).
+	// Empty for servers that only send create;dur=. Samples counts the
+	// creates whose header carried that stage — a stage absent from
+	// some samples (e.g. fc_warm on a cold fallback) reports fewer.
+	Stages map[string]stageStats `json:"stages,omitempty"`
+}
+
+// stageStats folds one named stage's samples across the bench run.
+type stageStats struct {
+	Samples int   `json:"samples"`
+	MeanMS  int64 `json:"mean_ms"`
+	P50MS   int64 `json:"p50_ms"`
 }
 
 // benchReport is the full JSON artifact (UC-94 + UC-95 combined).
@@ -544,6 +558,7 @@ func TestBenchCreateLatency(t *testing.T) {
 	var report benchReport
 	for _, br := range runtimes {
 		var apiD, runD, serverD []time.Duration
+		stageD := map[string][]time.Duration{}
 		failures := 0
 		for i := 0; i < samples; i++ {
 			opts := benchCreateOptions(t, br)
@@ -573,6 +588,15 @@ func TestBenchCreateLatency(t *testing.T) {
 			if ms, ok := c.LastServerCreateMS(); ok {
 				serverD = append(serverD, time.Duration(ms*float64(time.Millisecond)))
 			}
+			// Per-stage breakdown from the same header (Phase 0 of
+			// plans/firecracker-create-latency.md). Only stages the server
+			// actually reported land here; docker creates carry the
+			// runtime_wait/toolbox_wait pair, firecracker the fc_* set.
+			if stages, ok := c.LastServerCreateStages(); ok {
+				for name, ms := range stages {
+					stageD[name] = append(stageD[name], time.Duration(ms*float64(time.Millisecond)))
+				}
+			}
 		}
 
 		if len(apiD) == 0 {
@@ -580,6 +604,7 @@ func TestBenchCreateLatency(t *testing.T) {
 			continue
 		}
 		ls := summarize(br.runtime, samples, failures, apiD, runD, serverD)
+		ls.Stages = summarizeStages(stageD)
 		report.Latency = append(report.Latency, ls)
 		t.Logf("bench[%s] api p50=%dms p90=%dms p99=%dms | server p50=%dms p90=%dms p99=%dms | running p50=%dms p90=%dms p99=%dms (%d ok, %d fail)",
 			br.runtime, ls.APIp50MS, ls.APIp90MS, ls.APIp99MS,
@@ -612,6 +637,26 @@ func summarize(rt string, samples, failures int, apiD, runD, serverD []time.Dura
 		ls.Serverp99MS = percentile(serverD, 99).Milliseconds()
 	}
 	return ls
+}
+
+// summarizeStages folds the per-stage samples into the artifact's
+// latency[].stages block. Nil when the server reported no stages.
+func summarizeStages(stageD map[string][]time.Duration) map[string]stageStats {
+	if len(stageD) == 0 {
+		return nil
+	}
+	out := make(map[string]stageStats, len(stageD))
+	for name, durs := range stageD {
+		if len(durs) == 0 {
+			continue
+		}
+		out[name] = stageStats{
+			Samples: len(durs),
+			MeanMS:  meanMS(durs),
+			P50MS:   percentile(durs, 50).Milliseconds(),
+		}
+	}
+	return out
 }
 
 func meanMS(durs []time.Duration) int64 {

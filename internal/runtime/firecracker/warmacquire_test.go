@@ -25,6 +25,11 @@ type fakeWarmPool struct {
 	slot      *vmmpool.Slot
 	handle    vmmpool.SpawnedHandle
 	acquireEr error
+	// singleUse mimics the real pool's claim semantics: the preloaded
+	// slot is handed out exactly once; every later Acquire misses with
+	// ErrNoLoadedSlot. Used by the concurrent-duplicate regression.
+	singleUse bool
+	served    int
 
 	acquireCalls []acquireCall
 	releaseCalls []string
@@ -43,6 +48,10 @@ func (p *fakeWarmPool) AcquireWithHandle(_ context.Context, templateID, sandboxI
 	if p.acquireEr != nil {
 		return nil, nil, p.acquireEr
 	}
+	if p.singleUse && p.served > 0 {
+		return nil, nil, vmmpool.ErrNoLoadedSlot
+	}
+	p.served++
 	return p.slot, p.handle, nil
 }
 
@@ -436,6 +445,87 @@ func TestCreate_WarmEligibilityNoSnapshot(t *testing.T) {
 		t.Errorf("warm pool Acquire called on no-snapshot template: %v", pool.acquireCalls)
 	}
 	pool.mu.Unlock()
+}
+
+// TestAcquire_ConcurrentDuplicateCreate races two Creates for the SAME
+// sandbox id against a pool holding one warm slot (idempotency,
+// pr-review.md rule #1). Exactly one racer may claim the slot: one TAP
+// Transfer, one Resume of the warm VMM. The loser must miss cleanly
+// into the cold-spawn path (its own VMM) rather than double-resuming
+// or double-transferring the claimed slot.
+func TestAcquire_ConcurrentDuplicateCreate(t *testing.T) {
+	f := newDriverFixture(t)
+	pool, handle := stageWarmFixture(t, f)
+	pool.singleUse = true
+	stageWarmTemplate(t, f, false)
+
+	// Split clients per API socket so the warm slot's Resume count is
+	// isolated from the cold loser's own (legitimate) Resume.
+	warmClient := newFakeClient()
+	f.driver.SetClientFactory(func(socketPath string) VMMClient {
+		if socketPath == handle.apiSocket {
+			return warmClient
+		}
+		return f.client
+	})
+
+	const racers = 2
+	var wg sync.WaitGroup
+	errs := make([]error, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = f.driver.Create(context.Background(), models.CreateSandboxRequest{
+				Image:      "alpine:3.20",
+				CPU:        1,
+				MemoryMB:   128,
+				DiskGB:     1,
+				TemplateID: "tpl-warm",
+			}, "sb-dup-race", "tok", nil)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("racer %d Create: %v", i, err)
+		}
+	}
+
+	// Exactly one warm claim: one TAP transfer to the sandbox id.
+	f.pool.mu.Lock()
+	if len(f.pool.transfers) != 1 ||
+		f.pool.transfers[0].from != "vmms-warm-fixture" || f.pool.transfers[0].to != "sb-dup-race" {
+		t.Fatalf("tap transfers = %+v, want exactly [vmms-warm-fixture -> sb-dup-race]", f.pool.transfers)
+	}
+	f.pool.mu.Unlock()
+
+	// The warm VMM was resumed exactly once; a double-Resume would mean
+	// both racers claimed the same paused process.
+	warmClient.mu.Lock()
+	resumes := 0
+	for _, s := range warmClient.vmStates {
+		if s == firecracker.VMStateResumed {
+			resumes++
+		}
+	}
+	warmClient.mu.Unlock()
+	if resumes != 1 {
+		t.Fatalf("warm VMM Resume count = %d, want 1", resumes)
+	}
+
+	// Both racers hit the pool; the second was told the pool is empty.
+	pool.mu.Lock()
+	if len(pool.acquireCalls) != racers {
+		t.Errorf("warm pool Acquire calls = %d, want %d", len(pool.acquireCalls), racers)
+	}
+	pool.mu.Unlock()
+
+	// The loser cold-booted its own VMM (fixture fake), not the warm one.
+	if !f.vmm.started || !f.vmm.waited {
+		t.Errorf("cold fallback VMM started=%v waited=%v, want true/true", f.vmm.started, f.vmm.waited)
+	}
 }
 
 // TestDestroy_ReleasesWarmPoolSlot proves the symmetry: a sandbox
