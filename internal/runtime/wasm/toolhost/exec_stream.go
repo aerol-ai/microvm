@@ -121,9 +121,12 @@ func (h *Host) runExecStreamPTY(conn *websocket.Conn, cmd *exec.Cmd, start *exec
 	}
 	defer func() { _ = ptmx.Close() }()
 
-	done := make(chan struct{})
-	go h.execStreamReadPump(conn, ptmx, done, streamFramePrefixStdout)
-	go h.execStreamControlPump(conn, cmd, ptmx, done)
+	// Client → PTY in the background; PTY → client on the main goroutine so
+	// only one writer touches the websocket (gorilla/websocket is not
+	// concurrent-write safe).
+	go h.execStreamControlPump(conn, cmd, ptmx)
+
+	_ = pumpExecStreamReader(conn, ptmx, streamFramePrefixStdout)
 
 	exitCode, sig := waitExec(cmd)
 	writeStreamControl(conn, execStreamControlOut{Type: "exit", Code: exitCode, Signal: sig})
@@ -150,72 +153,73 @@ func (h *Host) runExecStreamPipes(conn *websocket.Conn, cmd *exec.Cmd) {
 		return
 	}
 
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		streamExecOutput(conn, stdout, streamFramePrefixStdout, done)
-	}()
-	go func() {
-		defer wg.Done()
-		streamExecOutput(conn, stderr, streamFramePrefixStderr, done)
-	}()
-	go h.execStreamStdinPump(conn, stdin, done)
+	var writeMu sync.Mutex
 
-	wg.Wait()
-	close(done)
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stdoutDone)
+		_ = pumpExecStreamReaderLocked(conn, stdout, streamFramePrefixStdout, &writeMu)
+	}()
+	go func() {
+		defer close(stderrDone)
+		_ = pumpExecStreamReaderLocked(conn, stderr, streamFramePrefixStderr, &writeMu)
+	}()
+	go h.execStreamStdinPump(conn, stdin)
+
+	<-stdoutDone
+	<-stderrDone
+
 	exitCode, sig := waitExec(cmd)
-	writeStreamControl(conn, execStreamControlOut{Type: "exit", Code: exitCode, Signal: sig})
+	writeMu.Lock()
+	_ = conn.WriteJSON(execStreamControlOut{Type: "exit", Code: exitCode, Signal: sig})
+	writeMu.Unlock()
 }
 
-func streamExecOutput(conn *websocket.Conn, r io.Reader, prefix byte, done <-chan struct{}) {
+func pumpExecStreamReader(conn *websocket.Conn, r io.Reader, prefix byte) error {
 	buf := make([]byte, 32*1024)
+	out := make([]byte, 1+len(buf))
+	out[0] = prefix
 	for {
-		select {
-		case <-done:
-			return
-		default:
-		}
 		n, err := r.Read(buf)
 		if n > 0 {
-			frame := append([]byte{prefix}, buf[:n]...)
-			if werr := conn.WriteMessage(websocket.BinaryMessage, frame); werr != nil {
-				return
+			out = append(out[:1], buf[:n]...)
+			if werr := conn.WriteMessage(websocket.BinaryMessage, out); werr != nil {
+				return werr
 			}
 		}
 		if err != nil {
-			return
+			return err
 		}
 	}
 }
 
-func (h *Host) execStreamReadPump(conn *websocket.Conn, r io.Reader, done chan struct{}, prefix byte) {
-	defer close(done)
+func pumpExecStreamReaderLocked(conn *websocket.Conn, r io.Reader, prefix byte, mu *sync.Mutex) error {
 	buf := make([]byte, 32*1024)
+	frame := make([]byte, 0, 1+cap(buf))
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			frame := append([]byte{prefix}, buf[:n]...)
-			if werr := conn.WriteMessage(websocket.BinaryMessage, frame); werr != nil {
-				return
+			frame = append(frame[:0], prefix)
+			frame = append(frame, buf[:n]...)
+			mu.Lock()
+			werr := conn.WriteMessage(websocket.BinaryMessage, frame)
+			mu.Unlock()
+			if werr != nil {
+				return werr
 			}
 		}
 		if err != nil {
-			return
+			return err
 		}
 	}
 }
 
-func (h *Host) execStreamControlPump(conn *websocket.Conn, cmd *exec.Cmd, ptmx *os.File, done <-chan struct{}) {
+func (h *Host) execStreamControlPump(conn *websocket.Conn, cmd *exec.Cmd, ptmx *os.File) {
 	for {
-		select {
-		case <-done:
-			return
-		default:
-		}
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
+			_ = ptmx.Close() // unblock the PTY read pump
 			return
 		}
 		switch msgType {
@@ -236,14 +240,9 @@ func (h *Host) execStreamControlPump(conn *websocket.Conn, cmd *exec.Cmd, ptmx *
 	}
 }
 
-func (h *Host) execStreamStdinPump(conn *websocket.Conn, stdin io.WriteCloser, done <-chan struct{}) {
+func (h *Host) execStreamStdinPump(conn *websocket.Conn, stdin io.WriteCloser) {
 	defer func() { _ = stdin.Close() }()
 	for {
-		select {
-		case <-done:
-			return
-		default:
-		}
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			return
