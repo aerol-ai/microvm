@@ -27,7 +27,7 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.create({ image: 'ubuntu:22.04' })
+    const sandbox = await client.create({ image: 'ubuntu:22.04', allowPublicTraffic: true })
 
     // Before exposing - 403
     await fetch(`${sandbox.publicURL}/proxy/21212/`)
@@ -43,7 +43,7 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({'image': 'ubuntu:22.04'})
+    sandbox = client.create({'image': 'ubuntu:22.04', 'allowPublicTraffic': True})
 
     # Before exposing - 403
     # GET sandbox['publicURL'] + '/proxy/21212/'
@@ -58,8 +58,10 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
   </TabItem>
   <TabItem label="Go">
     ```go
+    public := true
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ubuntu:22.04",
+        Image:              "ubuntu:22.04",
+        AllowPublicTraffic: &public,
     })
     if err != nil { log.Fatal(err) }
 
@@ -79,6 +81,7 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     ```rust
     let sandbox = client.create(CreateOptions {
         image: "ubuntu:22.04".to_string(),
+        allow_public_traffic: Some(true),
         ..Default::default()
     })?;
 
@@ -96,7 +99,9 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
   <TabItem label="Java">
     ```java
     Sandbox sandbox = client.create(
-        new CreateOptions().setImage("ubuntu:22.04")
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setAllowPublicTraffic(true)
     );
 
     // Before exposing - 403

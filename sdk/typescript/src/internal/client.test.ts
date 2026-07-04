@@ -89,6 +89,22 @@ test("internal client create serializes platform volumes", async () => {
   ]);
 });
 
+test("internal client create omits allowPublicTraffic when unset", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-default-private"));
+    },
+  });
+  await client.create({ image: "ubuntu:22.04" });
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as Record<string, unknown>;
+  assert.equal(body.allow_public_traffic, undefined);
+});
+
 test("internal client create serializes allowPublicTraffic=false", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

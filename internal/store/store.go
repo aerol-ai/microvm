@@ -1722,6 +1722,31 @@ func (s *Store) SetWakeArmed(ctx context.Context, id string, armed bool) error {
 	return nil
 }
 
+// SetAllowPublicTraffic flips the public-exposure flag together with the
+// derived public_url in one statement. The expose_port opt-in path (the only
+// way a private sandbox becomes public after create) is the caller; the two
+// columns must move atomically because every Get materializes both — a
+// public row with an empty public_url (or the reverse) would misreport
+// reachability. A dedicated setter rather than Upsert so the flip doesn't
+// race the runtime-state machine on the rest of the row.
+func (s *Store) SetAllowPublicTraffic(ctx context.Context, id string, allow bool, publicURL string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET allow_public_traffic = ?,
+		    public_url = ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, boolToInt(allow), publicURL, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set allow_public_traffic: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetAutoImportPending toggles the AOCR auto-import retry flag. The post-pull
 // auto-import path sets it to true on failure; the reconciler clears it after
 // a successful import. The reconciler must call this rather than Upsert to

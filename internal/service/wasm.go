@@ -195,18 +195,21 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	}
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 
-	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
-		// deleteSandboxPublicRoutes (not DeleteSandboxRoute) tears down the
-		// main route AND every per-custom-domain leaf. WASM is doubly exposed
-		// here: routes get installed both via syncSandboxPublicRoute's
-		// UpsertSandboxRoute loop and via syncWasmCustomDomainRoutes below,
-		// and both key on IngressCustomDomainHTTPRouteID — so the leaf delete
-		// covers both. 404 per leaf is a no-op, safe on a partial install.
-		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
-		_ = s.wasm.Destroy(ctx, sandbox)
-		cleanupMounts()
-		releaseAdmission()
-		return nil, err
+	// Private sandboxes skip caddy on the boot path; see the docker path.
+	if sandboxAllowsPublicTraffic(sandbox) {
+		if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
+			// deleteSandboxPublicRoutes (not DeleteSandboxRoute) tears down the
+			// main route AND every per-custom-domain leaf. WASM is doubly exposed
+			// here: routes get installed both via syncSandboxPublicRoute's
+			// UpsertSandboxRoute loop and via syncWasmCustomDomainRoutes below,
+			// and both key on IngressCustomDomainHTTPRouteID — so the leaf delete
+			// covers both. 404 per leaf is a no-op, safe on a partial install.
+			_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
+			_ = s.wasm.Destroy(ctx, sandbox)
+			cleanupMounts()
+			releaseAdmission()
+			return nil, err
+		}
 	}
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)

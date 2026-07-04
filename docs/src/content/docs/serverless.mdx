@@ -33,7 +33,7 @@ The sandbox keeps its ID, public URL, environment, mounts, and disk across stop 
 
 ## Enable per-sandbox
 
-`stopIfIdleFor` is required when `serverless: true`. The server rejects the request otherwise.
+`stopIfIdleFor` is required when `serverless: true`. The server rejects the request otherwise. Serverless wake rides the sandbox's **public** endpoints — a fully private sandbox has no routes to wake through. Calling `exposePort` (as below) opts the sandbox into public traffic automatically, so the usual create → expose flow needs no extra flag; only a serverless sandbox that never exposes a port would need `allowPublicTraffic: true` at create to be wakeable via its root URL. See [Network Isolation](/network-isolation/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

@@ -157,8 +157,8 @@ class CreateOptions(TypedDict, total=False):
     # mutually exclusive; a full block is networkBlockAll, not a 0.0.0.0/0 deny.
     networkAllowOut: List[str]
     networkDenyOut: List[str]
-    # Whether the sandbox may be exposed publicly. Defaults to True; False makes
-    # expose_port fail (reachable only via the toolbox proxy and SSH gateway).
+    # Whether the sandbox may be exposed publicly. Omitted defaults to private
+    # (no public URL, expose_port fails). True opts in; False permanently refuses.
     allowPublicTraffic: bool
     # Rewrite the upstream Host header on ingress to exposed HTTP ports to this
     # value so frameworks that validate Host (Vite, Django ALLOWED_HOSTS,

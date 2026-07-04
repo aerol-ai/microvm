@@ -23,7 +23,7 @@ gVisor works on **any standard server** - there are no bare-metal or special har
 
 ## Create a gVisor sandbox
 
-Pass `runtime: "gvisor"` in the create request.
+Pass `runtime: "gvisor"` in the create request. Public exposure is opt-in — `exposePort` flips the sandbox public on first use, or set `allowPublicTraffic: true` at create for a boot-time public URL; see [Network Isolation](/network-isolation/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -43,7 +43,6 @@ Pass `runtime: "gvisor"` in the create request.
     })
 
     console.log(sandbox.id)
-    console.log(sandbox.publicURL)
     ```
   </TabItem>
   <TabItem label="Python">
@@ -63,7 +62,6 @@ Pass `runtime: "gvisor"` in the create request.
     })
 
     print(sandbox.id)
-    print(sandbox.publicURL)
     ```
   </TabItem>
   <TabItem label="Go">
@@ -96,7 +94,7 @@ Pass `runtime: "gvisor"` in the create request.
         log.Fatal(err)
     }
 
-    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    fmt.Println(sandbox.ID)
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -116,7 +114,7 @@ Pass `runtime: "gvisor"` in the create request.
         ..Default::default()
     })?;
 
-    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    println!("{}", sandbox.data.id);
     ```
   </TabItem>
   <TabItem label="Java">
@@ -140,7 +138,7 @@ Pass `runtime: "gvisor"` in the create request.
             .setMemoryMb(512)
     );
 
-    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    System.out.println(sandbox.id);
     ```
   </TabItem>
 </Tabs>

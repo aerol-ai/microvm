@@ -1301,6 +1301,46 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			// The expose_port opt-in flips flag and public_url in ONE
+			// statement — a Get must never observe one moved without the
+			// other, or reachability is misreported.
+			name: "set_allow_public_traffic_moves_flag_and_url_together",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-flip-public")
+				deny := false
+				sandbox.AllowPublicTraffic = &deny
+				sandbox.PublicURL = ""
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				const url = "https://sb-flip-public.sandbox.test"
+				if err := st.SetAllowPublicTraffic(ctx, sandbox.ID, true, url); err != nil {
+					t.Fatalf("SetAllowPublicTraffic() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.AllowPublicTraffic == nil || !*got.AllowPublicTraffic {
+					t.Fatalf("AllowPublicTraffic = %v after flip, want explicit true", got.AllowPublicTraffic)
+				}
+				if got.PublicURL != url {
+					t.Fatalf("PublicURL = %q after flip, want %q", got.PublicURL, url)
+				}
+			},
+		},
+		{
+			name: "set_allow_public_traffic_returns_not_found_for_missing_id",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				err := st.SetAllowPublicTraffic(ctx, "missing", true, "https://missing.sandbox.test")
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound, got %v", err)
+				}
+			},
+		},
+		{
 			name: "list_returns_all_ports_with_one_query_per_call",
 			run: func(t *testing.T) {
 				// Three sandboxes: one with two ports, one with one port, one

@@ -189,9 +189,9 @@ export interface CreateOptions {
    */
   networkDenyOut?: string[];
   /**
-   * Whether the sandbox may be exposed to the public internet. Defaults to
-   * true; set `false` to make `exposePort` fail — the sandbox stays reachable
-   * only via the toolbox proxy and SSH gateway, not a public URL.
+   * Whether the sandbox may be exposed to the public internet. Omitted defaults
+   * to private (no public URL, `exposePort` fails). Set `true` to opt in to
+   * public exposure; `false` permanently refuses it for this sandbox.
    */
   allowPublicTraffic?: boolean;
   /**

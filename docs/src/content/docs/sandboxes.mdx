@@ -33,6 +33,10 @@ created ──► running ──► stopped ──► running
 
 ## Create
 
+:::note
+Sandboxes are **private by default**: omitting `allowPublicTraffic` gives no public ingress URL at boot. The first `exposePort` call opts the sandbox in (flips it public and installs its routes); set `allowPublicTraffic: true` at create to have the URL live from boot instead — see [Network Isolation](/network-isolation/).
+:::
+
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
@@ -55,7 +59,6 @@ created ──► running ──► stopped ──► running
     })
 
     console.log(sandbox.id)
-    console.log(sandbox.publicURL)
     console.log(sandbox.sshPrivateKey) // only returned by create()
     ```
   </TabItem>
@@ -80,7 +83,6 @@ created ──► running ──► stopped ──► running
     })
 
     print(sandbox.id)
-    print(sandbox.publicURL)
     print(sandbox.sshPrivateKey)  # only returned by create()
     ```
   </TabItem>
@@ -119,7 +121,7 @@ created ──► running ──► stopped ──► running
         log.Fatal(err)
     }
 
-    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    fmt.Println(sandbox.ID)
     fmt.Println(sandbox.SSHPrivateKey) // only returned by Create()
     ```
   </TabItem>
@@ -145,7 +147,7 @@ created ──► running ──► stopped ──► running
         ..Default::default()
     })?;
 
-    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    println!("{}", sandbox.data.id);
     println!("{:?}", sandbox.ssh_private_key); // only returned by create()
     ```
   </TabItem>
@@ -174,7 +176,7 @@ created ──► running ──► stopped ──► running
                 .setDestroyAtAge(86_400_000_000_000L))
     );
 
-    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    System.out.println(sandbox.id);
     System.out.println(sandbox.sshPrivateKey); // only returned by create()
     ```
   </TabItem>

@@ -228,10 +228,12 @@ func TestExposePortSkipsProbeOnStoppedSandbox(t *testing.T) {
 	}
 }
 
-// TestExposePortRejectedWhenPublicTrafficDisabled verifies that a sandbox
-// created with allow_public_traffic=false cannot be exposed: ExposePort returns
-// ErrPublicTrafficDisabled instead of installing a public route.
-func TestExposePortRejectedWhenPublicTrafficDisabled(t *testing.T) {
+// TestExposePortFlipsPublicTrafficDisabledSandbox verifies that ExposePort is
+// the opt-in lever for a sandbox created with allow_public_traffic=false:
+// instead of refusing, it flips the stored flag to true and the exposure
+// succeeds. A validation failure on the same sandbox must NOT flip the flag —
+// the mutation only happens once every reject path has been cleared.
+func TestExposePortFlipsPublicTrafficDisabledSandbox(t *testing.T) {
 	ctx := context.Background()
 	svc, st := newProbeSvc(t, func(_ context.Context, _ string, _ int) error { return nil })
 
@@ -249,9 +251,30 @@ func TestExposePortRejectedWhenPublicTrafficDisabled(t *testing.T) {
 		t.Fatalf("seed sandbox: %v", err)
 	}
 
-	_, err := svc.ExposePort(ctx, "sb-no-public", 8080, models.ExposedPortProtocolHTTP)
-	if !errors.Is(err, ErrPublicTrafficDisabled) {
-		t.Fatalf("ExposePort err = %v, want ErrPublicTrafficDisabled", err)
+	// A rejected call (invalid port) must leave the sandbox private.
+	if _, err := svc.ExposePort(ctx, "sb-no-public", 0, models.ExposedPortProtocolHTTP); err == nil {
+		t.Fatal("ExposePort with invalid port should fail")
+	}
+	afterReject, err := st.Get(ctx, "sb-no-public")
+	if err != nil {
+		t.Fatalf("store.Get after rejected expose: %v", err)
+	}
+	if afterReject.AllowPublicTraffic == nil || *afterReject.AllowPublicTraffic {
+		t.Fatalf("AllowPublicTraffic after rejected expose = %v, want still explicit false", afterReject.AllowPublicTraffic)
+	}
+
+	if _, err := svc.ExposePort(ctx, "sb-no-public", 8080, models.ExposedPortProtocolHTTP); err != nil {
+		t.Fatalf("ExposePort on a private sandbox should opt it in, got: %v", err)
+	}
+	flipped, err := st.Get(ctx, "sb-no-public")
+	if err != nil {
+		t.Fatalf("store.Get after expose: %v", err)
+	}
+	if flipped.AllowPublicTraffic == nil || !*flipped.AllowPublicTraffic {
+		t.Fatalf("AllowPublicTraffic after expose = %v, want explicit true", flipped.AllowPublicTraffic)
+	}
+	if len(flipped.ExposedPorts) != 1 || flipped.ExposedPorts[0].Port != 8080 {
+		t.Fatalf("ExposedPorts after expose = %+v, want port 8080", flipped.ExposedPorts)
 	}
 }
 

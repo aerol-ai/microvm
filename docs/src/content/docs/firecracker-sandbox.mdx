@@ -14,7 +14,7 @@ Use Firecracker when:
 
 ## Create a Firecracker sandbox
 
-Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the image and builds a Firecracker-compatible rootfs from it.
+Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the image and builds a Firecracker-compatible rootfs from it. Public exposure is opt-in — `exposePort` flips the sandbox public on first use, or set `allowPublicTraffic: true` at create for a boot-time public URL; see [Network Isolation](/network-isolation/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -34,7 +34,6 @@ Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the i
     })
 
     console.log(sandbox.id)
-    console.log(sandbox.publicURL)
     ```
   </TabItem>
   <TabItem label="Python">
@@ -54,7 +53,6 @@ Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the i
     })
 
     print(sandbox.id)
-    print(sandbox.publicURL)
     ```
   </TabItem>
   <TabItem label="Go">
@@ -87,7 +85,7 @@ Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the i
         log.Fatal(err)
     }
 
-    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    fmt.Println(sandbox.ID)
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -107,7 +105,7 @@ Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the i
         ..Default::default()
     })?;
 
-    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    println!("{}", sandbox.data.id);
     ```
   </TabItem>
   <TabItem label="Java">
@@ -131,7 +129,7 @@ Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the i
             .setMemoryMb(512)
     );
 
-    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    System.out.println(sandbox.id);
     ```
   </TabItem>
 </Tabs>

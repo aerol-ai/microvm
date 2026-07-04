@@ -280,34 +280,39 @@ The policy is persisted with the sandbox and reapplied automatically across stop
 
 ---
 
-## Disabling Public Exposure
+## Public Exposure Is Opt-In
 
-The options above control **outbound** traffic. To stop a sandbox from being reachable from the public internet at all, set **`allowPublicTraffic`** to `false` at create time. The sandbox can then never be exposed — `exposePort` returns an error — while the platform's own access paths (the toolbox `exec`/file proxy and the SSH gateway) keep working, since they do not route through the public ingress.
+The options above control **outbound** traffic. Inbound public reachability is a separate decision — and the default is **private**: a sandbox created without **`allowPublicTraffic`** boots with no `<sandbox-id>.<domain>` ingress route and an empty `public_url`. The platform's own access paths (the toolbox `exec`/file proxy and the SSH gateway) always work, since they do not route through the public ingress.
+
+There are two ways to opt in to public exposure:
+
+1. **Call `exposePort`.** Asking for a public port *is* the consent: the first `exposePort` on a private sandbox flips it to public — the flag is persisted, the `<sandbox-id>.<domain>` route is installed, `public_url` becomes live — and then the port route goes in. No extra step needed.
+2. **Set `allowPublicTraffic: true` at create time** if you want the sandbox URL live from boot, before any port is exposed:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
       image: 'ubuntu:22.04',
-      allowPublicTraffic: false,
+      allowPublicTraffic: true,
     })
-    // sandbox.exposePort(80) now rejects — no public URL is ever created.
+    // sandbox.publicUrl is live from boot, before any exposePort call.
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     sandbox = client.create({
         'image': 'ubuntu:22.04',
-        'allowPublicTraffic': False,
+        'allowPublicTraffic': True,
     })
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    publicOff := false
+    publicOn := true
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
         Image:              "ubuntu:22.04",
-        AllowPublicTraffic: &publicOff,
+        AllowPublicTraffic: &publicOn,
     })
     ```
   </TabItem>
@@ -315,7 +320,7 @@ The options above control **outbound** traffic. To stop a sandbox from being rea
     ```rust
     let sandbox = client.create(CreateOptions {
         image: "ubuntu:22.04".to_string(),
-        allow_public_traffic: Some(false),
+        allow_public_traffic: Some(true),
         ..Default::default()
     })?;
     ```
@@ -325,13 +330,15 @@ The options above control **outbound** traffic. To stop a sandbox from being rea
     Sandbox sandbox = client.create(
         new CreateOptions()
             .setImage("ubuntu:22.04")
-            .setAllowPublicTraffic(false)
+            .setAllowPublicTraffic(true)
     );
     ```
   </TabItem>
 </Tabs>
 
-Because AerolVM has no auth-gated public route, "no public traffic" is enforced by **refusing exposure** rather than by serving a private URL. Omit the field (or set it to `true`) to keep the default behaviour, where exposed ports are publicly reachable.
+The opt-in is one-way and sandbox-wide: once a port has been exposed, the sandbox is public (flag, root route, and `public_url`) and stays public even if every port is later unexposed. **Custom domains alone do not flip a private sandbox** — attaching a domain to a sandbox you kept private returns an error, so a domain can never silently publish it; expose a port (or create with the flag) first. Private creates also skip the ingress proxy entirely on the boot path, which shaves the route-install round trips off create latency.
+
+The Daytona compatibility facade maps its `public` field onto this flag (omitted means `true`, matching Daytona's platform default), and the E2B facade opts in by default for the same reason — E2B sandboxes are publicly addressable by contract.
 
 ---
 

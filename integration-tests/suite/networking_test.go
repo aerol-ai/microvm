@@ -5,6 +5,7 @@ package suite
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,4 +81,62 @@ func TestPreviewURLReachable(t *testing.T) {
 		time.Sleep(3 * time.Second)
 	}
 	t.Fatalf("preview URL %s never became reachable (last code %d, last err %v)", res.PublicURL, lastCode, lastErr)
+}
+
+// UC-97 — A create that omits allow_public_traffic is private: no ingress
+// route, empty public_url, toolbox exec still works. expose_port is then the
+// opt-in lever: it succeeds on the private sandbox, flips it public, and the
+// sandbox's public_url becomes non-empty.
+func TestCreatePrivateByDefault(t *testing.T) {
+	harness.Require(t, sc, "UC-97")
+	c := client(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	// Bypass NewSandbox — the harness opts in to public traffic for the other UCs.
+	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+		Image: harness.DefaultImage,
+		Name:  harness.UniqueName(sc, t),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().Destroy(cctx, sb.ID)
+	})
+	waitRunning(t, sb)
+
+	if sb.PublicURL != "" {
+		t.Fatalf("public_url = %q, want empty for a default (private) create", sb.PublicURL)
+	}
+
+	// The toolbox path must work while the sandbox has no public ingress.
+	ectx, ecancel := context.WithTimeout(context.Background(), time.Minute)
+	defer ecancel()
+	res, err := sb.ExecCommand(ectx, "echo private-ok")
+	if err != nil {
+		t.Fatalf("exec on private sandbox: %v", err)
+	}
+	if !strings.Contains(res.Stdout, "private-ok") {
+		t.Fatalf("exec stdout = %q, want private-ok", res.Stdout)
+	}
+
+	// expose_port opts the sandbox in: it must succeed and flip the sandbox
+	// public rather than refuse.
+	exposure, err := sb.ExposePort(ectx, 8080)
+	if err != nil {
+		t.Fatalf("expose port on private sandbox should opt it in, got: %v", err)
+	}
+	if exposure.PublicURL == "" {
+		t.Fatal("expose returned empty public URL after the opt-in flip")
+	}
+	flipped, err := c.SDK().Get(ectx, sb.ID)
+	if err != nil {
+		t.Fatalf("get after expose: %v", err)
+	}
+	if flipped.PublicURL == "" {
+		t.Fatal("sandbox public_url still empty after expose; the flip must persist flag + public_url")
+	}
 }

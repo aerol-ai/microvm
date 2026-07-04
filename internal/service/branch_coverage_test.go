@@ -173,9 +173,11 @@ func TestCreateSandboxValidationBranches(t *testing.T) {
 		svc, _, _ := newServiceRuntimeHarness(t, rt)
 		svc.cfg.EnableCustomDomains = true
 		svc.cfg.Domain = "sandbox.test"
+		allowPublic := true
 		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
-			Image:         "alpine:3.20",
-			CustomDomains: []string{"not-a-host"},
+			Image:              "alpine:3.20",
+			CustomDomains:      []string{"not-a-host"},
+			AllowPublicTraffic: &allowPublic,
 		})
 		if err == nil || !strings.Contains(err.Error(), "custom domain") {
 			t.Fatalf("CreateSandbox() error = %v, want custom domain validation failure", err)
@@ -268,7 +270,8 @@ func TestCreateSandboxRollbackAndCustomDomainBranches(t *testing.T) {
 		svc.caddy = caddy.New(svc.cfg)
 		svc.admitter = nil
 
-		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"})
+		allowPublic := true
+		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", AllowPublicTraffic: &allowPublic})
 		if err == nil || !strings.Contains(err.Error(), "patch caddy route failed") {
 			t.Fatalf("CreateSandbox() error = %v, want caddy failure", err)
 		}
@@ -287,9 +290,11 @@ func TestCreateSandboxRollbackAndCustomDomainBranches(t *testing.T) {
 		svc.cfg.Domain = "sandbox.test"
 		svc.admitter = nil
 
+		allowPublic := true
 		first, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-			Image:         "alpine:3.20",
-			CustomDomains: []string{"api.external.test"},
+			Image:              "alpine:3.20",
+			CustomDomains:      []string{"api.external.test"},
+			AllowPublicTraffic: &allowPublic,
 		}, "sb-domain-1")
 		if err != nil {
 			t.Fatalf("seed create: %v", err)
@@ -298,8 +303,9 @@ func TestCreateSandboxRollbackAndCustomDomainBranches(t *testing.T) {
 			t.Fatal("seed create returned nil response")
 		}
 		_, err = svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-			Image:         "alpine:3.20",
-			CustomDomains: []string{"api.external.test"},
+			Image:              "alpine:3.20",
+			CustomDomains:      []string{"api.external.test"},
+			AllowPublicTraffic: &allowPublic,
 		}, "sb-domain-2")
 		if err == nil || !errors.Is(err, storepkg.ErrCustomDomainConflict) {
 			t.Fatalf("CreateSandboxWithID() error = %v, want custom domain conflict", err)
@@ -325,9 +331,11 @@ func TestCreateSandboxRollbackAndCustomDomainBranches(t *testing.T) {
 		}
 		svc.AttachCluster(clusterStub)
 
+		allowPublic := true
 		_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-			Image:         "alpine:3.20",
-			CustomDomains: []string{"api.external.test"},
+			Image:              "alpine:3.20",
+			CustomDomains:      []string{"api.external.test"},
+			AllowPublicTraffic: &allowPublic,
 		}, "sb-domain-close")
 		if err == nil || !strings.Contains(err.Error(), "database is closed") {
 			t.Fatalf("CreateSandboxWithID() error = %v, want store close failure", err)
@@ -494,10 +502,12 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 		svc.cfg.CaddyServerID = "srv0"
 		svc.caddy = caddy.New(svc.cfg)
 
+		allowPublic := true
 		_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-			ModuleRef:     "hello.wasm",
-			Runtime:       models.RuntimeWasm,
-			CustomDomains: []string{"api.external.test"},
+			ModuleRef:          "hello.wasm",
+			Runtime:            models.RuntimeWasm,
+			CustomDomains:      []string{"api.external.test"},
+			AllowPublicTraffic: &allowPublic,
 		}, "sb-wasm-sync-fail")
 		if err == nil || !strings.Contains(err.Error(), "install wasm custom-domain route") {
 			t.Fatalf("CreateSandboxWithID() error = %v, want caddy sync failure", err)
@@ -543,10 +553,12 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 		svc.cfg.CaddyServerID = "srv0"
 		svc.caddy = caddy.New(svc.cfg)
 
+		allowPublic := true
 		_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-			ModuleRef:     "hello.wasm",
-			Runtime:       models.RuntimeWasm,
-			CustomDomains: []string{"api.external.test"},
+			ModuleRef:          "hello.wasm",
+			Runtime:            models.RuntimeWasm,
+			CustomDomains:      []string{"api.external.test"},
+			AllowPublicTraffic: &allowPublic,
 		}, "sb-wasm-close")
 		if err == nil || !strings.Contains(err.Error(), "database is closed") {
 			t.Fatalf("CreateSandboxWithID() error = %v, want final store read failure", err)

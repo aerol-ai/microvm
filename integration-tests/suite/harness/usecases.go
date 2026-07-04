@@ -126,6 +126,7 @@ var Registry = []UseCase{
 	{ID: "UC-36", Title: "Custom domain reachable after CNAME", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains, CapExternalDNSZone}, Implemented: true},
 	{ID: "UC-37", Title: "Network usage counters returned", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-38", Title: "Network limits patch enforced", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-97", Title: "Private-by-default create: no public URL until expose_port opts the sandbox in; exec works while private", Requires: []Capability{CapDocker}, Implemented: true},
 
 	// E. Exec, files, sessions, SSH
 	{ID: "UC-39", Title: "Toolbox exec returns output", Requires: []Capability{CapDocker}, Implemented: true},
