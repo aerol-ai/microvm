@@ -6,6 +6,7 @@
 #
 # This pairs the wasm-runtime use cases with cluster placement/forwarding: a
 # wasm sandbox can be created on any node and reached through any ingress.
+# The benchmark capability opts UC-94/UC-95 in for make integration-benchmark-wasm.
 name: cluster-3-mixed-wasm
 capabilities:
   - docker
@@ -13,6 +14,8 @@ capabilities:
   - wasm
   - domain
   - cluster
+  # Opt UC-94/UC-95 in here (docker + wasm latency; docker density).
+  - benchmark
 
 # Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
 expected_members: 3

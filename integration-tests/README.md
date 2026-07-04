@@ -47,10 +47,10 @@ Reports land in `integration-tests/reports/` (`<scenario>.md`, `<scenario>.json`
 
 `suite/benchmark_test.go` is an **opt-in** benchmark that reuses the live
 deployment to measure sandbox creation. It only runs where the scenario
-advertises the `benchmark` capability — **`cluster-hetero`** (every runtime) and
-**`cluster-3-mixed-fc`** (docker + firecracker in a 3-node mixed cluster) —
-because it is slow and provisions many sandboxes. Everywhere else UC-94/UC-95
-skip (not-applicable).
+advertises the `benchmark` capability — **`cluster-hetero`** (every runtime),
+**`cluster-3-mixed-fc`** (docker + firecracker), and **`cluster-3-mixed-wasm`**
+(docker + wasm) in 3-node mixed clusters — because it is slow and provisions
+many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
   firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
@@ -81,6 +81,9 @@ make integration-benchmark
 # Firecracker-focused 3× mixed cluster (docker + firecracker only; cheaper):
 make integration-benchmark-fc
 
+# WASM-focused 3× mixed cluster (docker + wasm only; cheap t3 spot boxes):
+make integration-benchmark-wasm
+
 # Manual env form (hetero):
 AEROL_BENCH=1 \
 AEROL_BENCH_OUT=integration-tests/reports/cluster-hetero-bench.json \
@@ -99,24 +102,31 @@ make integration-benchmark-only              # re-run just the bench against it
 make integration-cluster-mixed-fc keep       # 3× mixed FC cluster
 make integration-benchmark-fc-only         # re-run UC-94/UC-95 against it
 
+make integration-cluster-mixed-wasm keep   # 3× mixed WASM cluster
+make integration-benchmark-wasm-only       # re-run UC-94/UC-95 against it
+
 # Narrow the UC-94 sweep:
 AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
 # …or isolate firecracker latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-fc-only
+# …or isolate wasm latency (UC-95 skips when docker is excluded):
+AEROL_BENCH_RUNTIMES=wasm make integration-benchmark-wasm-only
 
 make integration-destroy                     # tear the kept cluster down
 make integration-destroy SCENARIO=cluster-3-mixed-fc
+make integration-destroy SCENARIO=cluster-3-mixed-wasm
 ```
 
 Percentiles + the density ceiling also print as `bench[...]` log lines (captured
 by `go test -json`); the `AEROL_BENCH_OUT` JSON adds the machine block.
 
 **WASM warm pool.** wasm scenarios boot with the warm-worker pool on so creates
-skip the cold module compile — CPython-on-wasm is ~10s cold on a t3. Benchmark
-provisions default the pool depth to `AEROL_BENCH_SAMPLES` (or
-`AEROL_WASM_POOL_DEPTH` when explicitly set); non-benchmark wasm scenarios keep
-depth `2`. Depth is baked into **node boot env**, so a cluster brought up before
-this change shows cold numbers until re-provisioned.
+skip the cold module compile — CPython-on-wasm is ~10s cold on a t3.
+`make integration-benchmark-wasm` sets `AEROL_WASM_POOL_DEPTH` to
+`WASM_BENCH_SAMPLES` (default 10) at provision time so UC-94 measures warm
+hits; `make integration-cluster-mixed-wasm` (non-benchmark) keeps depth `2`.
+Depth is baked into **node boot env**, so a cluster brought up before a pool
+depth change shows cold numbers until re-provisioned.
 
 **Firecracker benchmark path.** UC-94 creates one Firecracker template before
 timing and measures sandbox clones with `template_id`, not plain OCI image cold

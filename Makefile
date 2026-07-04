@@ -5,6 +5,7 @@ BIN_DIR ?= bin
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-fc integration-benchmark-fc-only \
+	integration-benchmark-wasm integration-benchmark-wasm-only \
 	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
 
 fmt:
@@ -145,6 +146,29 @@ integration-benchmark-fc:
 integration-benchmark-fc-only:
 	AEROL_BENCH_OUT=$(FC_BENCH_OUT) \
 		integration-tests/run.sh cluster-3-mixed-fc --bench-only
+
+# WASM-focused benchmark on the 3× mixed-wasm cluster: provisions
+# cluster-3-mixed-wasm with domain/TLS, runs the full suite with UC-94 (docker +
+# wasm latency) and UC-95 (docker density). Pool depth is set to the sample count
+# at provision time so UC-94 measures warm wasm hits (override with
+# AEROL_WASM_POOL_DEPTH / WASM_BENCH_SAMPLES). Narrow UC-94 to wasm only with
+# AEROL_BENCH_RUNTIMES=wasm (UC-95 will skip in that case).
+#   make integration-benchmark-wasm
+#   make integration-benchmark-wasm keep
+#   make integration-benchmark-wasm WASM_BENCH_OUT=/tmp/wasm-bench.json
+WASM_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-wasm-bench.json
+WASM_BENCH_SAMPLES ?= 10
+integration-benchmark-wasm:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
+	AEROL_WASM_POOL_DEPTH=$(if $(AEROL_WASM_POOL_DEPTH),$(AEROL_WASM_POOL_DEPTH),$(WASM_BENCH_SAMPLES)) \
+		integration-tests/run.sh cluster-3-mixed-wasm --no-disruptive $(RUN_FLAGS)
+
+# Re-run UC-94/UC-95 only against a cluster-3-mixed-wasm left up with `keep`.
+integration-benchmark-wasm-only:
+	AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
+		integration-tests/run.sh cluster-3-mixed-wasm --bench-only
 
 # Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
 # exercises the firecracker use cases (UC-24/47-50) without the full hetero
