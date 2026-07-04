@@ -14,7 +14,9 @@ type mockEngine struct {
 	err error
 }
 
-func (m *mockEngine) LoadModule(ctx context.Context, path string) error { return m.err }
+func (m *mockEngine) LoadModule(ctx context.Context, path string, _ wasmengine.LoadOptions) error {
+	return m.err
+}
 func (m *mockEngine) Instantiate(ctx context.Context, caps wasmengine.Capabilities) error {
 	return m.err
 }

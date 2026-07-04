@@ -1,6 +1,6 @@
 # WASM create latency: 5.4s → warm hits in the double-digit-ms class
 
-Status: **Proposed** (written 2026-07-04). No code started. Baseline numbers
+Status: **Implemented** (2026-07-04). Phases 0–4 landed in one change set. Baseline numbers
 are from the 2026-07-01 `cluster-hetero` UC-94 run
 (`integration-tests/reports/cluster-hetero-bench.json`).
 

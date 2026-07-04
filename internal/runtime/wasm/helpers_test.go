@@ -140,7 +140,7 @@ func TestCtxHelpers(t *testing.T) {
 	if !ctxDone(canceled, time.Now().Add(time.Hour)) {
 		t.Fatal("canceled ctx should be done")
 	}
-	sleepBrief(context.Background())
+	sleepBrief(context.Background(), 1)
 }
 
 func TestAsPortGateway(t *testing.T) {

@@ -31,14 +31,14 @@ func testEngineErrorPaths(t *testing.T, eng Engine) {
 	ctx := context.Background()
 
 	// Error on LoadModule (bad path)
-	if err := eng.LoadModule(ctx, "/does/not/exist.wasm"); err == nil {
+	if err := eng.LoadModule(ctx, "/does/not/exist.wasm", LoadOptions{}); err == nil {
 		t.Fatalf("expected error on LoadModule")
 	}
 
 	// Error on LoadModule (invalid wasm)
 	badWasm := filepath.Join(t.TempDir(), "bad.wasm")
 	os.WriteFile(badWasm, []byte("not a wasm file"), 0644)
-	if err := eng.LoadModule(ctx, badWasm); err == nil {
+	if err := eng.LoadModule(ctx, badWasm, LoadOptions{}); err == nil {
 		t.Fatalf("expected error on LoadModule bad wasm")
 	}
 
@@ -75,7 +75,7 @@ func testEngineErrorPaths(t *testing.T, eng Engine) {
 	goodWasm := filepath.Join(t.TempDir(), "good.wasm")
 	// Valid wasm module with 1 page memory exported:
 	os.WriteFile(goodWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06\x6d\x65\x6d\x6f\x72\x79\x02\x00"), 0644)
-	if err := eng.LoadModule(ctx, goodWasm); err != nil {
+	if err := eng.LoadModule(ctx, goodWasm, LoadOptions{MemoryMB: 16}); err != nil {
 		t.Fatalf("failed to load good wasm: %v", err)
 	}
 
@@ -98,14 +98,14 @@ func testEngineErrorPaths(t *testing.T, eng Engine) {
 	engNoMem, _ := newWazeroEngine(ctx)
 	noMemWasm := filepath.Join(t.TempDir(), "nomem.wasm")
 	os.WriteFile(noMemWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00"), 0644)
-	_ = engNoMem.LoadModule(ctx, noMemWasm)
+	_ = engNoMem.LoadModule(ctx, noMemWasm, LoadOptions{})
 	_ = engNoMem.Instantiate(ctx, Capabilities{})
 	if _, err := engNoMem.CaptureSnapshot(ctx); err == nil {
 		t.Fatalf("expected error on CaptureSnapshot without memory")
 	}
 
 	// Test double LoadModule to cover Close()
-	if err := eng.LoadModule(ctx, goodWasm); err != nil {
+	if err := eng.LoadModule(ctx, goodWasm, LoadOptions{MemoryMB: 16}); err != nil {
 		t.Fatalf("failed double LoadModule: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestRunBadExport(t *testing.T) {
 
 	goodWasm := filepath.Join(t.TempDir(), "good.wasm")
 	os.WriteFile(goodWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06\x6d\x65\x6d\x6f\x72\x79\x02\x00"), 0644)
-	eng.LoadModule(ctx, goodWasm)
+	eng.LoadModule(ctx, goodWasm, LoadOptions{MemoryMB: 16})
 	eng.Instantiate(ctx, Capabilities{})
 
 	if _, err := eng.Run(ctx, Capabilities{}, "does_not_exist"); err == nil {

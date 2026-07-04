@@ -32,7 +32,7 @@ func TestClient_EncodeDecodeErrors(t *testing.T) {
 		return nil, errors.New("mock encode error")
 	}
 
-	_ = c.LoadModule(sb, "path")
+	_ = c.LoadModule(sb, "path", 0)
 	_ = c.Instantiate(sb, wasmengine.Capabilities{})
 	_, _ = c.Exec(sb, wasmengine.Capabilities{}, "")
 	_ = c.Invoke(sb, "")

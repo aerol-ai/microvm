@@ -83,14 +83,14 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	if count, ok := d.supervisorSpawnCount(workerKey); ok {
 		spawnCount = count
 	}
-	if err := client.LoadModule(sandbox.ID, modulePath); err != nil {
-		return nil, fmt.Errorf("load module: %w", err)
-	}
-
 	memoryMB := sandbox.MemoryMB
 	if memoryMB <= 0 {
 		memoryMB = d.cfg.DefaultMemoryMB
 	}
+	if err := client.LoadModule(sandbox.ID, modulePath, memoryMB); err != nil {
+		return nil, fmt.Errorf("load module: %w", err)
+	}
+
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            sandbox.Env,
 		Args:           wasmArgsFromSandbox(sandbox),

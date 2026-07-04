@@ -57,7 +57,7 @@ func TestGuestWasip1HTTPServerEndToEnd(t *testing.T) {
 	defer cleanup()
 
 	sandboxID := "sb-wasip1-http"
-	if err := client.LoadModule(sandboxID, modPath); err != nil {
+	if err := client.LoadModule(sandboxID, modPath, 0); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 	caps := wasmengine.Capabilities{

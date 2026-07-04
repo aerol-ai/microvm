@@ -34,6 +34,8 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, spawner Spawner) {
 			return
 		case <-ticker.C:
 			p.refillTick(ctx, cfg.SpawnTimeout)
+		case <-p.refillKick:
+			p.refillTick(ctx, cfg.SpawnTimeout)
 		}
 	}
 }

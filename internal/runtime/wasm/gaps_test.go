@@ -74,7 +74,7 @@ type failLoadClient struct {
 	recordingWorkerClient
 }
 
-func (c *failLoadClient) LoadModule(string, string) error {
+func (c *failLoadClient) LoadModule(string, string, int) error {
 	return fmt.Errorf("load failed")
 }
 
@@ -90,7 +90,7 @@ type errWarmPool struct{}
 
 func (errWarmPool) NoteModule(string, string) {}
 
-func (errWarmPool) Acquire(context.Context, string, string) (*wasmpool.Slot, error) {
+func (errWarmPool) Acquire(context.Context, string, string, int) (*wasmpool.Slot, error) {
 	return nil, fmt.Errorf("warm pool broken")
 }
 
@@ -866,7 +866,7 @@ func TestRemoveImageEdgeCases(t *testing.T) {
 
 func TestTryAcquireWarmNilPool(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
-	slot, err := d.tryAcquireWarm(context.Background(), "digest", "/path")
+	slot, err := d.tryAcquireWarm(context.Background(), "digest", "/path", 256)
 	if err != nil || slot != nil {
 		t.Fatalf("nil pool = slot %v err %v", slot, err)
 	}

@@ -23,6 +23,7 @@ type Slot struct {
 	ModulePath   string
 	SocketPath   string
 	WorkerKey    string
+	MemoryMB     int
 	LoadedAt     time.Time
 }
 
@@ -30,14 +31,16 @@ type Slot struct {
 type Pool struct {
 	logger *slog.Logger
 
-	mu           sync.Mutex
-	defaultDepth int
-	targets      map[string]string // digest -> module path
-	ready        map[string][]*Slot
-	spawning     map[string]int
-	runDir       string
-	spawner      Spawner
-	metrics      *Metrics
+	mu              sync.Mutex
+	defaultDepth    int
+	defaultMemoryMB int
+	targets         map[string]string // digest -> module path
+	ready           map[string][]*Slot
+	spawning        map[string]int
+	runDir          string
+	spawner         Spawner
+	metrics         *Metrics
+	refillKick      chan struct{}
 }
 
 // New constructs a warm pool. runDir is the WASM runtime root (pool slots live under runDir/pool/).
@@ -46,17 +49,25 @@ func New(runDir string, logger *slog.Logger) *Pool {
 		logger = slog.Default()
 	}
 	return &Pool{
-		logger:   logger,
-		targets:  make(map[string]string),
-		ready:    make(map[string][]*Slot),
-		spawning: make(map[string]int),
-		runDir:   runDir,
-		metrics:  &Metrics{},
+		logger:     logger,
+		targets:    make(map[string]string),
+		ready:      make(map[string][]*Slot),
+		spawning:   make(map[string]int),
+		runDir:     runDir,
+		metrics:    &Metrics{},
+		refillKick: make(chan struct{}, 1),
 	}
 }
 
 // SetSpawner injects the worker spawner (production: SupervisorSpawner).
 func (p *Pool) SetSpawner(s Spawner) { p.spawner = s }
+
+// SetDefaultMemoryMB sets the guest memory cap used when warming pool slots.
+func (p *Pool) SetDefaultMemoryMB(n int) {
+	p.mu.Lock()
+	p.defaultMemoryMB = n
+	p.mu.Unlock()
+}
 
 // SetDefaultDepth sets the target warm depth per module digest when depth is unset.
 func (p *Pool) SetDefaultDepth(n int) {
@@ -95,8 +106,8 @@ func (p *Pool) ReadyCount(digest string) int {
 	return len(p.ready[digest])
 }
 
-// Acquire removes one warm slot for digest. Returns ErrNoSlot on miss.
-func (p *Pool) Acquire(_ context.Context, digest, modulePath string) (*Slot, error) {
+// Acquire removes one warm slot for digest whose MemoryMB matches. Returns ErrNoSlot on miss.
+func (p *Pool) Acquire(_ context.Context, digest, modulePath string, memoryMB int) (*Slot, error) {
 	if digest == "" {
 		return nil, ErrNoSlot
 	}
@@ -105,18 +116,32 @@ func (p *Pool) Acquire(_ context.Context, digest, modulePath string) (*Slot, err
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	q := p.ready[digest]
-	if len(q) == 0 {
-		if p.metrics != nil {
-			p.metrics.recordMiss()
+	for i := len(q) - 1; i >= 0; i-- {
+		if q[i].MemoryMB != memoryMB {
+			continue
 		}
-		return nil, ErrNoSlot
+		slot := q[i]
+		p.ready[digest] = append(q[:i], q[i+1:]...)
+		if p.metrics != nil {
+			p.metrics.recordHit()
+		}
+		return slot, nil
 	}
-	slot := q[len(q)-1]
-	p.ready[digest] = q[:len(q)-1]
 	if p.metrics != nil {
-		p.metrics.recordHit()
+		p.metrics.recordMiss()
 	}
-	return slot, nil
+	p.kickRefillLocked()
+	return nil, ErrNoSlot
+}
+
+func (p *Pool) kickRefillLocked() {
+	if p.refillKick == nil {
+		return
+	}
+	select {
+	case p.refillKick <- struct{}{}:
+	default:
+	}
 }
 
 // RecordLoaded pushes a freshly warmed slot into the ready queue.
@@ -232,7 +257,8 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 		return nil, err
 	}
 	socketPath := filepath.Join(dir, "worker.sock")
-	if err := p.spawner.Warm(ctx, slotID, socketPath, modulePath); err != nil {
+	memMB := p.defaultMemoryMB
+	if err := p.spawner.Warm(ctx, slotID, socketPath, modulePath, memMB); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
@@ -242,6 +268,7 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 		ModulePath:   modulePath,
 		SocketPath:   socketPath,
 		WorkerKey:    slotID,
+		MemoryMB:     memMB,
 		LoadedAt:     time.Now().UTC(),
 	}, nil
 }
@@ -268,11 +295,11 @@ func (p *Pool) Close() (drained int) {
 }
 
 // AcquireOrMiss is a helper that normalizes ErrNoSlot for callers that want a bool.
-func AcquireOrMiss(ctx context.Context, p *Pool, digest, path string) (*Slot, bool, error) {
+func AcquireOrMiss(ctx context.Context, p *Pool, digest, path string, memoryMB int) (*Slot, bool, error) {
 	if p == nil {
 		return nil, false, nil
 	}
-	slot, err := p.Acquire(ctx, digest, path)
+	slot, err := p.Acquire(ctx, digest, path, memoryMB)
 	if err == nil {
 		return slot, true, nil
 	}

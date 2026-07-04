@@ -98,7 +98,7 @@ func TestServerExecColdPathPreservesNetstatsTick(t *testing.T) {
 
 	client := NewClient(socketPath)
 	const sandboxID = "sb-exec"
-	if err := client.LoadModule(sandboxID, modPath); err != nil {
+	if err := client.LoadModule(sandboxID, modPath, 0); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 	if err := client.Instantiate(sandboxID, wasmengine.Capabilities{}); err != nil {

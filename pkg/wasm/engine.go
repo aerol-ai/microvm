@@ -4,10 +4,17 @@ import (
 	"context"
 )
 
+// LoadOptions carries per-load engine configuration. MemoryMB sets the wazero
+// runtime memory-limit pages before compilation so a later Instantiate with the
+// same cap does not rebuild the runtime (plans/wasm-create-latency.md Phase 1).
+type LoadOptions struct {
+	MemoryMB int
+}
+
 // Engine compiles and runs a single WASM module with WASI.
 type Engine interface {
 	// LoadModule compiles bytes from path. Idempotent per path within one engine.
-	LoadModule(ctx context.Context, path string) error
+	LoadModule(ctx context.Context, path string, opts LoadOptions) error
 	// Instantiate creates a runnable instance with the given capabilities.
 	Instantiate(ctx context.Context, caps Capabilities) error
 	// InvokeExport calls an exported function by name.

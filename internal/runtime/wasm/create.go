@@ -6,13 +6,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
+func effectiveMemoryMB(req models.CreateSandboxRequest, defaultMB int) int {
+	if req.MemoryMB > 0 {
+		return req.MemoryMB
+	}
+	return defaultMB
+}
+
 func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, _ string, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	driverStart := time.Now()
+	timing := createtiming.From(ctx)
+	defer func() {
+		if timing != nil {
+			timing.RecordStage("wasm_driver", time.Since(driverStart))
+		}
+	}()
+
 	if d.resolver == nil {
 		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
 	}
@@ -28,15 +45,29 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("wasm runtime: module_ref or image is required")
 	}
 
+	resolveStart := time.Now()
 	// Per-tenant registry creds ride the request (req.Registry), never global
 	// config — so a private oci:// module pulls under the caller's own AOCR
 	// identity. Falls back to the resolver's system identity when absent.
 	resolved, err := resolveWithRequestAuth(ctx, d.resolver, ref, req.Registry)
+	if timing != nil {
+		timing.RecordStage("wasm_resolve", time.Since(resolveStart))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
 	}
 
-	warmSlot, err := d.tryAcquireWarm(ctx, resolved.Digest, resolved.Path)
+	memoryMB := effectiveMemoryMB(req, d.cfg.DefaultMemoryMB)
+
+	warmStart := time.Now()
+	warmSlot, err := d.tryAcquireWarm(ctx, resolved.Digest, resolved.Path, memoryMB)
+	if timing != nil {
+		if warmSlot != nil {
+			timing.RecordStageDesc("wasm_warm", time.Since(warmStart), "hit")
+		} else {
+			timing.RecordStageDesc("wasm_warm", time.Since(warmStart), "miss")
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("warm pool acquire: %w", err)
 	}
@@ -51,11 +82,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if warmSlot != nil {
 		socketPath = warmSlot.SocketPath
 		workerKey = warmSlot.WorkerKey
-	}
-
-	memoryMB := req.MemoryMB
-	if memoryMB <= 0 {
-		memoryMB = d.cfg.DefaultMemoryMB
 	}
 
 	inst := &sandboxInstance{
@@ -96,21 +122,33 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	client := d.newWorkerClient(socketPath)
 	if warmSlot == nil {
+		spawnStart := time.Now()
 		if err := d.supervisor.Ensure(ctx, sandboxID, socketPath); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("start worker: %w", err)
 		}
-	}
-	if err := d.waitWorker(ctx, client, sandboxID); err != nil {
-		cleanup()
-		return nil, err
-	}
-	d.noteWorkerSpawnCount(inst)
-	if warmSlot == nil {
-		if err := client.LoadModule(sandboxID, resolved.Path); err != nil {
+		if err := d.waitWorker(ctx, client, sandboxID); err != nil {
+			cleanup()
+			return nil, err
+		}
+		if timing != nil {
+			timing.RecordStage("wasm_spawn", time.Since(spawnStart))
+		}
+		d.noteWorkerSpawnCount(inst)
+		loadStart := time.Now()
+		if err := client.LoadModule(sandboxID, resolved.Path, memoryMB); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("load module: %w", err)
 		}
+		if timing != nil {
+			timing.RecordStage("wasm_load", time.Since(loadStart))
+		}
+	} else {
+		if err := d.waitWorker(ctx, client, sandboxID); err != nil {
+			cleanup()
+			return nil, err
+		}
+		d.noteWorkerSpawnCount(inst)
 	}
 
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
@@ -120,9 +158,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, memoryMB, d.cfg.DefaultWallTimeout)
 
+	instStart := time.Now()
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("instantiate module: %w", err)
+	}
+	if timing != nil {
+		timing.RecordStage("wasm_instantiate", time.Since(instStart))
 	}
 	// _start is deferred until expose_port enables wasip1 listen (HTTP) or Exec/Invoke (one-shot).
 	inst.status = models.SandboxStatusStarted
@@ -191,6 +233,7 @@ func (d *Driver) runtimeState(inst *sandboxInstance) *models.SandboxRuntimeState
 
 func (d *Driver) waitWorker(ctx context.Context, client WorkerClient, sandboxID string) error {
 	deadline := ctxDeadline(ctx)
+	attempt := 0
 	for {
 		if err := client.Ping(sandboxID); err == nil {
 			return nil
@@ -198,6 +241,7 @@ func (d *Driver) waitWorker(ctx context.Context, client WorkerClient, sandboxID 
 		if ctxDone(ctx, deadline) {
 			return fmt.Errorf("worker not ready: %w", ctx.Err())
 		}
-		sleepBrief(ctx)
+		sleepBrief(ctx, attempt)
+		attempt++
 	}
 }

@@ -172,6 +172,12 @@ func TestLoadCases(t *testing.T) {
 				if cfg.FirecrackerSnapshotVerifyMode != "once" {
 					t.Fatalf("expected default FirecrackerSnapshotVerifyMode=once, got %q", cfg.FirecrackerSnapshotVerifyMode)
 				}
+				if !cfg.WasmPoolEnabled {
+					t.Fatalf("expected default WasmPoolEnabled=true, got false")
+				}
+				if cfg.WasmPoolDepthDefault != 2 {
+					t.Fatalf("expected default WasmPoolDepthDefault=2, got %d", cfg.WasmPoolDepthDefault)
+				}
 			},
 		},
 		{
@@ -317,6 +323,19 @@ func TestLoadCases(t *testing.T) {
 				_, err := Load()
 				if err == nil || !strings.Contains(err.Error(), "SB_CONTAINER_RUNTIME") {
 					t.Fatalf("expected SB_CONTAINER_RUNTIME error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "rejects_unknown_wasm_module_digest_mode",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_WASM", "true")
+				t.Setenv("SB_WASM_MODULE_DIGEST_MODE", "sometimes")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_WASM_MODULE_DIGEST_MODE") {
+					t.Fatalf("expected wasm digest mode error, got %v", err)
 				}
 			},
 		},

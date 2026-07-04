@@ -74,7 +74,7 @@ func TestResolvePinnedDigestMismatch(t *testing.T) {
 type noSlotPool struct{}
 
 func (noSlotPool) NoteModule(string, string) {}
-func (noSlotPool) Acquire(context.Context, string, string) (*wasmpool.Slot, error) {
+func (noSlotPool) Acquire(context.Context, string, string, int) (*wasmpool.Slot, error) {
 	return nil, wasmpool.ErrNoSlot
 }
 
@@ -82,7 +82,7 @@ func (noSlotPool) Acquire(context.Context, string, string) (*wasmpool.Slot, erro
 type hitSlotPool struct{}
 
 func (hitSlotPool) NoteModule(string, string) {}
-func (hitSlotPool) Acquire(context.Context, string, string) (*wasmpool.Slot, error) {
+func (hitSlotPool) Acquire(context.Context, string, string, int) (*wasmpool.Slot, error) {
 	return &wasmpool.Slot{
 		ID:         "warm-cov-1",
 		SocketPath: "/tmp/warm-cov.sock",
@@ -96,7 +96,7 @@ func (hitSlotPool) Acquire(context.Context, string, string) (*wasmpool.Slot, err
 func TestTryAcquireWarmErrNoSlot(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
 	d.SetWarmPool(noSlotPool{})
-	slot, err := d.tryAcquireWarm(context.Background(), "digest-noSlot", "/path/m.wasm")
+	slot, err := d.tryAcquireWarm(context.Background(), "digest-noSlot", "/path/m.wasm", 256)
 	if err != nil || slot != nil {
 		t.Fatalf("ErrNoSlot must yield (nil, nil): slot=%v err=%v", slot, err)
 	}
@@ -107,7 +107,7 @@ func TestTryAcquireWarmErrNoSlot(t *testing.T) {
 func TestTryAcquireWarmHit(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
 	d.SetWarmPool(hitSlotPool{})
-	slot, err := d.tryAcquireWarm(context.Background(), "digest-hit", "/path/m.wasm")
+	slot, err := d.tryAcquireWarm(context.Background(), "digest-hit", "/path/m.wasm", 256)
 	if err != nil || slot == nil {
 		t.Fatalf("expected warm hit: slot=%v err=%v", slot, err)
 	}

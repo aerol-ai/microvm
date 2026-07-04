@@ -194,3 +194,17 @@ func TestSeedStandardModules_ResolveErrorAndSuccess(t *testing.T) {
 	cancel()
 	seedStandardModules(cancelCtx, resolver, pool, resolver.Reserved, logger)
 }
+
+func TestEffectiveWasmCompileCacheDir_DefaultAndExplicit(t *testing.T) {
+	modules := "/var/lib/wasm/modules"
+	got := effectiveWasmCompileCacheDir(config.Config{WasmModulesDir: modules})
+	want := filepath.Join(modules, "cache", "wazero-compile")
+	if got != want {
+		t.Fatalf("default dir = %q, want %q", got, want)
+	}
+	t.Setenv("SB_WASM_COMPILE_CACHE_DIR", "")
+	got = effectiveWasmCompileCacheDir(config.Config{WasmCompileCacheDir: ""})
+	if got != "" {
+		t.Fatalf("explicit empty = %q, want disabled", got)
+	}
+}

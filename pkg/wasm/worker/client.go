@@ -142,8 +142,8 @@ func (c *Client) InstanceLoaded(ctx context.Context, sandboxID string) (bool, er
 }
 
 // LoadModule compiles the module at path inside the worker process.
-func (c *Client) LoadModule(sandboxID, path string) error {
-	body, err := encodePayload(loadModulePayload{Path: path})
+func (c *Client) LoadModule(sandboxID, path string, memoryMB int) error {
+	body, err := encodePayload(loadModulePayload{Path: path, MemoryMB: memoryMB})
 	if err != nil {
 		return err
 	}

@@ -8,7 +8,8 @@ import (
 )
 
 type loadModulePayload struct {
-	Path string `json:"path"`
+	Path     string `json:"path"`
+	MemoryMB int    `json:"memory_mb,omitempty"`
 }
 
 type instantiatePayload struct {

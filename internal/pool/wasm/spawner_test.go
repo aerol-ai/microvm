@@ -55,7 +55,7 @@ func TestSupervisorSpawnerWarmEnsureError(t *testing.T) {
 	sup := worker.NewSupervisor(brokenSpawn)
 	ss := NewSupervisorSpawner(sup)
 
-	err := ss.Warm(context.Background(), "slot1", "/tmp/nonexistent.sock", "/mod.wasm")
+	err := ss.Warm(context.Background(), "slot1", "/tmp/nonexistent.sock", "/mod.wasm", 0)
 	if err == nil {
 		t.Fatal("expected error from Warm when Ensure fails")
 	}
@@ -77,7 +77,7 @@ func TestSupervisorSpawnerWarmContextCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	err := ss.Warm(ctx, "slot1", socketPath, "/mod.wasm")
+	err := ss.Warm(ctx, "slot1", socketPath, "/mod.wasm", 0)
 	if err == nil {
 		t.Fatal("expected error (timeout) from Warm")
 	}
@@ -101,7 +101,7 @@ func TestSupervisorSpawnerWarmCtxDoneInSelect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 
-	err := ss.Warm(ctx, "slot-ctx", socketPath, "/mod.wasm")
+	err := ss.Warm(ctx, "slot-ctx", socketPath, "/mod.wasm", 0)
 	if err == nil {
 		t.Fatal("expected ctx cancellation error from Warm")
 	}
@@ -122,7 +122,7 @@ func TestSupervisorSpawnerWarmLoadModuleError(t *testing.T) {
 
 	// Pass a nonexistent module path — the server's LoadModule handler will
 	// fail to open the file and return MsgError.
-	err := ss.Warm(context.Background(), "slot-lm", socketPath, "/nonexistent/module.wasm")
+	err := ss.Warm(context.Background(), "slot-lm", socketPath, "/nonexistent/module.wasm", 0)
 	if err == nil {
 		t.Fatal("expected LoadModule error from Warm")
 	}
@@ -152,7 +152,7 @@ func TestSupervisorSpawnerWarmSuccess(t *testing.T) {
 	ss := NewSupervisorSpawner(sup)
 	ss.PingWait = 3 * time.Second
 
-	err := ss.Warm(context.Background(), "slot-ok", socketPath, modFile)
+	err := ss.Warm(context.Background(), "slot-ok", socketPath, modFile, 0)
 	if err != nil {
 		t.Fatalf("Warm happy path: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestSupervisorSpawnerWarmContextCancelDoesNotRespawnLoadedSlot(t *testing.T
 	ss.PingWait = 3 * time.Second
 
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := ss.Warm(ctx, "slot-cancel", socketPath, modFile); err != nil {
+	if err := ss.Warm(ctx, "slot-cancel", socketPath, modFile, 0); err != nil {
 		cancel()
 		t.Fatalf("Warm: %v", err)
 	}

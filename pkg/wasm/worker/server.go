@@ -174,7 +174,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			err = s.eng.LoadModule(ctx, p.Path)
+			err = s.eng.LoadModule(ctx, p.Path, wasmengine.LoadOptions{MemoryMB: p.MemoryMB})
 			s.mu.Unlock()
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
