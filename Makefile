@@ -163,26 +163,29 @@ integration-benchmark-fc-only:
 		integration-tests/run.sh cluster-3-mixed-fc --bench-only
 
 # WASM-focused benchmark on the 3× mixed-wasm cluster: provisions
-# cluster-3-mixed-wasm with domain/TLS, runs the full suite with UC-94 (docker +
-# wasm latency) and UC-95 (docker density). Pool depth defaults to 2 at provision
-# time so UC-94 measures warm wasm hits without overloading small nodes (override
-# with AEROL_WASM_POOL_DEPTH). Narrow UC-94 to wasm only with
-# AEROL_BENCH_RUNTIMES=wasm (UC-95 will skip in that case).
+# cluster-3-mixed-wasm with domain/TLS, then runs UC-94 wasm latency only
+# (no full suite, no Docker sandbox creates). Pool depth defaults to 2 at
+# provision time so UC-94 measures warm wasm hits (override with
+# AEROL_WASM_POOL_DEPTH). UC-95 (docker density) is skipped because
+# AEROL_BENCH_RUNTIMES=wasm. Add docker back with AEROL_BENCH_RUNTIMES=docker,wasm.
 #   make integration-benchmark-wasm
 #   make integration-benchmark-wasm keep
 #   make integration-benchmark-wasm WASM_BENCH_OUT=/tmp/wasm-bench.json
 WASM_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-wasm-bench.json
 WASM_BENCH_SAMPLES ?= 10
+WASM_BENCH_RUNTIMES ?= wasm
 integration-benchmark-wasm:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(WASM_BENCH_RUNTIMES) \
 	AEROL_WASM_POOL_DEPTH=$(if $(AEROL_WASM_POOL_DEPTH),$(AEROL_WASM_POOL_DEPTH),2) \
-		integration-tests/run.sh cluster-3-mixed-wasm --no-disruptive $(RUN_FLAGS)
+		integration-tests/run.sh cluster-3-mixed-wasm --bench-only $(RUN_FLAGS)
 
-# Re-run UC-94/UC-95 only against a cluster-3-mixed-wasm left up with `keep`.
+# Re-run UC-94/UC-95 against a cluster-3-mixed-wasm left up with `keep`.
 integration-benchmark-wasm-only:
-	AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(WASM_BENCH_RUNTIMES) \
 		integration-tests/run.sh cluster-3-mixed-wasm --bench-only
 
 # gVisor-focused benchmark on the 3× mixed-gvisor cluster: provisions

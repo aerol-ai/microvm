@@ -624,6 +624,22 @@ run_one() {
     return 0
   fi
 
+  # --bench-only: provision (above) then run UC-94/UC-95 only — no full suite,
+  # no Docker sandbox creates unless AEROL_BENCH_RUNTIMES includes docker.
+  if [[ "$BENCH_ONLY" == "1" ]]; then
+    local bench_out="${AEROL_BENCH_OUT:-integration-tests/reports/${scenario}-bench.json}"
+    set +e
+    run_bench_tests "$scenario" "$base_url" "$pat" "$caps_file" "$leased" \
+      "$expected_members" "$wasm_ref" "$bench_out"
+    local test_rc=$?
+    set -e
+    if [[ "$test_rc" != "0" ]]; then
+      collect_failure_logs "$scenario" "$caps_domain" "$targets" "$pat"
+      return "$test_rc"
+    fi
+    return 0
+  fi
+
   echo "=== running suite against ${base_url} ==="
   local allow_disruptive
   allow_disruptive=$(allow_disruptive_for "$scenario")
@@ -762,7 +778,73 @@ collect_logs_only() {
   echo "logs written to ${HERE}/reports/${scenario}-failure-logs.txt" >&2
 }
 
-# run_bench_only re-runs UC-94/UC-95 against an already-provisioned scenario
+# run_bench_tests executes UC-94/UC-95 (TestBench*) against a ready cluster.
+# Caller must set AEROL_BENCH=1 and pass bench_out (absolute path or empty).
+run_bench_tests() {
+  local scenario="$1" base_url="$2" pat="$3" caps_file="$4" leased="$5"
+  local expected_members="$6" wasm_ref="$7" bench_out="$8"
+
+  if [[ -n "$bench_out" && "$bench_out" != /* ]]; then
+    bench_out="${REPO_ROOT}/${bench_out}"
+  fi
+  mkdir -p "$(dirname "$bench_out")" "${HERE}/reports" 2>/dev/null || mkdir -p "${HERE}/reports"
+  if [[ -n "$bench_out" ]]; then
+    rm -f "$bench_out"
+  fi
+
+  local runtimes="${AEROL_BENCH_RUNTIMES:-all advertised}"
+  echo "=== benchmark (UC-94/UC-95) against ${base_url}; runtimes=${runtimes}; artifact=${bench_out:-logs only} ===" >&2
+  if ! wait_for_health "$base_url" "$pat"; then
+    echo "scenario ${scenario}: API not healthy at ${base_url}" >&2
+    return 2
+  fi
+  if [[ -n "$expected_members" ]]; then
+    wait_for_members "$base_url" "$pat" "$expected_members" || return 2
+  fi
+
+  set +e
+  AEROL_BENCH=1 \
+  AEROL_BENCH_OUT="${bench_out}" \
+  AEROL_BASE_URL="$base_url" \
+  AEROL_PAT="$pat" \
+  AEROL_SCENARIO="$scenario" \
+  AEROL_CAPS="${caps_file}" \
+  AEROL_DOMAIN="${leased}" \
+  AEROL_EXPECTED_MEMBERS="${expected_members}" \
+  AEROL_WASM_MODULE_REF="${wasm_ref}" \
+    go test -tags=integration -count=1 -timeout=60m -v \
+      -run 'TestBench' \
+      ./integration-tests/suite/...
+  local test_rc=$?
+  set -e
+  if [[ "$test_rc" != "0" ]]; then
+    return "$test_rc"
+  fi
+  if [[ -n "$bench_out" ]]; then
+    if [[ -f "$bench_out" ]]; then
+      echo "bench artifact: ${bench_out}" >&2
+      print_bench_artifact_summary "$bench_out"
+    else
+      echo "bench tests finished but artifact missing at ${bench_out}" >&2
+      return 2
+    fi
+  fi
+  return 0
+}
+
+# bench_cluster_ready is true when TF state exists and the API answers health.
+bench_cluster_ready() {
+  local scenario="$1"
+  local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  [[ -d "$sdir" ]] || return 1
+  local targets pat base_url
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+    || return 1
+  base_url=$(echo "$targets" | jq -r '.base_url // empty')
+  [[ -n "$base_url" ]] || return 1
+  pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
+  wait_for_health "$base_url" "$pat" 60
+}
 # (brought up with --keep). Loads API URL + domain from TF state so the operator
 # does not have to hand-export AEROL_BASE_URL / AEROL_CAPS / AEROL_PAT.
 run_bench_only() {
@@ -844,7 +926,11 @@ run_bench_only() {
 if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
   collect_logs_only "$SCENARIO"
 elif [[ "$BENCH_ONLY" == "1" ]]; then
-  run_bench_only "$SCENARIO"
+  if bench_cluster_ready "$SCENARIO"; then
+    run_bench_only "$SCENARIO"
+  else
+    run_one "$SCENARIO"
+  fi
 elif [[ "$SCENARIO" == "all" ]]; then
   for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64; do
     ( run_one "$s" )

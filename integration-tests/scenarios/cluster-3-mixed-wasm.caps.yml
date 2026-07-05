@@ -14,7 +14,8 @@ capabilities:
   - wasm
   - domain
   - cluster
-  # Opt UC-94/UC-95 in here (docker + wasm latency; docker density).
+  # Opt UC-94/UC-95 in for make integration-benchmark-wasm (wasm latency only;
+  # the make target passes AEROL_BENCH_RUNTIMES=wasm and --bench-only).
   - benchmark
 
 # Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
