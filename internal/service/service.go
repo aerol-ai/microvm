@@ -93,6 +93,10 @@ type Service struct {
 	wasm runtime.Runtime
 	// wasmModuleResolver resolves module_ref for POST /v1/wasm-modules.
 	wasmModuleResolver WasmModuleResolver
+	// wasmWarmPool receives registration-time NoteModule calls so the warm
+	// pool pre-compiles a module before its first create. Nil when the pool
+	// is disabled — registration then stays a pure catalogue write.
+	wasmWarmPool WasmWarmPoolNotifier
 	// templateBuilder is the Phase 2 OCI→ext4 builder used by the
 	// template lifecycle (internal/service/template.go). Nil unless main
 	// has called SetTemplateBuilder — which only happens when

@@ -413,6 +413,9 @@ func (s *server) stripSandboxPrefix(r *http.Request) *http.Request {
 }
 
 func readSandboxID() string {
+	if id := strings.TrimSpace(os.Getenv("SB_SANDBOX_ID")); id != "" {
+		return id
+	}
 	hostname, err := hostnameFn()
 	if err != nil {
 		return ""

@@ -33,6 +33,7 @@ integration-tests/run.sh single-node --keep        # leave infra up for debuggin
 integration-tests/run.sh single-node --prod-tls    # use real Let's Encrypt instead of staging
 make integration-cluster-hetero           # 8-node heterogeneous cluster (x86 fc)
 make integration-cluster-mixed-fc         # 3× mixed cluster, FC on seed c5.metal
+make integration-cluster-mixed-gvisor       # 3× mixed cluster, gVisor on every node
 make integration-single-fc                # single-node-fc (x86 firecracker, c5.metal)
 make integration-arm64                    # arm64 firecracker single + cluster scenarios
 make integration-arm64-single             # single-node-fc-arm64 (Graviton metal)
@@ -43,14 +44,46 @@ make integration-reap                   # terminate any leaked itest instances p
 Reports land in `integration-tests/reports/` (`<scenario>.md`, `<scenario>.json`,
 `index.md` matrix). Legend: ✅ pass · ❌ fail · ⚪ skip(n/a) · 🟡 pending · 🟤 inconclusive.
 
+## Persistent cert store (avoid Let's Encrypt re-issuance)
+
+Every domain scenario provisions a fresh box whose Caddy issues a `*.<domain>`
+wildcard via DNS-01. Because the box is thrown away each run, that cert used to
+be re-issued **every run** — the managed cert bucket is created and destroyed
+with each cluster, and single-node disabled sharing entirely. Against
+`--prod-tls` (or if staging limits bite) that burns the issuance budget.
+
+Run this **once per operator/account** to back the harness with a persistent,
+cross-run cert store:
+
+```bash
+make integration-cert-store-init
+```
+
+It idempotently creates a long-lived S3 bucket (`aerol-itest-caddy-certs-<acct>`,
+versioning + AES256 + public-access-block) that lives **outside** all scenario
+Terraform state — so per-scenario `terraform destroy` never wipes it — and
+writes a stable `caddy_cert_store` block (bucket coords + encryption key) into
+`config/secrets.yml`. From then on `run.sh` points every domain scenario at
+that bucket in BYO mode.
+
+Behaviour after bootstrap: domains are still **randomly** leased from the pool
+(`scenarios/domains.yml`), but `certmagic-s3` keys certs by
+`<prefix>/certificates/<acme-issuer>/<domain>`, so **the first run to land on a
+domain issues + stores its wildcard; every later run that draws the same domain
+reads it back instead of re-issuing.** The pool is finite, so each domain issues
+exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
+(different issuer directory). The encryption key is the only way to read the
+stored certs — save it like any root credential; losing or rotating it orphans
+every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
+
 ## Create benchmark (UC-94 / UC-95)
 
 `suite/benchmark_test.go` is an **opt-in** benchmark that reuses the live
 deployment to measure sandbox creation. It only runs where the scenario
 advertises the `benchmark` capability — **`cluster-hetero`** (every runtime),
-**`cluster-3-mixed-fc`** (docker + firecracker), and **`cluster-3-mixed-wasm`**
-(docker + wasm) in 3-node mixed clusters — because it is slow and provisions
-many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
+**`cluster-3-mixed-fc`** (docker + firecracker), **`cluster-3-mixed-gvisor`**
+(docker + gvisor), and **`cluster-3-mixed-wasm`** (docker + wasm) in 3-node mixed
+clusters — because it is slow and provisions many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
   firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
@@ -81,8 +114,14 @@ make integration-benchmark
 # Firecracker-focused 3× mixed cluster (docker + firecracker only; cheaper):
 make integration-benchmark-fc
 
-# WASM-focused 3× mixed cluster (docker + wasm only; cheap t3 spot boxes):
+# WASM-focused 3× mixed cluster (wasm latency benchmark only; no Docker
+# sandbox creates). Provisions cluster-3-mixed-wasm, runs UC-94 with
+# AEROL_BENCH_RUNTIMES=wasm (UC-95 skips). Full integration coverage
+# (docker + wasm UCs) is `make integration-cluster-mixed-wasm`.
 make integration-benchmark-wasm
+
+# gVisor-focused 3× mixed cluster (docker + gvisor only; cheap t3 spot boxes):
+make integration-benchmark-gvisor
 
 # Manual env form (hetero):
 AEROL_BENCH=1 \
@@ -102,18 +141,24 @@ make integration-benchmark-only              # re-run just the bench against it
 make integration-cluster-mixed-fc keep       # 3× mixed FC cluster
 make integration-benchmark-fc-only         # re-run UC-94/UC-95 against it
 
-make integration-cluster-mixed-wasm keep   # 3× mixed WASM cluster
-make integration-benchmark-wasm-only       # re-run UC-94/UC-95 against it
+make integration-cluster-mixed-wasm keep   # 3× mixed WASM cluster (full suite)
+make integration-benchmark-wasm-only       # re-run wasm bench against kept cluster
 
-# Narrow the UC-94 sweep:
+make integration-cluster-mixed-gvisor keep # 3× mixed gVisor cluster
+make integration-benchmark-gvisor-only     # re-run UC-94/UC-95 against it
+
+# Narrow the UC-94 sweep on hetero / mixed-fc / mixed-gvisor benches:
 AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
 # …or isolate firecracker latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-fc-only
-# …or isolate wasm latency (UC-95 skips when docker is excluded):
-AEROL_BENCH_RUNTIMES=wasm make integration-benchmark-wasm-only
+# …or isolate gvisor latency (UC-95 skips when docker is excluded):
+AEROL_BENCH_RUNTIMES=gvisor make integration-benchmark-gvisor-only
+# …or add docker density/latency back on the wasm cluster:
+AEROL_BENCH_RUNTIMES=docker,wasm make integration-benchmark-wasm-only
 
 make integration-destroy                     # tear the kept cluster down
 make integration-destroy SCENARIO=cluster-3-mixed-fc
+make integration-destroy SCENARIO=cluster-3-mixed-gvisor
 make integration-destroy SCENARIO=cluster-3-mixed-wasm
 ```
 
@@ -122,9 +167,14 @@ by `go test -json`); the `AEROL_BENCH_OUT` JSON adds the machine block.
 
 **WASM warm pool.** wasm scenarios boot with the warm-worker pool on so creates
 skip the cold module compile — CPython-on-wasm is ~10s cold on a t3.
-`make integration-benchmark-wasm` sets `AEROL_WASM_POOL_DEPTH` to
-`WASM_BENCH_SAMPLES` (default 10) at provision time so UC-94 measures warm
-hits; `make integration-cluster-mixed-wasm` (non-benchmark) keeps depth `2`.
+`make integration-benchmark-wasm` provisions `cluster-3-mixed-wasm` and runs
+**wasm-only** benchmarks (`--bench-only`, `AEROL_BENCH_RUNTIMES=wasm`): UC-94
+times wasm creates, UC-95 skips, and no full-suite Docker sandboxes are created.
+Use `make integration-cluster-mixed-wasm` for the full docker+wasm integration
+suite. Pool depth defaults to
+`2` by default at provision time so UC-94 measures warm hits without exhausting
+small nodes; `make integration-cluster-mixed-wasm` (non-benchmark) also keeps
+depth `2`.
 Depth is baked into **node boot env**, so a cluster brought up before a pool
 depth change shows cold numbers until re-provisioned.
 
@@ -143,7 +193,7 @@ you need a different base image.
 | `AEROL_BENCH_TFVARS` | `../scenarios/<scenario>.tfvars` | override the machine-config source |
 | `AEROL_BENCH_FC_TEMPLATE_IMAGE` | `docker://alpine:3.20` | Firecracker template image used for UC-94 clone latency |
 | `AEROL_WASM_MODULE_REF` | *(unset)* | staged `.wasm` ref; wasm latency skips without it |
-| `AEROL_WASM_POOL_DEPTH` | `AEROL_BENCH_SAMPLES` for benchmark provisions, otherwise `2` | warm wasm workers per module digest (provision-time; `0` when wasm off) |
+| `AEROL_WASM_POOL_DEPTH` | `2` | warm wasm workers per module digest (provision-time; `0` when wasm off) |
 
 ## What runs where
 

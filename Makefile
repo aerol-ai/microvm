@@ -6,7 +6,9 @@ BIN_DIR ?= bin
 	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
-	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
+	integration-benchmark-gvisor integration-benchmark-gvisor-only \
+	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
+	integration-cert-store-init integration-clear-lease
 
 fmt:
 	$(GO) fmt ./...
@@ -72,6 +74,13 @@ ifneq ($(RUN_EXTRA),)
 .PHONY: $(RUN_EXTRA)
 $(foreach w,$(RUN_EXTRA),$(eval $(w): ; @:))
 endif
+# One-time (per operator/account) bootstrap of the PERSISTENT cross-run Caddy
+# cert bucket + a stable encryption key in config/secrets.yml. After this, every
+# domain-bearing scenario REUSES a leased-domain's wildcard cert across runs
+# instead of re-issuing it against Let's Encrypt. Idempotent; safe to re-run.
+integration-cert-store-init:
+	integration-tests/lib/provision.sh cert-store-init
+
 integration-local:
 	integration-tests/run.sh local-mode $(RUN_FLAGS)
 
@@ -97,6 +106,12 @@ integration-cluster-mixed-wasm:
 # exercises firecracker placement through a multi-node cluster (cheaper than hetero).
 integration-cluster-mixed-fc:
 	integration-tests/run.sh cluster-3-mixed-fc $(RUN_FLAGS)
+
+# 3× mixed cluster with gVisor on every node — same cheap t3 topology as
+# integration-cluster-mixed, but runsc is installed at bootstrap so gvisor-runtime
+# UCs and the gvisor benchmark row exercise placement + forwarding.
+integration-cluster-mixed-gvisor:
+	integration-tests/run.sh cluster-3-mixed-gvisor $(RUN_FLAGS)
 
 integration-cluster-hetero:
 	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):
@@ -148,27 +163,47 @@ integration-benchmark-fc-only:
 		integration-tests/run.sh cluster-3-mixed-fc --bench-only
 
 # WASM-focused benchmark on the 3× mixed-wasm cluster: provisions
-# cluster-3-mixed-wasm with domain/TLS, runs the full suite with UC-94 (docker +
-# wasm latency) and UC-95 (docker density). Pool depth is set to the sample count
-# at provision time so UC-94 measures warm wasm hits (override with
-# AEROL_WASM_POOL_DEPTH / WASM_BENCH_SAMPLES). Narrow UC-94 to wasm only with
-# AEROL_BENCH_RUNTIMES=wasm (UC-95 will skip in that case).
+# cluster-3-mixed-wasm with domain/TLS, then runs UC-94 wasm latency only
+# (no full suite, no Docker sandbox creates). Pool depth defaults to 2 at
+# provision time so UC-94 measures warm wasm hits (override with
+# AEROL_WASM_POOL_DEPTH). UC-95 (docker density) is skipped because
+# AEROL_BENCH_RUNTIMES=wasm. Add docker back with AEROL_BENCH_RUNTIMES=docker,wasm.
 #   make integration-benchmark-wasm
 #   make integration-benchmark-wasm keep
 #   make integration-benchmark-wasm WASM_BENCH_OUT=/tmp/wasm-bench.json
 WASM_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-wasm-bench.json
 WASM_BENCH_SAMPLES ?= 10
+WASM_BENCH_RUNTIMES ?= wasm
 integration-benchmark-wasm:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
-	AEROL_WASM_POOL_DEPTH=$(if $(AEROL_WASM_POOL_DEPTH),$(AEROL_WASM_POOL_DEPTH),$(WASM_BENCH_SAMPLES)) \
-		integration-tests/run.sh cluster-3-mixed-wasm --no-disruptive $(RUN_FLAGS)
+	AEROL_BENCH_RUNTIMES=$(WASM_BENCH_RUNTIMES) \
+	AEROL_WASM_POOL_DEPTH=$(if $(AEROL_WASM_POOL_DEPTH),$(AEROL_WASM_POOL_DEPTH),2) \
+		integration-tests/run.sh cluster-3-mixed-wasm --bench-only $(RUN_FLAGS)
 
-# Re-run UC-94/UC-95 only against a cluster-3-mixed-wasm left up with `keep`.
+# Re-run UC-94/UC-95 against a cluster-3-mixed-wasm left up with `keep`.
 integration-benchmark-wasm-only:
-	AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(WASM_BENCH_RUNTIMES) \
 		integration-tests/run.sh cluster-3-mixed-wasm --bench-only
+
+# gVisor-focused benchmark on the 3× mixed-gvisor cluster: provisions
+# cluster-3-mixed-gvisor with domain/TLS, runs the full suite with UC-94 (docker +
+# gvisor latency) and UC-95 (docker density). Narrow UC-94 to gvisor only with
+# AEROL_BENCH_RUNTIMES=gvisor (UC-95 will skip in that case).
+#   make integration-benchmark-gvisor
+#   make integration-benchmark-gvisor keep
+#   make integration-benchmark-gvisor GVISOR_BENCH_OUT=/tmp/gvisor-bench.json
+GVISOR_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-gvisor-bench.json
+integration-benchmark-gvisor:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(GVISOR_BENCH_OUT) \
+		integration-tests/run.sh cluster-3-mixed-gvisor --no-disruptive $(RUN_FLAGS)
+
+# Re-run UC-94/UC-95 only against a cluster-3-mixed-gvisor left up with `keep`.
+integration-benchmark-gvisor-only:
+	AEROL_BENCH_OUT=$(GVISOR_BENCH_OUT) \
+		integration-tests/run.sh cluster-3-mixed-gvisor --bench-only
 
 # Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
 # exercises the firecracker use cases (UC-24/47-50) without the full hetero
@@ -209,3 +244,31 @@ integration-destroy:
 # integration-destroy but instance-only — leaves VPC/S3/IAM + TF state behind.
 integration-reap:
 	scripts/integration-reap.sh
+
+# Reset the domain-lease STATE so the next run re-leases from the CURRENT
+# domains.yml pool. Use this when a run is stuck re-picking a stale domain after
+# you edit the pool. A domain is remembered in THREE places, and this clears all
+# three (a --keep run reads them in this order, run.sh lease_domain_for_scenario):
+#   1. .tf/.domain-lease            — last pool index (fresh runs avoid repeats)
+#   2. .tf/<scenario>/.leased-domain — the pin a --keep run returns first
+#   3. .tf/<scenario>/config/cluster.yml .ingress.domain_name — the --keep
+#      fallback read after the pin + TF state; survives `destroy` and a
+#      pin-only clear, so it's the usual reason a stale domain "won't die".
+# Clears every scenario by default; scope to one with SCENARIO=. Infra-safe:
+# removes only local generated files (never touches AWS/TF state); the overlay
+# cluster.yml is regenerated from config/cluster.yml on the next run. For a
+# still-running --keep cluster the domain is re-derived from live TF state, so
+# this won't rotate a live deployment.
+#   make integration-clear-lease
+#   make integration-clear-lease SCENARIO=cluster-3-mixed-wasm
+integration-clear-lease:
+	@if [ -n "$(strip $(SCENARIO))" ]; then \
+		rm -f "integration-tests/.tf/$(SCENARIO)/.leased-domain" \
+		      "integration-tests/.tf/$(SCENARIO)/config/cluster.yml"; \
+		echo "cleared leased domain + stale overlay for '$(SCENARIO)'; next run re-leases from domains.yml"; \
+	else \
+		rm -f integration-tests/.tf/.domain-lease \
+		      integration-tests/.tf/*/.leased-domain \
+		      integration-tests/.tf/*/config/cluster.yml; \
+		echo "cleared ALL domain-lease state + stale overlays; next run re-leases from domains.yml"; \
+	fi

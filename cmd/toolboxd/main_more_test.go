@@ -172,3 +172,39 @@ func TestMainStartupBranchesWithStubs(t *testing.T) {
 		t.Fatal("fake vsock Close was not called")
 	}
 }
+
+func TestReadSandboxID(t *testing.T) {
+	oldHostnameFn := hostnameFn
+	t.Cleanup(func() { hostnameFn = oldHostnameFn })
+
+	tests := []struct {
+		name     string
+		envID    string
+		hostname string
+		hostErr  error
+		want     string
+	}{
+		{name: "env wins", envID: "sb-abc", hostname: "deadbeef1234", want: "sb-abc"},
+		{name: "env whitespace ignored", envID: "  ", hostname: "deadbeef1234", want: "deadbeef1234"},
+		{name: "fallback to hostname", hostname: "deadbeef1234", want: "deadbeef1234"},
+		{name: "both empty", hostErr: errors.New("no hostname"), want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envID != "" {
+				t.Setenv("SB_SANDBOX_ID", tc.envID)
+			} else {
+				t.Setenv("SB_SANDBOX_ID", "")
+			}
+			hostnameFn = func() (string, error) {
+				if tc.hostErr != nil {
+					return "", tc.hostErr
+				}
+				return tc.hostname, nil
+			}
+			if got := readSandboxID(); got != tc.want {
+				t.Fatalf("readSandboxID() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

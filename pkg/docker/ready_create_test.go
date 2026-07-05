@@ -89,7 +89,7 @@ func TestCreate_WiresReadySocketWhenEnabled(t *testing.T) {
 		t.Fatalf("binds missing ready socket: %v", binds)
 	}
 	envs, _ := captured["Env"].([]any)
-	var hasSocket, hasNonce bool
+	var hasSocket, hasNonce, hasSandboxID bool
 	for _, e := range envs {
 		s, _ := e.(string)
 		if strings.HasPrefix(s, readySocketEnv+"=") {
@@ -98,9 +98,15 @@ func TestCreate_WiresReadySocketWhenEnabled(t *testing.T) {
 		if strings.HasPrefix(s, readyNonceEnv+"=") {
 			hasNonce = true
 		}
+		if s == "SB_SANDBOX_ID=sb-create" {
+			hasSandboxID = true
+		}
 	}
 	if !hasSocket || !hasNonce {
 		t.Fatalf("env missing ready vars: socket=%v nonce=%v env=%v", hasSocket, hasNonce, envs)
+	}
+	if !hasSandboxID {
+		t.Fatalf("env missing SB_SANDBOX_ID: %v", envs)
 	}
 }
 
@@ -161,7 +167,18 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	})
 	t.Cleanup(closeFn)
 
+	var captured map[string]any
 	d := fakeCreateDaemon(t)
+	base := d.transport()
+	wrapped := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/containers/create" && r.Body != nil {
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &captured)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		return base(r)
+	})
+
 	c := newCreateClient(t, d, false, func(c *Client) {
 		c.readyEnabled = true
 		c.readyDir = readyDir
@@ -169,6 +186,8 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 		c.readinessPollInit = 5 * time.Millisecond
 		c.readinessPollMax = 10 * time.Millisecond
 		c.toolboxWaitTimeout = 2 * time.Second
+		c.httpClient = &http.Client{Transport: wrapped, Timeout: c.httpClient.Timeout}
+		c.streamClient = &http.Client{Transport: wrapped}
 	})
 	d.containerGet = func() *http.Response {
 		return textResponse(http.StatusOK, inspectBody("cid", "/sb-race", ip, true, "running", 7))
@@ -196,8 +215,12 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 				return
 			}
 			nonce := parts[1]
+			pushID := envValueFromCreate(captured, "SB_SANDBOX_ID")
+			if pushID == "" {
+				return
+			}
 			_ = readyproto.Encode(conn, readyproto.ReadySignal{
-				Event: readyproto.EventReady, SandboxID: "sb-race", Token: "tok", Nonce: nonce,
+				Event: readyproto.EventReady, SandboxID: pushID, Token: "tok", Nonce: nonce,
 			})
 			return
 		}
@@ -217,10 +240,100 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	}
 }
 
-func TestCreate_FallbackWhenPushDisabled(t *testing.T) {
+func TestCreate_HostnameStyleIDPushFallsBack(t *testing.T) {
+	requireLinuxUnix(t)
+	readyDir := t.TempDir()
+	ip, port, closeFn := toolboxServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	t.Cleanup(closeFn)
+
 	d := fakeCreateDaemon(t)
+	c := newCreateClient(t, d, false, func(c *Client) {
+		c.readyEnabled = true
+		c.readyDir = readyDir
+		c.toolboxPort = port
+		c.readinessPollInit = 5 * time.Millisecond
+		c.readinessPollMax = 10 * time.Millisecond
+		c.toolboxWaitTimeout = 2 * time.Second
+	})
+	d.containerGet = func() *http.Response {
+		return textResponse(http.StatusOK, inspectBody("cid", "/sb-fb-id", ip, true, "running", 7))
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			matches, _ := filepath.Glob(filepath.Join(readyDir, "sb-fb-id.*.sock"))
+			if len(matches) == 0 {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			conn, err := net.Dial("unix", matches[0])
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			base := filepath.Base(matches[0])
+			parts := strings.Split(strings.TrimSuffix(base, ".sock"), ".")
+			if len(parts) < 2 {
+				return
+			}
+			nonce := parts[1]
+			// Pre-fix toolboxd behavior: push container-hostname ID, not API sandbox ID.
+			_ = readyproto.Encode(conn, readyproto.ReadySignal{
+				Event: readyproto.EventReady, SandboxID: "deadbeef1234", Token: "tok", Nonce: nonce,
+			})
+			return
+		}
+	}()
+
+	before := readySocketInvalidAttempts.Value()
+	ctx, timing := WithCreateTiming(context.Background())
+	_, err := c.Create(ctx, models.CreateSandboxRequest{Image: "img"}, "sb-fb-id", "tok", nil)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if timing.Source != "health" {
+		t.Fatalf("source = %q, want health", timing.Source)
+	}
+	if readySocketInvalidAttempts.Value() <= before {
+		t.Fatalf("invalid attempts = %d, want > %d", readySocketInvalidAttempts.Value(), before)
+	}
+}
+
+func envValueFromCreate(captured map[string]any, key string) string {
+	envs, _ := captured["Env"].([]any)
+	prefix := key + "="
+	for _, e := range envs {
+		s, _ := e.(string)
+		if strings.HasPrefix(s, prefix) {
+			return strings.TrimPrefix(s, prefix)
+		}
+	}
+	return ""
+}
+
+func TestCreate_FallbackWhenPushDisabled(t *testing.T) {
+	var captured map[string]any
+	d := fakeCreateDaemon(t)
+	base := d.transport()
+	wrapped := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/containers/create" && r.Body != nil {
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &captured)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		return base(r)
+	})
 	c := newCreateClient(t, d, true, func(c *Client) {
 		c.readyEnabled = false
+		c.httpClient = &http.Client{Transport: wrapped, Timeout: c.httpClient.Timeout}
+		c.streamClient = &http.Client{Transport: wrapped}
 	})
 	ctx, timing := WithCreateTiming(context.Background())
 	_, err := c.Create(ctx, models.CreateSandboxRequest{Image: "img"}, "sb-fb", "tok", nil)
@@ -229,6 +342,9 @@ func TestCreate_FallbackWhenPushDisabled(t *testing.T) {
 	}
 	if timing.Source != "health" {
 		t.Fatalf("source = %q, want health", timing.Source)
+	}
+	if got := envValueFromCreate(captured, "SB_SANDBOX_ID"); got != "sb-fb" {
+		t.Fatalf("SB_SANDBOX_ID = %q, want sb-fb", got)
 	}
 }
 

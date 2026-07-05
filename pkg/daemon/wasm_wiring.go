@@ -89,6 +89,11 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		spawner := wasmpool.NewSupervisorSpawner(supervisor)
 		spawner.MemoryMB = cfg.WasmDefaultMemoryMB
 		driver.SetWarmPool(pool)
+		// Registration-time NoteModule (the API twin of seedStandardModules
+		// below): POST /v1/wasm-modules marks the resolved digest as a refill
+		// target on this node, so the pool pre-compiles before the module's
+		// first create instead of learning it lazily inside Acquire.
+		svc.SetWasmWarmPool(pool)
 		refillCfg := wasmpool.RefillConfig{
 			RefillInterval: cfg.WasmPoolRefillInterval,
 			SpawnTimeout:   30 * time.Second,

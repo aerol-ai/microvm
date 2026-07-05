@@ -167,6 +167,113 @@ func TestCreateWasmModule_HappyPath(t *testing.T) {
 	}
 }
 
+// recordingWarmPoolNotifier captures NoteModule calls from module registration.
+type recordingWarmPoolNotifier struct {
+	notes [][2]string // {digest, path}
+}
+
+func (r *recordingWarmPoolNotifier) NoteModule(digest, path string) {
+	r.notes = append(r.notes, [2]string{digest, path})
+}
+
+// Registration must arm the warm pool: the pool otherwise only learns a
+// non-standard module inside Acquire, i.e. on the first create, which then
+// pays the full cold compile (the p90 tail in the UC-94 bench).
+func TestCreateWasmModule_NotesWarmPoolOnRegister(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	modPath := filepath.Join(dir, "mod.wasm")
+	if err := os.WriteFile(modPath, []byte("wasm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := New(config.Config{EnableWasm: true, WasmModulesDir: dir}, logger, st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+	svc.SetWasmModuleResolver(stubWasmModuleResolver{path: modPath, digest: "warm-digest"})
+	rec := &recordingWarmPoolNotifier{}
+	svc.SetWasmWarmPool(rec)
+
+	req := models.CreateWasmModuleRequest{ModuleRef: "file://" + modPath}
+	if _, err := svc.CreateWasmModule(ctx, req); err != nil {
+		t.Fatalf("CreateWasmModule: %v", err)
+	}
+	if len(rec.notes) != 1 || rec.notes[0] != [2]string{"warm-digest", modPath} {
+		t.Fatalf("notes after register = %v, want one {warm-digest, %s}", rec.notes, modPath)
+	}
+
+	// Re-register (digest-id idempotent branch): must re-arm from the stored
+	// row — pool targets are in-memory, so a daemon restart forgets them while
+	// the catalogue row survives.
+	if _, err := svc.CreateWasmModule(ctx, req); err != nil {
+		t.Fatalf("idempotent CreateWasmModule: %v", err)
+	}
+	if len(rec.notes) != 2 || rec.notes[1] != [2]string{"warm-digest", modPath} {
+		t.Fatalf("notes after re-register = %v, want second {warm-digest, %s}", rec.notes, modPath)
+	}
+}
+
+func TestCreateWasmModule_ExplicitIDReregisterReArmsWarmPool(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	modPath := filepath.Join(dir, "mod.wasm")
+	if err := os.WriteFile(modPath, []byte("wasm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := New(config.Config{EnableWasm: true}, logger, st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+	svc.SetWasmModuleResolver(stubWasmModuleResolver{path: modPath, digest: "d-explicit"})
+
+	req := models.CreateWasmModuleRequest{ID: "my-mod", ModuleRef: "file://x"}
+	if _, err := svc.CreateWasmModule(ctx, req); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	// Pool wired only for the retry, mimicking a restart: the catalogue row
+	// exists, the pool is empty, and the idempotent path must still note.
+	rec := &recordingWarmPoolNotifier{}
+	svc.SetWasmWarmPool(rec)
+	if _, err := svc.CreateWasmModule(ctx, req); err != nil {
+		t.Fatalf("retry create: %v", err)
+	}
+	if len(rec.notes) != 1 || rec.notes[0] != [2]string{"d-explicit", modPath} {
+		t.Fatalf("notes = %v, want one {d-explicit, %s}", rec.notes, modPath)
+	}
+}
+
+func TestCreateWasmModule_ResolveFailureDoesNotNoteWarmPool(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := New(config.Config{EnableWasm: true}, logger, st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+	svc.SetWasmModuleResolver(erroringWasmModuleResolver{err: errors.New("not staged")})
+	rec := &recordingWarmPoolNotifier{}
+	svc.SetWasmWarmPool(rec)
+
+	if _, err := svc.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ModuleRef: "file://missing"}); err == nil {
+		t.Fatal("expected resolve error")
+	}
+	if len(rec.notes) != 0 {
+		t.Fatalf("failed registration must not arm the pool, got notes %v", rec.notes)
+	}
+}
+
 func TestCreateWasmModule_IdempotentExplicitID(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
