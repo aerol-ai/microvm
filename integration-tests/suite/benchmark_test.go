@@ -23,7 +23,7 @@ import (
 
 // benchmark_test.go holds the opt-in create benchmarks (UC-94/UC-95). They run
 // only where the scenario advertises CapBenchmark — cluster-hetero (every
-// runtime), cluster-3-mixed (docker only), cluster-3-mixed-fc (docker +
+// runtime), cluster-3-mixed-docker (docker only), cluster-3-mixed-fc (docker +
 // firecracker), cluster-3-mixed-gvisor (docker + gvisor), and cluster-3-mixed-wasm
 // (docker + wasm) — because they
 // many sandboxes. They reuse the same SDK client + cleanup contract as every
@@ -57,7 +57,7 @@ type benchRuntimeSpec struct {
 
 // requireBenchEnabled is a second gate on top of the CapBenchmark capability.
 // The capability keeps UC-94/UC-95 in the coverage matrix on benchmark-capable
-// scenarios (cluster-hetero, cluster-3-mixed, cluster-3-mixed-fc,
+// scenarios (cluster-hetero, cluster-3-mixed-docker, cluster-3-mixed-fc,
 // cluster-3-mixed-gvisor, cluster-3-mixed-wasm), but the benchmark is slow and
 // the density probe provisions sandboxes until
 // the fleet rejects — far too costly to run on every hetero pass. So it stays
@@ -702,7 +702,7 @@ func TestBenchDensity(t *testing.T) {
 		})
 		cancel()
 		if err != nil {
-			if isCapacityRejection(err) {
+			if isDensityCeiling(err) {
 				ds.StoppedOnCap = true
 				ds.StoppedReason = err.Error()
 				break
@@ -724,6 +724,19 @@ func TestBenchDensity(t *testing.T) {
 	}
 	t.Logf("bench density: created=%d running=%d stopped_on_cap=%v", ds.Created, ds.Running, ds.StoppedOnCap)
 	writeBenchArtifact(t, benchReport{Density: &ds})
+}
+
+// isDensityCeiling reports whether err is the fleet refusing more sandboxes —
+// either explicit capacity admission (HTTP 503 `capacity exceeded`) or cluster
+// placement exhaustion (`no worker placement target available`). Both are valid
+// UC-95 stop conditions: the probe measures how many sandboxes land before the
+// fleet stops accepting more.
+func isDensityCeiling(err error) bool {
+	if isCapacityRejection(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no worker placement target")
 }
 
 // isCapacityRejection reports whether err is the fleet refusing on capacity

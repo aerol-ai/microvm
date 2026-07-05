@@ -1,0 +1,17 @@
+# 3× mixed cluster: docker workers, public domain/TLS, and cluster mode (Raft +
+# forwarding). Same topology as cluster-3-mixed.tfvars — this scenario exists so
+# docker-only benchmark artifacts are named cluster-3-mixed-docker-* (parallel to
+# cluster-3-mixed-wasm for wasm benchmarks).
+#
+# The benchmark capability opts UC-94/UC-95 in for make integration-benchmark-docker.
+name: cluster-3-mixed-docker
+capabilities:
+  - docker
+  - platform-volumes
+  - domain
+  - cluster
+  # Opt UC-94/UC-95 in for make integration-benchmark-docker (docker latency +
+  # density only; the make target passes AEROL_BENCH_RUNTIMES=docker and --bench-only).
+  - benchmark
+
+expected_members: 3

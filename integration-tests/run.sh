@@ -8,9 +8,9 @@
 #   integration-tests/run.sh <scenario> [--bench-only]    # UC-94/UC-95 only (provision if needed)
 #   integration-tests/run.sh all       [flags]
 #
-# Scenarios: single-node | local-mode | cluster-3-mixed | cluster-3-mixed-fc |
-#            cluster-3-mixed-gvisor | cluster-3-mixed-wasm | cluster-hetero |
-#            single-node-fc | single-node-fc-arm64 | cluster-arm64
+# Scenarios: single-node | local-mode | cluster-3-mixed | cluster-3-mixed-docker |
+#            cluster-3-mixed-fc | cluster-3-mixed-gvisor | cluster-3-mixed-wasm |
+#            cluster-hetero | single-node-fc | single-node-fc-arm64 | cluster-arm64
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -338,6 +338,73 @@ print_bench_artifact_summary() {
   ' "$bench_out" >&2; then
     echo "benchmark summary unavailable: could not parse ${bench_out}" >&2
   fi
+}
+
+# write_bench_markdown renders a human-readable companion to the JSON artifact.
+# Bench-only runs do not execute the full UC suite, so this is the markdown
+# report for make integration-benchmark-* targets (parallel to *-bench.json).
+write_bench_markdown() {
+  local bench_out="$1"
+  [[ -f "$bench_out" ]] || return 0
+  local md_out="${bench_out%.json}.md"
+  {
+    echo "# Benchmark report — $(jq -r '.scenario // "unknown"' "$bench_out")"
+    echo
+    echo "timestamp: $(jq -r '.timestamp // "unknown"' "$bench_out")"
+    echo
+    jq -r '
+      if .machine then
+        "## Machine",
+        "",
+        ("source: " + (.machine.source // "")),
+        ("default_instance: " + (.machine.default_instance // "")),
+        "",
+        "| node | role | instance_type | extras |",
+        "|------|------|---------------|--------|",
+        (.machine.nodes[]? |
+          "| \(.name) | \(.role) | \(.instance_type // .machine.default_instance // "") | \(.extras // "") |")
+      else
+        empty
+      end
+    ' "$bench_out"
+    echo
+    echo "## UC-94 — create latency"
+    echo
+    jq -r '
+      if ((.latency // []) | length) == 0 then
+        "_no latency samples_"
+      else
+        "| runtime | samples | failures | api p50 | api p90 | api p99 | server p50 | server p90 | server p99 | running p50 | running p90 | running p99 |",
+        "|---------|---------|----------|---------|---------|---------|------------|------------|------------|-------------|-------------|-------------|",
+        (.latency[] |
+          "| \(.runtime) | \(.samples) | \(.failures) | \(.api_p50_ms)ms | \(.api_p90_ms)ms | \(.api_p99_ms)ms | \(.server_p50_ms)ms | \(.server_p90_ms)ms | \(.server_p99_ms)ms | \(.run_p50_ms)ms | \(.run_p90_ms)ms | \(.run_p99_ms)ms |")
+      end
+    ' "$bench_out"
+    echo
+    echo "## UC-95 — fleet density"
+    echo
+    jq -r '
+      if .density then
+        "- runtime: \(.density.runtime)",
+        "- created: \(.density.created)",
+        "- running: \(.density.running)",
+        "- stopped_on_cap: \(.density.stopped_on_cap)",
+        "- safety_cap_hit: \(.density.safety_cap_hit)",
+        (if ((.density.stopped_reason // "") | length) > 0 then "- stopped_reason: \(.density.stopped_reason)" else empty end)
+      else
+        "_no density probe result_"
+      end
+    ' "$bench_out"
+  } > "$md_out"
+  echo "bench markdown: ${md_out}" >&2
+}
+
+publish_bench_artifacts() {
+  local bench_out="$1"
+  [[ -n "$bench_out" && -f "$bench_out" ]] || return 0
+  echo "bench artifact: ${bench_out}" >&2
+  print_bench_artifact_summary "$bench_out"
+  write_bench_markdown "$bench_out"
 }
 
 tfvar_string_from_files() {
@@ -686,7 +753,7 @@ run_one() {
   AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" \
     -json "$json_out" -out "${HERE}/reports"
   if [[ "${AEROL_BENCH:-}" == "1" && -n "$bench_out" ]]; then
-    print_bench_artifact_summary "$bench_out"
+    publish_bench_artifacts "$bench_out"
   fi
 }
 
@@ -818,17 +885,15 @@ run_bench_tests() {
       ./integration-tests/suite/...
   local test_rc=$?
   set -e
+  if [[ -n "$bench_out" && -f "$bench_out" ]]; then
+    publish_bench_artifacts "$bench_out"
+  fi
   if [[ "$test_rc" != "0" ]]; then
     return "$test_rc"
   fi
-  if [[ -n "$bench_out" ]]; then
-    if [[ -f "$bench_out" ]]; then
-      echo "bench artifact: ${bench_out}" >&2
-      print_bench_artifact_summary "$bench_out"
-    else
-      echo "bench tests finished but artifact missing at ${bench_out}" >&2
-      return 2
-    fi
+  if [[ -n "$bench_out" && ! -f "$bench_out" ]]; then
+    echo "bench tests finished but artifact missing at ${bench_out}" >&2
+    return 2
   fi
   return 0
 }
@@ -897,7 +962,7 @@ elif [[ "$BENCH_ONLY" == "1" ]]; then
     run_one "$SCENARIO"
   fi
 elif [[ "$SCENARIO" == "all" ]]; then
-  for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64; do
+  for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-docker cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64; do
     ( run_one "$s" )
   done
 else
