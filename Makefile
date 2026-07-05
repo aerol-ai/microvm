@@ -6,7 +6,8 @@ BIN_DIR ?= bin
 	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
-	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
+	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
+	integration-cert-store-init
 
 fmt:
 	$(GO) fmt ./...
@@ -72,6 +73,13 @@ ifneq ($(RUN_EXTRA),)
 .PHONY: $(RUN_EXTRA)
 $(foreach w,$(RUN_EXTRA),$(eval $(w): ; @:))
 endif
+# One-time (per operator/account) bootstrap of the PERSISTENT cross-run Caddy
+# cert bucket + a stable encryption key in config/secrets.yml. After this, every
+# domain-bearing scenario REUSES a leased-domain's wildcard cert across runs
+# instead of re-issuing it against Let's Encrypt. Idempotent; safe to re-run.
+integration-cert-store-init:
+	integration-tests/lib/provision.sh cert-store-init
+
 integration-local:
 	integration-tests/run.sh local-mode $(RUN_FLAGS)
 
@@ -149,9 +157,9 @@ integration-benchmark-fc-only:
 
 # WASM-focused benchmark on the 3× mixed-wasm cluster: provisions
 # cluster-3-mixed-wasm with domain/TLS, runs the full suite with UC-94 (docker +
-# wasm latency) and UC-95 (docker density). Pool depth is set to the sample count
-# at provision time so UC-94 measures warm wasm hits (override with
-# AEROL_WASM_POOL_DEPTH / WASM_BENCH_SAMPLES). Narrow UC-94 to wasm only with
+# wasm latency) and UC-95 (docker density). Pool depth defaults to 2 at provision
+# time so UC-94 measures warm wasm hits without overloading small nodes (override
+# with AEROL_WASM_POOL_DEPTH). Narrow UC-94 to wasm only with
 # AEROL_BENCH_RUNTIMES=wasm (UC-95 will skip in that case).
 #   make integration-benchmark-wasm
 #   make integration-benchmark-wasm keep
@@ -161,7 +169,7 @@ WASM_BENCH_SAMPLES ?= 10
 integration-benchmark-wasm:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
-	AEROL_WASM_POOL_DEPTH=$(if $(AEROL_WASM_POOL_DEPTH),$(AEROL_WASM_POOL_DEPTH),$(WASM_BENCH_SAMPLES)) \
+	AEROL_WASM_POOL_DEPTH=$(if $(AEROL_WASM_POOL_DEPTH),$(AEROL_WASM_POOL_DEPTH),2) \
 		integration-tests/run.sh cluster-3-mixed-wasm --no-disruptive $(RUN_FLAGS)
 
 # Re-run UC-94/UC-95 only against a cluster-3-mixed-wasm left up with `keep`.

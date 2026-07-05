@@ -17,6 +17,10 @@ default_volume_size_gb = 40
 
 # A single node has nothing to share certs WITH; disable the prod-inherited
 # managed S3 cert bucket so the run doesn't create one. Cluster scenarios re-enable it.
+# NOTE: `make integration-cert-store-init` overrides this at runtime with a BYO
+# persistent bucket (run.sh → emit_cert_storage_tfvars) so the leased-domain
+# wildcard cert is reused across runs instead of re-issued. This stays the
+# fallback for operators who haven't bootstrapped that store.
 caddy_shared_cert_storage = {
   enabled = false
 }

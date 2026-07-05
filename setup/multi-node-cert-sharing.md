@@ -267,6 +267,22 @@ encryption key, not the bucket itself.
 
 ---
 
+## Integration-test persistent store (cross-run cert reuse)
+
+The same BYO mechanism doubles as a way to stop the **integration harness** from
+re-issuing a wildcard every run. Each domain scenario provisions a throwaway box
+whose Caddy issues `*.<leased-domain>`; because the managed cert bucket is
+created and destroyed with the cluster (and single-node disables sharing), the
+cert never survives teardown. `make integration-cert-store-init` creates one
+long-lived bucket **outside** any per-scenario state and pins a stable
+encryption key in `config/secrets.yml`; `integration-tests/run.sh` then feeds
+every domain scenario a BYO override pointing at it. Domains are still leased
+randomly from the pool, but since `certmagic-s3` keys certs per
+`<prefix>/certificates/<issuer>/<domain>`, each domain issues once and is reused
+on later runs. See
+[`integration-tests/README.md`](../integration-tests/README.md) →
+*Persistent cert store*.
+
 ## End-to-end verification
 
 The shared-storage cert-reuse guarantee is exercised end-to-end by
