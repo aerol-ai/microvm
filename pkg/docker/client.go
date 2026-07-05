@@ -384,10 +384,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		workingDir = "/"
 	}
 
-	envValues := make([]string, 0, len(req.Env)+3)
+	envValues := make([]string, 0, len(req.Env)+4)
 	envValues = append(envValues,
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", c.toolboxPort),
 		"SB_TOOLBOX_TOKEN="+toolboxToken,
+		"SB_SANDBOX_ID="+sandboxID,
 	)
 	for key, value := range req.Env {
 		envValues = append(envValues, key+"="+value)
@@ -442,7 +443,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		binds = append(binds, readyListener.BindSpec())
 		envValues = append(envValues, readyListener.EnvVars()...)
 		sort.Strings(envValues)
-		// envValues was sized to len(req.Env)+3, so appending the two ready
+		// envValues was sized to len(req.Env)+4, so appending the two ready
 		// vars reallocates the backing array — the slice already stored under
 		// createRequest["Env"] still points at the pre-append array. Re-store
 		// the grown slice or toolboxd never sees SB_READY_SOCKET/NONCE and the
@@ -1284,6 +1285,15 @@ func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, li
 		recordReadySocketHit(waitMS)
 	} else {
 		recordReadySocketFallback(waitMS)
+		if listener != nil {
+			n, reason := listener.InvalidAttempts()
+			if n > 0 {
+				c.logger.Warn("ready socket fell back to health poll",
+					"sandbox_id", listener.sandboxID,
+					"invalid_pushes", n,
+					"last_reason", reason)
+			}
+		}
 	}
 	return res.source, nil
 }

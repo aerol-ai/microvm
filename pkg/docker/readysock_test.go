@@ -79,6 +79,13 @@ func TestReadyListenerTokenMismatch(t *testing.T) {
 	if err := ln.Wait(ctx); err == nil {
 		t.Fatal("expected timeout or invalid cap error")
 	}
+	n, reason := ln.InvalidAttempts()
+	if n != 1 {
+		t.Fatalf("invalid attempts = %d, want 1", n)
+	}
+	if reason != "token mismatch" {
+		t.Fatalf("last reason = %q, want token mismatch", reason)
+	}
 }
 
 func TestReadyListenerNeverConnectTimesOut(t *testing.T) {

@@ -76,6 +76,10 @@ type ReadyListener struct {
 	closed     bool
 	closeMu    sync.Mutex
 	registered bool
+
+	invalidMu         sync.Mutex
+	invalidCount      int
+	lastInvalidReason string
 }
 
 // NewReadyListener creates and listens on a per-create unix socket under dir.
@@ -191,6 +195,7 @@ func (l *ReadyListener) Wait(ctx context.Context) error {
 
 		if err := l.readAndVerify(conn); err != nil {
 			invalid++
+			l.recordInvalidAttempt(err.Error())
 			recordReadySocketInvalid()
 			_ = conn.Close()
 			continue
@@ -198,6 +203,26 @@ func (l *ReadyListener) Wait(ctx context.Context) error {
 		_ = conn.Close()
 		return nil
 	}
+}
+
+func (l *ReadyListener) recordInvalidAttempt(reason string) {
+	if l == nil {
+		return
+	}
+	l.invalidMu.Lock()
+	l.invalidCount++
+	l.lastInvalidReason = reason
+	l.invalidMu.Unlock()
+}
+
+// InvalidAttempts reports how many pushes were rejected and the last reason.
+func (l *ReadyListener) InvalidAttempts() (int, string) {
+	if l == nil {
+		return 0, ""
+	}
+	l.invalidMu.Lock()
+	defer l.invalidMu.Unlock()
+	return l.invalidCount, l.lastInvalidReason
 }
 
 func (l *ReadyListener) readAndVerify(conn net.Conn) error {
