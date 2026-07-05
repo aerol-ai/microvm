@@ -1,0 +1,18 @@
+# 3× mixed cluster with gVisor enabled on every node. Same topology as
+# cluster-3-mixed (docker workers + public domain/TLS + cluster mode: Raft +
+# forwarding) but advertises `gvisor` and installs runsc via with_gvisor on each
+# node at bootstrap. Pairs the gvisor-runtime use cases with cluster placement
+# and cross-node forwarding on cheap spot t3 boxes — no bare metal required.
+#
+# The benchmark capability opts UC-94/UC-95 in for make integration-benchmark-gvisor.
+name: cluster-3-mixed-gvisor
+capabilities:
+  - docker
+  - platform-volumes
+  - gvisor
+  - domain
+  - cluster
+  # Opt UC-94/UC-95 in here (docker + gvisor latency; docker density).
+  - benchmark
+
+expected_members: 3

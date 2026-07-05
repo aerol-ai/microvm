@@ -1,5 +1,6 @@
 # 3× mixed cluster: docker workers, public domain/TLS, and cluster mode (Raft +
-# forwarding). No firecracker/gvisor/wasm — those land in cluster-hetero.
+# forwarding). No firecracker/wasm — those land in cluster-3-mixed-fc/wasm;
+# gvisor lands in cluster-3-mixed-gvisor; the full runtime matrix is cluster-hetero.
 name: cluster-3-mixed
 capabilities:
   - docker

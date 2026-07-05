@@ -33,6 +33,7 @@ integration-tests/run.sh single-node --keep        # leave infra up for debuggin
 integration-tests/run.sh single-node --prod-tls    # use real Let's Encrypt instead of staging
 make integration-cluster-hetero           # 8-node heterogeneous cluster (x86 fc)
 make integration-cluster-mixed-fc         # 3× mixed cluster, FC on seed c5.metal
+make integration-cluster-mixed-gvisor       # 3× mixed cluster, gVisor on every node
 make integration-single-fc                # single-node-fc (x86 firecracker, c5.metal)
 make integration-arm64                    # arm64 firecracker single + cluster scenarios
 make integration-arm64-single             # single-node-fc-arm64 (Graviton metal)
@@ -80,9 +81,9 @@ every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-
 `suite/benchmark_test.go` is an **opt-in** benchmark that reuses the live
 deployment to measure sandbox creation. It only runs where the scenario
 advertises the `benchmark` capability — **`cluster-hetero`** (every runtime),
-**`cluster-3-mixed-fc`** (docker + firecracker), and **`cluster-3-mixed-wasm`**
-(docker + wasm) in 3-node mixed clusters — because it is slow and provisions
-many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
+**`cluster-3-mixed-fc`** (docker + firecracker), **`cluster-3-mixed-gvisor`**
+(docker + gvisor), and **`cluster-3-mixed-wasm`** (docker + wasm) in 3-node mixed
+clusters — because it is slow and provisions many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
   firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
@@ -116,6 +117,9 @@ make integration-benchmark-fc
 # WASM-focused 3× mixed cluster (docker + wasm only; cheap t3 spot boxes):
 make integration-benchmark-wasm
 
+# gVisor-focused 3× mixed cluster (docker + gvisor only; cheap t3 spot boxes):
+make integration-benchmark-gvisor
+
 # Manual env form (hetero):
 AEROL_BENCH=1 \
 AEROL_BENCH_OUT=integration-tests/reports/cluster-hetero-bench.json \
@@ -137,15 +141,21 @@ make integration-benchmark-fc-only         # re-run UC-94/UC-95 against it
 make integration-cluster-mixed-wasm keep   # 3× mixed WASM cluster
 make integration-benchmark-wasm-only       # re-run UC-94/UC-95 against it
 
+make integration-cluster-mixed-gvisor keep # 3× mixed gVisor cluster
+make integration-benchmark-gvisor-only     # re-run UC-94/UC-95 against it
+
 # Narrow the UC-94 sweep:
 AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
 # …or isolate firecracker latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-fc-only
 # …or isolate wasm latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=wasm make integration-benchmark-wasm-only
+# …or isolate gvisor latency (UC-95 skips when docker is excluded):
+AEROL_BENCH_RUNTIMES=gvisor make integration-benchmark-gvisor-only
 
 make integration-destroy                     # tear the kept cluster down
 make integration-destroy SCENARIO=cluster-3-mixed-fc
+make integration-destroy SCENARIO=cluster-3-mixed-gvisor
 make integration-destroy SCENARIO=cluster-3-mixed-wasm
 ```
 

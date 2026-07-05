@@ -8,7 +8,8 @@
 #   integration-tests/run.sh all       [flags]
 #
 # Scenarios: single-node | local-mode | cluster-3-mixed | cluster-3-mixed-fc |
-#            cluster-hetero | single-node-fc | single-node-fc-arm64 | cluster-arm64
+#            cluster-3-mixed-gvisor | cluster-3-mixed-wasm | cluster-hetero |
+#            single-node-fc | single-node-fc-arm64 | cluster-arm64
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -845,7 +846,7 @@ if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
 elif [[ "$BENCH_ONLY" == "1" ]]; then
   run_bench_only "$SCENARIO"
 elif [[ "$SCENARIO" == "all" ]]; then
-  for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-wasm cluster-3-mixed-fc cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64; do
+  for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64; do
     ( run_one "$s" )
   done
 else

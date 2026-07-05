@@ -6,6 +6,7 @@ BIN_DIR ?= bin
 	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
+	integration-benchmark-gvisor integration-benchmark-gvisor-only \
 	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
 	integration-cert-store-init
 
@@ -106,6 +107,12 @@ integration-cluster-mixed-wasm:
 integration-cluster-mixed-fc:
 	integration-tests/run.sh cluster-3-mixed-fc $(RUN_FLAGS)
 
+# 3× mixed cluster with gVisor on every node — same cheap t3 topology as
+# integration-cluster-mixed, but runsc is installed at bootstrap so gvisor-runtime
+# UCs and the gvisor benchmark row exercise placement + forwarding.
+integration-cluster-mixed-gvisor:
+	integration-tests/run.sh cluster-3-mixed-gvisor $(RUN_FLAGS)
+
 integration-cluster-hetero:
 	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):
 	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
@@ -177,6 +184,23 @@ integration-benchmark-wasm-only:
 	AEROL_BENCH_OUT=$(WASM_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
 		integration-tests/run.sh cluster-3-mixed-wasm --bench-only
+
+# gVisor-focused benchmark on the 3× mixed-gvisor cluster: provisions
+# cluster-3-mixed-gvisor with domain/TLS, runs the full suite with UC-94 (docker +
+# gvisor latency) and UC-95 (docker density). Narrow UC-94 to gvisor only with
+# AEROL_BENCH_RUNTIMES=gvisor (UC-95 will skip in that case).
+#   make integration-benchmark-gvisor
+#   make integration-benchmark-gvisor keep
+#   make integration-benchmark-gvisor GVISOR_BENCH_OUT=/tmp/gvisor-bench.json
+GVISOR_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-gvisor-bench.json
+integration-benchmark-gvisor:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(GVISOR_BENCH_OUT) \
+		integration-tests/run.sh cluster-3-mixed-gvisor --no-disruptive $(RUN_FLAGS)
+
+# Re-run UC-94/UC-95 only against a cluster-3-mixed-gvisor left up with `keep`.
+integration-benchmark-gvisor-only:
+	AEROL_BENCH_OUT=$(GVISOR_BENCH_OUT) \
+		integration-tests/run.sh cluster-3-mixed-gvisor --bench-only
 
 # Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
 # exercises the firecracker use cases (UC-24/47-50) without the full hetero
