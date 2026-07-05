@@ -573,11 +573,12 @@ type CreateSandboxRequest struct {
 	NetworkDenyOut []string `json:"network_deny_out,omitempty"`
 	// AllowPublicTraffic controls whether the sandbox may be exposed to the
 	// public internet. On create, omitted (nil) defaults to private — no
-	// <id>.<domain> ingress route, empty public_url, and expose_port fails.
-	// Pass an explicit true to opt in to public exposure. False always refuses
-	// exposure. The sandbox stays reachable via the platform's own paths
-	// (toolbox exec/file proxy, SSH gateway), which do not route through the
-	// public ingress.
+	// <id>.<domain> ingress route and empty public_url. Pass an explicit true
+	// to opt in at create time, or call expose_port later (which flips the
+	// sandbox public as the opt-in lever). False always refuses exposure.
+	// The sandbox stays reachable via the platform's own paths (toolbox
+	// exec/file proxy, SSH gateway), which do not route through the public
+	// ingress.
 	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
 	// MaskRequestHost, when non-empty, rewrites the upstream Host header on
 	// ingress to exposed HTTP ports to this value. Dev servers and frameworks
