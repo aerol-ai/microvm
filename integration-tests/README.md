@@ -81,9 +81,10 @@ every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-
 `suite/benchmark_test.go` is an **opt-in** benchmark that reuses the live
 deployment to measure sandbox creation. It only runs where the scenario
 advertises the `benchmark` capability — **`cluster-hetero`** (every runtime),
-**`cluster-3-mixed-fc`** (docker + firecracker), **`cluster-3-mixed-gvisor`**
-(docker + gvisor), and **`cluster-3-mixed-wasm`** (docker + wasm) in 3-node mixed
-clusters — because it is slow and provisions many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
+**`cluster-3-mixed`** (docker only), **`cluster-3-mixed-fc`** (docker +
+firecracker), **`cluster-3-mixed-gvisor`** (docker + gvisor), and
+**`cluster-3-mixed-wasm`** (docker + wasm) in 3-node mixed clusters — because
+it is slow and provisions many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
   firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
@@ -110,6 +111,9 @@ you (`run.sh` passes the parent environment through to `go test`):
 ```bash
 # Full hetero run (docker + firecracker + gvisor + wasm):
 make integration-benchmark
+
+# Docker-focused 3× mixed cluster (docker latency + density only; cheapest):
+make integration-benchmark-docker
 
 # Firecracker-focused 3× mixed cluster (docker + firecracker only; cheaper):
 make integration-benchmark-fc
@@ -138,6 +142,9 @@ from TF state and force `AEROL_BENCH=1`, so nothing to export:
 make integration-cluster-hetero keep         # provision, leave it up
 make integration-benchmark-only              # re-run just the bench against it
 
+make integration-cluster-mixed keep          # 3× mixed docker cluster
+make integration-benchmark-docker-only       # re-run docker bench against it
+
 make integration-cluster-mixed-fc keep       # 3× mixed FC cluster
 make integration-benchmark-fc-only         # re-run UC-94/UC-95 against it
 
@@ -157,6 +164,7 @@ AEROL_BENCH_RUNTIMES=gvisor make integration-benchmark-gvisor-only
 AEROL_BENCH_RUNTIMES=docker,wasm make integration-benchmark-wasm-only
 
 make integration-destroy                     # tear the kept cluster down
+make integration-destroy SCENARIO=cluster-3-mixed
 make integration-destroy SCENARIO=cluster-3-mixed-fc
 make integration-destroy SCENARIO=cluster-3-mixed-gvisor
 make integration-destroy SCENARIO=cluster-3-mixed-wasm
@@ -164,6 +172,12 @@ make integration-destroy SCENARIO=cluster-3-mixed-wasm
 
 Percentiles + the density ceiling also print as `bench[...]` log lines (captured
 by `go test -json`); the `AEROL_BENCH_OUT` JSON adds the machine block.
+
+**Docker benchmark path.** `make integration-benchmark-docker` provisions
+`cluster-3-mixed` and runs **docker-only** benchmarks (`--bench-only`,
+`AEROL_BENCH_RUNTIMES=docker`): UC-94 times docker creates and UC-95 probes
+fleet density. Use `make integration-cluster-mixed` for the full docker
+integration suite (placement, forwarding, domain/TLS UCs).
 
 **WASM warm pool.** wasm scenarios boot with the warm-worker pool on so creates
 skip the cold module compile — CPython-on-wasm is ~10s cold on a t3.

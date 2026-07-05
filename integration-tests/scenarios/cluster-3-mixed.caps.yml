@@ -1,12 +1,17 @@
 # 3× mixed cluster: docker workers, public domain/TLS, and cluster mode (Raft +
 # forwarding). No firecracker/wasm — those land in cluster-3-mixed-fc/wasm;
 # gvisor lands in cluster-3-mixed-gvisor; the full runtime matrix is cluster-hetero.
+#
+# The benchmark capability opts UC-94/UC-95 in for make integration-benchmark-docker.
 name: cluster-3-mixed
 capabilities:
   - docker
   - platform-volumes
   - domain
   - cluster
+  # Opt UC-94/UC-95 in for make integration-benchmark-docker (docker latency +
+  # density only; the make target passes AEROL_BENCH_RUNTIMES=docker and --bench-only).
+  - benchmark
 
 # Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
 expected_members: 3
