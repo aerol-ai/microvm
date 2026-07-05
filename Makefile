@@ -8,7 +8,7 @@ BIN_DIR ?= bin
 	integration-benchmark-wasm integration-benchmark-wasm-only \
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
 	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
-	integration-cert-store-init
+	integration-cert-store-init integration-clear-lease
 
 fmt:
 	$(GO) fmt ./...
@@ -241,3 +241,31 @@ integration-destroy:
 # integration-destroy but instance-only — leaves VPC/S3/IAM + TF state behind.
 integration-reap:
 	scripts/integration-reap.sh
+
+# Reset the domain-lease STATE so the next run re-leases from the CURRENT
+# domains.yml pool. Use this when a run is stuck re-picking a stale domain after
+# you edit the pool. A domain is remembered in THREE places, and this clears all
+# three (a --keep run reads them in this order, run.sh lease_domain_for_scenario):
+#   1. .tf/.domain-lease            — last pool index (fresh runs avoid repeats)
+#   2. .tf/<scenario>/.leased-domain — the pin a --keep run returns first
+#   3. .tf/<scenario>/config/cluster.yml .ingress.domain_name — the --keep
+#      fallback read after the pin + TF state; survives `destroy` and a
+#      pin-only clear, so it's the usual reason a stale domain "won't die".
+# Clears every scenario by default; scope to one with SCENARIO=. Infra-safe:
+# removes only local generated files (never touches AWS/TF state); the overlay
+# cluster.yml is regenerated from config/cluster.yml on the next run. For a
+# still-running --keep cluster the domain is re-derived from live TF state, so
+# this won't rotate a live deployment.
+#   make integration-clear-lease
+#   make integration-clear-lease SCENARIO=cluster-3-mixed-wasm
+integration-clear-lease:
+	@if [ -n "$(strip $(SCENARIO))" ]; then \
+		rm -f "integration-tests/.tf/$(SCENARIO)/.leased-domain" \
+		      "integration-tests/.tf/$(SCENARIO)/config/cluster.yml"; \
+		echo "cleared leased domain + stale overlay for '$(SCENARIO)'; next run re-leases from domains.yml"; \
+	else \
+		rm -f integration-tests/.tf/.domain-lease \
+		      integration-tests/.tf/*/.leased-domain \
+		      integration-tests/.tf/*/config/cluster.yml; \
+		echo "cleared ALL domain-lease state + stale overlays; next run re-leases from domains.yml"; \
+	fi
