@@ -114,7 +114,10 @@ make integration-benchmark
 # Firecracker-focused 3× mixed cluster (docker + firecracker only; cheaper):
 make integration-benchmark-fc
 
-# WASM-focused 3× mixed cluster (docker + wasm only; cheap t3 spot boxes):
+# WASM-focused 3× mixed cluster (wasm latency benchmark only; no Docker
+# sandbox creates). Provisions cluster-3-mixed-wasm, runs UC-94 with
+# AEROL_BENCH_RUNTIMES=wasm (UC-95 skips). Full integration coverage
+# (docker + wasm UCs) is `make integration-cluster-mixed-wasm`.
 make integration-benchmark-wasm
 
 # gVisor-focused 3× mixed cluster (docker + gvisor only; cheap t3 spot boxes):
@@ -138,20 +141,20 @@ make integration-benchmark-only              # re-run just the bench against it
 make integration-cluster-mixed-fc keep       # 3× mixed FC cluster
 make integration-benchmark-fc-only         # re-run UC-94/UC-95 against it
 
-make integration-cluster-mixed-wasm keep   # 3× mixed WASM cluster
-make integration-benchmark-wasm-only       # re-run UC-94/UC-95 against it
+make integration-cluster-mixed-wasm keep   # 3× mixed WASM cluster (full suite)
+make integration-benchmark-wasm-only       # re-run wasm bench against kept cluster
 
 make integration-cluster-mixed-gvisor keep # 3× mixed gVisor cluster
 make integration-benchmark-gvisor-only     # re-run UC-94/UC-95 against it
 
-# Narrow the UC-94 sweep:
+# Narrow the UC-94 sweep on hetero / mixed-fc / mixed-gvisor benches:
 AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
 # …or isolate firecracker latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-fc-only
-# …or isolate wasm latency (UC-95 skips when docker is excluded):
-AEROL_BENCH_RUNTIMES=wasm make integration-benchmark-wasm-only
 # …or isolate gvisor latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=gvisor make integration-benchmark-gvisor-only
+# …or add docker density/latency back on the wasm cluster:
+AEROL_BENCH_RUNTIMES=docker,wasm make integration-benchmark-wasm-only
 
 make integration-destroy                     # tear the kept cluster down
 make integration-destroy SCENARIO=cluster-3-mixed-fc
@@ -164,7 +167,11 @@ by `go test -json`); the `AEROL_BENCH_OUT` JSON adds the machine block.
 
 **WASM warm pool.** wasm scenarios boot with the warm-worker pool on so creates
 skip the cold module compile — CPython-on-wasm is ~10s cold on a t3.
-`make integration-benchmark-wasm` sets `AEROL_WASM_POOL_DEPTH` to
+`make integration-benchmark-wasm` provisions `cluster-3-mixed-wasm` and runs
+**wasm-only** benchmarks (`--bench-only`, `AEROL_BENCH_RUNTIMES=wasm`): UC-94
+times wasm creates, UC-95 skips, and no full-suite Docker sandboxes are created.
+Use `make integration-cluster-mixed-wasm` for the full docker+wasm integration
+suite. Pool depth defaults to
 `2` by default at provision time so UC-94 measures warm hits without exhausting
 small nodes; `make integration-cluster-mixed-wasm` (non-benchmark) also keeps
 depth `2`.

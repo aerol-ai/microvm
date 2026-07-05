@@ -96,6 +96,31 @@ func (s *Service) SetWasmModuleResolver(r WasmModuleResolver) {
 	s.wasmModuleResolver = r
 }
 
+// WasmWarmPoolNotifier registers a resolved module as a warm-pool refill
+// target. Production wiring passes *wasmpool.Pool; tests inject a recorder.
+type WasmWarmPoolNotifier interface {
+	NoteModule(digest, modulePath string)
+}
+
+// SetWasmWarmPool wires the warm pool into module registration.
+func (s *Service) SetWasmWarmPool(p WasmWarmPoolNotifier) {
+	s.wasmWarmPool = p
+}
+
+// noteWasmWarmModule marks digest/path as a warm-pool refill target.
+// Registration is the earliest moment a non-standard module is local and
+// validated; without this the pool only learns a digest inside Acquire, so
+// the first create on each node pays the full cold compile (~2.8s for the
+// bench module on t3.medium — the p90 tail in the 2026-07-05 UC-94 run).
+// Best-effort and idempotent: the pool dedupes repeat notes, and a nil pool
+// (SB_WASM_POOL_ENABLED=false) keeps registration a pure catalogue write.
+func (s *Service) noteWasmWarmModule(digest, modulePath string) {
+	if s.wasmWarmPool == nil || strings.TrimSpace(digest) == "" || strings.TrimSpace(modulePath) == "" {
+		return
+	}
+	s.wasmWarmPool.NoteModule(digest, modulePath)
+}
+
 // CreateWasmModule resolves module_ref on this host and upserts the catalogue.
 // Idempotent when the caller supplies an explicit id that already points at
 // the same module_ref; conflicting ids return ErrWasmModuleIDConflict.
@@ -114,6 +139,10 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 	if explicitID != "" {
 		if existing, err := s.store.GetWasmModule(ctx, explicitID); err == nil {
 			if strings.TrimSpace(existing.ModuleRef) == moduleRef {
+				// Re-registering an already-catalogued module re-arms the warm
+				// pool: pool targets live in memory, so after a daemon restart
+				// the catalogue row exists but the pool has forgotten it.
+				s.noteWasmWarmModule(existing.Digest, existing.ModulePath)
 				return wasmModuleFromRecord(existing), nil
 			}
 			return nil, store.ErrWasmModuleIDConflict
@@ -147,6 +176,7 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 	}
 	if existing, err := s.store.GetWasmModule(ctx, id); err == nil {
 		if strings.TrimSpace(existing.ModuleRef) == moduleRef {
+			s.noteWasmWarmModule(existing.Digest, existing.ModulePath)
 			return wasmModuleFromRecord(existing), nil
 		}
 		return nil, store.ErrWasmModuleIDConflict
@@ -176,6 +206,9 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 		return nil, err
 	}
 	s.invalidateWasmModuleInventoryCache()
+	// Note AFTER the catalogue write: a module the pool warms should always
+	// be one the catalogue can resolve, never the reverse.
+	s.noteWasmWarmModule(resolved.Digest, resolved.Path)
 	return wasmModuleFromRecord(rec), nil
 }
 

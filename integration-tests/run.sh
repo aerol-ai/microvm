@@ -5,6 +5,7 @@
 # Usage:
 #   integration-tests/run.sh <scenario> [--keep] [--prod-tls] [--metal-on-demand]
 #   integration-tests/run.sh <scenario> [--no-disruptive]  # skip node-kill UCs
+#   integration-tests/run.sh <scenario> [--bench-only]    # UC-94/UC-95 only (provision if needed)
 #   integration-tests/run.sh all       [flags]
 #
 # Scenarios: single-node | local-mode | cluster-3-mixed | cluster-3-mixed-fc |
@@ -845,6 +846,8 @@ bench_cluster_ready() {
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
   wait_for_health "$base_url" "$pat" 60
 }
+
+# run_bench_only re-runs UC-94/UC-95 against an already-provisioned scenario
 # (brought up with --keep). Loads API URL + domain from TF state so the operator
 # does not have to hand-export AEROL_BASE_URL / AEROL_CAPS / AEROL_PAT.
 run_bench_only() {
@@ -881,46 +884,8 @@ run_bench_only() {
   fi
 
   local bench_out="${AEROL_BENCH_OUT:-integration-tests/reports/${scenario}-bench.json}"
-  if [[ "$bench_out" != /* ]]; then
-    bench_out="${REPO_ROOT}/${bench_out}"
-  fi
-  mkdir -p "$(dirname "$bench_out")" "${HERE}/reports"
-  rm -f "$bench_out"
-
-  echo "=== bench-only against ${base_url} (artifact=${bench_out}) ===" >&2
-  if ! wait_for_health "$base_url" "$pat"; then
-    echo "scenario ${scenario}: API not healthy at ${base_url}" >&2
-    exit 2
-  fi
-  if [[ -n "$expected_members" ]]; then
-    wait_for_members "$base_url" "$pat" "$expected_members" || exit 2
-  fi
-
-  set +e
-  AEROL_BENCH=1 \
-  AEROL_BENCH_OUT="${bench_out}" \
-  AEROL_BASE_URL="$base_url" \
-  AEROL_PAT="$pat" \
-  AEROL_SCENARIO="$scenario" \
-  AEROL_CAPS="${caps_file}" \
-  AEROL_DOMAIN="${leased}" \
-  AEROL_EXPECTED_MEMBERS="${expected_members}" \
-  AEROL_WASM_MODULE_REF="${wasm_ref}" \
-    go test -tags=integration -count=1 -timeout=60m -v \
-      -run 'TestBench' \
-      ./integration-tests/suite/...
-  local test_rc=$?
-  set -e
-  if [[ "$test_rc" != "0" ]]; then
-    exit "$test_rc"
-  fi
-  if [[ -f "$bench_out" ]]; then
-    echo "bench artifact: ${bench_out}" >&2
-    print_bench_artifact_summary "$bench_out"
-  else
-    echo "bench tests finished but artifact missing at ${bench_out}" >&2
-    exit 2
-  fi
+  run_bench_tests "$scenario" "$base_url" "$pat" "$caps_file" "$leased" \
+    "$expected_members" "$wasm_ref" "$bench_out"
 }
 
 if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then

@@ -11,6 +11,7 @@ import (
 	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
@@ -143,6 +144,58 @@ func TestWireWasmRuntime_WithPoolAndCatalogue(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	cancel()
 	time.Sleep(20 * time.Millisecond)
+}
+
+type wiringStubResolver struct {
+	path   string
+	digest string
+}
+
+func (r wiringStubResolver) Resolve(_ context.Context, ref string) (*wasmmod.ResolvedModule, error) {
+	return &wasmmod.ResolvedModule{Ref: ref, Path: r.path, Digest: r.digest, SizeBytes: 4}, nil
+}
+
+// Registering a module through the service must land it in the wired pool's
+// refill targets — the registration-time NoteModule seam, so the first create
+// of a registered module hits a warm slot instead of a cold compile.
+func TestWireWasmRuntime_RegistrationNotesWarmPool(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	st := openTestStore(t)
+	svc := service.New(config.Config{EnableWasm: true}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+
+	modulesDir := t.TempDir()
+	modPath := filepath.Join(modulesDir, "mod.wasm")
+	if err := os.WriteFile(modPath, []byte("fake-wasm"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pool := wireWasmRuntime(ctx, config.Config{
+		WasmRunDir:             t.TempDir(),
+		WasmModulesDir:         modulesDir,
+		WasmPoolEnabled:        true,
+		WasmPoolDepthDefault:   1,
+		WasmPoolRefillInterval: time.Hour, // keep the refill loop quiet
+	}, testLogger(), svc, st)
+	if pool == nil {
+		t.Fatal("expected non-nil pool")
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	// Swap in a stub resolver: this test asserts the pool wiring, not
+	// resolution; the setter is the same one wireWasmRuntime used.
+	svc.SetWasmModuleResolver(wiringStubResolver{path: modPath, digest: "d-wired"})
+	if _, err := svc.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ModuleRef: "file://" + modPath}); err != nil {
+		t.Fatalf("CreateWasmModule: %v", err)
+	}
+
+	for _, target := range pool.ListTargets() {
+		if target.Digest == "d-wired" && target.Path == modPath {
+			return
+		}
+	}
+	t.Fatalf("registered module missing from pool targets %v", pool.ListTargets())
 }
 
 func TestWireWasmRuntime_NilStoreSkipsCatalogue(t *testing.T) {
