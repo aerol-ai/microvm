@@ -529,6 +529,11 @@ func (a *Admitter) Snapshot() Snapshot {
 	return snap
 }
 
+// CanAdmitRequest is a non-mutating admission probe for a specific shape.
+func (a *Admitter) CanAdmitRequest(req Request) (bool, []string) {
+	return a.dryRun(req)
+}
+
 // dryRun is Admit's check-only path — it returns whether a request would be
 // admitted right now and the reasons if not, without mutating state.
 func (a *Admitter) dryRun(req Request) (bool, []string) {

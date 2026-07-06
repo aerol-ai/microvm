@@ -868,6 +868,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		if isSandboxNameConflict(err, sandbox.Name) {
 			return ErrSandboxNameConflict
 		}
+		if isSandboxIDConflict(err, sandbox.ID) {
+			return models.ErrSandboxExists
+		}
 		return fmt.Errorf("insert sandbox: %w", err)
 	}
 	return nil
@@ -3857,6 +3860,16 @@ func isSandboxNameConflict(err error, name string) bool {
 		return true
 	}
 	return strings.TrimSpace(name) != "" && isSQLiteUniqueConstraint(err)
+}
+
+func isSandboxIDConflict(err error, id string) bool {
+	if strings.TrimSpace(id) == "" {
+		return false
+	}
+	if strings.Contains(err.Error(), models.ErrSandboxExists.Error()) {
+		return true
+	}
+	return isSQLiteUniqueConstraint(err)
 }
 
 var ErrNotFound = errors.New("sandbox not found")

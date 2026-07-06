@@ -272,6 +272,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Wire the managed create-gate. Under Noop() this is the allow-all admitter,
 	// so the open-source build never gates a create.
 	svc.SetFleetAdmitter(cp.Admitter)
+	dockerWarmPool := wireDockerWarmPool(ctx, cfg, logger, dockerClient, admitter)
+	if dockerWarmPool != nil {
+		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
+	}
 	// Start the standing-driven enforcement loop. EnforcementFor binds the loop
 	// to the service as its FleetController; under Noop() the factory yields a
 	// no-op whose Start does nothing. Runs on the daemon's cancellable ctx so it

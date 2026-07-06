@@ -62,10 +62,28 @@ type server struct {
 	mu           sync.RWMutex
 	allowedPorts map[int]struct{}
 
+	parkedMode  bool
+	adopted     bool
+	deferredCmd []string
+
 	sessions *sessions.Manager
 	daytona  *daytonaCompat
 	envd     *envdCompat
 	cloneGen *clonegen.Generation
+}
+
+func (s *server) servingRequests() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.parkedMode || s.adopted
+}
+
+func (s *server) adoptIdentity(sandboxID, token string) {
+	s.mu.Lock()
+	s.sandboxID = strings.TrimSpace(sandboxID)
+	s.authToken = strings.TrimSpace(token)
+	s.adopted = true
+	s.mu.Unlock()
 }
 
 func (s *server) setAllowedPorts(ports []int) {
@@ -111,12 +129,14 @@ func main() {
 		authToken:    strings.TrimSpace(os.Getenv("SB_TOOLBOX_TOKEN")),
 		port:         envInt("SB_TOOLBOX_PORT", 2280),
 		allowedPorts: map[int]struct{}{},
+		parkedMode:   strings.TrimSpace(os.Getenv("SB_POOL_PARKED")) == "1",
 		daytona:      newDaytonaCompat(),
 		envd:         newEnvdCompat(),
 		cloneGen:     clonegen.New(envString("SB_CLONE_GEN_PATH", clonegen.DefaultPath), logger),
 	}
 	readySocket := strings.TrimSpace(os.Getenv("SB_READY_SOCKET"))
 	readyNonce := strings.TrimSpace(os.Getenv("SB_READY_NONCE"))
+	bootstrapToken := srv.authToken
 	// Evict the token from the process env table so child processes spawned
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
 	os.Unsetenv("SB_TOOLBOX_TOKEN")
@@ -138,7 +158,11 @@ func main() {
 	}
 
 	if len(os.Args) > 1 {
-		startUserCommandFn(logger, os.Args[1:])
+		if srv.parkedMode {
+			srv.deferredCmd = append([]string{}, os.Args[1:]...)
+		} else {
+			startUserCommandFn(logger, os.Args[1:])
+		}
 	}
 
 	addr := fmt.Sprintf(":%d", srv.port)
@@ -155,7 +179,11 @@ func main() {
 
 	// Push readiness only after the HTTP listener is accepting — same contract
 	// as /health 200 when create returns started.
-	announceReady(logger, srv.sandboxID, srv.authToken, readyNonce, readySocket)
+	if srv.parkedMode {
+		go runParkedReadyHandshake(logger, srv, readySocket, bootstrapToken, readyNonce)
+	} else {
+		announceReady(logger, srv.sandboxID, srv.authToken, readyNonce, readySocket)
+	}
 
 	go forwardShutdownSignalsFn(logger, httpServer)
 
@@ -288,6 +316,11 @@ func startReaper(logger *slog.Logger) {
 func (s *server) routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = s.stripSandboxPrefix(r)
+
+		if !s.servingRequests() && r.URL.Path != "/health" {
+			writeError(w, http.StatusServiceUnavailable, "sandbox not adopted")
+			return
+		}
 
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/":
