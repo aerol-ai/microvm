@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -13,8 +14,19 @@ import (
 	"github.com/aerol-ai/microvm/pkg/readyproto"
 )
 
+func shortToolboxTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "tb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestRunParkedReadyHandshake(t *testing.T) {
-	ln, err := net.Listen("unix", t.TempDir()+"/host.sock")
+	sockPath := shortToolboxTestDir(t) + "/host.sock"
+	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,25 +42,32 @@ func TestRunParkedReadyHandshake(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		if _, err := readyproto.DecodeParked(bufio.NewReader(conn)); err != nil {
-			t.Errorf("parked: %v", err)
-			return
-		}
-		_ = readyproto.EncodeAdopt(conn, readyproto.AdoptFrame{
-			Event: readyproto.EventAdopt, SandboxID: "sb-1", Token: "real-tok", Nonce: "adopt-n",
-		})
-		sig, err := readyproto.Decode(bufio.NewReader(conn))
-		if err != nil || sig.SandboxID != "sb-1" {
-			t.Errorf("ready ack: %+v err=%v", sig, err)
-		}
+		runParkedReadyHandshake(slog.Default(), srv, sockPath, "boot-tok", "park-n")
 	}()
 
-	runParkedReadyHandshake(slog.Default(), srv, ln.Addr().String(), "boot-tok", "park-n")
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer conn.Close()
+
+	br := bufio.NewReader(conn)
+	if _, err := readyproto.DecodeParked(br); err != nil {
+		t.Fatalf("decode parked: %v", err)
+	}
+	if err := readyproto.EncodeAdopt(conn, readyproto.AdoptFrame{
+		Event: readyproto.EventAdopt, SandboxID: "sb-1", Token: "real-tok", Nonce: "adopt-n",
+	}); err != nil {
+		t.Fatalf("encode adopt: %v", err)
+	}
+	sig, err := readyproto.Decode(br)
+	if err != nil {
+		t.Fatalf("decode ready ack: %v", err)
+	}
+	if sig.SandboxID != "sb-1" || sig.Token != "real-tok" || sig.Nonce != "adopt-n" {
+		t.Fatalf("ready ack = %+v", sig)
+	}
+
 	wg.Wait()
 
 	if !srv.servingRequests() || srv.sandboxID != "sb-1" {
