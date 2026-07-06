@@ -112,7 +112,8 @@ you (`run.sh` passes the parent environment through to `go test`):
 # Full hetero run (docker + firecracker + gvisor + wasm):
 make integration-benchmark
 
-# Docker-focused 3× mixed cluster (docker latency + density only; cheapest):
+# Docker-focused 3× mixed cluster (full suite + docker bench; writes
+# cluster-3-mixed-docker.json/.md and cluster-3-mixed-docker-bench.json):
 make integration-benchmark-docker
 
 # Firecracker-focused 3× mixed cluster (docker + firecracker only; cheaper):
@@ -174,15 +175,23 @@ Percentiles + the density ceiling also print as `bench[...]` log lines (captured
 by `go test -json`); the `AEROL_BENCH_OUT` JSON adds the machine block.
 
 **Docker benchmark path.** `make integration-benchmark-docker` provisions
-`cluster-3-mixed-docker` and runs **docker-only** benchmarks (`--bench-only`,
-`AEROL_BENCH_RUNTIMES=docker`): UC-94 times docker creates and UC-95 probes
-fleet density. Artifacts land as `integration-tests/reports/cluster-3-mixed-docker-bench.json`
-and `cluster-3-mixed-docker-bench.md`. The full UC matrix report
-(`cluster-3-mixed-docker.json` / `.md`) comes from
-`make integration-cluster-mixed-docker`, not the benchmark target — same split as
-wasm (`integration-benchmark-wasm` → `*-bench.json`; full suite → `*.json`/`.md`).
-Use `make integration-cluster-mixed` for the non-benchmark docker integration
-suite (placement, forwarding, domain/TLS UCs).
+`cluster-3-mixed-docker`, runs the **full integration suite** with
+`AEROL_BENCH_RUNTIMES=docker` (same shape as gvisor/fc benchmarks), and writes:
+- `integration-tests/reports/cluster-3-mixed-docker.json` + `.md` — full UC matrix
+- `integration-tests/reports/cluster-3-mixed-docker-bench.json` + `-bench.md` — UC-94/UC-95 timings
+
+Re-run only the bench against a kept cluster with `make integration-benchmark-docker-only`.
+Use `make integration-cluster-mixed-docker` when you want the full suite **without**
+the benchmark (UC-94/UC-95 skip unless `AEROL_BENCH=1`).
+
+**Failure logs** (`cluster-3-mixed-docker-failure-logs.txt`) are collected only when
+a run **fails** or infra is inconclusive — not on a green pass (same as every other
+scenario). Your bench run passed UC-94/UC-95, so no failure-log file was expected.
+To pull daemon logs from a kept cluster any time:
+
+```bash
+make integration-collect-logs SCENARIO=cluster-3-mixed-docker
+```
 
 **WASM warm pool.** wasm scenarios boot with the warm-worker pool on so creates
 skip the cold module compile — CPython-on-wasm is ~10s cold on a t3.

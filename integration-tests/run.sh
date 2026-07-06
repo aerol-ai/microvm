@@ -949,8 +949,18 @@ run_bench_only() {
   fi
 
   local bench_out="${AEROL_BENCH_OUT:-integration-tests/reports/${scenario}-bench.json}"
+  local caps_domain
+  caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file" 2>/dev/null || echo true)
+  set +e
   run_bench_tests "$scenario" "$base_url" "$pat" "$caps_file" "$leased" \
     "$expected_members" "$wasm_ref" "$bench_out"
+  local test_rc=$?
+  set -e
+  if [[ "$test_rc" != "0" ]]; then
+    collect_failure_logs "$scenario" "$caps_domain" "$targets" "$pat"
+    return "$test_rc"
+  fi
+  return 0
 }
 
 if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
