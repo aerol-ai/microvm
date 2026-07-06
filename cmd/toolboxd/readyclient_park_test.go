@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"log/slog"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,33 +27,38 @@ func TestParkedReadyOnConn(t *testing.T) {
 	}
 
 	guest, host := net.Pipe()
-	defer guest.Close()
-	defer host.Close()
+	t.Cleanup(func() { _ = guest.Close(); _ = host.Close() })
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// Host (sandboxd) side runs first so it is blocked on read before the guest
+	// writes parked. No conn deadline in parkedReadyOnConn — the guest blocks
+	// until the host responds, which avoids 3s timeouts when CI is slow to
+	// schedule goroutines.
+	hostDone := make(chan error, 1)
 	go func() {
-		defer wg.Done()
 		br := bufio.NewReader(host)
 		if _, err := readyproto.DecodeParked(br); err != nil {
-			t.Errorf("decode parked: %v", err)
+			hostDone <- err
 			return
 		}
 		if err := readyproto.EncodeAdopt(host, readyproto.AdoptFrame{
 			Event: readyproto.EventAdopt, SandboxID: "sb-1", Token: "real-tok", Nonce: "adopt-n",
 		}); err != nil {
-			t.Errorf("encode adopt: %v", err)
+			hostDone <- err
 			return
 		}
 		if _, err := readyproto.Decode(br); err != nil {
-			t.Errorf("decode ready: %v", err)
+			hostDone <- err
+			return
 		}
+		hostDone <- nil
 	}()
 
 	if err := parkedReadyOnConn(slog.Default(), srv, guest, "boot-tok", "park-n"); err != nil {
-		t.Fatalf("parkedReadyOnConn: %v", err)
+		t.Fatalf("guest: %v", err)
 	}
-	wg.Wait()
+	if err := <-hostDone; err != nil {
+		t.Fatalf("host: %v", err)
+	}
 
 	if !srv.servingRequests() || srv.sandboxID != "sb-1" {
 		t.Fatalf("server not adopted: id=%q serving=%v", srv.sandboxID, srv.servingRequests())

@@ -1,9 +1,37 @@
 package readyproto
 
 import (
+	"net"
 	"strings"
 	"testing"
 )
+
+func TestDecodeParkedFromOpenConn(t *testing.T) {
+	// Regression: readLine must stop at '\n', not EOF. Persistent park sockets
+	// stay open for the adopt frame after the parked hello.
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		if err := EncodeParked(client, ParkedSignal{Token: "t", Nonce: "n"}); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	got, err := DecodeParked(server)
+	if err != nil {
+		t.Fatalf("decode parked: %v", err)
+	}
+	if got.Token != "t" || got.Nonce != "n" {
+		t.Fatalf("got = %+v", got)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("encode parked: %v", err)
+	}
+}
 
 func TestDecodeParkedRejectsBadEvents(t *testing.T) {
 	cases := []string{

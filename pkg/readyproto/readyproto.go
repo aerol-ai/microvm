@@ -3,7 +3,7 @@
 package readyproto
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -157,12 +157,22 @@ func DecodeAdopt(r io.Reader) (AdoptFrame, error) {
 }
 
 func readLine(r io.Reader) (string, error) {
-	limited := io.LimitReader(r, MaxLineBytes+1)
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(limited); err != nil {
-		return "", err
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReader(r)
 	}
-	line := strings.TrimSpace(buf.String())
+	raw, err := br.ReadBytes('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) && len(raw) > 0 {
+			// Tolerate a final line without a trailing newline (tests, short reads).
+		} else {
+			return "", err
+		}
+	}
+	if len(raw) > MaxLineBytes+1 {
+		return "", fmt.Errorf("readyproto: line exceeds %d bytes", MaxLineBytes)
+	}
+	line := strings.TrimSpace(string(raw))
 	if line == "" {
 		return "", errors.New("readyproto: empty line")
 	}

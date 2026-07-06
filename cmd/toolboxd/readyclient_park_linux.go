@@ -30,14 +30,16 @@ func runParkedReadyHandshake(logger *slog.Logger, srv *server, socketPath, boots
 	}
 	defer conn.Close()
 
+	// Bound the full handshake on the real socket; tests call parkedReadyOnConn
+	// directly without a deadline so a paired reader can run on loaded CI.
+	_ = conn.SetDeadline(time.Now().Add(readyDialTimeout))
 	if err := parkedReadyOnConn(logger, srv, conn, bootstrapToken, parkNonce); err != nil {
 		logger.Warn("park ready handshake failed", "error", err)
 	}
 }
 
 // parkedReadyOnConn runs the guest-side parked→adopt→ready exchange on an
-// already-connected unix socket. Extracted for unit tests (net.Pipe) so we
-// don't depend on Accept/dial scheduling on loaded CI hosts.
+// already-connected unix socket. The caller sets conn deadlines when needed.
 func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstrapToken, parkNonce string) error {
 	if logger == nil || srv == nil || conn == nil {
 		return fmt.Errorf("park handshake: missing logger, server, or connection")
@@ -57,7 +59,6 @@ func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstra
 		return fmt.Errorf("parked write: %w", err)
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(readyDialTimeout))
 	frame, err := readyproto.DecodeAdopt(bufio.NewReader(conn))
 	if err != nil {
 		return fmt.Errorf("adopt read: %w", err)
