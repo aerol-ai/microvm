@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -29,21 +30,37 @@ func runParkedReadyHandshake(logger *slog.Logger, srv *server, socketPath, boots
 	}
 	defer conn.Close()
 
+	if err := parkedReadyOnConn(logger, srv, conn, bootstrapToken, parkNonce); err != nil {
+		logger.Warn("park ready handshake failed", "error", err)
+	}
+}
+
+// parkedReadyOnConn runs the guest-side parked→adopt→ready exchange on an
+// already-connected unix socket. Extracted for unit tests (net.Pipe) so we
+// don't depend on Accept/dial scheduling on loaded CI hosts.
+func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstrapToken, parkNonce string) error {
+	if logger == nil || srv == nil || conn == nil {
+		return fmt.Errorf("park handshake: missing logger, server, or connection")
+	}
+	bootstrapToken = strings.TrimSpace(bootstrapToken)
+	parkNonce = strings.TrimSpace(parkNonce)
+	if bootstrapToken == "" || parkNonce == "" {
+		return fmt.Errorf("park handshake: bootstrap token and nonce are required")
+	}
+
 	if err := readyproto.EncodeParked(conn, readyproto.ParkedSignal{
 		Event:        readyproto.EventParked,
 		Token:        bootstrapToken,
 		Nonce:        parkNonce,
 		AgentVersion: version.Version,
 	}); err != nil {
-		logger.Warn("park ready socket write failed", "error", err)
-		return
+		return fmt.Errorf("parked write: %w", err)
 	}
 
 	_ = conn.SetDeadline(time.Now().Add(readyDialTimeout))
 	frame, err := readyproto.DecodeAdopt(bufio.NewReader(conn))
 	if err != nil {
-		logger.Warn("park adopt frame read failed", "error", err)
-		return
+		return fmt.Errorf("adopt read: %w", err)
 	}
 
 	srv.adoptIdentity(frame.SandboxID, frame.Token)
@@ -55,8 +72,7 @@ func runParkedReadyHandshake(logger *slog.Logger, srv *server, socketPath, boots
 		Nonce:        frame.Nonce,
 		AgentVersion: version.Version,
 	}); err != nil {
-		logger.Warn("park adopt ack failed", "error", err)
-		return
+		return fmt.Errorf("ready ack: %w", err)
 	}
 
 	srv.mu.RLock()
@@ -65,4 +81,5 @@ func runParkedReadyHandshake(logger *slog.Logger, srv *server, socketPath, boots
 	if len(deferred) > 0 {
 		startUserCommandFn(logger, deferred)
 	}
+	return nil
 }
