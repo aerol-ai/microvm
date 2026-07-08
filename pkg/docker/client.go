@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -69,6 +70,8 @@ type Client struct {
 	pullSlots          chan struct{}
 	pullBackoff        time.Duration
 	pullFailures       map[string]imagePullFailure
+	warmPool           *dockerpool.Pool
+	parkDiskGB         int
 	// Mirror configuration: zero value disables rewriting and the pull
 	// path behaves exactly as it did before AOCR mirror support landed.
 	// Set via ConfigureMirror after construction; main() is responsible
@@ -138,6 +141,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		pullSlots:          pullSlots,
 		pullBackoff:        cfg.ImagePullFailureBackoff,
 		pullFailures:       make(map[string]imagePullFailure),
+		parkDiskGB:         models.DefaultDiskGB,
 	}, nil
 }
 
@@ -350,6 +354,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	ociRuntime, err := models.ResolveOCIRuntime(effectiveRuntime)
 	if err != nil {
 		return nil, err
+	}
+	if c.warmPool != nil {
+		if warm, warmErr := c.tryWarmAdopt(ctx, req, sandboxID, toolboxToken, hostMounts, effectiveRuntime); warmErr == nil {
+			return warm, nil
+		} else if errors.Is(warmErr, ErrSandboxContainerExists) {
+			return nil, warmErr
+		}
 	}
 
 	// Locally-built images (BuildImage tags them with content-addressed
@@ -1442,6 +1453,7 @@ func containerStatus(inspect containerInspect) models.SandboxStatus {
 }
 
 type imageInspect struct {
+	ID     string `json:"Id"`
 	Config struct {
 		WorkingDir string   `json:"WorkingDir"`
 		Entrypoint []string `json:"Entrypoint"`

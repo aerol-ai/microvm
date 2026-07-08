@@ -1190,9 +1190,16 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	state, err := s.docker.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
+		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {
+			return resp, nil
+		} else if !errors.Is(dupErr, err) {
+			releaseAdmission()
+			return nil, dupErr
+		}
 		releaseAdmission()
 		return nil, err
 	}
+	s.releaseAdoptedParkReservation(state)
 
 	// Seal the registry creds (if any) BEFORE building the row so a marshal
 	// or encrypt error doesn't leave a half-created sandbox: we already passed
@@ -1282,6 +1289,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
+		if resp, dupErr := s.handleDuplicateStoreCreate(ctx, sandbox.ID, err); dupErr == nil {
+			return resp, nil
+		} else if !errors.Is(dupErr, err) {
+			releaseAdmission()
+			return nil, dupErr
+		}
 		releaseAdmission()
 		return nil, err
 	}

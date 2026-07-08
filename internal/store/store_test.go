@@ -220,8 +220,8 @@ func TestStoreCases(t *testing.T) {
 				if err := st.Create(ctx, sandbox); err != nil {
 					t.Fatalf("Create() error = %v", err)
 				}
-				if err := st.Create(ctx, sandbox); err == nil {
-					t.Fatalf("expected duplicate Create() error")
+				if err := st.Create(ctx, sandbox); !errors.Is(err, models.ErrSandboxExists) {
+					t.Fatalf("Create() duplicate error = %v, want ErrSandboxExists", err)
 				}
 			},
 		},

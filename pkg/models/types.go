@@ -61,6 +61,9 @@ type SandboxRuntimeState struct {
 	// (codex P1). Empty when resolution did not yield a local path.
 	ModulePath      string
 	ModuleSizeBytes int64
+	// AdoptedParkID is non-empty when Create adopted a warm-pool slot; the
+	// service uses it to release the park capacity reservation (§4).
+	AdoptedParkID string
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and
@@ -104,6 +107,10 @@ const (
 // "kata" hits this path. Surfaced through the API as a 4xx so operators get
 // an actionable error instead of a generic 500.
 var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
+
+// ErrSandboxExists is returned when a sandbox row with the same primary key
+// already exists. Distinct from name conflicts (store.ErrSandboxNameConflict).
+var ErrSandboxExists = errors.New("sandbox already exists")
 
 // ErrSnapshotCorrupt is returned when a runtime snapshot fails checksum
 // verification at load time — the on-disk artifact does not match the

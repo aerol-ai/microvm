@@ -23,6 +23,35 @@ func TestDockerReadySocketEffectiveGating(t *testing.T) {
 		}
 	})
 
+	t.Run("pool_enabled_single_node", func(t *testing.T) {
+		t.Setenv("SB_ENABLE_CLUSTER", "false")
+		t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "true")
+		t.Setenv("SB_DOCKER_POOL_ENABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.DockerReadySocketEffective() {
+			t.Fatal("expected push enabled when docker warm pool is on")
+		}
+		if !cfg.DockerPoolEffective() {
+			t.Fatal("expected pool effective")
+		}
+	})
+
+	t.Run("pool_disabled_without_ready_socket", func(t *testing.T) {
+		t.Setenv("SB_ENABLE_CLUSTER", "false")
+		t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "false")
+		t.Setenv("SB_DOCKER_POOL_ENABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DockerPoolEffective() {
+			t.Fatal("pool requires ready socket knob")
+		}
+	})
+
 	t.Run("cluster_enabled_by_default", func(t *testing.T) {
 		t.Setenv("SB_ENABLE_CLUSTER", "true")
 		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")

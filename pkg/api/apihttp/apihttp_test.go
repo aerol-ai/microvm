@@ -284,3 +284,13 @@ func TestWriteStoreAwareError_WrappedSandboxNameConflict(t *testing.T) {
 		t.Errorf("status = %d, want 409 for wrapped ErrSandboxNameConflict", code)
 	}
 }
+
+func TestWriteStoreAwareError_SandboxExists(t *testing.T) {
+	code, msg := storeAwareErr(t, models.ErrSandboxExists)
+	if code != http.StatusConflict {
+		t.Errorf("status = %d, want 409 Conflict", code)
+	}
+	if msg == "" {
+		t.Error("error body must carry the conflict message")
+	}
+}

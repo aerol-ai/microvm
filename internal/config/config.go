@@ -309,9 +309,23 @@ type Config struct {
 	DockerReadySocketEnabled    bool
 	DockerReadinessPollInitial  time.Duration
 	DockerReadinessPollMax      time.Duration
-	ReconcileInterval           time.Duration
-	NetstatsPollInterval        time.Duration
-	UploadMaxBytes              int64
+	// DockerPoolEnabled gates the warm Docker container pool (default off in v1).
+	// SB_DOCKER_POOL_ENABLED.
+	DockerPoolEnabled bool
+	// DockerPoolDepth is warm slots per image key. SB_DOCKER_POOL_DEPTH.
+	DockerPoolDepth int
+	// DockerPoolImages is a comma-separated list of pinned warm targets.
+	// SB_DOCKER_POOL_IMAGES.
+	DockerPoolImages []string
+	// DockerPoolMaxImages caps miss-driven warm targets (LRU). SB_DOCKER_POOL_MAX_IMAGES.
+	DockerPoolMaxImages int
+	// DockerPoolIdleTTL reaps idle self-warmed targets. SB_DOCKER_POOL_IDLE_TTL.
+	DockerPoolIdleTTL time.Duration
+	// DockerPoolRefillInterval tops up the warm pool. SB_DOCKER_POOL_REFILL_INTERVAL.
+	DockerPoolRefillInterval time.Duration
+	ReconcileInterval        time.Duration
+	NetstatsPollInterval     time.Duration
+	UploadMaxBytes           int64
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -1270,6 +1284,12 @@ func Load() (Config, error) {
 		DockerReadySocketEnabled:   getEnvBool("SB_DOCKER_READY_SOCKET_ENABLED", true),
 		DockerReadinessPollInitial: getEnvDuration("SB_DOCKER_READINESS_POLL_INITIAL", 20*time.Millisecond),
 		DockerReadinessPollMax:     getEnvDuration("SB_DOCKER_READINESS_POLL_MAX", 300*time.Millisecond),
+		DockerPoolEnabled:          getEnvBool("SB_DOCKER_POOL_ENABLED", false),
+		DockerPoolDepth:            getEnvInt("SB_DOCKER_POOL_DEPTH", 2),
+		DockerPoolImages:           parseImageGCWhitelist(getEnv("SB_DOCKER_POOL_IMAGES", "")),
+		DockerPoolMaxImages:        getEnvInt("SB_DOCKER_POOL_MAX_IMAGES", 8),
+		DockerPoolIdleTTL:          getEnvDuration("SB_DOCKER_POOL_IDLE_TTL", 15*time.Minute),
+		DockerPoolRefillInterval:   getEnvDuration("SB_DOCKER_POOL_REFILL_INTERVAL", 5*time.Second),
 		ReconcileInterval:          getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:       getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:             int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
@@ -1953,11 +1973,16 @@ func (c Config) CreateSandboxTimeout() time.Duration {
 	return time.Duration(c.CreateSandboxTimeoutSeconds) * time.Second
 }
 
-// DockerReadySocketEffective is true only on cluster deployments where sandboxd
-// controls the host layout. Self-install and single-node hosts keep the safer
-// health-poll path even when SB_DOCKER_READY_SOCKET_ENABLED defaults true.
+// DockerReadySocketEffective is true when push-based readiness is active.
+// Cluster hosts enable by default; single-node hosts enable when the docker
+// warm pool is on (adoption depends on the held socket).
 func (c Config) DockerReadySocketEffective() bool {
-	return c.DockerReadySocketEnabled && c.EnableCluster
+	return c.DockerReadySocketEnabled && (c.EnableCluster || c.DockerPoolEnabled)
+}
+
+// DockerPoolEffective is true when the warm pool should run.
+func (c Config) DockerPoolEffective() bool {
+	return c.DockerPoolEnabled && c.DockerReadySocketEnabled
 }
 
 // DockerReadySocketDir is the host directory for per-create readiness sockets.

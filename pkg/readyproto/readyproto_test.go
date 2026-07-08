@@ -53,6 +53,44 @@ func TestDecodeUnknownFieldsTolerated(t *testing.T) {
 	}
 }
 
+func TestParkedAdoptRoundTrip(t *testing.T) {
+	parked := ParkedSignal{
+		Event:        EventParked,
+		Token:        "park-tok",
+		Nonce:        "park-nonce",
+		AgentVersion: "1.0.0",
+	}
+	var buf bytes.Buffer
+	if err := EncodeParked(&buf, parked); err != nil {
+		t.Fatalf("encode parked: %v", err)
+	}
+	gotParked, err := DecodeParked(&buf)
+	if err != nil {
+		t.Fatalf("decode parked: %v", err)
+	}
+	if gotParked != parked {
+		t.Fatalf("parked round-trip = %+v, want %+v", gotParked, parked)
+	}
+
+	adopt := AdoptFrame{
+		Event:     EventAdopt,
+		SandboxID: "sb-123",
+		Token:     "adopt-tok",
+		Nonce:     "adopt-nonce",
+	}
+	buf.Reset()
+	if err := EncodeAdopt(&buf, adopt); err != nil {
+		t.Fatalf("encode adopt: %v", err)
+	}
+	gotAdopt, err := DecodeAdopt(&buf)
+	if err != nil {
+		t.Fatalf("decode adopt: %v", err)
+	}
+	if gotAdopt != adopt {
+		t.Fatalf("adopt round-trip = %+v, want %+v", gotAdopt, adopt)
+	}
+}
+
 func TestDecodeRejectsEmptyValues(t *testing.T) {
 	cases := []string{
 		`{"event":"ready","sandbox_id":"","token":"t","nonce":"n"}`,

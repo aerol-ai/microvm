@@ -100,6 +100,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, "sandbox name already in use")
 		return
 	}
+	if errors.Is(err, models.ErrSandboxExists) {
+		WriteError(w, http.StatusConflict, "sandbox already exists")
+		return
+	}
 	if errors.Is(err, store.ErrSnapshotNameConflict) {
 		WriteError(w, http.StatusConflict, "snapshot name already in use")
 		return
