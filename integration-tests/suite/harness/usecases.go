@@ -58,6 +58,13 @@ const (
 	// — currently cluster-hetero — run the benchmark; everywhere else the UCs
 	// skip (not-applicable) instead of inflating cost on a normal pass.
 	CapBenchmark Capability = "benchmark"
+	// CapDockerPool is consumed by run.sh's config overlay, not by any UC's
+	// Requires: it flips docker.pool.enabled in the scenario's cluster.yml so
+	// UC-94 measures the warm-hit create path. It is deliberately separate
+	// from CapDocker because each parked slot holds a default-shaped capacity
+	// reservation, lowering the UC-95 density ceiling — scenarios opt in
+	// (plans/docker-warm-pool.md §9 documents the adjusted gates).
+	CapDockerPool Capability = "docker-pool"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -117,9 +124,9 @@ var Registry = []UseCase{
 
 	// D. Networking & ingress
 	{ID: "UC-29", Title: "Expose port returns preview URL", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-30", Title: "Preview URL reachable over HTTPS", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
+	{ID: "UC-30", Title: "Preview URL reachable over HTTPS after expose_port", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-31", Title: "Expose port idempotent (same URL)", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-32", Title: "Default <id>.<domain> reachable", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
+	{ID: "UC-32", Title: "Default <id>.<domain> unreachable until expose_port opts in", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-33", Title: "Unexpose port -> route gone", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-34", Title: "L4 raw TCP host-port reachable", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-35", Title: "Add custom domain -> DNS instructions", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains, CapExternalDNSZone}, Implemented: true},

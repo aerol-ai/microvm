@@ -16,7 +16,8 @@ import (
 )
 
 // httpServerSandbox spins up a sandbox running a trivial HTTP server on 8080,
-// the shared fixture for the expose/reach use cases.
+// the shared fixture for expose/idempotent/custom-domain use cases that do not
+// depend on the private-by-default ingress contract.
 func httpServerSandbox(t *testing.T, c *harness.Client) *microvm.Sandbox {
 	t.Helper()
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
@@ -26,6 +27,34 @@ func httpServerSandbox(t *testing.T, c *harness.Client) *microvm.Sandbox {
 	})
 	waitRunning(t, sb)
 	return sb
+}
+
+// privateHTTPServerSandbox creates a default-private sandbox (no
+// allow_public_traffic opt-in) with an HTTP server on 8080. Use for ingress
+// reachability UCs that must exercise the expose_port opt-in lever.
+func privateHTTPServerSandbox(t *testing.T, c *harness.Client) *microvm.Sandbox {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+		Image:            "python:3.12-alpine",
+		Name:             harness.UniqueName(sc, t),
+		ContainerCommand: []string{"python3", "-m", "http.server", "8080"},
+	})
+	if err != nil {
+		t.Fatalf("create private sandbox: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().Destroy(cctx, sb.ID)
+	})
+	waitRunning(t, sb)
+	return sb
+}
+
+func sandboxRootURL(domain, sandboxID string) string {
+	return fmt.Sprintf("https://%s.%s", sandboxID, domain)
 }
 
 // reachableHTTP polls url until it answers with <500 (route live) or the
@@ -54,6 +83,27 @@ func reachableHTTP(url string, timeout time.Duration) (int, error) {
 	return lastCode, fmt.Errorf("never reachable (last code %d, last err %v)", lastCode, lastErr)
 }
 
+// assertUnreachableHTTP polls url for window and fails if it ever answers <500.
+func assertUnreachableHTTP(t *testing.T, url string, window time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := http.DefaultClient.Do(req)
+		cancel()
+		if err != nil {
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode < 500 {
+			t.Fatalf("URL %s answered %d during private window, want unreachable", url, resp.StatusCode)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
 // UC-31 — Exposing the same port twice returns the same URL (idempotent).
 func TestExposePortIdempotent(t *testing.T) {
 	harness.Require(t, sc, "UC-31")
@@ -75,18 +125,38 @@ func TestExposePortIdempotent(t *testing.T) {
 	}
 }
 
-// UC-32 — The default <id>.<domain> URL routes to the sandbox over HTTPS.
+// UC-32 — A default-private create has no live root ingress; expose_port is
+// the opt-in lever that installs the <id>.<domain> route and makes it reachable.
 func TestDefaultURLReachable(t *testing.T) {
 	harness.Require(t, sc, "UC-32")
-	c := client(t)
-	sb := httpServerSandbox(t, c)
-	if sb.PublicURL == "" {
-		t.Fatal("sandbox has empty public_url")
+	if sc.Domain == "" {
+		t.Fatal("scenario lacks AEROL_DOMAIN for root URL assertions")
 	}
-	if code, err := reachableHTTP(sb.PublicURL, 90*time.Second); err != nil {
-		t.Fatalf("default URL %s: %v", sb.PublicURL, err)
+	c := client(t)
+	sb := privateHTTPServerSandbox(t, c)
+	if sb.PublicURL != "" {
+		t.Fatalf("public_url = %q, want empty for a default (private) create", sb.PublicURL)
+	}
+
+	root := sandboxRootURL(sc.Domain, sb.ID)
+	assertUnreachableHTTP(t, root, 20*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := sb.ExposePort(ctx, 8080); err != nil {
+		t.Fatalf("expose port: %v", err)
+	}
+	flipped, err := c.SDK().Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("get after expose: %v", err)
+	}
+	if flipped.PublicURL == "" {
+		t.Fatal("sandbox public_url still empty after expose; the flip must persist")
+	}
+	if code, err := reachableHTTP(flipped.PublicURL, 90*time.Second); err != nil {
+		t.Fatalf("default URL %s after expose: %v", flipped.PublicURL, err)
 	} else {
-		t.Logf("default URL answered %d", code)
+		t.Logf("default URL answered %d after expose_port opt-in", code)
 	}
 }
 

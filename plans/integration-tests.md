@@ -135,9 +135,9 @@ signal.
 
 ### D. Networking & ingress (UC-29 … UC-38)
 - **UC-29** Expose port returns a preview URL.
-- **UC-30** `https://<id>-<port>.<domain>` is reachable and serves the app.
+- **UC-30** `https://<id>-<port>.<domain>` is reachable after `expose_port` opts a default-private sandbox in.
 - **UC-31** Expose port is idempotent (same URL on repeat call — pr-review rule #1).
-- **UC-32** Default `https://<id>.<domain>` preview URL reachable.
+- **UC-32** Default `https://<id>.<domain>` is unreachable on a private create; becomes reachable after `expose_port`.
 - **UC-33** Unexpose port → route gone (`404`/connection refused).
 - **UC-34** L4 / raw TCP host-port reachability check.
 - **UC-35** Add custom domain → DNS instructions returned. **Requires a dedicated

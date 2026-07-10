@@ -37,22 +37,21 @@ func TestExposePortReturnsURL(t *testing.T) {
 	t.Logf("preview URL: %s", res.PublicURL)
 }
 
-// UC-30 — the preview URL is actually reachable over HTTPS (domain scenarios).
+// UC-30 — after expose_port on a default-private sandbox, the per-port preview
+// URL is actually reachable over HTTPS (domain scenarios).
 func TestPreviewURLReachable(t *testing.T) {
 	harness.Require(t, sc, "UC-30")
 	c := client(t)
-	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Image:            "python:3.12-alpine",
-		Name:             harness.UniqueName(sc, t),
-		ContainerCommand: []string{"python3", "-m", "http.server", "8080"},
-	})
-	waitRunning(t, sb)
+	sb := privateHTTPServerSandbox(t, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	res, err := sb.ExposePort(ctx, 8080)
 	if err != nil {
 		t.Fatalf("expose port: %v", err)
+	}
+	if res.PublicURL == "" {
+		t.Fatal("expose returned empty public_url")
 	}
 
 	// Routing + DNS + TLS can lag a few seconds behind the API response. Poll

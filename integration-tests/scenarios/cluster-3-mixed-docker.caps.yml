@@ -13,5 +13,10 @@ capabilities:
   # Opt UC-94/UC-95 in for make integration-benchmark-docker (docker latency +
   # density only; the make target passes AEROL_BENCH_RUNTIMES=docker and --bench-only).
   - benchmark
+  # Enable the docker warm container pool (park + adopt) so UC-94 measures the
+  # warm-hit path (<=100ms server p50 gate). Costs capacity: depth × pinned
+  # images parked slots per node hold default-shaped reservations, so the
+  # UC-95 density ceiling drops by that budget (plans/docker-warm-pool.md §9).
+  - docker-pool
 
 expected_members: 3

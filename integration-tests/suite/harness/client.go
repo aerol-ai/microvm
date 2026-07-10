@@ -107,10 +107,10 @@ func (c *Client) NewSandbox(t *testing.T, opts sdktypes.CreateSandboxOptions) *m
 		opts.Image = DefaultImage
 	}
 	// The server create default is private: no <id>.<domain> route until the
-	// first expose_port flips the sandbox public. The suite's UCs exercise the
-	// root URL straight after create, so the harness opts in at create unless
-	// a test sets the flag itself; a privacy-default UC should call
-	// c.SDK().Create directly with the flag omitted.
+	// first expose_port flips the sandbox public. Most UCs only need a running
+	// sandbox (exec/files/sessions), so the harness opts in at create unless a
+	// test sets the flag itself. Networking UCs that assert the private-default
+	// contract (UC-30/32/97) call c.SDK().Create directly with the flag omitted.
 	if opts.AllowPublicTraffic == nil {
 		public := true
 		opts.AllowPublicTraffic = &public
