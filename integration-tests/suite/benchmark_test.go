@@ -43,6 +43,11 @@ var benchRuntimes = []struct {
 	cap     harness.Capability
 }{
 	{"docker", harness.CapDocker},
+	// docker-cold is the same docker runtime forced past the warm container
+	// pool (see benchCreateOptions), so a pool-enabled scenario reports the
+	// cold floor next to the warm-hit row instead of losing it. On a
+	// pool-less scenario the two rows converge — cheap redundancy.
+	{"docker-cold", harness.CapDocker},
 	{"firecracker", harness.CapFirecracker},
 	{"gvisor", harness.CapGvisor},
 	{"wasm", harness.CapWasm},
@@ -136,6 +141,15 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 		if spec.templateID != "" {
 			opts.TemplateID = spec.templateID
 		}
+	case "docker-cold":
+		// The row name is docker-cold; the create itself is a plain docker
+		// create forced past the warm container pool: any Env entry makes
+		// poolEligible reject it, so every sample measures the cold engine
+		// path. The pause-netns pool still applies when enabled — it IS the
+		// cold path's accelerator, and this row is how its win is measured.
+		opts.Runtime = "docker"
+		opts.Image = harness.DefaultImage
+		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
 	default:
 		opts.Image = harness.DefaultImage
 	}

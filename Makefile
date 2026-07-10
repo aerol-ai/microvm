@@ -165,7 +165,10 @@ integration-benchmark-only:
 #   make integration-benchmark-docker DOCKER_BENCH_OUT=/tmp/docker-bench.json
 DOCKER_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-docker-bench.json
 DOCKER_BENCH_SAMPLES ?= 10
-DOCKER_BENCH_RUNTIMES ?= docker
+# docker-cold is the pool-ineligible variant of the same runtime: with the
+# warm pool on, the docker row measures warm hits and docker-cold keeps the
+# cold floor visible next to it (and shows the pause-netns pool's effect).
+DOCKER_BENCH_RUNTIMES ?= docker,docker-cold
 integration-benchmark-docker:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(DOCKER_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(DOCKER_BENCH_SAMPLES) \
