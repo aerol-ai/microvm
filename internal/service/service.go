@@ -30,6 +30,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -1269,6 +1270,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// syncSandboxPublicRoute is redundant here — crash residue is swept by
 	// the reconcile pass (cleanupPublicTrafficDisabledIngressState).
 	if sandboxAllowsPublicTraffic(sandbox) {
+		caddyStart := time.Now()
 		if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 			// UpsertSandboxRoute is non-atomic in domain mode: it installs the
 			// main route and then a per-custom-domain leaf route in a loop, so a
@@ -1282,8 +1284,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			releaseAdmission()
 			return nil, err
 		}
+		createtiming.From(ctx).RecordStage("svc_caddy", time.Since(caddyStart))
 	}
 
+	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
@@ -1316,10 +1320,18 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// Push any pending GC deadline for this image forward — a fresh
 	// create proves the image is back in active use, so the next
 	// destroy should restart the full TTL clock instead of inheriting
-	// the previous destroy's old timestamp. UPDATE-only: never inserts
-	// a row, so images that have never been GC-scheduled stay out of
-	// the ledger. Best-effort: an error here doesn't break the create.
-	s.refreshPendingImageGCOnUse(ctx, sandbox.Image)
+	// the previous destroy's old timestamp. Deferred off the response
+	// path: the helper is best-effort by design, and on the
+	// single-writer SQLite connection an inline UPDATE would queue the
+	// response behind unrelated writes. WithoutCancel because the
+	// request ctx dies when the response is written, and aborting the
+	// UPDATE there would turn "best-effort" into "never" on a busy
+	// host; the timeout keeps the detached write bounded.
+	go func(image string) {
+		gcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		s.refreshPendingImageGCOnUse(gcCtx, image)
+	}(sandbox.Image)
 
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
@@ -1357,6 +1369,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordStage("svc_persist", time.Since(persistStart))
 	return &models.CreateSandboxResponse{
 		Sandbox:       *stored,
 		SSHPrivateKey: privateKeyPEM,
