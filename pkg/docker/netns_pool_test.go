@@ -18,11 +18,15 @@ import (
 // live container table so create/rename/remove/list/inspect stay consistent
 // across calls, which the pool's reconcile and adopt paths depend on.
 type netnsFakeDaemon struct {
-	mu         sync.Mutex
-	nextID     int
-	containers map[string]*netnsFakeContainer // by ID
-	startErr   bool
-	requests   []string
+	mu           sync.Mutex
+	nextID       int
+	containers   map[string]*netnsFakeContainer // by ID
+	startErr     bool
+	listErr      bool
+	imageMissing bool // pause image absent until a pull lands
+	noIP         bool // created containers report no IP
+	pullCalls    int
+	requests     []string
 }
 
 type netnsFakeContainer struct {
@@ -74,7 +78,14 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 		d.requests = append(d.requests, r.Method+" "+p)
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(p, "/images/"):
+			if d.imageMissing {
+				return textResponse(http.StatusNotFound, `{"message":"No such image"}`), nil
+			}
 			return jsonResponse(http.StatusOK, map[string]any{"Id": "pauseimg"}), nil
+		case r.Method == http.MethodPost && p == "/images/create":
+			d.pullCalls++
+			d.imageMissing = false
+			return textResponse(http.StatusOK, "{}"), nil
 		case r.Method == http.MethodPost && p == "/containers/create":
 			var body struct {
 				Labels     map[string]string `json:"Labels"`
@@ -89,6 +100,9 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			// Docker realism: a container joined to another's netns has no
 			// NetworkSettings of its own — the IP belongs to the owner.
 			if strings.HasPrefix(body.HostConfig.NetworkMode, "container:") {
+				ip = ""
+			}
+			if d.noIP {
 				ip = ""
 			}
 			d.containers[id] = &netnsFakeContainer{
@@ -117,6 +131,9 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			c.name = r.URL.Query().Get("name")
 			return textResponse(http.StatusNoContent, ""), nil
 		case r.Method == http.MethodGet && p == "/containers/json":
+			if d.listErr {
+				return textResponse(http.StatusInternalServerError, "list failed"), nil
+			}
 			out := make([]map[string]any, 0, len(d.containers))
 			for _, c := range d.containers {
 				out = append(out, map[string]any{
@@ -364,5 +381,107 @@ func TestDestroyRemovesAdoptedPause(t *testing.T) {
 	}
 	if d.byRef("sb-ctr") != nil {
 		t.Fatal("Destroy did not remove the sandbox container")
+	}
+}
+
+func TestNewNetnsPoolDefaults(t *testing.T) {
+	p := newNetnsPool(slog.Default(), nil, 0, "  pause:img  ", 0)
+	if p.depth != 4 {
+		t.Fatalf("depth = %d, want default 4", p.depth)
+	}
+	if p.interval != 2*time.Second {
+		t.Fatalf("interval = %v, want default 2s", p.interval)
+	}
+	if p.pauseImage != "pause:img" {
+		t.Fatalf("pauseImage = %q, want trimmed", p.pauseImage)
+	}
+}
+
+// A fresh host has no pause image: spawnPause must pull it once (on the
+// refill goroutine, off the create path) instead of failing every tick —
+// the same self-warming contract the park pool's spawner has.
+func TestNetnsSpawnPausePullsMissingImage(t *testing.T) {
+	d := newNetnsFakeDaemon()
+	d.imageMissing = true
+	c := newNetnsClient(t, d)
+	p := newTestNetnsPool(c, 1)
+
+	slot, err := p.spawnPause(context.Background())
+	if err != nil {
+		t.Fatalf("spawnPause: %v", err)
+	}
+	if slot.containerID == "" || slot.ip == "" {
+		t.Fatalf("slot = %+v", slot)
+	}
+	if d.pullCalls != 1 {
+		t.Fatalf("pull calls = %d, want 1", d.pullCalls)
+	}
+}
+
+// Failure after the pause container exists must remove it — a leaked pause
+// holds a bridge IP and pollutes the next reconcile's inventory.
+func TestNetnsSpawnPauseFailureRemovesContainer(t *testing.T) {
+	t.Run("start fails", func(t *testing.T) {
+		d := newNetnsFakeDaemon()
+		d.startErr = true
+		c := newNetnsClient(t, d)
+		p := newTestNetnsPool(c, 1)
+
+		if _, err := p.spawnPause(context.Background()); err == nil ||
+			!strings.Contains(err.Error(), "start pause container") {
+			t.Fatalf("err = %v, want start failure", err)
+		}
+		if n := len(d.containers); n != 0 {
+			t.Fatalf("leaked pause containers: %d", n)
+		}
+	})
+
+	t.Run("no IP", func(t *testing.T) {
+		d := newNetnsFakeDaemon()
+		d.noIP = true
+		c := newNetnsClient(t, d)
+		p := newTestNetnsPool(c, 1)
+
+		if _, err := p.spawnPause(context.Background()); err == nil ||
+			!strings.Contains(err.Error(), "no IP") {
+			t.Fatalf("err = %v, want no-IP failure", err)
+		}
+		if n := len(d.containers); n != 0 {
+			t.Fatalf("leaked pause containers: %d", n)
+		}
+	})
+}
+
+// Reconcile must keep an adopted pause whose sandbox is alive (that netns is
+// in use!) and must survive a transient list failure without touching state.
+func TestNetnsPoolReconcileKeepsLiveAdoptedAndSurvivesListError(t *testing.T) {
+	d := newNetnsFakeDaemon()
+	// Adopted pause + its living sandbox container.
+	d.add(&netnsFakeContainer{
+		id: "pause-live", name: netnsAdoptedName("sb-live"), running: true,
+		ip: "172.30.0.8", labels: map[string]string{netnsPauseLabelKey: "true"},
+	})
+	d.add(&netnsFakeContainer{id: "cid-live", name: "sb-live", running: true, ip: "172.30.0.9"})
+	c := newNetnsClient(t, d)
+	p := newTestNetnsPool(c, 1)
+
+	p.reconcile(context.Background())
+	if d.byRef("pause-live") == nil {
+		t.Fatal("reconcile reaped the pause of a LIVE sandbox — its netns is in use")
+	}
+	if p.size() != 0 {
+		t.Fatalf("adopted pause must not enter the free list: size=%d", p.size())
+	}
+
+	d.listErr = true
+	p.reconcile(context.Background()) // must not panic or mutate
+	if d.byRef("pause-live") == nil || p.size() != 0 {
+		t.Fatal("state changed under a list error")
+	}
+}
+
+func TestContainerSummaryNameEmpty(t *testing.T) {
+	if got := containerSummaryName(containerSummary{}); got != "" {
+		t.Fatalf("name = %q, want empty for nameless summary", got)
 	}
 }

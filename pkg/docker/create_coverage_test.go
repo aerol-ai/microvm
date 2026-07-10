@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -489,5 +490,55 @@ func TestCreate_HostConfigInlinesResourceLimits(t *testing.T) {
 	}
 	if body.HostConfig["StorageOpt"] == nil {
 		t.Fatalf("create body missing StorageOpt: %v", body.HostConfig)
+	}
+}
+
+// The pure cold path (no warm pool, no netns pool) is the bench baseline:
+// its Server-Timing attribution must name every engine phase and must NOT
+// emit pool stages for pools that aren't wired — a phantom docker_pool
+// entry would make bench artifacts claim pool involvement on plain nodes.
+func TestCreate_ColdPathStageAttribution(t *testing.T) {
+	d := &fakeDaemon{
+		t: t,
+		imageInspect: func() *http.Response {
+			return jsonResponse(http.StatusOK, map[string]any{
+				"Id":     "sha256:img1",
+				"Config": map[string]any{"WorkingDir": "/", "Entrypoint": []string{}, "Cmd": []string{"/bin/sh"}},
+			})
+		},
+		create: func() *http.Response { return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid"}) },
+		start:  func() *http.Response { return textResponse(http.StatusNoContent, "") },
+	}
+	c := newCreateClient(t, d, true, nil)
+
+	ctx, timing := createtiming.With(context.Background())
+	rt, err := c.Create(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+	if rt.Status != models.SandboxStatusStarted {
+		t.Fatalf("runtime = %+v", rt)
+	}
+
+	stages := map[string]createtiming.Stage{}
+	for _, st := range timing.Stages() {
+		stages[st.Name] = st
+	}
+	for _, want := range []string{"docker_image", "docker_create", "docker_start"} {
+		if _, ok := stages[want]; !ok {
+			t.Fatalf("cold create missing %s stage (stages=%v)", want, stages)
+		}
+	}
+	if st := stages["docker_image"]; st.Desc != "local" {
+		t.Fatalf("docker_image desc = %q, want local (image was present)", st.Desc)
+	}
+	for _, phantom := range []string{"docker_pool", "docker_netns"} {
+		if _, ok := stages[phantom]; ok {
+			t.Fatalf("cold create emitted %s stage with no pool wired (stages=%v)", phantom, stages)
+		}
+	}
+	// Readiness on the plain cold path is the health poll (no push socket).
+	if timing.Source != "health" {
+		t.Fatalf("readiness source = %q, want health", timing.Source)
 	}
 }
