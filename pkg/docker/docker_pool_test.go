@@ -755,3 +755,194 @@ func TestUpdateContainerResourcesInlineBody(t *testing.T) {
 		t.Fatalf("update body missing inline Memory/CpuQuota: %v", body)
 	}
 }
+
+// The cold fallback is the safety net under every warm-pool defect: when an
+// adopt burns its slot, Create must still deliver a working sandbox AND the
+// Server-Timing must tell the truth about what happened — an adopt_failed
+// stage followed by the cold docker_create stage, not a disguised miss.
+func TestCreate_WarmAdoptFailureFallsBackToColdCreate(t *testing.T) {
+	d := &fakeDaemon{
+		t: t,
+		imageInspect: func() *http.Response {
+			return jsonResponse(http.StatusOK, map[string]any{
+				"Id":     "sha256:img1",
+				"Config": map[string]any{"WorkingDir": "/", "Entrypoint": []string{}, "Cmd": []string{"/bin/sh"}},
+			})
+		},
+		create: func() *http.Response { return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid-cold"}) },
+		start:  func() *http.Response { return textResponse(http.StatusNoContent, "") },
+	}
+	readyDir, err := os.MkdirTemp("", "rd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(readyDir) })
+
+	pool := dockerpool.New(slogDefault())
+	var released []string
+	pool.SetParkReleaser(func(slotID string) { released = append(released, slotID) })
+	c := newCreateClient(t, d, true, func(c *Client) {
+		c.defaultRuntime = models.RuntimeDocker
+		c.readyEnabled = true
+		c.readyDir = readyDir
+		c.SetWarmPool(pool)
+	})
+
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+	key := dockerpool.KeyFromRequest(req, models.RuntimeDocker)
+	// badParkHandle fails adoptParked before any engine call; ImageID must
+	// match the inspect response or Acquire discards the slot as stale and
+	// the create records a plain miss instead of an adopt failure.
+	pool.RecordLoaded(&dockerpool.ParkedSlot{
+		ID:          "park-burn",
+		ContainerID: "cid-park",
+		ImageID:     "sha256:img1",
+		Key:         key,
+		Handle:      badParkHandle{},
+	})
+
+	ctx, timing := createtiming.With(context.Background())
+	rt, err := c.Create(ctx, req, "sb", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create() = %v, want cold fallback success", err)
+	}
+	// AdoptedParkID empty proves the runtime came from the cold path, not
+	// the burned slot (the inspect stub reports its own container id).
+	if rt.AdoptedParkID != "" || rt.Status != models.SandboxStatusStarted {
+		t.Fatalf("runtime = %+v, want cold-created container", rt)
+	}
+	if len(released) != 1 || released[0] != "park-burn" {
+		t.Fatalf("burned slot reservation not released: %v", released)
+	}
+	if d.removeCalls != 1 {
+		t.Fatalf("burned park container not destroyed: removeCalls=%d", d.removeCalls)
+	}
+	stages := map[string]string{}
+	for _, st := range timing.Stages() {
+		stages[st.Name] = st.Desc
+	}
+	if stages["docker_pool"] != "adopt_failed" {
+		t.Fatalf("docker_pool desc = %q, want adopt_failed (stages=%v)", stages["docker_pool"], stages)
+	}
+	if _, cold := stages["docker_create"]; !cold {
+		t.Fatalf("cold docker_create stage missing after adopt failure (stages=%v)", stages)
+	}
+}
+
+// A pool miss must run the cold path untouched AND register the miss-driven
+// self-warm target under the same canonical keystring a boot-time pin would
+// use — that collision is what makes the next create a warm hit.
+func TestCreate_PoolMissRunsColdAndRegistersTarget(t *testing.T) {
+	d := &fakeDaemon{
+		t: t,
+		imageInspect: func() *http.Response {
+			return jsonResponse(http.StatusOK, map[string]any{
+				"Id":     "sha256:img1",
+				"Config": map[string]any{"WorkingDir": "/", "Entrypoint": []string{}, "Cmd": []string{"/bin/sh"}},
+			})
+		},
+		create: func() *http.Response { return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid-cold"}) },
+		start:  func() *http.Response { return textResponse(http.StatusNoContent, "") },
+	}
+	readyDir, err := os.MkdirTemp("", "rd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(readyDir) })
+
+	pool := dockerpool.New(slogDefault())
+	c := newCreateClient(t, d, true, func(c *Client) {
+		c.defaultRuntime = models.RuntimeDocker
+		c.readyEnabled = true
+		c.readyDir = readyDir
+		c.SetWarmPool(pool)
+	})
+
+	ctx, timing := createtiming.With(context.Background())
+	rt, err := c.Create(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+	if rt.AdoptedParkID != "" || rt.Status != models.SandboxStatusStarted {
+		t.Fatalf("runtime = %+v, want cold-created container", rt)
+	}
+	stages := map[string]string{}
+	for _, st := range timing.Stages() {
+		stages[st.Name] = st.Desc
+	}
+	if stages["docker_pool"] != "miss" {
+		t.Fatalf("docker_pool desc = %q, want miss (stages=%v)", stages["docker_pool"], stages)
+	}
+	if _, cold := stages["docker_create"]; !cold {
+		t.Fatalf("cold docker_create stage missing on miss (stages=%v)", stages)
+	}
+	targets := pool.ListTargets()
+	if len(targets) != 1 {
+		t.Fatalf("targets = %d, want 1 miss-driven target", len(targets))
+	}
+	pinned := dockerpool.Key{Image: "alpine:3.20", Runtime: models.RuntimeDocker}
+	if targets[0].KeyString() != pinned.KeyString() {
+		t.Fatalf("miss target key %q does not collide with pin key %q", targets[0].KeyString(), pinned.KeyString())
+	}
+}
+
+// A duplicate-create rename conflict must surface ErrSandboxContainerExists
+// from Create itself — NOT fall through to a cold create, which would race
+// the concurrent duplicate for the same container name (pr-review §1).
+func TestCreate_RenameConflictSkipsColdFallback(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	d.rename = func() *http.Response {
+		return textResponse(http.StatusConflict, `name "/sb-dup" is already in use`)
+	}
+	c := newPoolClient(t, d, nil)
+	pool := dockerpool.New(slogDefault())
+	c.SetWarmPool(pool)
+
+	pl, err := NewParkedListener(shortParkTestDir(t), "park-dup2", "tok", "nonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pl.Close() })
+	closeGuest := make(chan struct{})
+	t.Cleanup(func() { close(closeGuest) })
+	go func() {
+		conn, err := net.Dial("unix", pl.HostSocketPath())
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = readyproto.EncodeParked(conn, readyproto.ParkedSignal{
+			Event: readyproto.EventParked, Token: "tok", Nonce: "nonce",
+		})
+		<-closeGuest
+	}()
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := pl.WaitParked(waitCtx); err != nil {
+		t.Fatalf("WaitParked: %v", err)
+	}
+
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+	key := dockerpool.KeyFromRequest(req, models.RuntimeDocker)
+	pool.RecordLoaded(&dockerpool.ParkedSlot{
+		ID:          "park-dup2",
+		ContainerID: "cid-park",
+		ImageID:     "sha256:img1",
+		Key:         key,
+		Handle:      pl,
+	})
+
+	_, err = c.Create(context.Background(), req, "sb-dup", "tok", nil)
+	if !errors.Is(err, ErrSandboxContainerExists) {
+		t.Fatalf("Create() = %v, want ErrSandboxContainerExists", err)
+	}
+	if len(d.createBodies) != 0 {
+		t.Fatalf("cold create attempted despite duplicate-name conflict: %d bodies", len(d.createBodies))
+	}
+	if d.removeCalls != 0 {
+		t.Fatalf("pristine slot destroyed on rename conflict: removeCalls=%d", d.removeCalls)
+	}
+	if !pool.HasReady(key) {
+		t.Fatal("slot not returned to the pool after rename conflict")
+	}
+}
