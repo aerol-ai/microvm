@@ -182,21 +182,24 @@ func TestExecStream_WebsocketRunWithPTY(t *testing.T) {
 	if err := conn.WriteMessage(websocket.BinaryMessage, []byte("pty-input\n")); err != nil {
 		t.Fatalf("write PTY stdin frame: %v", err)
 	}
-	// Exercise PTY control handling: resize and signal branches.
+	// Exercise the PTY resize control branch up front; the signal branch is
+	// exercised below, only AFTER the echo has been observed — TERM racing
+	// cat's first read kills the process before any stdout frame exists,
+	// which is exactly the flake this ordering prevents on slow CI runners.
 	_ = conn.WriteJSON(map[string]any{"type": "resize", "cols": 100, "rows": 40})
-	_ = conn.WriteJSON(map[string]any{"type": "signal", "signal": "TERM"})
 
 	seenStdout := false
 	seenExit := false
-	for i := 0; i < 12 && !seenExit; i++ {
+	for i := 0; i < 24 && !seenExit; i++ {
 		msgType, payload, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
 		switch msgType {
 		case websocket.BinaryMessage:
-			if len(payload) > 1 && payload[0] == streamFramePrefixStdout && strings.Contains(string(payload[1:]), "pty-input") {
+			if !seenStdout && len(payload) > 1 && payload[0] == streamFramePrefixStdout && strings.Contains(string(payload[1:]), "pty-input") {
 				seenStdout = true
+				_ = conn.WriteJSON(map[string]any{"type": "signal", "signal": "TERM"})
 			}
 		case websocket.TextMessage:
 			var ctrl execStreamControlOut
