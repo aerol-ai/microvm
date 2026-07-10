@@ -144,25 +144,10 @@ func main() {
 
 	startReaperFn(logger)
 
-	sessionsMgr, err := sessionsNewFn(logger, sessions.Config{
-		SandboxID:          srv.sandboxID,
-		RecordingDir:       envString("SB_RECORDING_DIR", "/var/lib/toolboxd/recordings"),
-		RecordingRetention: envDuration("SB_RECORDING_RETENTION", 7*24*time.Hour),
-		BufferBytes:        envInt("SB_SESSION_BUFFER_BYTES", 1<<20),
-	})
-	if err != nil {
-		logger.Warn("session manager init failed; sessions disabled", "error", err)
-	} else {
-		srv.sessions = sessionsMgr
-		defer sessionsMgr.Close()
-	}
-
-	if len(os.Args) > 1 {
-		if srv.parkedMode {
-			srv.deferredCmd = append([]string{}, os.Args[1:]...)
-		} else {
-			startUserCommandFn(logger, os.Args[1:])
-		}
+	// The parked-mode handshake goroutine reads deferredCmd, so it must be
+	// assigned before the announce below starts that goroutine.
+	if len(os.Args) > 1 && srv.parkedMode {
+		srv.deferredCmd = append([]string{}, os.Args[1:]...)
 	}
 
 	addr := fmt.Sprintf(":%d", srv.port)
@@ -177,12 +162,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Push readiness only after the HTTP listener is accepting — same contract
-	// as /health 200 when create returns started.
+	// Snapshot identity fields before the parked handshake goroutine exists:
+	// adoptIdentity mutates them under srv.mu, and the sessions.Config read
+	// below would otherwise race. Park-time ID is also the correct one for
+	// the recordings dir — that matches the pre-reorder behavior, where the
+	// session manager was constructed before adoption could happen.
+	bootSandboxID := srv.sandboxID
+
+	// Push readiness as soon as the port is bound. Connections arriving
+	// before srv.Serve are held in the kernel accept backlog and served the
+	// moment Serve starts, so a bound listener satisfies the same contract
+	// as /health 200: a client that connects will get a response. Everything
+	// between here and Serve (session dir mkdir, user-command fork/exec) is
+	// deliberately kept off the time-to-ready path.
 	if srv.parkedMode {
 		go runParkedReadyHandshake(logger, srv, readySocket, bootstrapToken, readyNonce)
 	} else {
 		announceReady(logger, srv.sandboxID, srv.authToken, readyNonce, readySocket)
+	}
+
+	sessionsMgr, err := sessionsNewFn(logger, sessions.Config{
+		SandboxID:          bootSandboxID,
+		RecordingDir:       envString("SB_RECORDING_DIR", "/var/lib/toolboxd/recordings"),
+		RecordingRetention: envDuration("SB_RECORDING_RETENTION", 7*24*time.Hour),
+		BufferBytes:        envInt("SB_SESSION_BUFFER_BYTES", 1<<20),
+	})
+	if err != nil {
+		logger.Warn("session manager init failed; sessions disabled", "error", err)
+	} else {
+		srv.sessions = sessionsMgr
+		defer sessionsMgr.Close()
+	}
+
+	if len(os.Args) > 1 && !srv.parkedMode {
+		startUserCommandFn(logger, os.Args[1:])
 	}
 
 	go forwardShutdownSignalsFn(logger, httpServer)
