@@ -323,9 +323,27 @@ type Config struct {
 	DockerPoolIdleTTL time.Duration
 	// DockerPoolRefillInterval tops up the warm pool. SB_DOCKER_POOL_REFILL_INTERVAL.
 	DockerPoolRefillInterval time.Duration
-	ReconcileInterval        time.Duration
-	NetstatsPollInterval     time.Duration
-	UploadMaxBytes           int64
+	// DockerNetnsPoolEnabled gates the image-agnostic pause-netns warm pool:
+	// pre-started pause containers each hold a fully-built network namespace
+	// (veth, bridge attach, IP, iptables), and a create of ANY image adopts
+	// one via NetworkMode container:<id>, moving dockerd's per-container
+	// network setup off the boot path. Complements — does not replace — the
+	// per-image warm pool: this one helps every cold create regardless of
+	// image spread. Default off. SB_DOCKER_NETNS_POOL_ENABLED.
+	DockerNetnsPoolEnabled bool
+	// DockerNetnsPoolDepth is the number of pre-built pause slots kept warm.
+	// SB_DOCKER_NETNS_POOL_DEPTH.
+	DockerNetnsPoolDepth int
+	// DockerNetnsPoolPauseImage is the image for the netns-holding pause
+	// containers. Pulled lazily by the refill loop, never on the create path.
+	// SB_DOCKER_NETNS_POOL_PAUSE_IMAGE.
+	DockerNetnsPoolPauseImage string
+	// DockerNetnsPoolRefillInterval drives the refill/reap loop.
+	// SB_DOCKER_NETNS_POOL_REFILL_INTERVAL.
+	DockerNetnsPoolRefillInterval time.Duration
+	ReconcileInterval             time.Duration
+	NetstatsPollInterval          time.Duration
+	UploadMaxBytes                int64
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -1276,30 +1294,34 @@ func Load() (Config, error) {
 			NFSExport:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_EXPORT")),
 			NFSOptions:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_OPTIONS")),
 		},
-		LogLevel:                   strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
-		ShutdownTimeout:            getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
-		HTTPClientTimeout:          getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
-		DockerRuntimeWaitTimeout:   getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
-		ToolboxWaitTimeout:         getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
-		DockerReadySocketEnabled:   getEnvBool("SB_DOCKER_READY_SOCKET_ENABLED", true),
-		DockerReadinessPollInitial: getEnvDuration("SB_DOCKER_READINESS_POLL_INITIAL", 20*time.Millisecond),
-		DockerReadinessPollMax:     getEnvDuration("SB_DOCKER_READINESS_POLL_MAX", 300*time.Millisecond),
-		DockerPoolEnabled:          getEnvBool("SB_DOCKER_POOL_ENABLED", false),
-		DockerPoolDepth:            getEnvInt("SB_DOCKER_POOL_DEPTH", 2),
-		DockerPoolImages:           parseImageGCWhitelist(getEnv("SB_DOCKER_POOL_IMAGES", "")),
-		DockerPoolMaxImages:        getEnvInt("SB_DOCKER_POOL_MAX_IMAGES", 8),
-		DockerPoolIdleTTL:          getEnvDuration("SB_DOCKER_POOL_IDLE_TTL", 15*time.Minute),
-		DockerPoolRefillInterval:   getEnvDuration("SB_DOCKER_POOL_REFILL_INTERVAL", 5*time.Second),
-		ReconcileInterval:          getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
-		NetstatsPollInterval:       getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
-		UploadMaxBytes:             int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
-		OTELMetricsEnabled:         getEnvBool("SB_OTEL_METRICS_ENABLED", false),
-		OTELMetricsEndpoint:        firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
-		OTELMetricsInterval:        getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
-		OTELTracesEnabled:          getEnvBool("SB_OTEL_TRACES_ENABLED", false),
-		OTELTracesEndpoint:         firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
-		OTELTracesSampleRatio:      getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
-		OTELServiceName:            getEnv("OTEL_SERVICE_NAME", "sandboxd"),
+		LogLevel:                      strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
+		ShutdownTimeout:               getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
+		HTTPClientTimeout:             getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
+		DockerRuntimeWaitTimeout:      getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
+		ToolboxWaitTimeout:            getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
+		DockerReadySocketEnabled:      getEnvBool("SB_DOCKER_READY_SOCKET_ENABLED", true),
+		DockerReadinessPollInitial:    getEnvDuration("SB_DOCKER_READINESS_POLL_INITIAL", 20*time.Millisecond),
+		DockerReadinessPollMax:        getEnvDuration("SB_DOCKER_READINESS_POLL_MAX", 300*time.Millisecond),
+		DockerPoolEnabled:             getEnvBool("SB_DOCKER_POOL_ENABLED", false),
+		DockerPoolDepth:               getEnvInt("SB_DOCKER_POOL_DEPTH", 2),
+		DockerPoolImages:              parseImageGCWhitelist(getEnv("SB_DOCKER_POOL_IMAGES", "")),
+		DockerPoolMaxImages:           getEnvInt("SB_DOCKER_POOL_MAX_IMAGES", 8),
+		DockerPoolIdleTTL:             getEnvDuration("SB_DOCKER_POOL_IDLE_TTL", 15*time.Minute),
+		DockerPoolRefillInterval:      getEnvDuration("SB_DOCKER_POOL_REFILL_INTERVAL", 5*time.Second),
+		DockerNetnsPoolEnabled:        getEnvBool("SB_DOCKER_NETNS_POOL_ENABLED", false),
+		DockerNetnsPoolDepth:          getEnvInt("SB_DOCKER_NETNS_POOL_DEPTH", 4),
+		DockerNetnsPoolPauseImage:     getEnv("SB_DOCKER_NETNS_POOL_PAUSE_IMAGE", "registry.k8s.io/pause:3.10"),
+		DockerNetnsPoolRefillInterval: getEnvDuration("SB_DOCKER_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
+		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
+		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
+		UploadMaxBytes:                int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		OTELMetricsEnabled:            getEnvBool("SB_OTEL_METRICS_ENABLED", false),
+		OTELMetricsEndpoint:           firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
+		OTELMetricsInterval:           getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		OTELTracesEnabled:             getEnvBool("SB_OTEL_TRACES_ENABLED", false),
+		OTELTracesEndpoint:            firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+		OTELTracesSampleRatio:         getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
+		OTELServiceName:               getEnv("OTEL_SERVICE_NAME", "sandboxd"),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),

@@ -71,6 +71,7 @@ type Client struct {
 	pullBackoff        time.Duration
 	pullFailures       map[string]imagePullFailure
 	warmPool           *dockerpool.Pool
+	netnsPool          *NetnsPool
 	parkDiskGB         int
 	// Mirror configuration: zero value disables rewriting and the pull
 	// path behaves exactly as it did before AOCR mirror support landed.
@@ -479,12 +480,39 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		binds = append(binds, "/dev/dri:/dev/dri")
 	}
 
+	// Pause-netns adopt: join a prepaid network namespace instead of paying
+	// dockerd's veth/bridge/IPAM/iptables setup on the boot path. Works for
+	// any image (the pause slot carries only the netns). Gated to the plain
+	// docker runtime: gVisor's runsc manages its own network sandboxing and
+	// joining a foreign netns is not a supported shape there.
+	var adoptedNetns netnsSlot
+	var netnsAdopted, keepNetnsPause bool
+	if c.netnsPool != nil && effectiveRuntime == models.RuntimeDocker {
+		netnsStart := time.Now()
+		adoptedNetns, netnsAdopted = c.netnsPool.Adopt(ctx, sandboxID)
+		desc := "miss"
+		if netnsAdopted {
+			desc = "hit"
+		}
+		CreateTimingFrom(ctx).RecordStageDesc("docker_netns", time.Since(netnsStart), desc)
+	}
+	defer func() {
+		// The adopted slot already carries this sandbox's name, so on any
+		// failure below it must be removed, not returned to the pool — a
+		// rename back would race a concurrent duplicate create.
+		if netnsAdopted && !keepNetnsPause {
+			c.netnsPool.ReleaseAdopted(context.WithoutCancel(ctx), adoptedNetns)
+		}
+	}()
+
 	hostConfig := map[string]any{
 		"Privileged": c.privileged,
 		"Binds":      binds,
 	}
 
-	if c.network != "" && c.network != "bridge" {
+	if netnsAdopted {
+		hostConfig["NetworkMode"] = "container:" + adoptedNetns.containerID
+	} else if c.network != "" && c.network != "bridge" {
 		hostConfig["NetworkMode"] = c.network
 	}
 
@@ -647,6 +675,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	runtime.SandboxID = sandboxID
 	keepReadySocket = true
+	keepNetnsPause = true
 	return runtime, nil
 }
 
@@ -675,6 +704,10 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return nil
 	}
 	RemoveReadySocketsForSandbox(c.readyDir, sandbox.ID)
+	// Unconditional (not gated on the pool being enabled) so pause slots
+	// adopted before a config flip still get cleaned up; a sandbox that
+	// never had one is a swallowed 404.
+	c.removeNetnsPauseForSandbox(ctx, sandbox.ID)
 	containerRef := strings.TrimSpace(sandbox.ContainerID)
 	if containerRef == "" {
 		return errors.New("sandbox container ID is not available")
@@ -848,7 +881,7 @@ func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRunt
 	return &SandboxRuntime{
 		SandboxID:   sandboxIDFromContainerName(inspect.Name),
 		ContainerID: inspect.ID,
-		ContainerIP: getContainerIP(inspect, c.network),
+		ContainerIP: c.resolveContainerIP(ctx, inspect),
 		Status:      containerStatus(inspect),
 	}, nil
 }
@@ -880,7 +913,7 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 		runtime := &SandboxRuntime{
 			SandboxID:   sandboxIDFromContainerName(inspect.Name),
 			ContainerID: inspect.ID,
-			ContainerIP: getContainerIP(inspect, c.network),
+			ContainerIP: c.resolveContainerIP(ctx, inspect),
 			Status:      containerStatus(inspect),
 		}
 		if runtime.SandboxID == "" || isParkedSandboxID(runtime.SandboxID) {
@@ -1243,7 +1276,7 @@ func (c *Client) waitForContainerRunning(ctx context.Context, containerRef strin
 		if err != nil {
 			return "", containerInspect{}, fmt.Errorf("inspect container: %w", err)
 		}
-		containerIP := getContainerIP(inspect, c.network)
+		containerIP := c.resolveContainerIP(ctx, inspect)
 		if inspect.State != nil && inspect.State.Running && containerIP != "" {
 			return containerIP, inspect, nil
 		}
@@ -1443,6 +1476,24 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query url.V
 	return response, nil
 }
 
+// resolveContainerIP returns the sandbox-reachable IP for an inspected
+// container, following a container:<ref> NetworkMode to the netns owner
+// (an adopted pause slot from the netns pool): a joined container's own
+// NetworkSettings are always empty, so its IP lives on the owner.
+func (c *Client) resolveContainerIP(ctx context.Context, inspect containerInspect) string {
+	if ip := getContainerIP(inspect, c.network); ip != "" {
+		return ip
+	}
+	if ref, ok := strings.CutPrefix(inspect.HostConfig.NetworkMode, "container:"); ok && strings.TrimSpace(ref) != "" {
+		owner, err := c.inspectContainer(ctx, strings.TrimSpace(ref))
+		if err != nil {
+			return ""
+		}
+		return getContainerIP(owner, c.network)
+	}
+	return ""
+}
+
 func getContainerIP(inspect containerInspect, preferredNetwork string) string {
 	if preferredNetwork != "" {
 		if endpoint, ok := inspect.NetworkSettings.Networks[preferredNetwork]; ok && endpoint.IPAddress != "" {
@@ -1502,7 +1553,8 @@ type containerInspect struct {
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
 	HostConfig struct {
-		Binds []string `json:"Binds"`
+		Binds       []string `json:"Binds"`
+		NetworkMode string   `json:"NetworkMode"`
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Source      string `json:"Source"`
@@ -1512,6 +1564,7 @@ type containerInspect struct {
 
 type containerSummary struct {
 	ID     string            `json:"Id"`
+	Names  []string          `json:"Names"`
 	Labels map[string]string `json:"Labels"`
 }
 

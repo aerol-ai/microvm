@@ -19,6 +19,15 @@ var (
 	imagePullErrors            = expvar.NewMap("aerolvm_image_pull_errors_total")
 	imagePullLastNanos         = expvar.NewInt("aerolvm_image_pull_last_nanos")
 	imagePullLatency           = scaleobs.NewDurationBuckets("aerolvm_image_pull_latency_seconds_bucket")
+
+	// Pause-netns pool observability (see netns_pool.go). Hits/misses tell
+	// operators whether cold creates are actually landing on prepaid netns
+	// slots; refill errors + orphans reaped are the leak-watch signals.
+	netnsPoolHits          = expvar.NewInt("aerolvm_docker_netns_pool_hits_total")
+	netnsPoolMisses        = expvar.NewInt("aerolvm_docker_netns_pool_misses_total")
+	netnsPoolRefillErrors  = expvar.NewInt("aerolvm_docker_netns_pool_refill_errors_total")
+	netnsPoolOrphansReaped = expvar.NewInt("aerolvm_docker_netns_pool_orphans_reaped_total")
+	netnsPoolSize          = expvar.NewInt("aerolvm_docker_netns_pool_size")
 )
 
 func beginImagePullMetric() func(error) {
