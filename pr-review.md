@@ -290,6 +290,33 @@ flowchart LR
 **Live verification:** `make integration-cluster-hetero` — UC-74
 (CreateWithImage built-image graph).
 
+## 8. Code-path diagram (mermaid)
+
+Every PR that changes runtime behavior MUST include at least one mermaid
+diagram of the changed code path in its description. Prose descriptions of
+control flow hide exactly the bugs this checklist exists to catch — ordering
+mistakes, missed cleanup branches, races between goroutines. A diagram makes
+the reviewer walk the same branches the code walks.
+
+- **Which diagram:** `sequenceDiagram` for protocol / handshake / cross-process
+  changes (guest↔host, node↔node, client↔server); `flowchart` for control-flow,
+  lifecycle, or cleanup-path changes; both when the PR spans both.
+- **Annotate the delta, not just the end state.** Mark what changed on each
+  branch (before → after). A diagram of only the new behavior forces the
+  reviewer to reconstruct the old one from memory.
+- **Every failure/cleanup branch the PR touches must appear in the diagram** —
+  the discard paths are where leaks live (see §4). If a branch is too trivial
+  to draw, it is trivial enough to draw quickly.
+- Reference example: PR #289 ("What changed, visually") — a handshake
+  sequence diagram, a discard-path flowchart with each fixed leak marked, and
+  a before/after wiring-order flowchart.
+- "N/A — docs/comment-only change" is the only acceptable opt-out, same
+  convention as the other template sections.
+
+**Reviewer asks:** can I trace the changed request/lifecycle end-to-end from
+the diagram alone? Does every error branch in the diff appear as a branch in
+the diagram?
+
 ## PR description template
 
 Lives at [`.github/pull_request_template.md`](./.github/pull_request_template.md). GitHub auto-fills new PRs with it. Authors must answer every section; "N/A — <one-line reason>" is valid, empty is not.
