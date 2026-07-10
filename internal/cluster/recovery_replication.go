@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -91,23 +92,46 @@ func commandCarriesRecoveryPayload(spec *models.CreateSandboxRequest, secretRef 
 	return spec != nil || secretRef != "" || secretVersion != 0 || len(sealed) > 0
 }
 
+// replicateBlobToMembers pushes blob to every member concurrently. The PUTs
+// are independent (same blob, keyed by Ref, different hosts), and this runs
+// synchronously on the sandbox-create path — twice per create (opReserve and
+// opPlace) — so the wall-clock cost must be the slowest peer, not the sum of
+// all peers. Every member is attempted even when one fails, and the first
+// error in member order is returned, matching the previous serial loop.
+func replicateBlobToMembers(ctx context.Context, members []Member, blob RecoveryBlob, put func(context.Context, Member, RecoveryBlob) error) error {
+	if len(members) == 1 {
+		return put(ctx, members[0], blob)
+	}
+	errs := make([]error, len(members))
+	var wg sync.WaitGroup
+	for i, m := range members {
+		wg.Add(1)
+		go func(i int, m Member) {
+			defer wg.Done()
+			errs[i] = put(ctx, m, blob)
+		}(i, m)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *Cluster) storeAndReplicateRecoveryBlob(ctx context.Context, blob RecoveryBlob) error {
 	if err := c.StoreRecoveryBlob(ctx, blob); err != nil {
 		return err
 	}
-	var firstErr error
+	peers := make([]Member, 0)
 	for _, m := range c.recoveryServerMembers() {
 		if m.NodeID == "" || m.NodeID == c.nodeID {
 			continue
 		}
-		if err := c.putRecoveryBlobToMember(ctx, m, blob); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		peers = append(peers, m)
 	}
-	if firstErr != nil {
-		return firstErr
-	}
-	return nil
+	return replicateBlobToMembers(ctx, peers, blob, c.putRecoveryBlobToMember)
 }
 
 func (a *Agent) replicateRecoveryBlob(ctx context.Context, blob RecoveryBlob) error {
@@ -115,16 +139,7 @@ func (a *Agent) replicateRecoveryBlob(ctx context.Context, blob RecoveryBlob) er
 	if len(members) == 0 {
 		return errors.New("cluster agent: no live server-role control-plane members for recovery blob")
 	}
-	var firstErr error
-	for _, m := range members {
-		if err := a.putRecoveryBlobToMember(ctx, m, blob); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	return nil
+	return replicateBlobToMembers(ctx, members, blob, a.putRecoveryBlobToMember)
 }
 
 func (c *Cluster) StoreRecoveryBlob(ctx context.Context, blob RecoveryBlob) error {
