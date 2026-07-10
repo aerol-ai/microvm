@@ -65,6 +65,12 @@ const (
 	// reservation, lowering the UC-95 density ceiling — scenarios opt in
 	// (plans/docker-warm-pool.md §9 documents the adjusted gates).
 	CapDockerPool Capability = "docker-pool"
+	// CapDockerNetnsPool is likewise consumed by run.sh's config overlay: it
+	// flips docker.netns_pool.enabled so cold docker creates adopt prepaid
+	// pause-container network namespaces. Separate from CapDockerPool because
+	// the two pools are independent (netns slots hold no capacity
+	// reservations, so this one leaves the UC-95 density gate untouched).
+	CapDockerNetnsPool Capability = "docker-netns-pool"
 )
 
 // UseCase is one row of the coverage matrix.

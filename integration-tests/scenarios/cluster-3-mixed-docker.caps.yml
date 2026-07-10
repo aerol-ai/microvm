@@ -18,5 +18,10 @@ capabilities:
   # images parked slots per node hold default-shaped reservations, so the
   # UC-95 density ceiling drops by that budget (plans/docker-warm-pool.md §9).
   - docker-pool
+  # Enable the image-agnostic pause-netns pool alongside it: warm-pool misses
+  # (non-pinned images) then measure the prepaid-netns cold path instead of
+  # the full dockerd network setup. No capacity cost — pause slots hold no
+  # reservations — so the UC-95 density gate is unaffected.
+  - docker-netns-pool
 
 expected_members: 3

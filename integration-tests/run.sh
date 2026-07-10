@@ -489,12 +489,13 @@ run_one() {
 
   # Capability checks read the structured list (not a substring grep, which
   # would false-match the word "domain" in a caps-file comment).
-  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool
+  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool caps_docker_netns_pool
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file")
   caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
   caps_cluster=$(yq -r '.capabilities | contains(["cluster"])' "$caps_file")
   caps_platform_volumes=$(yq -r '.capabilities | contains(["platform-volumes"])' "$caps_file")
   caps_docker_pool=$(yq -r '.capabilities | contains(["docker-pool"])' "$caps_file")
+  caps_docker_netns_pool=$(yq -r '.capabilities | contains(["docker-netns-pool"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
     leased=$(lease_domain_for_scenario "$scenario")
   else
@@ -536,6 +537,13 @@ run_one() {
   # plans/docker-warm-pool.md §9 for the adjusted density gate).
   local docker_pool_depth
   docker_pool_depth="${AEROL_DOCKER_POOL_DEPTH:-2}"
+  # Pause-netns pool follows its own docker-netns-pool capability: unlike the
+  # per-image warm pool it holds no capacity reservations (a pause slot is
+  # ~1MB + one bridge IP), but it is still opt-in per scenario so the
+  # benchmark rows can compare prepaid-netns creates against plain cold path
+  # scenarios. Depth override mirrors the other pools.
+  local docker_netns_pool_depth
+  docker_netns_pool_depth="${AEROL_DOCKER_NETNS_POOL_DEPTH:-4}"
   # Upstream auto-import (pulling private prod images through AOCR hooks) and
   # the fleet control plane are prod-only side effects we always neutralize.
   yq '.auto_import.enabled = false
@@ -545,6 +553,8 @@ run_one() {
       | .wasm.pool.depth_default = '"$wasm_pool_depth"'
       | .docker.pool.enabled = '"$caps_docker_pool"'
       | .docker.pool.depth = '"$docker_pool_depth"'
+      | .docker.netns_pool.enabled = '"$caps_docker_netns_pool"'
+      | .docker.netns_pool.depth = '"$docker_netns_pool_depth"'
       | .platform_volumes.enabled = '"$caps_platform_volumes"'
       | .platform_volumes.backend = "s3"
       | .platform_volumes.s3_bucket = ""
