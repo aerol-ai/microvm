@@ -132,6 +132,13 @@
       SB_DOCKER_POOL_MAX_IMAGES: "{{ docker.pool.max_images | default(8) | int }}"
       SB_DOCKER_POOL_IDLE_TTL: "{{ docker.pool.idle_ttl | default('15m') }}"
       SB_DOCKER_POOL_REFILL_INTERVAL: "{{ docker.pool.refill_interval | default('5s') }}"
+      # Docker pause-netns pool (image-agnostic prepaid network namespaces).
+      # Defaults mirror config.go; pause_image must be pullable from the node
+      # or overridden to a mirror.
+      SB_DOCKER_NETNS_POOL_ENABLED: "{{ docker.netns_pool.enabled | default(false) | bool | string | lower }}"
+      SB_DOCKER_NETNS_POOL_DEPTH: "{{ docker.netns_pool.depth | default(4) | int }}"
+      SB_DOCKER_NETNS_POOL_PAUSE_IMAGE: "{{ docker.netns_pool.pause_image | default('registry.k8s.io/pause:3.10') }}"
+      SB_DOCKER_NETNS_POOL_REFILL_INTERVAL: "{{ docker.netns_pool.refill_interval | default('2s') }}"
 
   pre_tasks:
     - name: Check base sandboxd env file

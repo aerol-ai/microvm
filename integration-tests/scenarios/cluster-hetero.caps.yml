@@ -20,5 +20,10 @@ capabilities:
   # the one cluster carrying docker/gvisor/wasm together, so a per-runtime
   # create-latency + density benchmark is meaningful here.
   - benchmark
+  # Enable the image-agnostic pause-netns pool so docker creates on this
+  # cluster adopt prepaid network namespaces. Unlike docker-pool this holds
+  # no capacity reservations (a pause slot is ~1MB + one bridge IP), so it
+  # does not move the UC-95 density ceiling.
+  - docker-netns-pool
 
 expected_members: 8
