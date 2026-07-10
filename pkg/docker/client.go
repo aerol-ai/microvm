@@ -372,6 +372,8 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// where it came from. If the inspect fails (image missing) we fall
 	// through to a normal pull attempt and let that surface the registry
 	// error.
+	imageStart := time.Now()
+	imageSource := "local"
 	imageInspect, err := c.inspectImage(ctx, req.Image)
 	if err != nil {
 		if IsLocalOnlyImageRef(req.Image) || req.ImageDistributionMode == models.ImageDistributionLocalOnly {
@@ -384,11 +386,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if pullErr := c.pullImageDedup(pullCtx, req.Image, req.Registry); pullErr != nil {
 			return nil, pullErr
 		}
+		imageSource = "pulled"
 		imageInspect, err = c.inspectImage(ctx, req.Image)
 		if err != nil {
 			return nil, fmt.Errorf("inspect image: %w", err)
 		}
 	}
+	CreateTimingFrom(ctx).RecordStageDesc("docker_image", time.Since(imageStart), imageSource)
 
 	workingDir := strings.TrimSpace(imageInspect.Config.WorkingDir)
 	if workingDir == "" {
@@ -565,15 +569,19 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	createQuery := url.Values{}
 	createQuery.Set("name", sandboxID)
+	createStart := time.Now()
 	err = c.doJSON(ctx, http.MethodPost, "/containers/create", createQuery, createRequest, nil, &created)
+	CreateTimingFrom(ctx).RecordStage("docker_create", time.Since(createStart))
 	if err != nil {
 		return nil, fmt.Errorf("create container: %w", err)
 	}
 
+	startStart := time.Now()
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
 		_ = c.removeContainer(ctx, created.ID, true)
 		return nil, fmt.Errorf("start container: %w", err)
 	}
+	CreateTimingFrom(ctx).RecordStage("docker_start", time.Since(startStart))
 
 	runtimeWaitStart := time.Now()
 	containerIP, inspect, err := c.waitForContainerRunning(ctx, created.ID)
@@ -609,6 +617,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		Status:      models.SandboxStatusStarted,
 	}
 
+	netrulesStart := time.Now()
 	if req.NetworkBlockAll {
 		if err := c.networkRules.BlockAllEgress(runtime.ContainerIP); err != nil {
 			// Fail closed: the user opted into network isolation, so a sandbox
@@ -631,6 +640,9 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			_ = c.removeContainer(ctx, created.ID, true)
 			return nil, fmt.Errorf("apply egress policy: %w", err)
 		}
+	}
+	if req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		CreateTimingFrom(ctx).RecordStage("docker_netrules", time.Since(netrulesStart))
 	}
 
 	runtime.SandboxID = sandboxID
