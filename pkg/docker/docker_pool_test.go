@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -274,12 +276,16 @@ func TestUpdateContainerResourcesNoop(t *testing.T) {
 type poolFakeDaemon struct {
 	t            *testing.T
 	imageInspect func() *http.Response
+	pull         func() *http.Response
 	create       func() *http.Response
 	start        func() *http.Response
 	containerGet func() *http.Response
 	rename       func() *http.Response
 	update       func() *http.Response
 	listJSON     func() *http.Response
+	pullCalls    int
+	createBodies [][]byte
+	updateBodies [][]byte
 	removeCalls  int
 }
 
@@ -296,7 +302,16 @@ func (d *poolFakeDaemon) transport() roundTripFunc {
 			if d.imageInspect != nil {
 				return d.imageInspect(), nil
 			}
+		case r.Method == http.MethodPost && p == "/images/create":
+			d.pullCalls++
+			if d.pull != nil {
+				return d.pull(), nil
+			}
+			return textResponse(http.StatusOK, "{}"), nil
 		case r.Method == http.MethodPost && p == "/containers/create":
+			if body, err := io.ReadAll(r.Body); err == nil {
+				d.createBodies = append(d.createBodies, body)
+			}
 			if d.create != nil {
 				return d.create(), nil
 			}
@@ -314,6 +329,9 @@ func (d *poolFakeDaemon) transport() roundTripFunc {
 			}
 			return textResponse(http.StatusNoContent, ""), nil
 		case r.Method == http.MethodPost && strings.HasSuffix(p, "/update"):
+			if body, err := io.ReadAll(r.Body); err == nil {
+				d.updateBodies = append(d.updateBodies, body)
+			}
 			if d.update != nil {
 				return d.update(), nil
 			}
@@ -437,7 +455,8 @@ func TestTryWarmAdoptFailureReleasesReservation(t *testing.T) {
 		Handle:      badParkHandle{},
 	})
 
-	_, err := c.tryWarmAdopt(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-1", "tok", nil, models.RuntimeDocker)
+	ctx, timing := createtiming.With(context.Background())
+	_, err := c.tryWarmAdopt(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-1", "tok", nil, models.RuntimeDocker)
 	if err == nil || errors.Is(err, dockerpool.ErrNoSlot) {
 		t.Fatalf("expected adopt failure, got %v", err)
 	}
@@ -446,6 +465,18 @@ func TestTryWarmAdoptFailureReleasesReservation(t *testing.T) {
 	}
 	if d.removeCalls != 1 {
 		t.Fatalf("parked container not destroyed: removeCalls=%d", d.removeCalls)
+	}
+	// A burned slot must not masquerade as an ordinary miss in Server-Timing
+	// — that disguise is how a 100% adopt-failure rate hid in bench data.
+	var poolStage *createtiming.Stage
+	for _, st := range timing.Stages() {
+		if st.Name == "docker_pool" {
+			poolStage = &st
+			break
+		}
+	}
+	if poolStage == nil || poolStage.Desc != "adopt_failed" {
+		t.Fatalf("docker_pool stage = %+v, want desc=adopt_failed", poolStage)
 	}
 }
 
@@ -607,5 +638,120 @@ func TestRenameContainerConflictMapsToExists(t *testing.T) {
 	_, err = c.adoptParked(context.Background(), models.CreateSandboxRequest{}, "sb-dup", "tok", slot)
 	if !errors.Is(err, ErrSandboxContainerExists) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// A fresh host has no images: parkContainer must self-warm with a pull
+// instead of failing every refill tick until some sandbox create happens to
+// pull the image (pinned targets would otherwise never pre-warm at all).
+// The park-default resource limits must also land INLINE in HostConfig —
+// dockerd silently drops an unknown nested "Resources" key.
+func TestParkContainerPullsMissingImageAndInlinesLimits(t *testing.T) {
+	pulled := false
+	d := &poolFakeDaemon{t: t}
+	d.imageInspect = func() *http.Response {
+		if !pulled {
+			return textResponse(http.StatusNotFound, `{"message":"No such image"}`)
+		}
+		return jsonResponse(http.StatusOK, map[string]any{
+			"Id":     "sha256:img1",
+			"Config": map[string]any{"WorkingDir": "/", "Cmd": []string{"/bin/sh"}},
+		})
+	}
+	d.pull = func() *http.Response {
+		pulled = true
+		return textResponse(http.StatusOK, "{}")
+	}
+	// Fail the container create: it proves the flow got past pull+re-inspect
+	// without needing a live parked-handshake guest.
+	d.create = func() *http.Response {
+		return textResponse(http.StatusInternalServerError, `{"message":"boom"}`)
+	}
+	dir, err := os.MkdirTemp("", "rd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	c := newPoolClient(t, d, func(c *Client) {
+		c.pulls = make(map[string]*imagePull)
+		c.readyDir = dir
+	})
+
+	_, err = c.parkContainer(context.Background(), "park-test1", dockerpool.Key{
+		Image: "alpine:3.20", Runtime: models.RuntimeDocker,
+	})
+	if err == nil || !strings.Contains(err.Error(), "park create") {
+		t.Fatalf("err = %v, want park create failure after successful pull", err)
+	}
+	if d.pullCalls != 1 {
+		t.Fatalf("pull calls = %d, want 1", d.pullCalls)
+	}
+	if len(d.createBodies) != 1 {
+		t.Fatalf("create bodies = %d", len(d.createBodies))
+	}
+	var body struct {
+		HostConfig map[string]any `json:"HostConfig"`
+	}
+	if err := json.Unmarshal(d.createBodies[0], &body); err != nil {
+		t.Fatalf("create body: %v", err)
+	}
+	if _, nested := body.HostConfig["Resources"]; nested {
+		t.Fatal(`park create body nests limits under "Resources" — dockerd drops that key`)
+	}
+	if body.HostConfig["Memory"] == nil || body.HostConfig["CpuQuota"] == nil {
+		t.Fatalf("park create body missing inline Memory/CpuQuota: %v", body.HostConfig)
+	}
+}
+
+// Content-addressed local build tags cannot exist on a registry — a missing
+// one must fail immediately (feeding target eviction) without a pull attempt.
+func TestParkContainerLocalOnlyImageSkipsPull(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	d.imageInspect = func() *http.Response {
+		return textResponse(http.StatusNotFound, `{"message":"No such image"}`)
+	}
+	dir, err := os.MkdirTemp("", "rd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	c := newPoolClient(t, d, func(c *Client) {
+		c.pulls = make(map[string]*imagePull)
+		c.readyDir = dir
+	})
+
+	_, err = c.parkContainer(context.Background(), "park-test2", dockerpool.Key{
+		Image: BuiltImageNamespace + "/deadbeef:latest", Runtime: models.RuntimeDocker,
+	})
+	if err == nil || !strings.Contains(err.Error(), "inspect image") {
+		t.Fatalf("err = %v, want inspect failure", err)
+	}
+	if d.pullCalls != 0 {
+		t.Fatalf("pull calls = %d, want 0 for local-only ref", d.pullCalls)
+	}
+}
+
+// /containers/{id}/update takes container.UpdateConfig, which embeds the
+// Resources fields inline — nesting them under "Resources" is silently
+// ignored and an adopted container would keep its park-default limits.
+func TestUpdateContainerResourcesInlineBody(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	c := newPoolClient(t, d, nil)
+
+	if err := c.updateContainerResources(context.Background(), "cid1", 2, 1024); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.updateBodies) != 1 {
+		t.Fatalf("update bodies = %d", len(d.updateBodies))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(d.updateBodies[0], &body); err != nil {
+		t.Fatalf("update body: %v", err)
+	}
+	if _, nested := body["Resources"]; nested {
+		t.Fatal(`update body nests limits under "Resources" — dockerd ignores that key`)
+	}
+	if body["Memory"] == nil || body["CpuQuota"] == nil {
+		t.Fatalf("update body missing inline Memory/CpuQuota: %v", body)
 	}
 }

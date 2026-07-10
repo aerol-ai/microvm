@@ -125,3 +125,119 @@ func TestRunRefillWrapper(t *testing.T) {
 	cancel()
 	RunRefill(ctx, p, RefillConfig{}, &refillSpawner{}, nil, nil)
 }
+
+// A target whose image is gone for good (image-GC'd one-off snapshot/build
+// tag) must stop consuming refill ticks: without eviction the loop retries a
+// doomed park every interval forever — the live v0.5.29 nodes accumulated
+// ~190 spawn failures each retrying a deleted snapshot image.
+func TestRefillTickEvictsTargetAfterConsecutiveFailures(t *testing.T) {
+	p := New(nil)
+	p.SetDefaultDepth(1)
+	key := testKey()
+	p.NoteTarget(key)
+
+	spawner := &refillSpawner{err: errors.New("no such image")}
+	gate := &refillGate{canPark: true}
+	cfg := RefillConfig{ParkShape: ParkShape{Runtime: models.RuntimeDocker}}
+
+	for i := range maxConsecutiveSpawnFails {
+		if len(p.ListTargets()) != 1 {
+			t.Fatalf("target evicted early after %d failures", i)
+		}
+		p.refillTick(context.Background(), cfg, spawner, gate)
+	}
+	if len(p.ListTargets()) != 0 {
+		t.Fatalf("target not evicted after %d consecutive failures", maxConsecutiveSpawnFails)
+	}
+	if got := p.Metrics().Stats().TargetEvicts; got != 1 {
+		t.Fatalf("target evictions = %d, want 1", got)
+	}
+	// Every failed park must still have released its reservation.
+	if len(gate.released) != maxConsecutiveSpawnFails {
+		t.Fatalf("released = %d, want %d", len(gate.released), maxConsecutiveSpawnFails)
+	}
+
+	// A later miss re-registers the target — eviction is never sticky, and
+	// the failure streak starts fresh.
+	p.NoteMiss(key)
+	if len(p.ListTargets()) != 1 {
+		t.Fatal("NoteMiss did not re-register an evicted target")
+	}
+	p.refillTick(context.Background(), cfg, spawner, gate)
+	if len(p.ListTargets()) != 1 {
+		t.Fatal("re-registered target evicted after a single failure")
+	}
+}
+
+// Pinned targets are operator config: dropping one would silently disable a
+// deliberately warmed image, so they ride out any failure streak.
+func TestRefillTickNeverEvictsPinnedTarget(t *testing.T) {
+	p := New(nil)
+	p.SetDefaultDepth(1)
+	p.PinTarget(testKey())
+
+	spawner := &refillSpawner{err: errors.New("no such image")}
+	gate := &refillGate{canPark: true}
+	cfg := RefillConfig{ParkShape: ParkShape{Runtime: models.RuntimeDocker}}
+
+	for range maxConsecutiveSpawnFails + 2 {
+		p.refillTick(context.Background(), cfg, spawner, gate)
+	}
+	if len(p.ListTargets()) != 1 {
+		t.Fatal("pinned target was evicted")
+	}
+}
+
+// A success anywhere in the streak resets the count: the threshold measures
+// an unbroken run of failures, not a lifetime tally.
+func TestRefillTickSuccessResetsFailureStreak(t *testing.T) {
+	p := New(nil)
+	p.SetDefaultDepth(1)
+	key := testKey()
+	p.NoteTarget(key)
+
+	spawner := &refillSpawner{err: errors.New("transient")}
+	gate := &refillGate{canPark: true}
+	cfg := RefillConfig{ParkShape: ParkShape{Runtime: models.RuntimeDocker}}
+
+	for range maxConsecutiveSpawnFails - 1 {
+		p.refillTick(context.Background(), cfg, spawner, gate)
+	}
+	spawner.err = nil
+	p.refillTick(context.Background(), cfg, spawner, gate) // success resets
+	spawner.err = errors.New("transient again")
+	for range maxConsecutiveSpawnFails - 1 {
+		p.refillTick(context.Background(), cfg, spawner, gate)
+	}
+	if len(p.ListTargets()) != 1 {
+		t.Fatal("streak did not reset on success")
+	}
+}
+
+// Eviction must destroy any ready slots the target still holds and release
+// their park reservations — otherwise the admitter leaks capacity.
+func TestNoteSpawnFailureEvictionDestroysReadySlots(t *testing.T) {
+	p := New(nil)
+	p.SetDefaultDepth(2)
+	rec := &releaseRecorder{}
+	p.SetParkReleaser(rec.record)
+	spawner := &fakeSpawner{}
+	p.SetSpawner(spawner)
+	key := testKey()
+	p.NoteTarget(key)
+	p.RecordLoaded(&ParkedSlot{ID: "park-live", Key: key, Handle: &fakeHandle{alive: true}})
+
+	ks := key.KeyString()
+	for range maxConsecutiveSpawnFails {
+		p.NoteSpawnFailure(ks)
+	}
+	if len(p.ListTargets()) != 0 {
+		t.Fatal("target not evicted")
+	}
+	if len(spawner.destroyed) != 1 || spawner.destroyed[0] != "park-live" {
+		t.Fatalf("destroyed = %v", spawner.destroyed)
+	}
+	if len(rec.released) != 1 || rec.released[0] != "park-live" {
+		t.Fatalf("released = %v", rec.released)
+	}
+}

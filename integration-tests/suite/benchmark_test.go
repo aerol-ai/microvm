@@ -274,6 +274,60 @@ func warmBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRunt
 	}
 }
 
+// waitDockerPoolWarm blocks until a docker create is served from the warm
+// container pool (or a timeout passes). Without this gate the bench races the
+// pool's own self-warming: the suite runs right after node bootstrap, the
+// first creates all record misses (which is what REGISTERS the miss-driven
+// refill targets), and every sample measures the cold path — exactly the
+// v0.5.29 bench artifact, where docker_pool read 0ms on all ten samples. A
+// warm hit is a create whose Server-Timing has a docker_pool stage but no
+// docker_create stage (an adopted container never hits /containers/create).
+// Timing out is logged, not fatal: the samples still run and the stage
+// breakdown in the artifact shows the misses.
+func waitDockerPoolWarm(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) {
+	t.Helper()
+	if !sc.Has(harness.CapDockerPool) {
+		return
+	}
+	benchesDocker := false
+	for _, spec := range runtimes {
+		if spec.runtime == "docker" || spec.runtime == "" {
+			benchesDocker = true
+		}
+	}
+	if !benchesDocker {
+		return
+	}
+	deadline := time.Now().Add(time.Duration(benchEnvInt("AEROL_BENCH_POOL_WARM_SECONDS", 120)) * time.Second)
+	attempt := 0
+	for time.Now().Before(deadline) {
+		attempt++
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+			Name:  harness.UniqueName(sc, t),
+			Image: harness.DefaultImage,
+		})
+		cancel()
+		if err != nil {
+			t.Logf("bench[docker] pool-warm probe %d create failed: %v", attempt, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		stages, ok := c.LastServerCreateStages()
+		destroyBest(c, sb.ID)
+		if ok {
+			_, pool := stages["docker_pool"]
+			_, cold := stages["docker_create"]
+			if pool && !cold {
+				t.Logf("bench[docker] warm pool serving hits after %d probe(s)", attempt)
+				return
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	t.Logf("bench[docker] warm pool never served a hit within the warm window; samples will include misses")
+}
+
 func prepareBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) []benchRuntimeSpec {
 	t.Helper()
 	prepared := append([]benchRuntimeSpec(nil), runtimes...)
@@ -558,6 +612,7 @@ func TestBenchCreateLatency(t *testing.T) {
 	waitBenchmarkReady(t, c, runtimes)
 	runtimes = prepareBenchmarkRuntimes(t, c, runtimes)
 	warmBenchmarkRuntimes(t, c, runtimes)
+	waitDockerPoolWarm(t, c, runtimes)
 
 	var report benchReport
 	for _, br := range runtimes {

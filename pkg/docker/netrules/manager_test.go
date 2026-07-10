@@ -183,9 +183,13 @@ func TestManagerEnabledErrors(t *testing.T) {
 
 // memBackend is an in-memory RuleBackend for asserting rule-state semantics
 // of the selective-egress policy paths (allowlist/denylist + comment scoping)
-// without a fake iptables binary.
+// without a fake iptables binary. deleteErr selects which flavor of "rule
+// absent" error a Delete miss returns — legacy iptables and iptables-nft
+// word it differently, and the Manager must terminate its duplicate-sweep
+// loops on both.
 type memBackend struct {
-	rules []string
+	rules     []string
+	deleteErr error
 }
 
 func memKey(table, chain string, spec ...string) string {
@@ -209,12 +213,82 @@ func (m *memBackend) Delete(table, chain string, spec ...string) error {
 			return nil
 		}
 	}
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
 	return errNoMatch{}
 }
 
 type errNoMatch struct{}
 
 func (errNoMatch) Error() string { return "No chain/target/match by that name." }
+
+type errNftBadRule struct{}
+
+func (errNftBadRule) Error() string {
+	return "iptables v1.8.7 (nf_tables): Bad rule (does a matching rule exist in that chain?)."
+}
+
+// The Clear* duplicate-sweep loops probe past the last match, so the flavor
+// of the terminating "rule absent" error decides whether the clear reads as
+// success. Matching only the legacy wording made ClearBlockAllEgress fail on
+// every iptables-nft host (Ubuntu 22.04's default) — which burned a parked
+// slot on every warm-pool adopt. Both flavors must terminate cleanly, on a
+// present rule (sweep past the delete) and an absent one (immediate probe).
+func TestClearLoopsTerminateOnBothIptablesFlavors(t *testing.T) {
+	flavors := map[string]error{
+		"legacy": errNoMatch{},
+		"nft":    errNftBadRule{},
+	}
+	for name, flavor := range flavors {
+		t.Run(name, func(t *testing.T) {
+			backend := &memBackend{deleteErr: flavor}
+			mgr := NewWithBackend(backend)
+
+			if err := mgr.BlockAllEgress("10.0.0.7"); err != nil {
+				t.Fatalf("BlockAllEgress: %v", err)
+			}
+			if err := mgr.ClearBlockAllEgress("10.0.0.7"); err != nil {
+				t.Fatalf("ClearBlockAllEgress with present rule: %v", err)
+			}
+			if len(backend.rules) != 0 {
+				t.Fatalf("rules left after clear: %v", backend.rules)
+			}
+			if err := mgr.ClearBlockAllEgress("10.0.0.7"); err != nil {
+				t.Fatalf("ClearBlockAllEgress with absent rule: %v", err)
+			}
+
+			if err := mgr.BlockAllIngress("10.0.0.7"); err != nil {
+				t.Fatalf("BlockAllIngress: %v", err)
+			}
+			if err := mgr.ClearBlockAllIngress("10.0.0.7"); err != nil {
+				t.Fatalf("ClearBlockAllIngress with present rule: %v", err)
+			}
+
+			if err := mgr.ApplyEgressPolicy("10.0.0.7", []string{"1.2.3.0/24"}, nil); err != nil {
+				t.Fatalf("ApplyEgressPolicy: %v", err)
+			}
+			if err := mgr.ClearEgressPolicy("10.0.0.7", []string{"1.2.3.0/24"}, nil); err != nil {
+				t.Fatalf("ClearEgressPolicy: %v", err)
+			}
+			if len(backend.rules) != 0 {
+				t.Fatalf("policy rules left after clear: %v", backend.rules)
+			}
+		})
+	}
+}
+
+func TestRuleNotExist(t *testing.T) {
+	if ruleNotExist(nil) {
+		t.Fatal("nil error must not read as not-exist")
+	}
+	if !ruleNotExist(errNoMatch{}) || !ruleNotExist(errNftBadRule{}) {
+		t.Fatal("both iptables error flavors must read as not-exist")
+	}
+	if ruleNotExist(os.ErrPermission) {
+		t.Fatal("unrelated error must not read as not-exist")
+	}
+}
 
 func TestNewWithBackend(t *testing.T) {
 	if m := NewWithBackend(nil); m.Enabled() {

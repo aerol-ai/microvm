@@ -23,6 +23,7 @@ type Pool struct {
 	lastUsed      map[string]time.Time
 	ready         map[string][]*ParkedSlot
 	spawning      map[string]int
+	spawnFails    map[string]int // keyString -> consecutive park failures
 	spawner       Spawner
 	onReleasePark func(slotID string)
 	metrics       *Metrics
@@ -41,6 +42,7 @@ func New(logger *slog.Logger) *Pool {
 		lastUsed:   make(map[string]time.Time),
 		ready:      make(map[string][]*ParkedSlot),
 		spawning:   make(map[string]int),
+		spawnFails: make(map[string]int),
 		metrics:    &Metrics{},
 		refillKick: make(chan struct{}, 1),
 	}
@@ -148,7 +150,54 @@ func (p *Pool) evictLRUTargetLocked() []*ParkedSlot {
 	slots := p.ready[oldest]
 	delete(p.ready, oldest)
 	delete(p.spawning, oldest)
+	delete(p.spawnFails, oldest)
 	return slots
+}
+
+// maxConsecutiveSpawnFails is how many refill parks in a row may fail before
+// a miss-driven target is dropped. Without eviction, a target whose image is
+// gone for good (a one-off snapshot or build tag that image-GC removed)
+// wedges the refill loop into a permanent every-tick retry. Six failures is
+// ~30s at the default 5s interval — long enough to ride out a transient
+// registry blip, short enough that a dead image stops burning engine calls.
+// A later create of the same image re-registers the target via NoteMiss, so
+// eviction is never sticky. Pinned targets are operator config and are
+// exempt: silently dropping them would hide a config error.
+const maxConsecutiveSpawnFails = 6
+
+// NoteSpawnFailure counts a failed park for key and evicts the target once
+// the consecutive-failure threshold is crossed. Returns true when the target
+// was evicted. Slot destruction happens outside the lock (same rationale as
+// Acquire/NoteTarget).
+func (p *Pool) NoteSpawnFailure(ks string) bool {
+	var evicted []*ParkedSlot
+	p.mu.Lock()
+	p.spawnFails[ks]++
+	_, pinned := p.pinned[ks]
+	evict := !pinned && p.spawnFails[ks] >= maxConsecutiveSpawnFails
+	if evict {
+		evicted = p.ready[ks]
+		delete(p.targets, ks)
+		delete(p.lastUsed, ks)
+		delete(p.ready, ks)
+		delete(p.spawning, ks)
+		delete(p.spawnFails, ks)
+		p.publishParkedLocked()
+		if p.metrics != nil {
+			p.metrics.recordTargetEvict()
+		}
+	}
+	p.mu.Unlock()
+	p.destroySlots(context.Background(), evicted)
+	return evict
+}
+
+// ClearSpawnFailures resets the consecutive-failure count after a successful
+// park, so the eviction threshold only ever measures an unbroken run.
+func (p *Pool) ClearSpawnFailures(ks string) {
+	p.mu.Lock()
+	delete(p.spawnFails, ks)
+	p.mu.Unlock()
 }
 
 // HasReady reports whether any slot is queued for key. It exists so the
@@ -355,6 +404,7 @@ func (p *Pool) ReapIdle(now time.Time) int {
 		delete(p.lastUsed, ks)
 		delete(p.ready, ks)
 		delete(p.spawning, ks)
+		delete(p.spawnFails, ks)
 	}
 	p.publishParkedLocked()
 	p.mu.Unlock()

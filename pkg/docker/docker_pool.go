@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -132,7 +133,11 @@ func (c *Client) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 		if err == nil {
 			timing.RecordStageDesc("docker_pool", time.Since(start), "hit")
 		} else {
-			timing.RecordStageDesc("docker_pool", 0, "miss")
+			// Distinct desc on purpose: an adopt failure burns a parked slot
+			// and falls back to the cold path — folding it into "miss" is how
+			// the iptables-nft adopt breakage stayed invisible in bench stage
+			// data (every sample read as an ordinary cold miss).
+			timing.RecordStageDesc("docker_pool", time.Since(start), "adopt_failed")
 		}
 	}
 	if err != nil {
@@ -150,6 +155,9 @@ func (c *Client) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 		_ = c.destroyParked(ctx, slot)
 		c.warmPool.ReleasePark(slot.ID)
 		return nil, fmt.Errorf("warm adopt failed: %w", err)
+	}
+	if c.warmPool != nil {
+		c.warmPool.Metrics().RecordAdoptMS(float64(time.Since(start)) / float64(time.Millisecond))
 	}
 	if createtiming.From(ctx) != nil {
 		timing := createtiming.From(ctx)
@@ -188,8 +196,27 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 
 	imageInspect, err := c.inspectImage(ctx, key.Image)
 	if err != nil {
-		_ = pl.Close()
-		return nil, fmt.Errorf("inspect image: %w", err)
+		// Refill must be able to self-warm on a fresh host: without a pull
+		// here, a just-bootstrapped node fails every tick until the first
+		// sandbox create happens to pull the image, and pinned targets never
+		// pre-warm at all. Local-only refs (content-addressed build tags)
+		// can't exist on a registry — fail those immediately so the target
+		// feeds the consecutive-failure eviction instead of retrying forever.
+		// Park slots only serve credential-less creates (poolEligible rejects
+		// req.Registry), so an anonymous pull is the correct shape.
+		if IsLocalOnlyImageRef(key.Image) {
+			_ = pl.Close()
+			return nil, fmt.Errorf("inspect image: %w", err)
+		}
+		if pullErr := c.pullImageDedup(ctx, key.Image, nil); pullErr != nil {
+			_ = pl.Close()
+			return nil, fmt.Errorf("pull image for park: %w", pullErr)
+		}
+		imageInspect, err = c.inspectImage(ctx, key.Image)
+		if err != nil {
+			_ = pl.Close()
+			return nil, fmt.Errorf("inspect image: %w", err)
+		}
 	}
 
 	workingDir := strings.TrimSpace(imageInspect.Config.WorkingDir)
@@ -234,7 +261,9 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 		hostConfig["Runtime"] = ociRuntime
 	}
 	if !c.resourceLimitsOff {
-		hostConfig["Resources"] = parkDefaultResources(c)
+		// Inline, not nested under "Resources": HostConfig embeds the
+		// Resources fields in the Docker API JSON (see the cold path).
+		maps.Copy(hostConfig, parkDefaultResources(c))
 	}
 	if c.parkDiskGB > 0 && effectiveRuntime != models.RuntimeGvisor {
 		hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", c.parkDiskGB)}
@@ -426,8 +455,10 @@ func (c *Client) updateContainerResources(ctx context.Context, containerID strin
 	if len(resources) == 0 {
 		return nil
 	}
-	body := map[string]any{"Resources": resources}
-	return c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/update", nil, body, nil, nil)
+	// /containers/{id}/update takes container.UpdateConfig, which embeds
+	// Resources inline — a nested "Resources" key is silently ignored and
+	// the adopted container would keep its park-default limits.
+	return c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/update", nil, resources, nil, nil)
 }
 
 func mintBootstrapToken() (string, error) {

@@ -80,9 +80,15 @@ func (p *Pool) refillTick(parent context.Context, cfg RefillConfig, spawner Spaw
 				if gate != nil {
 					gate.ReleasePark(slotID)
 				}
-				p.logger.Warn("docker pool refill: park failed", "key", ks, "error", err)
+				if p.NoteSpawnFailure(ks) {
+					p.logger.Warn("docker pool refill: target evicted after consecutive park failures",
+						"key", ks, "fails", maxConsecutiveSpawnFails, "error", err)
+				} else {
+					p.logger.Warn("docker pool refill: park failed", "key", ks, "error", err)
+				}
 				break
 			}
+			p.ClearSpawnFailures(ks)
 			p.RecordLoaded(slot)
 			if p.metrics != nil {
 				p.metrics.recordRefill()

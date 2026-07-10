@@ -305,3 +305,35 @@ func TestKeyFromRequestAndKeyString(t *testing.T) {
 		t.Fatal("empty key string")
 	}
 }
+
+// Boot-time pins are built bare (Key{Image, Runtime}) while create-path keys
+// carry the metadata NormalizeCreateImageDistribution filled in. The two MUST
+// collide in the ready map, or pinned slots are parked under a keystring no
+// create ever computes — permanently unreachable warm capacity that, being
+// pinned, is never idle-reaped either. This is a live-cluster regression:
+// v0.5.29 nodes each carried two orphaned pinned alpine slots.
+func TestKeyStringPinnedBareKeyMatchesNormalizedCreateKey(t *testing.T) {
+	pinned := Key{Image: "alpine:3.20", Runtime: models.RuntimeDocker}
+	create := KeyFromRequest(models.CreateSandboxRequest{
+		Image:                 "alpine:3.20",
+		ImageRegistryRef:      "alpine:3.20",
+		ImageDistributionMode: models.ImageDistributionExternalRegistry,
+	}, models.RuntimeDocker)
+	if pinned.KeyString() != create.KeyString() {
+		t.Fatalf("pinned key %q != normalized create key %q", pinned.KeyString(), create.KeyString())
+	}
+
+	// AOCR refs and digests are identity-bearing: they must stay distinct.
+	aocr := KeyFromRequest(models.CreateSandboxRequest{
+		Image:                 "aocr.example/cluster/snapshots/base:latest",
+		ImageRegistryRef:      "aocr.example/cluster/snapshots/base:latest",
+		ImageDistributionMode: models.ImageDistributionAOCR,
+	}, models.RuntimeDocker)
+	if aocr.KeyString() == create.KeyString() {
+		t.Fatal("aocr key collided with external-registry key")
+	}
+	digested := Key{Image: "alpine:3.20", ImageDigest: "sha256:abc", Runtime: models.RuntimeDocker}
+	if digested.KeyString() == pinned.KeyString() {
+		t.Fatal("digest-bearing key collided with bare key")
+	}
+}
