@@ -15,6 +15,11 @@ import (
 	"github.com/aerol-ai/microvm/pkg/readyproto"
 )
 
+// parkWriteTimeout bounds only the two writes (parked hello, ready ack).
+// Var, not const, so the regression test can shrink it and prove the adopt
+// wait is NOT bounded by it.
+var parkWriteTimeout = readyDialTimeout
+
 func runParkedReadyHandshake(logger *slog.Logger, srv *server, socketPath, bootstrapToken, parkNonce string) {
 	socketPath = strings.TrimSpace(socketPath)
 	if socketPath == "" || srv == nil {
@@ -30,16 +35,17 @@ func runParkedReadyHandshake(logger *slog.Logger, srv *server, socketPath, boots
 	}
 	defer conn.Close()
 
-	// Bound the full handshake on the real socket; tests call parkedReadyOnConn
-	// directly without a deadline so a paired reader can run on loaded CI.
-	_ = conn.SetDeadline(time.Now().Add(readyDialTimeout))
 	if err := parkedReadyOnConn(logger, srv, conn, bootstrapToken, parkNonce); err != nil {
 		logger.Warn("park ready handshake failed", "error", err)
 	}
 }
 
 // parkedReadyOnConn runs the guest-side parked→adopt→ready exchange on an
-// already-connected unix socket. The caller sets conn deadlines when needed.
+// already-connected unix socket. Only the writes are deadline-bounded: the
+// adopt read must block for as long as the slot stays parked (minutes to
+// hours), so a blanket handshake deadline would kill every held connection
+// and the pool would never serve a warm hit. Connection death (sandboxd
+// restart, slot destroyed) surfaces as an adopt-read error instead.
 func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstrapToken, parkNonce string) error {
 	if logger == nil || srv == nil || conn == nil {
 		return fmt.Errorf("park handshake: missing logger, server, or connection")
@@ -50,6 +56,7 @@ func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstra
 		return fmt.Errorf("park handshake: bootstrap token and nonce are required")
 	}
 
+	_ = conn.SetWriteDeadline(time.Now().Add(parkWriteTimeout))
 	if err := readyproto.EncodeParked(conn, readyproto.ParkedSignal{
 		Event:        readyproto.EventParked,
 		Token:        bootstrapToken,
@@ -59,6 +66,8 @@ func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstra
 		return fmt.Errorf("parked write: %w", err)
 	}
 
+	// No read deadline: block until adopted (or the host closes the socket).
+	_ = conn.SetDeadline(time.Time{})
 	frame, err := readyproto.DecodeAdopt(bufio.NewReader(conn))
 	if err != nil {
 		return fmt.Errorf("adopt read: %w", err)
@@ -66,6 +75,7 @@ func parkedReadyOnConn(logger *slog.Logger, srv *server, conn net.Conn, bootstra
 
 	srv.adoptIdentity(frame.SandboxID, frame.Token)
 
+	_ = conn.SetWriteDeadline(time.Now().Add(parkWriteTimeout))
 	if err := readyproto.Encode(conn, readyproto.ReadySignal{
 		Event:        readyproto.EventReady,
 		SandboxID:    frame.SandboxID,

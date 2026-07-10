@@ -9,9 +9,19 @@ import (
 	"github.com/coreos/go-iptables/iptables"
 )
 
+// RuleBackend is the subset of iptables operations the Manager drives.
+// Production always wraps *go-iptables' IPTables; tests substitute an
+// in-memory backend so rule-state semantics (which rules survive an adopt,
+// a clear, a reapply) are assertable without root or a linux host.
+type RuleBackend interface {
+	Exists(table, chain string, rulespec ...string) (bool, error)
+	Insert(table, chain string, pos int, rulespec ...string) error
+	Delete(table, chain string, rulespec ...string) error
+}
+
 type Manager struct {
 	enabled bool
-	ipt     *iptables.IPTables
+	ipt     RuleBackend
 	// mu serializes Block/Clear pairs. iptables Exists+Insert is not atomic,
 	// and the poller, reconcile, SetNetworkLimits, and Destroy paths can all
 	// drive the same IP concurrently. Without this lock, two callers can both
@@ -34,6 +44,12 @@ func New(enabled bool) (*Manager, error) {
 		enabled: true,
 		ipt:     ipt,
 	}, nil
+}
+
+// NewWithBackend builds an enabled Manager over an injected backend. Test
+// seam only — production wiring goes through New.
+func NewWithBackend(backend RuleBackend) *Manager {
+	return &Manager{enabled: backend != nil, ipt: backend}
 }
 
 func (m *Manager) Enabled() bool {

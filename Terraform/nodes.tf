@@ -178,6 +178,7 @@ resource "aws_instance" "seed" {
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
     wasm_cfg               = local.wasm_cfg
+    docker_pool_cfg        = local.docker_pool_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
   }))
 
@@ -357,6 +358,7 @@ resource "aws_instance" "joiner" {
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
     wasm_cfg               = local.wasm_cfg
+    docker_pool_cfg        = local.docker_pool_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
   }))
 

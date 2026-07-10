@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/version"
@@ -30,6 +31,16 @@ type ParkedListener struct {
 	closed         bool
 	closeMu        sync.Mutex
 	registered     bool
+
+	// Held-connection liveness. The guest sends nothing between its parked
+	// hello and the adopt ack, so a background read on the held conn returns
+	// only when the guest dies (EOF) or misbehaves — either way the slot is
+	// unusable and Alive() must say so, or the pool hands out dead slots and
+	// every adopt falls back cold. adopting flags the intentional deadline
+	// interrupt used by Adopt to reclaim the conn from the monitor.
+	dead        bool
+	adopting    atomic.Bool
+	monitorDone chan struct{}
 }
 
 // NewParkedListener listens for a warm-pool parked hello.
@@ -124,10 +135,32 @@ func (l *ParkedListener) WaitParked(ctx context.Context) error {
 		_ = conn.Close()
 		return err
 	}
+	// verifyParked left a short deadline on the conn; the held connection must
+	// outlive it (the slot may stay parked for hours).
+	_ = conn.SetDeadline(time.Time{})
 	l.connMu.Lock()
 	l.conn = conn
+	l.monitorDone = make(chan struct{})
 	l.connMu.Unlock()
+	go l.monitorParked(conn)
 	return nil
+}
+
+// monitorParked blocks on the held conn to detect guest death while parked.
+// Any read result other than Adopt's intentional deadline interrupt marks the
+// slot dead: EOF/err means the guest closed, and bytes are a protocol
+// violation (the guest is silent until the host sends the adopt frame, which
+// only happens after this goroutine has exited).
+func (l *ParkedListener) monitorParked(conn net.Conn) {
+	defer close(l.monitorDone)
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if l.adopting.Load() && n == 0 && err != nil {
+		return
+	}
+	l.connMu.Lock()
+	l.dead = true
+	l.connMu.Unlock()
 }
 
 func (l *ParkedListener) verifyParked(conn net.Conn) error {
@@ -155,7 +188,7 @@ func (l *ParkedListener) Alive() bool {
 	}
 	l.connMu.Lock()
 	defer l.connMu.Unlock()
-	return l.conn != nil && !l.closed
+	return l.conn != nil && !l.closed && !l.dead
 }
 
 // Adopt sends the adopt frame and waits for the ready ack.
@@ -165,9 +198,25 @@ func (l *ParkedListener) Adopt(ctx context.Context, sandboxID, token, adoptNonce
 	}
 	l.connMu.Lock()
 	conn := l.conn
+	monitorDone := l.monitorDone
 	l.connMu.Unlock()
 	if conn == nil {
 		return errors.New("park connection is not held")
+	}
+
+	// Reclaim the conn from the liveness monitor: flag the interrupt as
+	// intentional, kick its blocking read with an immediate deadline, and wait
+	// for it to exit so it can't consume bytes of the ready ack below.
+	l.adopting.Store(true)
+	_ = conn.SetReadDeadline(time.Now())
+	if monitorDone != nil {
+		<-monitorDone
+	}
+	l.connMu.Lock()
+	dead := l.dead
+	l.connMu.Unlock()
+	if dead {
+		return errors.New("parked connection is dead")
 	}
 
 	deadline, ok := ctx.Deadline()

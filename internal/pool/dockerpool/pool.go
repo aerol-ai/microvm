@@ -56,6 +56,27 @@ func (p *Pool) releasePark(slotID string) {
 		p.onReleasePark(slotID)
 	}
 }
+
+// ReleasePark frees the capacity reservation of a slot that already left the
+// pool via Acquire but was discarded by the caller (e.g. adopt failure).
+// Every parked slot holds a park:<slot-id> admitter reservation; any path
+// that destroys the container without releasing it leaks capacity until the
+// node stops admitting creates.
+func (p *Pool) ReleasePark(slotID string) { p.releasePark(slotID) }
+
+// destroySlots tears down discarded slots outside the pool lock: the spawner
+// call talks to the Docker engine and must never run under p.mu.
+func (p *Pool) destroySlots(ctx context.Context, slots []*ParkedSlot) {
+	for _, slot := range slots {
+		if slot == nil {
+			continue
+		}
+		if p.spawner != nil {
+			_ = p.spawner.DestroyParked(ctx, slot)
+		}
+		p.releasePark(slot.ID)
+	}
+}
 func (p *Pool) SetDefaultDepth(n int) {
 	p.mu.Lock()
 	p.defaultDepth = n
@@ -88,18 +109,25 @@ func (p *Pool) NoteTarget(key Key) {
 	if ks == "" || key.Image == "" {
 		return
 	}
+	var evicted []*ParkedSlot
 	p.mu.Lock()
 	if _, pinned := p.pinned[ks]; !pinned {
 		if p.maxImages > 0 && len(p.targets) >= p.maxImages {
-			p.evictLRUTargetLocked()
+			evicted = p.evictLRUTargetLocked()
 		}
 	}
 	p.targets[ks] = key
 	p.lastUsed[ks] = time.Now().UTC()
 	p.mu.Unlock()
+	p.destroySlots(context.Background(), evicted)
 }
 
-func (p *Pool) evictLRUTargetLocked() {
+// evictLRUTargetLocked removes the least-recently-used non-pinned target from
+// the maps and returns its parked slots. The caller destroys them after
+// releasing p.mu — destruction talks to the Docker engine, and the old
+// unlock-relock-in-place pattern let concurrent map writers interleave with a
+// half-finished eviction.
+func (p *Pool) evictLRUTargetLocked() []*ParkedSlot {
 	var oldest string
 	var oldestAt time.Time
 	for ks := range p.targets {
@@ -113,71 +141,96 @@ func (p *Pool) evictLRUTargetLocked() {
 		}
 	}
 	if oldest == "" {
-		return
+		return nil
 	}
 	delete(p.targets, oldest)
 	delete(p.lastUsed, oldest)
 	slots := p.ready[oldest]
 	delete(p.ready, oldest)
 	delete(p.spawning, oldest)
-	spawner := p.spawner
-	p.mu.Unlock()
-	for _, slot := range slots {
-		if spawner != nil && slot != nil {
-			_ = spawner.DestroyParked(context.Background(), slot)
-		}
-	}
-	p.mu.Lock()
+	return slots
 }
 
-// Acquire removes one warm slot for key. imageID is re-validated at hand-out.
-func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*ParkedSlot, error) {
-	p.NoteTarget(key)
-	ks := key.KeyString()
-
+// HasReady reports whether any slot is queued for key. It exists so the
+// create path can skip the image-inspect engine call on a guaranteed miss —
+// keeping the miss path free of added boot-path work.
+func (p *Pool) HasReady(key Key) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.lastUsed[ks] = time.Now().UTC()
+	return len(p.ready[key.KeyString()]) > 0
+}
 
-	q := p.ready[ks]
-	for i := len(q) - 1; i >= 0; i-- {
-		slot := q[i]
-		if slot == nil || slot.Handle == nil || !slot.Handle.Alive() {
-			q = append(q[:i], q[i+1:]...)
-			if p.metrics != nil {
-				p.metrics.recordOrphan()
-			}
-			continue
-		}
-		if currentImageID != "" && slot.ImageID != "" && slot.ImageID != currentImageID {
-			dead := slot
-			q = append(q[:i], q[i+1:]...)
-			spawner := p.spawner
-			p.ready[ks] = q
-			p.mu.Unlock()
-			if spawner != nil {
-				_ = spawner.DestroyParked(ctx, dead)
-				p.releasePark(dead.ID)
-			}
-			if p.metrics != nil {
-				p.metrics.recordStaleImage()
-			}
-			p.mu.Lock()
-			continue
-		}
-		p.ready[ks] = append(q[:i], q[i+1:]...)
-		p.publishParkedLocked()
-		if p.metrics != nil {
-			p.metrics.recordHit()
-		}
-		return slot, nil
-	}
-	p.ready[ks] = q
+// NoteMiss registers a miss without scanning the queue: the target is noted
+// for self-warming, the miss is counted, and refill is kicked — the same
+// side effects an empty-queue Acquire would have had.
+func (p *Pool) NoteMiss(key Key) {
+	p.NoteTarget(key)
+	p.mu.Lock()
 	if p.metrics != nil {
 		p.metrics.recordMiss()
 	}
 	p.kickRefillLocked()
-	return nil, ErrNoSlot
+	p.mu.Unlock()
+}
+
+// Acquire removes one warm slot for key. imageID is re-validated at hand-out.
+// Dead and stale-image slots found along the way are pruned and destroyed —
+// container, netrules, AND park reservation — otherwise their DROP rules and
+// admitter reservations outlive the container object. All queue surgery
+// happens under one continuous lock hold; releasing p.mu mid-scan let a
+// concurrent RecordLoaded slot be clobbered by a stale slice write-back.
+func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*ParkedSlot, error) {
+	p.NoteTarget(key)
+	ks := key.KeyString()
+
+	var picked *ParkedSlot
+	var discardDead, discardStale []*ParkedSlot
+
+	p.mu.Lock()
+	p.lastUsed[ks] = time.Now().UTC()
+	q := p.ready[ks]
+	keep := q[:0]
+	for _, slot := range q {
+		switch {
+		case slot == nil || slot.Handle == nil || !slot.Handle.Alive():
+			if slot != nil {
+				discardDead = append(discardDead, slot)
+			}
+		case currentImageID != "" && slot.ImageID != "" && slot.ImageID != currentImageID:
+			discardStale = append(discardStale, slot)
+		case picked == nil:
+			picked = slot
+		default:
+			keep = append(keep, slot)
+		}
+	}
+	p.ready[ks] = keep
+	p.publishParkedLocked()
+	if p.metrics != nil {
+		for range discardDead {
+			p.metrics.recordOrphan()
+		}
+		for range discardStale {
+			p.metrics.recordStaleImage()
+		}
+		if picked != nil {
+			p.metrics.recordHit()
+		} else {
+			p.metrics.recordMiss()
+		}
+	}
+	if picked == nil {
+		p.kickRefillLocked()
+	}
+	p.mu.Unlock()
+
+	p.destroySlots(ctx, discardDead)
+	p.destroySlots(ctx, discardStale)
+
+	if picked == nil {
+		return nil, ErrNoSlot
+	}
+	return picked, nil
 }
 
 func (p *Pool) kickRefillLocked() {
@@ -188,6 +241,22 @@ func (p *Pool) kickRefillLocked() {
 	case p.refillKick <- struct{}{}:
 	default:
 	}
+}
+
+// ReturnSlot puts an acquired-but-untouched slot back into the ready queue
+// (duplicate-create rename conflict: the parked container was never adopted).
+// Unlike RecordLoaded it does not decrement the in-flight spawn counter — no
+// spawn completed here, and skewing that counter makes SpawnBudget park past
+// depth, each excess slot pinning a park reservation.
+func (p *Pool) ReturnSlot(slot *ParkedSlot) {
+	if slot == nil {
+		return
+	}
+	ks := slot.Key.KeyString()
+	p.mu.Lock()
+	p.ready[ks] = append(p.ready[ks], slot)
+	p.publishParkedLocked()
+	p.mu.Unlock()
 }
 
 // RecordLoaded pushes a freshly parked slot into the ready queue.
@@ -265,13 +334,14 @@ func (p *Pool) ListTargets() []Key {
 }
 
 // ReapIdle drops non-pinned targets with no recent use past idleTTL.
+// Map surgery happens under one lock hold; slot destruction after unlock
+// (same rationale as Acquire/NoteTarget).
 func (p *Pool) ReapIdle(now time.Time) int {
 	if p.idleTTL <= 0 {
 		return 0
 	}
+	var reaped []*ParkedSlot
 	p.mu.Lock()
-	var reaped int
-	spawner := p.spawner
 	for ks := range p.targets {
 		if _, pinned := p.pinned[ks]; pinned {
 			continue
@@ -280,24 +350,16 @@ func (p *Pool) ReapIdle(now time.Time) int {
 		if !last.IsZero() && now.Sub(last) < p.idleTTL {
 			continue
 		}
-		slots := append([]*ParkedSlot(nil), p.ready[ks]...)
+		reaped = append(reaped, p.ready[ks]...)
 		delete(p.targets, ks)
 		delete(p.lastUsed, ks)
 		delete(p.ready, ks)
 		delete(p.spawning, ks)
-		reaped += len(slots)
-		p.mu.Unlock()
-		for _, slot := range slots {
-			if spawner != nil && slot != nil {
-				_ = spawner.DestroyParked(context.Background(), slot)
-				p.releasePark(slot.ID)
-			}
-		}
-		p.mu.Lock()
 	}
 	p.publishParkedLocked()
 	p.mu.Unlock()
-	return reaped
+	p.destroySlots(context.Background(), reaped)
+	return len(reaped)
 }
 
 // Close drains all warm slots.
@@ -305,23 +367,19 @@ func (p *Pool) Close() int {
 	p.mu.Lock()
 	var slots []*ParkedSlot
 	for _, q := range p.ready {
-		slots = append(slots, q...)
-	}
-	p.ready = make(map[string][]*ParkedSlot)
-	spawner := p.spawner
-	p.mu.Unlock()
-	drained := 0
-	for _, slot := range slots {
-		if spawner != nil && slot != nil {
-			_ = spawner.DestroyParked(context.Background(), slot)
-			p.releasePark(slot.ID)
-			drained++
+		for _, slot := range q {
+			if slot != nil {
+				slots = append(slots, slot)
+			}
 		}
 	}
+	p.ready = make(map[string][]*ParkedSlot)
+	p.mu.Unlock()
+	p.destroySlots(context.Background(), slots)
 	if p.metrics != nil {
 		p.metrics.setParked(0)
 	}
-	return drained
+	return len(slots)
 }
 
 // NewSlotID mints a unique pool slot identifier.

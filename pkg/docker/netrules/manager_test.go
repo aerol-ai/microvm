@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -176,6 +178,123 @@ func TestManagerEnabledErrors(t *testing.T) {
 				t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// memBackend is an in-memory RuleBackend for asserting rule-state semantics
+// of the selective-egress policy paths (allowlist/denylist + comment scoping)
+// without a fake iptables binary.
+type memBackend struct {
+	rules []string
+}
+
+func memKey(table, chain string, spec ...string) string {
+	return table + "|" + chain + "|" + strings.Join(spec, "|")
+}
+
+func (m *memBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	return slices.Contains(m.rules, memKey(table, chain, spec...)), nil
+}
+
+func (m *memBackend) Insert(table, chain string, _ int, spec ...string) error {
+	m.rules = append(m.rules, memKey(table, chain, spec...))
+	return nil
+}
+
+func (m *memBackend) Delete(table, chain string, spec ...string) error {
+	k := memKey(table, chain, spec...)
+	for i, r := range m.rules {
+		if r == k {
+			m.rules = append(m.rules[:i], m.rules[i+1:]...)
+			return nil
+		}
+	}
+	return errNoMatch{}
+}
+
+type errNoMatch struct{}
+
+func (errNoMatch) Error() string { return "No chain/target/match by that name." }
+
+func TestNewWithBackend(t *testing.T) {
+	if m := NewWithBackend(nil); m.Enabled() {
+		t.Fatal("nil backend must build a disabled manager")
+	}
+	if m := NewWithBackend(&memBackend{}); !m.Enabled() {
+		t.Fatal("backend-built manager must be enabled")
+	}
+}
+
+func TestApplyEgressPolicyAllowlist(t *testing.T) {
+	backend := &memBackend{}
+	mgr := NewWithBackend(backend)
+	const ip = "10.0.0.5"
+	allow := []string{"1.1.1.1/32", "8.8.8.0/24"}
+
+	if err := mgr.ApplyEgressPolicy(ip, allow, nil); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// Idempotent reapply must not duplicate rules.
+	if err := mgr.ApplyEgressPolicy(ip, allow, nil); err != nil {
+		t.Fatalf("reapply: %v", err)
+	}
+	if len(backend.rules) != 3 {
+		t.Fatalf("rules = %v, want catch-all DROP + 2 ACCEPTs", backend.rules)
+	}
+	if ok, _ := backend.Exists("filter", "DOCKER-USER", "-s", ip, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); !ok {
+		t.Fatal("allowlist catch-all DROP missing")
+	}
+	for _, cidr := range allow {
+		if ok, _ := backend.Exists("filter", "DOCKER-USER", "-s", ip, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT"); !ok {
+			t.Fatalf("ACCEPT for %s missing", cidr)
+		}
+	}
+
+	if err := mgr.ClearEgressPolicy(ip, allow, nil); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if len(backend.rules) != 0 {
+		t.Fatalf("rules after clear = %v", backend.rules)
+	}
+	// Clearing an already-clean policy must tolerate absent rules.
+	if err := mgr.ClearEgressPolicy(ip, allow, nil); err != nil {
+		t.Fatalf("re-clear: %v", err)
+	}
+}
+
+func TestApplyEgressPolicyDenylist(t *testing.T) {
+	backend := &memBackend{}
+	mgr := NewWithBackend(backend)
+	const ip = "10.0.0.6"
+	deny := []string{"192.168.0.0/16"}
+
+	if err := mgr.ApplyEgressPolicy(ip, nil, deny); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(backend.rules) != 1 {
+		t.Fatalf("rules = %v, want one DROP", backend.rules)
+	}
+	if ok, _ := backend.Exists("filter", "DOCKER-USER", "-s", ip, "-d", deny[0], "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); !ok {
+		t.Fatal("denylist DROP missing")
+	}
+	if err := mgr.ClearEgressPolicy(ip, nil, deny); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if len(backend.rules) != 0 {
+		t.Fatalf("rules after clear = %v", backend.rules)
+	}
+}
+
+func TestApplyEgressPolicyDisabledAndEmptyIP(t *testing.T) {
+	if err := (&Manager{}).ApplyEgressPolicy("10.0.0.7", []string{"1.1.1.1/32"}, nil); err != nil {
+		t.Fatalf("disabled apply: %v", err)
+	}
+	if err := (&Manager{}).ClearEgressPolicy("10.0.0.7", []string{"1.1.1.1/32"}, nil); err != nil {
+		t.Fatalf("disabled clear: %v", err)
+	}
+	mgr := NewWithBackend(&memBackend{})
+	if err := mgr.ApplyEgressPolicy("", []string{"1.1.1.1/32"}, nil); err != nil {
+		t.Fatalf("empty ip apply: %v", err)
 	}
 }
 

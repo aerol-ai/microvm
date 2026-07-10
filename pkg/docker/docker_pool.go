@@ -81,12 +81,23 @@ func (c *Client) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 		return nil, dockerpool.ErrNoSlot
 	}
 
+	// Guaranteed miss: skip the image-inspect engine call so the miss path
+	// adds no boot-path work beyond a map lookup. Only a potential hit pays
+	// the inspect (needed to re-validate the parked slot's image identity).
+	key := dockerpool.KeyFromRequest(req, effectiveRuntime)
+	if !c.warmPool.HasReady(key) {
+		c.warmPool.NoteMiss(key)
+		if timing := CreateTimingFrom(ctx); timing != nil {
+			timing.RecordStageDesc("docker_pool", 0, "miss")
+		}
+		return nil, dockerpool.ErrNoSlot
+	}
+
 	imageInspect, err := c.inspectImage(ctx, req.Image)
 	if err != nil {
 		return nil, dockerpool.ErrNoSlot
 	}
 	imageID := strings.TrimSpace(imageInspect.ID)
-	key := dockerpool.KeyFromRequest(req, effectiveRuntime)
 	slot, err := c.warmPool.Acquire(ctx, key, imageID)
 	if err != nil {
 		if timing := CreateTimingFrom(ctx); timing != nil && errors.Is(err, dockerpool.ErrNoSlot) {
@@ -105,10 +116,19 @@ func (c *Client) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 		}
 	}
 	if err != nil {
-		_ = c.destroyParked(ctx, slot)
 		if errors.Is(err, ErrSandboxContainerExists) {
+			// Rename conflicted before the slot was touched: a concurrent
+			// duplicate create owns this sandbox ID. The parked container is
+			// still pristine — return it to the pool instead of burning it.
+			c.warmPool.ReturnSlot(slot)
 			return nil, err
 		}
+		// The slot left the pool at Acquire, so nothing else will free its
+		// park:<slot-id> capacity reservation — destroy AND release here, or
+		// every failed adopt permanently shrinks the node's admittable
+		// capacity.
+		_ = c.destroyParked(ctx, slot)
+		c.warmPool.ReleasePark(slot.ID)
 		return nil, fmt.Errorf("warm adopt failed: %w", err)
 	}
 	if createtiming.From(ctx) != nil {
@@ -315,17 +335,24 @@ func (c *Client) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	}, nil
 }
 
+// applyAdoptNetworkPolicy converts the park-time egress DROP into the adopted
+// sandbox's requested policy. Order matters: the requested rules go in first
+// so there is never a window where the container has unrestricted egress, and
+// the park DROP is removed last — but only when the request did NOT ask for
+// block-all, because the park DROP and the NetworkBlockAll rule are the SAME
+// iptables rule (-s <ip> -j DROP). Clearing it unconditionally would hand a
+// block-all sandbox open egress.
 func (c *Client) applyAdoptNetworkPolicy(containerIP string, req models.CreateSandboxRequest) error {
-	if req.NetworkBlockAll {
-		if err := c.networkRules.BlockAllEgress(containerIP); err != nil {
-			return err
-		}
-	}
 	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
 		if err := c.networkRules.ApplyEgressPolicy(containerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
 			_ = c.networkRules.ClearEgressPolicy(containerIP, req.NetworkAllowOut, req.NetworkDenyOut)
 			return err
 		}
+	}
+	if req.NetworkBlockAll {
+		// The park DROP already is the block-all rule; BlockAllEgress is
+		// idempotent and re-asserts it in case it was lost.
+		return c.networkRules.BlockAllEgress(containerIP)
 	}
 	return c.networkRules.ClearBlockAllEgress(containerIP)
 }
@@ -391,10 +418,13 @@ func mintBootstrapToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// ListParkedContainers returns running park-labeled containers for boot purge.
+// ListParkedContainers returns all park-labeled containers for boot purge.
+// all=1 matters: a parked container that crashed or exited still has its
+// container object and, worse, its IP-keyed DROP rule — listing only running
+// containers would leave both behind forever.
 func (c *Client) ListParkedContainers(ctx context.Context) ([]containerSummary, error) {
 	query := queryValues(map[string]string{
-		"all":     "0",
+		"all":     "1",
 		"filters": fmt.Sprintf(`{"label":["%s=%s"]}`, poolParkLabelKey, poolParkLabelValue),
 	})
 	var containers []containerSummary

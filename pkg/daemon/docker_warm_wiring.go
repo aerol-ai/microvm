@@ -57,7 +57,21 @@ func wireDockerWarmPool(ctx context.Context, cfg config.Config, logger *slog.Log
 		})
 	}
 
+	// Purge leftovers from a previous daemon run BEFORE the refill loop
+	// starts parking: the purge sweeps by label, so running it afterwards
+	// can destroy freshly parked slots the pool still tracks as live,
+	// stranding their park reservations.
+	if purged, err := dockerClient.PurgeParkedContainers(ctx); err != nil {
+		logger.Warn("docker warm pool boot purge failed", "error", err)
+	} else if purged > 0 {
+		logger.Info("docker warm pool boot purge", "containers", purged)
+	}
+
 	spawner := &docker.PoolSpawner{Client: dockerClient}
+	// Wire the spawner before anything can Acquire: slot discards inside the
+	// pool need it to destroy containers, and RunRefill's own SetSpawner
+	// happens on the goroutine's schedule, not ours.
+	pool.SetSpawner(spawner)
 	refillCfg := dockerpool.RefillConfig{
 		RefillInterval: cfg.DockerPoolRefillInterval,
 		SpawnTimeout:   cfg.DockerRuntimeWaitTimeout,
@@ -65,12 +79,6 @@ func wireDockerWarmPool(ctx context.Context, cfg config.Config, logger *slog.Log
 		ParkShape:      parkShape,
 	}
 	go dockerpool.RunRefill(ctx, pool, refillCfg, spawner, gate, logger)
-
-	if purged, err := dockerClient.PurgeParkedContainers(ctx); err != nil {
-		logger.Warn("docker warm pool boot purge failed", "error", err)
-	} else if purged > 0 {
-		logger.Info("docker warm pool boot purge", "containers", purged)
-	}
 
 	logger.Info("docker warm pool enabled",
 		"depth", cfg.DockerPoolDepth,

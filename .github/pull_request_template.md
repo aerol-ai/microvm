@@ -8,6 +8,21 @@ is not. See pr-review.md at the repo root for what each section is asking.
 
 <!-- 1-3 bullets: what changed and why. -->
 
+## Code-path diagram
+
+<!--
+REQUIRED for any change to runtime behavior (see pr-review.md §8): at least
+one ```mermaid``` diagram of the changed code path, annotated with what
+changed on each branch (before -> after).
+
+- sequenceDiagram for protocol / handshake / cross-process changes
+- flowchart for control-flow, lifecycle, or cleanup-path changes
+- every failure/cleanup branch the diff touches must appear as a branch
+
+Reference example: PR #289 "What changed, visually".
+Only valid opt-out: "N/A - docs/comment-only change."
+-->
+
 ## Sandbox boot impact
 
 <!--
