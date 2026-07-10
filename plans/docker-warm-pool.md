@@ -153,12 +153,16 @@ forces a miss:
 | `DiskGB` ≠ park default | **miss** (storage opt is create-time) |
 | `Env` non-empty | **miss in v1** (baked at create; Phase 2: adopt frame carries env, toolboxd injects into every exec/session it spawns — needs the PID-1-won't-see-it caveat documented) |
 | `Mounts` / `PlatformVolumes` non-empty | **miss** (binds are create-time) |
-| `OSUser`, `ContainerCommand`, `Registry`, `GPUs` set | **miss** |
+| `OSUser` empty or `root` (normalize default) | **yes** — cold path never sets Docker `User` from OSUser; park slots run as image default (root). Non-root OSUser → **miss** |
+| `ContainerCommand`, `Registry`, `GPUs` set | **miss** |
 | `NetworkBlockAll` / allow/deny lists / byte limits | yes — netrules applied at adopt (§2 ordering) |
 | `Name`, `Tags`, `Lifecycle`, `Failover`, custom domains | yes — store/service level, container-agnostic |
 
 The bench (`{"image":"alpine:3.20"}`) and default agent-workload creates
-are eligible; that's the traffic the 100ms goal is for.
+are eligible; that's the traffic the 100ms goal is for. Note:
+`normalizeCreateRequest` fills `OSUser="root"` before `docker.Create`, so
+eligibility must treat root as the park default — rejecting any non-empty
+OSUser made every create cold.
 
 ## 4. Capacity: park reservation → sandbox reservation transfer
 

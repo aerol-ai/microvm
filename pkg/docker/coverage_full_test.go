@@ -322,11 +322,20 @@ func TestListManaged(t *testing.T) {
 					{"Id": "managed", "Labels": map[string]string{managedLabelKey: "true"}},
 					{"Id": "unmanaged", "Labels": map[string]string{}},
 					{"Id": "inspect-fails", "Labels": map[string]string{managedLabelKey: "true"}},
+					// Warm-pool park: managed label + park label. Must not
+					// appear in ListManaged or reconcile will destroy it.
+					{"Id": "parked", "Labels": map[string]string{
+						managedLabelKey:  "true",
+						poolParkLabelKey: poolParkLabelValue,
+					}},
 				}), nil
 			case r.URL.Path == "/containers/managed/json":
 				return textResponse(http.StatusOK, inspectBody("managed", "/sb-managed", "172.17.0.2", true, "running", 1)), nil
 			case r.URL.Path == "/containers/inspect-fails/json":
 				return textResponse(http.StatusInternalServerError, "boom"), nil
+			case r.URL.Path == "/containers/parked/json":
+				t.Fatal("ListManaged must not inspect park-labeled containers")
+				return nil, nil
 			default:
 				t.Fatalf("unexpected path %s", r.URL.Path)
 				return nil, nil
@@ -341,6 +350,34 @@ func TestListManaged(t *testing.T) {
 		}
 		if _, ok := result["sb-managed"]; !ok {
 			t.Fatalf("ListManaged() missing sb-managed: %+v", result)
+		}
+		if _, ok := result["park-d316b60bc106a6f6"]; ok {
+			t.Fatal("ListManaged() must exclude parked containers")
+		}
+	})
+
+	t.Run("excludes_park_name_without_label", func(t *testing.T) {
+		// Defense in depth: even if the park label is missing, a park-*
+		// container name must not enter the orphan set.
+		c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.URL.Path == "/containers/json":
+				return jsonResponse(http.StatusOK, []map[string]any{
+					{"Id": "parked-nolabel", "Labels": map[string]string{managedLabelKey: "true"}},
+				}), nil
+			case r.URL.Path == "/containers/parked-nolabel/json":
+				return textResponse(http.StatusOK, inspectBody("parked-nolabel", "/park-aabbccddeeff0011", "172.17.0.9", true, "running", 1)), nil
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+				return nil, nil
+			}
+		})}}
+		result, err := c.ListManaged(context.Background())
+		if err != nil {
+			t.Fatalf("ListManaged() = %v", err)
+		}
+		if len(result) != 0 {
+			t.Fatalf("ListManaged() = %+v, want empty (park-* name excluded)", result)
 		}
 	})
 

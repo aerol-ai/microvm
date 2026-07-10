@@ -36,6 +36,9 @@ type fakeCapacityRuntime struct {
 	// startCount counts Start invocations so wake-helper tests can
 	// assert single-flight collapsing.
 	startCount int
+	// destroyedIDs records Destroy targets so orphan-skip tests can assert
+	// park-* inventory is left alone.
+	destroyedIDs []string
 }
 
 func (f *fakeCapacityRuntime) ListManaged(_ context.Context) (map[string]*models.SandboxRuntimeState, error) {
@@ -69,8 +72,13 @@ func (f *fakeCapacityRuntime) Start(context.Context, string) (*models.SandboxRun
 	}
 	return nil, nil
 }
-func (f *fakeCapacityRuntime) Stop(context.Context, string) error             { return nil }
-func (f *fakeCapacityRuntime) Destroy(context.Context, *models.Sandbox) error { return nil }
+func (f *fakeCapacityRuntime) Stop(context.Context, string) error { return nil }
+func (f *fakeCapacityRuntime) Destroy(_ context.Context, sb *models.Sandbox) error {
+	if sb != nil {
+		f.destroyedIDs = append(f.destroyedIDs, sb.ID)
+	}
+	return nil
+}
 func (f *fakeCapacityRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	return nil
 }
@@ -1142,6 +1150,50 @@ func TestReconcileMixedRuntimeStates(t *testing.T) {
 		if got.Status != models.SandboxStatusStarted {
 			t.Fatalf("%s status = %s, want started", id, got.Status)
 		}
+	}
+}
+
+// TestReconcileSkipsWarmPoolParkOrphans: parked warm-pool containers have no
+// DB row (by design) but still appear in ListManaged if a runtime surfaces
+// them. Reconcile must not Destroy them — that was emptying the pool on every
+// UC-63 / reconcile tick and forcing every create down the cold path.
+func TestReconcileSkipsWarmPoolParkOrphans(t *testing.T) {
+	ctx := context.Background()
+	parkID := "park-d316b60bc106a6f6"
+	realOrphan := "sb-real-orphan"
+	managed := map[string]*models.SandboxRuntimeState{
+		parkID: {
+			SandboxID:   parkID,
+			ContainerID: "ctr-" + parkID,
+			ContainerIP: "172.17.0.9",
+			Status:      models.SandboxStatusStarted,
+		},
+		realOrphan: {
+			SandboxID:   realOrphan,
+			ContainerID: "ctr-" + realOrphan,
+			ContainerIP: "172.17.0.10",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, _, _ := newCapacityHarness(t, managed, nil)
+	rt := svc.docker.(*fakeCapacityRuntime)
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, id := range rt.destroyedIDs {
+		if id == parkID {
+			t.Fatalf("Reconcile destroyed warm-pool park %q; destroyed=%v", parkID, rt.destroyedIDs)
+		}
+	}
+	foundReal := false
+	for _, id := range rt.destroyedIDs {
+		if id == realOrphan {
+			foundReal = true
+		}
+	}
+	if !foundReal {
+		t.Fatalf("Reconcile must still destroy real orphans; destroyed=%v", rt.destroyedIDs)
 	}
 }
 

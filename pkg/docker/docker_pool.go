@@ -20,6 +20,20 @@ import (
 const poolParkLabelKey = "aerol.pool"
 const poolParkLabelValue = "park"
 
+// isParkedContainerLabels reports whether Docker labels mark a warm-pool
+// parked container (not a sandbox). Used by ListManaged so reconcile does
+// not treat park inventory as orphans.
+func isParkedContainerLabels(labels map[string]string) bool {
+	return labels != nil && labels[poolParkLabelKey] == poolParkLabelValue
+}
+
+// isParkedSandboxID reports whether a container name / sandbox-id slot is a
+// warm-pool park id (park-<hex>). Belt-and-braces for ListManaged and the
+// service orphan pass when the park label is missing after a partial adopt.
+func isParkedSandboxID(id string) bool {
+	return strings.HasPrefix(strings.TrimSpace(id), "park-")
+}
+
 // ErrSandboxContainerExists is returned when adopt-time rename finds the
 // sandbox name already taken — signals the §6 duplicate-create protocol.
 var ErrSandboxContainerExists = errors.New("docker: sandbox container name already exists")
@@ -55,7 +69,13 @@ func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.Container
 	if len(req.Mounts) > 0 || len(req.PlatformVolumes) > 0 || len(hostMounts) > 0 {
 		return false
 	}
-	if strings.TrimSpace(req.OSUser) != "" {
+	// normalizeCreateRequest fills OSUser="root" for every default create.
+	// Parked containers also run as the image default user (root for alpine),
+	// and the cold Docker path never sets Docker's User field from OSUser —
+	// so the default/root case is byte-identical to a park slot. Only a
+	// non-default OSUser forces a miss (we cannot change the container user
+	// post-create).
+	if user := strings.TrimSpace(req.OSUser); user != "" && !strings.EqualFold(user, "root") {
 		return false
 	}
 	if len(req.ContainerCommand) > 0 {

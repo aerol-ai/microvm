@@ -854,6 +854,13 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 		if summary.Labels[managedLabelKey] != "true" {
 			continue
 		}
+		// Warm-pool parked containers carry aerolvm.managed=true (so the
+		// boot purge / events filter can find them) but they are not
+		// sandboxes — they have no DB row. Exclude them here so Reconcile's
+		// orphan pass does not destroy live park inventory.
+		if isParkedContainerLabels(summary.Labels) {
+			continue
+		}
 		inspect, err := c.inspectContainer(ctx, summary.ID)
 		if err != nil {
 			continue
@@ -864,9 +871,10 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 			ContainerIP: getContainerIP(inspect, c.network),
 			Status:      containerStatus(inspect),
 		}
-		if runtime.SandboxID != "" {
-			result[runtime.SandboxID] = runtime
+		if runtime.SandboxID == "" || isParkedSandboxID(runtime.SandboxID) {
+			continue
 		}
+		result[runtime.SandboxID] = runtime
 	}
 
 	return result, nil

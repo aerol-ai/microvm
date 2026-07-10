@@ -26,6 +26,14 @@ func TestPoolEligible(t *testing.T) {
 	if !poolEligible(base, nil, 0) {
 		t.Fatal("expected eligible base request")
 	}
+	// Default create path fills OSUser=root via normalizeCreateRequest; that
+	// must remain poolable or every warm-pool create falls through cold.
+	if !poolEligible(models.CreateSandboxRequest{Image: "alpine:3.20", OSUser: "root", DiskGB: 10}, nil, 10) {
+		t.Fatal("expected root OSUser (normalize default) to be eligible")
+	}
+	if !poolEligible(models.CreateSandboxRequest{Image: "alpine:3.20", OSUser: "ROOT", DiskGB: 10}, nil, 10) {
+		t.Fatal("expected case-insensitive root OSUser to be eligible")
+	}
 	cases := []struct {
 		name string
 		req  models.CreateSandboxRequest
@@ -36,7 +44,7 @@ func TestPoolEligible(t *testing.T) {
 		{name: "mounts", req: models.CreateSandboxRequest{Image: "i", Mounts: []models.MountSpec{{Type: "bind", Source: "/a", Target: "/b"}}}},
 		{name: "platform_volumes", req: models.CreateSandboxRequest{Image: "i", PlatformVolumes: []models.PlatformVolumeMount{{Name: "v", Path: "/p"}}}},
 		{name: "host_mounts", req: models.CreateSandboxRequest{Image: "i"}, mnts: []mounts.ContainerBind{{HostPath: "/h", ContainerPath: "/c"}}},
-		{name: "os_user", req: models.CreateSandboxRequest{Image: "i", OSUser: "root"}},
+		{name: "os_user_non_root", req: models.CreateSandboxRequest{Image: "i", OSUser: "ubuntu"}},
 		{name: "container_command", req: models.CreateSandboxRequest{Image: "i", ContainerCommand: []string{"sleep"}}},
 		{name: "registry", req: models.CreateSandboxRequest{Image: "i", Registry: &models.RegistryAuth{Username: "u"}}},
 		{name: "gpus", req: models.CreateSandboxRequest{Image: "i", GPUs: &models.GPURequest{Vendor: models.GPUVendorNVIDIA}}},
@@ -49,6 +57,24 @@ func TestPoolEligible(t *testing.T) {
 				t.Fatal("expected ineligible")
 			}
 		})
+	}
+}
+
+func TestIsParkedHelpers(t *testing.T) {
+	if !isParkedContainerLabels(map[string]string{poolParkLabelKey: poolParkLabelValue}) {
+		t.Fatal("expected park label to match")
+	}
+	if isParkedContainerLabels(map[string]string{managedLabelKey: "true"}) {
+		t.Fatal("managed-only labels must not look parked")
+	}
+	if isParkedContainerLabels(nil) {
+		t.Fatal("nil labels must not look parked")
+	}
+	if !isParkedSandboxID("park-d316b60bc106a6f6") {
+		t.Fatal("expected park- prefix id")
+	}
+	if isParkedSandboxID("sb-abc") {
+		t.Fatal("sandbox id must not look parked")
 	}
 }
 

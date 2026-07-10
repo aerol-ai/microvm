@@ -3807,9 +3807,15 @@ func (s *Service) Reconcile(ctx context.Context) error {
 
 	// Orphan runtime instances: managed by us but no DB row. Remove them so
 	// leaked state from a crashed create or a wiped DB doesn't accumulate.
+	// Skip warm-pool park-* ids: they are intentional inventory without a
+	// sandbox row. ListManaged already filters the park label; this is the
+	// defense-in-depth gate for any runtime that still surfaces them.
 	removeOrphans := func(rt runtime.Runtime, runtimeName string, items map[string]*models.SandboxRuntimeState) {
 		for sandboxID, state := range items {
 			if _, ok := knownIDs[sandboxID]; ok {
+				continue
+			}
+			if strings.HasPrefix(sandboxID, "park-") {
 				continue
 			}
 			s.logger.Warn("removing orphan runtime instance",
