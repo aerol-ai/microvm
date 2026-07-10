@@ -283,8 +283,10 @@ protocol:
 Acquire with image-ID revalidation, LRU + TTL, kickRefill), `refill.go`
 (ticker + kick + §4 capacity gate + guard band), `spawner.go` (Spawner
 interface; prod impl → `docker.Client.ParkContainer`), `metrics.go`
-(expvars `docker_pool_hit/miss/refill/orphan/parked/stale_image`,
-`docker_pool_adopt_ms`), `errors.go`. Each with `_test.go` (≥85%).
+(expvars `aerolvm_docker_pool_{hits,misses,refills,orphans,stale_images,spawn_fails,target_evictions}_total`,
+`aerolvm_docker_pool_parked`, `aerolvm_docker_pool_adopt_ms` — the aerolvm_
+prefix is what the observability exporter publishes into /v1/metrics),
+`errors.go`. Each with `_test.go` (≥85%).
 
 **`pkg/docker/client.go`** — `ParkContainer` (park identity create+start,
 records image ID, applies park DROP, returns slot handle with held conn);

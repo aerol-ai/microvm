@@ -1,7 +1,10 @@
 package docker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -431,4 +434,60 @@ func TestStartAndWaitForRuntime(t *testing.T) {
 			t.Fatal("waitForRuntime() expected timeout")
 		}
 	})
+}
+
+// The Docker API embeds container.Resources INLINE in HostConfig: a nested
+// "Resources" key is an unknown field dockerd silently drops. That exact
+// shape shipped from the first version of this client, so no sandbox ever
+// actually received cpu/memory limits (live containers showed Memory=0,
+// CpuQuota=0). Pin the wire shape, not just "no error".
+func TestCreate_HostConfigInlinesResourceLimits(t *testing.T) {
+	var createBody []byte
+	d := &fakeDaemon{
+		t: t,
+		imageInspect: func() *http.Response {
+			return jsonResponse(http.StatusOK, map[string]any{
+				"Config": map[string]any{"WorkingDir": "/", "Entrypoint": []string{}, "Cmd": []string{"/bin/sh"}},
+			})
+		},
+		// Failing the create keeps the test off the start/wait path; the
+		// request body is already captured by then.
+		create: func() *http.Response {
+			return textResponse(http.StatusInternalServerError, `{"message":"stop here"}`)
+		},
+	}
+	c := newCreateClient(t, d, true, nil)
+	base := c.httpClient.Transport
+	c.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/containers/create" {
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read create body: %v", err)
+			}
+			createBody = b
+			r.Body = io.NopCloser(bytes.NewReader(b))
+		}
+		return base.RoundTrip(r)
+	})
+
+	req := models.CreateSandboxRequest{Image: "registry.example/app:v1", CPU: 2, MemoryMB: 1024, DiskGB: 5}
+	if _, err := c.Create(context.Background(), req, "sb", "tok", nil); err == nil {
+		t.Fatal("Create() expected injected create failure")
+	}
+
+	var body struct {
+		HostConfig map[string]any `json:"HostConfig"`
+	}
+	if err := json.Unmarshal(createBody, &body); err != nil {
+		t.Fatalf("create body: %v", err)
+	}
+	if _, nested := body.HostConfig["Resources"]; nested {
+		t.Fatal(`create body nests limits under "Resources" — dockerd drops that key`)
+	}
+	if body.HostConfig["Memory"] == nil || body.HostConfig["CpuQuota"] == nil || body.HostConfig["MemorySwap"] == nil {
+		t.Fatalf("create body missing inline resource limits: %v", body.HostConfig)
+	}
+	if body.HostConfig["StorageOpt"] == nil {
+		t.Fatalf("create body missing StorageOpt: %v", body.HostConfig)
+	}
 }

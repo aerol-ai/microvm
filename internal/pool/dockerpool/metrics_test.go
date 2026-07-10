@@ -10,12 +10,14 @@ func TestMetricsStatsAndCounters(t *testing.T) {
 	m.recordOrphan()
 	m.recordStaleImage()
 	m.RecordSpawnFail()
+	m.recordTargetEvict()
 	m.setParked(3)
-	m.recordAdoptMS(12.5)
+	m.RecordAdoptMS(12.5)
 
 	snap := m.Stats()
 	if snap.Hits != 1 || snap.Misses != 1 || snap.Refilled != 1 ||
-		snap.Orphans != 1 || snap.StaleImages != 1 || snap.SpawnFail != 1 {
+		snap.Orphans != 1 || snap.StaleImages != 1 || snap.SpawnFail != 1 ||
+		snap.TargetEvicts != 1 {
 		t.Fatalf("snap = %+v", snap)
 	}
 	var nilMetrics *Metrics

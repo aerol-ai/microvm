@@ -15,14 +15,30 @@ type Key struct {
 	Runtime               string
 }
 
-// KeyString returns a stable map key for the pool.
+// KeyString returns a stable map key for the pool. It canonicalizes through
+// the same defaulting rule the service's image-distribution normalization
+// applies (empty mode → external_registry, empty ref → image), because keys
+// reach the pool from two sides that MUST collide: boot-time pins are built
+// bare (Key{Image, Runtime}), while create-path keys are computed after
+// NormalizeCreateImageDistribution filled the metadata. Without this, pinned
+// slots sit under a keystring no create ever computes — permanently
+// unreachable and, being pinned, never idle-reaped.
 func (k Key) KeyString() string {
+	mode := strings.TrimSpace(k.ImageDistributionMode)
+	ref := strings.TrimSpace(k.ImageRegistryRef)
+	image := strings.TrimSpace(k.Image)
+	if mode == "" && image != "" {
+		mode = models.ImageDistributionExternalRegistry
+	}
+	if (mode == models.ImageDistributionExternalRegistry || mode == models.ImageDistributionAOCR) && ref == "" {
+		ref = image
+	}
 	return strings.Join([]string{
-		k.Image,
-		k.ImageDigest,
-		k.ImageRegistryRef,
-		k.ImageDistributionMode,
-		k.Runtime,
+		image,
+		strings.TrimSpace(k.ImageDigest),
+		ref,
+		mode,
+		strings.TrimSpace(k.Runtime),
 	}, "\x00")
 }
 

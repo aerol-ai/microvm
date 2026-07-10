@@ -1,6 +1,7 @@
 package netrules
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -8,6 +9,29 @@ import (
 
 	"github.com/coreos/go-iptables/iptables"
 )
+
+// ruleNotExist reports whether a delete failed only because the rule was
+// already absent. The message differs by iptables flavor: legacy says
+// "No chain/target/match by that name", iptables-nft (Ubuntu 22.04's
+// default) says "Bad rule (does a matching rule exist in that chain?)".
+// go-iptables' typed error knows every flavor; the string fallback covers
+// backends that return plain errors (the RuleBackend test seam). Matching
+// only the legacy string here is exactly the bug that made every warm-pool
+// adopt fail on iptables-nft hosts: the duplicate-sweep loop's terminating
+// "rule gone" probe read as a fatal error.
+func ruleNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	var iptErr *iptables.Error
+	if errors.As(err, &iptErr) {
+		return iptErr.IsNotExist()
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "No chain/target/match") ||
+		strings.Contains(msg, "does a matching rule exist") ||
+		strings.Contains(msg, "does not exist")
+}
 
 // RuleBackend is the subset of iptables operations the Manager drives.
 // Production always wraps *go-iptables' IPTables; tests substitute an
@@ -99,7 +123,7 @@ func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 		if err == nil {
 			continue
 		}
-		if strings.Contains(err.Error(), "No chain/target/match") {
+		if ruleNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("delete egress rule: %w", err)
@@ -147,7 +171,7 @@ func (m *Manager) ClearBlockAllIngress(containerIP string) error {
 		if err == nil {
 			continue
 		}
-		if strings.Contains(err.Error(), "No chain/target/match") {
+		if ruleNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("delete ingress rule: %w", err)
@@ -254,7 +278,7 @@ func (m *Manager) deletePolicyRule(spec ...string) error {
 		if err == nil {
 			continue
 		}
-		if strings.Contains(err.Error(), "No chain/target/match") {
+		if ruleNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("delete egress policy rule: %w", err)

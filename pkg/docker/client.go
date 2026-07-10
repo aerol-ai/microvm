@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -361,6 +362,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return warm, nil
 		} else if errors.Is(warmErr, ErrSandboxContainerExists) {
 			return nil, warmErr
+		} else if !errors.Is(warmErr, dockerpool.ErrNoSlot) {
+			// A non-miss failure means a parked slot was acquired and then
+			// burned mid-adopt. The cold fallback below masks it from the
+			// caller, so this WARN is the only place the error surfaces —
+			// swallowing it silently is how a 100% adopt-failure rate went
+			// unnoticed while every create quietly paid rename+destroy on
+			// top of the full cold path.
+			c.logger.Warn("docker warm adopt failed; falling back to cold create",
+				"sandbox_id", sandboxID, "error", warmErr)
 		}
 	}
 
@@ -548,7 +558,12 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 				hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", req.DiskGB)}
 			}
 		}
-		hostConfig["Resources"] = resources
+		// The Docker API embeds Resources fields INLINE in HostConfig (the
+		// Go struct embeds container.Resources without a JSON tag). A nested
+		// "Resources" key is an unknown field dockerd silently drops — that
+		// exact shape shipped from the first version of this client and no
+		// sandbox ever actually received cpu/memory limits.
+		maps.Copy(hostConfig, resources)
 	}
 
 	if req.GPUs != nil {
