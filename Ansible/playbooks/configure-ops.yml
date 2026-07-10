@@ -124,6 +124,14 @@
       SB_WASM_REGISTRY_USERNAME: "{{ wasm.registry_username | default('') }}"
       SB_WASM_REGISTRY_PAT_PATH: "{{ wasm.registry_pat_path | default('') }}"
       SB_WASM_STANDARD_MODULES: "{{ wasm.standard_modules | default([]) | map(attribute='alias') | map('regex_replace', '^(.*)$', '\\1=\\1.wasm') | join(',') }}"
+      # Docker warm container pool (park + adopt). Defaults mirror config.go
+      # and Terraform's docker_pool_cfg so day-0 and day-2 render identically.
+      SB_DOCKER_POOL_ENABLED: "{{ docker.pool.enabled | default(false) | bool | string | lower }}"
+      SB_DOCKER_POOL_DEPTH: "{{ docker.pool.depth | default(2) | int }}"
+      SB_DOCKER_POOL_IMAGES: "{{ docker.pool.images | default([]) | join(',') }}"
+      SB_DOCKER_POOL_MAX_IMAGES: "{{ docker.pool.max_images | default(8) | int }}"
+      SB_DOCKER_POOL_IDLE_TTL: "{{ docker.pool.idle_ttl | default('15m') }}"
+      SB_DOCKER_POOL_REFILL_INTERVAL: "{{ docker.pool.refill_interval | default('5s') }}"
 
   pre_tasks:
     - name: Check base sandboxd env file

@@ -68,6 +68,55 @@ func TestParkedReadyOnConn(t *testing.T) {
 	}
 }
 
+// TestParkedAdoptOutlivesWriteTimeout is the regression test for the parked
+// handshake killing its own connection: a slot waits for adoption far longer
+// than any write timeout, so the adopt read must not be deadline-bounded.
+// The write timeout is shrunk to make "far longer" cheap for CI.
+func TestParkedAdoptOutlivesWriteTimeout(t *testing.T) {
+	oldTimeout := parkWriteTimeout
+	parkWriteTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { parkWriteTimeout = oldTimeout })
+	oldStart := startUserCommandFn
+	startUserCommandFn = func(_ *slog.Logger, _ []string) {}
+	t.Cleanup(func() { startUserCommandFn = oldStart })
+
+	srv := &server{logger: slog.Default(), parkedMode: true}
+	guest, host := net.Pipe()
+	t.Cleanup(func() { _ = guest.Close(); _ = host.Close() })
+
+	hostDone := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(host)
+		if _, err := readyproto.DecodeParked(br); err != nil {
+			hostDone <- err
+			return
+		}
+		// Park the slot for 10x the write timeout before adopting.
+		time.Sleep(250 * time.Millisecond)
+		if err := readyproto.EncodeAdopt(host, readyproto.AdoptFrame{
+			Event: readyproto.EventAdopt, SandboxID: "sb-slow", Token: "tok", Nonce: "n",
+		}); err != nil {
+			hostDone <- err
+			return
+		}
+		if _, err := readyproto.Decode(br); err != nil {
+			hostDone <- err
+			return
+		}
+		hostDone <- nil
+	}()
+
+	if err := parkedReadyOnConn(slog.Default(), srv, guest, "boot-tok", "park-n"); err != nil {
+		t.Fatalf("guest handshake died while parked: %v", err)
+	}
+	if err := <-hostDone; err != nil {
+		t.Fatalf("host: %v", err)
+	}
+	if !srv.servingRequests() || srv.sandboxID != "sb-slow" {
+		t.Fatalf("server not adopted: id=%q serving=%v", srv.sandboxID, srv.servingRequests())
+	}
+}
+
 func TestRunParkedReadyHandshakeNoop(t *testing.T) {
 	runParkedReadyHandshake(slog.Default(), nil, "", "tok", "n")
 	runParkedReadyHandshake(slog.Default(), &server{}, "  ", "tok", "n")

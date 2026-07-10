@@ -615,6 +615,14 @@ SB_WASM_REGISTRY_PUSH_HOST=${wasm_cfg.push_host}
 SB_WASM_REGISTRY_USERNAME=${wasm_cfg.registry_username}
 SB_WASM_REGISTRY_PAT_PATH=${wasm_cfg.registry_pat_path}
 SB_WASM_STANDARD_MODULES=${wasm_cfg.standard_modules}
+
+# Managed by Terraform bootstrap: Docker warm container pool (park + adopt).
+SB_DOCKER_POOL_ENABLED=${docker_pool_cfg.enabled}
+SB_DOCKER_POOL_DEPTH=${docker_pool_cfg.depth}
+SB_DOCKER_POOL_IMAGES=${docker_pool_cfg.images}
+SB_DOCKER_POOL_MAX_IMAGES=${docker_pool_cfg.max_images}
+SB_DOCKER_POOL_IDLE_TTL=${docker_pool_cfg.idle_ttl}
+SB_DOCKER_POOL_REFILL_INTERVAL=${docker_pool_cfg.refill_interval}
 EOF
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null

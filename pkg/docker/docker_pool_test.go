@@ -5,15 +5,20 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/readyproto"
 )
 
 func TestPoolEligible(t *testing.T) {
@@ -85,15 +90,101 @@ func TestSetWarmPool(t *testing.T) {
 	}
 }
 
+// memRuleBackend is an in-memory netrules.RuleBackend that tracks the live
+// rule set so tests can assert the terminal iptables state, not just "no
+// error". The park DROP and the NetworkBlockAll DROP are the same rule, so
+// these tests are the regression guard against an adopt stripping a
+// block-all sandbox's isolation.
+type memRuleBackend struct {
+	rules []string
+}
+
+func ruleKey(table, chain string, spec ...string) string {
+	return table + "/" + chain + "/" + strings.Join(spec, " ")
+}
+
+func (m *memRuleBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	return slices.Contains(m.rules, ruleKey(table, chain, spec...)), nil
+}
+
+func (m *memRuleBackend) Insert(table, chain string, _ int, spec ...string) error {
+	m.rules = append(m.rules, ruleKey(table, chain, spec...))
+	return nil
+}
+
+func (m *memRuleBackend) Delete(table, chain string, spec ...string) error {
+	k := ruleKey(table, chain, spec...)
+	for i, r := range m.rules {
+		if r == k {
+			m.rules = append(m.rules[:i], m.rules[i+1:]...)
+			return nil
+		}
+	}
+	return errors.New("No chain/target/match by that name")
+}
+
+func (m *memRuleBackend) has(spec ...string) bool {
+	ok, _ := m.Exists("filter", "DOCKER-USER", spec...)
+	return ok
+}
+
 func TestApplyAdoptNetworkPolicy(t *testing.T) {
-	c := &Client{networkRules: disabledRules(t)}
-	req := models.CreateSandboxRequest{
-		NetworkBlockAll: true,
-		NetworkAllowOut: []string{"8.8.8.8"},
-	}
-	if err := c.applyAdoptNetworkPolicy("10.0.0.2", req); err != nil {
-		t.Fatalf("apply: %v", err)
-	}
+	const ip = "10.0.0.2"
+	parkDrop := []string{"-s", ip, "-j", "DROP"}
+
+	t.Run("block-all request keeps the DROP", func(t *testing.T) {
+		backend := &memRuleBackend{}
+		rules := netrules.NewWithBackend(backend)
+		// Simulate the park-time DROP.
+		if err := rules.BlockAllEgress(ip); err != nil {
+			t.Fatal(err)
+		}
+		c := &Client{networkRules: rules}
+		req := models.CreateSandboxRequest{NetworkBlockAll: true}
+		if err := c.applyAdoptNetworkPolicy(ip, req); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if !backend.has(parkDrop...) {
+			t.Fatal("block-all sandbox lost its egress DROP on adopt")
+		}
+	})
+
+	t.Run("open request clears the park DROP", func(t *testing.T) {
+		backend := &memRuleBackend{}
+		rules := netrules.NewWithBackend(backend)
+		if err := rules.BlockAllEgress(ip); err != nil {
+			t.Fatal(err)
+		}
+		c := &Client{networkRules: rules}
+		if err := c.applyAdoptNetworkPolicy(ip, models.CreateSandboxRequest{}); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if backend.has(parkDrop...) {
+			t.Fatal("park DROP left behind on an unrestricted sandbox")
+		}
+	})
+
+	t.Run("allowlist request installs policy then clears park DROP", func(t *testing.T) {
+		backend := &memRuleBackend{}
+		rules := netrules.NewWithBackend(backend)
+		if err := rules.BlockAllEgress(ip); err != nil {
+			t.Fatal(err)
+		}
+		c := &Client{networkRules: rules}
+		req := models.CreateSandboxRequest{NetworkAllowOut: []string{"8.8.8.8/32"}}
+		if err := c.applyAdoptNetworkPolicy(ip, req); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if backend.has(parkDrop...) {
+			t.Fatal("uncommented park DROP should be cleared once the allowlist is in place")
+		}
+		if !backend.has("-s", ip, "-d", "8.8.8.8/32", "-m", "comment", "--comment", "sbx-egress", "-j", "ACCEPT") {
+			t.Fatal("allowlist ACCEPT missing after adopt")
+		}
+		if !backend.has("-s", ip, "-m", "comment", "--comment", "sbx-egress", "-j", "DROP") {
+			t.Fatal("allowlist catch-all DROP missing after adopt")
+		}
+	})
 }
 
 type badParkHandle struct{}
@@ -261,16 +352,30 @@ func slogDefault() *slog.Logger {
 
 func TestListAndPurgeParkedContainers(t *testing.T) {
 	d := &poolFakeDaemon{t: t}
+	var listQuery url.Values
 	d.listJSON = func() *http.Response {
 		return textResponse(http.StatusOK, `[{"Id":"park-c1"}]`)
 	}
-	c := newPoolClient(t, d, nil)
+	c := newPoolClient(t, d, func(c *Client) {
+		inner := c.httpClient.Transport
+		c.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/containers/json" {
+				listQuery = r.URL.Query()
+			}
+			return inner.RoundTrip(r)
+		})
+	})
 	purged, err := c.PurgeParkedContainers(context.Background())
 	if err != nil {
 		t.Fatalf("purge: %v", err)
 	}
 	if purged != 1 || d.removeCalls != 1 {
 		t.Fatalf("purged=%d removeCalls=%d", purged, d.removeCalls)
+	}
+	// all=1 or exited/crashed parked containers (and their DROP rules)
+	// survive every boot purge.
+	if got := listQuery.Get("all"); got != "1" {
+		t.Fatalf("purge list all=%q, want 1", got)
 	}
 }
 
@@ -280,6 +385,103 @@ func TestPurgeParkedContainersListError(t *testing.T) {
 	c := newPoolClient(t, d, nil)
 	if _, err := c.PurgeParkedContainers(context.Background()); err == nil {
 		t.Fatal("expected list error")
+	}
+}
+
+// TestTryWarmAdoptFailureReleasesReservation guards the adopt-failure leak:
+// once a slot leaves the pool via Acquire, only tryWarmAdopt can free its
+// park:<slot-id> capacity reservation. Without the release every failed adopt
+// permanently shrinks the node's admittable capacity.
+func TestTryWarmAdoptFailureReleasesReservation(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	c := newPoolClient(t, d, nil)
+	pool := dockerpool.New(slogDefault())
+	var released []string
+	pool.SetParkReleaser(func(slotID string) { released = append(released, slotID) })
+	c.SetWarmPool(pool)
+
+	key := dockerpool.KeyFromRequest(models.CreateSandboxRequest{Image: "alpine:3.20"}, models.RuntimeDocker)
+	// badParkHandle fails adoptParked's handle type assertion — an adopt
+	// failure after the slot has already left the pool.
+	pool.RecordLoaded(&dockerpool.ParkedSlot{
+		ID:          "park-fail",
+		ContainerID: "cid-park",
+		ImageID:     "sha256:img1",
+		Key:         key,
+		Handle:      badParkHandle{},
+	})
+
+	_, err := c.tryWarmAdopt(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-1", "tok", nil, models.RuntimeDocker)
+	if err == nil || errors.Is(err, dockerpool.ErrNoSlot) {
+		t.Fatalf("expected adopt failure, got %v", err)
+	}
+	if len(released) != 1 || released[0] != "park-fail" {
+		t.Fatalf("park reservation not released on adopt failure: %v", released)
+	}
+	if d.removeCalls != 1 {
+		t.Fatalf("parked container not destroyed: removeCalls=%d", d.removeCalls)
+	}
+}
+
+// TestTryWarmAdoptRenameConflictReturnsSlot: a duplicate-create rename
+// conflict happens before the slot is touched, so the parked container goes
+// back to the pool — not destroyed, reservation kept.
+func TestTryWarmAdoptRenameConflictReturnsSlot(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	d.rename = func() *http.Response {
+		return textResponse(http.StatusConflict, `name "/sb-dup" is already in use`)
+	}
+	c := newPoolClient(t, d, nil)
+	pool := dockerpool.New(slogDefault())
+	var released []string
+	pool.SetParkReleaser(func(slotID string) { released = append(released, slotID) })
+	c.SetWarmPool(pool)
+
+	pl, err := NewParkedListener(shortParkTestDir(t), "park-dup", "tok", "nonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pl.Close() })
+
+	// Acquire only hands out slots with a live held connection, so park a
+	// real guest on the socket and keep it open for the duration.
+	closeGuest := make(chan struct{})
+	t.Cleanup(func() { close(closeGuest) })
+	go func() {
+		conn, err := net.Dial("unix", pl.HostSocketPath())
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = readyproto.EncodeParked(conn, readyproto.ParkedSignal{
+			Event: readyproto.EventParked, Token: "tok", Nonce: "nonce",
+		})
+		<-closeGuest
+	}()
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := pl.WaitParked(waitCtx); err != nil {
+		t.Fatalf("WaitParked: %v", err)
+	}
+
+	key := dockerpool.KeyFromRequest(models.CreateSandboxRequest{Image: "alpine:3.20"}, models.RuntimeDocker)
+	pool.RecordLoaded(&dockerpool.ParkedSlot{
+		ID:          "park-dup",
+		ContainerID: "cid-park",
+		ImageID:     "sha256:img1",
+		Key:         key,
+		Handle:      pl,
+	})
+
+	_, err = c.tryWarmAdopt(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-dup", "tok", nil, models.RuntimeDocker)
+	if !errors.Is(err, ErrSandboxContainerExists) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(released) != 0 {
+		t.Fatalf("pristine slot's reservation must not be released: %v", released)
+	}
+	if d.removeCalls != 0 {
+		t.Fatalf("pristine slot must not be destroyed: removeCalls=%d", d.removeCalls)
 	}
 }
 

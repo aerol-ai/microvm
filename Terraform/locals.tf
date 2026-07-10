@@ -254,6 +254,18 @@ locals {
     standard_modules   = join(",", [for m in try(local.cluster_ops.wasm.standard_modules, []) : "${m.alias}=${m.alias}.wasm"])
   }
 
+  # Docker warm container pool (park + adopt). Mirrors wasm_cfg: values come
+  # from config/cluster.yml's docker.pool block, try() keeps older cluster.yml
+  # files (no docker: block) working with the same defaults config.go uses.
+  docker_pool_cfg = {
+    enabled         = try(local.cluster_ops.docker.pool.enabled, false) ? "true" : "false"
+    depth           = tostring(try(local.cluster_ops.docker.pool.depth, 2))
+    images          = join(",", try(local.cluster_ops.docker.pool.images, []))
+    max_images      = tostring(try(local.cluster_ops.docker.pool.max_images, 8))
+    idle_ttl        = try(local.cluster_ops.docker.pool.idle_ttl, "15m")
+    refill_interval = try(local.cluster_ops.docker.pool.refill_interval, "5s")
+  }
+
   # Homogeneous per-arch clusters (D5): one GOARCH for snapshot tagging and
   # Firecracker upstream artifact selection. The precondition on
   # validate_cluster_ops enforces a single distinct arch across nodes.

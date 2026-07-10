@@ -98,6 +98,26 @@ platform_volumes:
   nfs_export: ""
   nfs_options: ""
 
+# --- Docker warm container pool (park + adopt) ----------------------------
+# Pre-creates and boots default-shaped containers for the pinned images so an
+# eligible create adopts a ready container instead of paying the Docker
+# engine's create+start (~280ms on t3.medium). Off by default; requires the
+# readiness socket (SB_DOCKER_READY_SOCKET_ENABLED, on by default). Each
+# parked slot holds a default-shaped capacity reservation, so depth × images
+# must fit the node alongside real sandboxes — the refill gate keeps one
+# default-shaped guard band free. See plans/docker-warm-pool.md.
+docker:
+  pool:
+    enabled: false
+    # Warm slots kept per pinned image.
+    depth: 2
+    # Images warmed from daemon start. Empty pins alpine:3.20. Requests for
+    # other images self-warm on miss (LRU-capped by max_images).
+    images: []
+    max_images: 8
+    idle_ttl: "15m"
+    refill_interval: "5s"
+
 # --- Firecracker runtime bootstrap ---------------------------------------
 # Host-level Firecracker enablement is opt-in. The bootstrap path must
 # install the runtime binaries and provide a kernel image at the configured
