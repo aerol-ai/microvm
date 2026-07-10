@@ -367,6 +367,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/engineering-runtime-layers',
+        label: 'Engine, Chassis, Runtime',
+        description: 'Firecracker and Cloud Hypervisor are VMMs; Kata and gVisor are OCI runtimes. AerolVM hand-rolled its own micro-Kata directly on the Firecracker VMM, which is what makes the snapshot warm pool possible and a second engine cheap to add.',
+      },
+      {
+        type: 'link',
         href: '/engineering-idempotency',
         label: 'Idempotency on a Single Writer',
         description: 'Partial unique indexes + request_idempotency replay + a one-writer SQLite core. Making concurrent-duplicate races structurally unrepresentable.',
