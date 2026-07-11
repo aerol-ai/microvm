@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -143,6 +144,7 @@ type fakeRuntime struct {
 	createDelay time.Duration
 	createErr   error
 	createPanic bool
+	destroyErr  error
 	// createFinished flips once a Create call returned successfully — the
 	// promote-waits-for-create regression test reads it from the
 	// RecordPlacement hook.
@@ -205,6 +207,9 @@ func (f *fakeRuntime) Stop(_ context.Context, containerRef string) error {
 func (f *fakeRuntime) Destroy(_ context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil {
 		return nil
+	}
+	if f.destroyErr != nil {
+		return f.destroyErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1228,6 +1233,69 @@ func TestOverlapCreateAndPromote_SealFailRetracts(t *testing.T) {
 	})
 }
 
+func TestOverlapCreateAndPromote_PromoteFailureRetracts(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{
+		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
+		recordErr: errors.New("raft commit failed"),
+	}
+	svc, st := newCreateService(t, stub, false)
+	_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-promote-fail", OverlapOptions{PromoteWithSpec: true})
+	of, ok := AsOverlapFailure(err)
+	if !ok || of.Phase != OverlapPhasePromote || !strings.Contains(of.Error(), "raft commit failed") {
+		t.Fatalf("error = %v, want promote-phase failure", err)
+	}
+	if stub.deletes != 1 || stub.cancels != 0 {
+		t.Fatalf("retract calls delete=%d cancel=%d, want 1/0", stub.deletes, stub.cancels)
+	}
+	if _, getErr := st.Get(context.Background(), "sb-promote-fail"); !errors.Is(getErr, store.ErrNotFound) {
+		t.Fatalf("store row after retract = %v, want ErrNotFound", getErr)
+	}
+}
+
+func TestOverlapCreateAndPromote_RecordsTimingStages(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	svc, _ := newCreateService(t, stub, false)
+	timing := &createtiming.CreateTiming{}
+	_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-timing", OverlapOptions{Timing: timing})
+	if err != nil {
+		t.Fatalf("OverlapCreateAndPromote: %v", err)
+	}
+	names := make([]string, 0, len(timing.Stages()))
+	for _, s := range timing.Stages() {
+		names = append(names, s.Name)
+	}
+	for _, want := range []string{"create_with_id", "cluster_seal", "cluster_promote"} {
+		found := false
+		for _, n := range names {
+			if n == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("timing stages = %v, want %q", names, want)
+		}
+	}
+}
+
+func TestCreateOnSelectedNode_SelfWinsPromoteFailure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{
+		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
+		recordErr: cluster.ErrNameConflict,
+	}
+	svc, _ := newCreateService(t, stub, true)
+	_, err := CreateOnSelectedNode(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "", CreateOptions{})
+	if !errors.Is(err, cluster.ErrNameConflict) {
+		t.Fatalf("error = %v, want name conflict", err)
+	}
+	if stub.deletes != 1 {
+		t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
+	}
+}
+
 func TestRetractErrorBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -1278,6 +1346,72 @@ func TestRetractErrorBranches(t *testing.T) {
 		svc, _ := newCreateService(t, nil, false)
 		retractFailedPromote(context.Background(), svc, nil, logger, "sb-promote-nocluster")
 	})
+
+	t.Run("promote_destroy_failure_records_destroy_failed", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		rt := newFakeRuntime()
+		rt.destroyErr = errors.New("destroy boom")
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-destroy-fail"); err != nil {
+			t.Fatalf("CreateSandboxWithID: %v", err)
+		}
+		retractFailedPromote(context.Background(), svc, stub, logger, "sb-destroy-fail")
+	})
+
+	t.Run("reserved_destroy_failure_after_seal_fail", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		rt := newFakeRuntime()
+		rt.destroyErr = errors.New("destroy boom")
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-seal-destroy-fail"); err != nil {
+			t.Fatalf("CreateSandboxWithID: %v", err)
+		}
+		retractReservedCreate(context.Background(), svc, stub, logger, "sb-seal-destroy-fail", nil)
+	})
+
+	t.Run("promote_delete_secrets_failure", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		svc, st := newCreateService(t, stub, false)
+		_ = st.Close()
+		retractFailedPromote(context.Background(), svc, stub, logger, "sb-secrets-fail")
+	})
+}
+
+func TestCreateOnSelectedNode_ReservedResolvePlatformVolumesFailure(t *testing.T) {
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := config.Config{
+		EnableCaddy: false,
+		ToolboxPort: 2280,
+		PATToken:    "operator-pat",
+		PlatformVolumes: config.PlatformVolumesConfig{
+			Enabled:  true,
+			Backend:  config.PlatformVolumesBackendS3,
+			S3Bucket: "aerol-volumes",
+			S3Prefix: "volumes",
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger, st, newFakeRuntime(), nil, caddy.New(cfg), nil, nil, nil)
+	svc.AttachCluster(stub)
+
+	req := models.CreateSandboxRequest{
+		Image:           "alpine:3.20",
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "../escape", Path: "/x"}},
+	}
+	_, err = CreateOnSelectedNode(context.Background(), svc, logger, req, "sb-bad-vol", CreateOptions{})
+	if err == nil {
+		t.Fatal("expected platform volume resolution failure")
+	}
+	if stub.cancels != 1 {
+		t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
+	}
 }
 
 func TestOverlapFailureHelpers(t *testing.T) {

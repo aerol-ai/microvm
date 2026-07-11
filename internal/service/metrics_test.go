@@ -88,6 +88,18 @@ func TestMetricHelpersIncrementExpectedCounters(t *testing.T) {
 	if got := expvarMapValue(clusterPromoteRetractTotal, "ok") - retractBefore; got != 1 {
 		t.Fatalf("promote retract ok delta = %d, want 1", got)
 	}
+
+	unknownBefore := expvarMapValue(clusterPromoteRetractTotal, "unknown")
+	RecordPromoteRetract("")
+	RecordPromoteRetract("   ")
+	if got := expvarMapValue(clusterPromoteRetractTotal, "unknown") - unknownBefore; got != 2 {
+		t.Fatalf("promote retract unknown delta = %d, want 2", got)
+	}
+	destroyFailedBefore := expvarMapValue(clusterPromoteRetractTotal, "destroy_failed")
+	RecordPromoteRetract("destroy_failed")
+	if got := expvarMapValue(clusterPromoteRetractTotal, "destroy_failed") - destroyFailedBefore; got != 1 {
+		t.Fatalf("promote retract destroy_failed delta = %d, want 1", got)
+	}
 }
 
 func TestClassifyMetricErrorsAndHelpers(t *testing.T) {

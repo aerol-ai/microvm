@@ -104,13 +104,21 @@ func (r *apiRecordingRuntime) ClearNetworkBlockIngress(string) error            
 
 type promoteStubCluster struct {
 	*cluster.Noop
-	recordCalls []string
-	recordErr   error
-	recordDelay time.Duration
-	cancelCalls []string
-	cancelErr   error
-	deleteCalls []string
-	deleteErr   error
+	recordCalls   []string
+	recordErr     error
+	recordDelay   time.Duration
+	cancelCalls   []string
+	cancelErr     error
+	deleteCalls   []string
+	deleteErr     error
+	selfNodePanic bool
+}
+
+func (c *promoteStubCluster) SelfNodeID() string {
+	if c.selfNodePanic {
+		panic("seal leg panic")
+	}
+	return c.Noop.SelfNodeID()
 }
 
 func (c *promoteStubCluster) RecordPlacement(_ context.Context, id string, _ *models.CreateSandboxRequest, _ cluster.PlacementSecrets) error {
@@ -674,5 +682,79 @@ func TestClusterDestroyWrap_SuccessAndDeletePlacementWarn(t *testing.T) {
 	}
 	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-destroy" {
 		t.Fatalf("DeletePlacement calls = %+v, want [sb-destroy]", stub.deleteCalls)
+	}
+}
+
+func TestCreateSandboxOnSelectedNode_OverlapErrorMapping(t *testing.T) {
+	t.Run("reserved_seal_failure_returns_500", func(t *testing.T) {
+		rt := &apiRecordingRuntime{}
+		stub := &promoteStubCluster{
+			Noop:          cluster.NewNoop("node-a", "http://node-a", ""),
+			selfNodePanic: true,
+		}
+		h, _ := newClusterCreateHarness(t, rt, stub)
+		rr := httptest.NewRecorder()
+		h.createSandboxOnSelectedNode(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-seal-fail")
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "cluster: store secret ref:") {
+			t.Fatalf("body = %q, want seal error shape", rr.Body.String())
+		}
+		if len(stub.recordCalls) != 0 {
+			t.Fatalf("RecordPlacement calls = %+v, want none", stub.recordCalls)
+		}
+		if len(stub.cancelCalls) != 1 {
+			t.Fatalf("CancelReservation calls = %+v, want reserved-row retract", stub.cancelCalls)
+		}
+	})
+
+	t.Run("reserved_promote_name_conflict_returns_409", func(t *testing.T) {
+		rt := &apiRecordingRuntime{}
+		stub := &promoteStubCluster{
+			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
+			recordErr: cluster.ErrNameConflict,
+		}
+		h, _ := newClusterCreateHarness(t, rt, stub)
+		rr := httptest.NewRecorder()
+		h.createSandboxOnSelectedNode(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-name")
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("reserved_promote_generic_error_returns_503", func(t *testing.T) {
+		rt := &apiRecordingRuntime{}
+		stub := &promoteStubCluster{
+			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
+			recordErr: errors.New("raft unavailable"),
+		}
+		h, _ := newClusterCreateHarness(t, rt, stub)
+		rr := httptest.NewRecorder()
+		h.createSandboxOnSelectedNode(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-promote")
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "cluster: placement commit failed:") {
+			t.Fatalf("body = %q, want promote error shape", rr.Body.String())
+		}
+	})
+}
+
+func TestCreateSandboxOnSelectedNode_SelfWinsPromoteRollbackErrors(t *testing.T) {
+	rt := &apiRecordingRuntime{destroyErr: errors.New("destroy failed")}
+	stub := &promoteStubCluster{
+		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
+		recordErr: errors.New("raft commit failed"),
+		deleteErr: errors.New("delete failed"),
+	}
+	h, _ := newClusterCreateHarnessWithCipher(t, rt, stub)
+	rr := httptest.NewRecorder()
+	h.createSandboxOnSelectedNode(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), models.CreateSandboxRequest{Image: "alpine:3.20"}, "")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(stub.deleteCalls) != 1 {
+		t.Fatalf("DeletePlacement calls = %+v, want one attempt", stub.deleteCalls)
 	}
 }

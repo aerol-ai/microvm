@@ -46,6 +46,9 @@ func TestWarnIfLegacyIptables(t *testing.T) {
 	if out := logOutput("iptables v1.8.7 (legacy)", nil, BackendExec); out != "" {
 		t.Fatalf("exec backend must stay quiet, got %q", out)
 	}
+	if out := logOutput("iptables v1.8.7 (legacy)", nil, "  "+BackendNetlink+"  "); out == "" {
+		t.Fatal("trimmed netlink backend name must still warn on legacy hosts")
+	}
 	if out := logOutput("", errors.New("no iptables binary"), BackendNetlink); out != "" {
 		t.Fatalf("probe failure must stay quiet, got %q", out)
 	}

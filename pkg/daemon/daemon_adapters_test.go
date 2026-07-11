@@ -97,25 +97,30 @@ func TestFirecrackerPoolAdapter_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
 	pool := tap.New(st)
-	if err := pool.Seed(ctx, tap.SeedConfig{BaseCIDR: "172.20.0.0/30", PoolSize: 1}, time.Now()); err != nil {
+	if err := pool.Seed(ctx, tap.SeedConfig{BaseCIDR: "172.20.0.0/29", PoolSize: 2}, time.Now()); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
 	adapter := &firecrackerPoolAdapter{inner: pool}
 
-	slot, err := adapter.Allocate(ctx, "sb-1", time.Now())
+	now := time.Now()
+	slot, err := adapter.Allocate(ctx, "vmms-warm", now)
 	if err != nil {
-		t.Fatalf("Allocate: %v", err)
+		t.Fatalf("Allocate warm slot: %v", err)
 	}
-	if slot == nil || slot.TapName == "" || slot.VsockCID == 0 {
-		t.Fatalf("unexpected allocated slot: %+v", slot)
+	transferred, err := adapter.Transfer(ctx, "vmms-warm", "sb-1", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	if transferred == nil || transferred.TapName != slot.TapName {
+		t.Fatalf("Transfer slot mismatch: got=%+v want tap %q", transferred, slot.TapName)
 	}
 
 	got, err := adapter.Get(ctx, "sb-1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got == nil || got.TapName != slot.TapName {
-		t.Fatalf("Get slot mismatch: got=%+v want=%+v", got, slot)
+	if got == nil || got.TapName != transferred.TapName {
+		t.Fatalf("Get slot mismatch: got=%+v want=%+v", got, transferred)
 	}
 
 	if err := adapter.Release(ctx, "sb-1"); err != nil {
@@ -127,6 +132,10 @@ func TestFirecrackerPoolAdapter_RoundTrip(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("Get after release = %+v, want nil", got)
+	}
+
+	if _, err := adapter.Transfer(ctx, "missing-warm", "sb-miss", now); err == nil {
+		t.Fatal("Transfer from missing slot should fail")
 	}
 }
 
