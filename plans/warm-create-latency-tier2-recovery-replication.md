@@ -1,9 +1,15 @@
 # Warm create latency Tier 2: inline recovery payloads (40ms → ≤30ms gate unlock)
 
-Status: **implemented 2026-07-11 — PR #307** (branch
-`perf/warm-create-latency-tier2-inline-recovery`, stacked on PR #306) —
-T1–T3 done, offline suite green; **bench gate re-run (T4) pending**, which is
-what proves the ≤30ms unlock and closes T5. Follow-up to
+Status: **DONE — shipped in v0.6.0 (PR #307); T4 live bench run 2026-07-12.**
+T4 results (fresh 3× t3.medium, all-WAL raft, netlink verified by
+`AEROL_BENCH_EXPECT_NETRULES`, release build): `cluster_promote` p50
+**23–25ms → 10–11ms**; warm `create;dur` p50 **40–44ms → 28ms sparse
+(≤30ms gate PASS, p90 30ms, 8/8 warm hits, zero image resolves) / 32ms
+burst (2ms over, 2/10 warm-pool misses in-burst)**; externalize metric
+across all 3 nodes inline=1043 / blob=0 — the blob mesh never fired.
+Residual 10–11ms promote is the raft round itself (probe creates entering
+at the leader measure 9.6–12.9ms), not replication — shaving it further is
+Tier 3 territory. Follow-up to
 `plans/warm-create-latency-tier1.md` (gates run 2026-07-11) and the TODOS
 entry "cluster_promote is recovery-replication-bound". Tier 1 + 1.5 got the
 create leg to 17ms and the seal to 0ms, but the ≤30ms warm-p50 gate failed

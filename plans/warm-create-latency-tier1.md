@@ -1,19 +1,20 @@
 # Warm create latency Tier 1: 43ms → ≤30ms acceptance (semantics-preserving)
 
-Status: **implemented — bench gates RUN 2026-07-11 (live, 3× t3.medium,
-branch build, netlink, all-WAL): functional gates PASS, ≤30ms numeric gate
-FAILS at 40–44ms burst / 42ms sparse.** Per-stage: create leg
-(`create_with_id`) is **17ms** and sparse shows **zero `docker_image`
-resolves across 8 samples at 15s gaps** (Phase 1+2 working; seal overlapped
-to 0ms; p90 tail 362ms→48ms from Phases 2+4). The residual is
-`cluster_promote` at **23–25ms — identical on BoltDB and raft-wal**, so
-Phase 3's fsync premise does not hold: `applyCommand` synchronously
-replicates the recovery blob to every other member before the raft apply
-(`recovery_replication.go`, "twice per create"). Closing the gate needs that
-replication off the promote path — tracked in `TODOS.md`
-("cluster_promote is recovery-replication-bound"). Reports:
+Status: **DONE — shipped in v0.6.0; final T4 bench 2026-07-12 (live, fresh
+3× t3.medium, release build, netlink verified, all-WAL): sparse warm p50
+28ms — ≤30ms gate PASS; burst 32ms (2ms over, 2/10 in-burst warm-pool
+misses).** With Tier 2 (inline recovery, PR #307) merged, `cluster_promote`
+dropped 23–25ms → **10–11ms** and the externalize metric read inline=1043 /
+blob=0 across all nodes. UC-98 (live egress drop on netlink) PASS; bench
+backend gate confirmed netlink on every run. Residual promote is the raft
+round itself, not replication (leader-entry probes: 9.6–12.9ms) — further
+shaving is Tier 3. First-run history (2026-07-11, pre-Tier-2 branch build):
+gate FAILED at 40–44ms burst / 42ms sparse with promote at 23–25ms identical
+on BoltDB and raft-wal, which disproved Phase 3's fsync premise and produced
+the Tier 2 plan. Reports:
 `integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`
-+ `cluster-3-mixed-docker-sparse-bench.json`.
+(2026-07-11) + `cluster-3-mixed-docker-bench.json` / `-sparse-bench.json` /
+`-bench-suiteload.json` (2026-07-12).
 Successor to `plans/docker-warm-pool.md` §12, which shipped the
 warm-adopt fast path at **server p50 43ms** (v0.5.33). This plan removes the
 removable engine/consensus round-trips **without changing any idempotency or

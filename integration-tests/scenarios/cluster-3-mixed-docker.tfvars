@@ -19,8 +19,31 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
+# T4 bench run (plans/warm-create-latency-tier1.md §8): Phase 1 gates require
+# SB_NETRULES_BACKEND=netlink on every node. extra_user_data runs after the
+# bootstrap template's env-write + sandboxd restart, so append-and-restart is
+# the supported hook. tfvars are literal-only, hence the per-node repetition.
+# Remove for exec-baseline runs.
 nodes = {
-  node1 = { role = "mixed", seed = true, spot = true }
-  node2 = { role = "mixed", spot = true }
-  node3 = { role = "mixed", spot = true }
+  node1 = {
+    role            = "mixed", seed = true, spot = true
+    extra_user_data = <<-EOT
+      echo 'SB_NETRULES_BACKEND=netlink' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
+      sudo systemctl restart sandboxd
+    EOT
+  }
+  node2 = {
+    role            = "mixed", spot = true
+    extra_user_data = <<-EOT
+      echo 'SB_NETRULES_BACKEND=netlink' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
+      sudo systemctl restart sandboxd
+    EOT
+  }
+  node3 = {
+    role            = "mixed", spot = true
+    extra_user_data = <<-EOT
+      echo 'SB_NETRULES_BACKEND=netlink' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
+      sudo systemctl restart sandboxd
+    EOT
+  }
 }

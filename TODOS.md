@@ -52,11 +52,20 @@ no longer serialize. See `ip_lock_test.go`.
 - **Status:** IMPLEMENTED 2026-07-11 (PR #307, stacked on PR #306):
   `inlineRecoveryEligible` gate in `recovery_replication.go`, externalize-mode
   metric, determinism-parity + replay + threshold-crossing regression tests.
-  **Remaining:** operator bench re-run (plan T4) to confirm `create;dur`
-  p50 ≤ 30ms / `cluster_promote` ≤ 8ms, then close this entry.
-- **Start (for the bench re-run):** `make integration-benchmark-docker-only`
-  + `-sparse` with `SB_NETRULES_BACKEND=netlink`, all-WAL raft; prior
-  artifacts `integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`.
+- **T4 bench re-run DONE 2026-07-12** (v0.6.0 release build, fresh 3×
+  t3.medium, all-WAL, netlink, `AEROL_BENCH_EXPECT_NETRULES=netlink`):
+  `cluster_promote` p50 **23–25ms → 10–11ms**; warm `create;dur` p50
+  **40–44ms → 28ms sparse (gate ≤30ms PASS) / 32ms burst (2ms over)**.
+  Externalize metric across all 3 nodes: inline=1043, blob=0 — 100% of
+  cluster creates rode the Raft log; the blob mesh never fired. Artifacts:
+  `integration-tests/reports/cluster-3-mixed-docker-bench.json` (idle burst),
+  `-sparse-bench.json`, `-bench-suiteload.json` (under full-suite load).
+- **Remaining 10–11ms promote is the raft round itself, not replication:**
+  probe creates entered at the leader still measure 9.6–12.9ms with zero
+  variance spikes — leader WAL fsync + follower ack + owner→leader forward
+  on t3.medium/gp3. Closing this entry; shaving promote below ~8ms is a
+  Tier 3 shape (e.g. the withdrawn promote-overlap with a durable Creating
+  FSM state) and only matters if the burst 2ms overshoot matters.
 
 ## netrules backend switch on iptables-legacy hosts — DONE
 
@@ -67,19 +76,20 @@ iptables (`netrules.WarnIfLegacyIptables`, wired in `pkg/daemon`), and the
 drain-before-switch procedure is documented in `setup/single-node.md` +
 `packaging/.env.template`.
 
-## netlink live enforcement probe + bench backend gate — CODE DONE, live run pending
+## netlink live enforcement probe + bench backend gate — DONE (live-verified 2026-07-12)
 
-Closed the two open PR #306 review findings 2026-07-11:
+Closed the two open PR #306 review findings 2026-07-11; both live-verified on
+the T4 bench cluster (v0.6.0, netlink on all 3 nodes) 2026-07-12:
 - **UC-98** (`integration-tests/suite/netrules_test.go`): egress deny rule
-  must DROP real traffic from inside the sandbox (control sandbox proves the
-  target reachable; denied sandbox must time out; unrelated egress must flow).
-- **Bench backend gate**: `aerolvm_netrules_backend` expvar (exec | netlink |
-  disabled, recorded in `netrules.NewWithOptions`) + benches fail when
-  `AEROL_BENCH_EXPECT_NETRULES` doesn't match `/v1/metrics`.
+  must DROP real traffic from inside the sandbox — **PASS** on the netlink
+  backend (control sandbox reached the target; denied sandbox timed out;
+  unrelated egress flowed).
+- **Bench backend gate**: `aerolvm_netrules_backend` expvar + benches fail
+  when `AEROL_BENCH_EXPECT_NETRULES` doesn't match `/v1/metrics` — gate
+  confirmed netlink on the burst, sparse, and suite-load runs.
 
-**Remaining:** both only prove things on a live cluster — fold into the next
-operator integration run (the Tier 2 T4 bench re-run is the natural slot:
-set `AEROL_BENCH_EXPECT_NETRULES=netlink`, UC-98 runs in the same suite pass).
+With UC-98 + a full live soak now on record, flipping the server default
+`SB_NETRULES_BACKEND` exec→netlink is unblocked (separate decision/PR).
 
 ## Promote-fail rollback can leave a ghost Placed row (latent, cluster)
 
