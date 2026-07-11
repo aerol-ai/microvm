@@ -82,9 +82,25 @@ the seam; add the iptables-nft visibility e2e to the tag-gated suite (this
 is the exact spot where the invisible adopt-breakage bug lived — see the
 `ruleNotExist` comment).
 
-Exit gate: adopt-path netrules cost ≤1ms p50 (Option A) or ≤5ms (Option B),
-`docker_netrules` cold-path stage drops equivalently, zero
-`docker_pool;desc=adopt_failed` samples in a full bench run.
+**Phase 1 rider — refill-loop image-ID cache warming.** The ~45ms
+`docker_image;desc=resolve` (§1) hits sparse traffic on roughly every
+create because each node's 10s cache goes cold between creates and
+placement spreads consecutive creates across nodes. The park/refill path
+already resolves the image ID it parks (it is stored on the slot for
+`Acquire`'s identity validation), so the refill tick should `Put` that
+resolution into the image-ID cache each cycle. This keeps the cache
+permanently warm for pool-eligible images at zero boot-path cost, and
+*tightens* the out-of-band re-tag staleness window from the 10s TTL to the
+refill interval — the tick's resolution is fresher than anything the TTL
+allowed. In-band mutations (pull, build tag, GC delete) still flush
+immediately, unchanged.
+
+Exit gates: adopt-path netrules cost ≤1ms p50 (Option A) or ≤5ms
+(Option B), `docker_netrules` cold-path stage drops equivalently, zero
+`docker_pool;desc=adopt_failed` samples in a full bench run, and
+`docker_image;desc=resolve` appears on ~zero warm hits for pool-eligible
+images in a sparse-traffic probe sequence (one create per 15s+, spread
+across nodes).
 
 ## 3. Phase 2 — raft-wal log store (commit ~6–7ms → ~3–4ms on gp3)
 
@@ -176,15 +192,12 @@ p99 materially.
 
 ## 7. Open questions
 
-1. Image-ID cache TTL (10s) vs placement spread: sparse traffic pays the
-   ~45ms resolve on most creates because each node's cache is cold. Options:
-   raise TTL (staleness window for out-of-band re-tags grows — see the
-   rationale on `imageIDCacheTTL`), or warm the cache from the park refill
-   loop, which already knows the image ID it parked. The refill-loop warm
-   costs nothing on the boot path and keeps the 10s out-of-band guarantee —
-   likely a Phase 1 rider.
-2. Option A compat proof: which iptables flavors must the e2e matrix cover?
+1. Option A compat proof: which iptables flavors must the e2e matrix cover?
    (iptables-legacy hosts still exist in self-hosted deployments.)
+2. Non-pooled images still pay the once-per-TTL resolve (the Phase 1 rider
+   only keeps pool-eligible images warm — the refill loop doesn't know any
+   other refs). Acceptable, since non-pooled images miss the pool and go
+   cold anyway; revisit only if a facade workload shows otherwise.
 
 ## 8. Expected results
 
