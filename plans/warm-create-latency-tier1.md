@@ -1,11 +1,14 @@
 # Warm create latency Tier 1: 43ms → ≤30ms acceptance (semantics-preserving)
 
 Status: **planned (not started)** (written 2026-07-11; revised after eng review
-2026-07-11). Successor to `plans/docker-warm-pool.md` §12, which shipped the
+2026-07-11; post-review addenda 2026-07-11: Phase 2 flush-race fence + §6
+Tier-1.5 overlap record). Successor to `plans/docker-warm-pool.md` §12, which shipped the
 warm-adopt fast path at **server p50 43ms** (v0.5.33). This plan removes the
 removable engine/consensus round-trips **without changing any idempotency or
 failover semantics**. The semantics-changing follow-ups (async rename, async
-promote) stay deferred in §6.
+promote) stay deferred in §6, alongside a recorded Tier-1.5 candidate
+(seal+promote overlap, ~18–20ms path) that awaits its own failure-matrix
+design.
 
 **Acceptance target: warm p50 ≤ 30ms on the standard bench topology
 (t3.medium + gp3), measured under BOTH burst and sparse traffic.** The ≤25ms
@@ -187,7 +190,16 @@ warmTick (every RefillInterval, e.g. 5s):
 - **Tightens staleness:** because each tick *re-resolves* (fresh engine
   inspect), an out-of-band re-tag is picked up within one tick (≤5s) instead of
   the 10s TTL. In-band mutations (pull, build tag, GC delete) still `Flush`
-  immediately, unchanged.
+  immediately — kept true under the warm loop by the fence below.
+- **Flush/Put race — generation fence (post-review 2026-07-11):** a warm
+  tick's inspect can begin *before* an in-band mutation lands, and its `Put`
+  can arrive *after* the mutation's `Flush` — re-installing the stale ID and
+  silently weakening `image_cache.go`'s documented "in-band mutations never
+  wait on the TTL" to "within one tick". Fix: a **per-ref generation
+  counter**, bumped by `Flush`; the warm loop snapshots the generation before
+  its inspect and its `Put` is dropped when the generation has moved (the
+  next tick re-resolves fresh). Boot-path `Put`s are untouched — their
+  narrower pre-existing race window is not in scope.
 - **Zero boot-path cost:** the inspect runs in the background warm loop, never
   on `CreateSandbox`. Cost is one background inspect per pool-eligible key per
   tick — negligible for the small pool-eligible set (see §7 Q2 for the
@@ -208,6 +220,9 @@ Tests (fake clock, `image_cache.go`'s `now` seam already exists):
 - re-tag freshness: change the resolved ID between ticks, assert `Get` returns
   the new ID within one interval (proves "tightens staleness").
 - invariant: wiring rejects/warns when `RefillInterval >= imageIDCacheTTL`.
+- flush-race fence: `Flush` fired between the warm loop's generation snapshot
+  and its `Put` → the stale `Put` is dropped; the next tick installs the
+  fresh ID.
 - background-only: warming issues no `docker_image` boot-path timing stage.
 
 Exit gate: `docker_image;desc=resolve` appears on ~zero warm hits for
@@ -284,9 +299,36 @@ Set both to `MaxIdleConns: 64`, `MaxIdleConnsPerHost: 16`, `IdleConnTimeout:
 ≤ 12ms; p50 mostly unchanged. Test: one connection-reuse test against a counting
 test server, covering both transports.
 
-## 6. Deferred (Tier 3): async rename + async promote — entry-gated
+## 6. Deferred: Tier 1.5 overlap + Tier 3 async — entry-gated
 
-Not in scope. On record so the trade-off is documented:
+Not in scope. On record so the trade-offs are documented.
+
+**Tier 1.5 (recorded post-review 2026-07-11): overlap seal + promote with the
+local create — ~10ms, the path to ~18–20ms warm p50 without NVMe.** The
+response path is strictly sequential today (`cluster_handler.go:349-403`):
+`CreateSandboxWithID` (docker_pool, ~13–14ms post-Phase-1) →
+`PutClusterSecretsForRecipient` (seal) → `RecordPlacement` (Raft, ~10ms). But
+on the reserved path every seal/promote input is known **before** the create
+starts — the sandbox ID is minted on the router before `opReserve`
+(`cluster_handler.go:167`), and the redacted spec + self node ID likewise. Run
+seal+promote concurrently with the local create and **join both before
+responding**: the response path becomes max(create, seal+promote) ≈ the create
+alone, and the client-visible guarantee holds (the FSM knows the owner before
+the client can act — unlike Tier-3 async promote below, which stops waiting).
+Why it is NOT in this plan: the failure matrix widens. Today rollback only
+handles promote-failed-**after**-create-succeeded
+(`cluster_handler.go:405-424`); the overlap adds
+promote-succeeded-but-create-**failed** — a `Placed` FSM entry with no
+container for the failure window. That needs a documented retraction rule
+(pr-review §4), an owner-watcher analysis of the transient Placed-but-missing
+state, and the full cluster-correctness call-out (pr-review §6). A small
+design doc, not a config flip. **Entry: Phases 1–4 landed + a want for
+sub-20ms server-side warm p50 without the NVMe topology.** Prerequisite first
+slice either way: attribute the ~5–6ms residual glue with finer Server-Timing
+stages (validate / keygen / admit / seal); if the seal is 2–3ms of it,
+overlapping the seal alone is a low-risk subset.
+
+Tier 3 (semantics-changing), on record:
 
 - **Async rename**: the 11ms is dockerd's own container lock + state write; we
   can only move it off the response path. The warm-path duplicate guard is
@@ -330,6 +372,7 @@ here (p50 single-create never contends it), tracked in `TODOS.md`.
 | Today (v0.5.33, t3.medium + gp3) | 43ms | ~88ms (cache miss) | 78ms | — baseline |
 | Phases 1–4, standard topology | **≤ 30ms** | **≤ 30ms** | ≤ 45ms | **acceptance** |
 | NVMe topology (`plans/nvme-datadir.md`) | ≤ 25ms | ≤ 25ms | ≤ 35ms | not gated here |
+| (Tier 1.5 seal+promote overlap, §6) | ~18–20ms | ~18–20ms | — | not gated here |
 | (deferred Tier 3, for scale) | ~8–12ms | — | ~15–20ms | not gated here |
 
 Verification — **both** benches, run with `SB_NETRULES_BACKEND=netlink`:
@@ -363,6 +406,11 @@ Phase 3 (needs the Ansible rejoin cycle to roll out, one-way per node).
   moves the ≤25ms stretch, never the acceptance gate.
 - **Async rename / async promote** (Tier 3, §6) — semantics-changing, entry-gated
   on a sub-20ms product requirement.
+- **Seal+promote overlap with the local create** (Tier 1.5, §6) — awaits both
+  before responding so client semantics hold, but the
+  promote-succeeded/create-failed retraction needs its own design doc +
+  cluster-correctness call-out. Recorded in §6 with entry criteria; not scoped
+  here.
 - **`netrules` `Manager.mu` sharding** (`TODOS.md`) — concurrency ceiling; §6
   scopes p99/concurrency out; p50 never contends it.
 - **p99 / pool-sizing + single-flight refill** — hit-rate work, not hit-path;
@@ -375,7 +423,7 @@ Phase 3 (needs the Ansible rejoin cycle to roll out, one-way per node).
 |---|---|---|
 | netrules backend seam | `RuleBackend` iface + `NewWithBackend` (`manager.go:40-77`) | Reuse the seam; add nft backend + argv→nft translator (the seam is iptables-shaped, so translation is new work) |
 | not-exist classification | `ruleNotExist` (`manager.go:22`) | Keep for exec; add `Exists`-fallback for netlink (no new error strings) |
-| image-ID TTL cache | `imageIDCache` Get/Put/Flush (`image_cache.go`), wired at `docker_pool.go:117` | Reuse; add a Client-owned per-tick re-resolve/`Put` loop |
+| image-ID TTL cache | `imageIDCache` Get/Put/Flush (`image_cache.go`), wired at `docker_pool.go:117` | Reuse; add a Client-owned per-tick re-resolve/`Put` loop + per-ref generation fence on `Flush` |
 | warm refill loop | budget-gated `refillTick` (`refill.go`), the "self-warming refill" from `b8cd956` | Left as-is; warming is a **separate** Client ticker (refill can't reach the cache) |
 | raft log store | `setupRaft` boltdb (`raft.go:65`), `maybeRecoverRaftClusterFromPeersFile` (`raft_recovery.go`) | Swap log store to raft-wal behind a closable interface + format detection |
 | mTLS transport | `client.go:189`, `agent.go:135` | Raise idle-conn limits on both |
@@ -388,6 +436,7 @@ Phase 3 (needs the Ansible rejoin cycle to roll out, one-way per node).
 | nft rule not iptables-nft-compat | rule invisible to `iptables -L` / doesn't drop → egress leak or adopt mismatch | **[→E2E] yes** (visibility + drop, primary gate) | compat proof gates the default-flip | Silent (security-relevant) if unproven — hence e2e is the gate |
 | warm loop misconfig `RefillInterval ≥ TTL` | cache goes cold between ticks → sparse creates pay ~45ms again | yes (invariant test) | fail-fast/log at wiring | Slow creates, no error |
 | warm loop timing on background ctx | `RecordStageDesc` nil/mis-record | yes (background-only test) | use timing-free resolve variant | n/a (would be a panic if wired wrong) |
+| warm-loop `Put` racing an in-band `Flush` | stale ID re-installed after pull/re-tag → adopt validates against the previous image for ≤1 tick | yes (flush-race fence test) | per-ref generation fence drops the stale `Put` | Nothing — staleness prevented (silent if unfenced, hence the test) |
 | raft-wal mixed-format recovery | recovery opens wrong store type → node fails to rejoin | **[REGRESSION] yes** (mixed-format test) | detect → recover ordering | Operator sees rejoin failure (loud) |
 | WAL node reverted to bolt build | bolt can't read WAL → node won't start | rollout doc (not in-place revertable) | drain → rejoin fresh DataDir | Operator sees start failure (loud) — documented |
 | transport pool exhaustion (agent.go missed) | followers keep re-handshaking mTLS → p90 tail persists | yes (reuse test, both transports) | both call sites raised | Slow tail, no error |
@@ -427,10 +476,10 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: Code Quality — "netlink ENOENT unrecognized by `ruleNotExist` → clear loop fatal → adopt breaks (`manager.go:13` bug)"
   - Files: `pkg/docker/netrules/manager.go` (shared helper for `ClearBlockAllEgress:121`, `ClearBlockAllIngress:169`, `deletePolicyRule:275`)
   - Verify: **[REGRESSION]** netlink absent-rule clear terminates; exec no-regression (2 Delete, 0 Exists)
-- [ ] **T3 (P1, human: ~1 day / CC: ~1h)** — image-cache — Client-owned per-tick re-resolve warming loop + `RefillInterval < TTL` invariant
-  - Surfaced by: Architecture — "free-ride on Park fails the 15s sparse gate (10s TTL); needs unconditional per-tick re-resolve"
-  - Files: `pkg/docker/` (Client ticker + timing-free resolve), reads `internal/pool/dockerpool` `ListTargets`
-  - Verify: warm-across-sparse-gap (fake clock), re-tag freshness, invariant, background-only (no boot-path timing stage)
+- [ ] **T3 (P1, human: ~1 day / CC: ~1h)** — image-cache — Client-owned per-tick re-resolve warming loop + `RefillInterval < TTL` invariant + `Flush` generation fence
+  - Surfaced by: Architecture — "free-ride on Park fails the 15s sparse gate (10s TTL); needs unconditional per-tick re-resolve"; post-review — "warm `Put` can race an in-band `Flush` and re-install a stale ID"
+  - Files: `pkg/docker/` (Client ticker + timing-free resolve), `pkg/docker/image_cache.go` (per-ref generation), reads `internal/pool/dockerpool` `ListTargets` (exists, `pool.go:372`)
+  - Verify: warm-across-sparse-gap (fake clock), re-tag freshness, invariant, background-only (no boot-path timing stage), flush-race fence (stale `Put` dropped)
 - [ ] **T4 (P1, human: ~1 day / CC: ~40min)** — cluster — raft-wal log store + closable interface + format detection + mixed-format safety
   - Surfaced by: Architecture / Outside voice — "`raft.LogStore` lacks `Close`; detect→recover ordering; mixed-format & revert unstated"
   - Files: `internal/cluster/raft.go`, `internal/cluster/raft_recovery.go`, `go.mod`
