@@ -46,12 +46,24 @@ type RuleBackend interface {
 type Manager struct {
 	enabled bool
 	ipt     RuleBackend
-	// mu serializes Block/Clear pairs. iptables Exists+Insert is not atomic,
-	// and the poller, reconcile, SetNetworkLimits, and Destroy paths can all
-	// drive the same IP concurrently. Without this lock, two callers can both
-	// pass Exists and both Insert, leaving a duplicate that a single Delete
-	// in Clear* won't fully remove.
-	mu sync.Mutex
+	// ipMu guards ipLocks. Per-IP mutexes serialize Exists+Insert for one
+	// container IP (poller / reconcile / SetNetworkLimits / Destroy can all
+	// drive the same IP concurrently). Without per-IP exclusion, two callers
+	// can both pass Exists and both Insert, leaving a duplicate that a
+	// single Delete in Clear* won't fully remove.
+	//
+	// Sharding by IP (vs one global mu) lets concurrent creates for different
+	// sandboxes proceed in parallel so netrules does not head-of-line-block
+	// warm-create p99 under burst. Same-IP mutual exclusion is preserved.
+	ipMu    sync.Mutex
+	ipLocks map[string]*ipLock
+}
+
+// ipLock is a refcounted per-IP mutex. Refs track in-flight holders so idle
+// entries can be dropped — docker bridge IPs churn over a daemon lifetime.
+type ipLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 func New(enabled bool) (*Manager, error) {
@@ -100,6 +112,37 @@ func (m *Manager) Enabled() bool {
 	return m != nil && m.enabled
 }
 
+// lockIP acquires the per-container-IP mutex and returns the unlock func.
+// Callers must defer the result. Empty IP is a no-op (public methods already
+// short-circuit before locking).
+func (m *Manager) lockIP(ip string) func() {
+	if m == nil || ip == "" {
+		return func() {}
+	}
+	m.ipMu.Lock()
+	if m.ipLocks == nil {
+		m.ipLocks = make(map[string]*ipLock)
+	}
+	l := m.ipLocks[ip]
+	if l == nil {
+		l = &ipLock{}
+		m.ipLocks[ip] = l
+	}
+	l.refs++
+	m.ipMu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		m.ipMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(m.ipLocks, ip)
+		}
+		m.ipMu.Unlock()
+	}
+}
+
 // BlockAllEgress installs a DROP rule for traffic originating from
 // containerIP. The rule lives in DOCKER-USER, the chain Docker explicitly
 // reserves for operator-defined firewall rules. DOCKER-USER is jumped from
@@ -111,8 +154,8 @@ func (m *Manager) BlockAllEgress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	unlock := m.lockIP(containerIP)
+	defer unlock()
 
 	exists, err := m.ipt.Exists("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP")
 	if err != nil {
@@ -133,8 +176,8 @@ func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	unlock := m.lockIP(containerIP)
+	defer unlock()
 
 	if err := m.deleteUntilGone("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete egress rule: %w", err)
@@ -153,8 +196,8 @@ func (m *Manager) BlockAllIngress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	unlock := m.lockIP(containerIP)
+	defer unlock()
 
 	exists, err := m.ipt.Exists("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP")
 	if err != nil {
@@ -175,8 +218,8 @@ func (m *Manager) ClearBlockAllIngress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	unlock := m.lockIP(containerIP)
+	defer unlock()
 
 	if err := m.deleteUntilGone("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete ingress rule: %w", err)
@@ -205,8 +248,8 @@ func (m *Manager) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	unlock := m.lockIP(containerIP)
+	defer unlock()
 
 	if len(allowCIDRs) > 0 {
 		// The catch-all DROP must sit BELOW the per-CIDR ACCEPTs. Insert the
@@ -237,8 +280,8 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	unlock := m.lockIP(containerIP)
+	defer unlock()
 
 	var specs [][]string
 	for _, cidr := range allowCIDRs {

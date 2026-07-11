@@ -25,21 +25,8 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Start:** `Terraform/nodes.tf` + the node bootstrap template; add one
   optional NVMe bench scenario for the stretch gate (≤25ms).
 
-## netrules Manager mutex head-of-line blocking
+## netrules Manager mutex head-of-line blocking — DONE (PR #306)
 
-- **What:** shard `Manager.mu` per-container-IP (or move to lock-free netlink
-  ops) so concurrent creates don't serialize their Block/Clear/Apply calls.
-- **Why:** `pkg/docker/netrules/manager.go` guards every Block/Clear/Apply with
-  a single `Manager.mu` (`manager.go:46`). Under concurrent creates every
-  sandbox's netrules op queues behind one lock.
-- **Caveat / when it matters:** `plans/warm-create-latency-tier1.md` §6 scopes
-  p99 / concurrency OUT — the plan's targets are p50 (single create), which
-  never contends the mutex. Once the netlink backend lands, each op is sub-ms
-  so the critical section shrinks. This only becomes the next bottleneck if
-  concurrent-create p90/p99 throughput becomes a stated goal.
-- **Note on correctness:** the mutex is load-bearing — it serializes the
-  non-atomic `Exists`+`Insert` pair (`manager.go:51`). Sharding must preserve
-  per-IP mutual exclusion, not remove it.
-- **Depends on / blocked by:** Phase 1 netlink backend landing first (sub-ms
-  ops are what make the mutex the next-visible cost).
-- **Start:** `pkg/docker/netrules/manager.go`.
+Shipped as per-IP refcounted locks in `pkg/docker/netrules/manager.go`
+(`lockIP`). Same-IP Exists+Insert mutual exclusion preserved; different IPs
+no longer serialize. See `ip_lock_test.go`.

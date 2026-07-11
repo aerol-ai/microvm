@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -180,6 +181,7 @@ func TestManagerEnabledErrors(t *testing.T) {
 // word it differently, and the Manager must terminate its duplicate-sweep
 // loops on both.
 type memBackend struct {
+	mu        sync.Mutex
 	rules     []string
 	deleteErr error
 }
@@ -189,15 +191,21 @@ func memKey(table, chain string, spec ...string) string {
 }
 
 func (m *memBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return slices.Contains(m.rules, memKey(table, chain, spec...)), nil
 }
 
 func (m *memBackend) Insert(table, chain string, _ int, spec ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.rules = append(m.rules, memKey(table, chain, spec...))
 	return nil
 }
 
 func (m *memBackend) Delete(table, chain string, spec ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	k := memKey(table, chain, spec...)
 	for i, r := range m.rules {
 		if r == k {
@@ -209,6 +217,24 @@ func (m *memBackend) Delete(table, chain string, spec ...string) error {
 		return m.deleteErr
 	}
 	return errNoMatch{}
+}
+
+func (m *memBackend) ruleCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.rules)
+}
+
+func (m *memBackend) countMatching(substr string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.rules {
+		if strings.Contains(r, substr) {
+			n++
+		}
+	}
+	return n
 }
 
 type errNoMatch struct{}
@@ -286,17 +312,22 @@ func TestRuleNotExist(t *testing.T) {
 // regression suite (exec path must stay at 2 Delete / 0 Exists).
 type countingBackend struct {
 	memBackend
+	mu      sync.Mutex
 	deletes int
 	exists  int
 }
 
 func (c *countingBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	c.mu.Lock()
 	c.exists++
+	c.mu.Unlock()
 	return c.memBackend.Exists(table, chain, spec...)
 }
 
 func (c *countingBackend) Delete(table, chain string, spec ...string) error {
+	c.mu.Lock()
 	c.deletes++
+	c.mu.Unlock()
 	return c.memBackend.Delete(table, chain, spec...)
 }
 
