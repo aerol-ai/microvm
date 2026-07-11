@@ -44,11 +44,11 @@ no longer serialize. See `ip_lock_test.go`.
   promote (~23ms) — the ≤30ms Tier 1 gate fails at 40-44ms until promote
   sheds the sync replication. The api-side cost is bigger still: opReserve
   pays the same replication before the create even starts.
-- **Direction to evaluate:** the FSM already has a fetch path for missing
-  blobs (`recoveryResolver` / `fetchRecoveryBlob`), so async/lazy blob
-  replication with fetch-on-recovery may be semantics-preserving; or skip
-  externalize when the spec doesn't opt into failover.recreate. Needs its
-  own plan + failure analysis (blob unavailable at recovery time).
+- **Plan:** `plans/warm-create-latency-tier2-recovery-replication.md` —
+  inline small secret-free payloads in the Raft command (the original wire
+  shape, so mixed-version-safe both directions); blob mesh remains only for
+  legacy sealed bytes / oversized specs. Raft-quorum durability is strictly
+  stronger than today's best-effort mesh for failover recreate.
 - **Start:** `internal/cluster/recovery_replication.go`
   (`storeAndReplicateRecoveryBlob`), `recovery_store.go` fetch path; bench
   artifacts `integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`.
