@@ -783,14 +783,21 @@ func TestBenchCreateLatencySparse(t *testing.T) {
 		report.Latency = append(report.Latency, ls)
 		t.Logf("sparse[%s] server p50=%dms | warm_hits=%d resolve_on_warm=%d (%d ok, %d fail)",
 			br.runtime, ls.Serverp50MS, warmHits, resolveHits, len(apiD), failures)
-		if warmHits > 0 && resolveHits > 0 {
-			// Allow a single miss for racey first sample; more than that
-			// means the warm loop is not keeping the cache hot.
-			if resolveHits > 1 {
-				t.Errorf("sparse gate: docker_image resolve on %d/%d warm hits (want ~0)", resolveHits, warmHits)
-			}
+		// The gates below must not pass vacuously: a run with zero warm hits
+		// or no Server-Timing data proves nothing about the warm path, which
+		// is the entire point of the sparse sweep.
+		if warmHits == 0 {
+			t.Errorf("sparse gate: no warm pool hits across %d samples — pool drained or Server-Timing missing docker_pool", len(apiD))
 		}
-		if ls.Serverp50MS > 0 && ls.Serverp50MS > 30 {
+		if len(serverD) == 0 {
+			t.Errorf("sparse gate: no Server-Timing create durations captured across %d samples", len(apiD))
+		}
+		// Allow a single resolve for a racey first sample; more than that
+		// means the warm loop is not keeping the cache hot.
+		if resolveHits > 1 {
+			t.Errorf("sparse gate: docker_image resolve on %d/%d warm hits (want ~0)", resolveHits, warmHits)
+		}
+		if len(serverD) > 0 && ls.Serverp50MS > 30 {
 			t.Errorf("sparse gate: warm server p50=%dms want ≤30ms", ls.Serverp50MS)
 		}
 	}

@@ -132,26 +132,14 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	}
 
 	if clusterTLS != nil {
-		mtlsTransport := &http.Transport{
-			TLSClientConfig: clusterTLS.clientConfig(),
-			// Same idle-pool sizing as Cluster.internalClient — workers are
-			// the nodes that forward to the leader, so under-pooling here is
-			// what produced the leader_forward p90 tail.
-			DisableKeepAlives:   false,
-			MaxIdleConns:        64,
-			MaxIdleConnsPerHost: 16,
-			IdleConnTimeout:     90 * time.Second,
-		}
+		// Same idle-pool sizing as Cluster.internalClient — workers are the
+		// nodes that forward to the leader, so under-pooling here is what
+		// produced the leader_forward p90 tail.
 		a.internalClient = &http.Client{
 			Timeout:   commitTimeout + 2*time.Second,
-			Transport: mtlsTransport,
+			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
-		a.mtlsProxies = newProxyCache(&http.Transport{
-			TLSClientConfig:     clusterTLS.clientConfig(),
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		})
+		a.mtlsProxies = newProxyCache(newMTLSProxyTransport(clusterTLS.clientConfig()))
 		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, a.ApplyEncoded, logger)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
