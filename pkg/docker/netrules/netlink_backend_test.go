@@ -109,8 +109,10 @@ func TestNetlinkBackendInsertAtPosition(t *testing.T) {
 	if err := b.Insert("filter", "DOCKER-USER", 2, spec...); err != nil {
 		t.Fatalf("Insert pos=2: %v", err)
 	}
-	if len(fake.inserted) != 1 || fake.inserted[0].Position != 10 {
-		t.Fatalf("Position = %v, want handle 10 (rules[pos-1])", fake.inserted[0].Position)
+	// iptables -I chain 2 → insert before the current 2nd rule (0-based
+	// index pos-1), so Position is rules[1].Handle.
+	if len(fake.inserted) != 1 || fake.inserted[0].Position != 20 {
+		t.Fatalf("Position = %v, want handle 20 (rules[pos-1])", fake.inserted[0].Position)
 	}
 }
 
