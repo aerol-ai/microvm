@@ -397,11 +397,20 @@ here (p50 single-create never contends it), tracked in `TODOS.md`.
 | (Tier 1.5 seal-only overlap, §6 — promote overlap withdrawn post-review) | ~27–28ms | ~27–28ms | — | not gated here |
 | (deferred Tier 3, for scale) | ~8–12ms | — | ~15–20ms | not gated here |
 
-Verification — **both** benches, run with `SB_NETRULES_BACKEND=netlink`:
+Verification — **both** benches, run with `SB_NETRULES_BACKEND=netlink` and
+`AEROL_BENCH_EXPECT_NETRULES=netlink` (added post-review 2026-07-11: the bench
+scrapes `aerolvm_netrules_backend` from `/v1/metrics` and fails unless the
+cluster actually runs the expected backend, so a run can't silently measure
+exec):
 - `make integration-benchmark-docker-only` (existing burst) — image cache warm.
 - **`make integration-benchmark-docker-sparse` (NEW)** — one create per 15s+,
   placement-spread across nodes. Gate: `docker_image;desc=resolve` on ~zero warm
   hits AND warm p50 ≤ 30ms. This is the only gate that exercises Phase 2.
+- **UC-98 egress enforcement probe (NEW, post-review 2026-07-11)** — a deny
+  rule must actually DROP traffic from inside a sandbox
+  (`integration-tests/suite/netrules_test.go`). Runs on any docker scenario
+  pass; this is the live nftables drop test the netlink backend was missing
+  (unit tests only prove argv→expression translation).
 
 Per-stage attribution via Server-Timing must show `docker_pool` ≤ 15ms and the
 promote share of the residual ≤ 5ms (`aerolvm_raft_apply_latency` /

@@ -67,6 +67,20 @@ iptables (`netrules.WarnIfLegacyIptables`, wired in `pkg/daemon`), and the
 drain-before-switch procedure is documented in `setup/single-node.md` +
 `packaging/.env.template`.
 
+## netlink live enforcement probe + bench backend gate — CODE DONE, live run pending
+
+Closed the two open PR #306 review findings 2026-07-11:
+- **UC-98** (`integration-tests/suite/netrules_test.go`): egress deny rule
+  must DROP real traffic from inside the sandbox (control sandbox proves the
+  target reachable; denied sandbox must time out; unrelated egress must flow).
+- **Bench backend gate**: `aerolvm_netrules_backend` expvar (exec | netlink |
+  disabled, recorded in `netrules.NewWithOptions`) + benches fail when
+  `AEROL_BENCH_EXPECT_NETRULES` doesn't match `/v1/metrics`.
+
+**Remaining:** both only prove things on a live cluster — fold into the next
+operator integration run (the Tier 2 T4 bench re-run is the natural slot:
+set `AEROL_BENCH_EXPECT_NETRULES=netlink`, UC-98 runs in the same suite pass).
+
 ## Promote-fail rollback can leave a ghost Placed row (latent, cluster)
 
 - **Status:** fixed in Tier 1.5 (`OverlapCreateAndPromote` / self-wins

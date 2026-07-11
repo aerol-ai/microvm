@@ -10,6 +10,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -193,7 +194,8 @@ func retractReservedCreate(
 
 	result := "ok"
 	if err := svc.DestroySandbox(rbCtx, sandboxID); err != nil {
-		if createErr == nil {
+		switch {
+		case createErr == nil:
 			// Create succeeded (seal failed) — this destroy failure leaves a
 			// live local sandbox that ownership replay can resurrect.
 			result = "destroy_failed"
@@ -201,11 +203,25 @@ func retractReservedCreate(
 				logger.Error("cluster: rollback destroy after overlap failure failed",
 					"sandbox_id", sandboxID, "err", err)
 			}
-		} else if logger != nil {
-			// Create already failed → Destroy often sees not-found after the
-			// service rolled back its own partial state; keep it quiet.
-			logger.Warn("cluster: best-effort destroy after create failure",
-				"sandbox_id", sandboxID, "err", err)
+		case errors.Is(err, store.ErrNotFound):
+			// Create already failed → Destroy sees not-found after the service
+			// rolled back its own partial state. This is the expected outcome,
+			// not a rollback failure; keep the metric at ok and the log quiet.
+			if logger != nil {
+				logger.Warn("cluster: best-effort destroy after create failure",
+					"sandbox_id", sandboxID, "err", err)
+			}
+		default:
+			// The create leg failed AND destroy failed for a reason other than
+			// not-found — the create's own rollback may have left runtime state
+			// behind. The metric must not report ok, or the only rollback
+			// failure signal is a Warn log nobody alerts on.
+			result = "destroy_failed"
+			if logger != nil {
+				logger.Error("cluster: rollback destroy after create failure failed",
+					"sandbox_id", sandboxID, "err", err,
+					"create_err", errString(createErr))
+			}
 		}
 	}
 
