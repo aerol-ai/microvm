@@ -162,6 +162,11 @@ func exprEqual(a, b expr.Any) bool {
 		xc, xok := x.Info.(*xt.Comment)
 		yc, yok := y.Info.(*xt.Comment)
 		return xok && yok && *xc == *yc
+	case *expr.Counter:
+		// Counters are runtime state (packet/byte totals), not identity —
+		// two counter exprs always match regardless of what they've counted.
+		_, ok := b.(*expr.Counter)
+		return ok
 	default:
 		return false
 	}

@@ -175,9 +175,21 @@ func TestExprsEqualAndExprEqualBranches(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "unknown_type",
+			name: "counter_ignores_totals",
 			x:    &expr.Counter{},
-			y:    &expr.Counter{},
+			y:    &expr.Counter{Packets: 42, Bytes: 4096},
+			want: true,
+		},
+		{
+			name: "counter_vs_other_type",
+			x:    &expr.Counter{},
+			y:    &expr.Verdict{Kind: expr.VerdictDrop},
+			want: false,
+		},
+		{
+			name: "unknown_type",
+			x:    &expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			y:    &expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
 			want: false,
 		},
 		{
