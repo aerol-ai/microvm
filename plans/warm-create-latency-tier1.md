@@ -1,24 +1,31 @@
-# Warm create latency Tier 1: 43ms → ~25ms (semantics-preserving)
+# Warm create latency Tier 1: 43ms → ≤30ms acceptance (semantics-preserving)
 
-Status: **planned (not started)** (written 2026-07-11). Successor to
-`plans/docker-warm-pool.md` §12, which shipped the warm-adopt fast path at
-**server p50 43ms** (v0.5.33). This plan removes the remaining
-engine/consensus round-trips that are removable **without changing any
-idempotency or failover semantics**. The semantics-changing follow-ups
-(async rename, async promote) are documented in §6 as explicitly deferred.
+Status: **planned (not started)** (written 2026-07-11; revised after eng review
+2026-07-11). Successor to `plans/docker-warm-pool.md` §12, which shipped the
+warm-adopt fast path at **server p50 43ms** (v0.5.33). This plan removes the
+removable engine/consensus round-trips **without changing any idempotency or
+failover semantics**. The semantics-changing follow-ups (async rename, async
+promote) stay deferred in §6.
 
-Owner rules that apply: every phase here changes `CreateSandbox` callees
-(`/touch-create-sandbox`, boot-path call-outs per `pr-review.md` §2). Phase 2
-touches `internal/cluster/` (fragile area — regression tests next to the file
-+ cluster-correctness PR call-out mandatory). Phase 1 touches the netrules
-path that broke warm adopts once already on iptables-nft hosts; its
-regression suite is the floor, not the ceiling.
+**Acceptance target: warm p50 ≤ 30ms on the standard bench topology
+(t3.medium + gp3), measured under BOTH burst and sparse traffic.** The ≤25ms
+stretch depends on NVMe/io2 infra with weaker durability assumptions — that
+work is **split out to `plans/nvme-datadir.md`** (tracked in `TODOS.md`) and is
+NOT gated here. The old "→ ~25ms" headline conflated the code win with the
+infra win; this plan owns the code win only.
+
+Owner rules that apply: every phase changes `CreateSandbox` callees
+(`/touch-create-sandbox`, boot-path call-outs per `pr-review.md` §2). Phase 3
+touches `internal/cluster/` (fragile — regression tests next to the file +
+cluster-correctness PR call-out mandatory). Phase 1 touches the netrules path
+that broke warm adopts once already on iptables-nft hosts; its regression suite
+is the floor, not the ceiling.
 
 ## 1. Problem: measured anatomy of the 43ms warm hit
 
 Live probes against the kept `cluster-3-mixed-docker` cluster
 (2026-07-11, v0.5.33, t3.medium + gp3, follower worker). A pure warm hit
-(`docker_pool;desc=hit`, image cache hit) measured 44.6ms end-to-end
+(`docker_pool;desc=hit`, **image cache hit**) measured 44.6ms end-to-end
 server-side, fully attributed:
 
 | Component | Measured | Evidence |
@@ -36,188 +43,423 @@ The Raft promote splits further (leader vs follower expvar histograms):
 
 - **~6–7ms: the commit itself** — leader-local `aerolvm_raft_apply_latency`
   p50 ≈ 6–7ms, p90 ≈ 15ms (393 samples). raft-boltdb pays two fsyncs per
-  transaction on gp3 EBS (~1ms/fsync), in parallel with replication to one
-  follower (RTT + its fsync).
+  transaction on gp3 EBS (~1ms/fsync), **in parallel with replication to one
+  follower (RTT + its fsync)**. Note (eng review): the log-store swap only
+  removes the boltdb share of this; follower replication + follower fsync
+  remain, so the p50 win is bounded and only fully lands once all voters
+  migrate — see Phase 3 tempered math.
 - **~3ms: the follower→leader HTTP hop** (pooled mTLS). The p90 ≈ 20ms tail
   is consistent with connection churn: the internal transport has
   `MaxIdleConns: 4` total and the Go default 2 idle conns per host, so
-  concurrent creates re-handshake mTLS.
+  concurrent creates re-handshake mTLS. This limit exists in **both**
+  `internal/cluster/client.go:189` **and** `internal/cluster/agent.go:135`
+  (the follower/worker path via `NewAgent`).
 
 Placement/slot-pop itself is microseconds. The 43ms is three round-trips:
 dockerd rename (11ms), iptables execs (8ms), Raft commit (10ms).
 
-Second-order p50 effect: `docker_image;desc=resolve` (~45ms engine inspect)
-re-runs once per 10s cache TTL **per node**. Bursts on one node amortize it;
-sparse traffic spread by placement pays it on most creates (observed: 3 of 4
-probes). See §7 open questions.
+**Critical second-order effect — the image resolve (now Phase 2).**
+`docker_image;desc=resolve` (~45ms engine inspect) re-runs once per 10s cache
+TTL **per node**. The 44.6ms anatomy above is an **image-cache-HIT** sample;
+on a cache MISS add ~45ms → ~90ms. The probe observed a miss on **3 of 4**
+sparse creates: each node's 10s cache goes cold between creates and placement
+spreads consecutive creates across nodes, so on realistic sparse multi-node
+traffic the resolve dominates every other line item. This is why cache warming
+is a **first-class phase** (Phase 2), not a rider.
 
-## 2. Phase 1 — netrules off the exec path (~8ms → ≤1ms)
+## 2. Phase 1 — netrules off the exec path (~8ms → sub-ms target)
 
-`pkg/docker/netrules/manager.go` drives `go-iptables`, which shells out to
-the `iptables` binary per call (~4–5ms each on t3.medium). The adopt path
-pays ≥2 execs (`ClearBlockAllEgress` delete-until-missing loop); requests
-with egress policies pay 1–2 more per rule. Cold creates pay the same on
-`docker_netrules`.
+`pkg/docker/netrules/manager.go` drives `go-iptables`, which shells out to the
+`iptables` binary per call (~4–5ms each on t3.medium). The adopt path pays ≥2
+execs (`ClearBlockAllEgress` delete-until-missing loop); requests with egress
+policies pay 1–2 more per rule. Cold creates pay the same on `docker_netrules`.
 
-**Target design:** a netlink-native `RuleBackend` implementation. The seam
-already exists (`RuleBackend` interface + `NewWithBackend`), so this is a new
-backend, not a Manager rewrite.
+**Target design: a netlink-native `RuleBackend` (`google/nftables`).** The seam
+already exists (`RuleBackend` interface + `NewWithBackend`, `manager.go:40-77`),
+but it is **iptables-shaped**: `Exists/Insert/Delete` take iptables argv
+(`"-s", ip, "-j", "DROP"`; `"-m", "comment", "--comment", ...` for policies).
+So the netlink backend is **not a 3-method swap** — it is a translator. Phase 1
+therefore explicitly includes:
 
-- **Option A (target): `google/nftables`** — native netlink, sub-ms per op,
-  no exec. Risk: `DOCKER-USER` on Ubuntu 22.04+/Docker 28 is an iptables-nft
-  *compat* chain; rules written via raw netlink must emit the compat
-  expressions that `iptables`/dockerd tooling still lists and matches. This
-  is well-trodden (firewalld, kube-router do it) but must be proven with an
-  e2e check: rule inserted via the new backend is visible to `iptables -L
-  DOCKER-USER` and actually drops traffic.
-- **Option B (fallback): batch via `iptables-restore --noflush`** — one exec
-  per adopt instead of 2+N. Halves the cost (~4ms) rather than eliminating
-  it; zero compat risk.
+1. **An iptables-argv → nftables-expression translator** for the exact rule
+   shapes the Manager emits: `-s`/`-d` source/dest match, `-j DROP`/`-j ACCEPT`
+   verdict, and the `-m comment --comment sbx-egress` tag that keeps selective
+   egress disjoint from the blanket block (`egressPolicyComment`,
+   `manager.go:187`).
+2. **Rule-equality semantics** so `Exists` matches a rule the translator (or
+   dockerd/iptables tooling) previously wrote — the `DOCKER-USER` chain on
+   Ubuntu 22.04+/Docker 28 is an **iptables-nft compat** chain; rules written
+   via raw netlink must emit compat expressions that `iptables -L DOCKER-USER`
+   still lists and matches.
+3. **The compat proof is the PRIMARY feasibility gate, not a test detail.**
+   Well-trodden (firewalld, kube-router) but must be proven e2e: a rule inserted
+   via the new backend is visible to `iptables -L DOCKER-USER` **and actually
+   drops traffic**, across the iptables flavors in the matrix (see §7 Q1).
 
-Config: `SB_NETRULES_BACKEND=exec|netlink`, default `exec` until Option A
-soaks in an integration run; flip the default in a follow-up release.
+**Reworked clear loop (semantics-preserving, backend-agnostic).**
+`ClearBlockAllEgress` (`manager.go:121`), `ClearBlockAllIngress` (`:169`), and
+`deletePolicyRule` (`:275`) currently loop `Delete` until `ruleNotExist(err)`
+terminates. `ruleNotExist` (`manager.go:22`) classifies **iptables** errors
+(typed `*iptables.Error` or 3 substrings). A netlink backend returns netlink
+errors (e.g. `ENOENT` "no such file or directory") that match none of those →
+"rule gone" reads as **fatal** → the adopt path breaks — the **exact bug**
+`manager.go:13-21` memorializes. Fix (one shared helper, applied to all three
+loops):
 
-Regression floor: the existing manager tests run against both backends via
-the seam; add the iptables-nft visibility e2e to the tag-gated suite (this
-is the exact spot where the invisible adopt-breakage bug lived — see the
-`ruleNotExist` comment).
+```
+for {
+  err := Delete(...)
+  if err == nil { continue }              // swept one, retry (dup-sweep intact)
+  if ruleNotExist(err) { return nil }     // exec path: recognized, 2 execs, UNCHANGED
+  if ex, e := Exists(...); e == nil && !ex { return nil } // netlink: confirm gone
+  return err
+}
+```
 
-**Phase 1 rider — refill-loop image-ID cache warming.** The ~45ms
-`docker_image;desc=resolve` (§1) hits sparse traffic on roughly every
-create because each node's 10s cache goes cold between creates and
-placement spreads consecutive creates across nodes. The park/refill path
-already resolves the image ID it parks (it is stored on the slot for
-`Acquire`'s identity validation), so the refill tick should `Put` that
-resolution into the image-ID cache each cycle. This keeps the cache
-permanently warm for pool-eligible images at zero boot-path cost, and
-*tightens* the out-of-band re-tag staleness window from the 10s TTL to the
-refill interval — the tick's resolution is fresher than anything the TTL
-allowed. In-band mutations (pull, build tag, GC delete) still flush
-immediately, unchanged.
+This keeps the **exec backend at its current 2-exec cost** (the `Exists`
+fallback never fires when `ruleNotExist` already recognizes the error), so it
+does **not** regress the §8-gated cold-path `docker_netrules`; and it makes the
+netlink path safe **without** teaching `ruleNotExist` netlink error strings.
 
-Exit gates: adopt-path netrules cost ≤1ms p50 (Option A) or ≤5ms
-(Option B), `docker_netrules` cold-path stage drops equivalently, zero
-`docker_pool;desc=adopt_failed` samples in a full bench run, and
-`docker_image;desc=resolve` appears on ~zero warm hits for pool-eligible
-images in a sparse-traffic probe sequence (one create per 15s+, spread
-across nodes).
+**Fallback if the translator/compat proof stalls: Option B — batch via
+`iptables-restore --noflush`** (one exec per adopt instead of 2+N, ~halves the
+cost to ~4–5ms, zero compat risk). Kept as the documented off-ramp; if Option A
+soaks poorly, Option B still gets Phase 1 most of the way.
 
-## 3. Phase 2 — raft-wal log store (commit ~6–7ms → ~3–4ms on gp3)
+Config: `SB_NETRULES_BACKEND=exec|netlink`, default `exec` until Option A soaks
+in an integration run; flip the default in a follow-up release. **Consequence
+to bench honestly (eng review):** while the default is `exec`, the standard
+benchmark does NOT exercise the netlink path — the sparse/burst gates in §8
+must be run with `SB_NETRULES_BACKEND=netlink` to validate the Phase 1 win, and
+the default-flip is what carries it to production.
+
+Regression floor (all mandatory, next to `manager_test.go`):
+- **[REGRESSION]** netlink `Delete` on an absent rule → clear loop terminates
+  cleanly (unrecognized error + `Exists`=false path). Protects the
+  `manager.go:13` bug on the new backend.
+- exec no-regression: a call-counting backend asserts the common single-rule
+  clear issues **2 `Delete` calls and 0 `Exists` calls** (recognized not-exist
+  short-circuits the fallback).
+- translator round-trip: each Manager rule shape → nft expression → visible to
+  `iptables -L` (unit where possible; the drop-traffic proof is the e2e below).
+- **[→E2E, tag-gated]** iptables-nft `DOCKER-USER` visibility + actual drop,
+  across the §7-Q1 flavor matrix. This is the exact spot the invisible
+  adopt-breakage bug lived (`ruleNotExist` comment).
+
+Exit gates: adopt-path netrules cost sub-ms p50 (Option A) or ≤5ms (Option B),
+`docker_netrules` cold-path stage drops equivalently and the **exec backend
+does not regress**, zero `docker_pool;desc=adopt_failed` samples in a full
+bench run.
+
+## 3. Phase 2 — image-ID cache warming (first-class; ~45ms sparse resolve → ~0)
+
+Promoted from a rider at eng review: on realistic sparse multi-node traffic the
+~45ms `docker_image;desc=resolve` (§1) is the single biggest per-create cost,
+larger than iptables + Raft savings + forward-tail combined. The
+park/refill path already inspects each parked image (`docker_pool.go:312`
+stores `imageInspect.ID` on the slot), and the adopt path consults the TTL cache
+at `docker_pool.go:117` (`resolveImageIDCached`).
+
+**Why the naïve "free-ride on Park" rider does NOT work (eng review):**
+`refillTick` (`refill.go:56`) only calls `spawner.Park` when
+`SpawnBudget(ks) > 0` — i.e. only *after* consumption. When the pool sits full,
+no Park runs, so there is no fresh resolution to `Put`. And `Put` stamps a 10s
+TTL (`image_cache.go:72`); the sparse condition is "one create per 15s+", so
+even a post-consumption `Put` **expires before the next sparse create arrives
+(15s > 10s)** → cold resolve again. Free-riding on Park keeps the cache warm
+only when consumption outpaces the TTL — the opposite of the sparse traffic it
+targets.
+
+**Design: unconditional per-tick re-resolve, Client-owned.**
+
+```
+warmTick (every RefillInterval, e.g. 5s):
+  for key in pool.ListTargets():         // pool-eligible images only
+     id := <timing-free engine inspect>(key.image)   // OFF the boot path
+     imageIDs.Put(key.image, id)                       // refresh -> now + TTL
+```
+
+- **Keeps the cache warm:** `RefillInterval` (5s) < `imageIDCacheTTL` (10s), so
+  a pool-eligible image is re-`Put` before its entry can expire → sparse
+  creates always hit. **Invariant, asserted at wiring:
+  `RefillInterval < imageIDCacheTTL`** (fail-fast/log if violated; a misconfig
+  silently reverts to cold sparse creates).
+- **Tightens staleness:** because each tick *re-resolves* (fresh engine
+  inspect), an out-of-band re-tag is picked up within one tick (≤5s) instead of
+  the 10s TTL. In-band mutations (pull, build tag, GC delete) still `Flush`
+  immediately, unchanged.
+- **Zero boot-path cost:** the inspect runs in the background warm loop, never
+  on `CreateSandbox`. Cost is one background inspect per pool-eligible key per
+  tick — negligible for the small pool-eligible set (see §7 Q2 for the
+  many-images caveat).
+
+**Wiring boundary (eng review):** `resolveImageIDCached` is a `*docker.Client`
+method (`docker_pool.go:338`) that **records a `docker_image` timing stage** via
+`CreateTimingFrom(ctx).RecordStageDesc`. The refill loop lives in
+`internal/pool/dockerpool` and only sees the `Spawner` interface — it cannot
+reach `c.imageIDs`. So warming is a **Client-side responsibility** (a
+Client-owned ticker over `pool.ListTargets()`), and it MUST use a **timing-free
+resolve variant**, not `resolveImageIDCached` — calling the timing path with a
+background ctx risks a nil/mis-recorded `RecordStageDesc`.
+
+Tests (fake clock, `image_cache.go`'s `now` seam already exists):
+- warm-across-sparse-gap: tick warmer, advance clock past TTL **and** past the
+  15s inter-create gap, assert `Get` still hits (proves "permanently warm").
+- re-tag freshness: change the resolved ID between ticks, assert `Get` returns
+  the new ID within one interval (proves "tightens staleness").
+- invariant: wiring rejects/warns when `RefillInterval >= imageIDCacheTTL`.
+- background-only: warming issues no `docker_image` boot-path timing stage.
+
+Exit gate: `docker_image;desc=resolve` appears on ~zero warm hits for
+pool-eligible images in the **sparse** bench (§8), with warm p50 holding.
+
+## 4. Phase 3 — raft-wal log store (commit ~6–7ms → ~3–4ms on gp3)
 
 Swap the Raft **log store** from `raft-boltdb/v2` to `hashicorp/raft-wal`
 (`internal/cluster/raft.go` `setupRaft`). raft-wal exists precisely because
-BoltDB's two-fsync B+tree commit is the known hot-path cost (Consul and
-Vault both migrated); it also fixes BoltDB freelist growth, which degrades
-append latency as the log churns — a latent problem for us independent of
-this plan, given create/destroy churn. The **stable store stays Bolt**
-(tiny, rare writes).
+BoltDB's two-fsync B+tree commit is the known hot-path cost (Consul and Vault
+both migrated); it also fixes BoltDB freelist growth, which degrades append
+latency as the log churns. The **stable store stays Bolt** (tiny, rare writes).
+
+**Tempered perf expectation (eng review):** the log-store swap removes only the
+boltdb share of the ~6–7ms commit. Follower replication RTT + follower fsync
+remain, and the win only fully lands once **all voters** run WAL — a
+mixed-format cluster mid-rollout may not move p50 much. Expected p50 ≤ 4ms on
+gp3 is the **all-WAL** steady state, not the mid-rollout state.
 
 Scope and blast radius:
 
-- `raft-log.bolt` / `raft-stable.bolt` filenames appear only in
-  `internal/cluster/raft.go`; scripts/Ansible operate on the DataDir and
-  never name the files.
-- `internal/cluster/raft_recovery.go` takes `*raftboltdb.BoltStore` params —
-  co-change to accept the store interfaces so lost-quorum recovery works on
-  either format.
-- **Migration = per-node format detection, not conversion.** On startup: if
-  `raft-log.bolt` exists and is non-empty, keep Bolt for that node;
-  otherwise create raft-wal. Existing clusters move via the standard Ansible
-  drain → remove-member → rejoin cycle (fresh DataDir ⇒ WAL); integration
-  clusters are re-provisioned anyway. No offline converter.
+- `raft-log.bolt` / `raft-stable.bolt` filenames appear only in `raft.go`;
+  scripts/Ansible operate on the DataDir and never name the files.
+- **Type blast radius is wider than "recovery params" (eng review).**
+  `raftNode.logStore` is concrete `*raftboltdb.BoltStore` (`raft.go:21`) and
+  `raftNode.Close` calls `logStore.Close()` (`raft.go:166`) — but
+  `raft.LogStore` does **not** include `Close`. So the co-change needs a small
+  **custom closable interface** (`raft.LogStore` + `io.Closer`), used by both
+  the struct field and `raft_recovery.go`'s `maybeRecoverRaftClusterFromPeersFile`
+  (`raft_recovery.go:26-34`, currently concrete `*raftboltdb.BoltStore`).
+- **Migration = per-node format detection, not conversion.** On startup:
+  `if boltdb-log-file present → open Bolt; else → open WAL`. Detection runs
+  **before** recovery and hands `RecoverCluster` the **same store** it picked
+  (detect → recover ordering is load-bearing). Name the raft-wal on-disk
+  artifact explicitly so detection keys off "boltdb file present", not a fuzzy
+  "non-empty" (a boltdb file is never byte-empty). No offline converter.
 
-This is the fragile cluster area: regression tests next to `raft.go`
-(setup with WAL store, restart/recovery round-trip, single-node no-op when
-`EnableCluster=false`) plus a cluster-correctness call-out in the PR
-(replay safety unchanged — the log store is below the FSM; leader-change
-behavior unchanged; the risk is on-disk-format lifecycle, covered by the
-detection rule).
+**Mixed-format safety (mandatory cluster-correctness call-out).** During a
+rolling migration some nodes run Bolt and some run WAL. This **is safe**: the
+log store is **node-local**, raft replicates log **entries** over the transport
+(not store files), and the FSM sits **above** the store, so replay safety is
+unchanged. Leader-change behavior is unchanged. Rollout is one node at a time
+via the standard Ansible **drain → remove-member → rejoin** cycle, **never
+dropping below quorum**.
+
+**Revertability is NOT in-place (eng review — corrects the old §9 claim).**
+Once a node writes WAL state, boltdb-only code **cannot read it**. Reverting a
+node is therefore **drain → rejoin with the bolt build + a fresh DataDir**, not
+a config flip. Phases 1, 2, and 4 stay config-gated/revertable in place; Phase 3
+is a one-way door per node and the rollout doc must say so.
+
+Regression tests next to `raft.go` (mandatory): WAL setup; restart + recovery
+round-trip on a WAL node; **[REGRESSION]** mixed-format node → recovery uses the
+matching store type; detection unit test (bolt-present→bolt, absent→WAL);
+single-node no-op when `EnableCluster=false`.
 
 Exit gate: `aerolvm_raft_apply_latency` p50 ≤ 4ms on gp3 (≤ 2ms on NVMe),
-lost-quorum recovery runbook re-verified on a WAL node.
+all-WAL steady state; lost-quorum recovery runbook re-verified on a WAL node.
 
-## 4. Phase 3 — forward transport pooling (tail fix, trivial)
+## 5. Phase 4 — forward transport pooling (tail fix, trivial)
 
-`internal/cluster/client.go` (~L189): raise the internal mTLS transport to
-`MaxIdleConns: 64`, `MaxIdleConnsPerHost: 16`, `IdleConnTimeout: 90s`
-(matching the proxy cache right below it). Removes mTLS re-handshakes under
-concurrent creates. Expected: `leader_forward` p90 20ms → ≤ 12ms; p50
-mostly unchanged. One connection-reuse test against a counting test server.
+Raise the internal mTLS transport idle-conn limits so followers stop
+re-handshaking mTLS under concurrent creates. **Two call sites (eng review):**
 
-## 5. Phase 4 — fsync floor: NVMe / io2 data-dir option (Terraform)
+- `internal/cluster/client.go:189`
+- `internal/cluster/agent.go:135` (the `NewAgent` follower/worker path — the
+  nodes that actually forward to the leader, i.e. the path the p90 tail comes
+  from). Fixing only `client.go` leaves the tail on the forwarding nodes.
 
-gp3 fsync (~1ms) is the floor under every remaining fsync: both Raft
-stores, and the single-writer SQLite WAL behind `svc_persist` and the
-secrets ref. Options, operator-choice via Terraform variables:
-
-- **Instance-store NVMe** (c5d/m5d/m6id): fsync ~0.1ms → Raft commit
-  ~1–2ms, `svc_persist` sub-ms. Caveat: instance store evaporates on stop.
-  Raft log + SQLite are per-node state; a single node loss recovers via
-  rejoin, but a **full-cluster stop loses everything** → gate this topology
-  on the lost-quorum recovery runbook and say so in `Terraform/` docs.
-- **io2** — safer middle, smaller win (~0.5ms fsync).
-
-Scope: instance-type + volume variables in `Terraform/nodes.tf`, bootstrap
-template mounts the instance store at the sandboxd data dir when present.
-The standard integration bench topology **stays t3.medium+gp3** (cost);
-add one optional NVMe scenario for the stretch gate.
+Set both to `MaxIdleConns: 64`, `MaxIdleConnsPerHost: 16`, `IdleConnTimeout:
+90s`. (Note: the proxy caches just below each — `client.go:206`, `agent.go:147`
+— are `100/10/90s`; "match the neighbour" was imprecise, these are deliberately
+16-per-host for the forward fan-in.) Expected: `leader_forward` p90 20ms →
+≤ 12ms; p50 mostly unchanged. Test: one connection-reuse test against a counting
+test server, covering both transports.
 
 ## 6. Deferred (Tier 3): async rename + async promote — entry-gated
 
-Not in scope. Documented so the trade-off is on record:
+Not in scope. On record so the trade-off is documented:
 
-- **Async rename**: the 11ms is dockerd's own container lock + state write;
-  we can only move it off the response path. The warm-path duplicate guard
-  is already the in-process slot pop + the cluster reservation, so the
-  rename is belt-and-suspenders there — but the name=sandboxID convention
-  is **load-bearing for `ErrSandboxContainerExists` idempotency on the cold
-  path**, and a window where the container is still named `park-<hex>`
-  changes what reconcile and duplicate-create see. Needs its own design.
+- **Async rename**: the 11ms is dockerd's own container lock + state write; we
+  can only move it off the response path. The warm-path duplicate guard is
+  already the in-process slot pop + the cluster reservation, so the rename is
+  belt-and-suspenders there — but the `name=sandboxID` convention is
+  **load-bearing for `ErrSandboxContainerExists` idempotency on the cold path**,
+  and a window where the container is still named `park-<hex>` changes what
+  reconcile and duplicate-create see. Needs its own design.
 - **Async promote**: `RecordPlacement` is a synchronous response-path Raft
-  commit **by design** — the FSM must know the owner before the client can
-  act. The reservation already carries spec + target, so promote could
-  become TTL-fenced async, but that changes the recovery/replay story
+  commit **by design** — the FSM must know the owner before the client can act.
+  Could become TTL-fenced async, but that changes the recovery/replay story
   (what does the owner watcher do with a Reserved-but-running sandbox whose
-  owner died?) — split-brain and leader-change analysis required.
+  owner died?) — split-brain + leader-change analysis required.
 
-Entry criterion: a product requirement for sub-20ms server-side warm
-creates in cluster mode. Below ~20ms the WAN dominates everything a remote
-client observes (bench api p50 is ~800ms of network on 43ms of server).
+Entry criterion: a product requirement for sub-20ms server-side warm creates in
+cluster mode. Below ~20ms the WAN dominates everything a remote client observes
+(bench api p50 is ~800ms of network on 43ms of server).
 
-Also on record: **p99 is hit-rate work, not hit-path work.** At 9/10 hits,
-p99 is by definition a cold miss (~250–300ms floor). The fix is pool
-sizing ≥ worst burst + single-flight refill (see docker-warm-pool §10
-follow-ups), which collapses p99 to ~3× p50. No phase in this plan moves
-p99 materially.
+Also on record: **p99 is hit-rate work, not hit-path work.** At 9/10 hits, p99
+is by definition a cold miss (~250–300ms floor). The fix is pool sizing ≥ worst
+burst + single-flight refill (docker-warm-pool §10 follow-ups). No phase here
+moves p99 materially. Concurrency ceiling: the `netrules` `Manager.mu`
+serializes Block/Clear/Apply across creates (`manager.go:46`) — out of scope
+here (p50 single-create never contends it), tracked in `TODOS.md`.
 
 ## 7. Open questions
 
 1. Option A compat proof: which iptables flavors must the e2e matrix cover?
-   (iptables-legacy hosts still exist in self-hosted deployments.)
-2. Non-pooled images still pay the once-per-TTL resolve (the Phase 1 rider
-   only keeps pool-eligible images warm — the refill loop doesn't know any
-   other refs). Acceptable, since non-pooled images miss the pool and go
-   cold anyway; revisit only if a facade workload shows otherwise.
+   (iptables-legacy hosts still exist in self-hosted deployments; the matrix
+   also fixes how much translator/rule-equality surface Phase 1 must carry.)
+2. Non-pooled images still pay the once-per-TTL resolve — Phase 2 only warms
+   pool-eligible images (the ones `ListTargets` knows). Acceptable, since
+   non-pooled images miss the pool and go cold anyway. Also bounds the warm
+   loop's background inspect volume to the pool-eligible set; revisit (cap /
+   stagger) only if that set grows large or a facade workload shows otherwise.
 
 ## 8. Expected results
 
-| Configuration | warm p50 | warm p90 | Gate |
-|---|---|---|---|
-| Today (v0.5.33, t3.medium + gp3) | 43ms | 78ms | — baseline |
-| Phases 1–3 on standard bench topology | **≤ 30ms** | ≤ 45ms | **acceptance** |
-| + Phase 4 NVMe topology | ≤ 25ms | ≤ 35ms | stretch |
-| (deferred Tier 3, for scale) | ~8–12ms | ~15–20ms | not gated here |
+| Configuration | warm-burst p50 | warm-sparse p50 | warm p90 | Gate |
+|---|---|---|---|---|
+| Today (v0.5.33, t3.medium + gp3) | 43ms | ~88ms (cache miss) | 78ms | — baseline |
+| Phases 1–4, standard topology | **≤ 30ms** | **≤ 30ms** | ≤ 45ms | **acceptance** |
+| NVMe topology (`plans/nvme-datadir.md`) | ≤ 25ms | ≤ 25ms | ≤ 35ms | not gated here |
+| (deferred Tier 3, for scale) | ~8–12ms | — | ~15–20ms | not gated here |
 
-Verification: `make integration-benchmark-docker-only` on the standard
-topology; per-stage attribution via Server-Timing must show `docker_pool`
-≤ 15ms and the promote share of the residual ≤ 5ms
-(`aerolvm_raft_apply_latency` / `leader_forward` histograms).
-Cold-path `docker_netrules` and `docker_create` must not regress.
+Verification — **both** benches, run with `SB_NETRULES_BACKEND=netlink`:
+- `make integration-benchmark-docker-only` (existing burst) — image cache warm.
+- **`make integration-benchmark-docker-sparse` (NEW)** — one create per 15s+,
+  placement-spread across nodes. Gate: `docker_image;desc=resolve` on ~zero warm
+  hits AND warm p50 ≤ 30ms. This is the only gate that exercises Phase 2.
+
+Per-stage attribution via Server-Timing must show `docker_pool` ≤ 15ms and the
+promote share of the residual ≤ 5ms (`aerolvm_raft_apply_latency` /
+`leader_forward` histograms). Cold-path `docker_netrules` and `docker_create`
+must not regress (guards the Phase 1 exec-backend rework).
 
 ## 9. Phase ordering & release shape
 
-Each phase is independently shippable and independently revertable
-(config-gated where behavior could differ: netrules backend, log-store
-format detection). Suggested order: Phase 3 (trivial) → Phase 1 (biggest
-per-create win) → Phase 2 (needs the Ansible rejoin cycle to roll out) →
-Phase 4 (operator opt-in, no code dependency on the others).
+Each phase is independently shippable. Phases 1, 2, 4 are config-gated and
+**revertable in place**. **Phase 3 is NOT revertable in place** — a WAL node
+reverts only via drain → rejoin with the bolt build + fresh DataDir (see §4).
+
+Suggested order: Phase 4 (trivial, both transports) → Phase 2 (biggest sparse
+win, code-only) → Phase 1 (biggest burst win, riskiest — the nft translator) →
+Phase 3 (needs the Ansible rejoin cycle to roll out, one-way per node).
+
+---
+
+## NOT in scope
+
+- **NVMe/io2 data-dir infra** — split to `plans/nvme-datadir.md` (`TODOS.md`).
+  Different review surface (AWS infra), operator opt-in, no code dep, and NOT
+  semantics-preserving (instance-store loss = Raft log + SQLite state). Only
+  moves the ≤25ms stretch, never the acceptance gate.
+- **Async rename / async promote** (Tier 3, §6) — semantics-changing, entry-gated
+  on a sub-20ms product requirement.
+- **`netrules` `Manager.mu` sharding** (`TODOS.md`) — concurrency ceiling; §6
+  scopes p99/concurrency out; p50 never contends it.
+- **p99 / pool-sizing + single-flight refill** — hit-rate work, not hit-path;
+  docker-warm-pool §10 follow-up.
+- **Non-pooled image resolve** (§7 Q2) — out of the warm loop's knowledge.
+
+## What already exists (reused, not rebuilt)
+
+| Sub-problem | Existing code | Plan action |
+|---|---|---|
+| netrules backend seam | `RuleBackend` iface + `NewWithBackend` (`manager.go:40-77`) | Reuse the seam; add nft backend + argv→nft translator (the seam is iptables-shaped, so translation is new work) |
+| not-exist classification | `ruleNotExist` (`manager.go:22`) | Keep for exec; add `Exists`-fallback for netlink (no new error strings) |
+| image-ID TTL cache | `imageIDCache` Get/Put/Flush (`image_cache.go`), wired at `docker_pool.go:117` | Reuse; add a Client-owned per-tick re-resolve/`Put` loop |
+| warm refill loop | budget-gated `refillTick` (`refill.go`), the "self-warming refill" from `b8cd956` | Left as-is; warming is a **separate** Client ticker (refill can't reach the cache) |
+| raft log store | `setupRaft` boltdb (`raft.go:65`), `maybeRecoverRaftClusterFromPeersFile` (`raft_recovery.go`) | Swap log store to raft-wal behind a closable interface + format detection |
+| mTLS transport | `client.go:189`, `agent.go:135` | Raise idle-conn limits on both |
+
+## Failure modes (per new/changed codepath)
+
+| Codepath | Realistic prod failure | Test? | Error handling? | User sees? |
+|---|---|---|---|---|
+| netlink `Delete` on absent rule | netlink `ENOENT` unrecognized → clear loop returns fatal → **adopt breaks** | **[REGRESSION] yes** (Exists-fallback test) | Exists-fallback confirms gone → clean | Silent today → would be `adopt_failed` fallback to cold path |
+| nft rule not iptables-nft-compat | rule invisible to `iptables -L` / doesn't drop → egress leak or adopt mismatch | **[→E2E] yes** (visibility + drop, primary gate) | compat proof gates the default-flip | Silent (security-relevant) if unproven — hence e2e is the gate |
+| warm loop misconfig `RefillInterval ≥ TTL` | cache goes cold between ticks → sparse creates pay ~45ms again | yes (invariant test) | fail-fast/log at wiring | Slow creates, no error |
+| warm loop timing on background ctx | `RecordStageDesc` nil/mis-record | yes (background-only test) | use timing-free resolve variant | n/a (would be a panic if wired wrong) |
+| raft-wal mixed-format recovery | recovery opens wrong store type → node fails to rejoin | **[REGRESSION] yes** (mixed-format test) | detect → recover ordering | Operator sees rejoin failure (loud) |
+| WAL node reverted to bolt build | bolt can't read WAL → node won't start | rollout doc (not in-place revertable) | drain → rejoin fresh DataDir | Operator sees start failure (loud) — documented |
+| transport pool exhaustion (agent.go missed) | followers keep re-handshaking mTLS → p90 tail persists | yes (reuse test, both transports) | both call sites raised | Slow tail, no error |
+
+No failure mode is left with **no test AND no error handling AND silent** — the
+two silent ones (netlink not-exist, nft compat) both get the mandatory
+regression/e2e tests above.
+
+## Worktree parallelization strategy
+
+| Step | Modules touched | Depends on |
+|------|----------------|------------|
+| Phase 1 netrules | `pkg/docker/netrules/`, `pkg/docker/` (adopt) | — |
+| Phase 2 image warming | `pkg/docker/` (Client), `internal/pool/dockerpool/` (ListTargets read) | — |
+| Phase 3 raft-wal | `internal/cluster/` (raft.go, raft_recovery.go), `go.mod` | — |
+| Phase 4 transport | `internal/cluster/` (client.go, agent.go) | — |
+
+- **Lane A:** Phase 3 → Phase 4 (sequential — both touch `internal/cluster/`,
+  merge conflict risk otherwise).
+- **Lane B:** Phase 1 → Phase 2 (sequential — both touch `pkg/docker/`; Phase 1's
+  clear-loop rework and Phase 2's Client ticker are near each other).
+
+Execution: **launch Lane A and Lane B in parallel worktrees**, merge each lane
+internally, then merge the two lanes. **Conflict flag:** Phases 3 and 4 both
+touch `internal/cluster/` — keep them in the same lane (sequential), do not
+parallelize within Lane A.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each task derives from a specific
+finding above. Run with Claude Code or Codex; checkbox as you ship.
+
+- [ ] **T1 (P1, human: ~3-4 days / CC: ~3h)** — netrules — Build the netlink `RuleBackend` incl. the iptables-argv→nft-expression translator + rule-equality
+  - Surfaced by: Architecture / Outside voice — "RuleBackend is iptables-shaped; nftables is a translator, not a 3-method swap"
+  - Files: `pkg/docker/netrules/` (new backend + translator), `pkg/docker/netrules/manager_test.go`
+  - Verify: unit round-trip (Manager rule → nft expr → visible to `iptables -L`); tag-gated e2e drop proof
+- [ ] **T2 (P1, human: ~half day / CC: ~30min)** — netrules — Rework the three clear loops to delete-first + `Exists` fallback
+  - Surfaced by: Code Quality — "netlink ENOENT unrecognized by `ruleNotExist` → clear loop fatal → adopt breaks (`manager.go:13` bug)"
+  - Files: `pkg/docker/netrules/manager.go` (shared helper for `ClearBlockAllEgress:121`, `ClearBlockAllIngress:169`, `deletePolicyRule:275`)
+  - Verify: **[REGRESSION]** netlink absent-rule clear terminates; exec no-regression (2 Delete, 0 Exists)
+- [ ] **T3 (P1, human: ~1 day / CC: ~1h)** — image-cache — Client-owned per-tick re-resolve warming loop + `RefillInterval < TTL` invariant
+  - Surfaced by: Architecture — "free-ride on Park fails the 15s sparse gate (10s TTL); needs unconditional per-tick re-resolve"
+  - Files: `pkg/docker/` (Client ticker + timing-free resolve), reads `internal/pool/dockerpool` `ListTargets`
+  - Verify: warm-across-sparse-gap (fake clock), re-tag freshness, invariant, background-only (no boot-path timing stage)
+- [ ] **T4 (P1, human: ~1 day / CC: ~40min)** — cluster — raft-wal log store + closable interface + format detection + mixed-format safety
+  - Surfaced by: Architecture / Outside voice — "`raft.LogStore` lacks `Close`; detect→recover ordering; mixed-format & revert unstated"
+  - Files: `internal/cluster/raft.go`, `internal/cluster/raft_recovery.go`, `go.mod`
+  - Verify: WAL setup, restart round-trip, **[REGRESSION]** mixed-format recovery, detection unit, single-node no-op
+- [ ] **T5 (P2, human: ~20min / CC: ~5min)** — cluster — Raise idle-conn limits on BOTH `client.go:189` and `agent.go:135`
+  - Surfaced by: Outside voice — "Phase 4 missed `agent.go`; followers do the forwarding"
+  - Files: `internal/cluster/client.go`, `internal/cluster/agent.go`
+  - Verify: connection-reuse test against counting test server, both transports
+- [ ] **T6 (P1, human: ~1 day / CC: ~45min)** — integration-tests — Add `make integration-benchmark-docker-sparse` gate
+  - Surfaced by: Performance — "burst bench keeps cache warm; Phase 2's win invisible and its regression untested"
+  - Files: `integration-tests/suite/`, `Makefile`
+  - Verify: gate — `docker_image;desc=resolve` on ~0 warm hits AND warm p50 ≤ 30ms under sparse load
+- [ ] **T7 (P3, human: ~15min / CC: ~3min)** — docs/rollout — Document Phase 3 as NOT in-place revertable (drain→rejoin, fresh DataDir)
+  - Surfaced by: Outside voice — "raft-wal not revertable; §9 claim was false"
+  - Files: this plan §4/§9 (done), Ansible recovery runbook note
+  - Verify: rollout doc names the one-way door + quorum-preserving order
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | not run |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | not run |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 5 issues, 0 critical gaps, all folded |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | n/a (server/infra) |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | not run |
+
+- **CODEX (outside voice, `codex-plan-review`):** ran read-only/high-effort; verified the code paths and confirmed the review's findings independently. New items it surfaced were all folded: Phase 4 missed `agent.go:135`; raft-wal is not in-place revertable (§9 corrected); the netlink backend is an iptables-argv→nft translator, not a 3-method swap (Phase 1 rewritten); plus fold-in constraints (timing-free warm resolve, `LogStore.Close` interface, `Manager.mu` HOL → TODO).
+- **CROSS-MODEL:** no contradictions — Codex and the Eng review agreed on every finding; Codex extended (agent.go, revertability, translator depth) rather than disputing. Cross-model consensus on the image-cache budget-gate and the headline mislabel.
+- **VERDICT:** ENG CLEARED — ready to implement. Scope reduced (Phase 4 NVMe split to `plans/nvme-datadir.md`; image-resolve promoted to first-class Phase 2). 7 implementation tasks (T1–T7) recorded.
+
+NO UNRESOLVED DECISIONS
