@@ -188,11 +188,13 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	if clusterTLS != nil {
 		mtlsTransport := &http.Transport{
 			TLSClientConfig: clusterTLS.clientConfig(),
-			// Disable connection reuse across leader changes so a
-			// stale TLS session can't pin us to a former leader.
-			DisableKeepAlives: false,
-			MaxIdleConns:      4,
-			IdleConnTimeout:   30 * time.Second,
+			// Keep-alives stay on; the idle pool is sized for concurrent
+			// follower→leader promote fan-in so creates don't re-handshake
+			// mTLS under burst (warm-create-latency Tier 1 Phase 4).
+			DisableKeepAlives:   false,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
 		}
 		c.internalClient = &http.Client{
 			Timeout:   commitTimeout + 2*time.Second,

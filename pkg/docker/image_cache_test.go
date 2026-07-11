@@ -66,8 +66,58 @@ func TestImageIDCacheTTLExpiry(t *testing.T) {
 func TestImageIDCacheNilSafe(t *testing.T) {
 	var c *imageIDCache
 	c.Put("alpine:3.20", "sha256:abc")
+	c.PutIfGeneration("alpine:3.20", "sha256:abc", 0)
 	c.Flush("alpine:3.20")
 	if id, ok := c.Get("alpine:3.20"); ok || id != "" {
 		t.Fatalf("nil cache Get = %q, %v; want miss", id, ok)
+	}
+	if c.Generation("alpine:3.20") != 0 {
+		t.Fatal("nil cache Generation must be 0")
+	}
+}
+
+func TestImageIDCacheFlushGenerationFence(t *testing.T) {
+	c := newImageIDCache(time.Minute)
+	gen := c.Generation("alpine:3.20")
+	c.PutIfGeneration("alpine:3.20", "sha256:old", gen)
+	if id, ok := c.Get("alpine:3.20"); !ok || id != "sha256:old" {
+		t.Fatalf("seed PutIfGeneration = %q, %v", id, ok)
+	}
+
+	// Flush between warm snapshot and Put drops the stale install.
+	c.Flush("alpine:3.20")
+	if c.PutIfGeneration("alpine:3.20", "sha256:stale", gen) {
+		t.Fatal("PutIfGeneration must drop after Flush bumped generation")
+	}
+	if _, ok := c.Get("alpine:3.20"); ok {
+		t.Fatal("stale Put must not re-install after Flush")
+	}
+
+	// Next warm tick (fresh generation) installs cleanly.
+	gen2 := c.Generation("alpine:3.20")
+	if gen2 == gen {
+		t.Fatal("Flush must bump generation")
+	}
+	if !c.PutIfGeneration("alpine:3.20", "sha256:fresh", gen2) {
+		t.Fatal("fresh generation PutIfGeneration must succeed")
+	}
+	if id, ok := c.Get("alpine:3.20"); !ok || id != "sha256:fresh" {
+		t.Fatalf("Get after fresh Put = %q, %v", id, ok)
+	}
+}
+
+func TestImageIDCacheWarmAcrossSparseGap(t *testing.T) {
+	c := newImageIDCache(10 * time.Second)
+	current := time.Unix(1000, 0)
+	c.now = func() time.Time { return current }
+
+	// Simulate warm ticks every 5s across a 15s+ sparse gap.
+	for i := 0; i < 4; i++ {
+		c.Put("alpine:3.20", "sha256:abc")
+		current = current.Add(5 * time.Second)
+	}
+	// After 20s wall time with refreshes every 5s, entry must still hit.
+	if id, ok := c.Get("alpine:3.20"); !ok || id != "sha256:abc" {
+		t.Fatalf("warm-across-sparse-gap Get = %q, %v; want hit", id, ok)
 	}
 }

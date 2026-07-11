@@ -133,10 +133,14 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 
 	if clusterTLS != nil {
 		mtlsTransport := &http.Transport{
-			TLSClientConfig:   clusterTLS.clientConfig(),
-			DisableKeepAlives: false,
-			MaxIdleConns:      4,
-			IdleConnTimeout:   30 * time.Second,
+			TLSClientConfig: clusterTLS.clientConfig(),
+			// Same idle-pool sizing as Cluster.internalClient — workers are
+			// the nodes that forward to the leader, so under-pooling here is
+			// what produced the leader_forward p90 tail.
+			DisableKeepAlives:   false,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
 		}
 		a.internalClient = &http.Client{
 			Timeout:   commitTimeout + 2*time.Second,

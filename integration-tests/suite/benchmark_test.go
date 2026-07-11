@@ -698,6 +698,117 @@ func TestBenchCreateLatency(t *testing.T) {
 	writeBenchArtifact(t, report)
 }
 
+// UC-94-sparse — same create latency sweep as UC-94, but with a long gap
+// between samples so the image-ID TTL cache would go cold without the
+// Client-owned warm loop (plans/warm-create-latency-tier1.md Phase 2).
+// Gate: warm hits must not record docker_image (resolve) and warm server
+// p50 must stay ≤ 30ms on the standard topology.
+func TestBenchCreateLatencySparse(t *testing.T) {
+	harness.Require(t, sc, "UC-94")
+	requireBenchEnabled(t)
+	if os.Getenv("AEROL_BENCH_SPARSE") != "1" {
+		t.Skip("sparse benchmark disabled: set AEROL_BENCH_SPARSE=1 (one create per ≥15s)")
+	}
+	c := client(t)
+	samples := benchEnvInt("AEROL_BENCH_SAMPLES", 10)
+	gap := benchEnvDuration("AEROL_BENCH_SPARSE_GAP", 15*time.Second)
+	runtimes := selectedBenchRuntimes(t)
+	// Sparse gate is about the warm docker hit path.
+	var dockerOnly []benchRuntimeSpec
+	for _, br := range runtimes {
+		if br.runtime == "docker" {
+			dockerOnly = append(dockerOnly, br)
+		}
+	}
+	if len(dockerOnly) == 0 {
+		t.Skip("sparse bench requires docker runtime")
+	}
+	waitBenchmarkReady(t, c, dockerOnly)
+	dockerOnly = prepareBenchmarkRuntimes(t, c, dockerOnly)
+	warmBenchmarkRuntimes(t, c, dockerOnly)
+	waitDockerPoolWarm(t, c, dockerOnly)
+
+	var report benchReport
+	for _, br := range dockerOnly {
+		var apiD, runD, serverD []time.Duration
+		stageD := map[string][]time.Duration{}
+		failures := 0
+		resolveHits := 0
+		warmHits := 0
+		for i := 0; i < samples; i++ {
+			if i > 0 {
+				t.Logf("sparse gap %s before sample %d", gap, i)
+				time.Sleep(gap)
+			}
+			opts := benchCreateOptions(t, br)
+			start := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			sb, err := c.SDK().Create(ctx, opts)
+			apiElapsed := time.Since(start)
+			cancel()
+			if err != nil {
+				failures++
+				t.Logf("sparse[%s] sample %d create failed: %v", br.runtime, i, err)
+				continue
+			}
+			id := sb.ID
+			t.Cleanup(func() { destroyBest(c, id) })
+			if waitRunningTimed(t, sb) {
+				runD = append(runD, time.Since(start))
+			} else {
+				failures++
+			}
+			apiD = append(apiD, apiElapsed)
+			if ms, ok := c.LastServerCreateMS(); ok {
+				serverD = append(serverD, time.Duration(ms*float64(time.Millisecond)))
+			}
+			if stages, ok := c.LastServerCreateStages(); ok {
+				for name, ms := range stages {
+					stageD[name] = append(stageD[name], time.Duration(ms*float64(time.Millisecond)))
+				}
+				if _, hasPool := stages["docker_pool"]; hasPool {
+					warmHits++
+					if _, hasImg := stages["docker_image"]; hasImg {
+						resolveHits++
+					}
+				}
+			}
+		}
+		if len(apiD) == 0 {
+			t.Errorf("sparse[%s]: every create sample failed", br.runtime)
+			continue
+		}
+		ls := summarize(br.runtime+"-sparse", samples, failures, apiD, runD, serverD)
+		ls.Stages = summarizeStages(stageD)
+		report.Latency = append(report.Latency, ls)
+		t.Logf("sparse[%s] server p50=%dms | warm_hits=%d resolve_on_warm=%d (%d ok, %d fail)",
+			br.runtime, ls.Serverp50MS, warmHits, resolveHits, len(apiD), failures)
+		if warmHits > 0 && resolveHits > 0 {
+			// Allow a single miss for racey first sample; more than that
+			// means the warm loop is not keeping the cache hot.
+			if resolveHits > 1 {
+				t.Errorf("sparse gate: docker_image resolve on %d/%d warm hits (want ~0)", resolveHits, warmHits)
+			}
+		}
+		if ls.Serverp50MS > 0 && ls.Serverp50MS > 30 {
+			t.Errorf("sparse gate: warm server p50=%dms want ≤30ms", ls.Serverp50MS)
+		}
+	}
+	writeBenchArtifact(t, report)
+}
+
+func benchEnvDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
 // summarize folds raw samples into a latencyStats row.
 func summarize(rt string, samples, failures int, apiD, runD, serverD []time.Duration) latencyStats {
 	ls := latencyStats{Runtime: rt, Samples: samples, Failures: failures}

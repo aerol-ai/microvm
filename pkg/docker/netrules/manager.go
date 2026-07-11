@@ -55,19 +55,39 @@ type Manager struct {
 }
 
 func New(enabled bool) (*Manager, error) {
+	return NewWithOptions(enabled, BackendExec)
+}
+
+// Backend names for SB_NETRULES_BACKEND. Default remains exec until the
+// netlink path soaks in an integration run (warm-create-latency Tier 1).
+const (
+	BackendExec    = "exec"
+	BackendNetlink = "netlink"
+)
+
+// NewWithOptions builds a Manager with the chosen RuleBackend. Unknown
+// backend names fall back to exec with an error so misconfig is loud.
+func NewWithOptions(enabled bool, backend string) (*Manager, error) {
 	if !enabled || runtime.GOOS != "linux" {
 		return &Manager{enabled: false}, nil
 	}
 
-	ipt, err := iptables.New()
-	if err != nil {
-		return nil, fmt.Errorf("create iptables client: %w", err)
+	switch strings.ToLower(strings.TrimSpace(backend)) {
+	case "", BackendExec:
+		ipt, err := iptables.New()
+		if err != nil {
+			return nil, fmt.Errorf("create iptables client: %w", err)
+		}
+		return &Manager{enabled: true, ipt: ipt}, nil
+	case BackendNetlink:
+		nl, err := NewNetlinkBackend()
+		if err != nil {
+			return nil, fmt.Errorf("create netlink netrules backend: %w", err)
+		}
+		return &Manager{enabled: true, ipt: nl}, nil
+	default:
+		return nil, fmt.Errorf("unknown netrules backend %q (want exec|netlink)", backend)
 	}
-
-	return &Manager{
-		enabled: true,
-		ipt:     ipt,
-	}, nil
 }
 
 // NewWithBackend builds an enabled Manager over an injected backend. Test
@@ -116,18 +136,10 @@ func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Loop in case a prior race left a duplicate row — Delete only removes
-	// one match per call. Stop on the first "no such rule" return.
-	for {
-		err := m.ipt.Delete("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP")
-		if err == nil {
-			continue
-		}
-		if ruleNotExist(err) {
-			return nil
-		}
+	if err := m.deleteUntilGone("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete egress rule: %w", err)
 	}
+	return nil
 }
 
 // BlockAllIngress installs a DROP rule for traffic destined for containerIP,
@@ -166,16 +178,10 @@ func (m *Manager) ClearBlockAllIngress(containerIP string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for {
-		err := m.ipt.Delete("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP")
-		if err == nil {
-			continue
-		}
-		if ruleNotExist(err) {
-			return nil
-		}
+	if err := m.deleteUntilGone("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete ingress rule: %w", err)
 	}
+	return nil
 }
 
 // egressPolicyComment tags every selective-egress rule (allowlist/blocklist) so
@@ -273,14 +279,32 @@ func (m *Manager) ensurePolicyRule(spec ...string) error {
 // prior race may have left (Delete removes one match per call), and tolerating
 // an already-absent rule.
 func (m *Manager) deletePolicyRule(spec ...string) error {
+	if err := m.deleteUntilGone("filter", "DOCKER-USER", spec...); err != nil {
+		return fmt.Errorf("delete egress policy rule: %w", err)
+	}
+	return nil
+}
+
+// deleteUntilGone sweeps Delete until the rule is confirmed gone. The exec
+// (iptables) path short-circuits on ruleNotExist after the terminating probe
+// (2 Deletes, 0 Exists for a single present rule). The netlink path returns
+// unrecognized errors (e.g. ENOENT) that ruleNotExist does not classify — the
+// Exists fallback confirms absence without teaching ruleNotExist new strings.
+// That Exists path is exactly the manager.go:13 memorialized adopt-breakage
+// bug on a new backend.
+func (m *Manager) deleteUntilGone(table, chain string, spec ...string) error {
 	for {
-		err := m.ipt.Delete("filter", "DOCKER-USER", spec...)
+		err := m.ipt.Delete(table, chain, spec...)
 		if err == nil {
-			continue
+			continue // swept one, retry (dup-sweep intact)
 		}
 		if ruleNotExist(err) {
-			return nil
+			return nil // exec path: recognized, UNCHANGED cost
 		}
-		return fmt.Errorf("delete egress policy rule: %w", err)
+		ex, e := m.ipt.Exists(table, chain, spec...)
+		if e == nil && !ex {
+			return nil // netlink: confirm gone
+		}
+		return err
 	}
 }

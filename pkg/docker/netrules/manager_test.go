@@ -148,12 +148,6 @@ func TestManagerEnabledErrors(t *testing.T) {
 			wantErr: "insert egress rule",
 		},
 		{
-			name:    "egress_delete_error",
-			fail:    "delete",
-			run:     func() error { return mgr.ClearBlockAllEgress("10.0.0.2") },
-			wantErr: "delete egress rule",
-		},
-		{
 			name:    "ingress_exists_error",
 			fail:    "check",
 			run:     func() error { return mgr.BlockAllIngress("10.0.0.3") },
@@ -165,12 +159,10 @@ func TestManagerEnabledErrors(t *testing.T) {
 			run:     func() error { return mgr.BlockAllIngress("10.0.0.3") },
 			wantErr: "insert ingress rule",
 		},
-		{
-			name:    "ingress_delete_error",
-			fail:    "delete",
-			run:     func() error { return mgr.ClearBlockAllIngress("10.0.0.3") },
-			wantErr: "delete ingress rule",
-		},
+		// delete failures on an absent rule are no longer fatal: the Exists
+		// fallback confirms the rule is gone (netlink ENOENT path). Genuine
+		// delete failures while the rule still exists are covered by
+		// TestClearLoopDeleteErrorWhenStillPresent.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("FAKE_IPTABLES_FAIL", tc.fail)
@@ -287,6 +279,98 @@ func TestRuleNotExist(t *testing.T) {
 	}
 	if ruleNotExist(os.ErrPermission) {
 		t.Fatal("unrelated error must not read as not-exist")
+	}
+}
+
+// countingBackend tracks Delete/Exists call counts for the clear-loop
+// regression suite (exec path must stay at 2 Delete / 0 Exists).
+type countingBackend struct {
+	memBackend
+	deletes int
+	exists  int
+}
+
+func (c *countingBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	c.exists++
+	return c.memBackend.Exists(table, chain, spec...)
+}
+
+func (c *countingBackend) Delete(table, chain string, spec ...string) error {
+	c.deletes++
+	return c.memBackend.Delete(table, chain, spec...)
+}
+
+func TestClearLoopExecNoRegression(t *testing.T) {
+	backend := &countingBackend{memBackend: memBackend{deleteErr: errNoMatch{}}}
+	mgr := NewWithBackend(backend)
+	if err := mgr.BlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	backend.deletes, backend.exists = 0, 0
+	if err := mgr.ClearBlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	// Present rule: one successful Delete + one not-exist probe. Exists must
+	// never fire when ruleNotExist already recognizes the error.
+	if backend.deletes != 2 || backend.exists != 0 {
+		t.Fatalf("exec clear: deletes=%d exists=%d, want 2/0", backend.deletes, backend.exists)
+	}
+}
+
+func TestClearLoopNetlinkAbsentRuleExistsFallback(t *testing.T) {
+	// Netlink ENOENT is unrecognized by ruleNotExist — Exists must confirm
+	// gone or the clear loop returns fatal (the manager.go:13 adopt bug).
+	backend := &countingBackend{memBackend: memBackend{
+		deleteErr: errNetlinkNoSuchFile{},
+	}}
+	mgr := NewWithBackend(backend)
+	if err := mgr.ClearBlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatalf("netlink absent-rule clear must terminate cleanly: %v", err)
+	}
+	if backend.deletes < 1 || backend.exists < 1 {
+		t.Fatalf("netlink clear: deletes=%d exists=%d, want ≥1 each", backend.deletes, backend.exists)
+	}
+
+	// Same for ingress + policy delete paths.
+	backend.deletes, backend.exists = 0, 0
+	if err := mgr.ClearBlockAllIngress("10.0.0.7"); err != nil {
+		t.Fatalf("ingress clear: %v", err)
+	}
+	backend.deletes, backend.exists = 0, 0
+	if err := mgr.ClearEgressPolicy("10.0.0.7", []string{"1.2.3.0/24"}, nil); err != nil {
+		t.Fatalf("policy clear: %v", err)
+	}
+}
+
+type errNetlinkNoSuchFile struct{}
+
+func (errNetlinkNoSuchFile) Error() string { return "no such file or directory" }
+
+type stickyDeleteBackend struct {
+	countingBackend
+	deleteFail error
+}
+
+func (s *stickyDeleteBackend) Delete(table, chain string, spec ...string) error {
+	s.deletes++
+	if s.deleteFail != nil {
+		return s.deleteFail
+	}
+	return s.memBackend.Delete(table, chain, spec...)
+}
+
+func TestClearLoopDeleteErrorWhenStillPresent(t *testing.T) {
+	backend := &stickyDeleteBackend{
+		countingBackend: countingBackend{memBackend: memBackend{}},
+		deleteFail:      os.ErrPermission,
+	}
+	mgr := NewWithBackend(backend)
+	if err := mgr.BlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	// Rule still present (Delete always fails) → Exists=true → clear must error.
+	if err := mgr.ClearBlockAllEgress("10.0.0.7"); err == nil {
+		t.Fatal("expected delete error when rule still present")
 	}
 }
 

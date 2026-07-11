@@ -133,6 +133,30 @@ sudo /usr/local/sbin/cluster-join.sh \
 
 Rejoin one server at a time. Wait for membership and health before the next.
 
+## Raft-WAL log store (one-way per node)
+
+As of the warm-create-latency Tier 1 Phase 3 rollout, new nodes open the Raft
+**log** store as `hashicorp/raft-wal` under `$DataDir/raft-wal/` when
+`raft-log.bolt` is absent. Existing nodes that still have `raft-log.bolt` keep
+Bolt until they are drained and rejoined with a fresh DataDir.
+
+**This is NOT in-place revertable.** Once a node has written WAL state, a
+boltdb-only build cannot read it. To revert a WAL node to Bolt:
+
+1. `sandboxd-node-lifecycle.sh drain` (or equivalent) — never drop below quorum.
+2. `remove-member` the node from the cluster.
+3. Stop sandboxd, move aside the DataDir Raft tree (`mv …/raft …/raft.pre-revert.$(date +%s)`).
+4. Deploy the desired build against a **fresh** DataDir (current builds recreate
+   WAL when `raft-log.bolt` is absent; pin an older build only if you must stay
+   on Bolt).
+5. Rejoin with `cluster-join.sh --force`.
+
+Rollout is one node at a time via the standard **drain → remove-member →
+rejoin** cycle. Mixed-format clusters (some Bolt, some WAL) are safe: the log
+store is node-local; Raft replicates log entries over the transport, not store
+files. Re-verify this lost-quorum recovery runbook on a WAL node after the
+fleet is all-WAL.
+
 ## Post-Recovery Cleanup
 
 1. Take a fresh backup from the new leader.

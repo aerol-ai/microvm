@@ -27,7 +27,7 @@ func maybeRecoverRaftClusterFromPeersFile(
 	cfg raftSetupConfig,
 	rcfg *raft.Config,
 	fsm *placementFSM,
-	logStore *raftboltdb.BoltStore,
+	logStore closableLogStore,
 	stableStore *raftboltdb.BoltStore,
 	snaps raft.SnapshotStore,
 	transport raft.Transport,

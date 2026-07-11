@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -11,14 +12,29 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	raftwal "github.com/hashicorp/raft-wal"
 )
+
+const (
+	raftLogBoltFilename = "raft-log.bolt"
+	raftLogWALDirname   = "raft-wal"
+	raftStableFilename  = "raft-stable.bolt"
+)
+
+// closableLogStore is raft.LogStore plus Close. raft.LogStore itself has no
+// Close, but both BoltStore and raft-wal.WAL do — raftNode and recovery need
+// a single type that covers both formats.
+type closableLogStore interface {
+	raft.LogStore
+	io.Closer
+}
 
 // raftNode wraps the raft instance plus its on-disk stores so Close can shut
 // them down in the right order.
 type raftNode struct {
 	raft      *raft.Raft
 	transport *raft.NetworkTransport
-	logStore  *raftboltdb.BoltStore
+	logStore  closableLogStore
 	stableStr *raftboltdb.BoltStore
 	snaps     raft.SnapshotStore
 }
@@ -56,17 +72,21 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 	// Bridge raft's hclog to our slog. We accept some log-level lossiness in
 	// exchange for not running two log destinations.
 	rcfg.Logger = hclogAdapter(logger)
-	// More aggressive snapshotting than the default keeps the BoltDB log small
-	// at high create/destroy churn. 1024 entries ~= a few seconds of churn at
+	// More aggressive snapshotting than the default keeps the log small at
+	// high create/destroy churn. 1024 entries ~= a few seconds of churn at
 	// peak; trades disk I/O for memory and faster follower recovery.
 	rcfg.SnapshotInterval = 30 * time.Second
 	rcfg.SnapshotThreshold = 1024
 
-	logStore, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft-log.bolt"))
+	// Format detection BEFORE recovery: if raft-log.bolt is present keep Bolt
+	// (existing nodes); otherwise open raft-wal. Detection keys off the bolt
+	// file existing — a bolt file is never byte-empty — not a fuzzy
+	// "non-empty dir". Mixed-format clusters are safe (store is node-local).
+	logStore, err := openRaftLogStore(cfg.DataDir, logger)
 	if err != nil {
-		return nil, fmt.Errorf("raft setup: bolt log store: %w", err)
+		return nil, err
 	}
-	stableStore, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft-stable.bolt"))
+	stableStore, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, raftStableFilename))
 	if err != nil {
 		_ = logStore.Close()
 		return nil, fmt.Errorf("raft setup: bolt stable store: %w", err)
@@ -148,6 +168,54 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		stableStr: stableStore,
 		snaps:     snaps,
 	}, nil
+}
+
+// openRaftLogStore picks Bolt or WAL by on-disk format. Existing
+// raft-log.bolt → Bolt (no conversion). Absent → WAL under raft-wal/.
+// Reverting a WAL node is NOT in-place: drain → rejoin with bolt build +
+// fresh DataDir (see setup/runbooks/lost-quorum-recovery.md).
+func openRaftLogStore(dataDir string, logger *slog.Logger) (closableLogStore, error) {
+	boltPath := filepath.Join(dataDir, raftLogBoltFilename)
+	if st, err := os.Stat(boltPath); err == nil {
+		if st.IsDir() {
+			// A directory named raft-log.bolt is a corrupt layout, not a
+			// signal to open WAL — BoltStore would also refuse it.
+			return nil, fmt.Errorf("raft setup: bolt log store: %s is a directory", boltPath)
+		}
+		store, err := raftboltdb.NewBoltStore(boltPath)
+		if err != nil {
+			return nil, fmt.Errorf("raft setup: bolt log store: %w", err)
+		}
+		if logger != nil {
+			logger.Info("raft log store: boltdb (existing raft-log.bolt)")
+		}
+		return store, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("raft setup: stat log store: %w", err)
+	}
+
+	walDir := filepath.Join(dataDir, raftLogWALDirname)
+	if err := os.MkdirAll(walDir, 0o700); err != nil {
+		return nil, fmt.Errorf("raft setup: mkdir wal dir: %w", err)
+	}
+	store, err := raftwal.Open(walDir, raftwal.WithLogger(hclogAdapter(logger)))
+	if err != nil {
+		return nil, fmt.Errorf("raft setup: wal log store: %w", err)
+	}
+	if logger != nil {
+		logger.Info("raft log store: raft-wal", "dir", walDir)
+	}
+	return store, nil
+}
+
+// detectRaftLogStoreFormat is the unit-test seam for format detection.
+// Returns "bolt", "wal", or "" when dataDir is unusable.
+func detectRaftLogStoreFormat(dataDir string) string {
+	boltPath := filepath.Join(dataDir, raftLogBoltFilename)
+	if st, err := os.Stat(boltPath); err == nil && !st.IsDir() {
+		return "bolt"
+	}
+	return "wal"
 }
 
 func (r *raftNode) Close() error {

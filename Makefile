@@ -5,6 +5,7 @@ BIN_DIR ?= bin
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-docker integration-benchmark-docker-only \
+	integration-benchmark-docker-sparse \
 	integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
@@ -180,6 +181,20 @@ integration-benchmark-docker-only:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(DOCKER_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(DOCKER_BENCH_SAMPLES) \
 	AEROL_BENCH_RUNTIMES=$(DOCKER_BENCH_RUNTIMES) \
+		integration-tests/run.sh cluster-3-mixed-docker --bench-only
+
+# Sparse docker warm-create bench (plans/warm-create-latency-tier1.md Phase 2
+# gate): one create per ≥15s so the image-ID TTL would expire without the
+# Client-owned warm loop. Run with SB_NETRULES_BACKEND=netlink on the cluster
+# to also exercise Phase 1. Against a kept cluster:
+#   make integration-benchmark-docker-sparse
+DOCKER_SPARSE_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-docker-sparse-bench.json
+DOCKER_SPARSE_BENCH_SAMPLES ?= 8
+integration-benchmark-docker-sparse:
+	AEROL_BENCH=1 AEROL_BENCH_SPARSE=1 \
+	AEROL_BENCH_OUT=$(DOCKER_SPARSE_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(DOCKER_SPARSE_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=docker \
 		integration-tests/run.sh cluster-3-mixed-docker --bench-only
 
 # Firecracker-focused benchmark on the 3× mixed-fc cluster: provisions

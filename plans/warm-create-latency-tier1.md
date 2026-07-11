@@ -1,8 +1,6 @@
 # Warm create latency Tier 1: 43ms → ≤30ms acceptance (semantics-preserving)
 
-Status: **planned (not started)** (written 2026-07-11; revised after eng review
-2026-07-11; post-review addenda 2026-07-11: Phase 2 flush-race fence + §6
-Tier-1.5 overlap record). Successor to `plans/docker-warm-pool.md` §12, which shipped the
+Status: **implemented** (2026-07-11). Successor to `plans/docker-warm-pool.md` §12, which shipped the
 warm-adopt fast path at **server p50 43ms** (v0.5.33). This plan removes the
 removable engine/consensus round-trips **without changing any idempotency or
 failover semantics**. The semantics-changing follow-ups (async rename, async
@@ -468,31 +466,31 @@ parallelize within Lane A.
 Synthesized from this review's findings. Each task derives from a specific
 finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~3-4 days / CC: ~3h)** — netrules — Build the netlink `RuleBackend` incl. the iptables-argv→nft-expression translator + rule-equality
+- [x] **T1 (P1, human: ~3-4 days / CC: ~3h)** — netrules — Build the netlink `RuleBackend` incl. the iptables-argv→nft-expression translator + rule-equality
   - Surfaced by: Architecture / Outside voice — "RuleBackend is iptables-shaped; nftables is a translator, not a 3-method swap"
   - Files: `pkg/docker/netrules/` (new backend + translator), `pkg/docker/netrules/manager_test.go`
   - Verify: unit round-trip (Manager rule → nft expr → visible to `iptables -L`); tag-gated e2e drop proof
-- [ ] **T2 (P1, human: ~half day / CC: ~30min)** — netrules — Rework the three clear loops to delete-first + `Exists` fallback
+- [x] **T2 (P1, human: ~half day / CC: ~30min)** — netrules — Rework the three clear loops to delete-first + `Exists` fallback
   - Surfaced by: Code Quality — "netlink ENOENT unrecognized by `ruleNotExist` → clear loop fatal → adopt breaks (`manager.go:13` bug)"
   - Files: `pkg/docker/netrules/manager.go` (shared helper for `ClearBlockAllEgress:121`, `ClearBlockAllIngress:169`, `deletePolicyRule:275`)
   - Verify: **[REGRESSION]** netlink absent-rule clear terminates; exec no-regression (2 Delete, 0 Exists)
-- [ ] **T3 (P1, human: ~1 day / CC: ~1h)** — image-cache — Client-owned per-tick re-resolve warming loop + `RefillInterval < TTL` invariant + `Flush` generation fence
+- [x] **T3 (P1, human: ~1 day / CC: ~1h)** — image-cache — Client-owned per-tick re-resolve warming loop + `RefillInterval < TTL` invariant + `Flush` generation fence
   - Surfaced by: Architecture — "free-ride on Park fails the 15s sparse gate (10s TTL); needs unconditional per-tick re-resolve"; post-review — "warm `Put` can race an in-band `Flush` and re-install a stale ID"
   - Files: `pkg/docker/` (Client ticker + timing-free resolve), `pkg/docker/image_cache.go` (per-ref generation), reads `internal/pool/dockerpool` `ListTargets` (exists, `pool.go:372`)
   - Verify: warm-across-sparse-gap (fake clock), re-tag freshness, invariant, background-only (no boot-path timing stage), flush-race fence (stale `Put` dropped)
-- [ ] **T4 (P1, human: ~1 day / CC: ~40min)** — cluster — raft-wal log store + closable interface + format detection + mixed-format safety
+- [x] **T4 (P1, human: ~1 day / CC: ~40min)** — cluster — raft-wal log store + closable interface + format detection + mixed-format safety
   - Surfaced by: Architecture / Outside voice — "`raft.LogStore` lacks `Close`; detect→recover ordering; mixed-format & revert unstated"
   - Files: `internal/cluster/raft.go`, `internal/cluster/raft_recovery.go`, `go.mod`
   - Verify: WAL setup, restart round-trip, **[REGRESSION]** mixed-format recovery, detection unit, single-node no-op
-- [ ] **T5 (P2, human: ~20min / CC: ~5min)** — cluster — Raise idle-conn limits on BOTH `client.go:189` and `agent.go:135`
+- [x] **T5 (P2, human: ~20min / CC: ~5min)** — cluster — Raise idle-conn limits on BOTH `client.go:189` and `agent.go:135`
   - Surfaced by: Outside voice — "Phase 4 missed `agent.go`; followers do the forwarding"
   - Files: `internal/cluster/client.go`, `internal/cluster/agent.go`
   - Verify: connection-reuse test against counting test server, both transports
-- [ ] **T6 (P1, human: ~1 day / CC: ~45min)** — integration-tests — Add `make integration-benchmark-docker-sparse` gate
+- [x] **T6 (P1, human: ~1 day / CC: ~45min)** — integration-tests — Add `make integration-benchmark-docker-sparse` gate
   - Surfaced by: Performance — "burst bench keeps cache warm; Phase 2's win invisible and its regression untested"
   - Files: `integration-tests/suite/`, `Makefile`
   - Verify: gate — `docker_image;desc=resolve` on ~0 warm hits AND warm p50 ≤ 30ms under sparse load
-- [ ] **T7 (P3, human: ~15min / CC: ~3min)** — docs/rollout — Document Phase 3 as NOT in-place revertable (drain→rejoin, fresh DataDir)
+- [x] **T7 (P3, human: ~15min / CC: ~3min)** — docs/rollout — Document Phase 3 as NOT in-place revertable (drain→rejoin, fresh DataDir)
   - Surfaced by: Outside voice — "raft-wal not revertable; §9 claim was false"
   - Files: this plan §4/§9 (done), Ansible recovery runbook note
   - Verify: rollout doc names the one-way door + quorum-preserving order
