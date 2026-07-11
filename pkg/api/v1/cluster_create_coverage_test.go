@@ -278,21 +278,20 @@ func TestCreateSandboxOnSelectedNode_CreateFailureCancelsReservation(t *testing.
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
 	}
-	// Overlap runs promote∥create; promote may succeed (Noop) before create
-	// fails, so retract must DeletePlacement — CancelReservation alone is a
-	// no-op on Placed (Tier 1.5 §2.2 / §7.1).
-	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-fail" {
-		t.Fatalf("DeletePlacement calls = %+v, want [sb-fail]", stub.deleteCalls)
-	}
+	// Promote only fires after the create leg succeeds, so the row is still
+	// Reserved: retract cancels the reservation, never touches placements.
 	if len(stub.cancelCalls) != 1 || stub.cancelCalls[0] != "sb-fail" {
 		t.Fatalf("CancelReservation calls = %+v, want [sb-fail]", stub.cancelCalls)
 	}
+	if len(stub.deleteCalls) != 0 {
+		t.Fatalf("DeletePlacement calls = %+v, want none on a reserved-row retract", stub.deleteCalls)
+	}
 }
 
-// Promote-OK / create-FAIL is the load-bearing Tier 1.5 retract case: create
-// is delayed so RecordPlacement commits first; retract must still
-// DeletePlacement (not CancelReservation alone).
-func TestCreateSandboxOnSelectedNode_PromoteOKCreateFailRetractsPlacement(t *testing.T) {
+// Create-FAIL must never promote: the row stays Reserved (charged to
+// pending-create backpressure, invisible to the owner watcher) for the whole
+// local create, even a slow one.
+func TestCreateSandboxOnSelectedNode_CreateFailNeverPromotes(t *testing.T) {
 	rt := &apiRecordingRuntime{
 		createErr:   errors.New("runtime create failed"),
 		createDelay: 40 * time.Millisecond,
@@ -308,11 +307,11 @@ func TestCreateSandboxOnSelectedNode_PromoteOKCreateFailRetractsPlacement(t *tes
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
 	}
-	if len(stub.recordCalls) != 1 || stub.recordCalls[0] != "sb-promote-ok-create-fail" {
-		t.Fatalf("RecordPlacement calls = %+v, want promote before retract", stub.recordCalls)
+	if len(stub.recordCalls) != 0 {
+		t.Fatalf("RecordPlacement calls = %+v, want none when create failed", stub.recordCalls)
 	}
-	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-promote-ok-create-fail" {
-		t.Fatalf("DeletePlacement calls = %+v, want retract of Placed row", stub.deleteCalls)
+	if len(stub.cancelCalls) != 1 || stub.cancelCalls[0] != "sb-promote-ok-create-fail" {
+		t.Fatalf("CancelReservation calls = %+v, want reserved-row retract", stub.cancelCalls)
 	}
 }
 
@@ -336,15 +335,16 @@ func TestCreateSandboxOnSelectedNode_RecordPlacementFailureRollsBack(t *testing.
 		t.Fatalf("destroy ids = %+v, want rollback destroy", rt.destroyIDs)
 	}
 	// Errored-but-committed: stub recorded the place then returned err —
-	// DeletePlacement is mandatory (§7.2), not CancelReservation alone.
+	// DeletePlacement is mandatory (§7.2); opDelete also releases a
+	// still-Reserved row, so no separate CancelReservation.
 	if len(stub.recordCalls) != 1 {
 		t.Fatalf("RecordPlacement calls = %+v, want errored-but-committed apply", stub.recordCalls)
 	}
 	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-promote-fail" {
 		t.Fatalf("DeletePlacement calls = %+v, want [sb-promote-fail]", stub.deleteCalls)
 	}
-	if len(stub.cancelCalls) != 1 || stub.cancelCalls[0] != "sb-promote-fail" {
-		t.Fatalf("CancelReservation calls = %+v, want [sb-promote-fail]", stub.cancelCalls)
+	if len(stub.cancelCalls) != 0 {
+		t.Fatalf("CancelReservation calls = %+v, want none (opDelete covers Reserved)", stub.cancelCalls)
 	}
 }
 
@@ -437,9 +437,9 @@ func TestCreateSandboxOnSelectedNode_RecordPlacementGenericError(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
-	if len(rt.destroyIDs) != 1 || len(stub.cancelCalls) != 1 || len(stub.deleteCalls) != 1 {
-		t.Fatalf("destroy=%v cancel=%v delete=%v, want rollback + cancel + DeletePlacement",
-			rt.destroyIDs, stub.cancelCalls, stub.deleteCalls)
+	if len(rt.destroyIDs) != 1 || len(stub.deleteCalls) != 1 || len(stub.cancelCalls) != 0 {
+		t.Fatalf("destroy=%v delete=%v cancel=%v, want rollback destroy + DeletePlacement (no cancel)",
+			rt.destroyIDs, stub.deleteCalls, stub.cancelCalls)
 	}
 }
 
@@ -585,12 +585,12 @@ func TestCreateSandboxOnSelectedNode_CreateFailureCancelReservationError(t *test
 	}
 }
 
-func TestCreateSandboxOnSelectedNode_RecordPlacementDestroyAndCancelErrors(t *testing.T) {
+func TestCreateSandboxOnSelectedNode_RecordPlacementDestroyAndDeleteErrors(t *testing.T) {
 	rt := &apiRecordingRuntime{destroyErr: errors.New("destroy failed")}
 	stub := &promoteStubCluster{
 		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 		recordErr: errors.New("raft commit failed"),
-		cancelErr: errors.New("cancel failed"),
+		deleteErr: errors.New("delete failed"),
 	}
 	h, _ := newClusterCreateHarness(t, rt, stub)
 
@@ -602,8 +602,8 @@ func TestCreateSandboxOnSelectedNode_RecordPlacementDestroyAndCancelErrors(t *te
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
-	if len(stub.cancelCalls) != 1 {
-		t.Fatalf("CancelReservation calls = %+v, want one attempt", stub.cancelCalls)
+	if len(stub.deleteCalls) != 1 {
+		t.Fatalf("DeletePlacement calls = %+v, want one attempt despite errors", stub.deleteCalls)
 	}
 }
 

@@ -14,7 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// OverlapPhase names which leg failed after an overlapped reserved-path create.
+// OverlapPhase names which step failed on the overlapped reserved-path create.
 // Handlers use errors.As(*OverlapFailure) to map to the right HTTP status.
 const (
 	OverlapPhaseCreate  = "create"
@@ -22,9 +22,10 @@ const (
 	OverlapPhasePromote = "promote"
 )
 
-// OverlapFailure is returned when either overlapped leg fails. Retract has
-// already been attempted; the handler should surface Err (not invent a new
-// shape). Phase distinguishes create vs seal vs promote for status mapping.
+// OverlapFailure is returned when the create leg, seal leg, or the post-join
+// promote fails. Retract has already been attempted; the handler should
+// surface Err (not invent a new shape). Phase distinguishes create vs seal vs
+// promote for status mapping.
 type OverlapFailure struct {
 	Phase string
 	Err   error
@@ -44,7 +45,7 @@ func (f *OverlapFailure) Unwrap() error {
 	return f.Err
 }
 
-// OverlapOptions configures reserved-path create∥seal+promote.
+// OverlapOptions configures reserved-path create∥seal.
 type OverlapOptions struct {
 	// PromoteWithSpec includes the redacted create request in RecordPlacement.
 	// v1 always wants true; Daytona/E2B facades pass true; helpers that rely
@@ -58,16 +59,24 @@ type createLegResult struct {
 	err  error
 }
 
-type promoteLegResult struct {
-	secrets    cluster.PlacementSecrets
-	sealErr    error
-	promoteErr error
+type sealLegResult struct {
+	secrets cluster.PlacementSecrets
+	err     error
 }
 
 // OverlapCreateAndPromote runs CreateSandboxWithID in parallel with
-// PutClusterSecretsForRecipient + RecordPlacement, joins both before
-// returning, and synchronously retracts any committed side effects on
-// failure (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
+// PutClusterSecretsForRecipient (the seal), joins both, and only then
+// promotes via RecordPlacement
+// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
+//
+// Promote is deliberately NOT overlapped with the create. The FSM releases
+// the pending-reservation accounting on opPlace, and that accounting is what
+// ClusterCreateMaxPendingPerWorker backpressure and SelectPlacement's
+// double-booking guard count — promoting early would uncharge an in-flight
+// local create. It is also what keeps the placement invisible to the owner
+// watcher, which would otherwise start a concurrent recreate of a
+// failover-enabled sandbox whose local create outlives one 5s watcher tick.
+// The row must stay Reserved until the local create has succeeded.
 //
 // Reserved path only — reservationID must be non-empty. Self-wins /
 // CreateSandbox (no ID) stays sequential at the call site.
@@ -94,12 +103,11 @@ func OverlapCreateAndPromote(
 	// commitCtx is derived from the request so an overall deadline still
 	// bounds seal+promote, but we NEVER treat cancelling it as cleanup: a
 	// Raft apply can fail client-side and still land in the FSM (§2.2).
-	// Always join promoteCh, then retract deterministically.
 	commitCtx, commitCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer commitCancel()
 
 	createCh := make(chan createLegResult, 1)
-	promoteCh := make(chan promoteLegResult, 1)
+	sealCh := make(chan sealLegResult, 1)
 
 	// Both legs run in bare goroutines, where a panic is fatal to the whole
 	// daemon — net/http's per-request recover does not extend to goroutines
@@ -121,93 +129,97 @@ func OverlapCreateAndPromote(
 	}()
 
 	go func() {
-		var out promoteLegResult
-		stage := OverlapPhaseSeal
 		defer func() {
 			if r := recover(); r != nil {
-				err := fmt.Errorf("clustercreate: %s leg panicked: %v", stage, r)
-				if stage == OverlapPhaseSeal {
-					out.sealErr = err
-				} else {
-					out.promoteErr = err
-				}
-				promoteCh <- out
+				sealCh <- sealLegResult{err: fmt.Errorf("clustercreate: seal leg panicked: %v", r)}
 			}
 		}()
-		sealStart := time.Now()
-		secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, reservationID, req, c.SelfNodeID())
+		start := time.Now()
+		secrets, err := svc.PutClusterSecretsForRecipient(commitCtx, reservationID, req, c.SelfNodeID())
 		if opts.Timing != nil {
-			opts.Timing.RecordStage("cluster_seal", time.Since(sealStart))
+			opts.Timing.RecordStage("cluster_seal", time.Since(start))
 		}
-		if sealErr != nil {
-			out.sealErr = sealErr
-			promoteCh <- out
-			return
-		}
-		out.secrets = secrets
-		stage = OverlapPhasePromote
-		promoteStart := time.Now()
-		if opts.PromoteWithSpec {
-			redacted := service.RedactClusterSecrets(req)
-			out.promoteErr = c.RecordPlacement(commitCtx, reservationID, &redacted, secrets)
-		} else {
-			out.promoteErr = c.RecordPlacement(commitCtx, reservationID, nil, secrets)
-		}
-		if opts.Timing != nil {
-			opts.Timing.RecordStage("cluster_promote", time.Since(promoteStart))
-		}
-		promoteCh <- out
+		sealCh <- sealLegResult{secrets: secrets, err: err}
 	}()
 
 	cr := <-createCh
-	pr := <-promoteCh
+	sr := <-sealCh
 
-	if cr.err == nil && pr.sealErr == nil && pr.promoteErr == nil {
-		return cr.resp, nil
+	if cr.err != nil || sr.err != nil {
+		// Promote was never attempted, so the FSM row is still Reserved —
+		// CancelReservation is the correct release; no ambiguity to resolve.
+		retractReservedCreate(context.Background(), svc, c, logger, reservationID, cr.err)
+		if cr.err != nil {
+			return nil, &OverlapFailure{Phase: OverlapPhaseCreate, Err: cr.err}
+		}
+		return nil, &OverlapFailure{Phase: OverlapPhaseSeal, Err: sr.err}
 	}
 
-	retractAfterOverlap(context.Background(), svc, c, logger, reservationID, cr, pr)
-
-	switch {
-	case cr.err != nil:
-		return nil, &OverlapFailure{Phase: OverlapPhaseCreate, Err: cr.err}
-	case pr.sealErr != nil:
-		return nil, &OverlapFailure{Phase: OverlapPhaseSeal, Err: pr.sealErr}
-	default:
-		return nil, &OverlapFailure{Phase: OverlapPhasePromote, Err: pr.promoteErr}
+	promoteStart := time.Now()
+	var promoteErr error
+	if opts.PromoteWithSpec {
+		redacted := service.RedactClusterSecrets(req)
+		promoteErr = c.RecordPlacement(commitCtx, reservationID, &redacted, sr.secrets)
+	} else {
+		promoteErr = c.RecordPlacement(commitCtx, reservationID, nil, sr.secrets)
 	}
+	if opts.Timing != nil {
+		opts.Timing.RecordStage("cluster_promote", time.Since(promoteStart))
+	}
+	if promoteErr != nil {
+		retractFailedPromote(context.Background(), svc, c, logger, reservationID)
+		return nil, &OverlapFailure{Phase: OverlapPhasePromote, Err: promoteErr}
+	}
+	return cr.resp, nil
 }
 
-// retractAfterOverlap is the Option A sync retract from the Tier 1.5 plan.
-// Order: DeletePlacement (mandatory — covers Placed and ambiguous promote
-// errors) → CancelReservation (still-Reserved) → DeleteClusterSecrets →
-// DestroySandbox best-effort. Surfaces the original create/seal/promote
-// error to the caller; retract failure is operational (metric + log).
-func retractAfterOverlap(
+// retractReservedCreate cleans up after a create- or seal-leg failure, while
+// the FSM row is still Reserved. Order matters: DestroySandbox runs FIRST,
+// because a local sandbox that outlives its reservation gets re-asserted into
+// a fresh placement by ReplayClusterOwnership — resurrecting a create the
+// client was told failed. Only after the local truth is gone do we release
+// the reservation and the sealed secrets. The original leg error is what the
+// caller surfaces; retract failures are operational (metric + log).
+func retractReservedCreate(
 	ctx context.Context,
 	svc *service.Service,
 	c cluster.Client,
 	logger *slog.Logger,
 	sandboxID string,
-	cr createLegResult,
-	pr promoteLegResult,
+	createErr error,
 ) {
 	rbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	result := "ok"
-	if c != nil {
-		if err := c.DeletePlacement(rbCtx, sandboxID); err != nil {
-			result = "delete_placement_failed"
+	if err := svc.DestroySandbox(rbCtx, sandboxID); err != nil {
+		if createErr == nil {
+			// Create succeeded (seal failed) — this destroy failure leaves a
+			// live local sandbox that ownership replay can resurrect.
+			result = "destroy_failed"
 			if logger != nil {
-				logger.Error("cluster: DeletePlacement after overlap failure failed",
+				logger.Error("cluster: rollback destroy after overlap failure failed",
+					"sandbox_id", sandboxID, "err", err)
+			}
+		} else if logger != nil {
+			// Create already failed → Destroy often sees not-found after the
+			// service rolled back its own partial state; keep it quiet.
+			logger.Warn("cluster: best-effort destroy after create failure",
+				"sandbox_id", sandboxID, "err", err)
+		}
+	}
+
+	if c != nil {
+		if err := c.CancelReservation(rbCtx, sandboxID); err != nil {
+			if result == "ok" {
+				result = "cancel_failed"
+			}
+			if logger != nil {
+				logger.Warn("cluster: cancel reservation after overlap failure failed",
 					"sandbox_id", sandboxID, "err", err,
-					"create_err", errString(cr.err),
-					"seal_err", errString(pr.sealErr),
-					"promote_err", errString(pr.promoteErr))
+					"create_err", errString(createErr))
 			}
 		}
-		cancelReservation(rbCtx, c, logger, sandboxID)
 	}
 
 	if err := svc.DeleteClusterSecrets(rbCtx, sandboxID); err != nil {
@@ -220,17 +232,54 @@ func retractAfterOverlap(
 		}
 	}
 
+	service.RecordPromoteRetract(result)
+}
+
+// retractFailedPromote handles a promote that errored after a successful
+// create+seal. A client-side Raft error can still have committed in the FSM
+// (§2.2 of the Tier 1.5 plan), so DeletePlacement is mandatory — opDelete
+// removes both Placed and still-Reserved rows and releases the
+// pending-reservation accounting, which is why no separate CancelReservation
+// is needed here. Destroy runs first for the same ownership-replay reason as
+// retractReservedCreate.
+func retractFailedPromote(
+	ctx context.Context,
+	svc *service.Service,
+	c cluster.Client,
+	logger *slog.Logger,
+	sandboxID string,
+) {
+	rbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	result := "ok"
 	if err := svc.DestroySandbox(rbCtx, sandboxID); err != nil {
+		result = "destroy_failed"
 		if logger != nil {
-			// Create already failed → Destroy often sees not-found after the
-			// service rolled back its own partial state; keep it quiet.
-			if cr.err == nil {
-				logger.Error("cluster: rollback destroy after overlap failure failed",
-					"sandbox_id", sandboxID, "err", err)
-			} else {
-				logger.Warn("cluster: best-effort destroy after create failure",
+			logger.Error("cluster: rollback destroy after promote failure failed",
+				"sandbox_id", sandboxID, "err", err)
+		}
+	}
+
+	if c != nil {
+		if err := c.DeletePlacement(rbCtx, sandboxID); err != nil {
+			if result == "ok" {
+				result = "delete_placement_failed"
+			}
+			if logger != nil {
+				logger.Error("cluster: DeletePlacement after promote failure failed",
 					"sandbox_id", sandboxID, "err", err)
 			}
+		}
+	}
+
+	if err := svc.DeleteClusterSecrets(rbCtx, sandboxID); err != nil {
+		if result == "ok" {
+			result = "delete_secrets_failed"
+		}
+		if logger != nil {
+			logger.Warn("cluster: DeleteClusterSecrets after promote failure failed",
+				"sandbox_id", sandboxID, "err", err)
 		}
 	}
 

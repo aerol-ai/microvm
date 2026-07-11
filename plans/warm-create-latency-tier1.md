@@ -302,11 +302,16 @@ test server, covering both transports.
 
 ## 6. Deferred: Tier 1.5 overlap + Tier 3 async — entry-gated
 
-**Tier 1.5 is now a standalone plan:** 
-[`plans/warm-create-latency-tier1.5-seal-promote-overlap.md`](./warm-create-latency-tier1.5-seal-promote-overlap.md)
-(sync retract via `DeletePlacement` + secrets cleanup; join before 201;
-acceptance ≤ 20ms). Summary kept below for context; do not implement from
-this section alone.
+**Tier 1.5 is now a standalone plan:**
+[`plans/warm-create-latency-tier1.5-seal-promote-overlap.md`](./warm-create-latency-tier1.5-seal-promote-overlap.md).
+**Revised 2026-07-11 after PR #306 review: the promote overlap described
+below was withdrawn** — promoting before the local create finishes releases
+the FSM pending-reservation accounting that per-worker backpressure, the
+SelectPlacement double-booking guard, and owner-watcher invisibility all
+depend on (see the Tier 1.5 plan §0). Shipped shape: seal-only overlap,
+sequential promote, ≤ 30ms gate preserved (~2–3ms win; the ≤ 20ms target
+needs a durable Creating FSM state — Tier 3 candidate). The summary below is
+the ORIGINAL full-overlap sketch, kept for history; do not implement it.
 
 **Tier 1.5 (recorded post-review 2026-07-11): overlap seal + promote with the
 local create — ~10ms, the path to ~18–20ms warm p50 without NVMe.** The
@@ -378,7 +383,7 @@ here (p50 single-create never contends it), tracked in `TODOS.md`.
 | Today (v0.5.33, t3.medium + gp3) | 43ms | ~88ms (cache miss) | 78ms | — baseline |
 | Phases 1–4, standard topology | **≤ 30ms** | **≤ 30ms** | ≤ 45ms | **acceptance** |
 | NVMe topology (`plans/nvme-datadir.md`) | ≤ 25ms | ≤ 25ms | ≤ 35ms | not gated here |
-| (Tier 1.5 seal+promote overlap, §6) | ~18–20ms | ~18–20ms | — | not gated here |
+| (Tier 1.5 seal-only overlap, §6 — promote overlap withdrawn post-review) | ~27–28ms | ~27–28ms | — | not gated here |
 | (deferred Tier 3, for scale) | ~8–12ms | — | ~15–20ms | not gated here |
 
 Verification — **both** benches, run with `SB_NETRULES_BACKEND=netlink`:
@@ -412,9 +417,10 @@ Phase 3 (needs the Ansible rejoin cycle to roll out, one-way per node).
   moves the ≤25ms stretch, never the acceptance gate.
 - **Async rename / async promote** (Tier 3, §6) — semantics-changing, entry-gated
   on a sub-20ms product requirement.
-- **Seal+promote overlap with the local create** (Tier 1.5) — split to
+- **Seal overlap with the local create** (Tier 1.5) — split to
   [`plans/warm-create-latency-tier1.5-seal-promote-overlap.md`](./warm-create-latency-tier1.5-seal-promote-overlap.md).
-  Sync retract via `DeletePlacement`; join before 201; acceptance ≤ 20ms.
+  Revised post-review: promote stays sequential (FSM pending accounting);
+  seal-only overlap, ≤ 30ms gate unchanged.
 - **`netrules` `Manager.mu` sharding** (`TODOS.md`) — concurrency ceiling; §6
   scopes p99/concurrency out; p50 never contends it.
 - **p99 / pool-sizing + single-flight refill** — hit-rate work, not hit-path;

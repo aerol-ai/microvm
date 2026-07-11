@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,8 +48,8 @@ type clusterStub struct {
 	reserveCalls []reserveCall
 
 	recordErr   error
-	recordPanic bool
 	recordCalls []recordCall
+	onRecord    func()
 
 	selfNodePanic bool
 }
@@ -129,8 +130,8 @@ func (s *clusterStub) ReserveOnTarget(_ context.Context, sandboxID string, targe
 }
 
 func (s *clusterStub) RecordPlacement(_ context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets cluster.PlacementSecrets) error {
-	if s.recordPanic {
-		panic("record placement panic")
+	if s.onRecord != nil {
+		s.onRecord()
 	}
 	s.recordCalls = append(s.recordCalls, recordCall{sandboxID: sandboxID, spec: spec, secrets: secrets})
 	return s.recordErr
@@ -142,6 +143,10 @@ type fakeRuntime struct {
 	createDelay time.Duration
 	createErr   error
 	createPanic bool
+	// createFinished flips once a Create call returned successfully — the
+	// promote-waits-for-create regression test reads it from the
+	// RecordPlacement hook.
+	createFinished atomic.Bool
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -167,6 +172,7 @@ func (f *fakeRuntime) Create(_ context.Context, _ models.CreateSandboxRequest, s
 		Status:      models.SandboxStatusStarted,
 	}
 	f.states[sandboxID] = cloneRuntimeState(state)
+	f.createFinished.Store(true)
 	return cloneRuntimeState(state), nil
 }
 
@@ -944,16 +950,16 @@ func TestCreateOnSelectedNode(t *testing.T) {
 		if err == nil {
 			t.Fatal("CreateOnSelectedNode unexpectedly succeeded")
 		}
-		// Overlap may promote before create fails; retract DeletePlacement.
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
-		}
+		// Promote never ran, so the row is still Reserved: cancel, don't delete.
 		if stub.cancels != 1 {
 			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
 		}
+		if stub.deletes != 0 {
+			t.Fatalf("DeletePlacement calls = %d, want 0 on a reserved-row retract", stub.deletes)
+		}
 	})
 
-	t.Run("promote_ok_create_fail_retracts_placement", func(t *testing.T) {
+	t.Run("create_fail_never_promotes", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 		rt := &fakeRuntime{
 			states:      map[string]*models.SandboxRuntimeState{},
@@ -965,21 +971,21 @@ func TestCreateOnSelectedNode(t *testing.T) {
 		if err == nil {
 			t.Fatal("CreateOnSelectedNode unexpectedly succeeded")
 		}
-		if len(stub.recordCalls) != 1 {
-			t.Fatalf("RecordPlacement calls = %d, want 1 (promote-OK before create-FAIL)", len(stub.recordCalls))
+		if len(stub.recordCalls) != 0 {
+			t.Fatalf("RecordPlacement calls = %d, want 0 (promote must wait for create)", len(stub.recordCalls))
 		}
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
+		if stub.cancels != 1 {
+			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
 		}
 		if _, getErr := st.Get(context.Background(), "sb-overlap-fail"); !errors.Is(getErr, store.ErrNotFound) {
 			t.Fatalf("store row after retract = %v, want ErrNotFound", getErr)
 		}
 	})
 
-	t.Run("delete_placement_error_still_surfaces_create_error", func(t *testing.T) {
+	t.Run("cancel_error_still_surfaces_create_error", func(t *testing.T) {
 		stub := &clusterStub{
 			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
-			deleteErr: errors.New("raft delete failed"),
+			cancelErr: errors.New("raft cancel failed"),
 		}
 		rt := &fakeRuntime{
 			states:      map[string]*models.SandboxRuntimeState{},
@@ -991,8 +997,8 @@ func TestCreateOnSelectedNode(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "create boom") {
 			t.Fatalf("error = %v, want original create error", err)
 		}
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1 (attempted)", stub.deletes)
+		if stub.cancels != 1 {
+			t.Fatalf("CancelReservation calls = %d, want 1 (attempted)", stub.cancels)
 		}
 	})
 
@@ -1006,11 +1012,13 @@ func TestCreateOnSelectedNode(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "raft write failed") {
 			t.Fatalf("error = %v, want record placement failure", err)
 		}
-		if stub.cancels != 1 {
-			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
-		}
+		// A failed promote may still have committed — DeletePlacement is the
+		// mandatory release (it covers Reserved rows too, so no cancel).
 		if stub.deletes != 1 {
 			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
+		}
+		if stub.cancels != 0 {
+			t.Fatalf("CancelReservation calls = %d, want 0 (opDelete covers Reserved)", stub.cancels)
 		}
 		if _, err := st.Get(context.Background(), "sb-rollback"); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("store.Get(sb-rollback) err = %v, want ErrNotFound after rollback", err)
@@ -1119,10 +1127,11 @@ func TestOverlapCreateAndPromote_Guards(t *testing.T) {
 	})
 }
 
-// A panic in either leg must degrade to a leg failure (join + retract), not
-// crash the daemon — bare goroutines are outside net/http's per-request
-// recover, so an unrecovered panic here would take down every sandbox on the
-// node.
+// A panic in either overlapped leg must degrade to a leg failure (join +
+// retract), not crash the daemon — bare goroutines are outside net/http's
+// per-request recover, so an unrecovered panic here would take down every
+// sandbox on the node. (Promote runs on the request goroutine and needs no
+// extra recover, same as the sequential self-wins path.)
 func TestOverlapCreateAndPromote_PanicRecovery(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -1136,35 +1145,52 @@ func TestOverlapCreateAndPromote_PanicRecovery(t *testing.T) {
 		if !ok || of.Phase != OverlapPhaseCreate || !strings.Contains(of.Error(), "panicked") {
 			t.Fatalf("error = %v, want create-phase panic failure", err)
 		}
-		if stub.deletes != 1 || stub.cancels != 1 {
-			t.Fatalf("retract calls delete=%d cancel=%d, want 1/1", stub.deletes, stub.cancels)
+		if stub.cancels != 1 || stub.deletes != 0 {
+			t.Fatalf("retract calls cancel=%d delete=%d, want 1/0 (row still Reserved)", stub.cancels, stub.deletes)
+		}
+		if len(stub.recordCalls) != 0 {
+			t.Fatalf("RecordPlacement calls = %d, want 0", len(stub.recordCalls))
 		}
 	})
+}
 
-	t.Run("promote_leg_panic_retracts", func(t *testing.T) {
-		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		stub.recordPanic = true
-		svc, st := newCreateService(t, stub, false)
-		_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-panic-promote", OverlapOptions{})
-		of, ok := AsOverlapFailure(err)
-		if !ok || of.Phase != OverlapPhasePromote || !strings.Contains(of.Error(), "panicked") {
-			t.Fatalf("error = %v, want promote-phase panic failure", err)
+// The pending-reservation accounting (backpressure + double-booking guard +
+// owner-watcher invisibility) is only correct while the FSM row stays
+// Reserved for the full local create. RecordPlacement before the create leg
+// finished is the regression this guards against.
+func TestOverlapCreateAndPromote_PromoteWaitsForCreate(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	rt := newFakeRuntime()
+	rt.createDelay = 100 * time.Millisecond
+	var promotedEarly atomic.Bool
+	stub.onRecord = func() {
+		if !rt.createFinished.Load() {
+			promotedEarly.Store(true)
 		}
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
-		}
-		if _, getErr := st.Get(context.Background(), "sb-panic-promote"); !errors.Is(getErr, store.ErrNotFound) {
-			t.Fatalf("store row after retract = %v, want ErrNotFound", getErr)
-		}
-	})
+	}
+	svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+	resp, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-ordered", OverlapOptions{})
+	if err != nil {
+		t.Fatalf("OverlapCreateAndPromote: %v", err)
+	}
+	if resp.Sandbox.ID != "sb-ordered" {
+		t.Fatalf("sandbox id = %q, want sb-ordered", resp.Sandbox.ID)
+	}
+	if len(stub.recordCalls) != 1 {
+		t.Fatalf("RecordPlacement calls = %d, want 1", len(stub.recordCalls))
+	}
+	if promotedEarly.Load() {
+		t.Fatal("RecordPlacement ran before the create leg finished — pending-reservation backpressure is bypassed")
+	}
 }
 
 func TestOverlapCreateAndPromote_SealFailRetracts(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	t.Run("seal_stage_panic_maps_to_seal_phase", func(t *testing.T) {
+	t.Run("seal_leg_panic_maps_to_seal_phase", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		stub.selfNodePanic = true // fires inside the promote leg, at seal stage
+		stub.selfNodePanic = true // fires inside the seal leg goroutine
 		svc, st := newCreateService(t, stub, false)
 		_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-seal-panic", OverlapOptions{PromoteWithSpec: true})
 		of, ok := AsOverlapFailure(err)
@@ -1174,8 +1200,8 @@ func TestOverlapCreateAndPromote_SealFailRetracts(t *testing.T) {
 		if len(stub.recordCalls) != 0 {
 			t.Fatalf("RecordPlacement calls = %d, want 0 after seal failure", len(stub.recordCalls))
 		}
-		if stub.deletes != 1 || stub.cancels != 1 {
-			t.Fatalf("retract calls delete=%d cancel=%d, want 1/1", stub.deletes, stub.cancels)
+		if stub.cancels != 1 || stub.deletes != 0 {
+			t.Fatalf("retract calls cancel=%d delete=%d, want 1/0 (row still Reserved)", stub.cancels, stub.deletes)
 		}
 		if _, getErr := st.Get(context.Background(), "sb-seal-panic"); !errors.Is(getErr, store.ErrNotFound) {
 			t.Fatalf("store row after retract = %v, want ErrNotFound", getErr)
@@ -1185,7 +1211,7 @@ func TestOverlapCreateAndPromote_SealFailRetracts(t *testing.T) {
 	t.Run("create_error_takes_precedence_when_both_legs_fail", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 		// No cipher + registry password: BOTH legs fail on "cipher not
-		// initialized" — the surfaced phase must be create (switch order).
+		// initialized" — the surfaced phase must be create (check order).
 		svc, _ := newCreateService(t, stub, false)
 		req := models.CreateSandboxRequest{
 			Image:    "private.example.com/app:latest",
@@ -1196,44 +1222,61 @@ func TestOverlapCreateAndPromote_SealFailRetracts(t *testing.T) {
 		if !ok || of.Phase != OverlapPhaseCreate {
 			t.Fatalf("error = %v, want create-phase precedence", err)
 		}
-		if stub.deletes != 1 || stub.cancels != 1 {
-			t.Fatalf("retract calls delete=%d cancel=%d, want 1/1", stub.deletes, stub.cancels)
+		if stub.cancels != 1 || stub.deletes != 0 {
+			t.Fatalf("retract calls cancel=%d delete=%d, want 1/0", stub.cancels, stub.deletes)
 		}
 	})
 }
 
-func TestRetractAfterOverlap_ErrorBranches(t *testing.T) {
+func TestRetractErrorBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	t.Run("all_steps_fail_after_promote", func(t *testing.T) {
+	t.Run("reserved_all_steps_fail", func(t *testing.T) {
+		stub := &clusterStub{
+			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
+			cancelErr: errors.New("raft cancel failed"),
+		}
+		svc, st := newCreateService(t, stub, false)
+		_ = st.Close() // secrets + destroy both hit the closed store
+		retractReservedCreate(context.Background(), svc, stub, logger, "sb-retract-err", nil)
+		if stub.cancels != 1 || stub.deletes != 0 {
+			t.Fatalf("retract calls cancel=%d delete=%d, want 1/0", stub.cancels, stub.deletes)
+		}
+	})
+
+	t.Run("reserved_destroy_quiet_after_create_failure", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		svc, st := newCreateService(t, stub, false)
+		_ = st.Close()
+		retractReservedCreate(context.Background(), svc, stub, logger, "sb-retract-quiet",
+			errors.New("create boom"))
+		if stub.cancels != 1 {
+			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
+		}
+	})
+
+	t.Run("reserved_nil_cluster_skips_placement_ops", func(t *testing.T) {
+		svc, _ := newCreateService(t, nil, false)
+		retractReservedCreate(context.Background(), svc, nil, logger, "sb-no-cluster",
+			errors.New("create boom"))
+	})
+
+	t.Run("promote_all_steps_fail", func(t *testing.T) {
 		stub := &clusterStub{
 			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 			deleteErr: errors.New("raft delete failed"),
 		}
 		svc, st := newCreateService(t, stub, false)
-		_ = st.Close() // secrets + destroy both hit the closed store
-		retractAfterOverlap(context.Background(), svc, stub, logger, "sb-retract-err",
-			createLegResult{}, promoteLegResult{promoteErr: errors.New("promote boom")})
-		if stub.deletes != 1 || stub.cancels != 1 {
-			t.Fatalf("retract calls delete=%d cancel=%d, want 1/1", stub.deletes, stub.cancels)
-		}
-	})
-
-	t.Run("destroy_quiet_after_create_failure", func(t *testing.T) {
-		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		svc, st := newCreateService(t, stub, false)
 		_ = st.Close()
-		retractAfterOverlap(context.Background(), svc, stub, logger, "sb-retract-quiet",
-			createLegResult{err: errors.New("create boom")}, promoteLegResult{})
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
+		retractFailedPromote(context.Background(), svc, stub, logger, "sb-promote-err")
+		if stub.deletes != 1 || stub.cancels != 0 {
+			t.Fatalf("retract calls delete=%d cancel=%d, want 1/0", stub.deletes, stub.cancels)
 		}
 	})
 
-	t.Run("nil_cluster_skips_placement_ops", func(t *testing.T) {
+	t.Run("promote_nil_cluster_skips_placement_ops", func(t *testing.T) {
 		svc, _ := newCreateService(t, nil, false)
-		retractAfterOverlap(context.Background(), svc, nil, logger, "sb-no-cluster",
-			createLegResult{err: errors.New("create boom")}, promoteLegResult{})
+		retractFailedPromote(context.Background(), svc, nil, logger, "sb-promote-nocluster")
 	})
 }
 

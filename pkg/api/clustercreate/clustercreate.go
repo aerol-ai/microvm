@@ -214,8 +214,9 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	}
 	c := svc.Cluster()
 
-	// Reserved path: overlap CreateSandboxWithID with seal+promote so the
-	// response wall clock is max(legs). Resolve platform volumes first —
+	// Reserved path: overlap CreateSandboxWithID with the secrets seal, then
+	// promote after both legs join (the row must stay Reserved during the
+	// create — see OverlapCreateAndPromote). Resolve platform volumes first —
 	// store lookups only, no container — so PromoteWithSpec carries concrete
 	// MountSpecs (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
 	if reservationID != "" {

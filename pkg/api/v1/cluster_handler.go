@@ -313,9 +313,11 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 //     promote stay sequential (ID isn't fixed before create the same way).
 //   - reservationID != "": normal cluster create. The router already wrote
 //     the reservation with our redacted spec. CreateSandboxWithID runs in
-//     parallel with PutClusterSecretsForRecipient + RecordPlacement; both
-//     legs join before 201. Failure retract uses DeletePlacement (mandatory
-//     — CancelReservation alone is a no-op on Placed). See
+//     parallel with PutClusterSecretsForRecipient (the seal); RecordPlacement
+//     only fires after BOTH legs succeed, so the row stays Reserved — and
+//     charged to pending-create backpressure — for the whole local create.
+//     Promote-failure retract uses DeletePlacement (mandatory — the commit
+//     may have landed despite the error). See
 //     plans/warm-create-latency-tier1.5-seal-promote-overlap.md.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
 	createStart := time.Now()
