@@ -31,6 +31,28 @@ Shipped as per-IP refcounted locks in `pkg/docker/netrules/manager.go`
 (`lockIP`). Same-IP Exists+Insert mutual exclusion preserved; different IPs
 no longer serialize. See `ip_lock_test.go`.
 
+## cluster_promote is recovery-replication-bound, not fsync-bound (latency)
+
+- **What:** live bench 2026-07-11 (3× t3.medium, branch build, netlink):
+  `cluster_promote` p50 = 23ms on BoltDB and 25ms on raft-wal — the Phase 3
+  log-store swap moved nothing. `applyCommand` runs
+  `externalizeCommandRecovery` before every apply, which synchronously PUTs
+  the recovery blob to **every other member** (wall clock = slowest peer) —
+  the code comment in `recovery_replication.go` says it runs "twice per
+  create (opReserve and opPlace)". That, not the raft fsync, owns promote.
+- **Why it matters:** warm create;dur = create leg (~17ms, Tier 1 working) +
+  promote (~23ms) — the ≤30ms Tier 1 gate fails at 40-44ms until promote
+  sheds the sync replication. The api-side cost is bigger still: opReserve
+  pays the same replication before the create even starts.
+- **Direction to evaluate:** the FSM already has a fetch path for missing
+  blobs (`recoveryResolver` / `fetchRecoveryBlob`), so async/lazy blob
+  replication with fetch-on-recovery may be semantics-preserving; or skip
+  externalize when the spec doesn't opt into failover.recreate. Needs its
+  own plan + failure analysis (blob unavailable at recovery time).
+- **Start:** `internal/cluster/recovery_replication.go`
+  (`storeAndReplicateRecoveryBlob`), `recovery_store.go` fetch path; bench
+  artifacts `integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`.
+
 ## netrules backend switch on iptables-legacy hosts — DONE
 
 Counter parity (`translator_linux.go`) makes exec↔netlink cleanup

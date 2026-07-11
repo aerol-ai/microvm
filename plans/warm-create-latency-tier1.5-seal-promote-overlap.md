@@ -207,17 +207,23 @@ been recreated elsewhere from a create the client never saw succeed.)
 HTTP handler (status mapping 400/500/503/409) plus
 `OverlapWallClockNearMax` (wall clock ≈ create, not create+seal).
 
-## 7. Expected results
+## 7. Expected results — MEASURED 2026-07-11 (live 3× t3.medium, netlink, all-WAL)
 
 | Configuration | warm p50 (cluster reserved) | Gate |
 |---|---|---|
-| Tier 1 only (Phases 1–4) | ≤ 30ms | Tier 1 acceptance — **also this plan's gate** |
-| Tier 1.5 seal overlap | ~27–28ms | stretch, not gated |
+| Released baseline (v-latest) | 45ms burst (p90 362ms) | — |
+| Branch: Tier 1 + 1.5 seal overlap | **40–44ms burst / 42ms sparse (p90 44ms)** | ≤30ms **NOT met** |
 | Full overlap (withdrawn) | ~18–20ms | requires a durable Creating state — Tier 3 candidate |
 
-Verification: `make integration-benchmark-docker-only` + sparse. Server-
-Timing: `cluster_seal` must overlap `docker_pool` on the wall clock;
-`cluster_promote` (~3–5ms) is expected to remain serial.
+Measured stages: `create_with_id` 17ms, `cluster_seal` **0ms (fully
+overlapped — this plan's mechanism works)**, `cluster_promote` **23–25ms**.
+The promote is NOT the ~3–5ms Raft commit this plan assumed: it is dominated
+by the synchronous recovery-blob replication to every member inside
+`applyCommand` (`recovery_replication.go`) — identical on BoltDB and
+raft-wal. The ≤30ms gate is blocked on that, not on anything this plan
+changed; see `TODOS.md` ("cluster_promote is recovery-replication-bound").
+Sparse run also proved Phase 2: zero `docker_image` resolves across 8
+samples at 15s gaps.
 
 ## NOT in scope
 
@@ -238,10 +244,11 @@ Timing: `cluster_seal` must overlap `docker_pool` on the wall clock;
   promote-waits-for-create regression
 - [x] **T4** — Sequential self-wins promote-fail rollback fixed to
   `DeletePlacement` (latent ghost-Placed bug)
-- [ ] **T5** — PR description call-outs: boot-path latency, failure-path
+- [x] **T5** — PR description call-outs: boot-path latency, failure-path
   consistency, cluster correctness (§0 analysis)
-- [ ] **T6** — Bench: confirm ≤ 30ms held and `cluster_seal` off the wall
-  clock on the standard topology
+- [x] **T6** — Bench run 2026-07-11: `cluster_seal` confirmed off the wall
+  clock (0ms); ≤ 30ms NOT held — blocked on promote recovery replication
+  (§7, TODOS.md), not on this plan's mechanism
 
 ## Relation to Tier 1
 

@@ -1,9 +1,20 @@
 # Warm create latency Tier 1: 43ms → ≤30ms acceptance (semantics-preserving)
 
-Status: **implemented — bench gates pending** (code landed 2026-07-11,
-`0b39dee` + `0fbe7a9`; the §8 burst+sparse gates with
-`SB_NETRULES_BACKEND=netlink` have NOT been run — no
-`docker-sparse-bench` report exists yet). Successor to `plans/docker-warm-pool.md` §12, which shipped the
+Status: **implemented — bench gates RUN 2026-07-11 (live, 3× t3.medium,
+branch build, netlink, all-WAL): functional gates PASS, ≤30ms numeric gate
+FAILS at 40–44ms burst / 42ms sparse.** Per-stage: create leg
+(`create_with_id`) is **17ms** and sparse shows **zero `docker_image`
+resolves across 8 samples at 15s gaps** (Phase 1+2 working; seal overlapped
+to 0ms; p90 tail 362ms→48ms from Phases 2+4). The residual is
+`cluster_promote` at **23–25ms — identical on BoltDB and raft-wal**, so
+Phase 3's fsync premise does not hold: `applyCommand` synchronously
+replicates the recovery blob to every other member before the raft apply
+(`recovery_replication.go`, "twice per create"). Closing the gate needs that
+replication off the promote path — tracked in `TODOS.md`
+("cluster_promote is recovery-replication-bound"). Reports:
+`integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`
++ `cluster-3-mixed-docker-sparse-bench.json`.
+Successor to `plans/docker-warm-pool.md` §12, which shipped the
 warm-adopt fast path at **server p50 43ms** (v0.5.33). This plan removes the
 removable engine/consensus round-trips **without changing any idempotency or
 failover semantics**. The semantics-changing follow-ups (async rename, async
