@@ -354,6 +354,9 @@ func (c *Client) tagImage(ctx context.Context, sourceRef, repo, tag string) erro
 		"/images/"+url.PathEscape(sourceRef)+"/tag", query, nil, nil, nil); err != nil {
 		return fmt.Errorf("tag image %s as %s:%s: %w", sourceRef, repo, tag, err)
 	}
+	// The tag just moved (or was created); drop any cached resolution so the
+	// warm-adopt path re-inspects instead of trusting a pre-tag ID.
+	c.imageIDs.Flush(repo + ":" + tag)
 	return nil
 }
 
