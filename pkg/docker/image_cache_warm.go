@@ -47,6 +47,9 @@ func (c *Client) warmImageIDCacheOnce(ctx context.Context, pool *dockerpool.Pool
 	if c == nil || pool == nil {
 		return
 	}
+	// Piggyback map hygiene on the warm tick — the cache has no timer of its
+	// own, and refs that left the pool set would otherwise linger expired.
+	c.imageIDs.Prune()
 	for _, key := range pool.ListTargets() {
 		image := key.Image
 		if image == "" {
