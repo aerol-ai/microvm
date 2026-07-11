@@ -67,10 +67,9 @@ func TestPlacementRecoveryFileStorePutAndGetRecordRoundTrip(t *testing.T) {
 	}
 
 	ref, err := store.Put("sb-roundtrip", placementRecovery{
-		Spec:          &models.CreateSandboxRequest{Image: "alpine:3.20"},
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:3.20", Env: map[string]string{"A": "1"}},
 		SecretRef:     "cluster-secret:demo",
 		SecretVersion: 7,
-		SealedSecrets: []byte("sealed"),
 	})
 	if err != nil {
 		t.Fatalf("Put() error = %v", err)
@@ -92,21 +91,15 @@ func TestPlacementRecoveryFileStorePutAndGetRecordRoundTrip(t *testing.T) {
 	if record.Recovery.SecretRef != "cluster-secret:demo" || record.Recovery.SecretVersion != 7 {
 		t.Fatalf("GetRecord() secrets = %+v, want ref/version preserved", record.Recovery)
 	}
-	if string(record.Recovery.SealedSecrets) != "sealed" {
-		t.Fatalf("GetRecord() sealed secrets = %q, want sealed", string(record.Recovery.SealedSecrets))
-	}
 
 	record.Recovery.Spec.Image = "mutated"
-	record.Recovery.SealedSecrets[0] = 'X'
+	record.Recovery.Spec.Env["A"] = "mutated"
 	again, ok, err := store.GetRecord(ref)
 	if err != nil || !ok {
 		t.Fatalf("GetRecord() second read = ok:%v err:%v, want ok:true err:nil", ok, err)
 	}
-	if again.Recovery.Spec == nil || again.Recovery.Spec.Image != "alpine:3.20" {
+	if again.Recovery.Spec == nil || again.Recovery.Spec.Image != "alpine:3.20" || again.Recovery.Spec.Env["A"] != "1" {
 		t.Fatalf("GetRecord() second read spec = %+v, want original alpine spec", again.Recovery.Spec)
-	}
-	if string(again.Recovery.SealedSecrets) != "sealed" {
-		t.Fatalf("GetRecord() second read sealed secrets = %q, want sealed", string(again.Recovery.SealedSecrets))
 	}
 }
 

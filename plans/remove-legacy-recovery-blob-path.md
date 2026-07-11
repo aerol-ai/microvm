@@ -1,10 +1,14 @@
 # Remove the legacy recovery-blob emit path (inline-only recovery)
 
-Status: **planned 2026-07-12 — deliberately NOT started.** Pick up only after
-(1) PR #306 and PR #307 are merged, (2) the Tier 2 T4 bench gate passed, and
-(3) the zero-deployments premise in §0 still holds. Follow-up simplification
+Status: **DONE — implemented 2026-07-12** (branch
+`refactor/inline-only-recovery`), after all three pickup gates cleared:
+#306/#307 shipped in v0.6.0, the T4 bench passed (sparse 28ms ≤ 30ms gate,
+promote 10–11ms, inline=1043/blob=0), and the zero-producer premise was
+re-verified in-tree (T1). T5's snapshot-join fetch-on-miss regression test
+was written and committed FIRST, before any deletion. Net ~1,650 lines
+removed / ~290 added; full offline suite green. Follow-up simplification
 to `plans/warm-create-latency-tier2-recovery-replication.md`: Tier 2 made the
-blob path a residual fallback; this plan deletes the fallback so **inline is
+blob path a residual fallback; this plan deleted the fallback so **inline is
 the only way a recovery payload travels**, and the dual-path reasoning burden
 disappears.
 

@@ -120,38 +120,6 @@ func TestClusterInternalPlacementByName_OrphanedLookup(t *testing.T) {
 	}
 }
 
-func TestClusterInternalRecoveryPut_ValidationErrors(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
-	stub := &recoveryBlobStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-	svc.AttachCluster(stub)
-	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
-
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, "/v1/cluster/internal/recovery/", strings.NewReader(`{}`))
-	req.SetPathValue("ref", "")
-	h.clusterInternalRecoveryPut(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("empty ref status = %d, want 400", rr.Code)
-	}
-
-	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPut, "/v1/cluster/internal/recovery/ref-1", strings.NewReader("{bad"))
-	req.SetPathValue("ref", "ref-1")
-	h.clusterInternalRecoveryPut(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("invalid json status = %d, want 400", rr.Code)
-	}
-
-	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPut, "/v1/cluster/internal/recovery/ref-1", strings.NewReader(`{"ref":"other"}`))
-	req.SetPathValue("ref", "ref-1")
-	h.clusterInternalRecoveryPut(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("ref mismatch status = %d, want 400", rr.Code)
-	}
-}
-
 func TestClusterInternalRecoveryGet_StoreError(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)

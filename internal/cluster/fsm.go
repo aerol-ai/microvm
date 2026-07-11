@@ -43,33 +43,32 @@ const (
 	opDeleteVolumeAttach opCode = 18 // drop all platform-volume attachments for one sandbox
 )
 
-// command is the wire format for one raft log entry. New writers externalize
-// recovery payloads before encoding, so raft carries Name + RecoveryRef instead
-// of full Spec/secret bytes. Spec/SecretRef/SealedSecrets remain in the struct
-// for legacy log entries and direct FSM tests; any Spec MUST be redacted of
-// plaintext credentials before encoding.
+// command is the wire format for one raft log entry. Recovery payloads ride
+// inline: Spec plus the SecretRef/SecretVersion provider handle travel in the
+// entry itself, quorum-committed with the placement they describe (see
+// recovery_replication.go for the size cap). Any Spec MUST be redacted of
+// plaintext credentials before encoding — there is deliberately no field for
+// raw sealed bytes, because log entries and FSM snapshots are not erasable
+// per-sandbox.
 // Port/Protocol carry one (port, protocol) tuple for opAddExposedPort and
 // opRemoveExposedPort — replicated as intent-only so the new owner picks a
 // fresh host port from its own pool.
 //
 // Secrets follow the same preserve-on-empty rule as Spec at the FSM level: an
-// opPlace or opUpsertSpec that omits SecretRef/SecretVersion/SealedSecrets
-// does NOT erase a previously-replicated handle. That lets resize/lifecycle
-// write-throughs (which never touch credentials) leave the secret ref alone,
-// and lets boot-time replays that have the spec but not the secret provider
-// handle avoid clobbering the original.
+// opPlace or opUpsertSpec that omits SecretRef/SecretVersion does NOT erase a
+// previously-replicated handle. That lets resize/lifecycle write-throughs
+// (which never touch credentials) leave the secret ref alone, and lets
+// boot-time replays that have the spec but not the secret provider handle
+// avoid clobbering the original.
 type command struct {
 	Op                 opCode                       `json:"op"`
 	SandboxID          string                       `json:"sandbox_id"`
 	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
 	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
 	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
-	Name               string                       `json:"name,omitempty"`
-	RecoveryRef        string                       `json:"recovery_ref,omitempty"`
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
-	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
 	Port               int                          `json:"port,omitempty"`
 	Protocol           string                       `json:"protocol,omitempty"`
 	HostPort           int                          `json:"host_port,omitempty"`
@@ -111,12 +110,9 @@ type reservationCommand struct {
 	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
 	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
 	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
-	Name               string                       `json:"name,omitempty"`
-	RecoveryRef        string                       `json:"recovery_ref,omitempty"`
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
-	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
 	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
 }
 
@@ -134,9 +130,8 @@ func decodeCommand(b []byte) (command, error) {
 
 func (c command) placementSecrets() PlacementSecrets {
 	return PlacementSecrets{
-		Ref:          c.SecretRef,
-		Version:      c.SecretVersion,
-		LegacySealed: c.SealedSecrets,
+		Ref:     c.SecretRef,
+		Version: c.SecretVersion,
 	}
 }
 
@@ -146,12 +141,9 @@ func reservationFromCommand(c command) reservationCommand {
 		OwnerNodeID:        c.OwnerNodeID,
 		OwnerAPIURL:        c.OwnerAPIURL,
 		OwnerDataPlaneHost: c.OwnerDataPlaneHost,
-		Name:               c.Name,
-		RecoveryRef:        c.RecoveryRef,
 		Spec:               c.Spec,
 		SecretRef:          c.SecretRef,
 		SecretVersion:      c.SecretVersion,
-		SealedSecrets:      cloneBytes(c.SealedSecrets),
 		ExpiresUnix:        c.ExpiresUnix,
 	}
 }
@@ -163,12 +155,9 @@ func commandFromReservation(r reservationCommand) command {
 		OwnerNodeID:        r.OwnerNodeID,
 		OwnerAPIURL:        r.OwnerAPIURL,
 		OwnerDataPlaneHost: r.OwnerDataPlaneHost,
-		Name:               r.Name,
-		RecoveryRef:        r.RecoveryRef,
 		Spec:               r.Spec,
 		SecretRef:          r.SecretRef,
 		SecretVersion:      r.SecretVersion,
-		SealedSecrets:      cloneBytes(r.SealedSecrets),
 		ExpiresUnix:        r.ExpiresUnix,
 	}
 }
@@ -188,10 +177,7 @@ func applyCommandSecretUpdate(existing Placement, exists bool, cmd command) Plac
 	if !cmd.hasSecretUpdate() && exists {
 		return secretsFromPlacement(existing)
 	}
-	if cmd.SecretRef != "" || cmd.SecretVersion != 0 {
-		return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion}
-	}
-	return PlacementSecrets{LegacySealed: cloneBytes(cmd.SealedSecrets)}
+	return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion}
 }
 
 // placementFSM is the raft.FSM implementation. It keeps hot routing/admission
@@ -294,7 +280,6 @@ type placementRecovery struct {
 	Spec          *models.CreateSandboxRequest
 	SecretRef     string
 	SecretVersion int
-	SealedSecrets []byte
 }
 
 type hostPortClaim struct {
@@ -390,9 +375,6 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	if err != nil {
 		return fmt.Errorf("placementFSM: decode: %w", err)
 	}
-	if err := f.hydrateCommandRecovery(&cmd); err != nil {
-		return err
-	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -431,7 +413,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// Done before any state mutation so a conflict leaves the FSM
 		// untouched and the leader's apply path returns the sentinel for the
 		// API handler to roll back the local create.
-		name := commandName(cmd)
+		name := specName(cmd.Spec)
 		if cmd.Spec == nil && exists {
 			name = placementName(existing)
 		}
@@ -492,7 +474,6 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			Spec:               spec,
 			SecretRef:          secrets.Ref,
 			SecretVersion:      secrets.Version,
-			SealedSecrets:      secrets.LegacySealed,
 			ExposedPorts:       ports,
 			ExposedPortRoutes:  portRoutes,
 			CustomHostnames:    customHostnames,
@@ -684,7 +665,6 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
-			existing.SealedSecrets = secrets.LegacySealed
 		}
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
@@ -731,7 +711,6 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
-			existing.SealedSecrets = secrets.LegacySealed
 		}
 		wasReserved := existing.IsReserved()
 		if wasReserved {
@@ -986,20 +965,6 @@ func specName(spec *models.CreateSandboxRequest) string {
 	return strings.TrimSpace(spec.Name)
 }
 
-func commandName(cmd command) string {
-	if name := strings.TrimSpace(cmd.Name); name != "" {
-		return name
-	}
-	return specName(cmd.Spec)
-}
-
-func reservationName(r reservationCommand) string {
-	if name := strings.TrimSpace(r.Name); name != "" {
-		return name
-	}
-	return specName(r.Spec)
-}
-
 func placementName(p Placement) string {
 	if name := strings.TrimSpace(p.Name); name != "" {
 		return name
@@ -1028,7 +993,7 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 			}
 		}
 
-		name := reservationName(r)
+		name := specName(r.Spec)
 		if name == "" {
 			continue
 		}
@@ -1076,7 +1041,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
 	}
-	name := commandName(cmd)
+	name := specName(cmd.Spec)
 	if err := f.validateNameUniqueLocked(cmd.SandboxID, name); err != nil {
 		return err
 	}
@@ -1093,7 +1058,6 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		Spec:               cmd.Spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
-		SealedSecrets:      secrets.LegacySealed,
 		State:              PlacementStateReserved,
 		ExpiresUnix:        cmd.ExpiresUnix,
 	}
@@ -1569,41 +1533,15 @@ func attachPlacementRecovery(p Placement, rec placementRecovery) Placement {
 	p.Spec = rec.Spec
 	p.SecretRef = rec.SecretRef
 	p.SecretVersion = rec.SecretVersion
-	p.SealedSecrets = rec.SealedSecrets
 	return p
 }
 
-func (f *placementFSM) hydrateCommandRecovery(cmd *command) error {
-	if err := f.hydrateCommandRecoveryFields(cmd.SandboxID, cmd.RecoveryRef, &cmd.Spec, &cmd.SecretRef, &cmd.SecretVersion, &cmd.SealedSecrets); err != nil {
-		return err
-	}
-	for i := range cmd.Reservations {
-		r := &cmd.Reservations[i]
-		if err := f.hydrateCommandRecoveryFields(r.SandboxID, r.RecoveryRef, &r.Spec, &r.SecretRef, &r.SecretVersion, &r.SealedSecrets); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (f *placementFSM) hydrateCommandRecoveryFields(sandboxID, ref string, spec **models.CreateSandboxRequest, secretRef *string, secretVersion *int, sealed *[]byte) error {
-	if ref == "" {
-		return nil
-	}
-	rec, ok, err := f.resolveRecoveryRef(ref)
-	if err != nil {
-		return fmt.Errorf("placementFSM: load recovery %s for %s: %w", ref, sandboxID, err)
-	}
-	if !ok {
-		return fmt.Errorf("placementFSM: missing recovery blob %s for %s", ref, sandboxID)
-	}
-	*spec = rec.Spec
-	*secretRef = rec.SecretRef
-	*secretVersion = rec.SecretVersion
-	*sealed = rec.SealedSecrets
-	return nil
-}
-
+// resolveRecoveryRef serves ROW-level recovery hydration: FSM snapshots carry
+// hot rows with a RecoveryRef but not the payload, so a voter that joins from
+// a snapshot must fetch each payload from a peer exactly once (fetch-on-miss,
+// cached into the local store). Commands never carry refs — payloads ride
+// inline in the raft entry — so this is the only remote-recovery path left.
+// Pinned by TestFSMSnapshotJoinFetchOnMiss.
 func (f *placementFSM) resolveRecoveryRef(ref string) (placementRecovery, bool, error) {
 	if f.recoveryStore != nil {
 		rec, ok, err := f.recoveryStore.Get(ref)
@@ -1678,7 +1616,6 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 		Spec:          p.Spec,
 		SecretRef:     p.SecretRef,
 		SecretVersion: p.SecretVersion,
-		SealedSecrets: p.SealedSecrets,
 	}
 	if p.Name == "" {
 		p.Name = specName(p.Spec)
@@ -1686,12 +1623,11 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 	p.Spec = nil
 	p.SecretRef = ""
 	p.SecretVersion = 0
-	p.SealedSecrets = nil
 	return p, rec
 }
 
 func (r placementRecovery) empty() bool {
-	return r.Spec == nil && r.SecretRef == "" && r.SecretVersion == 0 && len(r.SealedSecrets) == 0
+	return r.Spec == nil && r.SecretRef == "" && r.SecretVersion == 0
 }
 
 // get returns the placement for id, or zero-value + false if absent.
@@ -2162,7 +2098,6 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 			full.Spec = rec.Spec
 			full.SecretRef = rec.SecretRef
 			full.SecretVersion = rec.SecretVersion
-			full.SealedSecrets = rec.SealedSecrets
 		}
 		if err := f.storePlacementLocked(id, full); err != nil {
 			return err
@@ -2249,7 +2184,6 @@ func cloneHotPlacement(p Placement) Placement {
 	p.Spec = nil
 	p.SecretRef = ""
 	p.SecretVersion = 0
-	p.SealedSecrets = nil
 	if len(p.ExposedPorts) > 0 {
 		ports := make(map[int]string, len(p.ExposedPorts))
 		for k, v := range p.ExposedPorts {
@@ -2272,13 +2206,11 @@ func cloneHotPlacement(p Placement) Placement {
 
 func clonePlacementRecovery(r placementRecovery) placementRecovery {
 	r.Spec = cloneCreateSandboxRequest(r.Spec)
-	r.SealedSecrets = cloneBytes(r.SealedSecrets)
 	return r
 }
 
 func clonePlacement(p Placement) Placement {
 	p.Spec = cloneCreateSandboxRequest(p.Spec)
-	p.SealedSecrets = cloneBytes(p.SealedSecrets)
 	if len(p.ExposedPorts) > 0 {
 		ports := make(map[int]string, len(p.ExposedPorts))
 		for k, v := range p.ExposedPorts {

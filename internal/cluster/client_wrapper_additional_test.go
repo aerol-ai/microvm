@@ -37,16 +37,14 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 		Spec:          &models.CreateSandboxRequest{Name: "demo", Image: "alpine:3.20"},
 		SecretRef:     "cluster-secret://sandbox/sb-demo/v1",
 		SecretVersion: 1,
-		SealedSecrets: []byte("legacy-sealed"),
 	})
 	applyOp(t, c.fsm, command{Op: opAddExposedPort, SandboxID: "sb-demo", Port: 8080, Protocol: "http"})
 	applyOp(t, c.fsm, command{Op: opSetNodeDrainState, NodeID: "drained-node", Drained: true})
 	applyOp(t, c.fsm, command{
-		Op:            opPlace,
-		SandboxID:     "sb-legacy",
-		OwnerNodeID:   "self-node",
-		Spec:          &models.CreateSandboxRequest{Name: "legacy", Image: "busybox"},
-		SealedSecrets: []byte("legacy-sealed"),
+		Op:          opPlace,
+		SandboxID:   "sb-legacy",
+		OwnerNodeID: "self-node",
+		Spec:        &models.CreateSandboxRequest{Name: "legacy", Image: "busybox"},
 	})
 
 	if got := c.SelfNodeID(); got != "self-node" {
@@ -75,11 +73,8 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 	}
 
 	secrets := c.SecretsOf("sb-demo")
-	if secrets.Ref != "cluster-secret://sandbox/sb-demo/v1" || secrets.Version != 1 || len(secrets.LegacySealed) != 0 {
+	if secrets.Ref != "cluster-secret://sandbox/sb-demo/v1" || secrets.Version != 1 {
 		t.Fatalf("SecretsOf() = %+v, want stored secret handle", secrets)
-	}
-	if got := string(c.SealedSecretsOf("sb-legacy")); got != "legacy-sealed" {
-		t.Fatalf("SealedSecretsOf() = %q, want legacy-sealed", got)
 	}
 	routes := c.ExposedPortsOf("sb-demo")
 	if routes[8080].Protocol != "http" {

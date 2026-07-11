@@ -349,7 +349,7 @@ func TestAgentSecretsOfAndExposedPortsLookupFailure(t *testing.T) {
 		gossip:     &gossipNode{memberIndex: index},
 		logger:     slog.Default(),
 	}
-	if got := agent.SecretsOf("sb-x"); got.LegacySealed != nil || got.Ref != "" {
+	if got := agent.SecretsOf("sb-x"); got.Ref != "" || got.Version != 0 {
 		t.Fatalf("SecretsOf on error = %+v", got)
 	}
 	if got := agent.ExposedPortsOf("sb-x"); got != nil {
@@ -672,9 +672,6 @@ func TestClusterReadWrapperPaths(t *testing.T) {
 	}
 	if got := c.SecretsOf("sb-read"); got.Ref != "secret-ref" {
 		t.Fatalf("SecretsOf = %+v", got)
-	}
-	if len(c.SealedSecretsOf("sb-read")) != 0 {
-		t.Fatalf("SealedSecretsOf = %v", c.SealedSecretsOf("sb-read"))
 	}
 	ports := c.ExposedPortsOf("sb-read")
 	if ports[80].Protocol != "http" {

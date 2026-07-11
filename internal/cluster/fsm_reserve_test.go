@@ -26,18 +26,17 @@ func applyOp(t *testing.T, fsm *placementFSM, cmd command) any {
 
 // TestFSMReserveWritesReservedState pins the basic write contract: a fresh
 // opReserve creates a Placement with State=Reserved, ExpiresUnix populated,
-// and the redacted spec + sealed secrets carried in the command preserved.
+// and the redacted spec + secret handle carried in the command preserved.
 // Without this, the promote step (opPlace with nil Spec) would have nothing
 // to inherit and we'd silently lose the create payload.
 func TestFSMReserveWritesReservedState(t *testing.T) {
 	fsm := newPlacementFSM()
 	expiry := time.Now().Add(120 * time.Second).Unix()
 	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "demo", CPU: 2, MemoryMB: 1024}
-	sealed := []byte("sealed-bag")
 
 	if got := applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b",
-		Spec: spec, SealedSecrets: sealed, ExpiresUnix: expiry,
+		Spec: spec, SecretRef: "cluster-secret://sandbox/sb1/v1", SecretVersion: 1, ExpiresUnix: expiry,
 	}); got != nil {
 		t.Fatalf("opReserve returned %v, want nil", got)
 	}
@@ -58,8 +57,8 @@ func TestFSMReserveWritesReservedState(t *testing.T) {
 	if p.Spec == nil || p.Spec.Image != "alpine" {
 		t.Fatalf("Spec = %+v, want preserved alpine spec", p.Spec)
 	}
-	if string(p.SealedSecrets) != "sealed-bag" {
-		t.Fatalf("SealedSecrets = %q, want sealed-bag", string(p.SealedSecrets))
+	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+		t.Fatalf("secret handle = (%q,%d), want preserved", p.SecretRef, p.SecretVersion)
 	}
 	pending := fsm.pendingReservationsByNode(time.Now().Unix())
 	if got := pending["B"]; got.CPU != 2 || got.MemoryMB != 1024 {
@@ -209,18 +208,17 @@ func TestFSMReserveBatchRejectsDuplicateNameWithoutPartialWrite(t *testing.T) {
 }
 
 // TestFSMPlacePromotesReservationInheritsSpec pins the central invariant of
-// the reservation→placed transition: opPlace with nil Spec/SealedSecrets must
-// (a) clear State and ExpiresUnix and (b) preserve the Spec + SealedSecrets
+// the reservation→placed transition: opPlace with an empty payload must
+// (a) clear State and ExpiresUnix and (b) preserve the Spec + secret handle
 // the reservation step replicated. This is the property that lets the
 // router-side reserve avoid duplicating the payload on the wire when the
 // target promotes.
 func TestFSMPlacePromotesReservationInheritsSpec(t *testing.T) {
 	fsm := newPlacementFSM()
 	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "demo"}
-	sealed := []byte("sealed-bag")
 	applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B",
-		Spec: spec, SealedSecrets: sealed,
+		Spec: spec, SecretRef: "cluster-secret://sandbox/sb1/v1", SecretVersion: 1,
 		ExpiresUnix: time.Now().Add(60 * time.Second).Unix(),
 	})
 
@@ -238,43 +236,8 @@ func TestFSMPlacePromotesReservationInheritsSpec(t *testing.T) {
 	if p.Spec == nil || p.Spec.Image != "alpine" {
 		t.Fatalf("Spec = %+v, want inherited from reservation", p.Spec)
 	}
-	if string(p.SealedSecrets) != "sealed-bag" {
-		t.Fatalf("SealedSecrets lost during promote: %q", string(p.SealedSecrets))
-	}
-}
-
-func TestFSMPlacePromotesReservationInheritsSecretRef(t *testing.T) {
-	fsm := newPlacementFSM()
-	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "demo-ref"}
-	applyOp(t, fsm, command{
-		Op: opReserve, SandboxID: "sb-ref", OwnerNodeID: "B",
-		Spec:          spec,
-		SecretRef:     "cluster-secret://sandbox/sb-ref/v1",
-		SecretVersion: 1,
-		SealedSecrets: []byte("must-not-enter-reservation"),
-		ExpiresUnix:   time.Now().Add(60 * time.Second).Unix(),
-	})
-	reserved, _ := fsm.get("sb-ref")
-	if reserved.SecretRef != "cluster-secret://sandbox/sb-ref/v1" || reserved.SecretVersion != 1 {
-		t.Fatalf("reservation secret handle = (%q,%d)", reserved.SecretRef, reserved.SecretVersion)
-	}
-	if len(reserved.SealedSecrets) != 0 {
-		t.Fatalf("reservation stored legacy sealed payload with ref: %q", string(reserved.SealedSecrets))
-	}
-
-	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-ref", OwnerNodeID: "B"}); got != nil {
-		t.Fatalf("opPlace promote = %v, want nil", got)
-	}
-
-	p, _ := fsm.get("sb-ref")
-	if p.IsReserved() {
-		t.Fatalf("State = %q, want placed after promote", p.State)
-	}
-	if p.SecretRef != "cluster-secret://sandbox/sb-ref/v1" || p.SecretVersion != 1 {
-		t.Fatalf("promoted secret handle = (%q,%d)", p.SecretRef, p.SecretVersion)
-	}
-	if len(p.SealedSecrets) != 0 {
-		t.Fatalf("promote stored legacy sealed payload with ref: %q", string(p.SealedSecrets))
+	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+		t.Fatalf("secret handle lost during promote: (%q,%d)", p.SecretRef, p.SecretVersion)
 	}
 }
 
@@ -341,9 +304,9 @@ func TestFSMSnapshotRoundTripPreservesReservedState(t *testing.T) {
 	expiry := time.Now().Add(120 * time.Second).Unix()
 	applyOp(t, src, command{
 		Op: opReserve, SandboxID: "sb-r", OwnerNodeID: "B",
-		Spec:          &models.CreateSandboxRequest{Image: "alpine", Name: "named-reservation"},
-		SealedSecrets: []byte("sealed"),
-		ExpiresUnix:   expiry,
+		Spec:        &models.CreateSandboxRequest{Image: "alpine", Name: "named-reservation"},
+		SecretRef:   "cluster-secret://sandbox/sb-r/v1",
+		ExpiresUnix: expiry,
 	})
 	applyOp(t, src, command{Op: opPlace, SandboxID: "sb-p", OwnerNodeID: "A"})
 
@@ -377,8 +340,8 @@ func TestFSMSnapshotRoundTripPreservesReservedState(t *testing.T) {
 	if got.Spec == nil || got.Spec.Name != "named-reservation" {
 		t.Fatalf("Spec lost during restore: %+v", got.Spec)
 	}
-	if string(got.SealedSecrets) != "sealed" {
-		t.Fatalf("SealedSecrets lost during restore: %q", string(got.SealedSecrets))
+	if got.SecretRef != "cluster-secret://sandbox/sb-r/v1" {
+		t.Fatalf("secret handle lost during restore: %q", got.SecretRef)
 	}
 	// Placed row alongside it must restore as Placed (zero-value State), not
 	// accidentally promoted-to-reserved by a back-compat shim.

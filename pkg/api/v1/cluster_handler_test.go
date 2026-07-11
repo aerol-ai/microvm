@@ -313,7 +313,7 @@ func TestClusterCreateWrapDoesNotPutSecretPayloadInRouterReservation(t *testing.
 	if rc.redacted.Registry.Server != "private.example.com" || rc.redacted.Registry.Username != "u" {
 		t.Fatalf("router reservation lost non-secret registry fields: %+v", rc.redacted.Registry)
 	}
-	if rc.secrets.Ref != "" || rc.secrets.Version != 0 || len(rc.secrets.LegacySealed) != 0 {
+	if rc.secrets.Ref != "" || rc.secrets.Version != 0 {
 		t.Fatalf("router reservation carried secret handle/payload: %+v", rc.secrets)
 	}
 }

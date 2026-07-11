@@ -47,11 +47,6 @@ var (
 
 	clusterReservationsExpired = expvar.NewInt("aerolvm_cluster_reservations_expired_total")
 
-	// recoveryExternalizeTotal counts externalize decisions by mode so an
-	// unexpected blob-path share (legacy sealed bytes or oversized specs on
-	// the create path) is visible before it shows up as promote latency.
-	recoveryExternalizeTotal = expvar.NewMap("aerolvm_cluster_recovery_externalize_total")
-
 	schedulerDecisions        = expvar.NewMap("aerolvm_scheduler_decisions_total")
 	schedulerCandidateRejects = expvar.NewMap("aerolvm_scheduler_candidate_rejects_total")
 	schedulerCandidatesLast   = expvar.NewInt("aerolvm_scheduler_candidates_last")
@@ -134,15 +129,6 @@ func recordOwnerForwardTargetMiss(reason string) {
 
 func recordExpiredReservation() {
 	clusterReservationsExpired.Add(1)
-}
-
-const (
-	recoveryExternalizeModeInline = "inline"
-	recoveryExternalizeModeBlob   = "blob"
-)
-
-func recordRecoveryExternalize(mode string) {
-	scaleobs.Add(recoveryExternalizeTotal, mode, 1)
 }
 
 func recordSchedulerDecision(reason string, candidates int, rejects map[string]int64) {

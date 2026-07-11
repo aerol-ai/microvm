@@ -173,25 +173,24 @@ func (p Placement) IsOrphaned() bool {
 }
 
 // PlacementSecrets is the recoverability handle paired with a redacted
-// placement spec. New writes populate Ref/Version only; the encrypted secret
-// payload lives behind the service secret provider rather than in Raft state.
-// LegacySealed is retained only so older snapshots/log entries that already
-// contain sealed bytes can still be opened during rolling upgrades.
+// placement spec. It carries a secret provider reference only — the encrypted
+// secret payload lives behind the service secret provider, never in Raft
+// state. There is deliberately no field for raw sealed bytes: the raft log
+// and FSM snapshots are not erasable per-sandbox, so making the field
+// unrepresentable is what enforces the "no secret material in the log" rule.
 type PlacementSecrets struct {
-	Ref          string `json:"ref,omitempty"`
-	Version      int    `json:"version,omitempty"`
-	LegacySealed []byte `json:"legacy_sealed,omitempty"`
+	Ref     string `json:"ref,omitempty"`
+	Version int    `json:"version,omitempty"`
 }
 
 func (s PlacementSecrets) hasUpdate() bool {
-	return s.Ref != "" || s.Version != 0 || s.LegacySealed != nil
+	return s.Ref != "" || s.Version != 0
 }
 
 func secretsFromPlacement(p Placement) PlacementSecrets {
 	return PlacementSecrets{
-		Ref:          p.SecretRef,
-		Version:      p.SecretVersion,
-		LegacySealed: cloneBytes(p.SealedSecrets),
+		Ref:     p.SecretRef,
+		Version: p.SecretVersion,
 	}
 }
 
@@ -209,9 +208,9 @@ func cloneBytes(in []byte) []byte {
 //
 // SecretRef/SecretVersion identify the secret provider record that can
 // rehydrate the redacted Spec on the owner or an authorized recovery target.
-// SealedSecrets is a legacy fallback for snapshots/logs written before the
-// reference model; new placement writes must leave it empty so Raft never
-// fans out secret material to every participant.
+// They are a handle, not secret material — raw sealed bytes have no field
+// anywhere in cluster state, so Raft can never fan secret material out to
+// every participant.
 //
 // ExposedPortRoute is the replicated routing intent for one exposed sandbox
 // port. Protocol drives which Caddy surface is used. HostPort is populated for
@@ -247,7 +246,6 @@ type Placement struct {
 	Spec              *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef         string                       `json:"secret_ref,omitempty"`
 	SecretVersion     int                          `json:"secret_version,omitempty"`
-	SealedSecrets     []byte                       `json:"sealed_secrets,omitempty"`
 	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
 	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
 	// CustomHostnames is the replicated set of user-bound hostnames pointing at
@@ -464,10 +462,6 @@ type Client interface {
 	// Empty when the sandbox was created without any private-registry / mount
 	// credentials, or when the placement predates secret replication.
 	SecretsOf(sandboxID string) PlacementSecrets
-
-	// SealedSecretsOf returns only the legacy sealed credential bag. New code
-	// should use SecretsOf; this method remains for older callsites/tests.
-	SealedSecretsOf(sandboxID string) []byte
 
 	// AddExposedPort records intent that sandboxID has port exposed. Raw TCP
 	// routes include HostPort so every ingress node can bind/proxy the same

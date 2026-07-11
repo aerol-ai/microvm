@@ -258,7 +258,6 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
-		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -273,7 +272,6 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
-		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -288,7 +286,6 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 		Spec:          spec,
 		SecretRef:     secrets.Ref,
 		SecretVersion: secrets.Version,
-		SealedSecrets: cloneBytes(secrets.LegacySealed),
 	})
 }
 
@@ -315,8 +312,6 @@ func (a *Agent) SecretsOf(sandboxID string) PlacementSecrets {
 	}
 	return secretsFromPlacement(lookup.Placement)
 }
-
-func (a *Agent) SealedSecretsOf(sandboxID string) []byte { return a.SecretsOf(sandboxID).LegacySealed }
 
 func (a *Agent) AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error {
 	if port <= 0 {
@@ -401,7 +396,6 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 		Spec:               redacted,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
-		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	})
 }
@@ -737,11 +731,10 @@ func (a *Agent) observePlacementVersion(version uint64) {
 }
 
 func (a *Agent) applyCommand(ctx context.Context, cmd command) error {
-	raftCmd, err := a.externalizeCommandRecovery(ctx, cmd)
-	if err != nil {
-		return fmt.Errorf("cluster agent: externalize recovery: %w", err)
+	if err := validateCommandRecoverySize(cmd); err != nil {
+		return err
 	}
-	payload, err := encodeCommand(raftCmd)
+	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}

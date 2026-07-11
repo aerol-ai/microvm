@@ -218,7 +218,6 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 					Version:           12,
 					SecretRef:         "cluster-secret://sandbox/sb-state/v1",
 					SecretVersion:     3,
-					SealedSecrets:     []byte("sealed"),
 					ExposedPortRoutes: map[int]ExposedPortRoute{5432: {Protocol: "tcp", HostPort: 22432, PublicURL: "tcp://sandbox.example.com:22432"}},
 				},
 				Owner: OwnerInfo{NodeID: "server-1", APIURL: "http://server-1"},
@@ -255,11 +254,8 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 		t.Fatalf("PlacementVersion() = %d, want 12", got)
 	}
 	secrets := agent.SecretsOf("sb-state")
-	if secrets.Ref != "cluster-secret://sandbox/sb-state/v1" || secrets.Version != 3 || string(secrets.LegacySealed) != "sealed" {
+	if secrets.Ref != "cluster-secret://sandbox/sb-state/v1" || secrets.Version != 3 {
 		t.Fatalf("SecretsOf() = %+v, want replicated secret handle", secrets)
-	}
-	if got := agent.SealedSecretsOf("sb-state"); string(got) != "sealed" {
-		t.Fatalf("SealedSecretsOf() = %q, want sealed", string(got))
 	}
 	routes := agent.ExposedPortsOf("sb-state")
 	if routes[5432].HostPort != 22432 || routes[5432].Protocol != "tcp" {
@@ -282,10 +278,7 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	if err := agent.ClaimOrphan(ctx, "sb-claim", nil, PlacementSecrets{}); err != nil {
 		t.Fatalf("ClaimOrphan() error = %v", err)
 	}
-	// LegacySealed forces the blob path: since Tier 2, a small secret-free
-	// spec stays inline in the raft command and produces no recovery blob
-	// (that contract is pinned in recovery_inline_test.go).
-	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{LegacySealed: []byte("sealed")}); err != nil {
+	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{}); err != nil {
 		t.Fatalf("UpsertSpec() error = %v", err)
 	}
 	if err := agent.AddExposedPort(ctx, "sb-port", 8080, ExposedPortRoute{Protocol: "http", PublicURL: "https://sandbox.example.com"}); err != nil {
@@ -326,9 +319,11 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 		t.Fatal("ApplyEncoded() accepted invalid payload")
 	}
 
-	blobs := capture.recoveryBlobsSnapshot()
-	if len(blobs) != 1 || blobs[0].SandboxID != "sb-upsert" || blobs[0].Spec == nil || blobs[0].Spec.Image != "alpine:3.20" {
-		t.Fatalf("recovery blobs = %+v, want one upsert-spec blob", blobs)
+	// Payloads ride inline in the raft command — the agent must never push
+	// a recovery blob to the control plane. The capture arm stays as a
+	// tripwire: any PUT to the recovery path lands here.
+	if blobs := capture.recoveryBlobsSnapshot(); len(blobs) != 0 {
+		t.Fatalf("recovery blobs = %+v, want none (inline-only recovery)", blobs)
 	}
 	cmds := capture.commandsSnapshot()
 	if len(cmds) != 10 {
@@ -347,8 +342,8 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 			t.Fatalf("captured commands missing op %d: %+v", op, cmds)
 		}
 	}
-	if upsert.RecoveryRef == "" || upsert.Spec != nil {
-		t.Fatalf("upsert command = %+v, want recovery ref externalized and nil spec", upsert)
+	if upsert.Spec == nil || upsert.Spec.Name != "named" {
+		t.Fatalf("upsert command = %+v, want inline spec (payloads ride the raft entry)", upsert)
 	}
 	paths := capture.removeMemberPathsSnapshot()
 	if len(paths) != 2 || paths[0] != "/v1/cluster/members/node-a?force=true" || paths[1] != "/v1/cluster/members/missing" {

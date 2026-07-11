@@ -508,21 +508,6 @@ func TestClusterInternalPlacementsPage_Success(t *testing.T) {
 	}
 }
 
-func TestClusterInternalRecoveryPut_RefMismatch(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
-	svc.AttachCluster(&recoveryBlobStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")})
-	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
-
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, "/v1/cluster/internal/recovery/ref-a", strings.NewReader(`{"ref":"ref-b","payload":"x"}`))
-	req.SetPathValue("ref", "ref-a")
-	h.clusterInternalRecoveryPut(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rr.Code)
-	}
-}
-
 func TestClusterIngressRoute_NoAliveOwners(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)

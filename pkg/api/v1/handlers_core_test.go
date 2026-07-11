@@ -330,7 +330,6 @@ func TestRedactPlacementSecretFields(t *testing.T) {
 	p := &cluster.Placement{
 		SecretRef:     "ref123",
 		SecretVersion: 7,
-		SealedSecrets: []byte("secret"),
 		SandboxID:     "sb-1",
 	}
 	redactPlacementSecretFields(p)
@@ -339,9 +338,6 @@ func TestRedactPlacementSecretFields(t *testing.T) {
 	}
 	if p.SecretVersion != 0 {
 		t.Errorf("SecretVersion = %d, want 0 after redact", p.SecretVersion)
-	}
-	if p.SealedSecrets != nil {
-		t.Errorf("SealedSecrets = %v, want nil after redact", p.SealedSecrets)
 	}
 	// Non-secret field must be preserved.
 	if p.SandboxID != "sb-1" {

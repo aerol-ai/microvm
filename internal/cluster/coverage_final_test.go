@@ -74,17 +74,19 @@ func TestClusterApplyEncodedRejectsMissingRecoveryRef(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 5*time.Second)
 
+	// The leader-forward path re-runs the defensive size validation: an
+	// oversized inline payload must be rejected before it reaches raft.
 	payload, err := encodeCommand(command{
 		Op:          opPlace,
-		SandboxID:   "sb-missing-recovery",
+		SandboxID:   "sb-oversized-recovery",
 		OwnerNodeID: c.nodeID,
-		RecoveryRef: placementRecoveryRefPrefix + strings.Repeat("f", 64),
+		Spec:        oversizedSpec("oversized"),
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if err := c.ApplyEncoded(context.Background(), payload); err == nil {
-		t.Fatal("ApplyEncoded() accepted missing recovery ref")
+	if err := c.ApplyEncoded(context.Background(), payload); !errors.Is(err, ErrRecoveryPayloadTooLarge) {
+		t.Fatalf("ApplyEncoded() oversized payload = %v, want ErrRecoveryPayloadTooLarge", err)
 	}
 }
 
@@ -425,19 +427,6 @@ func TestFSMClaimPendingReservationLockedIndexesReservedRow(t *testing.T) {
 	fsm.mu.Unlock()
 	if _, ok := fsm.reservedIndex["sb-res"]; !ok {
 		t.Fatal("reserved index missing after claimPendingReservationLocked")
-	}
-}
-
-func TestFSMHydrateCommandRecoveryBatchMissingRef(t *testing.T) {
-	fsm := newPlacementFSM()
-	cmd := command{
-		Op: opReserveBatch,
-		Reservations: []reservationCommand{
-			{SandboxID: "sb-batch", RecoveryRef: placementRecoveryRefPrefix + strings.Repeat("a", 64)},
-		},
-	}
-	if err := fsm.hydrateCommandRecovery(&cmd); err == nil {
-		t.Fatal("hydrateCommandRecovery() accepted missing batch recovery ref")
 	}
 }
 
@@ -903,22 +892,31 @@ func TestClusterPlacementsForShardsCustomCount(t *testing.T) {
 	}
 }
 
-func TestAgentApplyCommandExternalizeFailure(t *testing.T) {
+func TestAgentApplyCommandNoControlPlaneMembers(t *testing.T) {
 	agent := &Agent{
 		nodeID: "worker-self",
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{memberIndex: newGossipMemberIndex()},
 	}
-	// SealedSecrets force the blob path: since Tier 2, a small secret-free
-	// payload stays inline and never needs a recovery peer at externalize
-	// time (it would fail later, at the control-plane forward instead).
+	// Inline payloads need no recovery peer before the apply — with no
+	// control-plane members the command fails at the forward step, the only
+	// failure mode left on this path.
 	err := agent.applyCommand(context.Background(), command{
-		Op:            opPlace,
-		SandboxID:     "sb-no-recovery-peers",
-		Spec:          &models.CreateSandboxRequest{Image: "alpine"},
-		SealedSecrets: []byte("sealed"),
+		Op:        opPlace,
+		SandboxID: "sb-no-cp-members",
+		Spec:      &models.CreateSandboxRequest{Image: "alpine"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "no live server-role control-plane members") {
-		t.Fatalf("applyCommand() = %v, want recovery replication failure", err)
+		t.Fatalf("applyCommand() = %v, want control-plane forward failure", err)
+	}
+
+	// The defensive size cap fires before any forwarding.
+	err = agent.applyCommand(context.Background(), command{
+		Op:        opPlace,
+		SandboxID: "sb-agent-oversized",
+		Spec:      oversizedSpec("agent-oversized"),
+	})
+	if !errors.Is(err, ErrRecoveryPayloadTooLarge) {
+		t.Fatalf("applyCommand() oversized = %v, want ErrRecoveryPayloadTooLarge", err)
 	}
 }

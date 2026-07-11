@@ -1157,6 +1157,23 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	// Cluster mode carries the redacted spec inside the placement's raft log
+	// entry, which is size-capped (cluster.ValidateRecoveryPayloadSize) — there
+	// is no oversize fallback path. Reject here, before admission and container
+	// work, so the caller gets a clean 400 instead of a placement failure after
+	// the sandbox half-exists. The check includes this sandbox's deterministic
+	// secret ref even when the request carries no credentials: a later
+	// credential rotation attaches the handle via UpsertSpec and must not be
+	// blocked by a spec that barely fit without it. Cost: one JSON encode +
+	// SHA-256 of ≤4KiB (~µs), cluster mode only.
+	if s.cfg.EnableCluster {
+		redacted := RedactClusterSecrets(req)
+		handle := cluster.PlacementSecrets{Ref: clusterSecretRef(sandboxID, clusterSecretVersion), Version: clusterSecretVersion}
+		if err := cluster.ValidateRecoveryPayloadSize(sandboxID, &redacted, handle); err != nil {
+			return nil, fmt.Errorf("sandbox spec too large to replicate across the cluster (image, env, labels, and mount definitions all count): %w", err)
+		}
+	}
+
 	// Admission check uses normalized values (req.CPU/MemoryMB are guaranteed
 	// > 0 by normalizeCreateRequest above), so a default-sized request still
 	// counts against the host budget. Reservation happens here; every failure

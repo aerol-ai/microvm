@@ -9,33 +9,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// refCommandForTest replays the pre-Tier-2 externalize behavior byte-for-byte:
-// store the payload as a blob and strip it from the command. This is exactly
-// what an old-version emitter produces, so tests built on it double as the
-// mixed-version compatibility proof (old emitter → new voter).
-func refCommandForTest(t *testing.T, store placementRecoveryStore, cmd command) command {
-	t.Helper()
-	blob, err := newRecoveryBlob(cmd.SandboxID, placementRecovery{
-		Spec:          cmd.Spec,
-		SecretRef:     cmd.SecretRef,
-		SecretVersion: cmd.SecretVersion,
-		SealedSecrets: cloneBytes(cmd.SealedSecrets),
-	})
-	if err != nil {
-		t.Fatalf("newRecoveryBlob: %v", err)
-	}
-	if ref, err := store.Put(blob.SandboxID, blob.recovery()); err != nil || ref != blob.Ref {
-		t.Fatalf("seed blob: ref=%q err=%v, want %q", ref, err, blob.Ref)
-	}
-	cmd.Name = commandName(cmd)
-	cmd.RecoveryRef = blob.Ref
-	cmd.Spec = nil
-	cmd.SecretRef = ""
-	cmd.SecretVersion = 0
-	cmd.SealedSecrets = nil
-	return cmd
-}
-
 // normalizePlacementTimes zeroes the wall-clock fields so placements applied
 // in different test runs (or across a second boundary) compare equal.
 func normalizePlacementTimes(p Placement) Placement {
@@ -44,57 +17,42 @@ func normalizePlacementTimes(p Placement) Placement {
 	return p
 }
 
-// TestFSMInlineAndRefPlaceProduceIdenticalState is the Tier 2 determinism
-// gate: the same create carried inline vs pre-externalized as a ref must
-// materialize identical FSM rows — including the content-addressed
-// RecoveryRef, because storePlacementLocked splits an inline payload into the
-// voter's local recovery store under the same ref the blob path would use.
-func TestFSMInlineAndRefPlaceProduceIdenticalState(t *testing.T) {
-	base := command{
+// TestFSMInlinePlaceSplitsPayloadToLocalStore pins the failover contract for
+// inline commands (the only kind that exists): applying an opPlace splits the
+// payload into the voter's LOCAL recovery store under a content-addressed
+// ref, so a later failover recreate reads it locally without any peer traffic.
+func TestFSMInlinePlaceSplitsPayloadToLocalStore(t *testing.T) {
+	fsm := newPlacementFSMWithRecoveryStore(newPlacementRecoveryMemoryStore())
+	if got := applyOp(t, fsm, command{
 		Op:            opPlace,
-		SandboxID:     "sb-parity",
+		SandboxID:     "sb-split",
 		OwnerNodeID:   "node-a",
 		OwnerAPIURL:   "http://a",
-		Spec:          &models.CreateSandboxRequest{Name: "parity", Image: "alpine:3.20"},
+		Spec:          &models.CreateSandboxRequest{Name: "split", Image: "alpine:3.20"},
 		SecretRef:     "provider-ref",
 		SecretVersion: 2,
+	}); got != nil {
+		t.Fatalf("apply: %v", got)
 	}
-
-	inlineFSM := newPlacementFSMWithRecoveryStore(newPlacementRecoveryMemoryStore())
-	if got := applyOp(t, inlineFSM, base); got != nil {
-		t.Fatalf("inline apply: %v", got)
-	}
-
-	refStore := newPlacementRecoveryMemoryStore()
-	refFSM := newPlacementFSMWithRecoveryStore(refStore)
-	if got := applyOp(t, refFSM, refCommandForTest(t, refStore, base)); got != nil {
-		t.Fatalf("ref apply: %v", got)
-	}
-
-	a, ok := inlineFSM.get("sb-parity")
+	p, ok := fsm.get("sb-split")
 	if !ok {
-		t.Fatal("inline placement missing")
+		t.Fatal("placement missing")
 	}
-	b, ok := refFSM.get("sb-parity")
-	if !ok {
-		t.Fatal("ref placement missing")
-	}
-	if !reflect.DeepEqual(normalizePlacementTimes(a), normalizePlacementTimes(b)) {
-		t.Fatalf("inline vs ref placement diverged:\ninline: %+v\nref:    %+v", a, b)
-	}
-	if a.RecoveryRef == "" {
+	if p.RecoveryRef == "" {
 		t.Fatal("inline apply did not split payload into the local recovery store")
 	}
-	// The failover contract: after an inline apply the voter holds the blob
-	// locally, same as if the blob mesh had pre-replicated it.
-	if _, ok, err := inlineFSM.recoveryStore.Get(a.RecoveryRef); err != nil || !ok {
-		t.Fatalf("recovery blob missing locally after inline apply: ok=%v err=%v", ok, err)
+	rec, ok, err := fsm.recoveryStore.Get(p.RecoveryRef)
+	if err != nil || !ok {
+		t.Fatalf("recovery payload missing locally after inline apply: ok=%v err=%v", ok, err)
+	}
+	if rec.Spec == nil || rec.Spec.Image != "alpine:3.20" || rec.SecretRef != "provider-ref" || rec.SecretVersion != 2 {
+		t.Fatalf("stored recovery payload diverged from the command: %+v", rec)
 	}
 }
 
 // TestFSMInlineSpecEnforcesNameUniqueness pins that the cluster-wide name
-// index derives from the inline spec (commandName falls back to specName), so
-// inline commands get the same duplicate-name rejection as ref commands.
+// index derives from the inline spec, so duplicate names are rejected at the
+// FSM regardless of which node emitted the create.
 func TestFSMInlineSpecEnforcesNameUniqueness(t *testing.T) {
 	fsm := newPlacementFSMWithRecoveryStore(newPlacementRecoveryMemoryStore())
 	if got := applyOp(t, fsm, command{
@@ -113,11 +71,11 @@ func TestFSMInlineSpecEnforcesNameUniqueness(t *testing.T) {
 	}
 }
 
-// TestFSMReplayMixedInlineAndRefEntries pins the replay contract for a log
-// that interleaves inline and ref entries (the steady state of a
-// mixed-version cluster): a restarted FSM replaying the same entries against
-// the same recovery store converges to identical state.
-func TestFSMReplayMixedInlineAndRefEntries(t *testing.T) {
+// TestFSMReplayInlineEntries pins the replay contract: a restarted FSM
+// replaying the same inline entries against the same recovery store converges
+// to identical state, and a payload-free promote (the realistic
+// RecordPlacement-after-reserve shape) preserves the reservation's spec.
+func TestFSMReplayInlineEntries(t *testing.T) {
 	store := newPlacementRecoveryMemoryStore()
 	expiry := time.Now().Add(5 * time.Minute).Unix()
 	entries := []command{
@@ -125,12 +83,10 @@ func TestFSMReplayMixedInlineAndRefEntries(t *testing.T) {
 			Op: opReserve, SandboxID: "sb-a", OwnerNodeID: "node-a", ExpiresUnix: expiry,
 			Spec: &models.CreateSandboxRequest{Name: "a", Image: "alpine:3.20"}, SecretRef: "ra", SecretVersion: 1,
 		},
-		refCommandForTest(t, store, command{
+		{
 			Op: opReserve, SandboxID: "sb-b", OwnerNodeID: "node-b", ExpiresUnix: expiry,
-			Spec: oversizedSpec("b"),
-		}),
-		// Promotes carry no payload — the realistic RecordPlacement-after-
-		// reserve shape; the spec must be preserved from the reservation row.
+			Spec: &models.CreateSandboxRequest{Name: "b", Image: "debian:12"},
+		},
 		{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-a"},
 		{Op: opPlace, SandboxID: "sb-b", OwnerNodeID: "node-b"},
 	}
@@ -165,50 +121,10 @@ func TestFSMReplayMixedInlineAndRefEntries(t *testing.T) {
 	if a1.State != PlacementStatePlaced || a1.Spec == nil || a1.Spec.Image != "alpine:3.20" {
 		t.Fatalf("inline-reserved spec not preserved through promote: %+v", a1)
 	}
-	if b1.State != PlacementStatePlaced || b1.Spec == nil || len(b1.Spec.Image) <= inlineRecoveryMaxBytes {
-		t.Fatalf("ref-reserved spec not preserved through promote: %+v", b1)
+	if a1.SecretRef != "ra" || a1.SecretVersion != 1 {
+		t.Fatalf("secret handle not preserved through promote: %+v", a1)
 	}
-}
-
-// TestFSMThresholdCrossingReserveAndPlaceConverge pins the §5 edge: a
-// sandbox whose payload crosses inlineRecoveryMaxBytes between reserve and
-// place (or the reverse) still converges — both shapes are valid per-command.
-func TestFSMThresholdCrossingReserveAndPlaceConverge(t *testing.T) {
-	store := newPlacementRecoveryMemoryStore()
-	fsm := newPlacementFSMWithRecoveryStore(store)
-	expiry := time.Now().Add(5 * time.Minute).Unix()
-
-	// Inline reserve → ref place.
-	if got := applyOp(t, fsm, command{
-		Op: opReserve, SandboxID: "sb-x", OwnerNodeID: "node-a", ExpiresUnix: expiry,
-		Spec: &models.CreateSandboxRequest{Name: "cross-x", Image: "alpine:3.20"},
-	}); got != nil {
-		t.Fatalf("inline reserve: %v", got)
-	}
-	if got := applyOp(t, fsm, refCommandForTest(t, store, command{
-		Op: opPlace, SandboxID: "sb-x", OwnerNodeID: "node-a",
-		Spec: oversizedSpec("cross-x"),
-	})); got != nil {
-		t.Fatalf("ref place: %v", got)
-	}
-	if p, _ := fsm.get("sb-x"); p.State != PlacementStatePlaced || p.Spec == nil || len(p.Spec.Image) <= inlineRecoveryMaxBytes {
-		t.Fatalf("inline→ref crossing did not converge on the placed spec: %+v", p)
-	}
-
-	// Ref reserve → inline place.
-	if got := applyOp(t, fsm, refCommandForTest(t, store, command{
-		Op: opReserve, SandboxID: "sb-y", OwnerNodeID: "node-b", ExpiresUnix: expiry,
-		Spec: oversizedSpec("cross-y"),
-	})); got != nil {
-		t.Fatalf("ref reserve: %v", got)
-	}
-	if got := applyOp(t, fsm, command{
-		Op: opPlace, SandboxID: "sb-y", OwnerNodeID: "node-b",
-		Spec: &models.CreateSandboxRequest{Name: "cross-y", Image: "alpine:3.20"},
-	}); got != nil {
-		t.Fatalf("inline place: %v", got)
-	}
-	if p, _ := fsm.get("sb-y"); p.State != PlacementStatePlaced || p.Spec == nil || p.Spec.Image != "alpine:3.20" {
-		t.Fatalf("ref→inline crossing did not converge on the placed spec: %+v", p)
+	if b1.State != PlacementStatePlaced || b1.Spec == nil || b1.Spec.Image != "debian:12" {
+		t.Fatalf("sb-b spec not preserved through promote: %+v", b1)
 	}
 }

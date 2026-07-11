@@ -38,7 +38,6 @@ type RecoveryBlob struct {
 	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef     string                       `json:"secret_ref,omitempty"`
 	SecretVersion int                          `json:"secret_version,omitempty"`
-	SealedSecrets []byte                       `json:"sealed_secrets,omitempty"`
 }
 
 type placementRecoveryGCManifest struct {
@@ -61,18 +60,6 @@ func newPlacementFSMWithFileRecovery(raftDataDir string) (*placementFSM, error) 
 	return newPlacementFSMWithRecoveryStore(store), nil
 }
 
-func newRecoveryBlob(sandboxID string, rec placementRecovery) (RecoveryBlob, error) {
-	record := placementRecoveryStoreRecord{
-		SandboxID: sandboxID,
-		Recovery:  clonePlacementRecovery(rec),
-	}
-	ref, _, err := encodePlacementRecoveryRecord(record)
-	if err != nil {
-		return RecoveryBlob{}, err
-	}
-	return recoveryBlobFromRecord(ref, record), nil
-}
-
 func recoveryBlobFromRecord(ref string, record placementRecoveryStoreRecord) RecoveryBlob {
 	return RecoveryBlob{
 		Ref:           ref,
@@ -80,7 +67,6 @@ func recoveryBlobFromRecord(ref string, record placementRecoveryStoreRecord) Rec
 		Spec:          cloneCreateSandboxRequest(record.Recovery.Spec),
 		SecretRef:     record.Recovery.SecretRef,
 		SecretVersion: record.Recovery.SecretVersion,
-		SealedSecrets: cloneBytes(record.Recovery.SealedSecrets),
 	}
 }
 
@@ -89,7 +75,6 @@ func (b RecoveryBlob) recovery() placementRecovery {
 		Spec:          cloneCreateSandboxRequest(b.Spec),
 		SecretRef:     b.SecretRef,
 		SecretVersion: b.SecretVersion,
-		SealedSecrets: cloneBytes(b.SealedSecrets),
 	}
 }
 

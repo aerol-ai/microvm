@@ -719,7 +719,6 @@ func redactPlacementSecretFields(p *cluster.Placement) {
 	}
 	p.SecretRef = ""
 	p.SecretVersion = 0
-	p.SealedSecrets = nil
 }
 
 // clusterDestroyWrap runs the local destroy then deletes the placement
@@ -1183,39 +1182,13 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+// clusterRecoveryBlobStore is the read-only surface behind the recovery GET
+// endpoint. It exists so a snapshot-joined voter can fetch payloads its
+// snapshot references but its local store lacks (fetch-on-miss) — the only
+// remaining remote-recovery traffic now that payloads ride inline in raft
+// commands. There is deliberately no PUT half: nothing pushes blobs anymore.
 type clusterRecoveryBlobStore interface {
-	StoreRecoveryBlob(context.Context, cluster.RecoveryBlob) error
 	RecoveryBlob(context.Context, string) (cluster.RecoveryBlob, bool, error)
-}
-
-func (h *handlers) clusterInternalRecoveryPut(w http.ResponseWriter, r *http.Request) {
-	ref := strings.TrimSpace(r.PathValue("ref"))
-	if ref == "" {
-		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref required")
-		return
-	}
-	c, ok := h.deps.Service.Cluster().(clusterRecoveryBlobStore)
-	if !ok {
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: recovery store unavailable on this node")
-		return
-	}
-	var blob cluster.RecoveryBlob
-	if err := apihttp.DecodeJSON(w, r, &blob); err != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	if blob.Ref == "" {
-		blob.Ref = ref
-	}
-	if blob.Ref != ref {
-		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref mismatch")
-		return
-	}
-	if err := c.StoreRecoveryBlob(r.Context(), blob); err != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handlers) clusterInternalRecoveryGet(w http.ResponseWriter, r *http.Request) {

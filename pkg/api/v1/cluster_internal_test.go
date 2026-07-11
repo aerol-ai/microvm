@@ -113,17 +113,9 @@ func TestClusterInternalHandlers_BasicCoverage(t *testing.T) {
 		}
 	})
 
-	t.Run("recovery_put_get_unavailable", func(t *testing.T) {
+	t.Run("recovery_get_unavailable", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPut, "/v1/cluster/internal/recovery/ref-1", strings.NewReader(`{"ref":"ref-1"}`))
-		req.SetPathValue("ref", "ref-1")
-		h.clusterInternalRecoveryPut(rr, req)
-		if rr.Code != http.StatusServiceUnavailable {
-			t.Fatalf("put status = %d, want 503", rr.Code)
-		}
-
-		rr = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodGet, "/v1/cluster/internal/recovery/ref-1", nil)
+		req := httptest.NewRequest(http.MethodGet, "/v1/cluster/internal/recovery/ref-1", nil)
 		req.SetPathValue("ref", "ref-1")
 		h.clusterInternalRecoveryGet(rr, req)
 		if rr.Code != http.StatusServiceUnavailable {
