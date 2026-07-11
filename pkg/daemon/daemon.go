@@ -150,6 +150,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err != nil {
 		return fmt.Errorf("create netrules manager: %w", err)
 	}
+	if rules.Enabled() {
+		netrules.WarnIfLegacyIptables(cfg.NetrulesBackend, logger)
+	}
 
 	dockerClient, err := docker.New(logger, cfg, rules)
 	if err != nil {
