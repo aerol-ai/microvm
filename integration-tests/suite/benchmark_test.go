@@ -225,6 +225,16 @@ func benchClusterMembers(c *harness.Client) (capacityView, error) {
 	return members, nil
 }
 
+// benchClusterRuntime maps a UC-94 row name to the runtime string cluster
+// gossip advertises in supported_runtimes. docker-cold is a pool-ineligible
+// docker variant for the bench artifact, not a distinct engine.
+func benchClusterRuntime(runtime string) string {
+	if runtime == "docker-cold" {
+		return "docker"
+	}
+	return runtime
+}
+
 func missingBenchRuntimeTargets(members capacityView, runtimes []benchRuntimeSpec) []string {
 	var missing []string
 	for _, spec := range runtimes {
@@ -236,12 +246,13 @@ func missingBenchRuntimeTargets(members capacityView, runtimes []benchRuntimeSpe
 }
 
 func benchHasRuntimeTarget(members capacityView, runtime string) bool {
+	clusterRT := benchClusterRuntime(runtime)
 	for _, m := range members.Members {
 		if !m.Alive || m.Drained || m.CapacityStale || !benchCanOwnSandbox(m.Role) || !m.Capacity.CanAdmit {
 			continue
 		}
 		for _, rt := range m.Capacity.SupportedRuntimes {
-			if rt == runtime {
+			if rt == clusterRT {
 				return true
 			}
 		}
