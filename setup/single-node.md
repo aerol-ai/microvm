@@ -196,6 +196,14 @@ The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon if
 `/health` fails. The daemon itself restarts on any non-zero exit
 (`Restart=always`, max 10 restarts per 5 min).
 
+**Switching the netrules backend** (`SB_NETRULES_BACKEND=exec|netlink` in
+`/etc/sandboxd/sandboxd.env`): check `iptables -V` first. On iptables-nft
+hosts (modern default) the backends interoperate and an in-place switch is
+safe. On iptables-legacy hosts the two backends write to different kernel
+tables and cannot remove each other's rules — destroy all sandboxes before
+flipping, or recycled container IPs inherit stale egress rules. sandboxd
+logs a boot warning when it detects this combination.
+
 ---
 
 ## What's on disk

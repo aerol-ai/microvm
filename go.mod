@@ -24,7 +24,22 @@ require (
 	oras.land/oras-go/v2 v2.6.1
 )
 
-require github.com/opencontainers/go-digest v1.0.0
+require (
+	github.com/google/nftables v0.3.0
+	github.com/hashicorp/raft-wal v0.4.2
+	github.com/opencontainers/go-digest v1.0.0
+)
+
+require (
+	github.com/benbjohnson/immutable v0.4.0 // indirect
+	github.com/coreos/etcd v3.3.27+incompatible // indirect
+	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect
+	github.com/coreos/pkg v0.0.0-20220810130054-c7d1c02cb6cf // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
+	github.com/mdlayher/socket v0.5.0 // indirect
+	golang.org/x/exp v0.0.0-20220827204233-334a2380cb91 // indirect
+)
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect
@@ -60,7 +75,7 @@ require (
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/miekg/dns v1.1.72
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
-	go.etcd.io/bbolt v1.3.5 // indirect
+	go.etcd.io/bbolt v1.3.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.44.0

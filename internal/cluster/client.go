@@ -186,27 +186,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// fail handshake in exactly one way (chain mismatch) regardless of which
 	// channel they hit.
 	if clusterTLS != nil {
-		mtlsTransport := &http.Transport{
-			TLSClientConfig: clusterTLS.clientConfig(),
-			// Disable connection reuse across leader changes so a
-			// stale TLS session can't pin us to a former leader.
-			DisableKeepAlives: false,
-			MaxIdleConns:      4,
-			IdleConnTimeout:   30 * time.Second,
-		}
 		c.internalClient = &http.Client{
 			Timeout:   commitTimeout + 2*time.Second,
-			Transport: mtlsTransport,
+			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
-		// Owner API forwards (ReverseProxy) share the same TLS config but get
-		// a higher per-host idle pool — they're the steady-state hot path
-		// across cluster-internal hops, not the bursty raft leader-forward.
-		c.mtlsProxies = newProxyCache(&http.Transport{
-			TLSClientConfig:     clusterTLS.clientConfig(),
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		})
+		c.mtlsProxies = newProxyCache(newMTLSProxyTransport(clusterTLS.clientConfig()))
 		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger)
 		if err != nil {
 			_ = rn.Close()

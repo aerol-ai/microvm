@@ -282,7 +282,10 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	if err := agent.ClaimOrphan(ctx, "sb-claim", nil, PlacementSecrets{}); err != nil {
 		t.Fatalf("ClaimOrphan() error = %v", err)
 	}
-	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{}); err != nil {
+	// LegacySealed forces the blob path: since Tier 2, a small secret-free
+	// spec stays inline in the raft command and produces no recovery blob
+	// (that contract is pinned in recovery_inline_test.go).
+	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{LegacySealed: []byte("sealed")}); err != nil {
 		t.Fatalf("UpsertSpec() error = %v", err)
 	}
 	if err := agent.AddExposedPort(ctx, "sb-port", 8080, ExposedPortRoute{Protocol: "http", PublicURL: "https://sandbox.example.com"}); err != nil {

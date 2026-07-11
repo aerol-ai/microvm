@@ -76,6 +76,48 @@ func requireBenchEnabled(t *testing.T) {
 	}
 }
 
+// verifyNetrulesBackend fails the benchmark when the cluster is not running
+// the netrules backend named in AEROL_BENCH_EXPECT_NETRULES (exec|netlink).
+// SB_NETRULES_BACKEND is node-side provisioning config the bench cannot set
+// from here — without this gate a run intended to measure the netlink backend
+// (plans/warm-create-latency-tier1.md Phase 1) silently benches exec and the
+// numbers look plausible. Scrapes aerolvm_netrules_backend from /v1/metrics;
+// the scrape sees the node that answers it, which stands for the cluster
+// because provisioning applies one .env template to every node. Unset env
+// means no expectation — the gate is opt-in per run.
+func verifyNetrulesBackend(t *testing.T, c *harness.Client) {
+	t.Helper()
+	want := strings.ToLower(strings.TrimSpace(os.Getenv("AEROL_BENCH_EXPECT_NETRULES")))
+	if want == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body, err := c.GetText(ctx, "/v1/metrics")
+	if err != nil {
+		t.Fatalf("bench gate: scrape /v1/metrics for netrules backend: %v", err)
+	}
+	needle := fmt.Sprintf("aerolvm_netrules_backend{key=%q}", want)
+	var seen []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "aerolvm_netrules_backend{") {
+			continue
+		}
+		seen = append(seen, line)
+		if strings.HasPrefix(line, needle) && !strings.HasSuffix(line, " 0") {
+			t.Logf("bench gate: netrules backend %q confirmed (%s)", want, line)
+			return
+		}
+	}
+	report := strings.Join(seen, "; ")
+	if report == "" {
+		report = "metric absent — server build predates aerolvm_netrules_backend"
+	}
+	t.Fatalf("bench gate: cluster is not running netrules backend %q — set SB_NETRULES_BACKEND on the nodes and restart sandboxd (server reports: %s)",
+		want, report)
+}
+
 // benchRuntimeAllowed reports whether rt should be swept. AEROL_BENCH_RUNTIMES
 // (comma-separated, e.g. "docker,wasm") narrows the sweep — to isolate one
 // runtime or skip firecracker's slow cold-boots so a run actually finishes.
@@ -629,6 +671,7 @@ func TestBenchCreateLatency(t *testing.T) {
 	harness.Require(t, sc, "UC-94")
 	requireBenchEnabled(t)
 	c := client(t)
+	verifyNetrulesBackend(t, c)
 	samples := benchEnvInt("AEROL_BENCH_SAMPLES", 10)
 	runtimes := selectedBenchRuntimes(t)
 	if len(runtimes) == 0 {
@@ -696,6 +739,125 @@ func TestBenchCreateLatency(t *testing.T) {
 			ls.Runp50MS, ls.Runp90MS, ls.Runp99MS, len(apiD), failures)
 	}
 	writeBenchArtifact(t, report)
+}
+
+// UC-94-sparse — same create latency sweep as UC-94, but with a long gap
+// between samples so the image-ID TTL cache would go cold without the
+// Client-owned warm loop (plans/warm-create-latency-tier1.md Phase 2).
+// Gate: warm hits must not record docker_image (resolve) and warm server
+// p50 must stay ≤ 30ms on the standard topology.
+func TestBenchCreateLatencySparse(t *testing.T) {
+	harness.Require(t, sc, "UC-94")
+	requireBenchEnabled(t)
+	if os.Getenv("AEROL_BENCH_SPARSE") != "1" {
+		t.Skip("sparse benchmark disabled: set AEROL_BENCH_SPARSE=1 (one create per ≥15s)")
+	}
+	c := client(t)
+	verifyNetrulesBackend(t, c)
+	samples := benchEnvInt("AEROL_BENCH_SAMPLES", 10)
+	gap := benchEnvDuration("AEROL_BENCH_SPARSE_GAP", 15*time.Second)
+	runtimes := selectedBenchRuntimes(t)
+	// Sparse gate is about the warm docker hit path.
+	var dockerOnly []benchRuntimeSpec
+	for _, br := range runtimes {
+		if br.runtime == "docker" {
+			dockerOnly = append(dockerOnly, br)
+		}
+	}
+	if len(dockerOnly) == 0 {
+		t.Skip("sparse bench requires docker runtime")
+	}
+	waitBenchmarkReady(t, c, dockerOnly)
+	dockerOnly = prepareBenchmarkRuntimes(t, c, dockerOnly)
+	warmBenchmarkRuntimes(t, c, dockerOnly)
+	waitDockerPoolWarm(t, c, dockerOnly)
+
+	var report benchReport
+	for _, br := range dockerOnly {
+		var apiD, runD, serverD []time.Duration
+		stageD := map[string][]time.Duration{}
+		failures := 0
+		resolveHits := 0
+		warmHits := 0
+		for i := 0; i < samples; i++ {
+			if i > 0 {
+				t.Logf("sparse gap %s before sample %d", gap, i)
+				time.Sleep(gap)
+			}
+			opts := benchCreateOptions(t, br)
+			start := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			sb, err := c.SDK().Create(ctx, opts)
+			apiElapsed := time.Since(start)
+			cancel()
+			if err != nil {
+				failures++
+				t.Logf("sparse[%s] sample %d create failed: %v", br.runtime, i, err)
+				continue
+			}
+			id := sb.ID
+			t.Cleanup(func() { destroyBest(c, id) })
+			if waitRunningTimed(t, sb) {
+				runD = append(runD, time.Since(start))
+			} else {
+				failures++
+			}
+			apiD = append(apiD, apiElapsed)
+			if ms, ok := c.LastServerCreateMS(); ok {
+				serverD = append(serverD, time.Duration(ms*float64(time.Millisecond)))
+			}
+			if stages, ok := c.LastServerCreateStages(); ok {
+				for name, ms := range stages {
+					stageD[name] = append(stageD[name], time.Duration(ms*float64(time.Millisecond)))
+				}
+				if _, hasPool := stages["docker_pool"]; hasPool {
+					warmHits++
+					if _, hasImg := stages["docker_image"]; hasImg {
+						resolveHits++
+					}
+				}
+			}
+		}
+		if len(apiD) == 0 {
+			t.Errorf("sparse[%s]: every create sample failed", br.runtime)
+			continue
+		}
+		ls := summarize(br.runtime+"-sparse", samples, failures, apiD, runD, serverD)
+		ls.Stages = summarizeStages(stageD)
+		report.Latency = append(report.Latency, ls)
+		t.Logf("sparse[%s] server p50=%dms | warm_hits=%d resolve_on_warm=%d (%d ok, %d fail)",
+			br.runtime, ls.Serverp50MS, warmHits, resolveHits, len(apiD), failures)
+		// The gates below must not pass vacuously: a run with zero warm hits
+		// or no Server-Timing data proves nothing about the warm path, which
+		// is the entire point of the sparse sweep.
+		if warmHits == 0 {
+			t.Errorf("sparse gate: no warm pool hits across %d samples — pool drained or Server-Timing missing docker_pool", len(apiD))
+		}
+		if len(serverD) == 0 {
+			t.Errorf("sparse gate: no Server-Timing create durations captured across %d samples", len(apiD))
+		}
+		// Allow a single resolve for a racey first sample; more than that
+		// means the warm loop is not keeping the cache hot.
+		if resolveHits > 1 {
+			t.Errorf("sparse gate: docker_image resolve on %d/%d warm hits (want ~0)", resolveHits, warmHits)
+		}
+		if len(serverD) > 0 && ls.Serverp50MS > 30 {
+			t.Errorf("sparse gate: warm server p50=%dms want ≤30ms", ls.Serverp50MS)
+		}
+	}
+	writeBenchArtifact(t, report)
+}
+
+func benchEnvDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }
 
 // summarize folds raw samples into a latencyStats row.

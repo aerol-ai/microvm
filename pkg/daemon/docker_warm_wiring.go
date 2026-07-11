@@ -80,6 +80,11 @@ func wireDockerWarmPool(ctx context.Context, cfg config.Config, logger *slog.Log
 	}
 	go dockerpool.RunRefill(ctx, pool, refillCfg, spawner, gate, logger)
 
+	// Keep the image-ID TTL cache permanently warm for pool-eligible images
+	// so sparse creates never pay the ~45ms engine resolve. Interval must
+	// stay below imageIDCacheTTL (asserted inside StartImageIDCacheWarmer).
+	dockerClient.StartImageIDCacheWarmer(ctx, pool, cfg.DockerPoolRefillInterval, logger)
+
 	logger.Info("docker warm pool enabled",
 		"depth", cfg.DockerPoolDepth,
 		"max_images", cfg.DockerPoolMaxImages,

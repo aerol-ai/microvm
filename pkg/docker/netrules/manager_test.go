@@ -1,11 +1,14 @@
 package netrules
 
 import (
+	"errors"
+	"expvar"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -148,12 +151,6 @@ func TestManagerEnabledErrors(t *testing.T) {
 			wantErr: "insert egress rule",
 		},
 		{
-			name:    "egress_delete_error",
-			fail:    "delete",
-			run:     func() error { return mgr.ClearBlockAllEgress("10.0.0.2") },
-			wantErr: "delete egress rule",
-		},
-		{
 			name:    "ingress_exists_error",
 			fail:    "check",
 			run:     func() error { return mgr.BlockAllIngress("10.0.0.3") },
@@ -165,12 +162,10 @@ func TestManagerEnabledErrors(t *testing.T) {
 			run:     func() error { return mgr.BlockAllIngress("10.0.0.3") },
 			wantErr: "insert ingress rule",
 		},
-		{
-			name:    "ingress_delete_error",
-			fail:    "delete",
-			run:     func() error { return mgr.ClearBlockAllIngress("10.0.0.3") },
-			wantErr: "delete ingress rule",
-		},
+		// delete failures on an absent rule are no longer fatal: the Exists
+		// fallback confirms the rule is gone (netlink ENOENT path). Genuine
+		// delete failures while the rule still exists are covered by
+		// TestClearLoopDeleteErrorWhenStillPresent.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("FAKE_IPTABLES_FAIL", tc.fail)
@@ -188,6 +183,7 @@ func TestManagerEnabledErrors(t *testing.T) {
 // word it differently, and the Manager must terminate its duplicate-sweep
 // loops on both.
 type memBackend struct {
+	mu        sync.Mutex
 	rules     []string
 	deleteErr error
 }
@@ -197,15 +193,21 @@ func memKey(table, chain string, spec ...string) string {
 }
 
 func (m *memBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return slices.Contains(m.rules, memKey(table, chain, spec...)), nil
 }
 
 func (m *memBackend) Insert(table, chain string, _ int, spec ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.rules = append(m.rules, memKey(table, chain, spec...))
 	return nil
 }
 
 func (m *memBackend) Delete(table, chain string, spec ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	k := memKey(table, chain, spec...)
 	for i, r := range m.rules {
 		if r == k {
@@ -217,6 +219,24 @@ func (m *memBackend) Delete(table, chain string, spec ...string) error {
 		return m.deleteErr
 	}
 	return errNoMatch{}
+}
+
+func (m *memBackend) ruleCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.rules)
+}
+
+func (m *memBackend) countMatching(substr string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.rules {
+		if strings.Contains(r, substr) {
+			n++
+		}
+	}
+	return n
 }
 
 type errNoMatch struct{}
@@ -287,6 +307,103 @@ func TestRuleNotExist(t *testing.T) {
 	}
 	if ruleNotExist(os.ErrPermission) {
 		t.Fatal("unrelated error must not read as not-exist")
+	}
+}
+
+// countingBackend tracks Delete/Exists call counts for the clear-loop
+// regression suite (exec path must stay at 2 Delete / 0 Exists).
+type countingBackend struct {
+	memBackend
+	mu      sync.Mutex
+	deletes int
+	exists  int
+}
+
+func (c *countingBackend) Exists(table, chain string, spec ...string) (bool, error) {
+	c.mu.Lock()
+	c.exists++
+	c.mu.Unlock()
+	return c.memBackend.Exists(table, chain, spec...)
+}
+
+func (c *countingBackend) Delete(table, chain string, spec ...string) error {
+	c.mu.Lock()
+	c.deletes++
+	c.mu.Unlock()
+	return c.memBackend.Delete(table, chain, spec...)
+}
+
+func TestClearLoopExecNoRegression(t *testing.T) {
+	backend := &countingBackend{memBackend: memBackend{deleteErr: errNoMatch{}}}
+	mgr := NewWithBackend(backend)
+	if err := mgr.BlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	backend.deletes, backend.exists = 0, 0
+	if err := mgr.ClearBlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	// Present rule: one successful Delete + one not-exist probe. Exists must
+	// never fire when ruleNotExist already recognizes the error.
+	if backend.deletes != 2 || backend.exists != 0 {
+		t.Fatalf("exec clear: deletes=%d exists=%d, want 2/0", backend.deletes, backend.exists)
+	}
+}
+
+func TestClearLoopNetlinkAbsentRuleExistsFallback(t *testing.T) {
+	// Netlink ENOENT is unrecognized by ruleNotExist — Exists must confirm
+	// gone or the clear loop returns fatal (the manager.go:13 adopt bug).
+	backend := &countingBackend{memBackend: memBackend{
+		deleteErr: errNetlinkNoSuchFile{},
+	}}
+	mgr := NewWithBackend(backend)
+	if err := mgr.ClearBlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatalf("netlink absent-rule clear must terminate cleanly: %v", err)
+	}
+	if backend.deletes < 1 || backend.exists < 1 {
+		t.Fatalf("netlink clear: deletes=%d exists=%d, want ≥1 each", backend.deletes, backend.exists)
+	}
+
+	// Same for ingress + policy delete paths.
+	backend.deletes, backend.exists = 0, 0
+	if err := mgr.ClearBlockAllIngress("10.0.0.7"); err != nil {
+		t.Fatalf("ingress clear: %v", err)
+	}
+	backend.deletes, backend.exists = 0, 0
+	if err := mgr.ClearEgressPolicy("10.0.0.7", []string{"1.2.3.0/24"}, nil); err != nil {
+		t.Fatalf("policy clear: %v", err)
+	}
+}
+
+type errNetlinkNoSuchFile struct{}
+
+func (errNetlinkNoSuchFile) Error() string { return "no such file or directory" }
+
+type stickyDeleteBackend struct {
+	countingBackend
+	deleteFail error
+}
+
+func (s *stickyDeleteBackend) Delete(table, chain string, spec ...string) error {
+	s.deletes++
+	if s.deleteFail != nil {
+		return s.deleteFail
+	}
+	return s.memBackend.Delete(table, chain, spec...)
+}
+
+func TestClearLoopDeleteErrorWhenStillPresent(t *testing.T) {
+	backend := &stickyDeleteBackend{
+		countingBackend: countingBackend{memBackend: memBackend{}},
+		deleteFail:      os.ErrPermission,
+	}
+	mgr := NewWithBackend(backend)
+	if err := mgr.BlockAllEgress("10.0.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	// Rule still present (Delete always fails) → Exists=true → clear must error.
+	if err := mgr.ClearBlockAllEgress("10.0.0.7"); err == nil {
+		t.Fatal("expected delete error when rule still present")
 	}
 }
 
@@ -504,4 +621,74 @@ func contains(s, substr string) bool {
 		}
 		return false
 	}())
+}
+
+type errBackend struct {
+	existsErr error
+	insertErr error
+	deleteErr error
+}
+
+func (e *errBackend) Exists(string, string, ...string) (bool, error) { return false, e.existsErr }
+func (e *errBackend) Insert(string, string, int, ...string) error    { return e.insertErr }
+func (e *errBackend) Delete(string, string, ...string) error         { return e.deleteErr }
+
+func TestEnsureAndDeletePolicyRuleErrors(t *testing.T) {
+	t.Parallel()
+	mgr := NewWithBackend(&errBackend{existsErr: errors.New("exists boom")})
+	if err := mgr.ApplyEgressPolicy("10.0.0.7", []string{"1.1.1.1/32"}, nil); err == nil || !strings.Contains(err.Error(), "check egress policy rule") {
+		t.Fatalf("ensure exists err = %v", err)
+	}
+
+	mgr = NewWithBackend(&errBackend{insertErr: errors.New("insert boom")})
+	if err := mgr.ApplyEgressPolicy("10.0.0.7", nil, []string{"9.9.9.9/32"}); err == nil || !strings.Contains(err.Error(), "insert egress policy rule") {
+		t.Fatalf("ensure insert err = %v", err)
+	}
+
+	// deleteUntilGone: Delete errors, Exists also errors → surface Delete err wrapped.
+	mgr = NewWithBackend(&errBackend{
+		deleteErr: errors.New("delete boom"),
+		existsErr: errors.New("exists still failing"),
+	})
+	if err := mgr.ClearEgressPolicy("10.0.0.7", nil, []string{"9.9.9.9/32"}); err == nil || !strings.Contains(err.Error(), "delete egress policy rule") {
+		t.Fatalf("deletePolicyRule err = %v", err)
+	}
+}
+
+func TestNewWithOptionsDisabled(t *testing.T) {
+	t.Parallel()
+	m, err := NewWithOptions(false, BackendNetlink)
+	if err != nil || m.Enabled() {
+		t.Fatalf("disabled NewWithOptions = (%v,%v)", m, err)
+	}
+}
+
+func backendMetricValue(key string) int64 {
+	v, _ := backendSelected.Get(key).(*expvar.Int)
+	if v == nil {
+		return 0
+	}
+	return v.Value()
+}
+
+// Deliberately not parallel: exact-delta asserts on the shared expvar map
+// would race the parallel constructor tests above.
+func TestBackendSelectionMetric(t *testing.T) {
+	disabledBefore := backendMetricValue("disabled")
+	if _, err := NewWithOptions(false, BackendNetlink); err != nil {
+		t.Fatalf("NewWithOptions(disabled): %v", err)
+	}
+	if got := backendMetricValue("disabled") - disabledBefore; got != 1 {
+		t.Fatalf("disabled selection delta = %d, want 1", got)
+	}
+
+	// The exec/netlink constructor paths are linux-only; the recorder itself
+	// is what the bench gate reads, so pin its key names directly.
+	for _, name := range []string{BackendExec, BackendNetlink} {
+		before := backendMetricValue(name)
+		recordBackendSelected(name)
+		if got := backendMetricValue(name) - before; got != 1 {
+			t.Fatalf("%s selection delta = %d, want 1", name, got)
+		}
+	}
 }

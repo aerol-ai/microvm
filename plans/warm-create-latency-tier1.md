@@ -1,8 +1,20 @@
 # Warm create latency Tier 1: 43ms → ≤30ms acceptance (semantics-preserving)
 
-Status: **planned (not started)** (written 2026-07-11; revised after eng review
-2026-07-11; post-review addenda 2026-07-11: Phase 2 flush-race fence + §6
-Tier-1.5 overlap record). Successor to `plans/docker-warm-pool.md` §12, which shipped the
+Status: **implemented — bench gates RUN 2026-07-11 (live, 3× t3.medium,
+branch build, netlink, all-WAL): functional gates PASS, ≤30ms numeric gate
+FAILS at 40–44ms burst / 42ms sparse.** Per-stage: create leg
+(`create_with_id`) is **17ms** and sparse shows **zero `docker_image`
+resolves across 8 samples at 15s gaps** (Phase 1+2 working; seal overlapped
+to 0ms; p90 tail 362ms→48ms from Phases 2+4). The residual is
+`cluster_promote` at **23–25ms — identical on BoltDB and raft-wal**, so
+Phase 3's fsync premise does not hold: `applyCommand` synchronously
+replicates the recovery blob to every other member before the raft apply
+(`recovery_replication.go`, "twice per create"). Closing the gate needs that
+replication off the promote path — tracked in `TODOS.md`
+("cluster_promote is recovery-replication-bound"). Reports:
+`integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`
++ `cluster-3-mixed-docker-sparse-bench.json`.
+Successor to `plans/docker-warm-pool.md` §12, which shipped the
 warm-adopt fast path at **server p50 43ms** (v0.5.33). This plan removes the
 removable engine/consensus round-trips **without changing any idempotency or
 failover semantics**. The semantics-changing follow-ups (async rename, async
@@ -301,7 +313,16 @@ test server, covering both transports.
 
 ## 6. Deferred: Tier 1.5 overlap + Tier 3 async — entry-gated
 
-Not in scope. On record so the trade-offs are documented.
+**Tier 1.5 is now a standalone plan:**
+[`plans/warm-create-latency-tier1.5-seal-promote-overlap.md`](./warm-create-latency-tier1.5-seal-promote-overlap.md).
+**Revised 2026-07-11 after PR #306 review: the promote overlap described
+below was withdrawn** — promoting before the local create finishes releases
+the FSM pending-reservation accounting that per-worker backpressure, the
+SelectPlacement double-booking guard, and owner-watcher invisibility all
+depend on (see the Tier 1.5 plan §0). Shipped shape: seal-only overlap,
+sequential promote, ≤ 30ms gate preserved (~2–3ms win; the ≤ 20ms target
+needs a durable Creating FSM state — Tier 3 candidate). The summary below is
+the ORIGINAL full-overlap sketch, kept for history; do not implement it.
 
 **Tier 1.5 (recorded post-review 2026-07-11): overlap seal + promote with the
 local create — ~10ms, the path to ~18–20ms warm p50 without NVMe.** The
@@ -315,18 +336,19 @@ seal+promote concurrently with the local create and **join both before
 responding**: the response path becomes max(create, seal+promote) ≈ the create
 alone, and the client-visible guarantee holds (the FSM knows the owner before
 the client can act — unlike Tier-3 async promote below, which stops waiting).
-Why it is NOT in this plan: the failure matrix widens. Today rollback only
+Why it was split out of Tier 1: the failure matrix widens. Today rollback only
 handles promote-failed-**after**-create-succeeded
 (`cluster_handler.go:405-424`); the overlap adds
 promote-succeeded-but-create-**failed** — a `Placed` FSM entry with no
 container for the failure window. That needs a documented retraction rule
 (pr-review §4), an owner-watcher analysis of the transient Placed-but-missing
-state, and the full cluster-correctness call-out (pr-review §6). A small
-design doc, not a config flip. **Entry: Phases 1–4 landed + a want for
-sub-20ms server-side warm p50 without the NVMe topology.** Prerequisite first
-slice either way: attribute the ~5–6ms residual glue with finer Server-Timing
-stages (validate / keygen / admit / seal); if the seal is 2–3ms of it,
-overlapping the seal alone is a low-risk subset.
+state, and the full cluster-correctness call-out (pr-review §6) — now
+specified in the Tier 1.5 plan (Option A: sync `DeletePlacement`).
+**Entry: Phases 1–4 landed + a want for sub-20ms server-side warm p50 without
+the NVMe topology.** Prerequisite first slice either way: attribute the ~5–6ms
+residual glue with finer Server-Timing stages (validate / keygen / admit /
+seal); if the seal is 2–3ms of it, overlapping the seal alone is a low-risk
+subset (Tier 1.5 Phase A).
 
 Tier 3 (semantics-changing), on record:
 
@@ -372,14 +394,23 @@ here (p50 single-create never contends it), tracked in `TODOS.md`.
 | Today (v0.5.33, t3.medium + gp3) | 43ms | ~88ms (cache miss) | 78ms | — baseline |
 | Phases 1–4, standard topology | **≤ 30ms** | **≤ 30ms** | ≤ 45ms | **acceptance** |
 | NVMe topology (`plans/nvme-datadir.md`) | ≤ 25ms | ≤ 25ms | ≤ 35ms | not gated here |
-| (Tier 1.5 seal+promote overlap, §6) | ~18–20ms | ~18–20ms | — | not gated here |
+| (Tier 1.5 seal-only overlap, §6 — promote overlap withdrawn post-review) | ~27–28ms | ~27–28ms | — | not gated here |
 | (deferred Tier 3, for scale) | ~8–12ms | — | ~15–20ms | not gated here |
 
-Verification — **both** benches, run with `SB_NETRULES_BACKEND=netlink`:
+Verification — **both** benches, run with `SB_NETRULES_BACKEND=netlink` and
+`AEROL_BENCH_EXPECT_NETRULES=netlink` (added post-review 2026-07-11: the bench
+scrapes `aerolvm_netrules_backend` from `/v1/metrics` and fails unless the
+cluster actually runs the expected backend, so a run can't silently measure
+exec):
 - `make integration-benchmark-docker-only` (existing burst) — image cache warm.
 - **`make integration-benchmark-docker-sparse` (NEW)** — one create per 15s+,
   placement-spread across nodes. Gate: `docker_image;desc=resolve` on ~zero warm
   hits AND warm p50 ≤ 30ms. This is the only gate that exercises Phase 2.
+- **UC-98 egress enforcement probe (NEW, post-review 2026-07-11)** — a deny
+  rule must actually DROP traffic from inside a sandbox
+  (`integration-tests/suite/netrules_test.go`). Runs on any docker scenario
+  pass; this is the live nftables drop test the netlink backend was missing
+  (unit tests only prove argv→expression translation).
 
 Per-stage attribution via Server-Timing must show `docker_pool` ≤ 15ms and the
 promote share of the residual ≤ 5ms (`aerolvm_raft_apply_latency` /
@@ -406,11 +437,10 @@ Phase 3 (needs the Ansible rejoin cycle to roll out, one-way per node).
   moves the ≤25ms stretch, never the acceptance gate.
 - **Async rename / async promote** (Tier 3, §6) — semantics-changing, entry-gated
   on a sub-20ms product requirement.
-- **Seal+promote overlap with the local create** (Tier 1.5, §6) — awaits both
-  before responding so client semantics hold, but the
-  promote-succeeded/create-failed retraction needs its own design doc +
-  cluster-correctness call-out. Recorded in §6 with entry criteria; not scoped
-  here.
+- **Seal overlap with the local create** (Tier 1.5) — split to
+  [`plans/warm-create-latency-tier1.5-seal-promote-overlap.md`](./warm-create-latency-tier1.5-seal-promote-overlap.md).
+  Revised post-review: promote stays sequential (FSM pending accounting);
+  seal-only overlap, ≤ 30ms gate unchanged.
 - **`netrules` `Manager.mu` sharding** (`TODOS.md`) — concurrency ceiling; §6
   scopes p99/concurrency out; p50 never contends it.
 - **p99 / pool-sizing + single-flight refill** — hit-rate work, not hit-path;
@@ -468,31 +498,31 @@ parallelize within Lane A.
 Synthesized from this review's findings. Each task derives from a specific
 finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~3-4 days / CC: ~3h)** — netrules — Build the netlink `RuleBackend` incl. the iptables-argv→nft-expression translator + rule-equality
+- [x] **T1 (P1, human: ~3-4 days / CC: ~3h)** — netrules — Build the netlink `RuleBackend` incl. the iptables-argv→nft-expression translator + rule-equality
   - Surfaced by: Architecture / Outside voice — "RuleBackend is iptables-shaped; nftables is a translator, not a 3-method swap"
   - Files: `pkg/docker/netrules/` (new backend + translator), `pkg/docker/netrules/manager_test.go`
   - Verify: unit round-trip (Manager rule → nft expr → visible to `iptables -L`); tag-gated e2e drop proof
-- [ ] **T2 (P1, human: ~half day / CC: ~30min)** — netrules — Rework the three clear loops to delete-first + `Exists` fallback
+- [x] **T2 (P1, human: ~half day / CC: ~30min)** — netrules — Rework the three clear loops to delete-first + `Exists` fallback
   - Surfaced by: Code Quality — "netlink ENOENT unrecognized by `ruleNotExist` → clear loop fatal → adopt breaks (`manager.go:13` bug)"
   - Files: `pkg/docker/netrules/manager.go` (shared helper for `ClearBlockAllEgress:121`, `ClearBlockAllIngress:169`, `deletePolicyRule:275`)
   - Verify: **[REGRESSION]** netlink absent-rule clear terminates; exec no-regression (2 Delete, 0 Exists)
-- [ ] **T3 (P1, human: ~1 day / CC: ~1h)** — image-cache — Client-owned per-tick re-resolve warming loop + `RefillInterval < TTL` invariant + `Flush` generation fence
+- [x] **T3 (P1, human: ~1 day / CC: ~1h)** — image-cache — Client-owned per-tick re-resolve warming loop + `RefillInterval < TTL` invariant + `Flush` generation fence
   - Surfaced by: Architecture — "free-ride on Park fails the 15s sparse gate (10s TTL); needs unconditional per-tick re-resolve"; post-review — "warm `Put` can race an in-band `Flush` and re-install a stale ID"
   - Files: `pkg/docker/` (Client ticker + timing-free resolve), `pkg/docker/image_cache.go` (per-ref generation), reads `internal/pool/dockerpool` `ListTargets` (exists, `pool.go:372`)
   - Verify: warm-across-sparse-gap (fake clock), re-tag freshness, invariant, background-only (no boot-path timing stage), flush-race fence (stale `Put` dropped)
-- [ ] **T4 (P1, human: ~1 day / CC: ~40min)** — cluster — raft-wal log store + closable interface + format detection + mixed-format safety
+- [x] **T4 (P1, human: ~1 day / CC: ~40min)** — cluster — raft-wal log store + closable interface + format detection + mixed-format safety
   - Surfaced by: Architecture / Outside voice — "`raft.LogStore` lacks `Close`; detect→recover ordering; mixed-format & revert unstated"
   - Files: `internal/cluster/raft.go`, `internal/cluster/raft_recovery.go`, `go.mod`
   - Verify: WAL setup, restart round-trip, **[REGRESSION]** mixed-format recovery, detection unit, single-node no-op
-- [ ] **T5 (P2, human: ~20min / CC: ~5min)** — cluster — Raise idle-conn limits on BOTH `client.go:189` and `agent.go:135`
+- [x] **T5 (P2, human: ~20min / CC: ~5min)** — cluster — Raise idle-conn limits on BOTH `client.go:189` and `agent.go:135`
   - Surfaced by: Outside voice — "Phase 4 missed `agent.go`; followers do the forwarding"
   - Files: `internal/cluster/client.go`, `internal/cluster/agent.go`
   - Verify: connection-reuse test against counting test server, both transports
-- [ ] **T6 (P1, human: ~1 day / CC: ~45min)** — integration-tests — Add `make integration-benchmark-docker-sparse` gate
+- [x] **T6 (P1, human: ~1 day / CC: ~45min)** — integration-tests — Add `make integration-benchmark-docker-sparse` gate
   - Surfaced by: Performance — "burst bench keeps cache warm; Phase 2's win invisible and its regression untested"
   - Files: `integration-tests/suite/`, `Makefile`
   - Verify: gate — `docker_image;desc=resolve` on ~0 warm hits AND warm p50 ≤ 30ms under sparse load
-- [ ] **T7 (P3, human: ~15min / CC: ~3min)** — docs/rollout — Document Phase 3 as NOT in-place revertable (drain→rejoin, fresh DataDir)
+- [x] **T7 (P3, human: ~15min / CC: ~3min)** — docs/rollout — Document Phase 3 as NOT in-place revertable (drain→rejoin, fresh DataDir)
   - Surfaced by: Outside voice — "raft-wal not revertable; §9 claim was false"
   - Files: this plan §4/§9 (done), Ansible recovery runbook note
   - Verify: rollout doc names the one-way door + quorum-preserving order

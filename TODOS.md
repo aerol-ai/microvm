@@ -25,6 +25,74 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Start:** `Terraform/nodes.tf` + the node bootstrap template; add one
   optional NVMe bench scenario for the stretch gate (≤25ms).
 
+## netrules Manager mutex head-of-line blocking — DONE (PR #306)
+
+Shipped as per-IP refcounted locks in `pkg/docker/netrules/manager.go`
+(`lockIP`). Same-IP Exists+Insert mutual exclusion preserved; different IPs
+no longer serialize. See `ip_lock_test.go`.
+
+## cluster_promote is recovery-replication-bound, not fsync-bound (latency)
+
+- **What:** live bench 2026-07-11 (3× t3.medium, branch build, netlink):
+  `cluster_promote` p50 = 23ms on BoltDB and 25ms on raft-wal — the Phase 3
+  log-store swap moved nothing. `applyCommand` runs
+  `externalizeCommandRecovery` before every apply, which synchronously PUTs
+  the recovery blob to **every other member** (wall clock = slowest peer) —
+  the code comment in `recovery_replication.go` says it runs "twice per
+  create (opReserve and opPlace)". That, not the raft fsync, owns promote.
+- **Why it matters:** warm create;dur = create leg (~17ms, Tier 1 working) +
+  promote (~23ms) — the ≤30ms Tier 1 gate fails at 40-44ms until promote
+  sheds the sync replication. The api-side cost is bigger still: opReserve
+  pays the same replication before the create even starts.
+- **Plan:** `plans/warm-create-latency-tier2-recovery-replication.md` —
+  inline small secret-free payloads in the Raft command (the original wire
+  shape, so mixed-version-safe both directions); blob mesh remains only for
+  legacy sealed bytes / oversized specs. Raft-quorum durability is strictly
+  stronger than today's best-effort mesh for failover recreate.
+- **Status:** IMPLEMENTED 2026-07-11 (PR #307, stacked on PR #306):
+  `inlineRecoveryEligible` gate in `recovery_replication.go`, externalize-mode
+  metric, determinism-parity + replay + threshold-crossing regression tests.
+  **Remaining:** operator bench re-run (plan T4) to confirm `create;dur`
+  p50 ≤ 30ms / `cluster_promote` ≤ 8ms, then close this entry.
+- **Start (for the bench re-run):** `make integration-benchmark-docker-only`
+  + `-sparse` with `SB_NETRULES_BACKEND=netlink`, all-WAL raft; prior
+  artifacts `integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`.
+
+## netrules backend switch on iptables-legacy hosts — DONE
+
+Counter parity (`translator_linux.go`) makes exec↔netlink cleanup
+interoperate on iptables-nft hosts. For iptables-legacy hosts: sandboxd now
+logs a boot warning when `SB_NETRULES_BACKEND=netlink` meets a legacy
+iptables (`netrules.WarnIfLegacyIptables`, wired in `pkg/daemon`), and the
+drain-before-switch procedure is documented in `setup/single-node.md` +
+`packaging/.env.template`.
+
+## netlink live enforcement probe + bench backend gate — CODE DONE, live run pending
+
+Closed the two open PR #306 review findings 2026-07-11:
+- **UC-98** (`integration-tests/suite/netrules_test.go`): egress deny rule
+  must DROP real traffic from inside the sandbox (control sandbox proves the
+  target reachable; denied sandbox must time out; unrelated egress must flow).
+- **Bench backend gate**: `aerolvm_netrules_backend` expvar (exec | netlink |
+  disabled, recorded in `netrules.NewWithOptions`) + benches fail when
+  `AEROL_BENCH_EXPECT_NETRULES` doesn't match `/v1/metrics`.
+
+**Remaining:** both only prove things on a live cluster — fold into the next
+operator integration run (the Tier 2 T4 bench re-run is the natural slot:
+set `AEROL_BENCH_EXPECT_NETRULES=netlink`, UC-98 runs in the same suite pass).
+
+## Promote-fail rollback can leave a ghost Placed row (latent, cluster)
+
+- **Status:** fixed in Tier 1.5 (`OverlapCreateAndPromote` / self-wins
+  promote-fail now always `DeletePlacement`). See
+  `plans/warm-create-latency-tier1.5-seal-promote-overlap.md`.
+- **What was wrong:** promote-fail rollback in `cluster_handler.go` used
+  Destroy+CancelReservation only; `CancelReservation` is a no-op on Placed,
+  so an errored-but-committed Raft place left a ghost row until reconcile
+  (~5 min).
+- **Fix:** every promote-fail path (overlapped reserved + sequential
+  self-wins) calls `DeletePlacement`; reserved-path create-FAIL after
+  promote-OK retracts the same way.
 ## netrules Manager mutex head-of-line blocking
 
 - **What:** shard `Manager.mu` per-container-IP (or move to lock-free netlink

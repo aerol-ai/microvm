@@ -909,10 +909,14 @@ func TestAgentApplyCommandExternalizeFailure(t *testing.T) {
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{memberIndex: newGossipMemberIndex()},
 	}
+	// SealedSecrets force the blob path: since Tier 2, a small secret-free
+	// payload stays inline and never needs a recovery peer at externalize
+	// time (it would fail later, at the control-plane forward instead).
 	err := agent.applyCommand(context.Background(), command{
-		Op:        opPlace,
-		SandboxID: "sb-no-recovery-peers",
-		Spec:      &models.CreateSandboxRequest{Image: "alpine"},
+		Op:            opPlace,
+		SandboxID:     "sb-no-recovery-peers",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine"},
+		SealedSecrets: []byte("sealed"),
 	})
 	if err == nil || !strings.Contains(err.Error(), "no live server-role control-plane members") {
 		t.Fatalf("applyCommand() = %v, want recovery replication failure", err)

@@ -342,14 +342,39 @@ func (c *Client) resolveImageIDCached(ctx context.Context, imageRef string) (str
 	}
 	recordImageCacheMiss()
 	start := time.Now()
-	imageInspect, err := c.inspectImage(ctx, imageRef)
+	id, err := c.resolveImageID(ctx, imageRef)
 	if err != nil {
 		return "", err
 	}
 	CreateTimingFrom(ctx).RecordStageDesc("docker_image", time.Since(start), "resolve")
+	return id, nil
+}
+
+// resolveImageID is the timing-free engine inspect + Put used by the
+// background image-ID warm loop. Must not call CreateTimingFrom — a
+// background ctx has no create timing and would nil/mis-record a stage.
+func (c *Client) resolveImageID(ctx context.Context, imageRef string) (string, error) {
+	imageInspect, err := c.inspectImage(ctx, imageRef)
+	if err != nil {
+		return "", err
+	}
 	id := strings.TrimSpace(imageInspect.ID)
 	c.imageIDs.Put(imageRef, id)
 	return id, nil
+}
+
+// resolveImageIDForWarm is the warm-loop variant: snapshots the Flush
+// generation before inspect and only Puts when the generation is unchanged,
+// so an in-band Flush that races the warm tick cannot re-install a stale ID.
+func (c *Client) resolveImageIDForWarm(ctx context.Context, imageRef string) (string, bool, error) {
+	gen := c.imageIDs.Generation(imageRef)
+	imageInspect, err := c.inspectImage(ctx, imageRef)
+	if err != nil {
+		return "", false, err
+	}
+	id := strings.TrimSpace(imageInspect.ID)
+	ok := c.imageIDs.PutIfGeneration(imageRef, id, gen)
+	return id, ok, nil
 }
 
 func (c *Client) adoptParked(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, slot *dockerpool.ParkedSlot) (*SandboxRuntime, error) {
