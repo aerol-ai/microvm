@@ -81,9 +81,40 @@ func TestParseRulespecRejectsUnknown(t *testing.T) {
 		{"-s", "10.0.0.1"},
 		{"-j", "REJECT"},
 		{"-m", "state", "--state", "NEW", "-j", "DROP"},
+		{"-s"},                            // missing -s value
+		{"-d"},                            // missing -d value
+		{"-m"},                            // missing module
+		{"-m", "comment"},                 // missing --comment
+		{"-m", "comment", "--comment"},    // missing comment value
+		{"-j"},                            // missing verdict
+		{"-s", "not-an-ip", "-j", "DROP"}, // bad address
+		{"-d", "not-an-ip", "-j", "DROP"}, // bad -d
+		{"-j", "DROP"},                    // no -s/-d
 	} {
 		if _, err := parseRulespec(spec...); err == nil {
 			t.Fatalf("expected error for %v", spec)
 		}
+	}
+}
+
+func TestParseAddrOrCIDR(t *testing.T) {
+	t.Parallel()
+	n, err := parseAddrOrCIDR("10.1.2.3")
+	if err != nil || n.String() != "10.1.2.3/32" {
+		t.Fatalf("v4 = %v, %v", n, err)
+	}
+	n, err = parseAddrOrCIDR("2001:db8::1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ones, bits := n.Mask.Size()
+	if ones != 128 || bits != 128 {
+		t.Fatalf("v6 mask = %d/%d, want 128/128", ones, bits)
+	}
+	if _, err := parseAddrOrCIDR("nope"); err == nil {
+		t.Fatal("want invalid address")
+	}
+	if _, err := parseAddrOrCIDR("10.0.0.0/33"); err == nil {
+		t.Fatal("want bad CIDR")
 	}
 }

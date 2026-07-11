@@ -627,6 +627,32 @@ func TestPoolSpawnerParkNotConfigured(t *testing.T) {
 	}
 }
 
+func TestPoolSpawnerParkDelegatesToClient(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	d.imageInspect = func() *http.Response {
+		return jsonResponse(http.StatusOK, map[string]any{
+			"Id":     "sha256:img1",
+			"Config": map[string]any{"WorkingDir": "/", "Cmd": []string{"/bin/sh"}},
+		})
+	}
+	d.create = func() *http.Response {
+		return textResponse(http.StatusInternalServerError, `{"message":"boom"}`)
+	}
+	dir, err := os.MkdirTemp("", "rd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	c := newPoolClient(t, d, func(c *Client) { c.readyDir = dir })
+	sp := &PoolSpawner{Client: c}
+	_, err = sp.Park(context.Background(), "park-delegate", dockerpool.Key{
+		Image: "alpine:3.20", Runtime: models.RuntimeDocker,
+	})
+	if err == nil || !strings.Contains(err.Error(), "park create") {
+		t.Fatalf("Park err = %v, want delegated park create failure", err)
+	}
+}
+
 func TestRenameContainerConflictMapsToExists(t *testing.T) {
 	d := &poolFakeDaemon{t: t}
 	dir, err := os.MkdirTemp("", "rd")

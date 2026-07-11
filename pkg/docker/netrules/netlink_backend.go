@@ -3,7 +3,6 @@
 package netrules
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"syscall"
@@ -11,12 +10,22 @@ import (
 	"github.com/google/nftables"
 )
 
+// nftAPI is the Conn surface netlinkBackend needs. *nftables.Conn satisfies
+// it; tests inject a fake so Exists/Insert/Delete are covered without
+// CAP_NET_ADMIN or a live nftables socket.
+type nftAPI interface {
+	GetRules(t *nftables.Table, c *nftables.Chain) ([]*nftables.Rule, error)
+	InsertRule(r *nftables.Rule) *nftables.Rule
+	DelRule(r *nftables.Rule) error
+	Flush() error
+}
+
 // netlinkBackend drives DOCKER-USER via google/nftables (netlink), translating
 // the Manager's iptables-shaped argv into nft expressions. Rules land in the
 // iptables-nft compat filter/DOCKER-USER chain so iptables -L still lists them.
 type netlinkBackend struct {
 	mu   sync.Mutex
-	conn *nftables.Conn
+	conn nftAPI
 }
 
 // NewNetlinkBackend opens a netlink connection to the host nftables. Callers
@@ -124,44 +133,4 @@ func (b *netlinkBackend) lookup(table, chain string) (*nftables.Table, *nftables
 	tbl := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: table}
 	ch := &nftables.Chain{Name: chain, Table: tbl}
 	return tbl, ch, nil
-}
-
-func isNetlinkNotExist(err error) bool {
-	return errors.Is(err, syscall.ENOENT) ||
-		(err != nil && (containsFold(err.Error(), "no such file") ||
-			containsFold(err.Error(), "no such file or directory")))
-}
-
-func containsFold(s, substr string) bool {
-	if len(substr) == 0 {
-		return true
-	}
-	if len(s) < len(substr) {
-		return false
-	}
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if equalFoldASCII(s[i:i+len(substr)], substr) {
-			return true
-		}
-	}
-	return false
-}
-
-func equalFoldASCII(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
 }

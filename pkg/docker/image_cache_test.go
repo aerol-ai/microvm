@@ -104,6 +104,14 @@ func TestImageIDCacheFlushGenerationFence(t *testing.T) {
 	if id, ok := c.Get("alpine:3.20"); !ok || id != "sha256:fresh" {
 		t.Fatalf("Get after fresh Put = %q, %v", id, ok)
 	}
+
+	// Empty id / ref are rejected the same way Put rejects them.
+	if c.PutIfGeneration("alpine:3.20", "  ", gen2) {
+		t.Fatal("blank id must be rejected")
+	}
+	if c.PutIfGeneration("", "sha256:x", gen2) {
+		t.Fatal("empty ref must be rejected")
+	}
 }
 
 func TestImageIDCacheWarmAcrossSparseGap(t *testing.T) {

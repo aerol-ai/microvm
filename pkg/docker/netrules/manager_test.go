@@ -1,6 +1,7 @@
 package netrules
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -619,4 +620,44 @@ func contains(s, substr string) bool {
 		}
 		return false
 	}())
+}
+
+type errBackend struct {
+	existsErr error
+	insertErr error
+	deleteErr error
+}
+
+func (e *errBackend) Exists(string, string, ...string) (bool, error) { return false, e.existsErr }
+func (e *errBackend) Insert(string, string, int, ...string) error    { return e.insertErr }
+func (e *errBackend) Delete(string, string, ...string) error         { return e.deleteErr }
+
+func TestEnsureAndDeletePolicyRuleErrors(t *testing.T) {
+	t.Parallel()
+	mgr := NewWithBackend(&errBackend{existsErr: errors.New("exists boom")})
+	if err := mgr.ApplyEgressPolicy("10.0.0.7", []string{"1.1.1.1/32"}, nil); err == nil || !strings.Contains(err.Error(), "check egress policy rule") {
+		t.Fatalf("ensure exists err = %v", err)
+	}
+
+	mgr = NewWithBackend(&errBackend{insertErr: errors.New("insert boom")})
+	if err := mgr.ApplyEgressPolicy("10.0.0.7", nil, []string{"9.9.9.9/32"}); err == nil || !strings.Contains(err.Error(), "insert egress policy rule") {
+		t.Fatalf("ensure insert err = %v", err)
+	}
+
+	// deleteUntilGone: Delete errors, Exists also errors → surface Delete err wrapped.
+	mgr = NewWithBackend(&errBackend{
+		deleteErr: errors.New("delete boom"),
+		existsErr: errors.New("exists still failing"),
+	})
+	if err := mgr.ClearEgressPolicy("10.0.0.7", nil, []string{"9.9.9.9/32"}); err == nil || !strings.Contains(err.Error(), "delete egress policy rule") {
+		t.Fatalf("deletePolicyRule err = %v", err)
+	}
+}
+
+func TestNewWithOptionsDisabled(t *testing.T) {
+	t.Parallel()
+	m, err := NewWithOptions(false, BackendNetlink)
+	if err != nil || m.Enabled() {
+		t.Fatalf("disabled NewWithOptions = (%v,%v)", m, err)
+	}
 }
