@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -308,13 +309,14 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 // already selected this node. Two entry points:
 //
 //   - reservationID == "": local-only image path. No cluster reservation was
-//     written because the image cannot be moved to another worker.
+//     written because the image cannot be moved to another worker. Create and
+//     promote stay sequential (ID isn't fixed before create the same way).
 //   - reservationID != "": normal cluster create. The router already wrote
-//     the reservation with our redacted spec, even when this node is the
-//     selected worker. Use CreateSandboxWithID against the reserved ID, store
-//     a local secret ref, then RecordPlacement with the redacted spec + ref —
-//     opPlace transitions State=Reserved → Placed atomically while keeping
-//     secret material out of Raft.
+//     the reservation with our redacted spec. CreateSandboxWithID runs in
+//     parallel with PutClusterSecretsForRecipient + RecordPlacement; both
+//     legs join before 201. Failure retract uses DeletePlacement (mandatory
+//     — CancelReservation alone is a no-op on Placed). See
+//     plans/warm-create-latency-tier1.5-seal-promote-overlap.md.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
 	createStart := time.Now()
 	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
@@ -342,43 +344,34 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	// response carries only create;dur= and UC-96 attribution is lost.
 	createCtx, createTiming := docker.WithCreateTiming(r.Context())
 
-	var (
-		resp *models.CreateSandboxResponse
-		err  error
-	)
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
-		resp, err = h.deps.Service.CreateSandboxWithID(createCtx, req, reservationID)
-	} else {
-		service.RecordCreateReservationState("self_local")
-		resp, err = h.deps.Service.CreateSandbox(createCtx, req)
-	}
-	if err != nil {
-		// Local create failed — release the reservation so the leader's GC
-		// doesn't have to wait 120s to free the headroom. Best-effort: if
-		// CancelReservation also fails, the GC will catch it.
-		if reservationID != "" {
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if cErr := c.CancelReservation(rbCtx, reservationID); cErr != nil {
-				h.deps.Logger.Warn("cluster: cancel reservation after local create failed",
-					"sandbox_id", reservationID, "err", cErr)
-			}
-			rbCancel()
+		resp, err := clustercreate.OverlapCreateAndPromote(createCtx, h.deps.Service, h.deps.Logger, req, reservationID, clustercreate.OverlapOptions{
+			PromoteWithSpec: true,
+			Timing:          createTiming,
+		})
+		setCreateServerTiming(w, createStart, createTiming)
+		if err != nil {
+			h.writeOverlapCreateError(w, err)
+			return
 		}
+		apihttp.WriteJSON(w, http.StatusCreated, resp)
+		return
+	}
+
+	service.RecordCreateReservationState("self_local")
+	resp, err := h.deps.Service.CreateSandbox(createCtx, req)
+	if err != nil {
 		setCreateServerTiming(w, createStart, createTiming)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
-	// Raft commit on the response path. CreateSandbox latency is unchanged
-	// (the reserve commit happened on the router, before the body was
-	// forwarded — and is called out in the PR description per pr-review.md
-	// invariant 2). Single-node mode skips this branch entirely (cluster is
-	// Noop, RecordPlacement is a no-op).
+	// Raft commit on the response path. Self-wins keeps sequential seal+
+	// promote (no pre-minted reservation ID to overlap against).
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var promoteErr error
 	secrets, sealErr := h.deps.Service.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
 	if sealErr != nil {
 		h.deps.Logger.Error("cluster: store secret ref failed; rolling back create",
@@ -388,55 +381,69 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 			h.deps.Logger.Error("cluster: rollback destroy failed",
 				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
 		}
-		if reservationID != "" {
-			if cErr := c.CancelReservation(rbCtx, reservationID); cErr != nil {
-				h.deps.Logger.Warn("cluster: cancel reservation after secret-ref failure",
-					"sandbox_id", reservationID, "err", cErr)
-			}
+		// Self-wins has no reservation, but DeletePlacement still covers an
+		// ambiguous promote that somehow landed (and is a no-op if nothing
+		// was placed). Facades already do this via rollbackCreate.
+		if dErr := c.DeletePlacement(rbCtx, resp.Sandbox.ID); dErr != nil {
+			h.deps.Logger.Warn("cluster: DeletePlacement after secret-ref failure",
+				"sandbox_id", resp.Sandbox.ID, "err", dErr)
 		}
 		rbCancel()
 		setCreateServerTiming(w, createStart, createTiming)
-		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: store secret ref: "+sealErr.Error())
+		apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(sealErr))
 		return
 	}
 	redacted := service.RedactClusterSecrets(req)
-	promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
+	promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
 
 	if promoteErr != nil {
 		h.deps.Logger.Error("cluster: RecordPlacement failed; rolling back create",
 			"sandbox_id", resp.Sandbox.ID, "err", promoteErr)
-		// Fresh context — the request context may already be cancelled by
-		// the time we get here, but we still want the rollback to run.
 		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
 			h.deps.Logger.Error("cluster: rollback destroy failed",
 				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
 		}
-		// Also cancel the reservation so it doesn't linger until TTL — only
-		// if we had one (self-wins path has no reservation to cancel, and
-		// CancelReservation on a missing row is a no-op anyway).
-		if reservationID != "" {
-			if cErr := c.CancelReservation(rbCtx, reservationID); cErr != nil {
-				h.deps.Logger.Warn("cluster: cancel reservation after promote failed",
-					"sandbox_id", reservationID, "err", cErr)
-			}
+		// DeletePlacement is mandatory on promote-fail: a client-side Raft
+		// error can still mean the FSM applied the place (§2.2 / TODOS.md).
+		if dErr := c.DeletePlacement(rbCtx, resp.Sandbox.ID); dErr != nil {
+			h.deps.Logger.Warn("cluster: DeletePlacement after promote failed",
+				"sandbox_id", resp.Sandbox.ID, "err", dErr)
 		}
 		rbCancel()
-		// Cluster-wide name conflict surfaces as 409. With reservation-first
-		// this should only fire on the self-wins path (the reserve step
-		// already validated name uniqueness for the forward path).
 		if errors.Is(promoteErr, cluster.ErrNameConflict) {
 			setCreateServerTiming(w, createStart, createTiming)
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return
 		}
 		setCreateServerTiming(w, createStart, createTiming)
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: placement commit failed: "+promoteErr.Error())
+		apihttp.WriteError(w, http.StatusServiceUnavailable, clustercreate.FormatPromoteError(promoteErr))
 		return
 	}
 
 	setCreateServerTiming(w, createStart, createTiming)
 	apihttp.WriteJSON(w, http.StatusCreated, resp)
+}
+
+func (h *handlers) writeOverlapCreateError(w http.ResponseWriter, err error) {
+	if of, ok := clustercreate.AsOverlapFailure(err); ok {
+		switch of.Phase {
+		case clustercreate.OverlapPhaseSeal:
+			apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(of.Err))
+			return
+		case clustercreate.OverlapPhasePromote:
+			if errors.Is(of.Err, cluster.ErrNameConflict) {
+				apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+				return
+			}
+			apihttp.WriteError(w, http.StatusServiceUnavailable, clustercreate.FormatPromoteError(of.Err))
+			return
+		default:
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, of.Err)
+			return
+		}
+	}
+	apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 }
 
 // clusterListWrap aggregates GET /v1/sandboxes results across the cluster so

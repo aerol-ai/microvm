@@ -82,6 +82,12 @@ func TestMetricHelpersIncrementExpectedCounters(t *testing.T) {
 	if got := clusterSecretKeyMismatches.Value() - keyMismatchBefore; got != 1 {
 		t.Fatalf("key mismatch delta = %d, want 1", got)
 	}
+
+	retractBefore := expvarMapValue(clusterPromoteRetractTotal, "ok")
+	RecordPromoteRetract("ok")
+	if got := expvarMapValue(clusterPromoteRetractTotal, "ok") - retractBefore; got != 1 {
+		t.Fatalf("promote retract ok delta = %d, want 1", got)
+	}
 }
 
 func TestClassifyMetricErrorsAndHelpers(t *testing.T) {

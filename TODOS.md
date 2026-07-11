@@ -30,3 +30,16 @@ what, why, the caveat that motivated capturing it, and where to start.
 Shipped as per-IP refcounted locks in `pkg/docker/netrules/manager.go`
 (`lockIP`). Same-IP Exists+Insert mutual exclusion preserved; different IPs
 no longer serialize. See `ip_lock_test.go`.
+
+## Promote-fail rollback can leave a ghost Placed row (latent, cluster)
+
+- **Status:** fixed in Tier 1.5 (`OverlapCreateAndPromote` / self-wins
+  promote-fail now always `DeletePlacement`). See
+  `plans/warm-create-latency-tier1.5-seal-promote-overlap.md`.
+- **What was wrong:** promote-fail rollback in `cluster_handler.go` used
+  Destroy+CancelReservation only; `CancelReservation` is a no-op on Placed,
+  so an errored-but-committed Raft place left a ghost row until reconcile
+  (~5 min).
+- **Fix:** every promote-fail path (overlapped reserved + sequential
+  self-wins) calls `DeletePlacement`; reserved-path create-FAIL after
+  promote-OK retracts the same way.

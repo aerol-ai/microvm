@@ -213,21 +213,27 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		return nil, err
 	}
 	c := svc.Cluster()
-	var (
-		resp *models.CreateSandboxResponse
-		err  error
-	)
+
+	// Reserved path: overlap CreateSandboxWithID with seal+promote so the
+	// response wall clock is max(legs). Resolve platform volumes first —
+	// store lookups only, no container — so PromoteWithSpec carries concrete
+	// MountSpecs (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
-		resp, err = svc.CreateSandboxWithID(ctx, req, reservationID)
-	} else {
-		service.RecordCreateReservationState("self_local")
-		resp, err = svc.CreateSandbox(ctx, req)
-	}
-	if err != nil {
-		if reservationID != "" && c != nil {
-			cancelReservation(context.Background(), c, logger, reservationID)
+		if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
+			if c != nil {
+				cancelReservation(context.Background(), c, logger, reservationID)
+			}
+			return nil, err
 		}
+		return OverlapCreateAndPromote(ctx, svc, logger, req, reservationID, OverlapOptions{
+			PromoteWithSpec: opts.PromoteWithSpec,
+		})
+	}
+
+	service.RecordCreateReservationState("self_local")
+	resp, err := svc.CreateSandbox(ctx, req)
+	if err != nil {
 		return nil, err
 	}
 	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
@@ -237,24 +243,13 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	var promoteErr error
-	if reservationID != "" && !opts.PromoteWithSpec {
-		secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
-		if sealErr != nil {
-			rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
-			return nil, sealErr
-		}
-		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, nil, secrets)
-	} else {
-		secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
-		if sealErr != nil {
-			rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
-			return nil, sealErr
-		}
-		redacted := service.RedactClusterSecrets(req)
-		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
+	secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
+	if sealErr != nil {
+		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		return nil, sealErr
 	}
-	if promoteErr != nil {
+	redacted := service.RedactClusterSecrets(req)
+	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
 		return nil, promoteErr
 	}

@@ -46,6 +46,11 @@ var (
 	clusterSecretOpenLatency     = scaleobs.NewDurationBuckets("aerolvm_secret_decrypt_latency_seconds_bucket")
 	clusterSecretRecipientDenies = expvar.NewInt("aerolvm_secret_recipient_denied_total")
 
+	// Promote-retract counter for overlapped reserved-path create
+	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
+	// result so a DeletePlacement failure is visible without relying on logs.
+	clusterPromoteRetractTotal = expvar.NewMap("aerolvm_cluster_promote_retract_total")
+
 	// Wake metrics (D3 / C6 in plans/serverless-sandbox-http-wake.md).
 	// requests_total counts every EnsureSandboxAwakeForHTTP entry — both
 	// hot-path hits (already running) and cold starts; cold_starts_total
@@ -87,6 +92,18 @@ func beginSandboxCreateMetric() func(error) {
 
 func RecordCreateReservationState(state string) {
 	scaleobs.Add(createReservationStates, state, 1)
+}
+
+// RecordPromoteRetract increments aerolvm_cluster_promote_retract_total after
+// an overlapped create/promote failure path finishes its sync retract.
+// result is typically "ok", "delete_placement_failed", or
+// "delete_secrets_failed".
+func RecordPromoteRetract(result string) {
+	result = strings.TrimSpace(result)
+	if result == "" {
+		result = "unknown"
+	}
+	scaleobs.Add(clusterPromoteRetractTotal, result, 1)
 }
 
 func RecordExpiredReservations(count int) {

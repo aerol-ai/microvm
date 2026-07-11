@@ -1,6 +1,9 @@
 # Warm create latency Tier 1: 43ms → ≤30ms acceptance (semantics-preserving)
 
-Status: **implemented** (2026-07-11). Successor to `plans/docker-warm-pool.md` §12, which shipped the
+Status: **implemented — bench gates pending** (code landed 2026-07-11,
+`0b39dee` + `0fbe7a9`; the §8 burst+sparse gates with
+`SB_NETRULES_BACKEND=netlink` have NOT been run — no
+`docker-sparse-bench` report exists yet). Successor to `plans/docker-warm-pool.md` §12, which shipped the
 warm-adopt fast path at **server p50 43ms** (v0.5.33). This plan removes the
 removable engine/consensus round-trips **without changing any idempotency or
 failover semantics**. The semantics-changing follow-ups (async rename, async
@@ -299,7 +302,11 @@ test server, covering both transports.
 
 ## 6. Deferred: Tier 1.5 overlap + Tier 3 async — entry-gated
 
-Not in scope. On record so the trade-offs are documented.
+**Tier 1.5 is now a standalone plan:** 
+[`plans/warm-create-latency-tier1.5-seal-promote-overlap.md`](./warm-create-latency-tier1.5-seal-promote-overlap.md)
+(sync retract via `DeletePlacement` + secrets cleanup; join before 201;
+acceptance ≤ 20ms). Summary kept below for context; do not implement from
+this section alone.
 
 **Tier 1.5 (recorded post-review 2026-07-11): overlap seal + promote with the
 local create — ~10ms, the path to ~18–20ms warm p50 without NVMe.** The
@@ -313,18 +320,19 @@ seal+promote concurrently with the local create and **join both before
 responding**: the response path becomes max(create, seal+promote) ≈ the create
 alone, and the client-visible guarantee holds (the FSM knows the owner before
 the client can act — unlike Tier-3 async promote below, which stops waiting).
-Why it is NOT in this plan: the failure matrix widens. Today rollback only
+Why it was split out of Tier 1: the failure matrix widens. Today rollback only
 handles promote-failed-**after**-create-succeeded
 (`cluster_handler.go:405-424`); the overlap adds
 promote-succeeded-but-create-**failed** — a `Placed` FSM entry with no
 container for the failure window. That needs a documented retraction rule
 (pr-review §4), an owner-watcher analysis of the transient Placed-but-missing
-state, and the full cluster-correctness call-out (pr-review §6). A small
-design doc, not a config flip. **Entry: Phases 1–4 landed + a want for
-sub-20ms server-side warm p50 without the NVMe topology.** Prerequisite first
-slice either way: attribute the ~5–6ms residual glue with finer Server-Timing
-stages (validate / keygen / admit / seal); if the seal is 2–3ms of it,
-overlapping the seal alone is a low-risk subset.
+state, and the full cluster-correctness call-out (pr-review §6) — now
+specified in the Tier 1.5 plan (Option A: sync `DeletePlacement`).
+**Entry: Phases 1–4 landed + a want for sub-20ms server-side warm p50 without
+the NVMe topology.** Prerequisite first slice either way: attribute the ~5–6ms
+residual glue with finer Server-Timing stages (validate / keygen / admit /
+seal); if the seal is 2–3ms of it, overlapping the seal alone is a low-risk
+subset (Tier 1.5 Phase A).
 
 Tier 3 (semantics-changing), on record:
 
@@ -404,11 +412,9 @@ Phase 3 (needs the Ansible rejoin cycle to roll out, one-way per node).
   moves the ≤25ms stretch, never the acceptance gate.
 - **Async rename / async promote** (Tier 3, §6) — semantics-changing, entry-gated
   on a sub-20ms product requirement.
-- **Seal+promote overlap with the local create** (Tier 1.5, §6) — awaits both
-  before responding so client semantics hold, but the
-  promote-succeeded/create-failed retraction needs its own design doc +
-  cluster-correctness call-out. Recorded in §6 with entry criteria; not scoped
-  here.
+- **Seal+promote overlap with the local create** (Tier 1.5) — split to
+  [`plans/warm-create-latency-tier1.5-seal-promote-overlap.md`](./warm-create-latency-tier1.5-seal-promote-overlap.md).
+  Sync retract via `DeletePlacement`; join before 201; acceptance ≤ 20ms.
 - **`netrules` `Manager.mu` sharding** (`TODOS.md`) — concurrency ceiling; §6
   scopes p99/concurrency out; p50 never contends it.
 - **p99 / pool-sizing + single-flight refill** — hit-rate work, not hit-path;
