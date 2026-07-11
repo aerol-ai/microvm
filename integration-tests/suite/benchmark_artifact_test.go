@@ -29,6 +29,40 @@ func TestMergeBenchReportsPreservesLatencyWhenDensityArrives(t *testing.T) {
 	}
 }
 
+func TestMissingBenchRuntimeTargetsDockerColdUsesDockerGossip(t *testing.T) {
+	members := capacityView{}
+	members.Members = append(members.Members, struct {
+		NodeID        string `json:"node_id"`
+		NodeName      string `json:"node_name"`
+		Role          string `json:"role"`
+		Alive         bool   `json:"alive"`
+		Drained       bool   `json:"drained"`
+		CapacityStale bool   `json:"capacity_stale"`
+		Capacity      struct {
+			CanAdmit          bool     `json:"can_admit"`
+			SupportedRuntimes []string `json:"supported_runtimes"`
+		} `json:"capacity"`
+	}{
+		Role:  "mixed",
+		Alive: true,
+		Capacity: struct {
+			CanAdmit          bool     `json:"can_admit"`
+			SupportedRuntimes []string `json:"supported_runtimes"`
+		}{
+			CanAdmit:          true,
+			SupportedRuntimes: []string{"docker"},
+		},
+	})
+
+	missing := missingBenchRuntimeTargets(members, []benchRuntimeSpec{
+		{runtime: "docker"},
+		{runtime: "docker-cold"},
+	})
+	if len(missing) != 0 {
+		t.Fatalf("want no missing targets when docker is advertised, got %v", missing)
+	}
+}
+
 func TestMergeBenchReportsPreservesDensityWhenLatencyArrives(t *testing.T) {
 	existing := benchReport{
 		Density: &densityStats{
