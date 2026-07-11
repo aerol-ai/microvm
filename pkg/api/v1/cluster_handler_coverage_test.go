@@ -39,14 +39,6 @@ type recoveryBlobStubCluster struct {
 	getErr error
 }
 
-func (c *recoveryBlobStubCluster) StoreRecoveryBlob(_ context.Context, blob cluster.RecoveryBlob) error {
-	if c.blobs == nil {
-		c.blobs = map[string]cluster.RecoveryBlob{}
-	}
-	c.blobs[blob.Ref] = blob
-	return nil
-}
-
 func (c *recoveryBlobStubCluster) RecoveryBlob(_ context.Context, ref string) (cluster.RecoveryBlob, bool, error) {
 	if c.getErr != nil {
 		return cluster.RecoveryBlob{}, false, c.getErr
@@ -223,7 +215,7 @@ func TestClusterInternalPlacement_Reads(t *testing.T) {
 	stub := &internalPlacementStubCluster{
 		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
 		placement: cluster.Placement{
-			SandboxID: "sb-1", OwnerNodeID: "node-a", SecretRef: "secret", SealedSecrets: []byte("x"),
+			SandboxID: "sb-1", OwnerNodeID: "node-a", SecretRef: "secret",
 		},
 		hasPlace: true,
 		owner:    cluster.OwnerInfo{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
@@ -272,24 +264,20 @@ func TestClusterInternalPlacementByName_Success(t *testing.T) {
 	}
 }
 
-func TestClusterInternalRecoveryPutGet(t *testing.T) {
+func TestClusterInternalRecoveryGet(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
-	stub := &recoveryBlobStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	// The recovery surface is GET-only: nothing pushes blobs anymore, so the
+	// stub is seeded directly (as the FSM's storePlacementLocked would).
+	stub := &recoveryBlobStubCluster{
+		Noop:  cluster.NewNoop("node-a", "http://node-a", ""),
+		blobs: map[string]cluster.RecoveryBlob{"ref-1": {Ref: "ref-1", SandboxID: "sb-1"}},
+	}
 	svc.AttachCluster(stub)
 	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
 
-	putBody := `{"ref":"ref-1","payload":"abc"}`
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, "/v1/cluster/internal/recovery/ref-1", strings.NewReader(putBody))
-	req.SetPathValue("ref", "ref-1")
-	h.clusterInternalRecoveryPut(rr, req)
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("put status = %d, want 204; body=%s", rr.Code, rr.Body.String())
-	}
-
-	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/v1/cluster/internal/recovery/ref-1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/internal/recovery/ref-1", nil)
 	req.SetPathValue("ref", "ref-1")
 	h.clusterInternalRecoveryGet(rr, req)
 	if rr.Code != http.StatusOK {
@@ -302,6 +290,14 @@ func TestClusterInternalRecoveryPutGet(t *testing.T) {
 	h.clusterInternalRecoveryGet(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("missing status = %d, want 404", rr.Code)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/cluster/internal/recovery/", nil)
+	req.SetPathValue("ref", "")
+	h.clusterInternalRecoveryGet(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("empty ref status = %d, want 400", rr.Code)
 	}
 }
 

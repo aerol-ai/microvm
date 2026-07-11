@@ -179,7 +179,7 @@ func TestClusterSecretsAndExposedPortHelpers(t *testing.T) {
 	waitForLeader(t, c, 5*time.Second)
 
 	ctx := context.Background()
-	secrets := PlacementSecrets{Ref: "ref-1", Version: 2, LegacySealed: []byte("sealed")}
+	secrets := PlacementSecrets{Ref: "ref-1", Version: 2}
 	if err := c.RecordPlacement(ctx, "sb-helpers", &models.CreateSandboxRequest{Image: "alpine"}, secrets); err != nil {
 		t.Fatalf("RecordPlacement: %v", err)
 	}
@@ -188,9 +188,6 @@ func TestClusterSecretsAndExposedPortHelpers(t *testing.T) {
 	}
 	if got := c.SecretsOf("sb-helpers"); got.Ref != "ref-1" || got.Version != 2 {
 		t.Fatalf("SecretsOf = %+v", got)
-	}
-	if sealed := c.SealedSecretsOf("sb-helpers"); len(sealed) != 0 {
-		t.Fatalf("SealedSecretsOf with ref model = %q, want nil/empty", sealed)
 	}
 	if err := c.AddExposedPort(ctx, "sb-helpers", 3000, ExposedPortRoute{Protocol: "http"}); err != nil {
 		t.Fatalf("AddExposedPort: %v", err)
@@ -283,11 +280,8 @@ func TestFSMValidateReservationBatchLockedErrors(t *testing.T) {
 }
 
 func TestReservationNameHelpers(t *testing.T) {
-	if got := reservationName(reservationCommand{Name: "  named  "}); got != "named" {
-		t.Fatalf("reservationName explicit = %q", got)
-	}
-	if got := reservationName(reservationCommand{Spec: &models.CreateSandboxRequest{Name: "from-spec"}}); got != "from-spec" {
-		t.Fatalf("reservationName from spec = %q", got)
+	if got := specName(&models.CreateSandboxRequest{Name: "  from-spec  "}); got != "from-spec" {
+		t.Fatalf("specName = %q", got)
 	}
 	if got := placementName(Placement{Name: "p-name"}); got != "p-name" {
 		t.Fatalf("placementName = %q", got)
@@ -444,23 +438,6 @@ func TestPeerForcedNonVoterRoleMatrix(t *testing.T) {
 	c.gossip.memberIndex.upsert(Member{NodeID: "w1", Role: config.NodeRoleWorker})
 	if !c.peerForcedNonVoter("w1") {
 		t.Fatal("peerForcedNonVoter(worker) = false, want true")
-	}
-}
-
-func TestClusterSealedSecretsOfLegacyBag(t *testing.T) {
-	if testing.Short() {
-		t.Skip("integration test")
-	}
-	c, cleanup := newTestCluster(t, "ldr-legacy-sealed", true, nil)
-	defer cleanup()
-	waitForLeader(t, c, 5*time.Second)
-
-	sealed := []byte("legacy-bag")
-	if err := c.RecordPlacement(context.Background(), "sb-legacy-sealed", nil, PlacementSecrets{LegacySealed: sealed}); err != nil {
-		t.Fatalf("RecordPlacement: %v", err)
-	}
-	if got := c.SealedSecretsOf("sb-legacy-sealed"); string(got) != string(sealed) {
-		t.Fatalf("SealedSecretsOf = %q, want %q", got, sealed)
 	}
 }
 

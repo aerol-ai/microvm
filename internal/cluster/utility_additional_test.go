@@ -34,11 +34,8 @@ func TestNoopAdditionalMethods(t *testing.T) {
 	if n.SpecOf("demo") != nil {
 		t.Fatal("SpecOf() should be nil in single-node mode")
 	}
-	if got := n.SecretsOf("demo"); got.Ref != "" || got.Version != 0 || len(got.LegacySealed) != 0 {
+	if got := n.SecretsOf("demo"); got.Ref != "" || got.Version != 0 {
 		t.Fatalf("SecretsOf() = %+v, want zero value", got)
-	}
-	if got := n.SealedSecretsOf("demo"); got != nil {
-		t.Fatalf("SealedSecretsOf() = %v, want nil", got)
 	}
 	if err := n.AddExposedPort(context.Background(), "demo", 8080, ExposedPortRoute{Protocol: "http"}); err != nil {
 		t.Fatalf("AddExposedPort() error = %v", err)

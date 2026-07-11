@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/aerol-ai/microvm/internal/cluster"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -171,8 +170,8 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutClusterSecretsForRecipient: %v", err)
 	}
-	if handle.Ref == "" || handle.Version != clusterSecretVersion || len(handle.LegacySealed) != 0 {
-		t.Fatalf("handle = %+v, want ref/version without legacy sealed payload", handle)
+	if handle.Ref == "" || handle.Version != clusterSecretVersion {
+		t.Fatalf("handle = %+v, want ref/version handle", handle)
 	}
 
 	rec, err := st.GetClusterSecret(ctx, handle.Ref)
@@ -230,40 +229,6 @@ func TestUnsealClusterSecretsEmpty(t *testing.T) {
 	}
 	if out.Image != "alpine" {
 		t.Fatalf("passthrough lost spec: %+v", out)
-	}
-}
-
-func TestOpenClusterSecretsLegacyEnvelopeWrapper(t *testing.T) {
-	s := &Service{cipher: newTestCipher(t)}
-	req := models.CreateSandboxRequest{
-		Image:    "private.example.com/app:latest",
-		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "alice", Password: "super-secret-password"},
-	}
-	redacted := RedactClusterSecrets(req)
-	plain, err := json.Marshal(clusterSealedSecrets{
-		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "alice", Password: "super-secret-password"},
-	})
-	if err != nil {
-		t.Fatalf("marshal cluster secret bag: %v", err)
-	}
-	sealedPayload, err := s.cipher.EncryptWithAAD(plain, clusterSecretAAD([]string{"*"}))
-	if err != nil {
-		t.Fatalf("EncryptWithAAD: %v", err)
-	}
-	envelope, err := json.Marshal(clusterSealedSecretsEnvelope{
-		Version:    2,
-		Recipients: []string{"*"},
-		Payload:    sealedPayload,
-	})
-	if err != nil {
-		t.Fatalf("marshal legacy envelope: %v", err)
-	}
-	merged, err := s.OpenClusterSecrets(context.Background(), redacted, cluster.PlacementSecrets{LegacySealed: envelope})
-	if err != nil {
-		t.Fatalf("OpenClusterSecrets: %v", err)
-	}
-	if merged.Registry == nil || merged.Registry.Password != "super-secret-password" {
-		t.Fatalf("legacy envelope merge lost registry password: %+v", merged.Registry)
 	}
 }
 

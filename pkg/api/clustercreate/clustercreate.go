@@ -168,6 +168,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return Decision{}, false
 		}
+		// Oversized specs are a caller problem, not a cluster problem: the
+		// recovery payload rides inline in the raft entry and has a hard size
+		// cap with no fallback delivery path.
+		if errors.Is(err, cluster.ErrRecoveryPayloadTooLarge) {
+			writeError(w, http.StatusBadRequest, "sandbox spec too large to replicate across the cluster: "+err.Error())
+			return Decision{}, false
+		}
 		writeError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return Decision{}, false
 	}

@@ -243,7 +243,7 @@ func TestFSMHotPlacementReadsOmitRecoveryPayload(t *testing.T) {
 	if len(shardRows) != 1 {
 		t.Fatalf("placementsForShards len=%d, want 1", len(shardRows))
 	}
-	if shardRows[0].Spec != nil || shardRows[0].SecretRef != "" || shardRows[0].SecretVersion != 0 || len(shardRows[0].SealedSecrets) != 0 {
+	if shardRows[0].Spec != nil || shardRows[0].SecretRef != "" || shardRows[0].SecretVersion != 0 {
 		t.Fatalf("hot shard read included recovery payload: %+v", shardRows[0])
 	}
 	if shardRows[0].ExposedPorts[8080] != "http" {
@@ -478,11 +478,10 @@ func TestFSMSnapshotRestoreRoundTrip(t *testing.T) {
 func TestFSMSnapshotOmitsRecoveryPayload(t *testing.T) {
 	fsm := newPlacementFSM()
 	payload, _ := encodeCommand(command{
-		Op:            opPlace,
-		SandboxID:     "sb-secret",
-		OwnerNodeID:   "node-a",
-		Spec:          &models.CreateSandboxRequest{Image: "unique-image-only-in-recovery"},
-		SealedSecrets: []byte("unique-sealed-secret-only-in-recovery"),
+		Op:          opPlace,
+		SandboxID:   "sb-secret",
+		OwnerNodeID: "node-a",
+		Spec:        &models.CreateSandboxRequest{Image: "unique-image-only-in-recovery"},
 	})
 	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
 		t.Fatalf("place: %v", got)
@@ -496,88 +495,8 @@ func TestFSMSnapshotOmitsRecoveryPayload(t *testing.T) {
 		t.Fatalf("persist: %v", err)
 	}
 	raw := sink.Buffer.Bytes()
-	for _, forbidden := range [][]byte{
-		[]byte("unique-image-only-in-recovery"),
-		[]byte("unique-sealed-secret-only-in-recovery"),
-	} {
-		if bytes.Contains(raw, forbidden) {
-			t.Fatalf("snapshot persisted recovery payload %q", forbidden)
-		}
-	}
-}
-
-// TestFSMPreservesSealedSecrets covers the preserve-on-nil semantics for the
-// sealed-secrets bag: write-through paths that don't touch credentials (resize,
-// lifecycle, idempotent retries) must not erase the bag a previous opPlace
-// stored. Without this, a single opUpsertSpec replay would silently drop the
-// only copy of the registry password / mount creds the new owner needs at
-// failover.
-func TestFSMPreservesSealedSecrets(t *testing.T) {
-	fsm := newPlacementFSM()
-	sealed := []byte("ciphertext-blob-v1")
-
-	// 1. Initial opPlace stores spec + sealed bag.
-	place, _ := encodeCommand(command{
-		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a",
-		Spec:          &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
-		SealedSecrets: sealed,
-	})
-	if got := fsm.Apply(&raft.Log{Data: place}); got != nil {
-		t.Fatalf("opPlace: %v", got)
-	}
-	p, _ := fsm.get("sb1")
-	if !bytes.Equal(p.SealedSecrets, sealed) {
-		t.Fatalf("opPlace did not store SealedSecrets: %x", p.SealedSecrets)
-	}
-
-	// 2. opUpsertSpec with a NEW spec but nil SealedSecrets must keep the
-	// existing bag — resize/lifecycle replication takes this code path.
-	upsert, _ := encodeCommand(command{
-		Op: opUpsertSpec, SandboxID: "sb1",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2, MemoryMB: 512},
-	})
-	if got := fsm.Apply(&raft.Log{Data: upsert}); got != nil {
-		t.Fatalf("opUpsertSpec: %v", got)
-	}
-	p, _ = fsm.get("sb1")
-	if p.Spec == nil || p.Spec.CPU != 2 {
-		t.Fatalf("opUpsertSpec didn't update spec: %+v", p.Spec)
-	}
-	if !bytes.Equal(p.SealedSecrets, sealed) {
-		t.Fatalf("opUpsertSpec erased SealedSecrets: got %x, want %x", p.SealedSecrets, sealed)
-	}
-
-	// 3. Idempotent opPlace retry (no Spec, no SealedSecrets) must keep both.
-	retry, _ := encodeCommand(command{
-		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a",
-	})
-	if got := fsm.Apply(&raft.Log{Data: retry}); got != nil {
-		t.Fatalf("opPlace retry: %v", got)
-	}
-	p, _ = fsm.get("sb1")
-	if !bytes.Equal(p.SealedSecrets, sealed) {
-		t.Fatalf("idempotent opPlace erased SealedSecrets: %x", p.SealedSecrets)
-	}
-	if p.Spec == nil || p.Spec.CPU != 2 {
-		t.Fatalf("idempotent opPlace erased spec: %+v", p.Spec)
-	}
-
-	// 4. opUpsertSpec with a NEW sealed bag but nil Spec must rotate the bag
-	// while keeping the spec — used if we ever rotate creds without touching
-	// resources.
-	rotated := []byte("ciphertext-blob-v2")
-	upsertSealed, _ := encodeCommand(command{
-		Op: opUpsertSpec, SandboxID: "sb1", SealedSecrets: rotated,
-	})
-	if got := fsm.Apply(&raft.Log{Data: upsertSealed}); got != nil {
-		t.Fatalf("opUpsertSpec sealed-only: %v", got)
-	}
-	p, _ = fsm.get("sb1")
-	if !bytes.Equal(p.SealedSecrets, rotated) {
-		t.Fatalf("opUpsertSpec didn't rotate SealedSecrets: %x", p.SealedSecrets)
-	}
-	if p.Spec == nil || p.Spec.CPU != 2 {
-		t.Fatalf("sealed-only upsert erased spec: %+v", p.Spec)
+	if bytes.Contains(raw, []byte("unique-image-only-in-recovery")) {
+		t.Fatalf("snapshot persisted recovery payload")
 	}
 }
 
@@ -589,9 +508,6 @@ func TestFSMStoresSecretRefWithoutReplicatedPayload(t *testing.T) {
 		Spec:          &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
 		SecretRef:     "cluster-secret://sandbox/sb1/v1",
 		SecretVersion: 1,
-		// If a buggy caller accidentally populates both shapes, the ref model
-		// must win so raft state does not fan out the encrypted payload.
-		SealedSecrets: []byte("must-not-enter-placement"),
 	})
 	if got := fsm.Apply(&raft.Log{Data: place}); got != nil {
 		t.Fatalf("opPlace: %v", got)
@@ -599,9 +515,6 @@ func TestFSMStoresSecretRefWithoutReplicatedPayload(t *testing.T) {
 	p, _ := fsm.get("sb1")
 	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
 		t.Fatalf("secret handle = (%q,%d), want ref v1", p.SecretRef, p.SecretVersion)
-	}
-	if len(p.SealedSecrets) != 0 {
-		t.Fatalf("new ref placement stored legacy sealed payload: %q", string(p.SealedSecrets))
 	}
 
 	upsert, _ := encodeCommand(command{
@@ -615,9 +528,6 @@ func TestFSMStoresSecretRefWithoutReplicatedPayload(t *testing.T) {
 	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
 		t.Fatalf("secret ref was not preserved through spec-only upsert: %+v", p)
 	}
-	if len(p.SealedSecrets) != 0 {
-		t.Fatalf("spec-only upsert introduced legacy sealed payload: %q", string(p.SealedSecrets))
-	}
 
 	rotated, _ := encodeCommand(command{
 		Op: opUpsertSpec, SandboxID: "sb1",
@@ -630,9 +540,6 @@ func TestFSMStoresSecretRefWithoutReplicatedPayload(t *testing.T) {
 	p, _ = fsm.get("sb1")
 	if p.SecretRef != "cluster-secret://sandbox/sb1/v2" || p.SecretVersion != 2 {
 		t.Fatalf("secret ref did not rotate: (%q,%d)", p.SecretRef, p.SecretVersion)
-	}
-	if len(p.SealedSecrets) != 0 {
-		t.Fatalf("ref rotation stored legacy sealed payload: %q", string(p.SealedSecrets))
 	}
 }
 
@@ -656,7 +563,6 @@ func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
 			Lifecycle:        &models.Lifecycle{StopAtAge: time.Minute},
 			GPUs:             &models.GPURequest{Vendor: models.GPUVendorNVIDIA, DeviceIDs: []string{"0"}},
 		},
-		SealedSecrets: []byte("sealed"),
 	})
 	fsm.Apply(&raft.Log{Data: place})
 	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 8080, Protocol: "http"})
@@ -674,7 +580,6 @@ func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
 	got.Spec.Registry.Password = "mutated"
 	got.Spec.Lifecycle.StopAtAge = 2 * time.Minute
 	got.Spec.GPUs.DeviceIDs[0] = "1"
-	got.SealedSecrets[0] = 'X'
 	got.ExposedPorts[8080] = "tcp"
 
 	again, _ := fsm.get("sb1")
@@ -686,7 +591,6 @@ func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
 		again.Spec.Registry.Password != "p" ||
 		again.Spec.Lifecycle.StopAtAge != time.Minute ||
 		again.Spec.GPUs.DeviceIDs[0] != "0" ||
-		string(again.SealedSecrets) != "sealed" ||
 		again.ExposedPorts[8080] != "http" {
 		t.Fatalf("mutating get() result changed FSM state: %+v", again)
 	}
@@ -953,7 +857,7 @@ func TestFSMRestoreLegacySnapshotRecoversVersion(t *testing.T) {
 // even when later Applies mutate the FSM before Persist runs. Raft can defer
 // Persist arbitrarily long, so without per-value deep-copy here a snapshot
 // would silently capture post-snapshot state for any reference-typed field
-// (Spec, SealedSecrets, ExposedPorts) — that would break log truncation
+// (Spec, ExposedPorts) — that would break log truncation
 // safety: replaying the truncated tail against the persisted snapshot would
 // double-apply mutations the snapshot already absorbed.
 func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
@@ -966,7 +870,7 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 			Image: "alpine:before",
 			Env:   map[string]string{"K": "before"},
 		},
-		SealedSecrets: []byte("sealed-before"),
+		SecretRef: "cluster-secret://sandbox/sb1/v1",
 	})
 	src.Apply(&raft.Log{Data: place})
 
@@ -976,8 +880,9 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 	}
 
 	// Mutate the FSM AFTER the snapshot is taken but BEFORE Persist runs.
-	// Both opUpsertSpec (replaces Spec/SealedSecrets pointers) and a fresh
-	// opPlace (new owner / version) must not leak into the persisted bytes.
+	// Both opUpsertSpec (replaces the Spec pointer and secret handle) and a
+	// fresh opPlace (new owner / version) must not leak into the persisted
+	// bytes.
 	upsert, _ := encodeCommand(command{
 		Op:        opUpsertSpec,
 		SandboxID: "sb1",
@@ -985,7 +890,8 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 			Image: "alpine:after",
 			Env:   map[string]string{"K": "after"},
 		},
-		SealedSecrets: []byte("sealed-after"),
+		SecretRef:     "cluster-secret://sandbox/sb1/v2",
+		SecretVersion: 2,
 	})
 	src.Apply(&raft.Log{Data: upsert})
 
@@ -1008,8 +914,8 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 	if got.Spec.Env["K"] != "before" {
 		t.Fatalf("snapshot leaked post-snapshot Env mutation: K=%q", got.Spec.Env["K"])
 	}
-	if string(got.SealedSecrets) != "sealed-before" {
-		t.Fatalf("snapshot leaked post-snapshot SealedSecrets mutation: %q", got.SealedSecrets)
+	if got.SecretRef != "cluster-secret://sandbox/sb1/v1" {
+		t.Fatalf("snapshot leaked post-snapshot secret-handle mutation: %q", got.SecretRef)
 	}
 }
 

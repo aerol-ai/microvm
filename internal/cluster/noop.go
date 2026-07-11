@@ -71,7 +71,6 @@ func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.Cr
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
 func (n *Noop) SecretsOf(sandboxID string) PlacementSecrets          { return PlacementSecrets{} }
-func (n *Noop) SealedSecretsOf(sandboxID string) []byte              { return nil }
 func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error {
 	return nil
 }

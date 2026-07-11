@@ -80,10 +80,7 @@ func TestNewPlacementFSMWithFileRecovery(t *testing.T) {
 }
 
 func TestRecoveryBlob(t *testing.T) {
-	blob, err := newRecoveryBlob("sb-1", placementRecovery{SecretRef: "sr"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	blob := seedRecoveryBlob(t, newPlacementRecoveryMemoryStore(), "sb-1", placementRecovery{SecretRef: "sr"})
 	if blob.SandboxID != "sb-1" || blob.SecretRef != "sr" {
 		t.Errorf("wrong blob fields: %+v", blob)
 	}

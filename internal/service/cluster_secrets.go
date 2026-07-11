@@ -190,32 +190,29 @@ func (s *Service) PutClusterSecretsForRecipient(ctx context.Context, sandboxID s
 }
 
 // OpenClusterSecretsForNode resolves a replicated secret handle and merges the
-// decrypted credentials back into a redacted spec. LegacySealed is still
-// honored for placements written before the ref model.
+// decrypted credentials back into a redacted spec. The handle (Ref/Version)
+// is the only carrier — placements never embed sealed bytes.
 func (s *Service) OpenClusterSecretsForNode(ctx context.Context, redacted models.CreateSandboxRequest, secrets cluster.PlacementSecrets, nodeID string) (out models.CreateSandboxRequest, err error) {
-	if secrets.Ref == "" && len(secrets.LegacySealed) == 0 {
+	if secrets.Ref == "" {
 		return redacted, nil
 	}
 	done := beginClusterSecretOpen()
 	defer func() { done(err) }()
-	if secrets.Ref != "" {
-		if s.store == nil {
-			return redacted, errors.New("cluster secret store is not configured")
-		}
-		rec, err := s.store.GetClusterSecret(ctx, secrets.Ref)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				return redacted, fmt.Errorf("cluster secret ref %q not found", secrets.Ref)
-			}
-			return redacted, err
-		}
-		if secrets.Version != 0 && rec.Version != secrets.Version {
-			recordClusterSecretKeyMismatch()
-			return redacted, fmt.Errorf("cluster secret ref %q version mismatch: placement=%d store=%d", secrets.Ref, secrets.Version, rec.Version)
-		}
-		return s.UnsealClusterSecretsForNode(redacted, rec.SealedPayload, nodeID)
+	if s.store == nil {
+		return redacted, errors.New("cluster secret store is not configured")
 	}
-	return s.UnsealClusterSecretsForNode(redacted, secrets.LegacySealed, nodeID)
+	rec, err := s.store.GetClusterSecret(ctx, secrets.Ref)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return redacted, fmt.Errorf("cluster secret ref %q not found", secrets.Ref)
+		}
+		return redacted, err
+	}
+	if secrets.Version != 0 && rec.Version != secrets.Version {
+		recordClusterSecretKeyMismatch()
+		return redacted, fmt.Errorf("cluster secret ref %q version mismatch: placement=%d store=%d", secrets.Ref, secrets.Version, rec.Version)
+	}
+	return s.UnsealClusterSecretsForNode(redacted, rec.SealedPayload, nodeID)
 }
 
 func (s *Service) OpenClusterSecrets(ctx context.Context, redacted models.CreateSandboxRequest, secrets cluster.PlacementSecrets) (models.CreateSandboxRequest, error) {

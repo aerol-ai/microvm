@@ -152,15 +152,20 @@ func TestFSMClaimCustomHostnameLocked(t *testing.T) {
 
 func TestFSMStoreRecoveryBlob(t *testing.T) {
 	fsm := newPlacementFSM()
-	blob, _ := newRecoveryBlob("sb1", placementRecovery{SecretRef: "sr"})
-	err := fsm.storeRecoveryBlob(blob)
-	if err != nil {
+	blob := seedRecoveryBlob(t, newPlacementRecoveryMemoryStore(), "sb1", placementRecovery{SecretRef: "sr"})
+	if err := fsm.storeRecoveryBlob(blob); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	badBlob, _ := newRecoveryBlob("", placementRecovery{})
-	err = fsm.storeRecoveryBlob(badBlob)
-	if err == nil {
+	// A fetched blob whose bytes don't hash to its claimed ref must be
+	// rejected — the resolver trusts refs, not peers.
+	tampered := blob
+	tampered.SecretRef = "sr-tampered"
+	if err := fsm.storeRecoveryBlob(tampered); err == nil {
+		t.Errorf("expected ref-mismatch error for tampered blob")
+	}
+
+	if err := fsm.storeRecoveryBlob(RecoveryBlob{}); err == nil {
 		t.Errorf("expected error for empty sandbox id")
 	}
 }

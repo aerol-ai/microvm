@@ -373,7 +373,6 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
-		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -393,7 +392,6 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
-		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -415,7 +413,6 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 		Spec:          spec,
 		SecretRef:     secrets.Ref,
 		SecretVersion: secrets.Version,
-		SealedSecrets: cloneBytes(secrets.LegacySealed),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -427,20 +424,6 @@ func (c *Cluster) SecretsOf(sandboxID string) PlacementSecrets {
 		return PlacementSecrets{}
 	}
 	return secretsFromPlacement(p)
-}
-
-// SealedSecretsOf returns a copy of the legacy sealed credential bag paired
-// with SpecOf's spec. Returns nil when there's no placement, no sealed bag, or
-// the placement uses the secret-reference model. Caller-mutation is safe.
-func (c *Cluster) SealedSecretsOf(sandboxID string) []byte {
-	secrets := c.SecretsOf(sandboxID)
-	// The secret-reference model supersedes the legacy sealed bag: when a Ref
-	// is present, credentials are fetched by reference and any LegacySealed
-	// bytes are vestigial, so callers must not consume them.
-	if secrets.Ref != "" || len(secrets.LegacySealed) == 0 {
-		return nil
-	}
-	return secrets.LegacySealed
 }
 
 // SpecOf returns a deep-copy of the replicated spec for sandboxID, or nil if
@@ -596,7 +579,6 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		Spec:               redacted,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
-		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	}
 	return c.applyCommand(ctx, cmd)
@@ -625,7 +607,6 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 			Spec:               r.Redacted,
 			SecretRef:          r.Secrets.Ref,
 			SecretVersion:      r.Secrets.Version,
-			SealedSecrets:      cloneBytes(r.Secrets.LegacySealed),
 			ExpiresUnix:        now.Add(r.TTL).Unix(),
 		})
 	}
@@ -997,16 +978,15 @@ func placementCanBeClaimedBy(p Placement, nodeID string) bool {
 // DeletePlacement) safe to call from any node — without it, every owner-side
 // caller would have to know whether it's the leader and forward by hand.
 func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
-	raftCmd, err := c.externalizeCommandRecovery(ctx, cmd)
-	if err != nil {
-		return fmt.Errorf("cluster: externalize recovery: %w", err)
+	if err := validateCommandRecoverySize(cmd); err != nil {
+		return err
 	}
-	payload, err := encodeCommand(raftCmd)
+	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
 	if c.raft.raft.State() == raft.Leader {
-		if raftCmd.Op == opReserve || raftCmd.Op == opReserveBatch {
+		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
 		}
 		return c.applyEncodedLocal(ctx, payload)
@@ -1026,21 +1006,13 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if c.raft.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
-	if err := c.fsm.hydrateCommandRecovery(&cmd); err != nil {
+	if err := validateCommandRecoverySize(cmd); err != nil {
 		return err
 	}
-	raftCmd, err := c.externalizeCommandRecovery(ctx, cmd)
-	if err != nil {
-		return fmt.Errorf("cluster: externalize recovery: %w", err)
+	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
+		return c.applyReservationEncodedLocal(ctx, payload, cmd)
 	}
-	raftPayload, err := encodeCommand(raftCmd)
-	if err != nil {
-		return fmt.Errorf("cluster: encode command: %w", err)
-	}
-	if raftCmd.Op == opReserve || raftCmd.Op == opReserveBatch {
-		return c.applyReservationEncodedLocal(ctx, raftPayload, cmd)
-	}
-	return c.applyEncodedLocal(ctx, raftPayload)
+	return c.applyEncodedLocal(ctx, payload)
 }
 
 func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {

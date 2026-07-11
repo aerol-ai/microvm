@@ -768,7 +768,7 @@ func TestPrepare_ReservePaths(t *testing.T) {
 		if rc.redacted == nil || rc.redacted.Registry == nil || rc.redacted.Registry.Password != "" {
 			t.Fatalf("redacted registry = %+v, want password stripped", rc.redacted.Registry)
 		}
-		if rc.secrets.Ref != "" || rc.secrets.Version != 0 || len(rc.secrets.LegacySealed) != 0 {
+		if rc.secrets.Ref != "" || rc.secrets.Version != 0 {
 			t.Fatalf("reservation secrets = %+v, want empty", rc.secrets)
 		}
 	})

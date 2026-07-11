@@ -172,7 +172,6 @@ func startAgentControlPlaneServerWithVolumes(t *testing.T, c *Cluster, ln net.Li
 		}
 		p.SecretRef = ""
 		p.SecretVersion = 0
-		p.SealedSecrets = nil
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
 	})
