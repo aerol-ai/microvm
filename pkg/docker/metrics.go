@@ -28,7 +28,16 @@ var (
 	netnsPoolRefillErrors  = expvar.NewInt("aerolvm_docker_netns_pool_refill_errors_total")
 	netnsPoolOrphansReaped = expvar.NewInt("aerolvm_docker_netns_pool_orphans_reaped_total")
 	netnsPoolSize          = expvar.NewInt("aerolvm_docker_netns_pool_size")
+
+	// Warm-adopt image-ID cache (see image_cache.go). The hit ratio tells
+	// operators how often warm creates skip the per-create image inspect;
+	// a low ratio under steady traffic means the TTL is being outrun.
+	imageCacheHits   = expvar.NewInt("aerolvm_docker_image_cache_hits_total")
+	imageCacheMisses = expvar.NewInt("aerolvm_docker_image_cache_misses_total")
 )
+
+func recordImageCacheHit()  { imageCacheHits.Add(1) }
+func recordImageCacheMiss() { imageCacheMisses.Add(1) }
 
 func beginImagePullMetric() func(error) {
 	imagePullRequestsTotal.Add(1)

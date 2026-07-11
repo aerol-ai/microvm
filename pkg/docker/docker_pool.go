@@ -114,11 +114,10 @@ func (c *Client) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 		return nil, dockerpool.ErrNoSlot
 	}
 
-	imageInspect, err := c.inspectImage(ctx, req.Image)
+	imageID, err := c.resolveImageIDCached(ctx, req.Image)
 	if err != nil {
 		return nil, dockerpool.ErrNoSlot
 	}
-	imageID := strings.TrimSpace(imageInspect.ID)
 	slot, err := c.warmPool.Acquire(ctx, key, imageID)
 	if err != nil {
 		if timing := CreateTimingFrom(ctx); timing != nil && errors.Is(err, dockerpool.ErrNoSlot) {
@@ -332,6 +331,27 @@ func parkDefaultResources(c *Client) map[string]any {
 	return resources
 }
 
+// resolveImageIDCached resolves an image reference to its engine image ID,
+// consulting the TTL cache first. Only a cache miss pays the engine
+// round-trip, recorded as a docker_image stage (desc=resolve, distinct from
+// the cold path's local/pulled) so the cost stays visible in bench data.
+func (c *Client) resolveImageIDCached(ctx context.Context, imageRef string) (string, error) {
+	if id, ok := c.imageIDs.Get(imageRef); ok {
+		recordImageCacheHit()
+		return id, nil
+	}
+	recordImageCacheMiss()
+	start := time.Now()
+	imageInspect, err := c.inspectImage(ctx, imageRef)
+	if err != nil {
+		return "", err
+	}
+	CreateTimingFrom(ctx).RecordStageDesc("docker_image", time.Since(start), "resolve")
+	id := strings.TrimSpace(imageInspect.ID)
+	c.imageIDs.Put(imageRef, id)
+	return id, nil
+}
+
 func (c *Client) adoptParked(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, slot *dockerpool.ParkedSlot) (*SandboxRuntime, error) {
 	if slot == nil || slot.Handle == nil {
 		return nil, errors.New("parked slot is incomplete")
@@ -348,8 +368,13 @@ func (c *Client) adoptParked(ctx context.Context, req models.CreateSandboxReques
 		return nil, err
 	}
 
-	if err := c.updateContainerResources(ctx, slot.ContainerID, req.CPU, req.MemoryMB); err != nil {
-		return nil, err
+	// Parked containers were created with parkDefaultResources — the exact
+	// shape normalizeCreateRequest fills in for unspecified requests — so
+	// the update is a no-op engine round-trip unless the request diverges.
+	if req.CPU != models.DefaultCPU || req.MemoryMB != models.DefaultMemoryMB {
+		if err := c.updateContainerResources(ctx, slot.ContainerID, req.CPU, req.MemoryMB); err != nil {
+			return nil, err
+		}
 	}
 
 	adoptNonce, err := mintReadyNonce()
@@ -367,12 +392,17 @@ func (c *Client) adoptParked(ctx context.Context, req models.CreateSandboxReques
 		return nil, err
 	}
 
-	inspect, err := c.inspectContainer(ctx, slot.ContainerID)
-	if err != nil {
-		return nil, err
-	}
-	if ip := getContainerIP(inspect, c.network); ip != "" {
-		containerIP = ip
+	// The park-time IP is authoritative: the container has run uninterrupted
+	// since parkContainer inspected it (a died container can't pass the
+	// Adopt handshake above), so re-inspecting here would only re-read the
+	// same value. Inspect only as a fallback for a slot that somehow parked
+	// without an IP.
+	if containerIP == "" {
+		inspect, err := c.inspectContainer(ctx, slot.ContainerID)
+		if err != nil {
+			return nil, err
+		}
+		containerIP = getContainerIP(inspect, c.network)
 	}
 
 	return &SandboxRuntime{

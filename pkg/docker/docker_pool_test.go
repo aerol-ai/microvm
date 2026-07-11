@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -287,6 +288,12 @@ type poolFakeDaemon struct {
 	createBodies [][]byte
 	updateBodies [][]byte
 	removeCalls  int
+	// Engine round-trip counters for the warm-adopt fast path: the image-ID
+	// cache and slot-carried IP exist to keep these at zero/one per burst.
+	imageInspectCalls int
+	containerGetCalls int
+	imageTagCalls     int
+	imageDeleteCalls  int
 }
 
 func (d *poolFakeDaemon) transport() roundTripFunc {
@@ -299,9 +306,16 @@ func (d *poolFakeDaemon) transport() roundTripFunc {
 			}
 			return jsonResponse(http.StatusOK, []containerSummary{}), nil
 		case r.Method == http.MethodGet && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/json"):
+			d.imageInspectCalls++
 			if d.imageInspect != nil {
 				return d.imageInspect(), nil
 			}
+		case r.Method == http.MethodPost && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/tag"):
+			d.imageTagCalls++
+			return textResponse(http.StatusCreated, ""), nil
+		case r.Method == http.MethodDelete && strings.HasPrefix(p, "/images/"):
+			d.imageDeleteCalls++
+			return jsonResponse(http.StatusOK, []map[string]string{}), nil
 		case r.Method == http.MethodPost && p == "/images/create":
 			d.pullCalls++
 			if d.pull != nil {
@@ -320,6 +334,7 @@ func (d *poolFakeDaemon) transport() roundTripFunc {
 				return d.start(), nil
 			}
 		case r.Method == http.MethodGet && strings.HasPrefix(p, "/containers/") && strings.HasSuffix(p, "/json"):
+			d.containerGetCalls++
 			if d.containerGet != nil {
 				return d.containerGet(), nil
 			}
@@ -944,5 +959,231 @@ func TestCreate_RenameConflictSkipsColdFallback(t *testing.T) {
 	}
 	if !pool.HasReady(key) {
 		t.Fatal("slot not returned to the pool after rename conflict")
+	}
+}
+
+// parkGuestSlot parks one slot into the pool backed by a real ParkedListener
+// with a guest goroutine that completes the adopt handshake (parked signal →
+// adopt frame → ready ack), mirroring toolboxd's park-mode behavior.
+func parkGuestSlot(t *testing.T, pool *dockerpool.Pool, key dockerpool.Key, slotID, containerID, containerIP string) {
+	t.Helper()
+	pl, err := NewParkedListener(shortParkTestDir(t), slotID, "boot-tok", "boot-nonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pl.Close() })
+
+	go func() {
+		conn, err := net.Dial("unix", pl.HostSocketPath())
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := readyproto.EncodeParked(conn, readyproto.ParkedSignal{
+			Event: readyproto.EventParked, Token: "boot-tok", Nonce: "boot-nonce",
+		}); err != nil {
+			return
+		}
+		frame, err := readyproto.DecodeAdopt(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		_ = readyproto.Encode(conn, readyproto.ReadySignal{
+			Event:     readyproto.EventReady,
+			SandboxID: frame.SandboxID,
+			Token:     frame.Token,
+			Nonce:     frame.Nonce,
+		})
+	}()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := pl.WaitParked(waitCtx); err != nil {
+		t.Fatalf("WaitParked(%s): %v", slotID, err)
+	}
+	pool.RecordLoaded(&dockerpool.ParkedSlot{
+		ID:          slotID,
+		ContainerID: containerID,
+		ContainerIP: containerIP,
+		ImageID:     "sha256:img1",
+		Key:         key,
+		Handle:      pl,
+	})
+}
+
+// The warm-hit fast path: consecutive default-shaped adopts must pay exactly
+// one image-inspect round-trip (second create hits the image-ID cache), zero
+// container update calls (park shape == normalized default shape), and zero
+// post-adopt container inspects (the slot carries its park-time IP).
+func TestCreate_WarmAdoptFastPathSkipsEngineRoundTrips(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	pool := dockerpool.New(slogDefault())
+	c := newPoolClient(t, d, func(c *Client) {
+		c.SetWarmPool(pool)
+		c.imageIDs = newImageIDCache(time.Minute)
+	})
+
+	req := models.CreateSandboxRequest{
+		Image:    "alpine:3.20",
+		CPU:      models.DefaultCPU,
+		MemoryMB: models.DefaultMemoryMB,
+	}
+	key := dockerpool.KeyFromRequest(req, models.RuntimeDocker)
+	parkGuestSlot(t, pool, key, "park-fp1", "cid-park-1", "172.17.0.9")
+	parkGuestSlot(t, pool, key, "park-fp2", "cid-park-2", "172.17.0.10")
+
+	ctx1, timing1 := createtiming.With(context.Background())
+	rt1, err := c.Create(ctx1, req, "sb-fp1", "tok", nil)
+	if err != nil {
+		t.Fatalf("first Create() = %v", err)
+	}
+	ctx2, timing2 := createtiming.With(context.Background())
+	rt2, err := c.Create(ctx2, req, "sb-fp2", "tok", nil)
+	if err != nil {
+		t.Fatalf("second Create() = %v", err)
+	}
+
+	if rt1.AdoptedParkID == "" || rt2.AdoptedParkID == "" {
+		t.Fatalf("expected both creates to adopt, got %q / %q", rt1.AdoptedParkID, rt2.AdoptedParkID)
+	}
+	if rt1.ContainerIP == "" || rt2.ContainerIP == "" {
+		t.Fatalf("adopted runtimes missing slot-carried IPs: %q / %q", rt1.ContainerIP, rt2.ContainerIP)
+	}
+	if d.imageInspectCalls != 1 {
+		t.Fatalf("image inspects = %d, want 1 (second adopt must hit the image-ID cache)", d.imageInspectCalls)
+	}
+	if len(d.updateBodies) != 0 {
+		t.Fatalf("update calls = %d, want 0 (default shape matches park shape)", len(d.updateBodies))
+	}
+	if d.containerGetCalls != 0 {
+		t.Fatalf("container inspects = %d, want 0 (slot carries the park-time IP)", d.containerGetCalls)
+	}
+
+	stagesOf := func(tm *createtiming.CreateTiming) map[string]string {
+		out := map[string]string{}
+		for _, st := range tm.Stages() {
+			out[st.Name] = st.Desc
+		}
+		return out
+	}
+	first, second := stagesOf(timing1), stagesOf(timing2)
+	if first["docker_pool"] != "hit" || second["docker_pool"] != "hit" {
+		t.Fatalf("docker_pool descs = %q / %q, want hit/hit", first["docker_pool"], second["docker_pool"])
+	}
+	if first["docker_image"] != "resolve" {
+		t.Fatalf("first create docker_image desc = %q, want resolve (cache miss pays the inspect)", first["docker_image"])
+	}
+	if _, ok := second["docker_image"]; ok {
+		t.Fatalf("second create recorded docker_image %q; cache hit must skip the inspect stage", second["docker_image"])
+	}
+}
+
+// A request that diverges from the park shape must still resize the adopted
+// container — the skip is strictly for the byte-identical default shape.
+func TestCreate_WarmAdoptCustomShapeStillUpdates(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	pool := dockerpool.New(slogDefault())
+	c := newPoolClient(t, d, func(c *Client) {
+		c.SetWarmPool(pool)
+		c.imageIDs = newImageIDCache(time.Minute)
+	})
+
+	req := models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 2, MemoryMB: 2048}
+	key := dockerpool.KeyFromRequest(req, models.RuntimeDocker)
+	parkGuestSlot(t, pool, key, "park-cs1", "cid-park-1", "172.17.0.9")
+
+	rt, err := c.Create(context.Background(), req, "sb-cs1", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+	if rt.AdoptedParkID == "" {
+		t.Fatal("expected a warm adopt")
+	}
+	if len(d.updateBodies) != 1 {
+		t.Fatalf("update calls = %d, want 1 for a non-default shape", len(d.updateBodies))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(d.updateBodies[0], &body); err != nil {
+		t.Fatalf("update body: %v", err)
+	}
+	if body["CpuQuota"] != float64(200000) {
+		t.Fatalf("CpuQuota = %v, want 200000", body["CpuQuota"])
+	}
+	if body["Memory"] != float64(2048*1024*1024) {
+		t.Fatalf("Memory = %v, want 2GiB", body["Memory"])
+	}
+}
+
+// sandboxd-driven image mutations must flush the resolution cache so the
+// next warm probe re-inspects instead of adopting against a pre-change ID.
+func TestImageMutationsFlushImageIDCache(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	c := newPoolClient(t, d, func(c *Client) {
+		c.imageIDs = newImageIDCache(time.Minute)
+		c.pulls = make(map[string]*imagePull)
+		c.pullFailures = make(map[string]imagePullFailure)
+	})
+
+	seed := func() {
+		c.imageIDs.Put("alpine:3.20", "sha256:old")
+		if _, ok := c.imageIDs.Get("alpine:3.20"); !ok {
+			t.Fatal("seed entry missing")
+		}
+	}
+
+	seed()
+	if err := c.PullImage(context.Background(), "alpine:3.20", nil); err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	if _, ok := c.imageIDs.Get("alpine:3.20"); ok {
+		t.Fatal("pull must flush the cached resolution")
+	}
+
+	seed()
+	if err := c.RemoveImage(context.Background(), "alpine:3.20"); err != nil {
+		t.Fatalf("RemoveImage: %v", err)
+	}
+	if _, ok := c.imageIDs.Get("alpine:3.20"); ok {
+		t.Fatal("image delete must flush the cached resolution")
+	}
+	if d.imageDeleteCalls != 1 {
+		t.Fatalf("imageDeleteCalls = %d, want 1", d.imageDeleteCalls)
+	}
+
+	seed()
+	if err := c.tagImage(context.Background(), "sha256:new", "alpine", "3.20"); err != nil {
+		t.Fatalf("tagImage: %v", err)
+	}
+	if _, ok := c.imageIDs.Get("alpine:3.20"); ok {
+		t.Fatal("tag must flush the cached resolution for the target ref")
+	}
+	if d.imageTagCalls != 1 {
+		t.Fatalf("imageTagCalls = %d, want 1", d.imageTagCalls)
+	}
+}
+
+// A slot that somehow parked without an IP must fall back to the container
+// inspect instead of returning an empty ContainerIP to the service layer.
+func TestCreate_WarmAdoptEmptySlotIPFallsBackToInspect(t *testing.T) {
+	d := &poolFakeDaemon{t: t}
+	pool := dockerpool.New(slogDefault())
+	c := newPoolClient(t, d, func(c *Client) {
+		c.SetWarmPool(pool)
+		c.imageIDs = newImageIDCache(time.Minute)
+	})
+
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+	key := dockerpool.KeyFromRequest(req, models.RuntimeDocker)
+	parkGuestSlot(t, pool, key, "park-noip", "cid-park", "")
+
+	rt, err := c.Create(context.Background(), req, "sb-noip", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+	if d.containerGetCalls != 1 {
+		t.Fatalf("container inspects = %d, want exactly the fallback one", d.containerGetCalls)
+	}
+	if rt.ContainerIP != "172.17.0.9" {
+		t.Fatalf("ContainerIP = %q, want the inspect-provided 172.17.0.9", rt.ContainerIP)
 	}
 }

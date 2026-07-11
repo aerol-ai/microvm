@@ -74,6 +74,7 @@ type Client struct {
 	warmPool           *dockerpool.Pool
 	netnsPool          *NetnsPool
 	parkDiskGB         int
+	imageIDs           *imageIDCache
 	// Mirror configuration: zero value disables rewriting and the pull
 	// path behaves exactly as it did before AOCR mirror support landed.
 	// Set via ConfigureMirror after construction; main() is responsible
@@ -144,6 +145,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		pullBackoff:        cfg.ImagePullFailureBackoff,
 		pullFailures:       make(map[string]imagePullFailure),
 		parkDiskGB:         models.DefaultDiskGB,
+		imageIDs:           newImageIDCache(imageIDCacheTTL),
 	}, nil
 }
 
@@ -1149,6 +1151,12 @@ func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *mode
 			c.releasePullSlot()
 		}
 	}
+	// A successful pull may have moved the tag to a new image ID; drop the
+	// cached resolution before dedup waiters are released so no create built
+	// after this pull adopts against the pre-pull ID.
+	if inFlight.err == nil {
+		c.imageIDs.Flush(imageRef)
+	}
 
 	c.pullMu.Lock()
 	delete(c.pulls, key)
@@ -1659,6 +1667,9 @@ func (c *Client) RemoveImage(ctx context.Context, imageRef string) error {
 	if imageRef == "" {
 		return nil
 	}
+	// Flush before the delete: even a 404/409 outcome means the cached
+	// resolution is no longer trustworthy, and a re-inspect is cheap.
+	c.imageIDs.Flush(imageRef)
 	err := c.doJSON(ctx, http.MethodDelete, "/images/"+url.PathEscape(imageRef), nil, nil, nil, nil)
 	if err == nil {
 		return nil
