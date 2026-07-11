@@ -49,8 +49,13 @@ no longer serialize. See `ip_lock_test.go`.
   shape, so mixed-version-safe both directions); blob mesh remains only for
   legacy sealed bytes / oversized specs. Raft-quorum durability is strictly
   stronger than today's best-effort mesh for failover recreate.
-- **Start:** `internal/cluster/recovery_replication.go`
-  (`storeAndReplicateRecoveryBlob`), `recovery_store.go` fetch path; bench
+- **Status:** IMPLEMENTED 2026-07-11 (PR #307, stacked on PR #306):
+  `inlineRecoveryEligible` gate in `recovery_replication.go`, externalize-mode
+  metric, determinism-parity + replay + threshold-crossing regression tests.
+  **Remaining:** operator bench re-run (plan T4) to confirm `create;dur`
+  p50 ≤ 30ms / `cluster_promote` ≤ 8ms, then close this entry.
+- **Start (for the bench re-run):** `make integration-benchmark-docker-only`
+  + `-sparse` with `SB_NETRULES_BACKEND=netlink`, all-WAL raft; prior
   artifacts `integration-tests/reports/cluster-3-mixed-docker-bench-{baseline,netlink,netlink-wal}.json`.
 
 ## netrules backend switch on iptables-legacy hosts — DONE

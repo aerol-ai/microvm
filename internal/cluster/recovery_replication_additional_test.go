@@ -19,15 +19,20 @@ func TestCommandCarriesRecoveryPayload(t *testing.T) {
 	}
 }
 
+// TestExternalizeCommandRecovery covers the blob path of the two externalize
+// wrappers. Payloads are blob-forced (sealed bytes / oversized spec) because
+// small secret-free payloads stay inline since Tier 2 — that contract is
+// pinned in recovery_inline_test.go.
 func TestExternalizeCommandRecovery(t *testing.T) {
 	put := func(ctx context.Context, blob RecoveryBlob) error {
 		return nil
 	}
 
 	cmd := command{
-		Op:        opPlace,
-		Spec:      &models.CreateSandboxRequest{},
-		SandboxID: "sb1",
+		Op:            opPlace,
+		Spec:          &models.CreateSandboxRequest{},
+		SealedSecrets: []byte("sealed"),
+		SandboxID:     "sb1",
 	}
 
 	out, err := externalizeCommandRecovery(context.Background(), cmd, put)
@@ -44,7 +49,7 @@ func TestExternalizeCommandRecovery(t *testing.T) {
 	cmd2 := command{
 		Op: opReserveBatch,
 		Reservations: []reservationCommand{
-			{SandboxID: "sb2", Spec: &models.CreateSandboxRequest{}},
+			{SandboxID: "sb2", Spec: oversizedSpec("sb2")},
 		},
 	}
 	out2, err := externalizeCommandRecovery(context.Background(), cmd2, put)

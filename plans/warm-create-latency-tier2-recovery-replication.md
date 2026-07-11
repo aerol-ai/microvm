@@ -1,6 +1,9 @@
 # Warm create latency Tier 2: inline recovery payloads (40ms → ≤30ms gate unlock)
 
-Status: **draft — needs eng review.** Follow-up to
+Status: **implemented 2026-07-11 — PR #307** (branch
+`perf/warm-create-latency-tier2-inline-recovery`, stacked on PR #306) —
+T1–T3 done, offline suite green; **bench gate re-run (T4) pending**, which is
+what proves the ≤30ms unlock and closes T5. Follow-up to
 `plans/warm-create-latency-tier1.md` (gates run 2026-07-11) and the TODOS
 entry "cluster_promote is recovery-replication-bound". Tier 1 + 1.5 got the
 create leg to 17ms and the seal to 0ms, but the ≤30ms warm-p50 gate failed
@@ -84,9 +87,14 @@ inline-eligible iff:
   store+replicate entirely. The Raft command keeps `Spec`, `SecretRef`,
   `SecretVersion` inline — the ORIGINAL wire shape. FSM apply:
   `hydrateCommandRecovery` is already a no-op when `RecoveryRef == ""`;
-  `opPlace`/`opReserve` handling is unchanged. No blob file is created, so
-  there is nothing for `deletePlacementRecoveryLocked` / snapshot GC to
-  clean — both are already no-ops for refless rows.
+  `opPlace`/`opReserve` handling is unchanged. **Verified at implementation
+  time:** `storePlacementLocked` splits an inline payload into each voter's
+  *local* recovery store at apply time under the same content-addressed ref
+  the blob path would compute — so a blob file still lands on every voter
+  (written locally, not pushed over HTTP pre-apply), destroy-time deletion
+  and snapshot GC behave identically, and the stored FSM row is
+  byte-identical between the two wire shapes (pinned by the determinism
+  parity test).
 - **Not eligible (legacy sealed bytes, or oversized spec):** today's path,
   byte-for-byte — externalize, store locally, sync-replicate to all
   members, apply with `RecoveryRef`.
@@ -210,14 +218,17 @@ drift.
 
 ## Implementation tasks
 
-- [ ] **T1** — Eligibility gate in `externalizeCommandRecovery` (+ const,
-  rationale comment, externalize-mode metric)
-- [ ] **T2** — Regression tests §6.1–6.4 (`recovery_replication_test.go`,
-  `fsm_recovery_*_test.go`)
-- [ ] **T3** — PR call-outs: boot-path (§2 pr-review), cluster-correctness
-  (§4 rollout matrix, §5 failure modes), coverage at ~85%
+- [x] **T1** — Eligibility gate in `externalizeCommandRecovery` (+ const,
+  rationale comment, externalize-mode metric
+  `aerolvm_cluster_recovery_externalize_total{inline,blob}`)
+- [x] **T2** — Regression tests §6.1–6.4 (`recovery_inline_test.go` for the
+  gate + batch mixing; `fsm_recovery_inline_test.go` for determinism parity,
+  mixed-log replay, name-index-from-inline-spec, threshold crossing)
+- [x] **T3** — PR call-outs: boot-path (§2 pr-review), cluster-correctness
+  (§4 rollout matrix, §5 failure modes), coverage at ~85% — branch
+  `perf/warm-create-latency-tier2-inline-recovery`, stacked on PR #306
 - [ ] **T4** — Bench gate re-run (burst + sparse, netlink, all-WAL) —
   ≤30ms p50 with `cluster_promote` ≤8ms; update Tier 1/1.5 plan status
   lines to "gate MET" with the artifact paths
 - [ ] **T5** — Close the TODOS entry ("cluster_promote is
-  recovery-replication-bound") pointing here
+  recovery-replication-bound") pointing here (after T4 confirms the gate)

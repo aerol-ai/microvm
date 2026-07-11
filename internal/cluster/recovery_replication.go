@@ -38,16 +38,63 @@ func externalizeCommandRecovery(ctx context.Context, cmd command, put func(conte
 	return cmd, nil
 }
 
+// inlineRecoveryMaxBytes bounds the recovery payload a command may carry
+// inline in the raft log instead of pre-replicating it as a blob. The value
+// keeps log entries and FSM snapshots small: typical redacted specs encode to
+// ~0.5–1KiB, so 4KiB covers the normal create with headroom while capping
+// worst-case snapshot growth at ~4KiB per placement. A const, not config —
+// an env knob would make what the emitter sends diverge per node for no
+// benefit (any mix of inline and ref commands is valid either way).
+const inlineRecoveryMaxBytes = 4096
+
+// inlineRecoveryEligible reports whether a recovery payload may stay inline
+// in the raft command, skipping the blob store + synchronous replication to
+// every control-plane member. Two conditions, both load-bearing:
+//
+//   - Sealed secret bytes must NEVER enter the raft log: the log and FSM
+//     snapshots are not erasable per-sandbox, while blob files are deleted on
+//     destroy. The modern path's SecretRef is a provider handle, not secret
+//     material, so it may ride the log.
+//   - The encoded payload (the exact bytes the blob store would persist) must
+//     fit inlineRecoveryMaxBytes so log/snapshot growth stays bounded.
+//
+// Inline commands are the original wire shape: hydrateCommandRecovery is a
+// no-op for RecoveryRef == "", and at apply time storePlacementLocked splits
+// the payload into each voter's local recovery store under the same
+// content-addressed ref this encoding produces — so failover recreate and
+// destroy-time blob deletion behave exactly as on the blob path, minus the
+// pre-apply HTTP fan-out.
+func inlineRecoveryEligible(sandboxID string, rec placementRecovery) (bool, error) {
+	if len(rec.SealedSecrets) > 0 {
+		return false, nil
+	}
+	_, payload, err := encodePlacementRecoveryRecord(placementRecoveryStoreRecord{SandboxID: sandboxID, Recovery: rec})
+	if err != nil {
+		return false, err
+	}
+	return len(payload) <= inlineRecoveryMaxBytes, nil
+}
+
 func externalizeSingleCommandRecovery(ctx context.Context, cmd command, put func(context.Context, RecoveryBlob) error) (command, error) {
 	if !commandCarriesRecoveryPayload(cmd.Spec, cmd.SecretRef, cmd.SecretVersion, cmd.SealedSecrets) {
 		return cmd, nil
 	}
-	blob, err := newRecoveryBlob(cmd.SandboxID, placementRecovery{
+	rec := placementRecovery{
 		Spec:          cmd.Spec,
 		SecretRef:     cmd.SecretRef,
 		SecretVersion: cmd.SecretVersion,
 		SealedSecrets: cloneBytes(cmd.SealedSecrets),
-	})
+	}
+	inline, err := inlineRecoveryEligible(cmd.SandboxID, rec)
+	if err != nil {
+		return command{}, err
+	}
+	if inline {
+		recordRecoveryExternalize(recoveryExternalizeModeInline)
+		return cmd, nil
+	}
+	recordRecoveryExternalize(recoveryExternalizeModeBlob)
+	blob, err := newRecoveryBlob(cmd.SandboxID, rec)
 	if err != nil {
 		return command{}, err
 	}
@@ -67,12 +114,22 @@ func externalizeReservationRecovery(ctx context.Context, r reservationCommand, p
 	if !commandCarriesRecoveryPayload(r.Spec, r.SecretRef, r.SecretVersion, r.SealedSecrets) {
 		return r, nil
 	}
-	blob, err := newRecoveryBlob(r.SandboxID, placementRecovery{
+	rec := placementRecovery{
 		Spec:          r.Spec,
 		SecretRef:     r.SecretRef,
 		SecretVersion: r.SecretVersion,
 		SealedSecrets: cloneBytes(r.SealedSecrets),
-	})
+	}
+	inline, err := inlineRecoveryEligible(r.SandboxID, rec)
+	if err != nil {
+		return reservationCommand{}, err
+	}
+	if inline {
+		recordRecoveryExternalize(recoveryExternalizeModeInline)
+		return r, nil
+	}
+	recordRecoveryExternalize(recoveryExternalizeModeBlob)
+	blob, err := newRecoveryBlob(r.SandboxID, rec)
 	if err != nil {
 		return reservationCommand{}, err
 	}
