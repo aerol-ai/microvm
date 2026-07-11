@@ -266,6 +266,17 @@ locals {
     refill_interval = try(local.cluster_ops.docker.pool.refill_interval, "5s")
   }
 
+  # Pause-netns pool (image-agnostic prepaid network namespaces for docker
+  # cold creates). Values come from cluster.yml's docker.netns_pool block;
+  # defaults mirror config.go so Terraform and Ansible
+  # (playbooks/configure-ops.yml) render identical env on every node.
+  docker_netns_pool_cfg = {
+    enabled         = try(local.cluster_ops.docker.netns_pool.enabled, false) ? "true" : "false"
+    depth           = tostring(try(local.cluster_ops.docker.netns_pool.depth, 4))
+    pause_image     = try(local.cluster_ops.docker.netns_pool.pause_image, "registry.k8s.io/pause:3.10")
+    refill_interval = try(local.cluster_ops.docker.netns_pool.refill_interval, "2s")
+  }
+
   # Homogeneous per-arch clusters (D5): one GOARCH for snapshot tagging and
   # Firecracker upstream artifact selection. The precondition on
   # validate_cluster_ops enforces a single distinct arch across nodes.

@@ -623,6 +623,16 @@ SB_DOCKER_POOL_IMAGES=${docker_pool_cfg.images}
 SB_DOCKER_POOL_MAX_IMAGES=${docker_pool_cfg.max_images}
 SB_DOCKER_POOL_IDLE_TTL=${docker_pool_cfg.idle_ttl}
 SB_DOCKER_POOL_REFILL_INTERVAL=${docker_pool_cfg.refill_interval}
+
+# Managed by Terraform bootstrap: pause-netns pool (prepaid network
+# namespaces for docker cold creates). Without these lines the
+# docker-netns-pool capability silently no-ops: run.sh writes
+# docker.netns_pool.enabled into cluster.yml but only this template
+# turns cluster.yml into sandboxd env on Terraform-provisioned nodes.
+SB_DOCKER_NETNS_POOL_ENABLED=${docker_netns_pool_cfg.enabled}
+SB_DOCKER_NETNS_POOL_DEPTH=${docker_netns_pool_cfg.depth}
+SB_DOCKER_NETNS_POOL_PAUSE_IMAGE=${docker_netns_pool_cfg.pause_image}
+SB_DOCKER_NETNS_POOL_REFILL_INTERVAL=${docker_netns_pool_cfg.refill_interval}
 EOF
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
