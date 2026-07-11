@@ -14,6 +14,11 @@ import (
 // Address matches use native payload+cmp (iptables-nft stores the same for
 // simple -s/-d); the comment uses the xt comment match so iptables -L still
 // lists the tag that keeps selective egress disjoint from the blanket DROP.
+// A counter expr precedes the verdict because iptables-nft puts one on every
+// rule — emitting it keeps our rules byte-compatible with rules the exec
+// backend created, so `iptables -D` can remove ours and (via the
+// counter-insensitive match below) we can remove theirs after an operator
+// flips SB_NETRULES_BACKEND.
 func exprsFromRulespec(rulespec ...string) ([]expr.Any, error) {
 	parsed, err := parseRulespec(rulespec...)
 	if err != nil {
@@ -43,13 +48,14 @@ func exprsFromRulespec(rulespec ...string) ([]expr.Any, error) {
 	default:
 		return nil, fmt.Errorf("netrules: internal: unset verdict after parse")
 	}
-	exprs = append(exprs, &expr.Verdict{Kind: kind})
+	exprs = append(exprs, &expr.Counter{}, &expr.Verdict{Kind: kind})
 	return exprs, nil
 }
 
 // ipv4MatchExprs matches an IPv4 address/CIDR at the given network-header
 // offset (12 = saddr, 16 = daddr). Host-bit-cleared network address + mask
-// via Bitwise so /32 and wider CIDRs share one code path.
+// via Bitwise so /32 and wider CIDRs share one code path. Callers must feed
+// it IPv4 only — parseAddrOrCIDR/v4Only guarantee that for every rulespec.
 func ipv4MatchExprs(offset uint32, n *net.IPNet) []expr.Any {
 	ip4 := n.IP.To4()
 	mask := n.Mask
@@ -96,6 +102,27 @@ func ipv4MatchExprs(offset uint32, n *net.IPNet) []expr.Any {
 			Data:     network,
 		},
 	}
+}
+
+// exprsEqualIgnoringCounters is the backend's rule-identity check: counters
+// are runtime state (packet/byte totals), not identity, and their presence
+// varies by author — iptables-nft always adds one, older netlink-backend
+// builds never did. Stripping both sides lets Exists/Delete match rules
+// created by either backend, which is what makes an in-place
+// SB_NETRULES_BACKEND flip safe on iptables-nft hosts.
+func exprsEqualIgnoringCounters(a, b []expr.Any) bool {
+	return exprsEqual(stripCounters(a), stripCounters(b))
+}
+
+func stripCounters(exprs []expr.Any) []expr.Any {
+	out := make([]expr.Any, 0, len(exprs))
+	for _, e := range exprs {
+		if _, ok := e.(*expr.Counter); ok {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // exprsEqual reports whether two expression lists are semantically equal for

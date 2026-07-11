@@ -107,7 +107,10 @@ func parseRulespec(rulespec ...string) (parsedRule, error) {
 func parseAddrOrCIDR(s string) (*net.IPNet, error) {
 	if strings.Contains(s, "/") {
 		_, n, err := net.ParseCIDR(s)
-		return n, err
+		if err != nil {
+			return nil, err
+		}
+		return v4Only(n)
 	}
 	ip := net.ParseIP(s)
 	if ip == nil {
@@ -116,5 +119,19 @@ func parseAddrOrCIDR(s string) (*net.IPNet, error) {
 	if v4 := ip.To4(); v4 != nil {
 		return &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}, nil
 	}
-	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}, nil
+	return nil, fmt.Errorf("IPv6 not supported: the netlink backend drives the IPv4 filter table")
+}
+
+// v4Only rejects IPv6 and normalizes the rest to 4-byte form. This is the
+// single enforcement point that keeps 16-byte addresses away from
+// ipv4MatchExprs, which indexes IP[0..3] and would panic the daemon —
+// NetworkAllowOut/DenyOut CIDRs are user input, so failing closed here turns
+// a crash into a create error (the exec backend gets the same clean error
+// from the iptables binary).
+func v4Only(n *net.IPNet) (*net.IPNet, error) {
+	v4 := n.IP.To4()
+	if v4 == nil || len(n.Mask) != 4 {
+		return nil, fmt.Errorf("IPv6 not supported: the netlink backend drives the IPv4 filter table")
+	}
+	return &net.IPNet{IP: v4, Mask: n.Mask}, nil
 }

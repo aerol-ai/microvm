@@ -31,6 +31,23 @@ Shipped as per-IP refcounted locks in `pkg/docker/netrules/manager.go`
 (`lockIP`). Same-IP Exists+Insert mutual exclusion preserved; different IPs
 no longer serialize. See `ip_lock_test.go`.
 
+## netrules backend switch on iptables-legacy hosts (docs/ops)
+
+- **What:** the netlink backend emits/tolerates the iptables-nft `counter`
+  expr, so exec↔netlink rule cleanup interoperates on iptables-nft hosts
+  (the modern default). On **iptables-legacy** hosts the exec backend's
+  rules live in the legacy xtables world, which nft netlink cannot see —
+  both rule sets stay active simultaneously.
+- **Why it matters:** flipping `SB_NETRULES_BACKEND` on a legacy host with
+  live sandboxes strands the old backend's ACCEPT/DROP rules; a recycled
+  container IP then inherits a stale egress policy.
+- **Action:** document in the deployment docs that switching backends on
+  iptables-legacy hosts requires draining sandboxes first (`iptables -V`
+  says which mode the host runs). Optionally: startup warning when
+  `SB_NETRULES_BACKEND=netlink` and `iptables -V` reports legacy.
+- **Start:** `pkg/docker/netrules/translator_linux.go` (counter parity is
+  done); `setup/` deployment docs for the runbook note.
+
 ## Promote-fail rollback can leave a ghost Placed row (latent, cluster)
 
 - **Status:** fixed in Tier 1.5 (`OverlapCreateAndPromote` / self-wins

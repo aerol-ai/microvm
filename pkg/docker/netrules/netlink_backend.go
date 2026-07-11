@@ -4,7 +4,6 @@ package netrules
 
 import (
 	"fmt"
-	"sync"
 	"syscall"
 
 	"github.com/google/nftables"
@@ -23,19 +22,27 @@ type nftAPI interface {
 // netlinkBackend drives DOCKER-USER via google/nftables (netlink), translating
 // the Manager's iptables-shaped argv into nft expressions. Rules land in the
 // iptables-nft compat filter/DOCKER-USER chain so iptables -L still lists them.
+//
+// Every operation runs on its own Conn: nftables.Conn buffers messages until
+// Flush, so a shared instance would need a backend-wide mutex — which would
+// re-serialize all container IPs behind one lock and undo the Manager's
+// per-IP sharding. Per-op conns are cheap in non-lasting mode (the netlink
+// socket opens per Flush/GetRules, not per New), and same-IP mutual exclusion
+// is already the Manager's job via lockIP.
 type netlinkBackend struct {
-	mu   sync.Mutex
-	conn nftAPI
+	newConn func() (nftAPI, error)
 }
 
-// NewNetlinkBackend opens a netlink connection to the host nftables. Callers
-// must be on linux; non-linux builds use the stub that always errors.
+// NewNetlinkBackend wires the per-operation nftables connection factory.
+// Callers must be on linux; non-linux builds use the stub that always errors.
 func NewNetlinkBackend() (RuleBackend, error) {
-	c, err := nftables.New()
-	if err != nil {
-		return nil, fmt.Errorf("nftables conn: %w", err)
-	}
-	return &netlinkBackend{conn: c}, nil
+	return &netlinkBackend{newConn: func() (nftAPI, error) {
+		c, err := nftables.New()
+		if err != nil {
+			return nil, fmt.Errorf("nftables conn: %w", err)
+		}
+		return c, nil
+	}}, nil
 }
 
 func (b *netlinkBackend) Exists(table, chain string, rulespec ...string) (bool, error) {
@@ -43,18 +50,20 @@ func (b *netlinkBackend) Exists(table, chain string, rulespec ...string) (bool, 
 	if err != nil {
 		return false, err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	tbl, ch, err := b.lookup(table, chain)
+	tbl, ch, err := lookupTableChain(table, chain)
 	if err != nil {
 		return false, err
 	}
-	rules, err := b.conn.GetRules(tbl, ch)
+	conn, err := b.newConn()
+	if err != nil {
+		return false, err
+	}
+	rules, err := conn.GetRules(tbl, ch)
 	if err != nil {
 		return false, fmt.Errorf("nft get rules: %w", err)
 	}
 	for _, r := range rules {
-		if exprsEqual(want, r.Exprs) {
+		if exprsEqualIgnoringCounters(want, r.Exprs) {
 			return true, nil
 		}
 	}
@@ -66,9 +75,11 @@ func (b *netlinkBackend) Insert(table, chain string, pos int, rulespec ...string
 	if err != nil {
 		return err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	tbl, ch, err := b.lookup(table, chain)
+	tbl, ch, err := lookupTableChain(table, chain)
+	if err != nil {
+		return err
+	}
+	conn, err := b.newConn()
 	if err != nil {
 		return err
 	}
@@ -76,7 +87,7 @@ func (b *netlinkBackend) Insert(table, chain string, pos int, rulespec ...string
 	// Manager always Inserts at position 1 (top). nftables InsertRule without
 	// Position inserts at the beginning of the chain — same semantics.
 	if pos > 1 {
-		rules, gerr := b.conn.GetRules(tbl, ch)
+		rules, gerr := conn.GetRules(tbl, ch)
 		if gerr != nil {
 			return fmt.Errorf("nft get rules for insert pos: %w", gerr)
 		}
@@ -85,8 +96,8 @@ func (b *netlinkBackend) Insert(table, chain string, pos int, rulespec ...string
 			rule.Position = rules[idx].Handle
 		}
 	}
-	b.conn.InsertRule(rule)
-	if err := b.conn.Flush(); err != nil {
+	conn.InsertRule(rule)
+	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("nft insert: %w", err)
 	}
 	return nil
@@ -97,24 +108,26 @@ func (b *netlinkBackend) Delete(table, chain string, rulespec ...string) error {
 	if err != nil {
 		return err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	tbl, ch, err := b.lookup(table, chain)
+	tbl, ch, err := lookupTableChain(table, chain)
 	if err != nil {
 		return err
 	}
-	rules, err := b.conn.GetRules(tbl, ch)
+	conn, err := b.newConn()
+	if err != nil {
+		return err
+	}
+	rules, err := conn.GetRules(tbl, ch)
 	if err != nil {
 		return fmt.Errorf("nft get rules: %w", err)
 	}
 	for _, r := range rules {
-		if !exprsEqual(want, r.Exprs) {
+		if !exprsEqualIgnoringCounters(want, r.Exprs) {
 			continue
 		}
-		if err := b.conn.DelRule(r); err != nil {
+		if err := conn.DelRule(r); err != nil {
 			return fmt.Errorf("nft del rule: %w", err)
 		}
-		if err := b.conn.Flush(); err != nil {
+		if err := conn.Flush(); err != nil {
 			// ENOENT mid-flush means a concurrent clear already removed it.
 			if isNetlinkNotExist(err) {
 				return err
@@ -126,7 +139,7 @@ func (b *netlinkBackend) Delete(table, chain string, rulespec ...string) error {
 	return syscall.ENOENT
 }
 
-func (b *netlinkBackend) lookup(table, chain string) (*nftables.Table, *nftables.Chain, error) {
+func lookupTableChain(table, chain string) (*nftables.Table, *nftables.Chain, error) {
 	if table != "filter" {
 		return nil, nil, fmt.Errorf("netlink backend: unsupported table %q (want filter)", table)
 	}

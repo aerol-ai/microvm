@@ -37,6 +37,36 @@ func TestExprsFromRulespecRoundTrip(t *testing.T) {
 	if !found {
 		t.Fatal("comment match missing")
 	}
+	// iptables-nft parity: a counter expr must precede the verdict so rules
+	// we create are deletable via the exec backend and vice versa.
+	if _, ok := exprs[len(exprs)-2].(*expr.Counter); !ok {
+		t.Fatalf("penultimate expr = %#v, want *expr.Counter", exprs[len(exprs)-2])
+	}
+}
+
+func TestExprsEqualIgnoringCounters(t *testing.T) {
+	ours, err := exprsFromRulespec("-s", "10.0.0.5", "-j", "DROP")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same rule as the kernel would return it after traffic: non-zero totals.
+	live := make([]expr.Any, len(ours))
+	copy(live, ours)
+	for i, e := range live {
+		if _, ok := e.(*expr.Counter); ok {
+			live[i] = &expr.Counter{Packets: 9, Bytes: 512}
+		}
+	}
+	if !exprsEqualIgnoringCounters(ours, live) {
+		t.Fatal("counter totals must not affect rule identity")
+	}
+	if !exprsEqualIgnoringCounters(ours, stripCounters(ours)) {
+		t.Fatal("counter presence must not affect rule identity")
+	}
+	other, _ := exprsFromRulespec("-s", "10.0.0.6", "-j", "DROP")
+	if exprsEqualIgnoringCounters(ours, other) {
+		t.Fatal("different src must not match")
+	}
 }
 
 func TestExprsFromRulespecCIDRUsesBitwise(t *testing.T) {

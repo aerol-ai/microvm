@@ -103,18 +103,40 @@ func TestParseAddrOrCIDR(t *testing.T) {
 	if err != nil || n.String() != "10.1.2.3/32" {
 		t.Fatalf("v4 = %v, %v", n, err)
 	}
-	n, err = parseAddrOrCIDR("2001:db8::1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ones, bits := n.Mask.Size()
-	if ones != 128 || bits != 128 {
-		t.Fatalf("v6 mask = %d/%d, want 128/128", ones, bits)
+	n, err = parseAddrOrCIDR("10.0.0.0/8")
+	if err != nil || n.String() != "10.0.0.0/8" || len(n.IP) != 4 || len(n.Mask) != 4 {
+		t.Fatalf("v4 cidr = %v (ip=%d mask=%d bytes), %v; want 4-byte form", n, len(n.IP), len(n.Mask), err)
 	}
 	if _, err := parseAddrOrCIDR("nope"); err == nil {
 		t.Fatal("want invalid address")
 	}
 	if _, err := parseAddrOrCIDR("10.0.0.0/33"); err == nil {
 		t.Fatal("want bad CIDR")
+	}
+}
+
+// User-supplied NetworkAllowOut/DenyOut entries can be IPv6. The netlink
+// backend drives the IPv4 filter table only, and its translator indexes
+// IP[0..3] — a 16-byte address slipping past parse was a daemon panic. Every
+// IPv6 shape must fail closed at parse instead.
+func TestParseAddrOrCIDRRejectsIPv6(t *testing.T) {
+	t.Parallel()
+	for _, s := range []string{
+		"2001:db8::1",         // bare address
+		"2001:db8::/32",       // CIDR
+		"::ffff:10.1.2.3/120", // v4-mapped CIDR (16-byte mask)
+		"fe80::1",             // link-local
+	} {
+		if _, err := parseAddrOrCIDR(s); err == nil {
+			t.Errorf("parseAddrOrCIDR(%q) = nil error, want IPv6 rejection", s)
+		}
+	}
+	for _, spec := range [][]string{
+		{"-s", "2001:db8::/32", "-j", "ACCEPT"},
+		{"-d", "2001:db8::1", "-j", "DROP"},
+	} {
+		if _, err := parseRulespec(spec...); err == nil {
+			t.Errorf("parseRulespec(%v) = nil error, want IPv6 rejection", spec)
+		}
 	}
 }
