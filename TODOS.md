@@ -49,8 +49,7 @@ no longer serialize. See `ip_lock_test.go`.
   shape, so mixed-version-safe both directions); blob mesh remains only for
   legacy sealed bytes / oversized specs. Raft-quorum durability is strictly
   stronger than today's best-effort mesh for failover recreate.
-- **Status:** IMPLEMENTED 2026-07-11 (branch
-  `perf/warm-create-latency-tier2-inline-recovery`, stacked on PR #306):
+- **Status:** IMPLEMENTED 2026-07-11 (PR #307, stacked on PR #306):
   `inlineRecoveryEligible` gate in `recovery_replication.go`, externalize-mode
   metric, determinism-parity + replay + threshold-crossing regression tests.
   **Remaining:** operator bench re-run (plan T4) to confirm `create;dur`

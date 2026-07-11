@@ -1,7 +1,7 @@
 # Warm create latency Tier 2: inline recovery payloads (40ms → ≤30ms gate unlock)
 
-Status: **implemented 2026-07-11** on branch
-`perf/warm-create-latency-tier2-inline-recovery` (stacked on PR #306) —
+Status: **implemented 2026-07-11 — PR #307** (branch
+`perf/warm-create-latency-tier2-inline-recovery`, stacked on PR #306) —
 T1–T3 done, offline suite green; **bench gate re-run (T4) pending**, which is
 what proves the ≤30ms unlock and closes T5. Follow-up to
 `plans/warm-create-latency-tier1.md` (gates run 2026-07-11) and the TODOS
