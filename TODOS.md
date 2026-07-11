@@ -43,3 +43,23 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Depends on / blocked by:** Phase 1 netlink backend landing first (sub-ms
   ops are what make the mutex the next-visible cost).
 - **Start:** `pkg/docker/netrules/manager.go`.
+
+## Remove the legacy recovery-blob emit path (inline-only recovery) — PLANNED, do not start yet
+
+- **What:** delete the blob fallback Tier 2 kept: the `inlineRecoveryEligible`
+  gate, blob emit + member PUT fan-out, `command.SealedSecrets`,
+  `PlacementSecrets.LegacySealed`, and the dual-contract tests; oversized
+  specs (>4KiB) become a create-time validation error instead of a slow path.
+  Fetch-on-miss + the local recovery store STAY (snapshot-joined voters need
+  them even in a 100%-inline world).
+- **Why:** with zero deployments there are no legacy sealed-secret sandboxes,
+  no old logs, no mixed-version clusters — the compat machinery guards
+  nothing and costs dual-path reasoning on every future recovery change.
+  ~400–700 lines removed; makes "no secrets in the Raft log" structural
+  (the field stops existing).
+- **Caveat (why not yet):** it is a wire-compat break, valid only while the
+  zero-deployments premise holds — re-verify before starting. Blocked on
+  PR #306 + #307 merging and the Tier 2 T4 bench gate passing, so the
+  latency stack is proven before its code is reshaped.
+- **Start:** `plans/remove-legacy-recovery-blob-path.md` (tasks T1–T7;
+  T5's snapshot-join fetch-on-miss regression test comes FIRST).
