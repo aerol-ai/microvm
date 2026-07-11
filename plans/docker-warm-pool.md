@@ -1,6 +1,9 @@
 # Docker warm pool — sub-100ms create for pooled images
 
-**Status:** planned (not started) — rev 2, incorporates create-path review findings
+**Status:** SHIPPED & VERIFIED (v0.5.33, 2026-07-11) — warm-hit server p50
+**43ms** on t3.medium, less than half the ≤100ms gate. See §12 for the final
+measured numbers and the PR trail. Original plan text below is preserved
+as-written (rev 2).
 **Prereq:** `plans/docker-ready-socket-sandbox-id-fix.md` — SHIPPED (3b5af0c, v0.5.25) and live-verified; the adopt handshake below extends that socket protocol.
 **Related:** `internal/pool/wasm/` (the pattern to mirror), `internal/pool/vmm/` (daemon wiring + orphan pattern), `plans/wasm-create-latency.md` (the drain-vs-refill lesson).
 
@@ -405,3 +408,74 @@ configuration page + `setup/` runbook note on capacity sizing with pools.
 - [ ] Version-skew matrix in the PR description (§5 table — host-binary skew, not image skew).
 - [ ] `go test -coverprofile` — `internal/pool/dockerpool`, `pkg/docker`, `pkg/readyproto`, `cmd/toolboxd`, `internal/store`, `pkg/capacity` all ≥ ~85%.
 - [ ] Table-driven test style matching `store_test.go` / `ready_create_test.go`.
+
+## 12. Shipped — final measured results (2026-07-11, v0.5.33)
+
+Bench: `make integration-benchmark-docker`, cluster-3-mixed-docker
+(t3.medium × 3, spot), 10 samples/row, UC-94. `docker` = pool-eligible
+default-shape creates; `docker-cold` = pool-ineligible variant of the same
+runtime (env var buster) keeping the cold floor visible.
+
+### Server-side create latency (`create;dur`, ms)
+
+| row | p50 | p90 | p99 | notes |
+|---|---|---|---|---|
+| docker (warm) | **43** | **78** | 377 | 9/10 adopts; p99 = the single miss |
+| docker-cold | 274 | 294 | 314 | all 10 on prepaid netns (`docker_netns;desc=hit`) |
+
+The p50 journey across the fix series, same bench, same hardware:
+
+| build | warm p50 | what changed |
+|---|---|---|
+| v0.5.29 | 506ms | every adopt burned on iptables-nft; worse than no pool |
+| v0.5.29 (pre-pool baseline) | ~320ms | raw engine floor, no pool |
+| v0.5.30–32 (PR #297/#300) | 100ms | adopts survive nft, pins reachable, refill self-warms, netns pool actually deployed |
+| **v0.5.33 (PR #301)** | **43ms** | warm hit = 1 engine round-trip |
+
+### Warm-hit stage economics at v0.5.33
+
+| stage | cost | fate |
+|---|---|---|
+| image inspect before Acquire | ~40ms | cached (10s TTL, flushed by own pull/tag/GC-delete); shows as `docker_image;desc=resolve` once per burst |
+| adopt (`docker_pool;desc=hit`) | 15–20ms | was ~40ms: rename + handshake + iptables conversion remain; `docker update` skipped on park shape, post-adopt inspect replaced by slot-carried IP |
+| svc_persist + service layer | ~22ms | store write, keygen, admission, marshal |
+| **total** | **~43ms** | |
+
+### Acceptance gates (§9 Phase B) — scoreboard
+
+- UC-94 docker `server_p50_ms ≤ 100` with `docker_pool;desc=hit` on ≥ 8/10
+  samples: **PASS** — 43ms, 9/10 hits.
+- Orphan/stale expvars 0 across nodes: **PASS** (post-#297 eviction +
+  self-warm refill; `aerolvm_docker_pool_*` family).
+- UC-95 density with parked budget: **PASS** — 68 created before capacity
+  stop (depth 2/node parked reservations accounted).
+- UC-96* readiness UCs with `source=socket`: **PASS**.
+
+### What it took beyond this plan (the debugging trail)
+
+- **PR #288** — pool as designed here (park + adopt, readyproto v2).
+- **PR #294** — eligibility + orphan fixes.
+- **PR #297** — the four production killers: iptables-nft "Bad rule"
+  divergence treated as fatal in the duplicate-sweep delete loops (every
+  adopt burned); bare pin keys never matching normalized create keys
+  (pinned slots unreachable); refill unable to pull images and retrying
+  dead targets forever; adopt failures disguised as plain misses. Plus the
+  silently-dropped nested `"Resources"` key — no sandbox ever had cpu/mem
+  limits until this PR.
+- **PR #299** — `docker-cold` bench row so the cold floor stays visible.
+- **PR #300** — Terraform plumbing for the companion pause-netns pool
+  (capability existed but never reached node env; cold `docker_start`
+  172→113ms once deployed).
+- **PR #301** — warm-adopt fast path (image-ID cache, shape-matched update
+  skip, slot-carried IP): 100→43ms.
+
+Operational note for hot-swap verification: the parked handshake enforces
+toolboxd/sandboxd version match (toolboxd is a host bind-mount, §5) —
+swapping sandboxd alone kills every park spawn with "toolbox agent version
+mismatch". Install both release binaries; toolboxd needs no restart
+(bind-mounted per spawn).
+
+Remaining floor (~43ms) is rename + adopt handshake + iptables + service
+layer — no redundant engine round-trips left. Cold floor (~274ms) is
+dockerd `create`+`start` itself; next step there would be containerd-level
+work, explicitly out of scope (§10).
