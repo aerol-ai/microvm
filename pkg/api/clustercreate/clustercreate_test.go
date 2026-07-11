@@ -3,6 +3,7 @@ package clustercreate
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1296,6 +1297,22 @@ func TestCreateOnSelectedNode_SelfWinsPromoteFailure(t *testing.T) {
 	}
 }
 
+// promoteRetractCount reads one key of aerolvm_cluster_promote_retract_total
+// through the public expvar registry — the map itself is unexported in
+// internal/service, which is the point: retract shapes in this package must
+// report through service.RecordPromoteRetract, not a parallel counter.
+func promoteRetractCount(key string) int64 {
+	m, _ := expvar.Get("aerolvm_cluster_promote_retract_total").(*expvar.Map)
+	if m == nil {
+		return 0
+	}
+	v, _ := m.Get(key).(*expvar.Int)
+	if v == nil {
+		return 0
+	}
+	return v.Value()
+}
+
 func TestRetractErrorBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -1312,14 +1329,43 @@ func TestRetractErrorBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("reserved_destroy_quiet_after_create_failure", func(t *testing.T) {
+	t.Run("reserved_destroy_notfound_after_create_failure_stays_ok", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		svc, st := newCreateService(t, stub, false)
-		_ = st.Close()
+		svc, _ := newCreateService(t, stub, false)
+		okBefore := promoteRetractCount("ok")
+		failBefore := promoteRetractCount("destroy_failed")
+		// The sandbox was never persisted (create leg failed and rolled its own
+		// state back), so Destroy sees store.ErrNotFound — the one expected,
+		// quiet outcome that must keep the metric at ok.
 		retractReservedCreate(context.Background(), svc, stub, logger, "sb-retract-quiet",
 			errors.New("create boom"))
 		if stub.cancels != 1 {
 			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
+		}
+		if got := promoteRetractCount("ok") - okBefore; got != 1 {
+			t.Fatalf("retract ok delta = %d, want 1", got)
+		}
+		if got := promoteRetractCount("destroy_failed") - failBefore; got != 0 {
+			t.Fatalf("retract destroy_failed delta = %d, want 0", got)
+		}
+	})
+
+	t.Run("reserved_real_destroy_failure_after_create_failure_counts", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		rt := newFakeRuntime()
+		rt.destroyErr = errors.New("destroy boom")
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-retract-real-fail"); err != nil {
+			t.Fatalf("CreateSandboxWithID: %v", err)
+		}
+		failBefore := promoteRetractCount("destroy_failed")
+		// Create-leg failure normally means Destroy hits not-found — but here
+		// runtime state survived, so the destroy error is real and must be
+		// counted, not swallowed as ok behind a Warn log.
+		retractReservedCreate(context.Background(), svc, stub, logger, "sb-retract-real-fail",
+			errors.New("create boom"))
+		if got := promoteRetractCount("destroy_failed") - failBefore; got != 1 {
+			t.Fatalf("retract destroy_failed delta = %d, want 1", got)
 		}
 	})
 
@@ -1355,7 +1401,11 @@ func TestRetractErrorBranches(t *testing.T) {
 		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-destroy-fail"); err != nil {
 			t.Fatalf("CreateSandboxWithID: %v", err)
 		}
+		failBefore := promoteRetractCount("destroy_failed")
 		retractFailedPromote(context.Background(), svc, stub, logger, "sb-destroy-fail")
+		if got := promoteRetractCount("destroy_failed") - failBefore; got != 1 {
+			t.Fatalf("retract destroy_failed delta = %d, want 1", got)
+		}
 	})
 
 	t.Run("reserved_destroy_failure_after_seal_fail", func(t *testing.T) {

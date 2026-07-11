@@ -2,6 +2,7 @@ package netrules
 
 import (
 	"errors"
+	"expvar"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -659,5 +660,35 @@ func TestNewWithOptionsDisabled(t *testing.T) {
 	m, err := NewWithOptions(false, BackendNetlink)
 	if err != nil || m.Enabled() {
 		t.Fatalf("disabled NewWithOptions = (%v,%v)", m, err)
+	}
+}
+
+func backendMetricValue(key string) int64 {
+	v, _ := backendSelected.Get(key).(*expvar.Int)
+	if v == nil {
+		return 0
+	}
+	return v.Value()
+}
+
+// Deliberately not parallel: exact-delta asserts on the shared expvar map
+// would race the parallel constructor tests above.
+func TestBackendSelectionMetric(t *testing.T) {
+	disabledBefore := backendMetricValue("disabled")
+	if _, err := NewWithOptions(false, BackendNetlink); err != nil {
+		t.Fatalf("NewWithOptions(disabled): %v", err)
+	}
+	if got := backendMetricValue("disabled") - disabledBefore; got != 1 {
+		t.Fatalf("disabled selection delta = %d, want 1", got)
+	}
+
+	// The exec/netlink constructor paths are linux-only; the recorder itself
+	// is what the bench gate reads, so pin its key names directly.
+	for _, name := range []string{BackendExec, BackendNetlink} {
+		before := backendMetricValue(name)
+		recordBackendSelected(name)
+		if got := backendMetricValue(name) - before; got != 1 {
+			t.Fatalf("%s selection delta = %d, want 1", name, got)
+		}
 	}
 }

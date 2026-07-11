@@ -81,6 +81,7 @@ const (
 // backend names fall back to exec with an error so misconfig is loud.
 func NewWithOptions(enabled bool, backend string) (*Manager, error) {
 	if !enabled || runtime.GOOS != "linux" {
+		recordBackendSelected("disabled")
 		return &Manager{enabled: false}, nil
 	}
 
@@ -90,12 +91,14 @@ func NewWithOptions(enabled bool, backend string) (*Manager, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create iptables client: %w", err)
 		}
+		recordBackendSelected(BackendExec)
 		return &Manager{enabled: true, ipt: ipt}, nil
 	case BackendNetlink:
 		nl, err := NewNetlinkBackend()
 		if err != nil {
 			return nil, fmt.Errorf("create netlink netrules backend: %w", err)
 		}
+		recordBackendSelected(BackendNetlink)
 		return &Manager{enabled: true, ipt: nl}, nil
 	default:
 		return nil, fmt.Errorf("unknown netrules backend %q (want exec|netlink)", backend)
