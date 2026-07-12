@@ -14,14 +14,14 @@ func TestNewNetlinkBackendStub(t *testing.T) {
 
 func TestNewWithOptionsOffLinux(t *testing.T) {
 	t.Parallel()
-	m, err := NewWithOptions(true, BackendNetlink)
+	m, err := NewWithOptions(true, BackendNetlink, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.Enabled() {
 		t.Fatal("Manager must be disabled off linux")
 	}
-	m, err = NewWithOptions(true, "not-a-backend")
+	m, err = NewWithOptions(true, "not-a-backend", "")
 	if err != nil {
 		t.Fatal(err)
 	}

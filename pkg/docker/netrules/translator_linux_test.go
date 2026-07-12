@@ -218,11 +218,11 @@ func TestExprsEqualAndExprEqualBranches(t *testing.T) {
 }
 
 func TestNewWithOptionsUnknownAndNetlink(t *testing.T) {
-	if _, err := NewWithOptions(true, "mystery"); err == nil {
+	if _, err := NewWithOptions(true, "mystery", ""); err == nil {
 		t.Fatal("want unknown backend error")
 	}
 	// Netlink may fail without CAP_NET_ADMIN — either success or wrapped error.
-	m, err := NewWithOptions(true, BackendNetlink)
+	m, err := NewWithOptions(true, BackendNetlink, "")
 	if err != nil {
 		if m != nil {
 			t.Fatalf("err=%v but manager=%v", err, m)
@@ -235,7 +235,7 @@ func TestNewWithOptionsUnknownAndNetlink(t *testing.T) {
 }
 
 func TestNewWithOptionsExec(t *testing.T) {
-	m, err := NewWithOptions(true, BackendExec)
+	m, err := NewWithOptions(true, BackendExec, "")
 	if err != nil {
 		// iptables.New can fail in restricted CI; that's still a covered path.
 		t.Logf("exec backend unavailable: %v", err)
@@ -244,7 +244,7 @@ func TestNewWithOptionsExec(t *testing.T) {
 	if !m.Enabled() {
 		t.Fatal("exec Manager should be enabled")
 	}
-	m2, err := NewWithOptions(true, "")
+	m2, err := NewWithOptions(true, "", "")
 	if err != nil {
 		t.Logf("default exec unavailable: %v", err)
 		return

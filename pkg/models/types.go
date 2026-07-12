@@ -700,6 +700,11 @@ type Sandbox struct {
 	// host default at start time; new sandboxes always store the resolved
 	// value so the choice cannot drift across host restarts.
 	Runtime string `json:"runtime"`
+	// Engine is the host-level container engine that owns this sandbox's
+	// lifecycle (dockerd or native containerd). Pre-migration rows carry ""
+	// and resolve to docker so flipping SB_CONTAINER_ENGINE does not strand
+	// existing sandboxes on the wrong driver.
+	Engine string `json:"engine,omitempty"`
 	// GPUs is the GPU configuration this sandbox was created with. Nil means
 	// no GPU was requested.
 	GPUs *GPURequest `json:"gpus,omitempty"`

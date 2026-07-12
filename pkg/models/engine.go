@@ -1,0 +1,63 @@
+package models
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// Host-level container engine identifiers. Distinct from Sandbox.Runtime (OCI
+// runtime type: docker/gvisor/firecracker/wasm). Engine selects which daemon
+// on the host realizes OCI sandboxes (dockerd vs native containerd).
+const (
+	ContainerEngineDocker     = "docker"
+	ContainerEngineContainerd = "containerd"
+)
+
+// ResolveContainerEngine normalizes SB_CONTAINER_ENGINE. Empty or unknown
+// values default to docker so pre-migration hosts behave identically.
+func ResolveContainerEngine(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", ContainerEngineDocker:
+		return ContainerEngineDocker, nil
+	case ContainerEngineContainerd:
+		return ContainerEngineContainerd, nil
+	default:
+		return "", fmt.Errorf("unsupported container engine %q (allowed: %s, %s)",
+			value, ContainerEngineDocker, ContainerEngineContainerd)
+	}
+}
+
+// SandboxEngine returns the engine that owns this sandbox's container lifecycle.
+// Legacy rows with an empty engine column resolve to docker.
+func SandboxEngine(sandbox *Sandbox) string {
+	if sandbox == nil || strings.TrimSpace(sandbox.Engine) == "" {
+		return ContainerEngineDocker
+	}
+	return sandbox.Engine
+}
+
+// ValidateRuntimeRequest enforces runtime policy shared by dockerd and
+// containerd drivers. Privileged mode, GPU vendor, and disk quota warnings
+// must not fork per engine.
+func ValidateRuntimeRequest(req CreateSandboxRequest, effectiveRuntime string, privileged bool, logf func(string, ...any)) error {
+	if effectiveRuntime == RuntimeGvisor && privileged {
+		return fmt.Errorf("runtime %q is incompatible with privileged containers", effectiveRuntime)
+	}
+	if req.GPUs != nil && effectiveRuntime == RuntimeGvisor {
+		return fmt.Errorf(
+			"GPU access is not supported with the %q runtime: gVisor's user-space kernel "+
+				"cannot safely pass through host GPU drivers; use the %q runtime for GPU workloads",
+			RuntimeGvisor, RuntimeDocker,
+		)
+	}
+	if req.DiskGB > 0 && effectiveRuntime == RuntimeGvisor && logf != nil {
+		logf("ignoring disk quota: gvisor does not support StorageOpt size", "disk_gb", req.DiskGB)
+	}
+	return nil
+}
+
+// ErrContainerEngineNotRegistered is returned when a sandbox row points at an
+// engine driver that was not wired at daemon boot (e.g. containerd row on a
+// docker-only node).
+var ErrContainerEngineNotRegistered = errors.New("container engine driver not registered on this node")

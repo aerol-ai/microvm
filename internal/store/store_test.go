@@ -163,6 +163,24 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "engine_column_roundtrip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-engine-ctd")
+				sandbox.Engine = models.ContainerEngineContainerd
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Engine != models.ContainerEngineContainerd {
+					t.Fatalf("engine = %q, want %q", got.Engine, models.ContainerEngineContainerd)
+				}
+			},
+		},
+		{
 			name: "durability_roundtrip_and_default",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
@@ -1973,6 +1991,7 @@ func TestStoreHelperCases(t *testing.T) {
 			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
 			"",                 // failover_policy
 			"",                 // runtime
+			"docker",           // engine
 			"",                 // gpus_json
 			int64(0), int64(0), // net_bytes_in, net_bytes_out
 			int64(0), int64(0), // net_bytes_in_limit, net_bytes_out_limit

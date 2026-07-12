@@ -47,7 +47,7 @@ func (s *Service) StartLiveUsageSampler(ctx context.Context) {
 	if !s.usageEnabled() {
 		return // open-source build: nothing to ship samples to
 	}
-	if s.events == nil {
+	if s.dockerAux == nil {
 		s.logger.Warn("fleet live sampler: no docker client; live cpu/mem disabled (reserved axes unaffected)")
 		return
 	}
@@ -63,7 +63,7 @@ func (s *Service) StartLiveUsageSampler(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case now := <-t.C:
-				s.sampleLiveUsageOnce(ctx, now.UTC(), s.events.ContainerStats)
+				s.sampleLiveUsageOnce(ctx, now.UTC(), s.dockerAux.ContainerStats)
 			}
 		}
 	}()

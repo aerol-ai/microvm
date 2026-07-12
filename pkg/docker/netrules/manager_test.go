@@ -657,7 +657,7 @@ func TestEnsureAndDeletePolicyRuleErrors(t *testing.T) {
 
 func TestNewWithOptionsDisabled(t *testing.T) {
 	t.Parallel()
-	m, err := NewWithOptions(false, BackendNetlink)
+	m, err := NewWithOptions(false, BackendNetlink, "")
 	if err != nil || m.Enabled() {
 		t.Fatalf("disabled NewWithOptions = (%v,%v)", m, err)
 	}
@@ -675,7 +675,7 @@ func backendMetricValue(key string) int64 {
 // would race the parallel constructor tests above.
 func TestBackendSelectionMetric(t *testing.T) {
 	disabledBefore := backendMetricValue("disabled")
-	if _, err := NewWithOptions(false, BackendNetlink); err != nil {
+	if _, err := NewWithOptions(false, BackendNetlink, ""); err != nil {
 		t.Fatalf("NewWithOptions(disabled): %v", err)
 	}
 	if got := backendMetricValue("disabled") - disabledBefore; got != 1 {
