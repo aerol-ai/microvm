@@ -25,9 +25,15 @@ require (
 )
 
 require (
+	github.com/containerd/containerd v1.7.29
+	github.com/containerd/containerd/api v1.8.0
+	github.com/containerd/typeurl/v2 v2.1.1
 	github.com/google/nftables v0.3.0
 	github.com/hashicorp/raft-wal v0.4.2
 	github.com/opencontainers/go-digest v1.0.0
+	github.com/opencontainers/runtime-spec v1.2.0
+	github.com/vishvananda/netlink v1.3.0
+	github.com/vishvananda/netns v0.0.5
 )
 
 require (
@@ -37,15 +43,12 @@ require (
 	github.com/Microsoft/hcsshim v0.11.7 // indirect
 	github.com/benbjohnson/immutable v0.4.0 // indirect
 	github.com/containerd/cgroups v1.1.0 // indirect
-	github.com/containerd/containerd v1.7.29 // indirect
-	github.com/containerd/containerd/api v1.8.0 // indirect
 	github.com/containerd/continuity v0.4.4 // indirect
 	github.com/containerd/errdefs v0.3.0 // indirect
 	github.com/containerd/fifo v1.1.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
-	github.com/containerd/typeurl/v2 v2.1.1 // indirect
 	github.com/coreos/etcd v3.3.27+incompatible // indirect
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect
 	github.com/coreos/pkg v0.0.0-20220810130054-c7d1c02cb6cf // indirect
@@ -63,11 +66,9 @@ require (
 	github.com/moby/sys/signal v0.7.0 // indirect
 	github.com/moby/sys/user v0.3.0 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect
-	github.com/opencontainers/runtime-spec v1.2.0 // indirect
 	github.com/opencontainers/selinux v1.11.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/vishvananda/netns v0.0.5 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.45.0 // indirect
 	golang.org/x/exp v0.0.0-20220827204233-334a2380cb91 // indirect

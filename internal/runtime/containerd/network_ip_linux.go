@@ -5,7 +5,6 @@ package containerd
 import (
 	"context"
 	"fmt"
-	"net"
 
 	cntr "github.com/containerd/containerd"
 	"github.com/vishvananda/netlink"
