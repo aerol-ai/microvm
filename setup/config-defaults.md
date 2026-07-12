@@ -76,7 +76,7 @@ via Terraform/Ansible — do not flip the code default on.
 ## 🟠 Mid-rollout / not soaked — flip only with soak data
 | Env var | Status |
 |---|---|
-| `SB_FIRECRACKER_VMM_POOL_ENABLED` | Wired into the daemon (Phase 4, `daemon.go`), but the broader FC create-latency work is still in progress (`plans/firecracker-create-latency.md`). NB: the config.go comment ("nothing consumes it yet") is stale. |
+| `SB_FIRECRACKER_VMM_POOL_ENABLED` | Fully wired: daemon runs the refill goroutine + `Driver.SetWarmPool`, and `Driver.Create.tryAcquireWarm` consumes warm VMMs. Kept default-off **ship-dark** — code-complete but no benchmark gate in `plans/firecracker-create-latency.md` re-measured yet. Do not flip until those gates pass. |
 | `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED` | Being canaried (`plans/warm-direct-route-bypass.md`). |
 | `SB_L4_WAKE_DIRECT_BYPASS_ENABLED` | Ships only after HTTP has been default-on for two cycles. |
 
