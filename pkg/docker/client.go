@@ -337,17 +337,9 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// gVisor refuses privileged containers — its userspace kernel cannot
 	// safely grant the host capabilities --privileged implies. Catch the
 	// conflict here, before pulling the image and 30s into a doomed start.
-	if effectiveRuntime == models.RuntimeGvisor && c.privileged {
-		return nil, fmt.Errorf("runtime %q is incompatible with privileged containers", effectiveRuntime)
-	}
-	// gVisor's user-space kernel cannot pass through host GPU drivers. Fail
-	// before any image pull so the error is immediate and actionable.
-	if req.GPUs != nil && effectiveRuntime == models.RuntimeGvisor {
-		return nil, fmt.Errorf(
-			"GPU access is not supported with the %q runtime: gVisor's user-space kernel "+
-				"cannot safely pass through host GPU drivers; use the %q runtime for GPU workloads",
-			models.RuntimeGvisor, models.RuntimeDocker,
-		)
+	logf := func(msg string, args ...any) { c.logger.Warn(msg, args...) }
+	if err := models.ValidateRuntimeRequest(req, effectiveRuntime, c.privileged, logf); err != nil {
+		return nil, err
 	}
 	// Translate user-facing name to the OCI runtime binary Docker actually
 	// looks up in /etc/docker/daemon.json. ResolveOCIRuntime returns "" for

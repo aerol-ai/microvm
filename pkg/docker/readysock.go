@@ -66,6 +66,12 @@ func mintReadyNonce() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// MintReadyNonce returns a random nonce for per-create readiness sockets.
+// Exported for the containerd driver, which shares the same push protocol.
+func MintReadyNonce() (string, error) {
+	return mintReadyNonce()
+}
+
 // ReadyListener accepts a single valid readiness push from toolboxd.
 type ReadyListener struct {
 	hostPath   string

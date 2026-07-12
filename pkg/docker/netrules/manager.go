@@ -46,6 +46,10 @@ type RuleBackend interface {
 type Manager struct {
 	enabled bool
 	ipt     RuleBackend
+	// userChain is the filter-table chain for per-IP rules (DOCKER-USER on
+	// dockerd hosts, AEROLVM-USER under containerd). Empty defaults to
+	// ChainDockerUser so existing docker-only wiring is unchanged.
+	userChain string
 	// ipMu guards ipLocks. Per-IP mutexes serialize Exists+Insert for one
 	// container IP (poller / reconcile / SetNetworkLimits / Destroy can all
 	// drive the same IP concurrently). Without per-IP exclusion, two callers
@@ -66,25 +70,36 @@ type ipLock struct {
 	refs int
 }
 
-func New(enabled bool) (*Manager, error) {
-	return NewWithOptions(enabled, BackendExec)
-}
-
-// Backend names for SB_NETRULES_BACKEND. Netlink is the default: the
-// google/nftables path is in-process (no fork/exec per rule) and has soaked
-// through the warm-create-latency Tier 1 integration run. exec (go-iptables)
-// remains available as a fallback.
+// Backend names for SB_NETRULES_BACKEND.
 const (
 	BackendExec    = "exec"
 	BackendNetlink = "netlink"
+
+	ChainDockerUser  = "DOCKER-USER"
+	ChainAerolvmUser = "AEROLVM-USER"
 )
 
-// NewWithOptions builds a Manager with the chosen RuleBackend. Unknown
-// backend names fall back to exec with an error so misconfig is loud.
-func NewWithOptions(enabled bool, backend string) (*Manager, error) {
+func (m *Manager) filterChain() string {
+	if m == nil || strings.TrimSpace(m.userChain) == "" {
+		return ChainDockerUser
+	}
+	return m.userChain
+}
+
+func New(enabled bool) (*Manager, error) {
+	return NewWithOptions(enabled, BackendExec, "")
+}
+
+// NewWithOptions builds a Manager with the chosen RuleBackend. userChain
+// selects the filter chain for per-IP rules; empty defaults to DOCKER-USER.
+// Unknown backend names fall back to exec with an error so misconfig is loud.
+func NewWithOptions(enabled bool, backend, userChain string) (*Manager, error) {
+	if strings.TrimSpace(userChain) == "" {
+		userChain = ChainDockerUser
+	}
 	if !enabled || runtime.GOOS != "linux" {
 		recordBackendSelected("disabled")
-		return &Manager{enabled: false}, nil
+		return &Manager{enabled: false, userChain: userChain}, nil
 	}
 
 	switch strings.ToLower(strings.TrimSpace(backend)) {
@@ -94,14 +109,14 @@ func NewWithOptions(enabled bool, backend string) (*Manager, error) {
 			return nil, fmt.Errorf("create iptables client: %w", err)
 		}
 		recordBackendSelected(BackendExec)
-		return &Manager{enabled: true, ipt: ipt}, nil
+		return &Manager{enabled: true, ipt: ipt, userChain: userChain}, nil
 	case BackendNetlink:
 		nl, err := NewNetlinkBackend()
 		if err != nil {
 			return nil, fmt.Errorf("create netlink netrules backend: %w", err)
 		}
 		recordBackendSelected(BackendNetlink)
-		return &Manager{enabled: true, ipt: nl}, nil
+		return &Manager{enabled: true, ipt: nl, userChain: userChain}, nil
 	default:
 		return nil, fmt.Errorf("unknown netrules backend %q (want exec|netlink)", backend)
 	}
@@ -162,7 +177,7 @@ func (m *Manager) BlockAllEgress(containerIP string) error {
 	unlock := m.lockIP(containerIP)
 	defer unlock()
 
-	exists, err := m.ipt.Exists("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP")
+	exists, err := m.ipt.Exists("filter", m.filterChain(), "-s", containerIP, "-j", "DROP")
 	if err != nil {
 		return fmt.Errorf("check existing egress rule: %w", err)
 	}
@@ -170,7 +185,7 @@ func (m *Manager) BlockAllEgress(containerIP string) error {
 		return nil
 	}
 
-	if err := m.ipt.Insert("filter", "DOCKER-USER", 1, "-s", containerIP, "-j", "DROP"); err != nil {
+	if err := m.ipt.Insert("filter", m.filterChain(), 1, "-s", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("insert egress rule: %w", err)
 	}
 
@@ -184,7 +199,7 @@ func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 	unlock := m.lockIP(containerIP)
 	defer unlock()
 
-	if err := m.deleteUntilGone("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP"); err != nil {
+	if err := m.deleteUntilGone("filter", m.filterChain(), "-s", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete egress rule: %w", err)
 	}
 	return nil
@@ -204,7 +219,7 @@ func (m *Manager) BlockAllIngress(containerIP string) error {
 	unlock := m.lockIP(containerIP)
 	defer unlock()
 
-	exists, err := m.ipt.Exists("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP")
+	exists, err := m.ipt.Exists("filter", m.filterChain(), "-d", containerIP, "-j", "DROP")
 	if err != nil {
 		return fmt.Errorf("check existing ingress rule: %w", err)
 	}
@@ -212,7 +227,7 @@ func (m *Manager) BlockAllIngress(containerIP string) error {
 		return nil
 	}
 
-	if err := m.ipt.Insert("filter", "DOCKER-USER", 1, "-d", containerIP, "-j", "DROP"); err != nil {
+	if err := m.ipt.Insert("filter", m.filterChain(), 1, "-d", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("insert ingress rule: %w", err)
 	}
 
@@ -226,7 +241,7 @@ func (m *Manager) ClearBlockAllIngress(containerIP string) error {
 	unlock := m.lockIP(containerIP)
 	defer unlock()
 
-	if err := m.deleteUntilGone("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP"); err != nil {
+	if err := m.deleteUntilGone("filter", m.filterChain(), "-d", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete ingress rule: %w", err)
 	}
 	return nil
@@ -310,14 +325,14 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 // present. Insert-at-1 plus the Exists guard is the same idempotency contract
 // the BlockAll* methods use.
 func (m *Manager) ensurePolicyRule(spec ...string) error {
-	exists, err := m.ipt.Exists("filter", "DOCKER-USER", spec...)
+	exists, err := m.ipt.Exists("filter", m.filterChain(), spec...)
 	if err != nil {
 		return fmt.Errorf("check egress policy rule: %w", err)
 	}
 	if exists {
 		return nil
 	}
-	if err := m.ipt.Insert("filter", "DOCKER-USER", 1, spec...); err != nil {
+	if err := m.ipt.Insert("filter", m.filterChain(), 1, spec...); err != nil {
 		return fmt.Errorf("insert egress policy rule: %w", err)
 	}
 	return nil
@@ -327,7 +342,7 @@ func (m *Manager) ensurePolicyRule(spec ...string) error {
 // prior race may have left (Delete removes one match per call), and tolerating
 // an already-absent rule.
 func (m *Manager) deletePolicyRule(spec ...string) error {
-	if err := m.deleteUntilGone("filter", "DOCKER-USER", spec...); err != nil {
+	if err := m.deleteUntilGone("filter", m.filterChain(), spec...); err != nil {
 		return fmt.Errorf("delete egress policy rule: %w", err)
 	}
 	return nil

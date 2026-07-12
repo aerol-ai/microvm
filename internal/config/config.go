@@ -25,6 +25,12 @@ var snapshotRetentionSuffixPattern = regexp.MustCompile(`^--(ttl|idle)-[a-z0-9]+
 
 const defaultToolboxPort = 2280
 
+// DefaultContainerdRunDir is the single source of truth for the containerd
+// per-sandbox host-file workdir default (resolv.conf, hosts, task logs).
+// Referenced by both Load() and the containerd driver's FromDaemonConfig so
+// the default cannot drift between the two layers.
+const DefaultContainerdRunDir = "/var/lib/sandboxd/containerd"
+
 // NodeRole values for SB_NODE_ROLE. The role partitions which components a
 // cluster-mode daemon runs (Raft voter promotion, sandbox worker work, public
 // ingress reconciler). Default is NodeRoleMixed — every node runs every
@@ -122,7 +128,22 @@ type Config struct {
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
-	Runtime            string
+	Runtime string
+	// ContainerEngine selects the host daemon that realizes OCI sandboxes
+	// (dockerd vs native containerd). SB_CONTAINER_ENGINE; default docker.
+	ContainerEngine string
+	// ContainerdSocket is the containerd gRPC socket used when
+	// ContainerEngine=containerd. SB_CONTAINERD_SOCKET.
+	ContainerdSocket string
+	// ContainerdNamespace is the containerd namespace for aerolvm-managed
+	// workloads. SB_CONTAINERD_NAMESPACE; default aerolvm.
+	ContainerdNamespace string
+	// ContainerdRunDir is the host workdir for per-sandbox host files
+	// (resolv.conf, hosts, task logs). SB_CONTAINERD_RUN_DIR.
+	ContainerdRunDir string
+	// ContainerdLogDir overrides per-task log file placement; defaults to
+	// ${ContainerdRunDir}/logs. SB_CONTAINERD_LOG_DIR.
+	ContainerdLogDir   string
 	AutoReconcile      bool
 	EnableCaddy        bool
 	EnableNetworkRules bool
@@ -1243,6 +1264,11 @@ func Load() (Config, error) {
 		ContainerPrivileged:              getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
 		Runtime:                          getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
+		ContainerEngine:                  getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
+		ContainerdSocket:                 getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
+		ContainerdNamespace:              getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
+		ContainerdRunDir:                 getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
+		ContainerdLogDir:                 strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		AutoReconcile:                    getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:                      getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:               getEnvBool("SB_ENABLE_NETWORK_RULES", true),
@@ -1614,6 +1640,20 @@ func Load() (Config, error) {
 	if cfg.Runtime == models.RuntimeWasm {
 		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select WASM per-sandbox via the API once SB_ENABLE_WASM=true",
 			cfg.Runtime, models.RuntimeDocker)
+	}
+
+	resolvedEngine, err := models.ResolveContainerEngine(cfg.ContainerEngine)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid SB_CONTAINER_ENGINE: %w", err)
+	}
+	cfg.ContainerEngine = resolvedEngine
+	if cfg.ContainerEngine == models.ContainerEngineContainerd {
+		if strings.TrimSpace(cfg.ContainerdSocket) == "" {
+			return Config{}, errors.New("SB_CONTAINERD_SOCKET is required when SB_CONTAINER_ENGINE=containerd")
+		}
+		if strings.TrimSpace(cfg.ContainerdNamespace) == "" {
+			return Config{}, errors.New("SB_CONTAINERD_NAMESPACE is required when SB_CONTAINER_ENGINE=containerd")
+		}
 	}
 
 	// Firecracker host-side wiring is opt-in. The flag exists to gate the

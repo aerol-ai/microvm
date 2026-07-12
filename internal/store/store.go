@@ -683,6 +683,11 @@ func Open(path string) (*Store, error) {
 		// row and the common no-mask path = pass through whatever the route
 		// would otherwise send.
 		`ALTER TABLE sandboxes ADD COLUMN mask_request_host TEXT NOT NULL DEFAULT '';`,
+		// engine records which host container daemon owns lifecycle for this
+		// row (dockerd vs native containerd). Defaults to docker so every
+		// pre-migration row keeps routing through the dockerd driver after
+		// SB_CONTAINER_ENGINE=containerd lands on the node.
+		`ALTER TABLE sandboxes ADD COLUMN engine TEXT NOT NULL DEFAULT 'docker';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -794,7 +799,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
-			runtime, gpus_json,
+			runtime, engine, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
@@ -807,7 +812,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -841,6 +846,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandboxFailoverPolicy(sandbox),
 		sandbox.Runtime,
+		models.SandboxEngine(sandbox),
 		gpusJSON,
 		sandbox.NetworkBytesIn,
 		sandbox.NetworkBytesOut,
@@ -955,7 +961,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
-			runtime, gpus_json,
+			runtime, engine, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
@@ -968,7 +974,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -1000,6 +1006,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			destroy_at_age_ns = excluded.destroy_at_age_ns,
 			failover_policy = excluded.failover_policy,
 			runtime = excluded.runtime,
+			engine = excluded.engine,
 			gpus_json = excluded.gpus_json,
 			net_bytes_in_limit = excluded.net_bytes_in_limit,
 			net_bytes_out_limit = excluded.net_bytes_out_limit,
@@ -1051,6 +1058,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandboxFailoverPolicy(sandbox),
 		sandbox.Runtime,
+		models.SandboxEngine(sandbox),
 		gpusJSON,
 		sandbox.NetworkBytesIn,
 		sandbox.NetworkBytesOut,
@@ -1090,7 +1098,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
-			runtime, gpus_json,
+			runtime, engine, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
@@ -1137,7 +1145,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
-			runtime, gpus_json,
+			runtime, engine, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
@@ -1204,7 +1212,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
-			runtime, gpus_json,
+			runtime, engine, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
@@ -1255,7 +1263,7 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
-			runtime, gpus_json,
+			runtime, engine, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
@@ -3558,6 +3566,7 @@ func scanSandbox(scanner interface {
 		&destroyAtAgeNs,
 		&failoverPolicy,
 		&sandbox.Runtime,
+		&sandbox.Engine,
 		&gpusJSON,
 		&sandbox.NetworkBytesIn,
 		&sandbox.NetworkBytesOut,

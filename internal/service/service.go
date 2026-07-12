@@ -71,11 +71,15 @@ type Service struct {
 	cfg    config.Config
 	logger *slog.Logger
 	store  *store.Store
-	// docker holds the lifecycle-only runtime abstraction. The field name
-	// stays "docker" because every existing call site is shaped around it;
+	// docker holds the dockerd lifecycle driver. The field name stays
+	// "docker" because every existing call site is shaped around it;
 	// the type is runtime.Runtime so a non-Docker driver can be slotted in
 	// without touching service code.
 	docker runtime.Runtime
+	// containerd holds the native containerd lifecycle driver when
+	// SB_CONTAINER_ENGINE=containerd. Nil on docker-only hosts. Existing
+	// rows with engine=docker keep routing through s.docker during migration.
+	containerd runtime.Runtime
 	// firecracker is the second registered runtime (native Firecracker, per
 	// plans/snapshot-clone-fast-boot.md). Nil unless main.go has called
 	// SetFirecrackerRuntime — which only happens when cfg.EnableFirecracker
@@ -117,15 +121,20 @@ type Service struct {
 	// id (the pool's per-id uniqueness gate gives us idempotent
 	// reservation). Nil here also disables the snapshot phase.
 	templateCIDAllocator TemplateCIDAllocator
-	// events is the concrete Docker client for the daemon /events stream and
-	// any other Docker-API-shaped surface that intentionally stays outside
-	// the runtime abstraction. Today both fields point at the same instance.
-	events   *docker.Client
-	caddy    *caddy.Client
-	cipher   *secrets.Cipher
-	mounts   *mounts.Manager
-	admitter *capacity.Admitter
-	images   ImageDistributionProvider
+	// events is the engine-agnostic event + PID lookup surface for the
+	// daemon event monitor and netstats poller. On docker-only hosts this
+	// is the *docker.Client; under containerd it may be a mux across both
+	// engines during migration.
+	events docker.EventsSource
+	// dockerAux is the concrete docker client for APIs that remain dockerd-
+	// shaped during containerd migration (built-image GC, live stats). Always
+	// set on hosts that run dockerd; nil only in trimmed unit tests.
+	dockerAux *docker.Client
+	caddy     *caddy.Client
+	cipher    *secrets.Cipher
+	mounts    *mounts.Manager
+	admitter  *capacity.Admitter
+	images    ImageDistributionProvider
 	// volumeReclaimer deletes the backing bytes (S3 prefix / NFS dir) of deleted
 	// platform volumes. Non-nil only when the daemon wired a backend reclaimer;
 	// nil leaves the pending_volume_deletions ledger for an external reconciler.
@@ -378,7 +387,7 @@ type Service struct {
 	probeContainerPortFn func(ctx context.Context, containerIP string, port int) error
 }
 
-func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
+func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
 	s := &Service{
 		cfg:      cfg,
 		logger:   logger,
@@ -493,6 +502,52 @@ func (s *Service) SetWasmRuntime(r runtime.Runtime) {
 	s.wasm = r
 }
 
+// SetContainerdRuntime registers the containerd engine driver. Called from
+// pkg/daemon when SB_CONTAINER_ENGINE=containerd.
+func (s *Service) SetContainerdRuntime(r runtime.Runtime) {
+	s.containerd = r
+}
+
+// SetEventsSource wires the daemon event monitor + netstats PID lookup seam.
+func (s *Service) SetEventsSource(src docker.EventsSource) {
+	s.events = src
+}
+
+// SetDockerAuxClient wires docker-only auxiliary APIs (built-image GC, live
+// stats) that are not part of the EventsSource seam.
+func (s *Service) SetDockerAuxClient(c *docker.Client) {
+	s.dockerAux = c
+}
+
+// ociEngineForSandbox resolves the container engine (dockerd vs native
+// containerd) that owns an OCI-runtime sandbox row. It is terminal: the sole
+// caller (runtimeForSandbox) has already peeled off firecracker/wasm, so any
+// runtime that reaches here — including an unrecognized value written by a
+// newer binary or a hand-edited row — resolves to a concrete engine and never
+// calls back into runtimeForSandbox (a recursive fallback here would stack
+// overflow the daemon on an unknown runtime; pre-engine-column code was total
+// and returned s.docker for everything non-fc/wasm).
+func (s *Service) ociEngineForSandbox(sandbox *models.Sandbox) (runtime.Runtime, error) {
+	engine := models.SandboxEngine(sandbox)
+	if engine == models.ContainerEngineContainerd {
+		if s.containerd == nil {
+			return nil, fmt.Errorf("sandbox engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
+		}
+		return s.containerd, nil
+	}
+	return s.docker, nil
+}
+
+func (s *Service) ociEngineForNewCreate() (runtime.Runtime, error) {
+	if s.cfg.ContainerEngine == models.ContainerEngineContainerd {
+		if s.containerd == nil {
+			return nil, fmt.Errorf("host engine %q: %w", s.cfg.ContainerEngine, models.ErrContainerEngineNotRegistered)
+		}
+		return s.containerd, nil
+	}
+	return s.docker, nil
+}
+
 func (s *Service) isFirecrackerSandbox(sandbox *models.Sandbox) bool {
 	return sandbox != nil && sandbox.Runtime == models.RuntimeFirecracker
 }
@@ -512,7 +567,7 @@ func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, e
 		}
 		return s.wasm, nil
 	}
-	return s.docker, nil
+	return s.ociEngineForSandbox(sandbox)
 }
 
 func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
@@ -1205,7 +1260,26 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	state, err := s.docker.Create(ctx, req, sandboxID, toolboxToken, binds)
+	ociRt, err := s.ociEngineForNewCreate()
+	if err != nil {
+		cleanupMounts()
+		releaseAdmission()
+		return nil, err
+	}
+	chosenEngine := s.cfg.ContainerEngine
+	if chosenEngine == "" {
+		chosenEngine = models.ContainerEngineDocker
+	}
+	rollbackDestroy := func(partial *models.Sandbox) {
+		if partial == nil {
+			return
+		}
+		partial.Runtime = chosenRuntime
+		partial.Engine = chosenEngine
+		_ = ociRt.Destroy(cleanupCtx, partial)
+	}
+
+	state, err := ociRt.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {
@@ -1221,11 +1295,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	// Seal the registry creds (if any) BEFORE building the row so a marshal
 	// or encrypt error doesn't leave a half-created sandbox: we already passed
-	// docker.Create at this point, so failure here goes through the same
+	// runtime Create at this point, so failure here goes through the same
 	// rollback chain as any later store error below.
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.docker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime, ContainerIP: state.ContainerIP, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut})
+		rollbackDestroy(&models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime, Engine: chosenEngine, ContainerIP: state.ContainerIP, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut})
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -1261,6 +1335,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		Lifecycle:            lifecycle,
 		Failover:             req.Failover,
 		Runtime:              chosenRuntime,
+		Engine:               chosenEngine,
 		GPUs:                 req.GPUs,
 		RegistryAuthSealed:   sealedRegistry,
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
@@ -1296,7 +1371,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			// down the main route AND every custom-domain leaf — 404 per leaf is
 			// a no-op, so it's safe on a partial install.
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-			_ = s.docker.Destroy(cleanupCtx, sandbox)
+			rollbackDestroy(sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, err
@@ -1308,7 +1383,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	sandbox.OwnerRef = ownerRef
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.docker.Destroy(cleanupCtx, sandbox)
+		rollbackDestroy(sandbox)
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateStoreCreate(ctx, sandbox.ID, err); dupErr == nil {
 			return resp, nil
@@ -1327,7 +1402,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-			_ = s.docker.Destroy(cleanupCtx, sandbox)
+			rollbackDestroy(sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, fmt.Errorf("persist platform volume attachments: %w", err)
@@ -1354,7 +1429,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-			_ = s.docker.Destroy(cleanupCtx, sandbox)
+			rollbackDestroy(sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, fmt.Errorf("persist sandbox mounts: %w", err)
@@ -1366,7 +1441,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		// flows through unchanged so the API layer can map it to 409.
 		_ = s.store.Delete(ctx, sandbox.ID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.docker.Destroy(cleanupCtx, sandbox)
+		rollbackDestroy(sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -3591,6 +3666,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	containerdManaged := map[string]*models.SandboxRuntimeState{}
+	if s.containerd != nil {
+		containerdManaged, err = s.containerd.ListManaged(ctx)
+		if err != nil {
+			return err
+		}
+	}
 	firecrackerManaged := map[string]*models.SandboxRuntimeState{}
 	if s.firecracker != nil {
 		firecrackerManaged, err = s.firecracker.ListManaged(ctx)
@@ -3605,7 +3687,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			return err
 		}
 	}
-	managed := mergeManagedRuntimes(dockerManaged, firecrackerManaged, wasmManaged)
+	managed := mergeManagedRuntimes(dockerManaged, containerdManaged, firecrackerManaged, wasmManaged)
 
 	s.reconcileLocalClusterOwnership(ctx, known, managed)
 
@@ -3617,6 +3699,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 
 	for _, sandbox := range known {
 		runtimeManaged := dockerManaged
+		if models.SandboxEngine(sandbox) == models.ContainerEngineContainerd {
+			runtimeManaged = containerdManaged
+		}
 		if s.isFirecrackerSandbox(sandbox) {
 			runtimeManaged = firecrackerManaged
 		}
@@ -3625,6 +3710,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
+			// A containerd-owned row on a node whose containerd driver is not
+			// wired (operator flipped SB_CONTAINER_ENGINE back to docker, or a
+			// config rollback) has no managed entry — but the container may
+			// still be live under a containerd we simply aren't driving. Skip
+			// it rather than fall through to the delete-row branch below, which
+			// would tear down caddy routes, free the host_port, and delete the
+			// store row out from under a running task (data loss + leaked
+			// container + a freed host_port that can be reallocated while the
+			// old bindings persist).
+			if models.SandboxEngine(sandbox) == models.ContainerEngineContainerd && s.containerd == nil {
+				s.logger.Warn("reconcile: skipping containerd-owned sandbox; containerd driver not registered on this node",
+					"sandbox_id", sandbox.ID)
+				continue
+			}
 			if s.isWasmSandbox(sandbox) {
 				if s.reconcileWasmOfflineRow(ctx, sandbox) {
 					continue
@@ -4381,12 +4480,12 @@ func (s *Service) StartBuiltImageGC(ctx context.Context) {
 	if interval <= 0 {
 		return
 	}
-	if s.events == nil {
-		s.logger.Warn("built-image GC disabled: docker events client is nil")
+	if s.dockerAux == nil {
+		s.logger.Warn("built-image GC disabled: docker client is nil")
 		return
 	}
 	s.startPeriodic(ctx, interval, 30*time.Second, func(c context.Context) {
-		s.runBuiltImageGC(c, s.events.ListBuiltImages)
+		s.runBuiltImageGC(c, s.dockerAux.ListBuiltImages)
 	})
 }
 

@@ -163,6 +163,53 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "engine_column_roundtrip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-engine-ctd")
+				sandbox.Engine = models.ContainerEngineContainerd
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Engine != models.ContainerEngineContainerd {
+					t.Fatalf("engine = %q, want %q", got.Engine, models.ContainerEngineContainerd)
+				}
+			},
+		},
+		{
+			// A pre-migration row (or one written by an older binary after a
+			// downgrade) carries an empty engine; it must read back empty and
+			// resolve to docker so flipping SB_CONTAINER_ENGINE never strands
+			// it on the wrong driver. This is the D15-critical invariant.
+			name: "engine_legacy_empty_resolves_docker",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-engine-legacy")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				// Simulate a legacy row: blank the engine column directly.
+				if _, err := st.db.ExecContext(ctx,
+					`UPDATE sandboxes SET engine = '' WHERE id = ?`, sandbox.ID); err != nil {
+					t.Fatalf("raw update: %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Engine != "" {
+					t.Fatalf("engine = %q, want empty (legacy row)", got.Engine)
+				}
+				if resolved := models.SandboxEngine(got); resolved != models.ContainerEngineDocker {
+					t.Fatalf("SandboxEngine(legacy) = %q, want docker", resolved)
+				}
+			},
+		},
+		{
 			name: "durability_roundtrip_and_default",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
@@ -1973,6 +2020,7 @@ func TestStoreHelperCases(t *testing.T) {
 			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
 			"",                 // failover_policy
 			"",                 // runtime
+			"docker",           // engine
 			"",                 // gpus_json
 			int64(0), int64(0), // net_bytes_in, net_bytes_out
 			int64(0), int64(0), // net_bytes_in_limit, net_bytes_out_limit

@@ -146,7 +146,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 	defer db.Close()
 
-	rules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend)
+	// The dockerd driver ALWAYS drives DOCKER-USER, independent of the host
+	// engine choice. On a node flipped to containerd, pre-flip engine=docker
+	// sandboxes still route to this driver; if it shared a single AEROLVM-USER
+	// manager with the containerd driver, their cleanup/heal would read+write
+	// the wrong chain and leak stale DOCKER-USER rules. The containerd driver
+	// gets its own AEROLVM-USER manager in wireContainerEngine.
+	rules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend, netrules.ChainDockerUser)
 	if err != nil {
 		return fmt.Errorf("create netrules manager: %w", err)
 	}
@@ -267,6 +273,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	svc.SetDockerAuxClient(dockerClient)
+	if err := wireContainerEngine(ctx, cfg, logger, svc, dockerClient, rules); err != nil {
+		return fmt.Errorf("wire container engine: %w", err)
+	}
 	// Wire the control-plane usage reporter into the service's background loops
 	// (reconcile / event monitor / netstats / live sampler). Under
 	// controlplane.Noop() this is the no-op reporter, so the open-source build

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -186,7 +185,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 	if previousIP != "" {
-		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
+		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
@@ -259,7 +258,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 	if previousIP != "" {
-		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
+		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
@@ -305,7 +304,11 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	// Re-attach Caddy routes if the runtime IP changed (Docker daemon restart
 	// can reassign IPs). Inspect to get the current address rather than trust
 	// what's in the DB.
-	state, err := s.docker.Inspect(ctx, sandbox.ContainerID)
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return fmt.Errorf("resolve runtime: %w", err)
+	}
+	state, err := rt.Inspect(ctx, sandbox.ContainerID)
 	if err != nil {
 		return fmt.Errorf("inspect container: %w", err)
 	}
