@@ -51,6 +51,11 @@ feature is still mid-rollout.
 |---|---|
 | `SB_ENABLE_FIRECRACKER` | Needs KVM/metal host; rejects create otherwise. |
 | `SB_ENABLE_WASM` | Needs a provisioned wasm modules dir. |
+| `SB_CONTAINER_ENGINE` | `docker` (default) vs `containerd`. Empty/unknown → docker so pre-migration hosts are byte-identical. containerd is a host-level operator choice; per-sandbox rows record their owning engine so a flip never strands existing sandboxes. Phase 1 (dark): lifecycle + security envelope + seams; container networking is Phase 2 (`plans/containerd-engine.md`). |
+| `SB_CONTAINERD_SOCKET` | containerd gRPC socket; default `/run/containerd/containerd.sock`. Used only when `SB_CONTAINER_ENGINE=containerd`. |
+| `SB_CONTAINERD_NAMESPACE` | containerd namespace for aerolvm-managed workloads; default `aerolvm` (dockerd uses `moby`, so both engines coexist on one system containerd during migration). |
+| `SB_CONTAINERD_RUN_DIR` | Host workdir for per-sandbox generated files (resolv.conf, hosts, hostname) and task logs; default `/var/lib/sandboxd/containerd`. |
+| `SB_CONTAINERD_LOG_DIR` | Overrides per-task log file placement; defaults to `${SB_CONTAINERD_RUN_DIR}/logs`. Each task log is size-capped (containerd does not rotate task IO). |
 | `SB_ENABLE_CLUSTER` | Opt-in; cluster code must be a no-op when false. |
 | `SB_CLUSTER_BOOTSTRAP` | Single-seed cluster bring-up only. |
 | `SB_CLUSTER_SHARD_AWARE_INGRESS` | Cluster ingress topology. |

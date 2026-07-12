@@ -89,6 +89,17 @@ func TestWriteStoreAwareError_AdmissionUnavailable(t *testing.T) {
 	}
 }
 
+func TestWriteStoreAwareError_ContainerEngineNotRegistered(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, models.ErrContainerEngineNotRegistered)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (host wiring state, not client fault)", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After header missing")
+	}
+}
+
 func TestWriteStoreAwareError_ManuallyStopped(t *testing.T) {
 	code, _ := storeAwareErr(t, service.ErrSandboxManuallyStopped)
 	if code != http.StatusConflict {

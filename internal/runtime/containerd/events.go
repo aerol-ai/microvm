@@ -7,7 +7,10 @@ import (
 	"time"
 
 	cntr "github.com/containerd/containerd"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events"
+	"github.com/containerd/containerd/runtime"
+	"github.com/containerd/typeurl/v2"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
@@ -46,26 +49,31 @@ func (d *Driver) StreamEvents(ctx context.Context, out chan<- docker.DockerEvent
 	}
 }
 
+// normalizeContainerdEvent maps a containerd task-lifecycle envelope onto the
+// docker.DockerEvent the service monitor consumes. Topics are matched against
+// the canonical containerd constants (real topics are "/tasks/exit" etc., NOT
+// "/tasks/exited"), and the container ID is read from the typed protobuf
+// payload — it is not present in the topic path.
 func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 	if ev == nil {
 		return docker.DockerEvent{}, false
 	}
 	var action string
-	switch {
-	case contains(ev.Topic, "/tasks/started"):
+	switch ev.Topic {
+	case runtime.TaskStartEventTopic:
 		action = "start"
-	case contains(ev.Topic, "/tasks/paused"), contains(ev.Topic, "/tasks/stopped"):
+	case runtime.TaskPausedEventTopic:
 		action = "stop"
-	case contains(ev.Topic, "/tasks/deleted"):
-		action = "destroy"
-	case contains(ev.Topic, "/tasks/oom"):
-		action = "oom"
-	case contains(ev.Topic, "/tasks/exited"):
+	case runtime.TaskExitEventTopic:
 		action = "die"
+	case runtime.TaskOOMEventTopic:
+		action = "oom"
+	case runtime.TaskDeleteEventTopic:
+		action = "destroy"
 	default:
 		return docker.DockerEvent{}, false
 	}
-	id := extractContainerID(ev)
+	id := containerIDFromEvent(ev)
 	if id == "" {
 		return docker.DockerEvent{}, false
 	}
@@ -77,49 +85,27 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 	}, true
 }
 
-func extractContainerID(ev *events.Envelope) string {
-	// containerd task topics embed the container id in the topic path:
-	// /tasks/create/<ns>/<container>/<task>
-	parts := splitTopic(ev.Topic)
-	if len(parts) >= 5 {
-		return parts[4]
+// containerIDFromEvent decodes the typed task-event payload and returns its
+// ContainerID. All task events (TaskStart/TaskExit/TaskDelete/TaskOOM/…)
+// expose GetContainerID(), so a single interface assertion covers them.
+func containerIDFromEvent(ev *events.Envelope) string {
+	if ev.Event == nil {
+		return ""
+	}
+	decoded, err := typeurl.UnmarshalAny(ev.Event)
+	if err != nil {
+		return ""
+	}
+	if g, ok := decoded.(interface{ GetContainerID() string }); ok {
+		return g.GetContainerID()
 	}
 	return ""
 }
 
-func splitTopic(topic string) []string {
-	var out []string
-	cur := ""
-	for _, r := range topic {
-		if r == '/' {
-			if cur != "" {
-				out = append(out, cur)
-				cur = ""
-			}
-			continue
-		}
-		cur += string(r)
-	}
-	if cur != "" {
-		out = append(out, cur)
-	}
-	return out
-}
-
-func contains(s, sub string) bool {
-	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-// ContainerPID returns the init PID for a running task.
+// ContainerPID returns the init PID for a running task. "Not running here"
+// (no container / no task) is (0, nil) so the events mux can fall through to
+// the other engine; genuine lookup failures propagate so netstats diagnostics
+// aren't silently swallowed.
 func (d *Driver) ContainerPID(ctx context.Context, containerRef string) (int, error) {
 	client, err := d.ensureClient()
 	if err != nil {
@@ -127,19 +113,31 @@ func (d *Driver) ContainerPID(ctx context.Context, containerRef string) (int, er
 	}
 	container, err := client.LoadContainer(ctx, containerRef)
 	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		return 0, nil
+		if errdefs.IsNotFound(err) {
+			return 0, nil // container exists but has no running task
+		}
+		return 0, err
 	}
 	status, err := task.Status(ctx)
-	if err != nil || status.Status != cntr.Running {
+	if err != nil {
+		return 0, err
+	}
+	if status.Status != cntr.Running {
 		return 0, nil
 	}
 	pids, err := task.Pids(ctx)
-	if err != nil || len(pids) == 0 {
+	if err != nil {
 		return 0, err
+	}
+	if len(pids) == 0 {
+		return 0, nil
 	}
 	return int(pids[0].Pid), nil
 }

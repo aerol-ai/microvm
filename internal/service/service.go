@@ -519,18 +519,15 @@ func (s *Service) SetDockerAuxClient(c *docker.Client) {
 	s.dockerAux = c
 }
 
-func (s *Service) isOCIContainerSandbox(sandbox *models.Sandbox) bool {
-	if sandbox == nil {
-		return true
-	}
-	rt := strings.TrimSpace(sandbox.Runtime)
-	return rt == "" || rt == models.RuntimeDocker || rt == models.RuntimeGvisor || rt == models.RuntimeKata
-}
-
+// ociEngineForSandbox resolves the container engine (dockerd vs native
+// containerd) that owns an OCI-runtime sandbox row. It is terminal: the sole
+// caller (runtimeForSandbox) has already peeled off firecracker/wasm, so any
+// runtime that reaches here — including an unrecognized value written by a
+// newer binary or a hand-edited row — resolves to a concrete engine and never
+// calls back into runtimeForSandbox (a recursive fallback here would stack
+// overflow the daemon on an unknown runtime; pre-engine-column code was total
+// and returned s.docker for everything non-fc/wasm).
 func (s *Service) ociEngineForSandbox(sandbox *models.Sandbox) (runtime.Runtime, error) {
-	if !s.isOCIContainerSandbox(sandbox) {
-		return s.runtimeForSandbox(sandbox)
-	}
 	engine := models.SandboxEngine(sandbox)
 	if engine == models.ContainerEngineContainerd {
 		if s.containerd == nil {
@@ -3713,6 +3710,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
+			// A containerd-owned row on a node whose containerd driver is not
+			// wired (operator flipped SB_CONTAINER_ENGINE back to docker, or a
+			// config rollback) has no managed entry — but the container may
+			// still be live under a containerd we simply aren't driving. Skip
+			// it rather than fall through to the delete-row branch below, which
+			// would tear down caddy routes, free the host_port, and delete the
+			// store row out from under a running task (data loss + leaked
+			// container + a freed host_port that can be reallocated while the
+			// old bindings persist).
+			if models.SandboxEngine(sandbox) == models.ContainerEngineContainerd && s.containerd == nil {
+				s.logger.Warn("reconcile: skipping containerd-owned sandbox; containerd driver not registered on this node",
+					"sandbox_id", sandbox.ID)
+				continue
+			}
 			if s.isWasmSandbox(sandbox) {
 				if s.reconcileWasmOfflineRow(ctx, sandbox) {
 					continue

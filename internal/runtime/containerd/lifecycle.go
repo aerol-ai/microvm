@@ -27,8 +27,14 @@ import (
 // Create provisions and starts a managed task in the aerolvm namespace.
 func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
-		return nil, errors.New("sandbox ID is required")
+	// Validate the ID charset BEFORE it is used to build host filesystem
+	// paths (host files dir, task log). The ID can arrive attacker-controlled
+	// via the X-Cluster-Create-ID header; without this a "../"-laden ID would
+	// traverse out of RunDir/LogDir on write, and the failure-path RemoveAll
+	// would delete an attacker-chosen host directory. Mirrors the docker and
+	// firecracker drivers' defense-in-depth check.
+	if err := validateSandboxID(sandboxID); err != nil {
+		return nil, err
 	}
 	if err := d.ensureToolboxBinary(); err != nil {
 		return nil, err
@@ -52,15 +58,28 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	committed := false
+	// createdContainer gates host-side teardown: a caller that loses the
+	// concurrent-duplicate race (AlreadyExists at NewContainer) must NOT run
+	// LIFO teardown, because the host files and ready socket are keyed by
+	// sandboxID and belong to the winner — removing them would yank the bind
+	// mounts out from under the live winning container.
+	createdContainer := false
 	var (
 		container cntr.Container
 		task      cntr.Task
 		logPath   string
+		logCloser func()
 		hostFiles *sandboxHostFiles
 	)
 	defer func() {
-		if committed {
+		if committed || !createdContainer {
+			if logCloser != nil {
+				logCloser()
+			}
 			return
+		}
+		if logCloser != nil {
+			logCloser()
 		}
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
 	}()
@@ -93,18 +112,46 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if readyListener != nil {
 			_ = readyListener.Close()
 		}
-		if readySocketCreated && !keepReadySocket {
+		// Only reap the ready socket when this call owns it: on success we keep
+		// it, and on the AlreadyExists loser path (!createdContainer) it belongs
+		// to the winner — RemoveReadySocketsForSandbox is keyed by sandboxID and
+		// would nuke the winner's socket too.
+		if readySocketCreated && !keepReadySocket && createdContainer {
 			dockerpkg.RemoveReadySocketsForSandbox(d.cfg.ReadyDir, sandboxID)
 		}
 	}()
 
+	// Assemble the COMPLETE spec-opts slice before handing it to
+	// cntr.WithNewSpec. A variadic spread captures the slice at the call site;
+	// appending security/resource/ready opts afterward would silently drop
+	// them (append reallocates, leaving the WithNewSpec closure bound to the
+	// old backing array) — every non-privileged sandbox would then run with no
+	// seccomp, no NoNewPrivileges, no cap trim, and no cgroup limits.
 	specOpts := []oci.SpecOpts{
 		oci.WithImageConfig(image),
 		oci.WithProcessArgs(append([]string{d.cfg.ToolboxMountPath}, userCommand...)...),
-		oci.WithEnv(envValues),
 		oci.WithHostname(sandboxID),
-		oci.WithMounts(buildMounts(d.cfg, hostFiles, hostMounts)),
 	}
+	if !d.cfg.Privileged {
+		specOpts = append(specOpts, securitySpecOpts()...)
+	}
+	if !d.cfg.ResourceLimitsOff {
+		specOpts = append(specOpts, resourceSpecOpts(req)...)
+	}
+	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
+
+	if d.cfg.ReadyEnabled {
+		readyListener, err = d.setupReadySocket(&envValues, &mountSpecs, sandboxID, toolboxToken)
+		if err != nil {
+			return nil, err
+		}
+		readySocketCreated = true
+	}
+	// Env and mounts are finalized here (setupReadySocket may have appended to
+	// both), then applied last so nothing is lost to slice capture.
+	sort.Strings(envValues)
+	specOpts = append(specOpts, oci.WithEnv(envValues), oci.WithMounts(mountSpecs))
+
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
 		cntr.WithNewSnapshot(sandboxID, image),
@@ -113,20 +160,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if ociRuntime != "" {
 		containerOpts = append(containerOpts, cntr.WithRuntime(ociRuntime, nil))
-	}
-	if !d.cfg.Privileged {
-		specOpts = append(specOpts, securitySpecOpts()...)
-	}
-	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(req)...)
-	}
-
-	if d.cfg.ReadyEnabled {
-		readyListener, err = d.setupReadySocket(&envValues, sandboxID, toolboxToken, &specOpts)
-		if err != nil {
-			return nil, err
-		}
-		readySocketCreated = true
 	}
 
 	createStart := time.Now()
@@ -137,13 +170,19 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	createdContainer = true
 
 	logPath, err = d.taskLogPath(sandboxID)
 	if err != nil {
 		return nil, err
 	}
+	logIO, closeLog, err := taskLogIO(logPath)
+	if err != nil {
+		return nil, err
+	}
+	logCloser = closeLog
 
-	task, err = container.NewTask(ctx, cio.LogFile(logPath))
+	task, err = container.NewTask(ctx, logIO)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
 	}
@@ -389,19 +428,78 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	if ref == "" {
 		return nil, errors.New("image reference is required")
 	}
-	image, err := client.GetImage(ctx, ref)
-	if err == nil {
+	if image, err := client.GetImage(ctx, ref); err == nil {
 		return image, nil
 	}
-	opts := []cntr.RemoteOpt{}
-	if auth != nil && auth.Username != "" {
-		opts = append(opts, cntr.WithResolver(docker.NewResolver(docker.ResolverOptions{
-			Authorizer: docker.NewDockerAuthorizer(docker.WithAuthCreds(func(host string) (string, string, error) {
-				return auth.Username, auth.Password, nil
-			})),
-		})))
+	// Recent-failure backoff: don't hammer a registry that just rejected us on
+	// a burst of cold creates for the same missing/erroring ref.
+	if backoff := d.cfg.PullFailureBackoff; backoff > 0 {
+		d.pullFailMu.Lock()
+		until, ok := d.pullFailUntil[ref]
+		d.pullFailMu.Unlock()
+		if ok && time.Now().Before(until) {
+			return nil, fmt.Errorf("image pull for %q backing off after recent failure", ref)
+		}
 	}
-	return client.PullImage(ctx, ref, opts...)
+	// Single-flight: N concurrent cold creates of the same missing image
+	// collapse to one registry pull. Concurrency across distinct refs is
+	// capped by the pull semaphore.
+	res, err, _ := d.pullGroup.Do(ref, func() (any, error) {
+		if d.pullSem != nil {
+			select {
+			case d.pullSem <- struct{}{}:
+				defer func() { <-d.pullSem }()
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		// Re-check inside the flight: a sibling create may have unpacked it.
+		if image, getErr := client.GetImage(ctx, ref); getErr == nil {
+			return image, nil
+		}
+		// WithPullUnpack is mandatory: cntr.WithNewSnapshot expects the image
+		// layers unpacked into the snapshotter, and a bare Pull does not unpack.
+		opts := []cntr.RemoteOpt{cntr.WithPullUnpack}
+		if a := auth; a != nil && a.Username != "" {
+			refHost := registryHost(ref)
+			opts = append(opts, cntr.WithResolver(docker.NewResolver(docker.ResolverOptions{
+				// Scope creds to the ref's own registry host. Returning creds
+				// for every host would leak them to foreign-layer / redirect
+				// hosts the manifest resolution touches.
+				Authorizer: docker.NewDockerAuthorizer(docker.WithAuthCreds(func(host string) (string, string, error) {
+					if refHost != "" && host != refHost {
+						return "", "", nil
+					}
+					return a.Username, a.Password, nil
+				})),
+			})))
+		}
+		return client.PullImage(ctx, ref, opts...)
+	})
+	if err != nil {
+		if backoff := d.cfg.PullFailureBackoff; backoff > 0 {
+			d.pullFailMu.Lock()
+			d.pullFailUntil[ref] = time.Now().Add(backoff)
+			d.pullFailMu.Unlock()
+		}
+		return nil, err
+	}
+	return res.(cntr.Image), nil
+}
+
+// registryHost extracts the registry hostname from an image ref. Docker Hub
+// short refs (no host component) return "" so the authorizer matches the
+// resolver's own default-registry canonicalization.
+func registryHost(ref string) string {
+	slash := strings.IndexByte(ref, '/')
+	if slash < 0 {
+		return ""
+	}
+	first := ref[:slash]
+	if strings.ContainsAny(first, ".:") || first == "localhost" {
+		return first
+	}
+	return ""
 }
 
 func (d *Driver) ensureToolboxBinary() error {
@@ -414,7 +512,11 @@ func (d *Driver) ensureToolboxBinary() error {
 	return nil
 }
 
-func (d *Driver) setupReadySocket(env *[]string, sandboxID, toolboxToken string, specOpts *[]oci.SpecOpts) (*dockerpkg.ReadyListener, error) {
+// setupReadySocket mints the per-create readiness listener and appends its env
+// vars and the guest bind mount to the caller's slices. Both are applied to
+// the OCI spec by the caller AFTER this returns, so nothing is lost to slice
+// capture.
+func (d *Driver) setupReadySocket(env *[]string, mountSpecs *[]specs.Mount, sandboxID, toolboxToken string) (*dockerpkg.ReadyListener, error) {
 	if err := dockerpkg.EnsureReadyDir(d.cfg.ReadyDir); err != nil {
 		return nil, err
 	}
@@ -427,10 +529,9 @@ func (d *Driver) setupReadySocket(env *[]string, sandboxID, toolboxToken string,
 		return nil, err
 	}
 	*env = append(*env, readyListener.EnvVars()...)
-	sort.Strings(*env)
-	*specOpts = append(*specOpts, oci.WithMounts([]specs.Mount{
-		{Type: "bind", Source: readyListener.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"}},
-	}))
+	*mountSpecs = append(*mountSpecs, specs.Mount{
+		Type: "bind", Source: readyListener.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"},
+	})
 	return readyListener, nil
 }
 
@@ -530,7 +631,16 @@ func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
 		out = append(out, oci.WithMemoryLimit(uint64(req.MemoryMB)*1024*1024))
 	}
 	if req.CPU > 0 {
-		out = append(out, oci.WithCPUs(fmt.Sprintf("%.3f", req.CPU)))
+		// Fractional CPU is a CFS quota/period, NOT a cpuset. oci.WithCPUs sets
+		// Linux.Resources.CPU.Cpus (cpuset pinning), so "0.500" would be an
+		// invalid cpuset and runc would reject it. Mirror dockerd's --cpus:
+		// quota = cpus * period, period = 100ms.
+		const cpuPeriod uint64 = 100000
+		quota := int64(req.CPU * float64(cpuPeriod))
+		if quota < 1000 {
+			quota = 1000
+		}
+		out = append(out, oci.WithCPUCFS(quota, cpuPeriod))
 	}
 	return out
 }

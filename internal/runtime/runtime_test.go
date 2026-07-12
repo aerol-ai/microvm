@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/runtime"
+	containerdruntime "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -12,6 +13,11 @@ import (
 func TestDockerClientSatisfiesContainerRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*docker.Client)(nil)
 	var _ runtime.ContainerRuntime = (*docker.Client)(nil)
+}
+
+func TestContainerdDriverSatisfiesContainerRuntime(t *testing.T) {
+	var _ runtime.Runtime = (*containerdruntime.Driver)(nil)
+	var _ runtime.ContainerRuntime = (*containerdruntime.Driver)(nil)
 }
 
 func TestFirecrackerDriverSatisfiesContainerRuntime(t *testing.T) {

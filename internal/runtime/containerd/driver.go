@@ -3,7 +3,10 @@ package containerd
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
@@ -34,13 +37,16 @@ type Config struct {
 
 // FromDaemonConfig maps internal config into driver-local settings.
 func FromDaemonConfig(cfg config.Config) Config {
-	logDir := cfg.ContainerdLogDir
-	if logDir == "" {
-		logDir = cfg.ContainerdRunDir + "/logs"
-	}
+	// Resolve runDir's fallback FIRST so the log dir derives from the effective
+	// run dir — otherwise an empty ContainerdRunDir would place logs at "/logs"
+	// (host root) while files land under the real default.
 	runDir := cfg.ContainerdRunDir
 	if runDir == "" {
-		runDir = "/var/lib/sandboxd/containerd"
+		runDir = config.DefaultContainerdRunDir
+	}
+	logDir := cfg.ContainerdLogDir
+	if logDir == "" {
+		logDir = runDir + "/logs"
 	}
 	return Config{
 		Socket:             cfg.ContainerdSocket,
@@ -70,7 +76,20 @@ type Driver struct {
 	logger       *slog.Logger
 	cfg          Config
 	networkRules *netrules.Manager
-	client       *Client
+
+	// clientMu single-flights lazy connection establishment so a burst of
+	// concurrent first-creates dials containerd once instead of racing on the
+	// client field and leaking all-but-one gRPC connection.
+	clientMu sync.Mutex
+	client   *Client
+
+	// pullGroup collapses concurrent pulls of the same ref; pullSem caps
+	// concurrent pulls of distinct refs; pullFailUntil rate-limits retries of
+	// a ref that just failed. Together they replace dockerd's pull dedup.
+	pullGroup     singleflight.Group
+	pullSem       chan struct{}
+	pullFailMu    sync.Mutex
+	pullFailUntil map[string]time.Time
 }
 
 // New constructs a Driver. The containerd connection is lazy — Ping and
@@ -79,19 +98,29 @@ func New(cfg Config, rules *netrules.Manager, logger *slog.Logger) *Driver {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var sem chan struct{}
+	if cfg.PullMaxConcurrent > 0 {
+		sem = make(chan struct{}, cfg.PullMaxConcurrent)
+	}
 	return &Driver{
-		logger:       logger,
-		cfg:          cfg,
-		networkRules: rules,
+		logger:        logger,
+		cfg:           cfg,
+		networkRules:  rules,
+		pullSem:       sem,
+		pullFailUntil: make(map[string]time.Time),
 	}
 }
 
 // SetClient injects a containerd API client (tests / fakes).
 func (d *Driver) SetClient(c *Client) {
+	d.clientMu.Lock()
+	defer d.clientMu.Unlock()
 	d.client = c
 }
 
 func (d *Driver) ensureClient() (*Client, error) {
+	d.clientMu.Lock()
+	defer d.clientMu.Unlock()
 	if d.client != nil {
 		return d.client, nil
 	}

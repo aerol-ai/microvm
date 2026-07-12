@@ -146,7 +146,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 	defer db.Close()
 
-	rules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend, netrulesUserChain(cfg))
+	// The dockerd driver ALWAYS drives DOCKER-USER, independent of the host
+	// engine choice. On a node flipped to containerd, pre-flip engine=docker
+	// sandboxes still route to this driver; if it shared a single AEROLVM-USER
+	// manager with the containerd driver, their cleanup/heal would read+write
+	// the wrong chain and leak stale DOCKER-USER rules. The containerd driver
+	// gets its own AEROLVM-USER manager in wireContainerEngine.
+	rules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend, netrules.ChainDockerUser)
 	if err != nil {
 		return fmt.Errorf("create netrules manager: %w", err)
 	}

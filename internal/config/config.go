@@ -25,6 +25,12 @@ var snapshotRetentionSuffixPattern = regexp.MustCompile(`^--(ttl|idle)-[a-z0-9]+
 
 const defaultToolboxPort = 2280
 
+// DefaultContainerdRunDir is the single source of truth for the containerd
+// per-sandbox host-file workdir default (resolv.conf, hosts, task logs).
+// Referenced by both Load() and the containerd driver's FromDaemonConfig so
+// the default cannot drift between the two layers.
+const DefaultContainerdRunDir = "/var/lib/sandboxd/containerd"
+
 // NodeRole values for SB_NODE_ROLE. The role partitions which components a
 // cluster-mode daemon runs (Raft voter promotion, sandbox worker work, public
 // ingress reconciler). Default is NodeRoleMixed — every node runs every
@@ -1261,7 +1267,7 @@ func Load() (Config, error) {
 		ContainerEngine:                  getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                 getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
 		ContainerdNamespace:              getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
-		ContainerdRunDir:                 getEnv("SB_CONTAINERD_RUN_DIR", "/var/lib/sandboxd/containerd"),
+		ContainerdRunDir:                 getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
 		ContainerdLogDir:                 strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		AutoReconcile:                    getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:                      getEnvBool("SB_ENABLE_CADDY", true),
@@ -1636,10 +1642,11 @@ func Load() (Config, error) {
 			cfg.Runtime, models.RuntimeDocker)
 	}
 
-	if _, err := models.ResolveContainerEngine(cfg.ContainerEngine); err != nil {
+	resolvedEngine, err := models.ResolveContainerEngine(cfg.ContainerEngine)
+	if err != nil {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_ENGINE: %w", err)
 	}
-	cfg.ContainerEngine, _ = models.ResolveContainerEngine(cfg.ContainerEngine)
+	cfg.ContainerEngine = resolvedEngine
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
 		if strings.TrimSpace(cfg.ContainerdSocket) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_SOCKET is required when SB_CONTAINER_ENGINE=containerd")

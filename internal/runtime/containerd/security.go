@@ -3,7 +3,6 @@ package containerd
 import (
 	"github.com/containerd/containerd/contrib/seccomp"
 	"github.com/containerd/containerd/oci"
-	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // securitySpecOpts assembles the default non-privileged security envelope
@@ -63,6 +62,3 @@ func defaultReadonlyPaths() []string {
 		"/proc/sysrq-trigger",
 	}
 }
-
-// compile-time check that specs import stays referenced for mount builders.
-var _ = specs.LinuxNamespace{}

@@ -28,7 +28,11 @@ func Connect(socket, namespace string) (*Client, error) {
 	if ns == "" {
 		return nil, fmt.Errorf("containerd namespace is required")
 	}
-	raw, err := cntr.New(socket)
+	// Set the default namespace on the raw client too: methods on the returned
+	// cntr.Container/cntr.Task objects (NewTask, task.Start, task.Pids, Delete)
+	// do not flow through Client.withNS, so without a default they run with no
+	// namespace and fail with "namespace is required".
+	raw, err := cntr.New(socket, cntr.WithDefaultNamespace(ns))
 	if err != nil {
 		return nil, fmt.Errorf("dial containerd: %w", err)
 	}

@@ -77,6 +77,16 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, "fleet access validation temporarily unavailable; retry shortly")
 		return
 	}
+	// A sandbox row whose owning container engine is not wired on this node
+	// (e.g. an engine=containerd row reached after the operator flipped
+	// SB_CONTAINER_ENGINE back to docker) is a host wiring/migration state, not
+	// client fault. 503+Retry-After so SDK retry logic backs off instead of
+	// treating it as a malformed request that must not be retried.
+	if errors.Is(err, models.ErrContainerEngineNotRegistered) {
+		w.Header().Set("Retry-After", strconv.Itoa(admissionRetryAfterSeconds))
+		WriteError(w, http.StatusServiceUnavailable, "container engine for this sandbox is not available on this node; retry shortly")
+		return
+	}
 	// Wake-aware proxy sentinels (plans/serverless-sandbox-http-wake.md).
 	// 409 for manual-stop: the operator explicitly stopped the sandbox
 	// and the wake helper refused to auto-resume; the caller must

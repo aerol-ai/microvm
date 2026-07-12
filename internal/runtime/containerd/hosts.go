@@ -21,7 +21,7 @@ func prepareSandboxHostFiles(runDir, sandboxID string) (*sandboxHostFiles, error
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	resolvBody, err := generateResolvConf()
+	resolvBody, err := generateResolvConf(hostResolvConfPath)
 	if err != nil {
 		return nil, err
 	}
@@ -45,11 +45,16 @@ func prepareSandboxHostFiles(runDir, sandboxID string) (*sandboxHostFiles, error
 	}, nil
 }
 
-// generateResolvConf copies upstream resolvers from the host, stripping
-// loopback stubs like systemd-resolved's 127.0.0.53 that are unreachable
-// from a container netns.
-func generateResolvConf() (string, error) {
-	f, err := os.Open("/etc/resolv.conf")
+// hostResolvConfPath is the host resolver source generateResolvConf reads.
+// A package var (not a literal) so tests can point it at a fixture.
+const hostResolvConfPath = "/etc/resolv.conf"
+
+// generateResolvConf copies upstream resolvers from the given host resolv.conf,
+// stripping loopback stubs like systemd-resolved's 127.0.0.53 that are
+// unreachable from a container netns. A missing/empty source falls back to a
+// public resolver so the sandbox still resolves DNS.
+func generateResolvConf(path string) (string, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return "nameserver 8.8.8.8\n", nil
 	}
@@ -82,6 +87,9 @@ func generateResolvConf() (string, error) {
 		case "options":
 			options = append(options, fields[1:]...)
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
 	}
 	if len(nameservers) == 0 {
 		nameservers = []string{"8.8.8.8"}

@@ -13,7 +13,6 @@ import (
 )
 
 func containerIPv4FromTask(ctx context.Context, task cntr.Task) (string, error) {
-	_ = ctx
 	if task == nil {
 		return "", fmt.Errorf("task is nil")
 	}
