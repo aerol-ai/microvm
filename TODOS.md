@@ -3,6 +3,27 @@
 Deferred work items with enough context to pick up cold. Each entry says
 what, why, the caveat that motivated capturing it, and where to start.
 
+## Audit Firecracker outbound NAT path (networking)
+
+- **What:** Trace an FC sandbox's outbound connectivity on a live host
+  (`iptables -t nat -L`, `sysctl net.ipv4.ip_forward`) and either document
+  where NAT/forwarding comes from or file the gap as a bug.
+- **Why:** The containerd-engine plan review (2026-07-12) grepped the whole
+  tree for masquerade/ip_forward/br_netfilter handling and found **none** —
+  for Docker sandboxes, dockerd provides NAT invisibly; for FC VMs on /30
+  TAP slots (`internal/network/tap/host.go` does link/addr only), nothing
+  in the repo answers "how does traffic leave the box." Either it lives in
+  host bootstrap outside the repo (document it) or FC sandboxes have no
+  outbound internet (fix it).
+- **Caveat (why it's a TODO, not a bug yet):** may be a non-issue —
+  Terraform user-data / manual host provisioning may already set it up;
+  30 minutes on any FC bench host settles it.
+- **Depends on / blocked by:** access to a live FC host (bench topology
+  has them). Nothing else.
+- **Start:** any FC node: `iptables -t nat -L POSTROUTING -n`,
+  `sysctl net.ipv4.ip_forward`, then `Terraform/` node bootstrap templates
+  if rules exist but aren't in-repo.
+
 ## NVMe/io2 data-dir option (infra) — `plans/nvme-datadir.md`
 
 - **What:** Terraform instance-type + volume variables (`Terraform/nodes.tf`)
