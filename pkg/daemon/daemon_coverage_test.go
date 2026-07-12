@@ -123,6 +123,36 @@ func TestRun_ProviderFactoryErrorReturnsError(t *testing.T) {
 	}
 }
 
+func TestRun_GracefulShutdown(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_PUBLIC_HOST", "localhost")
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	t.Setenv("SB_DB_PATH", statePath)
+	t.Setenv("SB_TOOLBOX_BINARY_PATH", "/bin/true")
+	mountsRoot := t.TempDir()
+	t.Setenv("SB_MOUNTS_ROOT", mountsRoot)
+	t.Setenv("SB_MOUNTS_CRED_DIR", filepath.Join(mountsRoot, "creds"))
+	t.Setenv("SB_SSH_HOST_KEY_PATH", filepath.Join(t.TempDir(), "ssh_host_ed25519_key"))
+	t.Setenv("SB_LISTEN_ADDR", "127.0.0.1:0")
+	// Allow config to default to single-node mixed mode when cluster is disabled.
+	t.Setenv("SB_ENABLE_CLUSTER", "false")
+	t.Setenv("SB_ENABLE_FIRECRACKER", "false")
+	t.Setenv("SB_ENABLE_WASM", "false")
+	t.Setenv("SB_ENABLE_CADDY", "false")
+	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, testLogger(), nil)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
 type domainStubCluster struct {
 	*cluster.Noop
 	hosts map[string]string

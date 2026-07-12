@@ -16,6 +16,9 @@ func ociHappyConfig(t *testing.T) (oci.Config, string) {
 	if err := os.MkdirAll(bins, 0o755); err != nil {
 		t.Fatalf("mkdir bins: %v", err)
 	}
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatalf("mkdir work: %v", err)
+	}
 
 	skopeo := writeOCIFake(t, bins, "skopeo", `
 last="$1"

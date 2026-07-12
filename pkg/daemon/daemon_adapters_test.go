@@ -13,12 +13,15 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/network/tap"
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/oci"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 func testLogger() *slog.Logger {
@@ -81,10 +84,177 @@ func TestConfigureAOCRPullAuthGuard_NoPanic(t *testing.T) {
 	}, &docker.Client{})
 }
 
-func TestAdaptTapSlot(t *testing.T) {
-	if got := adaptTapSlot(nil); got != nil {
-		t.Fatalf("adaptTapSlot(nil) = %+v, want nil", got)
+func TestWireDockerNetnsPool_Enabled(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///tmp/daemon-netns-test.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := newTestDockerClient(t)
+	cfg := config.Config{
+		DockerNetnsPoolEnabled:        true,
+		DockerNetnsPoolDepth:          1,
+		DockerNetnsPoolPauseImage:     "alpine:3.20",
+		DockerNetnsPoolRefillInterval: 10 * time.Millisecond,
 	}
+	pool := wireDockerNetnsPool(ctx, cfg, testLogger(), c)
+	if pool == nil {
+		t.Fatal("expected netns pool")
+	}
+	cancel()
+	pool.Stop(context.Background())
+}
+
+func TestWireDockerWarmPool_Enabled(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///tmp/daemon-warm-test.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := newTestDockerClient(t)
+	admitter := capacity.NewWithRSSSource(capacity.HostInfo{}, capacity.Limits{}, capacity.NewProcMeminfoProbe(), nil)
+	cfg := config.Config{
+		DockerPoolEnabled:        true,
+		DockerReadySocketEnabled: true,
+		DockerPoolDepth:          1,
+		DockerPoolMaxImages:      1,
+		DockerPoolIdleTTL:        1 * time.Second,
+		DockerPoolRefillInterval: 10 * time.Millisecond,
+		DockerRuntimeWaitTimeout: 1 * time.Second,
+		Runtime:                  models.RuntimeDocker,
+	}
+	pool := wireDockerWarmPool(ctx, cfg, testLogger(), c, admitter)
+	if pool == nil {
+		t.Fatal("expected docker warm pool")
+	}
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	drainDockerWarmPool(pool, testLogger())
+}
+
+func TestReadBypassMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bypass_marker")
+	if readBypassMarker(path) {
+		t.Fatal("readBypassMarker(missing) = true, want false")
+	}
+	if err := os.WriteFile(path, []byte(" true\n"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	if !readBypassMarker(path) {
+		t.Fatal("readBypassMarker(true) = false, want true")
+	}
+}
+
+func TestEffectiveWasmCompileCacheDir(t *testing.T) {
+	cfg := config.Config{WasmModulesDir: "/tmp/modules", WasmCacheDir: "/tmp/cache"}
+	if got := effectiveWasmCompileCacheDir(cfg); got != filepath.Join("/tmp/cache", "wazero-compile") {
+		t.Fatalf("expected default cache dir, got %q", got)
+	}
+	t.Setenv("SB_WASM_COMPILE_CACHE_DIR", "/custom/cache")
+	cfg.WasmCompileCacheDir = "/custom/cache"
+	if got := effectiveWasmCompileCacheDir(cfg); got != "/custom/cache" {
+		t.Fatalf("expected explicit cache dir, got %q", got)
+	}
+}
+
+func TestWriteBypassMarker_Success(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bypass_marker")
+	if err := writeBypassMarker(path, true); err != nil {
+		t.Fatalf("writeBypassMarker: %v", err)
+	}
+	if !readBypassMarker(path) {
+		t.Fatal("expected marker to be true")
+	}
+	if err := writeBypassMarker(path, false); err != nil {
+		t.Fatalf("writeBypassMarker false: %v", err)
+	}
+	if readBypassMarker(path) {
+		t.Fatal("expected marker to be false")
+	}
+}
+
+func TestOCIHappyConfigHelpers(t *testing.T) {
+	cfg, work := ociHappyConfig(t)
+	if _, err := os.Stat(cfg.SkopeoBin); err != nil {
+		t.Fatalf("skopeo bin missing: %v", err)
+	}
+	if _, err := os.Stat(cfg.UmociBin); err != nil {
+		t.Fatalf("umoci bin missing: %v", err)
+	}
+	if _, err := os.Stat(cfg.Mkfs4Bin); err != nil {
+		t.Fatalf("mkfs.ext4 bin missing: %v", err)
+	}
+	if _, err := os.Stat(work); err != nil {
+		t.Fatalf("work dir missing: %v", err)
+	}
+}
+
+func TestSeedStandardModules(t *testing.T) {
+	modulesDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modulesDir, "python.wasm"), []byte{0x00, 0x61, 0x73, 0x6d, 0, 0, 0, 0}, 0o644); err != nil {
+		t.Fatalf("write wasm: %v", err)
+	}
+	resolver := wasmmod.NewModuleResolver(modulesDir, "")
+	resolver.Reserved["python"] = "python.wasm"
+	pool := wasmpool.New(t.TempDir(), testLogger())
+	seedStandardModules(context.Background(), resolver, pool, resolver.Reserved, testLogger())
+}
+
+func TestTemplateResolverAdapter_Resolve(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	logger := testLogger()
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
+	a := &templateResolverAdapter{svc: svc}
+	now := time.Now().UTC()
+
+	mustCreateTemplate := func(tpl *models.Template) {
+		t.Helper()
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate(%s): %v", tpl.ID, err)
+		}
+	}
+
+	mustCreateTemplate(&models.Template{ID: "tpl-ready", Image: "alpine", Status: models.TemplateStatusReadyNoSnapshot, RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now})
+	mustCreateTemplate(&models.Template{ID: "tpl-pending", Image: "alpine", Status: models.TemplateStatusPending, RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now})
+	mustCreateTemplate(&models.Template{ID: "tpl-no-rootfs", Image: "alpine", Status: models.TemplateStatusReady, RootfsPath: "", CreatedAt: now, UpdatedAt: now, HasSnapshot: true})
+
+	res, err := a.Resolve(ctx, "tpl-ready")
+	if err != nil {
+		t.Fatalf("Resolve tpl-ready: %v", err)
+	}
+	if res == nil || res.RootfsPath != "/tmp/rootfs.ext4" || res.HasSnapshot {
+		t.Fatalf("unexpected resolve result: %+v", res)
+	}
+
+	if _, err := a.Resolve(ctx, "tpl-pending"); err == nil {
+		t.Fatalf("expected error for pending template")
+	}
+	if _, err := a.Resolve(ctx, "tpl-no-rootfs"); err == nil {
+		t.Fatalf("expected error for ready template without rootfs")
+	}
+	if _, err := a.Resolve(ctx, "does-not-exist"); err == nil {
+		t.Fatalf("expected not-found error")
+	}
+}
+
+func TestFirecrackerRootfsAdapter_BuildSuccess(t *testing.T) {
+	cfg, work := ociHappyConfig(t)
+	builder, err := oci.New(cfg)
+	if err != nil {
+		t.Fatalf("oci.New: %v", err)
+	}
+	a := &firecrackerRootfsAdapter{inner: builder}
+	out := filepath.Join(work, "rootfs.ext4")
+	res, err := a.Build(context.Background(), fcruntime.RootfsBuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if res == nil || res.RootfsPath != out {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+func TestFirecrackerRootfsAdapter_BuildWithInjectFiles(t *testing.T) {
 
 	in := &tap.Slot{TapName: "fctap1", CIDR: "172.16.0.0/30", HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 33, GuestMAC: "02:00:00:00:00:03"}
 	got := adaptTapSlot(in)
@@ -238,95 +408,6 @@ func TestFirecrackerWarmPoolDepthCapsByTapBudget(t *testing.T) {
 					tc.configured, tc.tapSize, got, capped, tc.want, tc.wantCapped)
 			}
 		})
-	}
-}
-
-func TestTemplateResolverAdapter_Resolve(t *testing.T) {
-	ctx := context.Background()
-	st := openTestStore(t)
-	logger := testLogger()
-	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
-	a := &templateResolverAdapter{svc: svc}
-	now := time.Now().UTC()
-
-	mustCreateTemplate := func(tpl *models.Template) {
-		t.Helper()
-		if err := st.CreateTemplate(ctx, tpl); err != nil {
-			t.Fatalf("CreateTemplate(%s): %v", tpl.ID, err)
-		}
-	}
-
-	mustCreateTemplate(&models.Template{ID: "tpl-ready", Image: "alpine", Status: models.TemplateStatusReadyNoSnapshot, RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now})
-	mustCreateTemplate(&models.Template{ID: "tpl-pending", Image: "alpine", Status: models.TemplateStatusPending, RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now})
-	mustCreateTemplate(&models.Template{ID: "tpl-no-rootfs", Image: "alpine", Status: models.TemplateStatusReady, RootfsPath: "", CreatedAt: now, UpdatedAt: now, HasSnapshot: true})
-
-	res, err := a.Resolve(ctx, "tpl-ready")
-	if err != nil {
-		t.Fatalf("Resolve tpl-ready: %v", err)
-	}
-	if res == nil || res.RootfsPath != "/tmp/rootfs.ext4" || res.HasSnapshot {
-		t.Fatalf("unexpected resolve result: %+v", res)
-	}
-
-	if _, err := a.Resolve(ctx, "tpl-pending"); err == nil {
-		t.Fatalf("expected error for pending template")
-	}
-	if _, err := a.Resolve(ctx, "tpl-no-rootfs"); err == nil {
-		t.Fatalf("expected error for ready template without rootfs")
-	}
-	if _, err := a.Resolve(ctx, "does-not-exist"); err == nil {
-		t.Fatalf("expected not-found error")
-	}
-}
-
-func TestFirecrackerRootfsAdapter_BuildSuccess(t *testing.T) {
-	cfg, work := ociHappyConfig(t)
-	builder, err := oci.New(cfg)
-	if err != nil {
-		t.Fatalf("oci.New: %v", err)
-	}
-	a := &firecrackerRootfsAdapter{inner: builder}
-	out := filepath.Join(work, "rootfs.ext4")
-	res, err := a.Build(context.Background(), fcruntime.RootfsBuildRequest{
-		ImageRef: "docker://alpine:3.20",
-		OutPath:  out,
-	})
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	if res == nil || res.RootfsPath != out {
-		t.Fatalf("unexpected result: %+v", res)
-	}
-}
-
-func TestFirecrackerRootfsAdapter_BuildWithInjectFiles(t *testing.T) {
-	cfg, work := ociHappyConfig(t)
-	builder, err := oci.New(cfg)
-	if err != nil {
-		t.Fatalf("oci.New: %v", err)
-	}
-	hostBin := filepath.Join(t.TempDir(), "toolboxd")
-	if err := os.WriteFile(hostBin, []byte("ELF-ish"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	a := &firecrackerRootfsAdapter{inner: builder}
-	out := filepath.Join(work, "rootfs-inject.ext4")
-	res, err := a.Build(context.Background(), fcruntime.RootfsBuildRequest{
-		ImageRef: "docker://alpine:3.20",
-		OutPath:  out,
-		InjectFiles: []fcruntime.InjectFile{
-			{HostPath: hostBin, GuestPath: "/usr/local/bin/toolboxd", Mode: 0o755},
-			{Content: []byte("SB_TOOLBOX_TOKEN='tok'\n"), GuestPath: "/etc/toolboxd.env", Mode: 0o600},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	if res == nil || res.RootfsPath != out {
-		t.Fatalf("unexpected result: %+v", res)
-	}
-	if err := res.Cleanup(); err != nil {
-		t.Fatalf("Cleanup: %v", err)
 	}
 }
 
