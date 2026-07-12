@@ -6,7 +6,14 @@ Status: **DONE — implemented 2026-07-12** (branch
 promote 10–11ms, inline=1043/blob=0), and the zero-producer premise was
 re-verified in-tree (T1). T5's snapshot-join fetch-on-miss regression test
 was written and committed FIRST, before any deletion. Net ~1,650 lines
-removed / ~290 added; full offline suite green. Follow-up simplification
+removed / ~290 added; full offline suite green. **§5 live smoke DONE
+2026-07-12 (v0.7.0 release build, fresh 3× t3.medium, netlink, all-WAL):
+latency-neutral confirmed — sparse warm p50 28ms (p90 29ms, 8/8 warm) and
+idle burst p50 30ms vs v0.6.0's 28/32ms; `cluster_promote` p50 10–11ms
+unchanged; UC-98 PASS; suite 72/101 with only the known pre-existing UC-32
+failure. Both ≤30ms gates PASS on v0.7.0. Failover live-drill not exercised
+(bench runs skip disruptive tests); covered by the snapshot-join and
+inline-apply regression tests.** Follow-up simplification
 to `plans/warm-create-latency-tier2-recovery-replication.md`: Tier 2 made the
 blob path a residual fallback; this plan deleted the fallback so **inline is
 the only way a recovery payload travels**, and the dual-path reasoning burden
