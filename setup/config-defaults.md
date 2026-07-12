@@ -63,12 +63,20 @@ feature is still mid-rollout.
 | `SB_FLEET_ENABLED` | Managed control-plane only; open-source build stays no-op. |
 | `SB_IMAGE_BUILD_CONTEXT_ENABLED` | Context resolver not wired — returns 501 even when true. |
 
-## 🟠 Mid-rollout / not soaked — flip only with soak data
-| Env var | Status per code comment |
+## 🟢 Complete & shipped — default-off is a deliberate operator opt-in
+These work today and have soaked. Default-off is a host-resource/latency
+tradeoff the operator makes (warm slots hold containers resident and enabling
+the pool widens the ready-socket gate), **not** incompleteness. Clusters opt in
+via Terraform/Ansible — do not flip the code default on.
+| Env var | Status |
 |---|---|
-| `SB_DOCKER_POOL_ENABLED` | Warm pool WIP (`plans/docker-warm-pool.md`). |
-| `SB_DOCKER_NETNS_POOL_ENABLED` | Pause-netns pool experimental. |
-| `SB_FIRECRACKER_VMM_POOL_ENABLED` | Comment: "PR 4-B flips the default on once the integration is wired." Not wired yet. |
+| `SB_DOCKER_POOL_ENABLED` | SHIPPED & VERIFIED v0.5.33 (2026-07-11): warm-hit p50 **43ms**, beats the ≤100ms gate. Holds pre-started containers resident; enabling also widens `DockerReadySocketEffective`. See `plans/docker-warm-pool.md` §12. |
+| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. |
+
+## 🟠 Mid-rollout / not soaked — flip only with soak data
+| Env var | Status |
+|---|---|
+| `SB_FIRECRACKER_VMM_POOL_ENABLED` | Wired into the daemon (Phase 4, `daemon.go`), but the broader FC create-latency work is still in progress (`plans/firecracker-create-latency.md`). NB: the config.go comment ("nothing consumes it yet") is stale. |
 | `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED` | Being canaried (`plans/warm-direct-route-bypass.md`). |
 | `SB_L4_WAKE_DIRECT_BYPASS_ENABLED` | Ships only after HTTP has been default-on for two cycles. |
 
