@@ -83,8 +83,24 @@ func reachableHTTP(url string, timeout time.Duration) (int, error) {
 	return lastCode, fmt.Errorf("never reachable (last code %d, last err %v)", lastCode, lastErr)
 }
 
-// assertUnreachableHTTP polls url for window and fails if it ever answers <500.
-func assertUnreachableHTTP(t *testing.T, url string, window time.Duration) {
+// assertNoSandboxRoute polls url for window and fails if anything answers on
+// the sandbox's behalf. "Private" legitimately looks different per deployment
+// shape, so two outcomes are accepted:
+//
+//   - transport/TLS error — per-host on-demand-cert deployments never issue a
+//     cert for a route-less hostname, so the handshake itself fails;
+//   - a bare ingress 404 (or 421) — wildcard-cert deployments
+//     (caddy_shared_cert_storage) complete TLS for ANY subdomain and answer
+//     404 when no route matches, byte-identical to a sandbox that has never
+//     existed.
+//
+// Everything else fails: 2xx/3xx means content was served, 401/403 means a
+// route exists and merely gated the request, and 5xx means a reverse-proxy
+// route matched and reached for an upstream — all privacy violations during
+// the private window. Callers must probe a sandbox whose workload answers
+// 200 at "/" (privateHTTPServerSandbox), so a 404 here can only be the
+// ingress's no-route answer, never the workload's.
+func assertNoSandboxRoute(t *testing.T, url string, window time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
@@ -97,11 +113,25 @@ func assertUnreachableHTTP(t *testing.T, url string, window time.Duration) {
 			continue
 		}
 		resp.Body.Close()
-		if resp.StatusCode < 500 {
-			t.Fatalf("URL %s answered %d during private window, want unreachable", url, resp.StatusCode)
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMisdirectedRequest {
+			t.Fatalf("URL %s answered %d during private window, want no route (transport error, 404, or 421)", url, resp.StatusCode)
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// probeStatus does one GET and returns the status code, or -1 on a
+// transport/TLS error.
+func probeStatus(url string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return -1
+	}
+	resp.Body.Close()
+	return resp.StatusCode
 }
 
 // UC-31 — Exposing the same port twice returns the same URL (idempotent).
@@ -139,7 +169,19 @@ func TestDefaultURLReachable(t *testing.T) {
 	}
 
 	root := sandboxRootURL(sc.Domain, sb.ID)
-	assertUnreachableHTTP(t, root, 20*time.Second)
+	assertNoSandboxRoute(t, root, 20*time.Second)
+
+	// Anti-enumeration: on a wildcard-cert ingress the private sandbox's URL
+	// must be indistinguishable from a sandbox that has never existed — same
+	// status (or both hard-unreachable). A differing answer would let an
+	// attacker confirm sandbox IDs without reaching them. Compared only when
+	// both probes got an HTTP answer, so a transient transport blip on one
+	// side can't flake the test.
+	ghost := sandboxRootURL(sc.Domain, "sb-0000000000000000")
+	privateStatus, ghostStatus := probeStatus(root), probeStatus(ghost)
+	if privateStatus != -1 && ghostStatus != -1 && privateStatus != ghostStatus {
+		t.Fatalf("private sandbox answers %d but nonexistent sandbox answers %d — responses must be indistinguishable", privateStatus, ghostStatus)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
