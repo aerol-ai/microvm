@@ -701,13 +701,15 @@ type Config struct {
 	// SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT.
 	FirecrackerSnapshotPostResumeTimeout time.Duration
 
-	// FirecrackerVMMPoolEnabled gates the Phase 4 warm-VMM pool. In
-	// PR 4-A (this commit) the field is plumbed through but nothing
-	// consumes it yet — the pool primitive lands as an inert
-	// substrate. PR 4-B's runtime adapter and refill goroutine flip
-	// the default on once the integration is wired. Off by default
-	// here so a daemon rebuilt from this branch behaves identically
-	// to today. SB_FIRECRACKER_VMM_POOL_ENABLED.
+	// FirecrackerVMMPoolEnabled gates the Phase 4 warm-VMM pool. The pool
+	// is fully wired: pkg/daemon constructs it, runs the refill goroutine,
+	// and injects it via Driver.SetWarmPool; Driver.Create.tryAcquireWarm
+	// consumes a warm VMM ahead of the cold-spawn fallback. Kept off by
+	// default deliberately (ship-dark) — the warm path is code-complete but
+	// none of the benchmark gates in plans/firecracker-create-latency.md
+	// have been re-measured yet, so a daemon with the flag unset behaves
+	// identically to today. Do NOT flip the default until those gates pass.
+	// SB_FIRECRACKER_VMM_POOL_ENABLED.
 	FirecrackerVMMPoolEnabled bool
 	// FirecrackerVMMPoolDepthDefault is the warm-slot floor PR 4-B's
 	// refill goroutine will use for any template without an explicit
