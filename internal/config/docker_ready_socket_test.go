@@ -52,6 +52,34 @@ func TestDockerReadySocketEffectiveGating(t *testing.T) {
 		}
 	})
 
+	t.Run("containerd_pool_effective", func(t *testing.T) {
+		t.Setenv("SB_ENABLE_CLUSTER", "false")
+		t.Setenv("SB_CONTAINER_ENGINE", "containerd")
+		t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "true")
+		t.Setenv("SB_CONTAINERD_POOL_ENABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.ContainerdPoolEffective() {
+			t.Fatal("expected containerd pool effective")
+		}
+	})
+
+	t.Run("containerd_pool_requires_engine", func(t *testing.T) {
+		t.Setenv("SB_ENABLE_CLUSTER", "false")
+		t.Setenv("SB_CONTAINER_ENGINE", "docker")
+		t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "true")
+		t.Setenv("SB_CONTAINERD_POOL_ENABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ContainerdPoolEffective() {
+			t.Fatal("containerd pool must not run on docker engine default")
+		}
+	})
+
 	t.Run("cluster_enabled_by_default", func(t *testing.T) {
 		t.Setenv("SB_ENABLE_CLUSTER", "true")
 		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")

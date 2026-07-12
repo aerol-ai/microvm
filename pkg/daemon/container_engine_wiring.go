@@ -8,6 +8,8 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -23,25 +25,30 @@ func netrulesUserChain(cfg config.Config) string {
 // wireContainerEngine registers the containerd driver and event source when
 // SB_CONTAINER_ENGINE=containerd. On the docker default path it only wires the
 // events source to the docker client, leaving behavior byte-identical.
-func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, dockerClient *docker.Client, dockerRules *netrules.Manager) error {
+func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store, dockerClient *docker.Client, dockerRules *netrules.Manager, admitter *capacity.Admitter) (*containerdEngineWiring, error) {
 	_ = ctx
 	_ = dockerRules // docker driver keeps its own DOCKER-USER manager (daemon.go)
 	if cfg.ContainerEngine != models.ContainerEngineContainerd {
 		svc.SetEventsSource(dockerClient)
-		return nil
+		return nil, nil
 	}
 	// Dedicated AEROLVM-USER manager for the containerd driver so its rules
 	// never collide with the docker driver's DOCKER-USER rules on a
-	// mixed-engine (migrating) host. NOTE: creating the AEROLVM-USER chain and
-	// its FORWARD jump (EnsureChain) plus CNI-backed container networking are
-	// Phase 2 (plans/containerd-engine.md §4, §6). Until Phase 2 lands the
-	// containerd Create path has no container IP, so no per-IP rule is applied
-	// through this manager yet.
+	// mixed-engine (migrating) host. EnsureChain bootstraps the chain and
+	// FORWARD jump; CNI-backed container networking is Phase 2 (§4).
 	ctdRules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend, netrules.ChainAerolvmUser)
 	if err != nil {
-		return fmt.Errorf("create containerd netrules manager: %w", err)
+		return nil, fmt.Errorf("create containerd netrules manager: %w", err)
+	}
+	if err := ctdRules.EnsureChain(); err != nil {
+		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
 	}
 	driver := cntr.New(cntr.FromDaemonConfig(cfg), ctdRules, logger)
+	netnsPool, err := wireContainerdNativeNetnsPool(ctx, cfg, logger, st, driver)
+	if err != nil {
+		return nil, err
+	}
+	warmPool := wireContainerdWarmPool(ctx, cfg, logger, driver, admitter)
 	svc.SetContainerdRuntime(driver)
 	if dockerClient != nil {
 		svc.SetEventsSource(newMultiEventsSource(dockerClient, driver))
@@ -53,7 +60,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 		"namespace", cfg.ContainerdNamespace,
 		"netrules_chain", netrules.ChainAerolvmUser,
 	)
-	return nil
+	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, logger: logger}, nil
 }
 
 // multiEventsSource fans in dockerd and containerd event streams during

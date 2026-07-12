@@ -33,6 +33,7 @@ type Config struct {
 	HTTPClientTimeout  time.Duration
 	LogDir             string
 	RunDir             string
+	NativeNetnsPool    bool
 }
 
 // FromDaemonConfig maps internal config into driver-local settings.
@@ -68,6 +69,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		HTTPClientTimeout:  cfg.HTTPClientTimeout,
 		LogDir:             logDir,
 		RunDir:             runDir,
+		NativeNetnsPool:    cfg.ContainerdNativeNetnsPoolEnabled,
 	}
 }
 
@@ -90,6 +92,9 @@ type Driver struct {
 	pullSem       chan struct{}
 	pullFailMu    sync.Mutex
 	pullFailUntil map[string]time.Time
+
+	warmPool WarmPool
+	netns    NetnsHandoff
 }
 
 // New constructs a Driver. The containerd connection is lazy — Ping and
@@ -111,7 +116,10 @@ func New(cfg Config, rules *netrules.Manager, logger *slog.Logger) *Driver {
 	}
 }
 
-// SetClient injects a containerd API client (tests / fakes).
+// SetNetnsHandoff wires the native netns pool (Phase 2). Nil disables it.
+func (d *Driver) SetNetnsHandoff(h NetnsHandoff) {
+	d.netns = h
+}
 func (d *Driver) SetClient(c *Client) {
 	d.clientMu.Lock()
 	defer d.clientMu.Unlock()

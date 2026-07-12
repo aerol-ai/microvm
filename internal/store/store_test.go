@@ -1957,6 +1957,142 @@ func TestStoreCases(t *testing.T) {
 				}
 			},
 		},
+		// Regression: container_netns_slots partial unique index mirrors the
+		// firecracker_tap_pool / host_port idempotency primitives (Phase 2).
+		{
+			name: "container_netns_pool_seed_is_idempotent",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				if err := st.SeedContainerNetnsSlot(ctx, "aerol-netns-0", now); err != nil {
+					t.Fatalf("first seed: %v", err)
+				}
+				if err := st.SeedContainerNetnsSlot(ctx, "aerol-netns-0", now); err != nil {
+					t.Fatalf("re-seed: %v", err)
+				}
+				stats, err := st.GetContainerNetnsPoolStats(ctx)
+				if err != nil {
+					t.Fatalf("stats: %v", err)
+				}
+				if stats.Total != 1 || stats.Free != 1 {
+					t.Fatalf("stats = %+v, want total=1 free=1", stats)
+				}
+			},
+		},
+		{
+			name: "container_netns_pool_fsm_round_trip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				for i := 0; i < 3; i++ {
+					if err := st.SeedContainerNetnsSlot(ctx, "aerol-netns-"+iToStr(i), now); err != nil {
+						t.Fatalf("seed %d: %v", i, err)
+					}
+				}
+				slot, err := st.ReserveContainerNetnsSlot(ctx, "sb-1", now)
+				if err != nil || slot.State != NetnsSlotStateReserved {
+					t.Fatalf("reserve: %+v err=%v", slot, err)
+				}
+				slot, err = st.MarkContainerNetnsSlotRealized(ctx, "sb-1", "/run/netns/sb-1", "10.88.0.2", now)
+				if err != nil || slot.State != NetnsSlotStateRealized {
+					t.Fatalf("realize: %+v err=%v", slot, err)
+				}
+				slot, err = st.AdoptContainerNetnsSlot(ctx, "sb-1", now)
+				if err != nil || slot.State != NetnsSlotStateAdopted {
+					t.Fatalf("adopt: %+v err=%v", slot, err)
+				}
+				if err := st.ReleaseContainerNetnsSlot(ctx, "sb-1", now); err != nil {
+					t.Fatalf("release: %v", err)
+				}
+				stats, _ := st.GetContainerNetnsPoolStats(ctx)
+				if stats.Free != 3 {
+					t.Fatalf("after release free=%d want 3", stats.Free)
+				}
+			},
+		},
+		{
+			name: "container_netns_pool_reserve_idempotent",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				_ = st.SeedContainerNetnsSlot(ctx, "aerol-netns-0", now)
+				a, err := st.ReserveContainerNetnsSlot(ctx, "sb-dup", now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b, err := st.ReserveContainerNetnsSlot(ctx, "sb-dup", now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if a.SlotID != b.SlotID {
+					t.Fatalf("idempotent reserve changed slot: %s -> %s", a.SlotID, b.SlotID)
+				}
+			},
+		},
+		{
+			name: "container_netns_pool_exhaustion",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				_ = st.SeedContainerNetnsSlot(ctx, "aerol-netns-0", now)
+				if _, err := st.ReserveContainerNetnsSlot(ctx, "sb-a", now); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.ReserveContainerNetnsSlot(ctx, "sb-b", now); !errors.Is(err, ErrNoFreeContainerNetnsSlot) {
+					t.Fatalf("want exhaustion, got %v", err)
+				}
+			},
+		},
+		{
+			name: "container_netns_pool_partial_unique_blocks_double_reserve",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				for i := 0; i < 2; i++ {
+					_ = st.SeedContainerNetnsSlot(ctx, "aerol-netns-"+iToStr(i), now)
+				}
+				_, _ = st.ReserveContainerNetnsSlot(ctx, "sb-x", now)
+				_, err := st.db.ExecContext(ctx, `
+					UPDATE container_netns_slots SET sandbox_id = 'sb-x', state = 'reserved'
+					WHERE slot_id = 'aerol-netns-1' AND sandbox_id IS NULL
+				`)
+				if err == nil {
+					t.Fatal("expected partial unique index violation for duplicate sandbox_id")
+				}
+			},
+		},
+		{
+			name: "container_netns_mark_realized_idempotent",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				_ = st.SeedContainerNetnsSlot(ctx, "aerol-netns-0", now)
+				_, _ = st.ReserveContainerNetnsSlot(ctx, "sb-r", now)
+				a, err := st.MarkContainerNetnsSlotRealized(ctx, "sb-r", "/run/n", "10.0.0.5", now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b, err := st.MarkContainerNetnsSlotRealized(ctx, "sb-r", "/run/n", "10.0.0.5", now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if a.SlotID != b.SlotID || b.State != NetnsSlotStateRealized {
+					t.Fatalf("idempotent realize failed: %+v", b)
+				}
+			},
+		},
+		{
+			name: "container_netns_adopt_requires_realized",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				_ = st.SeedContainerNetnsSlot(ctx, "aerol-netns-0", now)
+				_, _ = st.ReserveContainerNetnsSlot(ctx, "sb-z", now)
+				if _, err := st.AdoptContainerNetnsSlot(ctx, "sb-z", now); err == nil {
+					t.Fatal("want error adopting reserved slot")
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {

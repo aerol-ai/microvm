@@ -18,6 +18,7 @@ import (
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
+	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -57,6 +58,31 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
+	if d.warmPool != nil {
+		if warm, warmErr := d.tryWarmAdopt(ctx, req, sandboxID, toolboxToken, hostMounts, effectiveRuntime); warmErr == nil {
+			return warm, nil
+		} else if errors.Is(warmErr, dockerpkg.ErrSandboxContainerExists) {
+			return nil, warmErr
+		} else if !errors.Is(warmErr, containerdpool.ErrNoSlot) {
+			d.logger.Warn("containerd warm adopt failed; falling back to cold create",
+				"sandbox_id", sandboxID, "error", warmErr)
+		}
+	}
+
+	var (
+		netnsPath        string
+		prepaidIP        string
+		netnsProvisioned bool
+	)
+	if d.cfg.NativeNetnsPool && d.netns != nil {
+		netnsPath, prepaidIP, err = d.netns.Provision(ctx, sandboxID)
+		if err != nil {
+			return nil, fmt.Errorf("provision netns: %w", err)
+		}
+		netnsProvisioned = true
+		createtiming.From(ctx).RecordStageDesc("containerd_netns", 0, "provisioned")
+	}
+
 	committed := false
 	// createdContainer gates host-side teardown: a caller that loses the
 	// concurrent-duplicate race (AlreadyExists at NewContainer) must NOT run
@@ -82,6 +108,12 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			logCloser()
 		}
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
+	}()
+	defer func() {
+		if committed || !netnsProvisioned || d.netns == nil {
+			return
+		}
+		_ = d.netns.Release(ctx, sandboxID)
 	}()
 
 	imageStart := time.Now()
@@ -138,6 +170,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if !d.cfg.ResourceLimitsOff {
 		specOpts = append(specOpts, resourceSpecOpts(req)...)
 	}
+	if netnsPath != "" {
+		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
+	}
 	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 
 	if d.cfg.ReadyEnabled {
@@ -152,14 +187,30 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	sort.Strings(envValues)
 	specOpts = append(specOpts, oci.WithEnv(envValues), oci.WithMounts(mountSpecs))
 
+	containerLabels := map[string]string{
+		managedLabelKey:   "true",
+		sandboxIDLabelKey: sandboxID,
+	}
+	if leaseID, err := d.pinImageLease(ctx, client, image); err != nil {
+		return nil, err
+	} else if leaseID != "" {
+		containerLabels[imageLeaseLabelKey] = leaseID
+	}
+
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
 		cntr.WithNewSnapshot(sandboxID, image),
 		cntr.WithNewSpec(specOpts...),
-		cntr.WithContainerLabels(map[string]string{managedLabelKey: "true"}),
+		cntr.WithContainerLabels(containerLabels),
 	}
 	if ociRuntime != "" {
-		containerOpts = append(containerOpts, cntr.WithRuntime(ociRuntime, nil))
+		opt, err := d.runtimeContainerOpt(ociRuntime)
+		if err != nil {
+			return nil, err
+		}
+		if opt != nil {
+			containerOpts = append(containerOpts, opt)
+		}
 	}
 
 	createStart := time.Now()
@@ -194,7 +245,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	createtiming.From(ctx).RecordStage("containerd_start", time.Since(startStart))
 
-	state, err := d.runtimeStateAfterStart(ctx, container, task, sandboxID)
+	state, err := d.runtimeStateAfterStart(ctx, container, task, sandboxID, prepaidIP)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +289,7 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	if err == nil {
 		status, statusErr := task.Status(ctx)
 		if statusErr == nil && status.Status == cntr.Running {
-			return d.runtimeStateAfterStart(ctx, container, task, containerRef)
+			return d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
 		}
 		_, _ = task.Delete(ctx, cntr.WithProcessKill)
 	}
@@ -254,7 +305,7 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
-	return d.runtimeStateAfterStart(ctx, container, task, containerRef)
+	return d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
 }
 
 func (d *Driver) Stop(ctx context.Context, containerRef string) error {
@@ -297,6 +348,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil {
 		return nil
 	}
+	if d.netns != nil {
+		_ = d.netns.Release(ctx, sandbox.ID)
+	}
 	dockerpkg.RemoveReadySocketsForSandbox(d.cfg.ReadyDir, sandbox.ID)
 	_ = d.removeHostFiles(sandbox.ID)
 	_ = d.removeTaskLog(sandbox.ID)
@@ -315,6 +369,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 			return nil
 		}
 		return err
+	}
+	if labels, lerr := container.Labels(ctx); lerr == nil {
+		d.releaseImageLease(ctx, client, labels)
 	}
 	if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 		_ = task.Kill(ctx, syscall.SIGKILL)
@@ -335,12 +392,27 @@ func (d *Driver) Inspect(ctx context.Context, containerRef string) (*models.Sand
 	task, err := container.Task(ctx, nil)
 	if err != nil {
 		return &models.SandboxRuntimeState{
-			SandboxID:   containerRef,
+			SandboxID:   d.sandboxIDFromContainer(ctx, container),
 			ContainerID: containerRef,
 			Status:      models.SandboxStatusStopped,
 		}, nil
 	}
-	return d.runtimeStateAfterStart(ctx, container, task, containerRef)
+	sandboxID := d.sandboxIDFromContainer(ctx, container)
+	return d.runtimeStateAfterStart(ctx, container, task, sandboxID, "")
+}
+
+func (d *Driver) sandboxIDFromContainer(ctx context.Context, container cntr.Container) string {
+	if container == nil {
+		return ""
+	}
+	id := container.ID()
+	labels, err := container.Labels(ctx)
+	if err == nil {
+		if sid := strings.TrimSpace(labels[sandboxIDLabelKey]); sid != "" {
+			return sid
+		}
+	}
+	return id
 }
 
 func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRuntimeState, error) {
@@ -354,18 +426,21 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 	}
 	out := make(map[string]*models.SandboxRuntimeState, len(containers))
 	for _, container := range containers {
+		labels, lerr := container.Labels(ctx)
+		if lerr != nil || IsParkedContainerLabels(labels) {
+			continue
+		}
 		id := container.ID()
 		state, err := d.Inspect(ctx, id)
 		if err != nil {
 			continue
 		}
+		if state.SandboxID == "" || IsParkedSandboxID(state.SandboxID) {
+			continue
+		}
 		out[state.SandboxID] = state
 	}
 	return out, nil
-}
-
-func (d *Driver) CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error) {
-	return "", fmt.Errorf("containerd snapshot commit is not implemented yet (plans/containerd-engine.md Phase 3)")
 }
 
 func (d *Driver) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
@@ -551,14 +626,22 @@ func (d *Driver) lifoTeardown(ctx context.Context, client *Client, container cnt
 	}
 }
 
-func (d *Driver) runtimeStateAfterStart(ctx context.Context, container cntr.Container, task cntr.Task, sandboxID string) (*models.SandboxRuntimeState, error) {
-	ip, err := containerIPv4FromTask(ctx, task)
+func (d *Driver) runtimeStateAfterStart(ctx context.Context, container cntr.Container, task cntr.Task, sandboxID, ipHint string) (*models.SandboxRuntimeState, error) {
+	ip, err := containerIPv4FromTaskFn(ctx, task)
+	if err != nil && strings.TrimSpace(ipHint) != "" {
+		ip = ipHint
+		err = nil
+	}
 	if err != nil {
 		return nil, err
 	}
+	containerID := sandboxID
+	if container != nil {
+		containerID = container.ID()
+	}
 	return &models.SandboxRuntimeState{
 		SandboxID:   sandboxID,
-		ContainerID: container.ID(),
+		ContainerID: containerID,
 		ContainerIP: ip,
 		Status:      models.SandboxStatusStarted,
 	}, nil
@@ -583,7 +666,7 @@ func (d *Driver) waitToolboxHTTP(ctx context.Context, containerIP, toolboxToken 
 			return err
 		}
 		// Health poll is implemented in pkg/docker; containerd reuses the same toolbox port contract.
-		if err := pollToolboxHealth(ctx, containerIP, d.cfg.ToolboxPort); err == nil {
+		if err := pollToolboxHealthFn(ctx, containerIP, d.cfg.ToolboxPort); err == nil {
 			return nil
 		}
 		select {

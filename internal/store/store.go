@@ -349,6 +349,23 @@ func Open(path string) (*Store, error) {
 		// scans once the pool grows past a handful of slots.
 		`CREATE INDEX IF NOT EXISTS idx_firecracker_vmm_pool_template_status
 			ON firecracker_vmm_pool(template_id, status);`,
+		// container_netns_slots is the pre-populated network-namespace pool for
+		// the containerd engine (Phase 2). Each row is one slot that moves
+		// free → reserved → realized → adopted under the FSM in
+		// plans/containerd-engine.md §4. CNI ADD/DEL and netns creation live
+		// in internal/network/netns/host.go; this table is the bookkeeping
+		// substrate (mirrors firecracker_tap_pool's role for Firecracker).
+		`CREATE TABLE IF NOT EXISTS container_netns_slots (
+			slot_id TEXT PRIMARY KEY,
+			netns_path TEXT NOT NULL DEFAULT '',
+			container_ip TEXT NOT NULL DEFAULT '',
+			sandbox_id TEXT,
+			state TEXT NOT NULL DEFAULT 'free',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_container_netns_slots_sandbox
+			ON container_netns_slots(sandbox_id) WHERE sandbox_id IS NOT NULL;`,
 		// Partial index on released_at keeps the GC sweep cheap even when
 		// the steady-state count of released rows is zero. Predicate is
 		// the GC selector verbatim so SQLite can use the index without a

@@ -274,8 +274,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
 	svc.SetDockerAuxClient(dockerClient)
-	if err := wireContainerEngine(ctx, cfg, logger, svc, dockerClient, rules); err != nil {
+	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
 		return fmt.Errorf("wire container engine: %w", err)
+	} else if ctd != nil {
+		defer ctd.Stop()
 	}
 	// Wire the control-plane usage reporter into the service's background loops
 	// (reconcile / event monitor / netstats / live sampler). Under

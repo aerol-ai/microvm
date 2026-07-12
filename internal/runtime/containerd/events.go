@@ -142,6 +142,9 @@ func (d *Driver) ContainerPID(ctx context.Context, containerRef string) (int, er
 	return int(pids[0].Pid), nil
 }
 
+// pollToolboxHealthFn is the toolbox readiness probe; tests stub it to avoid HTTP.
+var pollToolboxHealthFn = pollToolboxHealth
+
 func pollToolboxHealth(ctx context.Context, containerIP string, toolboxPort int) error {
 	target := fmt.Sprintf("http://%s:%d/health", containerIP, toolboxPort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
