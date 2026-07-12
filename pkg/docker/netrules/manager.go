@@ -70,8 +70,10 @@ func New(enabled bool) (*Manager, error) {
 	return NewWithOptions(enabled, BackendExec)
 }
 
-// Backend names for SB_NETRULES_BACKEND. Default remains exec until the
-// netlink path soaks in an integration run (warm-create-latency Tier 1).
+// Backend names for SB_NETRULES_BACKEND. Netlink is the default: the
+// google/nftables path is in-process (no fork/exec per rule) and has soaked
+// through the warm-create-latency Tier 1 integration run. exec (go-iptables)
+// remains available as a fallback.
 const (
 	BackendExec    = "exec"
 	BackendNetlink = "netlink"

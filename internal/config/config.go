@@ -127,7 +127,7 @@ type Config struct {
 	EnableCaddy        bool
 	EnableNetworkRules bool
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
-	// "exec" (default, go-iptables) or "netlink" (google/nftables). See
+	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
 	NetrulesBackend    string
 	EnableEventMonitor bool
@@ -1244,7 +1244,7 @@ func Load() (Config, error) {
 		AutoReconcile:                    getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:                      getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:               getEnvBool("SB_ENABLE_NETWORK_RULES", true),
-		NetrulesBackend:                  strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "exec"))),
+		NetrulesBackend:                  strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
 		EnableEventMonitor:               getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                 getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                 getEnvBool("SB_ENABLE_SERVERLESS", true),
