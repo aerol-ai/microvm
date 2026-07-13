@@ -111,7 +111,12 @@ func (r *ExecRunner) runPlugin(ctx context.Context, cmd, netnsPath, containerID 
 	if ifName == "" {
 		ifName = "eth0"
 	}
-	cniArgs := fmt.Sprintf("K8S_POD_NAMESPACE=aerolvm;K8S_POD_NAME=%s;K8S_POD_INFRA_CONTAINER_ID=%s", containerID, containerID)
+	// IgnoreUnknown=true is mandatory: plugins parse CNI_ARGS via types.LoadArgs,
+	// which ERRORS on any key it does not define ("unknown args [...]"). The
+	// bridge/host-local plugins do not define the K8S_POD_* keys, so without this
+	// prefix every ADD fails with code 999. Kubernetes passes IgnoreUnknown=1 for
+	// exactly this reason.
+	cniArgs := fmt.Sprintf("IgnoreUnknown=true;K8S_POD_NAMESPACE=aerolvm;K8S_POD_NAME=%s;K8S_POD_INFRA_CONTAINER_ID=%s", containerID, containerID)
 	invoke := exec.CommandContext(ctx, plugin)
 	invoke.Stdin = bytes.NewReader(netconf)
 	invoke.Env = append(os.Environ(),
