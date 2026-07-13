@@ -7,6 +7,11 @@ import (
 	"path/filepath"
 )
 
+// DefaultBridgeSubnet is the host-local IPAM subnet for the aerolvm0 bridge.
+// Shared so the netrules FORWARD-accept rules target the same CIDR the conflist
+// hands out.
+const DefaultBridgeSubnet = "10.88.0.0/16"
+
 // ConflistOptions parameterizes the generated bridge+host-local conflist.
 type ConflistOptions struct {
 	Name    string // network name, e.g. "aerolvm"
@@ -55,7 +60,7 @@ func RenderBridgeConflist(opts ConflistOptions) ([]byte, error) {
 		opts.Bridge = "aerolvm0"
 	}
 	if opts.Subnet == "" {
-		opts.Subnet = "10.88.0.0/16"
+		opts.Subnet = DefaultBridgeSubnet
 	}
 	mtu := opts.MTU
 	if mtu <= 0 {

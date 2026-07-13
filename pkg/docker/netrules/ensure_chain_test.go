@@ -31,6 +31,47 @@ func TestEnsureChainIdempotentLatch(t *testing.T) {
 	}
 }
 
+func TestEnsureChainInstallsBridgeForwardAccept(t *testing.T) {
+	be := &memBackend{}
+	mgr := &Manager{enabled: true, ipt: be, userChain: ChainAerolvmUser}
+	mgr.SetBridgeSubnet("10.88.0.0/16")
+	if err := mgr.EnsureChain(); err != nil {
+		t.Fatal(err)
+	}
+	// Subnet-scoped FORWARD ACCEPTs (both directions) survive dockerd's DROP.
+	if be.countMatching("|-s|10.88.0.0/16|-j|ACCEPT") != 1 {
+		t.Fatalf("missing -s subnet accept: %v", be.rules)
+	}
+	if be.countMatching("|-d|10.88.0.0/16|-j|ACCEPT") != 1 {
+		t.Fatalf("missing -d subnet accept: %v", be.rules)
+	}
+	// Idempotent — re-assert does not duplicate.
+	if err := mgr.ReassertChain(); err != nil {
+		t.Fatal(err)
+	}
+	if be.countMatching("|-s|10.88.0.0/16|-j|ACCEPT") != 1 {
+		t.Fatalf("subnet accept duplicated on reassert: %v", be.rules)
+	}
+	// A per-IP block coexists (isolation still enforced via the DROP).
+	if err := mgr.BlockAllEgress("10.88.0.5"); err != nil {
+		t.Fatal(err)
+	}
+	if be.countMatching("|-s|10.88.0.5|-j|DROP") != 1 {
+		t.Fatalf("per-IP block missing alongside bridge accept: %v", be.rules)
+	}
+}
+
+func TestEnsureChainNoBridgeAcceptWithoutSubnet(t *testing.T) {
+	be := &memBackend{}
+	mgr := &Manager{enabled: true, ipt: be, userChain: ChainAerolvmUser}
+	if err := mgr.EnsureChain(); err != nil {
+		t.Fatal(err)
+	}
+	if be.countMatching("ACCEPT") != 0 {
+		t.Fatalf("no bridge subnet set: expected no ACCEPT rules, got %v", be.rules)
+	}
+}
+
 func TestEnsureChainDisabledNoOp(t *testing.T) {
 	mgr := &Manager{enabled: false, userChain: ChainAerolvmUser}
 	if err := mgr.EnsureChain(); err != nil {
