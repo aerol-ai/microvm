@@ -1160,9 +1160,6 @@ func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest)
 		// their COPY/ADD steps silently no-op.
 		return "", "", errors.New("buildInfo.contextHashes is enabled but no context resolver is configured on this daemon")
 	}
-	if h.deps.ContainerEngine == models.ContainerEngineContainerd {
-		return "", "", models.ErrBuildKitUnavailable
-	}
 	if h.deps.Builder == nil {
 		return "", "", errors.New("multi-line buildInfo Dockerfiles require an image builder; daemon was started without one")
 	}

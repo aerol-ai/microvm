@@ -67,6 +67,23 @@ type Manager struct {
 	// Service.EnsureLayer4Ready.
 	chainReady atomic.Bool
 	chainMu    sync.Mutex
+	// bridgeSubnet, when set (containerd engine, e.g. 10.88.0.0/16), makes
+	// EnsureChain also install subnet-scoped FORWARD ACCEPT rules for our
+	// bridge. dockerd sets the FORWARD policy to DROP and only ACCEPTs docker0
+	// traffic; without our own ACCEPTs, all aerolvm0 egress and sandbox↔sandbox
+	// traffic is dropped by that policy. The CNI bridge plugin sets up the
+	// bridge + NAT but not FORWARD ACCEPTs (libnetwork did that for docker0),
+	// so it is ours (plan §4 item #5).
+	bridgeSubnet string
+}
+
+// SetBridgeSubnet records the sandbox bridge subnet whose forwarded traffic
+// EnsureChain/ReassertChain must ACCEPT (below any per-IP DROP). Empty = no-op.
+func (m *Manager) SetBridgeSubnet(subnet string) {
+	if m == nil {
+		return
+	}
+	m.bridgeSubnet = strings.TrimSpace(subnet)
 }
 
 // ipLock is a refcounted per-IP mutex. Refs track in-flight holders so idle

@@ -29,6 +29,7 @@ require (
 	github.com/containerd/containerd/api v1.8.0
 	github.com/containerd/platforms v0.2.1
 	github.com/containerd/typeurl/v2 v2.1.1
+	github.com/distribution/reference v0.6.0
 	github.com/google/nftables v0.3.0
 	github.com/hashicorp/raft-wal v0.4.2
 	github.com/opencontainers/go-digest v1.0.0
@@ -52,7 +53,6 @@ require (
 	github.com/coreos/etcd v3.3.27+incompatible // indirect
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect
 	github.com/coreos/pkg v0.0.0-20220810130054-c7d1c02cb6cf // indirect
-	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-events v0.0.0-20190806004212-e31b211e4f1c // indirect
 	github.com/felixge/httpsnoop v1.0.3 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect

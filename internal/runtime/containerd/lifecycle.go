@@ -15,6 +15,7 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/remotes/docker"
+	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
@@ -269,7 +270,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
+	// Attribute the readiness wait for Server-Timing (parity with the docker
+	// driver): the ready socket is the fast path ("socket"); the HTTP health
+	// poll is the fallback ("health"). Without this the create Server-Timing
+	// header carries no readiness source on containerd hosts (UC-11).
+	readyStart := time.Now()
+	readinessSource := "health"
 	if d.cfg.ReadyEnabled && readyListener != nil {
+		readinessSource = "socket"
 		if err := readyListener.Wait(ctx); err != nil {
 			return nil, fmt.Errorf("ready socket: %w", err)
 		}
@@ -277,6 +285,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	} else if err := d.waitToolboxHTTP(ctx, state.ContainerIP, toolboxToken); err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordReadinessWaits(0, time.Since(readyStart), readinessSource)
 
 	if req.NetworkBlockAll && state.ContainerIP != "" {
 		netrulesStart := time.Now()
@@ -325,6 +334,18 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 		return nil, err
 	}
 	defer closeLog()
+	// Resume re-creates the task from the stored spec, which bind-mounts the
+	// create-time ready socket. That socket was closed+unlinked after Create, so
+	// runc's mount fails ("open .../ready/<id>.<nonce>.sock: no such file"). Recreate
+	// the exact socket (nonce from the spec mount path, token from the spec env)
+	// so the mount succeeds and the restarted toolbox can re-signal readiness.
+	if d.cfg.ReadyEnabled {
+		if spec, serr := container.Spec(ctx); serr == nil {
+			if rl := d.recreateResumeReadySocket(spec); rl != nil {
+				defer func() { _ = rl.Close() }()
+			}
+		}
+	}
 	task, err = container.NewTask(ctx, logIO)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
@@ -471,7 +492,48 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 }
 
 func (d *Driver) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
-	return fmt.Errorf("containerd live resize is not implemented yet")
+	if d.cfg.ResourceLimitsOff {
+		return nil
+	}
+	client, err := d.ensureClient()
+	if err != nil {
+		return err
+	}
+	container, err := client.LoadContainer(ctx, containerRef)
+	if err != nil {
+		return fmt.Errorf("load container: %w", err)
+	}
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		// Stopped sandbox: the store holds the new size and it takes effect via
+		// the spec on next start; there is no live cgroup to update.
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("resize task: %w", err)
+	}
+	res := &specs.LinuxResources{}
+	if req.MemoryMB > 0 {
+		limit := int64(req.MemoryMB) * 1024 * 1024
+		res.Memory = &specs.LinuxMemory{Limit: &limit}
+	}
+	if req.CPU > 0 {
+		// Fractional CPU is a CFS quota/period (mirrors resourceSpecOpts + dockerd
+		// --cpus), not a cpuset.
+		const cpuPeriod uint64 = 100000
+		quota := int64(req.CPU * float64(cpuPeriod))
+		if quota < 1000 {
+			quota = 1000
+		}
+		period := cpuPeriod
+		res.CPU = &specs.LinuxCPU{Quota: &quota, Period: &period}
+	}
+	if res.Memory == nil && res.CPU == nil {
+		return nil
+	}
+	// DiskGB is soft-ignored (containerd overlayfs has no live quota; same as
+	// create — plans/containerd-engine-phase0-decisions.md DiskGB row).
+	return task.Update(ctx, cntr.WithResources(res))
 }
 
 func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
@@ -484,6 +546,31 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 		return nil
 	}
 	return removeImageFn(ctx, client, imageRef)
+}
+
+// ImageExists reports whether imageRef resolves to a local image in the
+// containerd store WITHOUT pulling. Used by the build handlers' cache
+// short-circuit (a freshly built tag) and mirrors ensureImage's local-ref
+// resolution (exact ref first, then :latest for a tagless local ref) so a
+// tag committed as "name:latest" is recognised when referenced as "name".
+func (d *Driver) ImageExists(ctx context.Context, imageRef string) (bool, error) {
+	client, err := d.ensureClient()
+	if err != nil {
+		return false, err
+	}
+	imageRef = strings.TrimSpace(imageRef)
+	if imageRef == "" {
+		return false, nil
+	}
+	if _, err := client.GetImage(ctx, imageRef); err == nil {
+		return true, nil
+	}
+	if !refHasTag(imageRef) {
+		if _, err := client.GetImage(ctx, imageRef+":latest"); err == nil {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // removeImageFn deletes an image from the containerd image store. Tests stub it.
@@ -538,6 +625,30 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return nil, errors.New("image reference is required")
+	}
+	// Local images (committed snapshots, custom-named builds) are stored under
+	// the EXACT ref given — look that up FIRST. Normalizing a bare local name
+	// like "myapp-snap:latest" to docker.io/library/myapp-snap:latest would miss
+	// the local image and try to pull it from Docker Hub (the UC-21
+	// create-from-snapshot failure).
+	if image, err := client.GetImage(ctx, ref); err == nil {
+		return image, nil
+	}
+	// A tagless local ref (e.g. a committed snapshot "myapp-snap", stored by the
+	// driver as "myapp-snap:latest") needs an exact tag for containerd's
+	// GetImage. Try :latest locally before the registry-normalized pull, or a
+	// snapshot referenced without a tag is mistaken for a Docker Hub image.
+	if !refHasTag(ref) {
+		if image, err := client.GetImage(ctx, ref+":latest"); err == nil {
+			return image, nil
+		}
+	}
+	// Normalize for the registry pull path, exactly as `ctr` does: containerd's
+	// resolver cannot parse a bare "alpine:3.20" — it reads it as host "alpine"
+	// with an invalid port ":3.20" ("dummy://alpine:3.20"). ParseDockerRef →
+	// docker.io/library/alpine:3.20.
+	if named, nerr := refdocker.ParseDockerRef(ref); nerr == nil {
+		ref = named.String()
 	}
 	if image, err := client.GetImage(ctx, ref); err == nil {
 		return image, nil
@@ -598,6 +709,16 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	return res.(cntr.Image), nil
 }
 
+// refHasTag reports whether the ref's final path component carries a :tag or
+// @digest (a host:port prefix does not count as a tag).
+func refHasTag(ref string) bool {
+	last := ref
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		last = ref[i+1:]
+	}
+	return strings.ContainsAny(last, ":@")
+}
+
 // registryHost extracts the registry hostname from an image ref. Docker Hub
 // short refs (no host component) return "" so the authorizer matches the
 // resolver's own default-registry canonicalization.
@@ -644,6 +765,49 @@ func (d *Driver) setupReadySocket(env *[]string, mountSpecs *[]specs.Mount, sand
 		Type: "bind", Source: readyListener.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"},
 	})
 	return readyListener, nil
+}
+
+// recreateResumeReadySocket recreates the create-time ready socket that a
+// stored spec bind-mounts, so a resumed task's runc mount does not fail on the
+// unlinked socket. The socket path encodes <sandboxID>.<nonce>; the token comes
+// from the spec env. Returns nil (caller proceeds without it) when the spec has
+// no ready mount or the token/nonce can't be recovered.
+func (d *Driver) recreateResumeReadySocket(spec *specs.Spec) *dockerpkg.ReadyListener {
+	if spec == nil || spec.Process == nil {
+		return nil
+	}
+	var source string
+	for _, m := range spec.Mounts {
+		if m.Destination == dockerpkg.GuestReadySocketPath {
+			source = m.Source
+			break
+		}
+	}
+	if source == "" {
+		return nil
+	}
+	// source is <ReadyDir>/<sandboxID>.<nonce>.sock
+	name := strings.TrimSuffix(filepath.Base(source), ".sock")
+	dot := strings.LastIndex(name, ".")
+	if dot <= 0 {
+		return nil
+	}
+	sandboxID, nonce := name[:dot], name[dot+1:]
+	var token string
+	for _, e := range spec.Process.Env {
+		if v, ok := strings.CutPrefix(e, "SB_TOOLBOX_TOKEN="); ok {
+			token = v
+			break
+		}
+	}
+	if token == "" || nonce == "" {
+		return nil
+	}
+	rl, err := dockerpkg.NewReadyListener(d.cfg.ReadyDir, sandboxID, token, nonce)
+	if err != nil {
+		return nil
+	}
+	return rl
 }
 
 func (d *Driver) lifoTeardown(ctx context.Context, client *Client, container cntr.Container, task cntr.Task, logPath string, hostFiles *sandboxHostFiles) {

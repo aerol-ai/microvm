@@ -70,6 +70,19 @@ func TestRecordDockerWaits(t *testing.T) {
 	}
 }
 
+func TestRecordReadinessWaits(t *testing.T) {
+	timing := &CreateTiming{}
+	timing.RecordReadinessWaits(0, 44*time.Millisecond, "health")
+	if timing.RuntimeWaitMS != 0 || timing.ToolboxWaitMS != 44 || timing.Source != "health" {
+		t.Fatalf("readiness waits = %+v, want 0/44/health", timing)
+	}
+	// RecordDockerWaits is the docker-named alias and must set the same fields.
+	timing.RecordDockerWaits(10*time.Millisecond, 20*time.Millisecond, "socket")
+	if timing.RuntimeWaitMS != 10 || timing.ToolboxWaitMS != 20 || timing.Source != "socket" {
+		t.Fatalf("alias waits = %+v, want 10/20/socket", timing)
+	}
+}
+
 func TestNilRecorderIsSafe(t *testing.T) {
 	var timing *CreateTiming
 	timing.RecordStage("fc_driver", time.Second)

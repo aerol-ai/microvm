@@ -306,8 +306,11 @@ func TestBuildImageRejectsMissingBuilder(t *testing.T) {
 	}
 }
 
-func TestBuildImageContainerdBuildKitAbsent(t *testing.T) {
-	// Phase 3 named test: buildkitd-absent → clear error, not a hang.
+func TestBuildImageContainerdRoutesThroughBuilder(t *testing.T) {
+	// Phase 3: on containerd the daemon wires a buildkit-backed builder, so a
+	// build request must flow THROUGH to that builder (no engine gate). The
+	// earlier "BuildKit unavailable" 503 gate is gone; buildkitd absence now
+	// surfaces as a builder error, not a blanket engine rejection.
 	builder := &fakeImageBuilder{}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
@@ -319,14 +322,30 @@ func TestBuildImageContainerdBuildKitAbsent(t *testing.T) {
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine"})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(builder.builds) != 1 {
+		t.Fatalf("containerd build must invoke the wired builder once, got %d", len(builder.builds))
+	}
+}
+
+func TestBuildImageContainerdNoBuilder(t *testing.T) {
+	// Containerd host started without a builder (buildkit wiring skipped): the
+	// generic "builder not configured" 503 fires — the same guard the dockerd
+	// path uses — rather than a hang or panic.
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Builder:         nil,
+		Build:           BuildConfig{},
+		Auth:            func(h http.Handler) http.Handler { return h },
+		ContainerEngine: models.ContainerEngineContainerd,
+	})
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine"})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "BuildKit") {
-		t.Fatalf("body should mention BuildKit: %s", rr.Body.String())
-	}
-	if len(builder.builds) != 0 {
-		t.Fatalf("must not invoke builder on containerd: %d builds", len(builder.builds))
 	}
 }
 

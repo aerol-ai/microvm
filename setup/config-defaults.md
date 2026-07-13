@@ -58,6 +58,7 @@ feature is still mid-rollout.
 | `SB_CONTAINERD_LOG_DIR` | Overrides per-task log file placement; defaults to `${SB_CONTAINERD_RUN_DIR}/logs`. Each task log is size-capped (containerd does not rotate task IO). |
 | `SB_CONTAINERD_CNI_PLUGIN_DIR` | CNI plugin binaries dir; default `/opt/cni/bin`. Only consumed when the native netns pool is enabled. |
 | `SB_CONTAINERD_CNI_CONF_PATH` | Bridge conflist path; default `/etc/cni/net.d/aerolvm.conflist`. Auto-generated at boot (bridge + host-local + `ipMasq`) if absent; an operator-provided file is never clobbered. |
+| `SB_CONTAINERD_BUILDKIT_ADDR` | buildkitd control socket for image builds on the containerd engine; default `unix:///run/buildkit/buildkitd.sock`. The bootstrap installs buildkitd with a containerd worker pinned to the aerolvm namespace, so built images land where the driver can run them. Only used when `SB_CONTAINER_ENGINE=containerd`. |
 | `SB_CONTAINERD_NETNS_POOL_DEPTH` | Prepaid netns slots to keep warm; default `4`. Only relevant when `SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true`. |
 | `SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL` | netns pool refill ticker; default `2s`. |
 | `SB_CONTAINERD_POOL_DEPTH` | Warm containers per image key; default `2`. Only relevant when `SB_CONTAINERD_POOL_ENABLED=true`. |

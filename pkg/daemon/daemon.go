@@ -29,6 +29,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
+	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -749,10 +750,22 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}()
 	}
 
+	// On the containerd engine, image builds run through buildkitd (buildctl)
+	// against the aerolvm namespace instead of the dockerd builder. Wire the
+	// composite builder so /images/build + snapshot-from-Dockerfile work; the
+	// dockerd path passes nil and NewServer falls back to the docker client.
+	var apiBuilder *cntr.ImageBuilder
+	if ctdWiring != nil {
+		apiBuilder = cntr.NewImageBuilder(ctdWiring.driver, cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger))
+	}
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
 	// behaves exactly as the PAT-only build did before this seam existed.
-	server := api.NewServer(logger, svc, dockerClient, cfg, cfg.PATToken, cp.Validator)
+	var builder apiv1.ImageBuilder
+	if apiBuilder != nil {
+		builder = apiBuilder
+	}
+	server := api.NewServer(logger, svc, dockerClient, builder, cfg, cfg.PATToken, cp.Validator)
 	logger.Info("dashboard available", "url", "http://"+cfg.ListenAddr()+"/ui")
 	// Mount the same API handler onto the cluster-internal mTLS listener so
 	// peers can reverse-proxy owner API calls over the cert-pinned channel

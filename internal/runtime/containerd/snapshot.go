@@ -38,6 +38,9 @@ type snapshotBackend interface {
 	writeBlob(ctx context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error)
 	createImage(ctx context.Context, img images.Image) (images.Image, error)
 	getImage(ctx context.Context, name string) (images.Image, error)
+	// unpack realizes the image's layers in the snapshotter so it can back a new
+	// container via WithNewSnapshot.
+	unpack(ctx context.Context, name, snapshotter string) error
 }
 
 type rawSnapshotBackend struct {
@@ -63,6 +66,14 @@ func (b *rawSnapshotBackend) createImage(ctx context.Context, img images.Image) 
 		return images.Image{}, errors.New("snapshot image create requires live containerd")
 	}
 	return raw.ImageService().Create(ctx, img)
+}
+
+func (b *rawSnapshotBackend) unpack(ctx context.Context, name, snapshotter string) error {
+	img, err := b.client.GetImage(ctx, name)
+	if err != nil {
+		return err
+	}
+	return img.Unpack(ctx, snapshotter)
 }
 
 func (b *rawSnapshotBackend) getImage(ctx context.Context, name string) (images.Image, error) {
@@ -239,9 +250,18 @@ func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client
 			if getErr != nil {
 				return "", fmt.Errorf("snapshot image exists: %w", err)
 			}
+			if uerr := backend.unpack(ctx, imageRef, info.Snapshotter); uerr != nil {
+				return "", fmt.Errorf("snapshot unpack (existing): %w", uerr)
+			}
 			return imageDigestID(existing.Target), nil
 		}
 		return "", fmt.Errorf("snapshot image create: %w", err)
+	}
+	// Unpack so the committed image's layers are realized in the snapshotter and
+	// it can back a new container via WithNewSnapshot — without this,
+	// create-from-snapshot fails with "parent snapshot ... does not exist".
+	if err := backend.unpack(ctx, imageRef, info.Snapshotter); err != nil {
+		return "", fmt.Errorf("snapshot unpack: %w", err)
 	}
 	return imageDigestID(created.Target), nil
 }
