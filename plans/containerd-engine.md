@@ -10,8 +10,7 @@ coexistence runbook + soak UC-99..102 + `single-node-containerd` scenario
 engine=containerd. Phase 0(e-1..e-3) + DiskGB soft-ignore recorded as
 defaults. **Offline implementation is caught up** — remaining work is
 operator/live: Phase 0(a–d) spikes, §8 soak on `single-node-containerd`,
-real overlay DiskGB (deferred). Uncommitted follow-up may still need
-commit/push to #325.
+real overlay DiskGB (deferred — see phase0-decisions § DiskGB follow-up).
 Plan written 2026-07-11; revised 2026-07-12 after eng review — 9 review findings
 + 5 cross-model findings folded, §4 rebased on CNI, one store change admitted;
 see the GSTACK REVIEW REPORT at the end. Companion to
@@ -475,10 +474,12 @@ flag.
    harness and the §8 gate catch it. Treat any `SpecOpts` refactor as
    high-risk; the harness must stay green on every PR touching the driver.
 2. **Disk quota (`DiskGB`).** dockerd's `StorageOpt size` needs
-   xfs+pquota backing; the containerd overlayfs snapshotter has its own
-   quota story. Parity must be verified on our actual filesystem layout —
-   and while we're there, verify what dockerd is *actually* enforcing
-   today (gVisor already ignores it silently; runc on non-xfs may too).
+   xfs+pquota backing; the containerd overlayfs snapshotter has no
+   equivalent today — soft-ignore + warn (same posture as gVisor).
+   **Full write-up / exit criteria:**
+   `plans/containerd-engine-phase0-decisions.md` § DiskGB follow-up.
+   Until that lands, capacity admission still reserves DiskGB; only
+   in-guest writable-layer enforcement is deferred.
 3. **New fragile surface.** A second engine implementation doubles where
    container-lifecycle bugs can live. Mitigation: ship dark, same
    Server-Timing stages (now engine-tagged, §2) so benches compare engines
