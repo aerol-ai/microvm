@@ -64,15 +64,25 @@ func From(ctx context.Context) *CreateTiming {
 	return timing
 }
 
-// RecordDockerWaits sets the docker runtime's readiness attribution.
-// Nil-safe so the runtime can call it unconditionally.
-func (t *CreateTiming) RecordDockerWaits(runtimeWait, toolboxWait time.Duration, source string) {
+// RecordReadinessWaits sets a runtime's readiness attribution: how long the
+// container runtime and toolbox waits took, and which signal proved readiness
+// ("socket" or "health"). Nil-safe so a driver can call it unconditionally.
+// setCreateServerTiming renders Source as the "readiness;desc=" entry, so a
+// driver that omits this leaves the create Server-Timing without a readiness
+// source (the containerd UC-11 gap).
+func (t *CreateTiming) RecordReadinessWaits(runtimeWait, toolboxWait time.Duration, source string) {
 	if t == nil {
 		return
 	}
 	t.RuntimeWaitMS = float64(runtimeWait.Microseconds()) / 1000
 	t.ToolboxWaitMS = float64(toolboxWait.Microseconds()) / 1000
 	t.Source = source
+}
+
+// RecordDockerWaits is the docker driver's original name for
+// RecordReadinessWaits, kept so existing docker callers are untouched.
+func (t *CreateTiming) RecordDockerWaits(runtimeWait, toolboxWait time.Duration, source string) {
+	t.RecordReadinessWaits(runtimeWait, toolboxWait, source)
 }
 
 // RecordStage appends a duration stage. Nil-safe; negative durations

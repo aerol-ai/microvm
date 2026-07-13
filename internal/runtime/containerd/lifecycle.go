@@ -270,7 +270,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
+	// Attribute the readiness wait for Server-Timing (parity with the docker
+	// driver): the ready socket is the fast path ("socket"); the HTTP health
+	// poll is the fallback ("health"). Without this the create Server-Timing
+	// header carries no readiness source on containerd hosts (UC-11).
+	readyStart := time.Now()
+	readinessSource := "health"
 	if d.cfg.ReadyEnabled && readyListener != nil {
+		readinessSource = "socket"
 		if err := readyListener.Wait(ctx); err != nil {
 			return nil, fmt.Errorf("ready socket: %w", err)
 		}
@@ -278,6 +285,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	} else if err := d.waitToolboxHTTP(ctx, state.ContainerIP, toolboxToken); err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordReadinessWaits(0, time.Since(readyStart), readinessSource)
 
 	if req.NetworkBlockAll && state.ContainerIP != "" {
 		netrulesStart := time.Now()
@@ -538,6 +546,31 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 		return nil
 	}
 	return removeImageFn(ctx, client, imageRef)
+}
+
+// ImageExists reports whether imageRef resolves to a local image in the
+// containerd store WITHOUT pulling. Used by the build handlers' cache
+// short-circuit (a freshly built tag) and mirrors ensureImage's local-ref
+// resolution (exact ref first, then :latest for a tagless local ref) so a
+// tag committed as "name:latest" is recognised when referenced as "name".
+func (d *Driver) ImageExists(ctx context.Context, imageRef string) (bool, error) {
+	client, err := d.ensureClient()
+	if err != nil {
+		return false, err
+	}
+	imageRef = strings.TrimSpace(imageRef)
+	if imageRef == "" {
+		return false, nil
+	}
+	if _, err := client.GetImage(ctx, imageRef); err == nil {
+		return true, nil
+	}
+	if !refHasTag(imageRef) {
+		if _, err := client.GetImage(ctx, imageRef+":latest"); err == nil {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // removeImageFn deletes an image from the containerd image store. Tests stub it.

@@ -672,6 +672,49 @@ if [ "${container_engine}" = "containerd" ]; then
       fi
     done
   fi
+
+  # buildkitd powers image builds on the containerd engine (POST /v1/images/build
+  # + snapshot-from-Dockerfile). buildctl talks to buildkitd over its default
+  # socket (/run/buildkit/buildkitd.sock = SB_CONTAINERD_BUILDKIT_ADDR default);
+  # buildkitd's containerd worker writes built images into the aerolvm namespace
+  # so the driver runs them directly with no extra pull. docker-default nodes
+  # never reach here. Idempotent: install skipped when buildkitd already present.
+  if ! command -v buildkitd >/dev/null 2>&1; then
+    case "$(uname -m)" in
+      x86_64|amd64) bk_arch=amd64 ;;
+      aarch64|arm64) bk_arch=arm64 ;;
+      *) echo "[bootstrap] unsupported arch $(uname -m) for buildkit" >&2; exit 1 ;;
+    esac
+    bk_ver=v0.17.2
+    bk_url="https://github.com/moby/buildkit/releases/download/$${bk_ver}/buildkit-$${bk_ver}.linux-$${bk_arch}.tar.gz"
+    echo "[bootstrap] installing buildkit $${bk_ver} ($${bk_arch})"
+    bk_tmp="$(mktemp -d)"
+    curl -fsSL "$${bk_url}" | sudo tar -xz -C "$${bk_tmp}"
+    sudo install -m 0755 "$${bk_tmp}/bin/buildkitd" /usr/local/bin/buildkitd
+    sudo install -m 0755 "$${bk_tmp}/bin/buildctl" /usr/local/bin/buildctl
+    rm -rf "$${bk_tmp}"
+  fi
+  # containerd worker only (no oci worker), pinned to the aerolvm namespace + our
+  # containerd socket so builds share the driver's image store. Host networking
+  # for RUN steps avoids needing a separate buildkit CNI config.
+  if [ ! -f /etc/systemd/system/buildkit.service ]; then
+    sudo tee /etc/systemd/system/buildkit.service >/dev/null <<UNIT
+[Unit]
+Description=BuildKit (aerolvm containerd worker)
+Requires=containerd.service
+After=containerd.service
+
+[Service]
+ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true --containerd-worker-addr=${containerd_cfg.socket} --containerd-worker-namespace=${containerd_cfg.namespace} --containerd-worker-net=host
+Restart=on-failure
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
+  fi
+  sudo systemctl enable --now buildkit.service || echo "[bootstrap] warning: buildkit.service failed to start" >&2
 fi
 
 sudo systemctl restart sandboxd

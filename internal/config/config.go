@@ -153,6 +153,11 @@ type Config struct {
 	ContainerdCNIPluginDir string
 	// ContainerdCNIConfPath is the bridge conflist used for ADD/DEL.
 	ContainerdCNIConfPath string
+	// ContainerdBuildKitAddr is the buildkitd control socket used for image
+	// builds on the containerd engine (buildctl --addr). The bootstrap installs
+	// buildkitd at the default socket with a containerd worker on the aerolvm
+	// namespace. SB_CONTAINERD_BUILDKIT_ADDR.
+	ContainerdBuildKitAddr string
 	// ContainerdNetnsPoolRefillInterval drives native netns pool refill.
 	ContainerdNetnsPoolRefillInterval time.Duration
 	// ContainerdPoolEnabled gates the warm containerd task pool (Phase 3).
@@ -1301,6 +1306,7 @@ func Load() (Config, error) {
 		ContainerdNetnsPoolDepth:          getEnvInt("SB_CONTAINERD_NETNS_POOL_DEPTH", 4),
 		ContainerdCNIPluginDir:            getEnv("SB_CONTAINERD_CNI_PLUGIN_DIR", "/opt/cni/bin"),
 		ContainerdCNIConfPath:             getEnv("SB_CONTAINERD_CNI_CONF_PATH", "/etc/cni/net.d/aerolvm.conflist"),
+		ContainerdBuildKitAddr:            getEnv("SB_CONTAINERD_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock"),
 		ContainerdNetnsPoolRefillInterval: getEnvDuration("SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
 		ContainerdPoolEnabled:             getEnvBool("SB_CONTAINERD_POOL_ENABLED", false),
 		ContainerdPoolDepth:               getEnvInt("SB_CONTAINERD_POOL_DEPTH", 2),

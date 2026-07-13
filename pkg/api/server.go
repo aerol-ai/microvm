@@ -28,7 +28,7 @@ import (
 type Server struct {
 	logger          *slog.Logger
 	service         *service.Service
-	builder         *docker.Client
+	builder         apiv1.ImageBuilder
 	build           daytona.BuildConfig
 	containerEngine string
 	patToken        string
@@ -40,14 +40,26 @@ type Server struct {
 // validation path; pass controlplane.Noop().Validator (or any rejecting
 // validator) for the open-source PAT-only behavior. A nil validator is treated
 // as reject-all so callers can't accidentally open the door by omission.
-func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
+//
+// builder is the image-builder the /images/build + snapshot-from-Dockerfile
+// paths use. On the dockerd engine this is the *docker.Client; on the
+// containerd engine the daemon passes a buildkit-backed builder. A nil builder
+// falls back to dockerClient so existing docker-only callers are unaffected;
+// when both are nil the build endpoints return 503 (builder not configured).
+func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder apiv1.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
 	if validator == nil {
 		validator = controlplane.Noop().Validator
+	}
+	// A nil *docker.Client wrapped in the interface would be a non-nil
+	// interface holding a nil pointer, defeating the handlers' `Builder == nil`
+	// guard. Only fall back when we actually have a docker client.
+	if builder == nil && dockerClient != nil {
+		builder = dockerClient
 	}
 	s := &Server{
 		logger:          logger,
 		service:         service,
-		builder:         dockerClient,
+		builder:         builder,
 		build:           daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,

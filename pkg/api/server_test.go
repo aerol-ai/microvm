@@ -93,7 +93,7 @@ func TestRequireAuthCases(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, config.Config{}, "pat-token", nil)
+			server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, config.Config{}, "pat-token", nil)
 			request := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
 			if tc.authorization != "" {
 				request.Header.Set("Authorization", tc.authorization)
@@ -123,7 +123,7 @@ func TestRequireAuthCases(t *testing.T) {
 //  3. GET /v1/metrics is PAT-gated and renders aerolvm_* expvars in
 //     Prometheus text format for production scrapers.
 func TestDashboardEndpoints(t *testing.T) {
-	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, config.Config{}, "pat-token", nil)
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, config.Config{}, "pat-token", nil)
 
 	t.Run("ui_is_served_unauthenticated_as_html", func(t *testing.T) {
 		request := httptest.NewRequest(http.MethodGet, "/ui", nil)
@@ -222,7 +222,7 @@ func keysOf(m map[string]any) []string {
 func TestHandleHealth(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
-	server := NewServer(logger, svc, nil, config.Config{}, "pat-token", nil)
+	server := NewServer(logger, svc, nil, nil, config.Config{}, "pat-token", nil)
 
 	request := httptest.NewRequest(http.MethodGet, "/health", nil)
 	response := httptest.NewRecorder()
