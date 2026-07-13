@@ -601,6 +601,15 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	if image, err := client.GetImage(ctx, ref); err == nil {
 		return image, nil
 	}
+	// A tagless local ref (e.g. a committed snapshot "myapp-snap", stored by the
+	// driver as "myapp-snap:latest") needs an exact tag for containerd's
+	// GetImage. Try :latest locally before the registry-normalized pull, or a
+	// snapshot referenced without a tag is mistaken for a Docker Hub image.
+	if !refHasTag(ref) {
+		if image, err := client.GetImage(ctx, ref+":latest"); err == nil {
+			return image, nil
+		}
+	}
 	// Normalize for the registry pull path, exactly as `ctr` does: containerd's
 	// resolver cannot parse a bare "alpine:3.20" — it reads it as host "alpine"
 	// with an invalid port ":3.20" ("dummy://alpine:3.20"). ParseDockerRef →
@@ -665,6 +674,16 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 		return nil, err
 	}
 	return res.(cntr.Image), nil
+}
+
+// refHasTag reports whether the ref's final path component carries a :tag or
+// @digest (a host:port prefix does not count as a tag).
+func refHasTag(ref string) bool {
+	last := ref
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		last = ref[i+1:]
+	}
+	return strings.ContainsAny(last, ":@")
 }
 
 // registryHost extracts the registry hostname from an image ref. Docker Hub
