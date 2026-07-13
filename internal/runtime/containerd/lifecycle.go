@@ -472,7 +472,48 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 }
 
 func (d *Driver) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
-	return fmt.Errorf("containerd live resize is not implemented yet")
+	if d.cfg.ResourceLimitsOff {
+		return nil
+	}
+	client, err := d.ensureClient()
+	if err != nil {
+		return err
+	}
+	container, err := client.LoadContainer(ctx, containerRef)
+	if err != nil {
+		return fmt.Errorf("load container: %w", err)
+	}
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		// Stopped sandbox: the store holds the new size and it takes effect via
+		// the spec on next start; there is no live cgroup to update.
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("resize task: %w", err)
+	}
+	res := &specs.LinuxResources{}
+	if req.MemoryMB > 0 {
+		limit := int64(req.MemoryMB) * 1024 * 1024
+		res.Memory = &specs.LinuxMemory{Limit: &limit}
+	}
+	if req.CPU > 0 {
+		// Fractional CPU is a CFS quota/period (mirrors resourceSpecOpts + dockerd
+		// --cpus), not a cpuset.
+		const cpuPeriod uint64 = 100000
+		quota := int64(req.CPU * float64(cpuPeriod))
+		if quota < 1000 {
+			quota = 1000
+		}
+		period := cpuPeriod
+		res.CPU = &specs.LinuxCPU{Quota: &quota, Period: &period}
+	}
+	if res.Memory == nil && res.CPU == nil {
+		return nil
+	}
+	// DiskGB is soft-ignored (containerd overlayfs has no live quota; same as
+	// create — plans/containerd-engine-phase0-decisions.md DiskGB row).
+	return task.Update(ctx, cntr.WithResources(res))
 }
 
 func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
@@ -540,11 +581,18 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	if ref == "" {
 		return nil, errors.New("image reference is required")
 	}
-	// Normalize short/docker refs to a fully-qualified name, exactly as `ctr`
-	// does. containerd's resolver cannot parse a bare "alpine:3.20" — it reads
-	// it as host "alpine" with an invalid port ":3.20" ("dummy://alpine:3.20").
-	// dockerd's libnetwork normalized this for the docker driver; the containerd
-	// driver must do it itself. ParseDockerRef → docker.io/library/alpine:3.20.
+	// Local images (committed snapshots, custom-named builds) are stored under
+	// the EXACT ref given — look that up FIRST. Normalizing a bare local name
+	// like "myapp-snap:latest" to docker.io/library/myapp-snap:latest would miss
+	// the local image and try to pull it from Docker Hub (the UC-21
+	// create-from-snapshot failure).
+	if image, err := client.GetImage(ctx, ref); err == nil {
+		return image, nil
+	}
+	// Normalize for the registry pull path, exactly as `ctr` does: containerd's
+	// resolver cannot parse a bare "alpine:3.20" — it reads it as host "alpine"
+	// with an invalid port ":3.20" ("dummy://alpine:3.20"). ParseDockerRef →
+	// docker.io/library/alpine:3.20.
 	if named, nerr := refdocker.ParseDockerRef(ref); nerr == nil {
 		ref = named.String()
 	}

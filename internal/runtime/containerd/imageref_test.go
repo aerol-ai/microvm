@@ -33,6 +33,33 @@ func TestEnsureImageNormalizesShortRef(t *testing.T) {
 	}
 }
 
+func TestEnsureImageFindsLocalRefBeforeNormalizing(t *testing.T) {
+	// A committed snapshot / custom-named local image is stored under the exact
+	// ref; it must be found as-is, not normalized to docker.io/... and pulled
+	// from Docker Hub (the UC-21 regression).
+	d := newTestDriver(t)
+	tr := newFakeTransport()
+	pulled := false
+	tr.getImageFn = func(_ context.Context, ref string) (cntr.Image, error) {
+		if ref == "myapp-snap:latest" {
+			return &fakeImage{name: ref}, nil
+		}
+		return nil, errors.New("not present")
+	}
+	tr.pullImageFn = func(context.Context, string, ...cntr.RemoteOpt) (cntr.Image, error) {
+		pulled = true
+		return nil, errors.New("should not pull a local ref")
+	}
+	d.SetClient(NewTestClient("aerolvm", tr))
+	img, err := d.ensureImage(context.Background(), d.client, "myapp-snap:latest", nil)
+	if err != nil || img == nil {
+		t.Fatalf("ensureImage local ref: img=%v err=%v", img, err)
+	}
+	if pulled {
+		t.Fatal("local snapshot ref must not trigger a Docker Hub pull")
+	}
+}
+
 func TestEnsureImageKeepsFullyQualifiedRef(t *testing.T) {
 	d := newTestDriver(t)
 	tr := newFakeTransport()
