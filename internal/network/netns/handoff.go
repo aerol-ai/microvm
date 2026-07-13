@@ -29,9 +29,16 @@ func (h *RuntimeHandoff) Provision(ctx context.Context, sandboxID string) (netns
 		return "", "", nil
 	}
 	now := h.now()
+	// Treat a claim as a ready hit only when the slot is actually realized
+	// (non-empty netns path AND IP). ClaimPooled/Reserve short-circuit on any
+	// existing row for the sandbox regardless of state, so a crash-left
+	// reserved/empty slot would otherwise be returned as a "hit" and the caller
+	// would build a container with no netns pin and no IP. Falling through to
+	// Build re-drives the FSM for the owned slot (Reserve returns it, then
+	// Realize/Adopt).
 	if slot, hit, err := h.pool.ClaimPooled(ctx, sandboxID, now); err != nil {
 		return "", "", err
-	} else if hit {
+	} else if hit && slot != nil && slot.NetnsPath != "" && slot.ContainerIP != "" {
 		return slot.NetnsPath, slot.ContainerIP, nil
 	}
 	slot, err := h.builder.Build(ctx, sandboxID)

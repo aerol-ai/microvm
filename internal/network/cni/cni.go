@@ -1,10 +1,14 @@
-// Package cni wraps the bridge+host-local CNI plugin pair for containerd
-// sandboxes. ADD/DEL are idempotent at the call-site: Del on a missing
-// allocation is a no-op; Add on an already-configured netns returns the
-// existing result when the fake/production runner detects prior state.
+// Package cni wraps the bridge+host-local CNI plugin for containerd sandboxes.
+// Our topology is a single bridge plugin with host-local IPAM embedded in its
+// config, so ADD/DEL invoke that one plugin over the standard CNI exec protocol
+// (CNI_* env vars + the plugin netconf on stdin) rather than chaining a plugin
+// list. DEL is idempotent by the CNI contract (DEL on a missing allocation is a
+// no-op); ADD is NOT idempotent at this layer — callers must not re-ADD the
+// same container into the same netns or host-local allocates a second IP.
 package cni
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,15 +30,18 @@ type Runner interface {
 	Del(ctx context.Context, netnsPath, containerID string) error
 }
 
-// Config locates plugin binaries and the bridge conflist on disk.
+// Config locates plugin binaries and the bridge conf on disk.
 type Config struct {
 	// PluginDir is typically /opt/cni/bin.
 	PluginDir string
-	// ConfPath is a .conflist or .conf consumed by the plugins.
+	// ConfPath is a .conflist or .conf consumed by the plugin.
 	ConfPath string
+	// IfName is the interface created inside the netns; defaults to eth0.
+	IfName string
 }
 
-// ExecRunner shells out to the CNI plugin binaries referenced by ConfPath.
+// ExecRunner shells out to the CNI plugin binary referenced by ConfPath's
+// `type`, speaking the CNI exec protocol.
 type ExecRunner struct {
 	cfg Config
 }
@@ -45,6 +52,9 @@ func NewExecRunner(cfg Config) (*ExecRunner, error) {
 	}
 	if strings.TrimSpace(cfg.ConfPath) == "" {
 		return nil, errors.New("cni conf path is required")
+	}
+	if strings.TrimSpace(cfg.IfName) == "" {
+		cfg.IfName = "eth0"
 	}
 	return &ExecRunner{cfg: cfg}, nil
 }
@@ -72,7 +82,7 @@ func (r *ExecRunner) Add(ctx context.Context, netnsPath, containerID string) (Re
 	}
 	for _, ip := range parsed.IPs {
 		if strings.Contains(ip.Address, ".") {
-			addr := strings.Split(ip.Address, "/")[0]
+			addr, _, _ := strings.Cut(ip.Address, "/")
 			return Result{IP4: addr}, nil
 		}
 	}
@@ -89,45 +99,103 @@ func (r *ExecRunner) Del(ctx context.Context, netnsPath, containerID string) err
 	return err
 }
 
+// runPlugin invokes the CNI plugin over the exec protocol: the operation and
+// container identity go in CNI_* environment variables and the network config
+// is piped on stdin (NOT positional argv, which real plugins ignore).
 func (r *ExecRunner) runPlugin(ctx context.Context, cmd, netnsPath, containerID string) ([]byte, error) {
-	plugin, conf, err := r.resolve(cmd)
+	plugin, netconf, err := r.resolve()
 	if err != nil {
 		return nil, err
 	}
-	cniArgs := fmt.Sprintf("K8S_POD_NAMESPACE=aerolvm;K8S_POD_NAME=%s;K8S_POD_INFRA_CONTAINER_ID=%s", containerID, containerID)
-	invoke := exec.CommandContext(ctx, plugin,
-		cmd,
-		conf,
-		netnsPath,
-		containerID,
-		"IGNORED",
-		"IGNORED",
-		cniArgs,
-	)
-	invoke.Env = append(os.Environ(), "CNI_PATH="+r.cfg.PluginDir)
-	out, err := invoke.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("cni %s %s: %w: %s", cmd, containerID, err, strings.TrimSpace(string(out)))
+	ifName := strings.TrimSpace(r.cfg.IfName)
+	if ifName == "" {
+		ifName = "eth0"
 	}
-	return out, nil
+	cniArgs := fmt.Sprintf("K8S_POD_NAMESPACE=aerolvm;K8S_POD_NAME=%s;K8S_POD_INFRA_CONTAINER_ID=%s", containerID, containerID)
+	invoke := exec.CommandContext(ctx, plugin)
+	invoke.Stdin = bytes.NewReader(netconf)
+	invoke.Env = append(os.Environ(),
+		"CNI_COMMAND="+cmd,
+		"CNI_CONTAINERID="+containerID,
+		"CNI_NETNS="+netnsPath,
+		"CNI_IFNAME="+ifName,
+		"CNI_PATH="+r.cfg.PluginDir,
+		"CNI_ARGS="+cniArgs,
+	)
+	var stdout, stderr bytes.Buffer
+	invoke.Stdout = &stdout
+	invoke.Stderr = &stderr
+	if err := invoke.Run(); err != nil {
+		return nil, fmt.Errorf("cni %s %s: %w: %s", cmd, containerID, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }
 
-func (r *ExecRunner) resolve(cmd string) (plugin string, conf string, err error) {
-	conf = r.cfg.ConfPath
-	base := filepath.Base(conf)
-	switch {
-	case strings.HasSuffix(base, ".conflist"), strings.HasSuffix(base, ".conf"):
-		// bridge plugin is the conventional first hop for our topology.
-		plugin = filepath.Join(r.cfg.PluginDir, "bridge")
-	default:
-		return "", "", fmt.Errorf("unsupported cni conf %q", conf)
+// resolve reads the netconf, reduces a .conflist to its single bridge plugin
+// config (our topology embeds host-local IPAM inside the bridge plugin, so
+// there is exactly one plugin to invoke), and locates that plugin's binary by
+// its declared `type`.
+func (r *ExecRunner) resolve() (plugin string, netconf []byte, err error) {
+	raw, err := os.ReadFile(r.cfg.ConfPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("read cni conf %q: %w", r.cfg.ConfPath, err)
 	}
+	netconf, err = singlePluginNetconf(raw)
+	if err != nil {
+		return "", nil, err
+	}
+	pluginType, err := netconfType(netconf)
+	if err != nil {
+		return "", nil, err
+	}
+	plugin = filepath.Join(r.cfg.PluginDir, pluginType)
 	if _, err := os.Stat(plugin); err != nil {
-		return "", "", fmt.Errorf("cni plugin %q: %w", plugin, err)
+		return "", nil, fmt.Errorf("cni plugin %q: %w", plugin, err)
 	}
-	if _, err := os.Stat(conf); err != nil {
-		return "", "", fmt.Errorf("cni conf %q: %w", conf, err)
+	return plugin, netconf, nil
+}
+
+// singlePluginNetconf returns the netconf to pipe to the plugin. For a
+// .conflist it extracts plugins[0] and injects the list's cniVersion+name
+// (each plugin config must carry them); a bare .conf is used as-is.
+func singlePluginNetconf(raw []byte) ([]byte, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil, fmt.Errorf("parse cni conf: %w", err)
 	}
-	_ = cmd
-	return plugin, conf, nil
+	plugins, ok := top["plugins"]
+	if !ok {
+		return raw, nil
+	}
+	var list []json.RawMessage
+	if err := json.Unmarshal(plugins, &list); err != nil {
+		return nil, fmt.Errorf("parse cni conflist plugins: %w", err)
+	}
+	if len(list) == 0 {
+		return nil, errors.New("cni conflist has no plugins")
+	}
+	var plugin map[string]json.RawMessage
+	if err := json.Unmarshal(list[0], &plugin); err != nil {
+		return nil, fmt.Errorf("parse cni plugin[0]: %w", err)
+	}
+	if v, ok := top["cniVersion"]; ok {
+		plugin["cniVersion"] = v
+	}
+	if n, ok := top["name"]; ok {
+		plugin["name"] = n
+	}
+	return json.Marshal(plugin)
+}
+
+func netconfType(conf []byte) (string, error) {
+	var m struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(conf, &m); err != nil {
+		return "", fmt.Errorf("parse cni plugin type: %w", err)
+	}
+	if strings.TrimSpace(m.Type) == "" {
+		return "", errors.New("cni plugin config has no type")
+	}
+	return m.Type, nil
 }

@@ -86,18 +86,30 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 			return "", fmt.Errorf("containerd push: lookup dest: %w", err)
 		}
 		if _, err := isvc.Create(ctx, images.Image{Name: dest, Target: target}); err != nil {
-			return "", fmt.Errorf("containerd push: create dest name: %w", err)
+			// A concurrent duplicate push may have created the name first — that
+			// is success, not an error (pr-review §1 idempotency). Fall through to
+			// the Push below with the same target.
+			if !errdefs.IsAlreadyExists(err) {
+				return "", fmt.Errorf("containerd push: create dest name: %w", err)
+			}
 		}
 	} else if _, err := isvc.Update(ctx, images.Image{Name: dest, Target: target}, "target"); err != nil {
 		// Name already exists; push with the source descriptor anyway.
 		_ = err
 	}
 
-	refHost := registryHost(dest)
+	// Scope creds to exactly one registry host; never broadcast them to every
+	// host the resolver dials (foreign-layer / redirect hosts). A hostless dest
+	// ref falls back to auth.Server, and if neither resolves a host we refuse
+	// rather than leak credentials.
+	scopeHost, err := pushCredScopeHost(dest, auth.Server)
+	if err != nil {
+		return "", err
+	}
 	opts := []cntr.RemoteOpt{
 		cntr.WithResolver(ctddocker.NewResolver(ctddocker.ResolverOptions{
 			Authorizer: ctddocker.NewDockerAuthorizer(ctddocker.WithAuthCreds(func(host string) (string, string, error) {
-				if refHost != "" && host != refHost && host != strings.TrimSpace(auth.Server) {
+				if host != scopeHost {
 					return "", "", nil
 				}
 				return auth.Username, auth.Password, nil
@@ -108,4 +120,18 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 		return "", fmt.Errorf("containerd push %s -> %s: %w", source, dest, err)
 	}
 	return string(target.Digest), nil
+}
+
+// pushCredScopeHost resolves the single registry host that push credentials may
+// be sent to: the dest ref's own host, or (for a hostless ref) the configured
+// auth server. Returns an error rather than "" so a bad ref can never widen the
+// cred scope to every host the resolver contacts.
+func pushCredScopeHost(dest, authServer string) (string, error) {
+	if h := registryHost(dest); h != "" {
+		return h, nil
+	}
+	if h := strings.TrimSpace(authServer); h != "" {
+		return h, nil
+	}
+	return "", fmt.Errorf("containerd push: cannot determine registry host for dest %q; refusing to broadcast credentials", dest)
 }

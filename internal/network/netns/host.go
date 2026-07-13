@@ -66,9 +66,13 @@ func (h *Host) Remove(ctx context.Context, slot Slot) error {
 	if path == "" {
 		return nil
 	}
-	_ = h.Runner.Del(ctx, path, slot.SandboxID)
+	// Surface the CNI DEL error rather than swallowing it: a dropped DEL leaks
+	// the veth pair and the host-local IPAM lease with no process death to free
+	// them. Conntrack flush and netns unlink are still attempted regardless.
+	delErr := h.Runner.Del(ctx, path, slot.SandboxID)
 	_ = hostnet.FlushConntrackForIP(slot.ContainerIP)
-	return h.removePath(path)
+	rmErr := h.removePath(path)
+	return errors.Join(delErr, rmErr)
 }
 
 func (h *Host) netnsRoot() string {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
@@ -131,12 +132,18 @@ func TestNilClientContentAccessors(t *testing.T) {
 }
 
 type fakeSnapshotBackend struct {
-	container cntr.Container
-	desc      ocispec.Descriptor
-	created   images.Image
-	createErr error
-	getImg    images.Image
-	getErr    error
+	container    cntr.Container
+	diffDesc     ocispec.Descriptor
+	baseManifest ocispec.Manifest
+	baseConfig   ocispec.Image
+	diffIDVal    digest.Digest
+	blobLabels   map[string]map[string]string // blob digest -> gc labels
+	blobTypes    map[string]string            // blob digest -> media type
+	createErr    error
+	created      images.Image
+	createdArg   images.Image
+	getImg       images.Image
+	getErr       error
 }
 
 func (f *fakeSnapshotBackend) loadContainer(context.Context, *Client, string) (cntr.Container, error) {
@@ -146,9 +153,26 @@ func (f *fakeSnapshotBackend) loadContainer(context.Context, *Client, string) (c
 	return f.container, nil
 }
 func (f *fakeSnapshotBackend) createDiff(context.Context, string, string, cntr.Container) (ocispec.Descriptor, error) {
-	return f.desc, nil
+	return f.diffDesc, nil
+}
+func (f *fakeSnapshotBackend) baseManifestAndConfig(context.Context, ocispec.Descriptor) (ocispec.Manifest, ocispec.Image, error) {
+	return f.baseManifest, f.baseConfig, nil
+}
+func (f *fakeSnapshotBackend) diffID(context.Context, ocispec.Descriptor) (digest.Digest, error) {
+	return f.diffIDVal, nil
+}
+func (f *fakeSnapshotBackend) writeBlob(_ context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error) {
+	if f.blobLabels == nil {
+		f.blobLabels = map[string]map[string]string{}
+		f.blobTypes = map[string]string{}
+	}
+	desc := ocispec.Descriptor{MediaType: mediaType, Digest: digest.FromBytes(data), Size: int64(len(data))}
+	f.blobLabels[desc.Digest.String()] = labels
+	f.blobTypes[desc.Digest.String()] = mediaType
+	return desc, nil
 }
 func (f *fakeSnapshotBackend) createImage(_ context.Context, img images.Image) (images.Image, error) {
+	f.createdArg = img
 	if f.createErr != nil {
 		return images.Image{}, f.createErr
 	}
@@ -164,32 +188,57 @@ func (f *fakeSnapshotBackend) getImage(context.Context, string) (images.Image, e
 	return f.getImg, nil
 }
 
+// baseFixture returns a backend seeded with a base image (one config + one
+// layer) plus the new diff, so the commit can assemble a real manifest.
+func baseFixture(task *fakeTask) *fakeSnapshotBackend {
+	layer := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayerGzip, Digest: digest.Digest("sha256:" + strings.Repeat("1", 64))}
+	return &fakeSnapshotBackend{
+		container: &fakeContainer{id: "sb-1", task: task},
+		diffDesc:  ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayerGzip, Digest: digest.Digest("sha256:" + strings.Repeat("2", 64))},
+		diffIDVal: digest.Digest("sha256:" + strings.Repeat("3", 64)),
+		baseManifest: ocispec.Manifest{
+			MediaType: ocispec.MediaTypeImageManifest,
+			Config:    ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: digest.Digest("sha256:" + strings.Repeat("4", 64))},
+			Layers:    []ocispec.Descriptor{layer},
+		},
+		baseConfig: ocispec.Image{RootFS: ocispec.RootFS{Type: "layers", DiffIDs: []digest.Digest{digest.Digest("sha256:" + strings.Repeat("5", 64))}}},
+	}
+}
+
 func TestCommitContainerSnapshotLiveFakeBackend(t *testing.T) {
 	d := newTestDriver(t)
-	dgst := digest.Digest("sha256:" + strings.Repeat("c", 64))
-	backend := &fakeSnapshotBackend{
-		container: &fakeContainer{id: "sb-1", task: &fakeTask{status: cntr.Running}},
-		desc:      ocispec.Descriptor{Digest: dgst},
-		created:   images.Image{Name: "snap:v1", Target: ocispec.Descriptor{Digest: dgst}},
-	}
+	backend := baseFixture(&fakeTask{status: cntr.Running})
 	testSnapshotBackend = backend
 	t.Cleanup(func() { testSnapshotBackend = nil })
 
 	got, err := d.commitContainerSnapshotLive(context.Background(), d.client, "sb-1", "snap:v1")
-	if err != nil || got != string(dgst) {
-		t.Fatalf("got=%q err=%v", got, err)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	// Returned digest must be the assembled MANIFEST, and createImage must have
+	// been handed a manifest target (not the bare diff layer).
+	if got == "" || got != string(backend.createdArg.Target.Digest) {
+		t.Fatalf("returned digest %q != created image target %q", got, backend.createdArg.Target.Digest)
+	}
+	if backend.createdArg.Target.MediaType != ocispec.MediaTypeImageManifest {
+		t.Fatalf("image target media type = %q, want manifest", backend.createdArg.Target.MediaType)
+	}
+	// The manifest blob must carry gc.ref labels for the config + every layer.
+	labels := backend.blobLabels[got]
+	if labels["containerd.io/gc.ref.content.config"] == "" {
+		t.Fatalf("manifest missing gc.ref config label: %v", labels)
+	}
+	if labels["containerd.io/gc.ref.content.l.0"] == "" || labels["containerd.io/gc.ref.content.l.1"] == "" {
+		t.Fatalf("manifest missing gc.ref layer labels (base + diff): %v", labels)
 	}
 }
 
 func TestCommitContainerSnapshotAlreadyExists(t *testing.T) {
 	d := newTestDriver(t)
 	dgst := digest.Digest("sha256:" + strings.Repeat("d", 64))
-	backend := &fakeSnapshotBackend{
-		container: &fakeContainer{id: "sb-1", task: &fakeTask{status: cntr.Running}},
-		desc:      ocispec.Descriptor{Digest: dgst},
-		createErr: errdefs.ErrAlreadyExists,
-		getImg:    images.Image{Target: ocispec.Descriptor{Digest: dgst}},
-	}
+	backend := baseFixture(&fakeTask{status: cntr.Running})
+	backend.createErr = errdefs.ErrAlreadyExists
+	backend.getImg = images.Image{Target: ocispec.Descriptor{Digest: dgst}}
 	testSnapshotBackend = backend
 	t.Cleanup(func() { testSnapshotBackend = nil })
 
@@ -201,17 +250,30 @@ func TestCommitContainerSnapshotAlreadyExists(t *testing.T) {
 
 func TestCommitContainerSnapshotStoppedTask(t *testing.T) {
 	d := newTestDriver(t)
-	dgst := digest.Digest("sha256:" + strings.Repeat("e", 64))
-	backend := &fakeSnapshotBackend{
-		container: &fakeContainer{id: "sb-1", task: &fakeTask{status: cntr.Stopped}},
-		desc:      ocispec.Descriptor{Digest: dgst},
-		created:   images.Image{Target: ocispec.Descriptor{Digest: dgst}},
-	}
+	backend := baseFixture(&fakeTask{status: cntr.Stopped})
 	testSnapshotBackend = backend
 	t.Cleanup(func() { testSnapshotBackend = nil })
 
 	got, err := d.commitContainerSnapshotLive(context.Background(), d.client, "sb-1", "snap:v1")
-	if err != nil || got != string(dgst) {
+	if err != nil || got == "" {
 		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
+
+func TestAssembleCommittedImageExtendsConfigAndManifest(t *testing.T) {
+	backend := baseFixture(nil)
+	img, err := assembleCommittedImage(context.Background(), backend, backend.baseManifest.Config, backend.diffDesc, "snap:v1", time.Unix(0, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.Name != "snap:v1" || img.Target.MediaType != ocispec.MediaTypeImageManifest {
+		t.Fatalf("assembled image wrong: %+v", img.Target)
+	}
+	if img.Labels["containerd.io/gc.root"] == "" {
+		t.Fatal("assembled image missing gc.root label")
+	}
+	// Two blobs must have been written: the new config and the manifest.
+	if len(backend.blobTypes) != 2 {
+		t.Fatalf("expected config+manifest blobs, wrote %d", len(backend.blobTypes))
 	}
 }

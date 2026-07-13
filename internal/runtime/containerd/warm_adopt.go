@@ -88,6 +88,13 @@ func (d *Driver) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 			return nil, err
 		}
 		_ = d.destroyParked(ctx, slot)
+		if d.netns != nil {
+			// adoptParked may have already reassigned the netns slot from the park
+			// id to sandboxID before failing (ReassignOwner runs before the network
+			// policy apply). destroyParked only releases the park id, so release
+			// under sandboxID too or the slot is stranded adopted with no container.
+			_ = d.netns.Release(ctx, sandboxID)
+		}
 		d.warmPool.ReleasePark(slot.ID)
 		return nil, fmt.Errorf("warm adopt failed: %w", err)
 	}
@@ -206,6 +213,23 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 	if pl, ok := slot.Handle.(*dockerpkg.ParkedListener); ok {
 		dockerpkg.RemoveParkSocket(pl.HostSocketPath())
 	}
+	// Release the prepaid netns slot the park held (keyed by the park slot id,
+	// which equals ContainerID for a parked container). Without this, every park
+	// teardown — LRU/stale-image evict, idle-TTL reap, shutdown drain, boot
+	// PurgeParkedContainers — permanently leaks a netns slot (row stays adopted
+	// under the dead park id, plus its veth/IPAM lease/conntrack) until the pool
+	// exhausts and cold creates fail with "provision netns: no free slot".
+	// Release is idempotent and a no-op if the slot was already reassigned to an
+	// adopting sandbox.
+	if d.netns != nil {
+		parkKey := strings.TrimSpace(slot.ID)
+		if parkKey == "" {
+			parkKey = strings.TrimSpace(slot.ContainerID)
+		}
+		if parkKey != "" {
+			_ = d.netns.Release(ctx, parkKey)
+		}
+	}
 	if slot.ContainerID != "" {
 		client, err := d.ensureClient()
 		if err != nil {
@@ -214,6 +238,11 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 		container, err := client.LoadContainer(ctx, slot.ContainerID)
 		if err != nil {
 			return err
+		}
+		// Release the image lease the park pinned, or GC can never reclaim the
+		// pinned layers (mirror Destroy's release).
+		if labels, lerr := container.Labels(ctx); lerr == nil {
+			d.releaseImageLease(ctx, client, labels)
 		}
 		if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 			_ = task.Kill(ctx, syscall.SIGKILL)

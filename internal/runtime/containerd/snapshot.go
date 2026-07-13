@@ -1,16 +1,21 @@
 package containerd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	cntr "github.com/containerd/containerd"
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/rootfs"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -24,6 +29,13 @@ var testSnapshotBackend snapshotBackend
 type snapshotBackend interface {
 	loadContainer(ctx context.Context, client *Client, containerRef string) (cntr.Container, error)
 	createDiff(ctx context.Context, snapshotKey, snapshotter string, container cntr.Container) (ocispec.Descriptor, error)
+	// baseManifestAndConfig reads the base image's manifest and its unmarshalled
+	// config, so the commit can extend them with the new diff layer.
+	baseManifestAndConfig(ctx context.Context, target ocispec.Descriptor) (ocispec.Manifest, ocispec.Image, error)
+	// diffID resolves the uncompressed digest (rootfs diff_id) of a layer blob.
+	diffID(ctx context.Context, desc ocispec.Descriptor) (digest.Digest, error)
+	// writeBlob content-addresses data and stores it with the given gc labels.
+	writeBlob(ctx context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error)
 	createImage(ctx context.Context, img images.Image) (images.Image, error)
 	getImage(ctx context.Context, name string) (images.Image, error)
 }
@@ -59,6 +71,56 @@ func (b *rawSnapshotBackend) getImage(ctx context.Context, name string) (images.
 		return images.Image{}, errors.New("snapshot image get requires live containerd")
 	}
 	return raw.ImageService().Get(ctx, name)
+}
+
+func (b *rawSnapshotBackend) baseManifestAndConfig(ctx context.Context, target ocispec.Descriptor) (ocispec.Manifest, ocispec.Image, error) {
+	raw := b.client.Raw()
+	if raw == nil {
+		return ocispec.Manifest{}, ocispec.Image{}, errors.New("snapshot base read requires live containerd")
+	}
+	cs := raw.ContentStore()
+	manifest, err := images.Manifest(ctx, cs, target, platforms.Default())
+	if err != nil {
+		return ocispec.Manifest{}, ocispec.Image{}, fmt.Errorf("read base manifest: %w", err)
+	}
+	configBytes, err := content.ReadBlob(ctx, cs, manifest.Config)
+	if err != nil {
+		return ocispec.Manifest{}, ocispec.Image{}, fmt.Errorf("read base config: %w", err)
+	}
+	var config ocispec.Image
+	if err := json.Unmarshal(configBytes, &config); err != nil {
+		return ocispec.Manifest{}, ocispec.Image{}, fmt.Errorf("parse base config: %w", err)
+	}
+	return manifest, config, nil
+}
+
+func (b *rawSnapshotBackend) diffID(ctx context.Context, desc ocispec.Descriptor) (digest.Digest, error) {
+	raw := b.client.Raw()
+	if raw == nil {
+		return "", errors.New("snapshot diff id requires live containerd")
+	}
+	return images.GetDiffID(ctx, raw.ContentStore(), desc)
+}
+
+func (b *rawSnapshotBackend) writeBlob(ctx context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error) {
+	raw := b.client.Raw()
+	if raw == nil {
+		return ocispec.Descriptor{}, errors.New("snapshot write blob requires live containerd")
+	}
+	desc := ocispec.Descriptor{
+		MediaType: mediaType,
+		Digest:    digest.FromBytes(data),
+		Size:      int64(len(data)),
+	}
+	ref := "aerolvm-snapshot-" + desc.Digest.String()
+	var opts []content.Opt
+	if len(labels) > 0 {
+		opts = append(opts, content.WithLabels(labels))
+	}
+	if err := content.WriteBlob(ctx, raw.ContentStore(), ref, bytes.NewReader(data), desc, opts...); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("write %s blob: %w", mediaType, err)
+	}
+	return desc, nil
 }
 
 func resolveSnapshotBackend(d *Driver, client *Client) snapshotBackend {
@@ -158,13 +220,17 @@ func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client
 	if err != nil {
 		return "", fmt.Errorf("snapshot diff: %w", err)
 	}
-	now := time.Now().UTC()
-	img := images.Image{
-		Name:   imageRef,
-		Target: desc,
-		Labels: map[string]string{
-			"containerd.io/gc.root": now.Format(time.RFC3339Nano),
-		},
+	baseImage := strings.TrimSpace(info.Image)
+	if baseImage == "" {
+		return "", errors.New("snapshot container has no base image reference")
+	}
+	base, err := backend.getImage(ctx, baseImage)
+	if err != nil {
+		return "", fmt.Errorf("snapshot base image %q: %w", baseImage, err)
+	}
+	img, err := assembleCommittedImage(ctx, backend, base.Target, desc, imageRef, time.Now().UTC())
+	if err != nil {
+		return "", err
 	}
 	created, err := backend.createImage(ctx, img)
 	if err != nil {
@@ -178,6 +244,70 @@ func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client
 		return "", fmt.Errorf("snapshot image create: %w", err)
 	}
 	return imageDigestID(created.Target), nil
+}
+
+// assembleCommittedImage builds a runnable/pushable OCI image from the base
+// image plus the new diff layer: it extends the base config's rootfs.diff_ids
+// and the base manifest's layers, writes the new config and manifest blobs
+// (with gc.ref labels so containerd's GC keeps the config + every layer), and
+// returns an image record targeting the new MANIFEST.
+//
+// The previous code assigned the diff-LAYER descriptor as the image Target, so
+// the "image" was not a manifest and could neither be run (WithNewSnapshot) nor
+// pushed. This assembly is verified offline for structure (config/manifest
+// shape + gc.ref labels) via the fake backend; the live content-store write and
+// a commit→re-run/push round trip are integration-suite territory (darwin has
+// no containerd content store).
+func assembleCommittedImage(ctx context.Context, backend snapshotBackend, baseTarget, diffDesc ocispec.Descriptor, imageRef string, now time.Time) (images.Image, error) {
+	manifest, config, err := backend.baseManifestAndConfig(ctx, baseTarget)
+	if err != nil {
+		return images.Image{}, err
+	}
+	diffID, err := backend.diffID(ctx, diffDesc)
+	if err != nil {
+		return images.Image{}, fmt.Errorf("snapshot diff id: %w", err)
+	}
+	config.RootFS.DiffIDs = append(config.RootFS.DiffIDs, diffID)
+	config.History = append(config.History, ocispec.History{
+		Created:   &now,
+		CreatedBy: "aerolvm snapshot commit",
+		Comment:   imageRef,
+	})
+	configBytes, err := json.Marshal(config)
+	if err != nil {
+		return images.Image{}, fmt.Errorf("marshal snapshot config: %w", err)
+	}
+	configDesc, err := backend.writeBlob(ctx, ocispec.MediaTypeImageConfig, configBytes, nil)
+	if err != nil {
+		return images.Image{}, err
+	}
+	manifest.Config = configDesc
+	manifest.Layers = append(manifest.Layers, diffDesc)
+	if manifest.MediaType == "" {
+		manifest.MediaType = ocispec.MediaTypeImageManifest
+	}
+	if manifest.SchemaVersion == 0 {
+		manifest.SchemaVersion = 2
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return images.Image{}, fmt.Errorf("marshal snapshot manifest: %w", err)
+	}
+	// GC ref labels: without them containerd's GC reaps the config and layer
+	// blobs the manifest references, breaking the image out from under itself.
+	refLabels := map[string]string{"containerd.io/gc.ref.content.config": configDesc.Digest.String()}
+	for i, layer := range manifest.Layers {
+		refLabels[fmt.Sprintf("containerd.io/gc.ref.content.l.%d", i)] = layer.Digest.String()
+	}
+	manifestDesc, err := backend.writeBlob(ctx, ocispec.MediaTypeImageManifest, manifestBytes, refLabels)
+	if err != nil {
+		return images.Image{}, err
+	}
+	return images.Image{
+		Name:   imageRef,
+		Target: manifestDesc,
+		Labels: map[string]string{"containerd.io/gc.root": now.Format(time.RFC3339Nano)},
+	}, nil
 }
 
 func (d *Driver) loadContainerForRef(ctx context.Context, client *Client, containerRef string) (cntr.Container, error) {

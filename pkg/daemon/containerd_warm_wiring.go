@@ -16,15 +16,19 @@ import (
 // containerdEngineWiring holds containerd-only background workers torn down on
 // daemon shutdown.
 type containerdEngineWiring struct {
-	netns  *containerdNetnsPool
-	warm   *containerdpool.Pool
-	driver *cntr.Driver
-	logger *slog.Logger
+	netns        *containerdNetnsPool
+	warm         *containerdpool.Pool
+	driver       *cntr.Driver
+	logger       *slog.Logger
+	stopReassert func()
 }
 
 func (w *containerdEngineWiring) Stop() {
 	if w == nil {
 		return
+	}
+	if w.stopReassert != nil {
+		w.stopReassert()
 	}
 	if w.netns != nil {
 		w.netns.Stop()

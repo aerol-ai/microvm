@@ -27,6 +27,7 @@ require (
 require (
 	github.com/containerd/containerd v1.7.29
 	github.com/containerd/containerd/api v1.8.0
+	github.com/containerd/platforms v0.2.1
 	github.com/containerd/typeurl/v2 v2.1.1
 	github.com/google/nftables v0.3.0
 	github.com/hashicorp/raft-wal v0.4.2
@@ -47,7 +48,6 @@ require (
 	github.com/containerd/errdefs v0.3.0 // indirect
 	github.com/containerd/fifo v1.1.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
-	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
 	github.com/coreos/etcd v3.3.27+incompatible // indirect
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect

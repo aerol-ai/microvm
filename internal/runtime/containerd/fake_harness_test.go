@@ -171,6 +171,7 @@ func (c *fakeContainer) Info(context.Context, ...cntr.InfoOpts) (containers.Cont
 	}
 	return containers.Container{
 		ID:          c.id,
+		Image:       "alpine:3.20",
 		Labels:      labels,
 		SnapshotKey: c.id + "-snap",
 		Snapshotter: "overlayfs",

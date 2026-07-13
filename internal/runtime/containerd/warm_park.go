@@ -137,6 +137,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		container cntr.Container
 		task      cntr.Task
 		logCloser func()
+		leaseID   string
 	)
 	committed := false
 	defer func() {
@@ -152,6 +153,12 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		_ = pl.Close()
 		if netnsProvisioned && d.netns != nil {
 			_ = d.netns.Release(ctx, slotID)
+		}
+		// The park pins an image lease before NewContainer; release it on any
+		// non-committed exit or the pinned layers never GC (same orphan class the
+		// cold path's lease defer fixes).
+		if leaseID != "" {
+			d.releaseImageLease(ctx, client, map[string]string{imageLeaseLabelKey: leaseID})
 		}
 	}()
 
@@ -186,9 +193,11 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		managedLabelKey:  "true",
 		poolParkLabelKey: poolParkLabelValue,
 	}
-	if leaseID, err := d.pinImageLease(ctx, client, image); err != nil {
+	leaseID, err = d.pinImageLease(ctx, client, image)
+	if err != nil {
 		return nil, err
-	} else if leaseID != "" {
+	}
+	if leaseID != "" {
 		labels[imageLeaseLabelKey] = leaseID
 	}
 	containerOpts := []cntr.NewContainerOpts{

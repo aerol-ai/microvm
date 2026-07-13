@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
@@ -43,6 +44,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	if err := ctdRules.EnsureChain(); err != nil {
 		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
 	}
+	reassertStop := startChainReassert(ctx, ctdRules, logger)
 	driver := cntr.New(cntr.FromDaemonConfig(cfg), ctdRules, logger)
 	netnsPool, err := wireContainerdNativeNetnsPool(ctx, cfg, logger, st, driver)
 	if err != nil {
@@ -61,7 +63,34 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 		"netrules_chain", netrules.ChainAerolvmUser,
 	)
 	cntr.PublishEngineTag(models.ContainerEngineContainerd)
-	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, driver: driver, logger: logger}, nil
+	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, driver: driver, logger: logger, stopReassert: reassertStop}, nil
+}
+
+// startChainReassert periodically re-asserts the AEROLVM-USER chain + FORWARD
+// jump. A dockerd restart on a coexistence host can flush/reorder FORWARD and
+// drop our jump; re-assertion (idempotent) restores it without waiting for a
+// sandboxd restart (plan §4 item #5). Returns a cancel func the wiring calls on
+// shutdown.
+func startChainReassert(ctx context.Context, rules *netrules.Manager, logger *slog.Logger) func() {
+	if rules == nil {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := rules.ReassertChain(); err != nil {
+					logger.Warn("re-assert AEROLVM-USER chain failed", "error", err)
+				}
+			}
+		}
+	}()
+	return cancel
 }
 
 // multiEventsSource fans in dockerd and containerd event streams during
