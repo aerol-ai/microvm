@@ -3,12 +3,15 @@
 Status: **in progress (Phases 1–4 landed dark behind `SB_CONTAINER_ENGINE=docker`;
 Phase 5 ops in flight)** —
 Phase 1 core driver + seams shipped (#311); Phases 2–4 networking / warm pool /
-gVisor seam in #325. `internal/runtime/containerd` coverage at the ~85% bar.
-Phase 5: `install.sh --with-containerd-engine`, Ansible CNI install + env
-toggle, Terraform bootstrap engine env, coexistence runbook, soak UC-99..102
-registered (`containerd-engine` cap). Phase 0 decision stubs:
-`plans/containerd-engine-phase0-decisions.md`. Remaining: live Phase 0
-measurements, disruptive restart helpers, §8 default-flip gates.
+gVisor seam in #325. Coverage ~85%. Phase 5: install/Ansible/Terraform +
+coexistence runbook + soak UC-99..102 + `single-node-containerd` scenario
+(`make integration-single-containerd`). Phase 0(e-4) version pin enforced at
+`Connect`. AOCR snapshot push uses containerd `RegistryPusher` when
+engine=containerd. Phase 0(e-1..e-3) + DiskGB soft-ignore recorded as
+defaults. **Offline implementation is caught up** — remaining work is
+operator/live: Phase 0(a–d) spikes, §8 soak on `single-node-containerd`,
+real overlay DiskGB (deferred). Uncommitted follow-up may still need
+commit/push to #325.
 Plan written 2026-07-11; revised 2026-07-12 after eng review — 9 review findings
 + 5 cross-model findings folded, §4 rebased on CNI, one store change admitted;
 see the GSTACK REVIEW REPORT at the end. Companion to

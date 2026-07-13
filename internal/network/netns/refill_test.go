@@ -106,6 +106,37 @@ func TestReconcileKeepsLiveAdopted(t *testing.T) {
 	}
 }
 
+// Crash after reserve but before CNI ADD: reserved row with empty netns path
+// must reset to free on reconcile when the sandbox is not live.
+func TestReconcileReapsCrashBeforeCNI(t *testing.T) {
+	st := openTestStore(t)
+	p := New(st)
+	host := NewFakeHost()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := p.Seed(ctx, SeedConfig{PoolSize: 1}, now); err != nil {
+		t.Fatal(err)
+	}
+	slot, err := st.ReserveContainerNetnsSlot(ctx, "sb-pre-cni", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot.NetnsPath != "" {
+		t.Fatalf("pre-CNI slot should have empty path, got %q", slot.NetnsPath)
+	}
+	reaped, err := p.Reconcile(ctx, host, nil, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reaped != 1 {
+		t.Fatalf("reaped=%d want 1", reaped)
+	}
+	stats, _ := p.Stats(ctx)
+	if stats.Free != 1 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
 // Crash between CNI ADD and store MarkRealized: reserved row + live netns path
 // must be reaped on boot reconcile when live==nil (daemon restart).
 func TestReconcileReapsCrashBetweenRealizeAndRecord(t *testing.T) {

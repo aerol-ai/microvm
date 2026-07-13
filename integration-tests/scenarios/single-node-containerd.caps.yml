@@ -1,0 +1,10 @@
+# Capabilities for the single-node containerd-engine soak scenario
+# (plans/containerd-engine.md Phase 5 / §8). run.sh flips
+# container_engine=containerd when this cap is present.
+name: single-node-containerd
+capabilities:
+  - docker
+  - containerd-engine
+  - platform-volumes
+  - domain
+  - custom-domains

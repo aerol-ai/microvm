@@ -61,7 +61,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 		"netrules_chain", netrules.ChainAerolvmUser,
 	)
 	cntr.PublishEngineTag(models.ContainerEngineContainerd)
-	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, logger: logger}, nil
+	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, driver: driver, logger: logger}, nil
 }
 
 // multiEventsSource fans in dockerd and containerd event streams during

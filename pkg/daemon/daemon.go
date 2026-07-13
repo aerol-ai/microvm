@@ -22,6 +22,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -274,9 +275,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
 	svc.SetDockerAuxClient(dockerClient)
+	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
 		return fmt.Errorf("wire container engine: %w", err)
 	} else if ctd != nil {
+		ctdWiring = ctd
 		defer ctd.Stop()
 	}
 	// Wire the control-plane usage reporter into the service's background loops
@@ -673,7 +676,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			svc.StartVolumeReclaim(ctx)
 		}
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
-		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
+		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient, ctdWiring)
 		startTemplateArtifactPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
 		// Phase 6 PR 6-B.2: consumer-side puller. Symmetric with the
 		// pusher above — once attached, EnsureTemplateLocal in the
@@ -1111,7 +1114,7 @@ func startAutoImportReconciler(ctx context.Context, logger *slog.Logger, cfg con
 // unset; both have non-empty defaults so the destination is always
 // resolvable. Auth reuses the auto-import cluster PAT path (re-read on
 // every push so rotation works without a restart).
-func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service, dockerClient *docker.Client) {
+func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service, dockerClient *docker.Client, ctd *containerdEngineWiring) {
 	if !cfg.SnapshotPushEnabled {
 		return
 	}
@@ -1119,13 +1122,21 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 	if host == "" {
 		host = strings.TrimSpace(cfg.ImageDistributionAOCRHost)
 	}
+	// Snapshots created under the containerd engine live in the aerolvm
+	// namespace — dockerd cannot push them. Prefer the containerd registry
+	// pusher when that engine owns the host (plans/containerd-engine.md §3).
+	var pushBackend service.SnapshotPushDocker = dockerClient
+	if cfg.ContainerEngine == models.ContainerEngineContainerd && ctd != nil && ctd.driver != nil {
+		pushBackend = cntr.NewRegistryPusher(ctd.driver)
+		logger.Info("snapshot push using containerd registry pusher")
+	}
 	pusher, err := service.NewSnapshotPusher(service.SnapshotPushConfig{
 		Enabled:   true,
 		Host:      host,
 		ClusterID: cfg.AutoImportClusterID,
 		PATPath:   cfg.AutoImportClusterPATPath,
 		TagSuffix: cfg.SnapshotPushTagSuffix,
-	}, dockerClient, logger)
+	}, pushBackend, logger)
 	if err != nil {
 		logger.Warn("snapshot push: pusher build failed; feature stays off",
 			"error", err)

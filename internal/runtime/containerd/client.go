@@ -37,6 +37,15 @@ func Connect(socket, namespace string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial containerd: %w", err)
 	}
+	ver, verr := raw.Version(context.Background())
+	if verr != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("containerd version: %w", verr)
+	}
+	if err := assertSupportedContainerdVersion(ver.Version); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
 	return &Client{raw: raw, namespace: ns, tr: &liveTransport{raw: cntrClientRaw{raw}, ns: ns}}, nil
 }
 

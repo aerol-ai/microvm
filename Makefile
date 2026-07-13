@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-wasm \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-docker integration-benchmark-docker-only \
 	integration-benchmark-docker-sparse \
@@ -92,6 +92,11 @@ integration-local:
 
 integration-single:
 	integration-tests/run.sh single-node $(RUN_FLAGS)
+
+# Single-node with SB_CONTAINER_ENGINE=containerd (containerd-engine cap).
+# Exercises UC-99..102 soak gates + docker UCs against the native driver.
+integration-single-containerd:
+	integration-tests/run.sh single-node-containerd $(RUN_FLAGS)
 
 # Single-node with the WASM runtime enabled (wasm.enabled + staged standard
 # modules, driven entirely by the `wasm` capability in single-node-wasm.caps.yml).

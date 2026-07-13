@@ -18,6 +18,7 @@ import (
 type containerdEngineWiring struct {
 	netns  *containerdNetnsPool
 	warm   *containerdpool.Pool
+	driver *cntr.Driver
 	logger *slog.Logger
 }
 
@@ -63,6 +64,11 @@ func wireContainerdWarmPool(ctx context.Context, cfg config.Config, logger *slog
 	}
 	pool.SetParkReleaser(gate.ReleasePark)
 	driver.SetWarmPool(pool)
+
+	// Image-ID cache (docker StartImageIDCacheWarmer) is intentionally NOT
+	// ported: containerd GetImage is a local metadata read, so the Tier-1
+	// docker cache rider does not pay for itself here (plans/containerd-engine.md
+	// §9.2). Re-measure only if a cold-create profile shows ResolveImage as hot.
 
 	images := cfg.ContainerdPoolImages
 	if len(images) == 0 {

@@ -57,6 +57,26 @@ func ValidateRuntimeRequest(req CreateSandboxRequest, effectiveRuntime string, p
 	return nil
 }
 
+// DiskGBEnforced reports whether the host engine actually applies CreateSandbox
+// DiskGB as a storage quota. dockerd may (xfs+pquota StorageOpt); containerd
+// overlayfs and gVisor do not today — callers should warn, not fail.
+func DiskGBEnforced(engine, runtime string) bool {
+	if runtime == RuntimeGvisor {
+		return false
+	}
+	return ResolveContainerEngineOrDocker(engine) == ContainerEngineDocker
+}
+
+// ResolveContainerEngineOrDocker is ResolveContainerEngine that never errors —
+// unknown/empty → docker (boot-path safe).
+func ResolveContainerEngineOrDocker(value string) string {
+	eng, err := ResolveContainerEngine(value)
+	if err != nil {
+		return ContainerEngineDocker
+	}
+	return eng
+}
+
 // ErrContainerEngineNotRegistered is returned when a sandbox row points at an
 // engine driver that was not wired at daemon boot (e.g. containerd row on a
 // docker-only node).

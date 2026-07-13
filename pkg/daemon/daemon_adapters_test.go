@@ -54,7 +54,7 @@ func TestDaemonReconcilerGuards_NoPanic(t *testing.T) {
 
 	// All of these should short-circuit cleanly under disabled/guard configs.
 	startAutoImportReconciler(ctx, logger, config.Config{AutoImportEnabled: false}, nil, nil)
-	startSnapshotPushReconciler(ctx, logger, config.Config{SnapshotPushEnabled: false}, nil, nil, nil)
+	startSnapshotPushReconciler(ctx, logger, config.Config{SnapshotPushEnabled: false}, nil, nil, nil, nil)
 	startTemplateRotationReconciler(ctx, logger, config.Config{EnableFirecracker: false}, nil, nil)
 	startTemplateRotationReconciler(ctx, logger, config.Config{EnableFirecracker: true, FirecrackerTemplateRotationInterval: time.Second, FirecrackerTemplateMaxAge: 0}, nil, nil)
 	attachTemplateArtifactPuller(logger, config.Config{EnableFirecracker: false}, nil, nil)

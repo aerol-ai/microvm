@@ -53,6 +53,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err := models.ValidateRuntimeRequest(req, effectiveRuntime, d.cfg.Privileged, logf); err != nil {
 		return nil, err
 	}
+	// DiskGB: dockerd may enforce via StorageOpt; containerd overlayfs does not
+	// (plans/containerd-engine-phase0-decisions.md DiskGB row). Soft-ignore.
+	if req.DiskGB > 0 && !models.DiskGBEnforced(models.ContainerEngineContainerd, effectiveRuntime) {
+		logf("ignoring disk quota: containerd overlayfs DiskGB not enforced yet", "disk_gb", req.DiskGB)
+	}
 	ociRuntime, err := models.ResolveOCIRuntime(effectiveRuntime)
 	if err != nil {
 		return nil, err
