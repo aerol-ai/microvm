@@ -126,7 +126,14 @@ func (r *ExecRunner) runPlugin(ctx context.Context, cmd, netnsPath, containerID 
 	invoke.Stdout = &stdout
 	invoke.Stderr = &stderr
 	if err := invoke.Run(); err != nil {
-		return nil, fmt.Errorf("cni %s %s: %w: %s", cmd, containerID, err, strings.TrimSpace(stderr.String()))
+		// CNI plugins report failures as a JSON error object on STDOUT (and
+		// commonly write nothing to stderr), so fall back to stdout or the real
+		// cause is lost as a bare "exit status 1".
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		return nil, fmt.Errorf("cni %s %s: %w: %s", cmd, containerID, err, detail)
 	}
 	return stdout.Bytes(), nil
 }
