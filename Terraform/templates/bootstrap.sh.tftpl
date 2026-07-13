@@ -635,8 +635,8 @@ SB_DOCKER_NETNS_POOL_PAUSE_IMAGE=${docker_netns_pool_cfg.pause_image}
 SB_DOCKER_NETNS_POOL_REFILL_INTERVAL=${docker_netns_pool_cfg.refill_interval}
 
 # Managed by Terraform bootstrap: container engine (plans/containerd-engine.md).
-# Default docker. containerd requires CNI plugins under cni_plugin_dir
-# (install via Ansible configure-ops or install.sh --with-containerd-engine).
+# Default docker. containerd requires CNI plugin binaries under cni_plugin_dir
+# (installed below when the engine is containerd).
 SB_CONTAINER_ENGINE=${container_engine}
 SB_CONTAINERD_SOCKET=${containerd_cfg.socket}
 SB_CONTAINERD_NAMESPACE=${containerd_cfg.namespace}
@@ -645,6 +645,35 @@ SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabl
 EOF
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
+
+# containerd engine needs the CNI bridge+host-local+loopback plugin binaries
+# under cni_plugin_dir, or the native netns pool's CNI ADD fails hard on every
+# create ("stat /opt/cni/bin/bridge: no such file or directory"). Nothing else
+# on the Terraform-provisioned path installs them (install.sh's
+# --with-containerd-engine covers the manual path). Gated on the engine so
+# docker-default nodes skip it entirely. Idempotent: skipped if bridge exists.
+if [ "${container_engine}" = "containerd" ]; then
+  cni_dir="${containerd_cfg.cni_plugin_dir}"
+  if [ ! -x "$${cni_dir}/bridge" ]; then
+    case "$$(uname -m)" in
+      x86_64|amd64) cni_arch=amd64 ;;
+      aarch64|arm64) cni_arch=arm64 ;;
+      *) echo "[bootstrap] unsupported arch $$(uname -m) for CNI plugins" >&2; exit 1 ;;
+    esac
+    cni_ver=v1.5.1
+    cni_url="https://github.com/containernetworking/plugins/releases/download/$${cni_ver}/cni-plugins-linux-$${cni_arch}-$${cni_ver}.tgz"
+    echo "[bootstrap] installing CNI plugins $${cni_ver} ($${cni_arch}) to $${cni_dir}"
+    sudo mkdir -p "$${cni_dir}"
+    curl -fsSL "$${cni_url}" | sudo tar -xz -C "$${cni_dir}"
+    for p in bridge host-local loopback; do
+      if [ ! -x "$${cni_dir}/$${p}" ]; then
+        echo "[bootstrap] expected $${cni_dir}/$${p} after CNI extract" >&2
+        exit 1
+      fi
+    done
+  fi
+fi
+
 sudo systemctl restart sandboxd
 
 ${extra_user_data}
