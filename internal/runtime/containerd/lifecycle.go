@@ -15,6 +15,7 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/remotes/docker"
+	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
@@ -538,6 +539,14 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return nil, errors.New("image reference is required")
+	}
+	// Normalize short/docker refs to a fully-qualified name, exactly as `ctr`
+	// does. containerd's resolver cannot parse a bare "alpine:3.20" — it reads
+	// it as host "alpine" with an invalid port ":3.20" ("dummy://alpine:3.20").
+	// dockerd's libnetwork normalized this for the docker driver; the containerd
+	// driver must do it itself. ParseDockerRef → docker.io/library/alpine:3.20.
+	if named, nerr := refdocker.ParseDockerRef(ref); nerr == nil {
+		ref = named.String()
 	}
 	if image, err := client.GetImage(ctx, ref); err == nil {
 		return image, nil
