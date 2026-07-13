@@ -24,6 +24,9 @@ func writeFakeCNIPlugin(t *testing.T, dir, pluginType, bodyADD string, exitCode 
 		"[ -n \"$CNI_COMMAND\" ] || { echo 'missing CNI_COMMAND' >&2; exit 3; }\n" +
 		"[ -n \"$CNI_CONTAINERID\" ] || { echo 'missing CNI_CONTAINERID' >&2; exit 3; }\n" +
 		"[ -n \"$CNI_NETNS\" ] || { echo 'missing CNI_NETNS' >&2; exit 3; }\n" +
+		// Real plugins reject unknown CNI_ARGS keys unless IgnoreUnknown is set;
+		// the K8S_POD_* keys we pass are unknown to bridge/host-local.
+		"case \"$CNI_ARGS\" in IgnoreUnknown=true*) ;; *) echo 'CNI_ARGS missing IgnoreUnknown=true' >&2; exit 3;; esac\n" +
 		"conf=$(cat)\n" +
 		"[ -n \"$conf\" ] || { echo 'empty stdin netconf' >&2; exit 3; }\n" +
 		"if [ \"$CNI_COMMAND\" = ADD ]; then printf '%s' '" + bodyADD + "'; fi\n" +
