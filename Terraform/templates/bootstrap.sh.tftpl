@@ -655,10 +655,10 @@ sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
 if [ "${container_engine}" = "containerd" ]; then
   cni_dir="${containerd_cfg.cni_plugin_dir}"
   if [ ! -x "$${cni_dir}/bridge" ]; then
-    case "$$(uname -m)" in
+    case "$(uname -m)" in
       x86_64|amd64) cni_arch=amd64 ;;
       aarch64|arm64) cni_arch=arm64 ;;
-      *) echo "[bootstrap] unsupported arch $$(uname -m) for CNI plugins" >&2; exit 1 ;;
+      *) echo "[bootstrap] unsupported arch $(uname -m) for CNI plugins" >&2; exit 1 ;;
     esac
     cni_ver=v1.5.1
     cni_url="https://github.com/containernetworking/plugins/releases/download/$${cni_ver}/cni-plugins-linux-$${cni_arch}-$${cni_ver}.tgz"
