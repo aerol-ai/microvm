@@ -352,7 +352,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 			PromoteWithSpec: true,
 			Timing:          createTiming,
 		})
-		setCreateServerTiming(w, createStart, createTiming)
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		if err != nil {
 			h.writeOverlapCreateError(w, err)
 			return
@@ -364,7 +364,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	service.RecordCreateReservationState("self_local")
 	resp, err := h.deps.Service.CreateSandbox(createCtx, req)
 	if err != nil {
-		setCreateServerTiming(w, createStart, createTiming)
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -391,7 +391,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 				"sandbox_id", resp.Sandbox.ID, "err", dErr)
 		}
 		rbCancel()
-		setCreateServerTiming(w, createStart, createTiming)
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(sealErr))
 		return
 	}
@@ -414,16 +414,16 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		}
 		rbCancel()
 		if errors.Is(promoteErr, cluster.ErrNameConflict) {
-			setCreateServerTiming(w, createStart, createTiming)
+			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return
 		}
-		setCreateServerTiming(w, createStart, createTiming)
+		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteError(w, http.StatusServiceUnavailable, clustercreate.FormatPromoteError(promoteErr))
 		return
 	}
 
-	setCreateServerTiming(w, createStart, createTiming)
+	setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 	apihttp.WriteJSON(w, http.StatusCreated, resp)
 }
 

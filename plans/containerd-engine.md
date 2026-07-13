@@ -1,12 +1,23 @@
 # containerd engine: dropping the dockerd tax (cold 274ms → ~110ms, warm 43ms → ~20ms)
 
-Status: **proposed (not started)** (written 2026-07-11; revised 2026-07-12
-after eng review — 9 review findings + 5 cross-model findings folded, §4
-rebased on CNI, one store change admitted; see the GSTACK REVIEW REPORT at
-the end). Companion to `plans/warm-create-latency-tier1.md` (which stays
-fully valid — every Tier 1 phase applies under either engine) and
-successor-in-spirit to `plans/docker-warm-pool.md` §10's "containerd work
-out of scope" note. This plan brings it in scope, with measured justification.
+Status: **in progress (Phases 1–4 landed dark behind `SB_CONTAINER_ENGINE=docker`;
+Phase 5 ops in flight)** —
+Phase 1 core driver + seams shipped (#311); Phases 2–4 networking / warm pool /
+gVisor seam in #325. Coverage ~85%. Phase 5: install/Ansible/Terraform +
+coexistence runbook + soak UC-99..102 + `single-node-containerd` scenario
+(`make integration-single-containerd`). Phase 0(e-4) version pin enforced at
+`Connect`. AOCR snapshot push uses containerd `RegistryPusher` when
+engine=containerd. Phase 0(e-1..e-3) + DiskGB soft-ignore recorded as
+defaults. **Offline implementation is caught up** — remaining work is
+operator/live: Phase 0(a–d) spikes, §8 soak on `single-node-containerd`,
+real overlay DiskGB (deferred — see phase0-decisions § DiskGB follow-up).
+Plan written 2026-07-11; revised 2026-07-12 after eng review — 9 review findings
++ 5 cross-model findings folded, §4 rebased on CNI, one store change admitted;
+see the GSTACK REVIEW REPORT at the end. Companion to
+`plans/warm-create-latency-tier1.md` (which stays fully valid — every Tier 1
+phase applies under either engine) and successor-in-spirit to
+`plans/docker-warm-pool.md` §10's "containerd work out of scope" note. This
+plan brings it in scope, with measured justification.
 
 Owner rules that apply: this is the largest fragile-area addition since
 cluster mode — a new engine behind `CreateSandbox` (`/touch-create-sandbox`
@@ -463,10 +474,12 @@ flag.
    harness and the §8 gate catch it. Treat any `SpecOpts` refactor as
    high-risk; the harness must stay green on every PR touching the driver.
 2. **Disk quota (`DiskGB`).** dockerd's `StorageOpt size` needs
-   xfs+pquota backing; the containerd overlayfs snapshotter has its own
-   quota story. Parity must be verified on our actual filesystem layout —
-   and while we're there, verify what dockerd is *actually* enforcing
-   today (gVisor already ignores it silently; runc on non-xfs may too).
+   xfs+pquota backing; the containerd overlayfs snapshotter has no
+   equivalent today — soft-ignore + warn (same posture as gVisor).
+   **Full write-up / exit criteria:**
+   `plans/containerd-engine-phase0-decisions.md` § DiskGB follow-up.
+   Until that lands, capacity admission still reserves DiskGB; only
+   in-guest writable-layer enforcement is deferred.
 3. **New fragile surface.** A second engine implementation doubles where
    container-lifecycle bugs can live. Mitigation: ship dark, same
    Server-Timing stages (now engine-tagged, §2) so benches compare engines

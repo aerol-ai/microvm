@@ -71,6 +71,11 @@ const (
 	// the two pools are independent (netns slots hold no capacity
 	// reservations, so this one leaves the UC-95 density gate untouched).
 	CapDockerNetnsPool Capability = "docker-netns-pool"
+	// CapContainerdEngine gates the Phase 5 containerd soak UCs
+	// (plans/containerd-engine.md §6/§8). Scenarios advertise it only when
+	// SB_CONTAINER_ENGINE=containerd on the deployment under test so the
+	// UCs skip (not-applicable) on docker-default hosts.
+	CapContainerdEngine Capability = "containerd-engine"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -267,6 +272,14 @@ var Registry = []UseCase{
 	{ID: "UC-96b", Title: "Docker socket push works for non-root container images", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 	{ID: "UC-96c", Title: "Docker socket push works under gVisor runtime", Requires: []Capability{CapCluster, CapDocker, CapGvisor}, Implemented: true},
 	{ID: "UC-96d", Title: "Socket-ready signal implies a genuinely serving agent (exec succeeds)", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+
+	// Containerd-engine soak gates (plans/containerd-engine.md Phase 5 / §8).
+	// CapContainerdEngine keeps them off docker-default scenarios until an
+	// operator opts a topology into SB_CONTAINER_ENGINE=containerd.
+	{ID: "UC-99", Title: "Neighbor isolation: egress-blocked sandbox cannot reach peer on same bridge", Requires: []Capability{CapContainerdEngine}, Implemented: true},
+	{ID: "UC-100", Title: "sandboxd restart reconcile: live sandboxes + parked + netns slots survive", Requires: []Capability{CapContainerdEngine}, Implemented: true},
+	{ID: "UC-101", Title: "containerd restart: shims survive and events resubscribe", Requires: []Capability{CapContainerdEngine}, Implemented: true},
+	{ID: "UC-102", Title: "dockerd coexistence: AEROLVM-USER jump survives dockerd restart", Requires: []Capability{CapContainerdEngine}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

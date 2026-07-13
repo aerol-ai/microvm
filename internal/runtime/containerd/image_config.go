@@ -3,6 +3,7 @@ package containerd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
@@ -11,7 +12,13 @@ import (
 )
 
 func imageDefaultCommand(ctx context.Context, client *Client, image cntr.Image) ([]string, error) {
-	provider := client.Raw().ContentStore()
+	if client == nil || client.contentProvider() == nil {
+		return nil, fmt.Errorf("content store unavailable")
+	}
+	return imageConfigCommand(ctx, client.contentProvider(), image)
+}
+
+func imageConfigCommand(ctx context.Context, provider content.Provider, image cntr.Image) ([]string, error) {
 	desc, err := image.Config(ctx)
 	if err != nil {
 		return nil, err

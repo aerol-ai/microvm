@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coreos/go-iptables/iptables"
 )
@@ -61,6 +62,11 @@ type Manager struct {
 	// warm-create p99 under burst. Same-IP mutual exclusion is preserved.
 	ipMu    sync.Mutex
 	ipLocks map[string]*ipLock
+	// chainReady latches true once EnsureChain has created the user chain and
+	// FORWARD jump. Same atomic.Bool + chainMu single-flight shape as
+	// Service.EnsureLayer4Ready.
+	chainReady atomic.Bool
+	chainMu    sync.Mutex
 }
 
 // ipLock is a refcounted per-IP mutex. Refs track in-flight holders so idle
@@ -109,7 +115,7 @@ func NewWithOptions(enabled bool, backend, userChain string) (*Manager, error) {
 			return nil, fmt.Errorf("create iptables client: %w", err)
 		}
 		recordBackendSelected(BackendExec)
-		return &Manager{enabled: true, ipt: ipt, userChain: userChain}, nil
+		return &Manager{enabled: true, ipt: newExecBackend(ipt), userChain: userChain}, nil
 	case BackendNetlink:
 		nl, err := NewNetlinkBackend()
 		if err != nil {

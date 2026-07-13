@@ -6,16 +6,21 @@ import (
 	"strings"
 
 	cntr "github.com/containerd/containerd"
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/namespaces"
 )
 
-const managedLabelKey = "aerolvm.managed"
+const (
+	managedLabelKey   = "aerolvm.managed"
+	sandboxIDLabelKey = "aerolvm.sandbox_id"
+)
 
 // Client wraps a namespaced containerd connection.
 type Client struct {
-	raw       *cntr.Client
 	namespace string
+	tr        clientTransport
+	raw       *cntr.Client // set only for live clients; Raw() uses this
 }
 
 // Connect dials the system containerd socket and scopes to namespace.
@@ -28,22 +33,27 @@ func Connect(socket, namespace string) (*Client, error) {
 	if ns == "" {
 		return nil, fmt.Errorf("containerd namespace is required")
 	}
-	// Set the default namespace on the raw client too: methods on the returned
-	// cntr.Container/cntr.Task objects (NewTask, task.Start, task.Pids, Delete)
-	// do not flow through Client.withNS, so without a default they run with no
-	// namespace and fail with "namespace is required".
 	raw, err := cntr.New(socket, cntr.WithDefaultNamespace(ns))
 	if err != nil {
 		return nil, fmt.Errorf("dial containerd: %w", err)
 	}
-	return &Client{raw: raw, namespace: ns}, nil
+	ver, verr := raw.Version(context.Background())
+	if verr != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("containerd version: %w", verr)
+	}
+	if err := assertSupportedContainerdVersion(ver.Version); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return &Client{raw: raw, namespace: ns, tr: &liveTransport{raw: cntrClientRaw{raw}, ns: ns}}, nil
 }
 
 func (c *Client) Close() error {
-	if c == nil || c.raw == nil {
+	if c == nil || c.tr == nil {
 		return nil
 	}
-	return c.raw.Close()
+	return c.tr.close()
 }
 
 func (c *Client) withNS(ctx context.Context) context.Context {
@@ -51,10 +61,10 @@ func (c *Client) withNS(ctx context.Context) context.Context {
 }
 
 func (c *Client) Ping(ctx context.Context) error {
-	if c == nil || c.raw == nil {
+	if c == nil || c.tr == nil {
 		return fmt.Errorf("containerd client is nil")
 	}
-	_, err := c.raw.IsServing(ctx)
+	_, err := c.tr.isServing(ctx)
 	return err
 }
 
@@ -73,25 +83,40 @@ func (c *Client) Namespace() string {
 }
 
 func (c *Client) LoadContainer(ctx context.Context, id string) (cntr.Container, error) {
-	return c.raw.LoadContainer(c.withNS(ctx), id)
+	return c.tr.loadContainer(c.withNS(ctx), id)
 }
 
 func (c *Client) NewContainer(ctx context.Context, id string, opts ...cntr.NewContainerOpts) (cntr.Container, error) {
-	return c.raw.NewContainer(c.withNS(ctx), id, opts...)
+	return c.tr.newContainer(c.withNS(ctx), id, opts...)
 }
 
 func (c *Client) GetImage(ctx context.Context, ref string) (cntr.Image, error) {
-	return c.raw.GetImage(c.withNS(ctx), ref)
+	return c.tr.getImage(c.withNS(ctx), ref)
 }
 
 func (c *Client) PullImage(ctx context.Context, ref string, opts ...cntr.RemoteOpt) (cntr.Image, error) {
-	return c.raw.Pull(c.withNS(ctx), ref, opts...)
+	return c.tr.pullImage(c.withNS(ctx), ref, opts...)
 }
 
 func (c *Client) ListContainers(ctx context.Context, filters ...string) ([]cntr.Container, error) {
-	return c.raw.Containers(c.withNS(ctx), filters...)
+	return c.tr.listContainers(c.withNS(ctx), filters...)
 }
 
 func (c *Client) SubscribeEvents(ctx context.Context, filters ...string) (<-chan *events.Envelope, <-chan error) {
-	return c.raw.EventService().Subscribe(c.withNS(ctx), filters...)
+	return c.tr.subscribe(c.withNS(ctx), filters...)
+}
+
+// ContentStore exposes the backing content store for image config reads.
+func (c *Client) ContentStore() content.Store {
+	if c == nil || c.tr == nil {
+		return nil
+	}
+	return c.tr.contentStore()
+}
+
+func (c *Client) contentProvider() content.Provider {
+	if c == nil || c.tr == nil {
+		return nil
+	}
+	return c.tr.contentProvider()
 }

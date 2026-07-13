@@ -185,6 +185,7 @@ func TestManagerEnabledErrors(t *testing.T) {
 type memBackend struct {
 	mu        sync.Mutex
 	rules     []string
+	chains    map[string]bool
 	deleteErr error
 }
 
@@ -237,6 +238,32 @@ func (m *memBackend) countMatching(substr string) int {
 		}
 	}
 	return n
+}
+
+func (m *memBackend) EnsureUserChain(chain string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.chains == nil {
+		m.chains = make(map[string]bool)
+	}
+	m.chains[chain] = true
+	return nil
+}
+
+func (m *memBackend) EnsureForwardJump(userChain string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := memKey("filter", "FORWARD", "-j", userChain)
+	if !slices.Contains(m.rules, key) {
+		m.rules = append(m.rules, key)
+	}
+	return nil
+}
+
+func (m *memBackend) hasChain(chain string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.chains != nil && m.chains[chain]
 }
 
 type errNoMatch struct{}

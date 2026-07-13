@@ -64,6 +64,16 @@ func TestGenerateResolvConf(t *testing.T) {
 	}
 }
 
+func TestPrepareSandboxHostFilesRunDirIsFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareSandboxHostFiles(path, "sb-1"); err == nil {
+		t.Fatal("want error when run dir is a file")
+	}
+}
+
 func TestPrepareSandboxHostFiles(t *testing.T) {
 	dir := t.TempDir()
 	hf, err := prepareSandboxHostFiles(dir, "sb-abc")

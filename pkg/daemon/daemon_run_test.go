@@ -508,7 +508,7 @@ func TestStartSnapshotPushReconciler_PusherBuildError(t *testing.T) {
 		AutoImportClusterID:           "",
 		AutoImportClusterPATPath:      "",
 		SnapshotPushReconcileInterval: 5 * time.Millisecond,
-	}, st, svc, nil)
+	}, st, svc, nil, nil)
 }
 
 func TestStartTemplateArtifactPushReconciler_PusherBuildError(t *testing.T) {

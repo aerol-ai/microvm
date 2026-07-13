@@ -143,10 +143,38 @@ type Config struct {
 	ContainerdRunDir string
 	// ContainerdLogDir overrides per-task log file placement; defaults to
 	// ${ContainerdRunDir}/logs. SB_CONTAINERD_LOG_DIR.
-	ContainerdLogDir   string
-	AutoReconcile      bool
-	EnableCaddy        bool
-	EnableNetworkRules bool
+	ContainerdLogDir string
+	// ContainerdNativeNetnsPoolEnabled gates the CNI-backed native netns pool
+	// for containerd creates (Phase 2). Default off — dockerd path unchanged.
+	ContainerdNativeNetnsPoolEnabled bool
+	// ContainerdNetnsPoolDepth is the number of prepaid slots seeded at boot.
+	ContainerdNetnsPoolDepth int
+	// ContainerdCNIPluginDir locates CNI plugin binaries (default /opt/cni/bin).
+	ContainerdCNIPluginDir string
+	// ContainerdCNIConfPath is the bridge conflist used for ADD/DEL.
+	ContainerdCNIConfPath string
+	// ContainerdNetnsPoolRefillInterval drives native netns pool refill.
+	ContainerdNetnsPoolRefillInterval time.Duration
+	// ContainerdPoolEnabled gates the warm containerd task pool (Phase 3).
+	// SB_CONTAINERD_POOL_ENABLED.
+	ContainerdPoolEnabled bool
+	// ContainerdPoolDepth is warm slots per image key. SB_CONTAINERD_POOL_DEPTH.
+	ContainerdPoolDepth int
+	// ContainerdPoolImages is a comma-separated list of pinned warm targets.
+	// SB_CONTAINERD_POOL_IMAGES.
+	ContainerdPoolImages []string
+	// ContainerdPoolMaxImages caps miss-driven warm targets (LRU).
+	// SB_CONTAINERD_POOL_MAX_IMAGES.
+	ContainerdPoolMaxImages int
+	// ContainerdPoolIdleTTL reaps idle self-warmed targets.
+	// SB_CONTAINERD_POOL_IDLE_TTL.
+	ContainerdPoolIdleTTL time.Duration
+	// ContainerdPoolRefillInterval tops up the warm pool.
+	// SB_CONTAINERD_POOL_REFILL_INTERVAL.
+	ContainerdPoolRefillInterval time.Duration
+	AutoReconcile                bool
+	EnableCaddy                  bool
+	EnableNetworkRules           bool
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
 	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
@@ -1247,69 +1275,80 @@ func Load() (Config, error) {
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
 	cfg := Config{
-		PATToken:                         strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
-		APIHost:                          getEnv("SB_API_HOST", "0.0.0.0"),
-		APIPort:                          getEnvInt("SB_API_PORT", 21212),
-		Domain:                           normalizeHost(os.Getenv("SB_DOMAIN")),
-		PublicHost:                       normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
-		CaddyAdminURL:                    getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
-		CaddyServerID:                    getEnv("SB_CADDY_SERVER_ID", "srv0"),
-		DBPath:                           getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
-		DockerNetwork:                    getEnv("SB_DOCKER_NETWORK", "bridge"),
-		ToolboxBinaryPath:                getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
-		ToolboxMountPath:                 getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
-		ToolboxPort:                      getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
-		IdleTimeoutMinutes:               getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
-		CreateSandboxTimeoutSeconds:      getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
-		ContainerPrivileged:              getEnvBool("SB_CONTAINER_PRIVILEGED", false),
-		ResourceLimitsOff:                getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
-		Runtime:                          getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
-		ContainerEngine:                  getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
-		ContainerdSocket:                 getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
-		ContainerdNamespace:              getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
-		ContainerdRunDir:                 getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
-		ContainerdLogDir:                 strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
-		AutoReconcile:                    getEnvBool("SB_AUTO_RECONCILE", true),
-		EnableCaddy:                      getEnvBool("SB_ENABLE_CADDY", true),
-		EnableNetworkRules:               getEnvBool("SB_ENABLE_NETWORK_RULES", true),
-		NetrulesBackend:                  strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
-		EnableEventMonitor:               getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
-		EnableSSHGateway:                 getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
-		EnableServerless:                 getEnvBool("SB_ENABLE_SERVERLESS", true),
-		EnableCustomDomains:              getEnvBool("SB_ENABLE_CUSTOM_DOMAINS", false),
-		CustomDomainsMaxPerSandbox:       getEnvInt("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", models.MaxCustomDomainsPerSandbox),
-		CustomDomainVerifyPrefix:         getEnv("SB_CUSTOM_DOMAIN_VERIFY_PREFIX", "_aerol-verify"),
-		CustomDomainVerifyValuePrefix:    getEnv("SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX", "aerol-verify="),
-		TLSOnDemandBurst:                 getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
-		TLSOnDemandInterval:              getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
-		ACMEDaemonBudgetFraction:         getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
-		ACMEDaemonBudgetWindow:           getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
-		ACMEDaemonBudgetCapacity:         getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
-		InternalIngressAddr:              getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
-		InternalL4WakeAddr:               getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
-		InternalL4WakeDir:                getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
-		L4WakeMaxPendingPerSandbox:       getEnvInt("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", 256),
-		L4WakeMaxPendingGlobal:           getEnvInt("SB_L4_WAKE_MAX_PENDING_GLOBAL", 4096),
-		L4WakeMaxActivePerSandbox:        getEnvInt("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", 4096),
-		L4WakeMaxActiveGlobal:            getEnvInt("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", 65536),
-		HTTPWakeMaxBuffer:                int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
-		HTTPWakeUpstreamReadyTimeout:     getEnvDuration("SB_HTTP_WAKE_UPSTREAM_READY_TIMEOUT", 30*time.Second),
-		HTTPWakeMaxPendingPerSandbox:     getEnvInt("SB_HTTP_WAKE_MAX_PENDING_PER_SANDBOX", 256),
-		HTTPWakeMaxPendingGlobal:         getEnvInt("SB_HTTP_WAKE_MAX_PENDING_GLOBAL", 4096),
-		HTTPWakeMaxBufferBytesGlobal:     int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL", 1024*1024*1024)),
-		WakeStartConcurrency:             getEnvInt("SB_WAKE_START_CONCURRENCY", 64),
-		HTTPWakeDirectBypassEnabled:      getEnvBool("SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED", false),
-		HTTPWakeDirectRouteRetryDuration: getEnvDuration("SB_HTTP_WAKE_DIRECT_ROUTE_RETRY_DURATION", 2*time.Second),
-		CaddyCoalesceInterval:            getEnvDuration("SB_CADDY_COALESCE_INTERVAL", 250*time.Millisecond),
-		L4WakeDirectBypassEnabled:        getEnvBool("SB_L4_WAKE_DIRECT_BYPASS_ENABLED", false),
-		TLSWakeListenerCloseDelay:        getEnvDuration("SB_TLS_WAKE_LISTENER_CLOSE_DELAY", 5*time.Second),
-		SSHListenAddr:                    getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
-		SSHHostKeyPath:                   getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
-		CredentialEncryptionKey:          strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
-		CredentialEncryptionKeyPath:      getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
-		MountsRootPath:                   getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
-		MountsCredentialsRuntimeDir:      getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
-		MountWaitTimeout:                 getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
+		PATToken:                          strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
+		APIHost:                           getEnv("SB_API_HOST", "0.0.0.0"),
+		APIPort:                           getEnvInt("SB_API_PORT", 21212),
+		Domain:                            normalizeHost(os.Getenv("SB_DOMAIN")),
+		PublicHost:                        normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
+		CaddyAdminURL:                     getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
+		CaddyServerID:                     getEnv("SB_CADDY_SERVER_ID", "srv0"),
+		DBPath:                            getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
+		DockerNetwork:                     getEnv("SB_DOCKER_NETWORK", "bridge"),
+		ToolboxBinaryPath:                 getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
+		ToolboxMountPath:                  getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
+		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
+		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
+		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
+		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
+		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
+		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
+		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
+		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
+		ContainerdNativeNetnsPoolEnabled:  getEnvBool("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", false),
+		ContainerdNetnsPoolDepth:          getEnvInt("SB_CONTAINERD_NETNS_POOL_DEPTH", 4),
+		ContainerdCNIPluginDir:            getEnv("SB_CONTAINERD_CNI_PLUGIN_DIR", "/opt/cni/bin"),
+		ContainerdCNIConfPath:             getEnv("SB_CONTAINERD_CNI_CONF_PATH", "/etc/cni/net.d/aerolvm.conflist"),
+		ContainerdNetnsPoolRefillInterval: getEnvDuration("SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
+		ContainerdPoolEnabled:             getEnvBool("SB_CONTAINERD_POOL_ENABLED", false),
+		ContainerdPoolDepth:               getEnvInt("SB_CONTAINERD_POOL_DEPTH", 2),
+		ContainerdPoolImages:              parseImageGCWhitelist(getEnv("SB_CONTAINERD_POOL_IMAGES", "")),
+		ContainerdPoolMaxImages:           getEnvInt("SB_CONTAINERD_POOL_MAX_IMAGES", 8),
+		ContainerdPoolIdleTTL:             getEnvDuration("SB_CONTAINERD_POOL_IDLE_TTL", 15*time.Minute),
+		ContainerdPoolRefillInterval:      getEnvDuration("SB_CONTAINERD_POOL_REFILL_INTERVAL", 5*time.Second),
+		AutoReconcile:                     getEnvBool("SB_AUTO_RECONCILE", true),
+		EnableCaddy:                       getEnvBool("SB_ENABLE_CADDY", true),
+		EnableNetworkRules:                getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
+		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
+		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
+		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),
+		EnableCustomDomains:               getEnvBool("SB_ENABLE_CUSTOM_DOMAINS", false),
+		CustomDomainsMaxPerSandbox:        getEnvInt("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", models.MaxCustomDomainsPerSandbox),
+		CustomDomainVerifyPrefix:          getEnv("SB_CUSTOM_DOMAIN_VERIFY_PREFIX", "_aerol-verify"),
+		CustomDomainVerifyValuePrefix:     getEnv("SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX", "aerol-verify="),
+		TLSOnDemandBurst:                  getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
+		TLSOnDemandInterval:               getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
+		ACMEDaemonBudgetFraction:          getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
+		ACMEDaemonBudgetWindow:            getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
+		ACMEDaemonBudgetCapacity:          getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
+		InternalIngressAddr:               getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
+		InternalL4WakeAddr:                getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
+		InternalL4WakeDir:                 getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
+		L4WakeMaxPendingPerSandbox:        getEnvInt("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", 256),
+		L4WakeMaxPendingGlobal:            getEnvInt("SB_L4_WAKE_MAX_PENDING_GLOBAL", 4096),
+		L4WakeMaxActivePerSandbox:         getEnvInt("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", 4096),
+		L4WakeMaxActiveGlobal:             getEnvInt("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", 65536),
+		HTTPWakeMaxBuffer:                 int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
+		HTTPWakeUpstreamReadyTimeout:      getEnvDuration("SB_HTTP_WAKE_UPSTREAM_READY_TIMEOUT", 30*time.Second),
+		HTTPWakeMaxPendingPerSandbox:      getEnvInt("SB_HTTP_WAKE_MAX_PENDING_PER_SANDBOX", 256),
+		HTTPWakeMaxPendingGlobal:          getEnvInt("SB_HTTP_WAKE_MAX_PENDING_GLOBAL", 4096),
+		HTTPWakeMaxBufferBytesGlobal:      int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL", 1024*1024*1024)),
+		WakeStartConcurrency:              getEnvInt("SB_WAKE_START_CONCURRENCY", 64),
+		HTTPWakeDirectBypassEnabled:       getEnvBool("SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED", false),
+		HTTPWakeDirectRouteRetryDuration:  getEnvDuration("SB_HTTP_WAKE_DIRECT_ROUTE_RETRY_DURATION", 2*time.Second),
+		CaddyCoalesceInterval:             getEnvDuration("SB_CADDY_COALESCE_INTERVAL", 250*time.Millisecond),
+		L4WakeDirectBypassEnabled:         getEnvBool("SB_L4_WAKE_DIRECT_BYPASS_ENABLED", false),
+		TLSWakeListenerCloseDelay:         getEnvDuration("SB_TLS_WAKE_LISTENER_CLOSE_DELAY", 5*time.Second),
+		SSHListenAddr:                     getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
+		SSHHostKeyPath:                    getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
+		CredentialEncryptionKey:           strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
+		CredentialEncryptionKeyPath:       getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
+		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
+		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
+		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
 		PlatformVolumes: PlatformVolumesConfig{
 			Enabled:            getEnvBool("SB_PLATFORM_VOLUMES_ENABLED", false),
 			Backend:            strings.ToLower(strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_BACKEND", PlatformVolumesBackendS3))),
@@ -2052,6 +2091,12 @@ func (c Config) DockerReadySocketEffective() bool {
 // DockerPoolEffective is true when the warm pool should run.
 func (c Config) DockerPoolEffective() bool {
 	return c.DockerPoolEnabled && c.DockerReadySocketEnabled
+}
+
+// ContainerdPoolEffective is true when the containerd warm pool should run.
+func (c Config) ContainerdPoolEffective() bool {
+	return c.ContainerEngine == models.ContainerEngineContainerd &&
+		c.ContainerdPoolEnabled && c.DockerReadySocketEnabled
 }
 
 // DockerReadySocketDir is the host directory for per-create readiness sockets.

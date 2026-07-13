@@ -1,6 +1,9 @@
 package containerd
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +11,8 @@ import (
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/typeurl/v2"
+
+	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
 func TestNormalizeContainerdEvent(t *testing.T) {
@@ -40,6 +45,13 @@ func TestNormalizeContainerdEvent(t *testing.T) {
 			wantOK:     true,
 			wantAction: "start",
 			wantID:     "sb-2",
+		},
+		{
+			name:       "task paused maps to stop",
+			env:        mkEnvelope(t, runtime.TaskPausedEventTopic, &apievents.TaskPaused{ContainerID: "sb-pause"}),
+			wantOK:     true,
+			wantAction: "stop",
+			wantID:     "sb-pause",
 		},
 		{
 			name:       "task delete maps to destroy",
@@ -83,4 +95,107 @@ func TestNormalizeContainerdEvent(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestContainerIDFromEventBadPayload(t *testing.T) {
+	if got := containerIDFromEvent(&events.Envelope{Event: nil}); got != "" {
+		t.Fatalf("got %q", got)
+	}
+	any, err := typeurl.MarshalAny(&apievents.TaskStart{ContainerID: "sb-ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := containerIDFromEvent(&events.Envelope{Event: any}); got != "sb-ok" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestStreamEventsContextCancel(t *testing.T) {
+	tr := newFakeTransport()
+	tr.emitEvents = true
+	d := New(Config{}, nil, nil)
+	d.SetClient(NewTestClient("aerolvm", tr))
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan docker.DockerEvent, 1)
+	errCh := make(chan error, 1)
+	go func() { errCh <- d.StreamEvents(ctx, out) }()
+	select {
+	case <-out:
+		cancel()
+	case <-time.After(2 * time.Second):
+		cancel()
+	}
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected err: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("StreamEvents did not exit")
+	}
+}
+
+func TestStreamEventsSubscribeError(t *testing.T) {
+	tr := &errorSubscribeTransport{}
+	d := New(Config{}, nil, nil)
+	d.SetClient(NewTestClient("aerolvm", tr))
+	ctx := context.Background()
+	err := d.StreamEvents(ctx, make(chan docker.DockerEvent))
+	if err == nil || !strings.Contains(err.Error(), "containerd event stream") {
+		t.Fatalf("want stream error, got %v", err)
+	}
+}
+
+func TestPollToolboxHealthConnectionRefused(t *testing.T) {
+	err := pollToolboxHealth(context.Background(), "127.0.0.1", 1)
+	if err == nil {
+		t.Fatal("want connection error")
+	}
+}
+
+func TestContainerIDFromEventEmptyID(t *testing.T) {
+	any, err := typeurl.MarshalAny(&apievents.TaskStart{ContainerID: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := containerIDFromEvent(&events.Envelope{Event: any}); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestNormalizeContainerdEventEmptyID(t *testing.T) {
+	any, err := typeurl.MarshalAny(&apievents.TaskExit{ContainerID: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &events.Envelope{Topic: runtime.TaskExitEventTopic, Event: any}
+	if _, ok := normalizeContainerdEvent(env); ok {
+		t.Fatal("want false for empty container id")
+	}
+}
+
+func TestStreamEventsClosedChannel(t *testing.T) {
+	tr := &closedSubscribeTransport{}
+	d := New(Config{}, nil, nil)
+	d.SetClient(NewTestClient("aerolvm", tr))
+	err := d.StreamEvents(context.Background(), make(chan docker.DockerEvent))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type closedSubscribeTransport struct{ fakeTransport }
+
+func (closedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+	ch := make(chan *events.Envelope)
+	close(ch)
+	return ch, make(chan error)
+}
+
+type errorSubscribeTransport struct{ fakeTransport }
+
+func (errorSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+	errCh := make(chan error, 1)
+	errCh <- errors.New("subscribe failed")
+	return make(chan *events.Envelope), errCh
 }

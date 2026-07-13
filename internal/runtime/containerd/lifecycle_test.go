@@ -7,6 +7,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	cntr "github.com/containerd/containerd"
 )
 
 func TestBuildEnvIncludesToolboxContractAndUserEnv(t *testing.T) {
@@ -57,9 +58,12 @@ func TestBuildMountsIncludesToolboxAndHostFilesAndUserBinds(t *testing.T) {
 }
 
 func TestUnimplementedPhaseMethods(t *testing.T) {
-	d := New(Config{}, nil, nil)
-	if _, err := d.CreateSnapshot(t.Context(), "c", "img"); err == nil || !strings.Contains(err.Error(), "Phase 3") {
-		t.Fatalf("CreateSnapshot should report Phase 3 gap, got %v", err)
+	d := newTestDriver(t)
+	tr := newFakeTransport()
+	tr.containers["c"] = &fakeContainer{id: "c", task: &fakeTask{status: cntr.Running}}
+	d.SetClient(NewTestClient("aerolvm", tr))
+	if _, err := d.CreateSnapshot(t.Context(), "c", "img:latest"); err == nil || !strings.Contains(err.Error(), "live containerd") {
+		t.Fatalf("CreateSnapshot should require live containerd, got %v", err)
 	}
 	if err := d.Resize(t.Context(), "c", models.ResizeSandboxRequest{}); err == nil {
 		t.Fatal("Resize should report not implemented")

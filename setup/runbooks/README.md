@@ -13,6 +13,7 @@ Use them during incidents and during scheduled drills:
 | [image-pull-storm.md](image-pull-storm.md) | Image pulls are queued, failing, rate-limited, or suppressed by backoff. |
 | [firecracker-template-health.md](firecracker-template-health.md) | Firecracker template push, pull, or rebuild metrics fire. |
 | [slo-breach.md](slo-breach.md) | Any sandboxd SLO alert fires and the first response is not obvious. |
+| [containerd-engine-coexistence.md](containerd-engine-coexistence.md) | Flipping or coexisting dockerd and native containerd engines. |
 
 ## Incident Roles
 

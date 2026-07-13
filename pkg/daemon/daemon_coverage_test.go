@@ -404,7 +404,7 @@ func TestStartSnapshotPushReconciler_Enabled(t *testing.T) {
 		AutoImportClusterPATPath:      patPath,
 		SnapshotPushReconcileInterval: 5 * time.Millisecond,
 		SnapshotPushMaxInFlight:       1,
-	}, st, svc, dc)
+	}, st, svc, dc, nil)
 	time.Sleep(40 * time.Millisecond)
 }
 
@@ -423,7 +423,7 @@ func TestStartSnapshotPushReconciler_HostFallback(t *testing.T) {
 		AutoImportClusterPATPath:      filepath.Join(t.TempDir(), "pat"),
 		SnapshotPushReconcileInterval: time.Hour,
 		SnapshotPushMaxInFlight:       1,
-	}, st, svc, dc)
+	}, st, svc, dc, nil)
 }
 
 // TestStartTemplateRotationReconciler_Enabled: firecracker on with both a

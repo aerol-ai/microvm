@@ -50,6 +50,9 @@ type Deps struct {
 	// Builder is optional. When nil, POST /v1/images/build responds 503.
 	Builder ImageBuilder
 	Build   BuildConfig
+	// ContainerEngine is the host engine (docker|containerd). Used for
+	// Server-Timing engine tags and BuildKit-absent clear errors.
+	ContainerEngine string
 }
 
 // RegisterRoutes mounts every v1 route onto mux. Paths are written with the

@@ -69,3 +69,18 @@ func TestValidateRuntimeRequest(t *testing.T) {
 		t.Fatal("sentinel error identity")
 	}
 }
+
+func TestDiskGBEnforced(t *testing.T) {
+	if !DiskGBEnforced(ContainerEngineDocker, RuntimeDocker) {
+		t.Fatal("docker+runc should enforce DiskGB when StorageOpt available")
+	}
+	if DiskGBEnforced(ContainerEngineContainerd, RuntimeDocker) {
+		t.Fatal("containerd should not claim DiskGB enforcement yet")
+	}
+	if DiskGBEnforced(ContainerEngineDocker, RuntimeGvisor) {
+		t.Fatal("gvisor never enforces DiskGB")
+	}
+	if ResolveContainerEngineOrDocker("podman") != ContainerEngineDocker {
+		t.Fatal("unknown engine should fall back to docker")
+	}
+}

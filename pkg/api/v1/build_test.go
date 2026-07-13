@@ -306,6 +306,30 @@ func TestBuildImageRejectsMissingBuilder(t *testing.T) {
 	}
 }
 
+func TestBuildImageContainerdBuildKitAbsent(t *testing.T) {
+	// Phase 3 named test: buildkitd-absent → clear error, not a hang.
+	builder := &fakeImageBuilder{}
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Builder:         builder,
+		Build:           BuildConfig{},
+		Auth:            func(h http.Handler) http.Handler { return h },
+		ContainerEngine: models.ContainerEngineContainerd,
+	})
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine"})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "BuildKit") {
+		t.Fatalf("body should mention BuildKit: %s", rr.Body.String())
+	}
+	if len(builder.builds) != 0 {
+		t.Fatalf("must not invoke builder on containerd: %d builds", len(builder.builds))
+	}
+}
+
 func TestBuildImagePushesAfterBuild(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo hi"
 	builder := &fakeImageBuilder{}

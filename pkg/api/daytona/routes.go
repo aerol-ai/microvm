@@ -47,6 +47,8 @@ type Deps struct {
 	// fast-path still works (it doesn't need a builder).
 	Builder ImageBuilder
 	Build   BuildConfig
+	// ContainerEngine selects BuildKit-absent clear errors on containerd hosts.
+	ContainerEngine string
 }
 
 // RegisterRoutes mounts the supported Daytona compatibility surface.
