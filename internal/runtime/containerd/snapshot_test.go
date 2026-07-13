@@ -144,6 +144,8 @@ type fakeSnapshotBackend struct {
 	createdArg   images.Image
 	getImg       images.Image
 	getErr       error
+	unpacked     bool
+	unpackErr    error
 }
 
 func (f *fakeSnapshotBackend) loadContainer(context.Context, *Client, string) (cntr.Container, error) {
@@ -187,6 +189,10 @@ func (f *fakeSnapshotBackend) getImage(context.Context, string) (images.Image, e
 	}
 	return f.getImg, nil
 }
+func (f *fakeSnapshotBackend) unpack(context.Context, string, string) error {
+	f.unpacked = true
+	return f.unpackErr
+}
 
 // baseFixture returns a backend seeded with a base image (one config + one
 // layer) plus the new diff, so the commit can assemble a real manifest.
@@ -214,6 +220,9 @@ func TestCommitContainerSnapshotLiveFakeBackend(t *testing.T) {
 	got, err := d.commitContainerSnapshotLive(context.Background(), d.client, "sb-1", "snap:v1")
 	if err != nil {
 		t.Fatalf("err=%v", err)
+	}
+	if !backend.unpacked {
+		t.Fatal("committed snapshot image must be unpacked so it can back a new container")
 	}
 	// Returned digest must be the assembled MANIFEST, and createImage must have
 	// been handed a manifest target (not the bare diff layer).
