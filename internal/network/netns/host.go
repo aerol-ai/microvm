@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,10 +26,13 @@ type HostManager interface {
 type Host struct {
 	Runner    cni.Runner
 	NetnsRoot string
-	// mkdir is a test seam; production leaves nil (os.MkdirAll).
+	// mkdir is a test seam for the netns root dir; production leaves nil.
 	mkdir func(path string, perm os.FileMode) error
-	// unlink removes a netns path; production uses os.Remove.
-	unlink func(path string) error
+	// addNetns/delNetns create and remove a REAL named network namespace.
+	// Production leaves them nil and execs `ip netns add/del`; tests stub them
+	// so unit tests need neither `ip` nor CAP_NET_ADMIN.
+	addNetns func(ctx context.Context, name string) error
+	delNetns func(ctx context.Context, name string) error
 }
 
 func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
@@ -39,39 +43,75 @@ func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
 		return "", "", errors.New("netns host: sandbox_id is required")
 	}
 	root := h.netnsRoot()
-	path := filepath.Join(root, slot.SandboxID)
 	if err := h.ensureDir(root); err != nil {
 		return "", "", err
 	}
-	// Touch path — production linux uses `ip netns add`; tests stub via mkdir.
-	if err := h.ensureDir(path); err != nil {
-		return "", "", fmt.Errorf("netns host: create %s: %w", path, err)
+	// Create a REAL network namespace, not just a directory: the CNI plugin and
+	// the containerd shim both open this path as a netns. `ip netns add` bind-
+	// mounts a fresh netns at /run/netns/<name>; a plain mkdir'd directory makes
+	// CNI ADD fail with a bare "exit status 1" (the plugin cannot enter a dir).
+	if err := h.createNetns(ctx, slot.SandboxID); err != nil {
+		return "", "", fmt.Errorf("netns host: create netns %s: %w", slot.SandboxID, err)
 	}
+	path := filepath.Join(root, slot.SandboxID)
 	res, err := h.Runner.Add(ctx, path, slot.SandboxID)
 	if err != nil {
-		_ = h.removePath(path)
+		_ = h.deleteNetns(ctx, slot.SandboxID)
 		return "", "", fmt.Errorf("netns host: cni add: %w", err)
 	}
 	return path, res.IP4, nil
+}
+
+// createNetns creates a persistent named netns (bind-mounted at
+// /run/netns/<name>). Idempotent: an already-present netns is not an error.
+func (h *Host) createNetns(ctx context.Context, name string) error {
+	if h.addNetns != nil {
+		return h.addNetns(ctx, name)
+	}
+	out, err := exec.CommandContext(ctx, "ip", "netns", "add", name).CombinedOutput()
+	if err != nil && !strings.Contains(strings.ToLower(string(out)), "file exists") {
+		return fmt.Errorf("ip netns add: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// deleteNetns removes a named netns. Idempotent: a missing netns is not an error.
+func (h *Host) deleteNetns(ctx context.Context, name string) error {
+	if h.delNetns != nil {
+		return h.delNetns(ctx, name)
+	}
+	out, err := exec.CommandContext(ctx, "ip", "netns", "del", name).CombinedOutput()
+	if err != nil {
+		low := strings.ToLower(string(out))
+		if strings.Contains(low, "no such file") || strings.Contains(low, "cannot remove") {
+			return nil
+		}
+		return fmt.Errorf("ip netns del: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (h *Host) Remove(ctx context.Context, slot Slot) error {
 	if h == nil || h.Runner == nil {
 		return nil
 	}
+	name := strings.TrimSpace(slot.SandboxID)
 	path := strings.TrimSpace(slot.NetnsPath)
-	if path == "" && strings.TrimSpace(slot.SandboxID) != "" {
-		path = filepath.Join(h.netnsRoot(), slot.SandboxID)
+	if name == "" && path != "" {
+		name = filepath.Base(path)
+	}
+	if name == "" {
+		return nil
 	}
 	if path == "" {
-		return nil
+		path = filepath.Join(h.netnsRoot(), name)
 	}
 	// Surface the CNI DEL error rather than swallowing it: a dropped DEL leaks
 	// the veth pair and the host-local IPAM lease with no process death to free
-	// them. Conntrack flush and netns unlink are still attempted regardless.
-	delErr := h.Runner.Del(ctx, path, slot.SandboxID)
+	// them. Conntrack flush and netns teardown are still attempted regardless.
+	delErr := h.Runner.Del(ctx, path, name)
 	_ = hostnet.FlushConntrackForIP(slot.ContainerIP)
-	rmErr := h.removePath(path)
+	rmErr := h.deleteNetns(ctx, name)
 	return errors.Join(delErr, rmErr)
 }
 
@@ -87,17 +127,6 @@ func (h *Host) ensureDir(path string) error {
 		return h.mkdir(path, 0o755)
 	}
 	return os.MkdirAll(path, 0o755)
-}
-
-func (h *Host) removePath(path string) error {
-	if h.unlink != nil {
-		return h.unlink(path)
-	}
-	err := os.Remove(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
 }
 
 // Builder sequences reserve → realize → adopt with LIFO teardown on failure.
