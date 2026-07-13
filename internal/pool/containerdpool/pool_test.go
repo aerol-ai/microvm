@@ -42,3 +42,19 @@ func TestPoolAcquireMiss(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestParkReservationIDDelegates(t *testing.T) {
+	// The admitter keys parked-slot capacity reservations by this id; it must be
+	// non-empty and stable for a given slot id so the reservation can be found
+	// again to release it.
+	id := ParkReservationID("park-ctd-7")
+	if id == "" {
+		t.Fatal("ParkReservationID returned empty string")
+	}
+	if again := ParkReservationID("park-ctd-7"); again != id {
+		t.Fatalf("ParkReservationID not stable: %q != %q", id, again)
+	}
+	if ParkReservationID("park-ctd-8") == id {
+		t.Fatal("distinct slot ids must yield distinct reservation ids")
+	}
+}
