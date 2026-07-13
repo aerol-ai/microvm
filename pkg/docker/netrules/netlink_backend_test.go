@@ -12,12 +12,14 @@ import (
 )
 
 type fakeNFT struct {
-	rules    []*nftables.Rule
-	getErr   error
-	flushErr error
-	delErr   error
-	inserted []*nftables.Rule
-	deleted  []*nftables.Rule
+	rules      []*nftables.Rule
+	chains     []*nftables.Chain
+	getErr     error
+	flushErr   error
+	delErr     error
+	inserted   []*nftables.Rule
+	deleted    []*nftables.Rule
+	addedChain []*nftables.Chain
 }
 
 func (f *fakeNFT) GetRules(*nftables.Table, *nftables.Chain) ([]*nftables.Rule, error) {
@@ -53,7 +55,71 @@ func (f *fakeNFT) DelRule(r *nftables.Rule) error {
 	return nil
 }
 
+func (f *fakeNFT) ListChains() ([]*nftables.Chain, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	out := make([]*nftables.Chain, len(f.chains))
+	copy(out, f.chains)
+	return out, nil
+}
+
+func (f *fakeNFT) AddChain(c *nftables.Chain) *nftables.Chain {
+	f.addedChain = append(f.addedChain, c)
+	f.chains = append(f.chains, c)
+	return c
+}
+
 func (f *fakeNFT) Flush() error { return f.flushErr }
+
+// TestNetlinkEnsureUserChainIdempotent covers the C1 bootstrap logic offline:
+// AddChain on an absent chain, no-op when it already exists. (Live nftables
+// realization is integration-only.)
+func TestNetlinkEnsureUserChainIdempotent(t *testing.T) {
+	fake := &fakeNFT{}
+	b := testNetlinkBackend(fake)
+	if err := b.EnsureUserChain(ChainAerolvmUser); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.addedChain) != 1 {
+		t.Fatalf("chain not created on first call: added=%d", len(fake.addedChain))
+	}
+	if err := b.EnsureUserChain(ChainAerolvmUser); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.addedChain) != 1 {
+		t.Fatalf("chain must not be re-created when present: added=%d", len(fake.addedChain))
+	}
+}
+
+func TestNetlinkEnsureForwardJumpIdempotent(t *testing.T) {
+	fake := &fakeNFT{}
+	b := testNetlinkBackend(fake)
+	if err := b.EnsureForwardJump(ChainAerolvmUser); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inserted) != 1 {
+		t.Fatalf("jump not inserted on first call: %d", len(fake.inserted))
+	}
+	// InsertRule mirrors the jump into f.rules, so the second call sees it.
+	if err := b.EnsureForwardJump(ChainAerolvmUser); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inserted) != 1 {
+		t.Fatalf("jump must not be duplicated: %d", len(fake.inserted))
+	}
+	found := false
+	for _, r := range fake.inserted {
+		for _, e := range r.Exprs {
+			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictJump && v.Chain == ChainAerolvmUser {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("inserted FORWARD rule is not a jump to the user chain")
+	}
+}
 
 // testNetlinkBackend wires a backend whose per-op connection factory always
 // hands back the same fake, so tests can assert on its recorded calls.

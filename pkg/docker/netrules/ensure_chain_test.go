@@ -113,3 +113,51 @@ func TestEnsureChainPropagatesBootstrapErrors(t *testing.T) {
 		t.Fatal("want jump error")
 	}
 }
+
+// ruleOnlyBackend implements RuleBackend but NOT bootstrapBackend — modeling a
+// backend that can insert per-IP rules but cannot create the user chain or its
+// FORWARD jump.
+type ruleOnlyBackend struct{}
+
+func (ruleOnlyBackend) Exists(string, string, ...string) (bool, error) { return false, nil }
+func (ruleOnlyBackend) Insert(string, string, int, ...string) error    { return nil }
+func (ruleOnlyBackend) Delete(string, string, ...string) error         { return nil }
+
+// TestEnsureChainFailsLoudOnNonBootstrapBackend is the regression for the
+// silent-latch trap: a backend that cannot bootstrap must make EnsureChain
+// return an error and NOT latch success (which would leave every per-IP egress
+// rule ineffective while reporting the chain "ready").
+func TestEnsureChainFailsLoudOnNonBootstrapBackend(t *testing.T) {
+	mgr := &Manager{enabled: true, ipt: ruleOnlyBackend{}, userChain: ChainAerolvmUser}
+	if err := mgr.EnsureChain(); err == nil {
+		t.Fatal("want error: non-bootstrap backend must not silently succeed")
+	}
+	if mgr.chainReady.Load() {
+		t.Fatal("must not latch success when the chain was never created")
+	}
+}
+
+// TestReassertChainReappliesJump proves re-assertion re-creates the chain and
+// jump after they are dropped (simulating a dockerd restart that flushed
+// FORWARD), without relying on the one-shot latch.
+func TestReassertChainReappliesJump(t *testing.T) {
+	be := &memBackend{}
+	mgr := &Manager{enabled: true, ipt: be, userChain: ChainAerolvmUser}
+	if err := mgr.EnsureChain(); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate dockerd flushing FORWARD + our chain.
+	be.reset()
+	if be.hasChain(ChainAerolvmUser) {
+		t.Fatal("precondition: chain should be gone after reset")
+	}
+	if err := mgr.ReassertChain(); err != nil {
+		t.Fatalf("ReassertChain: %v", err)
+	}
+	if !be.hasChain(ChainAerolvmUser) {
+		t.Fatal("ReassertChain must recreate the chain even after the latch is set")
+	}
+	if got := be.countMatching("|FORWARD|-j|" + ChainAerolvmUser); got != 1 {
+		t.Fatalf("forward jump not re-asserted: %d", got)
+	}
+}

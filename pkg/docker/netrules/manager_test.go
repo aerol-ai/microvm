@@ -266,6 +266,15 @@ func (m *memBackend) hasChain(chain string) bool {
 	return m.chains != nil && m.chains[chain]
 }
 
+// reset clears all rules and chains, modeling a dockerd restart that flushes
+// FORWARD and drops our chain/jump.
+func (m *memBackend) reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rules = nil
+	m.chains = nil
+}
+
 type errNoMatch struct{}
 
 func (errNoMatch) Error() string { return "No chain/target/match by that name." }

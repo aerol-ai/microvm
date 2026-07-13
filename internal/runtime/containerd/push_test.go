@@ -57,3 +57,33 @@ func TestRegistryPusherValidation(t *testing.T) {
 		t.Fatal("want nil pusher error")
 	}
 }
+
+func TestPushCredScopeHost(t *testing.T) {
+	cases := []struct {
+		name       string
+		dest       string
+		authServer string
+		want       string
+		wantErr    bool
+	}{
+		{"dest carries host", "aocr.example.com/repo/img:tag", "", "aocr.example.com", false},
+		{"dest host beats auth server", "aocr.example.com/r/i:t", "other.example.com", "aocr.example.com", false},
+		{"hostless ref falls back to auth server", "myrepo/img", "aocr.example.com", "aocr.example.com", false},
+		{"localhost with port", "localhost:5000/img", "", "localhost:5000", false},
+		{"no host anywhere refuses", "myrepo/img", "", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := pushCredScopeHost(tc.dest, tc.authServer)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("want error refusing to broadcast credentials")
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("pushCredScopeHost(%q,%q) = (%q,%v), want %q", tc.dest, tc.authServer, got, err, tc.want)
+			}
+		})
+	}
+}
