@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/leases"
@@ -15,6 +16,13 @@ import (
 const (
 	imageLeaseLabelKey = "aerolvm.image_lease"
 	leaseContentType   = "content"
+	// leaseExpiry is a GC backstop: the driver releases image leases explicitly
+	// on every success (Destroy) and failure path, but a daemon crash between
+	// pinning and NewContainer leaves an orphan with no defer to run and no
+	// lease reconciler. An expiration lets containerd GC reclaim such orphans.
+	// It never threatens a live sandbox: once NewContainer returns, the
+	// container's own snapshot pins the layers independently of this lease.
+	leaseExpiry = 24 * time.Hour
 )
 
 // leaseManager is the containerd leases.Manager surface pin/release need.
@@ -53,7 +61,7 @@ func (d *Driver) pinImageLease(ctx context.Context, client *Client, image cntr.I
 	if err != nil {
 		return "", err
 	}
-	lease, err := ls.Create(ctx, leases.WithID(leaseID))
+	lease, err := ls.Create(ctx, leases.WithID(leaseID), leases.WithExpiration(leaseExpiry))
 	if err != nil {
 		return "", fmt.Errorf("create image lease: %w", err)
 	}

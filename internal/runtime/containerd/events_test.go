@@ -47,11 +47,20 @@ func TestNormalizeContainerdEvent(t *testing.T) {
 			wantID:     "sb-2",
 		},
 		{
-			name:       "task paused maps to stop",
-			env:        mkEnvelope(t, runtime.TaskPausedEventTopic, &apievents.TaskPaused{ContainerID: "sb-pause"}),
-			wantOK:     true,
-			wantAction: "stop",
-			wantID:     "sb-pause",
+			// Regression: TaskPaused must be IGNORED, not mapped to "stop". The
+			// service consumer folds "stop" into markSandboxStopped (route +
+			// netrules + admitter teardown); mapping pause→stop made an internal
+			// CreateSnapshot pause tear the live sandbox down, and TaskResumed
+			// (below, also ignored) never restored it. Docker's pause/unpause are
+			// ignored by the consumer too — this is the parity fix.
+			name:   "task paused is ignored (snapshot pause must not stop the sandbox)",
+			env:    mkEnvelope(t, runtime.TaskPausedEventTopic, &apievents.TaskPaused{ContainerID: "sb-pause"}),
+			wantOK: false,
+		},
+		{
+			name:   "task resumed is ignored",
+			env:    mkEnvelope(t, runtime.TaskResumedEventTopic, &apievents.TaskResumed{ContainerID: "sb-resume"}),
+			wantOK: false,
 		},
 		{
 			name:       "task delete maps to destroy",

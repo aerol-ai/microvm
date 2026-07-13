@@ -12,7 +12,6 @@ import (
 	"time"
 
 	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/remotes/docker"
@@ -89,36 +88,49 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	committed := false
-	// createdContainer gates host-side teardown: a caller that loses the
-	// concurrent-duplicate race (AlreadyExists at NewContainer) must NOT run
-	// LIFO teardown, because the host files and ready socket are keyed by
-	// sandboxID and belong to the winner — removing them would yank the bind
-	// mounts out from under the live winning container.
-	createdContainer := false
+	// lostRace is set only when NewContainer returns AlreadyExists — i.e. this
+	// call lost a concurrent-duplicate/retry race to a winner that already owns
+	// the container. The winner owns the shared, sandboxID-keyed artifacts (host
+	// files, ready socket, netns slot, image lease), so the loser must NOT tear
+	// any of them down. A genuine solo failure (lostRace stays false) DOES clean
+	// up its own artifacts — leaning on boot reconcile for routine cleanup is the
+	// pr-review §4 anti-pattern. (The prior gate keyed teardown on
+	// createdContainer, which wrongly leaked host files / ready socket / netns
+	// slot / lease on any failure BEFORE NewContainer.)
+	lostRace := false
 	var (
 		container cntr.Container
 		task      cntr.Task
 		logPath   string
 		logCloser func()
 		hostFiles *sandboxHostFiles
+		leaseID   string
 	)
 	defer func() {
-		if committed || !createdContainer {
-			if logCloser != nil {
-				logCloser()
-			}
-			return
-		}
 		if logCloser != nil {
 			logCloser()
+		}
+		if committed || lostRace {
+			return
 		}
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
 	}()
 	defer func() {
-		if committed || !netnsProvisioned || d.netns == nil {
+		if committed || lostRace || !netnsProvisioned || d.netns == nil {
 			return
 		}
 		_ = d.netns.Release(ctx, sandboxID)
+	}()
+	defer func() {
+		// The image lease is created (with a random id) before NewContainer; on
+		// success it rides on the container labels and Destroy releases it. On any
+		// non-committed exit — including the AlreadyExists loser, whose lease id
+		// differs from the winner's — it is an orphan this call must delete, or GC
+		// can never reclaim the pinned layers.
+		if committed || leaseID == "" {
+			return
+		}
+		d.releaseImageLease(ctx, client, map[string]string{imageLeaseLabelKey: leaseID})
 	}()
 
 	imageStart := time.Now()
@@ -150,10 +162,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			_ = readyListener.Close()
 		}
 		// Only reap the ready socket when this call owns it: on success we keep
-		// it, and on the AlreadyExists loser path (!createdContainer) it belongs
-		// to the winner — RemoveReadySocketsForSandbox is keyed by sandboxID and
-		// would nuke the winner's socket too.
-		if readySocketCreated && !keepReadySocket && createdContainer {
+		// it, and on the AlreadyExists loser path (lostRace) it belongs to the
+		// winner — RemoveReadySocketsForSandbox is keyed by sandboxID and would
+		// nuke the winner's socket too. A genuine solo failure still reaps.
+		if readySocketCreated && !keepReadySocket && !lostRace {
 			dockerpkg.RemoveReadySocketsForSandbox(d.cfg.ReadyDir, sandboxID)
 		}
 	}()
@@ -196,9 +208,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		managedLabelKey:   "true",
 		sandboxIDLabelKey: sandboxID,
 	}
-	if leaseID, err := d.pinImageLease(ctx, client, image); err != nil {
+	leaseID, err = d.pinImageLease(ctx, client, image)
+	if err != nil {
 		return nil, err
-	} else if leaseID != "" {
+	}
+	if leaseID != "" {
 		containerLabels[imageLeaseLabelKey] = leaseID
 	}
 
@@ -222,11 +236,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	container, err = client.NewContainer(ctx, sandboxID, containerOpts...)
 	if err != nil {
 		if errdefs.IsAlreadyExists(err) {
+			lostRace = true
 			return nil, fmt.Errorf("%w: sandbox container already exists", dockerpkg.ErrSandboxContainerExists)
 		}
 		return nil, fmt.Errorf("create container: %w", err)
 	}
-	createdContainer = true
 
 	logPath, err = d.taskLogPath(sandboxID)
 	if err != nil {
@@ -302,7 +316,15 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	if err != nil {
 		return nil, err
 	}
-	logIO := cio.LogFile(logPath)
+	// Use the size-capped writer, not cio.LogFile: containerd never rotates task
+	// IO, so an uncapped resume log grows for the life of the task and can fill
+	// the host disk — the exact hazard Create's taskLogIO guards against. Closed
+	// on return, mirroring Create's logCloser handling.
+	logIO, closeLog, err := taskLogIO(logPath)
+	if err != nil {
+		return nil, err
+	}
+	defer closeLog()
 	task, err = container.NewTask(ctx, logIO)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)

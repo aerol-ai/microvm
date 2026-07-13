@@ -70,8 +70,6 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 	switch ev.Topic {
 	case runtime.TaskStartEventTopic:
 		action = "start"
-	case runtime.TaskPausedEventTopic:
-		action = "stop"
 	case runtime.TaskExitEventTopic:
 		action = "die"
 	case runtime.TaskOOMEventTopic:
@@ -79,6 +77,12 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 	case runtime.TaskDeleteEventTopic:
 		action = "destroy"
 	default:
+		// TaskPaused/TaskResumed are deliberately NOT mapped. The service
+		// consumer folds "stop" into markSandboxStopped (route + netrules +
+		// admitter teardown), so mapping TaskPaused→"stop" made an internal
+		// CreateSnapshot pause tear the live sandbox down — and TaskResumed,
+		// unmapped, never restored it. Docker's pause/unpause are likewise
+		// ignored by the consumer; parity requires the same here.
 		return docker.DockerEvent{}, false
 	}
 	id, exitCode := containerIDAndExitFromEvent(ev)
