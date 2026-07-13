@@ -71,6 +71,10 @@ sandboxd_auto_import_cluster_pat_path: "{{ sandboxd_secrets_dir }}/cluster-pat"
 sandboxd_ssh_host_key_path: /var/lib/sandboxd/ssh_host_ed25519_key
 sandboxd_ssh_host_key_src: ""
 
+# CNI plugins for SB_CONTAINER_ENGINE=containerd (plans/containerd-engine.md
+# Phase 5). Mirrors scripts/install.sh install_cni_plugins version pin.
+sandboxd_cni_plugins_version: "v1.5.1"
+
 # Optional Vault/SOPS workflow: deliver the secret from a file on the control
 # node instead of inlining it in config/secrets.yml. If a *_src path is set
 # AND the matching aocr.* key in config/secrets.yml is non-empty, the

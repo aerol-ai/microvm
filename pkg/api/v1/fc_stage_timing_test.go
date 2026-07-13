@@ -8,6 +8,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TestSetCreateServerTiming_FirecrackerStages is the Phase 0 regression
@@ -25,7 +26,7 @@ func TestSetCreateServerTiming_FirecrackerStages(t *testing.T) {
 		timing.RecordStage("fc_driver", 3120*time.Millisecond)
 
 		rr := httptest.NewRecorder()
-		setCreateServerTiming(rr, time.Now(), timing)
+		setCreateServerTiming(rr, time.Now(), timing, "")
 		st := rr.Header().Get("Server-Timing")
 
 		for _, want := range []string{
@@ -49,7 +50,7 @@ func TestSetCreateServerTiming_FirecrackerStages(t *testing.T) {
 	t.Run("absent_stages_omitted", func(t *testing.T) {
 		_, timing := docker.WithCreateTiming(t.Context())
 		rr := httptest.NewRecorder()
-		setCreateServerTiming(rr, time.Now(), timing)
+		setCreateServerTiming(rr, time.Now(), timing, "")
 		st := rr.Header().Get("Server-Timing")
 		if strings.Contains(st, "fc_") {
 			t.Fatalf("Server-Timing = %q, must carry no fc_ entries when none recorded", st)
@@ -65,7 +66,7 @@ func TestSetCreateServerTiming_FirecrackerStages(t *testing.T) {
 		timing.RecordStage("fc_driver", 300*time.Millisecond)
 
 		rr := httptest.NewRecorder()
-		setCreateServerTiming(rr, time.Now(), timing)
+		setCreateServerTiming(rr, time.Now(), timing, "")
 		st := rr.Header().Get("Server-Timing")
 		for _, want := range []string{
 			"runtime_wait;dur=120.0",
@@ -81,9 +82,18 @@ func TestSetCreateServerTiming_FirecrackerStages(t *testing.T) {
 
 	t.Run("nil_recorder_still_writes_create", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		setCreateServerTiming(rr, time.Now(), nil)
+		setCreateServerTiming(rr, time.Now(), nil, "")
 		if st := rr.Header().Get("Server-Timing"); !strings.HasPrefix(st, "create;dur=") {
 			t.Fatalf("Server-Timing = %q, want create;dur= with nil recorder", st)
+		}
+	})
+
+	t.Run("engine_tag_rendered", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		setCreateServerTiming(rr, time.Now(), nil, models.ContainerEngineContainerd)
+		st := rr.Header().Get("Server-Timing")
+		if !strings.Contains(st, "engine;desc=containerd") {
+			t.Fatalf("Server-Timing = %q, want engine tag", st)
 		}
 	})
 }

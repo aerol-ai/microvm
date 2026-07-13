@@ -158,6 +158,10 @@ type Snapshot struct {
 	// doesn't have, say, runsc installed. Empty = legacy node, treated as
 	// supporting any runtime so rolling upgrades don't strand pre-D peers.
 	SupportedRuntimes []string `json:"supported_runtimes,omitempty"`
+	// ContainerEngine is an observability tag (docker|containerd) so benches
+	// and canary nodes compare engines like-for-like. Deliberately NOT a
+	// placement attribute — see plans/containerd-engine.md §2 D18.
+	ContainerEngine string `json:"container_engine,omitempty"`
 	// LocalTemplateInventoryKnown distinguishes an authoritative empty
 	// Firecracker template inventory from a legacy/unknown peer. When
 	// false, placement treats LocalTemplateIDs as "unknown, allow" for

@@ -17,22 +17,42 @@ const (
 	leaseContentType   = "content"
 )
 
+// leaseManager is the containerd leases.Manager surface pin/release need.
+// Tests inject a fake so the lease path is covered offline.
+type leaseManager interface {
+	Create(context.Context, ...leases.Opt) (leases.Lease, error)
+	Delete(context.Context, leases.Lease, ...leases.DeleteOpt) error
+	AddResource(context.Context, leases.Lease, leases.Resource) error
+}
+
+// leasesServiceFn resolves the lease manager. Production uses client.Raw();
+// tests override.
+var leasesServiceFn = func(client *Client) leaseManager {
+	if client == nil {
+		return nil
+	}
+	raw := client.Raw()
+	if raw == nil {
+		return nil
+	}
+	return raw.LeasesService()
+}
+
 // pinImageLease creates a containerd lease pinning image content so GC cannot
-// reap layers mid-create (Phase 3). No-op when the client has no live backend.
+// reap layers mid-create (Phase 3). No-op when the client has no lease service.
 func (d *Driver) pinImageLease(ctx context.Context, client *Client, image cntr.Image) (string, error) {
 	_ = d
 	if client == nil || image == nil {
 		return "", nil
 	}
-	raw := client.Raw()
-	if raw == nil {
+	ls := leasesServiceFn(client)
+	if ls == nil {
 		return "", nil
 	}
 	leaseID, err := randomLeaseID("aerolvm-img-")
 	if err != nil {
 		return "", err
 	}
-	ls := raw.LeasesService()
 	lease, err := ls.Create(ctx, leases.WithID(leaseID))
 	if err != nil {
 		return "", fmt.Errorf("create image lease: %w", err)
@@ -57,11 +77,11 @@ func (d *Driver) releaseImageLease(ctx context.Context, client *Client, labels m
 	if leaseID == "" {
 		return
 	}
-	raw := client.Raw()
-	if raw == nil {
+	ls := leasesServiceFn(client)
+	if ls == nil {
 		return
 	}
-	_ = raw.LeasesService().Delete(ctx, leases.Lease{ID: leaseID})
+	_ = ls.Delete(ctx, leases.Lease{ID: leaseID})
 }
 
 func randomLeaseID(prefix string) (string, error) {

@@ -23,6 +23,7 @@ WITH_GVISOR="false"
 RUNSC_PATH=""
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
+WITH_CONTAINERD_ENGINE="false"
 LOCAL_MODE="false"
 NODE_NAME=""
 
@@ -97,6 +98,12 @@ Options:
                                release bucket (verified by SHA-512) if it
                                isn't already on PATH. Restarts Docker if
                                daemon.json actually changed.
+  --with-containerd-engine     Opt into SB_CONTAINER_ENGINE=containerd
+                               (dark default remains docker). Installs CNI
+                               bridge + host-local plugins under /opt/cni/bin
+                               and writes SB_CONTAINER_ENGINE=containerd into
+                               sandboxd.env. Requires a system containerd
+                               socket (usually /run/containerd/containerd.sock).
   --runsc-path <path>          Absolute path to a pre-installed runsc binary.
                                Skips the download step and registers this
                                binary instead. Only consulted with
@@ -351,6 +358,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--with-gvisor)
 			WITH_GVISOR="true"
+			shift
+			;;
+		--with-containerd-engine)
+			WITH_CONTAINERD_ENGINE="true"
 			shift
 			;;
 		--runsc-path)
@@ -787,6 +798,18 @@ EOF
 	if [[ "$WITH_GVISOR" == "true" ]]; then
 		echo "SB_HOST_RUNTIMES=docker,gvisor" >> /etc/sandboxd/sandboxd.env
 	fi
+	# Containerd engine is opt-in and dark by default (plans/containerd-engine.md).
+	# Flipping SB_CONTAINER_ENGINE here does not remove dockerd; coexistence is
+	# intentional during migration (engine column keeps old sandboxes driveable).
+	if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
+		cat >> /etc/sandboxd/sandboxd.env <<'EOF'
+SB_CONTAINER_ENGINE=containerd
+SB_CONTAINERD_SOCKET=/run/containerd/containerd.sock
+SB_CONTAINERD_NAMESPACE=aerolvm
+SB_CONTAINERD_CNI_PLUGIN_DIR=/opt/cni/bin
+SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true
+EOF
+	fi
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
 
@@ -1187,6 +1210,42 @@ install_runsc_binary() {
 	echo "Installed runsc to /usr/local/bin/runsc"
 }
 
+install_cni_plugins() {
+	# CNI bridge + host-local are required for containerd native netns
+	# (plans/containerd-engine.md §4 / Phase 5). Install under /opt/cni/bin.
+	local arch
+	case "$(uname -m)" in
+		x86_64|amd64)   arch="amd64" ;;
+		aarch64|arm64)  arch="arm64" ;;
+		*)
+			echo "--with-containerd-engine: unsupported architecture $(uname -m) for CNI plugins" >&2
+			exit 1
+			;;
+	esac
+
+	local ver="v1.5.1"
+	local url="https://github.com/containernetworking/plugins/releases/download/${ver}/cni-plugins-linux-${arch}-${ver}.tgz"
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064
+	trap "rm -rf '$tmp_dir'" RETURN
+
+	echo "Downloading CNI plugins ${ver} (${arch}) from ${url}"
+	if ! curl_download "$url" -o "${tmp_dir}/cni.tgz"; then
+		echo "--with-containerd-engine: failed to download CNI plugins from ${url}" >&2
+		exit 1
+	fi
+	mkdir -p /opt/cni/bin
+	tar -xzf "${tmp_dir}/cni.tgz" -C /opt/cni/bin
+	for plugin in bridge host-local loopback; do
+		if [[ ! -x "/opt/cni/bin/${plugin}" ]]; then
+			echo "--with-containerd-engine: expected /opt/cni/bin/${plugin} after extract" >&2
+			exit 1
+		fi
+	done
+	echo "Installed CNI plugins to /opt/cni/bin (bridge, host-local, loopback)"
+}
+
 register_gvisor_runtime() {
 	# Idempotently register gVisor's runsc as an alternative OCI runtime in
 	# /etc/docker/daemon.json. If runsc isn't already present we download and
@@ -1421,6 +1480,9 @@ fi
 install_packages
 if [[ "$WITH_GVISOR" == "true" ]]; then
 	register_gvisor_runtime
+fi
+if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
+	install_cni_plugins
 fi
 if [[ "$WITH_NVIDIA_GPU" == "true" ]]; then
 	install_nvidia_gpu

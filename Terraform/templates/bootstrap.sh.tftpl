@@ -633,6 +633,15 @@ SB_DOCKER_NETNS_POOL_ENABLED=${docker_netns_pool_cfg.enabled}
 SB_DOCKER_NETNS_POOL_DEPTH=${docker_netns_pool_cfg.depth}
 SB_DOCKER_NETNS_POOL_PAUSE_IMAGE=${docker_netns_pool_cfg.pause_image}
 SB_DOCKER_NETNS_POOL_REFILL_INTERVAL=${docker_netns_pool_cfg.refill_interval}
+
+# Managed by Terraform bootstrap: container engine (plans/containerd-engine.md).
+# Default docker. containerd requires CNI plugins under cni_plugin_dir
+# (install via Ansible configure-ops or install.sh --with-containerd-engine).
+SB_CONTAINER_ENGINE=${container_engine}
+SB_CONTAINERD_SOCKET=${containerd_cfg.socket}
+SB_CONTAINERD_NAMESPACE=${containerd_cfg.namespace}
+SB_CONTAINERD_CNI_PLUGIN_DIR=${containerd_cfg.cni_plugin_dir}
+SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabled}
 EOF
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null

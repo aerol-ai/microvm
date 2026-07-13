@@ -17,6 +17,60 @@ import (
 // snapshotCommitFn is the production snapshot commit seam; tests override it.
 var snapshotCommitFn = (*Driver).commitContainerSnapshotLive
 
+// testSnapshotBackend, when non-nil, replaces live containerd snapshot services.
+var testSnapshotBackend snapshotBackend
+
+// snapshotBackend is the live containerd surface CreateSnapshot needs.
+type snapshotBackend interface {
+	loadContainer(ctx context.Context, client *Client, containerRef string) (cntr.Container, error)
+	createDiff(ctx context.Context, snapshotKey, snapshotter string, container cntr.Container) (ocispec.Descriptor, error)
+	createImage(ctx context.Context, img images.Image) (images.Image, error)
+	getImage(ctx context.Context, name string) (images.Image, error)
+}
+
+type rawSnapshotBackend struct {
+	d      *Driver
+	client *Client
+}
+
+func (b *rawSnapshotBackend) loadContainer(ctx context.Context, _ *Client, containerRef string) (cntr.Container, error) {
+	return b.d.loadContainerForRef(ctx, b.client, containerRef)
+}
+
+func (b *rawSnapshotBackend) createDiff(ctx context.Context, snapshotKey, snapshotter string, _ cntr.Container) (ocispec.Descriptor, error) {
+	raw := b.client.Raw()
+	if raw == nil {
+		return ocispec.Descriptor{}, errors.New("snapshot diff requires live containerd")
+	}
+	return rootfs.CreateDiff(ctx, snapshotKey, raw.SnapshotService(snapshotter), raw.DiffService())
+}
+
+func (b *rawSnapshotBackend) createImage(ctx context.Context, img images.Image) (images.Image, error) {
+	raw := b.client.Raw()
+	if raw == nil {
+		return images.Image{}, errors.New("snapshot image create requires live containerd")
+	}
+	return raw.ImageService().Create(ctx, img)
+}
+
+func (b *rawSnapshotBackend) getImage(ctx context.Context, name string) (images.Image, error) {
+	raw := b.client.Raw()
+	if raw == nil {
+		return images.Image{}, errors.New("snapshot image get requires live containerd")
+	}
+	return raw.ImageService().Get(ctx, name)
+}
+
+func resolveSnapshotBackend(d *Driver, client *Client) snapshotBackend {
+	if testSnapshotBackend != nil {
+		return testSnapshotBackend
+	}
+	if client == nil || client.Raw() == nil {
+		return nil
+	}
+	return &rawSnapshotBackend{d: d, client: client}
+}
+
 // CreateSnapshot commits a running task filesystem into a new image in the
 // aerolvm namespace (plans/containerd-engine.md Phase 3).
 func (d *Driver) CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error) {
@@ -68,11 +122,11 @@ func splitSnapshotImageRef(imageRef string) (repo, tag string, err error) {
 }
 
 func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client, containerRef, imageRef string) (string, error) {
-	raw := client.Raw()
-	if raw == nil {
+	backend := resolveSnapshotBackend(d, client)
+	if backend == nil {
 		return "", errors.New("containerd snapshot commit requires live containerd")
 	}
-	container, err := d.loadContainerForRef(ctx, client, containerRef)
+	container, err := backend.loadContainer(ctx, client, containerRef)
 	if err != nil {
 		return "", err
 	}
@@ -100,8 +154,7 @@ func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client
 	if info.SnapshotKey == "" || info.Snapshotter == "" {
 		return "", errors.New("snapshot container has no rootfs snapshot")
 	}
-	ss := raw.SnapshotService(info.Snapshotter)
-	desc, err := rootfs.CreateDiff(ctx, info.SnapshotKey, ss, raw.DiffService())
+	desc, err := backend.createDiff(ctx, info.SnapshotKey, info.Snapshotter, container)
 	if err != nil {
 		return "", fmt.Errorf("snapshot diff: %w", err)
 	}
@@ -113,10 +166,10 @@ func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client
 			"containerd.io/gc.root": now.Format(time.RFC3339Nano),
 		},
 	}
-	created, err := raw.ImageService().Create(ctx, img)
+	created, err := backend.createImage(ctx, img)
 	if err != nil {
 		if errdefs.IsAlreadyExists(err) {
-			existing, getErr := raw.ImageService().Get(ctx, imageRef)
+			existing, getErr := backend.getImage(ctx, imageRef)
 			if getErr != nil {
 				return "", fmt.Errorf("snapshot image exists: %w", err)
 			}

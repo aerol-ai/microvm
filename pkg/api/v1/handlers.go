@@ -35,9 +35,12 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, h.deps.Service.Capacity())
 }
 
-func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docker.CreateTiming) {
+func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docker.CreateTiming, containerEngine string) {
 	parts := []string{
 		"create;dur=" + strconv.FormatFloat(float64(time.Since(start).Microseconds())/1000, 'f', 1, 64),
+	}
+	if engine := strings.TrimSpace(containerEngine); engine != "" {
+		parts = append(parts, "engine;desc="+engine)
 	}
 	if timing != nil {
 		if timing.RuntimeWaitMS > 0 || timing.Source != "" {
@@ -76,7 +79,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	createStart := time.Now()
 	ctx, createTiming := docker.WithCreateTiming(r.Context())
 	response, err := h.deps.Service.CreateSandbox(ctx, req)
-	setCreateServerTiming(w, createStart, createTiming)
+	setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			apihttp.WriteError(w, http.StatusGatewayTimeout, "sandbox create exceeded timeout")

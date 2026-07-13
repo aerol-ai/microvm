@@ -18,6 +18,7 @@ import (
 
 // TestContainerdPhase0CreateSpike runs a CreateSandbox-equivalent cold create
 // against live containerd (plans/containerd-engine.md Phase 0(b)).
+// Record measured elapsed in plans/containerd-engine-phase0-decisions.md (0b).
 //
 // Operator-run only — skipped unless AEROL_CONTAINERD_SPIKE=1 and the socket
 // exists. Example:

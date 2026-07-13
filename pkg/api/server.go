@@ -26,13 +26,14 @@ import (
 )
 
 type Server struct {
-	logger    *slog.Logger
-	service   *service.Service
-	builder   *docker.Client
-	build     daytona.BuildConfig
-	patToken  string
-	validator controlplane.Validator
-	mux       *http.ServeMux
+	logger          *slog.Logger
+	service         *service.Service
+	builder         *docker.Client
+	build           daytona.BuildConfig
+	containerEngine string
+	patToken        string
+	validator       controlplane.Validator
+	mux             *http.ServeMux
 }
 
 // NewServer constructs the API server. validator is the second-token (non-PAT)
@@ -44,13 +45,14 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		validator = controlplane.Noop().Validator
 	}
 	s := &Server{
-		logger:    logger,
-		service:   service,
-		builder:   dockerClient,
-		build:     daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
-		patToken:  patToken,
-		validator: validator,
-		mux:       http.NewServeMux(),
+		logger:          logger,
+		service:         service,
+		builder:         dockerClient,
+		build:           daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
+		containerEngine: cfg.ContainerEngine,
+		patToken:        patToken,
+		validator:       validator,
+		mux:             http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -68,11 +70,12 @@ func (s *Server) routes() {
 	// Each registered version owns its own URL prefix and is responsible for
 	// every route under it. Auth is shared across versions via Deps.Auth.
 	daytona.RegisterRoutes(s.mux, daytona.Deps{
-		Service: s.service,
-		Logger:  s.logger,
-		Auth:    s.requireAuth,
-		Builder: s.builder,
-		Build:   s.build,
+		Service:         s.service,
+		Logger:          s.logger,
+		Auth:            s.requireAuth,
+		Builder:         s.builder,
+		Build:           s.build,
+		ContainerEngine: s.containerEngine,
 	})
 
 	e2b.RegisterRoutes(s.mux, e2b.Deps{
@@ -82,11 +85,12 @@ func (s *Server) routes() {
 	})
 
 	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
-		Service: s.service,
-		Logger:  s.logger,
-		Auth:    s.requireAuth,
-		Builder: s.builder,
-		Build:   apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
+		Service:         s.service,
+		Logger:          s.logger,
+		Auth:            s.requireAuth,
+		Builder:         s.builder,
+		Build:           apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
+		ContainerEngine: s.containerEngine,
 	})
 
 	// Operator dashboard + expvar. /ui is unauth (static HTML; PAT prompted

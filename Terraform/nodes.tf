@@ -180,6 +180,8 @@ resource "aws_instance" "seed" {
     wasm_cfg               = local.wasm_cfg
     docker_pool_cfg        = local.docker_pool_cfg
     docker_netns_pool_cfg  = local.docker_netns_pool_cfg
+    container_engine       = local.container_engine
+    containerd_cfg         = local.containerd_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
   }))
 
@@ -361,6 +363,8 @@ resource "aws_instance" "joiner" {
     wasm_cfg               = local.wasm_cfg
     docker_pool_cfg        = local.docker_pool_cfg
     docker_netns_pool_cfg  = local.docker_netns_pool_cfg
+    container_engine       = local.container_engine
+    containerd_cfg         = local.containerd_cfg
     platform_volumes_cfg   = local.platform_volumes_cfg
   }))
 

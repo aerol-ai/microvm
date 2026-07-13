@@ -193,6 +193,10 @@ func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "dockerfile_content is required")
 		return
 	}
+	if h.deps.ContainerEngine == models.ContainerEngineContainerd {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, models.ErrBuildKitUnavailable.Error())
+		return
+	}
 	if h.deps.Builder == nil {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "image builder is not configured on this daemon")
 		return

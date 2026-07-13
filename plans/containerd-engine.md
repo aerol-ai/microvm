@@ -1,12 +1,21 @@
 # containerd engine: dropping the dockerd tax (cold 274ms → ~110ms, warm 43ms → ~20ms)
 
-Status: **proposed (not started)** (written 2026-07-11; revised 2026-07-12
-after eng review — 9 review findings + 5 cross-model findings folded, §4
-rebased on CNI, one store change admitted; see the GSTACK REVIEW REPORT at
-the end). Companion to `plans/warm-create-latency-tier1.md` (which stays
-fully valid — every Tier 1 phase applies under either engine) and
-successor-in-spirit to `plans/docker-warm-pool.md` §10's "containerd work
-out of scope" note. This plan brings it in scope, with measured justification.
+Status: **in progress (Phases 1–4 landed dark behind `SB_CONTAINER_ENGINE=docker`;
+Phase 5 ops in flight)** —
+Phase 1 core driver + seams shipped (#311); Phases 2–4 networking / warm pool /
+gVisor seam in #325. `internal/runtime/containerd` coverage at the ~85% bar.
+Phase 5: `install.sh --with-containerd-engine`, Ansible CNI install + env
+toggle, Terraform bootstrap engine env, coexistence runbook, soak UC-99..102
+registered (`containerd-engine` cap). Phase 0 decision stubs:
+`plans/containerd-engine-phase0-decisions.md`. Remaining: live Phase 0
+measurements, disruptive restart helpers, §8 default-flip gates.
+Plan written 2026-07-11; revised 2026-07-12 after eng review — 9 review findings
++ 5 cross-model findings folded, §4 rebased on CNI, one store change admitted;
+see the GSTACK REVIEW REPORT at the end. Companion to
+`plans/warm-create-latency-tier1.md` (which stays fully valid — every Tier 1
+phase applies under either engine) and successor-in-spirit to
+`plans/docker-warm-pool.md` §10's "containerd work out of scope" note. This
+plan brings it in scope, with measured justification.
 
 Owner rules that apply: this is the largest fragile-area addition since
 cluster mode — a new engine behind `CreateSandbox` (`/touch-create-sandbox`

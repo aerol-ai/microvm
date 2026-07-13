@@ -18,6 +18,7 @@ import (
 
 // TestContainerdPhase0RunscNetnsProof boots runsc in a driver-provisioned netns
 // (plans/containerd-engine.md Phase 0(c)).
+// Record proof outcome in plans/containerd-engine-phase0-decisions.md (0c).
 //
 // Operator-run: requires runsc + containerd shim, native netns pool, and CNI.
 // Example:

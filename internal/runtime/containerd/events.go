@@ -40,6 +40,14 @@ func (d *Driver) StreamEvents(ctx context.Context, out chan<- docker.DockerEvent
 			if !ok {
 				continue
 			}
+			// Warm-adopt keeps container ID as park-*; resolve the
+			// aerolvm.sandbox_id label so the service event monitor can
+			// match store rows without waiting for reconcile.
+			if c, loadErr := client.LoadContainer(ctx, normalized.ContainerID); loadErr == nil {
+				if sid := d.sandboxIDFromContainer(ctx, c); sid != "" {
+					normalized.SandboxID = sid
+				}
+			}
 			select {
 			case out <- normalized:
 			case <-ctx.Done():
@@ -73,14 +81,15 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 	default:
 		return docker.DockerEvent{}, false
 	}
-	id := containerIDFromEvent(ev)
+	id, exitCode := containerIDAndExitFromEvent(ev)
 	if id == "" {
 		return docker.DockerEvent{}, false
 	}
 	return docker.DockerEvent{
 		ContainerID: id,
-		SandboxID:   id,
+		SandboxID:   id, // enriched with sandbox_id label in StreamEvents
 		Action:      action,
+		ExitCode:    exitCode,
 		Time:        ev.Timestamp,
 	}, true
 }
@@ -89,17 +98,27 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 // ContainerID. All task events (TaskStart/TaskExit/TaskDelete/TaskOOM/…)
 // expose GetContainerID(), so a single interface assertion covers them.
 func containerIDFromEvent(ev *events.Envelope) string {
-	if ev.Event == nil {
-		return ""
+	id, _ := containerIDAndExitFromEvent(ev)
+	return id
+}
+
+func containerIDAndExitFromEvent(ev *events.Envelope) (string, int) {
+	if ev == nil || ev.Event == nil {
+		return "", 0
 	}
 	decoded, err := typeurl.UnmarshalAny(ev.Event)
 	if err != nil {
-		return ""
+		return "", 0
 	}
+	id := ""
 	if g, ok := decoded.(interface{ GetContainerID() string }); ok {
-		return g.GetContainerID()
+		id = g.GetContainerID()
 	}
-	return ""
+	exitCode := 0
+	if g, ok := decoded.(interface{ GetExitStatus() uint32 }); ok {
+		exitCode = int(g.GetExitStatus())
+	}
+	return id, exitCode
 }
 
 // ContainerPID returns the init PID for a running task. "Not running here"

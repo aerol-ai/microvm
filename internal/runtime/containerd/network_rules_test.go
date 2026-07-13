@@ -12,6 +12,15 @@ func TestNetworkRulesNilManagerNoOp(t *testing.T) {
 	if err := d.ApplyNetworkBlockAll("10.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
+	if err := d.ApplyNetworkBlockIngress("10.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ClearNetworkBlockIngress("10.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ClearNetworkBlockEgress("10.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
 	if err := d.ClearNetworkRules("10.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
@@ -23,6 +32,27 @@ func TestNetworkRulesNilManagerNoOp(t *testing.T) {
 	}
 	if err := d.PushAllowedPorts(t.Context(), "10.0.0.1", "tok", []int{8080}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEnsureRunscConfigNilDriverAndDefaultRunDir(t *testing.T) {
+	var d *Driver
+	if _, err := d.ensureRunscConfig(); err == nil {
+		t.Fatal("want nil driver error")
+	}
+	// Empty RunDir uses the production default path under /var/lib — skip
+	// writing there; just assert the path formula when RunDir is set to a
+	// short temp via Config after New.
+	tmp := shortReadyDir(t)
+	d2 := New(Config{RunDir: tmp}, nil, nil)
+	path, err := d2.ensureRunscConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second call is idempotent (file already exists).
+	path2, err := d2.ensureRunscConfig()
+	if err != nil || path2 != path {
+		t.Fatalf("path=%q path2=%q err=%v", path, path2, err)
 	}
 }
 

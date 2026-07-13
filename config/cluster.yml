@@ -118,6 +118,18 @@ docker:
     idle_ttl: "15m"
     refill_interval: "5s"
 
+# --- Container engine (dockerd vs native containerd) -----------------------
+# Host-level operator choice (plans/containerd-engine.md). Default docker keeps
+# pre-migration hosts byte-identical. Opt into containerd only after Phase 0
+# spikes + §8 gates; install.sh --with-containerd-engine (or Ansible below)
+# also installs CNI plugins under /opt/cni/bin.
+container_engine: "docker" # docker | containerd
+containerd:
+  socket: "/run/containerd/containerd.sock"
+  namespace: "aerolvm"
+  cni_plugin_dir: "/opt/cni/bin"
+  native_netns_pool_enabled: true
+
 # --- Firecracker runtime bootstrap ---------------------------------------
 # Host-level Firecracker enablement is opt-in. The bootstrap path must
 # install the runtime binaries and provide a kernel image at the configured

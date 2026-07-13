@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"errors"
 
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
@@ -42,10 +43,22 @@ type rawAPI interface {
 type cntrClientRaw struct{ *cntr.Client }
 
 func (c cntrClientRaw) Subscribe(ctx context.Context, filters ...string) (<-chan *events.Envelope, <-chan error) {
+	if c.Client == nil {
+		ch := make(chan *events.Envelope)
+		errCh := make(chan error, 1)
+		close(ch)
+		errCh <- errors.New("containerd client is nil")
+		return ch, errCh
+	}
 	return c.Client.EventService().Subscribe(ctx, filters...)
 }
 
-func (c cntrClientRaw) ContentProvider() content.Provider { return c.ContentStore() }
+func (c cntrClientRaw) ContentProvider() content.Provider {
+	if c.Client == nil {
+		return nil
+	}
+	return c.ContentStore()
+}
 
 type liveTransport struct {
 	raw rawAPI

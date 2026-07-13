@@ -60,6 +60,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 		"namespace", cfg.ContainerdNamespace,
 		"netrules_chain", netrules.ChainAerolvmUser,
 	)
+	cntr.PublishEngineTag(models.ContainerEngineContainerd)
 	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, logger: logger}, nil
 }
 

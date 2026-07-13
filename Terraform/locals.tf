@@ -277,6 +277,18 @@ locals {
     refill_interval = try(local.cluster_ops.docker.netns_pool.refill_interval, "2s")
   }
 
+  # Container engine (plans/containerd-engine.md Phase 5). Default docker keeps
+  # day-0 hosts byte-identical; containerd is opt-in via cluster.yml. Ansible
+  # configure-ops.yml installs CNI plugins when flipped; Terraform only writes
+  # the env (bootstrap assumes CNI already on the AMI / day-2 Ansible).
+  container_engine = try(local.cluster_ops.container_engine, "docker")
+  containerd_cfg = {
+    socket                    = try(local.cluster_ops.containerd.socket, "/run/containerd/containerd.sock")
+    namespace                 = try(local.cluster_ops.containerd.namespace, "aerolvm")
+    cni_plugin_dir            = try(local.cluster_ops.containerd.cni_plugin_dir, "/opt/cni/bin")
+    native_netns_pool_enabled = try(local.cluster_ops.containerd.native_netns_pool_enabled, true) ? "true" : "false"
+  }
+
   # Homogeneous per-arch clusters (D5): one GOARCH for snapshot tagging and
   # Firecracker upstream artifact selection. The precondition on
   # validate_cluster_ops enforces a single distinct arch across nodes.
@@ -412,6 +424,11 @@ resource "terraform_data" "validate_cluster_ops" {
     precondition {
       condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.fleet_control_plane.contract_refresh))
       error_message = "fleet_control_plane.contract_refresh must be a Go duration such as 30s, 5m, 1h."
+    }
+
+    precondition {
+      condition     = contains(["docker", "containerd"], local.container_engine)
+      error_message = "container_engine in config/cluster.yml must be \"docker\" or \"containerd\" (plans/containerd-engine.md)."
     }
   }
 }

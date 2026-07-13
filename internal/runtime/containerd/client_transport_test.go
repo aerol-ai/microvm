@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	cntr "github.com/containerd/containerd"
@@ -16,6 +17,28 @@ func TestLiveTransportCloseNilSafe(t *testing.T) {
 	}
 	if err := (&liveTransport{ns: "aerolvm"}).close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCntrClientRawNilSafe(t *testing.T) {
+	var raw cntrClientRaw
+	if raw.ContentProvider() != nil {
+		t.Fatal("nil client ContentProvider")
+	}
+	ch, errCh := raw.Subscribe(context.Background())
+	if ch == nil || errCh == nil {
+		t.Fatal("nil channels")
+	}
+	select {
+	case err := <-errCh:
+		if err == nil || !errors.Is(err, err) && err.Error() == "" {
+			t.Fatalf("err=%v", err)
+		}
+		if err.Error() != "containerd client is nil" {
+			t.Fatalf("err=%v", err)
+		}
+	default:
+		t.Fatal("expected immediate error")
 	}
 }
 

@@ -456,8 +456,17 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 	if imageRef == "" {
 		return nil
 	}
+	return removeImageFn(ctx, client, imageRef)
+}
+
+// removeImageFn deletes an image from the containerd image store. Tests stub it.
+var removeImageFn = func(ctx context.Context, client *Client, imageRef string) error {
+	raw := client.Raw()
+	if raw == nil {
+		return errors.New("containerd RemoveImage requires live containerd")
+	}
 	ctx = client.withNS(ctx)
-	if err := client.Raw().ImageService().Delete(ctx, imageRef); err != nil && !errdefs.IsNotFound(err) {
+	if err := raw.ImageService().Delete(ctx, imageRef); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
 	return nil

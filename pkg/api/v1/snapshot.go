@@ -122,6 +122,9 @@ func (h *handlers) resolveSnapshotImage(ctx context.Context, dockerfile string, 
 		// silently no-op.
 		return "", "", errBuildNotImplemented
 	}
+	if h.deps.ContainerEngine == models.ContainerEngineContainerd {
+		return "", "", models.ErrBuildKitUnavailable
+	}
 	if h.deps.Builder == nil {
 		return "", "", errors.New("multi-line dockerfile_content requires an image builder; daemon was started without one")
 	}

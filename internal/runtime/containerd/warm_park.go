@@ -21,6 +21,12 @@ import (
 
 const adoptReadyTimeout = 2 * time.Second
 
+// parkReadyWaitFn waits for the parked hello on the ready socket. Tests stub
+// it so the park path can complete offline without a guest toolbox.
+var parkReadyWaitFn = func(ctx context.Context, pl *dockerpkg.ParkedListener) error {
+	return pl.WaitParked(ctx)
+}
+
 // PoolSpawner implements containerdpool.Spawner against the containerd driver.
 type PoolSpawner struct {
 	Driver *Driver
@@ -226,7 +232,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 
 	waitCtx, cancel := context.WithTimeout(ctx, d.cfg.ToolboxWaitTimeout)
 	defer cancel()
-	if err := pl.WaitParked(waitCtx); err != nil {
+	if err := parkReadyWaitFn(waitCtx, pl); err != nil {
 		return nil, fmt.Errorf("park ready: %w", err)
 	}
 

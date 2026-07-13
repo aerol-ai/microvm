@@ -130,10 +130,16 @@ func (f *fakeTransport) contentStore() content.Store {
 
 func (f *fakeTransport) contentProvider() content.Provider { return f.provider }
 
-type fakeImage struct{ name string }
+type fakeImage struct {
+	name   string
+	target ocispec.Descriptor
+}
 
 func (f *fakeImage) Name() string { return f.name }
 func (f *fakeImage) Target() ocispec.Descriptor {
+	if f.target.Digest != "" || f.target.MediaType != "" {
+		return f.target
+	}
 	return ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest}
 }
 func (f *fakeImage) Labels() map[string]string                               { return nil }

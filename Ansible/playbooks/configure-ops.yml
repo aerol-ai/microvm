@@ -139,6 +139,15 @@
       SB_DOCKER_NETNS_POOL_DEPTH: "{{ docker.netns_pool.depth | default(4) | int }}"
       SB_DOCKER_NETNS_POOL_PAUSE_IMAGE: "{{ docker.netns_pool.pause_image | default('registry.k8s.io/pause:3.10') }}"
       SB_DOCKER_NETNS_POOL_REFILL_INTERVAL: "{{ docker.netns_pool.refill_interval | default('2s') }}"
+      # Container engine (plans/containerd-engine.md Phase 5). Default docker.
+      # Setting container_engine: containerd in config/cluster.yml flips the
+      # host engine; this play also installs CNI plugins under
+      # containerd.cni_plugin_dir when missing.
+      SB_CONTAINER_ENGINE: "{{ container_engine | default('docker') }}"
+      SB_CONTAINERD_SOCKET: "{{ containerd.socket | default('/run/containerd/containerd.sock') }}"
+      SB_CONTAINERD_NAMESPACE: "{{ containerd.namespace | default('aerolvm') }}"
+      SB_CONTAINERD_CNI_PLUGIN_DIR: "{{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"
+      SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED: "{{ containerd.native_netns_pool_enabled | default(true) | bool | string | lower }}"
 
   pre_tasks:
     - name: Check base sandboxd env file
@@ -244,6 +253,7 @@
         - "../../setup/runbooks/lost-quorum-recovery.md"
         - "../../setup/runbooks/image-pull-storm.md"
         - "../../setup/runbooks/slo-breach.md"
+        - "../../setup/runbooks/containerd-engine-coexistence.md"
 
     - name: Ensure sandboxd secrets directory exists
       when: >-
@@ -595,6 +605,78 @@
         owner: root
         group: root
       notify: Apply sandboxd ops config
+
+    # CNI plugins for containerd native netns (plans/containerd-engine.md Phase 5).
+    # Mirrors scripts/install.sh install_cni_plugins; only when cluster.yml flips
+    # container_engine to containerd. Idempotent: skip when bridge already present.
+    - name: Resolve CNI plugin architecture
+      when: (container_engine | default('docker')) == 'containerd'
+      ansible.builtin.set_fact:
+        sandboxd_cni_arch: "{{ 'amd64' if ansible_architecture in ['x86_64', 'amd64'] else ('arm64' if ansible_architecture in ['aarch64', 'arm64'] else '') }}"
+
+    - name: Refuse unknown architecture for CNI plugins
+      when:
+        - (container_engine | default('docker')) == 'containerd'
+        - sandboxd_cni_arch | length == 0
+      ansible.builtin.fail:
+        msg: "container_engine=containerd requires amd64/arm64 for CNI plugins (got {{ ansible_architecture }})"
+
+    - name: Check CNI bridge plugin present
+      when: (container_engine | default('docker')) == 'containerd'
+      ansible.builtin.stat:
+        path: "{{ (containerd.cni_plugin_dir | default('/opt/cni/bin')) }}/bridge"
+      register: sandboxd_cni_bridge
+
+    - name: Install CNI plugins for containerd engine
+      when:
+        - (container_engine | default('docker')) == 'containerd'
+        - not (sandboxd_cni_bridge.stat.exists | default(false))
+      block:
+        - name: Create CNI plugin directory
+          ansible.builtin.file:
+            path: "{{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"
+            state: directory
+            mode: "0755"
+            owner: root
+            group: root
+
+        - name: Create temp workspace for CNI plugins
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: cni
+          register: sandboxd_cni_tmp
+
+        - name: Download CNI plugins release
+          ansible.builtin.get_url:
+            url: "https://github.com/containernetworking/plugins/releases/download/{{ sandboxd_cni_plugins_version }}/cni-plugins-linux-{{ sandboxd_cni_arch }}-{{ sandboxd_cni_plugins_version }}.tgz"
+            dest: "{{ sandboxd_cni_tmp.path }}/cni.tgz"
+            mode: "0644"
+
+        - name: Extract CNI plugins
+          ansible.builtin.unarchive:
+            src: "{{ sandboxd_cni_tmp.path }}/cni.tgz"
+            dest: "{{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"
+            remote_src: true
+            extra_opts: ["--no-same-owner"]
+
+        - name: Verify required CNI plugins
+          ansible.builtin.stat:
+            path: "{{ (containerd.cni_plugin_dir | default('/opt/cni/bin')) }}/{{ item }}"
+          loop: [bridge, host-local, loopback]
+          register: sandboxd_cni_plugins
+
+        - name: Assert CNI plugins installed
+          ansible.builtin.assert:
+            that:
+              - item.stat.exists
+            fail_msg: "expected CNI plugin missing under {{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"
+          loop: "{{ sandboxd_cni_plugins.results }}"
+      always:
+        - name: Remove CNI plugin workspace
+          ansible.builtin.file:
+            path: "{{ sandboxd_cni_tmp.path }}"
+            state: absent
+          when: sandboxd_cni_tmp.path is defined
 
     # sandboxd_ops_env at the top of the play renders from cluster.yml plus
     # the local-only secret paths. No skip-on-empty: both Ansible and
