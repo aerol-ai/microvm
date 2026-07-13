@@ -44,6 +44,17 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: cfg.ContainerdNetnsPoolDepth}, now); err != nil {
 		return nil, fmt.Errorf("seed containerd netns pool: %w", err)
 	}
+	// Generate the bridge+host-local conflist (bridge, IPAM, outbound NAT) if
+	// absent — nothing else ships it, and without it the first CNI ADD fails on
+	// a missing conf. Size the bridge MTU to the host uplink so egress isn't
+	// throughput-capped (jumbo uplink) or blackholed via PMTUD (sub-1500 uplink).
+	if err := cni.EnsureBridgeConflist(cfg.ContainerdCNIConfPath, cni.ConflistOptions{
+		Name:   "aerolvm",
+		Bridge: "aerolvm0",
+		MTU:    cni.UplinkMTU(),
+	}); err != nil {
+		return nil, fmt.Errorf("ensure cni conflist: %w", err)
+	}
 	runner, err := cni.NewExecRunner(cni.Config{
 		PluginDir: cfg.ContainerdCNIPluginDir,
 		ConfPath:  cfg.ContainerdCNIConfPath,
