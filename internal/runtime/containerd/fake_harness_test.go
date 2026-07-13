@@ -391,7 +391,12 @@ func TestContainerPIDFake(t *testing.T) {
 }
 
 func TestSecuritySpecEnvelope(t *testing.T) {
-	spec := &specs.Spec{Linux: &specs.Linux{}, Process: &specs.Process{}}
+	// DefaultProfile reads Process.Capabilities.Bounding — must be non-nil
+	// (same shape as applyOpts in security_test.go).
+	spec := &specs.Spec{
+		Linux:   &specs.Linux{},
+		Process: &specs.Process{Capabilities: &specs.LinuxCapabilities{}},
+	}
 	ctx := context.Background()
 	for _, opt := range securitySpecOpts() {
 		if err := opt(ctx, nil, nil, spec); err != nil {
@@ -403,6 +408,9 @@ func TestSecuritySpecEnvelope(t *testing.T) {
 	}
 	if len(spec.Linux.MaskedPaths) == 0 || len(spec.Linux.ReadonlyPaths) == 0 {
 		t.Fatal("masked/readonly paths missing")
+	}
+	if spec.Linux.Seccomp == nil {
+		t.Fatal("seccomp profile missing")
 	}
 }
 
