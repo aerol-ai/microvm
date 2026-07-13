@@ -7,7 +7,6 @@ import (
 
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -19,11 +18,12 @@ func imageDefaultCommand(ctx context.Context, client *Client, image cntr.Image) 
 }
 
 func imageConfigCommand(ctx context.Context, provider content.Provider, image cntr.Image) ([]string, error) {
-	desc, err := image.Config(ctx)
-	if err != nil {
-		return nil, err
-	}
-	cfgDesc, err := images.Config(ctx, provider, desc, nil)
+	// Image.Config returns the config descriptor directly — containerd already
+	// resolves index→manifest→config for the client platform. Read it straight
+	// from the content store. Do NOT feed it back through images.Config, which
+	// expects a manifest/index and fails with "unexpected media type
+	// application/vnd.oci.image.config.v1+json" on the config descriptor.
+	cfgDesc, err := image.Config(ctx)
 	if err != nil {
 		return nil, err
 	}

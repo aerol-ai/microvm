@@ -41,6 +41,7 @@ func (r *memReaderAt) Close() error { return nil }
 
 type configFakeImage struct {
 	manifestDesc ocispec.Descriptor
+	configDesc   ocispec.Descriptor
 }
 
 func (c *configFakeImage) Name() string               { return "cfg:test" }
@@ -55,7 +56,9 @@ func (c *configFakeImage) Usage(context.Context, ...cntr.UsageOpt) (int64, error
 	return 0, nil
 }
 func (c *configFakeImage) Config(context.Context) (ocispec.Descriptor, error) {
-	return c.manifestDesc, nil
+	// Real containerd returns the CONFIG descriptor here (index→manifest→config
+	// already resolved), not the manifest.
+	return c.configDesc, nil
 }
 func (c *configFakeImage) IsUnpacked(context.Context, string) (bool, error) { return true, nil }
 func (c *configFakeImage) ContentStore() content.Store                      { return nil }
@@ -91,11 +94,18 @@ func newTestImageProvider(t *testing.T) (*memProvider, *configFakeImage) {
 		cfgDigest:      cfgBody,
 		manifestDigest: manifestBody,
 	}}
-	img := &configFakeImage{manifestDesc: ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
-		Digest:    manifestDigest,
-		Size:      int64(len(manifestBody)),
-	}}
+	img := &configFakeImage{
+		manifestDesc: ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageManifest,
+			Digest:    manifestDigest,
+			Size:      int64(len(manifestBody)),
+		},
+		configDesc: ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageConfig,
+			Digest:    cfgDigest,
+			Size:      int64(len(cfgBody)),
+		},
+	}
 	return provider, img
 }
 
