@@ -57,7 +57,7 @@ func TestBuildMountsIncludesToolboxAndHostFilesAndUserBinds(t *testing.T) {
 	}
 }
 
-func TestUnimplementedPhaseMethods(t *testing.T) {
+func TestCreateSnapshotRequiresLiveContainerd(t *testing.T) {
 	d := newTestDriver(t)
 	tr := newFakeTransport()
 	tr.containers["c"] = &fakeContainer{id: "c", task: &fakeTask{status: cntr.Running}}
@@ -65,7 +65,19 @@ func TestUnimplementedPhaseMethods(t *testing.T) {
 	if _, err := d.CreateSnapshot(t.Context(), "c", "img:latest"); err == nil || !strings.Contains(err.Error(), "live containerd") {
 		t.Fatalf("CreateSnapshot should require live containerd, got %v", err)
 	}
-	if err := d.Resize(t.Context(), "c", models.ResizeSandboxRequest{}); err == nil {
-		t.Fatal("Resize should report not implemented")
+}
+
+func TestResizeUpdatesRunningTask(t *testing.T) {
+	d := newTestDriver(t)
+	tr := newFakeTransport()
+	tr.containers["c"] = &fakeContainer{id: "c", task: &fakeTask{status: cntr.Running}}
+	d.SetClient(NewTestClient("aerolvm", tr))
+	// Resize is implemented (task.Update): a CPU/mem change against a running
+	// task succeeds, and an empty request is a no-op.
+	if err := d.Resize(t.Context(), "c", models.ResizeSandboxRequest{CPU: 2, MemoryMB: 512}); err != nil {
+		t.Fatalf("Resize should succeed against a running task, got %v", err)
+	}
+	if err := d.Resize(t.Context(), "c", models.ResizeSandboxRequest{}); err != nil {
+		t.Fatalf("empty Resize should be a no-op, got %v", err)
 	}
 }

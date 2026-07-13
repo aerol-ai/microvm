@@ -326,6 +326,18 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 		return nil, err
 	}
 	defer closeLog()
+	// Resume re-creates the task from the stored spec, which bind-mounts the
+	// create-time ready socket. That socket was closed+unlinked after Create, so
+	// runc's mount fails ("open .../ready/<id>.<nonce>.sock: no such file"). Recreate
+	// the exact socket (nonce from the spec mount path, token from the spec env)
+	// so the mount succeeds and the restarted toolbox can re-signal readiness.
+	if d.cfg.ReadyEnabled {
+		if spec, serr := container.Spec(ctx); serr == nil {
+			if rl := d.recreateResumeReadySocket(spec); rl != nil {
+				defer func() { _ = rl.Close() }()
+			}
+		}
+	}
 	task, err = container.NewTask(ctx, logIO)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
@@ -701,6 +713,49 @@ func (d *Driver) setupReadySocket(env *[]string, mountSpecs *[]specs.Mount, sand
 		Type: "bind", Source: readyListener.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"},
 	})
 	return readyListener, nil
+}
+
+// recreateResumeReadySocket recreates the create-time ready socket that a
+// stored spec bind-mounts, so a resumed task's runc mount does not fail on the
+// unlinked socket. The socket path encodes <sandboxID>.<nonce>; the token comes
+// from the spec env. Returns nil (caller proceeds without it) when the spec has
+// no ready mount or the token/nonce can't be recovered.
+func (d *Driver) recreateResumeReadySocket(spec *specs.Spec) *dockerpkg.ReadyListener {
+	if spec == nil || spec.Process == nil {
+		return nil
+	}
+	var source string
+	for _, m := range spec.Mounts {
+		if m.Destination == dockerpkg.GuestReadySocketPath {
+			source = m.Source
+			break
+		}
+	}
+	if source == "" {
+		return nil
+	}
+	// source is <ReadyDir>/<sandboxID>.<nonce>.sock
+	name := strings.TrimSuffix(filepath.Base(source), ".sock")
+	dot := strings.LastIndex(name, ".")
+	if dot <= 0 {
+		return nil
+	}
+	sandboxID, nonce := name[:dot], name[dot+1:]
+	var token string
+	for _, e := range spec.Process.Env {
+		if v, ok := strings.CutPrefix(e, "SB_TOOLBOX_TOKEN="); ok {
+			token = v
+			break
+		}
+	}
+	if token == "" || nonce == "" {
+		return nil
+	}
+	rl, err := dockerpkg.NewReadyListener(d.cfg.ReadyDir, sandboxID, token, nonce)
+	if err != nil {
+		return nil
+	}
+	return rl
 }
 
 func (d *Driver) lifoTeardown(ctx context.Context, client *Client, container cntr.Container, task cntr.Task, logPath string, hostFiles *sandboxHostFiles) {
