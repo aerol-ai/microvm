@@ -166,7 +166,9 @@ func (s *Server) Serve(conn net.Conn) error {
 				_ = s.eng.Close(ctx)
 				s.eng = nil
 			}
+			newEngStart := time.Now()
 			s.eng, err = wasmengine.NewEngineFor(ctx, workerEngineName())
+			newEngDur := time.Since(newEngStart)
 			if err != nil {
 				s.mu.Unlock()
 				if replyErr(env.SandboxID, err) != nil {
@@ -175,6 +177,13 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			err = s.eng.LoadModule(ctx, p.Path, wasmengine.LoadOptions{MemoryMB: p.MemoryMB})
+			// Read the engine's sub-stage breakdown before releasing the lock; the
+			// worker owns the NewEngineFor cost, so we splice it in here.
+			var timings wasmengine.LoadTimings
+			if r, ok := s.eng.(wasmengine.LoadTimingReporter); ok {
+				timings = r.LastLoadTimings()
+			}
+			timings.NewEngine = newEngDur
 			s.mu.Unlock()
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
@@ -182,7 +191,11 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			if err := replyOK(env.SandboxID); err != nil {
+			body, encErr := encodePayload(loadModuleResultPayload{Timings: timings})
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: env.SandboxID, Payload: body}); err != nil {
 				return err
 			}
 		case MsgInstantiate:

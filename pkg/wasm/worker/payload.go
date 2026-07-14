@@ -40,6 +40,13 @@ type okPayload struct {
 	OK bool `json:"ok"`
 }
 
+// loadModuleResultPayload rides the MsgLoadModule OK reply so the host create
+// path can emit the wasm_load sub-stage breakdown (Server-Timing). Old clients
+// that decode only okPayload keep working — expectOK ignores the payload.
+type loadModuleResultPayload struct {
+	Timings wasmengine.LoadTimings `json:"timings"`
+}
+
 type instanceStatusPayload struct {
 	Loaded bool `json:"loaded"`
 }

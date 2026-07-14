@@ -74,8 +74,8 @@ type failLoadClient struct {
 	recordingWorkerClient
 }
 
-func (c *failLoadClient) LoadModule(string, string, int) error {
-	return fmt.Errorf("load failed")
+func (c *failLoadClient) LoadModule(string, string, int) (wasmengine.LoadTimings, error) {
+	return wasmengine.LoadTimings{}, fmt.Errorf("load failed")
 }
 
 type failEnsureSupervisor struct {

@@ -147,7 +147,7 @@ func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	wc := driver.newWorkerClient(sock)
-	if err := wc.LoadModule(sandboxID, absMod, 0); err != nil {
+	if _, err := wc.LoadModule(sandboxID, absMod, 0); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 	caps := wasmengine.Capabilities{
@@ -201,7 +201,7 @@ func TestSetListenPortAfterColdInstantiate(t *testing.T) {
 		t.Fatal(err)
 	}
 	wc := driver.newWorkerClient(sock)
-	if err := wc.LoadModule(sandboxID, absMod, 0); err != nil {
+	if _, err := wc.LoadModule(sandboxID, absMod, 0); err != nil {
 		t.Fatal(err)
 	}
 	cold := wasmengine.Capabilities{

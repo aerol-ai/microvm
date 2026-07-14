@@ -136,12 +136,17 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		d.noteWorkerSpawnCount(inst)
 		loadStart := time.Now()
-		if err := client.LoadModule(sandboxID, resolved.Path, memoryMB); err != nil {
+		loadTimings, err := client.LoadModule(sandboxID, resolved.Path, memoryMB)
+		if err != nil {
 			cleanup()
 			return nil, fmt.Errorf("load module: %w", err)
 		}
 		if timing != nil {
 			timing.RecordStage("wasm_load", time.Since(loadStart))
+			// Sub-stages of wasm_load, reported by the worker, so the create-latency
+			// bench can see which step owns the ~2.8s cold load (compile dominates
+			// for CPython) — the measurement that gates plans/wasm-resident-module-host.md.
+			recordLoadSubStages(timing, loadTimings)
 		}
 	} else {
 		if err := d.waitWorker(ctx, client, sandboxID); err != nil {
@@ -173,6 +178,24 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.mu.Unlock()
 
 	return d.runtimeState(inst), nil
+}
+
+// recordLoadSubStages emits the wasm_load breakdown as separate Server-Timing
+// entries. Only non-zero stages are recorded so a warm-hit create (which never
+// calls LoadModule) and engines that don't report timings stay silent.
+func recordLoadSubStages(timing *createtiming.CreateTiming, t wasmengine.LoadTimings) {
+	if t.NewEngine > 0 {
+		timing.RecordStage("wasm_load_newengine", t.NewEngine)
+	}
+	if t.RuntimeInit > 0 {
+		timing.RecordStage("wasm_load_runtime", t.RuntimeInit)
+	}
+	if t.Read > 0 {
+		timing.RecordStage("wasm_load_read", t.Read)
+	}
+	if t.Compile > 0 {
+		timing.RecordStage("wasm_load_compile", t.Compile)
+	}
 }
 
 func preopensFromBinds(workDir string, binds []mounts.ContainerBind) []wasmengine.Preopen {

@@ -31,6 +31,9 @@ type wazeroEngine struct {
 	netHook     *NetworkHook
 	netHost     *wazeroNetHost
 	wasiCompat  bool
+	// lastLoad is the sub-stage breakdown of the most recent LoadModule, read
+	// back by the worker via LastLoadTimings() (LoadTimingReporter).
+	lastLoad LoadTimings
 }
 
 func newWazeroEngine(ctx context.Context) (*wazeroEngine, error) {
@@ -126,20 +129,34 @@ func (e *wazeroEngine) LoadModule(ctx context.Context, path string, opts LoadOpt
 	// rebuilding the runtime (ensureMemoryLimit path), and a failed prior load
 	// must not poison the next path.
 	e.moduleBytes = nil
+	e.lastLoad = LoadTimings{}
+	initStart := time.Now()
 	if err := e.initRuntime(ctx, opts.MemoryMB); err != nil {
 		return err
 	}
+	e.lastLoad.RuntimeInit = time.Since(initStart)
+	readStart := time.Now()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
+	e.lastLoad.Read = time.Since(readStart)
+	compileStart := time.Now()
 	compiled, err := compileModule(e.runtime, ctx, b)
 	if err != nil {
 		return fmt.Errorf("compile module: %w", err)
 	}
+	e.lastLoad.Compile = time.Since(compileStart)
 	e.moduleBytes = append([]byte(nil), b...)
 	e.compiled = compiled
 	return nil
+}
+
+// LastLoadTimings returns the sub-stage breakdown of the most recent LoadModule
+// (LoadTimingReporter). NewEngine is left zero here — it is filled in by the
+// worker, which owns the NewEngineFor call that precedes LoadModule.
+func (e *wazeroEngine) LastLoadTimings() LoadTimings {
+	return e.lastLoad
 }
 
 func (e *wazeroEngine) Instantiate(ctx context.Context, caps Capabilities) error {

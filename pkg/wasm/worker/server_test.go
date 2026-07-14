@@ -60,7 +60,7 @@ func TestServeSocketPath(t *testing.T) {
 	wasmPath := filepath.Join(t.TempDir(), "test.wasm")
 	_ = os.WriteFile(wasmPath, wasmBytes, 0644)
 
-	_ = client.LoadModule(sb, wasmPath, 0)
+	_, _ = client.LoadModule(sb, wasmPath, 0)
 
 	conn, _ := net.Dial("unix", sock)
 	if conn != nil {

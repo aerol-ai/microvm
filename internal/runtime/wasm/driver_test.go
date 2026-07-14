@@ -49,9 +49,9 @@ func (c *recordingWorkerClient) Ping(string) error { return nil }
 func (c *recordingWorkerClient) InstanceLoaded(context.Context, string) (bool, error) {
 	return true, nil
 }
-func (c *recordingWorkerClient) LoadModule(_, path string, _ int) error {
+func (c *recordingWorkerClient) LoadModule(_, path string, _ int) (wasmengine.LoadTimings, error) {
 	c.loadPath = path
-	return nil
+	return wasmengine.LoadTimings{}, nil
 }
 func (c *recordingWorkerClient) Instantiate(_ string, caps wasmengine.Capabilities) error {
 	c.instantiateCaps = append(c.instantiateCaps, caps)

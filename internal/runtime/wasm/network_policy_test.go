@@ -19,8 +19,8 @@ func (c *stubWorkerNetstatsClient) Ping(string) error { return nil }
 func (c *stubWorkerNetstatsClient) InstanceLoaded(context.Context, string) (bool, error) {
 	return true, nil
 }
-func (c *stubWorkerNetstatsClient) LoadModule(string, string, int) error {
-	return nil
+func (c *stubWorkerNetstatsClient) LoadModule(string, string, int) (wasmengine.LoadTimings, error) {
+	return wasmengine.LoadTimings{}, nil
 }
 func (c *stubWorkerNetstatsClient) Instantiate(string, wasmengine.Capabilities) error {
 	return nil

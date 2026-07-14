@@ -41,7 +41,7 @@ func TestWorkerColdPathLoadInstantiateInvoke(t *testing.T) {
 	if err := client.Ping(sandboxID); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
-	if err := client.LoadModule(sandboxID, modPath, 0); err != nil {
+	if _, err := client.LoadModule(sandboxID, modPath, 0); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
 	if err := client.Instantiate(sandboxID, wasmengine.Capabilities{Args: []string{"test"}}); err != nil {

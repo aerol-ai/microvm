@@ -116,7 +116,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		return nil, err
 	}
 	d.noteWorkerSpawnCount(inst)
-	if err := client.LoadModule(sandboxID, inst.modulePath, inst.memoryMB); err != nil {
+	if _, err := client.LoadModule(sandboxID, inst.modulePath, inst.memoryMB); err != nil {
 		return nil, fmt.Errorf("load module: %w", err)
 	}
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{

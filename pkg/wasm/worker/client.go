@@ -141,17 +141,27 @@ func (c *Client) InstanceLoaded(ctx context.Context, sandboxID string) (bool, er
 	return p.Loaded, nil
 }
 
-// LoadModule compiles the module at path inside the worker process.
-func (c *Client) LoadModule(sandboxID, path string, memoryMB int) error {
+// LoadModule compiles the module at path inside the worker process and returns
+// the sub-stage timing breakdown (best-effort; zero-valued if the worker did
+// not report it) so the host create path can emit wasm_load Server-Timing subs.
+func (c *Client) LoadModule(sandboxID, path string, memoryMB int) (wasmengine.LoadTimings, error) {
 	body, err := encodePayload(loadModulePayload{Path: path, MemoryMB: memoryMB})
 	if err != nil {
-		return err
+		return wasmengine.LoadTimings{}, err
 	}
 	reply, err := c.roundTrip(Envelope{Type: MsgLoadModule, SandboxID: sandboxID, Payload: body})
 	if err != nil {
-		return err
+		return wasmengine.LoadTimings{}, err
 	}
-	return c.expectOK(reply)
+	if err := c.expectOK(reply); err != nil {
+		return wasmengine.LoadTimings{}, err
+	}
+	var p loadModuleResultPayload
+	if len(reply.Payload) > 0 {
+		// Timings are diagnostic only; a decode failure must not fail the load.
+		_ = decodePayload(reply.Payload, &p)
+	}
+	return p.Timings, nil
 }
 
 // Instantiate creates a WASI instance with the given capabilities.
