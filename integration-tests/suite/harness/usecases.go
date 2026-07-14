@@ -71,10 +71,24 @@ const (
 	// the two pools are independent (netns slots hold no capacity
 	// reservations, so this one leaves the UC-95 density gate untouched).
 	CapDockerNetnsPool Capability = "docker-netns-pool"
-	// CapContainerdEngine gates the Phase 5 containerd soak UCs
-	// (plans/containerd-engine.md §6/§8). Scenarios advertise it only when
-	// SB_CONTAINER_ENGINE=containerd on the deployment under test so the
-	// UCs skip (not-applicable) on docker-default hosts.
+	// CapDockerEngine is consumed by run.sh's engine selection, not by any UC's
+	// Requires. It is an OPT-OUT: containerd is the DEFAULT engine for every
+	// scenario (run.sh writes SB_CONTAINER_ENGINE=containerd), and only a
+	// scenario advertising this cap runs dockerd instead. Exactly two do — the
+	// local dev install (local-mode) and the docker A/B benchmark baseline
+	// (cluster-3-mixed-docker, kept on docker so it stays a valid comparison
+	// against cluster-3-mixed-containerd). This encodes the target end-state of
+	// the docker->containerd migration: "local install uses docker, every real
+	// deployment uses containerd."
+	CapDockerEngine Capability = "docker-engine"
+	// CapContainerdEngine does NOT select the engine — that is now the default
+	// (see CapDockerEngine). It gates the containerd-SPECIFIC coverage: the
+	// Phase 5 soak/coexistence UCs (UC-99..102, plans/containerd-engine.md
+	// §6/§8) and the distinctly-labeled `containerd` benchmark row + density.
+	// Advertised only on the dedicated containerd validation scenarios
+	// (single-node-containerd, cluster-3-mixed-containerd) so UC-102's
+	// dockerd-coexistence restart stays off the runtime/metal scenarios where a
+	// pure-containerd host makes it not-applicable.
 	CapContainerdEngine Capability = "containerd-engine"
 )
 

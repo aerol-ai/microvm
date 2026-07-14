@@ -4,9 +4,15 @@
 # cluster-3-mixed-wasm for wasm benchmarks).
 #
 # The benchmark capability opts UC-94/UC-95 in for make integration-benchmark-docker.
+# docker-engine: containerd is the harness default for every cluster scenario;
+# this cap opts the docker A/B baseline back out to dockerd so its bench
+# artifacts (cluster-3-mixed-docker-*) stay a valid comparison against the
+# containerd engine measured by cluster-3-mixed-containerd. It is the only
+# cluster scenario that keeps docker.
 name: cluster-3-mixed-docker
 capabilities:
   - docker
+  - docker-engine
   - platform-volumes
   - domain
   - cluster

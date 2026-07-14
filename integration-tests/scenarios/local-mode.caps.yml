@@ -1,6 +1,12 @@
 # Local-mode install on a throwaway EC2 box. No public domain/TLS; run.sh
 # reaches sandboxd through an SSH tunnel to localhost:21212.
+#
+# docker-engine: local-mode is the ONE deployment class that stays on dockerd.
+# containerd is the harness default for every other scenario (run.sh engine
+# policy), so this cap opts local-mode back out — "the local installation always
+# uses docker."
 name: local-mode
 capabilities:
   - docker
+  - docker-engine
   - platform-volumes

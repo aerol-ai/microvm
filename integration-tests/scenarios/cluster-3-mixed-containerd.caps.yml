@@ -4,12 +4,14 @@
 # validated through the full cluster path and so its benchmark artifacts are
 # named cluster-3-mixed-containerd-* (parallel to cluster-3-mixed-docker).
 #
-# run.sh flips container_engine=containerd when the containerd-engine cap is
-# present. `docker` is still advertised because a containerd host runs the same
-# runc-backed OCI runtime (supported_runtimes advertises "docker"); containerd
-# is the host ENGINE, not a distinct runtime — so the full docker UC matrix +
-# the cluster UCs run against the native containerd driver, plus the Phase-5
-# containerd soak gates UC-99..102 (gated on containerd-engine).
+# containerd is the harness default engine now, so this cluster runs containerd
+# regardless. `docker` is still advertised because a containerd host runs the
+# same runc-backed OCI runtime (supported_runtimes advertises "docker");
+# containerd is the host ENGINE, not a distinct runtime — so the full docker UC
+# matrix + the cluster UCs run against the native containerd driver. The
+# containerd-engine cap here OPTS IN the containerd-specific coverage: the
+# Phase-5 soak gates UC-99..102 and the distinctly-labeled `containerd`
+# benchmark row (it no longer selects the engine).
 #
 # NOTE: the docker warm-container / pause-netns pools (docker-pool,
 # docker-netns-pool) are deliberately ABSENT — those are docker-engine features.

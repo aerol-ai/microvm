@@ -490,14 +490,14 @@ run_one() {
 
   # Capability checks read the structured list (not a substring grep, which
   # would false-match the word "domain" in a caps-file comment).
-  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool caps_docker_netns_pool caps_containerd_engine
+  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool caps_docker_netns_pool caps_docker_engine
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file")
   caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
   caps_cluster=$(yq -r '.capabilities | contains(["cluster"])' "$caps_file")
   caps_platform_volumes=$(yq -r '.capabilities | contains(["platform-volumes"])' "$caps_file")
   caps_docker_pool=$(yq -r '.capabilities | contains(["docker-pool"])' "$caps_file")
   caps_docker_netns_pool=$(yq -r '.capabilities | contains(["docker-netns-pool"])' "$caps_file")
-  caps_containerd_engine=$(yq -r '.capabilities | contains(["containerd-engine"])' "$caps_file")
+  caps_docker_engine=$(yq -r '.capabilities | contains(["docker-engine"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
     leased=$(lease_domain_for_scenario "$scenario")
   else
@@ -546,13 +546,22 @@ run_one() {
   # scenarios. Depth override mirrors the other pools.
   local docker_netns_pool_depth
   docker_netns_pool_depth="${AEROL_DOCKER_NETNS_POOL_DEPTH:-4}"
-  # Container engine follows the containerd-engine capability
-  # (plans/containerd-engine.md Phase 5). Default stays docker so existing
-  # scenarios remain byte-identical; opt-in scenarios flip cluster.yml and
-  # Terraform bootstrap writes SB_CONTAINER_ENGINE=containerd.
-  local container_engine="docker"
-  if [[ "$caps_containerd_engine" == "true" ]]; then
-    container_engine="containerd"
+  # Container engine policy: containerd is the DEFAULT engine for every
+  # deployment mode. Only a scenario advertising the `docker-engine` capability
+  # opts back out to dockerd — the local dev install (local-mode) and the docker
+  # A/B benchmark baseline (cluster-3-mixed-docker), which must stay docker to
+  # remain a valid comparison against cluster-3-mixed-containerd. This encodes
+  # the target end-state of the docker->containerd migration: "local install
+  # uses docker, every real deployment uses containerd." Terraform bootstrap
+  # writes SB_CONTAINER_ENGINE=${container_engine} and, when containerd, also
+  # installs the CNI plugins + buildkitd the native driver needs.
+  #
+  # NOTE: the containerd-engine capability no longer drives this choice — it
+  # gates the containerd-specific soak/coexistence UCs (UC-99..102) and the
+  # distinctly-labeled benchmark row (see harness CapContainerdEngine).
+  local container_engine="containerd"
+  if [[ "$caps_docker_engine" == "true" ]]; then
+    container_engine="docker"
   fi
   # Upstream auto-import (pulling private prod images through AOCR hooks) and
   # the fleet control plane are prod-only side effects we always neutralize.
