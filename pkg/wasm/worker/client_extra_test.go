@@ -17,7 +17,7 @@ func TestClient_ConnectionClosed_AllMethods(t *testing.T) {
 	ctx := context.Background()
 	sb := "sb"
 
-	if err := client.LoadModule(sb, "path", 0); err == nil {
+	if _, err := client.LoadModule(sb, "path", 0); err == nil {
 		t.Error("expected error")
 	}
 	if err := client.Instantiate(sb, wasmengine.Capabilities{}); err == nil {
@@ -179,7 +179,7 @@ func TestClient_AllMethods_Success(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_ = c.LoadModule("sb", "path", 0)
+	_, _ = c.LoadModule("sb", "path", 0)
 	_ = c.Instantiate("sb", wasmengine.Capabilities{})
 	_, _ = c.Exec("sb", wasmengine.Capabilities{}, "export")
 	_ = c.Invoke("sb", "export")
@@ -204,7 +204,7 @@ func TestClient_AllMethods_Error(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_ = c.LoadModule("sb", "path", 0)
+	_, _ = c.LoadModule("sb", "path", 0)
 	_ = c.Instantiate("sb", wasmengine.Capabilities{})
 	_, _ = c.Exec("sb", wasmengine.Capabilities{}, "export")
 	_ = c.Invoke("sb", "export")

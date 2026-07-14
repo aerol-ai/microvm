@@ -56,7 +56,7 @@ func (s *SupervisorSpawner) Warm(ctx context.Context, slotID, socketPath, module
 		worker.ReadyPollSleep(ctx, attempt)
 		attempt++
 	}
-	if err := client.LoadModule(slotID, modulePath, memoryMB); err != nil {
+	if _, err := client.LoadModule(slotID, modulePath, memoryMB); err != nil {
 		_ = s.Supervisor.Stop(slotID)
 		return fmt.Errorf("load module: %w", err)
 	}

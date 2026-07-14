@@ -87,7 +87,7 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	if memoryMB <= 0 {
 		memoryMB = d.cfg.DefaultMemoryMB
 	}
-	if err := client.LoadModule(sandbox.ID, modulePath, memoryMB); err != nil {
+	if _, err := client.LoadModule(sandbox.ID, modulePath, memoryMB); err != nil {
 		return nil, fmt.Errorf("load module: %w", err)
 	}
 
