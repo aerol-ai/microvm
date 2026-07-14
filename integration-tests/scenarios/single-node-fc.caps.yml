@@ -1,10 +1,23 @@
 # Capabilities the single-node x86 Firecracker scenario can satisfy. The suite
 # skips any use case whose required capabilities aren't all present here. Mirror
 # of single-node-fc-arm64 but on an x86 bare-metal host.
+#
+# benchmark: opts in UC-94 (create latency) so `make integration-benchmark-fc-single`
+# can measure the firecracker create path on ONE c5.metal box — far cheaper than
+# the 8-node cluster-hetero, and single-node isolates the FC driver cost (no Raft
+# placement / cross-node forward in the number).
+#
+# docker-engine: keep this metal FC box on the proven dockerd bootstrap. containerd
+# is the harness default now, but the container engine is irrelevant to firecracker
+# latency (FC bypasses it via Jailer + TAP + vsock), and containerd-on-c5.metal is
+# not yet live-verified — so for an expensive one-shot metal bench we do NOT want
+# the containerd CNI bootstrap as a provisioning variable.
 name: single-node-fc
 capabilities:
   - docker
+  - docker-engine
   - platform-volumes
   - firecracker
   - domain
   - custom-domains
+  - benchmark

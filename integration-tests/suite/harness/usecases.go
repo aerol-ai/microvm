@@ -280,7 +280,12 @@ var Registry = []UseCase{
 	// running) over a sample, reporting p50/p90/p99. UC-95 probes effective
 	// fleet density by creating sandboxes until the API rejects on capacity,
 	// then tears them all down. Both reuse the hetero cluster substrate.
-	{ID: "UC-94", Title: "Benchmark: per-runtime sandbox create latency", Requires: []Capability{CapCluster, CapBenchmark}, Implemented: true},
+	// UC-94 needs only CapBenchmark, not CapCluster: create latency is meaningful
+	// single-node too (the single-node-fc c5.metal box is the cheap way to profile
+	// the firecracker driver in isolation — no Raft/placement/forward in the
+	// number). The bench body already handles the no-cluster case: waitBenchmarkReady
+	// early-returns when CapCluster is absent, so it skips the members/leader wait.
+	{ID: "UC-94", Title: "Benchmark: per-runtime sandbox create latency", Requires: []Capability{CapBenchmark}, Implemented: true},
 	{ID: "UC-95", Title: "Benchmark: fleet density to capacity rejection", Requires: []Capability{CapCluster, CapBenchmark}, Implemented: true},
 	{ID: "UC-96", Title: "Docker create readiness delivered via unix-socket push", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 	{ID: "UC-96b", Title: "Docker socket push works for non-root container images", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
