@@ -726,9 +726,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 
 	if shouldStartSSHGateway(cfg) {
 		sshCfg := sshgateway.Config{
-			ListenAddr:  cfg.SSHListenAddr,
-			HostKeyPath: cfg.SSHHostKeyPath,
-			ToolboxPort: cfg.ToolboxPort,
+			ListenAddr:      cfg.SSHListenAddr,
+			HostKeyPath:     cfg.SSHHostKeyPath,
+			ToolboxPort:     cfg.ToolboxPort,
+			ContainerEngine: cfg.ContainerEngine,
 		}
 		// In cluster mode an SSH connection can land on a node that does not own
 		// the target sandbox. Point the gateway at this node's own v1 API

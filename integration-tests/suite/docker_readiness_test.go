@@ -134,14 +134,24 @@ func TestDockerReadinessSocketImpliesServingAgent(t *testing.T) {
 }
 
 // UC-97 is covered by pkg/docker unit tests (push disabled → health poll).
-// Non-cluster scenarios (local-mode, single-node) exercise the fallback on
-// live infra because EnableCluster=false keeps the push path off.
+// The health-poll fallback only applies on a node with EnableCluster=false;
+// push-based readiness ("socket") is correct whenever EnableCluster is true.
 func TestDockerReadinessFallbackOnNonCluster(t *testing.T) {
 	if sc.Satisfies(harness.UseCase{Requires: []harness.Capability{harness.CapCluster}}) {
 		t.Skip("cluster scenario uses socket push; fallback covered elsewhere")
 	}
 	harness.Require(t, sc, "UC-11")
 	c := client(t)
+	// The scenario capability tags this as "non-cluster", but single-node
+	// scenarios still run sandboxd as a 1-node cluster (seed → cluster-init sets
+	// SB_ENABLE_CLUSTER=true), which turns push-based readiness ON — so "socket"
+	// is correct there. DockerReadySocketEffective() gates on EnableCluster, not
+	// on node count, so key the fallback assertion off the node's ACTUAL mode
+	// (via /health) rather than the scenario tag. Only a truly non-cluster node
+	// (local-mode, EnableCluster=false) exercises the health-poll fallback.
+	if h, err := c.SDK().Health(context.Background()); err == nil && (h.ClusterTopology != "" || h.ClusterNodes > 0) {
+		t.Skip("node runs EnableCluster=true (1-node cluster); push readiness is on, socket is correct")
+	}
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
 		Image: harness.DefaultImage,
 		Name:  harness.UniqueName(sc, t),
