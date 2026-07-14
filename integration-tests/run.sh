@@ -8,9 +8,10 @@
 #   integration-tests/run.sh <scenario> [--bench-only]    # UC-94/UC-95 only (provision if needed)
 #   integration-tests/run.sh all       [flags]
 #
-# Scenarios: single-node | local-mode | cluster-3-mixed | cluster-3-mixed-docker |
-#            cluster-3-mixed-fc | cluster-3-mixed-gvisor | cluster-3-mixed-wasm |
-#            cluster-hetero | single-node-fc | single-node-fc-arm64 | cluster-arm64
+# Scenarios: single-node | single-node-containerd | local-mode | cluster-3-mixed |
+#            cluster-3-mixed-docker | cluster-3-mixed-containerd | cluster-3-mixed-fc |
+#            cluster-3-mixed-gvisor | cluster-3-mixed-wasm | cluster-hetero |
+#            single-node-fc | single-node-fc-arm64 | cluster-arm64
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the

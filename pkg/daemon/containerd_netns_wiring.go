@@ -41,7 +41,17 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	}
 	pool := netns.New(st)
 	now := time.Now()
-	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: cfg.ContainerdNetnsPoolDepth}, now); err != nil {
+	// Total capacity is decoupled from the warm depth (mirrors the firecracker
+	// TAP pool). Seeding only `depth` slots — as this once did — hard-capped every
+	// node at `depth` (default 4) concurrent sandboxes, because cold creates also
+	// reserve from this pool and it never grows. Seed the full size; the refiller
+	// below only pre-realizes `depth` of them. Guard size >= depth so the refiller
+	// can always reach its warm target even under an operator misconfiguration.
+	poolSize := cfg.ContainerdNetnsPoolSize
+	if poolSize < cfg.ContainerdNetnsPoolDepth {
+		poolSize = cfg.ContainerdNetnsPoolDepth
+	}
+	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: poolSize}, now); err != nil {
 		return nil, fmt.Errorf("seed containerd netns pool: %w", err)
 	}
 	// Generate the bridge+host-local conflist (bridge, IPAM, outbound NAT) if
@@ -85,7 +95,8 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	refiller := netns.NewRefiller(pool, host, cfg.ContainerdNetnsPoolDepth, cfg.ContainerdNetnsPoolRefillInterval)
 	go refiller.Run(ctx)
 	logger.Info("containerd native netns pool enabled",
-		"depth", cfg.ContainerdNetnsPoolDepth,
+		"pool_size", poolSize,
+		"warm_depth", cfg.ContainerdNetnsPoolDepth,
 		"refill_interval", cfg.ContainerdNetnsPoolRefillInterval,
 		"cni_plugin_dir", cfg.ContainerdCNIPluginDir,
 		"cni_conf", cfg.ContainerdCNIConfPath,

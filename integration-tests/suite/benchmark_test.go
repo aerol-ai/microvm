@@ -48,6 +48,15 @@ var benchRuntimes = []struct {
 	// cold floor next to the warm-hit row instead of losing it. On a
 	// pool-less scenario the two rows converge — cheap redundancy.
 	{"docker-cold", harness.CapDocker},
+	// containerd is a host ENGINE, not a runtime: a containerd node runs the
+	// same runc-backed OCI runtime and advertises "docker" in supported_runtimes
+	// (benchClusterRuntime maps this row back to "docker"), so the create itself
+	// is a plain docker create that the native containerd driver serves. The row
+	// exists only so the cluster-3-mixed-containerd artifact labels the engine
+	// distinctly from the docker baseline. Gated on CapContainerdEngine so it
+	// sweeps ONLY on containerd scenarios — the make target still narrows the
+	// sweep to just this row with AEROL_BENCH_RUNTIMES=containerd.
+	{"containerd", harness.CapContainerdEngine},
 	{"firecracker", harness.CapFirecracker},
 	{"gvisor", harness.CapGvisor},
 	{"wasm", harness.CapWasm},
@@ -192,6 +201,13 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 		opts.Runtime = "docker"
 		opts.Image = harness.DefaultImage
 		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
+	case "containerd":
+		// containerd is the host engine, reached via the "docker" runtime
+		// (the node advertises "docker"). This scenario runs no warm pool
+		// (docker-pool/containerd-pool caps absent), so every create already
+		// takes the cold engine path — the honest baseline against docker-cold.
+		opts.Runtime = "docker"
+		opts.Image = harness.DefaultImage
 	default:
 		opts.Image = harness.DefaultImage
 	}
@@ -269,9 +285,13 @@ func benchClusterMembers(c *harness.Client) (capacityView, error) {
 
 // benchClusterRuntime maps a UC-94 row name to the runtime string cluster
 // gossip advertises in supported_runtimes. docker-cold is a pool-ineligible
-// docker variant for the bench artifact, not a distinct engine.
+// docker variant for the bench artifact, not a distinct engine; containerd is
+// the host engine backing the same runc-backed "docker" runtime — a containerd
+// node advertises "docker" in supported_runtimes, so its readiness target is
+// checked under "docker" too.
 func benchClusterRuntime(runtime string) string {
-	if runtime == "docker-cold" {
+	switch runtime {
+	case "docker-cold", "containerd":
 		return "docker"
 	}
 	return runtime
@@ -917,11 +937,19 @@ func meanMS(durs []time.Duration) int64 {
 // capacity, then tear them all down. Docker is used because it's the densest
 // runtime and present on every cluster scenario, making the ceiling a stable
 // signal. A safety cap (AEROL_BENCH_MAX) bounds cost if admission never trips.
+//
+// On a containerd-engine scenario the "docker" runtime is served by the native
+// containerd driver (a containerd node advertises "docker" in
+// supported_runtimes), so the creates are genuinely containerd creates and the
+// ceiling measures containerd fleet density — we relabel the row "containerd"
+// so the artifact is self-documenting. Admission is capacity-based (CPU/mem
+// reservations), so the ceiling is engine-independent by design; the row still
+// gives an apples-to-apples density number next to the docker baseline.
 func TestBenchDensity(t *testing.T) {
 	harness.Require(t, sc, "UC-95")
 	requireBenchEnabled(t)
-	if !benchRuntimeAllowed("docker") {
-		t.Skip("AEROL_BENCH_RUNTIMES excludes docker; density probe is docker-only")
+	if !benchRuntimeAllowed("docker") && !benchRuntimeAllowed("containerd") {
+		t.Skip("AEROL_BENCH_RUNTIMES excludes docker and containerd; density probe needs one of them")
 	}
 	c := client(t)
 	dockerBench := []benchRuntimeSpec{{runtime: "docker"}}
@@ -929,7 +957,13 @@ func TestBenchDensity(t *testing.T) {
 	warmBenchmarkRuntimes(t, c, dockerBench)
 	maxSandboxes := benchEnvInt("AEROL_BENCH_MAX", 200)
 
-	ds := densityStats{Runtime: "docker"}
+	// The create runtime stays "docker" (what every node advertises); the label
+	// reflects the host engine so a containerd run reads as containerd density.
+	densityRuntime := "docker"
+	if sc.Has(harness.CapContainerdEngine) {
+		densityRuntime = "containerd"
+	}
+	ds := densityStats{Runtime: densityRuntime}
 	var ids []string
 	// Destroy everything we created, even on a fatal. Done in parallel to keep
 	// teardown bounded when the count is large.

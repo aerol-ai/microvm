@@ -2,10 +2,11 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-containerd integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-wasm \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-docker integration-benchmark-docker-only \
 	integration-benchmark-docker-sparse \
+	integration-benchmark-containerd integration-benchmark-containerd-only \
 	integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
@@ -113,6 +114,13 @@ integration-cluster-mixed:
 integration-cluster-mixed-docker:
 	integration-tests/run.sh cluster-3-mixed-docker $(RUN_FLAGS)
 
+# 3× mixed cluster running SB_CONTAINER_ENGINE=containerd — exercises the
+# containerd engine through the full cluster path (Raft placement + forwarding +
+# failover) plus the Phase-5 soak gates UC-99..102, which single-node-containerd
+# cannot cover (see cluster-3-mixed-containerd.caps.yml).
+integration-cluster-mixed-containerd:
+	integration-tests/run.sh cluster-3-mixed-containerd $(RUN_FLAGS)
+
 # 3× mixed cluster with the WASM runtime enabled — pairs the wasm-runtime use
 # cases with cluster placement/forwarding (see cluster-3-mixed-wasm.caps.yml).
 integration-cluster-mixed-wasm:
@@ -210,6 +218,35 @@ integration-benchmark-docker-sparse:
 	AEROL_BENCH_RUNTIMES=docker \
 	AEROL_BENCH_EXPECT_NETRULES=$(AEROL_BENCH_EXPECT_NETRULES) \
 		integration-tests/run.sh cluster-3-mixed-docker --bench-only
+
+# Containerd-engine benchmark on the 3× mixed-containerd cluster — the point of
+# the docker→containerd migration: does the native containerd driver create
+# faster than docker? Provisions cluster-3-mixed-containerd (domain/TLS,
+# SB_CONTAINER_ENGINE=containerd) and runs UC-94 containerd latency + UC-95
+# density (AEROL_BENCH_RUNTIMES=containerd; the density probe is engine-aware and
+# labels its row containerd). Compare the `containerd` row's server p50 against
+# the `docker-cold` row in cluster-3-mixed-docker-bench.json — both are cold
+# engine creates on the same netlink egress backend + t3.medium boxes.
+#   make integration-benchmark-containerd
+#   make integration-benchmark-containerd keep
+#   make integration-benchmark-containerd CONTAINERD_BENCH_OUT=/tmp/ctd-bench.json
+CONTAINERD_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-containerd-bench.json
+CONTAINERD_BENCH_SAMPLES ?= 10
+CONTAINERD_BENCH_RUNTIMES ?= containerd
+integration-benchmark-containerd:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(CONTAINERD_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(CONTAINERD_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(CONTAINERD_BENCH_RUNTIMES) \
+	AEROL_BENCH_EXPECT_NETRULES=$(AEROL_BENCH_EXPECT_NETRULES) \
+		integration-tests/run.sh cluster-3-mixed-containerd --no-disruptive $(RUN_FLAGS)
+
+# Re-run UC-94/UC-95 against a cluster-3-mixed-containerd left up with `keep`.
+integration-benchmark-containerd-only:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(CONTAINERD_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(CONTAINERD_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(CONTAINERD_BENCH_RUNTIMES) \
+	AEROL_BENCH_EXPECT_NETRULES=$(AEROL_BENCH_EXPECT_NETRULES) \
+		integration-tests/run.sh cluster-3-mixed-containerd --bench-only
 
 # Firecracker-focused benchmark on the 3× mixed-fc cluster: provisions
 # cluster-3-mixed-fc with domain/TLS, runs the full suite with UC-94 (docker +

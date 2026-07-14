@@ -1,0 +1,35 @@
+# 3× mixed cluster running SB_CONTAINER_ENGINE=containerd: containerd workers,
+# public domain/TLS, and cluster mode (Raft + forwarding). Same topology as
+# cluster-3-mixed-docker — this scenario exists so the containerd engine is
+# validated through the full cluster path and so its benchmark artifacts are
+# named cluster-3-mixed-containerd-* (parallel to cluster-3-mixed-docker).
+#
+# run.sh flips container_engine=containerd when the containerd-engine cap is
+# present. `docker` is still advertised because a containerd host runs the same
+# runc-backed OCI runtime (supported_runtimes advertises "docker"); containerd
+# is the host ENGINE, not a distinct runtime — so the full docker UC matrix +
+# the cluster UCs run against the native containerd driver, plus the Phase-5
+# containerd soak gates UC-99..102 (gated on containerd-engine).
+#
+# NOTE: the docker warm-container / pause-netns pools (docker-pool,
+# docker-netns-pool) are deliberately ABSENT — those are docker-engine features.
+# The containerd warm pools (SB_CONTAINERD_POOL_ENABLED /
+# SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED) are still ship-dark
+# (plans/containerd-engine.md §8), so this scenario measures the containerd COLD
+# create path, which is the honest baseline against the docker-cold bench row.
+#
+# The benchmark capability opts UC-94/UC-95 in for make integration-benchmark-containerd.
+name: cluster-3-mixed-containerd
+capabilities:
+  - docker
+  - containerd-engine
+  - platform-volumes
+  - domain
+  - cluster
+  # Opt UC-94/UC-95 in for make integration-benchmark-containerd (containerd
+  # latency + density; the make target passes AEROL_BENCH_RUNTIMES=containerd
+  # and --bench-only).
+  - benchmark
+
+# Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
+expected_members: 3

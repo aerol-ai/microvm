@@ -147,8 +147,20 @@ type Config struct {
 	// ContainerdNativeNetnsPoolEnabled gates the CNI-backed native netns pool
 	// for containerd creates (Phase 2). Default off — dockerd path unchanged.
 	ContainerdNativeNetnsPoolEnabled bool
-	// ContainerdNetnsPoolDepth is the number of prepaid slots seeded at boot.
+	// ContainerdNetnsPoolDepth is the number of slots the refiller keeps
+	// pre-realized (CNI ADD done) for a fast warm-hit create. It is the WARM
+	// target, NOT the total capacity — see ContainerdNetnsPoolSize.
+	// SB_CONTAINERD_NETNS_POOL_DEPTH.
 	ContainerdNetnsPoolDepth int
+	// ContainerdNetnsPoolSize is the TOTAL number of netns slots seeded at boot
+	// and therefore the ceiling on concurrent containerd sandboxes per node. It
+	// is decoupled from the warm depth exactly like the firecracker TAP pool
+	// (FirecrackerTapPoolSize is decoupled from the warm VMM depth): cold creates
+	// reserve+realize any free slot up to this size, while the refiller only
+	// pre-realizes ContainerdNetnsPoolDepth of them. Conflating the two (seeding
+	// only `depth` slots) capped every node at 4 concurrent sandboxes.
+	// SB_CONTAINERD_NETNS_POOL_SIZE.
+	ContainerdNetnsPoolSize int
 	// ContainerdCNIPluginDir locates CNI plugin binaries (default /opt/cni/bin).
 	ContainerdCNIPluginDir string
 	// ContainerdCNIConfPath is the bridge conflist used for ADD/DEL.
@@ -1304,6 +1316,7 @@ func Load() (Config, error) {
 		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		ContainerdNativeNetnsPoolEnabled:  getEnvBool("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", false),
 		ContainerdNetnsPoolDepth:          getEnvInt("SB_CONTAINERD_NETNS_POOL_DEPTH", 4),
+		ContainerdNetnsPoolSize:           getEnvInt("SB_CONTAINERD_NETNS_POOL_SIZE", 256),
 		ContainerdCNIPluginDir:            getEnv("SB_CONTAINERD_CNI_PLUGIN_DIR", "/opt/cni/bin"),
 		ContainerdCNIConfPath:             getEnv("SB_CONTAINERD_CNI_CONF_PATH", "/etc/cni/net.d/aerolvm.conflist"),
 		ContainerdBuildKitAddr:            getEnv("SB_CONTAINERD_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock"),
