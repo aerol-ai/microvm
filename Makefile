@@ -10,7 +10,7 @@ BIN_DIR ?= bin
 	integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
-	integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
+	integration-single-fc integration-benchmark-fc-single integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
 	integration-cert-store-init integration-clear-lease
 
 fmt:
@@ -313,6 +313,27 @@ integration-benchmark-gvisor-only:
 # cluster. On-Demand only (the metal box exceeds the Spot vCPU quota).
 integration-single-fc:
 	integration-tests/run.sh single-node-fc $(RUN_FLAGS)
+
+# Firecracker create-latency benchmark on ONE c5.metal box (single-node-fc).
+# The cheap diagnostic: cluster-hetero costs 8 nodes, this costs one, and being
+# single-node it isolates the FC DRIVER cost — no Raft placement or cross-node
+# forward hop in the number, so the per-stage Server-Timing breakdown
+# (fc_verify / fc_spawn / fc_load / fc_resume / fc_handshake / fc_post_resume)
+# attributes cleanly to the driver. UC-94 firecracker only (UC-95 density skips
+# because AEROL_BENCH_RUNTIMES=firecracker). Measures the COLD path (warm-VMM
+# pool stays default-off); enable SB_FIRECRACKER_VMM_POOL_ENABLED on the box to
+# also measure warm. Provisions On-Demand (metal exceeds Spot quota) and tears
+# down on exit unless you pass `keep`.
+#   make integration-benchmark-fc-single
+#   make integration-benchmark-fc-single keep
+#   make integration-benchmark-fc-single FC_SINGLE_BENCH_OUT=/tmp/fc-single.json
+FC_SINGLE_BENCH_OUT ?= integration-tests/reports/single-node-fc-bench.json
+FC_SINGLE_BENCH_SAMPLES ?= 10
+integration-benchmark-fc-single:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(FC_SINGLE_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(FC_SINGLE_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=firecracker \
+		integration-tests/run.sh single-node-fc $(RUN_FLAGS)
 
 integration-arm64-single:
 	integration-tests/run.sh single-node-fc-arm64 $(RUN_FLAGS)

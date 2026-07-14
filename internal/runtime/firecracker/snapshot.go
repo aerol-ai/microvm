@@ -14,6 +14,7 @@ package firecracker
 // the Driver's per-sandbox registry maps.
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -414,9 +415,19 @@ func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID ui
 	if _, err := conn.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	// Discard the ack. A short read budget keeps a hung guest from
-	// pinning the snapshot pipeline.
-	_, _ = io.CopyN(io.Discard, conn, 256)
+	// Read the single newline-delimited JSON ack the guest writes, and STOP at
+	// the newline. The guest (cmd/toolboxd handleVsockConn) keeps the
+	// connection open to serve further ops, so it never sends EOF after the
+	// ack. The previous `io.CopyN(io.Discard, conn, 256)` demanded 256 bytes:
+	// it read the ~12-byte ack, then blocked waiting for 244 bytes that never
+	// arrive until the conn's read deadline fired — burning the full
+	// PostResumeTimeout (~2s) on EVERY post_resume. That single stall was
+	// ~98% of firecracker snapshot-clone create latency (server p50 2030ms,
+	// fc_post_resume 2000ms, measured single-node-fc). The conn already carries
+	// the dial-context read deadline (vsock_dial_linux.go SetDeadline), so a
+	// genuinely hung guest still bails at the bound instead of hanging forever.
+	// We only care that the ack arrived; its content is discarded.
+	_, _ = bufio.NewReader(conn).ReadString('\n')
 	return nil
 }
 
