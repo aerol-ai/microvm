@@ -134,6 +134,25 @@ func (c *Client) NewSandbox(t *testing.T, opts sdktypes.CreateSandboxOptions) *m
 	return sb
 }
 
+// OwnerNodeID returns the cluster node that currently owns sandboxID, read from
+// the FSM placement view (/v1/cluster/placements/{id} → owner.node_id). It is
+// how a test establishes co-location, e.g. neighbor-isolation, which is a
+// same-bridge (same-node) property. The error is reported faithfully so a
+// caller can distinguish "not yet placed / transient" (retry) from a stable
+// answer; a single-node Noop deployment (no placement endpoint) surfaces as an
+// error, which the caller treats as "one node, one bridge" after retries.
+func (c *Client) OwnerNodeID(ctx context.Context, sandboxID string) (string, error) {
+	var pl struct {
+		Owner struct {
+			NodeID string `json:"node_id"`
+		} `json:"owner"`
+	}
+	if err := c.GetJSON(ctx, "/v1/cluster/placements/"+sandboxID, &pl); err != nil {
+		return "", err
+	}
+	return pl.Owner.NodeID, nil
+}
+
 // UniqueName returns a deployment-unique sandbox name for a test, so parallel
 // or repeated runs never collide: "<scenario>-<test>-<unixnano>".
 func UniqueName(sc *Scenario, t *testing.T) string {

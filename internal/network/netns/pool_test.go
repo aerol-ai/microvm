@@ -3,6 +3,7 @@ package netns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,6 +11,27 @@ import (
 	"github.com/aerol-ai/microvm/internal/network/cni"
 	"github.com/aerol-ai/microvm/internal/store"
 )
+
+// TestPoolCapacityIsSeedSize pins the density contract: a pool seeded to N
+// admits N concurrent reserves and rejects the N+1th. Regression for the
+// containerd density cap — the pool was seeded to the warm DEPTH (default 4)
+// instead of a decoupled total size, so cold creates (which also draw from
+// this pool) hard-capped every node at 4 concurrent sandboxes. Capacity must
+// track the seeded size, which is set independently of the warm depth.
+func TestPoolCapacityIsSeedSize(t *testing.T) {
+	const size = 16
+	p := testPool(t, size)
+	ctx := context.Background()
+	now := time.Unix(3, 0).UTC()
+	for i := 0; i < size; i++ {
+		if _, err := p.Reserve(ctx, fmt.Sprintf("sb-%d", i), now); err != nil {
+			t.Fatalf("reserve %d/%d failed: %v", i+1, size, err)
+		}
+	}
+	if _, err := p.Reserve(ctx, "sb-overflow", now); !errors.Is(err, store.ErrNoFreeContainerNetnsSlot) {
+		t.Fatalf("reserve past capacity: got %v, want ErrNoFreeContainerNetnsSlot", err)
+	}
+}
 
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
