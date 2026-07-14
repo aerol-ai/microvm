@@ -199,6 +199,22 @@ func (d *Driver) commitContainerSnapshotLive(ctx context.Context, client *Client
 	if backend == nil {
 		return "", errors.New("containerd snapshot commit requires live containerd")
 	}
+	// Hold a lease across the whole commit. createDiff writes the diff content
+	// to the store with NO gc reference — it only becomes GC-protected once the
+	// committed image's gc.ref.content.l.* labels land at createImage. Without a
+	// lease, a GC sweep in that window collects the diff (and its layers),
+	// surfacing intermittently as "content digest <x>: not found" at diff-id or
+	// unpack. The lease pins everything created here until it is released (by
+	// which point the image labels protect the content). WithDefaultNamespace on
+	// the raw client scopes the lease to the aerolvm namespace.
+	if raw := client.Raw(); raw != nil {
+		leasedCtx, release, lerr := raw.WithLease(ctx)
+		if lerr != nil {
+			return "", fmt.Errorf("snapshot lease: %w", lerr)
+		}
+		ctx = leasedCtx
+		defer func() { _ = release(ctx) }()
+	}
 	container, err := backend.loadContainer(ctx, client, containerRef)
 	if err != nil {
 		return "", err
