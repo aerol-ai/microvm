@@ -44,6 +44,31 @@ make integration-reap                   # terminate any leaked itest instances p
 Reports land in `integration-tests/reports/` (`<scenario>.md`, `<scenario>.json`,
 `index.md` matrix). Legend: ✅ pass · ❌ fail · ⚪ skip(n/a) · 🟡 pending · 🟤 inconclusive.
 
+## Container engine
+
+**containerd is the default engine for every scenario.** `run.sh` writes
+`SB_CONTAINER_ENGINE=containerd` into the config overlay unless a scenario
+advertises the `docker-engine` capability, in which case it uses dockerd. Only
+two scenarios opt out:
+
+- `local-mode` — the local dev install always uses docker.
+- `cluster-3-mixed-docker` — the docker A/B benchmark baseline, kept on docker so
+  its `cluster-3-mixed-docker-*` artifacts stay a valid comparison against the
+  containerd engine measured by `cluster-3-mixed-containerd`.
+
+This encodes the target end-state of the docker→containerd migration: *the local
+installation uses docker; every real deployment (single-node, mixed cluster,
+hetero cluster) uses containerd.* The `containerd-engine` capability no longer
+selects the engine — it opts a scenario into the containerd-specific soak UCs
+(UC-99..102) and the distinctly-labeled `containerd` benchmark row.
+
+Because containerd's CNI container networking is still ship-dark
+(`SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED`, `plans/containerd-engine.md` §8), the
+containerd path has been live-validated on t3 topologies (`cluster-3-mixed-containerd`);
+the metal (`*-fc`) and arm64 scenarios request containerd on hardware where the
+containerd bootstrap has not yet been live-proven — validate those on a `--keep`
+run before relying on them.
+
 ## Persistent cert store (avoid Let's Encrypt re-issuance)
 
 Every domain scenario provisions a fresh box whose Caddy issues a `*.<domain>`

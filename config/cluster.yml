@@ -119,11 +119,13 @@ docker:
     refill_interval: "5s"
 
 # --- Container engine (dockerd vs native containerd) -----------------------
-# Host-level operator choice (plans/containerd-engine.md). Default docker keeps
-# pre-migration hosts byte-identical. Opt into containerd only after Phase 0
-# spikes + §8 gates; install.sh --with-containerd-engine (or Ansible below)
-# also installs CNI plugins under /opt/cni/bin.
-container_engine: "docker" # docker | containerd
+# Default containerd: server deployments (this config → Terraform + Ansible) run
+# the native containerd engine — the target end-state of the docker→containerd
+# migration. Set to "docker" to keep a legacy dockerd host. The local install
+# (scripts/install.sh) is the one exception — it stays docker unless run with
+# --with-containerd-engine. Terraform/Ansible install the CNI plugins under
+# /opt/cni/bin when this is containerd.
+container_engine: "containerd" # containerd (default) | docker
 containerd:
   socket: "/run/containerd/containerd.sock"
   namespace: "aerolvm"

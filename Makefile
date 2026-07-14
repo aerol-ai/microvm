@@ -3,7 +3,7 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-containerd integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
-	integration-cluster-mixed-fc integration-cluster-hetero integration-cluster-hetero-safe \
+	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-docker integration-benchmark-docker-only \
 	integration-benchmark-docker-sparse \
 	integration-benchmark-containerd integration-benchmark-containerd-only \

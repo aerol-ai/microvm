@@ -277,11 +277,12 @@ locals {
     refill_interval = try(local.cluster_ops.docker.netns_pool.refill_interval, "2s")
   }
 
-  # Container engine (plans/containerd-engine.md Phase 5). Default docker keeps
-  # day-0 hosts byte-identical; containerd is opt-in via cluster.yml. Ansible
-  # configure-ops.yml installs CNI plugins when flipped; Terraform only writes
+  # Container engine (plans/containerd-engine.md Phase 5). Default containerd:
+  # server deployments run the native containerd engine (set container_engine:
+  # docker in cluster.yml to keep a legacy dockerd host). Ansible
+  # configure-ops.yml installs CNI plugins for containerd; Terraform only writes
   # the env (bootstrap assumes CNI already on the AMI / day-2 Ansible).
-  container_engine = try(local.cluster_ops.container_engine, "docker")
+  container_engine = try(local.cluster_ops.container_engine, "containerd")
   containerd_cfg = {
     socket                    = try(local.cluster_ops.containerd.socket, "/run/containerd/containerd.sock")
     namespace                 = try(local.cluster_ops.containerd.namespace, "aerolvm")

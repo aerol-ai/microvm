@@ -139,11 +139,11 @@
       SB_DOCKER_NETNS_POOL_DEPTH: "{{ docker.netns_pool.depth | default(4) | int }}"
       SB_DOCKER_NETNS_POOL_PAUSE_IMAGE: "{{ docker.netns_pool.pause_image | default('registry.k8s.io/pause:3.10') }}"
       SB_DOCKER_NETNS_POOL_REFILL_INTERVAL: "{{ docker.netns_pool.refill_interval | default('2s') }}"
-      # Container engine (plans/containerd-engine.md Phase 5). Default docker.
-      # Setting container_engine: containerd in config/cluster.yml flips the
-      # host engine; this play also installs CNI plugins under
-      # containerd.cni_plugin_dir when missing.
-      SB_CONTAINER_ENGINE: "{{ container_engine | default('docker') }}"
+      # Container engine (plans/containerd-engine.md Phase 5). Default containerd
+      # for server deployments; set container_engine: docker in
+      # config/cluster.yml to keep a legacy dockerd host. This play installs CNI
+      # plugins under containerd.cni_plugin_dir when the engine is containerd.
+      SB_CONTAINER_ENGINE: "{{ container_engine | default('containerd') }}"
       SB_CONTAINERD_SOCKET: "{{ containerd.socket | default('/run/containerd/containerd.sock') }}"
       SB_CONTAINERD_NAMESPACE: "{{ containerd.namespace | default('aerolvm') }}"
       SB_CONTAINERD_CNI_PLUGIN_DIR: "{{ containerd.cni_plugin_dir | default('/opt/cni/bin') }}"

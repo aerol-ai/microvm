@@ -1,6 +1,8 @@
 # Capabilities for the single-node containerd-engine soak scenario
-# (plans/containerd-engine.md Phase 5 / §8). run.sh flips
-# container_engine=containerd when this cap is present.
+# (plans/containerd-engine.md Phase 5 / §8). containerd is the harness default
+# engine now, so this scenario would run containerd regardless; the
+# containerd-engine cap is what OPTS IN the containerd-specific soak UCs
+# (UC-99..102) — it no longer selects the engine.
 name: single-node-containerd
 capabilities:
   - docker

@@ -20,10 +20,11 @@ capabilities:
   # the one cluster carrying docker/gvisor/wasm together, so a per-runtime
   # create-latency + density benchmark is meaningful here.
   - benchmark
-  # Enable the image-agnostic pause-netns pool so docker creates on this
-  # cluster adopt prepaid network namespaces. Unlike docker-pool this holds
-  # no capacity reservations (a pause slot is ~1MB + one bridge IP), so it
-  # does not move the UC-95 density ceiling.
-  - docker-netns-pool
+  # NOTE: this cluster runs SB_CONTAINER_ENGINE=containerd (the harness default;
+  # it does NOT advertise docker-engine). The docker RUNTIME is served by the
+  # native containerd driver, which brings its own CNI netns pool
+  # (SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED) — so the docker-engine-only
+  # pause-netns pool (docker-netns-pool) is intentionally absent here; it would
+  # be a no-op on a containerd host.
 
 expected_members: 8
