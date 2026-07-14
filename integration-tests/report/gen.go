@@ -14,6 +14,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -224,14 +226,33 @@ func summarize(rs []Result) Summary {
 }
 
 func parseEvents(r io.Reader) ([]testEvent, error) {
-	dec := json.NewDecoder(r)
+	// `go test -json` is line-delimited JSON. Parse line-by-line and skip a
+	// torn line rather than aborting the whole report: when a test writes to
+	// os.Stdout concurrently with the test framework, the -json stream can
+	// splice two records and corrupt one line. A streaming json.Decoder cannot
+	// resync past that; a Scanner just drops the bad line and keeps going.
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024) // test output lines can be large
 	var events []testEvent
-	for dec.More() {
+	skipped := 0
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 || line[0] != '{' {
+			skipped++
+			continue
+		}
 		var ev testEvent
-		if err := dec.Decode(&ev); err != nil {
-			return nil, err
+		if err := json.Unmarshal(line, &ev); err != nil {
+			skipped++
+			continue
 		}
 		events = append(events, ev)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr, "parseEvents: skipped %d malformed line(s) in the go test -json stream\n", skipped)
 	}
 	return events, nil
 }

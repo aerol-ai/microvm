@@ -386,3 +386,76 @@ func TestHTTPToWS(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleSession_ContainerdExecViaToolbox is the UC-43 regression: on the
+// containerd engine a one-shot ssh `exec` request must run through the
+// in-container toolbox session (POST /sessions carrying Command) rather than
+// the docker-exec path, which cannot reach a containerd task (echo would come
+// back exit 1). The command's exit status must propagate over the SSH channel.
+func TestHandleSession_ContainerdExecViaToolbox(t *testing.T) {
+	var posted *models.CreateSessionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sessions":
+			body, _ := io.ReadAll(r.Body)
+			var cr models.CreateSessionRequest
+			_ = json.Unmarshal(body, &cr)
+			posted = &cr
+			_, _ = w.Write([]byte(`{"id":"sess-local","name":"exec","status":"running"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/sessions/sess-local/attach":
+			up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			conn, err := up.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{streamFramePrefixStdout}, []byte("ssh-ok")...))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"exit","code":0}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	host, portStr, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	g := &Gateway{
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		containerEngine: models.ContainerEngineContainerd,
+		toolboxPort:     port,
+		svc: &fakeLookup{sandbox: &models.Sandbox{
+			ID:           "sb-ctd",
+			Status:       models.SandboxStatusStarted,
+			ContainerID:  "ctr-1",
+			ContainerIP:  host,
+			ToolboxToken: "tok",
+		}},
+	}
+	channel := &fakeChannel{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	requests := make(chan *ssh.Request, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleSession(context.Background(), "sb-ctd", "session", "default", false, channel, requests)
+	}()
+	requests <- &ssh.Request{Type: "exec", Payload: encodeString("echo ssh-ok")}
+	close(requests)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleSession did not return")
+	}
+
+	if posted == nil {
+		t.Fatal("containerd exec must POST a toolbox session; the docker-exec path was taken instead")
+	}
+	if posted.Command != "echo ssh-ok" {
+		t.Fatalf("toolbox session command = %q, want echo ssh-ok", posted.Command)
+	}
+	if got := channel.exitStatus(); got != 0 {
+		t.Fatalf("exit status = %d, want 0", got)
+	}
+}

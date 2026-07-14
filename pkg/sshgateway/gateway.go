@@ -60,6 +60,12 @@ type Config struct {
 	// RemoteAPIToken is the PAT presented on the loopback v1 call. Only used
 	// when RemoteAPIBaseURL is set.
 	RemoteAPIToken string
+	// ContainerEngine is the host runtime engine ("docker" | "containerd").
+	// On containerd, sandboxes are containerd tasks (not docker containers), so
+	// the docker-exec one-shot path cannot reach them — the gateway runs the
+	// command through the in-container toolbox session instead. Empty defaults
+	// to the docker behaviour.
+	ContainerEngine string
 }
 
 // Gateway terminates SSH connections on the host and bridges accepted shell /
@@ -82,6 +88,9 @@ type Gateway struct {
 	// remote branch is never taken.
 	remoteBaseURL string
 	remotePAT     string
+
+	// containerEngine gates the containerd one-shot-exec-via-toolbox path.
+	containerEngine string
 }
 
 // New constructs a Gateway. It loads or generates the host key. Returns an
@@ -106,8 +115,9 @@ func New(logger *slog.Logger, cfg Config, svc SandboxLookup, dockerCli DockerExe
 		dockerCli:   dockerCli,
 		toolboxPort: cfg.ToolboxPort,
 
-		remoteBaseURL: strings.TrimRight(strings.TrimSpace(cfg.RemoteAPIBaseURL), "/"),
-		remotePAT:     strings.TrimSpace(cfg.RemoteAPIToken),
+		remoteBaseURL:   strings.TrimRight(strings.TrimSpace(cfg.RemoteAPIBaseURL), "/"),
+		remotePAT:       strings.TrimSpace(cfg.RemoteAPIToken),
+		containerEngine: strings.TrimSpace(cfg.ContainerEngine),
 	}, nil
 }
 
@@ -366,8 +376,20 @@ func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionNam
 				replyRequest(req, false)
 				continue
 			}
-			cmd := []string{"sh", "-c", command}
 			replyRequest(req, true)
+			// Containerd sandboxes are containerd tasks, not docker containers, so
+			// the docker-exec path (runExec) cannot reach them (echo would come
+			// back exit 1). Run the one-shot command as its own short-lived
+			// toolbox session — the same engine-agnostic path the cross-node exec
+			// uses — so its exact exit status propagates. Docker is unchanged.
+			if g.containerEngine == models.ContainerEngineContainerd && g.toolboxPort > 0 && sandbox.ContainerIP != "" {
+				state.execCommand = command
+				ep := localSessionEndpoint(sandbox.ContainerIP, g.toolboxPort, sandbox.ToolboxToken)
+				exitCode := g.attachToSession(ctx, channel, ep, "exec-"+newForwardID(), state, nil)
+				_ = sendExitStatus(channel, uint32(exitCode))
+				return
+			}
+			cmd := []string{"sh", "-c", command}
 			g.runExec(ctx, channel, sandboxID, containerID, cmd, state)
 			return
 
