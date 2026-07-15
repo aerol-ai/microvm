@@ -30,6 +30,13 @@ type Driver struct {
 	// waitListenReady overrides guest TCP readiness polling (tests).
 	waitListenReady func(host string, port int) error
 
+	// residentSupervisor spawns/owns shared resident-host processes
+	// (--wasm-resident-host), one per (digest, memoryMB) bucket. Nil unless
+	// cfg.ResidentHostEnabled and wired via SetResidentHostSupervisor.
+	residentSupervisor WorkerSupervisor
+	residentMu         sync.Mutex
+	residentBuckets    map[string]*residentBucket
+
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance
 
@@ -67,6 +74,13 @@ func (d *Driver) SetWorkerClientFactory(f WorkerClientFactory) {
 	if f != nil {
 		d.newWorkerClient = f
 	}
+}
+
+// SetResidentHostSupervisor wires the supervisor that owns shared resident-host
+// processes. Only consulted when cfg.ResidentHostEnabled; leaving it nil (the
+// default) keeps every create on the per-sandbox worker path.
+func (d *Driver) SetResidentHostSupervisor(s WorkerSupervisor) {
+	d.residentSupervisor = s
 }
 
 // SetStateKV wires the durable host-KV store (§4.6).
@@ -115,6 +129,12 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 
 func (d *Driver) refreshWorkerInstanceState(ctx context.Context, sandboxID string, inst *sandboxInstance) *sandboxInstance {
 	if inst == nil || strings.TrimSpace(inst.socketPath) == "" {
+		return inst
+	}
+	// Resident-hosted instances live on a shared process tracked by the resident
+	// supervisor, not the per-sandbox one — the spawn-count / InstanceLoaded
+	// liveness checks below don't apply, so report the instance as-is.
+	if inst.fromResidentHost {
 		return inst
 	}
 	if count, ok := d.supervisorSpawnCount(d.workerKeyForInstance(sandboxID, inst)); ok {

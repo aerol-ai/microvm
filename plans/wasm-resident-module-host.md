@@ -73,9 +73,22 @@ must show the breakdown before Phase 1 starts. Interpretation → lever:
 | `wasm_load_runtime` + `_newengine` | resident **runtime** (a lighter variant of this plan — reuse the runtime, still re-`InstantiateModule`) |
 | `wasm_load_read` | mmap / keep module bytes resident (small, separate change) |
 
-The config note (`~10s` cold compile vs `~2.8s` cached) strongly implies
-`_compile` dominates, i.e. this plan is the right lever — but confirm, don't
-assume.
+**Gate result — GREEN (2026-07-15, `cluster-3-mixed-wasm`, v0.7.9, 10 samples,
+0 failures).** The breakdown of the cold miss (`wasm_load` p50 2843ms, n=2):
+
+| sub-stage | p50 | share |
+|---|---|---|
+| `wasm_load_compile` | **2768ms** | **~97%** |
+| `wasm_load_read` (25MB ReadFile) | 56ms | ~2% |
+| `wasm_load_newengine` | 1ms | ~0% |
+| `wasm_load_runtime` | 1ms | ~0% |
+
+`CompileModule` owns the cold load almost entirely — and note this is *with* the
+on-disk compile cache populated, so 2.77s is the cache-hit **deserialize** cost
+of a 25MB CPython image per fresh process, not a from-scratch 10s compile. A
+resident in-process `CompiledModule` skips even the deserialize, so a cold
+create collapses to `wasm_instantiate` (**9ms** in the same run). This plan (the
+resident compiled module) is confirmed the right lever; Phase 1 may start.
 
 ## Core insight
 
@@ -135,56 +148,123 @@ A **resident module host** is a long-lived worker process that:
 3. Services many `Instantiate` requests, each creating an isolated instance
    keyed by `sandboxID`; a create that routes here costs ~`wasm_instantiate`.
 
-### Engine (Phase 1)
+### Engine (Phase 1) — IMPLEMENTED 2026-07-15
 
-Add a multi-instance capability WITHOUT touching the base `Engine` interface
-(which `wasmtime` + several mocks implement). Preferred: a new
-`MultiInstanceEngine` in `pkg/wasm` wrapping `{runtime, compiled,
-map[sandboxID]api.Module}` with per-instance `Instantiate/StopInstance/Run/
-CaptureSnapshot/RestoreSnapshot/ResolvedListenPort`. The existing
-single-instance `wazeroEngine` stays the default path untouched. Offline unit
-tests: two instances of the same compiled module cannot read each other's
-linear memory; StopInstance on one leaves the other running; compile happens
-exactly once across N instantiates.
+`pkg/wasm/engine_multi.go`: `MultiInstanceEngine` wraps `{runtime, compiled,
+map[sandboxID]api.Module}` — compile-once (`LoadModule`), instantiate-many
+(`Instantiate(sandboxID, caps)` with a per-instance `WithName(sandboxID)` so
+co-tenants don't collide on one runtime), plus `StopInstance`, `InvokeExport`,
+`HasInstance`, `InstanceCount`, `Close`, and `LastLoadTimings`
+(`LoadTimingReporter`). MemoryMB is fixed at construction (the bucketing
+constraint above). The base `Engine` interface is untouched — `wasmtime` and the
+mocks are unaffected; the runtime builder + module/fs config helpers were
+extracted to free functions (`newBaseRuntime`, `moduleConfigFor`, `fsConfigFor`)
+so both engines share identical config (notably the compile cache), and the
+single-instance `wazeroEngine` delegates to them unchanged.
 
-### Worker protocol (Phase 2)
+Tests (`pkg/wasm/engine_multi_test.go`, offline): compile happens once across N
+instantiates (resident `compiled` pointer unchanged); two instances of the same
+module cannot read each other's linear memory (write to A, B stays zero);
+StopInstance on one leaves the co-tenant running and uncorrupted; duplicate
+sandboxID rejected; Instantiate-before-Load and empty-ID fail cleanly;
+`LoadTimingReporter` satisfied. Full `pkg/wasm` + driver + pool suites still
+green (the extraction did not disturb the single-instance path).
 
-The worker `Server` today holds one `s.eng` + one `s.lastCaps`
-(`server.go:16-24`). Make instance state per-`sandboxID` (the network mediator
-and byte counters are **already** keyed by sandboxID — `netUsageFor`,
-`mediator()` — so that half is done). Split the messages:
+**Deferred to Phase 2 (worker wiring), NOT in the Phase 1 engine:** per-instance
+networking (the worker's `NetMediator` is already sandboxID-keyed), IO-capturing
+`Run`, snapshot/restore, and wasip1 listeners (`expose_port`/HTTP — resident-host
+mode initially serves non-listen sandboxes; HTTP falls back to the cold path).
 
-- `MsgLoadModule` → load/compile the host's shared module once (idempotent per
-  bucket); returns the existing `LoadTimings`.
-- `MsgInstantiate` / `MsgStopInstance` / `MsgCheckpoint` / `MsgRestore` /
-  `MsgSetListenPort` → operate on the per-`sandboxID` instance.
+### Worker protocol (Phase 2) — IMPLEMENTED 2026-07-15
 
-**Scope limit for Phase 2:** wasip1 TCP listeners (`expose_port` / HTTP guests)
-resolve one listener fd per instance and the server tracks a single
-`lastCaps.WASIListenPort`. Multiplexing many listeners in one process is extra
-complexity, so the first cut supports resident-host mode **only for
-non-listen sandboxes** (one-shot exec / no `expose_port`); HTTP guests fall back
-to the cold per-process path. Lift this in a later phase if the bench shows
-HTTP guests need it.
+`pkg/wasm/worker/resident_server.go`: `ResidentServer` backed by a
+`MultiInstanceEngine`, spawned via `--wasm-resident-host <socket>`
+(`RunCLIResident` → `cmd/sandboxd/main.go`). It reuses the existing wire
+protocol + `Client` unchanged — only the server interprets the messages
+multi-instance:
 
-### Pool + routing (Phase 3)
+- `MsgLoadModule` → lazily builds the engine at the payload's `memoryMB` on
+  first call, compiles once, returns the existing `LoadTimings`; idempotent for
+  the same path; **refuses a second distinct module** (a bucket is one module).
+- `MsgInstantiate` / `MsgExec` / `MsgInvoke` / `MsgStopInstance` → per-`sandboxID`
+  on the resident engine (`MultiInstanceEngine.{Instantiate,Run,InvokeExport,
+  StopInstance}`).
+- Listener (`caps.ListenEnabled()`), checkpoint/restore, network/netstats →
+  **rejected** with a clear error, so a misrouted request fails loudly.
 
-`internal/pool/wasm` shifts from "pool of pre-instantiated slots" to "pool of
-resident hosts per (digest, memoryMB)." `Acquire` returns a host to instantiate
-into rather than a slot to adopt. Refill keeps `min` hosts compiled per hot
-bucket. This also naturally fixes the miss/refill race noted in
-`project_wasm_create_latency` — there is no separate per-sandbox cold spawn to
-race, because the create instantiates into a resident host.
+Tests (`pkg/wasm/worker/resident_server_test.go`, offline): load-once →
+instantiate+exec two sandboxes on the resident module; re-load same path is a
+no-op; a second distinct module is refused; per-sandbox StopInstance; a
+listener Instantiate is rejected.
 
-### Config (Phase 3)
+**Scope limit (unchanged):** resident-host mode serves **non-listen** sandboxes
+only; `expose_port`/HTTP guests fall back to the cold per-process path.
 
-- `SB_WASM_RESIDENT_HOST_ENABLED` (bool, **default false**) — gates the whole
-  path; when false, behavior is exactly today's.
-- `SB_WASM_RESIDENT_HOST_MAX_INSTANCES` (int, default e.g. 32) — per-host
-  instance cap (blast-radius bound + load spreading).
-- Interplay: when enabled, the resident host is the warm mechanism, so
-  `SB_WASM_POOL_ENABLED` semantics fold into host pre-compilation. Document
-  which wins in `setup/config-defaults.md`.
+**Remaining Phase 2 (eng-review-gated): per-instance egress isolation.** The
+engine's `wazeroNetHost` (`wazero_network.go`) holds ONE hook + a GLOBAL conn
+table, read by all three WASI host modules at call time. Co-tenancy needs it
+keyed by `mod.Name()` (= sandboxID, since instances are named) plus conn
+ownership so guest B can't touch guest A's socket. Until that lands, resident
+instances get base WASI + FS only (no mediated egress), so networking modules
+are not yet served here. This is the security-sensitive change that must go
+through review.
+
+### Config (Phase 3) — flag IMPLEMENTED 2026-07-15
+
+- `SB_WASM_RESIDENT_HOST_ENABLED` (bool, **default false**) → `cfg.WasmResidentHostEnabled`
+  (`internal/config/config.go`). Gates the whole path; false = today's behavior
+  exactly. **DONE.**
+- `SB_WASM_RESIDENT_HOST_MAX_INSTANCES` (int, per-host cap) — TODO with the
+  routing below.
+- Interplay with `SB_WASM_POOL_ENABLED` + `setup/config-defaults.md` — TODO.
+
+### Pool + driver routing (Phase 3b) — IMPLEMENTED 2026-07-15 (gated, offline-tested)
+
+Gated by `cfg.WasmResidentHostEnabled` (default false) so flag-off is a
+byte-for-byte no-op — the existing per-sandbox `Driver.Create` path is left
+completely untouched (verified: full `internal/runtime/wasm` suite still green).
+Shipped (`internal/runtime/wasm/resident.go` + edits to `driver.go`,
+`create.go`, `lifecycle.go`, `config.go`, `pkg/daemon/wasm_wiring.go`,
+`pkg/wasm/worker/supervisor.go`):
+
+1. Resident-host state on the driver + `SetResidentHostSupervisor` (a second
+   supervisor using `worker.DefaultResidentSpawner` → `--wasm-resident-host`),
+   `ensureResidentHost` keyed by bucket `residentBucketID(digest, memoryMB)`
+   with per-bucket single-flight (`residentBucket.mu`) on host spawn + one
+   host-level `LoadModule`.
+2. `create.go`: an early branch — when `residentHostEnabled()`, the create is
+   not public-expose (`createWantsPublicExpose`), and the digest is known —
+   returns `createOnResidentHost` (Ensure → waitWorker → host LoadModule →
+   `Instantiate(sandboxID)`), setting `fromResidentHost`, `socketPath`=bucket
+   socket, `workerKey`=bucket. Instantiate failure resets the bucket (respawn
+   safety) and rolls back.
+3. `lifecycle.go` Destroy: `fromResidentHost` → `client.StopInstance(sandboxID)`,
+   never `supervisor.Stop` (the shared host stays up). (Stop already calls
+   StopInstance, so it was already correct.)
+4. `driver.go` `refreshWorkerInstanceState`: short-circuits for
+   `fromResidentHost` (per-sandbox spawn-count liveness doesn't apply).
+5. Daemon wiring: the resident supervisor is constructed only when the flag is
+   set; nil/no-op otherwise.
+
+Tests (`internal/runtime/wasm/resident_test.go`, offline): create routes to the
+resident host (resident supervisor ensured, per-sandbox untouched, host-level
+load + instantiate, `fromResidentHost` + bucket workerKey); Destroy StopInstances
+without killing the host; flag-off takes the cold path; public-expose create
+takes the cold path.
+
+This also sidesteps the miss/refill race in `project_wasm_create_latency`: no
+separate per-sandbox cold spawn to race — creates instantiate into a resident host.
+
+**Remaining before the flag can flip ON (eng-review-gated):**
+- **Per-instance egress isolation** — resident instances currently get base
+  WASI + FS only; wasi-sockets/http egress needs the net host keyed by
+  `mod.Name()` + conn ownership (see Phase 2 note). Until then, networking
+  modules (likely CPython) aren't served by the resident host, so the live
+  CPython cold-load win still can't be benched.
+- **expose_port after create** on a private resident sandbox errors (resident
+  host rejects listeners). Document, or migrate-to-cold-on-expose.
+- **Host lifecycle**: idle-TTL teardown of resident hosts, capacity/admission
+  accounting for host-shared RAM, `SB_WASM_RESIDENT_HOST_MAX_INSTANCES` cap.
 
 ### Validation (Phase 4)
 

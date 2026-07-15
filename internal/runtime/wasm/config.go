@@ -13,15 +13,21 @@ type Config struct {
 	DefaultMemoryMB    int
 	DefaultWallTimeout time.Duration
 	DrainTimeout       time.Duration
+	// ResidentHostEnabled routes non-listen creates to a shared resident
+	// compile-once/instantiate-many host per (digest, memoryMB) bucket instead of
+	// a fresh per-sandbox worker (plans/wasm-resident-module-host.md). Default
+	// false; requires a resident supervisor wired via SetResidentHostSupervisor.
+	ResidentHostEnabled bool
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
 func FromDaemonConfig(cfg config.Config) Config {
 	return Config{
-		RunDir:             cfg.WasmRunDir,
-		ModulesDir:         cfg.WasmModulesDir,
-		DefaultMemoryMB:    cfg.WasmDefaultMemoryMB,
-		DefaultWallTimeout: cfg.WasmDefaultTimeout,
-		DrainTimeout:       cfg.WasmDrainTimeout,
+		RunDir:              cfg.WasmRunDir,
+		ModulesDir:          cfg.WasmModulesDir,
+		DefaultMemoryMB:     cfg.WasmDefaultMemoryMB,
+		DefaultWallTimeout:  cfg.WasmDefaultTimeout,
+		DrainTimeout:        cfg.WasmDrainTimeout,
+		ResidentHostEnabled: cfg.WasmResidentHostEnabled,
 	}
 }

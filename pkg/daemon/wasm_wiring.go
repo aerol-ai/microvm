@@ -59,6 +59,14 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	supervisor := worker.NewSupervisor(worker.DefaultSpawner)
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)
+	// Resident-module host (compile-once/instantiate-many): opt-in, default off.
+	// A second supervisor owns the shared host processes so their lifecycle is
+	// independent of per-sandbox workers. Wired only when enabled — otherwise the
+	// driver's residentHostEnabled() stays false and every create takes the
+	// per-sandbox path. See plans/wasm-resident-module-host.md.
+	if cfg.WasmResidentHostEnabled {
+		driver.SetResidentHostSupervisor(worker.NewSupervisor(worker.DefaultResidentSpawner))
+	}
 	if st != nil {
 		// Wrap the durable host-KV store in a per-sandbox write limiter so a
 		// chatty guest cannot starve the single-writer boot path (§4.6).

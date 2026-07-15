@@ -544,6 +544,14 @@ type Config struct {
 	// Default <WasmCacheDir>/wazero-compile. Empty disables the cache.
 	// SB_WASM_COMPILE_CACHE_DIR.
 	WasmCompileCacheDir string
+	// WasmResidentHostEnabled routes non-listen wasm creates to a resident
+	// compile-once/instantiate-many host process per (module, memoryMB) bucket
+	// instead of a fresh per-sandbox worker (plans/wasm-resident-module-host.md).
+	// It collapses the ~2.8s cold CompileModule to a ~9ms Instantiate, but shares
+	// one process across co-tenant sandboxes — so it is DEFAULT OFF and remains
+	// operator opt-in until the per-instance egress-isolation work + eng-review
+	// land, exactly like SB_DOCKER_POOL_ENABLED. SB_WASM_RESIDENT_HOST_ENABLED.
+	WasmResidentHostEnabled bool
 	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
 	// SB_WASM_DRAIN_TIMEOUT.
 	WasmDrainTimeout time.Duration
@@ -1527,6 +1535,7 @@ func Load() (Config, error) {
 		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
 		WasmModuleDigestMode:    strings.ToLower(getEnv("SB_WASM_MODULE_DIGEST_MODE", "once")),
 		WasmCompileCacheDir:     getEnv("SB_WASM_COMPILE_CACHE_DIR", ""),
+		WasmResidentHostEnabled: getEnvBool("SB_WASM_RESIDENT_HOST_ENABLED", false),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
