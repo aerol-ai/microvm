@@ -100,6 +100,42 @@ func (d *Driver) ensureResidentHost(ctx context.Context, digest, path string, me
 	return b, nil
 }
 
+// PrewarmResidentHosts brings up the resident host and compiles each ref's
+// module at daemon boot, so the FIRST create for a standard module is a ~ms
+// Instantiate instead of paying the one-time ~seconds CompileModule on the
+// create path. This is the fix for the lazy first-create-per-node tail measured
+// in the v0.7.10 A/B (resident server p99 ~1.7s = the un-amortized first
+// compile). Best-effort and meant to be backgrounded by the caller (compiling a
+// ~25MB module is slow — pr-review.md §2 keeps it off the boot-blocking path);
+// a ref that does not resolve or compile is logged and skipped. No-op unless
+// resident hosts are enabled.
+func (d *Driver) PrewarmResidentHosts(ctx context.Context, refs []string) {
+	if !d.residentHostEnabled() || d.resolver == nil {
+		return
+	}
+	for _, ref := range refs {
+		if ctx.Err() != nil {
+			return
+		}
+		resolved, err := d.resolver.Resolve(ctx, ref)
+		if err != nil || resolved == nil || resolved.Digest == "" {
+			if d.logger != nil {
+				d.logger.Warn("resident prewarm skipped: ref did not resolve", "ref", ref, "error", err)
+			}
+			continue
+		}
+		if _, err := d.ensureResidentHost(ctx, resolved.Digest, resolved.Path, d.cfg.DefaultMemoryMB); err != nil {
+			if d.logger != nil {
+				d.logger.Warn("resident prewarm failed", "ref", ref, "error", err)
+			}
+			continue
+		}
+		if d.logger != nil {
+			d.logger.Info("resident host prewarmed", "ref", ref, "digest", resolved.Digest, "memory_mb", d.cfg.DefaultMemoryMB)
+		}
+	}
+}
+
 // createOnResidentHost is the resident-host create path: it instantiates an
 // isolated instance into the shared bucket host instead of spawning a
 // per-sandbox worker + compiling. Reached only when residentHostEnabled() and
