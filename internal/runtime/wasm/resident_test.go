@@ -99,6 +99,50 @@ func TestCreateResidentRetryIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestPrewarmResidentHostsSkipsFirstCreateBringup guards the boot-time pre-warm:
+// after PrewarmResidentHosts brings up + compiles a module's host, the first
+// create for that module must NOT re-spawn or re-compile — it's a cached
+// (ready) bucket, so the create is instantiate-only. This is what moves the
+// one-time compile off the create path (the v0.7.10 tail fix).
+func TestPrewarmResidentHostsSkipsFirstCreateBringup(t *testing.T) {
+	d, _, resident, client := residentTestDriver(t, true)
+
+	d.PrewarmResidentHosts(context.Background(), []string{"demo.wasm"})
+	if resident.ensureCalls != 1 {
+		t.Fatalf("prewarm resident ensure calls = %d, want 1", resident.ensureCalls)
+	}
+	if client.loadPath == "" {
+		t.Fatal("prewarm did not LoadModule (compile) the resident host")
+	}
+
+	// First create for the same (digest, memoryMB) bucket must reuse the
+	// pre-warmed host: no additional Ensure, no additional LoadModule.
+	client.loadPath = ""
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-pw", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if resident.ensureCalls != 1 {
+		t.Fatalf("create re-brought-up the host: resident ensure calls = %d, want 1 (reuse pre-warmed)", resident.ensureCalls)
+	}
+	if client.loadPath != "" {
+		t.Fatalf("create re-compiled (LoadModule) despite pre-warm: loadPath=%q", client.loadPath)
+	}
+	inst, err := d.instance("sb-pw")
+	if err != nil || !inst.fromResidentHost {
+		t.Fatalf("create did not use the resident host (inst=%v err=%v)", inst, err)
+	}
+}
+
+// TestPrewarmResidentHostsDisabledNoop confirms pre-warm does nothing when the
+// flag is off (no resident supervisor consulted).
+func TestPrewarmResidentHostsDisabledNoop(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, false)
+	d.PrewarmResidentHosts(context.Background(), []string{"demo.wasm"})
+	if resident.ensureCalls != 0 {
+		t.Fatalf("prewarm ran with flag off: resident ensure calls = %d, want 0", resident.ensureCalls)
+	}
+}
+
 // TestCreateResidentDisabledUsesColdPath confirms the flag-off default is
 // untouched: creates take the per-sandbox worker path.
 func TestCreateResidentDisabledUsesColdPath(t *testing.T) {

@@ -119,6 +119,20 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 			"refill_interval", cfg.WasmPoolRefillInterval)
 	}
 
+	// Boot-time resident-host pre-warm: bring up + compile the standard-module
+	// resident hosts ahead of demand so the first create is an Instantiate, not a
+	// cold compile. Backgrounded (compiling ~25MB modules is slow) so it never
+	// blocks daemon boot (hard rule 2 / pr-review.md §2). No-op unless the flag
+	// is set and a resident supervisor was wired above.
+	if cfg.WasmResidentHostEnabled {
+		refs := make([]string, 0, len(cfg.WasmStandardModules))
+		for alias := range cfg.WasmStandardModules {
+			refs = append(refs, alias)
+		}
+		go driver.PrewarmResidentHosts(ctx, refs)
+		logger.Info("wasm resident host prewarm scheduled", "modules", len(refs))
+	}
+
 	logger.Info("wasm runtime enabled",
 		"run_dir", cfg.WasmRunDir,
 		"modules_dir", cfg.WasmModulesDir,
