@@ -26,6 +26,21 @@ func DefaultSpawner(ctx context.Context, socketPath string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
+// DefaultResidentSpawner runs the current executable as a resident-module host
+// (--wasm-resident-host → RunCLIResident): one process compiles a module once
+// and hosts many isolated sandbox instances. Used by the driver's resident-host
+// supervisor when SB_WASM_RESIDENT_HOST_ENABLED is set.
+func DefaultResidentSpawner(ctx context.Context, socketPath string) (*exec.Cmd, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, exe, "--wasm-resident-host", socketPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd, nil
+}
+
 // Slot tracks one sandbox worker subprocess.
 type Slot struct {
 	SandboxID  string

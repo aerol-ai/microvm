@@ -223,7 +223,12 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if d.net != nil {
 		d.net.ReleaseSandbox(sandboxID)
 	}
-	if d.supervisor != nil {
+	if inst != nil && inst.fromResidentHost {
+		// Shared resident host — remove only this instance; NEVER kill the
+		// process (co-tenants depend on it). Best-effort: a dead host already
+		// dropped the instance.
+		_ = d.newWorkerClient(inst.socketPath).StopInstance(sandboxID)
+	} else if d.supervisor != nil {
 		workerKey := sandboxID
 		if inst != nil && inst.workerKey != "" {
 			workerKey = inst.workerKey

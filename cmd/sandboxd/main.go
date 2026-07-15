@@ -12,9 +12,10 @@ import (
 )
 
 var (
-	runDaemon        = daemon.Run
-	runWasmWorkerCLI = worker.RunCLI
-	osExit           = os.Exit
+	runDaemon              = daemon.Run
+	runWasmWorkerCLI       = worker.RunCLI
+	runWasmResidentHostCLI = worker.RunCLIResident
+	osExit                 = os.Exit
 )
 
 func run(ctx context.Context, logger *slog.Logger) error {
@@ -29,6 +30,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
+	// Resident-module host: one process compiles a module once and hosts many
+	// isolated sandbox instances (plans/wasm-resident-module-host.md). Spawned
+	// only when SB_WASM_RESIDENT_HOST_ENABLED routes a create here.
+	if len(os.Args) >= 2 && os.Args[1] == "--wasm-resident-host" {
+		if err := runWasmResidentHostCLI(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")
 			osExit(1)
 		}

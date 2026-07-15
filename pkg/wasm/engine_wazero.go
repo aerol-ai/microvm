@@ -58,21 +58,9 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 		e.runtime = nil
 	}
 	pages := MemoryLimitPages(memoryMB)
-	cfg := wazero.NewRuntimeConfig()
-	if pages > 0 {
-		cfg = cfg.WithMemoryLimitPages(pages)
-	}
-	if dir := wazeroCompileCacheDir(); dir != "" {
-		cache, err := wazero.NewCompilationCacheWithDir(dir)
-		if err != nil {
-			return fmt.Errorf("compilation cache: %w", err)
-		}
-		cfg = cfg.WithCompilationCache(cache)
-	}
-	r := wazero.NewRuntimeWithConfig(ctx, cfg)
-	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
-		_ = r.Close(ctx)
-		return fmt.Errorf("wasi instantiate: %w", err)
+	r, err := newBaseRuntime(ctx, pages)
+	if err != nil {
+		return err
 	}
 	e.runtime = r
 	e.wasiCompat = false
@@ -89,6 +77,31 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 
 func wazeroCompileCacheDir() string {
 	return strings.TrimSpace(os.Getenv("AEROL_WASM_COMPILE_CACHE_DIR"))
+}
+
+// newBaseRuntime builds a wazero runtime at the given memory-limit pages with
+// the shared on-disk compilation cache and the base wasip1 host, but no guest
+// module compiled. Shared by the single-instance engine (initRuntime) and the
+// MultiInstanceEngine (engine_multi.go) so both get identical runtime config —
+// notably the same compilation cache, which is what makes a warm compile cheap.
+func newBaseRuntime(ctx context.Context, pages uint32) (wazero.Runtime, error) {
+	cfg := wazero.NewRuntimeConfig()
+	if pages > 0 {
+		cfg = cfg.WithMemoryLimitPages(pages)
+	}
+	if dir := wazeroCompileCacheDir(); dir != "" {
+		cache, err := wazero.NewCompilationCacheWithDir(dir)
+		if err != nil {
+			return nil, fmt.Errorf("compilation cache: %w", err)
+		}
+		cfg = cfg.WithCompilationCache(cache)
+	}
+	r := wazero.NewRuntimeWithConfig(ctx, cfg)
+	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
+		_ = r.Close(ctx)
+		return nil, fmt.Errorf("wasi instantiate: %w", err)
+	}
+	return r, nil
 }
 
 func (e *wazeroEngine) ensureWasiCompatHosts(ctx context.Context) error {
@@ -211,6 +224,14 @@ func (e *wazeroEngine) InvokeExport(ctx context.Context, name string) error {
 }
 
 func (e *wazeroEngine) moduleConfig(caps Capabilities) wazero.ModuleConfig {
+	return moduleConfigFor(caps)
+}
+
+// moduleConfigFor builds the wazero ModuleConfig for a set of capabilities. It
+// is a pure function of caps (no engine state), so both the single-instance
+// engine and the MultiInstanceEngine share it — the latter additionally sets a
+// per-instance WithName so many instances can coexist on one runtime.
+func moduleConfigFor(caps Capabilities) wazero.ModuleConfig {
 	cfg := wazero.NewModuleConfig().WithArgs(caps.Args...)
 	// Driver/worker invoke _start explicitly (background on create; after listen for HTTP).
 	cfg = cfg.WithSysWalltime().WithSysNanotime().WithStartFunctions()
@@ -305,6 +326,12 @@ func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities,
 // fd (3 + len(preopens)) rather than fd 3 — guests learn the right fd from the
 // AEROL_WASM_LISTEN_FD env var injected by moduleConfig (see listenerFD).
 func (e *wazeroEngine) fsConfigForCaps(caps Capabilities) wazero.FSConfig {
+	return fsConfigFor(caps)
+}
+
+// fsConfigFor builds directory preopens for a set of capabilities. Pure function
+// of caps (no engine state); shared with the MultiInstanceEngine.
+func fsConfigFor(caps Capabilities) wazero.FSConfig {
 	preopens := caps.Preopens
 	if len(preopens) == 0 {
 		return nil

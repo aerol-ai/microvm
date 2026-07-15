@@ -26,6 +26,12 @@ type sandboxInstance struct {
 	// driver must not keep reporting the sandbox as live.
 	workerSpawnCount int
 	fromWarmPool     bool
+	// fromResidentHost marks a sandbox instantiated into a shared resident host
+	// process (compile-once/instantiate-many). Its socketPath is the bucket host
+	// socket and workerKey is the bucket id — destroy must StopInstance, NOT kill
+	// the shared process, and the per-sandbox supervisor spawn-count tracking does
+	// not apply.
+	fromResidentHost bool
 	status           models.SandboxStatus
 	entryExport      string
 	baseEnv          map[string]string

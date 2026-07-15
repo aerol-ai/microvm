@@ -59,6 +59,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	memoryMB := effectiveMemoryMB(req, d.cfg.DefaultMemoryMB)
 
+	// Resident-host fast path (opt-in, non-listen, known digest): instantiate
+	// into a shared compile-once/instantiate-many host instead of spawning a
+	// per-sandbox worker + compiling. Everything below is the untouched
+	// per-sandbox path used when the flag is off (the default).
+	if d.residentHostEnabled() && !createWantsPublicExpose(req) && resolved.Digest != "" {
+		return d.createOnResidentHost(ctx, req, sandboxID, ref, resolved, memoryMB, hostMounts, timing)
+	}
+
 	warmStart := time.Now()
 	warmSlot, err := d.tryAcquireWarm(ctx, resolved.Digest, resolved.Path, memoryMB)
 	if timing != nil {
