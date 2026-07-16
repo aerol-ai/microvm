@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -435,6 +436,110 @@ type instantiateFailClient struct {
 
 func (c *instantiateFailClient) Instantiate(string, wasmengine.Capabilities) error {
 	return fmt.Errorf("cold instantiate boom")
+}
+
+// residentHostCount sums live resident host processes across all buckets.
+func residentHostCount(d *Driver) int {
+	var n int
+	d.residentMu.Lock()
+	buckets := d.residentBuckets
+	d.residentMu.Unlock()
+	for _, b := range buckets {
+		b.mu.Lock()
+		n += len(b.hosts)
+		b.mu.Unlock()
+	}
+	return n
+}
+
+// forceResidentHostsIdle backdates every idle (live==0) host's idle clock so the
+// reaper treats them as long-idle without a unit test having to wait.
+func forceResidentHostsIdle(d *Driver, at time.Time) {
+	d.residentMu.Lock()
+	buckets := d.residentBuckets
+	d.residentMu.Unlock()
+	for _, b := range buckets {
+		b.mu.Lock()
+		for _, h := range b.hosts {
+			if h.live == 0 {
+				h.idleSince = at
+			}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// TestResidentHostStats proves the PR-C observability snapshot tracks the live
+// resident-host footprint (buckets / hosts / instances) the operator sizes
+// memory headroom against.
+func TestResidentHostStats(t *testing.T) {
+	d, _, _, _ := residentTestDriver(t, true)
+	if s := d.ResidentHostStats(); s.Hosts != 0 || s.Instances != 0 || s.Buckets != 0 {
+		t.Fatalf("empty stats = %+v, want all zero", s)
+	}
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-1", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if s := d.ResidentHostStats(); s.Buckets != 1 || s.Hosts != 1 || s.Instances != 1 {
+		t.Fatalf("stats after 1 create = %+v, want buckets=1 hosts=1 instances=1", s)
+	}
+}
+
+// TestResidentReaperReapsIdleHost proves PR-C: a non-pinned resident host that
+// has held zero instances past the TTL is torn down (removed + supervisor.Stop).
+func TestResidentReaperReapsIdleHost(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-1", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if got := residentHostCount(d); got != 1 {
+		t.Fatalf("host count after destroy = %d, want 1 (idle, not yet reaped)", got)
+	}
+	forceResidentHostsIdle(d, time.Now().Add(-time.Hour))
+	stopsBefore := resident.stopCalls
+
+	d.reapIdleResidentHosts(time.Minute)
+
+	if got := residentHostCount(d); got != 0 {
+		t.Fatalf("host count after reap = %d, want 0 (idle host reaped)", got)
+	}
+	if resident.stopCalls <= stopsBefore {
+		t.Fatalf("reaper did not Stop the idle host (stopCalls %d -> %d)", stopsBefore, resident.stopCalls)
+	}
+}
+
+// TestResidentReaperKeepsPinnedAndActive proves the reaper never tears down a
+// pre-warmed (pinned) standard-module host, nor a host with live instances.
+func TestResidentReaperKeepsPinnedAndActive(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	// Pinned: pre-warmed standard host (operator/global bucket, live==0).
+	d.PrewarmResidentHosts(context.Background(), []string{"demo.wasm"})
+	// Active: an owner-scoped create that stays live (never destroyed).
+	userCtx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "acme"},
+	})
+	if _, err := d.Create(userCtx, models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-live", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	before := residentHostCount(d)
+	if before != 2 {
+		t.Fatalf("precondition host count = %d, want 2 (pinned global + live tenant)", before)
+	}
+	// Backdate the pinned host's idle clock too — the pin, not idleness, must save it.
+	forceResidentHostsIdle(d, time.Now().Add(-time.Hour))
+	stopsBefore := resident.stopCalls
+
+	d.reapIdleResidentHosts(time.Minute)
+
+	if got := residentHostCount(d); got != before {
+		t.Fatalf("host count after reap = %d, want %d (pinned + active both kept)", got, before)
+	}
+	if resident.stopCalls != stopsBefore {
+		t.Fatalf("reaper stopped a pinned/active host (stopCalls %d -> %d)", stopsBefore, resident.stopCalls)
+	}
 }
 
 // TestExposeMigrationFailureLeavesResident proves the cold-up-then-stop ordering:

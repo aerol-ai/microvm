@@ -556,6 +556,12 @@ type Config struct {
 	// process; when full the driver spills to a second host (<bucket>-2.sock).
 	// Default 32. SB_WASM_RESIDENT_HOST_MAX_INSTANCES.
 	WasmResidentHostMaxInstances int
+	// WasmResidentHostIdleTTL reaps a resident host process that has held zero
+	// instances for this long, reclaiming its compiled-module + runtime RAM.
+	// Pre-warmed standard-module hosts are pinned and never reaped. 0 disables
+	// the reaper (hosts live until daemon exit). Default 5m.
+	// SB_WASM_RESIDENT_HOST_IDLE_TTL.
+	WasmResidentHostIdleTTL time.Duration
 	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
 	// SB_WASM_DRAIN_TIMEOUT.
 	WasmDrainTimeout time.Duration
@@ -1541,6 +1547,7 @@ func Load() (Config, error) {
 		WasmCompileCacheDir:          getEnv("SB_WASM_COMPILE_CACHE_DIR", ""),
 		WasmResidentHostEnabled:      getEnvBool("SB_WASM_RESIDENT_HOST_ENABLED", false),
 		WasmResidentHostMaxInstances: getEnvInt("SB_WASM_RESIDENT_HOST_MAX_INSTANCES", 32),
+		WasmResidentHostIdleTTL:      getEnvDuration("SB_WASM_RESIDENT_HOST_IDLE_TTL", 5*time.Minute),
 		FirecrackerBinary:            getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:                 getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:       getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),

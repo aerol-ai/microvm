@@ -25,6 +25,10 @@ type residentBucket struct {
 	id    string
 	mu    sync.Mutex
 	hosts []*residentHost
+	// nextIndex is a monotonic host-index counter. It never reuses an index even
+	// after the idle-TTL reaper removes a host, so a later spill cannot collide
+	// with a surviving host's socket path.
+	nextIndex int
 }
 
 // residentHealthTTL bounds how stale a host's liveness proof may be before a
@@ -44,6 +48,12 @@ type residentHost struct {
 	live int
 	// lastCheck is when readiness was last proven (bring-up or health-check).
 	lastCheck time.Time
+	// idleSince is when live last dropped to 0 (zero while live>0). The reaper
+	// tears the host down once idle for ResidentHostIdleTTL.
+	idleSince time.Time
+	// pinned hosts (brought up by boot pre-warm) are never reaped, so standard
+	// modules stay hot for everyone.
+	pinned bool
 }
 
 // residentHostEnabled reports whether creates should route to a resident host.
@@ -151,6 +161,10 @@ func (d *Driver) releaseResidentSlot(socket string) {
 				if h.live > 0 {
 					h.live--
 				}
+				if h.live == 0 {
+					// Start the idle clock; the reaper tears the host down after TTL.
+					h.idleSince = time.Now()
+				}
 				b.mu.Unlock()
 				return
 			}
@@ -187,6 +201,11 @@ func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path 
 	take := func(h *residentHost) (*residentBucket, *residentHost, error) {
 		if reserve {
 			h.live++
+			h.idleSince = time.Time{} // active again — cancel any pending reap
+		} else {
+			// A prewarm (reserve=false) pins the host so the idle-TTL reaper keeps
+			// standard-module hosts resident.
+			h.pinned = true
 		}
 		return b, h, nil
 	}
@@ -213,8 +232,10 @@ func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path 
 		return take(h)
 	}
 
-	// All hosts full (or none yet) — spawn the next index.
-	index := len(b.hosts)
+	// All hosts full (or none yet) — spawn the next (monotonic) index so a
+	// reaped-then-respawned bucket never collides sockets.
+	index := b.nextIndex
+	b.nextIndex++
 	h := &residentHost{
 		socket: d.residentSocketPath(id, index),
 		index:  index,
@@ -457,4 +478,114 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 	// later respawn of THIS worker (uses the now-flipped per-sandbox workerKey).
 	d.noteWorkerSpawnCount(inst)
 	return nil
+}
+
+// ResidentHostStats is a point-in-time snapshot of the resident-host footprint,
+// exposed via expvar (aerolvm_wasm_resident_hosts) so operators can size memory
+// headroom. Admission (pkg/capacity) counts each sandbox at its full memoryMB
+// (an over-count that cushions the guest's actual linear memory) but does NOT
+// see a host process's own RAM (the shared compiled module + runtime, ~the
+// module's on-disk size per bucket). PR-C keeps that accounting deliberately
+// conservative: Hosts here lets an operator reserve headroom via
+// MemoryFloorRatio / MemoryReservationRatio (roughly Hosts × module footprint).
+type ResidentHostStats struct {
+	Buckets   int `json:"buckets"`   // distinct (ownerRef, digest, memoryMB) groups
+	Hosts     int `json:"hosts"`     // resident host processes (base RAM ≈ Hosts × module size)
+	Instances int `json:"instances"` // live co-tenant instances across all hosts
+}
+
+// ResidentHostStats returns the current resident-host footprint (see the type
+// doc for how it relates to admission headroom).
+func (d *Driver) ResidentHostStats() ResidentHostStats {
+	d.residentMu.Lock()
+	buckets := make([]*residentBucket, 0, len(d.residentBuckets))
+	for _, b := range d.residentBuckets {
+		buckets = append(buckets, b)
+	}
+	d.residentMu.Unlock()
+
+	stats := ResidentHostStats{Buckets: len(buckets)}
+	for _, b := range buckets {
+		b.mu.Lock()
+		for _, h := range b.hosts {
+			stats.Hosts++
+			stats.Instances += h.live
+		}
+		b.mu.Unlock()
+	}
+	return stats
+}
+
+// RunResidentReaper periodically tears down resident host processes that have
+// held zero instances for at least ttl, reclaiming their compiled-module +
+// runtime RAM (PR-C). Pre-warmed standard-module hosts are pinned and never
+// reaped. ttl<=0 (or the flag off) disables it. Blocks until ctx is cancelled,
+// so the daemon runs it in a goroutine and shutdown stops it.
+func (d *Driver) RunResidentReaper(ctx context.Context, ttl time.Duration) {
+	if ttl <= 0 || !d.residentHostEnabled() {
+		return
+	}
+	// Scan a few times per TTL so an idle host is reclaimed within ~ttl of going
+	// idle, bounded to a sane [5s, 1m] tick.
+	interval := ttl / 4
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.reapIdleResidentHosts(ttl)
+		}
+	}
+}
+
+// reapIdleResidentHosts removes every non-pinned host idle (live==0) for >= ttl.
+// Selection + removal from b.hosts happen under b.mu (so a concurrent create that
+// takes the host wins the race and the host is kept); the actual supervisor.Stop
+// runs OUTSIDE the lock so a slow stop never blocks creates for the bucket.
+func (d *Driver) reapIdleResidentHosts(ttl time.Duration) {
+	d.residentMu.Lock()
+	buckets := make([]*residentBucket, 0, len(d.residentBuckets))
+	for _, b := range d.residentBuckets {
+		buckets = append(buckets, b)
+	}
+	d.residentMu.Unlock()
+
+	now := time.Now()
+	type victim struct {
+		bucketID string
+		index    int
+		socket   string
+		idle     time.Duration
+	}
+	var victims []victim
+	for _, b := range buckets {
+		b.mu.Lock()
+		kept := make([]*residentHost, 0, len(b.hosts))
+		for _, h := range b.hosts {
+			if !h.pinned && h.live == 0 && !h.idleSince.IsZero() && now.Sub(h.idleSince) >= ttl {
+				victims = append(victims, victim{bucketID: b.id, index: h.index, socket: h.socket, idle: now.Sub(h.idleSince)})
+				continue
+			}
+			kept = append(kept, h)
+		}
+		b.hosts = kept
+		b.mu.Unlock()
+	}
+	for _, v := range victims {
+		if d.residentSupervisor != nil {
+			_ = d.residentSupervisor.Stop(d.residentHostKey(v.bucketID, v.index))
+		}
+		_ = os.Remove(v.socket)
+		if d.logger != nil {
+			d.logger.Info("reaped idle resident host", "bucket", v.bucketID, "socket", v.socket, "idle", v.idle.String())
+		}
+	}
 }

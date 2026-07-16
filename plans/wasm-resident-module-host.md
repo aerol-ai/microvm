@@ -480,6 +480,30 @@ compile.
   conservative over-count (treat each resident instance as full `memoryMB`) and
   refine later.
 
+**IMPLEMENTED 2026-07-17 (PR-C).**
+- **Idle-TTL reaper** — `Driver.RunResidentReaper` (daemon goroutine, gated by
+  the flag; stops on ctx cancel) scans every `SB_WASM_RESIDENT_HOST_IDLE_TTL/4`
+  (clamped 5s–1m; default TTL 5m, 0 disables) and `reapIdleResidentHosts` tears
+  down any host with `live==0` idle ≥ TTL. Pre-warmed standard-module hosts are
+  `pinned` (set when `ensureResidentHost` runs with `reserve=false`) and never
+  reaped. Idle tracking: `residentHost.idleSince` set when `releaseResidentSlot`
+  drops `live` to 0, cleared on the next reserve. Buckets use a **monotonic
+  `nextIndex`** so a reaped-then-respawned host can't collide sockets. Selection
+  is under `bucket.mu` (a concurrent create that takes the host wins and it's
+  kept); `supervisor.Stop` runs outside the lock. Tests:
+  `TestResidentReaperReapsIdleHost`, `TestResidentReaperKeepsPinnedAndActive`.
+- **`MAX_INSTANCES`** — shipped in PR-A (`SB_WASM_RESIDENT_HOST_MAX_INSTANCES`,
+  default 32, spill-to-second-host).
+- **Capacity — conservative + observability** (D-decision 2026-07-17). No
+  admission-path change: each sandbox is already admitted at full `memoryMB` (an
+  over-count that cushions the guest's actual linear memory), and the shared
+  per-bucket base (compiled image + runtime) is treated as uncounted headroom
+  operators reserve via `MemoryFloorRatio`/`MemoryReservationRatio`. To make that
+  sizeable, `Driver.ResidentHostStats` (buckets/hosts/instances) is published as
+  the `aerolvm_wasm_resident_hosts` expvar (test `TestResidentHostStats`). Exact
+  per-bucket-base reservation via a driver→`pkg/capacity` seam is deferred until
+  a real deployment shows the base RAM bites.
+
 ### Test plan (eng-review 2026-07-17)
 
 **PR-A (egress isolation) — offline, 100% of new branches:**
@@ -530,9 +554,11 @@ resident instance's host-shared cost.
   (default 32; spill to `<bucket>-2.sock` when full). Still default-off after this.
 - **PR-B — migrate-on-expose.** `internal/runtime/wasm/guest_http.go` +
   `resident.go` + tests.
-- **PR-C — host lifecycle + capacity.** idle-TTL reaper + `pkg/capacity`
-  host-shared RAM accounting + `internal/config/config.go` (idle-TTL env) + tests.
-  (`MAX_INSTANCES` shipped in PR-A.)
+- **PR-C — host lifecycle + capacity. DONE 2026-07-17.** idle-TTL reaper
+  (`RunResidentReaper` + `SB_WASM_RESIDENT_HOST_IDLE_TTL`, pinned prewarm hosts,
+  monotonic host index) + conservative capacity stance with the
+  `aerolvm_wasm_resident_hosts` expvar footprint metric + tests.
+  (`MAX_INSTANCES` shipped in PR-A; exact Admitter reservation deferred.)
 - **Flag flip** (`SB_WASM_RESIDENT_HOST_ENABLED` default → true) is a **4th,
   separate** change, only after A+B+C land and the live CPython bench is green.
 

@@ -21,6 +21,9 @@ type Config struct {
 	// ResidentHostMaxInstances caps co-tenants per host process; 0 = unbounded.
 	// When full, the driver spills to <bucket>-2.sock (SB_WASM_RESIDENT_HOST_MAX_INSTANCES).
 	ResidentHostMaxInstances int
+	// ResidentHostIdleTTL reaps a resident host holding zero instances for this
+	// long; 0 disables the reaper (SB_WASM_RESIDENT_HOST_IDLE_TTL).
+	ResidentHostIdleTTL time.Duration
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -33,5 +36,6 @@ func FromDaemonConfig(cfg config.Config) Config {
 		DrainTimeout:             cfg.WasmDrainTimeout,
 		ResidentHostEnabled:      cfg.WasmResidentHostEnabled,
 		ResidentHostMaxInstances: cfg.WasmResidentHostMaxInstances,
+		ResidentHostIdleTTL:      cfg.WasmResidentHostIdleTTL,
 	}
 }
