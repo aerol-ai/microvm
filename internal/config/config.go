@@ -545,13 +545,23 @@ type Config struct {
 	// SB_WASM_COMPILE_CACHE_DIR.
 	WasmCompileCacheDir string
 	// WasmResidentHostEnabled routes non-listen wasm creates to a resident
-	// compile-once/instantiate-many host process per (module, memoryMB) bucket
-	// instead of a fresh per-sandbox worker (plans/wasm-resident-module-host.md).
+	// compile-once/instantiate-many host process per (ownerRef, module, memoryMB)
+	// bucket instead of a fresh per-sandbox worker (plans/wasm-resident-module-host.md).
 	// It collapses the ~2.8s cold CompileModule to a ~9ms Instantiate, but shares
 	// one process across co-tenant sandboxes — so it is DEFAULT OFF and remains
-	// operator opt-in until the per-instance egress-isolation work + eng-review
-	// land, exactly like SB_DOCKER_POOL_ENABLED. SB_WASM_RESIDENT_HOST_ENABLED.
+	// operator opt-in until PR-A/B/C land, exactly like SB_DOCKER_POOL_ENABLED.
+	// SB_WASM_RESIDENT_HOST_ENABLED.
 	WasmResidentHostEnabled bool
+	// WasmResidentHostMaxInstances caps co-tenant instances per resident host
+	// process; when full the driver spills to a second host (<bucket>-2.sock).
+	// Default 32. SB_WASM_RESIDENT_HOST_MAX_INSTANCES.
+	WasmResidentHostMaxInstances int
+	// WasmResidentHostIdleTTL reaps a resident host process that has held zero
+	// instances for this long, reclaiming its compiled-module + runtime RAM.
+	// Pre-warmed standard-module hosts are pinned and never reaped. 0 disables
+	// the reaper (hosts live until daemon exit). Default 5m.
+	// SB_WASM_RESIDENT_HOST_IDLE_TTL.
+	WasmResidentHostIdleTTL time.Duration
 	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
 	// SB_WASM_DRAIN_TIMEOUT.
 	WasmDrainTimeout time.Duration
@@ -1523,34 +1533,36 @@ func Load() (Config, error) {
 		// not to throttle normal durable workloads. Operators tune down for
 		// stricter boot-path protection or set 0 to disable. WASM durable is new
 		// in this release, so there are no existing guests this default can break.
-		WasmStateKVWritesPerSec: getEnvFloat("SB_WASM_STATEKV_WRITES_PER_SEC", 50),
-		WasmStateKVBurst:        getEnvInt("SB_WASM_STATEKV_BURST", 100),
-		WasmModuleGCEnabled:     getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
-		WasmModuleGCInterval:    getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
-		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),
-		WasmCacheGCTTL:          getEnvDuration("SB_WASM_CACHE_GC_TTL", 24*time.Hour),
-		WasmCacheMaxBytes:       getEnvInt64("SB_WASM_CACHE_MAX_BYTES", 0),
-		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", true),
-		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 2),
-		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
-		WasmModuleDigestMode:    strings.ToLower(getEnv("SB_WASM_MODULE_DIGEST_MODE", "once")),
-		WasmCompileCacheDir:     getEnv("SB_WASM_COMPILE_CACHE_DIR", ""),
-		WasmResidentHostEnabled: getEnvBool("SB_WASM_RESIDENT_HOST_ENABLED", false),
-		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
-		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
-		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
-		FirecrackerRunDir:       getEnv("SB_FIRECRACKER_RUN_DIR", "/run/sandboxd/firecracker"),
-		FirecrackerTemplatesDir: getEnv("SB_FIRECRACKER_TEMPLATES_DIR", "/var/lib/sandboxd/firecracker/templates"),
-		UseJailer:               getEnvBool("SB_FIRECRACKER_USE_JAILER", true),
-		JailerChrootBase:        getEnv("SB_JAILER_CHROOT_BASE", "/srv/jailer"),
-		JailerUID:               getEnvInt("SB_JAILER_UID", 1000),
-		JailerGID:               getEnvInt("SB_JAILER_GID", 1000),
-		FirecrackerTapBaseCIDR:  getEnv("SB_FIRECRACKER_TAP_BASE_CIDR", "172.16.0.0/20"),
-		FirecrackerTapPoolSize:  getEnvInt("SB_FIRECRACKER_TAP_POOL_SIZE", 256),
-		FirecrackerSkopeoBin:    getEnv("SB_FIRECRACKER_SKOPEO_BIN", "/usr/bin/skopeo"),
-		FirecrackerUmociBin:     getEnv("SB_FIRECRACKER_UMOCI_BIN", "/usr/bin/umoci"),
-		FirecrackerMkfs4Bin:     getEnv("SB_FIRECRACKER_MKFS_BIN", "/sbin/mkfs.ext4"),
-		FirecrackerIPBinary:     strings.TrimSpace(os.Getenv("SB_FIRECRACKER_IP_BINARY")),
+		WasmStateKVWritesPerSec:      getEnvFloat("SB_WASM_STATEKV_WRITES_PER_SEC", 50),
+		WasmStateKVBurst:             getEnvInt("SB_WASM_STATEKV_BURST", 100),
+		WasmModuleGCEnabled:          getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
+		WasmModuleGCInterval:         getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
+		WasmModuleGCTTL:              getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),
+		WasmCacheGCTTL:               getEnvDuration("SB_WASM_CACHE_GC_TTL", 24*time.Hour),
+		WasmCacheMaxBytes:            getEnvInt64("SB_WASM_CACHE_MAX_BYTES", 0),
+		WasmPoolEnabled:              getEnvBool("SB_WASM_POOL_ENABLED", true),
+		WasmPoolDepthDefault:         getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 2),
+		WasmPoolRefillInterval:       getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
+		WasmModuleDigestMode:         strings.ToLower(getEnv("SB_WASM_MODULE_DIGEST_MODE", "once")),
+		WasmCompileCacheDir:          getEnv("SB_WASM_COMPILE_CACHE_DIR", ""),
+		WasmResidentHostEnabled:      getEnvBool("SB_WASM_RESIDENT_HOST_ENABLED", false),
+		WasmResidentHostMaxInstances: getEnvInt("SB_WASM_RESIDENT_HOST_MAX_INSTANCES", 32),
+		WasmResidentHostIdleTTL:      getEnvDuration("SB_WASM_RESIDENT_HOST_IDLE_TTL", 5*time.Minute),
+		FirecrackerBinary:            getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
+		JailerBinary:                 getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
+		FirecrackerKernelImage:       getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
+		FirecrackerRunDir:            getEnv("SB_FIRECRACKER_RUN_DIR", "/run/sandboxd/firecracker"),
+		FirecrackerTemplatesDir:      getEnv("SB_FIRECRACKER_TEMPLATES_DIR", "/var/lib/sandboxd/firecracker/templates"),
+		UseJailer:                    getEnvBool("SB_FIRECRACKER_USE_JAILER", true),
+		JailerChrootBase:             getEnv("SB_JAILER_CHROOT_BASE", "/srv/jailer"),
+		JailerUID:                    getEnvInt("SB_JAILER_UID", 1000),
+		JailerGID:                    getEnvInt("SB_JAILER_GID", 1000),
+		FirecrackerTapBaseCIDR:       getEnv("SB_FIRECRACKER_TAP_BASE_CIDR", "172.16.0.0/20"),
+		FirecrackerTapPoolSize:       getEnvInt("SB_FIRECRACKER_TAP_POOL_SIZE", 256),
+		FirecrackerSkopeoBin:         getEnv("SB_FIRECRACKER_SKOPEO_BIN", "/usr/bin/skopeo"),
+		FirecrackerUmociBin:          getEnv("SB_FIRECRACKER_UMOCI_BIN", "/usr/bin/umoci"),
+		FirecrackerMkfs4Bin:          getEnv("SB_FIRECRACKER_MKFS_BIN", "/sbin/mkfs.ext4"),
+		FirecrackerIPBinary:          strings.TrimSpace(os.Getenv("SB_FIRECRACKER_IP_BINARY")),
 
 		FirecrackerTemplateGCEnabled:  getEnvBool("SB_FIRECRACKER_TEMPLATE_GC_ENABLED", true),
 		FirecrackerTemplateGCInterval: getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_INTERVAL", 1*time.Hour),

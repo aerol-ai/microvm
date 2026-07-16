@@ -32,6 +32,10 @@ type sandboxInstance struct {
 	// the shared process, and the per-sandbox supervisor spawn-count tracking does
 	// not apply.
 	fromResidentHost bool
+	// residentSlotHeld is true once this instance has reserved a live slot on its
+	// resident host; releaseResidentSlotFor clears it so the slot is freed exactly
+	// once (Finding P1-2). Meaningless unless fromResidentHost.
+	residentSlotHeld bool
 	status           models.SandboxStatus
 	entryExport      string
 	baseEnv          map[string]string

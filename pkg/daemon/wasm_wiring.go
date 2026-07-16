@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"expvar"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -131,6 +132,22 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		}
 		go driver.PrewarmResidentHosts(ctx, refs)
 		logger.Info("wasm resident host prewarm scheduled", "modules", len(refs))
+		// Idle-TTL reaper: reclaim a resident host's RAM once it has held zero
+		// instances for the TTL (pre-warmed standard-module hosts are pinned and
+		// never reaped). Stops when ctx is cancelled on shutdown. No-op if the TTL
+		// is 0. See plans/wasm-resident-module-host.md PR-C.
+		go driver.RunResidentReaper(ctx, cfg.WasmResidentHostIdleTTL)
+		logger.Info("wasm resident host reaper scheduled", "idle_ttl", cfg.WasmResidentHostIdleTTL)
+		// Observability for the conservative capacity stance (PR-C): the admitter
+		// cannot see a resident host process's own RAM (shared compiled module +
+		// runtime), so expose the host footprint here and let operators reserve
+		// headroom via MemoryFloorRatio/MemoryReservationRatio. Guard the publish
+		// so a second wiring in-process (tests) doesn't panic on a duplicate name.
+		if expvar.Get("aerolvm_wasm_resident_hosts") == nil {
+			expvar.Publish("aerolvm_wasm_resident_hosts", expvar.Func(func() any {
+				return driver.ResidentHostStats()
+			}))
+		}
 	}
 
 	logger.Info("wasm runtime enabled",

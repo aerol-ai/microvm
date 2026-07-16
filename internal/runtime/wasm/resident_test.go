@@ -2,10 +2,14 @@ package wasm
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
@@ -59,8 +63,8 @@ func TestCreateRoutesToResidentHost(t *testing.T) {
 	if !inst.fromResidentHost {
 		t.Fatal("instance not marked fromResidentHost")
 	}
-	if inst.workerKey != residentBucketID("deadbeef", 0) {
-		t.Fatalf("workerKey=%q, want bucket %q", inst.workerKey, residentBucketID("deadbeef", 0))
+	if inst.workerKey != residentBucketID("", "deadbeef", 0) {
+		t.Fatalf("workerKey=%q, want bucket %q", inst.workerKey, residentBucketID("", "deadbeef", 0))
 	}
 
 	// Destroy must StopInstance (per-sandbox), NOT kill the shared host.
@@ -96,6 +100,21 @@ func TestCreateResidentRetryIsIdempotent(t *testing.T) {
 	}
 	if len(client.instantiateCaps) != 2 {
 		t.Fatalf("Instantiate calls = %d, want 2 (one per create)", len(client.instantiateCaps))
+	}
+	// Finding A: an idempotent retry must not inflate the host live count — the
+	// sandbox occupies exactly one slot no matter how many times create is retried.
+	var totalLive int
+	d.residentMu.Lock()
+	for _, b := range d.residentBuckets {
+		b.mu.Lock()
+		for _, h := range b.hosts {
+			totalLive += h.live
+		}
+		b.mu.Unlock()
+	}
+	d.residentMu.Unlock()
+	if totalLive != 1 {
+		t.Fatalf("host live count = %d after idempotent retry, want 1 (retry leaked a slot)", totalLive)
 	}
 }
 
@@ -186,5 +205,377 @@ func TestCreatePublicExposeUsesColdPath(t *testing.T) {
 	}
 	if inst.fromResidentHost {
 		t.Fatal("public-expose create wrongly routed to resident host")
+	}
+}
+
+// TestResidentBucketIDIncludesOwnerRef guards D7: a non-operator OwnerRef gets
+// its own bucket so SaaS tenants never co-locate; empty/operator stays global.
+func TestResidentBucketIDIncludesOwnerRef(t *testing.T) {
+	global := residentBucketID("", "deadbeef", 256)
+	tenant := residentBucketID("acme", "deadbeef", 256)
+	if global == tenant {
+		t.Fatalf("owner bucket collided with global: %q", global)
+	}
+	if residentBucketID("acme", "deadbeef", 256) != tenant {
+		t.Fatal("owner bucket not stable")
+	}
+	other := residentBucketID("globex", "deadbeef", 256)
+	if other == tenant {
+		t.Fatal("different owners share a bucket")
+	}
+}
+
+func TestCreateWithOwnerRefUsesDistinctResidentHost(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	opCtx := context.Background()
+	userCtx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "acme"},
+	})
+
+	if _, err := d.Create(opCtx, models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-op", "tok", nil); err != nil {
+		t.Fatalf("operator Create: %v", err)
+	}
+	if _, err := d.Create(userCtx, models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-user", "tok", nil); err != nil {
+		t.Fatalf("user Create: %v", err)
+	}
+	if resident.ensureCalls != 2 {
+		t.Fatalf("resident ensure calls = %d, want 2 (distinct owner buckets)", resident.ensureCalls)
+	}
+	opInst, _ := d.instance("sb-op")
+	userInst, _ := d.instance("sb-user")
+	if opInst.workerKey == userInst.workerKey {
+		t.Fatalf("owner create reused operator bucket key %q", opInst.workerKey)
+	}
+}
+
+func TestResidentMaxInstancesSpillsToSecondHost(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	d.cfg.ResidentHostMaxInstances = 1
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-1", "tok", nil); err != nil {
+		t.Fatalf("Create 1: %v", err)
+	}
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-2", "tok", nil); err != nil {
+		t.Fatalf("Create 2: %v", err)
+	}
+	if resident.ensureCalls != 2 {
+		t.Fatalf("resident ensure calls = %d, want 2 (spill to second host)", resident.ensureCalls)
+	}
+	a, _ := d.instance("sb-1")
+	b, _ := d.instance("sb-2")
+	if a.socketPath == b.socketPath {
+		t.Fatalf("both instances on same socket %q under MaxInstances=1", a.socketPath)
+	}
+}
+
+func TestInspectMarksDeadResidentHostStopped(t *testing.T) {
+	d, _, _, _ := residentTestDriver(t, true)
+	client := &unloadedWorkerClient{}
+	d.SetWorkerClientFactory(func(string) WorkerClient { return client })
+	d.mu.Lock()
+	d.byID["sb-dead"] = &sandboxInstance{
+		sandboxID:        "sb-dead",
+		socketPath:       "/tmp/fake-resident.sock",
+		fromResidentHost: true,
+		status:           models.SandboxStatusStarted,
+	}
+	d.mu.Unlock()
+
+	state, err := d.Inspect(context.Background(), "sb-dead")
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if state == nil || state.Status != models.SandboxStatusStopped {
+		t.Fatalf("state = %+v, want stopped after resident host gone", state)
+	}
+}
+
+func TestSetNetworkBlocksReachesResidentHost(t *testing.T) {
+	d, _, _, client := residentTestDriver(t, true)
+	netClient := &networkRecordingClient{recordingWorkerClient: *client}
+	d.SetWorkerClientFactory(func(string) WorkerClient { return netClient })
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-blocks", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	d.SetNetworkBlocks("sb-blocks", false, true)
+	if !netClient.blocksSet {
+		t.Fatal("SetNetworkBlocks did not reach the resident host socket")
+	}
+}
+
+type networkRecordingClient struct {
+	recordingWorkerClient
+	blocksSet bool
+}
+
+func (c *networkRecordingClient) SetNetworkBlocks(string, bool, bool) error {
+	c.blocksSet = true
+	return nil
+}
+
+// totalResidentLive sums the live slot count across every resident host so tests
+// can assert MAX_INSTANCES accounting (Findings A / P0-2 / P1-2).
+func totalResidentLive(d *Driver) int {
+	var total int
+	d.residentMu.Lock()
+	buckets := d.residentBuckets
+	d.residentMu.Unlock()
+	for _, b := range buckets {
+		b.mu.Lock()
+		for _, h := range b.hosts {
+			total += h.live
+		}
+		b.mu.Unlock()
+	}
+	return total
+}
+
+// TestResidentBucketIDNoCollision proves the hashed bucket id (P0-1) does not
+// co-locate distinct owners/modules that the old truncate+sanitize scheme would
+// have collided into one shared host process.
+func TestResidentBucketIDNoCollision(t *testing.T) {
+	// Long owners sharing a >24-char prefix (old code truncated to 24).
+	if residentBucketID("customer-aaaaaaaaaaaaaaaaaaaaaaaaaaaa-1", "sha256:deadbeef", 256) ==
+		residentBucketID("customer-aaaaaaaaaaaaaaaaaaaaaaaaaaaa-2", "sha256:deadbeef", 256) {
+		t.Fatal("distinct long owners collided to one bucket")
+	}
+	// Sanitization collision: a/b vs a-b (old code mapped '/' -> '-').
+	if residentBucketID("a/b", "sha256:deadbeef", 256) == residentBucketID("a-b", "sha256:deadbeef", 256) {
+		t.Fatal("owners a/b and a-b collided")
+	}
+	// Modules sharing a 16-char digest prefix (old code truncated to 16).
+	if residentBucketID("", "sha256:0000000000000000aaaa", 256) ==
+		residentBucketID("", "sha256:0000000000000000bbbb", 256) {
+		t.Fatal("modules sharing a 16-char digest prefix collided")
+	}
+	// Operator/empty owner must not collide with any real owner.
+	if residentBucketID("", "sha256:deadbeef", 256) == residentBucketID("owner1", "sha256:deadbeef", 256) {
+		t.Fatal("operator (empty owner) and owner1 collided")
+	}
+}
+
+// TestResidentRetryNoOrphanOrLeak proves an idempotent retry under MAX_INSTANCES
+// tears down the prior instance on its own host and keeps the live count at 1 —
+// no orphaned instance on a spilled host, no slot leak (P0-2 + Finding A).
+func TestResidentRetryNoOrphanOrLeak(t *testing.T) {
+	d, _, _, client := residentTestDriver(t, true)
+	d.cfg.ResidentHostMaxInstances = 1
+	req := models.CreateSandboxRequest{Image: "demo.wasm"}
+	if _, err := d.Create(context.Background(), req, "sb-x", "tok", nil); err != nil {
+		t.Fatalf("Create #1: %v", err)
+	}
+	client.stopped = false
+	if _, err := d.Create(context.Background(), req, "sb-x", "tok", nil); err != nil {
+		t.Fatalf("Create #2 (retry): %v", err)
+	}
+	if !client.stopped {
+		t.Fatal("retry did not StopInstance the prior instance on its host")
+	}
+	if got := totalResidentLive(d); got != 1 {
+		t.Fatalf("total resident live = %d after idempotent retry under MAX=1, want 1", got)
+	}
+}
+
+// TestPrewarmResidentHostDoesNotReserveSlot proves boot pre-warm brings up +
+// compiles a host without holding a live slot (P1-2) — otherwise every prewarmed
+// module would permanently inflate the bucket's occupancy.
+func TestPrewarmResidentHostDoesNotReserveSlot(t *testing.T) {
+	d, _, _, _ := residentTestDriver(t, true)
+	d.PrewarmResidentHosts(context.Background(), []string{"demo.wasm"})
+	if got := totalResidentLive(d); got != 0 {
+		t.Fatalf("prewarm reserved %d live slots, want 0", got)
+	}
+}
+
+// TestMigrateResidentToCold proves the PR-B core: migrating a private resident
+// sandbox brings up a dedicated cold worker, stops the resident copy, releases
+// its slot, and flips routing (workerKey + socket + fromResidentHost). The
+// SyncGuestListenPorts→migration wiring + failure ordering are covered by
+// TestExposeMigrationFailureLeavesResident (which reaches migration and errors
+// before the post-migration listener probe that needs a real guest).
+func TestMigrateResidentToCold(t *testing.T) {
+	d, perSandbox, _, client := residentTestDriver(t, true)
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-exp", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	inst, _ := d.instance("sb-exp")
+	if !inst.fromResidentHost {
+		t.Fatal("precondition: create should route to the resident host")
+	}
+	if got := totalResidentLive(d); got != 1 {
+		t.Fatalf("resident live before migrate = %d, want 1", got)
+	}
+
+	if err := d.migrateResidentToCold(context.Background(), inst); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if inst.fromResidentHost {
+		t.Fatal("still resident after migrate")
+	}
+	if inst.workerKey != "sb-exp" || filepath.Base(inst.socketPath) != "worker.sock" {
+		t.Fatalf("routing not flipped to cold worker: workerKey=%q socket=%q", inst.workerKey, inst.socketPath)
+	}
+	if !client.stopped {
+		t.Fatal("resident instance not StopInstance'd during migration")
+	}
+	if perSandbox.ensureCalls != 1 {
+		t.Fatalf("cold worker spawns = %d, want 1", perSandbox.ensureCalls)
+	}
+	if got := totalResidentLive(d); got != 0 {
+		t.Fatalf("resident live after migrate = %d, want 0 (slot not released)", got)
+	}
+}
+
+// instantiateFailClient fails Instantiate but is otherwise a normal recording
+// client, so a migration's cold bring-up fails at the instantiate step.
+type instantiateFailClient struct {
+	recordingWorkerClient
+}
+
+func (c *instantiateFailClient) Instantiate(string, wasmengine.Capabilities) error {
+	return fmt.Errorf("cold instantiate boom")
+}
+
+// residentHostCount sums live resident host processes across all buckets.
+func residentHostCount(d *Driver) int {
+	var n int
+	d.residentMu.Lock()
+	buckets := d.residentBuckets
+	d.residentMu.Unlock()
+	for _, b := range buckets {
+		b.mu.Lock()
+		n += len(b.hosts)
+		b.mu.Unlock()
+	}
+	return n
+}
+
+// forceResidentHostsIdle backdates every idle (live==0) host's idle clock so the
+// reaper treats them as long-idle without a unit test having to wait.
+func forceResidentHostsIdle(d *Driver, at time.Time) {
+	d.residentMu.Lock()
+	buckets := d.residentBuckets
+	d.residentMu.Unlock()
+	for _, b := range buckets {
+		b.mu.Lock()
+		for _, h := range b.hosts {
+			if h.live == 0 {
+				h.idleSince = at
+			}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// TestResidentHostStats proves the PR-C observability snapshot tracks the live
+// resident-host footprint (buckets / hosts / instances) the operator sizes
+// memory headroom against.
+func TestResidentHostStats(t *testing.T) {
+	d, _, _, _ := residentTestDriver(t, true)
+	if s := d.ResidentHostStats(); s.Hosts != 0 || s.Instances != 0 || s.Buckets != 0 {
+		t.Fatalf("empty stats = %+v, want all zero", s)
+	}
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-1", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if s := d.ResidentHostStats(); s.Buckets != 1 || s.Hosts != 1 || s.Instances != 1 {
+		t.Fatalf("stats after 1 create = %+v, want buckets=1 hosts=1 instances=1", s)
+	}
+}
+
+// TestResidentReaperReapsIdleHost proves PR-C: a non-pinned resident host that
+// has held zero instances past the TTL is torn down (removed + supervisor.Stop).
+func TestResidentReaperReapsIdleHost(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-1", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if got := residentHostCount(d); got != 1 {
+		t.Fatalf("host count after destroy = %d, want 1 (idle, not yet reaped)", got)
+	}
+	forceResidentHostsIdle(d, time.Now().Add(-time.Hour))
+	stopsBefore := resident.stopCalls
+
+	d.reapIdleResidentHosts(time.Minute)
+
+	if got := residentHostCount(d); got != 0 {
+		t.Fatalf("host count after reap = %d, want 0 (idle host reaped)", got)
+	}
+	if resident.stopCalls <= stopsBefore {
+		t.Fatalf("reaper did not Stop the idle host (stopCalls %d -> %d)", stopsBefore, resident.stopCalls)
+	}
+}
+
+// TestResidentReaperKeepsPinnedAndActive proves the reaper never tears down a
+// pre-warmed (pinned) standard-module host, nor a host with live instances.
+func TestResidentReaperKeepsPinnedAndActive(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	// Pinned: pre-warmed standard host (operator/global bucket, live==0).
+	d.PrewarmResidentHosts(context.Background(), []string{"demo.wasm"})
+	// Active: an owner-scoped create that stays live (never destroyed).
+	userCtx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "acme"},
+	})
+	if _, err := d.Create(userCtx, models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-live", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	before := residentHostCount(d)
+	if before != 2 {
+		t.Fatalf("precondition host count = %d, want 2 (pinned global + live tenant)", before)
+	}
+	// Backdate the pinned host's idle clock too — the pin, not idleness, must save it.
+	forceResidentHostsIdle(d, time.Now().Add(-time.Hour))
+	stopsBefore := resident.stopCalls
+
+	d.reapIdleResidentHosts(time.Minute)
+
+	if got := residentHostCount(d); got != before {
+		t.Fatalf("host count after reap = %d, want %d (pinned + active both kept)", got, before)
+	}
+	if resident.stopCalls != stopsBefore {
+		t.Fatalf("reaper stopped a pinned/active host (stopCalls %d -> %d)", stopsBefore, resident.stopCalls)
+	}
+}
+
+// TestExposeMigrationFailureLeavesResident proves the cold-up-then-stop ordering:
+// when the cold instantiate fails, the sandbox stays on the resident host (no
+// zero-instance window) and keeps its slot (PR-B failure path, pr-review.md §4).
+func TestExposeMigrationFailureLeavesResident(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	perSandbox := &fakeSupervisor{}
+	resident := &fakeSupervisor{}
+	normal := &recordingWorkerClient{}
+	failing := &instantiateFailClient{}
+	d := New(Config{RunDir: filepath.Join(dir, "run"), ModulesDir: dir, ResidentHostEnabled: true}, nil)
+	d.SetModuleResolver(fakeResolver{path: modPath, digest: "deadbeef"})
+	d.SetWorkerSupervisor(perSandbox)
+	d.SetResidentHostSupervisor(resident)
+	// The cold worker socket ends in worker.sock — fail its Instantiate; the
+	// resident bucket socket uses the normal client so the create still succeeds.
+	d.SetWorkerClientFactory(func(socket string) WorkerClient {
+		if filepath.Base(socket) == "worker.sock" {
+			return failing
+		}
+		return normal
+	})
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-fail", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := d.SyncGuestListenPorts(context.Background(), "sb-fail", []int{8080}); err == nil {
+		t.Fatal("expected migration failure to surface as an error")
+	}
+	inst, _ := d.instance("sb-fail")
+	if !inst.fromResidentHost {
+		t.Fatal("sandbox left the resident host despite cold-instantiate failure (zero-instance window)")
+	}
+	if got := totalResidentLive(d); got != 1 {
+		t.Fatalf("resident live = %d after failed migration, want 1 (slot wrongly released)", got)
 	}
 }

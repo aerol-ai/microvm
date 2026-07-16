@@ -131,10 +131,23 @@ func (d *Driver) refreshWorkerInstanceState(ctx context.Context, sandboxID strin
 	if inst == nil || strings.TrimSpace(inst.socketPath) == "" {
 		return inst
 	}
-	// Resident-hosted instances live on a shared process tracked by the resident
-	// supervisor, not the per-sandbox one — the spawn-count / InstanceLoaded
-	// liveness checks below don't apply, so report the instance as-is.
+	// Resident-hosted instances live on a shared process. Verify the host socket
+	// is still alive (D8) — after a host crash, Inspect/List must not report
+	// started for gone instances. Per-sandbox spawn-count does not apply.
 	if inst.fromResidentHost {
+		statusCtx := ctx
+		if statusCtx == nil {
+			statusCtx = context.Background()
+		}
+		if _, ok := statusCtx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			statusCtx, cancel = context.WithTimeout(statusCtx, 2*time.Second)
+			defer cancel()
+		}
+		loaded, err := d.newWorkerClient(inst.socketPath).InstanceLoaded(statusCtx, sandboxID)
+		if err != nil || !loaded {
+			return d.markWorkerInstanceStopped(sandboxID, inst)
+		}
 		return inst
 	}
 	if count, ok := d.supervisorSpawnCount(d.workerKeyForInstance(sandboxID, inst)); ok {

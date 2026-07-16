@@ -168,3 +168,20 @@ passed, zero-deployments premise re-verified in-tree). Branch
   cap. Defensive re-check at command encode + on the leader-forward path.
 - "No secrets in the Raft log" is now structural: no field exists to carry
   sealed bytes anywhere in cluster state.
+
+## Shard the WASM resident net-host mutex (performance, P3)
+
+- **What:** Shard `multiNetHost`'s single mutex (or split into per-map
+  RWMutexes) that guards the `hooks` / `conns` lookups in the resident
+  compile-once/instantiate-many WASM host (`pkg/wasm/engine_multi_network.go`,
+  shipped in PR-A of `plans/wasm-resident-module-host.md`, 2026-07-17).
+- **Why:** At very high co-tenant IO rates on one shared host process, the
+  single lock on every `tcp_dial`/`read`/`write`/`close` map lookup could show
+  up as contention.
+- **Caveat (why it's a TODO, not built now):** the design already releases the
+  lock BEFORE the blocking `conn.Read`/`Write`, so contention is only on
+  microsecond map lookups — adequate for correctness and the default-flag flip.
+  Building sharding now is premature optimization with no evidence it's needed.
+- **Depends on / start:** PR-A landed (done) + a profile (`go test -bench` or a
+  live cluster-3-mixed-wasm run) that actually shows lock contention. Eng-review
+  2026-07-17 (D9).

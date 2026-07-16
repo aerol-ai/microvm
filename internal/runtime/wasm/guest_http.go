@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 // GuestListenPortSyncer hot-updates wasip1 listener caps after expose_port.
@@ -25,8 +26,23 @@ func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, por
 	if inst.status != models.SandboxStatusStarted {
 		return nil
 	}
+	listenPort := wasip1ListenPort(ports)
+	if inst.fromResidentHost {
+		if listenPort == wasmengine.WASIListenPortDisabled {
+			// Resident sandboxes are non-listen by construction — there is no
+			// listener to disable, so an unexpose is a no-op (do not send a
+			// listener op to the shared host, which rejects them).
+			return nil
+		}
+		// expose_port needs a wasip1 listener the shared resident host cannot
+		// provide; migrate this sandbox onto a dedicated cold worker first
+		// (PR-B / plan D4-A), then install the listener on it below.
+		if err := d.migrateResidentToCold(ctx, inst); err != nil {
+			return fmt.Errorf("migrate resident sandbox %q for expose: %w", sandboxID, err)
+		}
+	}
 	client := d.newWorkerClient(inst.socketPath)
-	return d.syncGuestListenPort(ctx, inst, client, wasip1ListenPort(ports))
+	return d.syncGuestListenPort(ctx, inst, client, listenPort)
 }
 
 func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {

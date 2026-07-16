@@ -43,6 +43,7 @@ type recordingWorkerClient struct {
 	loadPath        string
 	stopped         bool
 	instantiateCaps []wasmengine.Capabilities
+	resolvedPort    int
 }
 
 func (c *recordingWorkerClient) Ping(string) error { return nil }
@@ -73,7 +74,9 @@ func (c *recordingWorkerClient) SetCapability(string, wasmengine.Capabilities) e
 func (c *recordingWorkerClient) NetstatsTick(string) (int64, int64, error)             { return 0, 0, nil }
 func (c *recordingWorkerClient) SetNetworkBlocks(string, bool, bool) error             { return nil }
 func (c *recordingWorkerClient) SetListenPort(string, int, string) error               { return nil }
-func (c *recordingWorkerClient) ResolvedListenPort(string) (int, error)                { return 0, nil }
+func (c *recordingWorkerClient) ResolvedListenPort(string) (int, error) {
+	return c.resolvedPort, nil
+}
 func (c *recordingWorkerClient) ProxyHTTP(string, int, http.ResponseWriter, *http.Request) error {
 	return nil
 }

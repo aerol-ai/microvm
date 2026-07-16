@@ -128,8 +128,12 @@ process." What still isolates co-tenants:
 
 - **Per-instance linear memory** — wazero gives each `InstantiateModule` its own
   memory; no shared memory unless explicitly configured (we don't).
-- **Per-instance memory cap** (`MemoryLimitPages`) and **fuel metering** bound a
-  single instance's resource use.
+- **Per-instance memory cap** (`MemoryLimitPages`) bounds a single instance's
+  memory. CPU-bound guests are bounded by **wall-clock cancellation**
+  (`WithInvocationDeadline`), NOT fuel — fuel accounting is wasmtime-only in this
+  codebase (Codex, eng-review 2026-07-17), so the resident (wazero) host relies
+  on the invocation deadline for CPU bounding. See the co-tenancy deadline
+  hardening in Phase 2b.
 - **Bounded instances per host** (`SB_WASM_RESIDENT_HOST_MAX_INSTANCES`) caps the
   blast radius and lets the pool spread load across host processes.
 
@@ -200,23 +204,19 @@ listener Instantiate is rejected.
 **Scope limit (unchanged):** resident-host mode serves **non-listen** sandboxes
 only; `expose_port`/HTTP guests fall back to the cold per-process path.
 
-**Remaining Phase 2 (eng-review-gated): per-instance egress isolation.** The
-engine's `wazeroNetHost` (`wazero_network.go`) holds ONE hook + a GLOBAL conn
-table, read by all three WASI host modules at call time. Co-tenancy needs it
-keyed by `mod.Name()` (= sandboxID, since instances are named) plus conn
-ownership so guest B can't touch guest A's socket. Until that lands, resident
-instances get base WASI + FS only (no mediated egress), so networking modules
-are not yet served here. This is the security-sensitive change that must go
-through review.
+**Phase 2 remainder (per-instance egress isolation) — IMPLEMENTED 2026-07-17
+(PR-A).** `multiNetHost` keys hooks + conns by `mod.Name()`; ResidentServer binds
+a per-sandbox `NetworkHook` via `NetMediator`. See Phase 2b §1.
 
 ### Config (Phase 3) — flag IMPLEMENTED 2026-07-15
 
 - `SB_WASM_RESIDENT_HOST_ENABLED` (bool, **default false**) → `cfg.WasmResidentHostEnabled`
   (`internal/config/config.go`). Gates the whole path; false = today's behavior
   exactly. **DONE.**
-- `SB_WASM_RESIDENT_HOST_MAX_INSTANCES` (int, per-host cap) — TODO with the
-  routing below.
-- Interplay with `SB_WASM_POOL_ENABLED` + `setup/config-defaults.md` — TODO.
+- `SB_WASM_RESIDENT_HOST_MAX_INSTANCES` (int, per-host cap, default 32) —
+  **DONE in PR-A** (spill to `<bucket>-2.sock` when full).
+- Interplay with `SB_WASM_POOL_ENABLED` + `setup/config-defaults.md` — TODO
+  (PR-C / docs).
 
 ### Pool + driver routing (Phase 3b) — IMPLEMENTED 2026-07-15 (gated, offline-tested)
 
@@ -255,16 +255,312 @@ takes the cold path.
 This also sidesteps the miss/refill race in `project_wasm_create_latency`: no
 separate per-sandbox cold spawn to race — creates instantiate into a resident host.
 
-**Remaining before the flag can flip ON (eng-review-gated):**
-- **Per-instance egress isolation** — resident instances currently get base
-  WASI + FS only; wasi-sockets/http egress needs the net host keyed by
-  `mod.Name()` + conn ownership (see Phase 2 note). Until then, networking
-  modules (likely CPython) aren't served by the resident host, so the live
-  CPython cold-load win still can't be benched.
-- **expose_port after create** on a private resident sandbox errors (resident
-  host rejects listeners). Document, or migrate-to-cold-on-expose.
-- **Host lifecycle**: idle-TTL teardown of resident hosts, capacity/admission
-  accounting for host-shared RAM, `SB_WASM_RESIDENT_HOST_MAX_INSTANCES` cap.
+**Remaining before the flag can flip ON (eng-review-gated) — designed in Phase 2b below:**
+- **Per-instance egress isolation** — **DONE (PR-A, 2026-07-17).**
+- **expose_port after create** on a private resident sandbox — PR-B (migrate-on-expose).
+- **Host lifecycle**: idle-TTL teardown + capacity/admission accounting — PR-C
+  (`SB_WASM_RESIDENT_HOST_MAX_INSTANCES` shipped in PR-A).
+
+## Phase 2b — egress isolation + expose + capacity (design, 2026-07-17, eng-review)
+
+The three items above are what stand between "shipped, default-off" and "safe to
+flip the default on." They are independent workstreams and ship as **three
+stacked PRs** (see staging at the end). Item 1 is the only security-sensitive
+one and gates the other two.
+
+### 1. Per-instance egress isolation (PR-A, the blocker)
+
+**The gap.** Outbound TCP for a wasip1 guest goes through the custom
+`aerol/vm/net` host module (`tcp_dial`/`tcp_read`/`tcp_write`/`tcp_close`) — NOT
+wasip1 sockets (wasi-preview1 has no outbound `sock_connect`; only
+accept/recv/send on an already-listening fd, which resident-host mode doesn't
+serve). That host module lives in `wazeroNetHost` (`pkg/wasm/wazero_network.go`),
+which today holds **one** `hook *NetworkHook` and **one global**
+`conns map[uint64]net.Conn`. It is correct for the single-instance engine (one
+sandbox per process) and is **not instantiated at all** on `MultiInstanceEngine`,
+so resident instances get base WASI + FS only.
+
+Two things break if we naively instantiate the existing host on the shared
+runtime: (a) one hook can't represent N co-tenant sandboxes' dialers/meters, and
+(b) a global conn table lets guest B pass a `conn_id` that belongs to guest A and
+read/write A's socket — a cross-tenant data leak.
+
+**The fix — key everything by `mod.Name()`.** `MultiInstanceEngine.Instantiate`
+already sets `WithName(sandboxID)` (engine_multi.go:131), so every host-function
+call carries the caller's identity in `mod.Name()`. A new multi-tenant net host:
+
+```
+                     one resident runtime, one "aerol/vm/net" host module
+                     ┌───────────────────────────────────────────────────┐
+ guest A (mod.Name   │  tcp_dial(mod, addr):                              │
+   = "sbx-A") ───────┼─►  sid := mod.Name()          // "sbx-A"           │
+                     │    hook := hooks[sid]          // A's dialer+meter  │
+ guest B (mod.Name   │    if hook==nil||blocked → errBlocked              │
+   = "sbx-B") ───────┼─►  conn := hook.Dial(addr)     // A's NetMediator   │
+                     │    id := nextID++                                  │
+                     │    conns[sid][id] = conn      // OWNED by sbx-A     │
+                     │                                                     │
+                     │  tcp_read(mod, id, buf):                           │
+                     │    sid := mod.Name()                               │
+                     │    conn := conns[sid][id]     // B can't see A's id │
+                     │    if conn==nil → errClosed                        │
+                     │    n := conn.Read(buf); hooks[sid].Meter.AddIn(n)  │
+                     └───────────────────────────────────────────────────┘
+   hooks:  map[sandboxID]*NetworkHook          (per-tenant dialer + meter)
+   conns:  map[sandboxID]map[uint64]net.Conn   (per-tenant conn table = ownership)
+```
+
+- `hooks map[string]*NetworkHook` replaces the single `hook`. Every host fn reads
+  `mod.Name()` and looks up that sandbox's hook; a missing hook → `errBlocked`
+  (fail closed, never fall through to another tenant's dialer).
+- `conns map[string]map[uint64]net.Conn` replaces the global table. A `conn_id`
+  is only resolvable inside its owner's inner map, so B passing A's id finds
+  nothing → `errClosed`. This is the conn-ownership guarantee, enforced by data
+  structure, not by a check that can be forgotten.
+- Bytes meter through `hooks[sid].Meter` (per-tenant), so `NetstatsTick` stays
+  per-sandbox.
+
+The single-instance `wazeroEngine` keeps its existing one-hook host untouched
+(it is correct there and flag-off must stay byte-for-byte identical). The
+multi-tenant host is a **new type** (`multiNetHost` in a new
+`pkg/wasm/engine_multi_network.go`), instantiated lazily on the resident runtime
+the first time any instance binds a hook. `MultiInstanceEngine` gains
+`SetNetworkHook(sandboxID, *NetworkHook)` / `ClearNetworkHook(sandboxID)`
+mirroring `NetworkAwareEngine`.
+
+**Decisions locked (eng-review 2026-07-17):**
+- **Bucket by `(ownerRef, digest, memoryMB)`, not just `(digest, memoryMB)`**
+  (D7 — AerolVM is SaaS + multi-tenant, [[project_saas_multitenant]], not only
+  self-hosted). When a create carries a **non-operator `OwnerRef`** (control-plane
+  resolved — `models.Sandbox.OwnerRef` / `ownerRefForCreate(ctx)`), the owner is
+  mixed into `residentBucketID`, so a customer's sandboxes never co-locate in one
+  process with another customer's — no cross-customer socket/blast-radius sharing.
+  An **empty/operator `OwnerRef`** (the only case on the open-source build) keeps
+  today's fully-shared global bucket, preserving max compile amortization for the
+  self-hosted case. This is **in code, not docs** — `ownerRef` is a real
+  dimension of `residentBucketID`. Wiring: thread `ownerRef` into the wasm
+  `Driver.Create` path (the 4th `Create` arg is currently unused `_ string`, or
+  read it from the create ctx as `ownerRefForCreate` does).
+- **Conn ownership = structural nested map** `conns map[sandboxID]map[uint64]net.Conn`
+  (D3-A). A `conn_id` is unresolvable outside its owner's inner map, so a
+  cross-tenant read is unrepresentable, not merely guarded. `nextID` stays a
+  global atomic (ids are unscoped-unusable, need not be secret).
+- **DRY the socket body** (D5-A): factor `conn.Read`/`Write` + meter +
+  error-mapping into a helper taking an already-resolved `(conn, meter)`; the
+  single-instance host and `multiNetHost` differ ONLY in the resolve step
+  (one field vs `mod.Name()` lookup). Security logic stays single-sourced.
+- **Thread the invocation deadline into the dial** (D6-A): pass the host-fn
+  call's ctx into `DialContext` instead of `context.Background()`, in BOTH the
+  multi host and the existing single host (`wazero_network.go:106`, same one-line
+  bug). Bounds a dial by min(invocation deadline, 30s dialer timeout).
+- Missing hook or blocked egress → `errBlocked` (**fail closed**); never fall
+  through to another tenant's dialer.
+
+**Worker wiring** (`resident_server.go`) mirrors the single-instance `Server`,
+which already has all the per-sandbox pieces:
+- `ResidentServer` gets its own `*NetMediator` (already sandboxID-keyed:
+  `SetBlocks`/`DrainUsage`/`DialContext` all take a sandboxID).
+- `MsgInstantiate` → after `eng.Instantiate`, bind
+  `eng.SetNetworkHook(sandboxID, &NetworkHook{SandboxID: sandboxID,
+  Dial: mediatorDialer{m, sandboxID}, Meter: workerByteMeter{usageFor(sandboxID)}})`
+  — identical to `Server.bindNetworkHook`, just keyed.
+- `MsgSetNetworkBlocks` → `mediator().SetBlocks(sandboxID, …)` (was rejected).
+- `MsgNetstatsTick` → `mediator().DrainUsage(sandboxID)` (was rejected).
+- `MsgStopInstance` → `eng.ClearNetworkHook(sandboxID)` + drop mediator usage.
+
+Once wired, the driver's existing egress-policy plumbing (the service layer
+sends `SetNetworkBlocks` after create) flows to resident sandboxes unchanged, so
+the `createOnResidentHost` caps no longer need to be networking-stripped.
+
+**Residual co-tenancy risk to enumerate:** a single mutex guards `hooks`/`conns`
+lookups (released before the blocking `conn.Read`/`Write`, so no head-of-line
+blocking across tenants). A panic inside a host fn still runs on the shared
+process (existing co-tenancy risk, already documented). A hung dial is bounded
+by `NetMediator`'s 30s dialer timeout, but note `tcp_dial` currently dials with
+`context.Background()` (wazero_network.go:106) — it ignores the invocation
+deadline. Pre-existing, but worth fixing under co-tenancy so one tenant's slow
+dial can't pin a goroutine indefinitely.
+
+### 1b. Co-tenancy correctness hardening (PR-A, D8 — from Codex outside voice)
+
+Shared-process correctness that a naive multi-tenant net host would miss. All in
+PR-A because the flag flip depends on them.
+
+- **Per-instance call/lifecycle lock or refcount.** `MultiInstanceEngine.InvokeExport`
+  (engine_multi.go:215) releases the engine lock before `fn.Call`, while
+  `StopInstance`/`Run` can `Close`/replace the same `api.Module` concurrently →
+  use-after-close. Add a per-instance guard (refcount or per-instance mutex) so a
+  Stop waits for in-flight calls (or cancels them) and a call sees a stable
+  module. **Plus a stress test** proving wazero permits parallel `Call` across
+  *different* modules on one runtime under load (the design's core unproven
+  assumption).
+- **Connection cleanup on teardown.** `StopInstance`, `Run` (which drops+replaces
+  the module at engine_multi.go:162), and `ClearNetworkHook(sid)` must **close +
+  delete `conns[sid]`**. This frees sockets AND is the lever that unblocks a
+  pinned `tcp_read`/`tcp_write` (closing the conn makes the blocked Read return)
+  — so it doubles as the fix for reads/writes having no deadline (D6 only covered
+  dial).
+- **Resident `MsgInvoke` invocation deadline.** `resident_server.go` calls
+  `eng.InvokeExport(ctx, …)` with `ctx=context.Background()` (resident_server.go:56)
+  — no deadline, unlike the single-instance `Server` which wraps invoke with
+  `WithInvocationDeadline`. Bug in already-merged code; fix here. (`MsgExec` is
+  fine — `Run` wraps it internally.)
+- **Respawn / idempotency hardening (P2, merged-code gaps):**
+  - `refreshWorkerInstanceState` short-circuits `fromResidentHost` instances
+    without checking host liveness (driver.go:137) → after a host crash,
+    `Inspect`/`List` report `started` for gone instances. Verify the host socket
+    (or a generation token) for resident instances.
+  - `ensureResidentHost` skips health/load when `bucket.ready` (resident.go:81);
+    if the supervisor restarted the host behind the same socket, `ready` is stale
+    until an instantiate fails. Health-check (Ping + `InstanceStatus.Loaded`) on
+    reuse, or track a host generation.
+  - `ResidentServer.LoadModule` reads `loadedPath` unlocked then loads then writes
+    it — two concurrent different-path loads can both pass `prev==""`. Hold the
+    lock across check+load (or single-flight per path in the server), so the
+    one-module-per-host invariant holds even without the driver single-flight.
+
+### 2. expose_port after create (PR-B)
+
+With private-by-default (`project_private_by_default`), a normal create is
+private → routes to the resident host, and the caller exposes a port **later**.
+The resident host can't add a wasip1 listener to an already-instantiated shared
+runtime (the listener is configured per-instance via `experimentalsock.WithConfig`
+at instantiate time, engine_wazero.go withNetworkContext). So expose-after-create
+on a resident sandbox is **the normal flow now, not a rare edge** — a plain error
+is not acceptable.
+
+**Design: migrate-on-expose, cold-up-then-stop-resident (D4-A, eng-review
+2026-07-17).** When `expose_port` (→ `SyncGuestListenPorts`,
+`internal/runtime/wasm/guest_http.go:20`) hits a `fromResidentHost` sandbox:
+1. Instantiate the sandbox on a **fresh cold per-process worker WITH** the
+   listener config, preserving sandboxID + workDir + env + digest.
+2. Only after the cold instance is confirmed up, `StopInstance` on the resident
+   host and flip `inst.fromResidentHost=false` + `inst.socketPath` to the cold
+   worker.
+There is **no window with zero instances**: if step 1 fails, the resident copy
+is still serving and expose returns an error (failure-path consistency,
+pr-review §4). Costs a bit of transient RAM during the swap. The first expose
+pays a cold `wasm_load` once (acceptable — expose is not the hot create path);
+subsequent traffic is normal. Rejected: stop-then-recreate (real zero-instance
+window + a rollback that can itself fail), and routing every possibly-exposing
+create to cold up front (defeats the latency win — private-by-default means
+almost everything could expose).
+
+**IMPLEMENTED 2026-07-17.** `Driver.migrateResidentToCold` (`resident.go`) does
+the cold-up-then-stop dance (spawn dedicated worker → waitWorker → LoadModule →
+Instantiate listener-disabled → then StopInstance on the resident host +
+`releaseResidentSlotFor` + flip `socketPath`/`workerKey`/`fromResidentHost` +
+`noteWorkerSpawnCount`); a cold-bring-up failure Stops the half-spawned worker
+and leaves the sandbox resident. `SyncGuestListenPorts` (`guest_http.go`) calls
+it before the listener sync when the sandbox is `fromResidentHost` and the
+request enables a listener (an unexpose on a still-resident sandbox is a no-op).
+Tests: `resident_test.go` `TestMigrateResidentToCold` (routing flip + slot
+release + resident stop) and `TestExposeMigrationFailureLeavesResident`
+(cold-instantiate failure keeps the sandbox resident, slot retained, error
+surfaced). Not on the `CreateSandbox` boot path; first expose pays one cold
+compile.
+
+### 3. Host lifecycle + capacity (PR-C)
+
+- **Idle-TTL reaper.** A resident host with `InstanceCount()==0` for
+  `SB_WASM_RESIDENT_HOST_IDLE_TTL` (default e.g. 5m) is torn down to reclaim RAM
+  (a bucket holds the ~25MB compiled image + runtime resident). Boot pre-warm
+  re-creates standard-module hosts, so the reaper must not fight pre-warm — skip
+  reaping pre-warmed standard-module buckets, or let pre-warm re-spawn on next
+  demand. Reaper is a ticker goroutine on the driver, gated by the flag.
+- **`SB_WASM_RESIDENT_HOST_MAX_INSTANCES`.** Cap instances per host process; when
+  a bucket's host is full, spawn a second host for the same bucket
+  (`<bucket>-2.sock`) and route there. Bounds blast radius per the isolation
+  section.
+- **Capacity/admission.** `pkg/capacity` Admitter models per-sandbox RAM. A
+  resident bucket's cost is `compiled image + runtime` **once per bucket** plus
+  per-instance linear memory (≤ `memoryMB`). The admitter needs a host-shared
+  cost model so it doesn't over- or under-count resident instances. This is the
+  fuzziest item; if it can't be made correct quickly, gate the flag flip on a
+  conservative over-count (treat each resident instance as full `memoryMB`) and
+  refine later.
+
+**IMPLEMENTED 2026-07-17 (PR-C).**
+- **Idle-TTL reaper** — `Driver.RunResidentReaper` (daemon goroutine, gated by
+  the flag; stops on ctx cancel) scans every `SB_WASM_RESIDENT_HOST_IDLE_TTL/4`
+  (clamped 5s–1m; default TTL 5m, 0 disables) and `reapIdleResidentHosts` tears
+  down any host with `live==0` idle ≥ TTL. Pre-warmed standard-module hosts are
+  `pinned` (set when `ensureResidentHost` runs with `reserve=false`) and never
+  reaped. Idle tracking: `residentHost.idleSince` set when `releaseResidentSlot`
+  drops `live` to 0, cleared on the next reserve. Buckets use a **monotonic
+  `nextIndex`** so a reaped-then-respawned host can't collide sockets. Selection
+  is under `bucket.mu` (a concurrent create that takes the host wins and it's
+  kept); `supervisor.Stop` runs outside the lock. Tests:
+  `TestResidentReaperReapsIdleHost`, `TestResidentReaperKeepsPinnedAndActive`.
+- **`MAX_INSTANCES`** — shipped in PR-A (`SB_WASM_RESIDENT_HOST_MAX_INSTANCES`,
+  default 32, spill-to-second-host).
+- **Capacity — conservative + observability** (D-decision 2026-07-17). No
+  admission-path change: each sandbox is already admitted at full `memoryMB` (an
+  over-count that cushions the guest's actual linear memory), and the shared
+  per-bucket base (compiled image + runtime) is treated as uncounted headroom
+  operators reserve via `MemoryFloorRatio`/`MemoryReservationRatio`. To make that
+  sizeable, `Driver.ResidentHostStats` (buckets/hosts/instances) is published as
+  the `aerolvm_wasm_resident_hosts` expvar (test `TestResidentHostStats`). Exact
+  per-bucket-base reservation via a driver→`pkg/capacity` seam is deferred until
+  a real deployment shows the base RAM bites.
+
+### Test plan (eng-review 2026-07-17)
+
+**PR-A (egress isolation) — offline, 100% of new branches:**
+- `pkg/wasm/engine_multi_network_test.go`:
+  - **★★★ IRON-RULE isolation regression (security boundary + fragile area):**
+    two co-tenant instances on one `MultiInstanceEngine`; A dials → conn_id; B
+    `tcp_read`/`tcp_write`/`tcp_close` with A's conn_id → `errClosed`, A's conn
+    stays usable. Proves the cross-tenant deny the whole PR exists for.
+  - per-tenant metering attribution (A's bytes ≠ B's bytes);
+  - `SetBlocks(A)` blocks A's egress, B still dials (per-tenant policy);
+  - fail-closed: no hook / blocked → `errBlocked`;
+  - `ClearNetworkHook(A)` leaves B's networking live;
+  - dial honors the invocation deadline (D6-A) — a canceled ctx aborts the dial.
+- `pkg/wasm/worker/resident_server_test.go` (extend): `MsgSetNetworkBlocks` /
+  `MsgNetstatsTick` now succeed keyed per-sandbox (were rejected);
+  `MsgInstantiate` binds a hook so a dial works; `MsgStopInstance` clears it.
+- `internal/runtime/wasm/resident_test.go` (extend): `createOnResidentHost` caps
+  no longer strip networking; `Driver.SetNetworkBlocks` on a `fromResidentHost`
+  sandbox reaches the bucket socket and is honored; a **non-operator `OwnerRef`
+  buckets to a distinct host** from the operator/empty case (D7); host-crash →
+  `refreshWorkerInstanceState` no longer reports a gone instance as `started`.
+- Correctness cluster (D8): **concurrency stress test** — N goroutines
+  Instantiate/Invoke/StopInstance across distinct sandboxIDs on one
+  `MultiInstanceEngine` with `-race`, asserting no use-after-close and that
+  parallel `Call`s across modules actually run; conn cleanup — `StopInstance`
+  closes owned conns and a blocked `tcp_read` returns; `MsgInvoke` respects the
+  invocation deadline; `LoadModule` two-concurrent-different-paths keeps one
+  module.
+- **Live (Phase 4, `[→E2E]`):** CPython egress on the resident host,
+  `make integration-benchmark-wasm` on `cluster-3-mixed-wasm` — the win that
+  couldn't be benched until egress works.
+
+**PR-B (migrate-on-expose):** `expose_port` on a `fromResidentHost` sandbox
+migrates to cold + listener works; cold-create failure leaves the resident copy
+serving + returns an error (no zero-instance window); idempotent re-expose.
+
+**PR-C (lifecycle):** idle-TTL reaps a 0-instance host but NOT a pre-warmed
+standard bucket; `MAX_INSTANCES` spills to a second host; admitter counts a
+resident instance's host-shared cost.
+
+### Staging (3 stacked PRs)
+
+- **PR-A — egress isolation + hard cap** — **IMPLEMENTED 2026-07-17**.
+  `pkg/wasm/engine_multi_network.go` (new), `engine_multi.go`,
+  `wazero_network.go` (shared helper + dial-ctx), `worker/resident_server.go`,
+  `internal/runtime/wasm/resident.go` (+ owner bucketing + max-instances spill +
+  host liveness) + tests. **Includes `SB_WASM_RESIDENT_HOST_MAX_INSTANCES`**
+  (default 32; spill to `<bucket>-2.sock` when full). Still default-off after this.
+- **PR-B — migrate-on-expose.** `internal/runtime/wasm/guest_http.go` +
+  `resident.go` + tests.
+- **PR-C — host lifecycle + capacity. DONE 2026-07-17.** idle-TTL reaper
+  (`RunResidentReaper` + `SB_WASM_RESIDENT_HOST_IDLE_TTL`, pinned prewarm hosts,
+  monotonic host index) + conservative capacity stance with the
+  `aerolvm_wasm_resident_hosts` expvar footprint metric + tests.
+  (`MAX_INSTANCES` shipped in PR-A; exact Admitter reservation deferred.)
+- **Flag flip** (`SB_WASM_RESIDENT_HOST_ENABLED` default → true) is a **4th,
+  separate** change, only after A+B+C land and the live CPython bench is green.
 
 ### Validation (Phase 4)
 
@@ -295,3 +591,19 @@ enumeration gate the default flip.
 - Memory accounting for admission control (`pkg/capacity`) — a resident host's
   RAM is shared across instances; the admitter's per-sandbox model needs to
   understand host-shared cost.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 1 | issues_found | 13 findings, all folded/resolved |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | clean | 6 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+- **CODEX:** 13 findings. P1 cluster (per-instance call/lifecycle lock + refcount + parallel-call stress test, conn cleanup on teardown, `MsgInvoke` invocation deadline) + P2 respawn hardening (host-liveness in `refreshWorkerInstanceState`, `bucket.ready` health-check, `LoadModule` check-then-load race) all folded into PR-A (D8). Fuel-framing doc corrected (wazero = wall-time only).
+- **CROSS-MODEL:** two tensions, both resolved. Sharing granularity → bucket by `(ownerRef, digest, memoryMB)` (multi-tenant SaaS isolation, operator/empty keeps global bucket). Capacity sequencing → `MAX_INSTANCES` moved from PR-C into PR-A. No residual disagreement.
+- **VERDICT:** ENG CLEARED — design locked across PR-A (egress isolation + hard cap + co-tenancy correctness), PR-B (migrate-on-expose), PR-C (idle-TTL + capacity), then a separate flag flip. **PR-A implemented 2026-07-17;** next is PR-B.
+
+NO UNRESOLVED DECISIONS

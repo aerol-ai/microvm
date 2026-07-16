@@ -14,37 +14,38 @@ import (
 	"github.com/tetratelabs/wazero/sys"
 )
 
+// multiInstance is one co-tenant sandbox on a MultiInstanceEngine. mu serializes
+// Call vs Close so StopInstance/Run cannot Close a module under an in-flight
+// InvokeExport (D8 use-after-close).
+type multiInstance struct {
+	mod api.Module
+	mu  sync.Mutex
+}
+
 // MultiInstanceEngine holds one resident wazero runtime + one compiled module
 // and instantiates many isolated instances from it — compile-once,
 // instantiate-many. It is the Phase 1 primitive for the resident-module host
-// (plans/wasm-resident-module-host.md).
-//
-// Why it exists: the v0.7.9 cluster-3-mixed-wasm bench measured a cold create's
-// `wasm_load` at 2843ms p50, of which `wasm_load_compile` was 2768ms (~97%) —
-// and that is WITH the on-disk compile cache populated, so it is the per-process
-// deserialize of a 25MB CPython image, not a from-scratch compile. Reusing a
-// resident in-process CompiledModule skips that entirely: an Instantiate against
-// it measured 9ms. This type turns a "cold" create into an Instantiate.
+// (plans/wasm-resident-module-host.md), extended in Phase 2b PR-A with
+// per-instance network hooks (multiNetHost) and call/lifecycle locking.
 //
 // Bucketing constraint: wazero sets the memory limit at the runtime level and a
 // CompiledModule is bound to its runtime, so one MultiInstanceEngine serves a
-// single (module, memoryMB) bucket. MemoryMB is fixed at construction; the pool
-// (Phase 3) routes a create to an engine whose MemoryMB matches, else cold path.
+// single (module, memoryMB) bucket. MemoryMB is fixed at construction.
 //
-// Isolation: wazero gives every InstantiateModule its own linear memory, so
-// co-tenant instances cannot read each other's memory (proven in
-// engine_multi_test.go). Per-instance networking, snapshot/restore, IO-capturing
-// Run, and wasip1 listeners are deliberately NOT here yet — they are Phase 2,
-// wired when this engine is embedded in the worker (the worker's NetMediator is
-// already keyed by sandboxID). Phase 1 is the isolated-instance primitive only.
+// Isolation: wazero gives every InstantiateModule its own linear memory.
+// Networking is keyed by mod.Name() (= sandboxID) via multiNetHost so co-tenants
+// cannot share sockets. wasip1 listeners and checkpoint/restore remain out of
+// scope for resident hosts.
 type MultiInstanceEngine struct {
-	mu        sync.Mutex
-	runtime   wazero.Runtime
-	compiled  wazero.CompiledModule
-	memoryMB  int
-	pages     uint32
-	instances map[string]api.Module
-	lastLoad  LoadTimings
+	mu                sync.Mutex
+	runtime           wazero.Runtime
+	compiled          wazero.CompiledModule
+	memoryMB          int
+	pages             uint32
+	instances         map[string]*multiInstance
+	lastLoad          LoadTimings
+	netHost           *multiNetHost
+	netHostRegistered bool
 }
 
 // NewMultiInstanceEngine builds the resident runtime (memory-limited to memoryMB,
@@ -60,7 +61,7 @@ func NewMultiInstanceEngine(ctx context.Context, memoryMB int) (*MultiInstanceEn
 		runtime:   r,
 		memoryMB:  memoryMB,
 		pages:     pages,
-		instances: make(map[string]api.Module),
+		instances: make(map[string]*multiInstance),
 	}, nil
 }
 
@@ -110,6 +111,30 @@ func (m *MultiInstanceEngine) LastLoadTimings() LoadTimings {
 	return m.lastLoad
 }
 
+// SetNetworkHook binds a per-sandbox NetworkHook for mediated egress. The hook
+// is looked up at host-fn call time by mod.Name() (= sandboxID).
+func (m *MultiInstanceEngine) SetNetworkHook(sandboxID string, hook *NetworkHook) {
+	if sandboxID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.netHost == nil {
+		m.netHost = newMultiNetHost()
+	}
+	m.netHost.setHook(sandboxID, hook)
+}
+
+// ClearNetworkHook drops the sandbox's hook and closes every conn it owns.
+func (m *MultiInstanceEngine) ClearNetworkHook(sandboxID string) {
+	m.mu.Lock()
+	host := m.netHost
+	m.mu.Unlock()
+	if host != nil {
+		host.clearSandbox(sandboxID)
+	}
+}
+
 // Instantiate creates an isolated instance keyed by sandboxID from the resident
 // compiled module. This is the fast path the whole design exists for: it costs
 // an Instantiate (~9ms), not a CompileModule (~2.8s). _start is NOT run here
@@ -126,6 +151,11 @@ func (m *MultiInstanceEngine) Instantiate(ctx context.Context, sandboxID string,
 	if _, ok := m.instances[sandboxID]; ok {
 		return fmt.Errorf("instance %q already exists", sandboxID)
 	}
+	// Register aerol/vm/net before guest Instantiate so modules that import it
+	// resolve; dials fail closed until SetNetworkHook binds a per-sandbox hook.
+	if err := m.ensureNetworkHostLocked(ctx); err != nil {
+		return err
+	}
 	// wazero rejects two instances sharing a module name on one runtime, so key
 	// the instance name by sandboxID to keep co-tenants distinct.
 	cfg := moduleConfigFor(caps).WithName(sandboxID)
@@ -136,7 +166,7 @@ func (m *MultiInstanceEngine) Instantiate(ctx context.Context, sandboxID string,
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}
-	m.instances[sandboxID] = mod
+	m.instances[sandboxID] = &multiInstance{mod: mod}
 	return nil
 }
 
@@ -159,14 +189,30 @@ func (m *MultiInstanceEngine) Run(ctx context.Context, sandboxID string, caps Ca
 		m.mu.Unlock()
 		return RunResult{}, fmt.Errorf("no compiled module loaded")
 	}
-	// Re-instantiate semantics: drop any prior instance for this sandbox first.
-	if old, ok := m.instances[sandboxID]; ok {
-		_ = old.Close(ctx)
-		delete(m.instances, sandboxID)
+	if err := m.ensureNetworkHostLocked(ctx); err != nil {
+		m.mu.Unlock()
+		return RunResult{}, err
 	}
+	// Re-instantiate semantics: drop any prior instance for this sandbox first.
+	old := m.instances[sandboxID]
+	delete(m.instances, sandboxID)
 	compiled := m.compiled
 	runtime := m.runtime
+	host := m.netHost
 	m.mu.Unlock()
+
+	if host != nil {
+		// Close owned sockets BEFORE waiting on old.mu: a guest blocked in a host
+		// tcp_read/write holds old.mu and wazero cannot preempt it, so closing the
+		// conn first makes the blocked Read return and the call unwind (Finding
+		// P1-1). The hook stays so the next Exec still has a dialer.
+		host.closeConns(sandboxID)
+	}
+	if old != nil {
+		old.mu.Lock()
+		_ = old.mod.Close(ctx)
+		old.mu.Unlock()
+	}
 
 	invokeCtx, cancel := WithInvocationDeadline(ctx, caps)
 	defer cancel()
@@ -181,19 +227,23 @@ func (m *MultiInstanceEngine) Run(ctx context.Context, sandboxID string, caps Ca
 	if err != nil {
 		return RunResult{}, fmt.Errorf("instantiate module: %w", err)
 	}
+	inst := &multiInstance{mod: mod}
 	m.mu.Lock()
-	m.instances[sandboxID] = mod
+	m.instances[sandboxID] = inst
 	m.mu.Unlock()
 
 	result := RunResult{}
+	inst.mu.Lock()
 	fn := mod.ExportedFunction(export)
 	if fn == nil {
+		inst.mu.Unlock()
 		result.ExitCode = 1
 		result.Stdout = stdout.String()
 		result.Stderr = stderr.String()
 		return result, fmt.Errorf("export %q not found", export)
 	}
 	_, callErr := fn.Call(invokeCtx)
+	inst.mu.Unlock()
 	result.ExitCode = exitCodeFromInvoke(callErr)
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
@@ -210,16 +260,19 @@ func (m *MultiInstanceEngine) Run(ctx context.Context, sandboxID string, caps Ca
 	return result, nil
 }
 
-// InvokeExport calls an exported function on one instance. The lock is released
-// before the call so a long-running export does not serialize co-tenants.
+// InvokeExport calls an exported function on one instance. The engine lock is
+// released before the call so a long-running export does not serialize
+// co-tenants; the per-instance lock keeps StopInstance from Closing underfoot.
 func (m *MultiInstanceEngine) InvokeExport(ctx context.Context, sandboxID, name string) error {
 	m.mu.Lock()
-	mod, ok := m.instances[sandboxID]
+	inst, ok := m.instances[sandboxID]
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("no instance %q", sandboxID)
 	}
-	fn := mod.ExportedFunction(name)
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	fn := inst.mod.ExportedFunction(name)
 	if fn == nil {
 		return fmt.Errorf("export %q not found", name)
 	}
@@ -228,18 +281,36 @@ func (m *MultiInstanceEngine) InvokeExport(ctx context.Context, sandboxID, name 
 }
 
 // StopInstance closes one instance and leaves every co-tenant running.
-// Idempotent: stopping an unknown sandboxID is a no-op.
+// Idempotent: stopping an unknown sandboxID is a no-op. Waits for in-flight
+// InvokeExport/Run calls on that instance, then closes owned network conns.
 func (m *MultiInstanceEngine) StopInstance(ctx context.Context, sandboxID string) error {
 	m.mu.Lock()
-	mod, ok := m.instances[sandboxID]
+	inst, ok := m.instances[sandboxID]
 	if ok {
 		delete(m.instances, sandboxID)
 	}
+	host := m.netHost
 	m.mu.Unlock()
+	// Close owned sockets BEFORE taking inst.mu: a guest blocked in a host
+	// tcp_read/write (which wazero cannot preempt) holds inst.mu, so waiting on it
+	// first would deadlock — closing the conn makes the blocked Read return and
+	// the guest call unwind (Finding P1-1).
+	if host != nil {
+		host.closeConns(sandboxID)
+	}
 	if !ok {
+		if host != nil {
+			host.clearSandbox(sandboxID)
+		}
 		return nil
 	}
-	return mod.Close(ctx)
+	inst.mu.Lock()
+	err := inst.mod.Close(ctx)
+	inst.mu.Unlock()
+	if host != nil {
+		host.clearSandbox(sandboxID)
+	}
+	return err
 }
 
 // HasInstance reports whether sandboxID has a live instance.
@@ -258,28 +329,43 @@ func (m *MultiInstanceEngine) InstanceCount() int {
 }
 
 // instanceModule returns the raw wazero module for one sandbox (nil if absent).
-// Package-internal: used by tests and by future per-instance snapshot/network
-// wiring in Phase 2.
+// Package-internal: used by tests and by per-instance snapshot/network wiring.
 func (m *MultiInstanceEngine) instanceModule(sandboxID string) api.Module {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.instances[sandboxID]
+	inst := m.instances[sandboxID]
+	if inst == nil {
+		return nil
+	}
+	return inst.mod
 }
 
 // Close tears down every instance, the compiled module, and the runtime.
 func (m *MultiInstanceEngine) Close(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for id, mod := range m.instances {
-		_ = mod.Close(ctx)
-		delete(m.instances, id)
+	instances := m.instances
+	m.instances = make(map[string]*multiInstance)
+	host := m.netHost
+	m.netHost = nil
+	m.netHostRegistered = false
+	compiled := m.compiled
+	m.compiled = nil
+	runtime := m.runtime
+	m.mu.Unlock()
+
+	if host != nil {
+		host.closeAll()
 	}
-	if m.compiled != nil {
-		_ = m.compiled.Close(ctx)
-		m.compiled = nil
+	for _, inst := range instances {
+		inst.mu.Lock()
+		_ = inst.mod.Close(ctx)
+		inst.mu.Unlock()
 	}
-	if m.runtime != nil {
-		return m.runtime.Close(ctx)
+	if compiled != nil {
+		_ = compiled.Close(ctx)
+	}
+	if runtime != nil {
+		return runtime.Close(ctx)
 	}
 	return nil
 }
