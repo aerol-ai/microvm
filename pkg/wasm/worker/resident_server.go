@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -12,34 +13,79 @@ import (
 
 // ResidentServer serves the worker protocol backed by a MultiInstanceEngine:
 // one resident process compiles a module once and hosts many isolated sandbox
-// instances (compile-once, instantiate-many). It is the Phase 2 host process
-// for plans/wasm-resident-module-host.md, spawned via `--wasm-resident-host`.
+// instances (compile-once, instantiate-many). Spawned via `--wasm-resident-host`.
 //
-// Scope (initial cut, default-off): non-listen, non-networking sandboxes —
-// LoadModule (once, host-level), Instantiate/Exec/Invoke/StopInstance keyed by
-// sandboxID. Listener (expose_port/HTTP), checkpoint/restore, and per-instance
-// egress mediation are rejected here on purpose; the driver routes those to the
-// per-sandbox cold path. Per-instance egress isolation on a shared runtime
-// (name-keyed hooks + conn ownership) is the eng-review-gated Phase 2 remainder.
+// Phase 2b PR-A: per-instance egress via MultiInstanceEngine.SetNetworkHook
+// (name-keyed hooks + conn ownership) and a shared NetMediator. Listener
+// (expose_port/HTTP) and checkpoint/restore remain rejected — those stay on the
+// per-sandbox cold path (migrate-on-expose is PR-B).
 type ResidentServer struct {
 	mu         sync.Mutex
 	eng        *wasmengine.MultiInstanceEngine
 	loadedPath string
+	net        *NetMediator
+	workerNet  map[string]*workerNetUsage
+	lastCaps   map[string]wasmengine.Capabilities
 }
 
-// ensureEngine lazily builds the MultiInstanceEngine on the first LoadModule,
-// fixing the runtime memory limit to the bucket's memoryMB.
-func (s *ResidentServer) ensureEngine(ctx context.Context, memoryMB int) (*wasmengine.MultiInstanceEngine, error) {
+func (s *ResidentServer) mediator() *NetMediator {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.eng == nil {
-		eng, err := wasmengine.NewMultiInstanceEngine(ctx, memoryMB)
-		if err != nil {
-			return nil, err
-		}
-		s.eng = eng
+	if s.net == nil {
+		s.net = newNetMediator()
 	}
-	return s.eng, nil
+	return s.net
+}
+
+func (s *ResidentServer) netUsageFor(sandboxID string) *workerNetUsage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.workerNet == nil {
+		s.workerNet = make(map[string]*workerNetUsage)
+	}
+	if s.workerNet[sandboxID] == nil {
+		s.workerNet[sandboxID] = &workerNetUsage{}
+	}
+	return s.workerNet[sandboxID]
+}
+
+func (s *ResidentServer) bindNetworkHook(eng *wasmengine.MultiInstanceEngine, sandboxID string) {
+	if eng == nil || sandboxID == "" {
+		return
+	}
+	m := s.mediator()
+	usage := s.netUsageFor(sandboxID)
+	eng.SetNetworkHook(sandboxID, &wasmengine.NetworkHook{
+		SandboxID: sandboxID,
+		Dial:      mediatorDialer{m: m, sandboxID: sandboxID},
+		Meter:     &workerByteMeter{u: usage},
+	})
+}
+
+func (s *ResidentServer) clearNetworkHook(eng *wasmengine.MultiInstanceEngine, sandboxID string) {
+	if eng == nil {
+		return
+	}
+	eng.ClearNetworkHook(sandboxID)
+	s.mu.Lock()
+	delete(s.workerNet, sandboxID)
+	delete(s.lastCaps, sandboxID)
+	s.mu.Unlock()
+}
+
+func (s *ResidentServer) storeCaps(sandboxID string, caps wasmengine.Capabilities) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastCaps == nil {
+		s.lastCaps = make(map[string]wasmengine.Capabilities)
+	}
+	s.lastCaps[sandboxID] = caps
+}
+
+func (s *ResidentServer) capsFor(sandboxID string) wasmengine.Capabilities {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastCaps[sandboxID]
 }
 
 func (s *ResidentServer) engine() *wasmengine.MultiInstanceEngine {
@@ -88,6 +134,11 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 		case MsgInstanceStatus:
 			eng := s.engine()
 			loaded := eng != nil && eng.Loaded()
+			if eng != nil && env.SandboxID != "" {
+				// Prefer per-sandbox liveness when a sandboxID is supplied so
+				// Inspect can detect a gone instance after host respawn.
+				loaded = eng.HasInstance(env.SandboxID)
+			}
 			body, encErr := encodePayload(instanceStatusPayload{Loaded: loaded})
 			if encErr != nil {
 				return encErr
@@ -105,38 +156,45 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			eng, err := s.ensureEngine(ctx, p.MemoryMB)
-			if err != nil {
-				if replyErr(env.SandboxID, err) != nil {
-					return err
-				}
-				continue
-			}
-			// A resident host is one (module, memoryMB) bucket. Loading a second,
-			// different module into it is a routing bug — reject rather than blow
-			// away the compiled module other live instances depend on.
+			// Hold the server lock across check+load so two concurrent
+			// different-path loads cannot both pass prev=="" (D8).
 			s.mu.Lock()
 			prev := s.loadedPath
-			s.mu.Unlock()
 			if prev != "" && prev != p.Path {
+				s.mu.Unlock()
 				if replyErr(env.SandboxID, fmt.Errorf("resident host already bound to %q, refusing to load %q", prev, p.Path)) != nil {
 					return err
 				}
 				continue
 			}
+			var eng *wasmengine.MultiInstanceEngine
+			var ensureErr error
+			if s.eng == nil {
+				eng, ensureErr = wasmengine.NewMultiInstanceEngine(ctx, p.MemoryMB)
+				if ensureErr != nil {
+					s.mu.Unlock()
+					if replyErr(env.SandboxID, ensureErr) != nil {
+						return err
+					}
+					continue
+				}
+				s.eng = eng
+			} else {
+				eng = s.eng
+			}
 			var timings wasmengine.LoadTimings
 			if prev != p.Path {
-				if err := eng.LoadModule(ctx, p.Path); err != nil {
-					if replyErr(env.SandboxID, err) != nil {
+				if loadErr := eng.LoadModule(ctx, p.Path); loadErr != nil {
+					s.mu.Unlock()
+					if replyErr(env.SandboxID, loadErr) != nil {
 						return err
 					}
 					continue
 				}
 				timings = eng.LastLoadTimings()
-				s.mu.Lock()
 				s.loadedPath = p.Path
-				s.mu.Unlock()
 			}
+			s.mu.Unlock()
 			body, encErr := encodePayload(loadModuleResultPayload{Timings: timings})
 			if encErr != nil {
 				return encErr
@@ -165,12 +223,15 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.bindNetworkHook(eng, env.SandboxID)
 			if err := eng.Instantiate(ctx, env.SandboxID, p.Caps); err != nil {
+				s.clearNetworkHook(eng, env.SandboxID)
 				if replyErr(env.SandboxID, err) != nil {
 					return err
 				}
 				continue
 			}
+			s.storeCaps(env.SandboxID, p.Caps)
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
@@ -189,6 +250,8 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.bindNetworkHook(eng, env.SandboxID)
+			s.storeCaps(env.SandboxID, p.Caps)
 			result, runErr := eng.Run(ctx, env.SandboxID, p.Caps, p.Export)
 			if runErr != nil && result.ExitCode == 0 && result.Stderr == "" {
 				if replyErr(env.SandboxID, runErr) != nil {
@@ -216,6 +279,9 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			if p.Export == "" {
+				p.Export = "_start"
+			}
 			eng := s.engine()
 			if eng == nil {
 				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
@@ -223,8 +289,13 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			if err := eng.InvokeExport(ctx, env.SandboxID, p.Export); err != nil {
-				if replyErr(env.SandboxID, err) != nil {
+			s.bindNetworkHook(eng, env.SandboxID)
+			// Honor caps wall timeout (D8) — previously invoked with Background.
+			invokeCtx, cancel := wasmengine.WithInvocationDeadline(ctx, s.capsFor(env.SandboxID))
+			invokeErr := eng.InvokeExport(invokeCtx, env.SandboxID, p.Export)
+			cancel()
+			if invokeErr != nil {
+				if replyErr(env.SandboxID, invokeErr) != nil {
 					return err
 				}
 				continue
@@ -241,13 +312,40 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 					}
 					continue
 				}
+				s.clearNetworkHook(eng, env.SandboxID)
+				_, _ = s.mediator().DrainUsage(env.SandboxID)
 			}
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
+		case MsgSetNetworkBlocks:
+			var p setNetworkBlocksPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mediator().SetBlocks(env.SandboxID, p.BlockIngress, p.BlockEgress)
+			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgNetstatsTick:
+			sandboxID := strings.TrimSpace(env.SandboxID)
+			u := s.netUsageFor(sandboxID)
+			sockIn, sockOut := s.mediator().DrainUsage(sandboxID)
+			body, encErr := encodePayload(netstatsResultPayload{
+				BytesIn:  u.bytesIn.Swap(0) + sockIn,
+				BytesOut: u.bytesOut.Swap(0) + sockOut,
+			})
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: sandboxID, Payload: body}); err != nil {
+				return err
+			}
 		default:
-			// Checkpoint/Restore, listener, network, and netstats ops are not
-			// served by a resident host in this cut.
+			// Checkpoint/Restore and listener ops are not served by a resident host.
 			if unsupported(env.SandboxID, string(env.Type)) != nil {
 				return err
 			}

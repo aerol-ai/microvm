@@ -33,7 +33,9 @@ func (m *mockMemory) Write(offset uint32, v []byte) bool {
 
 type mockModule struct {
 	api.Module
-	mem *mockMemory
+	mem  *mockMemory
+	name string
 }
 
 func (m *mockModule) Memory() api.Memory { return m.mem }
+func (m *mockModule) Name() string       { return m.name }

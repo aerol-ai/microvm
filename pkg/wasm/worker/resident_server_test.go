@@ -112,3 +112,57 @@ func TestResidentServer_RejectsListener(t *testing.T) {
 	}
 	time.Sleep(10 * time.Millisecond)
 }
+
+// TestResidentServer_NetworkBlocksAndNetstats confirms MsgSetNetworkBlocks /
+// MsgNetstatsTick are keyed per-sandbox (were rejected before PR-A) and that
+// Instantiate binds a hook so mediated dial works.
+func TestResidentServer_NetworkBlocksAndNetstats(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	client, _ := serveResident(t)
+	if _, err := client.LoadModule("host", modPath, 0); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	caps := nonListenCaps("wasm")
+	if err := client.Instantiate("sb-net", caps); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	if err := client.SetNetworkBlocks("sb-net", false, true); err != nil {
+		t.Fatalf("SetNetworkBlocks: %v", err)
+	}
+	in, out, err := client.NetstatsTick("sb-net")
+	if err != nil {
+		t.Fatalf("NetstatsTick: %v", err)
+	}
+	if in != 0 || out != 0 {
+		t.Fatalf("netstats = (%d,%d), want (0,0)", in, out)
+	}
+	if err := client.StopInstance("sb-net"); err != nil {
+		t.Fatalf("StopInstance: %v", err)
+	}
+}
+
+// TestResidentServer_LoadModuleConcurrentDistinctPathsKeepsOneModule guards the
+// D8 check-then-load race: two concurrent different-path loads must not both
+// pass prev=="" — one wins, the other is refused.
+func TestResidentServer_LoadModuleConcurrentDistinctPathsKeepsOneModule(t *testing.T) {
+	dir := t.TempDir()
+	a := wasmmod.WriteMinimalWasm(t, dir, "a.wasm")
+	b := wasmmod.WriteMinimalWasm(t, dir, "b.wasm")
+	client, _ := serveResident(t)
+
+	errCh := make(chan error, 2)
+	go func() { _, err := client.LoadModule("host", a, 0); errCh <- err }()
+	go func() { _, err := client.LoadModule("host", b, 0); errCh <- err }()
+	var ok, fail int
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			fail++
+		} else {
+			ok++
+		}
+	}
+	if ok != 1 || fail != 1 {
+		t.Fatalf("concurrent distinct loads: ok=%d fail=%d, want 1/1", ok, fail)
+	}
+}

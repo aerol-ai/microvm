@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
@@ -59,8 +60,8 @@ func TestCreateRoutesToResidentHost(t *testing.T) {
 	if !inst.fromResidentHost {
 		t.Fatal("instance not marked fromResidentHost")
 	}
-	if inst.workerKey != residentBucketID("deadbeef", 0) {
-		t.Fatalf("workerKey=%q, want bucket %q", inst.workerKey, residentBucketID("deadbeef", 0))
+	if inst.workerKey != residentBucketID("", "deadbeef", 0) {
+		t.Fatalf("workerKey=%q, want bucket %q", inst.workerKey, residentBucketID("", "deadbeef", 0))
 	}
 
 	// Destroy must StopInstance (per-sandbox), NOT kill the shared host.
@@ -96,6 +97,21 @@ func TestCreateResidentRetryIsIdempotent(t *testing.T) {
 	}
 	if len(client.instantiateCaps) != 2 {
 		t.Fatalf("Instantiate calls = %d, want 2 (one per create)", len(client.instantiateCaps))
+	}
+	// Finding A: an idempotent retry must not inflate the host live count — the
+	// sandbox occupies exactly one slot no matter how many times create is retried.
+	var totalLive int
+	d.residentMu.Lock()
+	for _, b := range d.residentBuckets {
+		b.mu.Lock()
+		for _, h := range b.hosts {
+			totalLive += h.live
+		}
+		b.mu.Unlock()
+	}
+	d.residentMu.Unlock()
+	if totalLive != 1 {
+		t.Fatalf("host live count = %d after idempotent retry, want 1 (retry leaked a slot)", totalLive)
 	}
 }
 
@@ -186,5 +202,185 @@ func TestCreatePublicExposeUsesColdPath(t *testing.T) {
 	}
 	if inst.fromResidentHost {
 		t.Fatal("public-expose create wrongly routed to resident host")
+	}
+}
+
+// TestResidentBucketIDIncludesOwnerRef guards D7: a non-operator OwnerRef gets
+// its own bucket so SaaS tenants never co-locate; empty/operator stays global.
+func TestResidentBucketIDIncludesOwnerRef(t *testing.T) {
+	global := residentBucketID("", "deadbeef", 256)
+	tenant := residentBucketID("acme", "deadbeef", 256)
+	if global == tenant {
+		t.Fatalf("owner bucket collided with global: %q", global)
+	}
+	if residentBucketID("acme", "deadbeef", 256) != tenant {
+		t.Fatal("owner bucket not stable")
+	}
+	other := residentBucketID("globex", "deadbeef", 256)
+	if other == tenant {
+		t.Fatal("different owners share a bucket")
+	}
+}
+
+func TestCreateWithOwnerRefUsesDistinctResidentHost(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	opCtx := context.Background()
+	userCtx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "acme"},
+	})
+
+	if _, err := d.Create(opCtx, models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-op", "tok", nil); err != nil {
+		t.Fatalf("operator Create: %v", err)
+	}
+	if _, err := d.Create(userCtx, models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-user", "tok", nil); err != nil {
+		t.Fatalf("user Create: %v", err)
+	}
+	if resident.ensureCalls != 2 {
+		t.Fatalf("resident ensure calls = %d, want 2 (distinct owner buckets)", resident.ensureCalls)
+	}
+	opInst, _ := d.instance("sb-op")
+	userInst, _ := d.instance("sb-user")
+	if opInst.workerKey == userInst.workerKey {
+		t.Fatalf("owner create reused operator bucket key %q", opInst.workerKey)
+	}
+}
+
+func TestResidentMaxInstancesSpillsToSecondHost(t *testing.T) {
+	d, _, resident, _ := residentTestDriver(t, true)
+	d.cfg.ResidentHostMaxInstances = 1
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-1", "tok", nil); err != nil {
+		t.Fatalf("Create 1: %v", err)
+	}
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-2", "tok", nil); err != nil {
+		t.Fatalf("Create 2: %v", err)
+	}
+	if resident.ensureCalls != 2 {
+		t.Fatalf("resident ensure calls = %d, want 2 (spill to second host)", resident.ensureCalls)
+	}
+	a, _ := d.instance("sb-1")
+	b, _ := d.instance("sb-2")
+	if a.socketPath == b.socketPath {
+		t.Fatalf("both instances on same socket %q under MaxInstances=1", a.socketPath)
+	}
+}
+
+func TestInspectMarksDeadResidentHostStopped(t *testing.T) {
+	d, _, _, _ := residentTestDriver(t, true)
+	client := &unloadedWorkerClient{}
+	d.SetWorkerClientFactory(func(string) WorkerClient { return client })
+	d.mu.Lock()
+	d.byID["sb-dead"] = &sandboxInstance{
+		sandboxID:        "sb-dead",
+		socketPath:       "/tmp/fake-resident.sock",
+		fromResidentHost: true,
+		status:           models.SandboxStatusStarted,
+	}
+	d.mu.Unlock()
+
+	state, err := d.Inspect(context.Background(), "sb-dead")
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if state == nil || state.Status != models.SandboxStatusStopped {
+		t.Fatalf("state = %+v, want stopped after resident host gone", state)
+	}
+}
+
+func TestSetNetworkBlocksReachesResidentHost(t *testing.T) {
+	d, _, _, client := residentTestDriver(t, true)
+	netClient := &networkRecordingClient{recordingWorkerClient: *client}
+	d.SetWorkerClientFactory(func(string) WorkerClient { return netClient })
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-blocks", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	d.SetNetworkBlocks("sb-blocks", false, true)
+	if !netClient.blocksSet {
+		t.Fatal("SetNetworkBlocks did not reach the resident host socket")
+	}
+}
+
+type networkRecordingClient struct {
+	recordingWorkerClient
+	blocksSet bool
+}
+
+func (c *networkRecordingClient) SetNetworkBlocks(string, bool, bool) error {
+	c.blocksSet = true
+	return nil
+}
+
+// totalResidentLive sums the live slot count across every resident host so tests
+// can assert MAX_INSTANCES accounting (Findings A / P0-2 / P1-2).
+func totalResidentLive(d *Driver) int {
+	var total int
+	d.residentMu.Lock()
+	buckets := d.residentBuckets
+	d.residentMu.Unlock()
+	for _, b := range buckets {
+		b.mu.Lock()
+		for _, h := range b.hosts {
+			total += h.live
+		}
+		b.mu.Unlock()
+	}
+	return total
+}
+
+// TestResidentBucketIDNoCollision proves the hashed bucket id (P0-1) does not
+// co-locate distinct owners/modules that the old truncate+sanitize scheme would
+// have collided into one shared host process.
+func TestResidentBucketIDNoCollision(t *testing.T) {
+	// Long owners sharing a >24-char prefix (old code truncated to 24).
+	if residentBucketID("customer-aaaaaaaaaaaaaaaaaaaaaaaaaaaa-1", "sha256:deadbeef", 256) ==
+		residentBucketID("customer-aaaaaaaaaaaaaaaaaaaaaaaaaaaa-2", "sha256:deadbeef", 256) {
+		t.Fatal("distinct long owners collided to one bucket")
+	}
+	// Sanitization collision: a/b vs a-b (old code mapped '/' -> '-').
+	if residentBucketID("a/b", "sha256:deadbeef", 256) == residentBucketID("a-b", "sha256:deadbeef", 256) {
+		t.Fatal("owners a/b and a-b collided")
+	}
+	// Modules sharing a 16-char digest prefix (old code truncated to 16).
+	if residentBucketID("", "sha256:0000000000000000aaaa", 256) ==
+		residentBucketID("", "sha256:0000000000000000bbbb", 256) {
+		t.Fatal("modules sharing a 16-char digest prefix collided")
+	}
+	// Operator/empty owner must not collide with any real owner.
+	if residentBucketID("", "sha256:deadbeef", 256) == residentBucketID("owner1", "sha256:deadbeef", 256) {
+		t.Fatal("operator (empty owner) and owner1 collided")
+	}
+}
+
+// TestResidentRetryNoOrphanOrLeak proves an idempotent retry under MAX_INSTANCES
+// tears down the prior instance on its own host and keeps the live count at 1 —
+// no orphaned instance on a spilled host, no slot leak (P0-2 + Finding A).
+func TestResidentRetryNoOrphanOrLeak(t *testing.T) {
+	d, _, _, client := residentTestDriver(t, true)
+	d.cfg.ResidentHostMaxInstances = 1
+	req := models.CreateSandboxRequest{Image: "demo.wasm"}
+	if _, err := d.Create(context.Background(), req, "sb-x", "tok", nil); err != nil {
+		t.Fatalf("Create #1: %v", err)
+	}
+	client.stopped = false
+	if _, err := d.Create(context.Background(), req, "sb-x", "tok", nil); err != nil {
+		t.Fatalf("Create #2 (retry): %v", err)
+	}
+	if !client.stopped {
+		t.Fatal("retry did not StopInstance the prior instance on its host")
+	}
+	if got := totalResidentLive(d); got != 1 {
+		t.Fatalf("total resident live = %d after idempotent retry under MAX=1, want 1", got)
+	}
+}
+
+// TestPrewarmResidentHostDoesNotReserveSlot proves boot pre-warm brings up +
+// compiles a host without holding a live slot (P1-2) — otherwise every prewarmed
+// module would permanently inflate the bucket's occupancy.
+func TestPrewarmResidentHostDoesNotReserveSlot(t *testing.T) {
+	d, _, _, _ := residentTestDriver(t, true)
+	d.PrewarmResidentHosts(context.Background(), []string{"demo.wasm"})
+	if got := totalResidentLive(d); got != 0 {
+		t.Fatalf("prewarm reserved %d live slots, want 0", got)
 	}
 }

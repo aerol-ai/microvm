@@ -228,6 +228,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		// process (co-tenants depend on it). Best-effort: a dead host already
 		// dropped the instance.
 		_ = d.newWorkerClient(inst.socketPath).StopInstance(sandboxID)
+		d.releaseResidentSlotFor(inst)
 	} else if d.supervisor != nil {
 		workerKey := sandboxID
 		if inst != nil && inst.workerKey != "" {

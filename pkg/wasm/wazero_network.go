@@ -79,7 +79,7 @@ func (e *wazeroEngine) ensureNetworkHost(ctx context.Context) error {
 	return nil
 }
 
-func (h *wazeroNetHost) tcpDial(_ context.Context, mod api.Module, stack []uint64) {
+func (h *wazeroNetHost) tcpDial(ctx context.Context, mod api.Module, stack []uint64) {
 	const (
 		errInvalid = int32(1)
 		errDial    = int32(2)
@@ -103,7 +103,10 @@ func (h *wazeroNetHost) tcpDial(_ context.Context, mod api.Module, stack []uint6
 	if !ok {
 		return
 	}
-	conn, err := hook.Dial.DialContext(context.Background(), "tcp", string(addr))
+	// Honor the invocation deadline (D6-A): previously dialed with
+	// context.Background(), which ignored caps wall timeout under co-tenancy
+	// and the single-instance path alike.
+	conn, err := hook.Dial.DialContext(ctx, "tcp", string(addr))
 	if err != nil {
 		if errors.Is(err, ErrNetworkEgressBlocked) {
 			stack[0] = uint64(errBlocked)
@@ -160,15 +163,7 @@ func (h *wazeroNetHost) tcpRead(_ context.Context, mod api.Module, stack []uint6
 	if !ok {
 		return
 	}
-	n, err := conn.Read(buf)
-	if n > 0 && meter != nil {
-		meter.AddIn(int64(n))
-	}
-	if err != nil {
-		stack[0] = uint64(int32(n))
-		return
-	}
-	stack[0] = uint64(int32(n))
+	stack[0] = uint64(netConnRead(conn, meter, buf))
 }
 
 func (h *wazeroNetHost) tcpWrite(_ context.Context, mod api.Module, stack []uint64) {
@@ -193,13 +188,5 @@ func (h *wazeroNetHost) tcpWrite(_ context.Context, mod api.Module, stack []uint
 	if !ok {
 		return
 	}
-	n, err := conn.Write(buf)
-	if n > 0 && meter != nil {
-		meter.AddOut(int64(n))
-	}
-	if err != nil {
-		stack[0] = uint64(int32(n))
-		return
-	}
-	stack[0] = uint64(int32(n))
+	stack[0] = uint64(netConnWrite(conn, meter, buf))
 }
