@@ -25,8 +25,33 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
+# Bench the resident compile-once/instantiate-many host with egress isolation
+# (PR #339, v0.7.12): SB_WASM_RESIDENT_HOST_ENABLED must be on for creates to
+# route to the shared resident host instead of the per-sandbox cold/warm path.
+# extra_user_data runs after the bootstrap env-write + sandboxd start, so it's
+# append-and-restart (same hook the docker netlink bench uses); the restart lands
+# during cloud-init before run.sh waits for 3 gossip members. tfvars are
+# literal-only, hence the per-node repetition.
 nodes = {
-  node1 = { role = "mixed", seed = true, spot = true }
-  node2 = { role = "mixed", spot = true }
-  node3 = { role = "mixed", spot = true }
+  node1 = {
+    role            = "mixed", seed = true, spot = true
+    extra_user_data = <<-EOT
+      echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
+      sudo systemctl restart sandboxd
+    EOT
+  }
+  node2 = {
+    role            = "mixed", spot = true
+    extra_user_data = <<-EOT
+      echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
+      sudo systemctl restart sandboxd
+    EOT
+  }
+  node3 = {
+    role            = "mixed", spot = true
+    extra_user_data = <<-EOT
+      echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
+      sudo systemctl restart sandboxd
+    EOT
+  }
 }
