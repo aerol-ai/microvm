@@ -374,6 +374,12 @@ func TestTransfer_ConcurrentDuplicate(t *testing.T) {
 	})
 }
 
+func TestSlotFromStoreNil(t *testing.T) {
+	if got := slotFromStore(nil); got != nil {
+		t.Fatalf("slotFromStore(nil) = %+v", got)
+	}
+}
+
 // newTestSandbox inserts a row into sandboxes so the firecracker_tap_pool
 // allocate doesn't break referential expectations. The pool table does
 // NOT carry a FOREIGN KEY on sandbox_id (the table seeds before any

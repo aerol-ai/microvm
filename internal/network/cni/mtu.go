@@ -8,6 +8,11 @@ const (
 	DefaultBridgeMTU = 1500
 )
 
+var (
+	defaultRouteInterfaceFn = defaultRouteInterface
+	interfaceByNameFn       = net.InterfaceByName
+)
+
 // BridgeMTU is the docker-parity default MTU. Callers that want uplink parity
 // use UplinkMTU() and fall back to this.
 func BridgeMTU() int {
@@ -20,11 +25,11 @@ func BridgeMTU() int {
 // jumbo-frame uplink (AWS ENA is 9001) a 1500 bridge caps throughput, and on a
 // sub-1500 uplink (overlay/VPN/GRE) a 1500 bridge blackholes egress via PMTUD.
 func UplinkMTU() int {
-	iface := defaultRouteInterface()
+	iface := defaultRouteInterfaceFn()
 	if iface == "" {
 		return 0
 	}
-	ni, err := net.InterfaceByName(iface)
+	ni, err := interfaceByNameFn(iface)
 	if err != nil || ni.MTU <= 0 {
 		return 0
 	}

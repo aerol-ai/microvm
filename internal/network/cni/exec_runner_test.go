@@ -189,3 +189,32 @@ func TestSinglePluginNetconfBareConf(t *testing.T) {
 		t.Fatalf("bare conf should pass through: out=%s err=%v", out, err)
 	}
 }
+
+func TestSinglePluginNetconfParseFailures(t *testing.T) {
+	t.Run("invalid top-level JSON", func(t *testing.T) {
+		if _, err := singlePluginNetconf([]byte(`{"plugins":`)); err == nil {
+			t.Fatal("want parse error")
+		}
+	})
+
+	t.Run("invalid plugins shape", func(t *testing.T) {
+		if _, err := singlePluginNetconf([]byte(`{"plugins":{}}`)); err == nil {
+			t.Fatal("want plugins parse error")
+		}
+	})
+
+	t.Run("invalid plugin item", func(t *testing.T) {
+		if _, err := singlePluginNetconf([]byte(`{"plugins":[123]}`)); err == nil {
+			t.Fatal("want plugin item parse error")
+		}
+	})
+}
+
+func TestNetconfTypeErrors(t *testing.T) {
+	if _, err := netconfType([]byte(`{"type":`)); err == nil {
+		t.Fatal("want parse error")
+	}
+	if _, err := netconfType([]byte(`{"name":"aerolvm"}`)); err == nil {
+		t.Fatal("want missing type error")
+	}
+}

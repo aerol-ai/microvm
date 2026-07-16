@@ -151,6 +151,24 @@ func TestEnsure_UsesExplicitGuestMACForNeighbor(t *testing.T) {
 	}
 }
 
+func TestEnsure_SkipsNeighborWhenCIDIsReservedAndNoMAC(t *testing.T) {
+	r := &recordingRun{}
+	h := newHostWithRun(r)
+	slot := Slot{
+		TapName:  "fctap-no-neigh",
+		CIDR:     "172.16.1.0/30",
+		HostIP:   "172.16.1.1",
+		GuestIP:  "172.16.1.2",
+		VsockCID: 2,
+	}
+	if err := h.Ensure(context.Background(), slot); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if len(r.calls) != 3 {
+		t.Fatalf("expected 3 calls without neigh replace, got %d", len(r.calls))
+	}
+}
+
 // TestEnsure_AddrAddFailureBubbles confirms a non-idempotent addr-add
 // failure surfaces verbatim — operator needs the `ip` output to diagnose
 // (most commonly: missing CAP_NET_ADMIN on the daemon).
@@ -225,6 +243,18 @@ func TestHostHelpers(t *testing.T) {
 		}
 		if len(r.calls) != 1 || r.calls[0].name != "/test/ip" {
 			t.Fatalf("calls = %+v, want one /test/ip invocation", r.calls)
+		}
+	})
+
+	t.Run("exec_falls_back_to_command_context", func(t *testing.T) {
+		h := &Host{IPCmd: "/usr/bin/true"}
+		if out, err := h.exec(context.Background()); err != nil || len(out) != 0 {
+			t.Fatalf("exec(true) out=%q err=%v", string(out), err)
+		}
+
+		h = &Host{IPCmd: "/usr/bin/false"}
+		if _, err := h.exec(context.Background()); err == nil {
+			t.Fatal("exec(false) should fail")
 		}
 	})
 

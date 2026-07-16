@@ -60,6 +60,16 @@ func TestRenderBridgeConflistHonorsMTU(t *testing.T) {
 	}
 }
 
+func TestRenderBridgeConflistIncludesGateway(t *testing.T) {
+	body, err := RenderBridgeConflist(ConflistOptions{Gateway: "10.88.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(body), `"gateway": "10.88.0.1"`) {
+		t.Fatalf("gateway not rendered: %s", body)
+	}
+}
+
 func TestEnsureBridgeConflistWritesThenNoClobber(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "net.d", "aerolvm.conflist")
@@ -86,6 +96,35 @@ func TestEnsureBridgeConflistWritesThenNoClobber(t *testing.T) {
 func TestEnsureBridgeConflistRequiresPath(t *testing.T) {
 	if err := EnsureBridgeConflist("", ConflistOptions{}); err == nil {
 		t.Fatal("want error for empty path")
+	}
+}
+
+func TestEnsureBridgeConflistMkdirFailure(t *testing.T) {
+	dir := t.TempDir()
+	blockedParent := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(blockedParent, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(blockedParent, "aerolvm.conflist")
+	if err := EnsureBridgeConflist(path, ConflistOptions{}); err == nil {
+		t.Fatal("want mkdir failure for non-directory parent")
+	}
+}
+
+func TestEnsureBridgeConflistWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	readonly := filepath.Join(dir, "readonly")
+	if err := os.MkdirAll(readonly, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readonly, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(readonly, 0o755) })
+
+	path := filepath.Join(readonly, "aerolvm.conflist")
+	if err := EnsureBridgeConflist(path, ConflistOptions{}); err == nil {
+		t.Fatal("want write failure when target path is a directory")
 	}
 }
 
