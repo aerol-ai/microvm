@@ -8,7 +8,7 @@ A side-by-side look at how AerolVM compares to the two most common alternatives 
 
 | | AerolVM | e2b | Daytona |
 |---|---|---|---|
-| **Hosting** | Self-hosted on your infra | Cloud (managed, no self-host) | Self-hosted |
+| **Hosting** | Self-host on your infra, or managed multi-tenant SaaS | Cloud (managed, no self-host) | Self-hosted |
 | **Set Up Complexity** | Easy for Single Node | No self-host | Extremely Complex for Single Node |
 | **Can run locally** | ✅ | ✗ | ✗ |
 | **Open source** | ✅ | ✗ | ✅ |
