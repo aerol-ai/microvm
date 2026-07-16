@@ -446,6 +446,20 @@ window + a rollback that can itself fail), and routing every possibly-exposing
 create to cold up front (defeats the latency win — private-by-default means
 almost everything could expose).
 
+**IMPLEMENTED 2026-07-17.** `Driver.migrateResidentToCold` (`resident.go`) does
+the cold-up-then-stop dance (spawn dedicated worker → waitWorker → LoadModule →
+Instantiate listener-disabled → then StopInstance on the resident host +
+`releaseResidentSlotFor` + flip `socketPath`/`workerKey`/`fromResidentHost` +
+`noteWorkerSpawnCount`); a cold-bring-up failure Stops the half-spawned worker
+and leaves the sandbox resident. `SyncGuestListenPorts` (`guest_http.go`) calls
+it before the listener sync when the sandbox is `fromResidentHost` and the
+request enables a listener (an unexpose on a still-resident sandbox is a no-op).
+Tests: `resident_test.go` `TestMigrateResidentToCold` (routing flip + slot
+release + resident stop) and `TestExposeMigrationFailureLeavesResident`
+(cold-instantiate failure keeps the sandbox resident, slot retained, error
+surfaced). Not on the `CreateSandbox` boot path; first expose pays one cold
+compile.
+
 ### 3. Host lifecycle + capacity (PR-C)
 
 - **Idle-TTL reaper.** A resident host with `InstanceCount()==0` for

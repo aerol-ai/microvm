@@ -2,11 +2,13 @@ package wasm
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
@@ -382,5 +384,93 @@ func TestPrewarmResidentHostDoesNotReserveSlot(t *testing.T) {
 	d.PrewarmResidentHosts(context.Background(), []string{"demo.wasm"})
 	if got := totalResidentLive(d); got != 0 {
 		t.Fatalf("prewarm reserved %d live slots, want 0", got)
+	}
+}
+
+// TestMigrateResidentToCold proves the PR-B core: migrating a private resident
+// sandbox brings up a dedicated cold worker, stops the resident copy, releases
+// its slot, and flips routing (workerKey + socket + fromResidentHost). The
+// SyncGuestListenPorts→migration wiring + failure ordering are covered by
+// TestExposeMigrationFailureLeavesResident (which reaches migration and errors
+// before the post-migration listener probe that needs a real guest).
+func TestMigrateResidentToCold(t *testing.T) {
+	d, perSandbox, _, client := residentTestDriver(t, true)
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-exp", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	inst, _ := d.instance("sb-exp")
+	if !inst.fromResidentHost {
+		t.Fatal("precondition: create should route to the resident host")
+	}
+	if got := totalResidentLive(d); got != 1 {
+		t.Fatalf("resident live before migrate = %d, want 1", got)
+	}
+
+	if err := d.migrateResidentToCold(context.Background(), inst); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if inst.fromResidentHost {
+		t.Fatal("still resident after migrate")
+	}
+	if inst.workerKey != "sb-exp" || filepath.Base(inst.socketPath) != "worker.sock" {
+		t.Fatalf("routing not flipped to cold worker: workerKey=%q socket=%q", inst.workerKey, inst.socketPath)
+	}
+	if !client.stopped {
+		t.Fatal("resident instance not StopInstance'd during migration")
+	}
+	if perSandbox.ensureCalls != 1 {
+		t.Fatalf("cold worker spawns = %d, want 1", perSandbox.ensureCalls)
+	}
+	if got := totalResidentLive(d); got != 0 {
+		t.Fatalf("resident live after migrate = %d, want 0 (slot not released)", got)
+	}
+}
+
+// instantiateFailClient fails Instantiate but is otherwise a normal recording
+// client, so a migration's cold bring-up fails at the instantiate step.
+type instantiateFailClient struct {
+	recordingWorkerClient
+}
+
+func (c *instantiateFailClient) Instantiate(string, wasmengine.Capabilities) error {
+	return fmt.Errorf("cold instantiate boom")
+}
+
+// TestExposeMigrationFailureLeavesResident proves the cold-up-then-stop ordering:
+// when the cold instantiate fails, the sandbox stays on the resident host (no
+// zero-instance window) and keeps its slot (PR-B failure path, pr-review.md §4).
+func TestExposeMigrationFailureLeavesResident(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	perSandbox := &fakeSupervisor{}
+	resident := &fakeSupervisor{}
+	normal := &recordingWorkerClient{}
+	failing := &instantiateFailClient{}
+	d := New(Config{RunDir: filepath.Join(dir, "run"), ModulesDir: dir, ResidentHostEnabled: true}, nil)
+	d.SetModuleResolver(fakeResolver{path: modPath, digest: "deadbeef"})
+	d.SetWorkerSupervisor(perSandbox)
+	d.SetResidentHostSupervisor(resident)
+	// The cold worker socket ends in worker.sock — fail its Instantiate; the
+	// resident bucket socket uses the normal client so the create still succeeds.
+	d.SetWorkerClientFactory(func(socket string) WorkerClient {
+		if filepath.Base(socket) == "worker.sock" {
+			return failing
+		}
+		return normal
+	})
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-fail", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := d.SyncGuestListenPorts(context.Background(), "sb-fail", []int{8080}); err == nil {
+		t.Fatal("expected migration failure to surface as an error")
+	}
+	inst, _ := d.instance("sb-fail")
+	if !inst.fromResidentHost {
+		t.Fatal("sandbox left the resident host despite cold-instantiate failure (zero-instance window)")
+	}
+	if got := totalResidentLive(d); got != 1 {
+		t.Fatalf("resident live = %d after failed migration, want 1 (slot wrongly released)", got)
 	}
 }

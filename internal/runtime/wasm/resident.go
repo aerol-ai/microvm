@@ -398,3 +398,63 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	d.mu.Unlock()
 	return d.runtimeState(inst), nil
 }
+
+// migrateResidentToCold moves a resident-hosted sandbox onto a dedicated cold
+// per-process worker WITH listener capability, so expose_port can install a
+// wasip1 listener the shared resident host cannot provide (PR-B / plan D4-A).
+//
+// Ordering is cold-up-then-stop-resident: the cold worker is spawned, compiled,
+// and the instance re-instantiated there FIRST; only once that succeeds is the
+// resident copy stopped and the instance's routing flipped. A failure in the
+// cold bring-up tears the half-spawned cold worker down and leaves the resident
+// copy serving (no zero-instance window; pr-review.md §4). The first expose pays
+// one cold LoadModule (~compile) — acceptable, since expose is off the
+// CreateSandbox boot path and not the hot create. Guest linear memory does not
+// survive (a fresh instance is created); /work persists (same workDir), and a
+// private sandbox has not run _start yet, so there is no in-flight state to lose.
+func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstance) error {
+	if d.supervisor == nil {
+		return fmt.Errorf("worker supervisor not configured")
+	}
+	residentSocket := inst.socketPath
+	coldSocket := filepath.Join(inst.workDir, "worker.sock")
+	client := d.newWorkerClient(coldSocket)
+
+	// 1) Bring up the dedicated cold worker + compile + instantiate (listener
+	//    disabled; the caller's syncGuestListenPort enables it right after).
+	if err := d.supervisor.Ensure(ctx, inst.sandboxID, coldSocket); err != nil {
+		return fmt.Errorf("start cold worker: %w", err)
+	}
+	if err := d.waitWorker(ctx, client, inst.sandboxID); err != nil {
+		_ = d.supervisor.Stop(inst.sandboxID)
+		return err
+	}
+	if _, err := client.LoadModule(inst.sandboxID, inst.modulePath, inst.memoryMB); err != nil {
+		_ = d.supervisor.Stop(inst.sandboxID)
+		return fmt.Errorf("cold load module: %w", err)
+	}
+	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
+		Env:            inst.baseEnv,
+		Args:           inst.baseArgs,
+		Preopens:       append([]wasmengine.Preopen(nil), inst.preopens...),
+		WASIListenPort: wasmengine.WASIListenPortDisabled,
+	}, inst.memoryMB, d.cfg.DefaultWallTimeout)
+	if err := client.Instantiate(inst.sandboxID, caps); err != nil {
+		_ = d.supervisor.Stop(inst.sandboxID)
+		return fmt.Errorf("cold instantiate: %w", err)
+	}
+
+	// 2) Cold copy is up — remove only this instance from the shared resident host
+	//    (never kill the host / co-tenants), release its slot, and flip routing.
+	_ = d.newWorkerClient(residentSocket).StopInstance(inst.sandboxID)
+	d.releaseResidentSlotFor(inst)
+	d.mu.Lock()
+	inst.socketPath = coldSocket
+	inst.workerKey = inst.sandboxID
+	inst.fromResidentHost = false
+	d.mu.Unlock()
+	// Track the cold worker's spawn count so refreshWorkerInstanceState detects a
+	// later respawn of THIS worker (uses the now-flipped per-sandbox workerKey).
+	d.noteWorkerSpawnCount(inst)
+	return nil
+}
