@@ -10,7 +10,7 @@
 
 <h3 align="center">
   Run Untrusted Code Safely.<br/>
-  Self-Hosted Sandbox Infrastructure for AI Agents and Ephemeral Workloads.
+  Self-Hosted or Fully-Managed Sandbox Infrastructure for AI Agents and Ephemeral Workloads.
 </h3>
 
 <p align="center">
@@ -29,7 +29,7 @@
 
 &nbsp;
 
-AerolVM is open-source, self-hosted sandbox infrastructure for running isolated code environments on your own Linux host. Each sandbox is a fully isolated compute unit with its own filesystem, network namespace, and allocated vCPU, RAM, and disk - spinning up in **under 60ms** and supporting Docker, gVisor, and Firecracker runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
+AerolVM is open-source sandbox infrastructure for running isolated code environments - self-host it on your own Linux host, or run it as a managed, multi-tenant service. Each sandbox is a fully isolated compute unit with its own filesystem, network namespace, and allocated vCPU, RAM, and disk - spinning up in **under 60ms** and supporting Docker, gVisor, and Firecracker runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
 
 ## Features
 
@@ -49,7 +49,7 @@ AerolVM beats the two most common alternatives on the axes that matter most for 
 
 | | AerolVM | e2b | Daytona |
 | :--- | :--- | :--- | :--- |
-| **Self-hosted** | ✅ Single binary, one-line install | ✗ Cloud only | ✅ Complex multi-component setup |
+| **Deployment** | ✅ Self-host (single binary, one-line install) or managed multi-tenant SaaS | ✗ Cloud only | ✅ Self-host (complex multi-component setup) |
 | **Runs locally** | ✅ `--local` flag, no DNS needed | ✗ | ✗ |
 | **Sandbox startup** | < 90ms | ~200ms | < 90ms |
 | **Runtime isolation** | ✅ Docker, gVisor (user-space kernel), Firecracker (microVM) | Firecracker (microVM) | Docker only |

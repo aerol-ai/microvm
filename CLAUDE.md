@@ -1,6 +1,6 @@
 # AerolVM — Claude Code Instructions
 
-Self-hosted Docker-backed sandbox platform. Go daemon + 5 SDKs + Astro docs site.
+Self-hosted or managed multi-tenant Docker-backed sandbox platform. Go daemon + 5 SDKs + Astro docs site.
 For non-trivial changes, invoke the matching project skill before coding (they live in
 [`.claude/skills/`](./.claude/skills/) — see the "Project skills" table below).
 Read [`pr-review.md`](./pr-review.md) before opening any PR that touches the server.

@@ -56,11 +56,11 @@ Reference: [Daytona README](https://github.com/daytonaio/daytona/blob/main/READM
 
 1. **Add an HTML-centered logo block** with `<picture>` + `srcset` for dark/light mode. Use `docs/public/aerol-logo.svg` via GitHub raw URL.
 
-2. **Write a 2-line tagline** under the logo: first line is action ("Run Untrusted Code Safely."), second line expands ("Self-Hosted Sandbox Infrastructure for AI Agents and Ephemeral Workloads.").
+2. **Write a 2-line tagline** under the logo: first line is action ("Run Untrusted Code Safely."), second line expands ("Self-Hosted or Fully-Managed Sandbox Infrastructure for AI Agents and Ephemeral Workloads.").
 
 3. **Add a centered nav-links paragraph** under the tagline: Documentation · Quick Start · Report Bug · Request Feature. Gives every visitor a clear next action.
 
-4. **Write a 3-sentence intro paragraph** that names: what it is (self-hosted Docker sandbox platform), what makes it different (single-binary, sub-90ms cold start, gVisor isolation, Raft cluster mode), who it is for (AI agent pipelines and ephemeral CI).
+4. **Write a 3-sentence intro paragraph** that names: what it is (self-hosted or managed multi-tenant Docker sandbox platform), what makes it different (single-binary, sub-90ms cold start, gVisor isolation, Raft cluster mode), who it is for (AI agent pipelines and ephemeral CI).
 
 5. **Add a Features table with 4–5 columns** mapping capability areas to linked docs pages. Categories: Sandboxes · Execution · Networking & Ports · Storage & Secrets · Platform & Cluster. Each cell is a link.
 

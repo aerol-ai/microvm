@@ -217,7 +217,7 @@ Legend: ✅ **Not present** · ⚠️ **Partial / risk** · ❌ **Present (real 
 | E2B-2 | NFS / persistent volume instability | ⚠️ Inherited risk | AerolVM delegates to host tools (`mount.nfs`, `mountpoint-s3`, etc.) per `pkg/mounts/manager.go:2`. The Manager correctly rolls back failed mounts (`pkg/mounts/manager.go`), but cannot shield against an unstable NFS server. |
 | E2B-3 | Cold start ~150ms | ✅ Runtime-dependent | Docker, gVisor, Firecracker, WASM runtimes all configurable. Firecracker templates (`SB_ENABLE_FIRECRACKER`) allow snapshot-restore paths. Operators choose the trade-off. |
 | E2B-4 | Hard runtime ceilings (1h / 24h) | ✅ Not present | No platform-enforced ceiling. `Lifecycle.StopAtAge` / `DestroyAtAge` are optional and user-set. Unset = runs indefinitely (`internal/service/service.go:3784-3791`). |
-| E2B-5 | Pricing cliffs at scale | ✅ Not applicable | Self-hosted. Operator owns infrastructure costs. |
+| E2B-5 | Pricing cliffs at scale | ⚠️ Applies to the managed offering | Self-hosted: the operator owns infrastructure costs, no vendor cliff. The managed multi-tenant SaaS must price to avoid recreating the same cliffs. |
 | E2B-6 | Port-not-open race on boot | ❌ Present | `ExposePort()` (`internal/service/service.go:2164`) calls `s.installHTTPPortRoute` and `s.store.UpsertPort` without first probing whether the container port is actually listening. There is no `WaitForPort` before route installation. Only the SSH gateway has a probe (`probeSSHGateway`, `service.go:4627`), and it's daemon-level only, not per-port. Caddy will route traffic to the port immediately — clients that race `ExposePort` with container startup will get connection refused. |
 | E2B-7 | Silent template deprecation / 504 | ✅ Not present | Firecracker templates have explicit GC via `FirecrackerTemplateGCTTL` (`internal/config/config.go:516`). Deletion while a sandbox references the template returns `ErrTemplateInUse` → 409 (`pkg/api/apihttp/apihttp.go:89-90`). No silent removal. |
 | E2B-8 | API ConnectTimeout under burst creates | ⚠️ Infrastructure risk | SQLite single-writer with 5s busy timeout (`internal/store/store.go:23`, `sqliteBusyTimeoutMS=5000`). Under extreme burst, SQLite write queue saturation could produce context deadlines before the busy timeout expires. WAL mode mitigates reads. |
@@ -250,7 +250,7 @@ Legend: ✅ **Not present** · ⚠️ **Partial / risk** · ❌ **Present (real 
 |---|-------|---------|----------|
 | M-1 | gVisor `/proc/self/root` sandbox escape | ⚠️ Inherited if gVisor used | AerolVM supports gVisor via `runtime=gvisor` (`pkg/docker/client.go:300-318`). The escape class (`/proc/self/root` path rewriting bypassing deny patterns) is a gVisor kernel issue, not an AerolVM issue. If operators deploy gVisor, they inherit the class of risk until gVisor patches it. AerolVM itself has no deny-pattern enforcement that could be bypassed. |
 | M-2 | gVisor ≠ microVM isolation | ⚠️ Architecture-dependent | AerolVM exposes both: `runtime=gvisor` (user-space kernel, shared host kernel) and `runtime=firecracker` (full microVM, separate kernel). The choice is per-sandbox. Operators using Firecracker get full isolation; operators defaulting to Docker/gVisor do not. |
-| M-3 | Cost significantly higher than alternatives | ✅ Not applicable | Self-hosted. |
+| M-3 | Cost significantly higher than alternatives | ⚠️ Applies to the managed offering | Self-hosted: operator owns costs. The managed multi-tenant SaaS must keep unit economics competitive. |
 
 ---
 
@@ -268,7 +268,7 @@ Legend: ✅ **Not present** · ⚠️ **Partial / risk** · ❌ **Present (real 
 
 ### Fly.io Sprites Issues vs AerolVM
 
-Sprites issues are mostly managed-cloud reliability issues (control plane down, 500 on create, non-responsive after use). AerolVM is self-hosted. The structural equivalents are addressed as follows:
+Sprites issues are mostly managed-cloud reliability issues (control plane down, 500 on create, non-responsive after use). Self-hosted AerolVM avoids them structurally; the managed multi-tenant offering owns these concerns directly. The structural equivalents are addressed as follows:
 
 | Sprites Issue | AerolVM Equivalent |
 |---|---|
