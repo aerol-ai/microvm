@@ -1004,7 +1004,7 @@ func newServiceRuntimeHarness(t *testing.T, rt *recordingRuntime) (*Service, *st
 	t.Cleanup(mgr.Close)
 
 	admitter := capacity.New(
-		capacity.HostInfo{CPUCores: 8, MemoryTotalMB: 16384, SupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeWasm, models.RuntimeFirecracker}},
+		capacity.HostInfo{CPUCores: 8, MemoryTotalMB: 16384, SupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeWasm, models.RuntimeFirecracker, models.RuntimeIsolate}},
 		capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
 		nil,
 	)

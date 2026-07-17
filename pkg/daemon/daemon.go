@@ -467,7 +467,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	if cfg.EnableIsolate && cfg.IsWorker() {
-		_ = wireIsolateRuntime(cfg, logger, svc)
+		if _, err := wireIsolateRuntime(cfg, logger, svc); err != nil {
+			return fmt.Errorf("wire isolate runtime: %w", err)
+		}
 	} else if cfg.EnableIsolate {
 		logger.Info("isolate runtime skipped on non-worker node", "node_role", cfg.NodeRole)
 	}

@@ -68,7 +68,10 @@ func TestCreateIsolateSandboxGate(t *testing.T) {
 		}
 	})
 
-	t.Run("phase1_driver_skeleton_rejects_not_implemented", func(t *testing.T) {
+	t.Run("driver_without_resolver_rejects_not_implemented", func(t *testing.T) {
+		// A driver with no bundle resolver wired (a daemon-wiring bug) rejects
+		// with ErrRuntimeNotImplemented rather than panicking — the dispatch
+		// chain reaches the driver, which reports the missing dependency.
 		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 		svc.cfg.EnableIsolate = true
 		svc.SetIsolateRuntime(isolateruntime.New(isolateruntime.Config{}, nil))
@@ -76,7 +79,7 @@ func TestCreateIsolateSandboxGate(t *testing.T) {
 			Runtime: models.RuntimeIsolate, ModuleRef: "handler.js",
 		})
 		if !errors.Is(err, models.ErrRuntimeNotImplemented) {
-			t.Fatalf("err = %v, want ErrRuntimeNotImplemented from the Phase-1 skeleton", err)
+			t.Fatalf("err = %v, want ErrRuntimeNotImplemented for a resolver-less driver", err)
 		}
 	})
 }

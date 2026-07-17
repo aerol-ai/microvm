@@ -22,7 +22,6 @@ import (
 	"sync"
 
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 // Driver implements runtime.Runtime for isolate sandboxes. Isolate satisfies
@@ -32,11 +31,32 @@ type Driver struct {
 	cfg    Config
 	logger *slog.Logger
 
-	resolver BundleResolver
-	warmPool WarmPool
+	resolver   BundleResolver
+	supervisor HostSupervisor
+	warmPool   WarmPool
 
 	mu   sync.Mutex
-	byID map[string]*models.SandboxRuntimeState
+	byID map[string]*sandboxRecord
+
+	// groups is the group router: one running host per isolate-group key
+	// (§2.1). groupsMu guards it and the single-flight spawn bookkeeping.
+	groupsMu sync.Mutex
+	groups   map[string]*group
+	spawning map[string]chan struct{}
+}
+
+// sandboxRecord is the driver's per-sandbox bookkeeping: the runtime state it
+// hands back to the service plus the group it was loaded into (so Destroy can
+// route the unload and trigger last-member teardown).
+type sandboxRecord struct {
+	state    *models.SandboxRuntimeState
+	groupKey string
+}
+
+// group is one running workerd host plus the group key it serves.
+type group struct {
+	key  string
+	host GroupHost
 }
 
 // New constructs an isolate driver. The zero value is not usable.
@@ -45,9 +65,11 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		logger = slog.Default()
 	}
 	return &Driver{
-		cfg:    cfg,
-		logger: logger,
-		byID:   make(map[string]*models.SandboxRuntimeState),
+		cfg:      cfg,
+		logger:   logger,
+		byID:     make(map[string]*sandboxRecord),
+		groups:   make(map[string]*group),
+		spawning: make(map[string]chan struct{}),
 	}
 }
 
@@ -55,6 +77,12 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 // production, Phase 2).
 func (d *Driver) SetBundleResolver(r BundleResolver) {
 	d.resolver = r
+}
+
+// SetHostSupervisor injects the workerd group supervisor (pkg/isolate in
+// production, Phase 2).
+func (d *Driver) SetHostSupervisor(s HostSupervisor) {
+	d.supervisor = s
 }
 
 // SetWarmPool injects the blank-workerd-host pool (internal/pool/isolate,
@@ -69,26 +97,50 @@ func notImplemented(op string) error {
 	return fmt.Errorf("isolate runtime %s: pending plans/isolate-runtime.md Phase 2: %w", op, models.ErrRuntimeNotImplemented)
 }
 
-func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
-	return nil, notImplemented("create")
-}
-
+// Start is a no-op re-affirmation for isolates: a "started" sandbox is one
+// whose bundle is pinned on its group host, which Create already did. There is
+// no stopped→running transition to drive (an isolate is compiled lazily on
+// invoke), so Start returns the current state. An unknown id is a 404-shaped
+// nil,nil per the Runtime contract.
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
-	return nil, notImplemented("start")
+	d.mu.Lock()
+	rec := d.byID[sandboxID]
+	d.mu.Unlock()
+	if rec == nil {
+		return nil, nil
+	}
+	rec.state.Status = models.SandboxStatusStarted
+	return rec.state, nil
 }
 
+// Stop marks a sandbox stopped but keeps its bundle pinned so a later Start is
+// instant. The group process stays up for co-resident sandboxes; true teardown
+// is Destroy. (Idle-group reaping is Phase 3.)
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
-	return notImplemented("stop")
+	d.mu.Lock()
+	rec := d.byID[sandboxID]
+	if rec != nil {
+		rec.state.Status = models.SandboxStatusStopped
+	}
+	d.mu.Unlock()
+	return nil
 }
 
-// Destroy removes the sandbox's isolate and, when it was the group's last
-// member, the group process (Phase 2). Nil is a no-op per the Runtime
-// contract — cleanup paths may not have a sandbox record yet.
+// Destroy removes the sandbox from its group host and, when it was the group's
+// last member, tears the group process down (§2.1 last-member teardown). Nil,
+// or an unknown sandbox, is a no-op — cleanup paths may run without a record.
 func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil {
 		return nil
 	}
-	return notImplemented("destroy")
+	d.mu.Lock()
+	rec := d.byID[sandbox.ID]
+	delete(d.byID, sandbox.ID)
+	d.mu.Unlock()
+	if rec != nil {
+		d.releaseFromGroup(rec.groupKey, sandbox.ID)
+	}
+	return nil
 }
 
 // CreateSnapshot is unsupported by design, not just unimplemented: V8 exposes
@@ -105,23 +157,23 @@ func (d *Driver) Resize(ctx context.Context, sandboxID string, req models.Resize
 
 func (d *Driver) Inspect(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
 	d.mu.Lock()
-	state := d.byID[sandboxID]
+	rec := d.byID[sandboxID]
 	d.mu.Unlock()
-	if state == nil {
+	if rec == nil {
 		return nil, nil
 	}
-	return state, nil
+	return rec.state, nil
 }
 
-// ListManaged returns the runtime state of every isolate this daemon owns.
-// Phase 1 manages none (Create always rejects), so reconcile sees an empty
-// map and correctly terminal-izes any stray rows rather than erroring.
+// ListManaged returns the runtime state of every isolate this daemon owns, so
+// restart reconcile can match live isolates against persisted rows and
+// terminal-ize any strays.
 func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	out := make(map[string]*models.SandboxRuntimeState, len(d.byID))
-	for id, state := range d.byID {
-		out[id] = state
+	for id, rec := range d.byID {
+		out[id] = rec.state
 	}
 	return out, nil
 }
