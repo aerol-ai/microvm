@@ -547,10 +547,12 @@ type Config struct {
 	// WasmResidentHostEnabled routes non-listen wasm creates to a resident
 	// compile-once/instantiate-many host process per (ownerRef, module, memoryMB)
 	// bucket instead of a fresh per-sandbox worker (plans/wasm-resident-module-host.md).
-	// It collapses the ~2.8s cold CompileModule to a ~9ms Instantiate, but shares
-	// one process across co-tenant sandboxes — so it is DEFAULT OFF and remains
-	// operator opt-in until PR-A/B/C land, exactly like SB_DOCKER_POOL_ENABLED.
-	// SB_WASM_RESIDENT_HOST_ENABLED.
+	// It collapses the ~2.8s cold CompileModule to a ~9ms Instantiate. It shares
+	// one process across co-tenant sandboxes, so it went through eng-review +
+	// per-instance egress isolation (owner-scoped buckets keep customers apart) +
+	// a green live bench (v0.7.12) before the default flipped. DEFAULT ON as of
+	// v0.7.12; set SB_WASM_RESIDENT_HOST_ENABLED=false to force the per-sandbox
+	// worker path.
 	WasmResidentHostEnabled bool
 	// WasmResidentHostMaxInstances caps co-tenant instances per resident host
 	// process; when full the driver spills to a second host (<bucket>-2.sock).
@@ -1545,7 +1547,7 @@ func Load() (Config, error) {
 		WasmPoolRefillInterval:       getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
 		WasmModuleDigestMode:         strings.ToLower(getEnv("SB_WASM_MODULE_DIGEST_MODE", "once")),
 		WasmCompileCacheDir:          getEnv("SB_WASM_COMPILE_CACHE_DIR", ""),
-		WasmResidentHostEnabled:      getEnvBool("SB_WASM_RESIDENT_HOST_ENABLED", false),
+		WasmResidentHostEnabled:      getEnvBool("SB_WASM_RESIDENT_HOST_ENABLED", true),
 		WasmResidentHostMaxInstances: getEnvInt("SB_WASM_RESIDENT_HOST_MAX_INSTANCES", 32),
 		WasmResidentHostIdleTTL:      getEnvDuration("SB_WASM_RESIDENT_HOST_IDLE_TTL", 5*time.Minute),
 		FirecrackerBinary:            getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
