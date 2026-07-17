@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 func discardLogger() *slog.Logger {
@@ -303,5 +304,93 @@ func TestWriteStoreAwareError_SandboxExists(t *testing.T) {
 	}
 	if msg == "" {
 		t.Error("error body must carry the conflict message")
+	}
+}
+
+func TestWriteStoreAwareError_PublicTrafficDisabled(t *testing.T) {
+	code, _ := storeAwareErr(t, service.ErrPublicTrafficDisabled)
+	if code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", code)
+	}
+}
+
+func TestWriteStoreAwareError_WasmModuleConflict(t *testing.T) {
+	code, _ := storeAwareErr(t, store.ErrWasmModuleIDConflict)
+	if code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", code)
+	}
+}
+
+func TestWriteStoreAwareError_WasmModuleInUse(t *testing.T) {
+	code, _ := storeAwareErr(t, store.ErrWasmModuleInUse)
+	if code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", code)
+	}
+}
+
+func TestWriteStoreAwareError_PlatformVolumesDisabled(t *testing.T) {
+	code, _ := storeAwareErr(t, models.ErrPlatformVolumesDisabled)
+	if code != http.StatusPreconditionFailed {
+		t.Errorf("status = %d, want 412", code)
+	}
+}
+
+func TestWriteStoreAwareError_PlatformVolumesUnsupportedRuntime(t *testing.T) {
+	code, _ := storeAwareErr(t, models.ErrPlatformVolumesUnsupportedRuntime)
+	if code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", code)
+	}
+}
+
+func TestWriteStoreAwareError_PlatformVolumeQuota(t *testing.T) {
+	code, _ := storeAwareErr(t, models.ErrPlatformVolumeQuota)
+	if code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", code)
+	}
+}
+
+func TestWriteStoreAwareError_ModuleNotFound(t *testing.T) {
+	code, _ := storeAwareErr(t, wasmmod.ErrModuleNotFound)
+	if code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", code)
+	}
+}
+
+func TestWriteStoreAwareError_RegistryNotAllowed(t *testing.T) {
+	code, _ := storeAwareErr(t, wasmmod.ErrRegistryNotAllowed)
+	if code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", code)
+	}
+}
+
+func TestWriteStoreAwareError_RegistryAuth(t *testing.T) {
+	code, _ := storeAwareErr(t, wasmmod.ErrRegistryAuth)
+	if code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", code)
+	}
+}
+
+func TestWriteStoreAwareError_ModuleTooLarge(t *testing.T) {
+	code, _ := storeAwareErr(t, wasmmod.ErrModuleTooLarge)
+	if code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", code)
+	}
+}
+
+func TestWriteStoreAwareError_ComponentModelUnsupported(t *testing.T) {
+	code, _ := storeAwareErr(t, wasmmod.ErrComponentModelUnsupported)
+	if code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", code)
+	}
+}
+
+func TestWriteStoreAwareError_RegistryUnavailable(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, wasmmod.ErrRegistryUnavailable)
+	if rr.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") != "5" {
+		t.Errorf("Retry-After = %q, want 5", rr.Header().Get("Retry-After"))
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 )
 
+var randReader io.Reader = rand.Reader
+
 // Cipher seals and opens user-supplied secrets (cloud credentials for sandbox
 // mounts) using AES-256-GCM. The seal format is `nonce(12) || ciphertext+tag`.
 // The key never leaves this package; sealed bytes are what crosses other
@@ -51,7 +53,7 @@ func (c *Cipher) EncryptWithAAD(plain []byte, aad []byte) ([]byte, error) {
 		return nil, errors.New("cipher not initialized")
 	}
 	nonce := make([]byte, c.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+	if _, err := io.ReadFull(randReader, nonce); err != nil {
 		return nil, fmt.Errorf("nonce: %w", err)
 	}
 	sealed := c.gcm.Seal(nil, nonce, plain, aad)
@@ -109,7 +111,7 @@ func loadOrGenerateKey(keyB64, fallbackPath string) ([]byte, error) {
 		return nil, fmt.Errorf("create key directory: %w", err)
 	}
 	keyBytes := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, keyBytes); err != nil {
+	if _, err := io.ReadFull(randReader, keyBytes); err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
 	}
 	encoded := base64.StdEncoding.EncodeToString(keyBytes)

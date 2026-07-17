@@ -3,10 +3,17 @@ package secrets
 import (
 	"bytes"
 	"encoding/base64"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+type errReader struct{}
+
+func (errReader) Read(p []byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
+}
 
 func TestCipherRoundTrip(t *testing.T) {
 	keyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xa5}, 32))
@@ -152,6 +159,30 @@ func TestLoadOrGenerateKeyEdgeCases(t *testing.T) {
 	os.Mkdir(isdir, 0700)
 	if _, err := loadOrGenerateKey("", isdir); err == nil {
 		t.Fatal("expected error when fallback path is a directory")
+	}
+
+	// Directory creation failure: parent directory is not writable.
+	nonWritable := filepath.Join(dir, "nowrite")
+	if err := os.Mkdir(nonWritable, 0500); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	path = filepath.Join(nonWritable, "key")
+	if _, err := loadOrGenerateKey("", path); err == nil {
+		t.Fatal("expected error when key directory cannot be created")
+	}
+}
+
+func TestEncryptWithAADRandomSourceError(t *testing.T) {
+	keyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+	c, err := NewCipher(keyB64, "")
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	old := randReader
+	randReader = errReader{}
+	defer func() { randReader = old }()
+	if _, err := c.EncryptWithAAD([]byte("secret"), nil); err == nil {
+		t.Fatal("expected error when rand.Reader fails")
 	}
 }
 
