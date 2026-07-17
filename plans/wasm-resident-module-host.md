@@ -561,6 +561,9 @@ resident instance's host-shared cost.
   (`MAX_INSTANCES` shipped in PR-A; exact Admitter reservation deferred.)
 - **Flag flip** (`SB_WASM_RESIDENT_HOST_ENABLED` default → true) is a **4th,
   separate** change, only after A+B+C land and the live CPython bench is green.
+  **Live bench GREEN (2026-07-17, v0.7.12)** — see Validation below. Still one
+  pre-flip cleanup: enabling the resident host should **skip the warm pool**, not
+  just supersede it at create time (see Validation).
 
 ### Validation (Phase 4)
 
@@ -568,6 +571,29 @@ resident instance's host-shared cost.
 target is cold-miss `wasm_load` collapsing toward `wasm_instantiate` (~10ms) and
 the p99 tail flattening. Stays default-off; eng-review + the isolation risk
 enumeration gate the default flip.
+
+**Result — GREEN (2026-07-17, v0.7.12, `cluster-3-mixed-wasm`, flag on via
+`extra_user_data`, 10 samples, 0 failures):** every create took the resident
+path — the only create stage recorded is `wasm_instantiate` (p50 **11ms**), with
+NO `wasm_load`/`wasm_load_compile` and NO `wasm_warm` (the cold/warm-pool
+signatures). Server latency **p50 22ms · p90 46ms · p99 50ms** (mean 26ms),
+`cluster_promote` 7ms. Versus the flag-off warm-pool baseline (p90/p99
+2722/3042ms from cold-compile misses) the ~3s tail is **gone (~98% p99
+reduction)** — flat ~20–50ms across all samples. 0 failures confirms
+standard-module creates succeed co-tenant on the shared resident host with the
+per-tenant net host active. Artifact: `wasm-bench-v0712-t3large.json`.
+
+**Two operational findings from the bench (pre-flag-flip):**
+1. **Resident + warm pool are redundant and double-consume RAM.** With the flag
+   on, non-listen creates take the resident path and never touch the warm pool,
+   yet the pool still pre-spawns workers. On a t3.medium (~4GB) that + boot
+   pre-warm (4 standard modules resident) starved the box — the live-memory floor
+   correctly rejected creates at 274MB free. The bench needed a t3.large. **Fix
+   before flip:** when `SB_WASM_RESIDENT_HOST_ENABLED` is on, skip/short-circuit
+   the warm pool (`SB_WASM_POOL_ENABLED`) for the modules the resident host
+   serves, so operators don't pay double memory.
+2. **`SB_WASM_POOL_DEPTH_DEFAULT=0` is rejected when the pool is enabled** — not a
+   way to disable the pool; use `SB_WASM_POOL_ENABLED=false`.
 
 ## Expected outcome
 

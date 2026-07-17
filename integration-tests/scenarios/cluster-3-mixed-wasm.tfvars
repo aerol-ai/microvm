@@ -16,7 +16,12 @@ extra_tags = {
   ttl   = "4"
 }
 
-default_instance_type  = "t3.medium"
+# t3.large (8GB) for the resident-host bench: with SB_WASM_RESIDENT_HOST_ENABLED
+# on, boot pre-warm compiles all 4 standard modules resident AND the harness
+# force-enables the warm pool (depth must be >0), so a t3.medium (~4GB) starves —
+# run 1 hit the live-memory floor at 274MB free. The larger box fits both; the
+# measured create path is still the resident host (it supersedes the warm pool).
+default_instance_type  = "t3.large"
 default_volume_size_gb = 40
 
 # Three mixed nodes share Caddy cert storage so any ingress can serve the
