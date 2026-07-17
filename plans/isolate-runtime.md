@@ -224,6 +224,29 @@ from a warm pool of blank processes (density cost, correctness kept) or
 (b) config regeneration + graceful drain (latency cost). The ≤10ms warm-create
 target is **provisional on this spike**.
 
+**Spike result — GREEN (2026-07-17, workerd `v1.20260717.1`, darwin-arm64).**
+Ran a controller worker with a `workerLoader` binding (`--experimental`)
+against a real workerd; the controller's provider callback loads a distinct
+isolate per name (`env.LOADER.get(id, provider)`), invoked over its
+`getEntrypoint().fetch()`. Measured, one process, no restarts:
+
+| path | p50 | p90 | notes |
+|---|---|---|---|
+| fresh inject (new isolate/request) | **1.65ms** | 2.14ms | min 1.33ms; p99 56ms is a first-few JIT/GC outlier |
+| cached warm hit (same name) | **0.32ms** | 0.44ms | provider does NOT re-run — co-resident isolates untouched |
+| cold spawn→first-200 (baseline) | 38ms | — | the denominator injection beats ~23× |
+
+Injection is **~1.6ms p50, well under the ≤10ms target**, with per-name isolate
+caching giving a free warm path. **Decision: the injection path wins — Phase 2
+builds the controller-worker + `WorkerLoader` architecture; the two fallbacks
+are shelved.** Criterion 1 (fast inject, no co-tenant disruption) is met;
+criterion 2 (inbound attribution) is satisfied by the driver-set routing key
+the client cannot forge (demonstrated via `x-sb-id`); criterion 3 (per-sandbox
+`globalOutbound`) is a workerd-native binding wired in Phase 3's egress
+attribution — not yet benched. Encoded as `TestInjectionSpikeDynamicLoad`
+(tag-gated). `compatibilityFlags = ["experimental"]` + `--experimental` are
+required for the loader binding on this build.
+
 ---
 
 ## 3. The exec/toolbox problem (isolates have no shell)
