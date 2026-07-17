@@ -109,6 +109,16 @@ func TestDefaultSpawner(t *testing.T) {
 	}
 }
 
+func TestDefaultResidentSpawner(t *testing.T) {
+	cmd, err := DefaultResidentSpawner(context.Background(), "/tmp/test-resident.sock")
+	if err != nil {
+		t.Fatalf("DefaultResidentSpawner: %v", err)
+	}
+	if cmd == nil {
+		t.Fatal("expected cmd")
+	}
+}
+
 func TestRunCLI(t *testing.T) {
 	// wrong args
 	err := RunCLI([]string{})

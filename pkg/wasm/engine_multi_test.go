@@ -183,3 +183,27 @@ func TestMultiInstanceEngine_ReportsLoadTimings(t *testing.T) {
 		t.Fatalf("Compile timing not reported: %v", got)
 	}
 }
+
+func TestMultiInstanceEngineHelpersAndHooks(t *testing.T) {
+	ctx := context.Background()
+	eng, err := NewMultiInstanceEngine(ctx, 64)
+	if err != nil {
+		t.Fatalf("NewMultiInstanceEngine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close(ctx) })
+
+	if got := eng.MemoryMB(); got != 64 {
+		t.Fatalf("MemoryMB=%d, want 64", got)
+	}
+	if eng.Loaded() {
+		t.Fatal("Loaded=true before LoadModule")
+	}
+
+	eng.SetNetworkHook("", nil)
+	eng.SetNetworkHook("sb", nil)
+	if eng.netHost == nil {
+		t.Fatal("SetNetworkHook did not initialize netHost")
+	}
+	eng.ClearNetworkHook("sb")
+	eng.ClearNetworkHook("missing")
+}

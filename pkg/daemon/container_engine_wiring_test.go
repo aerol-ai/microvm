@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -106,4 +108,37 @@ func TestNetrulesUserChainByEngine(t *testing.T) {
 	if got := netrulesUserChain(config.Config{}); got != "DOCKER-USER" {
 		t.Fatalf("default chain = %q, want DOCKER-USER (dark-default)", got)
 	}
+}
+
+func TestStartChainReassertNilRules(t *testing.T) {
+	stop := startChainReassert(context.Background(), nil, testLogger())
+	stop()
+}
+
+func TestWireContainerEngineContainerdPathWithoutDockerClient(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	svc := &service.Service{}
+	cfg := config.Config{
+		ContainerEngine:                  models.ContainerEngineContainerd,
+		EnableNetworkRules:               false,
+		NetrulesBackend:                  "exec",
+		ContainerdNativeNetnsPoolEnabled: false,
+		ContainerdPoolEnabled:            false,
+	}
+	w, err := wireContainerEngine(context.Background(), cfg, testLogger(), svc, st, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("wireContainerEngine: %v", err)
+	}
+	if w == nil || w.driver == nil {
+		t.Fatal("expected containerd wiring with driver")
+	}
+	if w.stopReassert == nil {
+		t.Fatal("expected reassert stop func")
+	}
+	w.Stop()
 }

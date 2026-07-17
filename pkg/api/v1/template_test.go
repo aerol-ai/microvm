@@ -371,6 +371,14 @@ func TestV1ListTemplates_ReturnsRows(t *testing.T) {
 		t.Fatalf("CreateTemplate: %v", err)
 	}
 
+	// Wait for the background build goroutine to complete before the test
+	// returns, so t.TempDir cleanup can remove the directories it created.
+	select {
+	case <-env.builder.done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("builder.Build did not run")
+	}
+
 	req := httptest.NewRequest(http.MethodGet, "/v1/templates", nil)
 	rr := httptest.NewRecorder()
 	env.handler.ServeHTTP(rr, req)

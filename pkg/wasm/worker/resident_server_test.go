@@ -1,10 +1,12 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,5 +166,103 @@ func TestResidentServer_LoadModuleConcurrentDistinctPathsKeepsOneModule(t *testi
 	}
 	if ok != 1 || fail != 1 {
 		t.Fatalf("concurrent distinct loads: ok=%d fail=%d, want 1/1", ok, fail)
+	}
+}
+
+func TestResidentServerUnsupportedOpsReturnErrors(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	client, _ := serveResident(t)
+	if _, err := client.LoadModule("host", modPath, 0); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	caps := nonListenCaps("wasm")
+	if err := client.Instantiate("sb-u", caps); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+
+	if err := client.Checkpoint(context.Background(), "sb-u", dir, wasmengine.SnapshotConfig{}); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Checkpoint err=%v, want not supported", err)
+	}
+	if err := client.Restore("sb-u", dir, caps); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Restore err=%v, want not supported", err)
+	}
+	if err := client.SetCapability("sb-u", caps); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("SetCapability err=%v, want not supported", err)
+	}
+}
+
+func TestRunCLIResidentUsageError(t *testing.T) {
+	if err := RunCLIResident(nil); err == nil {
+		t.Fatal("expected usage error")
+	}
+}
+
+func TestResidentServerCapsForDefault(t *testing.T) {
+	s := &ResidentServer{}
+	if got := s.capsFor("missing"); got.Args != nil {
+		t.Fatalf("capsFor missing sandbox = %+v, want zero value", got)
+	}
+}
+
+func TestResidentServerServeControlPaths(t *testing.T) {
+	s := &ResidentServer{}
+	roundTrip := func(req Envelope) Envelope {
+		t.Helper()
+		c1, c2 := net.Pipe()
+		errCh := make(chan error, 1)
+		go func() { errCh <- s.Serve(c2) }()
+		if err := writeFrame(c1, req); err != nil {
+			t.Fatalf("writeFrame: %v", err)
+		}
+		resp, err := readFrame(c1)
+		if err != nil {
+			t.Fatalf("readFrame: %v", err)
+		}
+		_ = c1.Close()
+		<-errCh
+		return resp
+	}
+
+	if resp := roundTrip(Envelope{Type: MsgHealthPing, SandboxID: "sb"}); resp.Type != MsgPong {
+		t.Fatalf("MsgHealthPing response=%q, want %q", resp.Type, MsgPong)
+	}
+	if resp := roundTrip(Envelope{Type: MsgInstanceStatus, SandboxID: "sb"}); resp.Type != MsgOK {
+		t.Fatalf("MsgInstanceStatus response=%q, want %q", resp.Type, MsgOK)
+	}
+	if resp := roundTrip(Envelope{Type: MsgInstantiate, SandboxID: "sb", Payload: []byte("not-json")}); resp.Type != MsgError {
+		t.Fatalf("MsgInstantiate bad payload response=%q, want %q", resp.Type, MsgError)
+	}
+	if resp := roundTrip(Envelope{Type: MsgExec, SandboxID: "sb", Payload: []byte("not-json")}); resp.Type != MsgError {
+		t.Fatalf("MsgExec bad payload response=%q, want %q", resp.Type, MsgError)
+	}
+	if resp := roundTrip(Envelope{Type: MsgInvoke, SandboxID: "sb", Payload: []byte("not-json")}); resp.Type != MsgError {
+		t.Fatalf("MsgInvoke bad payload response=%q, want %q", resp.Type, MsgError)
+	}
+	if resp := roundTrip(Envelope{Type: MsgSetNetworkBlocks, SandboxID: "sb", Payload: []byte("not-json")}); resp.Type != MsgError {
+		t.Fatalf("MsgSetNetworkBlocks bad payload response=%q, want %q", resp.Type, MsgError)
+	}
+	if resp := roundTrip(Envelope{Type: MsgStopInstance, SandboxID: "sb"}); resp.Type != MsgOK {
+		t.Fatalf("MsgStopInstance response=%q, want %q", resp.Type, MsgOK)
+	}
+	if resp := roundTrip(Envelope{Type: MsgNetstatsTick, SandboxID: " sb "}); resp.Type != MsgOK {
+		t.Fatalf("MsgNetstatsTick response=%q, want %q", resp.Type, MsgOK)
+	}
+	if resp := roundTrip(Envelope{Type: MsgCheckpoint, SandboxID: "sb"}); resp.Type != MsgError {
+		t.Fatalf("MsgCheckpoint response=%q, want %q", resp.Type, MsgError)
+	}
+}
+
+func TestServeSocketPathResidentInvalidPath(t *testing.T) {
+	err := ServeSocketPathResident(filepath.Join("/no", "such", "dir", "resident.sock"))
+	if err == nil {
+		t.Fatal("expected listen error for invalid socket path")
+	}
+}
+
+func TestRunCLIResidentDelegatesToServe(t *testing.T) {
+	err := RunCLIResident([]string{filepath.Join("/no", "such", "dir", "resident.sock")})
+	if err == nil {
+		t.Fatal("expected listen error")
 	}
 }

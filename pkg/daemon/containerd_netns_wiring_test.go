@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -35,6 +36,55 @@ func TestWireContainerdNativeNetnsPoolEnabledRequiresCNIPaths(t *testing.T) {
 			pool.Stop()
 		}
 		t.Fatal("want cni config error")
+	}
+}
+
+func TestContainerdNetnsPoolStopNilSafe(t *testing.T) {
+	var p *containerdNetnsPool
+	p.Stop()
+
+	(&containerdNetnsPool{}).Stop()
+}
+
+func TestWireContainerdNativeNetnsPoolRequiresDriverAndStore(t *testing.T) {
+	cfg := config.Config{
+		ContainerEngine:                  "containerd",
+		ContainerdNativeNetnsPoolEnabled: true,
+	}
+	if _, err := wireContainerdNativeNetnsPool(context.Background(), cfg, testLogger(), nil, nil); err == nil {
+		t.Fatal("want driver/store required error")
+	}
+}
+
+func TestWireContainerdNativeNetnsPoolSuccessWithoutWarmRealization(t *testing.T) {
+	st := openDaemonTestStore(t)
+	work := t.TempDir()
+	cfg := config.Config{
+		ContainerEngine:                   "containerd",
+		ContainerdNativeNetnsPoolEnabled:  true,
+		ContainerdNetnsPoolDepth:          0,
+		ContainerdNetnsPoolSize:           1,
+		ContainerdNetnsPoolRefillInterval: 10,
+		ContainerdCNIPluginDir:            filepath.Join(work, "cni-bin"),
+		ContainerdCNIConfPath:             filepath.Join(work, "cni", "aerolvm.conflist"),
+	}
+	driver := cntr.New(cntr.FromDaemonConfig(cfg), nil, testLogger())
+
+	pool, err := wireContainerdNativeNetnsPool(context.Background(), cfg, testLogger(), st, driver)
+	if err != nil {
+		t.Fatalf("wireContainerdNativeNetnsPool: %v", err)
+	}
+	if pool == nil {
+		t.Fatal("expected non-nil pool")
+	}
+	pool.Stop()
+
+	stats, err := netns.New(st).Stats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Total != 1 {
+		t.Fatalf("seeded %d netns slots, want 1", stats.Total)
 	}
 }
 
