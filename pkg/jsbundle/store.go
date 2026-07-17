@@ -154,7 +154,10 @@ func (s *Store) Put(tenant, name string, b *Bundle) (string, error) {
 		}
 	}
 
-	if tenant != "" && !contains(s.byTenant[tenant], digest) {
+	// Track ownership for every tenant INCLUDING the null/operator tenant so
+	// the catalogue (list/ownership) works for it too; the quota exemption for
+	// "" lives in the check above, not here.
+	if !contains(s.byTenant[tenant], digest) {
 		s.byTenant[tenant] = append(s.byTenant[tenant], digest)
 	}
 	if name != "" {
@@ -215,6 +218,39 @@ func (s *Store) Delete(digest string) error {
 		return err
 	}
 	return s.persistIndexLocked()
+}
+
+// ListDigests returns the content digests a tenant owns (the catalogue GET
+// scope for POST /v1/js-bundles). Order is unspecified.
+func (s *Store) ListDigests(tenant string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.byTenant[tenant]))
+	copy(out, s.byTenant[tenant])
+	return out
+}
+
+// TenantOwns reports whether tenant owns digest — the ownership gate for
+// GET/DELETE /v1/js-bundles/{digest} so one tenant cannot read or delete
+// another's bundle by guessing a digest.
+func (s *Store) TenantOwns(tenant, digest string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Contains(s.byTenant[tenant], digest)
+}
+
+// NamesForTenant returns the uploaded name → digest pointers a tenant holds.
+func (s *Store) NamesForTenant(tenant string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]string)
+	prefix := tenant + "\x00"
+	for k, digest := range s.names {
+		if name, ok := strings.CutPrefix(k, prefix); ok {
+			out[name] = digest
+		}
+	}
+	return out
 }
 
 // nameKey scopes an uploaded name to a tenant so two tenants may reuse the same

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime/isolate"
+	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -46,6 +47,29 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 		return nil, errors.New("module_ref or image is required for isolate runtime (the JS/TS bundle reference)")
 	}
 	req.ModuleRef = bundleRef
+
+	// Owner-scoped bundle resolution + digest pin. The bundle name space is the
+	// caller's identity (owner_ref), NOT the isolate-group key (tenant_id) —
+	// those are different axes (who owns the code vs. which process co-hosts
+	// it). Resolving here, before the driver, pins "sha256:<digest>" onto the
+	// request so: the driver (and a failover peer) resolve the exact bytes by
+	// digest regardless of tenant, create is idempotent under retry, and an
+	// uploaded name a user references actually resolves under that user. When
+	// no store is wired (SB_ENABLE_ISOLATE off in a unit harness) the ref is
+	// left untouched for the driver to handle.
+	if s.isolateBundles != nil {
+		owner := ownerRefForCreate(ctx)
+		resolved, resolveErr := jsbundle.NewResolver(s.isolateBundles).Resolve(ctx, owner, bundleRef)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve bundle %q: %w", bundleRef, resolveErr)
+		}
+		// Ensure the resolved bytes are in the store (a file:// ref is not yet),
+		// so the driver's by-digest resolve and failover both find them.
+		if _, err := s.isolateBundles.Put(owner, "", resolved); err != nil {
+			return nil, fmt.Errorf("stage bundle: %w", err)
+		}
+		req.ModuleRef = "sha256:" + resolved.Digest
+	}
 
 	tenantID, err := s.authorizeIsolateTenantID(ctx, req.TenantID)
 	if err != nil {

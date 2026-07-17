@@ -1302,3 +1302,29 @@ type PushWasmModuleResponse struct {
 	Digest    string `json:"digest"`
 	SizeBytes int64  `json:"size_bytes"`
 }
+
+// CreateJSBundleRequest is the body for POST /v1/js-bundles — the "no image,
+// no registry" upload path for the isolate runtime (plans/isolate-runtime.md
+// §8). The bundle is the JS/TS a workerd isolate runs. A one-file bundle sets
+// Source (+ optional MainModule name); a multi-module bundle sets Modules
+// directly. Name is an optional human alias the caller can reference on create
+// instead of the digest; it is scoped to the caller's identity. The API is
+// EXPERIMENTAL until the §10.1 demand checkpoint passes.
+type CreateJSBundleRequest struct {
+	Name              string            `json:"name,omitempty"`
+	MainModule        string            `json:"main_module,omitempty"`
+	Source            string            `json:"source,omitempty"`
+	Modules           map[string]string `json:"modules,omitempty"`
+	CompatibilityDate string            `json:"compatibility_date,omitempty"`
+}
+
+// JSBundle is the catalogue view of a stored bundle (POST/GET /v1/js-bundles).
+// ModuleRef is the "sha256:<digest>" form a create request passes as
+// module_ref; Name, when set, is the alias that also resolves on create.
+type JSBundle struct {
+	Digest     string `json:"digest"`
+	ModuleRef  string `json:"module_ref"`
+	Name       string `json:"name,omitempty"`
+	MainModule string `json:"main_module"`
+	SizeBytes  int64  `json:"size_bytes"`
+}

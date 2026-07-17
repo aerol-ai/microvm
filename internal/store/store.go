@@ -5290,6 +5290,10 @@ var ErrWasmModuleIDConflict = errors.New("wasm module id already in use")
 // ErrWasmModuleInUse blocks DELETE while a sandbox still references the module.
 var ErrWasmModuleInUse = errors.New("wasm module is referenced by an active sandbox")
 
+// ErrJSBundleInUse blocks DELETE /v1/js-bundles/{digest} while an isolate
+// sandbox still pins that bundle digest (plans/isolate-runtime.md §8).
+var ErrJSBundleInUse = errors.New("js bundle is referenced by an active sandbox")
+
 func scanWasmModule(row interface {
 	Scan(dest ...any) error
 }) (WasmModuleRecord, error) {

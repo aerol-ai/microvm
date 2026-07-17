@@ -33,6 +33,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
+	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -101,6 +102,10 @@ type Service struct {
 	// SetIsolateRuntime when cfg.EnableIsolate is true. Host-mediated like
 	// wasm: satisfies Runtime only, never ContainerRuntime.
 	isolate runtime.Runtime
+	// isolateBundles is the content-addressed JS/TS bundle store behind
+	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
+	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
+	isolateBundles *jsbundle.Store
 	// wasmModuleResolver resolves module_ref for POST /v1/wasm-modules.
 	wasmModuleResolver WasmModuleResolver
 	// wasmWarmPool receives registration-time NoteModule calls so the warm

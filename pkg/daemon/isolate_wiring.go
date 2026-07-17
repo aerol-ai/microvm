@@ -33,6 +33,10 @@ func wireIsolateRuntime(cfg config.Config, logger *slog.Logger, svc *service.Ser
 	driver.SetBundleResolver(isolateruntime.NewBundleResolver(jsbundle.NewResolver(store)))
 	driver.SetHostSupervisor(isolateruntime.NewHostSupervisor(isoCfg))
 
+	// The service owns the same store instance: it serves POST /v1/js-bundles
+	// and does the owner-scoped name→digest resolution on create, and the
+	// driver's resolver reads the digests back out.
+	svc.SetIsolateBundleStore(store)
 	svc.SetIsolateRuntime(driver)
 	logger.Info("isolate runtime enabled",
 		"workerd_path", cfg.IsolateWorkerdPath,

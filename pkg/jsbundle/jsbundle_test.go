@@ -222,6 +222,38 @@ func TestResolver(t *testing.T) {
 	}
 }
 
+func TestStoreListAndOwnership(t *testing.T) {
+	s, _ := NewStore(StoreConfig{Dir: t.TempDir()})
+	a, _ := BuildFromSource("main.js", "export default{};//a", "")
+	b, _ := BuildFromSource("main.js", "export default{};//b", "")
+	da, _ := s.Put("acme", "one", a)
+	db, _ := s.Put("acme", "two", b)
+	_, _ = s.Put("other", "x", a) // other tenant owns the same digest da
+
+	got := s.ListDigests("acme")
+	if len(got) != 2 {
+		t.Fatalf("acme owns %d digests, want 2", len(got))
+	}
+	if !s.TenantOwns("acme", da) || !s.TenantOwns("acme", db) {
+		t.Fatal("acme should own both digests")
+	}
+	if s.TenantOwns("acme", "deadbeef") {
+		t.Fatal("acme should not own an unknown digest")
+	}
+	// A digest one tenant never stored is not theirs.
+	if s.TenantOwns("stranger", da) {
+		t.Fatal("stranger owns nothing")
+	}
+	names := s.NamesForTenant("acme")
+	if names["one"] != da || names["two"] != db || len(names) != 2 {
+		t.Fatalf("acme names = %+v", names)
+	}
+	// Names are tenant-scoped: other's "x" must not leak into acme's view.
+	if _, ok := names["x"]; ok {
+		t.Fatal("cross-tenant name leaked into acme's NamesForTenant")
+	}
+}
+
 func TestResolverNilStore(t *testing.T) {
 	r := NewResolver(nil)
 	ctx := context.Background()
