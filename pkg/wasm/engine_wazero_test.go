@@ -108,6 +108,214 @@ func TestExitCodeFromInvoke(t *testing.T) {
 	}
 }
 
+func TestWazeroEngine_CompileCacheDirEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AEROL_WASM_COMPILE_CACHE_DIR", dir)
+
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+}
+
+func TestWazeroEngine_EnsureMemoryLimitRebuildsRuntime(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	wasmPath := writeDummyWasm(t, dir)
+
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	if err := eng.LoadModule(ctx, wasmPath, LoadOptions{MemoryMB: 10}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	if err := eng.ensureMemoryLimit(ctx, 20); err != nil {
+		t.Fatalf("ensureMemoryLimit: %v", err)
+	}
+	if eng.memoryPages == 0 {
+		t.Fatal("expected memoryPages to be set")
+	}
+}
+
+func TestWazeroEngine_InvokeExportNotFound(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	wasmPath := writeDummyWasm(t, dir)
+
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	if err := eng.LoadModule(ctx, wasmPath, LoadOptions{MemoryMB: 10}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	if err := eng.Instantiate(ctx, Capabilities{MemoryMB: 10}); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	if err := eng.InvokeExport(ctx, "missing"); err == nil {
+		t.Fatal("expected error for missing export")
+	}
+}
+
+func TestWazeroEngine_RunExportNotFound(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	wasmPath := writeDummyWasm(t, dir)
+
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	if err := eng.LoadModule(ctx, wasmPath, LoadOptions{MemoryMB: 10}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	res, err := eng.Run(ctx, Capabilities{MemoryMB: 10}, "missing")
+	if err == nil {
+		t.Fatal("expected error for missing export")
+	}
+	if res.ExitCode != 1 {
+		t.Fatalf("expected exit code 1, got %d", res.ExitCode)
+	}
+}
+
+func TestWazeroEngine_FsConfigForPreopens(t *testing.T) {
+	caps := Capabilities{Preopens: []Preopen{{HostPath: "/tmp", GuestPath: "/work"}}}
+	cfg := fsConfigFor(caps)
+	if cfg == nil {
+		t.Fatal("expected non-nil FSConfig")
+	}
+}
+
+func TestWazeroEngine_ListenerFD(t *testing.T) {
+	caps := Capabilities{Preopens: []Preopen{{HostPath: "/tmp", GuestPath: "/work"}}}
+	if ListenerFD(caps) != 3+len(caps.Preopens) {
+		t.Fatalf("unexpected ListenerFD")
+	}
+}
+
+func TestWazeroEngine_LoadModuleMissingFile(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if err := eng.LoadModule(ctx, "/tmp/does-not-exist.wasm", LoadOptions{MemoryMB: 10}); err == nil {
+		t.Fatal("expected error for missing module file")
+	}
+}
+
+func TestWazeroEngine_ResolvedListenPort_NoModule(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if got, ok := eng.ResolvedListenPort(); got != 0 || ok {
+		t.Fatalf("ResolvedListenPort = (%d,%v), want (0,false)", got, ok)
+	}
+}
+
+func TestWazeroEngine_CloseNilModule(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	if err := eng.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestWazeroEngine_InstantiateWithoutLoadFails(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if err := eng.Instantiate(ctx, Capabilities{MemoryMB: 10}); err == nil {
+		t.Fatal("expected error when instantiate without loaded module")
+	}
+}
+
+func TestWazeroEngine_StopInstanceWithoutModuleNoop(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if err := eng.StopInstance(ctx); err != nil {
+		t.Fatalf("StopInstance: %v", err)
+	}
+}
+
+func TestWazeroEngine_CallExportNoActiveInstance(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if _, err := eng.callExport(ctx, "_start"); err == nil {
+		t.Fatal("expected error for no active instance")
+	}
+}
+
+func TestWazeroEngine_CaptureSnapshotNoModule(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if _, err := eng.CaptureSnapshot(ctx); err == nil {
+		t.Fatal("expected error for no active instance")
+	}
+}
+
+func TestWazeroEngine_RestoreSnapshotWithoutMemory(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	wasmPath := writeDummyWasm(t, dir)
+
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if err := eng.LoadModule(ctx, wasmPath, LoadOptions{MemoryMB: 10}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	if err := eng.RestoreSnapshot(ctx, SnapshotRestoreInput{}, Capabilities{MemoryMB: 10}); err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
+	}
+}
+
+func TestWazeroEngine_EnsureWasiCompatHostsNoRuntime(t *testing.T) {
+	eng := &wazeroEngine{}
+	if err := eng.ensureWasiCompatHosts(context.Background()); err != nil {
+		t.Fatalf("ensureWasiCompatHosts: %v", err)
+	}
+}
+
+func TestWazeroEngine_StringsTrimJoinEmpty(t *testing.T) {
+	if got := stringsTrimJoin("", ""); got != "" {
+		t.Fatalf("expected empty string, got %q", got)
+	}
+}
+
 func TestSnapshotCodecHelpers(t *testing.T) {
 	if len(SnapshotMediaTypes()) == 0 {
 		t.Fatal("expected media types")
