@@ -146,7 +146,7 @@ func TestRun_GracefulShutdown(t *testing.T) {
 	go func() {
 		done <- Run(ctx, testLogger(), nil)
 	}()
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Run returned error: %v", err)

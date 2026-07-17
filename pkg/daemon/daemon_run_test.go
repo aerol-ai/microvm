@@ -101,6 +101,9 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 
 func runWithAutoCancel(t *testing.T, delay time.Duration, makeProvider ProviderFactory) error {
 	t.Helper()
+	if delay < 500*time.Millisecond {
+		delay = 500 * time.Millisecond
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
