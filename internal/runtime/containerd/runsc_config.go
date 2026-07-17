@@ -24,12 +24,21 @@ func (d *Driver) ensureRunscConfig() (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
+	// [runsc_config] is the section the runsc shim's toml Config actually
+	// decodes into runsc flags — the previous [runscflags] name was silently
+	// ignored, so host-uds never reached runsc and the in-guest toolboxd could
+	// not dial the bind-mounted readiness socket (create then stalls to its
+	// deadline). Compare CONTENT, not existence: a stat-only check strands
+	// nodes upgraded from the old format on the stale file forever (caught
+	// live on cluster-3-mixed-gvisor).
+	body := []byte("# Managed by AerolVM containerd driver (do not edit).\n[runsc_config]\n  host-uds = \"open\"\n")
+	if existing, err := os.ReadFile(path); err == nil {
+		if string(existing) == string(body) {
+			return path, nil
+		}
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}
-	body := []byte("# Managed by AerolVM containerd driver (do not edit).\n[runscflags]\n  host-uds = \"open\"\n")
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		return "", err
 	}

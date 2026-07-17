@@ -11,6 +11,8 @@ import (
 	cntr "github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/events"
+	"github.com/containerd/containerd/oci"
+	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/typeurl/v2"
 
@@ -36,6 +38,58 @@ func TestRuntimeContainerOptRunsc(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `host-uds = "open"`) {
 		t.Fatalf("config missing host-uds open:\n%s", body)
+	}
+	if !strings.Contains(string(body), "[runsc_config]") {
+		t.Fatalf("config missing [runsc_config] section (the shim silently ignores other section names):\n%s", body)
+	}
+}
+
+// Regression for the first live cluster-3-mixed-gvisor run: the shim
+// typeurl-unmarshals task options against its own proto registry, so the
+// options MUST marshal to containerd's well-known runtimeoptions.v1.Options
+// URL. A custom-registered Go type marshals fine client-side but fails task
+// create with "type with url ...: not found" on the shim.
+func TestRunscRuntimeOptsWireType(t *testing.T) {
+	d := New(Config{RunDir: t.TempDir()}, nil, nil)
+	v, err := d.runscRuntimeOpts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	any, err := typeurl.MarshalAny(v)
+	if err != nil {
+		t.Fatalf("marshal runsc options: %v", err)
+	}
+	if !strings.HasSuffix(any.GetTypeUrl(), "runtimeoptions.v1.Options") {
+		t.Fatalf("options Any URL = %q, want the well-known runtimeoptions.v1.Options", any.GetTypeUrl())
+	}
+	ro, ok := v.(*runtimeoptions.Options)
+	if !ok {
+		t.Fatalf("options concrete type = %T", v)
+	}
+	if ro.TypeUrl != runscOptionsTypeUrl {
+		t.Fatalf("options.TypeUrl = %q, want %q (shim rejects others as unsupported)", ro.TypeUrl, runscOptionsTypeUrl)
+	}
+}
+
+// Regression for the second live cluster-3-mixed-gvisor failure: without the
+// CRI container-type=sandbox annotation the runsc shim classifies the
+// container as a pod SUB-container and deadlocks in task create waiting for
+// output-pipe EOF from the standalone sandbox runsc boots anyway (reproduced
+// with plain ctr on both containerd 1.7 and 2.2).
+func TestRunscSandboxAnnotationOpt(t *testing.T) {
+	spec := &oci.Spec{}
+	if err := runscSandboxAnnotationOpt()(context.Background(), nil, nil, spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Annotations[criContainerTypeAnnotation]; got != criContainerTypeSandbox {
+		t.Fatalf("annotation %q = %q, want %q", criContainerTypeAnnotation, got, criContainerTypeSandbox)
+	}
+	spec.Annotations["keep"] = "me"
+	if err := runscSandboxAnnotationOpt()(context.Background(), nil, nil, spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.Annotations["keep"] != "me" {
+		t.Fatal("existing annotations must be preserved")
 	}
 }
 

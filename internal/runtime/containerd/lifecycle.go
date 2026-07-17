@@ -191,6 +191,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
+	if ociRuntime == "runsc" {
+		specOpts = append(specOpts, runscSandboxAnnotationOpt())
+	}
 	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 
 	if d.cfg.ReadyEnabled {

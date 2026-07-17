@@ -188,6 +188,9 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
+	if ociRuntime == "runsc" {
+		specOpts = append(specOpts, runscSandboxAnnotationOpt())
+	}
 
 	labels := map[string]string{
 		managedLabelKey:  "true",

@@ -10,7 +10,8 @@
 #
 # Scenarios: single-node | single-node-containerd | local-mode | cluster-3-mixed |
 #            cluster-3-mixed-docker | cluster-3-mixed-containerd | cluster-3-mixed-fc |
-#            cluster-3-mixed-gvisor | cluster-3-mixed-wasm | cluster-hetero |
+#            cluster-3-mixed-gvisor | cluster-3-mixed-gvisor-docker |
+#            cluster-3-mixed-wasm | cluster-hetero |
 #            single-node-fc | single-node-fc-arm64 | cluster-arm64
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any

@@ -10,6 +10,7 @@ BIN_DIR ?= bin
 	integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
+	integration-benchmark-gvisor-docker integration-benchmark-gvisor-docker-only \
 	integration-single-fc integration-benchmark-fc-single integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
 	integration-cert-store-init integration-clear-lease
 
@@ -291,22 +292,54 @@ integration-benchmark-wasm-only:
 	AEROL_BENCH_RUNTIMES=$(WASM_BENCH_RUNTIMES) \
 		integration-tests/run.sh cluster-3-mixed-wasm --bench-only
 
-# gVisor-focused benchmark on the 3× mixed-gvisor cluster: provisions
-# cluster-3-mixed-gvisor with domain/TLS, runs the full suite with UC-94 (docker +
-# gvisor latency) and UC-95 (docker density). Narrow UC-94 to gvisor only with
-# AEROL_BENCH_RUNTIMES=gvisor (UC-95 will skip in that case).
+# gVisor create-latency benchmark on the 3× mixed-gvisor cluster (containerd
+# engine — the harness default; the scenario has no docker-engine cap, so
+# runtime "gvisor" is served by the native containerd driver via the
+# io.containerd.runsc.v1 shim). Provisions cluster-3-mixed-gvisor with
+# domain/TLS, runs UC-94 gvisor latency only (AEROL_BENCH_RUNTIMES=gvisor →
+# UC-95 density skips; it's engine-capacity-bound, not runtime-bound), writes
+# the artifact, and tears down. Engine A/B twin: integration-benchmark-gvisor-docker.
+# Compare against the runc rows in cluster-3-mixed-{docker,containerd}-bench.json
+# (same t3.medium boxes) for the sandboxing overhead.
 #   make integration-benchmark-gvisor
 #   make integration-benchmark-gvisor keep
 #   make integration-benchmark-gvisor GVISOR_BENCH_OUT=/tmp/gvisor-bench.json
 GVISOR_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-gvisor-bench.json
+GVISOR_BENCH_SAMPLES ?= 10
+GVISOR_BENCH_RUNTIMES ?= gvisor
 integration-benchmark-gvisor:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(GVISOR_BENCH_OUT) \
-		integration-tests/run.sh cluster-3-mixed-gvisor --no-disruptive $(RUN_FLAGS)
+	AEROL_BENCH_SAMPLES=$(GVISOR_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(GVISOR_BENCH_RUNTIMES) \
+		integration-tests/run.sh cluster-3-mixed-gvisor --bench-only $(RUN_FLAGS)
 
-# Re-run UC-94/UC-95 only against a cluster-3-mixed-gvisor left up with `keep`.
+# Re-run UC-94 against a cluster-3-mixed-gvisor left up with `keep`.
 integration-benchmark-gvisor-only:
-	AEROL_BENCH_OUT=$(GVISOR_BENCH_OUT) \
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(GVISOR_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(GVISOR_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(GVISOR_BENCH_RUNTIMES) \
 		integration-tests/run.sh cluster-3-mixed-gvisor --bench-only
+
+# Same gvisor benchmark on the DOCKER engine (cluster-3-mixed-gvisor-docker
+# carries the docker-engine cap): runsc launched through dockerd's daemon.json
+# runtime registration instead of the containerd shim. Together with
+# integration-benchmark-gvisor this gives the per-engine gvisor A/B on
+# identical t3.medium topology.
+#   make integration-benchmark-gvisor-docker
+#   make integration-benchmark-gvisor-docker keep
+GVISOR_DOCKER_BENCH_OUT ?= integration-tests/reports/cluster-3-mixed-gvisor-docker-bench.json
+integration-benchmark-gvisor-docker:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(GVISOR_DOCKER_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(GVISOR_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(GVISOR_BENCH_RUNTIMES) \
+		integration-tests/run.sh cluster-3-mixed-gvisor-docker --bench-only $(RUN_FLAGS)
+
+# Re-run UC-94 against a cluster-3-mixed-gvisor-docker left up with `keep`.
+integration-benchmark-gvisor-docker-only:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(GVISOR_DOCKER_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(GVISOR_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(GVISOR_BENCH_RUNTIMES) \
+		integration-tests/run.sh cluster-3-mixed-gvisor-docker --bench-only
 
 # Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
 # exercises the firecracker use cases (UC-24/47-50) without the full hetero

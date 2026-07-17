@@ -1,0 +1,19 @@
+# 3× mixed cluster with gVisor on the DOCKER engine — the A/B twin of
+# cluster-3-mixed-gvisor (which runs the harness-default containerd engine).
+# docker-engine: opts back out to dockerd so the gvisor benchmark row measures
+# runsc launched through docker's daemon.json runtime registration, directly
+# comparable against the containerd shim path benched by
+# make integration-benchmark-gvisor.
+name: cluster-3-mixed-gvisor-docker
+capabilities:
+  - docker
+  - docker-engine
+  - platform-volumes
+  - gvisor
+  - domain
+  - cluster
+  # Opt UC-94/UC-95 in for make integration-benchmark-gvisor-docker (the make
+  # target passes AEROL_BENCH_RUNTIMES=gvisor and --bench-only, so UC-95 skips).
+  - benchmark
+
+expected_members: 3

@@ -10,6 +10,7 @@ import (
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
+	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -93,9 +94,27 @@ func TestEnsureRunscConfigWritesHostUDS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ro, ok := opt.(*runscShimOptions)
+	ro, ok := opt.(*runtimeoptions.Options)
 	if !ok || ro.ConfigPath != path {
 		t.Fatalf("opts=%T %+v", opt, opt)
+	}
+	if ro.TypeUrl != runscOptionsTypeUrl {
+		t.Fatalf("options TypeUrl=%q want %q", ro.TypeUrl, runscOptionsTypeUrl)
+	}
+	// A stale config from an older binary (e.g. the ignored [runscflags]
+	// section) must be rewritten, not kept — content decides, not existence.
+	if err := os.WriteFile(path, []byte("[runscflags]\n  host-uds = \"open\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ensureRunscConfig(); err != nil {
+		t.Fatal(err)
+	}
+	body, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "[runsc_config]") {
+		t.Fatalf("stale config not rewritten:\n%s", body)
 	}
 }
 

@@ -94,10 +94,13 @@ Options:
                                alternative OCI runtime in
                                /etc/docker/daemon.json so sandboxes can opt
                                into gVisor isolation via runtime: "runsc" on
-                               create. Downloads runsc from the upstream
-                               release bucket (verified by SHA-512) if it
-                               isn't already on PATH. Restarts Docker if
-                               daemon.json actually changed.
+                               create. Also installs containerd-shim-runsc-v1
+                               so the containerd engine can serve the same
+                               runtime via the io.containerd.runsc.v1 shim.
+                               Downloads both from the upstream release
+                               bucket (verified by SHA-512) if not already on
+                               PATH. Restarts Docker if daemon.json actually
+                               changed.
   --with-containerd-engine     Opt into SB_CONTAINER_ENGINE=containerd
                                (dark default remains docker). Installs CNI
                                bridge + host-local plugins under /opt/cni/bin
@@ -1210,6 +1213,57 @@ install_runsc_binary() {
 	echo "Installed runsc to /usr/local/bin/runsc"
 }
 
+install_runsc_shim() {
+	# The containerd engine reaches gVisor through the io.containerd.runsc.v1
+	# shim (internal/runtime/containerd/runtime_gvisor.go): containerd resolves
+	# that runtime name by exec'ing containerd-shim-runsc-v1 from its PATH, so
+	# the daemon.json registration below covers dockerd only. Install the shim
+	# next to runsc so --with-gvisor works under both engines — without it a
+	# runtime:"gvisor" create on a containerd node fails at shim launch.
+	if command -v containerd-shim-runsc-v1 >/dev/null 2>&1; then
+		echo "containerd-shim-runsc-v1 already installed"
+		return 0
+	fi
+
+	local arch
+	case "$(uname -m)" in
+		x86_64|amd64)   arch="x86_64" ;;
+		aarch64|arm64)  arch="aarch64" ;;
+		*)
+			echo "--with-gvisor: unsupported architecture $(uname -m) for containerd-shim-runsc-v1" >&2
+			exit 1
+			;;
+	esac
+
+	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
+	trap "rm -rf '$tmp_dir'" RETURN
+
+	echo "Downloading containerd-shim-runsc-v1 for ${arch} from ${base}"
+	if ! curl_download "${base}/containerd-shim-runsc-v1" -o "${tmp_dir}/containerd-shim-runsc-v1"; then
+		echo "--with-gvisor: failed to download containerd-shim-runsc-v1 from ${base}/containerd-shim-runsc-v1" >&2
+		exit 1
+	fi
+	if ! curl_download "${base}/containerd-shim-runsc-v1.sha512" -o "${tmp_dir}/containerd-shim-runsc-v1.sha512"; then
+		echo "--with-gvisor: failed to download containerd-shim-runsc-v1.sha512" >&2
+		exit 1
+	fi
+
+	(
+		cd "$tmp_dir"
+		awk '{print $1"  containerd-shim-runsc-v1"}' containerd-shim-runsc-v1.sha512 > shim.sha512.local
+		if ! sha512sum -c shim.sha512.local; then
+			echo "--with-gvisor: containerd-shim-runsc-v1 checksum verification failed" >&2
+			exit 1
+		fi
+	)
+
+	install -m 0755 "${tmp_dir}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
+	echo "Installed containerd-shim-runsc-v1 to /usr/local/bin/containerd-shim-runsc-v1"
+}
+
 install_cni_plugins() {
 	# CNI bridge + host-local are required for containerd native netns
 	# (plans/containerd-engine.md §4 / Phase 5). Install under /opt/cni/bin.
@@ -1263,6 +1317,8 @@ register_gvisor_runtime() {
 		echo "--with-gvisor: runsc binary at $runsc_bin is not executable" >&2
 		exit 1
 	fi
+
+	install_runsc_shim
 
 	mkdir -p /etc/docker
 	local daemon_json="/etc/docker/daemon.json"
