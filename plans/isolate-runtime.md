@@ -1,6 +1,6 @@
 # V8-Isolate Sandboxes (Deno/Workers model) — Design & Implementation Plan
 
-Status: **In progress — Phase 1 landed; Phase 2 cold path landed (bundle-upload API + demand pitch pending)** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-17
+Status: **In progress — Phase 1 landed; Phase 2 code complete (cold path + /v1/js-bundles); demand pitch + idle-TTL reaper pending** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-17
 
 This plan adds a **fifth runtime** to AerolVM — **V8 isolates** (the
 Deno-Deploy / Cloudflare-Workers model) — as a peer to `docker`, `gvisor`,
@@ -530,12 +530,16 @@ Every new package ships with `_test.go` next to it at the ~85% bar (§11).
     isolate.go` full boot path (durability normalize, admission, store.Create,
     LIFO unwind); daemon wiring builds the store/resolver/supervisor. Driver
     and host end-to-end tests spawn a real workerd and serve requests.
-    **STILL PENDING in Phase 2:** the `POST /v1/js-bundles` upload catalogue
-    (bundle refs today resolve via `file://`/path/digest/uploaded-name against
-    the store, but nothing populates it over HTTP yet — this is the "no image,
-    no registry" remote path); group idle-TTL reaper (last-member teardown
-    ships; idle reaping is deferred with the Phase-3 pool); and the §10.1
-    demand pitch (business, not code).
+  - **LANDED 2026-07-17 (bundle upload API):** `POST/GET/GET{id}/DELETE{id}
+    /v1/js-bundles` (`pkg/api/v1/js_bundle.go`) over `internal/service/
+    isolate_bundles.go` — owner-scoped upload/list/get/delete, delete refuses a
+    digest a live sandbox pins. The create path resolves an uploaded name
+    owner-scoped and pins `sha256:<digest>` before the driver. This makes the
+    "no image, no registry" remote path real.
+    **STILL PENDING in Phase 2:** group idle-TTL reaper (last-member teardown
+    ships; idle reaping is deferred with the Phase-3 pool); content-addressed
+    bundle GC/eviction of unreferenced bundles (Delete is manual today); and
+    the §10.1 demand pitch (business, not code).
 - **Phase 3 — Inbound HTTP + toolbox + P0 gate execution.** `guest_http.go`
   fetch proxy with driver-attributed routing; per-sandbox egress attribution;
   `exec` = invoke-handler; Caddy L7 route (expose_port opt-in, pool NOT
