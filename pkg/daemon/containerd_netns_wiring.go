@@ -21,6 +21,8 @@ type containerdNetnsPool struct {
 	host     *netns.Host
 }
 
+var ensureForwardingSysctls = hostnet.EnsureForwardingSysctls
+
 func (p *containerdNetnsPool) Stop() {
 	if p == nil {
 		return
@@ -72,7 +74,7 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	if err != nil {
 		return nil, fmt.Errorf("cni runner: %w", err)
 	}
-	if err := hostnet.EnsureForwardingSysctls(); err != nil {
+	if err := ensureForwardingSysctls(); err != nil {
 		return nil, fmt.Errorf("host forwarding sysctls: %w", err)
 	}
 	host := &netns.Host{Runner: runner}

@@ -59,6 +59,9 @@ func TestWireContainerdNativeNetnsPoolRequiresDriverAndStore(t *testing.T) {
 func TestWireContainerdNativeNetnsPoolSuccessWithoutWarmRealization(t *testing.T) {
 	st := openDaemonTestStore(t)
 	work := t.TempDir()
+	origSysctls := ensureForwardingSysctls
+	ensureForwardingSysctls = func() error { return nil }
+	t.Cleanup(func() { ensureForwardingSysctls = origSysctls })
 	cfg := config.Config{
 		ContainerEngine:                   "containerd",
 		ContainerdNativeNetnsPoolEnabled:  true,
