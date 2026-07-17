@@ -1,6 +1,6 @@
 # V8-Isolate Sandboxes (Deno/Workers model) — Design & Implementation Plan
 
-Status: **In progress — Phase 1 landed** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-17
+Status: **In progress — Phase 1 landed; Phase 2 cold path landed (bundle-upload API + demand pitch pending)** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-17
 
 This plan adds a **fifth runtime** to AerolVM — **V8 isolates** (the
 Deno-Deploy / Cloudflare-Workers model) — as a peer to `docker`, `gvisor`,
@@ -522,6 +522,20 @@ Every new package ships with `_test.go` next to it at the ~85% bar (§11).
   wait for the checkpoint); durability default; group idle-TTL + last-member
   lifecycle; service helper `internal/service/isolate.go`. **The §10.1 demand
   pitch runs during this phase.**
+  - **LANDED 2026-07-17 (cold path):** `pkg/jsbundle` (content-addressed store
+    + resolver, 85%); `pkg/isolate` (workerd group host: capnp gen + controller
+    worker + bundle-server + injection; pure logic 100%, real-workerd
+    end-to-end proven); driver group router + single-flight + last-member
+    teardown + real `Create/Start/Stop/Destroy` (91%); `internal/service/
+    isolate.go` full boot path (durability normalize, admission, store.Create,
+    LIFO unwind); daemon wiring builds the store/resolver/supervisor. Driver
+    and host end-to-end tests spawn a real workerd and serve requests.
+    **STILL PENDING in Phase 2:** the `POST /v1/js-bundles` upload catalogue
+    (bundle refs today resolve via `file://`/path/digest/uploaded-name against
+    the store, but nothing populates it over HTTP yet — this is the "no image,
+    no registry" remote path); group idle-TTL reaper (last-member teardown
+    ships; idle reaping is deferred with the Phase-3 pool); and the §10.1
+    demand pitch (business, not code).
 - **Phase 3 — Inbound HTTP + toolbox + P0 gate execution.** `guest_http.go`
   fetch proxy with driver-attributed routing; per-sandbox egress attribution;
   `exec` = invoke-handler; Caddy L7 route (expose_port opt-in, pool NOT
