@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 func TestEngine_ErrorPaths(t *testing.T) {
@@ -130,5 +132,63 @@ func TestRunBadExport(t *testing.T) {
 
 	if _, err := eng.Run(ctx, Capabilities{}, "does_not_exist"); err == nil {
 		t.Fatalf("expected error on Run with bad export")
+	}
+}
+func TestWazeroEngine_EnsureWasiCompatHosts(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	if err := eng.ensureWasiCompatHosts(ctx); err != nil {
+		t.Fatalf("ensureWasiCompatHosts: %v", err)
+	}
+	if !eng.wasiCompat {
+		t.Fatal("expected wasiCompat to be true after ensureWasiCompatHosts")
+	}
+	if err := eng.ensureWasiCompatHosts(ctx); err != nil {
+		t.Fatalf("second ensureWasiCompatHosts: %v", err)
+	}
+}
+
+func TestWazeroEngine_CaptureAndRestoreSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteCheckpointWasm(t, dir, "mem.wasm")
+	ctx := context.Background()
+
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	if err := eng.LoadModule(ctx, modPath, LoadOptions{MemoryMB: 16}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	if err := eng.Instantiate(ctx, Capabilities{}); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+
+	cap, err := eng.CaptureSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CaptureSnapshot: %v", err)
+	}
+	if len(cap.Memory) == 0 {
+		t.Fatal("expected captured memory to be non-empty")
+	}
+
+	eng2, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng2.Close(ctx)
+
+	if err := eng2.LoadModule(ctx, modPath, LoadOptions{MemoryMB: 16}); err != nil {
+		t.Fatalf("LoadModule on eng2: %v", err)
+	}
+	if err := eng2.RestoreSnapshot(ctx, SnapshotRestoreInput{Config: cap.Config, Memory: cap.Memory, Globals: cap.Globals, WASIState: cap.WASIState}, Capabilities{}); err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
 	}
 }

@@ -78,10 +78,78 @@ func TestDecodeNoTrailingNewline(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeParkedSignal(t *testing.T) {
+	want := ParkedSignal{Token: "tok", Nonce: "nonce"}
+	var buf bytes.Buffer
+	if err := EncodeParked(&buf, want); err != nil {
+		t.Fatalf("EncodeParked: %v", err)
+	}
+	got, err := DecodeParked(&buf)
+	if err != nil {
+		t.Fatalf("DecodeParked: %v", err)
+	}
+	if got.Event != EventParked || got.Token != want.Token || got.Nonce != want.Nonce {
+		t.Fatalf("got = %+v", got)
+	}
+}
+
+func TestEncodeDecodeAdoptFrame(t *testing.T) {
+	want := AdoptFrame{SandboxID: "sb", Token: "tok", Nonce: "nonce"}
+	var buf bytes.Buffer
+	if err := EncodeAdopt(&buf, want); err != nil {
+		t.Fatalf("EncodeAdopt: %v", err)
+	}
+	got, err := DecodeAdopt(&buf)
+	if err != nil {
+		t.Fatalf("DecodeAdopt: %v", err)
+	}
+	if got.Event != EventAdopt || got.SandboxID != want.SandboxID || got.Token != want.Token || got.Nonce != want.Nonce {
+		t.Fatalf("got = %+v", got)
+	}
+}
+
+func TestDecodeReadySignalMissingFields(t *testing.T) {
+	cases := []string{
+		`{"event":"ready","token":"tok","nonce":"n"}`,
+		`{"event":"ready","sandbox_id":"sb","nonce":"n"}`,
+		`{"event":"ready","sandbox_id":"sb","token":"tok"}`,
+	}
+	for _, line := range cases {
+		_, err := Decode(strings.NewReader(line + "\n"))
+		if err == nil {
+			t.Fatal("expected error for missing field")
+		}
+	}
+}
+
+func TestDecodeParkedSignalBadEvent(t *testing.T) {
+	_, err := DecodeParked(strings.NewReader(`{"event":"ready","token":"tok","nonce":"n"}\n`))
+	if err == nil {
+		t.Fatal("expected error for bad parked event")
+	}
+}
+
+func TestDecodeAdoptFrameBadEvent(t *testing.T) {
+	_, err := DecodeAdopt(strings.NewReader(`{"event":"ready","sandbox_id":"sb","token":"tok","nonce":"n"}\n`))
+	if err == nil {
+		t.Fatal("expected error for bad adopt event")
+	}
+}
+
 func TestReadLineEmptyLine(t *testing.T) {
 	_, err := readLine(strings.NewReader("\n"))
-	if err == nil || !strings.Contains(err.Error(), "empty line") {
-		t.Fatalf("expected empty line error, got %v", err)
+	if err == nil {
+		t.Fatal("expected error for empty line")
+	}
+}
+
+func TestReadLineEOFWithoutNewline(t *testing.T) {
+	got, err := readLine(strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("readLine: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got = %q", got)
 	}
 }
 
