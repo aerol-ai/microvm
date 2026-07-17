@@ -96,6 +96,11 @@ type Service struct {
 	// unless pkg/daemon has called SetWasmRuntime when cfg.EnableWasm is
 	// true.
 	wasm runtime.Runtime
+	// isolate is the fifth registered runtime — V8 isolates, Workers model
+	// (plans/isolate-runtime.md). Nil unless pkg/daemon has called
+	// SetIsolateRuntime when cfg.EnableIsolate is true. Host-mediated like
+	// wasm: satisfies Runtime only, never ContainerRuntime.
+	isolate runtime.Runtime
 	// wasmModuleResolver resolves module_ref for POST /v1/wasm-modules.
 	wasmModuleResolver WasmModuleResolver
 	// wasmWarmPool receives registration-time NoteModule calls so the warm
@@ -502,6 +507,12 @@ func (s *Service) SetWasmRuntime(r runtime.Runtime) {
 	s.wasm = r
 }
 
+// SetIsolateRuntime registers the V8-isolate driver. Called from pkg/daemon
+// when cfg.EnableIsolate is true.
+func (s *Service) SetIsolateRuntime(r runtime.Runtime) {
+	s.isolate = r
+}
+
 // SetContainerdRuntime registers the containerd engine driver. Called from
 // pkg/daemon when SB_CONTAINER_ENGINE=containerd.
 func (s *Service) SetContainerdRuntime(r runtime.Runtime) {
@@ -567,11 +578,20 @@ func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, e
 		}
 		return s.wasm, nil
 	}
+	if s.isIsolateSandbox(sandbox) {
+		if s.isolate == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered: %w",
+				models.RuntimeIsolate, models.ErrRuntimeNotImplemented)
+		}
+		return s.isolate, nil
+	}
 	return s.ociEngineForSandbox(sandbox)
 }
 
 func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
-	if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) {
+	// Host-mediated runtimes have no container: the sandbox ID is the
+	// end-to-end runtime reference.
+	if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) || s.isIsolateSandbox(sandbox) {
 		return sandbox.ID
 	}
 	return sandboxContainerRef(sandbox)
@@ -1148,6 +1168,22 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 		req.Runtime = chosenRuntime
 		return s.createWasmSandbox(ctx, req, idOverride)
+	}
+	// "isolate" is the fifth runtime (V8 isolates, Workers model), dispatched
+	// to internal/runtime/isolate per plans/isolate-runtime.md. Same two
+	// operator-troubleshooting shapes as the firecracker/wasm gates: flag off
+	// vs driver-not-registered.
+	if chosenRuntime == models.RuntimeIsolate {
+		if !s.cfg.EnableIsolate {
+			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_ISOLATE=true on this host (see plans/isolate-runtime.md): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		if s.isolate == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_ISOLATE=true but daemon did not call SetIsolateRuntime): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		req.Runtime = chosenRuntime
+		return s.createIsolateSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
 

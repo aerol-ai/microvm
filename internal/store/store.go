@@ -705,6 +705,15 @@ func Open(path string) (*Store, error) {
 		// pre-migration row keeps routing through the dockerd driver after
 		// SB_CONTAINER_ENGINE=containerd lands on the node.
 		`ALTER TABLE sandboxes ADD COLUMN engine TEXT NOT NULL DEFAULT 'docker';`,
+		// tenant_id is the isolate-group key (plans/isolate-runtime.md §2.1):
+		// runtime=isolate sandboxes with the same tenant share one workerd
+		// process, so restart reconcile and failover must rebuild the same
+		// grouping. Empty is the null tenant — every pre-migration row and
+		// every sandbox whose group key fell back to the authenticated
+		// identity (NOT NULL DEFAULT '' rather than NULL, matching owner_ref:
+		// empty-string sentinels keep scanSandbox free of NullString
+		// plumbing). Unused by other runtimes today.
+		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -828,8 +837,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
-			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			owner_ref, fleet_suspended,
+			tenant_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -886,6 +896,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.WasmRegistryDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
+		strings.TrimSpace(sandbox.TenantID),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -990,8 +1001,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
-			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			owner_ref, fleet_suspended,
+			tenant_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -1041,7 +1053,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			wasm_registry_ref = excluded.wasm_registry_ref,
 			wasm_registry_digest = excluded.wasm_registry_digest,
 			owner_ref = excluded.owner_ref,
-			fleet_suspended = excluded.fleet_suspended
+			fleet_suspended = excluded.fleet_suspended,
+			tenant_id = excluded.tenant_id
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -1098,6 +1111,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.WasmRegistryDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
+		strings.TrimSpace(sandbox.TenantID),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -1127,7 +1141,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
-			owner_ref, fleet_suspended
+			owner_ref, fleet_suspended,
+			tenant_id
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -1174,7 +1189,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
-			owner_ref, fleet_suspended
+			owner_ref, fleet_suspended,
+			tenant_id
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -1241,7 +1257,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
-			owner_ref, fleet_suspended
+			owner_ref, fleet_suspended,
+			tenant_id
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -1292,7 +1309,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
-			owner_ref, fleet_suspended
+			owner_ref, fleet_suspended,
+			tenant_id
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -3606,6 +3624,7 @@ func scanSandbox(scanner interface {
 		&sandbox.WasmRegistryDigest,
 		&sandbox.OwnerRef,
 		&fleetSuspended,
+		&sandbox.TenantID,
 	)
 	if err != nil {
 		return nil, err

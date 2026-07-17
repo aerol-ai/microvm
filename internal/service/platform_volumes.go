@@ -40,9 +40,11 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 		return nil, models.ErrPlatformVolumesDisabled
 	}
 
-	// Runtime gate: firecracker and wasm cannot bind-mount host paths, so a
-	// volume would silently never appear. Reject before we do any storage work.
-	if chosenRuntime == models.RuntimeFirecracker || chosenRuntime == models.RuntimeWasm {
+	// Runtime gate: firecracker, wasm, and isolate cannot bind-mount host
+	// paths (isolates have no filesystem at all — plans/isolate-runtime.md
+	// §3), so a volume would silently never appear. Reject before we do any
+	// storage work.
+	if chosenRuntime == models.RuntimeFirecracker || chosenRuntime == models.RuntimeWasm || chosenRuntime == models.RuntimeIsolate {
 		return nil, fmt.Errorf("%w (got %q)", models.ErrPlatformVolumesUnsupportedRuntime, chosenRuntime)
 	}
 

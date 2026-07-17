@@ -466,6 +466,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		logger.Info("wasm runtime skipped on non-worker node", "node_role", cfg.NodeRole)
 	}
 
+	if cfg.EnableIsolate && cfg.IsWorker() {
+		_ = wireIsolateRuntime(cfg, logger, svc)
+	} else if cfg.EnableIsolate {
+		logger.Info("isolate runtime skipped on non-worker node", "node_role", cfg.NodeRole)
+	}
+
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
 	// control-plane RPC, but no Raft transport and no placement FSM copy.
@@ -1496,6 +1502,9 @@ func supportedRuntimesForConfig(cfg config.Config) []string {
 	}
 	if cfg.EnableWasm && cfg.IsWorker() {
 		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeWasm)
+	}
+	if cfg.EnableIsolate && cfg.IsWorker() {
+		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeIsolate)
 	}
 	return runtimes
 }

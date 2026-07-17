@@ -340,6 +340,129 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			// SB_ENABLE_ISOLATE alone must load: every isolate knob has a
+			// usable default so a single env var opts a host in
+			// (plans/isolate-runtime.md Phase 1).
+			name: "isolate_enable_loads_with_defaults",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_ISOLATE", "true")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if !cfg.EnableIsolate {
+					t.Fatal("expected EnableIsolate=true")
+				}
+				if cfg.IsolateWorkerdPath != "/usr/local/bin/workerd" {
+					t.Fatalf("IsolateWorkerdPath = %q", cfg.IsolateWorkerdPath)
+				}
+				if cfg.IsolateRunDir != "/run/sandboxd/isolate" {
+					t.Fatalf("IsolateRunDir = %q", cfg.IsolateRunDir)
+				}
+				if cfg.IsolateGroupGranularity != IsolateGroupPerTenant {
+					t.Fatalf("IsolateGroupGranularity = %q, want %q", cfg.IsolateGroupGranularity, IsolateGroupPerTenant)
+				}
+				if !cfg.IsolateUseJail {
+					t.Fatal("expected IsolateUseJail=true by default (unjailed workerd is dev-only)")
+				}
+				if cfg.IsolateJailUID != 1000 || cfg.IsolateJailGID != 1000 {
+					t.Fatalf("jail uid/gid = %d/%d, want 1000/1000", cfg.IsolateJailUID, cfg.IsolateJailGID)
+				}
+				if cfg.IsolateJitless {
+					t.Fatal("expected IsolateJitless=false by default")
+				}
+			},
+		},
+		{
+			// The host default runtime cannot be "isolate" — same rule as
+			// firecracker/wasm: select it per-sandbox via the API.
+			name: "rejects_isolate_as_host_default_runtime",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_CONTAINER_RUNTIME", "isolate")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_ENABLE_ISOLATE") {
+					t.Fatalf("expected isolate host-default rejection, got %v", err)
+				}
+			},
+		},
+		{
+			name: "rejects_unknown_isolate_group_granularity",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_ISOLATE", "true")
+				t.Setenv("SB_ISOLATE_GROUP_GRANULARITY", "per-planet")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_ISOLATE_GROUP_GRANULARITY") {
+					t.Fatalf("expected granularity error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "accepts_per_sandbox_isolate_granularity",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_ISOLATE", "true")
+				t.Setenv("SB_ISOLATE_GROUP_GRANULARITY", "per-sandbox")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.IsolateGroupGranularity != IsolateGroupPerSandbox {
+					t.Fatalf("IsolateGroupGranularity = %q", cfg.IsolateGroupGranularity)
+				}
+			},
+		},
+		{
+			name: "isolate_workerd_path_override",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_ISOLATE", "true")
+				t.Setenv("SB_ISOLATE_WORKERD_PATH", "/opt/workerd/bin/workerd")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.IsolateWorkerdPath != "/opt/workerd/bin/workerd" {
+					t.Fatalf("IsolateWorkerdPath = %q", cfg.IsolateWorkerdPath)
+				}
+			},
+		},
+		{
+			// A jailed-but-root workerd defeats the point of the jail; uid/gid
+			// 0 is a misconfiguration, not a privilege drop.
+			name: "rejects_root_isolate_jail_uid",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_ISOLATE", "true")
+				t.Setenv("SB_ISOLATE_JAIL_UID", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "non-root") {
+					t.Fatalf("expected non-root jail uid error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "isolate_jail_disabled_skips_jail_validation",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_ISOLATE", "true")
+				t.Setenv("SB_ISOLATE_USE_JAIL", "false")
+				t.Setenv("SB_ISOLATE_JAIL_CHROOT_BASE", "")
+				if _, err := Load(); err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+			},
+		},
+		{
 			name: "rejects_unknown_firecracker_snapshot_verify_mode",
 			run: func(t *testing.T) {
 				clearEnv(t)

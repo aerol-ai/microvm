@@ -162,6 +162,12 @@ func TestSupportedRuntimesForConfig(t *testing.T) {
 		{name: "wasm_enabled_server_does_not_advertise_wasm", cfg: config.Config{EnableWasm: true, NodeRole: config.NodeRoleServer}, want: []string{models.RuntimeDocker}},
 		{name: "firecracker_enabled_advertises_fc", cfg: config.Config{EnableFirecracker: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
 		{name: "both_enabled", cfg: config.Config{EnableFirecracker: true, EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker, models.RuntimeWasm}},
+		// The isolate flag must advertise like wasm's — same placement-bug
+		// class if omitted: cluster mode would reject every isolate create
+		// with ErrNoPlacementTarget.
+		{name: "isolate_enabled_advertises_isolate", cfg: config.Config{EnableIsolate: true}, want: []string{models.RuntimeDocker, models.RuntimeIsolate}},
+		{name: "isolate_enabled_ingress_does_not_advertise", cfg: config.Config{EnableIsolate: true, NodeRole: config.NodeRoleIngress}, want: []string{models.RuntimeDocker}},
+		{name: "all_optional_runtimes_enabled", cfg: config.Config{EnableFirecracker: true, EnableWasm: true, EnableIsolate: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker, models.RuntimeWasm, models.RuntimeIsolate}},
 		{name: "explicit_host_runtimes_override", cfg: config.Config{HostSupportedRuntimes: []string{models.RuntimeGvisor}, EnableWasm: true}, want: []string{models.RuntimeGvisor, models.RuntimeWasm}},
 		// What install.sh --with-gvisor writes (SB_HOST_RUNTIMES=docker,gvisor):
 		// gVisor has no enable flag, so the install script must advertise it

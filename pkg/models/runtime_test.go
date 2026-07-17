@@ -25,6 +25,10 @@ func TestValidRuntime(t *testing.T) {
 		// flipped SB_ENABLE_FIRECRACKER on (see service.go).
 		{name: "firecracker_accepted_as_identifier", input: "firecracker", want: "firecracker"},
 		{name: "wasm_accepted_as_identifier", input: "wasm", want: "wasm"},
+		// Isolate follows the same accept-ahead-of-implementation pattern:
+		// CreateSandbox rejects with ErrRuntimeNotImplemented until
+		// SB_ENABLE_ISOLATE is set (plans/isolate-runtime.md Phase 1).
+		{name: "isolate_accepted_as_identifier", input: "isolate", want: "isolate"},
 		{name: "runc_legacy_rejected", input: "runc", wantErr: true},
 		{name: "runsc_legacy_rejected", input: "runsc", wantErr: true},
 		{name: "case_sensitive", input: "Docker", wantErr: true},
@@ -69,6 +73,7 @@ func TestResolveOCIRuntime(t *testing.T) {
 		// coercing the request to runc.
 		{name: "firecracker_returns_not_implemented", input: "firecracker", wantErr: ErrRuntimeNotImplemented},
 		{name: "wasm_returns_not_implemented", input: "wasm", wantErr: ErrRuntimeNotImplemented},
+		{name: "isolate_returns_not_implemented", input: "isolate", wantErr: ErrRuntimeNotImplemented},
 		{name: "unknown_value_errors", input: "containerd", want: ""},
 	}
 

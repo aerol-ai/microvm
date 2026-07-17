@@ -1,6 +1,6 @@
 # V8-Isolate Sandboxes (Deno/Workers model) — Design & Implementation Plan
 
-Status: **Proposed — reviewed & amended** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-17
+Status: **In progress — Phase 1 landed** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-17
 
 This plan adds a **fifth runtime** to AerolVM — **V8 isolates** (the
 Deno-Deploy / Cloudflare-Workers model) — as a peer to `docker`, `gvisor`,
@@ -26,6 +26,30 @@ with Deno Sandbox (microVMs).
 
 ## 0. Review history
 
+- **2026-07-17 — Phase 1 implemented.** Landed: `RuntimeIsolate` +
+  `ValidRuntime` + durability set (ephemeral default, passivatable rejected,
+  durable Phase-5-gated); server-authorized `TenantID` on
+  `CreateSandboxRequest` + `models.Sandbox` + nullable-semantics `tenant_id`
+  store column (empty = null tenant, `owner_ref` convention); `SB_ENABLE_ISOLATE`
+  / `SB_ISOLATE_WORKERD_PATH` / `SB_ISOLATE_RUN_DIR` /
+  `SB_ISOLATE_GROUP_GRANULARITY` / jail knobs / `SB_ISOLATE_JITLESS` config;
+  `internal/runtime/isolate` skeleton driver (Runtime-only, methods →
+  `ErrRuntimeNotImplemented`, Ping stats workerd) + jail spec
+  (chroot/cgroup/drop-priv/seccomp allowlist with jitless variant, group-key
+  sanitizer) + regression tests at 97.2% coverage; service dispatch
+  (`isIsolateSandbox` in `runtimeForSandbox`/`runtimeRef`, gated
+  `createIsolateSandbox`, tenant-authorization regression tests incl. the
+  forced-co-residency case); daemon wiring + `SupportedRuntimes` advertisement;
+  platform-volumes reject set; workerd distribution (`install.sh
+  --with-isolate`, pinned v1.20260717.1 + SHA-256, Terraform `with_isolate`
+  passthrough, upgrade runbook `setup/runbooks/isolate-workerd-upgrade.md`);
+  P0 gate specified as a tag-gated ratchet test
+  (`p0_gate_integration_test.go` — FAILS the moment create lands until the
+  gate assertions are implemented); §2.2 spike harness scaffolded
+  (`inject_spike_integration_test.go`, cold-boot baseline measurement; the
+  ≤10ms injection measurement needs the Phase-2 host wrapper). Still open
+  from Phase 1: running the spike on a workerd host and §13 Q1's final
+  tenant-identity source decision (the authorization rule is implemented).
 - **2026-07-17 — `/office-hours` + `/plan-eng-review` (this amendment).**
   Approved design doc:
   `~/.gstack/projects/aerol-ai-microvm/sumansaurabh-plans-isolate-runtime-design-20260717-111513.md`

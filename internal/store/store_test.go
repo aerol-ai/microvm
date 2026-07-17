@@ -2174,6 +2174,7 @@ func TestStoreHelperCases(t *testing.T) {
 			"", "", // wasm_registry_ref, wasm_registry_digest
 			"", // owner_ref
 			0,  // fleet_suspended
+			"", // tenant_id
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {
@@ -2379,6 +2380,65 @@ func TestMaskRequestHostColumnRoundTrip(t *testing.T) {
 	}
 	if got.MaskRequestHost != "" {
 		t.Fatalf("default MaskRequestHost = %q, want empty", got.MaskRequestHost)
+	}
+}
+
+// tenant_id is the isolate-group key (plans/isolate-runtime.md §2.1): restart
+// reconcile and failover rebuild per-tenant workerd groups from this column,
+// so it must survive Create/Get/List/Upsert unchanged and default to the null
+// tenant ("") for rows that never set one (null-tenant back-compat).
+func TestTenantIDColumnRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sb := sampleSandbox("sb-tenant")
+	sb.Runtime = models.RuntimeIsolate
+	sb.TenantID = "acme-corp"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.TenantID != "acme-corp" {
+		t.Fatalf("TenantID = %q, want %q", got.TenantID, "acme-corp")
+	}
+
+	// List paths must carry the column too — the isolate reconcile path uses
+	// ListByRuntime to rebuild group membership after a restart.
+	byRuntime, err := st.ListByRuntime(ctx, models.RuntimeIsolate)
+	if err != nil {
+		t.Fatalf("ListByRuntime: %v", err)
+	}
+	if len(byRuntime) != 1 || byRuntime[0].TenantID != "acme-corp" {
+		t.Fatalf("ListByRuntime tenant = %+v, want one row with tenant acme-corp", byRuntime)
+	}
+
+	// Upsert updates the group key (failover recreate rewrites the row).
+	sb.TenantID = "acme-corp-2"
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	got, err = st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get after upsert: %v", err)
+	}
+	if got.TenantID != "acme-corp-2" {
+		t.Fatalf("TenantID after upsert = %q, want %q", got.TenantID, "acme-corp-2")
+	}
+
+	// Null-tenant back-compat: a row that never set a tenant reads back "".
+	plain := sampleSandbox("sb-no-tenant")
+	if err := st.Create(ctx, plain); err != nil {
+		t.Fatalf("Create plain: %v", err)
+	}
+	got, err = st.Get(ctx, plain.ID)
+	if err != nil {
+		t.Fatalf("Get plain: %v", err)
+	}
+	if got.TenantID != "" {
+		t.Fatalf("default TenantID = %q, want empty (null tenant)", got.TenantID)
 	}
 }
 

@@ -45,6 +45,9 @@ func TestDefaultDurabilityForRuntime(t *testing.T) {
 	if got := DefaultDurabilityForRuntime(RuntimeWasm); got != DurabilityEphemeral {
 		t.Fatalf("wasm default = %q, want %q", got, DurabilityEphemeral)
 	}
+	if got := DefaultDurabilityForRuntime(RuntimeIsolate); got != DurabilityEphemeral {
+		t.Fatalf("isolate default = %q, want %q", got, DurabilityEphemeral)
+	}
 }
 
 func TestNormalizeCreateDurability(t *testing.T) {
@@ -72,5 +75,39 @@ func TestNormalizeCreateDurability(t *testing.T) {
 	_, err = NormalizeCreateDurability(DurabilityDurable, RuntimeWasm)
 	if !errors.Is(err, ErrRuntimeNotImplemented) {
 		t.Fatalf("expected ErrRuntimeNotImplemented, got %v", err)
+	}
+}
+
+// Isolate durability set (plans/isolate-runtime.md §4): default ephemeral,
+// passivatable rejected outright (the bundle is the image — nothing to
+// passivate), durable gated behind Phase 5 as ErrRuntimeNotImplemented.
+func TestNormalizeCreateDurabilityIsolate(t *testing.T) {
+	got, err := NormalizeCreateDurability("", RuntimeIsolate)
+	if err != nil {
+		t.Fatalf("default isolate: %v", err)
+	}
+	if got != DurabilityEphemeral {
+		t.Fatalf("got %q, want %q", got, DurabilityEphemeral)
+	}
+
+	got, err = NormalizeCreateDurability(DurabilityEphemeral, RuntimeIsolate)
+	if err != nil {
+		t.Fatalf("explicit ephemeral: %v", err)
+	}
+	if got != DurabilityEphemeral {
+		t.Fatalf("got %q, want %q", got, DurabilityEphemeral)
+	}
+
+	_, err = NormalizeCreateDurability(DurabilityPassivatable, RuntimeIsolate)
+	if err == nil {
+		t.Fatal("expected error for passivatable on isolate")
+	}
+	if errors.Is(err, ErrRuntimeNotImplemented) {
+		t.Fatalf("passivatable must be rejected outright, not 'not yet': %v", err)
+	}
+
+	_, err = NormalizeCreateDurability(DurabilityDurable, RuntimeIsolate)
+	if !errors.Is(err, ErrRuntimeNotImplemented) {
+		t.Fatalf("expected ErrRuntimeNotImplemented for durable on isolate (Phase 5), got %v", err)
 	}
 }

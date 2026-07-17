@@ -93,6 +93,14 @@ const (
 	// ValidRuntime accepts the identifier ahead of the implementation; create
 	// rejects with ErrRuntimeNotImplemented until SB_ENABLE_WASM lands.
 	RuntimeWasm = "wasm"
+	// RuntimeIsolate selects the V8-isolate (Workers-model) runtime
+	// (plans/isolate-runtime.md). The name is deliberately engine-neutral —
+	// "isolate" describes the model (isolates + fetch handler + capability
+	// grants), not the workerd engine behind it. ValidRuntime accepts the
+	// identifier ahead of the implementation; create rejects with
+	// ErrRuntimeNotImplemented until the operator flips SB_ENABLE_ISOLATE
+	// AND the driver has landed (same gate shape as firecracker/wasm).
+	RuntimeIsolate = "isolate"
 )
 
 // Durability class for sandbox restart/survival semantics (plans/wasm-runtime.md §4.2).
@@ -197,11 +205,11 @@ func (g *GPURequest) Validate() error {
 // the runtime layer, we should already know the value is one we can act on.
 func ValidRuntime(value string) (string, error) {
 	switch value {
-	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm:
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm, RuntimeIsolate:
 		return value, nil
 	default:
-		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s, %s)",
-			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm)
+		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s, %s, %s)",
+			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm, RuntimeIsolate)
 	}
 }
 
@@ -218,10 +226,10 @@ func ValidDurability(value string) (string, error) {
 }
 
 // DefaultDurabilityForRuntime returns the API default when the caller omits
-// durability on create. WASM defaults to ephemeral; container/VM runtimes
-// default to passivatable (they survive restarts natively).
+// durability on create. WASM and isolate default to ephemeral; container/VM
+// runtimes default to passivatable (they survive restarts natively).
 func DefaultDurabilityForRuntime(runtime string) string {
-	if runtime == RuntimeWasm {
+	if runtime == RuntimeWasm || runtime == RuntimeIsolate {
 		return DurabilityEphemeral
 	}
 	return DurabilityPassivatable
@@ -237,8 +245,18 @@ func NormalizeCreateDurability(value, runtime string) (string, error) {
 	if normalized == "" {
 		normalized = DefaultDurabilityForRuntime(runtime)
 	}
+	// Isolates have nothing to passivate: the bundle IS the image, so a
+	// stopped isolate is recreated from it, not resumed from a checkpoint
+	// (plans/isolate-runtime.md §4). Rejecting at create keeps the class an
+	// honest promise rather than a silent alias for ephemeral.
+	if runtime == RuntimeIsolate && normalized == DurabilityPassivatable {
+		return "", fmt.Errorf("durability %q is not supported for runtime %q (the bundle is the image; nothing to passivate)", normalized, runtime)
+	}
 	if normalized == DurabilityDurable {
-		if runtime != RuntimeWasm {
+		// durable is designed for wasm (statekv, shipped behind this gate) and
+		// isolate (statekv reattach, plans/isolate-runtime.md Phase 5); other
+		// runtimes reject it outright rather than "not yet".
+		if runtime != RuntimeWasm && runtime != RuntimeIsolate {
 			return "", fmt.Errorf("durability %q is not supported for runtime %q", normalized, runtime)
 		}
 		return "", fmt.Errorf("durability %q: %w", normalized, ErrRuntimeNotImplemented)
@@ -264,10 +282,10 @@ func ResolveOCIRuntime(value string) (string, error) {
 		return "runsc", nil
 	case RuntimeKata:
 		return "", ErrRuntimeNotImplemented
-	case RuntimeFirecracker, RuntimeWasm:
-		// Firecracker and WASM are not OCI runtimes Docker can shell out to.
-		// Reaching this branch means the service layer failed to dispatch the
-		// request away from the Docker driver.
+	case RuntimeFirecracker, RuntimeWasm, RuntimeIsolate:
+		// Firecracker, WASM, and isolate are not OCI runtimes Docker can shell
+		// out to. Reaching this branch means the service layer failed to
+		// dispatch the request away from the Docker driver.
 		return "", ErrRuntimeNotImplemented
 	default:
 		return "", fmt.Errorf("unsupported runtime %q", value)
@@ -631,7 +649,20 @@ type CreateSandboxRequest struct {
 	Durability string `json:"durability,omitempty"`
 	// ModuleRef selects the WASM module for runtime=wasm. When set, Image may
 	// be omitted; when empty, Image is treated as the module reference.
+	// runtime=isolate reuses this field for the JS/TS bundle reference
+	// (plans/isolate-runtime.md §9) — no separate bundle_ref field until the
+	// demand checkpoint validates the tier.
 	ModuleRef string `json:"module_ref,omitempty"`
+	// TenantID is the isolate-group key for runtime=isolate: sandboxes with
+	// the same tenant share one workerd process; the OS-process boundary
+	// between tenants is the REQUIRED cross-tenant isolation boundary
+	// (plans/isolate-runtime.md §2.1). SECURITY: this value is
+	// server-authorized, never a free-form client value — a caller who could
+	// choose an arbitrary group key could force co-residency inside another
+	// tenant's process. The service layer rejects values the authenticated
+	// identity is not authorized to use; when empty, the group key falls back
+	// to the authenticated API identity. Ignored by other runtimes today.
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -813,6 +844,13 @@ type Sandbox struct {
 	WasmRegistryRef string `json:"-"`
 	// WasmRegistryDigest is the manifest digest from the last AOCR push.
 	WasmRegistryDigest string `json:"-"`
+	// TenantID is the isolate-group key this sandbox was created under
+	// (runtime=isolate only; empty for other runtimes and when the group key
+	// fell back to the authenticated identity). Persisted so restart
+	// reconcile and cluster failover rebuild the same per-tenant group
+	// process the security posture is stated in terms of
+	// (plans/isolate-runtime.md §2.1).
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 // ModuleRefForCreate returns the WASM module reference from a create request.
