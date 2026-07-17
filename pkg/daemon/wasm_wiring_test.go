@@ -261,3 +261,32 @@ func TestEffectiveWasmCompileCacheDir_DefaultAndExplicit(t *testing.T) {
 		t.Fatalf("explicit empty = %q, want disabled", got)
 	}
 }
+
+// TestWarmPoolEffectivelyEnabled guards the resident/warm-pool redundancy fix:
+// the warm pool is wired only when enabled AND the resident host is off (with
+// resident on, every non-listen create goes resident and the pool would just
+// double the memory). See plans/wasm-resident-module-host.md Validation.
+func TestWarmPoolEffectivelyEnabled(t *testing.T) {
+	cases := []struct {
+		name     string
+		pool     bool
+		resident bool
+		want     bool
+	}{
+		{"pool-off", false, false, false},
+		{"pool-on-resident-off", true, false, true},
+		{"pool-on-resident-on", true, true, false}, // redundant → skip
+		{"pool-off-resident-on", false, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := warmPoolEffectivelyEnabled(config.Config{
+				WasmPoolEnabled:         c.pool,
+				WasmResidentHostEnabled: c.resident,
+			})
+			if got != c.want {
+				t.Fatalf("warmPoolEffectivelyEnabled(pool=%v,resident=%v)=%v, want %v", c.pool, c.resident, got, c.want)
+			}
+		})
+	}
+}

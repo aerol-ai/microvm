@@ -91,7 +91,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	}
 
 	var pool *wasmpool.Pool
-	if cfg.WasmPoolEnabled {
+	if warmPoolEffectivelyEnabled(cfg) {
 		pool = wasmpool.New(cfg.WasmRunDir, logger)
 		pool.SetDefaultDepth(cfg.WasmPoolDepthDefault)
 		pool.SetDefaultMemoryMB(cfg.WasmDefaultMemoryMB)
@@ -118,6 +118,14 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		logger.Info("wasm warm pool enabled",
 			"depth_default", cfg.WasmPoolDepthDefault,
 			"refill_interval", cfg.WasmPoolRefillInterval)
+	} else if cfg.WasmPoolEnabled {
+		// Resident host on: it serves every non-listen create, so the warm pool
+		// would only pre-spawn redundant per-sandbox workers for the same modules
+		// (double the resident memory — starved a t3.medium in the 2026-07-17
+		// bench). Skip it. Public-expose creates take the cold path either way
+		// (migrate-on-expose already pays that compile). See
+		// plans/wasm-resident-module-host.md Validation.
+		logger.Info("wasm warm pool skipped: resident host enabled (would only pre-spawn redundant workers for resident-served modules)")
 	}
 
 	// Boot-time resident-host pre-warm: bring up + compile the standard-module
@@ -160,6 +168,16 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		wasmWiringTestHook(resolver)
 	}
 	return pool
+}
+
+// warmPoolEffectivelyEnabled reports whether the per-sandbox WASM warm pool
+// should actually be wired. It is enabled only when the operator asked for it
+// AND the resident host is off: with the resident host on, every non-listen
+// create instantiates into a shared resident host and never consults the warm
+// pool, so pre-spawning warm workers just doubles the resident memory footprint
+// (2026-07-17 bench finding). The two are redundant; resident wins.
+func warmPoolEffectivelyEnabled(cfg config.Config) bool {
+	return cfg.WasmPoolEnabled && !cfg.WasmResidentHostEnabled
 }
 
 // effectiveWasmCompileCacheDir returns the wazero compile cache path. When
