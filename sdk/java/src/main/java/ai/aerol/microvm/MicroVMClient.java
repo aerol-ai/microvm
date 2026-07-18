@@ -880,6 +880,9 @@ public class MicroVMClient {
         copy.lifecycle = source.lifecycle;
         copy.failover = source.failover;
         copy.runtime = source.runtime;
+        copy.durability = source.durability;
+        copy.moduleRef = source.moduleRef;
+        copy.tenantId = source.tenantId;
         copy.gpus = source.gpus;
         copy.customDomains = source.customDomains;
         return copy;

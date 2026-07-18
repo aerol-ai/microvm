@@ -214,6 +214,7 @@ variable "nodes" {
       arch             (string,  optional "amd64" or "arm64"; derived from instance_type when unset)
       with_firecracker (bool,    default var.default_with_firecracker)
       with_gvisor      (bool,    default var.default_with_gvisor)
+      with_isolate     (bool,    default var.default_with_isolate)
       with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
       with_amd_gpu     (bool,    default var.default_with_amd_gpu)
       idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
@@ -232,6 +233,7 @@ variable "nodes" {
     arch              = optional(string)
     with_firecracker  = optional(bool)
     with_gvisor       = optional(bool)
+    with_isolate      = optional(bool)
     with_nvidia_gpu   = optional(bool)
     with_amd_gpu      = optional(bool)
     idle_timeout_min  = optional(number)
@@ -331,6 +333,12 @@ variable "default_with_firecracker" {
 
 variable "default_with_gvisor" {
   description = "Install gVisor runsc and register it as an alternative OCI runtime. Per-node override via nodes[*].with_gvisor."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_isolate" {
+  description = "Install Cloudflare workerd (version-pinned, SHA-256 verified) and write SB_ENABLE_ISOLATE=true so sandboxes can opt into the V8-isolate runtime (plans/isolate-runtime.md). Per-node override via nodes[*].with_isolate."
   type        = bool
   default     = false
 }

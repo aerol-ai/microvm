@@ -75,6 +75,7 @@ resource "aws_instance" "seed" {
     acme_email                               = local.acme_email
     with_firecracker                         = local.seed_node.with_firecracker
     with_gvisor                              = local.seed_node.with_gvisor
+    with_isolate                             = local.seed_node.with_isolate
     with_nvidia_gpu                          = local.seed_node.with_nvidia_gpu
     with_amd_gpu                             = local.seed_node.with_amd_gpu
     idle_timeout_min                         = local.seed_node.idle_timeout_min
@@ -258,6 +259,7 @@ resource "aws_instance" "joiner" {
     acme_email                               = local.acme_email
     with_firecracker                         = each.value.with_firecracker
     with_gvisor                              = each.value.with_gvisor
+    with_isolate                             = each.value.with_isolate
     with_nvidia_gpu                          = each.value.with_nvidia_gpu
     with_amd_gpu                             = each.value.with_amd_gpu
     idle_timeout_min                         = each.value.idle_timeout_min

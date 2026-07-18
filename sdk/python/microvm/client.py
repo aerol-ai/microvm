@@ -1107,6 +1107,10 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             ],
             "lifecycle": _to_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else None,
             "failover": _to_api_failover(failover) if isinstance(failover, dict) else None,
+            "runtime": _first_of(options, "runtime"),
+            "durability": _first_of(options, "durability"),
+            "module_ref": _first_of(options, "moduleRef", "module_ref"),
+            "tenant_id": _first_of(options, "tenantId", "tenant_id"),
             "custom_domains": _first_of(options, "customDomains", "custom_domains"),
         }
     )
@@ -1546,6 +1550,21 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     custom_domains = _first_of(sandbox, "custom_domains", "customDomains")
     if isinstance(custom_domains, list) and len(custom_domains) > 0:
         result["customDomains"] = [_from_api_custom_domain(item) for item in custom_domains if isinstance(item, dict)]
+    runtime = _first_of(sandbox, "runtime")
+    if runtime not in (None,):
+        result["runtime"] = str(runtime)  # type: ignore[typeddict-item]
+    durability = _first_of(sandbox, "durability")
+    if durability not in (None, ""):
+        result["durability"] = str(durability)  # type: ignore[typeddict-item]
+    module_ref = _first_of(sandbox, "module_ref", "moduleRef")
+    if module_ref not in (None, ""):
+        result["module_ref"] = str(module_ref)
+    module_digest = _first_of(sandbox, "module_digest", "moduleDigest")
+    if module_digest not in (None, ""):
+        result["module_digest"] = str(module_digest)
+    tenant_id = _first_of(sandbox, "tenant_id", "tenantId")
+    if tenant_id not in (None, ""):
+        result["tenant_id"] = str(tenant_id)
     return result
 
 

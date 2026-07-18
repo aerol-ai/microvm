@@ -113,6 +113,7 @@ const (
 	RuntimeKata        = models.RuntimeKata
 	RuntimeFirecracker = models.RuntimeFirecracker
 	RuntimeWasm        = models.RuntimeWasm
+	RuntimeIsolate     = models.RuntimeIsolate
 )
 
 const (

@@ -236,15 +236,22 @@ export interface CreateOptions {
    *
    * GPU access is not supported with `"gvisor"`.
    */
-  runtime?: "docker" | "gvisor" | "kata" | "firecracker" | "wasm";
+  runtime?: "docker" | "gvisor" | "kata" | "firecracker" | "wasm" | "isolate";
   /**
    * Survival class across daemon restarts. Omit for the runtime default:
-   * `passivatable` for docker/gvisor/firecracker, `ephemeral` for wasm.
+   * `passivatable` for docker/gvisor/firecracker, `ephemeral` for wasm/isolate.
    * `durable` is wasm-only and not yet implemented.
    */
   durability?: Durability;
-  /** WASM module reference. When runtime is wasm, may be used instead of image. */
+  /** WASM module / isolate bundle reference. When runtime is wasm or isolate, may be used instead of image. */
   moduleRef?: string;
+  /**
+   * Isolate-group key for `runtime: "isolate"`. Sandboxes with the same
+   * tenant share one workerd process. Server-authorized; when omitted the
+   * group key falls back to the authenticated identity. Ignored by other
+   * runtimes.
+   */
+  tenantId?: string;
   /**
    * Attach GPU resources to the sandbox. Omit for CPU-only workloads.
    * Not compatible with runtime="gvisor".
@@ -471,13 +478,15 @@ export interface Sandbox {
    * Container runtime this sandbox is running under. Empty string indicates
    * a pre-migration row that resolves to the host default at start time.
    */
-  runtime: "" | "docker" | "gvisor" | "kata" | "firecracker" | "wasm";
+  runtime: "" | "docker" | "gvisor" | "kata" | "firecracker" | "wasm" | "isolate";
   /** Survival class this sandbox was created with. */
   durability?: Durability;
-  /** Resolved WASM module reference when runtime is wasm. */
+  /** Resolved WASM module / isolate bundle reference when runtime is wasm or isolate. */
   moduleRef?: string;
   /** sha256 hex digest of the resolved WASM module bytes. */
   moduleDigest?: string;
+  /** Isolate-group key this sandbox was created under (`runtime: "isolate"` only). */
+  tenantId?: string;
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
 }

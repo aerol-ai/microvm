@@ -182,11 +182,16 @@ class CreateOptions(TypedDict, total=False):
     # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
     # when running untrusted workloads. "kata" is reserved and rejected by the
     # API today. Not compatible with gpus.
-    runtime: Literal["docker", "gvisor", "kata", "firecracker", "wasm"]
+    runtime: Literal["docker", "gvisor", "kata", "firecracker", "wasm", "isolate"]
     # Survival class across daemon restarts. Omit for the runtime default.
     durability: Literal["ephemeral", "passivatable", "durable"]
-    # WASM module reference. When runtime is wasm, may be used instead of image.
+    # WASM module / isolate bundle reference. When runtime is wasm or isolate,
+    # may be used instead of image.
     module_ref: str
+    # Isolate-group key for runtime=isolate. Server-authorized; when omitted
+    # the group key falls back to the authenticated identity. Ignored by other
+    # runtimes.
+    tenant_id: str
     # Attach GPU resources to the sandbox. Omit for CPU-only workloads.
     # Not compatible with runtime="gvisor".
     gpus: GPUOptions
@@ -429,10 +434,12 @@ class SandboxData(TypedDict, total=False):
     failover: Failover
     # Container runtime this sandbox is running under. Empty string indicates
     # a pre-migration row that resolves to the host default at start time.
-    runtime: Literal["", "docker", "gvisor", "kata", "firecracker", "wasm"]
+    runtime: Literal["", "docker", "gvisor", "kata", "firecracker", "wasm", "isolate"]
     durability: Literal["ephemeral", "passivatable", "durable"]
     module_ref: str
     module_digest: str
+    # Isolate-group key this sandbox was created under (runtime=isolate only).
+    tenant_id: str
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
 

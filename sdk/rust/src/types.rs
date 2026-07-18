@@ -245,9 +245,15 @@ pub struct CreateOptions {
     /// Survival class across daemon restarts. Omit for the runtime default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durability: Option<String>,
-    /// WASM module reference. When runtime is wasm, may be used instead of image.
+    /// WASM module / isolate bundle reference. When runtime is wasm or
+    /// isolate, may be used instead of image.
     #[serde(rename = "module_ref", skip_serializing_if = "Option::is_none")]
     pub module_ref: Option<String>,
+    /// Isolate-group key for `runtime = "isolate"`. Server-authorized; when
+    /// omitted the group key falls back to the authenticated identity.
+    /// Ignored by other runtimes.
+    #[serde(rename = "tenant_id", skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -559,6 +565,9 @@ pub struct Sandbox {
     pub module_ref: Option<String>,
     #[serde(rename = "module_digest", skip_serializing_if = "Option::is_none")]
     pub module_digest: Option<String>,
+    /// Isolate-group key this sandbox was created under (`runtime = "isolate"` only).
+    #[serde(rename = "tenant_id", skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

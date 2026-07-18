@@ -21,6 +21,15 @@ CADDY_BINARY_URL=""
 CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
 RUNSC_PATH=""
+WITH_ISOLATE="false"
+WORKERD_PATH=""
+# Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
+# Phase 1). Upstream ships gzipped standalone binaries with no checksum
+# sidecar, so the per-arch SHA-256 is pinned here and MUST be bumped together
+# with the version — see setup/runbooks for the upgrade recipe.
+WORKERD_VERSION="v1.20260717.1"
+WORKERD_SHA256_LINUX_64="7ff61e052347ab3122c43b1e2419ccd68bd91e3c766f9770320591798e0e89a0"
+WORKERD_SHA256_LINUX_ARM64="3ef71b4a692d2705fa4db0636724409be833402f1c9b99094294a5901989680d"
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
@@ -111,6 +120,17 @@ Options:
                                Skips the download step and registers this
                                binary instead. Only consulted with
                                --with-gvisor.
+  --with-isolate               Install Cloudflare's workerd (version-pinned,
+                               SHA-256 verified against hashes embedded in
+                               this script) to /usr/local/bin/workerd and
+                               write SB_ENABLE_ISOLATE=true so sandboxes can
+                               opt into the V8-isolate runtime via
+                               runtime:"isolate" on create
+                               (plans/isolate-runtime.md).
+  --workerd-path <path>        Absolute path to a pre-installed workerd
+                               binary. Skips the download and points
+                               SB_ISOLATE_WORKERD_PATH at it. Only consulted
+                               with --with-isolate.
   --with-nvidia-gpu            Install nvidia-container-toolkit and register
                                the nvidia OCI runtime in daemon.json. Requires
                                NVIDIA drivers already installed on the host
@@ -369,6 +389,14 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--runsc-path)
 			RUNSC_PATH="$2"
+			shift 2
+			;;
+		--with-isolate)
+			WITH_ISOLATE="true"
+			shift
+			;;
+		--workerd-path)
+			WORKERD_PATH="$2"
 			shift 2
 			;;
 		--with-nvidia-gpu)
@@ -800,6 +828,16 @@ EOF
 	# binary landed on also tells the cluster it can place gVisor sandboxes.
 	if [[ "$WITH_GVISOR" == "true" ]]; then
 		echo "SB_HOST_RUNTIMES=docker,gvisor" >> /etc/sandboxd/sandboxd.env
+	fi
+	# Isolate runtime (plans/isolate-runtime.md). SB_ENABLE_ISOLATE is enough
+	# for advertisement — the daemon appends "isolate" to SupportedRuntimes
+	# from the flag itself. SB_ISOLATE_WORKERD_PATH only needs writing when
+	# the binary is somewhere other than the daemon's default.
+	if [[ "$WITH_ISOLATE" == "true" ]]; then
+		echo "SB_ENABLE_ISOLATE=true" >> /etc/sandboxd/sandboxd.env
+		if [[ -n "${WORKERD_BIN_RESOLVED:-}" && "$WORKERD_BIN_RESOLVED" != "/usr/local/bin/workerd" ]]; then
+			echo "SB_ISOLATE_WORKERD_PATH=$WORKERD_BIN_RESOLVED" >> /etc/sandboxd/sandboxd.env
+		fi
 	fi
 	# Containerd engine is opt-in and dark by default (plans/containerd-engine.md).
 	# Flipping SB_CONTAINER_ENGINE here does not remove dockerd; coexistence is
@@ -1264,6 +1302,62 @@ install_runsc_shim() {
 	echo "Installed containerd-shim-runsc-v1 to /usr/local/bin/containerd-shim-runsc-v1"
 }
 
+install_workerd_binary() {
+	# Download the version-pinned workerd release from GitHub and install it
+	# to /usr/local/bin (plans/isolate-runtime.md Phase 1 — same recipe as the
+	# runsc shim). Assets are gzipped standalone binaries
+	# (workerd-linux-{64,arm64}.gz); upstream publishes no checksum sidecar,
+	# so verification runs against the SHA-256 pinned next to WORKERD_VERSION
+	# at the top of this script. Bump version + hashes together.
+	local arch sha
+	case "$(uname -m)" in
+		x86_64|amd64)   arch="linux-64";    sha="$WORKERD_SHA256_LINUX_64" ;;
+		aarch64|arm64)  arch="linux-arm64"; sha="$WORKERD_SHA256_LINUX_ARM64" ;;
+		*)
+			echo "--with-isolate: unsupported architecture $(uname -m) for workerd" >&2
+			exit 1
+			;;
+	esac
+
+	local url="https://github.com/cloudflare/workerd/releases/download/${WORKERD_VERSION}/workerd-${arch}.gz"
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
+	trap "rm -rf '$tmp_dir'" RETURN
+
+	echo "Downloading workerd ${WORKERD_VERSION} for ${arch} from ${url}"
+	if ! curl_download "$url" -o "${tmp_dir}/workerd.gz"; then
+		echo "--with-isolate: failed to download workerd from ${url}" >&2
+		exit 1
+	fi
+	if ! echo "${sha}  ${tmp_dir}/workerd.gz" | sha256sum -c -; then
+		echo "--with-isolate: workerd checksum verification failed (pinned ${sha} for ${WORKERD_VERSION}/${arch})" >&2
+		exit 1
+	fi
+	gunzip -f "${tmp_dir}/workerd.gz"
+	install -m 0755 "${tmp_dir}/workerd" /usr/local/bin/workerd
+	echo "Installed workerd ${WORKERD_VERSION} to /usr/local/bin/workerd"
+}
+
+register_isolate_runtime() {
+	# Resolve the workerd binary for SB_ISOLATE_WORKERD_PATH: an explicit
+	# --workerd-path wins, then a binary already on PATH, then the pinned
+	# download. Unlike gVisor there is no daemon.json registration — the
+	# isolate driver execs workerd directly (host-mediated, no OCI runtime).
+	if [[ -n "$WORKERD_PATH" ]]; then
+		WORKERD_BIN_RESOLVED="$WORKERD_PATH"
+	elif command -v workerd >/dev/null 2>&1; then
+		WORKERD_BIN_RESOLVED="$(command -v workerd)"
+	else
+		install_workerd_binary
+		WORKERD_BIN_RESOLVED="/usr/local/bin/workerd"
+	fi
+	if [[ ! -x "$WORKERD_BIN_RESOLVED" ]]; then
+		echo "--with-isolate: workerd binary at $WORKERD_BIN_RESOLVED is not executable" >&2
+		exit 1
+	fi
+}
+
 install_cni_plugins() {
 	# CNI bridge + host-local are required for containerd native netns
 	# (plans/containerd-engine.md §4 / Phase 5). Install under /opt/cni/bin.
@@ -1536,6 +1630,9 @@ fi
 install_packages
 if [[ "$WITH_GVISOR" == "true" ]]; then
 	register_gvisor_runtime
+fi
+if [[ "$WITH_ISOLATE" == "true" ]]; then
+	register_isolate_runtime
 fi
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
 	install_cni_plugins

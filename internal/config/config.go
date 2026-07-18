@@ -52,6 +52,14 @@ const (
 	NodeRoleMixed   = "mixed"
 )
 
+// Isolate-group granularity values (plans/isolate-runtime.md §2.1): the unit
+// of sandboxes that shares one workerd OS process. per-tenant is the default
+// security posture; per-sandbox is the hostile-code tier.
+const (
+	IsolateGroupPerTenant  = "per-tenant"
+	IsolateGroupPerSandbox = "per-sandbox"
+)
+
 func validNodeRoles() []string {
 	return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed}
 }
@@ -607,6 +615,65 @@ type Config struct {
 	// until back under the cap, independent of TTL. 0 = unlimited.
 	// SB_WASM_CACHE_MAX_BYTES.
 	WasmCacheMaxBytes int64
+	// EnableIsolate opts this host in to the V8-isolate (Workers-model)
+	// runtime (plans/isolate-runtime.md). False (the default) keeps isolate
+	// creates at ErrRuntimeNotImplemented unless the operator flips
+	// SB_ENABLE_ISOLATE.
+	EnableIsolate bool
+	// IsolateWorkerdPath is the absolute path to the workerd binary that
+	// hosts isolate groups. Required only when EnableIsolate is true;
+	// distributed version-pinned + checksummed by scripts/install.sh (same
+	// recipe as the runsc shim). Not stat()-ed at config load — the driver's
+	// Ping() does that and /health surfaces the result, mirroring the
+	// Firecracker binary handling. SB_ISOLATE_WORKERD_PATH.
+	IsolateWorkerdPath string
+	// IsolateRunDir holds per-group runtime state (workerd sockets, capnp
+	// configs, per-sandbox egress UDS endpoints). Default
+	// /run/sandboxd/isolate. SB_ISOLATE_RUN_DIR.
+	IsolateRunDir string
+	// IsolateGroupGranularity sets the isolate-group key granularity — the
+	// unit that shares one workerd OS process (plans/isolate-runtime.md
+	// §2.1). "per-tenant" (default) groups a tenant's sandboxes into one
+	// process; "per-sandbox" gives every sandbox its own process (the
+	// hostile-code tier: strongest boundary, lowest density). The OS-process
+	// boundary between groups is the REQUIRED cross-tenant boundary, not
+	// defense-in-depth garnish. SB_ISOLATE_GROUP_GRANULARITY.
+	IsolateGroupGranularity string
+	// IsolateUseJail wraps each workerd group process in the isolate jail
+	// (chroot + cgroups + drop-priv + seccomp; internal/runtime/isolate/jail.go).
+	// Default true — running workerd unjailed is a development-only posture,
+	// mirroring SB_FIRECRACKER_USE_JAILER. SB_ISOLATE_USE_JAIL.
+	IsolateUseJail bool
+	// IsolateJailChrootBase is the parent directory for per-group chroots.
+	// Default /srv/isolate-jail. SB_ISOLATE_JAIL_CHROOT_BASE.
+	IsolateJailChrootBase string
+	// IsolateJailUID / IsolateJailGID are the unprivileged uid/gid workerd
+	// drops to inside the jail. SB_ISOLATE_JAIL_UID / SB_ISOLATE_JAIL_GID.
+	IsolateJailUID int
+	IsolateJailGID int
+	// IsolateJitless launches workerd's V8 with --jitless: no writable+
+	// executable pages, so the seccomp allowlist can drop the W^X/JIT
+	// syscall surface at a large throughput cost. The honest alternative
+	// for the per-sandbox paranoid tier if the JIT allowlist proves too
+	// broad (plans/isolate-runtime.md §2.1). SB_ISOLATE_JITLESS.
+	IsolateJitless bool
+	// IsolateGroupIdleTTL is how long an isolate group may sit without
+	// Create/Invoke before the idle reaper tears the workerd process down
+	// (plans/isolate-runtime.md Phase 2 leftover / I22). Zero disables.
+	// Default 5m. SB_ISOLATE_GROUP_IDLE_TTL.
+	IsolateGroupIdleTTL time.Duration
+	// IsolatePoolEnabled gates the blank-workerd warm pool (Phase 3).
+	// Default true when EnableIsolate is on. SB_ISOLATE_POOL_ENABLED.
+	IsolatePoolEnabled bool
+	// IsolatePoolDepthDefault is the target number of blank warm hosts.
+	// SB_ISOLATE_POOL_DEPTH_DEFAULT.
+	IsolatePoolDepthDefault int
+	// IsolatePoolRefillInterval is how often the refill loop tops up the pool.
+	// SB_ISOLATE_POOL_REFILL_INTERVAL.
+	IsolatePoolRefillInterval time.Duration
+	// IsolateBundleGCInterval is how often unreferenced content-addressed
+	// bundles are swept. Zero disables. Default 15m. SB_ISOLATE_BUNDLE_GC_INTERVAL.
+	IsolateBundleGCInterval time.Duration
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1550,6 +1617,20 @@ func Load() (Config, error) {
 		WasmResidentHostEnabled:      getEnvBool("SB_WASM_RESIDENT_HOST_ENABLED", true),
 		WasmResidentHostMaxInstances: getEnvInt("SB_WASM_RESIDENT_HOST_MAX_INSTANCES", 32),
 		WasmResidentHostIdleTTL:      getEnvDuration("SB_WASM_RESIDENT_HOST_IDLE_TTL", 5*time.Minute),
+		EnableIsolate:                getEnvBool("SB_ENABLE_ISOLATE", false),
+		IsolateWorkerdPath:           getEnv("SB_ISOLATE_WORKERD_PATH", "/usr/local/bin/workerd"),
+		IsolateRunDir:                getEnv("SB_ISOLATE_RUN_DIR", "/run/sandboxd/isolate"),
+		IsolateGroupGranularity:      strings.ToLower(strings.TrimSpace(getEnv("SB_ISOLATE_GROUP_GRANULARITY", IsolateGroupPerTenant))),
+		IsolateUseJail:               getEnvBool("SB_ISOLATE_USE_JAIL", true),
+		IsolateJailChrootBase:        getEnv("SB_ISOLATE_JAIL_CHROOT_BASE", "/srv/isolate-jail"),
+		IsolateJailUID:               getEnvInt("SB_ISOLATE_JAIL_UID", 1000),
+		IsolateJailGID:               getEnvInt("SB_ISOLATE_JAIL_GID", 1000),
+		IsolateJitless:               getEnvBool("SB_ISOLATE_JITLESS", false),
+		IsolateGroupIdleTTL:          getEnvDuration("SB_ISOLATE_GROUP_IDLE_TTL", 5*time.Minute),
+		IsolatePoolEnabled:           getEnvBool("SB_ISOLATE_POOL_ENABLED", true),
+		IsolatePoolDepthDefault:      getEnvInt("SB_ISOLATE_POOL_DEPTH_DEFAULT", 2),
+		IsolatePoolRefillInterval:    getEnvDuration("SB_ISOLATE_POOL_REFILL_INTERVAL", 5*time.Second),
+		IsolateBundleGCInterval:      getEnvDuration("SB_ISOLATE_BUNDLE_GC_INTERVAL", 15*time.Minute),
 		FirecrackerBinary:            getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:                 getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:       getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
@@ -1722,6 +1803,10 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select WASM per-sandbox via the API once SB_ENABLE_WASM=true",
 			cfg.Runtime, models.RuntimeDocker)
 	}
+	if cfg.Runtime == models.RuntimeIsolate {
+		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select the isolate runtime per-sandbox via the API once SB_ENABLE_ISOLATE=true",
+			cfg.Runtime, models.RuntimeDocker)
+	}
 
 	resolvedEngine, err := models.ResolveContainerEngine(cfg.ContainerEngine)
 	if err != nil {
@@ -1744,7 +1829,7 @@ func Load() (Config, error) {
 	// fail at boot rather than on the first create — same model as
 	// EnableSSHGateway. The paths are not stat()-ed here on purpose: the
 	// runtime driver's Ping() does that and the daemon surfaces the result
-	// via /healthz, which is the right place for operators to look.
+	// via /health, which is the right place for operators to look.
 	if cfg.EnableFirecracker {
 		if cfg.FirecrackerBinary == "" {
 			return Config{}, errors.New("SB_FIRECRACKER_BINARY is required when SB_ENABLE_FIRECRACKER=true")
@@ -1819,6 +1904,41 @@ func Load() (Config, error) {
 		}
 		if cfg.WasmModuleDigestMode != "once" && cfg.WasmModuleDigestMode != "always" {
 			return Config{}, errors.New("SB_WASM_MODULE_DIGEST_MODE must be either once or always")
+		}
+	}
+	// Isolate host-side wiring is opt-in, same model as EnableFirecracker /
+	// EnableWasm: the flag gates driver registration in pkg/daemon; when off
+	// the service rejects isolate creates with ErrRuntimeNotImplemented. The
+	// workerd path is not stat()-ed here on purpose — the driver's Ping()
+	// does that and /health surfaces the result.
+	if cfg.EnableIsolate {
+		if cfg.IsolateWorkerdPath == "" {
+			return Config{}, errors.New("SB_ISOLATE_WORKERD_PATH is required when SB_ENABLE_ISOLATE=true")
+		}
+		if cfg.IsolateRunDir == "" {
+			return Config{}, errors.New("SB_ISOLATE_RUN_DIR is required when SB_ENABLE_ISOLATE=true")
+		}
+		switch cfg.IsolateGroupGranularity {
+		case IsolateGroupPerTenant, IsolateGroupPerSandbox:
+		default:
+			return Config{}, fmt.Errorf("SB_ISOLATE_GROUP_GRANULARITY=%q: want %s or %s",
+				cfg.IsolateGroupGranularity, IsolateGroupPerTenant, IsolateGroupPerSandbox)
+		}
+		if cfg.IsolateUseJail {
+			if cfg.IsolateJailChrootBase == "" {
+				return Config{}, errors.New("SB_ISOLATE_JAIL_CHROOT_BASE is required when SB_ISOLATE_USE_JAIL=true")
+			}
+			if cfg.IsolateJailUID < 0 || cfg.IsolateJailGID < 0 {
+				return Config{}, fmt.Errorf("SB_ISOLATE_JAIL_UID/SB_ISOLATE_JAIL_GID must be >= 0 (got %d/%d)", cfg.IsolateJailUID, cfg.IsolateJailGID)
+			}
+			// Dropping privileges to uid/gid 0 is not dropping privileges: a
+			// jailed-but-root workerd defeats the point of the jail.
+			if cfg.IsolateJailUID == 0 || cfg.IsolateJailGID == 0 {
+				return Config{}, errors.New("SB_ISOLATE_JAIL_UID/SB_ISOLATE_JAIL_GID must be non-root (> 0) when SB_ISOLATE_USE_JAIL=true")
+			}
+		}
+		if cfg.IsolatePoolEnabled && cfg.IsolatePoolDepthDefault <= 0 {
+			return Config{}, errors.New("SB_ISOLATE_POOL_DEPTH_DEFAULT must be > 0 when SB_ISOLATE_POOL_ENABLED=true")
 		}
 	}
 

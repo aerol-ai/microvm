@@ -33,6 +33,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
+	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -96,6 +97,20 @@ type Service struct {
 	// unless pkg/daemon has called SetWasmRuntime when cfg.EnableWasm is
 	// true.
 	wasm runtime.Runtime
+	// isolate is the fifth registered runtime — V8 isolates, Workers model
+	// (plans/isolate-runtime.md). Nil unless pkg/daemon has called
+	// SetIsolateRuntime when cfg.EnableIsolate is true. Host-mediated like
+	// wasm: satisfies Runtime only, never ContainerRuntime.
+	isolate runtime.Runtime
+	// isolateBundles is the content-addressed JS/TS bundle store behind
+	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
+	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
+	isolateBundles *jsbundle.Store
+	// isolateStaging refcounts content digests staged by an in-flight isolate
+	// create but not yet pinned by a persisted store row, so the bundle GC does
+	// not reap them mid-create (pinStagingDigest / stagingDigests).
+	isolateStagingMu sync.Mutex
+	isolateStaging   map[string]int
 	// wasmModuleResolver resolves module_ref for POST /v1/wasm-modules.
 	wasmModuleResolver WasmModuleResolver
 	// wasmWarmPool receives registration-time NoteModule calls so the warm
@@ -502,6 +517,12 @@ func (s *Service) SetWasmRuntime(r runtime.Runtime) {
 	s.wasm = r
 }
 
+// SetIsolateRuntime registers the V8-isolate driver. Called from pkg/daemon
+// when cfg.EnableIsolate is true.
+func (s *Service) SetIsolateRuntime(r runtime.Runtime) {
+	s.isolate = r
+}
+
 // SetContainerdRuntime registers the containerd engine driver. Called from
 // pkg/daemon when SB_CONTAINER_ENGINE=containerd.
 func (s *Service) SetContainerdRuntime(r runtime.Runtime) {
@@ -567,11 +588,20 @@ func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, e
 		}
 		return s.wasm, nil
 	}
+	if s.isIsolateSandbox(sandbox) {
+		if s.isolate == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered: %w",
+				models.RuntimeIsolate, models.ErrRuntimeNotImplemented)
+		}
+		return s.isolate, nil
+	}
 	return s.ociEngineForSandbox(sandbox)
 }
 
 func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
-	if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) {
+	// Host-mediated runtimes have no container: the sandbox ID is the
+	// end-to-end runtime reference.
+	if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) || s.isIsolateSandbox(sandbox) {
 		return sandbox.ID
 	}
 	return sandboxContainerRef(sandbox)
@@ -1148,6 +1178,22 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 		req.Runtime = chosenRuntime
 		return s.createWasmSandbox(ctx, req, idOverride)
+	}
+	// "isolate" is the fifth runtime (V8 isolates, Workers model), dispatched
+	// to internal/runtime/isolate per plans/isolate-runtime.md. Same two
+	// operator-troubleshooting shapes as the firecracker/wasm gates: flag off
+	// vs driver-not-registered.
+	if chosenRuntime == models.RuntimeIsolate {
+		if !s.cfg.EnableIsolate {
+			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_ISOLATE=true on this host (see plans/isolate-runtime.md): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		if s.isolate == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_ISOLATE=true but daemon did not call SetIsolateRuntime): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		req.Runtime = chosenRuntime
+		return s.createIsolateSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
 
@@ -2518,6 +2564,10 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	if s.isWasmSandbox(sandbox) && canonicalProto != models.ExposedPortProtocolHTTP {
 		return models.ExposePortResponse{}, unsupportedWasmOption("expose_port protocol " + canonicalProto)
 	}
+	if s.isIsolateSandbox(sandbox) && canonicalProto != models.ExposedPortProtocolHTTP {
+		return models.ExposePortResponse{}, fmt.Errorf("runtime %q only supports expose_port protocol http (host-mediated): %w",
+			models.RuntimeIsolate, models.ErrRuntimeNotImplemented)
+	}
 
 	now := time.Now().UTC()
 	existingBefore := findExposure(sandbox, port)
@@ -2995,6 +3045,9 @@ func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbo
 	if s.isWasmSandbox(sandbox) {
 		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
 	}
+	if s.isIsolateSandbox(sandbox) {
+		return s.installIsolateHTTPPortRoute(ctx, sandbox, port)
+	}
 	// The direct route is where DIRECT-path Host masking is enforced; the
 	// serverless wake route can't carry it (the loopback ingress proxy
 	// overwrites Host on re-dial), so that path masks in the proxy instead.
@@ -3122,6 +3175,7 @@ func (s *Service) serverlessWakeEnabled(sandbox *models.Sandbox) bool {
 // without knowing which shape is currently live is safe and cheap.
 func (s *Service) removeHTTPPortRoute(ctx context.Context, id string, port int) error {
 	s.releaseWasmHTTPListener(id, port)
+	s.releaseIsolateHTTPListener(id, port)
 	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
 		return err
 	}
@@ -3219,6 +3273,13 @@ func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) 
 	mask := strings.TrimSpace(sandbox.MaskRequestHost)
 	if s.isWasmSandbox(sandbox) {
 		url, err := s.wasmHTTPUpstreamURL(ctx, id, port)
+		if err != nil {
+			return PortEndpoint{}, err
+		}
+		return PortEndpoint{URL: url, MaskRequestHost: mask}, nil
+	}
+	if s.isIsolateSandbox(sandbox) {
+		url, err := s.isolateHTTPUpstreamURL(ctx, id, port)
 		if err != nil {
 			return PortEndpoint{}, err
 		}
@@ -3400,6 +3461,28 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		}
 	}
 
+	// Isolate health mirrors wasm: Ping stats the workerd binary so a
+	// missing/broken binary surfaces as degraded here rather than only as
+	// failed creates. Non-worker nodes never host isolates, so they report
+	// "skipped" and do not degrade.
+	isolateStatus := "disabled"
+	if s.cfg.EnableIsolate {
+		if !s.cfg.IsWorker() {
+			isolateStatus = "skipped on non-worker node"
+		} else {
+			switch rt := s.isolate.(type) {
+			case nil:
+				isolateStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeIsolate)
+			default:
+				if err := rt.Ping(ctx); err != nil {
+					isolateStatus = err.Error()
+				} else {
+					isolateStatus = "ok"
+				}
+			}
+		}
+	}
+
 	status := "ok"
 	if dockerStatus != "ok" || caddyStatus != "ok" {
 		status = "degraded"
@@ -3408,6 +3491,9 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		status = "degraded"
 	}
 	if s.cfg.EnableWasm && s.cfg.IsWorker() && wasmStatus != "ok" {
+		status = "degraded"
+	}
+	if s.cfg.EnableIsolate && s.cfg.IsWorker() && isolateStatus != "ok" {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.
@@ -3436,6 +3522,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		Caddy:           caddyStatus,
 		Firecracker:     firecrackerStatus,
 		Wasm:            wasmStatus,
+		Isolate:         isolateStatus,
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
@@ -5072,6 +5159,10 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	}
 	if s.isWasmSandbox(sandbox) {
 		s.syncWasmAllowedPorts(ctx, sandbox)
+		return
+	}
+	if s.isIsolateSandbox(sandbox) {
+		s.syncIsolateAllowedPorts(ctx, sandbox)
 		return
 	}
 	ports := make([]int, 0, len(sandbox.ExposedPorts))

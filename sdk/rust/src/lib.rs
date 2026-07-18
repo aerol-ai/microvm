@@ -1986,6 +1986,7 @@ mod tests {
             custom_domains: None,
             durability: None,
             module_ref: None,
+            tenant_id: None,
         }
     }
 

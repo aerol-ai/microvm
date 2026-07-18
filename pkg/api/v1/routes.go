@@ -130,6 +130,14 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/wasm-modules/{id}", d.Auth(http.HandlerFunc(h.getWasmModule)))
 	mux.Handle("DELETE "+PathPrefix+"/wasm-modules/{id}", d.Auth(http.HandlerFunc(h.deleteWasmModule)))
 
+	// JS/TS bundle catalogue (plans/isolate-runtime.md §8) — the isolate
+	// runtime's "no image, no registry" upload path. Owner-scoped; per-host.
+	// EXPERIMENTAL until the §10.1 demand checkpoint.
+	mux.Handle("POST "+PathPrefix+"/js-bundles", d.Auth(http.HandlerFunc(h.createJSBundle)))
+	mux.Handle("GET "+PathPrefix+"/js-bundles", d.Auth(http.HandlerFunc(h.listJSBundles)))
+	mux.Handle("GET "+PathPrefix+"/js-bundles/{id}", d.Auth(http.HandlerFunc(h.getJSBundle)))
+	mux.Handle("DELETE "+PathPrefix+"/js-bundles/{id}", d.Auth(http.HandlerFunc(h.deleteJSBundle)))
+
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
 	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.Auth(wrap(http.HandlerFunc(h.sessionsProxy))))

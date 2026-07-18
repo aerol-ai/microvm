@@ -155,6 +155,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
+            href: '/isolate-sandbox',
+            label: 'Isolate',
+            description: 'V8 isolate sandboxes — push a JS/TS fetch handler, no image.',
+          },
+          {
+            type: 'link',
             href: '/gvisor-sandbox',
             label: 'gVisor',
             description: 'User-space kernel isolation for untrusted code.',
