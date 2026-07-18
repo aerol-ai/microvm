@@ -61,7 +61,7 @@ Caddy issues exactly two certificates, `<domain>` and `*.<domain>`, then renews 
 
 | Runtime | Installer flag | Notes |
 |---|---|---|
-| Docker | Default | Lowest overhead. Best for trusted workloads. |
+| OCI (`runtime: "docker"`) on **containerd** | Default engine | Production default (`SB_CONTAINER_ENGINE=containerd`). Broadest image compatibility. |
 | gVisor | `--with-gvisor` | Adds a user-space kernel boundary for untrusted code. |
 | Firecracker | `--with-firecracker` | MicroVM runtime; needs KVM / bare metal. |
 | WASM | Config (`SB_ENABLE_WASM` / wasm workers) | WASI modules; no separate installer flag on single-node by default. See [WASM Sandbox](/wasm-sandbox). |

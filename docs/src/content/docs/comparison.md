@@ -13,8 +13,8 @@ A side-by-side look at how AerolVM compares to the two most common alternatives 
 | **Can run locally** | ✅ | ✗ | ✗ |
 | **Open source** | ✅ | ✗ | ✅ |
 | **Primary use case** | AI agents + ephemeral CI | AI agent code execution | Developer workspaces |
-| **Sandbox startup (server p50)** | Isolate ~4ms · WASM ~22ms · Docker ~30ms · Firecracker ~34ms | ~200ms | <90ms |
-| **Runtime isolation** | Docker, gVisor, Firecracker (microVM), WASM, V8 isolate (workerd) | Firecracker | Docker |
+| **Sandbox startup (server p50)** | Isolate ~4ms · WASM ~22ms · Firecracker ~34ms · containerd ~189ms | ~200ms | <90ms |
+| **Runtime isolation** | OCI (containerd default), gVisor, Firecracker (microVM), WASM, V8 isolate (workerd) | Firecracker | Docker |
 | **Serverless / Workers-style sandboxes** | ✅ WASM + V8 isolate (Lambda / Workers model) | ✗ | ✗ |
 | **Security** | gVisor + Firecracker + isolate jail / WASM sandboxing | Firecracker | ✗ |
 | **Port Isolation** | ✅ | ✗ | ✗ |
@@ -81,7 +81,7 @@ AerolVM covers the same AI execution use case while running entirely on your own
 
 **Daytona** targets persistent developer workspaces - IDE integration, git-based environments, long-lived dev containers. It is not designed for ephemeral, high-frequency sandbox creation that AI agents need.
 
-- **Slow lifecycle.** Daytona workspaces take seconds to start because they're full persistent VMs. AerolVM warm-creates Docker/Firecracker sandboxes in ~30ms server-side (V8 isolates in ~4ms) - the difference between an agent waiting on infrastructure and an agent running code.
+- **Slow lifecycle.** Daytona workspaces take seconds to start because they're full persistent VMs. AerolVM warm-creates Firecracker sandboxes in ~34ms server-side and V8 isolates in ~4ms (default OCI/containerd path ~189ms) - the difference between an agent waiting on infrastructure and an agent running code.
 - **Setup complexity.** Daytona is genuinely difficult to self-host: multiple components, infrastructure dependencies, and ongoing operational overhead. AerolVM is a single-binary install with a one-line script.
 - **No kernel-level isolation, no per-sandbox egress control, no port allowlist.** Daytona assumes you trust the people using your workspaces. AerolVM assumes you don't trust the code running inside the sandbox.
 - **Workspace ergonomics over agent ergonomics.** Daytona's SDK and feature surface are built for humans editing code in an IDE. AerolVM's SDKs (TS, Python, Go, Rust, Java) are built for programmatic, high-throughput use.

@@ -11,14 +11,14 @@ disk. WASM and isolate sandboxes are host-mediated (no guest filesystem) and
 opt into a different create shape (`module_ref` instead of `image`).
 
 Warm server-side create is roughly **~4ms** (isolate), **~22ms** (WASM resident
-host), **~30ms** (Docker / Firecracker warm pool) — see the live UC-94 table in
-the repository README.
+host), **~34ms** (Firecracker warm pool), **~189ms** (default OCI on
+containerd) — see the live UC-94 table in the repository README.
 
 ## Sandbox types
 
 | Type | Runtime value | Description |
 |---|---|---|
-| Docker | `docker` (default) | Standard runc-backed containers. Works on any node. |
+| OCI / Docker API | `docker` (default) | Standard runc-backed containers on the **containerd** host engine by default (`SB_CONTAINER_ENGINE=containerd`). Works on any node. |
 | gVisor | `gvisor` | User-space kernel - intercepts syscalls. Better isolation, same hardware requirements. See [gVisor Sandbox](/gvisor-sandbox). |
 | Firecracker | `firecracker` | Full microVM - warm-pool create ~34ms server-side. Requires bare-metal / KVM nodes. See [Firecracker Sandbox](/firecracker-sandbox). |
 | WASM | `wasm` | WASI modules in host workers; optional durable checkpoints. See [WASM Sandbox](/wasm-sandbox). |
