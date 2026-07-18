@@ -8,18 +8,21 @@ import (
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
-// Create is the Phase-2 cold path (plans/isolate-runtime.md §10): resolve the
+// Create is the cold path (plans/isolate-runtime.md §10): resolve the
 // sandbox's bundle, route it to its isolate group (spawning the group's workerd
-// process under single-flight on the first create), and load the bundle onto
-// that host. The sandbox is "running" the moment its bundle is pinned — the
-// isolate itself is compiled lazily on first invoke (the §2.2 warm path). No
-// per-IP networking, no container: this is host-mediated like WASM.
+// process under single-flight on the first create — or claiming a warm blank
+// host when the pool is enabled), and load the bundle onto that host. The
+// sandbox is "running" the moment its bundle is pinned — the isolate itself is
+// compiled lazily on first invoke (the §2.2 warm path). No per-IP networking,
+// no container: this is host-mediated like WASM.
 //
 // Failure rule (LIFO): if load fails after the group was acquired, the sandbox
 // is released from the group, which tears the group's process down when this
 // create had spawned it and no other member joined — so a failed first-create
 // never leaks an empty workerd process (§11 empty-group rule).
 func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	_ = toolboxToken
+	_ = hostMounts
 	if d.resolver == nil {
 		return nil, fmt.Errorf("isolate: bundle resolver not registered: %w", models.ErrRuntimeNotImplemented)
 	}
@@ -44,21 +47,33 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	if err := host.Load(sandboxID, bundle); err != nil {
-		// Undo: drop this sandbox and reap the group if we just spawned it and
-		// it is now empty.
 		d.releaseFromGroup(groupKey, sandboxID)
 		return nil, fmt.Errorf("isolate: load bundle onto group %q: %w", groupKey, err)
 	}
 
+	egress := policyFromCreate(req.NetworkBlockAll, req.NetworkAllowOut, req.NetworkDenyOut)
+	if setter, ok := host.(EgressPolicySetter); ok {
+		setter.SetEgressPolicy(sandboxID, egress)
+	}
+	// Mirror WASM: host-mediated sandboxes advertise loopback so
+	// syncAllowedPorts / expose_port probe gating still run.
 	state := &models.SandboxRuntimeState{
 		SandboxID:    sandboxID,
 		Status:       models.SandboxStatusStarted,
 		ModuleRef:    ref,
 		ModuleDigest: bundle.Digest,
-		ModulePath:   bundle.Digest, // content-addressed; the digest IS the locator
+		ModulePath:   bundle.Digest,
+		ContainerIP:  "127.0.0.1",
 	}
 	d.mu.Lock()
-	d.byID[sandboxID] = &sandboxRecord{state: state, groupKey: groupKey}
+	d.byID[sandboxID] = &sandboxRecord{
+		state:     state,
+		groupKey:  groupKey,
+		tenantID:  req.TenantID,
+		bundleRef: "sha256:" + bundle.Digest,
+		egress:    egress,
+	}
 	d.mu.Unlock()
+	d.touchGroup(groupKey)
 	return state, nil
 }

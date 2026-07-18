@@ -183,6 +183,10 @@ interface ApiSandbox {
   lifecycle?: ApiLifecycle;
   failover?: ApiFailover;
   runtime?: string;
+  durability?: string;
+  module_ref?: string;
+  module_digest?: string;
+  tenant_id?: string;
 }
 
 interface ApiCreateSandboxResponse extends ApiSandbox {
@@ -1119,6 +1123,9 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     lifecycle: options.lifecycle ? toApiLifecycle(options.lifecycle) : undefined,
     failover: options.failover ? toApiFailover(options.failover) : undefined,
     runtime: options.runtime,
+    durability: options.durability,
+    module_ref: options.moduleRef,
+    tenant_id: options.tenantId,
     custom_domains: options.customDomains,
   };
 }
@@ -1209,6 +1216,10 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     lifecycle: fromApiLifecycle(sandbox.lifecycle),
     failover: fromApiFailover(sandbox.failover),
     runtime: normalizeRuntime(sandbox.runtime),
+    durability: sandbox.durability as Sandbox["durability"] | undefined,
+    moduleRef: sandbox.module_ref,
+    moduleDigest: sandbox.module_digest,
+    tenantId: sandbox.tenant_id,
   };
 }
 
@@ -1216,7 +1227,14 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
 // tolerating older sandboxd versions that don't send the field at all (treat
 // as "" — i.e. host default at start time).
 function normalizeRuntime(value: string | undefined): Sandbox["runtime"] {
-  if (value === "docker" || value === "gvisor" || value === "kata") {
+  if (
+    value === "docker" ||
+    value === "gvisor" ||
+    value === "kata" ||
+    value === "firecracker" ||
+    value === "wasm" ||
+    value === "isolate"
+  ) {
     return value;
   }
   return "";

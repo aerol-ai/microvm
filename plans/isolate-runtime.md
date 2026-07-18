@@ -1,6 +1,6 @@
 # V8-Isolate Sandboxes (Deno/Workers model) — Design & Implementation Plan
 
-Status: **In progress — Phase 1 landed; Phase 2 code complete (cold path + /v1/js-bundles); demand pitch + idle-TTL reaper pending** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-17
+Status: **In progress — Phases 1–3 landed (cold path, /v1/js-bundles, idle-TTL, bundle GC, guest HTTP, attributed egress, expose_port, warm pool, P0 gate, docs + SDK constants); §10.1 demand pitch still open (gates Phase 4)** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-18
 
 This plan adds a **fifth runtime** to AerolVM — **V8 isolates** (the
 Deno-Deploy / Cloudflare-Workers model) — as a peer to `docker`, `gvisor`,
@@ -26,6 +26,12 @@ with Deno Sandbox (microVMs).
 
 ## 0. Review history
 
+- **2026-07-18 — Phases 2 leftovers + Phase 3 landed.** Idle-TTL reaper;
+  unreferenced bundle GC; guest HTTP PortGateway + expose_port (HTTP-only,
+  no TCP pool); per-sandbox attributed egress (`x-sb-id` shim); toolbox exec
+  = invoke-handler; blank-host warm pool with boot prewarm; P0 gate
+  executes (tag-gated); `docs/.../isolate-sandbox.mdx` + 5-SDK
+  `runtime:"isolate"` / `tenant_id`. Demand pitch still open (§10.1) — 0/3.
 - **2026-07-17 — Phase 1 implemented.** Landed: `RuntimeIsolate` +
   `ValidRuntime` + durability set (ephemeral default, passivatable rejected,
   durable Phase-5-gated); server-authorized `TenantID` on
@@ -536,32 +542,40 @@ Every new package ships with `_test.go` next to it at the ~85% bar (§11).
     digest a live sandbox pins. The create path resolves an uploaded name
     owner-scoped and pins `sha256:<digest>` before the driver. This makes the
     "no image, no registry" remote path real.
-    **STILL PENDING in Phase 2:** group idle-TTL reaper (last-member teardown
-    ships; idle reaping is deferred with the Phase-3 pool); content-addressed
-    bundle GC/eviction of unreferenced bundles (Delete is manual today); and
-    the §10.1 demand pitch (business, not code).
+    **LANDED 2026-07-18 (Phase-2 leftovers):** group idle-TTL reaper
+    (`RunIdleReaper` / `lifecycle.go`); content-addressed bundle GC
+    (`jsbundle.Store.GCUnreferenced` + `RunJSBundleGCLoop`). **STILL PENDING:**
+    the §10.1 demand pitch (business, not code) — capture verbatim reactions
+    in §0 using the template below.
 - **Phase 3 — Inbound HTTP + toolbox + P0 gate execution.** `guest_http.go`
   fetch proxy with driver-attributed routing; per-sandbox egress attribution;
   `exec` = invoke-handler; Caddy L7 route (expose_port opt-in, pool NOT
   walked); basic per-tenant warm pool; **P0 gate executes**; capability-denied
   egress test.
+  - **LANDED 2026-07-18:** host-mediated `PortGateway` + `expose_port` (HTTP
+    only, `UpsertPortRouteWithDial`); attributed egress (`x-sb-id` shim +
+    per-sandbox policy on the Go proxy); toolbox exec = invoke-handler (501
+    otherwise); `internal/pool/isolate` blank-host warm pool with boot
+    prewarm; P0 gate implemented as tag-gated integration test; docs page
+    `isolate-sandbox.mdx` + 5-SDK `runtime:"isolate"` / `tenant_id` constants.
 - **Phase 4 — Density (GATED on §10.1 checkpoint results).** Isolate-group
   packing beyond per-tenant granularity where trust allows; CPU/mem limit
   mapping; single-node admission footprint + density bench; per-invocation
   billing export; snapshot spike only if warm-pool numbers justify it.
-- **Phase 5 — Durability + cluster + facades + docs + SDKs.** `durable`
+- **Phase 5 — Durability + cluster + facades.** `durable`
   enablement (statekv reattach + `NormalizeCreateDurability`); cluster
   placement with tenant-affinity / forwarding / failover parity (no-op when
   `EnableCluster` false; group failover rehydrates from bundles + statekv);
   facade parity where facades exist (Daytona today; E2B is a separate planned
-  program this depends on); custom domains; docs page(s); 5-SDK constants.
+  program this depends on); custom domains. *(Docs page + 5-SDK
+  `runtime:"isolate"` / `tenant_id` constants landed early with Phase 3.)*
 
 Each phase is independently mergeable because the `Runtime` surface stays
 stable — the property every prior skeleton was landed to prove.
 
 ### 10.1 Demand checkpoint (gates Phase 4)
 
-During Phase 2, pitch to 5–10 credible prospects (agent-infra teams,
+During Phase 2–3, pitch to 5–10 credible prospects (agent-infra teams,
 E2B/Daytona-adjacent users, existing AerolVM operators): **"Push a JS handler
 with scoped capabilities to your own infra — no image, no external registry,
 invoke it over HTTP in milliseconds."** Capture verbatim reactions in §0.
@@ -571,6 +585,22 @@ re-scope Phases 4–5. For each positive reaction, capture (outside-voice bar):
 the named workload, expected invocation volume, required APIs/grants, their
 threat model (whose code runs), and explicit acceptance of no-shell /
 no-filesystem semantics — "sounds cool" without those five does not count.
+
+**Capture template (paste into §0 as reactions arrive):**
+
+```
+### Demand pitch — YYYY-MM-DD — <prospect / company>
+- Contact:
+- Verbatim reaction:
+- Named workload:
+- Expected invocation volume:
+- Required APIs / grants:
+- Threat model (whose code runs):
+- Accepts no-shell / no-filesystem? (yes/no + quote):
+- Counts toward ≥3 bar? (yes/no):
+```
+
+Status: **0 / 3** reactions captured — Phase 4 remains gated.
 
 ---
 

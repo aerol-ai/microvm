@@ -163,26 +163,50 @@ func TestBundleServerServesPinnedBundle(t *testing.T) {
 	}
 }
 
-// TestEgressServerDeniesFailClosed asserts the Phase-2 egress boundary refuses
-// everything (fail-closed until Phase 3's per-sandbox proxy).
-func TestEgressServerDeniesFailClosed(t *testing.T) {
+// TestEgressServerAttributedFailClosed asserts the Phase-3 egress boundary
+// refuses unattributed traffic and sandboxes without a registered policy.
+func TestEgressServerAttributedFailClosed(t *testing.T) {
 	h, _ := NewHost(HostConfig{WorkerdPath: "/w", GroupKey: "acme", RunDir: shortRunDir(t)})
 	if err := h.startEgressServer(); err != nil {
 		t.Fatal(err)
 	}
 	defer h.stopServers()
 	client := unixHTTPClient(h.egressSock)
+
+	// No x-sb-id → deny.
 	resp, err := client.Get("http://egress/anything")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("egress status = %d, want 403", resp.StatusCode)
+		t.Fatalf("unattributed egress status = %d, want 403", resp.StatusCode)
+	}
+
+	// x-sb-id present but no policy registered → deny.
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("x-sb-id", "sb-1")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "egress denied") {
-		t.Fatalf("body = %q", body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "no policy") {
+		t.Fatalf("no-policy status/body = %d %q", resp.StatusCode, body)
+	}
+
+	// BlockAll policy → deny even with attribution.
+	h.SetEgressPolicy("sb-1", EgressPolicy{BlockAll: true})
+	req, _ = http.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("x-sb-id", "sb-1")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("block-all status = %d, want 403", resp.StatusCode)
 	}
 }
 

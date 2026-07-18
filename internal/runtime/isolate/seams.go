@@ -49,17 +49,10 @@ type HostSupervisor interface {
 	SpawnGroup(ctx context.Context, spec JailSpec) (GroupHost, error)
 }
 
-// WarmHost is a pre-spawned blank workerd process a tenant's FIRST create
-// claims (the group router runs before the pool: subsequent creates join the
-// tenant's existing group and never touch the pool). Phase 3.
-type WarmHost struct {
-	SocketPath string
-	PID        int
-}
-
-// WarmPool hands out blank workerd hosts. Production implementation:
+// WarmPool hands out blank workerd group hosts. Production implementation:
 // internal/pool/isolate (Phase 3). ok=false means empty or disabled — the
-// caller cold-spawns. Unused by the Phase-2 cold path.
+// caller cold-spawns. The group router runs before the pool: only a tenant's
+// FIRST create claims; subsequent creates join the existing group.
 type WarmPool interface {
-	Acquire(ctx context.Context) (WarmHost, bool)
+	Acquire(ctx context.Context) (GroupHost, bool)
 }

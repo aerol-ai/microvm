@@ -17,13 +17,9 @@ func (s *Service) isIsolateSandbox(sandbox *models.Sandbox) bool {
 }
 
 // createIsolateSandbox is the V8-isolate runtime create path
-// (plans/isolate-runtime.md). Phase 1 mirrors the wasm/firecracker
-// scaffolding: validate unsupported options, authorize the tenant group key,
-// dispatch to the driver. Create on the driver still returns
-// ErrRuntimeNotImplemented until Phase 2 lands the cold path (bundle resolve
-// → group router → inject); admission reservation and row persistence land
-// with it — reserving capacity for a create that cannot yet succeed would
-// only add a release path to unwind.
+// (plans/isolate-runtime.md): validate unsupported options, authorize the
+// tenant group key, resolve+pin the bundle, admit, driver.Create (group
+// router + inject), persist the row with LIFO unwind.
 func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
 	if req.GPUs != nil {
 		return nil, fmt.Errorf("runtime %q does not support GPUs (see plans/isolate-runtime.md): %w",
@@ -161,11 +157,10 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	}
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 
-	// No caddy on the Phase-2 boot path: external inbound routing to the fetch
-	// handler (guest_http.go + expose_port) lands in Phase 3, so a created
-	// isolate is invocable by the driver but not yet publicly routed. This
-	// matches the private-by-default posture and keeps the boot path free of
-	// L7 work.
+	// Loopback IP so syncAllowedPorts / expose_port probe gating treat the
+	// sandbox as host-mediated (same posture as WASM). Public L7 routing is
+	// opt-in via expose_port — creates stay private-by-default.
+	sandbox.ContainerIP = "127.0.0.1"
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.isolate.Destroy(ctx, sandbox)
 		releaseAdmission()

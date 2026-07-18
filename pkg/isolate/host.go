@@ -38,8 +38,9 @@ type Host struct {
 	hostSock    string
 	egressSock  string
 
-	mu      sync.RWMutex
-	bundles map[string]*jsbundle.Bundle // sandbox id → pinned bundle
+	mu           sync.RWMutex
+	bundles      map[string]*jsbundle.Bundle // sandbox id → pinned bundle
+	egressPolicy map[string]EgressPolicy     // sandbox id → outbound policy
 
 	cmd        *exec.Cmd
 	bundleSrv  *http.Server
@@ -63,11 +64,12 @@ func NewHost(cfg HostConfig) (*Host, error) {
 		cfg.StartTimeout = 10 * time.Second
 	}
 	return &Host{
-		cfg:         cfg,
-		controlSock: filepath.Join(cfg.RunDir, controlSocketName),
-		hostSock:    filepath.Join(cfg.RunDir, hostSocketName),
-		egressSock:  filepath.Join(cfg.RunDir, egressSocketName),
-		bundles:     make(map[string]*jsbundle.Bundle),
+		cfg:          cfg,
+		controlSock:  filepath.Join(cfg.RunDir, controlSocketName),
+		hostSock:     filepath.Join(cfg.RunDir, hostSocketName),
+		egressSock:   filepath.Join(cfg.RunDir, egressSocketName),
+		bundles:      make(map[string]*jsbundle.Bundle),
+		egressPolicy: make(map[string]EgressPolicy),
 	}, nil
 }
 
@@ -95,6 +97,7 @@ func (h *Host) Load(id string, b *jsbundle.Bundle) error {
 func (h *Host) Unload(id string) int {
 	h.mu.Lock()
 	delete(h.bundles, id)
+	delete(h.egressPolicy, id)
 	n := len(h.bundles)
 	h.mu.Unlock()
 	return n
@@ -108,8 +111,8 @@ func (h *Host) LoadedCount() int {
 }
 
 // Start generates the group's config + controller, starts the bundle-server and
-// the Phase-2 deny-all egress server on their unix sockets, spawns workerd, and
-// waits until the control socket answers.
+// the Phase-3 attributed egress server on their unix sockets, spawns workerd,
+// and waits until the control socket answers.
 func (h *Host) Start(ctx context.Context) error {
 	if err := os.MkdirAll(h.cfg.RunDir, 0o700); err != nil {
 		return fmt.Errorf("isolate: mkdir run dir: %w", err)
@@ -190,22 +193,6 @@ func (h *Host) startBundleServer() error {
 	})
 	h.bundleSrv = &http.Server{Handler: mux}
 	go func() { _ = h.bundleSrv.Serve(ln) }()
-	return nil
-}
-
-// startEgressServer is the Phase-2 fail-closed egress boundary: every outbound
-// fetch an isolate makes hits this and is refused. Phase 3 replaces it with the
-// per-sandbox attributed proxy; failing closed until then means an isolate
-// cannot reach the network before egress policy exists to govern it.
-func (h *Host) startEgressServer() error {
-	ln, err := net.Listen("unix", h.egressSock)
-	if err != nil {
-		return fmt.Errorf("isolate: listen egress socket: %w", err)
-	}
-	h.egressSrv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "egress denied (isolate egress policy lands in Phase 3)", http.StatusForbidden)
-	})}
-	go func() { _ = h.egressSrv.Serve(ln) }()
 	return nil
 }
 

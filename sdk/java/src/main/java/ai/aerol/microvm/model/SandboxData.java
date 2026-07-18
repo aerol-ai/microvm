@@ -43,6 +43,9 @@ public class SandboxData {
     public String moduleRef;
     @JsonProperty("module_digest")
     public String moduleDigest;
+    /** Isolate-group key this sandbox was created under ({@code runtime=isolate} only). */
+    @JsonProperty("tenant_id")
+    public String tenantId;
     /** GPU configuration this sandbox was created with. Null means no GPU. */
     public GpuOptions gpus;
 
@@ -81,6 +84,9 @@ public class SandboxData {
         failover = other.failover == null ? null : other.failover.copy();
         runtime = other.runtime == null ? "" : other.runtime;
         durability = other.durability;
+        moduleRef = other.moduleRef;
+        moduleDigest = other.moduleDigest;
+        tenantId = other.tenantId;
         gpus = other.gpus == null ? null : other.gpus.copy();
     }
 }

@@ -2559,6 +2559,10 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	if s.isWasmSandbox(sandbox) && canonicalProto != models.ExposedPortProtocolHTTP {
 		return models.ExposePortResponse{}, unsupportedWasmOption("expose_port protocol " + canonicalProto)
 	}
+	if s.isIsolateSandbox(sandbox) && canonicalProto != models.ExposedPortProtocolHTTP {
+		return models.ExposePortResponse{}, fmt.Errorf("runtime %q only supports expose_port protocol http (host-mediated): %w",
+			models.RuntimeIsolate, models.ErrRuntimeNotImplemented)
+	}
 
 	now := time.Now().UTC()
 	existingBefore := findExposure(sandbox, port)
@@ -3036,6 +3040,9 @@ func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbo
 	if s.isWasmSandbox(sandbox) {
 		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
 	}
+	if s.isIsolateSandbox(sandbox) {
+		return s.installIsolateHTTPPortRoute(ctx, sandbox, port)
+	}
 	// The direct route is where DIRECT-path Host masking is enforced; the
 	// serverless wake route can't carry it (the loopback ingress proxy
 	// overwrites Host on re-dial), so that path masks in the proxy instead.
@@ -3163,6 +3170,7 @@ func (s *Service) serverlessWakeEnabled(sandbox *models.Sandbox) bool {
 // without knowing which shape is currently live is safe and cheap.
 func (s *Service) removeHTTPPortRoute(ctx context.Context, id string, port int) error {
 	s.releaseWasmHTTPListener(id, port)
+	s.releaseIsolateHTTPListener(id, port)
 	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
 		return err
 	}
@@ -3260,6 +3268,13 @@ func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) 
 	mask := strings.TrimSpace(sandbox.MaskRequestHost)
 	if s.isWasmSandbox(sandbox) {
 		url, err := s.wasmHTTPUpstreamURL(ctx, id, port)
+		if err != nil {
+			return PortEndpoint{}, err
+		}
+		return PortEndpoint{URL: url, MaskRequestHost: mask}, nil
+	}
+	if s.isIsolateSandbox(sandbox) {
+		url, err := s.isolateHTTPUpstreamURL(ctx, id, port)
 		if err != nil {
 			return PortEndpoint{}, err
 		}
@@ -5113,6 +5128,10 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	}
 	if s.isWasmSandbox(sandbox) {
 		s.syncWasmAllowedPorts(ctx, sandbox)
+		return
+	}
+	if s.isIsolateSandbox(sandbox) {
+		s.syncIsolateAllowedPorts(ctx, sandbox)
 		return
 	}
 	ports := make([]int, 0, len(sandbox.ExposedPorts))

@@ -163,7 +163,7 @@ func (stubResolver) Resolve(ctx context.Context, tenant, ref string) (*jsbundle.
 
 type stubPool struct{}
 
-func (stubPool) Acquire(ctx context.Context) (WarmHost, bool) { return WarmHost{}, false }
+func (stubPool) Acquire(ctx context.Context) (GroupHost, bool) { return nil, false }
 
 func TestSetters(t *testing.T) {
 	d := New(Config{}, nil)

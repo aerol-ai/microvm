@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 
+	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -37,6 +38,19 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		host, ok := s.wasm.(wasmruntime.ToolboxHost)
 		if !ok {
 			return fmt.Errorf("wasm runtime does not implement toolbox host")
+		}
+		req := r.Clone(ctx)
+		req.URL.Path = path
+		host.ServeToolbox(ctx, sandboxID, sandbox.ToolboxToken, w, req)
+		return nil
+	}
+	if s.isIsolateSandbox(sandbox) {
+		if s.isolate == nil {
+			return fmt.Errorf("runtime %q: driver not registered", sandbox.Runtime)
+		}
+		host, ok := isolateruntime.AsToolboxHost(s.isolate)
+		if !ok {
+			return fmt.Errorf("isolate runtime does not implement toolbox host")
 		}
 		req := r.Clone(ctx)
 		req.URL.Path = path

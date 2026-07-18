@@ -3,6 +3,7 @@ package isolate
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // The group router (plans/isolate-runtime.md §2.1). Sandboxes are placed into
@@ -65,15 +66,25 @@ func (d *Driver) acquireGroup(ctx context.Context, groupKey string, cpu float64,
 			d.groupsMu.Unlock()
 			return nil, err
 		}
-		d.groups[groupKey] = &group{key: groupKey, host: host}
+		d.groups[groupKey] = &group{key: groupKey, host: host, lastUsed: timeNow()}
 		d.groupsMu.Unlock()
 		return host, nil
 	}
 }
 
+// timeNow is stubbed in idle-reaper tests.
+var timeNow = func() time.Time { return time.Now() }
+
 // spawnGroup builds the group's jail spec and asks the supervisor to realize
 // it. Held outside groupsMu so a slow workerd spawn does not block the router.
+// When a warm pool is wired, a blank host is claimed first (group router runs
+// before the pool: only a tenant's FIRST create reaches here).
 func (d *Driver) spawnGroup(ctx context.Context, groupKey string, cpu float64, memMB int) (GroupHost, error) {
+	if d.warmPool != nil {
+		if host, ok := d.warmPool.Acquire(ctx); ok && host != nil {
+			return host, nil
+		}
+	}
 	spec, err := BuildJailSpec(d.cfg, groupKey, cpu, memMB)
 	if err != nil {
 		return nil, fmt.Errorf("isolate: build jail spec for group %q: %w", groupKey, err)

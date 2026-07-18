@@ -30,9 +30,11 @@ const controllerModuleName = "controller.js"
 //   - rejects requests with no x-sb-id (the driver always sets it);
 //   - dynamically loads the isolate for that id, fetching the bundle from the
 //     HOST binding on a cache miss;
-//   - fails egress closed: globalOutbound is bound to the EGRESS service, which
-//     in Phase 2 is a deny-all stub (Phase 3 swaps in the per-sandbox proxy);
-//   - strips the control header before haading the request to the isolate.
+//   - attributes egress per sandbox: each sandbox's globalOutbound is a tiny
+//     shim isolate (also via LOADER) that stamps x-sb-id before hitting the
+//     shared EGRESS service, so the Go proxy knows ownership at accept time
+//     (plans/isolate-runtime.md §4 Phase 3);
+//   - strips the control header before handing the request to the isolate.
 const controllerJS = `export default {
   async fetch(request, env) {
     const id = request.headers.get("x-sb-id");
@@ -47,11 +49,20 @@ const controllerJS = `export default {
     if (probe.status === 404) return new Response("no such sandbox", { status: 404 });
     if (!probe.ok) return new Response("isolate bundle fetch " + probe.status, { status: 502 });
     const spec = await probe.json();
+    // Per-sandbox egress shim: stamps x-sb-id so the Go egress proxy can apply
+    // that sandbox's allowlist. Cached under id+":eg" so warm hits skip recompile.
+    const egShimSrc = "export default { async fetch(req, env) { const h = new Headers(req.headers); h.set(\"x-sb-id\", " + JSON.stringify(id) + "); return env.E.fetch(new Request(req, { headers: h })); } };";
+    const eg = env.LOADER.get(id + ":eg", async () => ({
+      compatibilityDate: "2026-01-01",
+      mainModule: "eg.js",
+      modules: { "eg.js": egShimSrc },
+      bindings: [{ name: "E", service: "egress" }],
+    }));
     const worker = env.LOADER.get(id, async () => ({
       compatibilityDate: spec.compatibility_date,
       mainModule: spec.main_module,
       modules: spec.modules,
-      globalOutbound: env.EGRESS,
+      globalOutbound: eg,
     }));
     const fwd = new Request(request);
     fwd.headers.delete("x-sb-id");

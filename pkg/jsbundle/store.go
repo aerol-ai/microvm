@@ -197,6 +197,68 @@ func (s *Store) GetByName(tenant, name string) (*Bundle, error) {
 	return s.GetByDigest(digest)
 }
 
+// ListAllDigests returns every content digest currently in the store (across
+// all tenants). Used by the unreferenced-bundle GC sweep.
+func (s *Store) ListAllDigests() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]struct{})
+	for _, digests := range s.byTenant {
+		for _, d := range digests {
+			seen[d] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for d := range seen {
+		out = append(out, d)
+	}
+	return out
+}
+
+// GCUnreferenced deletes every digest that is neither pinned by a live sandbox
+// nor referenced by an uploaded catalogue name. Named uploads with no live
+// sandbox are kept — the catalogue IS a reference. Returns digests removed.
+func (s *Store) GCUnreferenced(pinned map[string]struct{}) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	named := make(map[string]struct{}, len(s.names))
+	for _, d := range s.names {
+		named[d] = struct{}{}
+	}
+	candidates := make(map[string]struct{})
+	for _, digests := range s.byTenant {
+		for _, d := range digests {
+			if _, ok := pinned[d]; ok {
+				continue
+			}
+			if _, ok := named[d]; ok {
+				continue
+			}
+			candidates[d] = struct{}{}
+		}
+	}
+	var removed []string
+	for d := range candidates {
+		if err := os.Remove(s.blobPath(d)); err != nil && !os.IsNotExist(err) {
+			return removed, err
+		}
+		for tenant, digests := range s.byTenant {
+			s.byTenant[tenant] = remove(digests, d)
+			if len(s.byTenant[tenant]) == 0 {
+				delete(s.byTenant, tenant)
+			}
+		}
+		removed = append(removed, d)
+	}
+	if len(removed) == 0 {
+		return nil, nil
+	}
+	if err := s.persistIndexLocked(); err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+
 // Delete removes a bundle blob and any names pointing at it (reference-counted
 // GC of unreferenced bundles is driven by the caller). Deleting an absent
 // digest is a no-op.

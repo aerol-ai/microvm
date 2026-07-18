@@ -657,6 +657,23 @@ type Config struct {
 	// for the per-sandbox paranoid tier if the JIT allowlist proves too
 	// broad (plans/isolate-runtime.md §2.1). SB_ISOLATE_JITLESS.
 	IsolateJitless bool
+	// IsolateGroupIdleTTL is how long an isolate group may sit without
+	// Create/Invoke before the idle reaper tears the workerd process down
+	// (plans/isolate-runtime.md Phase 2 leftover / I22). Zero disables.
+	// Default 5m. SB_ISOLATE_GROUP_IDLE_TTL.
+	IsolateGroupIdleTTL time.Duration
+	// IsolatePoolEnabled gates the blank-workerd warm pool (Phase 3).
+	// Default true when EnableIsolate is on. SB_ISOLATE_POOL_ENABLED.
+	IsolatePoolEnabled bool
+	// IsolatePoolDepthDefault is the target number of blank warm hosts.
+	// SB_ISOLATE_POOL_DEPTH_DEFAULT.
+	IsolatePoolDepthDefault int
+	// IsolatePoolRefillInterval is how often the refill loop tops up the pool.
+	// SB_ISOLATE_POOL_REFILL_INTERVAL.
+	IsolatePoolRefillInterval time.Duration
+	// IsolateBundleGCInterval is how often unreferenced content-addressed
+	// bundles are swept. Zero disables. Default 15m. SB_ISOLATE_BUNDLE_GC_INTERVAL.
+	IsolateBundleGCInterval time.Duration
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1609,6 +1626,11 @@ func Load() (Config, error) {
 		IsolateJailUID:               getEnvInt("SB_ISOLATE_JAIL_UID", 1000),
 		IsolateJailGID:               getEnvInt("SB_ISOLATE_JAIL_GID", 1000),
 		IsolateJitless:               getEnvBool("SB_ISOLATE_JITLESS", false),
+		IsolateGroupIdleTTL:          getEnvDuration("SB_ISOLATE_GROUP_IDLE_TTL", 5*time.Minute),
+		IsolatePoolEnabled:           getEnvBool("SB_ISOLATE_POOL_ENABLED", true),
+		IsolatePoolDepthDefault:      getEnvInt("SB_ISOLATE_POOL_DEPTH_DEFAULT", 2),
+		IsolatePoolRefillInterval:    getEnvDuration("SB_ISOLATE_POOL_REFILL_INTERVAL", 5*time.Second),
+		IsolateBundleGCInterval:      getEnvDuration("SB_ISOLATE_BUNDLE_GC_INTERVAL", 15*time.Minute),
 		FirecrackerBinary:            getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:                 getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:       getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
@@ -1914,6 +1936,9 @@ func Load() (Config, error) {
 			if cfg.IsolateJailUID == 0 || cfg.IsolateJailGID == 0 {
 				return Config{}, errors.New("SB_ISOLATE_JAIL_UID/SB_ISOLATE_JAIL_GID must be non-root (> 0) when SB_ISOLATE_USE_JAIL=true")
 			}
+		}
+		if cfg.IsolatePoolEnabled && cfg.IsolatePoolDepthDefault <= 0 {
+			return Config{}, errors.New("SB_ISOLATE_POOL_DEPTH_DEFAULT must be > 0 when SB_ISOLATE_POOL_ENABLED=true")
 		}
 	}
 

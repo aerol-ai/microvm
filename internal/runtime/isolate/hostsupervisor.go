@@ -11,11 +11,6 @@ import (
 // JailSpec by starting a pkg/isolate.Host (the workerd process + controller +
 // bundle-server). It lives in the driver package so pkg/isolate need not know
 // the driver's seam.
-//
-// Phase 2 wires the run directory and workerd binary; the JailSpec's
-// chroot/cgroup/seccomp realization (jail.go) is applied by pkg/isolate when
-// the jail lands (the spec is already validated here). The host's per-group run
-// dir is <RunDir>/<groupKey> so two groups never share sockets.
 type workerdSupervisor struct {
 	workerdPath string
 	runDir      string
@@ -41,5 +36,20 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 	if err := host.Start(ctx); err != nil {
 		return nil, err
 	}
-	return host, nil
+	return &hostAdapter{Host: host}, nil
+}
+
+// hostAdapter bridges pkg/isolate.Host onto the driver's GroupHost +
+// EgressPolicySetter seams (the policy struct lives in both packages to avoid
+// an import cycle).
+type hostAdapter struct {
+	*pkgisolate.Host
+}
+
+func (a *hostAdapter) SetEgressPolicy(id string, p EgressPolicy) {
+	a.Host.SetEgressPolicy(id, pkgisolate.EgressPolicy{
+		BlockAll: p.BlockAll,
+		Allow:    p.Allow,
+		Deny:     p.Deny,
+	})
 }

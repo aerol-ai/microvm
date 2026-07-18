@@ -1,6 +1,8 @@
 package isolate
 
 import (
+	"time"
+
 	"github.com/aerol-ai/microvm/internal/config"
 )
 
@@ -32,6 +34,9 @@ type Config struct {
 	// Jitless runs V8 with --jitless so the seccomp allowlist can drop the
 	// W^X/JIT syscall surface (per-sandbox paranoid tier, §2.1).
 	Jitless bool
+	// IdleTTL is how long a group may sit without Create/Invoke before the
+	// idle reaper tears it down. Zero disables the reaper.
+	IdleTTL time.Duration
 }
 
 // FromDaemonConfig projects the isolate slice of daemon config into driver config.
@@ -45,5 +50,6 @@ func FromDaemonConfig(cfg config.Config) Config {
 		JailUID:          cfg.IsolateJailUID,
 		JailGID:          cfg.IsolateJailGID,
 		Jitless:          cfg.IsolateJitless,
+		IdleTTL:          cfg.IsolateGroupIdleTTL,
 	}
 }

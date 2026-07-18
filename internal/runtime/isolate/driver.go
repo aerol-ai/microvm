@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -34,6 +35,7 @@ type Driver struct {
 	resolver   BundleResolver
 	supervisor HostSupervisor
 	warmPool   WarmPool
+	net        *networkGateway
 
 	mu   sync.Mutex
 	byID map[string]*sandboxRecord
@@ -47,16 +49,23 @@ type Driver struct {
 
 // sandboxRecord is the driver's per-sandbox bookkeeping: the runtime state it
 // hands back to the service plus the group it was loaded into (so Destroy can
-// route the unload and trigger last-member teardown).
+// route the unload and trigger last-member teardown). needsReload is set when
+// the idle-TTL reaper tore the group down out from under a still-registered
+// sandbox — the next Start/Invoke re-acquires a group and re-pins the bundle.
 type sandboxRecord struct {
-	state    *models.SandboxRuntimeState
-	groupKey string
+	state       *models.SandboxRuntimeState
+	groupKey    string
+	tenantID    string
+	bundleRef   string
+	egress      EgressPolicy
+	needsReload bool
 }
 
 // group is one running workerd host plus the group key it serves.
 type group struct {
-	key  string
-	host GroupHost
+	key      string
+	host     GroupHost
+	lastUsed time.Time
 }
 
 // New constructs an isolate driver. The zero value is not usable.
@@ -64,13 +73,18 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Driver{
+	d := &Driver{
 		cfg:      cfg,
 		logger:   logger,
 		byID:     make(map[string]*sandboxRecord),
 		groups:   make(map[string]*group),
 		spawning: make(map[string]chan struct{}),
+		net:      newNetworkGateway(),
 	}
+	// Ingress: Caddy dials the loopback mediator; the mediator calls Invoke
+	// on the sandbox's group host (Phase 3 guest_http).
+	d.net.SetHTTPProxy(d.guestHTTPProxy)
+	return d
 }
 
 // SetBundleResolver injects the JS/TS bundle resolver (pkg/jsbundle in
@@ -97,11 +111,9 @@ func notImplemented(op string) error {
 	return fmt.Errorf("isolate runtime %s: pending plans/isolate-runtime.md Phase 2: %w", op, models.ErrRuntimeNotImplemented)
 }
 
-// Start is a no-op re-affirmation for isolates: a "started" sandbox is one
-// whose bundle is pinned on its group host, which Create already did. There is
-// no stopped→running transition to drive (an isolate is compiled lazily on
-// invoke), so Start returns the current state. An unknown id is a 404-shaped
-// nil,nil per the Runtime contract.
+// Start re-affirms a running isolate, and re-pins the bundle after an idle-TTL
+// reap tore the group down. An unknown id is a 404-shaped nil,nil per the
+// Runtime contract.
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
 	d.mu.Lock()
 	rec := d.byID[sandboxID]
@@ -109,13 +121,24 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if rec == nil {
 		return nil, nil
 	}
-	rec.state.Status = models.SandboxStatusStarted
+	if err := d.ensureLoaded(ctx, sandboxID); err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	rec = d.byID[sandboxID]
+	if rec != nil {
+		rec.state.Status = models.SandboxStatusStarted
+	}
+	d.mu.Unlock()
+	if rec == nil {
+		return nil, nil
+	}
 	return rec.state, nil
 }
 
 // Stop marks a sandbox stopped but keeps its bundle pinned so a later Start is
 // instant. The group process stays up for co-resident sandboxes; true teardown
-// is Destroy. (Idle-group reaping is Phase 3.)
+// is Destroy. Idle groups are reaped by RunIdleReaper.
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
 	d.mu.Lock()
 	rec := d.byID[sandboxID]
@@ -137,8 +160,11 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	rec := d.byID[sandbox.ID]
 	delete(d.byID, sandbox.ID)
 	d.mu.Unlock()
-	if rec != nil {
+	if rec != nil && rec.groupKey != "" {
 		d.releaseFromGroup(rec.groupKey, sandbox.ID)
+	}
+	if d.net != nil {
+		d.net.ReleaseSandbox(sandbox.ID)
 	}
 	return nil
 }

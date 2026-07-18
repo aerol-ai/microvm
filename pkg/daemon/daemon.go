@@ -24,6 +24,7 @@ import (
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
+	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -466,10 +467,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		logger.Info("wasm runtime skipped on non-worker node", "node_role", cfg.NodeRole)
 	}
 
+	var isolateDriver *isolateruntime.Driver
 	if cfg.EnableIsolate && cfg.IsWorker() {
-		if _, err := wireIsolateRuntime(cfg, logger, svc); err != nil {
+		var err error
+		isolateDriver, err = wireIsolateRuntime(cfg, logger, svc)
+		if err != nil {
 			return fmt.Errorf("wire isolate runtime: %w", err)
 		}
+		startIsolateBackground(ctx, cfg, isolateDriver, svc)
 	} else if cfg.EnableIsolate {
 		logger.Info("isolate runtime skipped on non-worker node", "node_role", cfg.NodeRole)
 	}

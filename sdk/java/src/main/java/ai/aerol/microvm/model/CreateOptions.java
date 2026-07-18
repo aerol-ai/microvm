@@ -47,9 +47,16 @@ public class CreateOptions {
     public String runtime;
     /** Survival class across daemon restarts. Null uses the runtime default. */
     public String durability;
-    /** WASM module reference. When runtime is wasm, may be used instead of image. */
+    /** WASM module / isolate bundle reference. When runtime is wasm or isolate, may be used instead of image. */
     @JsonProperty("module_ref")
     public String moduleRef;
+    /**
+     * Isolate-group key for {@code runtime=isolate}. Server-authorized; when
+     * omitted the group key falls back to the authenticated identity. Ignored
+     * by other runtimes.
+     */
+    @JsonProperty("tenant_id")
+    public String tenantId;
     /** Attach GPU resources to the sandbox. Null means no GPU (CPU-only). */
     public GpuOptions gpus;
     /**
@@ -164,6 +171,16 @@ public class CreateOptions {
 
     public CreateOptions setDurability(String durability) {
         this.durability = durability;
+        return this;
+    }
+
+    public CreateOptions setModuleRef(String moduleRef) {
+        this.moduleRef = moduleRef;
+        return this;
+    }
+
+    public CreateOptions setTenantId(String tenantId) {
+        this.tenantId = tenantId;
         return this;
     }
 

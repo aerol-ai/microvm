@@ -115,6 +115,45 @@ func TestStorePutGetIdempotentAndNamed(t *testing.T) {
 	}
 }
 
+func TestGCUnreferencedKeepsNamedAndPinned(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(StoreConfig{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := BuildFromSource("a.js", "export default {async fetch(){return new Response('a')}}", "")
+	b, _ := BuildFromSource("b.js", "export default {async fetch(){return new Response('b')}}", "")
+	c, _ := BuildFromSource("c.js", "export default {async fetch(){return new Response('c')}}", "")
+	da, err := s.Put("t1", "", a) // unreferenced, unnamed → GC
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := s.Put("t1", "named", b) // named → keep
+	if err != nil {
+		t.Fatal(err)
+	}
+	dc, err := s.Put("t1", "", c) // pinned → keep
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := s.GCUnreferenced(map[string]struct{}{dc: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != da {
+		t.Fatalf("removed = %v, want [%s]", removed, da)
+	}
+	if _, err := s.GetByDigest(db); err != nil {
+		t.Fatalf("named digest was GC'd: %v", err)
+	}
+	if _, err := s.GetByDigest(dc); err != nil {
+		t.Fatalf("pinned digest was GC'd: %v", err)
+	}
+	if _, err := s.GetByDigest(da); err == nil {
+		t.Fatal("unreferenced unnamed digest still present")
+	}
+}
+
 func TestStoreSizeCapAndQuota(t *testing.T) {
 	s, err := NewStore(StoreConfig{Dir: t.TempDir(), MaxBytes: 10})
 	if err != nil {

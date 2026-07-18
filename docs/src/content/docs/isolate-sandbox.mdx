@@ -1,0 +1,141 @@
+---
+title: Isolate Sandbox
+description: Deploy a JS/TS fetch handler as a V8 isolate — no image, no registry, host-mediated HTTP.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Isolate sandboxes run a JavaScript/TypeScript `fetch` handler inside a V8
+isolate (Cloudflare's `workerd` engine). Push a bundle, get an HTTP entrypoint
+with capability-scoped egress — no Dockerfile, no container image, no shell or
+filesystem. This is the Workers-model tier that complements Firecracker
+microVMs.
+
+Requires `SB_ENABLE_ISOLATE=true` and a pinned `workerd` binary on the host
+(`install.sh --with-isolate`).
+
+## Create an isolate sandbox
+
+Pass `runtime: "isolate"` and a `module_ref` pointing at a JS/TS bundle —
+an uploaded catalogue name/digest, or a `file://` path for operators. Isolates
+default to `durability: "ephemeral"`; `passivatable` is rejected and `durable`
+is not yet enabled.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    const sandbox = await client.create({
+      module_ref: 'sha256:…', // or an uploaded bundle name
+      runtime: 'isolate',
+      memoryMB: 128,
+      networkAllowOut: ['api.example.com'],
+    })
+
+    console.log(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url='https://sandbox.example.com',
+        pat_token='your-token',
+    )
+
+    sandbox = client.create({
+        'module_ref': 'sha256:…',
+        'runtime': 'isolate',
+        'memoryMB': 128,
+        'network_allow_out': ['api.example.com'],
+    })
+
+    print(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+
+        "github.com/aerol-ai/microvm/pkg/microvm"
+        "github.com/aerol-ai/microvm/pkg/types"
+    )
+
+    client, err := microvm.New(microvm.Config{
+        APIURL:   "https://sandbox.example.com",
+        PATToken: "your-token",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sb, err := client.Create(context.Background(), types.CreateSandboxRequest{
+        ModuleRef:       "sha256:…",
+        Runtime:         types.RuntimeIsolate,
+        MemoryMB:        128,
+        NetworkAllowOut: []string{"api.example.com"},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sb.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateSandboxRequest};
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new("https://sandbox.example.com", "your-token")?;
+        let sandbox = client
+            .create(CreateSandboxRequest {
+                module_ref: Some("sha256:…".into()),
+                runtime: Some("isolate".into()),
+                memory_mb: Some(128),
+                ..Default::default()
+            })
+            .await?;
+        println!("{}", sandbox.id);
+        Ok(())
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.Sandbox;
+
+    MicroVMClient client = new MicroVMClient.Builder()
+        .apiUrl("https://sandbox.example.com")
+        .patToken("your-token")
+        .build();
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setModuleRef("sha256:…")
+        .setRuntime("isolate")
+        .setMemoryMB(128));
+
+    System.out.println(sandbox.id);
+    ```
+  </TabItem>
+</Tabs>
+
+## Residual limits
+
+Isolates have **no shell, no filesystem, and no arbitrary binary**. Toolbox
+`exec` invokes the `fetch` handler; other toolbox verbs return 501. Upload
+bundles via `POST /v1/js-bundles` (experimental until the demand checkpoint
+lands). Public HTTP is opt-in with `expose_port` (HTTP only — the TCP host-port
+pool is never walked).
