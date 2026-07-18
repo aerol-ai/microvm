@@ -9,12 +9,13 @@ matrix. Full design + decisions: [`../plans/integration-tests.md`](../plans/inte
 > key + separate `TF_DATA_DIR`) so production state is never touched. Spot
 > instances + auto-teardown + `make integration-reap` keep cost down.
 
-## Status: Phase 0 (walking skeleton)
+## Status
 
-Implemented end-to-end on the `single-node` scenario: UC-10 (auth), UC-11
-(create), UC-16 (delete), UC-29 (expose), UC-30 (reachable). Everything else is
-in the registry as **pending** and shows up that way in the report. Cluster
-scenarios land in Phase 2.
+Live scenarios cover single-node (docker / containerd / fc / wasm / isolate),
+3× mixed clusters (docker, containerd, gvisor, wasm, fc), hetero, local-mode,
+and arm64. Reports and the coverage matrix live in `reports/`. Isolate is
+exercised by `make integration-single-isolate` (UC-103/104/105) and
+`make integration-benchmark-isolate` (UC-94).
 
 ## Prerequisites
 
@@ -27,13 +28,15 @@ scenarios land in Phase 2.
 ## Run
 
 ```bash
-make integration-single                 # single-node scenario (Phase 0)
+make integration-single                 # single-node scenario
+make integration-single-isolate         # single-node + V8-isolate (workerd); UC-103/104/105
 make integration-local                  # local-mode (--local install on a throwaway box)
 integration-tests/run.sh single-node --keep        # leave infra up for debugging
 integration-tests/run.sh single-node --prod-tls    # use real Let's Encrypt instead of staging
 make integration-cluster-hetero           # 8-node heterogeneous cluster (x86 fc)
 make integration-cluster-mixed-fc         # 3× mixed cluster, FC on seed c5.metal
 make integration-cluster-mixed-gvisor       # 3× mixed cluster, gVisor on every node
+make integration-cluster-mixed-wasm         # 3× mixed cluster, WASM workers
 make integration-single-fc                # single-node-fc (x86 firecracker, c5.metal)
 make integration-arm64                    # arm64 firecracker single + cluster scenarios
 make integration-arm64-single             # single-node-fc-arm64 (Graviton metal)
@@ -107,17 +110,19 @@ every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-
 deployment to measure sandbox creation. It only runs where the scenario
 advertises the `benchmark` capability — **`cluster-hetero`** (every runtime),
 **`cluster-3-mixed-docker`** (docker only), **`cluster-3-mixed-fc`** (docker +
-firecracker), **`cluster-3-mixed-gvisor`** (docker + gvisor), and
-**`cluster-3-mixed-wasm`** (docker + wasm) in 3-node mixed clusters — because
-it is slow and provisions many sandboxes. Everywhere else UC-94/UC-95 skip (not-applicable).
+firecracker), **`cluster-3-mixed-gvisor`** (docker + gvisor),
+**`cluster-3-mixed-wasm`** (docker + wasm), and **`single-node-isolate`**
+(isolate) — because it is slow and provisions many sandboxes. Everywhere else
+UC-94/UC-95 skip (not-applicable).
 
 - **UC-94 — create latency:** for each runtime the scenario has (docker,
-  firecracker, gvisor, wasm) it creates `AEROL_BENCH_SAMPLES` sandboxes
+  firecracker, gvisor, wasm, isolate) it creates `AEROL_BENCH_SAMPLES` sandboxes
   serially, reporting p50/p90/p99 + mean for three timings: **api** (the
   `Create()` client round-trip), **server** (the API's own `Server-Timing`
   header for the create — client↔cluster network excluded), and **running**
   (create→`started`). `api − server` is that network overhead, so you can tell a
-  slow create from a slow link.
+  slow create from a slow link. For isolate, the bench uploads one JS bundle and
+  pins a shared `tenant_id` so samples hit the warm group path.
 - **UC-95 — fleet density:** creates docker sandboxes until the fleet rejects on
   capacity (HTTP 503 `capacity exceeded`), reports how many landed, then tears
   them all down. `AEROL_BENCH_MAX` bounds cost if admission never trips.
@@ -153,6 +158,10 @@ make integration-benchmark-wasm
 # gVisor-focused 3× mixed cluster (docker + gvisor only; cheap t3 spot boxes):
 make integration-benchmark-gvisor
 
+# V8-isolate (workerd) create-latency on single-node-isolate (t3.medium):
+# AEROL_BENCH_RUNTIMES=isolate; UC-95 skipped (no CapCluster).
+make integration-benchmark-isolate
+
 # Manual env form (hetero):
 AEROL_BENCH=1 \
 AEROL_BENCH_OUT=integration-tests/reports/cluster-hetero-bench.json \
@@ -180,11 +189,14 @@ make integration-benchmark-wasm-only       # re-run wasm bench against kept clus
 make integration-cluster-mixed-gvisor keep # 3× mixed gVisor cluster
 make integration-benchmark-gvisor-only     # re-run UC-94/UC-95 against it
 
+make integration-single-isolate keep       # single-node isolate (functional UCs)
+make integration-benchmark-isolate-only    # re-run UC-94 isolate latency
+
 # Narrow the UC-94 sweep on hetero / mixed-fc / mixed-gvisor benches:
 AEROL_BENCH_RUNTIMES=docker,gvisor,wasm make integration-benchmark-only
-# …or isolate firecracker latency (UC-95 skips when docker is excluded):
+# …or firecracker-only latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=firecracker make integration-benchmark-fc-only
-# …or isolate gvisor latency (UC-95 skips when docker is excluded):
+# …or gvisor-only latency (UC-95 skips when docker is excluded):
 AEROL_BENCH_RUNTIMES=gvisor make integration-benchmark-gvisor-only
 # …or add docker density/latency back on the wasm cluster:
 AEROL_BENCH_RUNTIMES=docker,wasm make integration-benchmark-wasm-only
@@ -194,6 +206,7 @@ make integration-destroy SCENARIO=cluster-3-mixed-docker
 make integration-destroy SCENARIO=cluster-3-mixed-fc
 make integration-destroy SCENARIO=cluster-3-mixed-gvisor
 make integration-destroy SCENARIO=cluster-3-mixed-wasm
+make integration-destroy SCENARIO=single-node-isolate
 ```
 
 Percentiles + the density ceiling also print as `bench[...]` log lines (captured

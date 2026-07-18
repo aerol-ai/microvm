@@ -5,7 +5,12 @@ description: Create sandboxes backed by Firecracker microVMs for full kernel iso
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Firecracker sandboxes run inside lightweight virtual machines instead of containers. Each sandbox boots its own Linux kernel in under 100ms and is completely isolated from the host and from other sandboxes at the hardware level. There is no shared kernel - a vulnerability in one sandbox cannot affect another.
+Firecracker sandboxes run inside lightweight virtual machines instead of
+containers. Each sandbox boots its own Linux kernel and is completely isolated
+from the host and from other sandboxes at the hardware level. There is no shared
+kernel - a vulnerability in one sandbox cannot affect another. With the snapshot
+warm pool, live UC-94 on `single-node-fc` (`c5.metal`) measures **~34ms** server
+create p50 (API ~300ms includes client WAN).
 
 Use Firecracker when:
 - You are running untrusted or LLM-generated code that should not have any path to the host kernel

@@ -14,7 +14,7 @@ stack, and picking one means not picking the others.
 They are not at the same layer. **Firecracker and Cloud Hypervisor are engines.
 Kata is a chassis you drop an engine into.** Asking "Firecracker or Kata" is
 like asking "a V8 or a sedan" — the sedan *has* a V8. This page lays out the
-layer cake, shows exactly where AerolVM's four runtimes sit in it, and explains
+layer cake, shows exactly where AerolVM's five runtimes sit in it, and explains
 why AerolVM ended up writing its own chassis instead of adopting one off the
 shelf.
 
@@ -57,9 +57,9 @@ Firecracker. Kata runs *on top of* Firecracker.** The moment you internalize
 that, "Firecracker vs Kata" dissolves — they're answering questions one layer
 apart.
 
-## Where AerolVM's four runtimes actually sit
+## Where AerolVM's five runtimes actually sit
 
-AerolVM ships four runtimes today. They do not line up in a single row —
+AerolVM ships five runtimes today. They do not line up in a single row —
 they're spread across two different layers:
 
 | Runtime | Layer | Isolation mechanism |
@@ -67,12 +67,14 @@ they're spread across two different layers:
 | **Docker** (`runtime: "docker"`) | OCI runtime (`runc`) | Linux namespaces + cgroups |
 | **gVisor** (`runtime: "gvisor"`) | OCI runtime (`runsc`) | Userspace kernel intercepting syscalls |
 | **Firecracker** (`runtime: "firecracker"`) | Our own OCI-runtime-equivalent → VMM | Hardware VM (KVM) |
-| **WASM** (`runtime: "wasm"`) | A different axis entirely | Language VM / sandboxed bytecode |
+| **WASM** (`runtime: "wasm"`) | Language VM / sandboxed bytecode | Host-mediated WASI workers (optional resident host) |
+| **Isolate** (`runtime: "isolate"`) | Language VM (V8 / workerd) | Per-tenant workerd group + host-mediated egress; off by default |
 
 Docker and gVisor are drop-in OCI runtimes — the container ecosystem handed
-them to us. WASM is off the diagram: it isolates at the language-VM layer, not
-the container layer, so it trades syscall compatibility for the smallest
-possible footprint (see [WASM Architecture](/wasm-architecture/)).
+them to us. WASM and isolate are off the OCI diagram: they isolate at the
+language-VM layer, not the container layer, so they trade syscall compatibility
+for density and create latency (see [WASM Architecture](/wasm-architecture/) and
+[Isolate Sandbox](/isolate-sandbox/)).
 
 Firecracker is the interesting one. There is no off-the-shelf OCI runtime in
 that row, because **we wrote it ourselves.**
@@ -155,8 +157,8 @@ snapshots, the fast-boot trick carries over intact.
 
 Critically, none of this touches the SDK. Runtime selection is one string in
 the create call — the same field that already distinguishes Docker, gVisor,
-Firecracker, and WASM. A new engine slots in behind it without changing a line
-of client code:
+Firecracker, WASM, and isolate. A new engine slots in behind it without changing
+a line of client code:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -168,7 +170,7 @@ of client code:
       patToken: process.env.SB_PAT_TOKEN,
     })
 
-    // Runtime is a string. Today it selects docker | gvisor | firecracker | wasm.
+    // Runtime is a string. Today it selects docker | gvisor | firecracker | wasm | isolate.
     // A new VMM (e.g. cloud-hypervisor) would slot in behind this same field
     // without any SDK change.
     const sbx = await client.create({
@@ -283,11 +285,12 @@ layer is a VM, pick which engine.
 
 | You want | Pick this layer | Notes |
 |---|---|---|
-| Max compatibility, lowest overhead, trusted-ish code | `runc` (Docker) | Namespaces. Fastest, weakest boundary. |
+| Max compatibility, lowest overhead, trusted-ish code | `runc` (Docker) | Namespaces. Fast OCI path (~30ms warm server create). |
 | Untrusted code, container UX, no VM cost | gVisor (`runsc`) | Userspace kernel. Strong boundary, some syscall-compat gaps. |
-| Hardware-VM isolation with sub-100ms boot | Firecracker | Our hand-rolled driver + snapshot warm pool. Default microVM. |
+| Hardware-VM isolation with ~30ms warm boot | Firecracker | Our hand-rolled driver + snapshot warm pool. Default microVM. |
 | GPU passthrough / confidential VMs / hotplug | Cloud Hypervisor *(candidate engine)* | Same layer as Firecracker; swap the engine, reuse the chassis. |
-| Smallest possible footprint, per-request isolation | WASM | Language-VM layer. Different tradeoff axis entirely. |
+| Smallest possible footprint, WASI modules | WASM | Language-VM layer; resident host ~22ms warm create. |
+| JS/TS `fetch` handlers, Workers density | Isolate (V8 / workerd) | Language-VM layer; ~4ms warm server create; off by default. |
 
 The mental model to walk away with: **Firecracker and Cloud Hypervisor are
 engines; Docker/gVisor/Kata are chassis; AerolVM built its own chassis so it

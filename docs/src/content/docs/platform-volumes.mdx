@@ -31,7 +31,8 @@ A platform volume:
 Platform volumes must be **enabled by the operator** (see [Operator
 setup](#operator-setup)). If they are not configured, every volume request is
 rejected with **412 Precondition Failed**. Volumes are supported on the
-`docker` and `gvisor` runtimes only — `firecracker` and `wasm` reject them.
+`docker` and `gvisor` runtimes only — `firecracker`, `wasm`, and `isolate`
+reject them.
 Platform volumes count against the same per-sandbox cap as external mounts (8
 total).
 
