@@ -28,7 +28,7 @@ require (
 	github.com/containerd/containerd v1.7.29
 	github.com/containerd/containerd/api v1.8.0
 	github.com/containerd/platforms v0.2.1
-	github.com/containerd/typeurl/v2 v2.1.1
+	github.com/containerd/typeurl/v2 v2.3.0
 	github.com/distribution/reference v0.6.0
 	github.com/google/nftables v0.3.0
 	github.com/hashicorp/raft-wal v0.4.2
