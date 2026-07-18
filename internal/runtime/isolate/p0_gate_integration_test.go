@@ -126,11 +126,12 @@ func TestP0HostileIsolateContainment(t *testing.T) {
 		t.Fatalf("create good: %v", err)
 	}
 
-	// (b) Undeclared egress is refused: the Go proxy denies with 403 (surfaced to
-	// the isolate as "egress-ok:403") or the fetch throws ("egress-err:*"). A 2xx
-	// upstream ("egress-ok:2xx") would mean egress actually leaked. (Egress is
-	// deny-all today — attribution is a §4 follow-up — so every destination is
-	// refused, which subsumes this allowlist check.)
+	// (b) Undeclared egress is refused: egress is attributed per-sandbox by slot
+	// (§4), so this sandbox's outbound is enforced against ITS allowlist
+	// (127.0.0.1/32) — example.invalid is not in it, so the Go proxy denies with
+	// 403 (surfaced as "egress-ok:403") or the fetch throws ("egress-err:*"). And
+	// even a 127.0.0.1 destination would be refused by the SSRF IP-range guard. A
+	// 2xx upstream ("egress-ok:2xx") would mean the capability boundary leaked.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://isolate/egress", nil)
 	resp, err := d.InvokeHTTP(ctx, "sb-hostile", req)
 	if err != nil {

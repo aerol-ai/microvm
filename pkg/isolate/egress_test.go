@@ -62,15 +62,14 @@ func TestIsBlockedEgressIP(t *testing.T) {
 	}
 }
 
-// TestServeEgressBlocksLiteralSSRF proves an isolate whose policy is the default
+// TestProxyEgressBlocksLiteralSSRF proves an isolate whose policy is the default
 // allow-all still cannot reach a loopback/metadata IP literal through the proxy.
-func TestServeEgressBlocksLiteralSSRF(t *testing.T) {
-	h := &Host{egressPolicy: map[string]EgressPolicy{"sb-1": {}}} // allow-all policy
+func TestProxyEgressBlocksLiteralSSRF(t *testing.T) {
+	h := &Host{}
 	for _, target := range []string{"http://127.0.0.1:21212/v1/sandboxes", "http://169.254.169.254/latest/meta-data/"} {
 		req := httptest.NewRequest(http.MethodGet, target, nil)
-		req.Header.Set("x-sb-id", "sb-1")
 		rec := httptest.NewRecorder()
-		h.serveEgress(rec, req)
+		h.proxyEgress(rec, req, EgressPolicy{}) // allow-all policy
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("egress to %s = %d, want 403 (blocked)", target, rec.Code)
 		}
@@ -80,21 +79,50 @@ func TestServeEgressBlocksLiteralSSRF(t *testing.T) {
 	}
 }
 
-func TestServeEgressRequiresAttribution(t *testing.T) {
-	h := &Host{egressPolicy: map[string]EgressPolicy{}}
-	// No x-sb-id → forbidden (attribution missing).
-	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+// TestProxyEgressPolicyDeny covers the offline decision branches of proxyEgress:
+// a host outside the allowlist is refused, and a request with no destination
+// authority is refused (both without touching the network).
+func TestProxyEgressPolicyDeny(t *testing.T) {
+	h := &Host{}
+
+	// Host not in the allowlist → 403 by policy.
+	req := httptest.NewRequest(http.MethodGet, "http://other.example/x", nil)
 	rec := httptest.NewRecorder()
-	h.serveEgress(rec, req)
+	h.proxyEgress(rec, req, EgressPolicy{Allow: []string{"only.example"}})
 	if rec.Code != http.StatusForbidden {
-		t.Fatalf("egress without x-sb-id = %d, want 403", rec.Code)
+		t.Fatalf("non-allowlisted host = %d, want 403", rec.Code)
 	}
-	// Unknown sandbox id (no policy) → forbidden (fail-closed).
-	req = httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
-	req.Header.Set("x-sb-id", "unknown")
+	if body, _ := io.ReadAll(rec.Result().Body); !strings.Contains(string(body), "policy") {
+		t.Fatalf("deny body = %q, want a policy denial", body)
+	}
+
+	// No destination authority → 403 (cannot attribute a target).
+	req = httptest.NewRequest(http.MethodGet, "http://x/y", nil)
+	req.Host = ""
+	req.URL.Host = ""
 	rec = httptest.NewRecorder()
-	h.serveEgress(rec, req)
+	h.proxyEgress(rec, req, EgressPolicy{})
 	if rec.Code != http.StatusForbidden {
-		t.Fatalf("egress for unknown sandbox = %d, want 403 (fail-closed)", rec.Code)
+		t.Fatalf("no-host = %d, want 403", rec.Code)
+	}
+}
+
+// TestServeEgressSlotFailsClosed proves the per-slot handler denies when the
+// slot has no attributed owner (a teardown race) or the owner has no registered
+// policy — the socket, not a header, is the attribution.
+func TestServeEgressSlotFailsClosed(t *testing.T) {
+	h := &Host{idBySlot: []string{""}, egressPolicy: map[string]EgressPolicy{}}
+	// Slot 0 has no owner → forbidden.
+	rec := httptest.NewRecorder()
+	h.serveEgressSlot(0, rec, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("unowned slot = %d, want 403", rec.Code)
+	}
+	// Owner present but no policy registered → forbidden (fail-closed).
+	h.idBySlot[0] = "sb-x"
+	rec = httptest.NewRecorder()
+	h.serveEgressSlot(0, rec, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("owner without policy = %d, want 403 (fail-closed)", rec.Code)
 	}
 }

@@ -37,6 +37,9 @@ type Config struct {
 	// IdleTTL is how long a group may sit without Create/Invoke before the
 	// idle reaper tears it down. Zero disables the reaper.
 	IdleTTL time.Duration
+	// EgressPoolSize is the per-group egress-slot pool size (§4): the cap on
+	// concurrently-egressing sandboxes in a group. Zero → pkg/isolate default.
+	EgressPoolSize int
 }
 
 // FromDaemonConfig projects the isolate slice of daemon config into driver config.
@@ -51,5 +54,6 @@ func FromDaemonConfig(cfg config.Config) Config {
 		JailGID:          cfg.IsolateJailGID,
 		Jitless:          cfg.IsolateJitless,
 		IdleTTL:          cfg.IsolateGroupIdleTTL,
+		EgressPoolSize:   cfg.IsolateEgressPoolSize,
 	}
 }

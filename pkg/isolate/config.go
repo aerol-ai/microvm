@@ -30,10 +30,11 @@ const controllerModuleName = "controller.js"
 //   - rejects requests with no x-sb-id (the driver always sets it);
 //   - dynamically loads the isolate for that id, fetching the bundle from the
 //     HOST binding on a cache miss;
-//   - attributes egress per sandbox: each sandbox's globalOutbound is a tiny
-//     shim isolate (also via LOADER) that stamps x-sb-id before hitting the
-//     shared EGRESS service, so the Go proxy knows ownership at accept time
-//     (plans/isolate-runtime.md §4 Phase 3);
+//   - attributes egress per sandbox by SLOT: the host assigns each egressing
+//     sandbox an egress slot and returns it in the bundle spec, so the loaded
+//     worker's globalOutbound binds to that slot's dedicated static egress
+//     service (env["EGRESS_"+slot]) — one host UDS per slot, ownership known at
+//     accept time (plans/isolate-runtime.md §4);
 //   - strips the control header before handing the request to the isolate.
 const controllerJS = `export default {
   async fetch(request, env) {
@@ -49,21 +50,26 @@ const controllerJS = `export default {
     if (probe.status === 404) return new Response("no such sandbox", { status: 404 });
     if (!probe.ok) return new Response("isolate bundle fetch " + probe.status, { status: 502 });
     const spec = await probe.json();
-    // Egress: the sandbox worker's globalOutbound is the STATIC egress service
-    // (a real Fetcher). It cannot be a per-sandbox shim loaded via env.LOADER —
-    // workerd rejects a dynamically-loaded worker's stub/entrypoint as
-    // globalOutbound of ANOTHER dynamic worker ("Entrypoints to dynamically-
-    // loaded workers cannot be transferred"). So per-request x-sb-id
-    // attribution via a shim is not expressible this way; the Go egress server
-    // therefore sees no attribution and fail-closed DENIES all egress (the
-    // Phase-2 deny-all posture). Restoring per-sandbox allowlists needs a
-    // workerd-supported attribution mechanism (plans/isolate-runtime.md §4
-    // follow-up) — until then egress is deny-all, which is safe.
+    // Egress attribution is by SOCKET, not header. workerd only accepts a real
+    // static service binding as globalOutbound — a JS-object Fetcher is rejected
+    // ("not of type 'Fetcher'") and a dynamically-loaded worker stub is rejected
+    // ("Entrypoints to dynamically-loaded workers cannot be transferred"). So the
+    // host pre-declares a pool of per-slot egress services (EGRESS_0..) each on
+    // its own UDS, assigns this sandbox a slot, and returns egress_slot here; we
+    // bind globalOutbound to that slot's service. The loaded worker is given NO
+    // other bindings, so it can reach ONLY its own slot — attribution is
+    // structural and unforgeable. A sandbox with no slot (block-all, or the pool
+    // is exhausted) binds EGRESS_DENY, which fail-closed 403s (spike-proven
+    // 2026-07-18; plans/isolate-runtime.md §4).
+    const slot = spec.egress_slot;
+    const outbound = (slot === undefined || slot === null || slot < 0)
+      ? env.EGRESS_DENY
+      : env["EGRESS_" + slot];
     const worker = env.LOADER.get(id, async () => ({
       compatibilityDate: spec.compatibility_date,
       mainModule: spec.main_module,
       modules: spec.modules,
-      globalOutbound: env.EGRESS,
+      globalOutbound: outbound,
     }));
     const fwd = new Request(request);
     fwd.headers.delete("x-sb-id");
@@ -76,24 +82,41 @@ const controllerJS = `export default {
 // dir: the controller listens on the first (driver → isolate traffic), the Go
 // host serves the bundle-server on the second (controller → host bundle fetch).
 const (
-	controlSocketName = "control.sock"
-	hostSocketName    = "host.sock"
-	egressSocketName  = "egress.sock"
+	controlSocketName    = "control.sock"
+	hostSocketName       = "host.sock"
+	egressDenySocketName = "egress-deny.sock"
 )
+
+// egressSlotSocketName is the host UDS for egress slot n (§4). The pool is
+// pre-declared in the group config, but the host binds a slot's socket only when
+// it assigns that slot to a sandbox — so runtime cost tracks egressing
+// sandboxes, not pool size.
+func egressSlotSocketName(n int) string { return fmt.Sprintf("egress-%d.sock", n) }
 
 // capnpConfig renders the workerd config for one group. controlSock is where
 // workerd listens for sandbox traffic; hostSock is the Go bundle-server the
-// controller's provider fetches from; egressSock is the deny-all (Phase 2) /
-// per-sandbox (Phase 3) egress service. loaderID scopes the workerLoader cache
-// (per-group, so two groups never share loaded isolates).
-func capnpConfig(controlSock, hostSock, egressSock, loaderID string) string {
+// controller's provider fetches from; egressSocks is the pre-declared pool of
+// per-slot egress services (§4) — one static service per slot, each bound to a
+// host UDS the driver assigns per egressing sandbox; denySock backs EGRESS_DENY,
+// the fail-closed service block-all / no-slot sandboxes bind. loaderID scopes
+// the workerLoader cache (per-group, so two groups never share loaded isolates).
+//
+// External services are dialed lazily by workerd (spike-confirmed 2026-07-18):
+// declaring K egress services whose UDS have no listener yet is fine — workerd
+// only connects on a subrequest, so an unassigned slot is never dialed.
+func capnpConfig(controlSock, hostSock string, egressSocks []string, denySock, loaderID string) string {
+	var svcs, binds strings.Builder
+	for i, sock := range egressSocks {
+		fmt.Fprintf(&svcs, "    (name = \"egress%d\", external = (address = \"unix:%s\", http = ())),\n", i, sock)
+		fmt.Fprintf(&binds, "    (name = \"EGRESS_%d\", service = \"egress%d\"),\n", i, i)
+	}
 	return fmt.Sprintf(`using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   services = [
     (name = "controller", worker = .controller),
     (name = "host", external = (address = "unix:%s", http = ())),
-    (name = "egress", external = (address = "unix:%s", http = ())),
-  ],
+    (name = "egressDeny", external = (address = "unix:%s", http = ())),
+%s  ],
   sockets = [
     (name = "control", address = "unix:%s", http = (), service = "controller"),
   ]
@@ -105,10 +128,10 @@ const controller :Workerd.Worker = (
   bindings = [
     (name = "LOADER", workerLoader = (id = %s)),
     (name = "HOST", service = "host"),
-    (name = "EGRESS", service = "egress"),
-  ],
+    (name = "EGRESS_DENY", service = "egressDeny"),
+%s  ],
 );
-`, hostSock, egressSock, controlSock, controllerModuleName, controllerModuleName, strconv.Quote(loaderID))
+`, hostSock, denySock, svcs.String(), controlSock, controllerModuleName, controllerModuleName, strconv.Quote(loaderID), binds.String())
 }
 
 // bundleWireJSON is the shape the bundle-server returns and the controller
@@ -117,6 +140,9 @@ type bundleWireJSON struct {
 	CompatibilityDate string            `json:"compatibility_date"`
 	MainModule        string            `json:"main_module"`
 	Modules           map[string]string `json:"modules"`
+	// EgressSlot is the sandbox's assigned egress slot (§4). Nil (omitted) means
+	// no slot — the controller binds EGRESS_DENY (block-all or pool exhausted).
+	EgressSlot *int `json:"egress_slot,omitempty"`
 }
 
 // validateLoaderID guards the workerLoader cache id (it is embedded in the
