@@ -2,13 +2,14 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-containerd integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-docker integration-benchmark-docker-only \
 	integration-benchmark-docker-sparse \
 	integration-benchmark-containerd integration-benchmark-containerd-only \
 	integration-benchmark-fc integration-benchmark-fc-only \
 	integration-benchmark-wasm integration-benchmark-wasm-only \
+	integration-benchmark-isolate integration-benchmark-isolate-only \
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
 	integration-benchmark-gvisor-docker integration-benchmark-gvisor-docker-only \
 	integration-single-fc integration-benchmark-fc-single integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
@@ -105,6 +106,14 @@ integration-single-containerd:
 # Smallest scenario that exercises the wasm-runtime use cases.
 integration-single-wasm:
 	integration-tests/run.sh single-node-wasm $(RUN_FLAGS)
+
+# Single-node with the V8-isolate (workerd) runtime enabled. Driven entirely by
+# default_with_isolate=true in single-node-isolate.tfvars (install.sh
+# --with-isolate downloads workerd + writes SB_ENABLE_ISOLATE=true) — no config
+# overlay, no node-side staging. Exercises the isolate-runtime use cases
+# (UC-103..105), including the per-sandbox egress-attribution proof.
+integration-single-isolate:
+	integration-tests/run.sh single-node-isolate $(RUN_FLAGS)
 
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)
@@ -291,6 +300,33 @@ integration-benchmark-wasm-only:
 	AEROL_BENCH_SAMPLES=$(WASM_BENCH_SAMPLES) \
 	AEROL_BENCH_RUNTIMES=$(WASM_BENCH_RUNTIMES) \
 		integration-tests/run.sh cluster-3-mixed-wasm --bench-only
+
+# V8-isolate (workerd) create-latency benchmark on the single-node-isolate box.
+# Provisions single-node-isolate (t3.medium, jail off) and runs UC-94 isolate
+# latency only (AEROL_BENCH_RUNTIMES=isolate). warmBenchmarkRuntimes spawns the
+# tenant's workerd group once, so the samples measure the warm create path
+# (isolate loaded into an already-running group). UC-95 (density) is skipped: it
+# needs CapCluster, which a single node lacks. UC-94 is meaningful single-node
+# (no Raft/placement/forward in the number). Add docker with
+# AEROL_BENCH_RUNTIMES=docker,isolate.
+#   make integration-benchmark-isolate
+#   make integration-benchmark-isolate keep
+#   make integration-benchmark-isolate ISOLATE_BENCH_OUT=/tmp/isolate-bench.json
+ISOLATE_BENCH_OUT ?= integration-tests/reports/single-node-isolate-bench.json
+ISOLATE_BENCH_SAMPLES ?= 10
+ISOLATE_BENCH_RUNTIMES ?= isolate
+integration-benchmark-isolate:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(ISOLATE_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(ISOLATE_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(ISOLATE_BENCH_RUNTIMES) \
+		integration-tests/run.sh single-node-isolate --bench-only $(RUN_FLAGS)
+
+# Re-run UC-94 against a single-node-isolate left up with `keep`.
+integration-benchmark-isolate-only:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(ISOLATE_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(ISOLATE_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(ISOLATE_BENCH_RUNTIMES) \
+		integration-tests/run.sh single-node-isolate --bench-only
 
 # gVisor create-latency benchmark on the 3× mixed-gvisor cluster (containerd
 # engine — the harness default; the scenario has no docker-engine cap, so

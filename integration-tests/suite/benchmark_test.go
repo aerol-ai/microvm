@@ -24,9 +24,9 @@ import (
 // benchmark_test.go holds the opt-in create benchmarks (UC-94/UC-95). They run
 // only where the scenario advertises CapBenchmark — cluster-hetero (every
 // runtime), cluster-3-mixed-docker (docker only), cluster-3-mixed-fc (docker +
-// firecracker), cluster-3-mixed-gvisor (docker + gvisor), and cluster-3-mixed-wasm
-// (docker + wasm) — because they
-// many sandboxes. They reuse the same SDK client + cleanup contract as every
+// firecracker), cluster-3-mixed-gvisor (docker + gvisor), cluster-3-mixed-wasm
+// (docker + wasm), and single-node-isolate (docker + isolate) — because they
+// provision many sandboxes. They reuse the same SDK client + cleanup contract as every
 // other use case; the only difference is they record timings instead of
 // asserting a single create.
 //
@@ -60,6 +60,11 @@ var benchRuntimes = []struct {
 	{"firecracker", harness.CapFirecracker},
 	{"gvisor", harness.CapGvisor},
 	{"wasm", harness.CapWasm},
+	// isolate (V8/workerd) measures the warm create path: warmBenchmarkRuntimes
+	// spawns the tenant's workerd group once, then every sample is an isolate
+	// loaded into that already-running group (compile-once / instantiate-many).
+	// A bundle is uploaded once in selectedBenchRuntimes and reused as ModuleRef.
+	{"isolate", harness.CapIsolate},
 }
 
 type benchRuntimeSpec struct {
@@ -67,6 +72,11 @@ type benchRuntimeSpec struct {
 	image      string
 	wasmRef    string
 	templateID string
+	// bundleRef + tenantID configure an isolate create: the JS bundle uploaded
+	// once for the sweep, and the shared workerd group key so samples reuse one
+	// warm group. Unused by other runtimes.
+	bundleRef string
+	tenantID  string
 }
 
 // requireBenchEnabled is a second gate on top of the CapBenchmark capability.
@@ -169,6 +179,15 @@ func selectedBenchRuntimes(t *testing.T) []benchRuntimeSpec {
 				continue
 			}
 		}
+		if br.runtime == "isolate" {
+			// Upload the bench bundle once (content-addressed + idempotent) and
+			// reference it by name on every create. A single shared tenant keeps
+			// all samples in one warm workerd group so the numbers reflect the
+			// steady-state create path, not a group cold-spawn per sample.
+			spec.bundleRef = uploadBundle(t, client(t), "itest-isolate-bench",
+				`export default { async fetch() { return new Response("bench"); } };`)
+			spec.tenantID = "bench-isolate"
+		}
 		selected = append(selected, spec)
 	}
 	return selected
@@ -184,6 +203,12 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 	case "wasm":
 		opts.Image = spec.wasmRef
 		opts.ModuleRef = spec.wasmRef
+	case "isolate":
+		// The bundle IS the image; ModuleRef references it and TenantID keeps
+		// every sample in one warm workerd group.
+		opts.ModuleRef = spec.bundleRef
+		opts.TenantID = spec.tenantID
+		opts.MemoryMB = 128
 	case "firecracker":
 		opts.Image = spec.image
 		if opts.Image == "" {
