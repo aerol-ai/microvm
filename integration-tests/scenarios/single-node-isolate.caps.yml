@@ -1,0 +1,20 @@
+# Single-node scenario with the V8-isolate (workerd) runtime turned on. Same
+# topology as single-node (one mixed box + public domain/TLS) but advertises
+# `isolate`, which gates the isolate use cases (UC-103..105) in the suite. The
+# runtime itself is enabled purely by provisioning: single-node-isolate.tfvars
+# sets default_with_isolate=true → install.sh --with-isolate downloads workerd +
+# writes SB_ENABLE_ISOLATE=true. Unlike wasm there is NO run.sh overlay flip and
+# no node-side staging (the UCs upload JS bundles over the API), so `isolate` is
+# an advertisement-only capability — the same shape as `gvisor`.
+#
+# `docker` is advertised too because the mixed node also runs the docker runtime;
+# it gives the isolate scenario free base-lifecycle regression coverage and
+# proves isolate coexists with docker on one host. `domain` gives a public
+# base_url + TLS the UCs talk to.
+#
+# This is the smallest scenario that exercises the isolate-runtime use cases.
+name: single-node-isolate
+capabilities:
+  - docker
+  - isolate
+  - domain

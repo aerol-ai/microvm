@@ -46,6 +46,28 @@ func (c *Client) rawPost(ctx context.Context, path string, body any) (*http.Resp
 	return http.DefaultClient.Do(req)
 }
 
+// Delete issues an authenticated DELETE and returns an error on any non-2xx.
+// Used by the isolate js-bundle catalogue UC, whose delete verb the Go SDK does
+// not wrap. 204 No Content (the catalogue's success status) and any 2xx count as
+// success; the body snippet on failure surfaces what the server said.
+func (c *Client) Delete(ctx context.Context, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.sc.BaseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.sc.PAT)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("DELETE %s: status %d: %s", path, resp.StatusCode, snippet(b))
+	}
+	return nil
+}
+
 // GetJSON GETs path and decodes a 2xx JSON body into out. Any non-2xx is an
 // error carrying the status and a snippet of the body, so a failing use case
 // reports what the server actually said.

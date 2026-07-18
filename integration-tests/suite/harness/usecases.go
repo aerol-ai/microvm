@@ -19,9 +19,18 @@ const (
 	CapFirecracker Capability = "firecracker" // a firecracker-capable worker
 	CapGvisor      Capability = "gvisor"      // a gvisor-capable worker
 	CapWasm        Capability = "wasm"        // wasm runtime + staged module
-	CapGPU         Capability = "gpu"         // a GPU worker
-	CapDomain      Capability = "domain"      // public domain + TLS (not local-mode)
-	CapCluster     Capability = "cluster"     // multi-node cluster (raft/forwarding)
+	// CapIsolate gates the V8-isolate (workerd) use cases (UC-103..105). Like
+	// CapGvisor it is advertisement-only: the runtime is enabled purely by
+	// provisioning (default_with_isolate=true → install.sh --with-isolate writes
+	// SB_ENABLE_ISOLATE=true + installs workerd), not by any run.sh config-overlay
+	// flip. A scenario advertises it when its node was provisioned --with-isolate;
+	// where the runtime is off, the isolate UCs skip (not-applicable) rather than
+	// hard-fail. Unlike CapWasm it needs no node-side module staging — the UCs
+	// upload JS bundles over POST /v1/js-bundles at runtime.
+	CapIsolate Capability = "isolate" // V8-isolate (workerd) runtime available
+	CapGPU     Capability = "gpu"     // a GPU worker
+	CapDomain  Capability = "domain"  // public domain + TLS (not local-mode)
+	CapCluster Capability = "cluster" // multi-node cluster (raft/forwarding)
 	// CapMixedArchNegative gates UC-79: inject a foreign-arch snapshot ref and
 	// assert the arm64 cluster refuses to resume it.
 	CapMixedArchNegative Capability = "mixed-arch-negative"
@@ -299,6 +308,32 @@ var Registry = []UseCase{
 	{ID: "UC-100", Title: "sandboxd restart reconcile: live sandboxes + parked + netns slots survive", Requires: []Capability{CapContainerdEngine}, Implemented: true},
 	{ID: "UC-101", Title: "containerd restart: shims survive and events resubscribe", Requires: []Capability{CapContainerdEngine}, Implemented: true},
 	{ID: "UC-102", Title: "dockerd coexistence: AEROLVM-USER jump survives dockerd restart", Requires: []Capability{CapContainerdEngine}, Implemented: true},
+
+	// L. V8-isolate runtime (workerd) — plans/isolate-runtime.md. Gated on
+	// CapIsolate, which a scenario advertises only when its node was provisioned
+	// --with-isolate (SB_ENABLE_ISOLATE=true + a workerd binary). These are the
+	// repeatable live coverage for the isolate runtime — before them the only
+	// isolate validation on real infra was an ad-hoc manual recipe.
+	//
+	// UC-103 is the end-to-end "isolate runs": upload a JS bundle over
+	// POST /v1/js-bundles, create a runtime=isolate sandbox referencing it, and
+	// drive its fetch handler via toolbox exec (the isolate driver maps an exec
+	// command to a fetch on that URL path). Proves workerd installed, the group
+	// spawned, the bundle loaded, and the fetch handler served.
+	{ID: "UC-103", Title: "Isolate-runtime sandbox runs (upload bundle + create + exec-fetch)", Requires: []Capability{CapIsolate}, Implemented: true},
+	// UC-104 is the per-sandbox egress-attribution proof (the §4 redesign shipped
+	// in v0.7.16 / PR #340). Two isolate sandboxes in the SAME tenant group get
+	// DIFFERENT egress policies enforced: an allow-listed sandbox reaches its
+	// allowed host but is refused a non-allowed one, while a block-all sandbox in
+	// the same group is refused everything. Attribution is the egress slot socket,
+	// not a forgeable header — so this is what turns "egress works" from an
+	// offline claim into a live, multi-tenant guarantee.
+	{ID: "UC-104", Title: "Isolate per-sandbox egress allowlist enforced (block-all + allow differ in one tenant)", Requires: []Capability{CapIsolate}, Implemented: true},
+	// UC-105 exercises the js-bundle catalogue CRUD the isolate runtime uploads
+	// through (POST/GET/DELETE /v1/js-bundles): upload returns a digest, list/get
+	// surface it, delete removes it. The owner-scoping + in-use-refusal edges are
+	// covered offline; this is the live round-trip.
+	{ID: "UC-105", Title: "Isolate js-bundle catalogue CRUD (upload/list/get/delete)", Requires: []Capability{CapIsolate}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

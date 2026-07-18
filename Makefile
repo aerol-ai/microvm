@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-containerd integration-single-wasm integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-benchmark integration-benchmark-only integration-benchmark-docker integration-benchmark-docker-only \
 	integration-benchmark-docker-sparse \
@@ -105,6 +105,14 @@ integration-single-containerd:
 # Smallest scenario that exercises the wasm-runtime use cases.
 integration-single-wasm:
 	integration-tests/run.sh single-node-wasm $(RUN_FLAGS)
+
+# Single-node with the V8-isolate (workerd) runtime enabled. Driven entirely by
+# default_with_isolate=true in single-node-isolate.tfvars (install.sh
+# --with-isolate downloads workerd + writes SB_ENABLE_ISOLATE=true) — no config
+# overlay, no node-side staging. Exercises the isolate-runtime use cases
+# (UC-103..105), including the per-sandbox egress-attribution proof.
+integration-single-isolate:
+	integration-tests/run.sh single-node-isolate $(RUN_FLAGS)
 
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)
