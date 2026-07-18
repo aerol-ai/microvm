@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,65 +117,80 @@ func TestPhase3IngressPortGatewayEndToEnd(t *testing.T) {
 	}
 }
 
-// TestPhase3EgressDeniedByDefault: an isolate's outbound fetch must never reach
-// upstream. Per-sandbox x-sb-id attribution via a loaded shim is not currently
-// expressible (workerd rejects a dynamically-loaded worker's entrypoint as
-// another worker's globalOutbound), so globalOutbound points at the static
-// egress service and the Go proxy fail-closed DENIES every request (no
-// attribution) — the safe Phase-2 deny-all posture. A denied fetch surfaces to
-// the isolate as a 403 upstream status (body "ok:403") or a thrown error
-// ("err:*"); a 2xx upstream would mean egress leaked.
-func TestPhase3EgressAttributionEndToEnd(t *testing.T) {
+// TestPhase3PerSandboxEgressEndToEnd proves the §4 redesign live against real
+// workerd: egress is attributed PER SANDBOX by slot, so two sandboxes in the
+// SAME tenant group get DIFFERENT policies enforced. An allow-listed sandbox
+// reaches an allowed host and is refused a non-allowed one; a block-all sandbox
+// in the same group is refused everything. Attribution is the slot socket — a
+// forged x-sb-id on the outbound is irrelevant.
+//
+// A policy denial surfaces to the isolate as an upstream 403 from the egress
+// proxy (body "status=403"); an allowed fetch is 200 (reachable) or 502/throw
+// (allowed but unreachable), never 403 — so the allow assertion holds even where
+// the runner has no outbound internet.
+func TestPhase3PerSandboxEgressEndToEnd(t *testing.T) {
 	workerd := requireWorkerd(t)
 	runDir := shortRunDir(t)
 	d := phase3Driver(t, workerd, runDir)
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	bundleDir := t.TempDir()
 	src := `export default { async fetch(req) {
-  const url = new URL(req.url);
-  if (url.pathname === "/egress") {
-    try {
-      const r = await fetch("https://example.invalid/");
-      return new Response("ok:" + r.status);
-    } catch (e) {
-      return new Response("err:" + (e && e.message ? e.message : String(e)), { status: 502 });
-    }
+  const u = new URL(req.url);
+  try {
+    const r = await fetch(u.searchParams.get("t"));
+    return new Response("status=" + r.status);
+  } catch (e) {
+    return new Response("throw=" + (e && e.message ? e.message : String(e)));
   }
-  return new Response("hi");
 }};`
 	p := filepath.Join(bundleDir, "eg.js")
 	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	ref := "file://" + p
 
+	// Two sandboxes in ONE tenant group with DIFFERENT egress policies.
 	if _, err := d.Create(ctx, models.CreateSandboxRequest{
-		Runtime:         models.RuntimeIsolate,
-		ModuleRef:       "file://" + p,
-		TenantID:        "eg",
-		MemoryMB:        128,
+		Runtime: models.RuntimeIsolate, ModuleRef: ref, TenantID: "eg-tenant", MemoryMB: 128,
+		NetworkAllowOut: []string{"example.com"},
+	}, "sb-allow", "", nil); err != nil {
+		t.Fatalf("create allow: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), &models.Sandbox{ID: "sb-allow"}) })
+	if _, err := d.Create(ctx, models.CreateSandboxRequest{
+		Runtime: models.RuntimeIsolate, ModuleRef: ref, TenantID: "eg-tenant", MemoryMB: 128,
 		NetworkBlockAll: true,
-	}, "sb-eg", "", nil); err != nil {
-		t.Fatalf("create: %v", err)
+	}, "sb-block", "", nil); err != nil {
+		t.Fatalf("create block: %v", err)
 	}
-	t.Cleanup(func() { _ = d.Destroy(context.Background(), &models.Sandbox{ID: "sb-eg"}) })
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), &models.Sandbox{ID: "sb-block"}) })
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://isolate/egress", nil)
-	resp, err := d.InvokeHTTP(ctx, "sb-eg", req)
-	if err != nil {
-		t.Fatalf("invoke: %v", err)
+	invoke := func(id, target string) string {
+		u := "http://isolate/?t=" + url.QueryEscape(target)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		resp, err := d.InvokeHTTP(ctx, id, req)
+		if err != nil {
+			t.Fatalf("invoke %s: %v", id, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return string(b)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	// Blocked egress is "ok:403" (proxy denied) or "err:*" (fetch threw). Only a
-	// 2xx upstream status means egress actually leaked to example.invalid.
-	got := string(body)
-	if strings.HasPrefix(got, "ok:2") {
-		t.Fatalf("egress reached upstream (body=%q) — deny-all policy broken", got)
+
+	// Allowed sandbox → allowed host: PERMITTED (not a policy 403).
+	if got := invoke("sb-allow", "https://example.com/"); strings.Contains(got, "status=403") {
+		t.Fatalf("allow→example.com = %q, want it permitted (not a 403 policy denial)", got)
 	}
-	if !strings.HasPrefix(got, "ok:") && !strings.HasPrefix(got, "err:") {
-		t.Fatalf("unexpected egress body %q", got)
+	// Allowed sandbox → NON-allowed host: DENIED by its own allowlist.
+	if got := invoke("sb-allow", "https://not-allowed.example/"); !strings.Contains(got, "status=403") {
+		t.Fatalf("allow→not-allowed = %q, want status=403 (allowlist enforced)", got)
+	}
+	// Block-all sandbox in the SAME group → allowed host still DENIED (proving
+	// per-sandbox differentiation, not a group-wide policy).
+	if got := invoke("sb-block", "https://example.com/"); !strings.Contains(got, "status=403") {
+		t.Fatalf("block→example.com = %q, want status=403 (block-all)", got)
 	}
 }
 

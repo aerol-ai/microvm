@@ -28,7 +28,8 @@ with Deno Sandbox (microVMs).
 
 - **2026-07-18 — Phases 2 leftovers + Phase 3 landed.** Idle-TTL reaper;
   unreferenced bundle GC; guest HTTP PortGateway + expose_port (HTTP-only,
-  no TCP pool); per-sandbox attributed egress (`x-sb-id` shim); toolbox exec
+  no TCP pool); per-sandbox attributed egress (per-slot egress-service pool —
+  §4, superseding the rejected `x-sb-id` shim); toolbox exec
   = invoke-handler; blank-host warm pool with boot prewarm; P0 gate
   executes (tag-gated); `docs/.../isolate-sandbox.mdx` + 5-SDK
   `runtime:"isolate"` / `tenant_id`. Demand pitch still open (§10.1) — 0/3.
@@ -295,16 +296,38 @@ already exposes on its `WorkerClient`:
 - outbound `fetch()` is routed through a **host-side proxy** the driver
   controls, so egress allowlist / CIDR policy / byte-counting still apply — the
   same knobs iptables gives Docker, enforced at the proxy layer;
-- **per-sandbox egress attribution (Phase-3 deliverable):** capability
-  manifests are per-sandbox but the proxy is shared per group, so each
-  worker's `globalOutbound` is bound to a **per-sandbox UDS endpoint** on the
-  host proxy — ownership known at accept time; the proxy applies that
-  sandbox's allowlist/CIDR/byte-count. This is the exact connection-ownership
-  problem that delayed the WASM resident-host flag; it lands with a regression
-  test, not mid-implementation. Byte counters are per-connection atomics — no
-  shared mutex on the data path (the netrules-Manager head-of-line lesson,
-  PR #306). Non-network grants (env, KV, timers) are config-time workerd
-  bindings, not proxy-enforced;
+- **per-sandbox egress attribution (§4 redesign — mechanism proven by spike
+  2026-07-18):** capability manifests are per-sandbox but one workerd process
+  serves a whole group, so attribution has to survive dynamic loading. The
+  obvious designs are both **rejected by workerd**: a per-sandbox shim worker as
+  `globalOutbound` ("Entrypoints to dynamically-loaded workers cannot be
+  transferred") and an inline JS-object `globalOutbound` ("the provided value is
+  not of type 'Fetcher'"). workerd only accepts a **real static service binding**
+  as `globalOutbound`. So attribution is carried by **which static egress
+  service the sandbox is bound to**: the group config pre-declares a **pool of
+  `K` egress services** (`EGRESS_0..EGRESS_{K-1}`), each on its own host UDS
+  (`egress-<slot>.sock`); the host assigns each egressing sandbox a **slot** and
+  returns `egress_slot` in the bundle spec, so the controller's loader spec sets
+  `globalOutbound: env["EGRESS_"+slot]`. The loaded worker is given **no other
+  bindings**, so it can reach only its own slot — attribution is **structural and
+  unforgeable** (the sandbox cannot name a sibling slot; a forged `x-sb-id` on the
+  outbound request is irrelevant because ownership is the socket, not a header).
+  The per-slot Go listener applies that sandbox's allowlist/CIDR/SSRF-block/
+  byte-count; ownership is known at accept time. Spike-confirmed properties:
+  `env["EGRESS_"+slot]` loads and routes; alpha's traffic reaches only
+  `egress-0.sock`, beta's only `egress-1.sock`, persisting across warm re-hits;
+  the sandbox env exposes no sibling binding; and **external services are dialed
+  lazily** — workerd boots and serves with declared-but-unbound egress sockets,
+  so the pool config is cheap and the host listens only on **assigned** slots
+  (runtime cost ∝ egressing sandboxes, not `K`). Block-all sandboxes and
+  pool-exhaustion spill bind a shared **`EGRESS_DENY`** service that fail-closed
+  403s (spill is **logged**, never silent — CLAUDE.md no-silent-caps rule). `K`
+  is a per-group cap on *concurrently-egressing* sandboxes (block-all costs no
+  slot); it is configurable (`SB_ISOLATE_EGRESS_POOL_SIZE`, default 64) and a
+  known density limit that Phase 4 can raise via policy-interned slot sharing.
+  Byte counters are per-connection atomics — no shared mutex on the data path
+  (the netrules-Manager head-of-line lesson, PR #306). Non-network grants (env,
+  KV, timers) are config-time workerd bindings, not proxy-enforced;
 - inbound HTTP is proxied by the driver to the isolate's `fetch` handler via
   driver-attributed routing — per-worker sockets where the injection path
   supports them, or a trusted dispatcher entrypoint otherwise; never client
@@ -553,8 +576,11 @@ Every new package ships with `_test.go` next to it at the ~85% bar (§11).
   walked); basic per-tenant warm pool; **P0 gate executes**; capability-denied
   egress test.
   - **LANDED 2026-07-18:** host-mediated `PortGateway` + `expose_port` (HTTP
-    only, `UpsertPortRouteWithDial`); attributed egress (`x-sb-id` shim +
-    per-sandbox policy on the Go proxy); toolbox exec = invoke-handler (501
+    only, `UpsertPortRouteWithDial`); per-sandbox attributed egress (per-slot
+    egress-service pool — §4, superseding the rejected `x-sb-id` shim: workerd
+    only accepts a static service binding as globalOutbound, so attribution is
+    by which slot socket the outbound arrives on; block-all/pool-exhausted →
+    EGRESS_DENY); toolbox exec = invoke-handler (501
     otherwise); `internal/pool/isolate` blank-host warm pool with boot
     prewarm; P0 gate implemented as tag-gated integration test; docs page
     `isolate-sandbox.mdx` + 5-SDK `runtime:"isolate"` / `tenant_id` constants.

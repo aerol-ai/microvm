@@ -12,25 +12,28 @@ import (
 // bundle-server). It lives in the driver package so pkg/isolate need not know
 // the driver's seam.
 type workerdSupervisor struct {
-	workerdPath string
-	runDir      string
-	useJail     bool
+	workerdPath    string
+	runDir         string
+	useJail        bool
+	egressPoolSize int
 }
 
 // NewHostSupervisor builds the production supervisor over the isolate config.
 func NewHostSupervisor(cfg Config) HostSupervisor {
 	return &workerdSupervisor{
-		workerdPath: cfg.WorkerdPath,
-		runDir:      cfg.RunDir,
-		useJail:     cfg.UseJail,
+		workerdPath:    cfg.WorkerdPath,
+		runDir:         cfg.RunDir,
+		useJail:        cfg.UseJail,
+		egressPoolSize: cfg.EgressPoolSize,
 	}
 }
 
 func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (GroupHost, error) {
 	host, err := pkgisolate.NewHost(pkgisolate.HostConfig{
-		WorkerdPath: s.workerdPath,
-		GroupKey:    spec.GroupKey,
-		RunDir:      filepath.Join(s.runDir, spec.GroupKey),
+		WorkerdPath:    s.workerdPath,
+		GroupKey:       spec.GroupKey,
+		RunDir:         filepath.Join(s.runDir, spec.GroupKey),
+		EgressPoolSize: s.egressPoolSize,
 		// When UseJail is set, the host MUST realize this spec or fail closed.
 		Jail: pkgisolate.JailConfig{
 			Require:       s.useJail,

@@ -42,20 +42,29 @@ func shortRunDir(t *testing.T) string {
 }
 
 func TestCapnpConfigContents(t *testing.T) {
-	cfg := capnpConfig("/run/control.sock", "/run/host.sock", "/run/egress.sock", "acme")
+	cfg := capnpConfig("/run/control.sock", "/run/host.sock",
+		[]string{"/run/egress-0.sock", "/run/egress-1.sock"}, "/run/egress-deny.sock", "acme")
 	for _, want := range []string{
 		`address = "unix:/run/control.sock"`,
 		`external = (address = "unix:/run/host.sock"`,
-		`external = (address = "unix:/run/egress.sock"`,
+		`external = (address = "unix:/run/egress-deny.sock"`,
+		`(name = "egress0", external = (address = "unix:/run/egress-0.sock"`,
+		`(name = "egress1", external = (address = "unix:/run/egress-1.sock"`,
 		`workerLoader = (id = "acme")`,
 		`(name = "HOST", service = "host")`,
-		`(name = "EGRESS", service = "egress")`,
+		`(name = "EGRESS_DENY", service = "egressDeny")`,
+		`(name = "EGRESS_0", service = "egress0")`,
+		`(name = "EGRESS_1", service = "egress1")`,
 		`compatibilityFlags = ["experimental"]`,
 		`embed "controller.js"`,
 	} {
 		if !strings.Contains(cfg, want) {
 			t.Fatalf("config missing %q:\n%s", want, cfg)
 		}
+	}
+	// The old single shared "egress" service must be gone.
+	if strings.Contains(cfg, `(name = "EGRESS", service = "egress")`) {
+		t.Fatalf("config still wires the removed single EGRESS service:\n%s", cfg)
 	}
 }
 
@@ -163,50 +172,88 @@ func TestBundleServerServesPinnedBundle(t *testing.T) {
 	}
 }
 
-// TestEgressServerAttributedFailClosed asserts the Phase-3 egress boundary
-// refuses unattributed traffic and sandboxes without a registered policy.
-func TestEgressServerAttributedFailClosed(t *testing.T) {
-	h, _ := NewHost(HostConfig{WorkerdPath: "/w", GroupKey: "acme", RunDir: shortRunDir(t)})
-	if err := h.startEgressServer(); err != nil {
+// TestEgressDenyServerAndSlotLifecycle covers the §4 slot model end to end
+// (offline, no workerd): the always-on EGRESS_DENY service, slot assignment for
+// allow-all sandboxes, no-slot for block-all, per-slot SSRF enforcement, pool
+// exhaustion falling back to deny (never a shared slot), and Unload freeing a
+// slot for reuse.
+func TestEgressDenyServerAndSlotLifecycle(t *testing.T) {
+	h, _ := NewHost(HostConfig{WorkerdPath: "/w", GroupKey: "acme", RunDir: shortRunDir(t), EgressPoolSize: 2})
+	if err := h.startEgressDenyServer(); err != nil {
 		t.Fatal(err)
 	}
 	defer h.stopServers()
-	client := unixHTTPClient(h.egressSock)
 
-	// No x-sb-id → deny.
-	resp, err := client.Get("http://egress/anything")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("unattributed egress status = %d, want 403", resp.StatusCode)
-	}
-
-	// x-sb-id present but no policy registered → deny.
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
-	req.Header.Set("x-sb-id", "sb-1")
-	resp, err = client.Do(req)
+	// EGRESS_DENY always 403s — this is what block-all / no-slot sandboxes bind.
+	deny := unixHTTPClient(h.egressDenySock)
+	resp, err := deny.Get("http://egress/anything")
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "no policy") {
-		t.Fatalf("no-policy status/body = %d %q", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "no egress slot") {
+		t.Fatalf("deny status/body = %d %q", resp.StatusCode, body)
 	}
 
-	// BlockAll policy → deny even with attribution.
-	h.SetEgressPolicy("sb-1", EgressPolicy{BlockAll: true})
-	req, _ = http.NewRequest(http.MethodGet, "http://example.com/", nil)
-	req.Header.Set("x-sb-id", "sb-1")
-	resp, err = client.Do(req)
+	// Block-all sandbox claims no slot (binds EGRESS_DENY).
+	h.SetEgressPolicy("sb-block", EgressPolicy{BlockAll: true})
+	if _, ok := h.slotByID["sb-block"]; ok {
+		t.Fatal("block-all sandbox must not claim a slot")
+	}
+
+	// Allow-all sandbox claims slot 0 and binds its dedicated socket.
+	h.SetEgressPolicy("sb-1", EgressPolicy{})
+	slot, ok := h.slotByID["sb-1"]
+	if !ok {
+		t.Fatal("sb-1 got no slot")
+	}
+	if h.idBySlot[slot] != "sb-1" {
+		t.Fatalf("idBySlot[%d] = %q, want sb-1", slot, h.idBySlot[slot])
+	}
+	if _, err := os.Stat(h.egressSocks[slot]); err != nil {
+		t.Fatalf("slot socket not bound: %v", err)
+	}
+
+	// The slot socket still blocks SSRF even under an allow-all policy: the
+	// socket attributes the request to sb-1, whose policy allows all HOSTS but
+	// the IP-range guard refuses loopback/metadata.
+	slotClient := unixHTTPClient(h.egressSocks[slot])
+	resp, err = slotClient.Get("http://127.0.0.1:21212/v1/sandboxes")
 	if err != nil {
 		t.Fatal(err)
 	}
+	sb, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("block-all status = %d, want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(sb), "blocked") {
+		t.Fatalf("SSRF via slot = %d %q, want 403 blocked", resp.StatusCode, sb)
+	}
+
+	// Second allow-all sandbox gets a DISTINCT slot; the pool (size 2) is now full.
+	h.SetEgressPolicy("sb-2", EgressPolicy{})
+	if _, ok := h.slotByID["sb-2"]; !ok || h.slotByID["sb-2"] == slot {
+		t.Fatalf("sb-2 slot = %v (ok=%v), want a distinct slot", h.slotByID["sb-2"], ok)
+	}
+
+	// Third sandbox: pool exhausted → no slot (deny-all fallback, logged) — it
+	// must NOT share another sandbox's slot.
+	h.SetEgressPolicy("sb-3", EgressPolicy{})
+	if _, ok := h.slotByID["sb-3"]; ok {
+		t.Fatal("sb-3 must not get a slot from an exhausted pool")
+	}
+
+	// Unload frees sb-1's slot and removes its socket; the slot is then reusable.
+	sock1 := h.egressSocks[slot]
+	h.Unload("sb-1")
+	if _, ok := h.slotByID["sb-1"]; ok {
+		t.Fatal("Unload did not release the slot")
+	}
+	if _, err := os.Stat(sock1); !os.IsNotExist(err) {
+		t.Fatalf("slot socket not removed after Unload: %v", err)
+	}
+	h.SetEgressPolicy("sb-3", EgressPolicy{})
+	if _, ok := h.slotByID["sb-3"]; !ok {
+		t.Fatal("sb-3 should reclaim the freed slot")
 	}
 }
 
@@ -223,12 +270,20 @@ func TestWriteConfigProducesFiles(t *testing.T) {
 	if err != nil || !strings.Contains(string(ctrl), "x-sb-id") {
 		t.Fatalf("controller.js = %q err=%v", ctrl, err)
 	}
+	// The controller binds globalOutbound to the sandbox's egress slot service.
+	if !strings.Contains(string(ctrl), `env["EGRESS_" + slot]`) || !strings.Contains(string(ctrl), "EGRESS_DENY") {
+		t.Fatalf("controller.js missing slot-based egress binding: %q", ctrl)
+	}
 	cfg, err := os.ReadFile(filepath.Join(dir, "config.capnp"))
 	if err != nil || !strings.Contains(string(cfg), `workerLoader = (id = "acme")`) {
 		t.Fatalf("config.capnp missing loader id: %q err=%v", cfg, err)
 	}
 	if !strings.Contains(string(cfg), h.hostSock) {
 		t.Fatalf("config.capnp does not wire host sock %q", h.hostSock)
+	}
+	// The egress pool + deny service are declared (default pool size).
+	if !strings.Contains(string(cfg), "EGRESS_DENY") || !strings.Contains(string(cfg), `(name = "EGRESS_0"`) {
+		t.Fatalf("config.capnp missing egress pool/deny wiring: %q", cfg)
 	}
 }
 
@@ -239,7 +294,7 @@ func TestStopIdempotent(t *testing.T) {
 	if err := h.startBundleServer(); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.startEgressServer(); err != nil {
+	if err := h.startEgressDenyServer(); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.Stop(); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +17,12 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 )
+
+// defaultEgressPoolSize is the per-group egress-slot pool size when unset (§4).
+// It caps concurrently-egressing sandboxes in a group; block-all sandboxes cost
+// no slot. Sized generously because sockets are cheap and only bound per active
+// egress sandbox; operators tune it via SB_ISOLATE_EGRESS_POOL_SIZE.
+const defaultEgressPoolSize = 64
 
 // HostConfig configures one workerd group host.
 type HostConfig struct {
@@ -31,17 +38,26 @@ type HostConfig struct {
 	// true, Start applies it before exec and FAILS CLOSED if it cannot be
 	// realized on this platform — the group never runs unconfined.
 	Jail JailConfig
+	// EgressPoolSize is the number of per-slot egress services pre-declared in
+	// the group config (§4). Caps concurrently-egressing sandboxes; zero →
+	// defaultEgressPoolSize.
+	EgressPoolSize int
+	// Logger records egress pool-exhaustion spill (no silent caps). Nil →
+	// slog.Default().
+	Logger *slog.Logger
 }
 
 // Host owns one workerd process for an isolate group and the Go-side
 // bundle-server the controller fetches bundles from. It is safe for concurrent
 // use: Load/Unload/Invoke may race with each other.
 type Host struct {
-	cfg HostConfig
+	cfg    HostConfig
+	logger *slog.Logger
 
-	controlSock string
-	hostSock    string
-	egressSock  string
+	controlSock    string
+	hostSock       string
+	egressDenySock string
+	egressSocks    []string // slot → per-slot egress UDS path (len == pool size)
 
 	// started is the fast-path liveness flag Invoke checks; atomic so a
 	// concurrent Stop (last-member teardown / idle reaper) racing an in-flight
@@ -52,12 +68,19 @@ type Host struct {
 	mu           sync.RWMutex
 	bundles      map[string]*jsbundle.Bundle // sandbox id → pinned bundle
 	egressPolicy map[string]EgressPolicy     // sandbox id → outbound policy
+	// Egress slot allocation (§4): a sandbox with a non-block-all policy is
+	// assigned a slot; its dedicated egress listener (slotSrv[slot]) is bound
+	// lazily on assignment and torn down on Unload. Attribution is the socket,
+	// so idBySlot[slot] is the authoritative owner the slot handler enforces.
+	slotByID map[string]int // sandbox id → assigned slot
+	idBySlot []string       // slot → sandbox id ("" == free)
+	slotSrv  []*http.Server // slot → lazily-started listener (nil == unbound)
 	// cmd/ctrlClient/servers are set once in Start and cleared in Stop; guarded
 	// by mu because Invoke reads ctrlClient while Stop nils cmd concurrently.
-	cmd        *exec.Cmd
-	bundleSrv  *http.Server
-	egressSrv  *http.Server
-	ctrlClient *http.Client
+	cmd           *exec.Cmd
+	bundleSrv     *http.Server
+	egressDenySrv *http.Server
+	ctrlClient    *http.Client
 }
 
 // NewHost prepares (does not start) a group host.
@@ -74,13 +97,29 @@ func NewHost(cfg HostConfig) (*Host, error) {
 	if cfg.StartTimeout == 0 {
 		cfg.StartTimeout = 10 * time.Second
 	}
+	if cfg.EgressPoolSize <= 0 {
+		cfg.EgressPoolSize = defaultEgressPoolSize
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	egressSocks := make([]string, cfg.EgressPoolSize)
+	for i := range egressSocks {
+		egressSocks[i] = filepath.Join(cfg.RunDir, egressSlotSocketName(i))
+	}
 	return &Host{
-		cfg:          cfg,
-		controlSock:  filepath.Join(cfg.RunDir, controlSocketName),
-		hostSock:     filepath.Join(cfg.RunDir, hostSocketName),
-		egressSock:   filepath.Join(cfg.RunDir, egressSocketName),
-		bundles:      make(map[string]*jsbundle.Bundle),
-		egressPolicy: make(map[string]EgressPolicy),
+		cfg:            cfg,
+		logger:         logger,
+		controlSock:    filepath.Join(cfg.RunDir, controlSocketName),
+		hostSock:       filepath.Join(cfg.RunDir, hostSocketName),
+		egressDenySock: filepath.Join(cfg.RunDir, egressDenySocketName),
+		egressSocks:    egressSocks,
+		bundles:        make(map[string]*jsbundle.Bundle),
+		egressPolicy:   make(map[string]EgressPolicy),
+		slotByID:       make(map[string]int),
+		idBySlot:       make([]string, cfg.EgressPoolSize),
+		slotSrv:        make([]*http.Server, cfg.EgressPoolSize),
 	}, nil
 }
 
@@ -109,6 +148,9 @@ func (h *Host) Unload(id string) int {
 	h.mu.Lock()
 	delete(h.bundles, id)
 	delete(h.egressPolicy, id)
+	if slot, ok := h.slotByID[id]; ok {
+		h.freeSlotLocked(id, slot)
+	}
 	n := len(h.bundles)
 	h.mu.Unlock()
 	return n
@@ -129,14 +171,18 @@ func (h *Host) Start(ctx context.Context) error {
 		return fmt.Errorf("isolate: mkdir run dir: %w", err)
 	}
 	// Stale sockets from a crashed predecessor would make workerd's bind fail.
-	for _, s := range []string{h.controlSock, h.hostSock, h.egressSock} {
+	stale := append([]string{h.controlSock, h.hostSock, h.egressDenySock}, h.egressSocks...)
+	for _, s := range stale {
 		_ = os.Remove(s)
 	}
 
 	if err := h.startBundleServer(); err != nil {
 		return err
 	}
-	if err := h.startEgressServer(); err != nil {
+	// The deny service (EGRESS_DENY) is always up: block-all and pool-exhausted
+	// sandboxes bind it. Per-slot egress listeners are bound lazily when the
+	// driver assigns a slot (SetEgressPolicy), so an idle group holds none.
+	if err := h.startEgressDenyServer(); err != nil {
 		_ = h.stopServers()
 		return err
 	}
@@ -182,7 +228,7 @@ func (h *Host) writeConfig() error {
 	if err := os.WriteFile(filepath.Join(h.cfg.RunDir, controllerModuleName), []byte(controllerJS), 0o600); err != nil {
 		return fmt.Errorf("isolate: write controller: %w", err)
 	}
-	cfg := capnpConfig(h.controlSock, h.hostSock, h.egressSock, h.cfg.GroupKey)
+	cfg := capnpConfig(h.controlSock, h.hostSock, h.egressSocks, h.egressDenySock, h.cfg.GroupKey)
 	if err := os.WriteFile(filepath.Join(h.cfg.RunDir, "config.capnp"), []byte(cfg), 0o600); err != nil {
 		return fmt.Errorf("isolate: write config: %w", err)
 	}
@@ -202,17 +248,25 @@ func (h *Host) startBundleServer() error {
 		id := strings.TrimPrefix(r.URL.Path, "/bundle/")
 		h.mu.RLock()
 		b := h.bundles[id]
+		slot, hasSlot := h.slotByID[id]
 		h.mu.RUnlock()
 		if b == nil {
 			http.Error(w, "no such sandbox", http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(bundleWireJSON{
+		wire := bundleWireJSON{
 			CompatibilityDate: b.CompatibilityDate,
 			MainModule:        b.MainModule,
 			Modules:           b.Modules,
-		})
+		}
+		// Carry the assigned egress slot so the controller binds this sandbox's
+		// globalOutbound to its dedicated slot service; no slot → EGRESS_DENY.
+		if hasSlot {
+			s := slot
+			wire.EgressSlot = &s
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(wire)
 	})
 	h.bundleSrv = &http.Server{Handler: mux}
 	go func() { _ = h.bundleSrv.Serve(ln) }()
@@ -268,15 +322,25 @@ func (h *Host) Invoke(ctx context.Context, id string, r *http.Request) (*http.Re
 	return client.Do(out)
 }
 
-// stopServers shuts down the bundle + egress servers and removes their sockets.
+// stopServers shuts down the bundle + egress (deny + all per-slot) servers and
+// removes their sockets.
 func (h *Host) stopServers() error {
+	h.mu.Lock()
 	if h.bundleSrv != nil {
 		_ = h.bundleSrv.Close()
 	}
-	if h.egressSrv != nil {
-		_ = h.egressSrv.Close()
+	if h.egressDenySrv != nil {
+		_ = h.egressDenySrv.Close()
 	}
-	for _, s := range []string{h.hostSock, h.egressSock, h.controlSock} {
+	for i, srv := range h.slotSrv {
+		if srv != nil {
+			_ = srv.Close()
+			h.slotSrv[i] = nil
+		}
+	}
+	h.mu.Unlock()
+	socks := append([]string{h.hostSock, h.egressDenySock, h.controlSock}, h.egressSocks...)
+	for _, s := range socks {
 		_ = os.Remove(s)
 	}
 	return nil

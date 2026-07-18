@@ -674,6 +674,11 @@ type Config struct {
 	// IsolateBundleGCInterval is how often unreferenced content-addressed
 	// bundles are swept. Zero disables. Default 15m. SB_ISOLATE_BUNDLE_GC_INTERVAL.
 	IsolateBundleGCInterval time.Duration
+	// IsolateEgressPoolSize is the per-group egress-slot pool size (§4): the cap
+	// on concurrently-egressing sandboxes in a group (block-all sandboxes cost no
+	// slot). A sandbox beyond the pool falls back to deny-all egress (logged).
+	// Default 64. SB_ISOLATE_EGRESS_POOL_SIZE.
+	IsolateEgressPoolSize int
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1631,6 +1636,7 @@ func Load() (Config, error) {
 		IsolatePoolDepthDefault:      getEnvInt("SB_ISOLATE_POOL_DEPTH_DEFAULT", 2),
 		IsolatePoolRefillInterval:    getEnvDuration("SB_ISOLATE_POOL_REFILL_INTERVAL", 5*time.Second),
 		IsolateBundleGCInterval:      getEnvDuration("SB_ISOLATE_BUNDLE_GC_INTERVAL", 15*time.Minute),
+		IsolateEgressPoolSize:        getEnvInt("SB_ISOLATE_EGRESS_POOL_SIZE", 64),
 		FirecrackerBinary:            getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:                 getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:       getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
