@@ -1,6 +1,6 @@
 ---
 title: Isolate Sandbox
-description: Deploy a JS/TS fetch handler as a V8 isolate — no image, no registry, host-mediated HTTP.
+description: Deploy a JS/TS fetch handler as a V8 isolate — no image, no registry, host-mediated HTTP with per-sandbox egress.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -9,17 +9,38 @@ Isolate sandboxes run a JavaScript/TypeScript `fetch` handler inside a V8
 isolate (Cloudflare's `workerd` engine). Push a bundle, get an HTTP entrypoint
 with capability-scoped egress — no Dockerfile, no container image, no shell or
 filesystem. This is the Workers-model tier that complements Firecracker
-microVMs.
+microVMs and WASM modules.
 
 Requires `SB_ENABLE_ISOLATE=true` and a pinned `workerd` binary on the host
-(`install.sh --with-isolate`).
+(`install.sh --with-isolate`, or Terraform `with_isolate = true` /
+`default_with_isolate = true`). Off by default.
+
+## Create latency
+
+Warm create (bundle already uploaded, tenant group already running) is the
+steady-state path. Live UC-94 on `single-node-isolate` (`t3.medium`, jail off,
+10 samples, 0 failures):
+
+| Metric | p50 | p90 | p99 |
+|---|---|---|---|
+| **Server create** | **4ms** | 6ms | 19ms |
+| Client API round-trip | 266ms | 269ms | 289ms |
+
+The API figure includes laptop → region WAN; quote **server** latency for
+create cost. Cold first-create for a tenant also pays one workerd group spawn;
+subsequent creates in that tenant inject into the resident group.
 
 ## Create an isolate sandbox
 
 Pass `runtime: "isolate"` and a `module_ref` pointing at a JS/TS bundle —
-an uploaded catalogue name/digest, or a `file://` path for operators. Isolates
+an uploaded catalogue digest/name, or a `file://` path for operators. Isolates
 default to `durability: "ephemeral"`; `passivatable` is rejected and `durable`
 is not yet enabled.
+
+Upload the bundle once with `POST /v1/js-bundles` (experimental catalogue),
+then create with the returned digest as `module_ref`. Same-tenant sandboxes
+share one workerd group process (server-authorized `tenant_id`); the group key
+is never client-chosen for forced co-residency.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -66,22 +87,23 @@ is not yet enabled.
         "context"
         "fmt"
         "log"
+        "os"
 
-        "github.com/aerol-ai/microvm/pkg/microvm"
-        "github.com/aerol-ai/microvm/pkg/types"
+        microvm  "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
     )
 
-    client, err := microvm.New(microvm.Config{
-        APIURL:   "https://sandbox.example.com",
-        PATToken: "your-token",
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   os.Getenv("SB_API_URL"),
+        PATToken: os.Getenv("SB_PAT_TOKEN"),
     })
     if err != nil {
         log.Fatal(err)
     }
 
-    sb, err := client.Create(context.Background(), types.CreateSandboxOptions{
+    sb, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
         ModuleRef:       "sha256:…",
-        Runtime:         types.RuntimeIsolate,
+        Runtime:         sdktypes.RuntimeIsolate,
         MemoryMB:        128,
         NetworkAllowOut: []string{"api.example.com"},
     })
@@ -97,12 +119,16 @@ is not yet enabled.
 
     #[tokio::main]
     async fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let client = Client::new("https://sandbox.example.com", "your-token")?;
+        let client = Client::new(
+            Some("https://sandbox.example.com"),
+            Some("your-token"),
+        )?;
         let sandbox = client
             .create(CreateOptions {
                 module_ref: Some("sha256:…".into()),
                 runtime: Some("isolate".into()),
                 memory_mb: Some(128),
+                network_allow_out: Some(vec!["api.example.com".into()]),
                 ..Default::default()
             })
             .await?;
@@ -125,17 +151,57 @@ is not yet enabled.
     Sandbox sandbox = client.create(new CreateOptions()
         .setModuleRef("sha256:…")
         .setRuntime("isolate")
-        .setMemoryMb(128));
+        .setMemoryMb(128)
+        .setNetworkAllowOut(java.util.List.of("api.example.com")));
 
     System.out.println(sandbox.id);
     ```
   </TabItem>
 </Tabs>
 
+## Per-sandbox egress
+
+Outbound `fetch` is host-mediated. Each sandbox binds a dedicated egress slot
+in the workerd group config — attribution is structural (which static egress
+service the worker can reach), not a forgeable header. Within one tenant group
+you can mix:
+
+- `networkAllowOut: ['api.example.com']` — only listed hosts
+- `networkBlockAll: true` — fail-closed deny (same as an empty allowlist with no opens)
+- allow-all with SSRF guards still blocking link-local / EC2 metadata / loopback
+
+`SB_ISOLATE_EGRESS_POOL_SIZE` (default 64) caps concurrently egressing sandboxes
+per group. Pool exhaustion binds a deny service and logs spill — never silent
+open egress.
+
+Public HTTP ingress is opt-in with `exposePort` (HTTP only — the TCP host-port
+pool is never walked for isolates).
+
 ## Residual limits
 
 Isolates have **no shell, no filesystem, and no arbitrary binary**. Toolbox
-`exec` invokes the `fetch` handler; other toolbox verbs return 501. Upload
-bundles via `POST /v1/js-bundles` (experimental until the demand checkpoint
-lands). Public HTTP is opt-in with `expose_port` (HTTP only — the TCP host-port
-pool is never walked).
+`exec` invokes the `fetch` handler; other toolbox verbs return 501. Platform
+volumes and OCI images are rejected. SSH is not available.
+
+The outer jail (chroot + seccomp) defaults on in config; full chroot populate
+with the workerd binary is still landing — deploy with
+`SB_ISOLATE_USE_JAIL=false` until that follow-up ships (the live integration
+scenario does this today). Cross-tenant isolation remains one OS process per
+tenant group regardless.
+
+## Operator setup
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `SB_ENABLE_ISOLATE` | `false` | Advertise + accept `runtime: "isolate"` |
+| `SB_ISOLATE_WORKERD_PATH` | install path | Pinned workerd binary |
+| `SB_ISOLATE_GROUP_GRANULARITY` | `per-tenant` | Or `per-sandbox` for stronger isolation / lower density |
+| `SB_ISOLATE_EGRESS_POOL_SIZE` | `64` | Concurrent egress slots per group |
+| `SB_ISOLATE_USE_JAIL` | `true` | Outer jail; set `false` until chroot-populate lands |
+
+Installer: `install.sh --with-isolate`. Cluster Terraform:
+`with_isolate = true` on workers (or `default_with_isolate`). Operators upgrade
+the pinned workerd via `setup/runbooks/isolate-workerd-upgrade.md`.
+
+Live coverage: `make integration-single-isolate` (UC-103/104/105) and
+`make integration-benchmark-isolate` (UC-94 create latency).

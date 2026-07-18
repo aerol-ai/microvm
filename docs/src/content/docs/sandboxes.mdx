@@ -5,7 +5,14 @@ description: Create, manage, and resize standard Docker sandboxes.
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A sandbox is an isolated compute environment. Each sandbox has its own filesystem, network namespace, and configurable vCPU, memory, and disk. Sandboxes spin up in under 90ms and run any OCI-compatible image.
+A sandbox is an isolated compute environment. Container and microVM sandboxes
+have their own filesystem, network namespace, and configurable vCPU, memory, and
+disk. WASM and isolate sandboxes are host-mediated (no guest filesystem) and
+opt into a different create shape (`module_ref` instead of `image`).
+
+Warm server-side create is roughly **~4ms** (isolate), **~22ms** (WASM resident
+host), **~30ms** (Docker / Firecracker warm pool) — see the live UC-94 table in
+the repository README.
 
 ## Sandbox types
 
@@ -13,7 +20,9 @@ A sandbox is an isolated compute environment. Each sandbox has its own filesyste
 |---|---|---|
 | Docker | `docker` (default) | Standard runc-backed containers. Works on any node. |
 | gVisor | `gvisor` | User-space kernel - intercepts syscalls. Better isolation, same hardware requirements. See [gVisor Sandbox](/gvisor-sandbox). |
-| Firecracker | `firecracker` | Full microVM - each sandbox boots its own kernel in under 100ms. Requires bare-metal nodes. See [Firecracker Sandbox](/firecracker-sandbox). |
+| Firecracker | `firecracker` | Full microVM - warm-pool create ~34ms server-side. Requires bare-metal / KVM nodes. See [Firecracker Sandbox](/firecracker-sandbox). |
+| WASM | `wasm` | WASI modules in host workers; optional durable checkpoints. See [WASM Sandbox](/wasm-sandbox). |
+| Isolate | `isolate` | V8 isolate (`workerd`) running a JS/TS `fetch` handler — no image. Off by default (`--with-isolate`). See [Isolate Sandbox](/isolate-sandbox). |
 | GPU | `docker` + `gpus` field | Standard Docker with direct GPU passthrough. See [GPU Sandbox](/gpu-sandboxes). |
 
 ## Lifecycle states

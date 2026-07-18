@@ -185,7 +185,27 @@ Set the `*_url` fields to download locations for the binaries and kernel artifac
 
 After deployment, you register container images as Firecracker templates and then create sandboxes using the `firecracker` runtime. See [Firecracker Templates](/firecracker-templates) for the step-by-step workflow.
 
-## Step 7 - Enable GPU support (optional)
+## Step 7 - Enable Isolate (optional)
+
+The V8-isolate runtime runs JS/TS `fetch` handlers inside Cloudflare `workerd`
+(Workers model). It is off by default. Enabling it on a worker installs a
+version-pinned, SHA-256-verified `workerd` binary and sets `SB_ENABLE_ISOLATE=true`.
+
+```hcl
+nodes = {
+  srv1 = { role = "server", seed = true, instance_type = "t3.small" }
+  wrk1 = { role = "worker", with_isolate = true, instance_type = "t3.large" }
+  wrk2 = { role = "worker", with_isolate = true, instance_type = "t3.large" }
+  ing1 = { role = "ingress",                     instance_type = "t3.medium" }
+}
+```
+
+Or set `default_with_isolate = true` for every node. After deploy, create with
+`runtime: "isolate"` and a `module_ref` pointing at an uploaded JS bundle
+(`POST /v1/js-bundles`). See [Isolate Sandbox](/isolate-sandbox) for egress
+attribution, residual limits, and the ~4ms warm create path.
+
+## Step 8 - Enable GPU support (optional)
 
 AerolVM can pass through physical GPUs to sandboxes. NVIDIA and AMD GPUs are both supported. GPU-enabled worker nodes run alongside regular workers - the cluster placement engine automatically routes GPU sandbox requests to nodes that have the right hardware.
 
@@ -228,7 +248,7 @@ GPU passthrough is not compatible with gVisor. A sandbox can use either a GPU or
 
 After deployment, see [GPU Sandboxes](/gpu-sandboxes) for the full sandbox creation flow.
 
-## Step 8 - Deploy
+## Step 9 - Deploy
 
 Initialize the Terraform providers (only needed once per machine):
 
@@ -256,7 +276,7 @@ ssh ubuntu@<seed-ip> sudo tail -f /var/log/aerolvm-bootstrap.log
 
 Wait until you see `[bootstrap] complete`. The seed takes a few minutes to start the cluster; other nodes join after the seed finishes and uploads its configuration to S3.
 
-## Step 9 - Verify
+## Step 10 - Verify
 
 Once bootstrap is complete, check that all nodes joined:
 

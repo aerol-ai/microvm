@@ -2,26 +2,34 @@
 title: Quick Start
 ---
 
-**AerolVM** is open-source infrastructure for running isolated code environments. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated vCPU, RAM, and disk with a support of Docker, GVisor, Kata and Wasm.
+**AerolVM** is open-source infrastructure for running isolated code environments.
+Self-host it or run it as managed multi-tenant SaaS. Each sandbox is a fully
+isolated compute unit — Docker/gVisor containers, Firecracker microVMs, WASM
+modules, or V8 isolates — with its own network policy and allocated resources.
 
-The idea is to provide a seamless, secure sandbox experience that can start in under 50ms to 1s.
+Warm create latency (server-side) ranges from **~4ms** (V8 isolate) through
+**~30ms** (Docker / Firecracker warm pool) depending on runtime. See the
+[README benchmark table](https://github.com/aerol-ai/microvm#create-latency-live-uc-94)
+for the latest UC-94 numbers.
 
-Sandboxes are the core component of the [Aerol.ai](https://aerol.ai) platform, spinning up in under 70ms from code to execution and running any code in Python, TypeScript, and JavaScript. Built on OCI/Docker compatibility, massive parallelization, and unlimited persistence, sandboxes deliver consistent, predictable environments for agent workflows.
-
-Agents and developers interact with sandboxes programmatically using the AerolVM SDKs, API, and CLI. Operations span sandbox lifecycle management, filesystem operations, process and code execution, and runtime configuration. Our stateful environment snapshots enable persistent agent operations across sessions, making AerolVM the ideal foundation for AI agent architectures.
+Agents and developers interact with sandboxes programmatically using the AerolVM
+SDKs, API, and CLI. Operations span sandbox lifecycle management, filesystem
+operations, process and code execution, and runtime configuration. Stateful
+environment snapshots enable persistent agent operations across sessions.
 
 ## Runtimes
 
-AerolVM supports multiple container runtimes, giving you a choice between security and compatibility:
-
-| Runtime | Status | Use Case |
+| Runtime | Status | Use case |
 |---|---|---|
-| Docker | ✅ | Fast startup, broad image compatibility, standard workloads |
-| GVisor | ✅ | Kernel-level isolation without a full VM - ideal for untrusted code |
-| Firecracker | ✅ | Kernel-level isolation Full VM isolation with hardware virtualization |
-| WebAssembly | ✅ | Ultra-lightweight WASI workloads with optional durable checkpoints |
+| Docker | ✅ | Fast OCI images, broadest compatibility (default) |
+| gVisor | ✅ | User-space kernel isolation for untrusted code (`--with-gvisor`) |
+| Firecracker | ✅ | Hardware microVM isolation; warm pool ~34ms server create |
+| WebAssembly | ✅ | WASI modules; resident host ~22ms warm create |
+| Isolate (V8 / workerd) | ✅ (off by default) | JS/TS `fetch` handlers; **~4ms** warm server create (`--with-isolate`) |
 
-Docker is the default runtime today. GVisor, Firecracker, and WebAssembly are also available when enabled in server config.
+Kata Containers is not implemented — create requests with `runtime: "kata"`
+return not-implemented. Docker is the default. Enable the others in server
+config or installer flags as needed.
 
 ## Use Cases
 
@@ -29,6 +37,7 @@ Docker is the default runtime today. GVisor, Firecracker, and WebAssembly are al
 - **CI / ephemeral build agents** - spin up a fresh environment per job, destroy when done
 - **Interactive developer environments** - persistent workspaces with SSH, port previews, and file sync
 - **Data processing pipelines** - attach cloud storage, run transforms, and extract results
+- **Edge-style JS handlers** - deploy a V8 isolate with per-sandbox egress, no container image
 
 ## Next Steps
 
@@ -38,3 +47,4 @@ Docker is the default runtime today. GVisor, Firecracker, and WebAssembly are al
 - [Streaming Exec](/exec-streaming) - stream stdout/stderr live and use interactive PTY sessions
 - [Sessions](/sessions) - persistent terminal sessions that survive reconnects
 - [WebAssembly Sandboxes](/wasm-sandbox) - create and run WASI modules with durable checkpoints
+- [Isolate Sandboxes](/isolate-sandbox) - push a JS/TS fetch handler as a V8 isolate

@@ -57,16 +57,20 @@ Cloudflare is the current documented DNS-01 provider. Create a scoped API token 
 
 Caddy issues exactly two certificates, `<domain>` and `*.<domain>`, then renews them on a schedule.
 
-## Container Runtimes
+## Container and language runtimes
 
 | Runtime | Installer flag | Notes |
 |---|---|---|
 | Docker | Default | Lowest overhead. Best for trusted workloads. |
 | gVisor | `--with-gvisor` | Adds a user-space kernel boundary for untrusted code. |
-| Firecracker | `--with-firecracker` | MicroVM runtime for fast, secure isolation. |
-| Kata Containers | Not available yet | Create requests return `runtime not yet implemented`. |
+| Firecracker | `--with-firecracker` | MicroVM runtime; needs KVM / bare metal. |
+| WASM | Config (`SB_ENABLE_WASM` / wasm workers) | WASI modules; no separate installer flag on single-node by default. See [WASM Sandbox](/wasm-sandbox). |
+| Isolate (V8 / workerd) | `--with-isolate` | Downloads pinned `workerd`, sets `SB_ENABLE_ISOLATE=true`. Off by default. See [Isolate Sandbox](/isolate-sandbox). |
+| Kata Containers | Not available | Create requests return `runtime not yet implemented`. |
 
 If you want gVisor on the host, add `--with-gvisor` to the install command above. gVisor is not compatible with `--privileged` containers, ignores `disk_gb`, requires cgroupv2 plus systemd, and does not support GPU passthrough.
+
+For V8 isolates, add `--with-isolate`. Until full jail chroot-populate lands, operators may need `SB_ISOLATE_USE_JAIL=false` for end-to-end creates (the live integration scenario does this).
 
 ## GPU Support
 

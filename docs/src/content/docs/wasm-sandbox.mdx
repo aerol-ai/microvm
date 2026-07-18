@@ -5,7 +5,12 @@ description: Run WebAssembly/WASI workloads with optional checkpoint durability 
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-WASM sandboxes run guest modules inside isolated worker processes on the host. They boot quickly, share the same toolbox and routing model as Docker sandboxes, and support optional checkpoint durability for daemon restarts and cluster failover.
+WASM sandboxes run guest modules inside isolated worker processes on the host.
+They boot quickly, share the same toolbox and routing model as Docker sandboxes,
+and support optional checkpoint durability for daemon restarts and cluster
+failover. With the resident host enabled (default on recent releases), warm
+create is ~**22ms** server p50 on `cluster-3-mixed-wasm` (flat ~20–50ms; the
+multi-second cold-compile tail is gone).
 
 ## Create a WASM sandbox
 

@@ -101,8 +101,9 @@ internal/
   observability/ OTEL traces + expvar metrics exporter for sandboxd.
   pool/          Warm pools for fast boot. pool/vmm/ holds pre-booted
                  Firecracker snapshots (snapshot-load fast-boot); pool/wasm/
-                 holds pre-spawned WASM workers. Both publish expvar
-                 hit/miss/orphan metrics and refill on a ticker.
+                 holds pre-spawned WASM workers; pool/isolate/ holds blank
+                 workerd hosts. Publish expvar hit/miss/orphan metrics and
+                 refill on a ticker.
   runtime/       Runtime.Runtime interface + drivers. runtime.go defines
                  Runtime (Create/Start/Stop/Destroy/Snapshot/Inspect/…) and
                  ContainerRuntime (adds the network-rule methods); use
@@ -112,8 +113,10 @@ internal/
                  wasm/ (Runtime only — host-mediated networking, no per-IP
                  iptables; wasm/toolhost/ is the host-side file/exec/sessions
                  HTTP handler, wasm/statekv/ is the durable per-sandbox KV
-                 store backed by the wasm_state_kv table). See "Runtime
-                 drivers" below.
+                 store backed by the wasm_state_kv table),
+                 isolate/ (Runtime only — V8/workerd Workers model, off by
+                 default behind SB_ENABLE_ISOLATE; per-tenant group + host-
+                 mediated egress). See "Runtime drivers" below.
   scaleobs/      Scale-out observability metrics (admission / placement).
   service/       Business logic. Version-agnostic. Owns Service struct,
                  CreateSandbox / CreateSandboxWithID / RecreateSandbox entry
@@ -166,6 +169,8 @@ pkg/
   wasmmod/       WASM module resolver + OCI registry (ORAS push/pull/delete).
                  Resolves a ref (path, file://, bare name) → local .wasm and
                  validates the artifact.
+  isolate/       workerd engine host (pkg/isolate) — group supervisor, jail
+                 spec, per-slot egress pool. Driven by internal/runtime/isolate.
 sdk/
   typescript/    @aerol-ai/aerolvm-sdk. src/MicroVM.ts + Sandbox.ts; transport
                  in src/internal/api/v1/.
@@ -274,6 +279,7 @@ For changes that don't match a skill, the file-level "where to look" map is:
 | Add server business logic | `internal/service/service.go` (or new file in same package) |
 | Firecracker VM runtime / Jailer / snapshots | `internal/runtime/firecracker/driver.go`, REST client `pkg/firecracker/client.go`, warm pool `internal/pool/vmm/`, rootfs `pkg/oci/`, TAP `internal/network/tap/` |
 | WASM runtime / engine / modules | `internal/runtime/wasm/driver.go`, host handler `internal/runtime/wasm/toolhost/`, KV `internal/runtime/wasm/statekv/`, engine `pkg/wasm/`, modules `pkg/wasmmod/`, warm pool `internal/pool/wasm/` |
+| V8-isolate runtime (workerd) | `internal/runtime/isolate/`, `pkg/isolate/`, warm pool `internal/pool/isolate/`, docs `docs/.../isolate-sandbox.mdx`, plan `plans/isolate-runtime.md` |
 | Add/run a runtime driver (the interface itself) | `internal/runtime/runtime.go` (Runtime + ContainerRuntime) |
 | Daemon boot wiring (new subsystem into Run) | `pkg/daemon/` |
 | Managed control-plane seam | `pkg/controlplane/` (keep open-source build a no-op) |

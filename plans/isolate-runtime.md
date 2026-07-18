@@ -1,6 +1,6 @@
 # V8-Isolate Sandboxes (Deno/Workers model) — Design & Implementation Plan
 
-Status: **In progress — Phases 1–3 landed (cold path, /v1/js-bundles, idle-TTL, bundle GC, guest HTTP, attributed egress, expose_port, warm pool, P0 gate, docs + SDK constants); §10.1 demand pitch still open (gates Phase 4)** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-18
+Status: **In progress — Phases 1–3 landed + live harness (cold path, /v1/js-bundles, idle-TTL, bundle GC, guest HTTP, attributed egress, expose_port, warm pool, P0 gate, docs + SDK constants, `single-node-isolate` UC-103/104/105, UC-94 bench); §10.1 demand pitch still open (gates Phase 4)** · Owner: TBD · Created: 2026-07-10 · Amended: 2026-07-18
 
 This plan adds a **fifth runtime** to AerolVM — **V8 isolates** (the
 Deno-Deploy / Cloudflare-Workers model) — as a peer to `docker`, `gvisor`,
@@ -15,8 +15,10 @@ bundle instead of a `.wasm`.
 The isolate runtime is the **Workers-model tier**: push a JS/TS bundle, get a
 `fetch` handler with capability-scoped grants — no image build, no external
 registry, near-zero per-sandbox footprint, thousands of sandboxes per host.
-Create latency (~5ms warm target) is a supporting stat, not the headline: the
-resident-WASM host already creates at a flat ~21ms, so what this tier uniquely
+Create latency is a supporting stat, not the headline: live UC-94 on
+`single-node-isolate` (t3.medium, jail off, 10 samples) measured **warm server
+p50=4ms / p90=6ms / p99=19ms** (API p50=266ms is laptop→region WAN). The
+resident-WASM host already creates at a flat ~22ms, so what this tier uniquely
 adds is the **deployment model and density economics**, not raw speed. It is
 the complement to the Firecracker tier (arbitrary binaries, real VM isolation)
 — the same two-tier split Deno arrived at when it paired Workers (isolates)
@@ -26,6 +28,13 @@ with Deno Sandbox (microVMs).
 
 ## 0. Review history
 
+- **2026-07-18 — Live integration + UC-94 bench.** `single-node-isolate`
+  scenario (`make integration-single-isolate`): UC-103 (runs), UC-104
+  (per-sandbox egress allowlist in one tenant group), UC-105 (js-bundle
+  catalogue CRUD) green on released v0.7.16 + workerd. UC-94 via
+  `make integration-benchmark-isolate`: warm isolate server p50=4ms (artifact
+  `reports/single-node-isolate-bench.{json,md}`). Jail left off until
+  chroot-populate lands.
 - **2026-07-18 — Phases 2 leftovers + Phase 3 landed.** Idle-TTL reaper;
   unreferenced bundle GC; guest HTTP PortGateway + expose_port (HTTP-only,
   no TCP pool); per-sandbox attributed egress (per-slot egress-service pool —
