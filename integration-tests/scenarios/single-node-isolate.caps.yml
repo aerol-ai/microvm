@@ -18,3 +18,9 @@ capabilities:
   - docker
   - isolate
   - domain
+  # Opt UC-94 in for `make integration-benchmark-isolate` (isolate create latency
+  # only; the make target passes AEROL_BENCH_RUNTIMES=isolate + --bench-only).
+  # UC-94 is dormant unless AEROL_BENCH=1, so the functional
+  # `make integration-single-isolate` run skips it. UC-95 (density) stays skipped
+  # here — it also needs CapCluster, which a single node lacks.
+  - benchmark
