@@ -185,10 +185,12 @@ func TestSetters(t *testing.T) {
 
 // fakeGroupHost records loads/unloads without a real workerd process.
 type fakeGroupHost struct {
-	mu      sync.Mutex
-	loaded  map[string]bool
-	stopped bool
-	loadErr error
+	mu       sync.Mutex
+	loaded   map[string]bool
+	stopped  bool
+	loadErr  error
+	loadGate chan struct{} // if non-nil, Load blocks on it (teardown-race test)
+	inLoad   chan struct{} // if non-nil, closed once Load is entered
 }
 
 func newFakeGroupHost() *fakeGroupHost { return &fakeGroupHost{loaded: map[string]bool{}} }
@@ -197,10 +199,26 @@ func (h *fakeGroupHost) Load(id string, b *jsbundle.Bundle) error {
 	if h.loadErr != nil {
 		return h.loadErr
 	}
+	if h.inLoad != nil {
+		select {
+		case <-h.inLoad:
+		default:
+			close(h.inLoad)
+		}
+	}
+	if h.loadGate != nil {
+		<-h.loadGate
+	}
 	h.mu.Lock()
 	h.loaded[id] = true
 	h.mu.Unlock()
 	return nil
+}
+
+func (h *fakeGroupHost) isStopped() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stopped
 }
 func (h *fakeGroupHost) Unload(id string) int {
 	h.mu.Lock()

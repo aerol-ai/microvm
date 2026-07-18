@@ -148,7 +148,16 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 			return fmt.Errorf("bundle %s is in use by sandbox %s: %w", digest, sb.ID, store.ErrJSBundleInUse)
 		}
 	}
-	return s.isolateBundles.Delete(digest)
+	// Owner-scoped, ref-counted delete: removes only this owner's ownership and
+	// drops the shared blob only when no tenant still owns it. Maps the store's
+	// not-found to the API 404.
+	if err := s.isolateBundles.Delete(owner, digest); err != nil {
+		if errors.Is(err, jsbundle.ErrBundleNotFound) {
+			return store.ErrNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 // jsBundleView builds the catalogue DTO for a stored bundle.

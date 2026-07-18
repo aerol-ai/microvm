@@ -61,11 +61,19 @@ type sandboxRecord struct {
 	needsReload bool
 }
 
-// group is one running workerd host plus the group key it serves.
+// group is one running workerd host plus the group key it serves. members is
+// the router-side set of sandbox ids currently placed in this group, guarded by
+// groupsMu. It — not host.Unload's pinned-bundle count — is the authority for
+// last-member teardown: because a joining create adds its id under groupsMu
+// (in acquireGroup) BEFORE it calls host.Load outside the lock, a concurrent
+// last-member Destroy can no longer read a zero count and Stop() the process
+// out from under that in-flight join. Set semantics also make a double
+// acquire/reload of the same id idempotent.
 type group struct {
 	key      string
 	host     GroupHost
 	lastUsed time.Time
+	members  map[string]struct{}
 }
 
 // New constructs an isolate driver. The zero value is not usable.
@@ -205,7 +213,7 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 }
 
 // Ping verifies the workerd binary exists. Config load deliberately does not
-// stat the path; this is the seam /healthz surfaces it through, mirroring the
+// stat the path; this is the seam /health surfaces it through, mirroring the
 // Firecracker driver.
 func (d *Driver) Ping(ctx context.Context) error {
 	info, err := os.Stat(d.cfg.WorkerdPath)

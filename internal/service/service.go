@@ -106,6 +106,11 @@ type Service struct {
 	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
 	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
 	isolateBundles *jsbundle.Store
+	// isolateStaging refcounts content digests staged by an in-flight isolate
+	// create but not yet pinned by a persisted store row, so the bundle GC does
+	// not reap them mid-create (pinStagingDigest / stagingDigests).
+	isolateStagingMu sync.Mutex
+	isolateStaging   map[string]int
 	// wasmModuleResolver resolves module_ref for POST /v1/wasm-modules.
 	wasmModuleResolver WasmModuleResolver
 	// wasmWarmPool receives registration-time NoteModule calls so the warm
@@ -3456,6 +3461,28 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		}
 	}
 
+	// Isolate health mirrors wasm: Ping stats the workerd binary so a
+	// missing/broken binary surfaces as degraded here rather than only as
+	// failed creates. Non-worker nodes never host isolates, so they report
+	// "skipped" and do not degrade.
+	isolateStatus := "disabled"
+	if s.cfg.EnableIsolate {
+		if !s.cfg.IsWorker() {
+			isolateStatus = "skipped on non-worker node"
+		} else {
+			switch rt := s.isolate.(type) {
+			case nil:
+				isolateStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeIsolate)
+			default:
+				if err := rt.Ping(ctx); err != nil {
+					isolateStatus = err.Error()
+				} else {
+					isolateStatus = "ok"
+				}
+			}
+		}
+	}
+
 	status := "ok"
 	if dockerStatus != "ok" || caddyStatus != "ok" {
 		status = "degraded"
@@ -3464,6 +3491,9 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		status = "degraded"
 	}
 	if s.cfg.EnableWasm && s.cfg.IsWorker() && wasmStatus != "ok" {
+		status = "degraded"
+	}
+	if s.cfg.EnableIsolate && s.cfg.IsWorker() && isolateStatus != "ok" {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.
@@ -3492,6 +3522,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		Caddy:           caddyStatus,
 		Firecracker:     firecrackerStatus,
 		Wasm:            wasmStatus,
+		Isolate:         isolateStatus,
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,

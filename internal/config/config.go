@@ -624,7 +624,7 @@ type Config struct {
 	// hosts isolate groups. Required only when EnableIsolate is true;
 	// distributed version-pinned + checksummed by scripts/install.sh (same
 	// recipe as the runsc shim). Not stat()-ed at config load — the driver's
-	// Ping() does that and /healthz surfaces the result, mirroring the
+	// Ping() does that and /health surfaces the result, mirroring the
 	// Firecracker binary handling. SB_ISOLATE_WORKERD_PATH.
 	IsolateWorkerdPath string
 	// IsolateRunDir holds per-group runtime state (workerd sockets, capnp
@@ -1829,7 +1829,7 @@ func Load() (Config, error) {
 	// fail at boot rather than on the first create — same model as
 	// EnableSSHGateway. The paths are not stat()-ed here on purpose: the
 	// runtime driver's Ping() does that and the daemon surfaces the result
-	// via /healthz, which is the right place for operators to look.
+	// via /health, which is the right place for operators to look.
 	if cfg.EnableFirecracker {
 		if cfg.FirecrackerBinary == "" {
 			return Config{}, errors.New("SB_FIRECRACKER_BINARY is required when SB_ENABLE_FIRECRACKER=true")
@@ -1910,7 +1910,7 @@ func Load() (Config, error) {
 	// EnableWasm: the flag gates driver registration in pkg/daemon; when off
 	// the service rejects isolate creates with ErrRuntimeNotImplemented. The
 	// workerd path is not stat()-ed here on purpose — the driver's Ping()
-	// does that and /healthz surfaces the result.
+	// does that and /health surfaces the result.
 	if cfg.EnableIsolate {
 		if cfg.IsolateWorkerdPath == "" {
 			return Config{}, errors.New("SB_ISOLATE_WORKERD_PATH is required when SB_ENABLE_ISOLATE=true")

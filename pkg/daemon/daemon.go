@@ -470,7 +470,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	var isolateDriver *isolateruntime.Driver
 	if cfg.EnableIsolate && cfg.IsWorker() {
 		var err error
-		isolateDriver, err = wireIsolateRuntime(cfg, logger, svc)
+		isolateDriver, err = wireIsolateRuntime(ctx, cfg, logger, svc)
 		if err != nil {
 			return fmt.Errorf("wire isolate runtime: %w", err)
 		}

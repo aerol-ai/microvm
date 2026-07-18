@@ -182,10 +182,13 @@ func TestAuthorizeIsolateTenantID(t *testing.T) {
 		wantErr   string
 	}{
 		// Empty falls back to the authenticated identity at group-routing
-		// time — allowed for every caller class, returns the null tenant.
+		// time. Unscoped/operator callers get the null tenant (one trust
+		// domain); a SCOPED caller must NOT collapse into the shared default
+		// group, so empty resolves to a stable per-owner key (here the owner
+		// "acme" is itself a valid group key, so it is used verbatim).
 		{name: "empty_unscoped", ctx: context.Background(), requested: "", want: ""},
 		{name: "empty_operator", ctx: operatorCtx(), requested: "", want: ""},
-		{name: "empty_scoped", ctx: userCtx("acme"), requested: "", want: ""},
+		{name: "empty_scoped", ctx: userCtx("acme"), requested: "", want: "acme"},
 		// Operator/PAT and internal callers partition tenants freely.
 		{name: "operator_any_tenant", ctx: operatorCtx(), requested: "customer-7", want: "customer-7"},
 		{name: "internal_any_tenant", ctx: context.Background(), requested: "customer-7", want: "customer-7"},
@@ -196,7 +199,7 @@ func TestAuthorizeIsolateTenantID(t *testing.T) {
 		// Malformed keys are rejected before authorization — they become
 		// chroot/cgroup names (jail spec's SanitizeGroupKey is the check).
 		{name: "traversal_rejected", ctx: operatorCtx(), requested: "../../etc", wantErr: "invalid tenant_id"},
-		{name: "whitespace_only_falls_back", ctx: userCtx("acme"), requested: "   ", want: ""},
+		{name: "whitespace_only_falls_back", ctx: userCtx("acme"), requested: "   ", want: "acme"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -217,6 +220,35 @@ func TestAuthorizeIsolateTenantID(t *testing.T) {
 	}
 }
 
+// TestIsolateGroupKeyForOwner covers the B2 anti-co-residency derivation: a
+// scoped caller's empty tenant_id must map to a stable, valid, PER-OWNER group
+// key (never the shared "default"). Owners that are already valid group keys are
+// used verbatim; the rest hash into a stable "own-<hex>" key.
+func TestIsolateGroupKeyForOwner(t *testing.T) {
+	if got := isolateGroupKeyForOwner("acme"); got != "acme" {
+		t.Fatalf("valid owner key = %q, want verbatim %q", got, "acme")
+	}
+	if got := isolateGroupKeyForOwner(""); got != "" {
+		t.Fatalf("empty owner = %q, want empty", got)
+	}
+	// A non-conforming owner (email) hashes to a stable, valid group key.
+	h1 := isolateGroupKeyForOwner("user@example.com")
+	h2 := isolateGroupKeyForOwner("user@example.com")
+	if h1 != h2 {
+		t.Fatalf("owner key not stable: %q != %q", h1, h2)
+	}
+	if !strings.HasPrefix(h1, "own-") {
+		t.Fatalf("hashed owner key = %q, want own- prefix", h1)
+	}
+	if _, err := isolateruntime.SanitizeGroupKey(h1); err != nil {
+		t.Fatalf("hashed owner key %q is not a valid group key: %v", h1, err)
+	}
+	// Distinct owners get distinct groups (no forced co-residency).
+	if isolateGroupKeyForOwner("a@x.com") == isolateGroupKeyForOwner("b@x.com") {
+		t.Fatal("distinct owners collapsed to the same group key")
+	}
+}
+
 // End-to-end shape of the regression: the authorized tenant reaches the
 // driver on the request; the unauthorized one never gets that far.
 func TestCreateIsolateTenantAuthorizationEndToEnd(t *testing.T) {
@@ -225,8 +257,10 @@ func TestCreateIsolateTenantAuthorizationEndToEnd(t *testing.T) {
 	driver := &recordingRuntime{createErr: errors.New("driver reached")}
 	svc.SetIsolateRuntime(driver)
 
+	// Use a NAME ref (not a file:// / *.js ref) so the request reaches tenant
+	// authorization rather than tripping the operator-only file-ref gate.
 	_, err := svc.CreateSandbox(userCtx("acme"), models.CreateSandboxRequest{
-		Runtime: models.RuntimeIsolate, ModuleRef: "b.js", TenantID: "victim-corp",
+		Runtime: models.RuntimeIsolate, ModuleRef: "mybundle", TenantID: "victim-corp",
 	})
 	if err == nil || !strings.Contains(err.Error(), "not authorized") {
 		t.Fatalf("foreign tenant err = %v, want authorization rejection", err)
@@ -236,7 +270,7 @@ func TestCreateIsolateTenantAuthorizationEndToEnd(t *testing.T) {
 	}
 
 	_, err = svc.CreateSandbox(userCtx("acme"), models.CreateSandboxRequest{
-		Runtime: models.RuntimeIsolate, ModuleRef: "b.js", TenantID: "acme",
+		Runtime: models.RuntimeIsolate, ModuleRef: "mybundle", TenantID: "acme",
 	})
 	if err == nil || !strings.Contains(err.Error(), "driver reached") {
 		t.Fatalf("own tenant err = %v, want the driver's error", err)

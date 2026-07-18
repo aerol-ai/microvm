@@ -90,7 +90,7 @@ func TestIsolateOfflineBenchmark(t *testing.T) {
 	// the driver handle so the cleanup can tear down the workerd group
 	// processes — leaving them resident makes `go test` block on their open
 	// stdio pipes (WaitDelay) even after the test body passes.
-	driver, err := wireIsolateRuntime(cfg, logger, svc)
+	driver, err := wireIsolateRuntime(context.Background(), cfg, logger, svc)
 	if err != nil {
 		t.Fatalf("wire isolate runtime: %v", err)
 	}

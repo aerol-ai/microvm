@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // EgressPolicy is the per-sandbox outbound policy enforced by the host-side
@@ -29,12 +31,6 @@ func (h *Host) SetEgressPolicy(id string, p EgressPolicy) {
 		h.egressPolicy = make(map[string]EgressPolicy)
 	}
 	h.egressPolicy[id] = p
-	h.mu.Unlock()
-}
-
-func (h *Host) clearEgressPolicy(id string) {
-	h.mu.Lock()
-	delete(h.egressPolicy, id)
 	h.mu.Unlock()
 }
 
@@ -77,13 +73,24 @@ func (h *Host) serveEgress(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "egress denied by sandbox policy", http.StatusForbidden)
 		return
 	}
+	// Defense-in-depth against SSRF: isolate egress runs from the HOST network
+	// namespace, so a hostname allowlist alone would still let untrusted tenant
+	// JS reach the sandboxd API on loopback and the cloud metadata endpoint
+	// (169.254.169.254 → instance IAM credentials). Reject an IP-literal
+	// destination in a special-use range up front, and — because a hostname can
+	// resolve into those ranges (or be rebound) — the shared egressTransport
+	// re-checks the resolved IP at dial time (egressDialControl).
+	if ip := net.ParseIP(host); ip != nil && isBlockedEgressIP(ip) {
+		http.Error(w, "egress denied: destination is a blocked (loopback/link-local/private) address", http.StatusForbidden)
+		return
+	}
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
 	outReq.Header.Del("x-sb-id")
 	if outReq.URL.Scheme == "" {
 		outReq.URL.Scheme = "https"
 	}
-	resp, err := http.DefaultTransport.RoundTrip(outReq)
+	resp, err := egressTransport.RoundTrip(outReq)
 	if err != nil {
 		http.Error(w, "egress proxy: "+err.Error(), http.StatusBadGateway)
 		return
@@ -117,6 +124,48 @@ func egressAllowed(p EgressPolicy, host string) bool {
 		}
 	}
 	return false
+}
+
+// egressTransport is the shared outbound transport for the egress proxy. Its
+// dial Control hook runs AFTER DNS resolution with the concrete IP, so it
+// blocks special-use destinations even when reached via a hostname (or a
+// rebound one) — the authoritative SSRF guard behind the literal check in
+// serveEgress.
+var egressTransport = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   egressDialControl,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: time.Second,
+}
+
+func egressDialControl(_, address string, _ syscall.RawConn) error {
+	host := address
+	if h, _, err := net.SplitHostPort(address); err == nil {
+		host = h
+	}
+	if ip := net.ParseIP(host); ip != nil && isBlockedEgressIP(ip) {
+		return fmt.Errorf("egress denied: destination %s is in a blocked (loopback/link-local/private) range", ip)
+	}
+	return nil
+}
+
+// isBlockedEgressIP reports whether ip is in a range untrusted isolate code
+// must never reach through the host proxy: loopback (the sandboxd API), link-
+// local (cloud metadata 169.254.169.254 / fe80::/10), private (RFC1918 + ULA),
+// unspecified, and multicast.
+func isBlockedEgressIP(ip net.IP) bool {
+	return ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsPrivate() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast() ||
+		ip.IsInterfaceLocalMulticast()
 }
 
 func hostMatches(host, rule string) bool {

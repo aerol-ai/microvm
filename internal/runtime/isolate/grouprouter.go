@@ -26,18 +26,23 @@ func (d *Driver) groupKeyForCreate(tenantID, sandboxID string) (string, error) {
 	return SanitizeGroupKey(raw)
 }
 
-// acquireGroup returns the running host for groupKey, spawning it under a
-// per-key single-flight if it does not exist yet. cpu/memMB are the group's
-// resource caps for the jail spec (Phase 4 refines the mapping). The returned
-// host is owned by the router; callers must not Stop it — teardown goes through
-// the last-member path in Destroy.
-func (d *Driver) acquireGroup(ctx context.Context, groupKey string, cpu float64, memMB int) (GroupHost, error) {
+// acquireGroup returns the running host for groupKey and registers sandboxID as
+// a member of that group, spawning the group under a per-key single-flight if it
+// does not exist yet. cpu/memMB are the group's resource caps for the jail spec
+// (Phase 4 refines the mapping). The returned host is owned by the router;
+// callers must not Stop it — teardown goes through the last-member path in
+// Destroy. Registering the member here, under groupsMu and before the caller's
+// out-of-lock host.Load, is what closes the join-vs-teardown race: a concurrent
+// last-member release sees this id in members and does not tear the group down.
+func (d *Driver) acquireGroup(ctx context.Context, groupKey, sandboxID string, cpu float64, memMB int) (GroupHost, error) {
 	if d.supervisor == nil {
 		return nil, fmt.Errorf("isolate: host supervisor not registered")
 	}
 	for {
 		d.groupsMu.Lock()
 		if g := d.groups[groupKey]; g != nil {
+			g.members[sandboxID] = struct{}{}
+			g.lastUsed = timeNow()
 			d.groupsMu.Unlock()
 			return g.host, nil
 		}
@@ -66,7 +71,12 @@ func (d *Driver) acquireGroup(ctx context.Context, groupKey string, cpu float64,
 			d.groupsMu.Unlock()
 			return nil, err
 		}
-		d.groups[groupKey] = &group{key: groupKey, host: host, lastUsed: timeNow()}
+		d.groups[groupKey] = &group{
+			key:      groupKey,
+			host:     host,
+			lastUsed: timeNow(),
+			members:  map[string]struct{}{sandboxID: {}},
+		}
 		d.groupsMu.Unlock()
 		return host, nil
 	}
@@ -96,27 +106,33 @@ func (d *Driver) spawnGroup(ctx context.Context, groupKey string, cpu float64, m
 	return host, nil
 }
 
-// releaseFromGroup unloads a sandbox from its group and tears the group's
-// process down when it was the last member (§2.1 last-member teardown, §11
-// group idle-TTL is Phase 3). Safe to call for an unknown group/sandbox.
+// releaseFromGroup removes a sandbox from its group and tears the group's
+// process down when it was the last member (§2.1 last-member teardown). Safe to
+// call for an unknown group/sandbox.
+//
+// The teardown decision is made from the router's own member set under
+// groupsMu, NOT from host.Unload's pinned-bundle count: the membership delete
+// and the emptiness check are one atomic critical section, so a create that has
+// already registered its id in acquireGroup (before its out-of-lock host.Load)
+// keeps the group alive until that create either commits or releases. host is
+// Unloaded (bundle pin dropped) and Stopped OUTSIDE the lock so a slow teardown
+// never blocks the router.
 func (d *Driver) releaseFromGroup(groupKey, sandboxID string) {
 	d.groupsMu.Lock()
 	g := d.groups[groupKey]
-	d.groupsMu.Unlock()
 	if g == nil {
+		d.groupsMu.Unlock()
 		return
 	}
-	remaining := g.host.Unload(sandboxID)
-	if remaining > 0 {
-		return
-	}
-	// Last member left: remove the group from the router, then stop its
-	// process. Remove first so a concurrent create for this key spawns a fresh
-	// group rather than joining one being torn down.
-	d.groupsMu.Lock()
-	if d.groups[groupKey] == g {
+	delete(g.members, sandboxID)
+	empty := len(g.members) == 0
+	if empty {
 		delete(d.groups, groupKey)
 	}
 	d.groupsMu.Unlock()
-	_ = g.host.Stop()
+
+	g.host.Unload(sandboxID)
+	if empty {
+		_ = g.host.Stop()
+	}
 }

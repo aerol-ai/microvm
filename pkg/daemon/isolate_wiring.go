@@ -11,6 +11,7 @@ import (
 	isolatepool "github.com/aerol-ai/microvm/internal/pool/isolate"
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
 	"github.com/aerol-ai/microvm/internal/service"
+	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 )
 
@@ -18,7 +19,7 @@ import (
 // (pkg/jsbundle content-addressed store), its workerd group supervisor
 // (pkg/isolate), the blank-host warm pool, idle-TTL reaper, and bundle GC
 // (plans/isolate-runtime.md Phase 2 leftovers + Phase 3).
-func wireIsolateRuntime(cfg config.Config, logger *slog.Logger, svc *service.Service) (*isolateruntime.Driver, error) {
+func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service) (*isolateruntime.Driver, error) {
 	isoCfg := isolateruntime.FromDaemonConfig(cfg)
 	driver := isolateruntime.New(isoCfg, logger)
 
@@ -39,9 +40,14 @@ func wireIsolateRuntime(cfg config.Config, logger *slog.Logger, svc *service.Ser
 		driver.SetWarmPool(pool)
 		// Boot prewarm + refill: fill blank hosts before the first create
 		// (the wasm prewarm lesson — ticker-only leaves the first creates cold).
+		// Runs on the daemon ctx so the refill loop stops on shutdown (matching
+		// the idle-reaper / bundle-GC loops), rather than leaking on
+		// context.Background() until process exit.
 		go func() {
-			ctx := context.Background()
 			for i := 0; i < cfg.IsolatePoolDepthDefault; i++ {
+				if ctx.Err() != nil {
+					return
+				}
 				if err := pool.WarmOne(ctx); err != nil {
 					logger.Warn("isolate warm pool boot fill failed", "error", err)
 					break
@@ -53,11 +59,22 @@ func wireIsolateRuntime(cfg config.Config, logger *slog.Logger, svc *service.Ser
 
 	svc.SetIsolateBundleStore(store)
 	svc.SetIsolateRuntime(driver)
+	// Honest jail reporting: distinguish "jail requested" (config) from "jail
+	// realizable here" (platform). When jail is requested but not realizable,
+	// isolate creates FAIL CLOSED — say so loudly rather than logging a bare
+	// jail=true that implies confinement the host can't provide.
+	jailRealizable := pkgisolate.JailRealizable()
+	if cfg.IsolateUseJail && !jailRealizable {
+		logger.Warn("isolate jail requested but not realizable on this host; isolate creates will FAIL CLOSED — set SB_ISOLATE_USE_JAIL=false to run unconfined (accepting the risk) or deploy on Linux",
+			"platform_can_jail", jailRealizable,
+		)
+	}
 	logger.Info("isolate runtime enabled",
 		"workerd_path", cfg.IsolateWorkerdPath,
 		"run_dir", cfg.IsolateRunDir,
 		"group_granularity", cfg.IsolateGroupGranularity,
-		"jail", cfg.IsolateUseJail,
+		"jail_requested", cfg.IsolateUseJail,
+		"jail_realizable", jailRealizable,
 		"jitless", cfg.IsolateJitless,
 		"idle_ttl", cfg.IsolateGroupIdleTTL,
 		"pool", cfg.IsolatePoolEnabled,

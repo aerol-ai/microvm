@@ -40,6 +40,9 @@ func TestP0HostileIsolateContainment(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	// The workerd control/host/egress sockets live under RunDir/<group>; keep
+	// that root short so it fits the macOS unix-socket sun_path (~104 chars).
+	runDir := shortRunDir(t)
 	bundleStore, err := jsbundle.NewStore(jsbundle.StoreConfig{Dir: filepath.Join(dir, "bundles")})
 	if err != nil {
 		t.Fatal(err)
@@ -73,15 +76,21 @@ func TestP0HostileIsolateContainment(t *testing.T) {
 
 	d := New(Config{
 		WorkerdPath:      workerd,
-		RunDir:           filepath.Join(dir, "run"),
+		RunDir:           runDir,
 		GroupGranularity: GroupPerTenant,
 		UseJail:          false, // CI hosts may lack cgroup; jail is covered by unit tests
-		IdleTTL:          0,
+		// The jail SPEC is always built + validated on create (only realization
+		// is gated by UseJail), so a valid absolute chroot base + non-root
+		// uid/gid are required even with the jail off.
+		JailChrootBase: filepath.Join(dir, "jail"),
+		JailUID:        1000,
+		JailGID:        1000,
+		IdleTTL:        0,
 	}, nil)
 	d.SetBundleResolver(NewBundleResolver(jsbundle.NewResolver(bundleStore)))
 	d.SetHostSupervisor(NewHostSupervisor(Config{
 		WorkerdPath: workerd,
-		RunDir:      filepath.Join(dir, "run"),
+		RunDir:      runDir,
 	}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -117,9 +126,11 @@ func TestP0HostileIsolateContainment(t *testing.T) {
 		t.Fatalf("create good: %v", err)
 	}
 
-	// (b) Undeclared egress is refused — either the Go proxy 403s (surfaced as
-	// the shim/EGRESS response) or the isolate sees a fetch failure. Never a
-	// clean "egress-ok".
+	// (b) Undeclared egress is refused: the Go proxy denies with 403 (surfaced to
+	// the isolate as "egress-ok:403") or the fetch throws ("egress-err:*"). A 2xx
+	// upstream ("egress-ok:2xx") would mean egress actually leaked. (Egress is
+	// deny-all today — attribution is a §4 follow-up — so every destination is
+	// refused, which subsumes this allowlist check.)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://isolate/egress", nil)
 	resp, err := d.InvokeHTTP(ctx, "sb-hostile", req)
 	if err != nil {
@@ -127,8 +138,8 @@ func TestP0HostileIsolateContainment(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if strings.Contains(string(body), "egress-ok:") {
-		t.Fatalf("undeclared egress succeeded (body=%q) — capability boundary broken", body)
+	if strings.HasPrefix(string(body), "egress-ok:2") {
+		t.Fatalf("undeclared egress reached upstream (body=%q) — capability boundary broken", body)
 	}
 
 	// (c) Driver still serves after hostile traffic.

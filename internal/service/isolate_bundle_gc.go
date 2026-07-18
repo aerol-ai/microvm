@@ -57,6 +57,51 @@ func (s *Service) gcUnreferencedJSBundles(ctx context.Context) (int, error) {
 			pinned[d] = struct{}{}
 		}
 	}
+	// Also spare digests staged by an in-flight create that has not yet written
+	// its store row — otherwise a sweep in that window reaps a blob the create
+	// still needs (TOCTOU). See pinStagingDigest in createIsolateSandbox.
+	for d := range s.stagingDigests() {
+		pinned[d] = struct{}{}
+	}
 	removed, err := s.isolateBundles.GCUnreferenced(pinned)
 	return len(removed), err
+}
+
+// pinStagingDigest / unpinStagingDigest / stagingDigests track content digests
+// staged by an in-flight isolate create but not yet pinned by a persisted store
+// row, so gcUnreferencedJSBundles does not reap them mid-create. Refcounted so
+// concurrent creates of the same digest are safe.
+func (s *Service) pinStagingDigest(digest string) {
+	if digest == "" {
+		return
+	}
+	s.isolateStagingMu.Lock()
+	if s.isolateStaging == nil {
+		s.isolateStaging = make(map[string]int)
+	}
+	s.isolateStaging[digest]++
+	s.isolateStagingMu.Unlock()
+}
+
+func (s *Service) unpinStagingDigest(digest string) {
+	if digest == "" {
+		return
+	}
+	s.isolateStagingMu.Lock()
+	if n := s.isolateStaging[digest]; n <= 1 {
+		delete(s.isolateStaging, digest)
+	} else {
+		s.isolateStaging[digest] = n - 1
+	}
+	s.isolateStagingMu.Unlock()
+}
+
+func (s *Service) stagingDigests() map[string]struct{} {
+	s.isolateStagingMu.Lock()
+	defer s.isolateStagingMu.Unlock()
+	out := make(map[string]struct{}, len(s.isolateStaging))
+	for d := range s.isolateStaging {
+		out[d] = struct{}{}
+	}
+	return out
 }

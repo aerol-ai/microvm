@@ -1042,6 +1042,7 @@ type HealthStatus struct {
 	Caddy           string `json:"caddy"`
 	Firecracker     string `json:"firecracker,omitempty"`
 	Wasm            string `json:"wasm,omitempty"`
+	Isolate         string `json:"isolate,omitempty"`
 	SSHGateway      string `json:"ssh_gateway"`
 	ClusterTopology string `json:"cluster_topology,omitempty"`
 	ClusterNodes    int    `json:"cluster_nodes,omitempty"`

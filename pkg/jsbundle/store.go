@@ -197,24 +197,6 @@ func (s *Store) GetByName(tenant, name string) (*Bundle, error) {
 	return s.GetByDigest(digest)
 }
 
-// ListAllDigests returns every content digest currently in the store (across
-// all tenants). Used by the unreferenced-bundle GC sweep.
-func (s *Store) ListAllDigests() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	seen := make(map[string]struct{})
-	for _, digests := range s.byTenant {
-		for _, d := range digests {
-			seen[d] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for d := range seen {
-		out = append(out, d)
-	}
-	return out
-}
-
 // GCUnreferenced deletes every digest that is neither pinned by a live sandbox
 // nor referenced by an uploaded catalogue name. Named uploads with no live
 // sandbox are kept — the catalogue IS a reference. Returns digests removed.
@@ -259,25 +241,44 @@ func (s *Store) GCUnreferenced(pinned map[string]struct{}) ([]string, error) {
 	return removed, nil
 }
 
-// Delete removes a bundle blob and any names pointing at it (reference-counted
-// GC of unreferenced bundles is driven by the caller). Deleting an absent
-// digest is a no-op.
-func (s *Store) Delete(digest string) error {
+// Delete removes tenant's ownership of a digest: it drops tenant's name
+// pointers to it and its entry in tenant's ownership list, and removes the
+// shared blob ONLY when no other tenant still owns it. Blobs are content-
+// addressed and DEDUPLICATED across tenants, so a tenant deleting bytes it
+// happens to share with another tenant must not evict the other tenant's
+// bundle. Returns ErrBundleNotFound when tenant does not own the digest so
+// DELETE /v1/js-bundles/{digest} 404s (matching /v1/wasm-modules) instead of
+// silently succeeding on an unknown or unowned id.
+func (s *Store) Delete(tenant, digest string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !slices.Contains(s.byTenant[tenant], digest) {
+		return ErrBundleNotFound
+	}
+	// Drop only the caller's name pointers to this digest.
+	prefix := tenant + "\x00"
 	for name, d := range s.names {
-		if d == digest {
+		if d == digest && strings.HasPrefix(name, prefix) {
 			delete(s.names, name)
 		}
 	}
-	for tenant, digests := range s.byTenant {
-		s.byTenant[tenant] = remove(digests, digest)
-		if len(s.byTenant[tenant]) == 0 {
-			delete(s.byTenant, tenant)
+	// Drop the caller's ownership.
+	s.byTenant[tenant] = remove(s.byTenant[tenant], digest)
+	if len(s.byTenant[tenant]) == 0 {
+		delete(s.byTenant, tenant)
+	}
+	// Remove the shared blob only when no tenant owns it anymore.
+	stillOwned := false
+	for _, digests := range s.byTenant {
+		if slices.Contains(digests, digest) {
+			stillOwned = true
+			break
 		}
 	}
-	if err := os.Remove(s.blobPath(digest)); err != nil && !os.IsNotExist(err) {
-		return err
+	if !stillOwned {
+		if err := os.Remove(s.blobPath(digest)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	return s.persistIndexLocked()
 }

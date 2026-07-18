@@ -49,20 +49,21 @@ const controllerJS = `export default {
     if (probe.status === 404) return new Response("no such sandbox", { status: 404 });
     if (!probe.ok) return new Response("isolate bundle fetch " + probe.status, { status: 502 });
     const spec = await probe.json();
-    // Per-sandbox egress shim: stamps x-sb-id so the Go egress proxy can apply
-    // that sandbox's allowlist. Cached under id+":eg" so warm hits skip recompile.
-    const egShimSrc = "export default { async fetch(req, env) { const h = new Headers(req.headers); h.set(\"x-sb-id\", " + JSON.stringify(id) + "); return env.E.fetch(new Request(req, { headers: h })); } };";
-    const eg = env.LOADER.get(id + ":eg", async () => ({
-      compatibilityDate: "2026-01-01",
-      mainModule: "eg.js",
-      modules: { "eg.js": egShimSrc },
-      bindings: [{ name: "E", service: "egress" }],
-    }));
+    // Egress: the sandbox worker's globalOutbound is the STATIC egress service
+    // (a real Fetcher). It cannot be a per-sandbox shim loaded via env.LOADER —
+    // workerd rejects a dynamically-loaded worker's stub/entrypoint as
+    // globalOutbound of ANOTHER dynamic worker ("Entrypoints to dynamically-
+    // loaded workers cannot be transferred"). So per-request x-sb-id
+    // attribution via a shim is not expressible this way; the Go egress server
+    // therefore sees no attribution and fail-closed DENIES all egress (the
+    // Phase-2 deny-all posture). Restoring per-sandbox allowlists needs a
+    // workerd-supported attribution mechanism (plans/isolate-runtime.md §4
+    // follow-up) — until then egress is deny-all, which is safe.
     const worker = env.LOADER.get(id, async () => ({
       compatibilityDate: spec.compatibility_date,
       mainModule: spec.main_module,
       modules: spec.modules,
-      globalOutbound: eg,
+      globalOutbound: env.EGRESS,
     }));
     const fwd = new Request(request);
     fwd.headers.delete("x-sb-id");

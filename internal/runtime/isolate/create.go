@@ -41,7 +41,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
-	host, err := d.acquireGroup(ctx, groupKey, req.CPU, req.MemoryMB)
+	host, err := d.acquireGroup(ctx, groupKey, sandboxID, req.CPU, req.MemoryMB)
 	if err != nil {
 		return nil, err
 	}
@@ -67,10 +67,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	d.mu.Lock()
 	d.byID[sandboxID] = &sandboxRecord{
-		state:     state,
-		groupKey:  groupKey,
-		tenantID:  req.TenantID,
-		bundleRef: "sha256:" + bundle.Digest,
+		state:    state,
+		groupKey: groupKey,
+		tenantID: req.TenantID,
+		// Keep the ORIGINAL ref for local reload (idle-reap respawn), not a
+		// forced "sha256:<digest>": in production the service already pins the
+		// digest form here, but a driver-direct file:// ref has no store to be
+		// resolved by digest — reload must re-resolve the same ref it created
+		// from. (Cross-node failover re-resolves via the service, which passes
+		// the digest, so nothing there regresses.)
+		bundleRef: ref,
 		egress:    egress,
 	}
 	d.mu.Unlock()

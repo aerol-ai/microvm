@@ -19,7 +19,7 @@ func TestWireIsolateRuntime(t *testing.T) {
 	st := openTestStore(t)
 	svc := service.New(config.Config{EnableIsolate: true}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 
-	driver, err := wireIsolateRuntime(config.Config{
+	driver, err := wireIsolateRuntime(context.Background(), config.Config{
 		IsolateWorkerdPath:      "/usr/local/bin/workerd",
 		IsolateRunDir:           t.TempDir(),
 		IsolateGroupGranularity: config.IsolateGroupPerTenant,

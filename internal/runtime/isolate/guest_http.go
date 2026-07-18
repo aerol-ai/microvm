@@ -91,7 +91,7 @@ func (d *Driver) reloadSandbox(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return err
 	}
-	host, err := d.acquireGroup(ctx, groupKey, cpu, memMB)
+	host, err := d.acquireGroup(ctx, groupKey, sandboxID, cpu, memMB)
 	if err != nil {
 		return err
 	}

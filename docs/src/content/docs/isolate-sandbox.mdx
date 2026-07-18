@@ -32,7 +32,7 @@ is not yet enabled.
     })
 
     const sandbox = await client.create({
-      module_ref: 'sha256:…', // or an uploaded bundle name
+      moduleRef: 'sha256:…', // or an uploaded bundle name
       runtime: 'isolate',
       memoryMB: 128,
       networkAllowOut: ['api.example.com'],
@@ -79,7 +79,7 @@ is not yet enabled.
         log.Fatal(err)
     }
 
-    sb, err := client.Create(context.Background(), types.CreateSandboxRequest{
+    sb, err := client.Create(context.Background(), types.CreateSandboxOptions{
         ModuleRef:       "sha256:…",
         Runtime:         types.RuntimeIsolate,
         MemoryMB:        128,
@@ -93,13 +93,13 @@ is not yet enabled.
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    use aerolvm_sdk::{Client, CreateSandboxRequest};
+    use aerolvm_sdk::{Client, CreateOptions};
 
     #[tokio::main]
     async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::new("https://sandbox.example.com", "your-token")?;
         let sandbox = client
-            .create(CreateSandboxRequest {
+            .create(CreateOptions {
                 module_ref: Some("sha256:…".into()),
                 runtime: Some("isolate".into()),
                 memory_mb: Some(128),
@@ -125,7 +125,7 @@ is not yet enabled.
     Sandbox sandbox = client.create(new CreateOptions()
         .setModuleRef("sha256:…")
         .setRuntime("isolate")
-        .setMemoryMB(128));
+        .setMemoryMb(128));
 
     System.out.println(sandbox.id);
     ```

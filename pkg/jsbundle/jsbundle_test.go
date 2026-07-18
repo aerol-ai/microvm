@@ -208,7 +208,7 @@ func TestStoreDelete(t *testing.T) {
 	s, _ := NewStore(StoreConfig{Dir: t.TempDir()})
 	b, _ := BuildFromSource("main.js", sampleWorker, "")
 	d, _ := s.Put("acme", "hook", b)
-	if err := s.Delete(d); err != nil {
+	if err := s.Delete("acme", d); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.GetByDigest(d); !errors.Is(err, ErrBundleNotFound) {
@@ -217,9 +217,43 @@ func TestStoreDelete(t *testing.T) {
 	if _, err := s.GetByName("acme", "hook"); !errors.Is(err, ErrBundleNotFound) {
 		t.Fatalf("post-delete name still resolves: %v", err)
 	}
-	// Deleting again is a no-op.
-	if err := s.Delete(d); err != nil {
-		t.Fatalf("re-delete err %v", err)
+	// Deleting again is now ErrBundleNotFound (the tenant no longer owns it),
+	// which the API maps to 404 — matching /v1/wasm-modules.
+	if err := s.Delete("acme", d); !errors.Is(err, ErrBundleNotFound) {
+		t.Fatalf("re-delete err = %v, want ErrBundleNotFound", err)
+	}
+}
+
+// TestStoreDeleteRefcountedAcrossTenants proves a tenant deleting bytes it
+// shares with another tenant (same content digest) does not evict the other
+// tenant's bundle — the blob is removed only when no tenant owns it.
+func TestStoreDeleteRefcountedAcrossTenants(t *testing.T) {
+	s, _ := NewStore(StoreConfig{Dir: t.TempDir()})
+	b, _ := BuildFromSource("main.js", sampleWorker, "")
+	d, _ := s.Put("acme", "hook", b)
+	if _, err := s.Put("other", "mine", b); err != nil { // same bytes → same digest
+		t.Fatal(err)
+	}
+	// acme deletes: the shared blob must survive because other still owns it.
+	if err := s.Delete("acme", d); err != nil {
+		t.Fatal(err)
+	}
+	if s.TenantOwns("acme", d) {
+		t.Fatal("acme should no longer own the digest")
+	}
+	if got, err := s.GetByName("other", "mine"); err != nil || got.Digest != d {
+		t.Fatalf("other's bundle evicted by acme's delete: %+v err=%v", got, err)
+	}
+	// A tenant that never owned the digest gets 404, not a silent success.
+	if err := s.Delete("stranger", d); !errors.Is(err, ErrBundleNotFound) {
+		t.Fatalf("stranger delete = %v, want ErrBundleNotFound", err)
+	}
+	// other deletes last owner → blob is gone.
+	if err := s.Delete("other", d); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetByDigest(d); !errors.Is(err, ErrBundleNotFound) {
+		t.Fatalf("blob should be gone after last owner deletes: %v", err)
 	}
 }
 

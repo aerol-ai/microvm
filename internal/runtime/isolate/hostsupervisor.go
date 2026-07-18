@@ -14,6 +14,7 @@ import (
 type workerdSupervisor struct {
 	workerdPath string
 	runDir      string
+	useJail     bool
 }
 
 // NewHostSupervisor builds the production supervisor over the isolate config.
@@ -21,6 +22,7 @@ func NewHostSupervisor(cfg Config) HostSupervisor {
 	return &workerdSupervisor{
 		workerdPath: cfg.WorkerdPath,
 		runDir:      cfg.RunDir,
+		useJail:     cfg.UseJail,
 	}
 }
 
@@ -29,6 +31,16 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 		WorkerdPath: s.workerdPath,
 		GroupKey:    spec.GroupKey,
 		RunDir:      filepath.Join(s.runDir, spec.GroupKey),
+		// When UseJail is set, the host MUST realize this spec or fail closed.
+		Jail: pkgisolate.JailConfig{
+			Require:       s.useJail,
+			ChrootDir:     spec.ChrootDir,
+			UID:           spec.UID,
+			GID:           spec.GID,
+			CgroupName:    spec.CgroupName,
+			MemoryLimitMB: spec.MemoryLimitMB,
+			Jitless:       spec.Jitless,
+		},
 	})
 	if err != nil {
 		return nil, err

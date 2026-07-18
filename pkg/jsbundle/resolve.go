@@ -82,6 +82,15 @@ func isHex64(s string) bool {
 	return true
 }
 
+// IsFileRef reports whether ref is a filesystem/file:// entrypoint (as opposed
+// to a digest or an uploaded name). The service uses it to gate host-filesystem
+// reads to operator/unscoped callers — a scoped tenant must not be able to make
+// the daemon read an arbitrary host file via module_ref:"file:///…".
+func IsFileRef(ref string) bool {
+	_, ok := asFilePath(strings.TrimSpace(ref))
+	return ok
+}
+
 // asFilePath recognizes a file:// URL or a bare path with a JS/TS extension.
 func asFilePath(ref string) (string, bool) {
 	if rest, ok := strings.CutPrefix(ref, "file://"); ok {

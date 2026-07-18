@@ -69,7 +69,7 @@ func TestIsolateAPICreateInvokeDestroy(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(cfg, logger, db, nil, nil, nil, nil, nil, admitter)
-	driver, err := wireIsolateRuntime(cfg, logger, svc)
+	driver, err := wireIsolateRuntime(context.Background(), cfg, logger, svc)
 	if err != nil {
 		t.Fatalf("wire: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestIsolateAPIBundleGCAfterDestroy(t *testing.T) {
 		SupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeIsolate},
 	}, capacity.Limits{}, benchMemProbe{freeMB: 32768})
 	svc := service.New(cfg, logger, db, nil, nil, nil, nil, nil, admitter)
-	if _, err := wireIsolateRuntime(cfg, logger, svc); err != nil {
+	if _, err := wireIsolateRuntime(context.Background(), cfg, logger, svc); err != nil {
 		t.Fatal(err)
 	}
 

@@ -37,7 +37,7 @@ checksum sidecar, so the pin in the script is the trust anchor.
    - drain the node (`Ansible/playbooks/` drain flow),
    - re-run the workerd install step (or `install.sh --with-isolate` on a
      fresh node),
-   - restart `sandboxd`, confirm `GET /v1/health` reports the isolate runtime
+   - restart `sandboxd`, confirm `GET /health` reports the isolate runtime
      healthy (Ping stats the binary),
    - undrain.
 5. Isolate group processes do NOT hot-swap the binary: resident groups keep
@@ -55,5 +55,5 @@ rollback has no artifact-migration step.
 ```bash
 /usr/local/bin/workerd --version
 sha256sum /usr/local/bin/workerd   # compare against your own record, not upstream
-curl -s localhost:21212/v1/health | jq .   # isolate runtime should be ok
+curl -s localhost:21212/health | jq .   # isolate runtime should be ok
 ```

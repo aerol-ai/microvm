@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
@@ -26,6 +27,10 @@ type HostConfig struct {
 	RunDir string
 	// StartTimeout bounds the spawn→ready wait. Zero → 10s.
 	StartTimeout time.Duration
+	// Jail is the OS confinement for the workerd process. When Jail.Require is
+	// true, Start applies it before exec and FAILS CLOSED if it cannot be
+	// realized on this platform — the group never runs unconfined.
+	Jail JailConfig
 }
 
 // Host owns one workerd process for an isolate group and the Go-side
@@ -38,15 +43,21 @@ type Host struct {
 	hostSock    string
 	egressSock  string
 
+	// started is the fast-path liveness flag Invoke checks; atomic so a
+	// concurrent Stop (last-member teardown / idle reaper) racing an in-flight
+	// Invoke is not a data race. The pointer/server fields it gates are read
+	// under mu.
+	started atomic.Bool
+
 	mu           sync.RWMutex
 	bundles      map[string]*jsbundle.Bundle // sandbox id → pinned bundle
 	egressPolicy map[string]EgressPolicy     // sandbox id → outbound policy
-
+	// cmd/ctrlClient/servers are set once in Start and cleared in Stop; guarded
+	// by mu because Invoke reads ctrlClient while Stop nils cmd concurrently.
 	cmd        *exec.Cmd
 	bundleSrv  *http.Server
 	egressSrv  *http.Server
 	ctrlClient *http.Client
-	started    bool
 }
 
 // NewHost prepares (does not start) a group host.
@@ -140,18 +151,30 @@ func (h *Host) Start(ctx context.Context) error {
 	cmd.Dir = h.cfg.RunDir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
+	// Fail-closed jail gate: if confinement is REQUIRED but this platform can't
+	// realize it (or the spec is incomplete), refuse to spawn rather than run
+	// untrusted tenant JS unconfined while the operator believes it is jailed.
+	if h.cfg.Jail.Require {
+		if err := applyJail(cmd, h.cfg.Jail); err != nil {
+			_ = h.stopServers()
+			return fmt.Errorf("isolate: jail required but not realized here — refusing to spawn workerd unconfined (set SB_ISOLATE_USE_JAIL=false to run without a jail, accepting the risk): %w", err)
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		_ = h.stopServers()
 		return fmt.Errorf("isolate: start workerd: %w", err)
 	}
+	client := unixHTTPClient(h.controlSock)
+	h.mu.Lock()
 	h.cmd = cmd
-	h.ctrlClient = unixHTTPClient(h.controlSock)
+	h.ctrlClient = client
+	h.mu.Unlock()
 
-	if err := h.waitReady(ctx); err != nil {
+	if err := h.waitReady(ctx, cmd, client); err != nil {
 		_ = h.Stop()
 		return err
 	}
-	h.started = true
+	h.started.Store(true)
 	return nil
 }
 
@@ -196,7 +219,10 @@ func (h *Host) startBundleServer() error {
 	return nil
 }
 
-func (h *Host) waitReady(ctx context.Context) error {
+// waitReady polls the control socket until the controller answers. cmd and
+// client are passed in (not read from the struct) so this runs entirely on
+// startup-local state — no lock needed and no race with a later Invoke/Stop.
+func (h *Host) waitReady(ctx context.Context, cmd *exec.Cmd, client *http.Client) error {
 	deadline := time.Now().Add(h.cfg.StartTimeout)
 	// A readiness probe carries a sentinel id the provider will 404 on; a 502
 	// (load failed) still proves the controller is serving, which is all we
@@ -207,12 +233,12 @@ func (h *Host) waitReady(ctx context.Context) error {
 		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://ctrl/", nil)
 		req.Header.Set("x-sb-id", "__readiness__")
-		resp, err := h.ctrlClient.Do(req)
+		resp, err := client.Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
 			return nil
 		}
-		if h.cmd.ProcessState != nil && h.cmd.ProcessState.Exited() {
+		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 			return fmt.Errorf("isolate: workerd exited during startup")
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -224,7 +250,13 @@ func (h *Host) waitReady(ctx context.Context) error {
 // request is forwarded verbatim except that x-sb-id is (re)set to id so the
 // controller routes it; the isolate never sees the control header.
 func (h *Host) Invoke(ctx context.Context, id string, r *http.Request) (*http.Response, error) {
-	if !h.started {
+	if !h.started.Load() {
+		return nil, fmt.Errorf("isolate: host not started")
+	}
+	h.mu.RLock()
+	client := h.ctrlClient
+	h.mu.RUnlock()
+	if client == nil {
 		return nil, fmt.Errorf("isolate: host not started")
 	}
 	out := r.Clone(ctx)
@@ -233,7 +265,7 @@ func (h *Host) Invoke(ctx context.Context, id string, r *http.Request) (*http.Re
 	out.URL.Host = "ctrl"
 	out.Host = "ctrl"
 	out.Header.Set("x-sb-id", id)
-	return h.ctrlClient.Do(out)
+	return client.Do(out)
 }
 
 // stopServers shuts down the bundle + egress servers and removes their sockets.
@@ -252,11 +284,14 @@ func (h *Host) stopServers() error {
 
 // Stop kills the workerd process and tears down the host servers. Idempotent.
 func (h *Host) Stop() error {
-	h.started = false
-	if h.cmd != nil && h.cmd.Process != nil {
-		_ = h.cmd.Process.Kill()
-		_, _ = h.cmd.Process.Wait()
-		h.cmd = nil
+	h.started.Store(false)
+	h.mu.Lock()
+	cmd := h.cmd
+	h.cmd = nil
+	h.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
 	}
 	return h.stopServers()
 }

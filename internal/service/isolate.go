@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -44,6 +46,16 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	}
 	req.ModuleRef = bundleRef
 
+	// file:// and bare-path bundle refs read a file off the HOST filesystem as
+	// the daemon user. That is an operator/self-host convenience, not something
+	// a scoped tenant may drive — otherwise module_ref:"file:///etc/…" turns
+	// create into an arbitrary host-file read. Gate it to unscoped callers;
+	// scoped callers must upload via POST /v1/js-bundles and reference a digest
+	// or name.
+	if _, scoped := ownerScope(ctx); scoped && jsbundle.IsFileRef(bundleRef) {
+		return nil, fmt.Errorf("runtime %q: file:// bundle refs are operator-only; upload via /v1/js-bundles and reference the digest or name", req.Runtime)
+	}
+
 	// Owner-scoped bundle resolution + digest pin. The bundle name space is the
 	// caller's identity (owner_ref), NOT the isolate-group key (tenant_id) —
 	// those are different axes (who owns the code vs. which process co-hosts
@@ -60,11 +72,20 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 			return nil, fmt.Errorf("resolve bundle %q: %w", bundleRef, resolveErr)
 		}
 		// Ensure the resolved bytes are in the store (a file:// ref is not yet),
-		// so the driver's by-digest resolve and failover both find them.
+		// so the driver's by-digest resolve and failover both find them. Put is
+		// a fast no-op when this owner already holds the digest (the common
+		// case), so this is the only boot-path I/O: one index rewrite the first
+		// time a digest is staged, none thereafter (pr-review.md §2).
 		if _, err := s.isolateBundles.Put(owner, "", resolved); err != nil {
 			return nil, fmt.Errorf("stage bundle: %w", err)
 		}
 		req.ModuleRef = "sha256:" + resolved.Digest
+		// Protect the staged digest from the bundle GC for the rest of this
+		// create: it is not yet pinned by a store row, so a GC sweep between
+		// here and store.Create would otherwise reap the blob and strand the
+		// sandbox on the next reload/failover (a TOCTOU on the GC).
+		s.pinStagingDigest(resolved.Digest)
+		defer s.unpinStagingDigest(resolved.Digest)
 	}
 
 	tenantID, err := s.authorizeIsolateTenantID(ctx, req.TenantID)
@@ -162,6 +183,21 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// opt-in via expose_port — creates stay private-by-default.
 	sandbox.ContainerIP = "127.0.0.1"
 	if err := s.store.Create(ctx, sandbox); err != nil {
+		if errors.Is(err, models.ErrSandboxExists) {
+			// A concurrent create with the same id won the INSERT. Both callers
+			// ran the full driver create for the SAME id — host.Load, the group
+			// member set, and admission are all keyed by id and idempotent, so
+			// the winner's driver state and reservation are shared and already
+			// correct. Rolling back here (Destroy + Release) would tear down the
+			// winner's live sandbox and free its reservation (pr-review.md §4:
+			// never delete state another caller installed). Return the committed
+			// row instead — idempotent success.
+			stored, getErr := s.store.Get(ctx, sandbox.ID)
+			if getErr != nil {
+				return nil, getErr
+			}
+			return &models.CreateSandboxResponse{Sandbox: *stored}, nil
+		}
 		_ = s.isolate.Destroy(ctx, sandbox)
 		releaseAdmission()
 		return nil, err
@@ -186,29 +222,54 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 // policy, so the value must match — or be authorized by — the authenticated
 // identity.
 //
-//   - empty: allowed for everyone; returns "" and the group key falls back to
-//     the authenticated identity at group-routing time (single-tenant
-//     self-hosters get one group with zero config).
-//   - user-scoped token: only its own OwnerRef is authorized. Anything else
-//     is rejected — this is the forced-co-residency regression case.
-//   - operator/PAT and internal callers: any well-formed value. The operator
-//     IS the platform; partitioning its customers into named tenant groups is
-//     exactly what the field exists for.
+//   - empty + scoped caller: resolves to a STABLE per-owner group key
+//     (isolateGroupKeyForOwner) so each authenticated identity gets its own
+//     workerd process. It must NOT return "" here — "" routes to the shared
+//     DefaultGroupKey ("default"), which would co-locate every scoped tenant
+//     that omits tenant_id in one process (the forced-co-residency this field
+//     exists to prevent).
+//   - empty + operator/unscoped caller: returns "" → the single default group.
+//     The operator is one trust domain; it partitions customers by passing an
+//     explicit tenant_id.
+//   - user-scoped token with an explicit value: only its own OwnerRef is
+//     authorized. Anything else is rejected — the forced-co-residency case.
+//   - operator/PAT and internal callers: any well-formed value.
 //
 // Explicit values must additionally be well-formed group keys (they become
 // chroot directory and cgroup names — isolate.SanitizeGroupKey is the single
 // definition of well-formed).
 func (s *Service) authorizeIsolateTenantID(ctx context.Context, requested string) (string, error) {
 	requested = strings.TrimSpace(requested)
+	owner, scoped := ownerScope(ctx)
 	if requested == "" {
+		if scoped {
+			return isolateGroupKeyForOwner(owner), nil
+		}
 		return "", nil
 	}
 	if _, err := isolate.SanitizeGroupKey(requested); err != nil {
 		return "", fmt.Errorf("invalid tenant_id: %w", err)
 	}
-	owner, scoped := ownerScope(ctx)
 	if scoped && requested != owner {
 		return "", fmt.Errorf("tenant_id %q is not authorized for the authenticated identity", requested)
 	}
 	return requested, nil
+}
+
+// isolateGroupKeyForOwner derives a stable, valid isolate-group key from a
+// scoped caller's OwnerRef. OwnerRef is a control-plane identity of unspecified
+// shape, so it may not satisfy isolate.SanitizeGroupKey (it becomes a chroot
+// dir + cgroup name). When it already is a valid key we use it verbatim so the
+// group is human-legible; otherwise we hash it into a stable "own-<hex>" key.
+// Deterministic, so restart reconcile and failover rebuild the same grouping.
+func isolateGroupKeyForOwner(owner string) string {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return ""
+	}
+	if _, err := isolate.SanitizeGroupKey(owner); err == nil {
+		return owner
+	}
+	sum := sha256.Sum256([]byte(owner))
+	return "own-" + hex.EncodeToString(sum[:16])
 }
