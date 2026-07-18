@@ -20,7 +20,7 @@
     "mermaid": "^11.16.0",
     "sass": "^1.101.0",
     "tailwindcss": "^4.3.2",
-    "typescript": "^5.8.3"
+    "typescript": "^7.0.2"
   },
   "devDependencies": {
     "prettier": "^3.9.5",
