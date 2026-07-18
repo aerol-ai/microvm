@@ -64,17 +64,18 @@ they're spread across two different layers:
 
 | Runtime | Layer | Isolation mechanism |
 |---|---|---|
-| **Docker** (`runtime: "docker"`) | OCI runtime (`runc`) | Linux namespaces + cgroups |
+| **OCI / Docker API** (`runtime: "docker"`) | OCI runtime (`runc`) on **containerd** (default host engine) | Linux namespaces + cgroups |
 | **gVisor** (`runtime: "gvisor"`) | OCI runtime (`runsc`) | Userspace kernel intercepting syscalls |
 | **Firecracker** (`runtime: "firecracker"`) | Our own OCI-runtime-equivalent → VMM | Hardware VM (KVM) |
 | **WASM** (`runtime: "wasm"`) | Language VM / sandboxed bytecode | Host-mediated WASI workers (optional resident host) |
 | **Isolate** (`runtime: "isolate"`) | Language VM (V8 / workerd) | Per-tenant workerd group + host-mediated egress; off by default |
 
-Docker and gVisor are drop-in OCI runtimes — the container ecosystem handed
-them to us. WASM and isolate are off the OCI diagram: they isolate at the
-language-VM layer, not the container layer, so they trade syscall compatibility
-for density and create latency (see [WASM Architecture](/wasm-architecture/) and
-[Isolate Sandbox](/isolate-sandbox/)).
+The API still says `runtime: "docker"` for OCI sandboxes; production nodes
+realize them with the native **containerd** driver (`SB_CONTAINER_ENGINE=containerd`).
+gVisor is a drop-in OCI runtime beside that path. WASM and isolate are off the
+OCI diagram: they isolate at the language-VM layer, not the container layer, so
+they trade syscall compatibility for density and create latency (see
+[WASM Architecture](/wasm-architecture/) and [Isolate Sandbox](/isolate-sandbox/)).
 
 Firecracker is the interesting one. There is no off-the-shelf OCI runtime in
 that row, because **we wrote it ourselves.**
@@ -285,9 +286,9 @@ layer is a VM, pick which engine.
 
 | You want | Pick this layer | Notes |
 |---|---|---|
-| Max compatibility, lowest overhead, trusted-ish code | `runc` (Docker) | Namespaces. Fast OCI path (~30ms warm server create). |
+| Max compatibility, lowest overhead, trusted-ish code | `runc` via containerd (`runtime: "docker"`) | Namespaces. Default OCI engine (~189ms server create on live UC-94). |
 | Untrusted code, container UX, no VM cost | gVisor (`runsc`) | Userspace kernel. Strong boundary, some syscall-compat gaps. |
-| Hardware-VM isolation with ~30ms warm boot | Firecracker | Our hand-rolled driver + snapshot warm pool. Default microVM. |
+| Hardware-VM isolation with ~34ms warm boot | Firecracker | Our hand-rolled driver + snapshot warm pool. Default microVM. |
 | GPU passthrough / confidential VMs / hotplug | Cloud Hypervisor *(candidate engine)* | Same layer as Firecracker; swap the engine, reuse the chassis. |
 | Smallest possible footprint, WASI modules | WASM | Language-VM layer; resident host ~22ms warm create. |
 | JS/TS `fetch` handlers, Workers density | Isolate (V8 / workerd) | Language-VM layer; ~4ms warm server create; off by default. |

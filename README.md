@@ -29,7 +29,7 @@
 
 &nbsp;
 
-AerolVM is open-source sandbox infrastructure for running isolated code environments - self-host it on your own Linux host, or run it as a managed, multi-tenant service. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated resources - create latency as low as **4ms server-side** (V8 isolate warm path) and supporting Docker, gVisor, Firecracker, WASM, and V8-isolate runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
+AerolVM is open-source sandbox infrastructure for running isolated code environments - self-host it on your own Linux host, or run it as a managed, multi-tenant service. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated resources - create latency as low as **4ms server-side** (V8 isolate warm path) and supporting OCI containers on **containerd** (default), gVisor, Firecracker, WASM, and V8-isolate runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
 
 ## Features
 
@@ -40,7 +40,7 @@ AerolVM provides a complete surface for building sandbox-backed products and age
 | [Lifecycle (create / start / stop / destroy)](https://microvm.aerol.ai/sandboxes) | [Streaming exec & PTY](https://microvm.aerol.ai/exec-streaming) | [HTTP preview URLs](https://microvm.aerol.ai/preview) | [External storage (S3, NFS, SSHFS, rclone)](https://microvm.aerol.ai/external-storage) | [Raft-coordinated cluster](https://microvm.aerol.ai/cluster-setup) |
 | [Environment & resource limits](https://microvm.aerol.ai/environment) | [Persistent PTY sessions w/ replay](https://microvm.aerol.ai/sessions) | [TCP port exposure](https://microvm.aerol.ai/tcp-ports) | [Encrypted sandbox secrets](https://microvm.aerol.ai/environment) | [HA failover & durability](https://microvm.aerol.ai/durability) |
 | [Snapshots (stop-start persistence)](https://microvm.aerol.ai/snapshots) | [SSH access per sandbox](https://microvm.aerol.ai/ssh-access) | [TLS + SNI port routing](https://microvm.aerol.ai/tcp-vs-tls-ports) | [Custom domains](https://microvm.aerol.ai/custom-domains) | [Cluster ingress topology](https://microvm.aerol.ai/cluster-ingress) |
-| [Multi-runtime (Docker / gVisor / Firecracker / WASM / Isolate)](https://microvm.aerol.ai/sandboxes) | [File system operations](https://microvm.aerol.ai/file-system) | [Per-sandbox egress control](https://microvm.aerol.ai/network-isolation) | [Sandbox tags & tenant scoping](https://microvm.aerol.ai/sandbox-tags) | [Reconciler & self-healing](https://microvm.aerol.ai/reconcile) |
+| [Multi-runtime (containerd OCI / gVisor / Firecracker / WASM / Isolate)](https://microvm.aerol.ai/sandboxes) | [File system operations](https://microvm.aerol.ai/file-system) | [Per-sandbox egress control](https://microvm.aerol.ai/network-isolation) | [Sandbox tags & tenant scoping](https://microvm.aerol.ai/sandbox-tags) | [Reconciler & self-healing](https://microvm.aerol.ai/reconcile) |
 | [GPU sandboxes](https://microvm.aerol.ai/gpu-sandboxes) | [Port allowlist](https://microvm.aerol.ai/port-allowlist) | [Per-sandbox network quotas](https://microvm.aerol.ai/network-usage) | [Dashboard](https://microvm.aerol.ai/dashboard) | [Operational runbooks](https://microvm.aerol.ai/operational-runbooks) |
 
 ## Why AerolVM
@@ -51,8 +51,8 @@ AerolVM beats the two most common alternatives on the axes that matter most for 
 | :--- | :--- | :--- | :--- |
 | **Deployment** | ✅ Self-host (single binary, one-line install) or managed multi-tenant SaaS | ✗ Cloud only | ✅ Self-host (complex multi-component setup) |
 | **Runs locally** | ✅ `--local` flag, no DNS needed | ✗ | ✗ |
-| **Sandbox startup (server p50)** | Isolate ~4ms · WASM ~22ms · Docker ~30ms · Firecracker ~34ms | ~200ms | < 90ms |
-| **Runtime isolation** | ✅ Docker, gVisor, Firecracker (microVM), WASM, V8 isolate (workerd) | Firecracker (microVM) | Docker only |
+| **Sandbox startup (server p50)** | Isolate ~4ms · WASM ~22ms · Firecracker ~34ms · containerd ~189ms | ~200ms | < 90ms |
+| **Runtime isolation** | ✅ OCI (containerd default) / gVisor / Firecracker / WASM / V8 isolate | Firecracker (microVM) | Docker only |
 | **Sandbox lifetime** | Unlimited | 1 day | Unlimited |
 | **Serverless / Workers-style sandboxes** | ✅ WASM + V8 isolate | ✗ | ✗ |
 | **TCP + TLS port routing** | ✅ | ✗ | ✗ |
@@ -69,7 +69,7 @@ AerolVM beats the two most common alternatives on the axes that matter most for 
 
 ### vs e2b
 
-e2b is the fastest managed path if you want zero infrastructure, but it means your code runs on someone else's hardware with no self-hosting option, per-sandbox-hour billing that compounds fast at scale, a hard 1-day sandbox lifetime cap, and a single isolation model. AerolVM covers the same AI execution use case on infrastructure you own — pick Docker, gVisor, Firecracker, WASM, or V8 isolates — with predictable fixed-cost pricing.
+e2b is the fastest managed path if you want zero infrastructure, but it means your code runs on someone else's hardware with no self-hosting option, per-sandbox-hour billing that compounds fast at scale, a hard 1-day sandbox lifetime cap, and a single isolation model. AerolVM covers the same AI execution use case on infrastructure you own — pick OCI on containerd, gVisor, Firecracker, WASM, or V8 isolates — with predictable fixed-cost pricing.
 
 > **Already on the e2b SDK?** AerolVM's `/e2b` API facade means your existing code keeps working - just point `E2B_API_URL` at your AerolVM host.
 
@@ -84,7 +84,7 @@ Daytona targets long-lived developer workspaces, not high-frequency ephemeral ag
 AerolVM is a single Go binary (`sandboxd`) wired to three components:
 
 - **Caddy** - handles wildcard TLS via DNS-01, L7 HTTP routing (`<sandbox-id>.<domain>`), and L4 TCP SNI routing (`<sandbox-id>-<port>.<domain>`). The daemon talks to the Caddy admin API; no config files are reloaded at runtime.
-- **Runtimes** - Docker (`runc`), gVisor (`runsc`), Firecracker (microVM), WASM (WASI workers / resident host), and V8 isolate (`workerd`). OCI runtimes share the Docker/containerd path; WASM and isolate are host-mediated and Runtime-only.
+- **Runtimes** - OCI containers (`runtime: "docker"` on the **containerd** engine by default; dockerd optional), gVisor (`runsc`), Firecracker (microVM), WASM (WASI workers / resident host), and V8 isolate (`workerd`). WASM and isolate are host-mediated and Runtime-only.
 - **SQLite (WAL mode, single-writer)** - stores sandbox state, the TCP host-port pool, exposed-port intents, and sealed secrets. Single-writer means no contention; WAL mode means reads never block writes.
 
 For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-replicated placement state) and **SWIM gossip** (membership + capacity heartbeats). Nodes take `server`, `worker`, or `ingress` roles. The Raft voter count stays fixed at 3 or 5 regardless of how many workers you add - the same topology Kubernetes uses for control-plane vs. data-plane scaling. See [Cluster Setup](https://microvm.aerol.ai/cluster-setup).
@@ -100,8 +100,8 @@ For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-
 │                      │                              │
 │          ┌───────────┼───────────┐                  │
 │          ▼           ▼           ▼                  │
-│   Docker/gVisor   Caddy      SSH gateway            │
-│   FC/WASM/isolate admin API  (Ed25519)              │
+│  containerd/gVisor  Caddy      SSH gateway            │
+│  FC/WASM/isolate  admin API  (Ed25519)              │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -109,7 +109,7 @@ For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-
 
 | Runtime | Status | Install / enable | Use case |
 | :--- | :--- | :--- | :--- |
-| Docker (`runc`) | ✅ Available | Default | Broadest OCI image compatibility. |
+| OCI / `docker` API (`runc` via **containerd**) | ✅ Available | Default engine (`SB_CONTAINER_ENGINE=containerd`) | Broadest OCI image compatibility. |
 | gVisor (`runsc`) | ✅ Available | `--with-gvisor` | User-space kernel for untrusted LLM code. |
 | Firecracker | ✅ Available | `--with-firecracker` (bare metal / KVM) | MicroVM - dedicated kernel per sandbox. |
 | WASM | ✅ Available | Config / cluster wasm workers | WASI modules; resident host ~22ms warm create. |
@@ -117,17 +117,17 @@ For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-
 
 ## Create latency (live UC-94)
 
-Server-side create from `Server-Timing` (excludes client↔cluster WAN). Artifacts under `integration-tests/reports/`.
+Server-side create from `Server-Timing` (excludes client↔cluster WAN). Artifacts under `integration-tests/reports/`. Production deployments use the **containerd** engine for OCI sandboxes (`runtime: "docker"` on the wire).
 
-| Runtime | Server p50 | Server p90 | Server p99 | Topology | Notes |
+| Runtime / engine | Server p50 | Server p90 | Server p99 | Topology | Notes |
 | :--- | ---: | ---: | ---: | :--- | :--- |
 | **Isolate** | **4ms** | 6ms | 19ms | `single-node-isolate` · t3.medium | Warm path (same tenant group); API p50 266ms is WAN |
 | **WASM** (resident host) | **22ms** | 46ms | 50ms | `cluster-3-mixed-wasm` · t3.large | Flag-on resident host; no cold-compile tail |
-| **Docker** (sparse / warm) | **28–30ms** | 29–332ms | 30–373ms | `cluster-3-mixed-docker` · t3.medium | Sparse bench holds ~28ms; burst p90 can include image/netrule work |
 | **Firecracker** (warm pool) | **34ms** | 36ms | 37ms | `single-node-fc` · c5.metal | Post warm-pool path; cold/template builds are higher |
+| **containerd** (OCI default) | **189ms** | 225ms | 233ms | `cluster-3-mixed-containerd` · t3.medium | Default host engine; API runtime remains `docker` |
 | **gVisor** | **284ms** | 330ms | 346ms | `cluster-3-mixed-gvisor` · t3.medium | User-space kernel boot cost |
 
-Reproduce: `make integration-benchmark-isolate`, `integration-benchmark-wasm`, `integration-benchmark-docker`, `integration-benchmark-fc`, `integration-benchmark-gvisor`.
+Reproduce: `make integration-benchmark-isolate`, `integration-benchmark-wasm`, `integration-benchmark-containerd`, `integration-benchmark-fc`, `integration-benchmark-gvisor`.
 
 ## SDKs
 

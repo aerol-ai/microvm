@@ -4,11 +4,13 @@ title: Quick Start
 
 **AerolVM** is open-source infrastructure for running isolated code environments.
 Self-host it or run it as managed multi-tenant SaaS. Each sandbox is a fully
-isolated compute unit — Docker/gVisor containers, Firecracker microVMs, WASM
-modules, or V8 isolates — with its own network policy and allocated resources.
+isolated compute unit — OCI containers on containerd, gVisor, Firecracker
+microVMs, WASM modules, or V8 isolates — with its own network policy and
+allocated resources.
 
 Warm create latency (server-side) ranges from **~4ms** (V8 isolate) through
-**~30ms** (Docker / Firecracker warm pool) depending on runtime. See the
+**~34ms** (Firecracker warm pool) and **~189ms** (default OCI on containerd)
+depending on runtime. See the
 [README benchmark table](https://github.com/aerol-ai/microvm#create-latency-live-uc-94)
 for the latest UC-94 numbers.
 
@@ -21,15 +23,16 @@ environment snapshots enable persistent agent operations across sessions.
 
 | Runtime | Status | Use case |
 |---|---|---|
-| Docker | ✅ | Fast OCI images, broadest compatibility (default) |
+| OCI (`runtime: "docker"` on **containerd**) | ✅ | Fast OCI images, broadest compatibility (default engine) |
 | gVisor | ✅ | User-space kernel isolation for untrusted code (`--with-gvisor`) |
 | Firecracker | ✅ | Hardware microVM isolation; warm pool ~34ms server create |
 | WebAssembly | ✅ | WASI modules; resident host ~22ms warm create |
 | Isolate (V8 / workerd) | ✅ (off by default) | JS/TS `fetch` handlers; **~4ms** warm server create (`--with-isolate`) |
 
 Kata Containers is not implemented — create requests with `runtime: "kata"`
-return not-implemented. Docker is the default. Enable the others in server
-config or installer flags as needed.
+return not-implemented. The default API runtime is `docker` (OCI); production
+hosts run it on the **containerd** engine (`SB_CONTAINER_ENGINE=containerd`).
+Enable the other runtimes in server config or installer flags as needed.
 
 ## Use Cases
 
