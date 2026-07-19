@@ -361,29 +361,39 @@ func benchCanOwnSandbox(role string) bool {
 	return false
 }
 
-func warmBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) {
+// warmBenchmarkRuntimes warms one create per runtime and returns the runtimes
+// whose warmup SUCCEEDED plus the names that were dropped. A runtime whose
+// warmup fails (e.g. isolate can't resolve its bundle) is skipped with t.Errorf
+// rather than fataling the whole sweep — otherwise one broken runtime zeroes the
+// latency numbers for every healthy one (docker/containerd/wasm never get
+// measured). Mirrors the main loop's "every create sample failed" → Errorf
+// severity: the test still goes red so the breakage is visible, but the healthy
+// runtimes are measured and the artifact is written.
+func warmBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) ([]benchRuntimeSpec, []string) {
 	t.Helper()
+	var healthy []benchRuntimeSpec
+	var dropped []string
 	for _, spec := range runtimes {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		sb, err := c.SDK().Create(ctx, benchCreateOptions(t, spec))
 		cancel()
 		if err != nil {
-			t.Fatalf("bench[%s] warmup create failed after readiness: %v", spec.runtime, err)
+			t.Errorf("bench[%s] warmup create failed after readiness (runtime skipped): %v", spec.runtime, err)
+			dropped = append(dropped, spec.runtime)
+			continue
 		}
-		destroy := true
 		id := sb.ID
-		defer func() {
-			if destroy {
-				destroyBest(c, id)
-			}
-		}()
-		if !waitRunningTimed(t, sb) {
-			t.Fatalf("bench[%s] warmup sandbox %s did not reach started", spec.runtime, id)
-		}
+		started := waitRunningTimed(t, sb)
 		destroyBest(c, id)
-		destroy = false
+		if !started {
+			t.Errorf("bench[%s] warmup sandbox %s did not reach started (runtime skipped)", spec.runtime, id)
+			dropped = append(dropped, spec.runtime)
+			continue
+		}
 		_, _ = c.LastServerCreateMS()
+		healthy = append(healthy, spec)
 	}
+	return healthy, dropped
 }
 
 // waitDockerPoolWarm blocks until a docker create is served from the warm
@@ -747,7 +757,13 @@ func TestBenchCreateLatency(t *testing.T) {
 	}
 	waitBenchmarkReady(t, c, runtimes)
 	runtimes = prepareBenchmarkRuntimes(t, c, runtimes)
-	warmBenchmarkRuntimes(t, c, runtimes)
+	runtimes, warmupDropped := warmBenchmarkRuntimes(t, c, runtimes)
+	if len(warmupDropped) > 0 {
+		t.Logf("bench: %d runtime(s) dropped after warmup failure: %v — healthy runtimes still measured", len(warmupDropped), warmupDropped)
+	}
+	if len(runtimes) == 0 {
+		t.Fatalf("bench: every runtime failed warmup (%v); no latency to measure", warmupDropped)
+	}
 	waitDockerPoolWarm(t, c, runtimes)
 
 	var report benchReport
@@ -840,7 +856,10 @@ func TestBenchCreateLatencySparse(t *testing.T) {
 	}
 	waitBenchmarkReady(t, c, dockerOnly)
 	dockerOnly = prepareBenchmarkRuntimes(t, c, dockerOnly)
-	warmBenchmarkRuntimes(t, c, dockerOnly)
+	dockerOnly, _ = warmBenchmarkRuntimes(t, c, dockerOnly)
+	if len(dockerOnly) == 0 {
+		t.Fatal("sparse bench: docker runtime failed warmup")
+	}
 	waitDockerPoolWarm(t, c, dockerOnly)
 
 	var report benchReport

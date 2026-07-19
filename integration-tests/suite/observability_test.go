@@ -3,6 +3,7 @@
 package suite
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,11 +55,19 @@ func TestUC107_PrometheusSandboxdTargetsUp(t *testing.T) {
 		t.Fatal("integration_targets.nodes empty")
 	}
 
-	// Prometheus listens on loopback on the obs host; query via SSH.
+	// Prometheus listens on loopback on the obs host; query via SSH. Capture
+	// stdout ONLY (via .Output(), not .CombinedOutput()): ssh writes the
+	// "Warning: Permanently added <host> to the list of known hosts" line to
+	// stderr, and merging it into stdout corrupts the JSON with a leading 'W'
+	// (invalid character 'W' looking for beginning of value). stderr is kept
+	// separately for diagnostics on failure.
 	script := `curl -sf http://127.0.0.1:9090/api/v1/targets`
-	out, err := exec.Command("ssh", append(sshHarnessOpts(), fmt.Sprintf("ubuntu@%s", targets.ObsPublicIP), script)...).CombinedOutput()
+	cmd := exec.Command("ssh", append(sshHarnessOpts(), fmt.Sprintf("ubuntu@%s", targets.ObsPublicIP), script)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("prometheus targets query via obs ssh: %v (%s)", err, strings.TrimSpace(string(out)))
+		t.Fatalf("prometheus targets query via obs ssh: %v (stderr: %s) (stdout: %s)", err, strings.TrimSpace(stderr.String()), strings.TrimSpace(string(out)))
 	}
 
 	var payload struct {
@@ -104,5 +113,8 @@ func sshHarnessOpts() []string {
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
 		"-o", "BatchMode=yes",
+		// Suppress the "Warning: Permanently added ... to the list of known
+		// hosts" line ssh writes to stderr; belt-and-suspenders with .Output().
+		"-o", "LogLevel=ERROR",
 	}
 }
