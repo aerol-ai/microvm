@@ -3,6 +3,7 @@
 package sims
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -67,29 +68,59 @@ func buildRegistry() []Sim {
 	return sims
 }
 
-// RunAll executes every registered sim and returns per-sim results (never rolled up).
+// RunAll executes every registered sim and returns per-sim results (never rolled
+// up). Each sim runs in an ISOLATED subtest: a t.Fatal (runtime.Goexit) or panic
+// in one sim — or in a shared helper like newIsolate/execFetch — fails only that
+// sim, and the pass still runs the rest and records the full catalogue. Before
+// this, one isolate sim's t.Fatal Goexit'd the whole pass before RecordResults
+// ran, so the catalogue (UC-108's per-sim contract) never got written.
 func RunAll(ctx *RunContext) []Result {
 	out := make([]Result, 0, len(Registry))
 	for _, sim := range Registry {
-		ctx.Started = time.Now()
-		res := sim.Run(ctx)
-		if res.SimID == "" {
-			res.SimID = sim.ID
-		}
-		if res.Runtime == "" {
-			res.Runtime = sim.Runtime
-		}
-		if res.Category == "" {
-			res.Category = sim.Category
-		}
-		if res.Subcategory == "" {
-			res.Subcategory = sim.Subcategory
-		}
-		if res.LatencyMS == 0 {
-			res.LatencyMS = time.Since(ctx.Started).Milliseconds()
-		}
+		res := runIsolatedSim(ctx, sim)
 		out = append(out, res)
 		_ = PushHeartbeat(res.SimID)
 	}
 	return out
+}
+
+func runIsolatedSim(parent *RunContext, sim Sim) Result {
+	var res Result
+	var returned bool
+	start := time.Now()
+	// t.Run runs the sim in its own goroutine; a Fatal/Goexit or panic there is
+	// contained (t.Run waits and returns to us either way).
+	parent.T.Run(sim.ID, func(subT *testing.T) {
+		simCtx := &RunContext{T: subT, Scenario: parent.Scenario, Client: parent.Client, Started: start}
+		defer func() {
+			if r := recover(); r != nil {
+				res = Result{SimID: sim.ID, Success: false, Notes: fmt.Sprintf("panic: %v", r)}
+				returned = true
+			}
+		}()
+		res = sim.Run(simCtx)
+		returned = true
+	})
+	if !returned {
+		// The sim (or a helper) called t.Fatal -> runtime.Goexit before returning
+		// a Result. recover() doesn't catch Goexit, so the flag tells us to
+		// record a failure and keep the pass going.
+		res = Result{SimID: sim.ID, Success: false, Notes: "aborted: t.Fatal in sim or helper"}
+	}
+	if res.SimID == "" {
+		res.SimID = sim.ID
+	}
+	if res.Runtime == "" {
+		res.Runtime = sim.Runtime
+	}
+	if res.Category == "" {
+		res.Category = sim.Category
+	}
+	if res.Subcategory == "" {
+		res.Subcategory = sim.Subcategory
+	}
+	if res.LatencyMS == 0 {
+		res.LatencyMS = time.Since(start).Milliseconds()
+	}
+	return res
 }
