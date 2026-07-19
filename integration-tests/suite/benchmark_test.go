@@ -796,6 +796,13 @@ func TestBenchCreateLatency(t *testing.T) {
 		var apiD, runD, serverD []time.Duration
 		stageD := map[string][]time.Duration{}
 		failures := 0
+		// Sandboxes created for THIS runtime's samples, torn down before the next
+		// runtime starts. Without this, a 6-runtime sweep accumulated all
+		// samples×runtimes sandboxes at once (t.Cleanup only fires when the whole
+		// test returns), so the tail runtimes starved with "no worker placement
+		// target available". Within a runtime the batch stays resident, so warm-
+		// pool hit latency is still measured faithfully.
+		var batchIDs []string
 		for i := 0; i < samples; i++ {
 			opts := benchCreateOptions(t, br)
 
@@ -809,8 +816,10 @@ func TestBenchCreateLatency(t *testing.T) {
 				t.Logf("bench[%s] sample %d create failed: %v", br.runtime, i, err)
 				continue
 			}
-			// Guaranteed teardown even on a panic/fatal in the loop.
+			// Guaranteed teardown even on a panic/fatal in the loop (double-destroy
+			// with the per-runtime batch teardown below is a harmless 404).
 			id := sb.ID
+			batchIDs = append(batchIDs, id)
 			t.Cleanup(func() { destroyBest(c, id) })
 
 			if waitRunningTimed(t, sb) {
@@ -834,6 +843,9 @@ func TestBenchCreateLatency(t *testing.T) {
 				}
 			}
 		}
+
+		// Free this runtime's capacity before measuring the next one.
+		destroyAll(c, batchIDs)
 
 		if len(apiD) == 0 {
 			t.Errorf("bench[%s]: every create sample failed", br.runtime)
