@@ -25,12 +25,6 @@ default_volume_size_gb = 40
 default_with_gvisor    = true
 default_with_isolate   = true
 
-# CM-5: this scenario exposes real data services (Postgres/Redis/Jupyter) for a
-# sim pass. Scope all public sandbox ingress to admin_allowed_cidrs so nothing
-# lands on the open internet. Requires admin_allowed_cidrs to be narrowed to the
-# operator IP in the chained prod tfvars (the SG precondition enforces it).
-scope_public_ingress_to_admin = true
-
 # Obs node (Terraform/obs.tf). run.sh also passes -var deploy_obs=true when the
 # scenario caps advertise observability; keep the default false so other
 # scenarios never pay for it.

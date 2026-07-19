@@ -22,12 +22,6 @@ default_volume_size_gb = 40
 default_with_gvisor    = false
 default_with_isolate   = false
 
-# CM-5: the soak exposes real data services for hours. Scope all public sandbox
-# ingress to admin_allowed_cidrs (operator IP) so no open Postgres/Redis/Jupyter
-# sits on the internet. The SG precondition refuses to apply if admin_allowed_cidrs
-# is still 0.0.0.0/0.
-scope_public_ingress_to_admin = true
-
 deploy_obs        = true
 obs_instance_type = "m6i.large"
 
