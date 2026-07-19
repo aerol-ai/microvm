@@ -57,6 +57,11 @@ var benchRuntimes = []struct {
 	// sweeps ONLY on containerd scenarios — the make target still narrows the
 	// sweep to just this row with AEROL_BENCH_RUNTIMES=containerd.
 	{"containerd", harness.CapContainerdEngine},
+	// containerd-cold is the containerd engine forced past the warm pool (the
+	// containerd analogue of docker-cold) — the cold-engine floor reported next
+	// to the warm containerd row, so a containerd-only sweep shows both paths
+	// without any docker-labeled row.
+	{"containerd-cold", harness.CapContainerdEngine},
 	{"firecracker", harness.CapFirecracker},
 	{"gvisor", harness.CapGvisor},
 	{"wasm", harness.CapWasm},
@@ -227,12 +232,19 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 		opts.Image = harness.DefaultImage
 		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
 	case "containerd":
-		// containerd is the host engine, reached via the "docker" runtime
-		// (the node advertises "docker"). This scenario runs no warm pool
-		// (docker-pool/containerd-pool caps absent), so every create already
-		// takes the cold engine path — the honest baseline against docker-cold.
+		// containerd is the host ENGINE, reached via the "docker" runtime (the
+		// node advertises "docker"; dockerd is not on the create path). Pool-
+		// eligible, so with SB_CONTAINERD_POOL_ENABLED it measures the WARM path
+		// (adopts a ready containerd task).
 		opts.Runtime = "docker"
 		opts.Image = harness.DefaultImage
+	case "containerd-cold":
+		// Same containerd engine, forced past the warm pool (any Env entry makes
+		// poolEligible reject it) → the cold-engine floor, labeled containerd so a
+		// containerd-only sweep reports warm + cold without a docker-labeled row.
+		opts.Runtime = "docker"
+		opts.Image = harness.DefaultImage
+		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
 	default:
 		opts.Image = harness.DefaultImage
 	}
@@ -316,7 +328,7 @@ func benchClusterMembers(c *harness.Client) (capacityView, error) {
 // checked under "docker" too.
 func benchClusterRuntime(runtime string) string {
 	switch runtime {
-	case "docker-cold", "containerd":
+	case "docker-cold", "containerd", "containerd-cold":
 		return "docker"
 	}
 	return runtime
