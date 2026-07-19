@@ -7,20 +7,25 @@
   "panels": [
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "One row per runtime: true create percentiles from the benchReport pushed to Pushgateway (CM-2). samples (N) is how many creates were measured. Headline numbers come from the hetero (metal) soak; t3/mixed rows are connectivity-only (CM-4).",
+      "description": "One row per runtime: server-side create percentiles from the benchReport pushed to Pushgateway (CM-2). Client API round-trip is intentionally omitted — it is mostly runner↔AWS network, not a runtime capability. samples (N) = creates measured for that runtime. Headline numbers come from the hetero (metal) soak; t3/mixed is connectivity-only (CM-4).",
       "fieldConfig": {
         "defaults": {
           "custom": { "align": "auto", "filterable": false },
-          "decimals": 0
+          "decimals": 0,
+          "unit": "none"
         },
         "overrides": [
           {
-            "matcher": { "id": "byRegexp", "options": "/p50|p90|p99|api/i" },
+            "matcher": { "id": "byRegexp", "options": "/p50|p90|p99/i" },
             "properties": [{ "id": "unit", "value": "ms" }]
           },
           {
-            "matcher": { "id": "byName", "options": "samples (N)" },
-            "properties": [{ "id": "unit", "value": "short" }]
+            "matcher": { "id": "byRegexp", "options": "/samples/i" },
+            "properties": [
+              { "id": "unit", "value": "none" },
+              { "id": "decimals", "value": 0 },
+              { "id": "custom.displayMode", "value": "auto" }
+            ]
           }
         ]
       },
@@ -32,8 +37,7 @@
         { "expr": "aerolvm_bench_create_server_p50_ms", "format": "table", "instant": true, "refId": "A" },
         { "expr": "aerolvm_bench_create_server_p90_ms", "format": "table", "instant": true, "refId": "B" },
         { "expr": "aerolvm_bench_create_server_p99_ms", "format": "table", "instant": true, "refId": "C" },
-        { "expr": "aerolvm_bench_create_api_p50_ms", "format": "table", "instant": true, "refId": "D" },
-        { "expr": "aerolvm_bench_samples", "format": "table", "instant": true, "refId": "E" }
+        { "expr": "aerolvm_bench_samples", "format": "table", "instant": true, "refId": "D" }
       ],
       "transformations": [
         {
@@ -48,24 +52,31 @@
               "Time 1": true,
               "Time 2": true,
               "Time 3": true,
-              "Time 4": true,
               "__name__": true,
               "__name__ 1": true,
               "__name__ 2": true,
               "__name__ 3": true,
-              "__name__ 4": true,
               "job": true,
               "job 1": true,
               "job 2": true,
               "job 3": true,
-              "job 4": true,
               "instance": true,
               "instance 1": true,
               "instance 2": true,
               "instance 3": true,
-              "instance 4": true,
               "exported_job": true,
               "exported_instance": true
+            },
+            "indexByName": {
+              "runtime": 0,
+              "Value": 1,
+              "Value #A": 1,
+              "Value 1": 2,
+              "Value #B": 2,
+              "Value 2": 3,
+              "Value #C": 3,
+              "Value 3": 4,
+              "Value #D": 4
             },
             "renameByName": {
               "runtime": "Runtime",
@@ -78,12 +89,9 @@
               "Value 2": "server p99 (ms)",
               "Value #C": "server p99 (ms)",
               "Value C": "server p99 (ms)",
-              "Value 3": "api p50 (ms)",
-              "Value #D": "api p50 (ms)",
-              "Value D": "api p50 (ms)",
-              "Value 4": "samples (N)",
-              "Value #E": "samples (N)",
-              "Value E": "samples (N)"
+              "Value 3": "samples (N)",
+              "Value #D": "samples (N)",
+              "Value D": "samples (N)"
             }
           }
         },
@@ -95,7 +103,7 @@
           }
         }
       ],
-      "title": "Runtime Capability Matrix — create latency",
+      "title": "Runtime Capability Matrix — server create latency",
       "type": "table"
     },
     {
@@ -216,5 +224,5 @@
   "timezone": "browser",
   "title": "D2 Capability Matrix",
   "uid": "aerolvm-d2-capability",
-  "version": 2
+  "version": 3
 }

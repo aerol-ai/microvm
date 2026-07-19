@@ -64,6 +64,10 @@ var benchRuntimes = []struct {
 	{"containerd-cold", harness.CapContainerdEngine},
 	{"firecracker", harness.CapFirecracker},
 	{"gvisor", harness.CapGvisor},
+	// gvisor-cold is the gVisor runtime forced past the warm pool (like
+	// docker-cold), so the runsc cold-create floor is reported next to the warm
+	// gvisor row instead of the two blending into one ambiguous number.
+	{"gvisor-cold", harness.CapGvisor},
 	{"wasm", harness.CapWasm},
 	// isolate (V8/workerd) measures the warm create path: warmBenchmarkRuntimes
 	// spawns the tenant's workerd group once, then every sample is an isolate
@@ -245,6 +249,13 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 		opts.Runtime = "docker"
 		opts.Image = harness.DefaultImage
 		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
+	case "gvisor-cold":
+		// gVisor (runsc) forced past the warm pool → the cold runsc task
+		// create+start floor, reported next to the warm gvisor row. The plain
+		// "gvisor" row (default case, no Env) stays pool-eligible = the hot path.
+		opts.Runtime = "gvisor"
+		opts.Image = harness.DefaultImage
+		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
 	default:
 		opts.Image = harness.DefaultImage
 	}
@@ -330,6 +341,8 @@ func benchClusterRuntime(runtime string) string {
 	switch runtime {
 	case "docker-cold", "containerd", "containerd-cold":
 		return "docker"
+	case "gvisor-cold":
+		return "gvisor"
 	}
 	return runtime
 }
