@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,8 +17,17 @@ func PushgatewayURL() string {
 	return strings.TrimSpace(os.Getenv("AEROL_PUSHGATEWAY_URL"))
 }
 
+// defaultPushClient delivers the real metric payloads (bench percentiles,
+// catalogue rollups). Those are the data we actually want in Prometheus and
+// there are only a handful per run, so a generous timeout is worth paying.
+var defaultPushClient = &http.Client{Timeout: 15 * time.Second}
+
 // PushText posts Prometheus text exposition to Pushgateway job/instance.
 func PushText(job, instance, body string) error {
+	return pushTextWith(defaultPushClient, job, instance, body)
+}
+
+func pushTextWith(client *http.Client, job, instance, body string) error {
 	base := PushgatewayURL()
 	if base == "" {
 		return nil
@@ -32,7 +42,6 @@ func PushText(job, instance, body string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("pushgateway: push: %w", err)
@@ -75,8 +84,42 @@ func FormatPercentileGauges(metricPrefix, runtime string, p50, p90, p99 int64) s
 	return b.String()
 }
 
-// PushSimHeartbeat pushes a 1-valued gauge proving the sim runner is alive.
+var (
+	// heartbeatClient uses a short timeout because a heartbeat is disposable:
+	// against a dead or unreachable Pushgateway we drop the beat rather than
+	// wait out a full dial. PushText keeps the longer timeout for the real
+	// metric payloads we actually want delivered.
+	heartbeatClient = &http.Client{Timeout: 2 * time.Second}
+
+	// heartbeatDisabled trips after the first failed heartbeat. Heartbeats fire
+	// once per simulation (dozens per run); a dead Pushgateway used to stall the
+	// sim loop 15s × N (~730s on a 56-sim pass). One failure ⇒ assume the
+	// endpoint is gone and skip the rest for this process.
+	heartbeatDisabled atomic.Bool
+)
+
+// PushSimHeartbeat fires a best-effort liveness gauge for one sim. It is
+// fire-and-forget: it never blocks the caller and never fails a run — losing a
+// heartbeat is harmless, stalling a run is not. The push runs in the
+// background with a short timeout, and a single failure disables further
+// heartbeats so an unreachable Pushgateway can't spawn a doomed goroutine per
+// remaining sim.
 func PushSimHeartbeat(simID string) error {
+	if PushgatewayURL() == "" || heartbeatDisabled.Load() {
+		return nil
+	}
+	go func() {
+		if err := doSimHeartbeat(simID); err != nil {
+			heartbeatDisabled.Store(true)
+		}
+	}()
+	return nil
+}
+
+// doSimHeartbeat performs the synchronous heartbeat push. It is unexported and
+// separate from PushSimHeartbeat's goroutine wrapper so tests can exercise the
+// push (and the short-timeout client) deterministically.
+func doSimHeartbeat(simID string) error {
 	body := FormatGauge("aerolvm_sim_heartbeat", 1, map[string]string{"sim": simID})
-	return PushText("aerolvm_sims", simID, body)
+	return pushTextWith(heartbeatClient, "aerolvm_sims", simID, body)
 }
