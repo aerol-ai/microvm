@@ -61,7 +61,7 @@ output "integration_targets" {
       }
     ]
     grafana_url     = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:3000" : ""
-    pushgateway_url = var.deploy_obs ? "http://${aws_instance.obs[0].private_ip}:9091" : ""
+    pushgateway_url = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:9091" : ""
     obs_public_ip   = var.deploy_obs ? aws_instance.obs[0].public_ip : ""
     obs_private_ip  = var.deploy_obs ? aws_instance.obs[0].private_ip : ""
   }
@@ -73,8 +73,8 @@ output "grafana_url" {
 }
 
 output "pushgateway_url" {
-  description = "Pushgateway base URL (VPC-private). Empty when deploy_obs=false."
-  value       = var.deploy_obs ? "http://${aws_instance.obs[0].private_ip}:9091" : ""
+  description = "Pushgateway base URL (obs public IP). The bench runs on the operator machine and pushes here, so it must be operator-reachable, not VPC-private. Empty when deploy_obs=false."
+  value       = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:9091" : ""
 }
 
 output "grafana_admin_password" {

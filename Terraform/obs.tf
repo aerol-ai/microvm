@@ -62,7 +62,10 @@ resource "aws_security_group_rule" "obs_ssh" {
   description       = "SSH from admin CIDRs (bootstrap debug)"
 }
 
-# Pushgateway is VPC-private — suite/sims push from inside the VPC later.
+# Pushgateway ingress: the bench (pushBenchPercentiles) runs on the OPERATOR
+# machine, not in the VPC, so :9091 must be reachable from admin CIDRs — a
+# VPC-only rule silently dropped every push and left D2 empty. Keep the VPC CIDR
+# too for any in-cluster pusher. Scoped like Grafana :3000 (admin_allowed_cidrs).
 resource "aws_security_group_rule" "obs_pushgateway" {
   count = var.deploy_obs ? 1 : 0
 
@@ -71,8 +74,8 @@ resource "aws_security_group_rule" "obs_pushgateway" {
   protocol          = "tcp"
   from_port         = 9091
   to_port           = 9091
-  cidr_blocks       = [var.vpc_cidr]
-  description       = "Pushgateway from VPC (private)"
+  cidr_blocks       = concat([var.vpc_cidr], var.admin_allowed_cidrs)
+  description       = "Pushgateway from VPC + admin CIDRs (operator bench pushes here)"
 }
 
 # Arch-2: sandboxd nodes accept :21212 scrapes from the obs SG (not CIDR).
