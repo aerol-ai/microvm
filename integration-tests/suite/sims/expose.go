@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,35 @@ import (
 	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
+
+// exposeDialTarget resolves the host:port to TCP-probe for an exposure. Raw-TCP
+// exposures carry Host/HostPort directly. TLS and HTTP exposures multiplex on
+// the shared ingress listener and leave HostPort=0 by design (see
+// models.ExposePortResponse: "Host/HostPort are populated only on the raw-TCP
+// path"), so their dial target must be parsed from PublicURL — e.g.
+// tls://sb-<id>-<port>.<domain>:443. Probing Host/HostPort for a TLS exposure
+// dials ":0" (the SVC-01 postgres regression this fixes).
+func exposeDialTarget(e sdktypes.ExposeResult) (string, int, error) {
+	if e.HostPort != 0 {
+		return e.Host, e.HostPort, nil
+	}
+	u, err := url.Parse(e.PublicURL)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse public_url %q: %w", e.PublicURL, err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", 0, fmt.Errorf("public_url %q has no host", e.PublicURL)
+	}
+	port := 443 // shared TLS/HTTPS ingress listener when PublicURL omits a port
+	if p := u.Port(); p != "" {
+		port, err = strconv.Atoi(p)
+		if err != nil {
+			return "", 0, fmt.Errorf("public_url %q port: %w", e.PublicURL, err)
+		}
+	}
+	return host, port, nil
+}
 
 func securedExpose(t *testing.T, c *harness.Client, sc *harness.Scenario, opts sdktypes.CreateSandboxOptions, port int, protocol string) (*microvm.Sandbox, sdktypes.ExposeResult) {
 	t.Helper()

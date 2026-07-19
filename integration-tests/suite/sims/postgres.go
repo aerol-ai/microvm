@@ -36,12 +36,31 @@ func runPostgresSupabase(ctx *RunContext) Result {
 			"POSTGRES_DB":       "bench",
 		},
 	}, 5432, "tls")
-	if err := waitTCP(exposed.Host, exposed.HostPort, 90*time.Second); err != nil {
+	// TLS-SNI exposes multiplex on the shared :443 listener, so HostPort is 0 by
+	// design — dial the endpoint parsed from PublicURL, not Host/HostPort.
+	host, hostPort, err := exposeDialTarget(exposed)
+	if err != nil {
+		return fail(res, "postgres tls endpoint: %v", err)
+	}
+	if err := waitTCP(host, hostPort, 90*time.Second); err != nil {
 		return fail(res, "postgres tls port: %v", err)
 	}
-	out, err := execInSandbox(sb, fmt.Sprintf(`PGPASSWORD=%s psql -h 127.0.0.1 -U postgres -d bench -tAc "SELECT 1"`, password))
-	if err != nil || strings.TrimSpace(out) != "1" {
-		return fail(res, "psql in sandbox: %v out=%q", err, out)
+	// The TLS-SNI ingress listener answers on :443 immediately, so the expose
+	// probe above can't gate on postgres itself — poll SELECT 1 until first-boot
+	// initdb finishes and the server accepts queries. PGCONNECT_TIMEOUT keeps a
+	// not-yet-ready attempt from blocking the whole exec deadline.
+	selectOne := fmt.Sprintf(`PGCONNECT_TIMEOUT=5 PGPASSWORD=%s psql -h 127.0.0.1 -U postgres -d bench -tAc "SELECT 1"`, password)
+	var out string
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		out, err = execInSandbox(sb, selectOne)
+		if err == nil && strings.TrimSpace(out) == "1" {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fail(res, "psql in sandbox: %v out=%q", err, out)
+		}
+		time.Sleep(3 * time.Second)
 	}
 	// CQ-1: apply the vendored RLS seed and prove row-level security is actually
 	// enabled, so SVC-01's "RLS" claim is backed by a real check rather than the
