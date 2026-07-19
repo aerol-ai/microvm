@@ -62,6 +62,8 @@ nodes = {
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=false' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null || true
       echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
       echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
       sudo systemctl restart sandboxd || true
     EOT
   }

@@ -58,6 +58,8 @@ nodes = {
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }
@@ -72,6 +74,8 @@ nodes = {
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }
@@ -86,6 +90,8 @@ nodes = {
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_DEPTH=8' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_REFILL_INTERVAL=2s' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }
