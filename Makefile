@@ -156,7 +156,9 @@ integration-cluster-mixed-gvisor:
 # validates connectivity and screenshots only. See plans/investor-benchmark-observability.md.
 MIXED_OBS_BENCH_OUT ?= integration-tests/reports/cluster-mixed-benchmark-with-obs-bench.json
 MIXED_OBS_BENCH_SAMPLES ?= 10
-MIXED_OBS_BENCH_RUNTIMES ?= docker,containerd,gvisor,wasm,isolate
+# docker-cold forces a create past the warm pool → the cold-path floor reported
+# next to the warm docker/containerd rows (both warm + cold in one sweep).
+MIXED_OBS_BENCH_RUNTIMES ?= docker,docker-cold,containerd,gvisor,wasm,isolate
 integration-cluster-mixed-obs:
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(MIXED_OBS_BENCH_OUT) \
 	AEROL_BENCH_SAMPLES=$(MIXED_OBS_BENCH_SAMPLES) \
@@ -174,7 +176,7 @@ integration-cluster-mixed-obs-only:
 # Flagship hetero soak — T7 resolved: 5×c5.metal workers (~$21/hr, ~$63–84/3–4h).
 # AEROL_HETERO_OBS_T7_OK=1 acknowledges the cost; override to 0 to force refuse.
 HETERO_OBS_BENCH_OUT ?= integration-tests/reports/cluster-hetero-benchmark-with-obs-bench.json
-HETERO_OBS_BENCH_RUNTIMES ?= docker,containerd,gvisor,wasm,isolate,firecracker
+HETERO_OBS_BENCH_RUNTIMES ?= docker,docker-cold,containerd,gvisor,wasm,isolate,firecracker
 integration-cluster-hetero-obs:
 	AEROL_HETERO_OBS_T7_OK=$${AEROL_HETERO_OBS_T7_OK:-1} \
 	AEROL_BENCH=1 AEROL_BENCH_OUT=$(HETERO_OBS_BENCH_OUT) \
