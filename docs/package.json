@@ -14,7 +14,7 @@
     "@astrojs/starlight": "0.39.3",
     "@fontsource/ibm-plex-sans-condensed": "^5.2.8",
     "@fontsource/inter": "^5.1.1",
-    "@fontsource/space-mono": "^5.1.1",
+    "@fontsource/space-mono": "^5.3.0",
     "astro": "6.4.8",
     "astro-mermaid": "^2.1.0",
     "mermaid": "^11.16.0",
