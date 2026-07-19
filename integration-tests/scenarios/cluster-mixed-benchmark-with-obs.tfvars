@@ -39,6 +39,13 @@ caddy_shared_cert_storage = {
 # ship install.sh that bundles containerd-shim-runsc-v1). SB_HOST_RUNTIMES is
 # written by install.sh --with-gvisor; isolate is appended by the daemon when
 # EnableIsolate is on. tfvars are literal-only, hence the repetition.
+#
+# Warm pools for best-case latency: WASM (resident+pool) and isolate pools are
+# on by default; the containerd warm TASK pool is enabled here (seeded with the
+# bench image alpine:3.20) so container creates adopt a ready task. The netns
+# (network) pool is already on by default (containerd.native_netns_pool_enabled).
+# NOTE: warm slots hold capacity, so UC-95 density is measured with the pool
+# resident (Perf-1 -p 1 keeps sims off the density window).
 nodes = {
   node1 = {
     role            = "mixed", seed = true, spot = false
@@ -49,6 +56,8 @@ nodes = {
       sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }
@@ -61,6 +70,8 @@ nodes = {
       sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }
@@ -73,6 +84,8 @@ nodes = {
       sudo install -m 0755 /tmp/runsc-shim /usr/local/bin/containerd-shim-runsc-v1
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=true' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null
       echo 'SB_ISOLATE_USE_JAIL=false' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
       sudo systemctl restart sandboxd
     EOT
   }

@@ -49,13 +49,19 @@ nodes = {
   ingress-1 = { role = "ingress", spot = false, instance_type = "m6i.large" }
   ingress-2 = { role = "ingress", spot = false, instance_type = "m6i.large" }
 
-  # Density + containerd headline target (write-hot SQLite owner).
+  # Density + containerd headline target (write-hot SQLite owner). Enables the
+  # containerd warm TASK pool seeded with the bench image (alpine:3.20) so
+  # container creates adopt a ready task instead of paying engine create+start —
+  # best-case latency. The netns (network) pool is already on by default
+  # (config/cluster.yml containerd.native_netns_pool_enabled: true).
   worker-c = {
     role = "worker", spot = false
     instance_type = "c5.metal", volume_size_gb = 80
     volume_iops = 8000, volume_throughput = 250
     extra_user_data = <<-EOT
       echo 'SB_WASM_RESIDENT_HOST_ENABLED=false' | sudo tee -a /etc/sandboxd/cluster.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_ENABLED=true' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
+      echo 'SB_CONTAINERD_POOL_IMAGES=alpine:3.20' | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null || true
       sudo systemctl restart sandboxd || true
     EOT
   }
