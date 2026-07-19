@@ -114,9 +114,13 @@ resource "aws_ebs_volume" "obs_prometheus" {
 }
 
 locals {
+  # Embed dashboards as RAW JSON (not base64): templatefile inserts variable
+  # values verbatim without re-interpreting ${}/%{} in them, and raw JSON gzips
+  # ~8x better than base64 under the outer base64gzip — base64'd dashboards blew
+  # past the 16 KB EC2 user_data limit (raw-embed decoded ~7 KB vs ~13 KB).
   obs_dashboard_files = var.deploy_obs ? {
     for f in fileset("${path.module}/../setup/grafana", "*.json") :
-    f => filebase64("${path.module}/../setup/grafana/${f}")
+    f => file("${path.module}/../setup/grafana/${f}")
   } : {}
 
   obs_prometheus_yml = var.deploy_obs ? templatefile("${path.module}/../setup/obs/prometheus.yml.tftpl", {

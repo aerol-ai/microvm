@@ -69,8 +69,10 @@ cat > "$OBS_ROOT/grafana/provisioning/dashboards/dashboards.yml" <<'DBPROV_EOF'
 ${grafana_dashboards_yml}
 DBPROV_EOF
 
-%{ for name, content_b64 in dashboard_files ~}
-echo '${content_b64}' | base64 -d > "$OBS_ROOT/grafana/dashboards/${name}"
+%{ for name, content in dashboard_files ~}
+cat > "$OBS_ROOT/grafana/dashboards/${name}" <<'__AEROLVM_DASH_EOF__'
+${content}
+__AEROLVM_DASH_EOF__
 %{ endfor ~}
 
 cat > "$OBS_ROOT/.env" <<EOF
