@@ -74,6 +74,17 @@ func (d *Driver) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 	if timing := createtiming.From(ctx); timing != nil {
 		if err == nil {
 			timing.RecordStageDesc("containerd_pool", time.Since(start), "hit")
+			// Parity with the docker driver (pkg/docker/docker_pool.go): a warm
+			// adopt proves readiness through the same unix-socket ready-ack
+			// handshake — ParkedListener.Adopt sends the adopt frame and waits for
+			// the toolbox to ack under the new sandbox identity — so the create's
+			// Server-Timing must attribute readiness to "socket", not leave it
+			// blank. Without this, the pool-hit path carried no readiness source
+			// and UC-96/96c/96d read source="" (the docker driver already guards
+			// this; containerd was missing it). Waits stay 0: the adopt elapsed
+			// time is already in the containerd_pool stage above, so recording it
+			// again as a readiness wait would double-count.
+			timing.RecordReadinessWaits(0, 0, "socket")
 		} else {
 			timing.RecordStageDesc("containerd_pool", time.Since(start), "adopt_failed")
 		}

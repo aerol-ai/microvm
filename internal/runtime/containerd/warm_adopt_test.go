@@ -177,6 +177,34 @@ func TestTryWarmAdoptHitRecordsTiming(t *testing.T) {
 	}
 }
 
+// TestTryWarmAdoptHitRecordsSocketReadiness guards the UC-96/96c/96d regression:
+// a warm-pool adopt must attribute readiness to the unix socket (the adopt
+// ready-ack handshake), not leave the Server-Timing source blank as the pool
+// path did before. Mirrors the docker driver's RecordDockerWaits(0,0,"socket").
+func TestTryWarmAdoptHitRecordsSocketReadiness(t *testing.T) {
+	stubToolboxProbe(t)
+	p := containerdpool.New(nil)
+	key := containerdpool.KeyFromRequest(models.CreateSandboxRequest{Image: "alpine:3.20"}, models.RuntimeDocker)
+	p.NoteTarget(key)
+	tr := newFakeTransport()
+	tr.containers["park-1"] = &fakeContainer{id: "park-1", labels: map[string]string{poolParkLabelKey: poolParkLabelValue}}
+	d := newTestDriver(t)
+	d.cfg.ReadyEnabled = true
+	d.SetClient(NewTestClient("aerolvm", tr))
+	d.SetWarmPool(p)
+	p.RecordLoaded(&containerdpool.ParkedSlot{
+		ID: "park-1", ContainerID: "park-1", ContainerIP: "10.88.0.9",
+		ImageID: "sha256:img", Key: key, Handle: &fakeHandle{alive: true},
+	})
+	ctx, timing := createtiming.With(context.Background())
+	if _, err := d.tryWarmAdopt(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-warm3", "tok", nil, models.RuntimeDocker); err != nil {
+		t.Fatal(err)
+	}
+	if timing.Source != "socket" {
+		t.Fatalf("readiness source = %q, want socket", timing.Source)
+	}
+}
+
 func TestRemoveImageEmptyAndStub(t *testing.T) {
 	d := newTestDriver(t)
 	if err := d.RemoveImage(context.Background(), "  "); err != nil {
