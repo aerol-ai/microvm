@@ -106,6 +106,11 @@ type Service struct {
 	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
 	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
 	isolateBundles *jsbundle.Store
+	// jsBundleReplicator fans a newly-uploaded bundle out to cluster peers so an
+	// isolate create placed on any node resolves it locally (isolate's bundle
+	// store is per-node). Nil in single-node mode (no-op) and set by pkg/daemon
+	// to (*cluster).ReplicateJSBundle only when EnableCluster && EnableIsolate.
+	jsBundleReplicator func(ctx context.Context, owner string, req models.CreateJSBundleRequest) error
 	// isolateStaging refcounts content digests staged by an in-flight isolate
 	// create but not yet pinned by a persisted store row, so the bundle GC does
 	// not reap them mid-create (pinStagingDigest / stagingDigests).

@@ -3,6 +3,7 @@ package v1
 import (
 	"net/http"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -18,7 +19,14 @@ func (h *handlers) createJSBundle(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	bundle, err := h.deps.Service.CreateJSBundle(r.Context(), req)
+	ctx := r.Context()
+	// A cluster peer replicating an uploaded bundle marks the request so the
+	// service stores it under the original owner (carried in the header) and
+	// does not fan it out again (loop guard).
+	if r.Header.Get(models.HeaderJSBundleReplicated) == "1" {
+		ctx = service.WithReplicatedJSBundleOwner(ctx, r.Header.Get(models.HeaderJSBundleOwner))
+	}
+	bundle, err := h.deps.Service.CreateJSBundle(ctx, req)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
