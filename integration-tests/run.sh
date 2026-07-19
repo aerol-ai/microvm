@@ -831,6 +831,15 @@ run_one() {
   fi
   mkdir -p "$(dirname "$catalogue_out")"
 
+  # Perf-1 clean window: when density (UC-95) and the resident sims run in the
+  # same pass, serialize test packages (-p 1) so long-lived postgres/redis/jupyter
+  # sims aren't occupying the node while UC-95 measures the density ceiling.
+  # Only for the bench+sims combo — normal integration runs keep full parallelism.
+  local pflag=""
+  if [[ "${AEROL_BENCH:-}" == "1" && "${AEROL_SIMS:-}" == "1" ]]; then
+    pflag="-p 1"
+  fi
+
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
@@ -847,7 +856,7 @@ run_one() {
     AEROL_OBS_PUSHGATEWAY_URL="${AEROL_OBS_PUSHGATEWAY_URL:-}" \
     AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
     AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-}" \
-    go test -tags=integration -count=1 -timeout=60m -json ./integration-tests/suite/... > "$json_out"
+    go test -tags=integration -count=1 ${pflag} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
 

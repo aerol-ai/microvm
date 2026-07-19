@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -554,42 +553,12 @@ type benchReport struct {
 
 var benchArtifactMu sync.Mutex
 
-// machineConfig is the hardware the numbers were measured on, copied from the
-// scenario's tfvars so a result is self-describing — a create latency is
-// meaningless without knowing whether the worker is a t3.medium or a c5.metal.
-// It records the intended (terraform-declared) topology, not live-probed specs;
-// that's the deliberate trade in keeping the bench tfvars-sourced and offline.
-type machineConfig struct {
-	Source          string     `json:"source"`           // tfvars path it was read from
-	DefaultInstance string     `json:"default_instance"` // default_instance_type
-	Nodes           []nodeSpec `json:"nodes"`            // one row per declared node
-}
-
-// nodeSpec is one node's declared shape from the tfvars nodes map.
-type nodeSpec struct {
-	Name         string `json:"name"`
-	Role         string `json:"role"`
-	InstanceType string `json:"instance_type"` // empty => inherits DefaultInstance
-	Extras       string `json:"extras,omitempty"`
-}
-
-// tfvarsNodeLine matches a single `name = { ... }` entry in the nodes map.
-var tfvarsNodeLine = regexp.MustCompile(`^\s*([A-Za-z0-9_-]+)\s*=\s*\{(.*)\}\s*$`)
-
-// tfvarsAttr pulls a quoted `key = "value"` attribute out of a node body.
-func tfvarsAttr(body, key string) string {
-	re := regexp.MustCompile(key + `\s*=\s*"([^"]*)"`)
-	if m := re.FindStringSubmatch(body); m != nil {
-		return m[1]
-	}
-	return ""
-}
-
 // loadMachineConfig parses the scenario's tfvars into a machineConfig. It is
 // best-effort: a missing/unreadable file yields nil (logged), never a failure —
 // the timings are still useful without the hardware stamp. AEROL_BENCH_TFVARS
 // overrides the path; otherwise it defaults to ../scenarios/<scenario>.tfvars
-// relative to the suite working directory.
+// relative to the suite working directory. The parse itself lives in the
+// non-tagged machineconfig.go so it can be unit-tested offline.
 func loadMachineConfig(t *testing.T) *machineConfig {
 	t.Helper()
 	path := os.Getenv("AEROL_BENCH_TFVARS")
@@ -601,45 +570,7 @@ func loadMachineConfig(t *testing.T) *machineConfig {
 		t.Logf("bench: machine config unavailable (%s): %v", path, err)
 		return nil
 	}
-	mc := &machineConfig{Source: path}
-	inNodes := false
-	for _, line := range strings.Split(string(raw), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if v := tfvarsAttr(trimmed, "default_instance_type"); v != "" {
-			mc.DefaultInstance = v
-		}
-		switch {
-		case strings.HasPrefix(trimmed, "nodes") && strings.Contains(trimmed, "{"):
-			inNodes = true
-			continue
-		case inNodes && trimmed == "}":
-			inNodes = false
-			continue
-		}
-		if !inNodes {
-			continue
-		}
-		m := tfvarsNodeLine.FindStringSubmatch(trimmed)
-		if m == nil {
-			continue
-		}
-		body := m[2]
-		ns := nodeSpec{Name: m[1], Role: tfvarsAttr(body, "role"), InstanceType: tfvarsAttr(body, "instance_type")}
-		// Capture the with_* feature flags (with_firecracker/with_gvisor) so the
-		// reader knows which runtime a worker was provisioned for.
-		var extras []string
-		for _, flag := range []string{"with_firecracker", "with_gvisor"} {
-			if regexp.MustCompile(flag + `\s*=\s*true`).MatchString(body) {
-				extras = append(extras, flag)
-			}
-		}
-		ns.Extras = strings.Join(extras, ",")
-		mc.Nodes = append(mc.Nodes, ns)
-	}
-	return mc
+	return parseMachineConfig(raw, path)
 }
 
 // densityStats is the UC-95 summary: how many sandboxes landed before the fleet

@@ -47,6 +47,21 @@ resource "aws_security_group_rule" "obs_grafana" {
   description       = "Grafana UI from operator CIDRs"
 }
 
+# SSH from operator CIDRs — the obs box runs a cloud-init bootstrap (Docker repo
+# + compose up); without a shell a bootstrap failure is only visible via EC2
+# serial console. Scoped to admin CIDRs (never 0.0.0.0/0), same as the nodes.
+resource "aws_security_group_rule" "obs_ssh" {
+  count = var.deploy_obs ? 1 : 0
+
+  type              = "ingress"
+  security_group_id = aws_security_group.obs[0].id
+  protocol          = "tcp"
+  from_port         = 22
+  to_port           = 22
+  cidr_blocks       = var.admin_allowed_cidrs
+  description       = "SSH from admin CIDRs (bootstrap debug)"
+}
+
 # Pushgateway is VPC-private — suite/sims push from inside the VPC later.
 resource "aws_security_group_rule" "obs_pushgateway" {
   count = var.deploy_obs ? 1 : 0

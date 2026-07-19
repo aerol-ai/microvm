@@ -97,6 +97,9 @@ func (t *CreateTiming) RecordStage(name string, d time.Duration) {
 	t.mu.Lock()
 	t.stages = append(t.stages, Stage{Name: name, DurMS: float64(d.Microseconds()) / 1000})
 	t.mu.Unlock()
+	// Boot-path (pr-review §2): this runs on every create. Deliberately AFTER the
+	// unlock — it's a lock-free expvar atomic increment (bounded static stage-name
+	// set), not held under t.mu, so it adds ~150ns and no create serialization.
 	exportCreateStage(name, d)
 }
 
@@ -112,6 +115,7 @@ func (t *CreateTiming) RecordStageDesc(name string, d time.Duration, desc string
 	t.mu.Lock()
 	t.stages = append(t.stages, Stage{Name: name, DurMS: float64(d.Microseconds()) / 1000, Desc: desc})
 	t.mu.Unlock()
+	// Boot-path (pr-review §2): same as RecordStage — post-unlock, lock-free atomic.
 	exportCreateStage(name, d)
 }
 

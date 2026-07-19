@@ -35,8 +35,21 @@ grep -q "$PROM_MOUNT" /etc/fstab || echo "$DATA_DEV $PROM_MOUNT ext4 defaults,no
 mountpoint -q "$PROM_MOUNT" || mount "$PROM_MOUNT"
 chown -R 65534:65534 "$PROM_MOUNT"
 
+# Docker Engine + the v2 `compose` plugin. The stock Ubuntu (jammy) archive
+# ships `docker.io` but NOT `docker-compose-plugin` — that package lives only in
+# Docker's own apt repo — so `docker compose` (used below) would fail and, under
+# `set -euo pipefail`, abort the whole bootstrap. Add Docker's repo first.
+# (The sandboxd fleet defaults to containerd; the obs box is standalone infra
+# and uses Docker Compose purely to declare the 4-service monitoring stack.)
 apt-get update -y
-apt-get install -y docker.io docker-compose-plugin curl jq
+apt-get install -y ca-certificates curl gnupg jq
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+. /etc/os-release
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
 
 OBS_ROOT=/opt/aerolvm-obs

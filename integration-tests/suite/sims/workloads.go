@@ -143,6 +143,7 @@ func runServerlessWakeSim(ctx *RunContext) Result {
 		defer tcancel()
 		_ = sb.UnexposePort(tctx, 8080)
 		_ = ctx.Client.SDK().Destroy(tctx, sb.ID)
+		assertTornDown(ctx.T, ctx.Client, sb.ID, "http", "", 0)
 	})
 	if err := waitHTTP200(exposed.PublicURL, 30*time.Second); err != nil {
 		return fail(res, "initial hit: %v", err)

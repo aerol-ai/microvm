@@ -80,6 +80,19 @@ variable "admin_allowed_cidrs" {
   default     = ["0.0.0.0/0"]
 }
 
+# CM-5: for the benchmark/soak scenarios the sandboxes expose real data services
+# (Postgres, Redis, Jupyter) for hours. In production those exposures are meant
+# to be public (default below is unchanged: 0.0.0.0/0). When this is true, the
+# public HTTP/HTTPS, raw-TCP (L4) pool, and SSH-gateway ingress are scoped to
+# admin_allowed_cidrs instead — so a benchmark cluster never puts an open DB on
+# the internet. The precondition on public_l4_pool refuses to apply if this is
+# on while admin_allowed_cidrs is still wide open.
+variable "scope_public_ingress_to_admin" {
+  description = "Scope public sandbox ingress (HTTP/L4/SSH-gateway) to admin_allowed_cidrs instead of 0.0.0.0/0. Leave false for production; true for benchmark/soak clusters."
+  type        = bool
+  default     = false
+}
+
 variable "public_http_ports" {
   description = "Public TCP ports opened on ingress-bearing nodes. Defaults to 80/443."
   type        = list(number)

@@ -154,6 +154,14 @@ resource "aws_security_group_rule" "cluster_internal_udp" {
   description       = "Cluster-internal UDP ${each.key} (SWIM gossip)"
 }
 
+# CM-5: public sandbox ingress CIDRs. Production default is 0.0.0.0/0 (public
+# services are meant to be public); benchmark/soak clusters set
+# scope_public_ingress_to_admin=true so exposed Postgres/Redis/Jupyter is only
+# reachable from the operator, never the open internet.
+locals {
+  public_ingress_cidrs = var.scope_public_ingress_to_admin ? var.admin_allowed_cidrs : ["0.0.0.0/0"]
+}
+
 # Public HTTP/HTTPS — opened on every node SG, but only ingress-bearing nodes
 # actually answer. Keeping the rule global avoids a second SG; if you want
 # strict isolation set var.public_http_ports = [] and add your own SG.
@@ -164,7 +172,7 @@ resource "aws_security_group_rule" "public_http" {
   protocol          = "tcp"
   from_port         = tonumber(each.key)
   to_port           = tonumber(each.key)
-  cidr_blocks       = ["0.0.0.0/0"]
+  cidr_blocks       = local.public_ingress_cidrs
   description       = "Public ingress TCP ${each.key}"
 }
 
@@ -178,8 +186,18 @@ resource "aws_security_group_rule" "public_l4_pool" {
   protocol          = "tcp"
   from_port         = var.l4_port_range.start
   to_port           = var.l4_port_range.end
-  cidr_blocks       = ["0.0.0.0/0"]
+  cidr_blocks       = local.public_ingress_cidrs
   description       = "Public raw-TCP (L4) exposure pool ${var.l4_port_range.start}-${var.l4_port_range.end}"
+
+  # CM-5 footgun guard: scoping public ingress to "admin" is meaningless if the
+  # admin CIDRs are themselves wide open — refuse to apply rather than silently
+  # leave a benchmark cluster's exposed data services on the whole internet.
+  lifecycle {
+    precondition {
+      condition     = !var.scope_public_ingress_to_admin || !contains(var.admin_allowed_cidrs, "0.0.0.0/0")
+      error_message = "scope_public_ingress_to_admin=true requires admin_allowed_cidrs to be narrowed to the operator IP (not 0.0.0.0/0)."
+    }
+  }
 }
 
 # Per-sandbox SSH gateway. Distinct from admin SSH (22): this is the public
@@ -192,6 +210,6 @@ resource "aws_security_group_rule" "public_ssh_gateway" {
   protocol          = "tcp"
   from_port         = var.ssh_gateway_port
   to_port           = var.ssh_gateway_port
-  cidr_blocks       = ["0.0.0.0/0"]
+  cidr_blocks       = local.public_ingress_cidrs
   description       = "Public per-sandbox SSH gateway ${var.ssh_gateway_port}"
 }

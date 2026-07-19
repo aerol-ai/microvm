@@ -49,8 +49,49 @@ func securedExpose(t *testing.T, c *harness.Client, sc *harness.Scenario, opts s
 		defer tcancel()
 		_ = sb.UnexposePort(tctx, port)
 		_ = c.SDK().Destroy(tctx, sb.ID)
+		assertTornDown(t, c, sb.ID, protocol, res.Host, res.HostPort)
 	})
 	return sb, res
+}
+
+// assertTornDown is the CM-5 verified-teardown check: after Destroy the sandbox
+// must be gone from the API, and a raw-TCP exposure's host port must stop
+// accepting connections. Without this a silently-failed Unexpose/Destroy would
+// leave a public DB/Redis route up for the rest of the soak while the run stays
+// green. Uses t.Errorf (not Fatalf) so a stuck teardown is reported without
+// aborting other cleanups.
+func assertTornDown(t *testing.T, c *harness.Client, sbID, protocol, host string, hostPort int) {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	// 1) The sandbox (and its caddy route) must disappear from the API.
+	for {
+		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err := c.SDK().Get(gctx, sbID)
+		cancel()
+		if err != nil { // not-found => destroyed
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("CM-5 teardown: sandbox %s still present after destroy", sbID)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	// 2) A dedicated raw-TCP host port must refuse new connections. (TLS-SNI/HTTP
+	// exposures share the ingress :443, so the sandbox-gone check above is the
+	// route signal for those; a port probe there would false-positive on :443.)
+	if protocol == "tcp" && host != "" && hostPort != 0 {
+		for {
+			if err := tcpPing(host, hostPort); err != nil {
+				return // refused/timeout => route torn down
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("CM-5 teardown: %s:%d still accepts TCP after destroy", host, hostPort)
+				return
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
 }
 
 func waitRunningTB(t *testing.T, sb *microvm.Sandbox) {
@@ -81,16 +122,33 @@ func tcpPing(host string, port int) error {
 	return conn.Close()
 }
 
-func redisRESPPing(host string, port int) error {
+// redisRESPPing sends AUTH (when password != "") then PING. With no password on
+// a --requirepass server, Redis answers PING with a NOAUTH error, so this
+// returns an error — which is exactly what the CM-5 "unauth must be refused"
+// probe relies on.
+func redisRESPPing(host string, port int, password string) error {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	r := bufio.NewReader(conn)
+	if password != "" {
+		if _, err := fmt.Fprintf(conn, "AUTH %s\r\n", password); err != nil {
+			return err
+		}
+		authLine, err := r.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(authLine, "+OK") {
+			return fmt.Errorf("redis AUTH rejected: %q", strings.TrimSpace(authLine))
+		}
+	}
 	if _, err := fmt.Fprintf(conn, "PING\r\n"); err != nil {
 		return err
 	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
+	line, err := r.ReadString('\n')
 	if err != nil {
 		return err
 	}

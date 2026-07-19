@@ -17,8 +17,15 @@ services:
   pushgateway:
     image: prom/pushgateway:v1.9.0
     restart: unless-stopped
+    # Persist pushed samples to a volume so a container restart at hour 3 of the
+    # soak doesn't drop the accumulated per-runtime rows before Prometheus's next
+    # scrape (belt-and-suspenders with the 15s scrape into the persistent TSDB).
     command:
       - --web.listen-address=0.0.0.0:9091
+      - --persistence.file=/pushgateway/store
+      - --persistence.interval=1m
+    volumes:
+      - pushgateway-data:/pushgateway
     ports:
       - "9091:9091"
 
@@ -48,3 +55,4 @@ services:
 
 volumes:
   grafana-data:
+  pushgateway-data:

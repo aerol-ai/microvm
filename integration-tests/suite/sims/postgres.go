@@ -4,6 +4,7 @@ package sims
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"os"
 	"strconv"
@@ -15,6 +16,12 @@ import (
 	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
+
+// pgInitSQL is the vendored RLS seed applied by the postgres-supabase sim. Kept
+// self-contained (CQ-1) so the harness needs no external example checkout.
+//
+//go:embed fixtures/postgres/init.sql
+var pgInitSQL []byte
 
 func runPostgresSupabase(ctx *RunContext) Result {
 	res := baseResult(ctx, "postgres-supabase", "SVC-01")
@@ -36,9 +43,25 @@ func runPostgresSupabase(ctx *RunContext) Result {
 	if err != nil || strings.TrimSpace(out) != "1" {
 		return fail(res, "psql in sandbox: %v out=%q", err, out)
 	}
+	// CQ-1: apply the vendored RLS seed and prove row-level security is actually
+	// enabled, so SVC-01's "RLS" claim is backed by a real check rather than the
+	// fixture sitting unused.
+	uctx, ucancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := sb.UploadFile(uctx, "/tmp/init.sql", pgInitSQL); err != nil {
+		ucancel()
+		return fail(res, "upload init.sql: %v", err)
+	}
+	ucancel()
+	if _, err := execInSandbox(sb, fmt.Sprintf(`PGPASSWORD=%s psql -h 127.0.0.1 -U postgres -d bench -f /tmp/init.sql`, password)); err != nil {
+		return fail(res, "apply init.sql: %v", err)
+	}
+	rls, err := execInSandbox(sb, fmt.Sprintf(`PGPASSWORD=%s psql -h 127.0.0.1 -U postgres -d bench -tAc "SELECT relrowsecurity FROM pg_class WHERE relname='bench_rows'"`, password))
+	if err != nil || strings.TrimSpace(rls) != "t" {
+		return fail(res, "RLS not enabled on bench_rows: %v out=%q", err, rls)
+	}
 	res.PublicURL = exposed.PublicURL
 	res.Success = true
-	res.Notes = "postgres SELECT 1; TLS host port open"
+	res.Notes = "RLS enabled on bench_rows; SELECT 1 over TLS"
 	return res
 }
 
@@ -47,18 +70,26 @@ func runRedisUpstash(ctx *RunContext) Result {
 	if !ctx.Scenario.Has(harness.CapDocker) || !ctx.Scenario.Has(harness.CapDomain) {
 		return skip(res, "requires docker + domain for TCP expose")
 	}
+	// CM-5: the port is publicly reachable (scoped to the operator via the SG),
+	// so the instance must still require auth — never an open Redis. An
+	// unauthenticated PING must be REFUSED, and only an AUTH'd PING may succeed.
+	const password = "itest-redis-pass"
 	_, exposed := securedExpose(ctx.T, ctx.Client, ctx.Scenario, sdktypes.CreateSandboxOptions{
-		Image: "redis:7-alpine",
+		Image:            "redis:7-alpine",
+		ContainerCommand: []string{"redis-server", "--requirepass", password},
 	}, 6379, "tcp")
 	if err := waitTCP(exposed.Host, exposed.HostPort, 90*time.Second); err != nil {
 		return fail(res, "redis tcp: %v", err)
 	}
-	if err := redisRESPPing(exposed.Host, exposed.HostPort); err != nil {
-		return fail(res, "redis RESP: %v", err)
+	if err := redisRESPPing(exposed.Host, exposed.HostPort, ""); err == nil {
+		return fail(res, "redis accepted unauthenticated PING — auth not enforced")
+	}
+	if err := redisRESPPing(exposed.Host, exposed.HostPort, password); err != nil {
+		return fail(res, "redis authed RESP: %v", err)
 	}
 	res.PublicURL = fmt.Sprintf("tcp://%s:%d", exposed.Host, exposed.HostPort)
 	res.Success = true
-	res.Notes = "TCP RESP PING ok"
+	res.Notes = "password-protected; AUTH+PING ok, unauth PING refused"
 	return res
 }
 
