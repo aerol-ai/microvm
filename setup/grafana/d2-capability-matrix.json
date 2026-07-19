@@ -7,11 +7,26 @@
   "panels": [
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Per-runtime create latency from the runtime-labeled benchReport pushed to Pushgateway (CM-2). One row per runtime = the capability matrix. Density lives in D6 (native metrics, no runtime label). Headline numbers come from the hetero (metal) soak; t3/mixed rows are connectivity-only (CM-4).",
-      "fieldConfig": { "defaults": { "custom": { "align": "auto" }, "unit": "ms" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "description": "One row per runtime: true create percentiles from the benchReport pushed to Pushgateway (CM-2). samples (N) is how many creates were measured. Headline numbers come from the hetero (metal) soak; t3/mixed rows are connectivity-only (CM-4).",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": false },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/p50|p90|p99|api/i" },
+            "properties": [{ "id": "unit", "value": "ms" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "samples (N)" },
+            "properties": [{ "id": "unit", "value": "short" }]
+          }
+        ]
+      },
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 0 },
       "id": 1,
-      "options": { "showHeader": true, "cellHeight": "sm" },
+      "options": { "showHeader": true, "cellHeight": "sm", "footer": { "show": false } },
       "pluginVersion": "11.0.0",
       "targets": [
         { "expr": "aerolvm_bench_create_server_p50_ms", "format": "table", "instant": true, "refId": "A" },
@@ -21,45 +36,154 @@
         { "expr": "aerolvm_bench_samples", "format": "table", "instant": true, "refId": "E" }
       ],
       "transformations": [
-        { "id": "merge", "options": {} },
-        { "id": "organize", "options": {
-            "excludeByName": { "Time": true, "job": true, "instance": true, "exported_job": true, "exported_instance": true },
+        {
+          "id": "joinByField",
+          "options": { "byField": "runtime", "mode": "outer" }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "__name__": true,
+              "__name__ 1": true,
+              "__name__ 2": true,
+              "__name__ 3": true,
+              "__name__ 4": true,
+              "job": true,
+              "job 1": true,
+              "job 2": true,
+              "job 3": true,
+              "job 4": true,
+              "instance": true,
+              "instance 1": true,
+              "instance 2": true,
+              "instance 3": true,
+              "instance 4": true,
+              "exported_job": true,
+              "exported_instance": true
+            },
             "renameByName": {
               "runtime": "Runtime",
+              "Value": "server p50 (ms)",
               "Value #A": "server p50 (ms)",
+              "Value A": "server p50 (ms)",
+              "Value 1": "server p90 (ms)",
               "Value #B": "server p90 (ms)",
+              "Value B": "server p90 (ms)",
+              "Value 2": "server p99 (ms)",
               "Value #C": "server p99 (ms)",
+              "Value C": "server p99 (ms)",
+              "Value 3": "api p50 (ms)",
               "Value #D": "api p50 (ms)",
-              "Value #E": "samples (N)"
+              "Value D": "api p50 (ms)",
+              "Value 4": "samples (N)",
+              "Value #E": "samples (N)",
+              "Value E": "samples (N)"
             }
-        } }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [{ "field": "server p50 (ms)", "desc": false }]
+          }
+        }
       ],
-      "title": "Runtime Capability Matrix — create latency (pushed, runtime-labeled)",
+      "title": "Runtime Capability Matrix — create latency",
       "type": "table"
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Non-cumulative histogram: rate by bucket key — never histogram_quantile.",
-      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "id": 2,
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" }, "stacking": { "mode": "normal", "group": "A" } },
+      "description": "Same server p50 as the table, as a bar chart — one bar per runtime.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 300 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 0 },
+      "id": 5,
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "text": {}
+      },
+      "pluginVersion": "11.0.0",
       "targets": [
-        { "expr": "sum(rate(aerolvm_create_latency_seconds_bucket[5m])) by (key)", "legendFormat": "{{key}}", "refId": "A" }
+        {
+          "expr": "aerolvm_bench_create_server_p50_ms",
+          "legendFormat": "{{runtime}}",
+          "instant": true,
+          "refId": "A"
+        }
       ],
-      "title": "Create Latency Shape",
+      "title": "Server create p50 by runtime",
+      "type": "bargauge"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Non-cumulative histogram: rate by bucket key — never histogram_quantile. Shape only; quote p50/p90/p99 from the table above.",
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "id": 2,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "stacking": { "mode": "normal", "group": "A" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(aerolvm_create_latency_seconds_bucket[5m])) by (key)",
+          "legendFormat": "{{key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Create Latency Shape (live buckets — not percentiles)",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
       "id": 3,
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
       "targets": [
-        { "expr": "sum(rate(aerolvm_docker_pool_hits_total[5m])) / clamp_min(sum(rate(aerolvm_docker_pool_hits_total[5m])) + sum(rate(aerolvm_docker_pool_misses_total[5m])), 1e-9)", "legendFormat": "docker pool", "refId": "A" },
-        { "expr": "sum(rate(aerolvm_vmm_pool_acquire_total{key=\"hit\"}[5m])) / clamp_min(sum(rate(aerolvm_vmm_pool_acquire_total{key=\"hit\"}[5m])) + sum(rate(aerolvm_vmm_pool_acquire_total{key=\"miss\"}[5m])), 1e-9)", "legendFormat": "vmm pool", "refId": "B" },
-        { "expr": "sum(rate(aerolvm_docker_netns_pool_hits_total[5m])) / clamp_min(sum(rate(aerolvm_docker_netns_pool_hits_total[5m])) + sum(rate(aerolvm_docker_netns_pool_misses_total[5m])), 1e-9)", "legendFormat": "netns pool", "refId": "C" }
+        {
+          "expr": "sum(rate(aerolvm_docker_pool_hits_total[5m])) / clamp_min(sum(rate(aerolvm_docker_pool_hits_total[5m])) + sum(rate(aerolvm_docker_pool_misses_total[5m])), 1e-9)",
+          "legendFormat": "docker pool",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aerolvm_vmm_pool_acquire_total{key=\"hit\"}[5m])) / clamp_min(sum(rate(aerolvm_vmm_pool_acquire_total{key=\"hit\"}[5m])) + sum(rate(aerolvm_vmm_pool_acquire_total{key=\"miss\"}[5m])), 1e-9)",
+          "legendFormat": "vmm pool",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(aerolvm_docker_netns_pool_hits_total[5m])) / clamp_min(sum(rate(aerolvm_docker_netns_pool_hits_total[5m])) + sum(rate(aerolvm_docker_netns_pool_misses_total[5m])), 1e-9)",
+          "legendFormat": "netns pool",
+          "refId": "C"
+        }
       ],
       "title": "Warm Pool Hit Rate",
       "type": "timeseries"
@@ -67,11 +191,18 @@
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
       "id": 4,
-      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
       "targets": [
-        { "expr": "sum by (instance) (rate(aerolvm_create_requests_total[5m]))", "legendFormat": "{{instance}}", "refId": "A" }
+        {
+          "expr": "sum by (instance) (rate(aerolvm_create_requests_total[5m]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
       ],
       "title": "Create Activity by Node",
       "type": "timeseries"
@@ -85,5 +216,5 @@
   "timezone": "browser",
   "title": "D2 Capability Matrix",
   "uid": "aerolvm-d2-capability",
-  "version": 1
+  "version": 2
 }
