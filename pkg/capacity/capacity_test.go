@@ -906,3 +906,37 @@ func TestSnapshotRSSFieldsZeroBeforeReady(t *testing.T) {
 		t.Fatalf("RSSWatermarkMB = %d, want %d", snap.RSSWatermarkMB, 1638 /* 16384 * 0.10 */)
 	}
 }
+
+// TestSnapshotSandboxesByRuntime covers the per-isolation live-sandbox gauge:
+// Snapshot aggregates reservations by runtime, the expvar map mirrors it, and a
+// runtime that drops to zero is removed (no stale value lingers).
+func TestSnapshotSandboxesByRuntime(t *testing.T) {
+	a := New(HostInfo{CPUCores: 16, MemoryTotalMB: 16384, DiskTotalGB: 200}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		DiskReservationRatio:   1.0,
+	}, fakeProbe{free: 8192})
+	a.Reserve("sb-c1", Request{CPU: 1, MemoryMB: 128, Runtime: "docker"})
+	a.Reserve("sb-c2", Request{CPU: 1, MemoryMB: 128, Runtime: "docker"})
+	a.Reserve("sb-w1", Request{CPU: 1, MemoryMB: 128, Runtime: "wasm"})
+	a.Reserve("sb-any", Request{CPU: 1, MemoryMB: 128}) // no runtime -> "unspecified"
+
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 4 {
+		t.Fatalf("SandboxesActive = %d, want 4", snap.SandboxesActive)
+	}
+	for rt, want := range map[string]int{"docker": 2, "wasm": 1, "unspecified": 1} {
+		if got := snap.SandboxesByRuntime[rt]; got != want {
+			t.Fatalf("SandboxesByRuntime[%s] = %d, want %d", rt, got, want)
+		}
+	}
+	if v := sandboxesByRuntime.Get("docker"); v == nil || v.String() != "2" {
+		t.Fatalf("aerolvm_sandboxes_by_runtime{key=docker} = %v, want 2", v)
+	}
+	// Releasing the sole wasm sandbox must remove its key on the next snapshot.
+	a.Release("sb-w1")
+	_ = a.Snapshot()
+	if v := sandboxesByRuntime.Get("wasm"); v != nil {
+		t.Fatalf("sandboxes_by_runtime{key=wasm} should be deleted after release, got %v", v)
+	}
+}

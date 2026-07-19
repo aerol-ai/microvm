@@ -140,6 +140,59 @@
       ],
       "title": "Sim heartbeats (gVisor probe / SVC sims)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Live sandbox reservations per isolation type. NOTE: 'docker' here is the containerd engine's runc-backed OCI runtime (SB_CONTAINER_ENGINE=containerd; dockerd is not on the create path); gvisor=runsc, wasm/isolate/firecracker as named. Populates once a sandboxd build exporting aerolvm_sandboxes_by_runtime is deployed.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "id": 5,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (key) (aerolvm_sandboxes_by_runtime)",
+          "legendFormat": "{{key}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Live Sandboxes by Isolation Type",
+      "type": "bargauge"
     }
   ],
   "refresh": "10s",
