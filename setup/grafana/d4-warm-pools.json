@@ -1,0 +1,446 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(aerolvm_docker_pool_hits_total[5m]) / clamp_min(rate(aerolvm_docker_pool_hits_total[5m])+rate(aerolvm_docker_pool_misses_total[5m]), 1e-9)",
+          "legendFormat": "docker hit-rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Docker pool hit rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(aerolvm_wasm_pool_hits_total[5m]) / clamp_min(rate(aerolvm_wasm_pool_hits_total[5m])+rate(aerolvm_wasm_pool_misses_total[5m]), 1e-9)",
+          "legendFormat": "wasm hit-rate",
+          "refId": "A"
+        }
+      ],
+      "title": "WASM pool hit rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(aerolvm_isolate_pool_hits_total[5m]) / clamp_min(rate(aerolvm_isolate_pool_hits_total[5m])+rate(aerolvm_isolate_pool_misses_total[5m]), 1e-9)",
+          "legendFormat": "isolate hit-rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Isolate pool hit rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(aerolvm_vmm_pool_acquire_total[5m])) by (key)",
+          "legendFormat": "vmm {{key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "VMM acquire outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(aerolvm_docker_netns_pool_hits_total[5m])",
+          "legendFormat": "netns hits",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(aerolvm_docker_netns_pool_misses_total[5m])",
+          "legendFormat": "netns misses",
+          "refId": "B"
+        }
+      ],
+      "title": "Netns pool hits/misses",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(aerolvm_docker_pool_orphans_total[5m])",
+          "legendFormat": "orphans",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(aerolvm_docker_pool_spawn_fails_total[5m])",
+          "legendFormat": "spawn fails",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(aerolvm_wasm_pool_spawn_fails_total[5m])",
+          "legendFormat": "wasm spawn fails",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(aerolvm_isolate_pool_spawn_fails_total[5m])",
+          "legendFormat": "isolate spawn fails",
+          "refId": "D"
+        }
+      ],
+      "title": "Docker orphans / spawn fails",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Fraction of container creates that MISSED the warm pool and took the cold engine path. Container warm pool is exported under docker_pool_* on containerd nodes (the 'docker' runtime = containerd engine).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(aerolvm_docker_pool_misses_total[5m]) / clamp_min(rate(aerolvm_docker_pool_hits_total[5m]) + rate(aerolvm_docker_pool_misses_total[5m]), 1e-9)",
+          "legendFormat": "cold-miss rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Container Pool Cold-Miss Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Latency to adopt a ready (warm) container from the pool \u2014 the warm-path cost. Container warm pool is exported under docker_pool_* on containerd nodes (the 'docker' runtime = containerd engine).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "aerolvm_docker_pool_adopt_ms",
+          "legendFormat": "warm adopt ms",
+          "refId": "A"
+        }
+      ],
+      "title": "Warm Adopt Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Warm slots currently parked (\u2248 configured pool depth). If this sits below depth, the refiller can't keep up and creates fall cold. Container warm pool is exported under docker_pool_* on containerd nodes (the 'docker' runtime = containerd engine).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "aerolvm_docker_pool_parked",
+          "legendFormat": "parked slots",
+          "refId": "A"
+        }
+      ],
+      "title": "Parked Warm Slots (pool depth)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "aerolvm",
+    "pools"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(aerolvm_host_pressure_sandboxes, instance)",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "runtime",
+        "type": "custom",
+        "query": "containerd,gvisor,wasm,isolate,firecracker,docker",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "scenario",
+        "type": "custom",
+        "query": "cluster-mixed-benchmark-with-obs,cluster-hetero-benchmark-with-obs",
+        "current": {
+          "text": "cluster-mixed-benchmark-with-obs",
+          "value": "cluster-mixed-benchmark-with-obs"
+        },
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "D4 Warm-Pool Efficiency",
+  "uid": "aerolvm-d4-pools",
+  "version": 1
+}

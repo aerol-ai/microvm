@@ -1,0 +1,25 @@
+# Everyday investor-benchmark scenario: 3× mixed sandboxd nodes + dedicated
+# obs1 (Prometheus/Grafana/Pushgateway). Advertises every host-mediated runtime
+# (containerd/docker, gVisor, WASM, isolate) plus observability + simulations.
+# No Firecracker — that lives in the hetero flagship (gated on T7 budget).
+#
+# expected_members is the Raft/gossip count only (obs1 is outside the nodes map).
+# Caps must include CapContainerdEngine so the containerd bench row emits, and
+# CapExternalDNSZone so UC-35/36 can run when the harness wires a second zone.
+name: cluster-mixed-benchmark-with-obs
+capabilities:
+  - docker
+  - containerd-engine
+  - gvisor
+  - wasm
+  - isolate
+  - platform-volumes
+  - domain
+  - custom-domains
+  - external-dns-zone
+  - cluster
+  - benchmark
+  - observability
+  - simulations
+
+expected_members: 3

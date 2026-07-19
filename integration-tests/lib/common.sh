@@ -321,3 +321,22 @@ wait_for_members() {
   echo "cluster: expected ${expected} members, never reached (last ${last})" >&2
   return 1
 }
+
+# wait_for_grafana <url> [timeout_s]
+# Polls Grafana /api/health until HTTP 200 or timeout.
+wait_for_grafana() {
+  local url="$1" timeout="${2:-600}"
+  local deadline=$(( $(date +%s) + timeout ))
+  url="${url%/}"
+  while (( $(date +%s) < deadline )); do
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/api/health" || echo 000)
+    if [[ "$code" == "200" ]]; then
+      echo "grafana: ${url} ready"
+      return 0
+    fi
+    sleep 10
+  done
+  echo "grafana: ${url} not ready after ${timeout}s" >&2
+  return 1
+}

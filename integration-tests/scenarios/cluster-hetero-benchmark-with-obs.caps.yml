@@ -1,0 +1,20 @@
+# Flagship hetero soak (T7 resolved 2026-07-19): 5×c5.metal workers + HA ingress
+# + obs. expected_members excludes obs1. No optional 12th arm64 metal.
+name: cluster-hetero-benchmark-with-obs
+capabilities:
+  - docker
+  - containerd-engine
+  - firecracker
+  - gvisor
+  - wasm
+  - isolate
+  - platform-volumes
+  - domain
+  - custom-domains
+  - external-dns-zone
+  - cluster
+  - benchmark
+  - observability
+  - simulations
+
+expected_members: 10

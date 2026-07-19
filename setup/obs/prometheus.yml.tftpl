@@ -1,0 +1,27 @@
+# Prometheus scrape config rendered by Terraform/obs.tf.
+#
+# SECURITY: the cluster PAT is stored at rest in this file on the obs host so
+# Prometheus can scrape PAT-gated /v1/metrics on sandboxd nodes. Treat the obs
+# instance as sensitive — see setup/obs/README.md.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: sandboxd
+    metrics_path: /v1/metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials: ${pat_token}
+    static_configs:
+      - targets:
+%{ for target in scrape_targets ~}
+          - ${target}
+%{ endfor ~}
+
+  - job_name: pushgateway
+    honor_labels: true
+    static_configs:
+      - targets:
+          - pushgateway:9091

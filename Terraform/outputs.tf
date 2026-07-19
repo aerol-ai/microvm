@@ -60,7 +60,27 @@ output "integration_targets" {
         spot        = local.nodes_resolved[n].spot
       }
     ]
+    grafana_url     = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:3000" : ""
+    pushgateway_url = var.deploy_obs ? "http://${aws_instance.obs[0].private_ip}:9091" : ""
+    obs_public_ip   = var.deploy_obs ? aws_instance.obs[0].public_ip : ""
+    obs_private_ip  = var.deploy_obs ? aws_instance.obs[0].private_ip : ""
   }
+}
+
+output "grafana_url" {
+  description = "Grafana UI URL on the dedicated obs node. Empty when deploy_obs=false."
+  value       = var.deploy_obs ? "http://${aws_instance.obs[0].public_ip}:3000" : ""
+}
+
+output "pushgateway_url" {
+  description = "Pushgateway base URL (VPC-private). Empty when deploy_obs=false."
+  value       = var.deploy_obs ? "http://${aws_instance.obs[0].private_ip}:9091" : ""
+}
+
+output "grafana_admin_password" {
+  description = "Grafana admin password for the obs node. SAVE for login — integration-test clusters only."
+  value       = var.deploy_obs ? random_password.grafana_admin[0].result : ""
+  sensitive   = true
 }
 
 output "bundle_bucket" {

@@ -185,3 +185,40 @@ passed, zero-deployments premise re-verified in-tree). Branch
 - **Depends on / start:** PR-A landed (done) + a profile (`go test -bench` or a
   live cluster-3-mixed-wasm run) that actually shows lock contention. Eng-review
   2026-07-17 (D9).
+
+## Metrics-scoped read-only token (security, `pkg/api` auth)
+
+- **What:** Add a read-only / metrics-scoped bearer token to the auth layer so a
+  scrape credential can `GET /v1/metrics` (+ read-only observability endpoints)
+  but cannot mutate the cluster.
+- **Why:** The investor-benchmark obs stack (`plans/investor-benchmark-observability.md`)
+  scrapes `/v1/metrics` with the full-access cluster PAT, baked into the Prometheus
+  config on `obs1` + in Terraform state. Any real Prometheus deployment wants this
+  too — a leaked scrape token shouldn't be able to create/destroy sandboxes.
+- **Caveat (why deferred, not built):** eng review 2026-07-19 (Arch-4) accepted the
+  PAT-at-rest risk for the *disposable* itest cluster (leased domain + ttl=4 + reaper
+  + SG-to-SG private scrape + operator-IP-scoped Grafana). Blast radius is a throwaway
+  cluster destroyed the same day; building token scoping is server auth work well
+  outside a benchmark PR.
+- **Depends on / blocked by:** auth is single-PAT today (`pkg/api`, UC-10). Nothing
+  blocks it; it's a standalone auth feature.
+- **Start:** `pkg/api/` auth middleware + token model; the obs scrape
+  (`setup/obs/prometheus.yml.tftpl`) is the first consumer.
+
+## Native per-runtime metric labels (observability, `internal/service` + `internal/pool`)
+
+- **What:** Add a `runtime=` label to the native create/pool metrics
+  (`aerolvm_create_latency_seconds_bucket`, pool hit/miss) so live per-runtime
+  slicing works from Prometheus directly.
+- **Why:** eng review 2026-07-19 (CM-2) found native metrics carry no runtime label,
+  so per-runtime dashboards can't be built from live metrics — the benchmark works
+  around it by pushing runtime-labeled `benchReport` metrics to a Pushgateway. A real
+  operator dashboard would want native per-runtime observability without that
+  indirection.
+- **Caveat (why deferred):** it's hot-path server work (extra expvar cardinality + a
+  label on the create path) beyond the accepted §9 instrumentation scope, needs its
+  own pr-review + regression test, and the pushed-benchReport approach already covers
+  the benchmark's needs. Watch `histogram` cardinality (runtime × le_* buckets).
+- **Depends on / blocked by:** rides naturally on the §9 create-stage instrumentation
+  (`plans/investor-benchmark-observability.md` §9) once that lands.
+- **Start:** `internal/service/metrics.go` (create), `internal/pool/{wasm,isolate,vmm,dockerpool}/metrics.go`.

@@ -99,6 +99,16 @@ const (
 	// dockerd-coexistence restart stays off the runtime/metal scenarios where a
 	// pure-containerd host makes it not-applicable.
 	CapContainerdEngine Capability = "containerd-engine"
+	// CapObservability gates UC-106/107 ("Grafana up", "Prometheus sees all
+	// sandboxd nodes") and tells run.sh to pass -var deploy_obs=true so
+	// Terraform/obs.tf provisions the dedicated obs EC2. Advertisement +
+	// provisioning only — same shape as CapGvisor/CapIsolate.
+	CapObservability Capability = "observability"
+	// CapSimulations gates the suite/sims workload catalogue and UC-108
+	// (per-sim pass/fail). Opt-in like CapBenchmark: slow, provisions long-
+	// lived services, and needs AEROL_SIMS=1. UC-108 must never roll up to a
+	// single "all green" — each sim records independently.
+	CapSimulations Capability = "simulations"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -334,6 +344,13 @@ var Registry = []UseCase{
 	// surface it, delete removes it. The owner-scoping + in-use-refusal edges are
 	// covered offline; this is the live round-trip.
 	{ID: "UC-105", Title: "Isolate js-bundle catalogue CRUD (upload/list/get/delete)", Requires: []Capability{CapIsolate}, Implemented: true},
+
+	// Investor-benchmark observability (plans/investor-benchmark-observability.md).
+	// UC-106/107 prove the obs stack is actually up; UC-108 asserts each
+	// simulation's recorded success signal independently (never a single rollup).
+	{ID: "UC-106", Title: "Observability: Grafana reachable + Prometheus datasource healthy", Requires: []Capability{CapObservability}, Implemented: true},
+	{ID: "UC-107", Title: "Observability: all expected sandboxd nodes are up in Prometheus", Requires: []Capability{CapObservability, CapCluster}, Implemented: true},
+	{ID: "UC-108", Title: "Simulations: each recorded sim success signal is green (per-sim)", Requires: []Capability{CapSimulations}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

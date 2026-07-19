@@ -22,6 +22,13 @@ var (
 	hostPressureRejectReasons  = expvar.NewMap("aerolvm_host_pressure_reject_reasons")
 	hostPressureReasonKeysMu   sync.Mutex
 	hostPressureReasonKeys     = make(map[string]struct{})
+	// aerolvm_sandboxes_by_runtime{key="docker|gvisor|wasm|isolate|firecracker"}
+	// — live sandbox count per isolation type (the bare host_pressure_sandboxes
+	// gauge has no runtime label). Stale runtimes are deleted so a runtime that
+	// drops to zero doesn't linger at its old value.
+	sandboxesByRuntime       = expvar.NewMap("aerolvm_sandboxes_by_runtime")
+	sandboxesByRuntimeKeysMu sync.Mutex
+	sandboxesByRuntimeKeys   = make(map[string]struct{})
 	// Phase 5 effective-memory axis. Three gauges so dashboards can
 	// plot "real RSS in use", "headroom we'd admit against", and "the
 	// floor we refuse below". Zero on hosts without a sampler (the
@@ -52,6 +59,26 @@ func recordHostPressure(s Snapshot) {
 		hostPressureCanAdmit.Set(0)
 	}
 	recordHostPressureReasons(s.Reasons)
+	recordSandboxesByRuntime(s.SandboxesByRuntime)
+}
+
+func recordSandboxesByRuntime(byRuntime map[string]int) {
+	sandboxesByRuntimeKeysMu.Lock()
+	defer sandboxesByRuntimeKeysMu.Unlock()
+	next := make(map[string]struct{}, len(byRuntime))
+	for runtime, n := range byRuntime {
+		key := scaleobs.Key(runtime)
+		next[key] = struct{}{}
+		v := new(expvar.Int)
+		v.Set(int64(n))
+		sandboxesByRuntime.Set(key, v)
+	}
+	for key := range sandboxesByRuntimeKeys {
+		if _, ok := next[key]; !ok {
+			sandboxesByRuntime.Delete(key)
+		}
+	}
+	sandboxesByRuntimeKeys = next
 }
 
 func recordHostPressureReasons(reasons []string) {

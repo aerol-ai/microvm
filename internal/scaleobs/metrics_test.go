@@ -161,3 +161,37 @@ func TestDurationLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestNestedDurationBuckets_Observe(t *testing.T) {
+	n := NewNestedDurationBuckets("test_nested_"+t.Name(),
+		10*time.Millisecond, 100*time.Millisecond, time.Second)
+
+	n.Observe("fc_verify", 5*time.Millisecond)
+	if got := n.Value("fc_verify", "le_10ms"); got != 1 {
+		t.Fatalf("fc_verify le_10ms = %d, want 1", got)
+	}
+	if got := n.Value("fc_verify", "le_100ms"); got != 0 {
+		t.Fatalf("fc_verify le_100ms = %d, want 0", got)
+	}
+
+	n.Observe("fc_spawn", 50*time.Millisecond)
+	if got := n.Value("fc_spawn", "le_100ms"); got != 1 {
+		t.Fatalf("fc_spawn le_100ms = %d, want 1", got)
+	}
+
+	n.Observe("fc_warm", 2*time.Second)
+	if got := n.Value("fc_warm", "le_inf"); got != 1 {
+		t.Fatalf("fc_warm le_inf = %d, want 1", got)
+	}
+}
+
+func TestNestedDurationBuckets_NilAndEmptyLabel(t *testing.T) {
+	var n *NestedDurationBuckets
+	n.Observe("fc_verify", time.Second)
+
+	n = NewNestedDurationBuckets("test_nested_nil_" + t.Name())
+	n.Observe("", time.Second)
+	if got := n.Value("fc_verify", "le_1s"); got != 0 {
+		t.Fatalf("empty label observe = %d, want 0", got)
+	}
+}

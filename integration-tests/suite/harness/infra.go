@@ -21,11 +21,15 @@ type IntegrationNode struct {
 
 // IntegrationTargets mirrors Terraform output integration_targets.
 type IntegrationTargets struct {
-	BaseURL   string            `json:"base_url"`
-	Domain    string            `json:"domain"`
-	IngressIP string            `json:"ingress_ip"`
-	SeedIP    string            `json:"seed_ip"`
-	Nodes     []IntegrationNode `json:"nodes"`
+	BaseURL        string            `json:"base_url"`
+	Domain         string            `json:"domain"`
+	IngressIP      string            `json:"ingress_ip"`
+	SeedIP         string            `json:"seed_ip"`
+	Nodes          []IntegrationNode `json:"nodes"`
+	GrafanaURL     string            `json:"grafana_url"`
+	PushgatewayURL string            `json:"pushgateway_url"`
+	ObsPublicIP    string            `json:"obs_public_ip"`
+	ObsPrivateIP   string            `json:"obs_private_ip"`
 }
 
 // LoadIntegrationTargets parses AEROL_INTEGRATION_TARGETS (JSON from run.sh).

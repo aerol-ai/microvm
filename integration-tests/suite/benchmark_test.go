@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	cat "github.com/aerol-ai/microvm/integration-tests/catalogue"
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
@@ -57,6 +57,11 @@ var benchRuntimes = []struct {
 	// sweeps ONLY on containerd scenarios — the make target still narrows the
 	// sweep to just this row with AEROL_BENCH_RUNTIMES=containerd.
 	{"containerd", harness.CapContainerdEngine},
+	// containerd-cold is the containerd engine forced past the warm pool (the
+	// containerd analogue of docker-cold) — the cold-engine floor reported next
+	// to the warm containerd row, so a containerd-only sweep shows both paths
+	// without any docker-labeled row.
+	{"containerd-cold", harness.CapContainerdEngine},
 	{"firecracker", harness.CapFirecracker},
 	{"gvisor", harness.CapGvisor},
 	{"wasm", harness.CapWasm},
@@ -227,12 +232,19 @@ func benchCreateOptions(t *testing.T, spec benchRuntimeSpec) sdktypes.CreateSand
 		opts.Image = harness.DefaultImage
 		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
 	case "containerd":
-		// containerd is the host engine, reached via the "docker" runtime
-		// (the node advertises "docker"). This scenario runs no warm pool
-		// (docker-pool/containerd-pool caps absent), so every create already
-		// takes the cold engine path — the honest baseline against docker-cold.
+		// containerd is the host ENGINE, reached via the "docker" runtime (the
+		// node advertises "docker"; dockerd is not on the create path). Pool-
+		// eligible, so with SB_CONTAINERD_POOL_ENABLED it measures the WARM path
+		// (adopts a ready containerd task).
 		opts.Runtime = "docker"
 		opts.Image = harness.DefaultImage
+	case "containerd-cold":
+		// Same containerd engine, forced past the warm pool (any Env entry makes
+		// poolEligible reject it) → the cold-engine floor, labeled containerd so a
+		// containerd-only sweep reports warm + cold without a docker-labeled row.
+		opts.Runtime = "docker"
+		opts.Image = harness.DefaultImage
+		opts.Env = map[string]string{"AEROL_BENCH_COLD": "1"}
 	default:
 		opts.Image = harness.DefaultImage
 	}
@@ -316,7 +328,7 @@ func benchClusterMembers(c *harness.Client) (capacityView, error) {
 // checked under "docker" too.
 func benchClusterRuntime(runtime string) string {
 	switch runtime {
-	case "docker-cold", "containerd":
+	case "docker-cold", "containerd", "containerd-cold":
 		return "docker"
 	}
 	return runtime
@@ -361,29 +373,39 @@ func benchCanOwnSandbox(role string) bool {
 	return false
 }
 
-func warmBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) {
+// warmBenchmarkRuntimes warms one create per runtime and returns the runtimes
+// whose warmup SUCCEEDED plus the names that were dropped. A runtime whose
+// warmup fails (e.g. isolate can't resolve its bundle) is skipped with t.Errorf
+// rather than fataling the whole sweep — otherwise one broken runtime zeroes the
+// latency numbers for every healthy one (docker/containerd/wasm never get
+// measured). Mirrors the main loop's "every create sample failed" → Errorf
+// severity: the test still goes red so the breakage is visible, but the healthy
+// runtimes are measured and the artifact is written.
+func warmBenchmarkRuntimes(t *testing.T, c *harness.Client, runtimes []benchRuntimeSpec) ([]benchRuntimeSpec, []string) {
 	t.Helper()
+	var healthy []benchRuntimeSpec
+	var dropped []string
 	for _, spec := range runtimes {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		sb, err := c.SDK().Create(ctx, benchCreateOptions(t, spec))
 		cancel()
 		if err != nil {
-			t.Fatalf("bench[%s] warmup create failed after readiness: %v", spec.runtime, err)
+			t.Errorf("bench[%s] warmup create failed after readiness (runtime skipped): %v", spec.runtime, err)
+			dropped = append(dropped, spec.runtime)
+			continue
 		}
-		destroy := true
 		id := sb.ID
-		defer func() {
-			if destroy {
-				destroyBest(c, id)
-			}
-		}()
-		if !waitRunningTimed(t, sb) {
-			t.Fatalf("bench[%s] warmup sandbox %s did not reach started", spec.runtime, id)
-		}
+		started := waitRunningTimed(t, sb)
 		destroyBest(c, id)
-		destroy = false
+		if !started {
+			t.Errorf("bench[%s] warmup sandbox %s did not reach started (runtime skipped)", spec.runtime, id)
+			dropped = append(dropped, spec.runtime)
+			continue
+		}
 		_, _ = c.LastServerCreateMS()
+		healthy = append(healthy, spec)
 	}
+	return healthy, dropped
 }
 
 // waitDockerPoolWarm blocks until a docker create is served from the warm
@@ -524,6 +546,13 @@ type latencyStats struct {
 	// creates whose header carried that stage — a stage absent from
 	// some samples (e.g. fc_warm on a cold fallback) reports fewer.
 	Stages map[string]stageStats `json:"stages,omitempty"`
+	// Raw sample lists accumulate across soak-loop passes (CM-3). Smoke runs
+	// (SAMPLES=10) leave these empty; soak recomputes p50/p90/p99 over the
+	// union so headline percentiles disclose a defensible N.
+	APISamplesMS    []int64 `json:"api_samples_ms,omitempty"`
+	RunSamplesMS    []int64 `json:"run_samples_ms,omitempty"`
+	ServerSamplesMS []int64 `json:"server_samples_ms,omitempty"`
+	Method          string  `json:"method,omitempty"` // e.g. "soak-accumulated"
 }
 
 // stageStats folds one named stage's samples across the bench run.
@@ -540,46 +569,18 @@ type benchReport struct {
 	Machine   *machineConfig `json:"machine,omitempty"`
 	Latency   []latencyStats `json:"latency,omitempty"`
 	Density   *densityStats  `json:"density,omitempty"`
+	// HeadlineNote documents CM-3/CM-4 methodology for consumers of the JSON.
+	HeadlineNote string `json:"headline_note,omitempty"`
 }
 
 var benchArtifactMu sync.Mutex
-
-// machineConfig is the hardware the numbers were measured on, copied from the
-// scenario's tfvars so a result is self-describing — a create latency is
-// meaningless without knowing whether the worker is a t3.medium or a c5.metal.
-// It records the intended (terraform-declared) topology, not live-probed specs;
-// that's the deliberate trade in keeping the bench tfvars-sourced and offline.
-type machineConfig struct {
-	Source          string     `json:"source"`           // tfvars path it was read from
-	DefaultInstance string     `json:"default_instance"` // default_instance_type
-	Nodes           []nodeSpec `json:"nodes"`            // one row per declared node
-}
-
-// nodeSpec is one node's declared shape from the tfvars nodes map.
-type nodeSpec struct {
-	Name         string `json:"name"`
-	Role         string `json:"role"`
-	InstanceType string `json:"instance_type"` // empty => inherits DefaultInstance
-	Extras       string `json:"extras,omitempty"`
-}
-
-// tfvarsNodeLine matches a single `name = { ... }` entry in the nodes map.
-var tfvarsNodeLine = regexp.MustCompile(`^\s*([A-Za-z0-9_-]+)\s*=\s*\{(.*)\}\s*$`)
-
-// tfvarsAttr pulls a quoted `key = "value"` attribute out of a node body.
-func tfvarsAttr(body, key string) string {
-	re := regexp.MustCompile(key + `\s*=\s*"([^"]*)"`)
-	if m := re.FindStringSubmatch(body); m != nil {
-		return m[1]
-	}
-	return ""
-}
 
 // loadMachineConfig parses the scenario's tfvars into a machineConfig. It is
 // best-effort: a missing/unreadable file yields nil (logged), never a failure —
 // the timings are still useful without the hardware stamp. AEROL_BENCH_TFVARS
 // overrides the path; otherwise it defaults to ../scenarios/<scenario>.tfvars
-// relative to the suite working directory.
+// relative to the suite working directory. The parse itself lives in the
+// non-tagged machineconfig.go so it can be unit-tested offline.
 func loadMachineConfig(t *testing.T) *machineConfig {
 	t.Helper()
 	path := os.Getenv("AEROL_BENCH_TFVARS")
@@ -591,45 +592,7 @@ func loadMachineConfig(t *testing.T) *machineConfig {
 		t.Logf("bench: machine config unavailable (%s): %v", path, err)
 		return nil
 	}
-	mc := &machineConfig{Source: path}
-	inNodes := false
-	for _, line := range strings.Split(string(raw), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if v := tfvarsAttr(trimmed, "default_instance_type"); v != "" {
-			mc.DefaultInstance = v
-		}
-		switch {
-		case strings.HasPrefix(trimmed, "nodes") && strings.Contains(trimmed, "{"):
-			inNodes = true
-			continue
-		case inNodes && trimmed == "}":
-			inNodes = false
-			continue
-		}
-		if !inNodes {
-			continue
-		}
-		m := tfvarsNodeLine.FindStringSubmatch(trimmed)
-		if m == nil {
-			continue
-		}
-		body := m[2]
-		ns := nodeSpec{Name: m[1], Role: tfvarsAttr(body, "role"), InstanceType: tfvarsAttr(body, "instance_type")}
-		// Capture the with_* feature flags (with_firecracker/with_gvisor) so the
-		// reader knows which runtime a worker was provisioned for.
-		var extras []string
-		for _, flag := range []string{"with_firecracker", "with_gvisor"} {
-			if regexp.MustCompile(flag + `\s*=\s*true`).MatchString(body) {
-				extras = append(extras, flag)
-			}
-		}
-		ns.Extras = strings.Join(extras, ",")
-		mc.Nodes = append(mc.Nodes, ns)
-	}
-	return mc
+	return parseMachineConfig(raw, path)
 }
 
 // densityStats is the UC-95 summary: how many sandboxes landed before the fleet
@@ -644,17 +607,90 @@ type densityStats struct {
 }
 
 func mergeBenchReports(base, update benchReport) benchReport {
-	if update.Latency != nil {
-		base.Latency = update.Latency
+	if len(update.Latency) > 0 {
+		base.Latency = mergeLatencyStats(base.Latency, update.Latency)
 	}
 	if update.Density != nil {
 		base.Density = update.Density
 	}
+	if update.Machine != nil {
+		base.Machine = update.Machine
+	}
+	if update.HeadlineNote != "" {
+		base.HeadlineNote = update.HeadlineNote
+	}
 	return base
+}
+
+// mergeLatencyStats unions per-runtime raw samples across soak passes and
+// recomputes percentiles (CM-3). Falls back to overwrite when neither side
+// carries raw samples (legacy smoke artifacts).
+func mergeLatencyStats(base, update []latencyStats) []latencyStats {
+	byRT := map[string]latencyStats{}
+	order := []string{}
+	add := func(ls latencyStats) {
+		cur, ok := byRT[ls.Runtime]
+		if !ok {
+			byRT[ls.Runtime] = ls
+			order = append(order, ls.Runtime)
+			return
+		}
+		if len(ls.APISamplesMS) == 0 && len(cur.APISamplesMS) == 0 {
+			byRT[ls.Runtime] = ls // legacy overwrite
+			return
+		}
+		cur.APISamplesMS = append(cur.APISamplesMS, ls.APISamplesMS...)
+		cur.RunSamplesMS = append(cur.RunSamplesMS, ls.RunSamplesMS...)
+		cur.ServerSamplesMS = append(cur.ServerSamplesMS, ls.ServerSamplesMS...)
+		cur.Failures += ls.Failures
+		byRT[ls.Runtime] = recomputeLatencyFromSamples(cur)
+	}
+	for _, ls := range base {
+		add(ls)
+	}
+	for _, ls := range update {
+		add(ls)
+	}
+	out := make([]latencyStats, 0, len(order))
+	for _, rt := range order {
+		out = append(out, byRT[rt])
+	}
+	return out
+}
+
+func recomputeLatencyFromSamples(ls latencyStats) latencyStats {
+	apiD := msSliceToDurations(ls.APISamplesMS)
+	runD := msSliceToDurations(ls.RunSamplesMS)
+	serverD := msSliceToDurations(ls.ServerSamplesMS)
+	out := summarize(ls.Runtime, len(apiD)+ls.Failures, ls.Failures, apiD, runD, serverD)
+	out.APISamplesMS = ls.APISamplesMS
+	out.RunSamplesMS = ls.RunSamplesMS
+	out.ServerSamplesMS = ls.ServerSamplesMS
+	out.Stages = ls.Stages
+	out.Method = "soak-accumulated"
+	return out
+}
+
+func msSliceToDurations(ms []int64) []time.Duration {
+	out := make([]time.Duration, len(ms))
+	for i, v := range ms {
+		out[i] = time.Duration(v) * time.Millisecond
+	}
+	return out
+}
+
+func durationsToMS(durs []time.Duration) []int64 {
+	out := make([]int64, len(durs))
+	for i, d := range durs {
+		out[i] = d.Milliseconds()
+	}
+	return out
 }
 
 // writeBenchArtifact persists the report when AEROL_BENCH_OUT is set. Failure to
 // write is logged, never fatal: the t.Logf numbers are the source of record.
+// Cross-process soak passes share a flock via catalogue.AtomicMergeJSON — the
+// in-process benchArtifactMu alone is not enough when run.sh loops go test.
 func writeBenchArtifact(t *testing.T, rep benchReport) {
 	t.Helper()
 	out := os.Getenv("AEROL_BENCH_OUT")
@@ -663,49 +699,58 @@ func writeBenchArtifact(t *testing.T, rep benchReport) {
 	}
 	benchArtifactMu.Lock()
 	defer benchArtifactMu.Unlock()
-	if raw, err := os.ReadFile(out); err == nil && strings.TrimSpace(string(raw)) != "" {
-		var existing benchReport
-		if err := json.Unmarshal(raw, &existing); err != nil {
-			t.Logf("bench: read existing artifact %s: %v", out, err)
-		} else {
-			rep = mergeBenchReports(existing, rep)
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		t.Logf("bench: read existing artifact %s: %v", out, err)
-	}
 
 	rep.Scenario = sc.Name
 	rep.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	if machine := loadMachineConfig(t); machine != nil {
 		rep.Machine = machine
 	}
-	blob, err := json.MarshalIndent(rep, "", "  ")
+	if rep.HeadlineNote == "" {
+		rep.HeadlineNote = "p50/p90/p99 over accumulated samples when api_samples_ms present; SAMPLES=10 is smoke only. Mixed/t3 is not a headline source (CM-4)."
+	}
+
+	var published benchReport
+	err := cat.AtomicMergeJSON(out, func(existing []byte) ([]byte, error) {
+		merged := rep
+		if len(existing) > 0 && strings.TrimSpace(string(existing)) != "" {
+			var prev benchReport
+			if err := json.Unmarshal(existing, &prev); err != nil {
+				return nil, err
+			}
+			merged = mergeBenchReports(prev, rep)
+			merged.Scenario = rep.Scenario
+			merged.Timestamp = rep.Timestamp
+			if rep.Machine != nil {
+				merged.Machine = rep.Machine
+			}
+		}
+		published = merged
+		return json.MarshalIndent(merged, "", "  ")
+	})
 	if err != nil {
-		t.Logf("bench: marshal artifact: %v", err)
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		t.Logf("bench: mkdir %s: %v", filepath.Dir(out), err)
-		return
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(out), ".bench-*.json")
-	if err != nil {
-		t.Logf("bench: create temp artifact %s: %v", out, err)
-		return
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(blob); err != nil {
-		_ = tmp.Close()
-		t.Logf("bench: write temp artifact %s: %v", tmpName, err)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		t.Logf("bench: close temp artifact %s: %v", tmpName, err)
-		return
-	}
-	if err := os.Rename(tmpName, out); err != nil {
 		t.Logf("bench: publish artifact %s: %v", out, err)
+		return
+	}
+	pushBenchPercentiles(t, published)
+}
+
+// pushBenchPercentiles publishes runtime-labeled gauges to Pushgateway (CM-1/2).
+func pushBenchPercentiles(t *testing.T, rep benchReport) {
+	t.Helper()
+	if cat.PushgatewayURL() == "" {
+		return
+	}
+	var body strings.Builder
+	for _, ls := range rep.Latency {
+		body.WriteString(cat.FormatPercentileGauges("aerolvm_bench_create_api", ls.Runtime, ls.APIp50MS, ls.APIp90MS, ls.APIp99MS))
+		body.WriteString(cat.FormatPercentileGauges("aerolvm_bench_create_server", ls.Runtime, ls.Serverp50MS, ls.Serverp90MS, ls.Serverp99MS))
+		body.WriteString(cat.FormatGauge("aerolvm_bench_samples", float64(ls.Samples), map[string]string{"runtime": ls.Runtime}))
+	}
+	if body.Len() == 0 {
+		return
+	}
+	if err := cat.PushText("aerolvm_bench", sc.Name, body.String()); err != nil {
+		t.Logf("bench: pushgateway: %v (recorded skip; soak continues)", err)
 	}
 }
 
@@ -724,7 +769,13 @@ func TestBenchCreateLatency(t *testing.T) {
 	}
 	waitBenchmarkReady(t, c, runtimes)
 	runtimes = prepareBenchmarkRuntimes(t, c, runtimes)
-	warmBenchmarkRuntimes(t, c, runtimes)
+	runtimes, warmupDropped := warmBenchmarkRuntimes(t, c, runtimes)
+	if len(warmupDropped) > 0 {
+		t.Logf("bench: %d runtime(s) dropped after warmup failure: %v — healthy runtimes still measured", len(warmupDropped), warmupDropped)
+	}
+	if len(runtimes) == 0 {
+		t.Fatalf("bench: every runtime failed warmup (%v); no latency to measure", warmupDropped)
+	}
 	waitDockerPoolWarm(t, c, runtimes)
 
 	var report benchReport
@@ -777,6 +828,9 @@ func TestBenchCreateLatency(t *testing.T) {
 		}
 		ls := summarize(br.runtime, samples, failures, apiD, runD, serverD)
 		ls.Stages = summarizeStages(stageD)
+		ls.APISamplesMS = durationsToMS(apiD)
+		ls.RunSamplesMS = durationsToMS(runD)
+		ls.ServerSamplesMS = durationsToMS(serverD)
 		report.Latency = append(report.Latency, ls)
 		t.Logf("bench[%s] api p50=%dms p90=%dms p99=%dms | server p50=%dms p90=%dms p99=%dms | running p50=%dms p90=%dms p99=%dms (%d ok, %d fail)",
 			br.runtime, ls.APIp50MS, ls.APIp90MS, ls.APIp99MS,
@@ -814,7 +868,10 @@ func TestBenchCreateLatencySparse(t *testing.T) {
 	}
 	waitBenchmarkReady(t, c, dockerOnly)
 	dockerOnly = prepareBenchmarkRuntimes(t, c, dockerOnly)
-	warmBenchmarkRuntimes(t, c, dockerOnly)
+	dockerOnly, _ = warmBenchmarkRuntimes(t, c, dockerOnly)
+	if len(dockerOnly) == 0 {
+		t.Fatal("sparse bench: docker runtime failed warmup")
+	}
 	waitDockerPoolWarm(t, c, dockerOnly)
 
 	var report benchReport
@@ -869,6 +926,9 @@ func TestBenchCreateLatencySparse(t *testing.T) {
 		}
 		ls := summarize(br.runtime+"-sparse", samples, failures, apiD, runD, serverD)
 		ls.Stages = summarizeStages(stageD)
+		ls.APISamplesMS = durationsToMS(apiD)
+		ls.RunSamplesMS = durationsToMS(runD)
+		ls.ServerSamplesMS = durationsToMS(serverD)
 		report.Latency = append(report.Latency, ls)
 		t.Logf("sparse[%s] server p50=%dms | warm_hits=%d resolve_on_warm=%d (%d ok, %d fail)",
 			br.runtime, ls.Serverp50MS, warmHits, resolveHits, len(apiD), failures)

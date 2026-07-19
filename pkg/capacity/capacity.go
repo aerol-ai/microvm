@@ -106,28 +106,34 @@ type Request struct {
 // present here, otherwise placement scores against stale assumptions and the
 // caller fans out to a node that can't actually admit.
 type Snapshot struct {
-	HostCPUCores              int      `json:"host_cpu_cores"`
-	HostMemoryTotalMB         int      `json:"host_memory_total_mb"`
-	HostDiskTotalGB           int      `json:"host_disk_total_gb,omitempty"`
-	HostDiskFreeGB            int      `json:"host_disk_free_gb,omitempty"`
-	ReservedCPU               float64  `json:"reserved_cpu"`
-	ReservedMemoryMB          int      `json:"reserved_memory_mb"`
-	ReservedDiskGB            int      `json:"reserved_disk_gb,omitempty"`
-	ReservedGPUs              int      `json:"reserved_gpus,omitempty"`
-	AvailableCPU              float64  `json:"available_cpu"`
-	AvailableMemoryMB         int      `json:"available_memory_mb"`
-	AvailableDiskGB           int      `json:"available_disk_gb,omitempty"`
-	AvailableGPUs             int      `json:"available_gpus,omitempty"`
-	LiveMemoryFreeMB          int      `json:"live_memory_free_mb"`
-	SandboxesActive           int      `json:"sandboxes_active"`
-	CanAdmit                  bool     `json:"can_admit"`
-	Reasons                   []string `json:"reasons,omitempty"`
-	CPUReservationRatio       float64  `json:"cpu_reservation_ratio"`
-	MemoryReservationRatio    float64  `json:"memory_reservation_ratio"`
-	DiskReservationRatio      float64  `json:"disk_reservation_ratio,omitempty"`
-	MemoryFloorRatio          float64  `json:"memory_floor_ratio"`
-	CPUOverProvisionFactor    float64  `json:"cpu_overprovision_factor"`
-	MemoryOverProvisionFactor float64  `json:"memory_overprovision_factor"`
+	HostCPUCores      int     `json:"host_cpu_cores"`
+	HostMemoryTotalMB int     `json:"host_memory_total_mb"`
+	HostDiskTotalGB   int     `json:"host_disk_total_gb,omitempty"`
+	HostDiskFreeGB    int     `json:"host_disk_free_gb,omitempty"`
+	ReservedCPU       float64 `json:"reserved_cpu"`
+	ReservedMemoryMB  int     `json:"reserved_memory_mb"`
+	ReservedDiskGB    int     `json:"reserved_disk_gb,omitempty"`
+	ReservedGPUs      int     `json:"reserved_gpus,omitempty"`
+	AvailableCPU      float64 `json:"available_cpu"`
+	AvailableMemoryMB int     `json:"available_memory_mb"`
+	AvailableDiskGB   int     `json:"available_disk_gb,omitempty"`
+	AvailableGPUs     int     `json:"available_gpus,omitempty"`
+	LiveMemoryFreeMB  int     `json:"live_memory_free_mb"`
+	SandboxesActive   int     `json:"sandboxes_active"`
+	// SandboxesByRuntime is the live reservation count keyed by OCI runtime
+	// ("docker"/containerd, "gvisor", "wasm", "isolate", "firecracker";
+	// "unspecified" for a runtime-agnostic reservation). Lets dashboards show
+	// live sandboxes broken down by isolation type — the bare SandboxesActive
+	// gauge has no runtime label.
+	SandboxesByRuntime        map[string]int `json:"sandboxes_by_runtime,omitempty"`
+	CanAdmit                  bool           `json:"can_admit"`
+	Reasons                   []string       `json:"reasons,omitempty"`
+	CPUReservationRatio       float64        `json:"cpu_reservation_ratio"`
+	MemoryReservationRatio    float64        `json:"memory_reservation_ratio"`
+	DiskReservationRatio      float64        `json:"disk_reservation_ratio,omitempty"`
+	MemoryFloorRatio          float64        `json:"memory_floor_ratio"`
+	CPUOverProvisionFactor    float64        `json:"cpu_overprovision_factor"`
+	MemoryOverProvisionFactor float64        `json:"memory_overprovision_factor"`
 	// MemoryFloorMB is the absolute floor derived from MemoryFloorRatio and
 	// host memory, exposed for operators reading /capacity.
 	MemoryFloorMB int `json:"memory_floor_mb"`
@@ -465,6 +471,17 @@ func (a *Admitter) Reserve(sandboxID string, req Request) {
 func (a *Admitter) Snapshot() Snapshot {
 	a.mu.Lock()
 	count := len(a.reservations)
+	// Break the live count down by runtime for the per-isolation dashboard.
+	// Cheap: one pass over the same reservations map we already sized above,
+	// bounded by the handful of runtimes a host supports.
+	byRuntime := make(map[string]int, len(a.host.SupportedRuntimes)+1)
+	for _, req := range a.reservations {
+		rt := req.Runtime
+		if rt == "" {
+			rt = "unspecified"
+		}
+		byRuntime[rt]++
+	}
 	totalCPU := a.totalCPU
 	totalMem := a.totalMemMB
 	totalDisk := a.totalDiskGB
@@ -507,6 +524,7 @@ func (a *Admitter) Snapshot() Snapshot {
 		AvailableGPUs:             maxInt(a.host.GPUCount-totalGPUs, 0),
 		LiveMemoryFreeMB:          free,
 		SandboxesActive:           count,
+		SandboxesByRuntime:        byRuntime,
 		CPUReservationRatio:       a.limits.CPUReservationRatio,
 		MemoryReservationRatio:    a.limits.MemoryReservationRatio,
 		DiskReservationRatio:      a.limits.DiskReservationRatio,
