@@ -33,6 +33,10 @@ type Host struct {
 	// so unit tests need neither `ip` nor CAP_NET_ADMIN.
 	addNetns func(ctx context.Context, name string) error
 	delNetns func(ctx context.Context, name string) error
+	// loopbackUp flips `lo` up inside the named netns. Test seam like
+	// addNetns/delNetns; production leaves it nil and execs `ip -n <name> link
+	// set lo up`.
+	loopbackUp func(ctx context.Context, name string) error
 }
 
 func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
@@ -53,6 +57,17 @@ func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
 	if err := h.createNetns(ctx, slot.SandboxID); err != nil {
 		return "", "", fmt.Errorf("netns host: create netns %s: %w", slot.SandboxID, err)
 	}
+	// A fresh netns has loopback DOWN, and the CNI runner invokes only the bridge
+	// plugin (cni.resolve reduces the conflist to plugins[0]), so nothing brings
+	// lo up. Without this, 127.0.0.1 / localhost TCP inside the sandbox times out
+	// even though a service binds 0.0.0.0 — breaking any app that dials localhost
+	// (postgres, redis, dev servers, multi-process apps). Do it before CNI ADD so
+	// the namespace is fully usable the instant the container attaches; roll back
+	// the netns on failure, mirroring the CNI ADD path below.
+	if err := h.bringLoopbackUp(ctx, slot.SandboxID); err != nil {
+		_ = h.deleteNetns(ctx, slot.SandboxID)
+		return "", "", fmt.Errorf("netns host: loopback up %s: %w", slot.SandboxID, err)
+	}
 	path := filepath.Join(root, slot.SandboxID)
 	res, err := h.Runner.Add(ctx, path, slot.SandboxID)
 	if err != nil {
@@ -71,6 +86,20 @@ func (h *Host) createNetns(ctx context.Context, name string) error {
 	out, err := exec.CommandContext(ctx, "ip", "netns", "add", name).CombinedOutput()
 	if err != nil && !strings.Contains(strings.ToLower(string(out)), "file exists") {
 		return fmt.Errorf("ip netns add: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// bringLoopbackUp flips `lo` up inside the named netns. Idempotent: bringing an
+// already-up loopback up again is a no-op in iproute2. Uses `ip -n <name>`
+// (runs in the netns at /run/netns/<name> created by createNetns).
+func (h *Host) bringLoopbackUp(ctx context.Context, name string) error {
+	if h.loopbackUp != nil {
+		return h.loopbackUp(ctx, name)
+	}
+	out, err := exec.CommandContext(ctx, "ip", "-n", name, "link", "set", "lo", "up").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip -n %s link set lo up: %v: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

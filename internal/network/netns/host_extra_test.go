@@ -13,10 +13,11 @@ func TestHostRealizeRunnerErrorCleansUp(t *testing.T) {
 	runner := cni.NewFakeRunner()
 	runner.SetAddError(errors.New("cni add boom"))
 	h := &Host{
-		Runner:    runner,
-		NetnsRoot: t.TempDir(),
-		addNetns:  func(context.Context, string) error { return nil },
-		delNetns:  func(context.Context, string) error { return nil },
+		Runner:     runner,
+		NetnsRoot:  t.TempDir(),
+		addNetns:   func(context.Context, string) error { return nil },
+		delNetns:   func(context.Context, string) error { return nil },
+		loopbackUp: func(context.Context, string) error { return nil },
 	}
 	if _, _, err := h.Realize(context.Background(), Slot{SandboxID: "sb-x"}); err == nil {
 		t.Fatal("want realize error when CNI ADD fails")
@@ -42,10 +43,11 @@ func TestHostRealizeCreatesRealNetns(t *testing.T) {
 	var created, deleted string
 	runner := cni.NewFakeRunner()
 	h := &Host{
-		Runner:    runner,
-		NetnsRoot: t.TempDir(),
-		addNetns:  func(_ context.Context, name string) error { created = name; return nil },
-		delNetns:  func(_ context.Context, name string) error { deleted = name; return nil },
+		Runner:     runner,
+		NetnsRoot:  t.TempDir(),
+		addNetns:   func(_ context.Context, name string) error { created = name; return nil },
+		delNetns:   func(_ context.Context, name string) error { deleted = name; return nil },
+		loopbackUp: func(context.Context, string) error { return nil },
 	}
 	path, ip, err := h.Realize(context.Background(), Slot{SandboxID: "sb-real"})
 	if err != nil {
@@ -59,6 +61,46 @@ func TestHostRealizeCreatesRealNetns(t *testing.T) {
 	}
 	if deleted != "" {
 		t.Fatalf("netns should not be deleted on success, deleted=%q", deleted)
+	}
+}
+
+// TestHostRealizeBringsLoopbackUp is the regression guard for the live bug where
+// containerd sandboxes booted with `lo` DOWN, so 127.0.0.1/localhost TCP timed
+// out (postgres bound 0.0.0.0 but nothing could dial it over loopback).
+func TestHostRealizeBringsLoopbackUp(t *testing.T) {
+	var loName string
+	runner := cni.NewFakeRunner()
+	h := &Host{
+		Runner:     runner,
+		NetnsRoot:  t.TempDir(),
+		addNetns:   func(context.Context, string) error { return nil },
+		delNetns:   func(context.Context, string) error { return nil },
+		loopbackUp: func(_ context.Context, name string) error { loName = name; return nil },
+	}
+	if _, _, err := h.Realize(context.Background(), Slot{SandboxID: "sb-lo"}); err != nil {
+		t.Fatalf("Realize: %v", err)
+	}
+	if loName != "sb-lo" {
+		t.Fatalf("loopback not brought up for sb-lo, got %q", loName)
+	}
+}
+
+// A loopback-up failure must roll back the netns, not leak it.
+func TestHostRealizeLoopbackFailureCleansUp(t *testing.T) {
+	var deleted string
+	runner := cni.NewFakeRunner()
+	h := &Host{
+		Runner:     runner,
+		NetnsRoot:  t.TempDir(),
+		addNetns:   func(context.Context, string) error { return nil },
+		delNetns:   func(_ context.Context, name string) error { deleted = name; return nil },
+		loopbackUp: func(context.Context, string) error { return errors.New("lo boom") },
+	}
+	if _, _, err := h.Realize(context.Background(), Slot{SandboxID: "sb-lo2"}); err == nil {
+		t.Fatal("want realize error when loopback up fails")
+	}
+	if deleted != "sb-lo2" {
+		t.Fatalf("netns not cleaned up after loopback failure, deleted=%q", deleted)
 	}
 }
 

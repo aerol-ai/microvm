@@ -209,10 +209,11 @@ func TestTargetDepth(t *testing.T) {
 	}
 	runner := cni.NewFakeRunner()
 	_ = p.Prewarm(context.Background(), &Host{
-		Runner:    runner,
-		NetnsRoot: t.TempDir(),
-		addNetns:  func(context.Context, string) error { return nil },
-		delNetns:  func(context.Context, string) error { return nil },
+		Runner:     runner,
+		NetnsRoot:  t.TempDir(),
+		addNetns:   func(context.Context, string) error { return nil },
+		delNetns:   func(context.Context, string) error { return nil },
+		loopbackUp: func(context.Context, string) error { return nil },
 	}, time.Now())
 	need, _ = p.TargetDepth(context.Background(), 2)
 	if need != 1 {

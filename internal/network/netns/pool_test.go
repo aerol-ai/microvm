@@ -149,10 +149,11 @@ func TestHostRealizeRemoveWithCNI(t *testing.T) {
 	h := &Host{
 		Runner:    runner,
 		NetnsRoot: t.TempDir(),
-		// Stub real netns create/delete so the unit test needs neither `ip` nor
-		// CAP_NET_ADMIN.
-		addNetns: func(context.Context, string) error { return nil },
-		delNetns: func(context.Context, string) error { return nil },
+		// Stub real netns create/delete + loopback-up so the unit test needs
+		// neither `ip` nor CAP_NET_ADMIN.
+		addNetns:   func(context.Context, string) error { return nil },
+		delNetns:   func(context.Context, string) error { return nil },
+		loopbackUp: func(context.Context, string) error { return nil },
 	}
 	ctx := context.Background()
 	slot := Slot{SandboxID: "sb-h"}
