@@ -36,6 +36,7 @@ NO_DISRUPTIVE=0
 COLLECT_LOGS_ONLY=0
 BENCH_ONLY=0
 DESTROY_ONLY=0
+OBS_SNAPSHOT_ONLY=0
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -63,11 +64,14 @@ for arg in "$@"; do
     # instances — everything, and clears the TF state). Unlike integration-reap
     # (which only terminates EC2 instances), this is the real cleanup.
     --destroy-only) DESTROY_ONLY=1 ;;
+    # Render Grafana dashboard PNGs from a keep-provisioned obs stack and pull
+    # them into integration-tests/reports/obs/ (Phase 5 snapshot pipeline).
+    --obs-snapshot-only) OBS_SNAPSHOT_ONLY=1 ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only]" >&2; exit 2; }
 # Reject shell metacharacters so a polluted SCENARIO env (or make injection)
 # cannot turn one run.sh invocation into multiple shell commands.
 if [[ "$SCENARIO" == *[$';#&|<>']* ]] || [[ "$SCENARIO" == *$'\n'* ]]; then
@@ -103,6 +107,33 @@ tf_varfile_args() {
 # (flips firecracker bare-metal nodes off spot; cheap t3 spot nodes unaffected).
 on_demand_tfvar() {
   [[ "$METAL_ON_DEMAND" == "1" ]] && echo "true" || echo "false"
+}
+
+# deploy_obs_tfvar mirrors the scenario observability capability into Terraform's
+# deploy_obs var (dedicated obs EC2 outside var.nodes).
+deploy_obs_tfvar() {
+  local caps_file="$1"
+  if yq -r '.capabilities | contains(["observability"])' "$caps_file" | grep -q true; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+# T7 resolved 2026-07-19: 5×c5.metal workers + 2×m6i.large ingress + 3×t3.medium
+# servers + m6i.large obs (~$21/hr). Kept as a cost acknowledgement gate — set
+# AEROL_HETERO_OBS_T7_OK=1 (Makefile does) to proceed; unset still warns loudly.
+acknowledge_hetero_obs_t7() {
+  local scenario="$1"
+  if [[ "$scenario" != "cluster-hetero-benchmark-with-obs" ]]; then
+    return 0
+  fi
+  if [[ "${AEROL_HETERO_OBS_T7_OK:-}" == "1" ]]; then
+    echo "hetero-obs T7 acknowledged: 5×c5.metal workers, ~\$21/hr / ~\$63–84 per 3–4h soak" >&2
+    return 0
+  fi
+  echo "WARNING: ${scenario} costs ~\$21/hr (5×c5.metal). Set AEROL_HETERO_OBS_T7_OK=1 to acknowledge (Makefile target does)." >&2
+  exit 2
 }
 
 # emit_cert_storage_tfvars writes the persistent BYO cert-store override for a
@@ -193,7 +224,8 @@ teardown() {
     terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
-    -var="force_on_demand=$(on_demand_tfvar)"; then
+    -var="force_on_demand=$(on_demand_tfvar)" \
+    -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"; then
     rm -f "${REPO_ROOT}/integration-tests/.tf/${scenario}/.leased-domain"
   else
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
@@ -473,6 +505,8 @@ run_one() {
   local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
   local overlay="${sdir}/config"
 
+  acknowledge_hetero_obs_t7 "$scenario"
+
   # Preflight: a scenario is fully described by its tfvars + caps.yml. Fail
   # cleanly here rather than mid-terraform when one is missing (e.g. `all`
   # running before a scenario's files exist).
@@ -500,6 +534,7 @@ run_one() {
   caps_docker_pool=$(yq -r '.capabilities | contains(["docker-pool"])' "$caps_file")
   caps_docker_netns_pool=$(yq -r '.capabilities | contains(["docker-netns-pool"])' "$caps_file")
   caps_docker_engine=$(yq -r '.capabilities | contains(["docker-engine"])' "$caps_file")
+  caps_obs=$(yq -r '.capabilities | contains(["observability"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
     leased=$(lease_domain_for_scenario "$scenario")
   else
@@ -637,11 +672,14 @@ run_one() {
   TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" apply -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
     -var="config_dir=${overlay}" \
-    -var="force_on_demand=$(on_demand_tfvar)"
+    -var="force_on_demand=$(on_demand_tfvar)" \
+    -var="deploy_obs=$(deploy_obs_tfvar "$caps_file")"
 
   # Discover endpoint.
-  local targets base_url pat
+  local targets base_url pat grafana_url pushgateway_url
   targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets)
+  grafana_url=$(echo "$targets" | jq -r '.grafana_url // ""')
+  pushgateway_url=$(echo "$targets" | jq -r '.pushgateway_url // ""')
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
 
   local inconclusive=0
@@ -704,6 +742,22 @@ run_one() {
   expected_members=$(yq -r '.expected_members // ""' "$caps_file")
   if [[ "$inconclusive" != "1" && "$caps_cluster" == "true" && -n "$expected_members" ]]; then
     wait_for_members "$base_url" "$pat" "$expected_members" || inconclusive=1
+  fi
+
+  # Observability stack: wait for Grafana after sandboxd health (obs user_data
+  # installs docker + compose and can lag the node bootstrap).
+  if [[ "$inconclusive" != "1" && "$caps_obs" == "true" && -n "$grafana_url" ]]; then
+    echo "=== waiting for observability stack (${grafana_url}) ==="
+    if wait_for_grafana "$grafana_url"; then
+      export AEROL_OBS_GRAFANA_URL="$grafana_url"
+      export AEROL_OBS_PUSHGATEWAY_URL="$pushgateway_url"
+      # catalogue.PushgatewayURL reads AEROL_PUSHGATEWAY_URL (suite/sims).
+      export AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-$pushgateway_url}"
+      export AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-${AEROL_OBS_SOAK_HOURS:-}}"
+    else
+      echo "scenario ${scenario}: grafana not ready" >&2
+      inconclusive=1
+    fi
   fi
 
   # For wasm-capable scenarios the runtime UC references a staged standard
@@ -771,6 +825,12 @@ run_one() {
     fi
   fi
   set +e
+  local catalogue_out="${AEROL_CATALOGUE_OUT:-${HERE}/reports/${scenario}-catalogue.json}"
+  if [[ "$catalogue_out" != /* ]]; then
+    catalogue_out="${REPO_ROOT}/${catalogue_out}"
+  fi
+  mkdir -p "$(dirname "$catalogue_out")"
+
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
@@ -779,10 +839,53 @@ run_one() {
     AEROL_ALLOW_DISRUPTIVE="${allow_disruptive}" \
     AEROL_BENCH="${AEROL_BENCH:-}" \
     AEROL_BENCH_OUT="${bench_out}" \
+    AEROL_SIMS="${AEROL_SIMS:-}" \
+    AEROL_SIMS_SELECT="${AEROL_SIMS_SELECT:-}" \
+    AEROL_CATALOGUE_OUT="${catalogue_out}" \
     AEROL_WASM_MODULE_REF="${wasm_ref}" \
+    AEROL_OBS_GRAFANA_URL="${AEROL_OBS_GRAFANA_URL:-}" \
+    AEROL_OBS_PUSHGATEWAY_URL="${AEROL_OBS_PUSHGATEWAY_URL:-}" \
+    AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
+    AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-}" \
     go test -tags=integration -count=1 -timeout=60m -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
+
+  # Arch-1 soak: loop short UC-94 passes that atomically merge into the
+  # catalogue/bench JSON. Survives a mid-run failure; avoids the 60m hard kill
+  # of a single 3–4h test. Density (UC-95) is NOT in the loop — Perf-1 clean
+  # window (run once after soak, or in the initial suite pass only).
+  local soak_hours="${AEROL_SOAK_HOURS:-0}"
+  if [[ "$inconclusive" != "1" && "${AEROL_BENCH:-}" == "1" && "$soak_hours" != "0" && "$soak_hours" != "" ]]; then
+    local soak_deadline soak_interval pass=0
+    soak_deadline=$(( $(date +%s) + soak_hours * 3600 ))
+    soak_interval="${AEROL_SOAK_SAMPLE_INTERVAL:-300}"
+    echo "=== soak loop: ${soak_hours}h, interval=${soak_interval}s (UC-94 only; incremental merge) ===" >&2
+    while (( $(date +%s) < soak_deadline )); do
+      pass=$((pass + 1))
+      echo "=== soak pass ${pass} ===" >&2
+      set +e
+      AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
+        AEROL_CAPS="${caps_file}" \
+        AEROL_DOMAIN="${leased}" \
+        AEROL_EXPECTED_MEMBERS="${expected_members}" \
+        AEROL_INTEGRATION_TARGETS="${targets}" \
+        AEROL_BENCH=1 \
+        AEROL_BENCH_OUT="${bench_out}" \
+        AEROL_BENCH_SAMPLES="${AEROL_BENCH_SAMPLES:-10}" \
+        AEROL_CATALOGUE_OUT="${catalogue_out}" \
+        AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
+        AEROL_SIMS=0 \
+        go test -tags=integration -count=1 -timeout=60m -v \
+          -run '^TestBenchCreateLatency$' \
+          ./integration-tests/suite/ || echo "soak pass ${pass} failed (continuing)" >&2
+      set -e
+      if (( $(date +%s) + soak_interval >= soak_deadline )); then
+        break
+      fi
+      sleep "$soak_interval"
+    done
+  fi
 
   # On any suite failure, grab sandboxd + caddy logs from every node BEFORE the
   # EXIT trap tears the boxes down — otherwise a real test failure (as opposed
@@ -796,6 +899,9 @@ run_one() {
     -json "$json_out" -out "${HERE}/reports"
   if [[ "${AEROL_BENCH:-}" == "1" && -n "$bench_out" ]]; then
     publish_bench_artifacts "$bench_out"
+  fi
+  if [[ -f "$catalogue_out" ]]; then
+    go run "${HERE}/catalogue/cmd/gen" -scenario "$scenario" -in "$catalogue_out" -out "${HERE}/reports" || true
   fi
 }
 
@@ -1005,8 +1111,62 @@ run_bench_only() {
   return 0
 }
 
+# run_obs_snapshot_only renders D1/D2/D5/D6/D11 (and optional others) via
+# Grafana's image renderer on a keep-provisioned obs node, then scp's PNGs into
+# integration-tests/reports/obs/.
+run_obs_snapshot_only() {
+  local scenario="$1"
+  local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  if [[ ! -d "$sdir" ]]; then
+    echo "no TF state at ${sdir} — provision with keep first" >&2
+    exit 2
+  fi
+  local targets grafana_url obs_ip pw
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+    || { echo "could not read integration_targets" >&2; exit 2; }
+  grafana_url=$(echo "$targets" | jq -r '.grafana_url // empty')
+  obs_ip=$(echo "$targets" | jq -r '.obs_public_ip // empty')
+  if [[ -z "$grafana_url" || -z "$obs_ip" ]]; then
+    echo "obs not deployed for ${scenario} (grafana_url/obs_public_ip empty)" >&2
+    exit 2
+  fi
+  pw=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -raw grafana_admin_password 2>/dev/null || true)
+  local out_dir="${HERE}/reports/obs"
+  mkdir -p "$out_dir"
+  local uids=(
+    aerolvm-d1-executive aerolvm-d2-capability aerolvm-d5-cluster aerolvm-d6-capacity
+    aerolvm-d3-boot aerolvm-d4-pools aerolvm-d7-ingress aerolvm-d8-wake
+    aerolvm-d9-security aerolvm-d10-sims aerolvm-d11-cost
+  )
+  # Prefer UIDs that exist; ignore render failures per-board so one missing board
+  # does not kill the asset pull.
+  echo "=== capturing Grafana snapshots from ${grafana_url} → ${out_dir} ===" >&2
+  for uid in "${uids[@]}"; do
+    local remote="/tmp/${uid}.png"
+    # Render via Grafana on the obs host (renderer is loopback-only).
+    if ssh "${SSH_OPTS[@]}" "ubuntu@${obs_ip}" \
+      "curl -sf -u admin:${pw} -o '${remote}' \
+        'http://127.0.0.1:3000/render/d/${uid}?orgId=1&from=now-3h&to=now&width=1600&height=900&tz=UTC' \
+        || curl -sf -u admin:${pw} -o '${remote}' \
+        'http://127.0.0.1:3000/render/d-solo/${uid}/panel-1?orgId=1&from=now-3h&to=now&width=1600&height=900'"; then
+      scp "${SSH_OPTS[@]}" "ubuntu@${obs_ip}:${remote}" "${out_dir}/${uid}.png" || true
+      echo "snapshot: ${uid}.png" >&2
+    else
+      echo "snapshot skip: ${uid} (render failed)" >&2
+    fi
+  done
+  # Also dump a Grafana snapshot JSON for D1 (shareable, self-contained).
+  ssh "${SSH_OPTS[@]}" "ubuntu@${obs_ip}" \
+    "curl -sf -u admin:${pw} -H 'Content-Type: application/json' \
+      -d '{\"dashboard\":{\"uid\":\"aerolvm-d1-executive\"},\"name\":\"itest-d1\",\"expires\":0}' \
+      http://127.0.0.1:3000/api/snapshots" > "${out_dir}/d1-snapshot.json" 2>/dev/null || true
+  echo "obs snapshots in ${out_dir}" >&2
+}
+
 if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
   collect_logs_only "$SCENARIO"
+elif [[ "$OBS_SNAPSHOT_ONLY" == "1" ]]; then
+  run_obs_snapshot_only "$SCENARIO"
 elif [[ "$BENCH_ONLY" == "1" ]]; then
   if bench_cluster_ready "$SCENARIO"; then
     run_bench_only "$SCENARIO"
@@ -1014,7 +1174,7 @@ elif [[ "$BENCH_ONLY" == "1" ]]; then
     run_one "$SCENARIO"
   fi
 elif [[ "$SCENARIO" == "all" ]]; then
-  for s in local-mode single-node single-node-wasm single-node-isolate cluster-3-mixed cluster-3-mixed-docker cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64; do
+  for s in local-mode single-node single-node-wasm single-node-isolate cluster-3-mixed cluster-3-mixed-docker cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64 cluster-mixed-benchmark-with-obs; do
     ( run_one "$s" )
   done
 else

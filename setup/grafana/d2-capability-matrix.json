@@ -1,0 +1,66 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Lane B will push per-runtime bench percentiles to Pushgateway. Until then this board shows live scrape signals only.",
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "content": "Per-runtime p50/p90/p99 rows will appear from Pushgateway after suite/sims (Lane B). Live create shape and pool efficiency below use /v1/metrics scrapes.", "mode": "markdown" },
+      "title": "Capability Matrix (pushgateway hook)",
+      "type": "text"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Non-cumulative histogram: rate by bucket key — never histogram_quantile.",
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 3 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" }, "stacking": { "mode": "normal", "group": "A" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_create_latency_seconds_bucket[5m])) by (key)", "legendFormat": "{{key}}", "refId": "A" }
+      ],
+      "title": "Create Latency Shape",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 3 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_docker_pool_hits_total[5m])) / clamp_min(sum(rate(aerolvm_docker_pool_hits_total[5m])) + sum(rate(aerolvm_docker_pool_misses_total[5m])), 1e-9)", "legendFormat": "docker pool", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_vmm_pool_acquire_total{key=\"hit\"}[5m])) / clamp_min(sum(rate(aerolvm_vmm_pool_acquire_total{key=\"hit\"}[5m])) + sum(rate(aerolvm_vmm_pool_acquire_total{key=\"miss\"}[5m])), 1e-9)", "legendFormat": "vmm pool", "refId": "B" },
+        { "expr": "sum(rate(aerolvm_docker_netns_pool_hits_total[5m])) / clamp_min(sum(rate(aerolvm_docker_netns_pool_hits_total[5m])) + sum(rate(aerolvm_docker_netns_pool_misses_total[5m])), 1e-9)", "legendFormat": "netns pool", "refId": "C" }
+      ],
+      "title": "Warm Pool Hit Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 11 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (instance) (rate(aerolvm_create_requests_total[5m]))", "legendFormat": "{{instance}}", "refId": "A" }
+      ],
+      "title": "Create Activity by Node",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["aerolvm", "benchmark", "capability"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "D2 Capability Matrix",
+  "uid": "aerolvm-d2-capability",
+  "version": 1
+}

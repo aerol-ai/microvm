@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	cat "github.com/aerol-ai/microvm/integration-tests/catalogue"
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
@@ -524,6 +525,13 @@ type latencyStats struct {
 	// creates whose header carried that stage — a stage absent from
 	// some samples (e.g. fc_warm on a cold fallback) reports fewer.
 	Stages map[string]stageStats `json:"stages,omitempty"`
+	// Raw sample lists accumulate across soak-loop passes (CM-3). Smoke runs
+	// (SAMPLES=10) leave these empty; soak recomputes p50/p90/p99 over the
+	// union so headline percentiles disclose a defensible N.
+	APISamplesMS    []int64 `json:"api_samples_ms,omitempty"`
+	RunSamplesMS    []int64 `json:"run_samples_ms,omitempty"`
+	ServerSamplesMS []int64 `json:"server_samples_ms,omitempty"`
+	Method          string  `json:"method,omitempty"` // e.g. "soak-accumulated"
 }
 
 // stageStats folds one named stage's samples across the bench run.
@@ -540,6 +548,8 @@ type benchReport struct {
 	Machine   *machineConfig `json:"machine,omitempty"`
 	Latency   []latencyStats `json:"latency,omitempty"`
 	Density   *densityStats  `json:"density,omitempty"`
+	// HeadlineNote documents CM-3/CM-4 methodology for consumers of the JSON.
+	HeadlineNote string `json:"headline_note,omitempty"`
 }
 
 var benchArtifactMu sync.Mutex
@@ -644,17 +654,90 @@ type densityStats struct {
 }
 
 func mergeBenchReports(base, update benchReport) benchReport {
-	if update.Latency != nil {
-		base.Latency = update.Latency
+	if len(update.Latency) > 0 {
+		base.Latency = mergeLatencyStats(base.Latency, update.Latency)
 	}
 	if update.Density != nil {
 		base.Density = update.Density
 	}
+	if update.Machine != nil {
+		base.Machine = update.Machine
+	}
+	if update.HeadlineNote != "" {
+		base.HeadlineNote = update.HeadlineNote
+	}
 	return base
+}
+
+// mergeLatencyStats unions per-runtime raw samples across soak passes and
+// recomputes percentiles (CM-3). Falls back to overwrite when neither side
+// carries raw samples (legacy smoke artifacts).
+func mergeLatencyStats(base, update []latencyStats) []latencyStats {
+	byRT := map[string]latencyStats{}
+	order := []string{}
+	add := func(ls latencyStats) {
+		cur, ok := byRT[ls.Runtime]
+		if !ok {
+			byRT[ls.Runtime] = ls
+			order = append(order, ls.Runtime)
+			return
+		}
+		if len(ls.APISamplesMS) == 0 && len(cur.APISamplesMS) == 0 {
+			byRT[ls.Runtime] = ls // legacy overwrite
+			return
+		}
+		cur.APISamplesMS = append(cur.APISamplesMS, ls.APISamplesMS...)
+		cur.RunSamplesMS = append(cur.RunSamplesMS, ls.RunSamplesMS...)
+		cur.ServerSamplesMS = append(cur.ServerSamplesMS, ls.ServerSamplesMS...)
+		cur.Failures += ls.Failures
+		byRT[ls.Runtime] = recomputeLatencyFromSamples(cur)
+	}
+	for _, ls := range base {
+		add(ls)
+	}
+	for _, ls := range update {
+		add(ls)
+	}
+	out := make([]latencyStats, 0, len(order))
+	for _, rt := range order {
+		out = append(out, byRT[rt])
+	}
+	return out
+}
+
+func recomputeLatencyFromSamples(ls latencyStats) latencyStats {
+	apiD := msSliceToDurations(ls.APISamplesMS)
+	runD := msSliceToDurations(ls.RunSamplesMS)
+	serverD := msSliceToDurations(ls.ServerSamplesMS)
+	out := summarize(ls.Runtime, len(apiD)+ls.Failures, ls.Failures, apiD, runD, serverD)
+	out.APISamplesMS = ls.APISamplesMS
+	out.RunSamplesMS = ls.RunSamplesMS
+	out.ServerSamplesMS = ls.ServerSamplesMS
+	out.Stages = ls.Stages
+	out.Method = "soak-accumulated"
+	return out
+}
+
+func msSliceToDurations(ms []int64) []time.Duration {
+	out := make([]time.Duration, len(ms))
+	for i, v := range ms {
+		out[i] = time.Duration(v) * time.Millisecond
+	}
+	return out
+}
+
+func durationsToMS(durs []time.Duration) []int64 {
+	out := make([]int64, len(durs))
+	for i, d := range durs {
+		out[i] = d.Milliseconds()
+	}
+	return out
 }
 
 // writeBenchArtifact persists the report when AEROL_BENCH_OUT is set. Failure to
 // write is logged, never fatal: the t.Logf numbers are the source of record.
+// Cross-process soak passes share a flock via catalogue.AtomicMergeJSON — the
+// in-process benchArtifactMu alone is not enough when run.sh loops go test.
 func writeBenchArtifact(t *testing.T, rep benchReport) {
 	t.Helper()
 	out := os.Getenv("AEROL_BENCH_OUT")
@@ -663,49 +746,58 @@ func writeBenchArtifact(t *testing.T, rep benchReport) {
 	}
 	benchArtifactMu.Lock()
 	defer benchArtifactMu.Unlock()
-	if raw, err := os.ReadFile(out); err == nil && strings.TrimSpace(string(raw)) != "" {
-		var existing benchReport
-		if err := json.Unmarshal(raw, &existing); err != nil {
-			t.Logf("bench: read existing artifact %s: %v", out, err)
-		} else {
-			rep = mergeBenchReports(existing, rep)
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		t.Logf("bench: read existing artifact %s: %v", out, err)
-	}
 
 	rep.Scenario = sc.Name
 	rep.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	if machine := loadMachineConfig(t); machine != nil {
 		rep.Machine = machine
 	}
-	blob, err := json.MarshalIndent(rep, "", "  ")
+	if rep.HeadlineNote == "" {
+		rep.HeadlineNote = "p50/p90/p99 over accumulated samples when api_samples_ms present; SAMPLES=10 is smoke only. Mixed/t3 is not a headline source (CM-4)."
+	}
+
+	var published benchReport
+	err := cat.AtomicMergeJSON(out, func(existing []byte) ([]byte, error) {
+		merged := rep
+		if len(existing) > 0 && strings.TrimSpace(string(existing)) != "" {
+			var prev benchReport
+			if err := json.Unmarshal(existing, &prev); err != nil {
+				return nil, err
+			}
+			merged = mergeBenchReports(prev, rep)
+			merged.Scenario = rep.Scenario
+			merged.Timestamp = rep.Timestamp
+			if rep.Machine != nil {
+				merged.Machine = rep.Machine
+			}
+		}
+		published = merged
+		return json.MarshalIndent(merged, "", "  ")
+	})
 	if err != nil {
-		t.Logf("bench: marshal artifact: %v", err)
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		t.Logf("bench: mkdir %s: %v", filepath.Dir(out), err)
-		return
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(out), ".bench-*.json")
-	if err != nil {
-		t.Logf("bench: create temp artifact %s: %v", out, err)
-		return
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(blob); err != nil {
-		_ = tmp.Close()
-		t.Logf("bench: write temp artifact %s: %v", tmpName, err)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		t.Logf("bench: close temp artifact %s: %v", tmpName, err)
-		return
-	}
-	if err := os.Rename(tmpName, out); err != nil {
 		t.Logf("bench: publish artifact %s: %v", out, err)
+		return
+	}
+	pushBenchPercentiles(t, published)
+}
+
+// pushBenchPercentiles publishes runtime-labeled gauges to Pushgateway (CM-1/2).
+func pushBenchPercentiles(t *testing.T, rep benchReport) {
+	t.Helper()
+	if cat.PushgatewayURL() == "" {
+		return
+	}
+	var body strings.Builder
+	for _, ls := range rep.Latency {
+		body.WriteString(cat.FormatPercentileGauges("aerolvm_bench_create_api", ls.Runtime, ls.APIp50MS, ls.APIp90MS, ls.APIp99MS))
+		body.WriteString(cat.FormatPercentileGauges("aerolvm_bench_create_server", ls.Runtime, ls.Serverp50MS, ls.Serverp90MS, ls.Serverp99MS))
+		body.WriteString(cat.FormatGauge("aerolvm_bench_samples", float64(ls.Samples), map[string]string{"runtime": ls.Runtime}))
+	}
+	if body.Len() == 0 {
+		return
+	}
+	if err := cat.PushText("aerolvm_bench", sc.Name, body.String()); err != nil {
+		t.Logf("bench: pushgateway: %v (recorded skip; soak continues)", err)
 	}
 }
 
@@ -777,6 +869,9 @@ func TestBenchCreateLatency(t *testing.T) {
 		}
 		ls := summarize(br.runtime, samples, failures, apiD, runD, serverD)
 		ls.Stages = summarizeStages(stageD)
+		ls.APISamplesMS = durationsToMS(apiD)
+		ls.RunSamplesMS = durationsToMS(runD)
+		ls.ServerSamplesMS = durationsToMS(serverD)
 		report.Latency = append(report.Latency, ls)
 		t.Logf("bench[%s] api p50=%dms p90=%dms p99=%dms | server p50=%dms p90=%dms p99=%dms | running p50=%dms p90=%dms p99=%dms (%d ok, %d fail)",
 			br.runtime, ls.APIp50MS, ls.APIp90MS, ls.APIp99MS,
@@ -869,6 +964,9 @@ func TestBenchCreateLatencySparse(t *testing.T) {
 		}
 		ls := summarize(br.runtime+"-sparse", samples, failures, apiD, runD, serverD)
 		ls.Stages = summarizeStages(stageD)
+		ls.APISamplesMS = durationsToMS(apiD)
+		ls.RunSamplesMS = durationsToMS(runD)
+		ls.ServerSamplesMS = durationsToMS(serverD)
 		report.Latency = append(report.Latency, ls)
 		t.Logf("sparse[%s] server p50=%dms | warm_hits=%d resolve_on_warm=%d (%d ok, %d fail)",
 			br.runtime, ls.Serverp50MS, warmHits, resolveHits, len(apiD), failures)

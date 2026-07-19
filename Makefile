@@ -4,6 +4,8 @@ BIN_DIR ?= bin
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
+	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
+	integration-cluster-hetero-obs integration-cluster-hetero-obs-only integration-obs-snapshot \
 	integration-benchmark integration-benchmark-only integration-benchmark-docker integration-benchmark-docker-only \
 	integration-benchmark-docker-sparse \
 	integration-benchmark-containerd integration-benchmark-containerd-only \
@@ -147,6 +149,50 @@ integration-cluster-mixed-fc:
 # UCs and the gvisor benchmark row exercise placement + forwarding.
 integration-cluster-mixed-gvisor:
 	integration-tests/run.sh cluster-3-mixed-gvisor $(RUN_FLAGS)
+
+# Investor-grade mixed benchmark + live Grafana (Phase 0).
+# Provisions 3× t3.large on-demand + obs1; runs UC suite + AEROL_BENCH + AEROL_SIMS.
+# Headline p50/p90/p99 must NOT be sourced from this t3 topology (CM-4) — mixed
+# validates connectivity and screenshots only. See plans/investor-benchmark-observability.md.
+MIXED_OBS_BENCH_OUT ?= integration-tests/reports/cluster-mixed-benchmark-with-obs-bench.json
+MIXED_OBS_BENCH_SAMPLES ?= 10
+MIXED_OBS_BENCH_RUNTIMES ?= docker,containerd,gvisor,wasm,isolate
+integration-cluster-mixed-obs:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(MIXED_OBS_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(MIXED_OBS_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(MIXED_OBS_BENCH_RUNTIMES) \
+	AEROL_SIMS=1 \
+		integration-tests/run.sh cluster-mixed-benchmark-with-obs --no-disruptive $(RUN_FLAGS)
+
+integration-cluster-mixed-obs-only:
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(MIXED_OBS_BENCH_OUT) \
+	AEROL_BENCH_SAMPLES=$(MIXED_OBS_BENCH_SAMPLES) \
+	AEROL_BENCH_RUNTIMES=$(MIXED_OBS_BENCH_RUNTIMES) \
+	AEROL_SIMS=1 \
+		integration-tests/run.sh cluster-mixed-benchmark-with-obs --bench-only
+
+# Flagship hetero soak — T7 resolved: 5×c5.metal workers (~$21/hr, ~$63–84/3–4h).
+# AEROL_HETERO_OBS_T7_OK=1 acknowledges the cost; override to 0 to force refuse.
+HETERO_OBS_BENCH_OUT ?= integration-tests/reports/cluster-hetero-benchmark-with-obs-bench.json
+HETERO_OBS_BENCH_RUNTIMES ?= docker,containerd,gvisor,wasm,isolate,firecracker
+integration-cluster-hetero-obs:
+	AEROL_HETERO_OBS_T7_OK=$${AEROL_HETERO_OBS_T7_OK:-1} \
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(HETERO_OBS_BENCH_OUT) \
+	AEROL_BENCH_RUNTIMES=$(HETERO_OBS_BENCH_RUNTIMES) \
+	AEROL_SIMS=1 AEROL_SOAK_HOURS=$${AEROL_SOAK_HOURS:-3} \
+		integration-tests/run.sh cluster-hetero-benchmark-with-obs --no-disruptive $(RUN_FLAGS)
+
+integration-cluster-hetero-obs-only:
+	AEROL_HETERO_OBS_T7_OK=$${AEROL_HETERO_OBS_T7_OK:-1} \
+	AEROL_BENCH=1 AEROL_BENCH_OUT=$(HETERO_OBS_BENCH_OUT) \
+	AEROL_BENCH_RUNTIMES=$(HETERO_OBS_BENCH_RUNTIMES) \
+	AEROL_SIMS=1 \
+		integration-tests/run.sh cluster-hetero-benchmark-with-obs --bench-only
+
+# Render+pull Grafana snapshots from a keep-provisioned obs stack.
+integration-obs-snapshot:
+	AEROL_OBS_SNAPSHOT=1 \
+		integration-tests/run.sh '$(or $(SCENARIO),cluster-mixed-benchmark-with-obs)' --obs-snapshot-only
 
 integration-cluster-hetero:
 	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):

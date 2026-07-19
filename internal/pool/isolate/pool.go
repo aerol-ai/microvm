@@ -8,7 +8,6 @@ import (
 	"context"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
@@ -17,14 +16,6 @@ import (
 // Spawner creates a blank group host for the pool.
 type Spawner interface {
 	Spawn(ctx context.Context) (isolateruntime.GroupHost, error)
-}
-
-// Metrics are hit/miss/refill counters for expvar-style observation.
-type Metrics struct {
-	Hits      atomic.Int64
-	Misses    atomic.Int64
-	Refilled  atomic.Int64
-	SpawnFail atomic.Int64
 }
 
 // Pool keeps pre-spawned blank workerd group hosts.
@@ -66,13 +57,13 @@ func (p *Pool) Acquire(_ context.Context) (isolateruntime.GroupHost, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.ready) == 0 {
-		p.metrics.Misses.Add(1)
+		p.metrics.recordMiss()
 		p.kickLocked()
 		return nil, false
 	}
 	h := p.ready[len(p.ready)-1]
 	p.ready = p.ready[:len(p.ready)-1]
-	p.metrics.Hits.Add(1)
+	p.metrics.recordHit()
 	p.kickLocked()
 	return h, true
 }
@@ -98,13 +89,13 @@ func (p *Pool) WarmOne(ctx context.Context) error {
 	}
 	h, err := p.spawner.Spawn(ctx)
 	if err != nil {
-		p.metrics.SpawnFail.Add(1)
+		p.metrics.recordSpawnFail()
 		return err
 	}
 	p.mu.Lock()
 	p.ready = append(p.ready, h)
 	p.mu.Unlock()
-	p.metrics.Refilled.Add(1)
+	p.metrics.recordRefill()
 	return nil
 }
 

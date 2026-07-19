@@ -1,0 +1,80 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(aerolvm_gossip_members_alive)", "legendFormat": "alive", "refId": "A" },
+        { "expr": "sum(aerolvm_gossip_members_total)", "legendFormat": "total", "refId": "B" }
+      ],
+      "title": "Gossip Members",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "max(aerolvm_worker_lease_max_age_nanos) / 1e9", "legendFormat": "max lease age", "refId": "A" }],
+      "title": "Worker Lease Max Age",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_raft_apply_errors_total[5m])) by (key)", "legendFormat": "apply {{key}}", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_raft_snapshot_errors_total[5m])) by (key)", "legendFormat": "snapshot {{key}}", "refId": "B" }
+      ],
+      "title": "Raft Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_scheduler_decisions_total[5m])) by (key)", "legendFormat": "{{key}}", "refId": "A" }
+      ],
+      "title": "Scheduler Decisions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_owner_forward_total[5m]))", "legendFormat": "forwards/s", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_owner_forward_stale_421_total[5m]))", "legendFormat": "stale 421/s", "refId": "B" },
+        { "expr": "sum(rate(aerolvm_placement_cache_refresh_total[5m]))", "legendFormat": "cache refresh/s", "refId": "C" }
+      ],
+      "title": "Forwarding & Placement Cache",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["aerolvm", "cluster"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "D5 Cluster Health",
+  "uid": "aerolvm-d5-cluster",
+  "version": 1
+}

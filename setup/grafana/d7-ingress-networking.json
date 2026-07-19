@@ -1,0 +1,284 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(aerolvm_ingress_routes_http)",
+          "legendFormat": "http",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aerolvm_ingress_routes_tls)",
+          "legendFormat": "tls",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(aerolvm_ingress_routes_tcp)",
+          "legendFormat": "tcp",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(aerolvm_ingress_routes_total)",
+          "legendFormat": "total",
+          "refId": "D"
+        }
+      ],
+      "title": "Routes by kind",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(aerolvm_ingress_route_desired_revision) - sum(aerolvm_ingress_route_applied_revision)",
+          "legendFormat": "desired-applied",
+          "refId": "A"
+        }
+      ],
+      "title": "Route revision lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(aerolvm_caddy_admin_calls_total[5m]))",
+          "legendFormat": "calls/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aerolvm_caddy_admin_errors_total[5m]))",
+          "legendFormat": "errors/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Caddy admin calls / errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(aerolvm_caddy_admin_latency_seconds_bucket[5m])) by (key)",
+          "legendFormat": "{{key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Caddy admin latency buckets (non-cumulative)",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(aerolvm_ingress_caddy_ops_pending)",
+          "legendFormat": "pending",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aerolvm_ingress_caddy_ops_inflight)",
+          "legendFormat": "inflight",
+          "refId": "B"
+        }
+      ],
+      "title": "Ingress caddy batch pressure",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "aerolvm",
+    "ingress"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(aerolvm_host_pressure_sandboxes, instance)",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "runtime",
+        "type": "custom",
+        "query": "containerd,gvisor,wasm,isolate,firecracker,docker",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "scenario",
+        "type": "custom",
+        "query": "cluster-mixed-benchmark-with-obs,cluster-hetero-benchmark-with-obs",
+        "current": {
+          "text": "cluster-mixed-benchmark-with-obs",
+          "value": "cluster-mixed-benchmark-with-obs"
+        },
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "D7 Ingress & Networking",
+  "uid": "aerolvm-d7-ingress",
+  "version": 1
+}

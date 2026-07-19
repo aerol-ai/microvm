@@ -97,6 +97,7 @@ func (t *CreateTiming) RecordStage(name string, d time.Duration) {
 	t.mu.Lock()
 	t.stages = append(t.stages, Stage{Name: name, DurMS: float64(d.Microseconds()) / 1000})
 	t.mu.Unlock()
+	exportCreateStage(name, d)
 }
 
 // RecordStageDesc appends a duration stage that also carries a desc
@@ -111,6 +112,7 @@ func (t *CreateTiming) RecordStageDesc(name string, d time.Duration, desc string
 	t.mu.Lock()
 	t.stages = append(t.stages, Stage{Name: name, DurMS: float64(d.Microseconds()) / 1000, Desc: desc})
 	t.mu.Unlock()
+	exportCreateStage(name, d)
 }
 
 // Stages returns a copy of the recorded stages in record order.

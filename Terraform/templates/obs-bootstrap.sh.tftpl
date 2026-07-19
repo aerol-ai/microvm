@@ -1,0 +1,71 @@
+#!/bin/bash
+# obs-bootstrap.sh — provision Prometheus + Grafana on a dedicated obs EC2 instance.
+# Rendered by Terraform/obs.tf; not for manual execution.
+set -euo pipefail
+exec > /var/log/aerolvm-obs-bootstrap.log 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "=== aerolvm obs bootstrap starting ==="
+
+# Persistent Prometheus TSDB on a dedicated EBS volume (Arch-5).
+PROM_MOUNT=/var/lib/prometheus
+mkdir -p "$PROM_MOUNT"
+
+# Wait for the attached data volume (Terraform attaches /dev/sdf → NVMe on Nitro).
+DATA_DEV=""
+for _ in $(seq 1 60); do
+  for candidate in /dev/sdf /dev/xvdf /dev/nvme1n1; do
+    if [[ -b "$candidate" ]]; then
+      DATA_DEV="$candidate"
+      break 2
+    fi
+  done
+  sleep 2
+done
+if [[ -z "$DATA_DEV" ]]; then
+  echo "ERROR: prometheus data volume not found" >&2
+  exit 1
+fi
+
+if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
+  mkfs.ext4 -F "$DATA_DEV"
+fi
+grep -q "$PROM_MOUNT" /etc/fstab || echo "$DATA_DEV $PROM_MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+mountpoint -q "$PROM_MOUNT" || mount "$PROM_MOUNT"
+chown -R 65534:65534 "$PROM_MOUNT"
+
+apt-get update -y
+apt-get install -y docker.io docker-compose-plugin curl jq
+systemctl enable --now docker
+
+OBS_ROOT=/opt/aerolvm-obs
+mkdir -p "$OBS_ROOT/grafana/dashboards" "$OBS_ROOT/grafana/provisioning/datasources" "$OBS_ROOT/grafana/provisioning/dashboards"
+
+cat > "$OBS_ROOT/docker-compose.yml" <<'COMPOSE_EOF'
+${docker_compose}
+COMPOSE_EOF
+
+echo '${prometheus_yml_b64}' | base64 -d > "$OBS_ROOT/prometheus.yml"
+
+cat > "$OBS_ROOT/grafana/provisioning/datasources/prometheus.yml" <<'DS_EOF'
+${grafana_datasource_yml}
+DS_EOF
+
+cat > "$OBS_ROOT/grafana/provisioning/dashboards/dashboards.yml" <<'DBPROV_EOF'
+${grafana_dashboards_yml}
+DBPROV_EOF
+
+%{ for name, content_b64 in dashboard_files ~}
+echo '${content_b64}' | base64 -d > "$OBS_ROOT/grafana/dashboards/${name}"
+%{ endfor ~}
+
+cat > "$OBS_ROOT/.env" <<EOF
+GRAFANA_ADMIN_PASSWORD=${grafana_admin_password}
+EOF
+chmod 600 "$OBS_ROOT/.env"
+
+cd "$OBS_ROOT"
+docker compose --env-file .env up -d
+
+echo "=== aerolvm obs bootstrap complete ==="

@@ -443,6 +443,28 @@ variable "firecracker" {
 }
 
 ###############################################################################
+# Observability stack (integration-test obs node)
+###############################################################################
+
+variable "deploy_obs" {
+  description = "When true, provision a dedicated obs EC2 (Prometheus + Grafana + Pushgateway) outside var.nodes. The integration harness sets this when the scenario advertises the observability capability."
+  type        = bool
+  default     = false
+}
+
+variable "obs_instance_type" {
+  description = "Instance type for the dedicated observability node."
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "obs_prometheus_volume_size_gb" {
+  description = "Persistent EBS volume size (GiB) for Prometheus TSDB on the obs node."
+  type        = number
+  default     = 50
+}
+
+###############################################################################
 # Observability and operational hardening
 ###############################################################################
 

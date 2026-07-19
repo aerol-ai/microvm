@@ -1,0 +1,163 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "content": "Static price map (us-east-1 on-demand ballpark): c5.metal\u2248$4.08/hr, m6i.large\u2248$0.096/hr, t3.medium\u2248$0.042/hr, t3.large\u2248$0.083/hr. **Hetero flagship (T7):** 5\u00d7c5.metal workers + 2\u00d7m6i.large ingress + 3\u00d7t3.medium servers + m6i.large obs \u2248 **~$21/hr \u2192 ~$63\u201384 for a 3\u20134h soak**. Mixed (Phase 0) is commodity validation only \u2014 never a headline source (CM-4). README comparison: ~$4k/mo self-host vs ~$12k e2b/Daytona at 100 sandboxes (illustrative).",
+        "mode": "markdown"
+      },
+      "title": "Cost board (2026-07-19, source: eng-review T7 topology)",
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(aerolvm_host_pressure_sandboxes)",
+          "legendFormat": "live sandboxes",
+          "refId": "A"
+        }
+      ],
+      "title": "Sandboxes per fleet",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(aerolvm_host_pressure_reserved_cpu_millicores) / clamp_min(sum(aerolvm_host_pressure_cpu_budget_millicores), 1)",
+          "legendFormat": "cpu util",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aerolvm_host_pressure_reserved_memory_mb) / clamp_min(sum(aerolvm_host_pressure_memory_budget_mb), 1)",
+          "legendFormat": "mem util",
+          "refId": "B"
+        }
+      ],
+      "title": "CPU reserved / budget",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "aerolvm",
+    "cost"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(aerolvm_host_pressure_sandboxes, instance)",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "runtime",
+        "type": "custom",
+        "query": "containerd,gvisor,wasm,isolate,firecracker,docker",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "scenario",
+        "type": "custom",
+        "query": "cluster-mixed-benchmark-with-obs,cluster-hetero-benchmark-with-obs",
+        "current": {
+          "text": "cluster-mixed-benchmark-with-obs",
+          "value": "cluster-mixed-benchmark-with-obs"
+        },
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "D11 Cost & Efficiency",
+  "uid": "aerolvm-d11-cost",
+  "version": 1
+}

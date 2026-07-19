@@ -4,6 +4,7 @@ import (
 	"expvar"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -72,6 +73,75 @@ func (b *DurationBuckets) Count() int64 {
 		total += b.Value(label)
 	}
 	return total
+}
+
+// NestedDurationBuckets is a two-level expvar histogram: the outer map key
+// is a caller label (e.g. create stage name) and inner keys are le_* buckets.
+// The observability scraper emits these as key/key2 Prometheus labels.
+type NestedDurationBuckets struct {
+	root   *expvar.Map
+	bounds []time.Duration
+	labels []string
+	cache  sync.Map // normalized label -> *expvar.Map
+}
+
+func NewNestedDurationBuckets(name string, bounds ...time.Duration) *NestedDurationBuckets {
+	if len(bounds) == 0 {
+		bounds = DefaultDurationBuckets
+	}
+	cp := make([]time.Duration, len(bounds))
+	copy(cp, bounds)
+	labels := make([]string, 0, len(cp)+1)
+	for _, bound := range cp {
+		labels = append(labels, durationLabel(bound))
+	}
+	labels = append(labels, "le_inf")
+	return &NestedDurationBuckets{
+		root:   expvar.NewMap(name),
+		bounds: cp,
+		labels: labels,
+	}
+}
+
+func (n *NestedDurationBuckets) Observe(label string, elapsed time.Duration) {
+	if n == nil || n.root == nil || strings.TrimSpace(label) == "" {
+		return
+	}
+	m := n.bucketsFor(Key(label))
+	for i, bound := range n.bounds {
+		if elapsed <= bound {
+			m.Add(n.labels[i], 1)
+			return
+		}
+	}
+	m.Add("le_inf", 1)
+}
+
+func (n *NestedDurationBuckets) bucketsFor(key string) *expvar.Map {
+	if v, ok := n.cache.Load(key); ok {
+		return v.(*expvar.Map)
+	}
+	sub := new(expvar.Map).Init()
+	for _, label := range n.labels {
+		sub.Add(label, 0)
+	}
+	if actual, loaded := n.cache.LoadOrStore(key, sub); loaded {
+		return actual.(*expvar.Map)
+	}
+	n.root.Set(key, sub)
+	return sub
+}
+
+// Value returns the bucket count for a label pair (tests and diagnostics).
+func (n *NestedDurationBuckets) Value(label, bucket string) int64 {
+	if n == nil || n.root == nil {
+		return 0
+	}
+	sub, ok := n.root.Get(Key(label)).(*expvar.Map)
+	if !ok || sub == nil {
+		return 0
+	}
+	return IntValue(sub.Get(bucket))
 }
 
 func Add(m *expvar.Map, key string, delta int64) {
