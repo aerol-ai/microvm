@@ -26,7 +26,7 @@ require (
 
 require (
 	github.com/containerd/containerd v1.7.34
-	github.com/containerd/containerd/api v1.8.0
+	github.com/containerd/containerd/api v1.11.1
 	github.com/containerd/platforms v0.2.1
 	github.com/containerd/typeurl/v2 v2.3.0
 	github.com/distribution/reference v0.6.0
