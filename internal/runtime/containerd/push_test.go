@@ -3,11 +3,63 @@ package containerd
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// TestPushSourceCandidatesLatestFallback locks in the snapshot-push fix: a
+// tagless source (the bare snapshot name the reconciler passes) must fall back
+// to "<name>:latest", because CreateSnapshot commits the local image as
+// "<name>:latest". Without the fallback, livePush's exact-match GetImage failed
+// "image not found", the snapshot never reached AOCR, and cross-node
+// create-from-snapshot broke (UC-21). An already-tagged/digested ref is used
+// as-is so we never invent a spurious ":latest" candidate.
+func TestPushSourceCandidatesLatestFallback(t *testing.T) {
+	cases := []struct {
+		name   string
+		source string
+		want   []string
+	}{
+		{
+			name:   "tagless snapshot name falls back to :latest",
+			source: "cluster-x-testsnap-1700000000-snap",
+			want:   []string{"cluster-x-testsnap-1700000000-snap", "cluster-x-testsnap-1700000000-snap:latest"},
+		},
+		{
+			name:   "already-tagged ref used as-is",
+			source: "cluster-x-testsnap-1700000000-snap:latest",
+			want:   []string{"cluster-x-testsnap-1700000000-snap:latest"},
+		},
+		{
+			name:   "versioned tag used as-is",
+			source: "repo/app:v1",
+			want:   []string{"repo/app:v1"},
+		},
+		{
+			// The registry host:port colon must NOT be mistaken for a tag, so a
+			// tagless AOCR-style repo still gets the :latest fallback.
+			source: "aocr.aerol.ai:443/cluster/prod/snapshots/s-snap",
+			name:   "registry host:port with tagless repo still falls back",
+			want:   []string{"aocr.aerol.ai:443/cluster/prod/snapshots/s-snap", "aocr.aerol.ai:443/cluster/prod/snapshots/s-snap:latest"},
+		},
+		{
+			name:   "digest ref used as-is",
+			source: "repo/app@sha256:abc123",
+			want:   []string{"repo/app@sha256:abc123"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pushSourceCandidates(tc.source)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("pushSourceCandidates(%q) = %v, want %v", tc.source, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestRegistryPusherPushImage(t *testing.T) {
 	p := NewRegistryPusher(nil)

@@ -71,7 +71,19 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 	if err != nil {
 		return "", fmt.Errorf("containerd push: %w", err)
 	}
-	img, err := client.GetImage(ctx, source)
+	// Snapshots are committed locally as "<name>:latest" (formatSnapshotImageRef
+	// normalizes a tagless name), but the snapshot-push reconciler passes the
+	// bare "<name>". GetImage is exact-match, so a single bare lookup missed and
+	// every containerd snapshot push failed "image not found" — the image never
+	// reached AOCR and cross-node create-from-snapshot broke (single-node found
+	// it locally and never needed the push). Try the exact ref, then
+	// "<name>:latest", mirroring the create/pull path (ImageExists / ensureImage).
+	var img cntr.Image
+	for _, candidate := range pushSourceCandidates(source) {
+		if img, err = client.GetImage(ctx, candidate); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return "", fmt.Errorf("containerd push: get %s: %w", source, err)
 	}
@@ -120,6 +132,21 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 		return "", fmt.Errorf("containerd push %s -> %s: %w", source, dest, err)
 	}
 	return string(target.Digest), nil
+}
+
+// pushSourceCandidates lists the local image refs livePush tries, in order, to
+// resolve the source image to upload. Snapshots are committed as "<name>:latest"
+// (formatSnapshotImageRef normalizes a tagless name), but the snapshot-push
+// reconciler passes the bare "<name>"; containerd's GetImage is exact-match, so
+// without the ":latest" fallback the push failed "image not found" and the
+// snapshot never reached AOCR, breaking cross-node create-from-snapshot. Mirrors
+// the create/pull path's exact-then-":latest" resolution (see ImageExists). A
+// ref that already carries a tag or digest is used as-is.
+func pushSourceCandidates(source string) []string {
+	if refHasTag(source) {
+		return []string{source}
+	}
+	return []string{source, source + ":latest"}
 }
 
 // pushCredScopeHost resolves the single registry host that push credentials may
