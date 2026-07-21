@@ -796,13 +796,6 @@ func TestBenchCreateLatency(t *testing.T) {
 		var apiD, runD, serverD []time.Duration
 		stageD := map[string][]time.Duration{}
 		failures := 0
-		// Sandboxes created for THIS runtime's samples, torn down before the next
-		// runtime starts. Without this, a 6-runtime sweep accumulated all
-		// samples×runtimes sandboxes at once (t.Cleanup only fires when the whole
-		// test returns), so the tail runtimes starved with "no worker placement
-		// target available". Within a runtime the batch stays resident, so warm-
-		// pool hit latency is still measured faithfully.
-		var batchIDs []string
 		for i := 0; i < samples; i++ {
 			opts := benchCreateOptions(t, br)
 
@@ -816,10 +809,9 @@ func TestBenchCreateLatency(t *testing.T) {
 				t.Logf("bench[%s] sample %d create failed: %v", br.runtime, i, err)
 				continue
 			}
-			// Guaranteed teardown even on a panic/fatal in the loop (double-destroy
-			// with the per-runtime batch teardown below is a harmless 404).
+			// Panic/fatal safety net; the in-loop destroy below is the normal
+			// teardown path (a double-destroy is a harmless 404).
 			id := sb.ID
-			batchIDs = append(batchIDs, id)
 			t.Cleanup(func() { destroyBest(c, id) })
 
 			if waitRunningTimed(t, sb) {
@@ -842,10 +834,17 @@ func TestBenchCreateLatency(t *testing.T) {
 					stageD[name] = append(stageD[name], time.Duration(ms*float64(time.Millisecond)))
 				}
 			}
-		}
 
-		// Free this runtime's capacity before measuring the next one.
-		destroyAll(c, batchIDs)
+			// Free capacity immediately: this sample's create + running latency
+			// is already recorded, so the sandbox never needs to stay resident.
+			// Holding all `samples` sandboxes resident over-subscribed a small
+			// (t3.large, 10x-overprovision) cluster — once the warm pools plus
+			// the resident batch filled the per-node CPU budget, the tail samples
+			// failed with "cluster: no worker placement target available".
+			// Sequential create latency needs at most one live sandbox at a time;
+			// the warm pool refills between samples.
+			destroyBest(c, id)
+		}
 
 		if len(apiD) == 0 {
 			t.Errorf("bench[%s]: every create sample failed", br.runtime)
