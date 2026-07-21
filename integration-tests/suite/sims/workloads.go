@@ -118,9 +118,15 @@ func runServerlessWakeSim(ctx *RunContext) Result {
 	}
 	trueVal := true
 	sb, err := ctx.Client.SDK().Create(context.Background(), sdktypes.CreateSandboxOptions{
-		Name:               harness.UniqueName(ctx.Scenario, ctx.T),
-		Image:              "hashicorp/http-echo:1.0",
-		ContainerCommand:   []string{"-text=awake", "-listen=:8080"},
+		Name:  harness.UniqueName(ctx.Scenario, ctx.T),
+		Image: "hashicorp/http-echo:1.0",
+		// ContainerCommand is the FULL argv the toolbox execs — it replaces the
+		// image ENTRYPOINT (both docker and containerd drivers set the container
+		// entrypoint to the toolbox shim and pass this as the argv it runs). So
+		// argv[0] must be the http-echo binary, not a bare flag; passing just
+		// "-text=..." makes the toolbox try to exec "-text=awake" → the main
+		// process never starts and :8080 gets connection-refused.
+		ContainerCommand:   []string{"/http-echo", "-text=awake", "-listen=:8080"},
 		AllowPublicTraffic: &trueVal,
 		Lifecycle: &sdktypes.Lifecycle{
 			StopIfIdleFor: 30 * time.Second,
