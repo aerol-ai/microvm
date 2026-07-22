@@ -220,6 +220,17 @@ stage_wasm_modules() {
   local ip tgt i alias ref file
   for ip in "${ips[@]}"; do
     tgt="ubuntu@${ip}"
+    # Block until THIS node's user-data finished before touching its sandboxd.
+    # The domain branch only waits on DNS/TLS/health, which proves the SEED
+    # answers (Caddy fronts the API) — a joiner can still be mid-bootstrap here.
+    # install.sh writes+enables the sandboxd unit late, so a restart that races
+    # it fails "Unit sandboxd.service not found" and aborts the whole scenario
+    # as inconclusive. cloud-init status --wait is idempotent and returns at
+    # once on an already-finished box, so this only costs time on the real race.
+    if ! wait_for_cloud_init "$tgt"; then
+      echo "stage_wasm: ${tgt} cloud-init did not finish" >&2
+      return 1
+    fi
     if ! ssh "${SSH_OPTS[@]}" "$tgt" "sudo mkdir -p '${modules_dir}'"; then
       echo "stage_wasm: mkdir ${modules_dir} on ${tgt} failed" >&2
       return 1
