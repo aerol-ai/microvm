@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -73,11 +74,28 @@ func runHyperparamFarm(ctx *RunContext) Result {
 		go func() {
 			defer wg.Done()
 			acc := fmt.Sprintf("0.%d42", i+5)
-			sb, err := ctx.Client.SDK().Create(context.Background(), sdktypes.CreateSandboxOptions{
-				Name:             harness.UniqueName(ctx.Scenario, ctx.T) + fmt.Sprintf("-train-%d", i),
-				Image:            "alpine:3.20",
-				ContainerCommand: []string{"sh", "-c", "sleep 1; echo accuracy=" + acc},
-			})
+			// A 3-wide concurrent create burst can momentarily exceed a node's
+			// pending-reservation budget on this small benchmark cluster: the
+			// warm pools already hold most of the per-node CPU-budget slots, so
+			// one trainer can lose the race for the last slot even though
+			// capacity frees the instant an in-flight create resolves. Real
+			// hyperparameter fan-out retries these transient admission
+			// rejections — without it a single one flakes the whole farm. Stagger
+			// the retry (grows with attempt) so the trainers don't re-collide on
+			// the same freed slot. Non-transient errors fail fast.
+			var sb *microvm.Sandbox
+			var err error
+			for attempt := 0; attempt < 4; attempt++ {
+				sb, err = ctx.Client.SDK().Create(context.Background(), sdktypes.CreateSandboxOptions{
+					Name:             harness.UniqueName(ctx.Scenario, ctx.T) + fmt.Sprintf("-train-%d", i),
+					Image:            "alpine:3.20",
+					ContainerCommand: []string{"sh", "-c", "sleep 1; echo accuracy=" + acc},
+				})
+				if err == nil || !isTransientCapacity(err) {
+					break
+				}
+				time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			}
 			if err != nil {
 				ch <- outcome{err: err}
 				return
@@ -231,4 +249,21 @@ PY`
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
+// isTransientCapacity reports whether a create error is a transient cluster
+// admission rejection — a concurrent burst momentarily exceeding a node's
+// pending-reservation budget — that clears with a brief backoff, as opposed to
+// a hard/permanent failure. Matched on the message because the SDK surfaces the
+// server's admission-control error as a plain error string. Kept narrow so a
+// real bug (bad image, auth, malformed request) still fails the sim fast.
+func isTransientCapacity(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "target capacity exceeded") ||
+		strings.Contains(m, "pending reservations") ||
+		strings.Contains(m, "no worker placement target") ||
+		strings.Contains(m, "cannot fit sandbox")
 }
