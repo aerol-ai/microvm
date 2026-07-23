@@ -645,3 +645,25 @@ func TestReconcileReInspectsBeforeReap(t *testing.T) {
 		}
 	})
 }
+
+// TestReconcileGoneContainerConfirmedFallsThrough covers the guard's
+// fall-through-to-reap paths that the Reconcile-level test can't reach: a nil
+// row, and a sandbox whose runtime driver isn't registered (Inspect can't be
+// attempted). Both must report "confirmed gone" so a row is never pinned
+// forever by a nil entry or a missing driver.
+func TestReconcileGoneContainerConfirmedFallsThrough(t *testing.T) {
+	svc := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx := context.Background()
+
+	if !svc.reconcileGoneContainerConfirmed(ctx, nil) {
+		t.Fatal("nil sandbox must be treated as confirmed gone")
+	}
+
+	// Engine=containerd with no containerd driver registered → runtimeForSandbox
+	// returns ErrContainerEngineNotRegistered, so there is no runtime to
+	// re-Inspect with; the guard must fall through to the reap.
+	orphan := &models.Sandbox{ID: "sb-nodriver", Runtime: models.RuntimeDocker, Engine: models.ContainerEngineContainerd}
+	if !svc.reconcileGoneContainerConfirmed(ctx, orphan) {
+		t.Fatal("sandbox with an unregistered runtime driver must be treated as confirmed gone")
+	}
+}
