@@ -25,7 +25,11 @@ import (
 // if reached, so a future refactor that starts calling them in reconcile fails
 // the test instead of silently passing.
 type fakeReconcileRuntime struct {
-	managed               map[string]*models.SandboxRuntimeState
+	managed map[string]*models.SandboxRuntimeState
+	// inspect backs the reconcile guard's targeted re-Inspect (a container the
+	// bulk ListManaged snapshot missed). Keyed by runtime ref; a ref absent
+	// here returns a not-found error, i.e. "container is durably gone".
+	inspect               map[string]*models.SandboxRuntimeState
 	removeImageHits       atomic.Int32
 	networkBlockAllCalls  []string
 	allowPushAllowedPorts bool
@@ -62,8 +66,11 @@ func (f *fakeReconcileRuntime) Destroy(context.Context, *models.Sandbox) error {
 func (f *fakeReconcileRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("unexpected Resize on reconcile destroyed path")
 }
-func (f *fakeReconcileRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
-	panic("unexpected Inspect on reconcile destroyed path")
+func (f *fakeReconcileRuntime) Inspect(_ context.Context, ref string) (*models.SandboxRuntimeState, error) {
+	if st, ok := f.inspect[ref]; ok {
+		return st, nil
+	}
+	return nil, errors.New("container not found")
 }
 func (f *fakeReconcileRuntime) Ping(context.Context) error {
 	panic("unexpected Ping on reconcile destroyed path")
@@ -241,6 +248,8 @@ func TestReconcileDestroyedRowFreesHostPort(t *testing.T) {
 	)
 
 	// Seed: a started sandbox with one TCP exposure holding host_port=22500.
+	// rt.managed is empty and rt.inspect has no entry, so the reconcile guard's
+	// re-Inspect returns "container not found" → durably gone → reaped.
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
 		ID:           sandboxID,
@@ -541,5 +550,120 @@ func TestDieEventDoesNotDeleteRow(t *testing.T) {
 	}
 	if rt.removeImageHits.Load() != 0 {
 		t.Fatalf("die must not GC image, got %d hits", rt.removeImageHits.Load())
+	}
+}
+
+// TestReconcileReInspectsBeforeReap is the UC-20 regression. The reconcile
+// "container gone" branch reaps a row (and, in cluster mode, its FSM placement)
+// when the sandbox ID is absent from the bulk ListManaged snapshot. That
+// snapshot is one racy read per tick whose per-container Inspect silently skips
+// a container it can't read at that instant (mid-adopt/mid-start). Pre-fix the
+// reap fired on that single miss, deleting a healthy sandbox's row and surfacing
+// as an intermittent cross-node snapshot 404. Post-fix a targeted re-Inspect
+// that still resolves the container spares the row; a genuinely-gone container
+// (Inspect error / empty identity) is still reaped.
+func TestReconcileReInspectsBeforeReap(t *testing.T) {
+	newSvc := func(rt *fakeReconcileRuntime) (*Service, *store.Store) {
+		dbPath := filepath.Join(t.TempDir(), "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
+			RootDir:     filepath.Join(t.TempDir(), "mounts"),
+			CredDir:     filepath.Join(t.TempDir(), "cred"),
+			WaitTimeout: time.Second,
+		})
+		if err != nil {
+			t.Fatalf("mounts.New: %v", err)
+		}
+		t.Cleanup(mgr.Close)
+		svc := &Service{
+			cfg:    config.Config{ImageBuildGCEnabled: true},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			store:  st,
+			docker: rt,
+			caddy: caddy.New(config.Config{
+				EnableCaddy:       false,
+				HTTPClientTimeout: time.Second,
+			}),
+			mounts: mgr,
+		}
+		return svc, st
+	}
+
+	seed := func(st *store.Store, id string) {
+		now := time.Now().UTC()
+		if err := st.Create(context.Background(), &models.Sandbox{
+			ID:           id,
+			Image:        "ubuntu:22.04",
+			Status:       models.SandboxStatusStarted,
+			ContainerID:  "ctr-" + id,
+			ContainerIP:  "10.0.0.5",
+			Runtime:      models.RuntimeDocker,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			LastActiveAt: now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	ctx := context.Background()
+
+	// Bulk snapshot missed it, but a targeted re-Inspect resolves the container
+	// (non-empty runtime identity) — the exact UC-20 race. Must NOT be reaped.
+	t.Run("re-inspect resolves container -> spared", func(t *testing.T) {
+		rt := &fakeReconcileRuntime{
+			managed: map[string]*models.SandboxRuntimeState{},
+			inspect: map[string]*models.SandboxRuntimeState{
+				"ctr-sb-settling": {SandboxID: "sb-settling", ContainerID: "ctr-sb-settling", Status: models.SandboxStatusStarted},
+			},
+		}
+		svc, st := newSvc(rt)
+		seed(st, "sb-settling")
+		if err := svc.Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if _, err := st.Get(ctx, "sb-settling"); err != nil {
+			t.Fatalf("sandbox with a re-inspectable container was reaped on a stale bulk snapshot: %v", err)
+		}
+	})
+
+	// Absent from ListManaged AND re-Inspect returns not-found: durably gone,
+	// cleanup must still run so orphan rows don't accumulate.
+	t.Run("re-inspect not-found -> reaped", func(t *testing.T) {
+		rt := &fakeReconcileRuntime{managed: map[string]*models.SandboxRuntimeState{}}
+		svc, st := newSvc(rt)
+		seed(st, "sb-dead")
+		if err := svc.Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if _, err := st.Get(ctx, "sb-dead"); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("durably-gone sandbox should be reaped, got err=%v", err)
+		}
+	})
+}
+
+// TestReconcileGoneContainerConfirmedFallsThrough covers the guard's
+// fall-through-to-reap paths that the Reconcile-level test can't reach: a nil
+// row, and a sandbox whose runtime driver isn't registered (Inspect can't be
+// attempted). Both must report "confirmed gone" so a row is never pinned
+// forever by a nil entry or a missing driver.
+func TestReconcileGoneContainerConfirmedFallsThrough(t *testing.T) {
+	svc := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx := context.Background()
+
+	if !svc.reconcileGoneContainerConfirmed(ctx, nil) {
+		t.Fatal("nil sandbox must be treated as confirmed gone")
+	}
+
+	// Engine=containerd with no containerd driver registered → runtimeForSandbox
+	// returns ErrContainerEngineNotRegistered, so there is no runtime to
+	// re-Inspect with; the guard must fall through to the reap.
+	orphan := &models.Sandbox{ID: "sb-nodriver", Runtime: models.RuntimeDocker, Engine: models.ContainerEngineContainerd}
+	if !svc.reconcileGoneContainerConfirmed(ctx, orphan) {
+		t.Fatal("sandbox with an unregistered runtime driver must be treated as confirmed gone")
 	}
 }
