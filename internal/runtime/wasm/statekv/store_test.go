@@ -88,3 +88,26 @@ func TestErrNotFound(t *testing.T) {
 		t.Fatal("ErrNotFound should have a message")
 	}
 }
+
+func TestNewSQLiteStore_Constructor(t *testing.T) {
+	// NewSQLiteStore wraps a (possibly nil) store pointer; the important
+	// invariant is that the returned *SQLiteStore is non-nil and that
+	// calling any method on it with a nil inner store returns the
+	// "not configured" sentinel error rather than panicking.
+	s := NewSQLiteStore(nil)
+	if s == nil {
+		t.Fatal("NewSQLiteStore(nil) must return a non-nil *SQLiteStore")
+	}
+	if _, _, err := s.Get(nil, "sb", "k"); err == nil { //nolint:staticcheck
+		t.Fatal("Get with nil inner store should return error")
+	}
+	if err := s.Set(nil, "sb", "k", []byte("v")); err == nil { //nolint:staticcheck
+		t.Fatal("Set with nil inner store should return error")
+	}
+	if err := s.Delete(nil, "sb", "k"); err == nil { //nolint:staticcheck
+		t.Fatal("Delete with nil inner store should return error")
+	}
+	if _, err := s.ListKeys(nil, "sb"); err == nil { //nolint:staticcheck
+		t.Fatal("ListKeys with nil inner store should return error")
+	}
+}
