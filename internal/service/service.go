@@ -3729,6 +3729,33 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	s.logger.Info("capacity reservations replayed", "count", replayed)
 }
 
+// reconcileGoneContainerConfirmed reports whether a sandbox absent from the
+// bulk ListManaged snapshot is DURABLY gone and safe to reap (which deletes the
+// store row and, in cluster mode, the FSM placement). ListManaged is one racy
+// read per tick whose per-container Inspect silently skips a container it can't
+// read at that instant (mid-adopt/mid-start — see the `if err != nil` continue
+// in the containerd driver's ListManaged). Reaping on that single miss drops a
+// healthy sandbox's row and its cluster placement, which surfaced as an
+// intermittent cross-node snapshot 404 (UC-20). So re-verify with a direct,
+// targeted Inspect before destroying: a container the driver can still resolve
+// (non-empty runtime identity, no error) is NOT gone — the bulk snapshot was
+// stale — so spare it and let the next steady-state pass adopt it. A missing
+// driver, an Inspect error, or an empty identity all fall through to the reap,
+// so a genuinely-dead container is still cleaned up on this pass.
+func (s *Service) reconcileGoneContainerConfirmed(ctx context.Context, sandbox *models.Sandbox) bool {
+	if sandbox == nil {
+		return true
+	}
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return true
+	}
+	if st, err := rt.Inspect(ctx, s.runtimeRef(sandbox)); err == nil && st != nil && st.ContainerID != "" {
+		return false
+	}
+	return true
+}
+
 func (s *Service) Reconcile(ctx context.Context) error {
 	// Topology heartbeat: surface a cluster that has crossed the
 	// 10-ingress-node sharding threshold without operator opt-in to
@@ -3854,6 +3881,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 						_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 					}
 				}
+				continue
+			}
+			// The bulk ListManaged snapshot missed this row, but that is one racy
+			// read per tick — its per-container Inspect silently skips a
+			// container it can't read at that instant (mid-adopt/mid-start).
+			// Re-verify with a targeted Inspect before the destructive teardown
+			// below, which deletes the row AND the FSM placement
+			// (deleteSelfOwnedClusterPlacement): reaping a container that is
+			// actually still there turns a transient miss into permanent loss and
+			// an intermittent cross-node snapshot 404 on a healthy sandbox
+			// (UC-20). Confirmed-gone (error / no such container) still reaps.
+			if !s.reconcileGoneContainerConfirmed(ctx, sandbox) {
 				continue
 			}
 			// Container is gone (manual `docker rm`, OOM kill, host reboot,
