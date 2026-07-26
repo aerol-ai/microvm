@@ -54,8 +54,12 @@ func totalMemoryMB() (int, error) {
 	return readMeminfoField("MemTotal")
 }
 
+// meminfoPath is the /proc/meminfo source. Tests override it to a fixture
+// file so Linux coverage does not depend on the live host's meminfo shape.
+var meminfoPath = "/proc/meminfo"
+
 func readMeminfoField(field string) (int, error) {
-	f, err := os.Open("/proc/meminfo")
+	f, err := os.Open(meminfoPath)
 	if err != nil {
 		return 0, err
 	}

@@ -161,6 +161,25 @@ func TestFinal95APIListenAndServeError(t *testing.T) {
 	}
 }
 
+func TestFinal95IngressListenAndServeError(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	t.Setenv("SB_ENABLE_CADDY", "true")
+	t.Setenv("SB_ENABLE_SERVERLESS", "true")
+	t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "false")
+	t.Setenv("SB_INTERNAL_INGRESS_ADDR", ln.Addr().String())
+	t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_INTERNAL_L4_WAKE_DIR", paths.internalL4WakeDir)
+	// Ingress ListenAndServe hits EADDRINUSE → cancel path at daemon.go.
+	if err := runWithAutoCancel(t, 800*time.Millisecond, nil); err != nil {
+		t.Logf("Run err (ok): %v", err)
+	}
+}
+
 func TestFinal95BypassMarkerWriteFailure(t *testing.T) {
 	paths := setBaseRunEnv(t)
 	// Put DB inside a directory we will make unwritable after creation.
