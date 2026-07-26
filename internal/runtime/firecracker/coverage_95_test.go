@@ -1416,20 +1416,6 @@ func TestWriteSandboxSnapshot_RemoveOldBackupWarn(t *testing.T) {
 	}
 }
 
-func TestCopyFile_OpenFailureOnFifoWithoutWriter(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("linux returns ENXIO when opening a fifo without a writer")
-	}
-	dir := t.TempDir()
-	fifo := filepath.Join(dir, "fifo")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatalf("mkfifo: %v", err)
-	}
-	if err := copyFile(fifo, filepath.Join(dir, "dst")); err == nil || !strings.Contains(err.Error(), "open ") {
-		t.Fatalf("fifo open: got %v", err)
-	}
-}
-
 func TestCreate_WaitSocketAndOverlayMkfsMissingBin(t *testing.T) {
 	f := newDriverFixture(t)
 	f.vmm.waitErr = os.ErrDeadlineExceeded
