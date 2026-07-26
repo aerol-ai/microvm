@@ -186,6 +186,26 @@ func TestEncryptWithAADRandomSourceError(t *testing.T) {
 	}
 }
 
+func TestLoadOrGenerateKeyMkdirAndRandErrors(t *testing.T) {
+	dir := t.TempDir()
+	// Parent path is a file → MkdirAll fails.
+	parent := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrGenerateKey("", filepath.Join(parent, "key")); err == nil {
+		t.Fatal("want mkdir error when parent is a file")
+	}
+
+	// Fresh path + broken entropy → generate-key ReadFull fails.
+	old := randReader
+	randReader = errReader{}
+	defer func() { randReader = old }()
+	if _, err := loadOrGenerateKey("", filepath.Join(dir, "fresh-key")); err == nil {
+		t.Fatal("want generate-key error when randReader fails")
+	}
+}
+
 func TestCipherAAD(t *testing.T) {
 	keyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
 	c, _ := NewCipher(keyB64, "")

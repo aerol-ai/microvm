@@ -88,11 +88,11 @@ func TestSupervisor_Respawn(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 
-	// wait for it to finish and respawn
-	time.Sleep(100 * time.Millisecond)
-
-	count := s.SpawnCount(sb)
-	if count < 2 {
+	deadline := time.Now().Add(time.Second)
+	for s.SpawnCount(sb) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if count := s.SpawnCount(sb); count < 2 {
 		t.Fatalf("expected it to respawn, got count %d", count)
 	}
 

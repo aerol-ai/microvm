@@ -734,16 +734,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			// flag. The reconciler then picks it up on its next sweep, calls
 			// AOCR ImportAPI, and clears the flag on success. Worker-only:
 			// non-worker nodes never pull sandbox images.
-			dockerClient.SetPullObserver(func(obsCtx context.Context, sandboxID string) {
-				// Use a fresh short-deadline context: the pull's ctx may be
-				// cancelled before this fires (Docker ack races container
-				// start), and a SQLite UPDATE is local and quick.
-				flagCtx, flagCancel := context.WithTimeout(context.Background(), 2*time.Second)
-				defer flagCancel()
-				if err := db.SetAutoImportPending(flagCtx, sandboxID, true); err != nil {
-					logger.Warn("auto-import: flag pending failed; reconciler will not retry",
-						"sandbox_id", sandboxID, "error", err)
-				}
+			dockerClient.SetPullObserver(func(_ context.Context, sandboxID string) {
+				flagSandboxAutoImportPending(db, logger, sandboxID)
 			})
 		}
 	}
@@ -1075,6 +1067,21 @@ func nonEmptyHosts(hosts []string) []string {
 // reconciler's `retryOne` will clear the flag with reason `no spec`. That's
 // the right behavior: without a replicated spec there's no recreate path that
 // could benefit from the import anyway.
+// flagSandboxAutoImportPending marks a sandbox for AOCR import after a
+// mirrored private pull. Extracted so tests can cover the SQLite failure
+// path without driving a real docker pull through Run.
+func flagSandboxAutoImportPending(db *store.Store, logger *slog.Logger, sandboxID string) {
+	// Use a fresh short-deadline context: the pull's ctx may be cancelled
+	// before this fires (Docker ack races container start), and a SQLite
+	// UPDATE is local and quick.
+	flagCtx, flagCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer flagCancel()
+	if err := db.SetAutoImportPending(flagCtx, sandboxID, true); err != nil {
+		logger.Warn("auto-import: flag pending failed; reconciler will not retry",
+			"sandbox_id", sandboxID, "error", err)
+	}
+}
+
 func startAutoImportReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service) {
 	if !cfg.AutoImportEnabled {
 		return
@@ -1255,6 +1262,13 @@ func startTemplateRotationReconciler(ctx context.Context, logger *slog.Logger, c
 		return
 	}
 	if !rotCfg.IsEnabled() {
+		return
+	}
+	// Guard before wrapping: a nil *Store inside TemplateRotationStoreAdapter
+	// is a non-nil interface value, so NewTemplateRotationReconciler's
+	// store==nil check would miss it and panic on the first RunOnce.
+	if db == nil || svc == nil {
+		logger.Warn("template rotation: store and service are required; feature stays off")
 		return
 	}
 	adapter := &service.TemplateRotationStoreAdapter{Store: db}

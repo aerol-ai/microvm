@@ -2,6 +2,7 @@ package e2b
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,11 +13,13 @@ import (
 	"net/http/httptest"
 	neturl "net/url"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -468,6 +471,7 @@ type fakeE2BRuntime struct {
 	errCreateSnapshot error
 	onCreateChan      chan struct{}
 	blockCreate       chan struct{}
+	afterCreate       func()
 }
 
 func newFakeE2BRuntime() *fakeE2BRuntime {
@@ -505,6 +509,9 @@ func (f *fakeE2BRuntime) Create(_ context.Context, _ models.CreateSandboxRequest
 		Status:      models.SandboxStatusStarted,
 	}
 	f.states[sandboxID] = cloneRuntimeState(state)
+	if f.afterCreate != nil {
+		f.afterCreate()
+	}
 	return cloneRuntimeState(state), nil
 }
 
@@ -632,6 +639,16 @@ func sanitizeSnapshotID(value string) string {
 
 func newE2BHandlerTestEnv(t *testing.T) (*service.Service, *store.Store, http.Handler) {
 	return newE2BHandlerTestEnvWithRuntime(t, newFakeE2BRuntime(), config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: 2280})
+}
+
+func execStoreSQL(t *testing.T, st *store.Store, query string) {
+	t.Helper()
+	rv := reflect.ValueOf(st).Elem()
+	field := rv.FieldByName("db")
+	db := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Interface().(*sql.DB)
+	if _, err := db.ExecContext(context.Background(), query); err != nil {
+		t.Fatalf("exec %q: %v", query, err)
+	}
 }
 
 func newE2BHandlerTestEnvWithRuntime(t *testing.T, runtime *fakeE2BRuntime, cfg config.Config) (*service.Service, *store.Store, http.Handler) {

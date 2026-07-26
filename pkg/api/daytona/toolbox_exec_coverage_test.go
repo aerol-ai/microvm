@@ -122,6 +122,130 @@ func newToolboxExecEnv(t *testing.T) (facadeURL, sandboxID string) {
 	return facadeServer.URL, sandboxID
 }
 
+func TestToolboxExecuteCommand_StderrFallback(t *testing.T) {
+	facadeURL, id := newToolboxExecEnvWithHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"stdout":"","stderr":"fallback-value","exit_code":1,"duration_ms":1}`)
+	})
+
+	resp, err := http.Post(
+		facadeURL+ToolboxPrefix+"/"+id+"/process/execute",
+		"application/json",
+		strings.NewReader(`{"command":"false"}`),
+	)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "fallback-value") {
+		t.Fatalf("response = %s", body)
+	}
+}
+
+func TestToolboxBulkDownload_RequestError(t *testing.T) {
+	svc, st, _, _ := newHandlerExtraTestEnv(t)
+	h := newHandlers(Deps{Service: svc, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	now := time.Now().UTC()
+	if err := st.Upsert(context.Background(), &models.Sandbox{
+		ID: "sb-dl-err", Name: "sb-dl-err", Status: models.SandboxStatusStarted,
+		ContainerIP: "127.0.0.1", ToolboxEnabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/files/bulk-download", strings.NewReader(`{"paths":["/a.txt"]}`))
+	h.bulkDownload(rr, req, "sb-dl-err")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+}
+
+func newToolboxExecEnvWithHandler(t *testing.T, executeFn http.HandlerFunc) (facadeURL, sandboxID string) {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/process/execute", executeFn)
+	mux.HandleFunc("/files/download", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = io.WriteString(w, "ok")
+	})
+	mux.HandleFunc("/files/upload", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseMultipartForm(1 << 20)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	toolboxServer := httptest.NewServer(mux)
+	t.Cleanup(toolboxServer.Close)
+
+	host, portText, err := net.SplitHostPort(mustParseURL(t, toolboxServer.URL).Host)
+	if err != nil {
+		t.Fatalf("split toolbox host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse toolbox port: %v", err)
+	}
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mountManager, err := mounts.New(logger, mounts.Config{
+		RootDir:     filepath.Join(dir, "mounts"),
+		CredDir:     filepath.Join(dir, "cred"),
+		WaitTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("mounts.New: %v", err)
+	}
+	t.Cleanup(mountManager.Close)
+
+	cfg := config.Config{
+		DBPath:            filepath.Join(dir, "state.db"),
+		PublicHost:        "sandbox.test",
+		ToolboxPort:       port,
+		Runtime:           models.RuntimeDocker,
+		EnableCaddy:       false,
+		HTTPClientTimeout: 5 * time.Second,
+	}
+	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, mountManager, nil)
+
+	sandboxID = "sb-exec-stderr"
+	now := time.Now().UTC().Round(time.Second)
+	if err := st.Upsert(context.Background(), &models.Sandbox{
+		ID:             sandboxID,
+		Name:           sandboxID,
+		Image:          "ubuntu:22.04",
+		Status:         models.SandboxStatusStarted,
+		ContainerID:    "ctr-" + sandboxID,
+		ContainerIP:    host,
+		ToolboxEnabled: true,
+		ToolboxToken:   "tok-exec",
+		Runtime:        models.RuntimeDocker,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActiveAt:   now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	mux2 := http.NewServeMux()
+	RegisterRoutes(mux2, Deps{
+		Service: svc,
+		Logger:  logger,
+		Auth:    func(next http.Handler) http.Handler { return next },
+	})
+	facadeServer := httptest.NewServer(mux2)
+	t.Cleanup(facadeServer.Close)
+	return facadeServer.URL, sandboxID
+}
+
 func TestToolboxExecuteCommand(t *testing.T) {
 	facadeURL, id := newToolboxExecEnv(t)
 

@@ -24,6 +24,11 @@ type testOCIRegistry struct {
 	mu        sync.Mutex
 	blobs     map[string][]byte
 	manifests map[string][]byte // keyed by "repo/tag-or-digest"
+	// manifestFetchFail forces manifest blob GET to fail after HEAD resolve succeeds.
+	manifestFetchFail bool
+	// deleteFail forces DELETE /manifests to return 500 so delete error paths
+	// can be exercised without a live registry.
+	deleteFail bool
 }
 
 func startTestOCIRegistry(t *testing.T, repo string) *testOCIRegistry {
@@ -60,6 +65,29 @@ func (r *testOCIRegistry) setManifest(tag string, body []byte) {
 		dgst := digest.FromBytes(body).String()
 		r.manifests[rest+"/"+dgst] = body
 	}
+	r.mu.Unlock()
+}
+
+func (r *testOCIRegistry) setManifestFetchFail(tag string, fail bool) {
+	r.mu.Lock()
+	r.manifestFetchFail = fail
+	r.mu.Unlock()
+	_ = tag
+}
+
+func (r *testOCIRegistry) setManifestOnly(tag string) {
+	manifest := []byte(`{
+		"schemaVersion": 2,
+		"mediaType": "application/vnd.oci.image.manifest.v1+json",
+		"config": {"mediaType":"application/vnd.oci.empty.v1+json","size":0,"digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},
+		"layers": [{"mediaType":"application/wasm","size":8,"digest":"sha256:missinglayer0000000000000000000000000000000000000000000000000000"}]
+	}`)
+	r.setManifest(tag, manifest)
+}
+
+func (r *testOCIRegistry) setDeleteFail(fail bool) {
+	r.mu.Lock()
+	r.deleteFail = fail
 	r.mu.Unlock()
 }
 
@@ -194,6 +222,13 @@ func (r *testOCIRegistry) serveManifest(w http.ResponseWriter, req *http.Request
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		r.mu.Lock()
+		failFetch := r.manifestFetchFail
+		r.mu.Unlock()
+		if failFetch {
+			http.Error(w, "fetch denied", http.StatusForbidden)
+			return
+		}
 		if _, err := w.Write(data); err != nil {
 			r.t.Errorf("write manifest: %v", err)
 		}
@@ -214,6 +249,10 @@ func (r *testOCIRegistry) serveManifest(w http.ResponseWriter, req *http.Request
 		w.Header().Set("Docker-Content-Digest", dgst)
 		w.WriteHeader(http.StatusCreated)
 	case http.MethodDelete:
+		if r.deleteFail {
+			http.Error(w, "delete failed", http.StatusInternalServerError)
+			return
+		}
 		r.mu.Lock()
 		delete(r.manifests, key)
 		r.mu.Unlock()

@@ -2,6 +2,8 @@ package wasm
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
@@ -206,4 +208,46 @@ func TestMultiInstanceEngineHelpersAndHooks(t *testing.T) {
 	}
 	eng.ClearNetworkHook("sb")
 	eng.ClearNetworkHook("missing")
+}
+
+func TestMultiInstanceEngineErrorAndReplacementPaths(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	module := wasmmod.WriteMinimalWasm(t, dir, "valid.wasm")
+	invalid := filepath.Join(dir, "invalid.wasm")
+	if err := os.WriteFile(invalid, []byte("not wasm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := NewMultiInstanceEngine(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = eng.Close(ctx) })
+	if err := eng.LoadModule(ctx, filepath.Join(dir, "missing.wasm")); err == nil {
+		t.Fatal("missing module unexpectedly loaded")
+	}
+	if err := eng.LoadModule(ctx, invalid); err == nil {
+		t.Fatal("invalid module unexpectedly loaded")
+	}
+	if err := eng.LoadModule(ctx, module); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.LoadModule(ctx, module); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Run(ctx, "missing-export", Capabilities{}, "does-not-exist"); err == nil {
+		t.Fatal("missing export unexpectedly ran")
+	}
+	if err := eng.InvokeExport(ctx, "missing", "_start"); err == nil {
+		t.Fatal("missing instance unexpectedly invoked")
+	}
+	if err := eng.Instantiate(ctx, "instance", Capabilities{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.InvokeExport(ctx, "instance", "does-not-exist"); err == nil {
+		t.Fatal("missing export unexpectedly invoked")
+	}
+	if eng.instanceModule("missing") != nil {
+		t.Fatal("missing instance returned a module")
+	}
 }

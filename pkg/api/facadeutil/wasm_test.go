@@ -3,6 +3,7 @@ package facadeutil
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/store"
@@ -102,5 +103,24 @@ func TestTranslateWasmCreatePropagatesGetterError(t *testing.T) {
 	_, _, err := TranslateWasmCreate(context.Background(), get, "mod-1", nil)
 	if err == nil || err.Error() != "db down" {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTranslateWasmCreateMissingModuleRef(t *testing.T) {
+	_, _, err := TranslateWasmCreate(context.Background(), nil, "", map[string]string{
+		"runtime": models.RuntimeWasm,
+		// module_ref intentionally omitted
+	})
+	if err == nil || !strings.Contains(err.Error(), "module_ref") {
+		t.Fatalf("err = %v, want module_ref required", err)
+	}
+}
+
+func TestLabelValueEmpty(t *testing.T) {
+	if got := labelValue(map[string]string{"runtime": "  "}, "runtime", "aerol.runtime"); got != "" {
+		t.Fatalf("labelValue = %q, want empty", got)
+	}
+	if got := labelValue(nil, "runtime"); got != "" {
+		t.Fatalf("labelValue(nil) = %q", got)
 	}
 }

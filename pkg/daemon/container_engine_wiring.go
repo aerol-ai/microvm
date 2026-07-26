@@ -71,6 +71,10 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, driver: driver, logger: logger, stopReassert: reassertStop}, nil
 }
 
+// chainReassertInterval is the AEROLVM-USER re-assert cadence. Tests shrink it
+// so the ticker body is exercised without a 30s wait.
+var chainReassertInterval = 30 * time.Second
+
 // startChainReassert periodically re-asserts the AEROLVM-USER chain + FORWARD
 // jump. A dockerd restart on a coexistence host can flush/reorder FORWARD and
 // drop our jump; re-assertion (idempotent) restores it without waiting for a
@@ -82,7 +86,7 @@ func startChainReassert(ctx context.Context, rules *netrules.Manager, logger *sl
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
-		t := time.NewTicker(30 * time.Second)
+		t := time.NewTicker(chainReassertInterval)
 		defer t.Stop()
 		for {
 			select {

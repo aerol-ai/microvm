@@ -97,6 +97,8 @@ func drainDockerWarmPool(pool *dockerpool.Pool, logger *slog.Logger) {
 		return
 	}
 	if drained := pool.Close(); drained > 0 {
-		logger.Info("docker warm pool drained on shutdown", "slots", drained)
+		if logger != nil {
+			logger.Info("docker warm pool drained on shutdown", "slots", drained)
+		}
 	}
 }

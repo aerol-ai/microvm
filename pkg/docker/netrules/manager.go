@@ -115,7 +115,9 @@ func New(enabled bool) (*Manager, error) {
 
 // NewWithOptions builds a Manager with the chosen RuleBackend. userChain
 // selects the filter chain for per-IP rules; empty defaults to DOCKER-USER.
-// Unknown backend names fall back to exec with an error so misconfig is loud.
+// Unknown backend names error so misconfig is loud. Enabled backends are
+// linux-only (see newEnabledManager); other platforms always return a
+// disabled manager.
 func NewWithOptions(enabled bool, backend, userChain string) (*Manager, error) {
 	if strings.TrimSpace(userChain) == "" {
 		userChain = ChainDockerUser
@@ -124,25 +126,7 @@ func NewWithOptions(enabled bool, backend, userChain string) (*Manager, error) {
 		recordBackendSelected("disabled")
 		return &Manager{enabled: false, userChain: userChain}, nil
 	}
-
-	switch strings.ToLower(strings.TrimSpace(backend)) {
-	case "", BackendExec:
-		ipt, err := iptables.New()
-		if err != nil {
-			return nil, fmt.Errorf("create iptables client: %w", err)
-		}
-		recordBackendSelected(BackendExec)
-		return &Manager{enabled: true, ipt: newExecBackend(ipt), userChain: userChain}, nil
-	case BackendNetlink:
-		nl, err := NewNetlinkBackend()
-		if err != nil {
-			return nil, fmt.Errorf("create netlink netrules backend: %w", err)
-		}
-		recordBackendSelected(BackendNetlink)
-		return &Manager{enabled: true, ipt: nl, userChain: userChain}, nil
-	default:
-		return nil, fmt.Errorf("unknown netrules backend %q (want exec|netlink)", backend)
-	}
+	return newEnabledManager(backend, userChain)
 }
 
 // NewWithBackend builds an enabled Manager over an injected backend. Test

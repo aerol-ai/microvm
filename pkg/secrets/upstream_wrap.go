@@ -3,7 +3,6 @@ package secrets
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -83,7 +82,9 @@ func wrapWithClock(ring *UpstreamWrapKeyRing, creds UpstreamCredentials, now fun
 		return "", fmt.Errorf("gcm wrap: %w", err)
 	}
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+	// Use the package randReader (same as Cipher) so tests can inject entropy
+	// failures without monkey-patching crypto/rand.Reader globally.
+	if _, err := io.ReadFull(randReader, nonce); err != nil {
 		return "", fmt.Errorf("nonce: %w", err)
 	}
 	// gcm.Seal returns ciphertext || tag — exactly the layout AOCR's

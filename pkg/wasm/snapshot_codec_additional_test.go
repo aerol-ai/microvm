@@ -61,6 +61,26 @@ func TestZstdCompressEmpty(t *testing.T) {
 	}
 }
 
+func TestWriteSnapshotDirAppliesPortableDefaults(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "mem.snap")
+	if err := WriteSnapshotDir(dir, SnapshotCapture{Memory: []byte("memory")}); err != nil {
+		t.Fatalf("WriteSnapshotDir: %v", err)
+	}
+	got, err := ReadSnapshotDir(dir, "")
+	if err != nil {
+		t.Fatalf("ReadSnapshotDir: %v", err)
+	}
+	if got.Config.SchemaVersion != snapshotSchemaVersion || got.Config.Engine != engineWazero {
+		t.Fatalf("defaults = %+v", got.Config)
+	}
+	if got.Config.WASIVersion != wasiPreview1 || got.Config.CapturedAt == "" {
+		t.Fatalf("portable metadata defaults = %+v", got.Config)
+	}
+	if string(got.Globals) != "[]" || string(got.WASIState) != "{}" {
+		t.Fatalf("default state = globals:%q wasi:%q", got.Globals, got.WASIState)
+	}
+}
+
 func TestReadSnapshotDir_ErrorPaths(t *testing.T) {
 	base := SnapshotCapture{
 		Config: SnapshotConfig{

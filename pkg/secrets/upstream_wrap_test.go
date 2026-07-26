@@ -182,3 +182,13 @@ func TestWrapUpstreamCreds_InvalidKeySize(t *testing.T) {
 		t.Fatal("expected error with invalid key size")
 	}
 }
+
+func TestWrapUpstreamCreds_NonceEntropyFailure(t *testing.T) {
+	ring := ParseUpstreamWrapKeyRing(b64(key32(0xaa)))
+	old := randReader
+	randReader = errReader{}
+	defer func() { randReader = old }()
+	if _, err := WrapUpstreamCreds(ring, sampleCreds()); err == nil {
+		t.Fatal("want nonce error when randReader fails")
+	}
+}
