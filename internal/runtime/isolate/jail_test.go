@@ -111,6 +111,13 @@ func TestBuildJailSpec(t *testing.T) {
 	if _, err := BuildJailSpec(cfg, "../../etc", 0, 0); err == nil {
 		t.Fatal("expected error for traversal group key")
 	}
+
+	// Invalid jail uid fails validation inside BuildJailSpec.
+	badCfg := cfg
+	badCfg.JailUID = 0
+	if _, err := BuildJailSpec(badCfg, "acme", 0, 0); err == nil {
+		t.Fatal("expected error for root uid in BuildJailSpec")
+	}
 }
 
 func TestJailSpecValidate(t *testing.T) {
@@ -137,6 +144,7 @@ func TestJailSpecValidate(t *testing.T) {
 		{name: "negative_uid", mutate: func(s *JailSpec) { s.UID = -1 }},
 		{name: "negative_cpu", mutate: func(s *JailSpec) { s.CPUQuota = -1 }},
 		{name: "negative_memory", mutate: func(s *JailSpec) { s.MemoryLimitMB = -1 }},
+		{name: "invalid_group_key", mutate: func(s *JailSpec) { s.GroupKey = "../../etc" }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

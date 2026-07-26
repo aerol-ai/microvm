@@ -23,6 +23,15 @@ type Client struct {
 	raw       *cntr.Client // set only for live clients; Raw() uses this
 }
 
+// connectDialFn dials containerd; tests inject a stub rawAPI to avoid a live socket.
+var connectDialFn = func(socket, namespace string) (rawAPI, error) {
+	raw, err := cntr.New(socket, cntr.WithDefaultNamespace(namespace))
+	if err != nil {
+		return nil, err
+	}
+	return cntrClientRaw{raw}, nil
+}
+
 // Connect dials the system containerd socket and scopes to namespace.
 func Connect(socket, namespace string) (*Client, error) {
 	socket = strings.TrimSpace(socket)
@@ -33,7 +42,7 @@ func Connect(socket, namespace string) (*Client, error) {
 	if ns == "" {
 		return nil, fmt.Errorf("containerd namespace is required")
 	}
-	raw, err := cntr.New(socket, cntr.WithDefaultNamespace(ns))
+	raw, err := connectDialFn(socket, ns)
 	if err != nil {
 		return nil, fmt.Errorf("dial containerd: %w", err)
 	}
@@ -46,7 +55,10 @@ func Connect(socket, namespace string) (*Client, error) {
 		_ = raw.Close()
 		return nil, err
 	}
-	return &Client{raw: raw, namespace: ns, tr: &liveTransport{raw: cntrClientRaw{raw}, ns: ns}}, nil
+	if cc, ok := raw.(cntrClientRaw); ok && cc.Client != nil {
+		return &Client{raw: cc.Client, namespace: ns, tr: &liveTransport{raw: raw, ns: ns}}, nil
+	}
+	return &Client{namespace: ns, tr: &liveTransport{raw: raw, ns: ns}}, nil
 }
 
 func (c *Client) Close() error {

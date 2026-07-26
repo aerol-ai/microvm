@@ -72,6 +72,30 @@ func TestNewRateLimitedStoreBurstDefault(t *testing.T) {
 	}
 }
 
+func TestRateLimitedStoreRefillCapsAtBurst(t *testing.T) {
+	inner := &fakeStore{}
+	rl := NewRateLimitedStore(inner, 10 /*per sec*/, 3 /*burst*/).(*RateLimitedStore)
+	now := time.Now()
+	rl.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		if err := rl.Set(ctx, "sb", "k", []byte("v")); err != nil {
+			t.Fatalf("drain write %d: %v", i, err)
+		}
+	}
+	// Long idle would refill far past burst without the cap branch in allow().
+	now = now.Add(2 * time.Second)
+	for i := 0; i < 3; i++ {
+		if err := rl.Set(ctx, "sb", "k", []byte("v")); err != nil {
+			t.Fatalf("post-refill write %d: %v", i, err)
+		}
+	}
+	if err := rl.Set(ctx, "sb", "k", []byte("v")); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("7th write should throttle, got %v", err)
+	}
+}
+
 func TestRateLimitedStoreListKeysPassthrough(t *testing.T) {
 	inner := &fakeStore{}
 	rl := NewRateLimitedStore(inner, 10, 1)

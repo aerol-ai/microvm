@@ -13,7 +13,21 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	ctddocker "github.com/containerd/containerd/remotes/docker"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+// pushLiveDeps is the containerd surface livePush exercises. Production wires
+// client.Raw(); tests inject a fake so the push path is covered offline.
+type pushLiveDeps struct {
+	getImage    func(context.Context, string) (cntr.Image, error)
+	imageGet    func(context.Context, string) (images.Image, error)
+	imageCreate func(context.Context, images.Image) (images.Image, error)
+	imageUpdate func(context.Context, images.Image, ...string) (images.Image, error)
+	push        func(context.Context, string, ocispec.Descriptor, ...cntr.RemoteOpt) error
+}
+
+// pushLiveDepsFn resolves push dependencies; nil uses client.Raw().
+var pushLiveDepsFn func(*Client) (pushLiveDeps, error)
 
 // RegistryPusher pushes local aerolvm-namespace images to a remote registry
 // (AOCR snapshot path). Implements service.SnapshotPushDocker so the existing
@@ -78,26 +92,25 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 	// reached AOCR and cross-node create-from-snapshot broke (single-node found
 	// it locally and never needed the push). Try the exact ref, then
 	// "<name>:latest", mirroring the create/pull path (ImageExists / ensureImage).
+	deps, err := resolvePushLiveDeps(client)
+	if err != nil {
+		return "", err
+	}
 	var img cntr.Image
 	for _, candidate := range pushSourceCandidates(source) {
-		if img, err = client.GetImage(ctx, candidate); err == nil {
+		if img, err = deps.getImage(ctx, candidate); err == nil {
 			break
 		}
 	}
 	if err != nil {
 		return "", fmt.Errorf("containerd push: get %s: %w", source, err)
 	}
-	raw := client.Raw()
-	if raw == nil {
-		return "", errors.New("containerd push: live client required")
-	}
 	target := img.Target()
-	isvc := raw.ImageService()
-	if _, err := isvc.Get(ctx, dest); err != nil {
+	if _, err := deps.imageGet(ctx, dest); err != nil {
 		if !errdefs.IsNotFound(err) {
 			return "", fmt.Errorf("containerd push: lookup dest: %w", err)
 		}
-		if _, err := isvc.Create(ctx, images.Image{Name: dest, Target: target}); err != nil {
+		if _, err := deps.imageCreate(ctx, images.Image{Name: dest, Target: target}); err != nil {
 			// A concurrent duplicate push may have created the name first — that
 			// is success, not an error (pr-review §1 idempotency). Fall through to
 			// the Push below with the same target.
@@ -105,7 +118,7 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 				return "", fmt.Errorf("containerd push: create dest name: %w", err)
 			}
 		}
-	} else if _, err := isvc.Update(ctx, images.Image{Name: dest, Target: target}, "target"); err != nil {
+	} else if _, err := deps.imageUpdate(ctx, images.Image{Name: dest, Target: target}, "target"); err != nil {
 		// Name already exists; push with the source descriptor anyway.
 		_ = err
 	}
@@ -128,10 +141,28 @@ func (p *RegistryPusher) livePush(ctx context.Context, source, dest string, auth
 			})),
 		})),
 	}
-	if err := raw.Push(ctx, dest, target, opts...); err != nil {
+	if err := deps.push(ctx, dest, target, opts...); err != nil {
 		return "", fmt.Errorf("containerd push %s -> %s: %w", source, dest, err)
 	}
 	return string(target.Digest), nil
+}
+
+func resolvePushLiveDeps(client *Client) (pushLiveDeps, error) {
+	if pushLiveDepsFn != nil {
+		return pushLiveDepsFn(client)
+	}
+	raw := client.Raw()
+	if raw == nil {
+		return pushLiveDeps{}, errors.New("containerd push: live client required")
+	}
+	isvc := raw.ImageService()
+	return pushLiveDeps{
+		getImage:    client.GetImage,
+		imageGet:    isvc.Get,
+		imageCreate: isvc.Create,
+		imageUpdate: isvc.Update,
+		push:        raw.Push,
+	}, nil
 }
 
 // pushSourceCandidates lists the local image refs livePush tries, in order, to

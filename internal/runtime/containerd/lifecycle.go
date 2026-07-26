@@ -281,7 +281,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	readinessSource := "health"
 	if d.cfg.ReadyEnabled && readyListener != nil {
 		readinessSource = "socket"
-		if err := readyListener.Wait(ctx); err != nil {
+		if err := createReadyWaitFn(ctx, readyListener); err != nil {
 			return nil, fmt.Errorf("ready socket: %w", err)
 		}
 		keepReadySocket = true
@@ -359,6 +359,12 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	return d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
 }
 
+// stopGraceTimeout and stopPollInterval are test seams for Stop's SIGTERM→SIGKILL path.
+var (
+	stopGraceTimeout = 10 * time.Second
+	stopPollInterval = 100 * time.Millisecond
+)
+
 func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 	client, err := d.ensureClient()
 	if err != nil {
@@ -373,7 +379,7 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 		return nil
 	}
 	_ = task.Kill(ctx, syscall.SIGTERM)
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(stopGraceTimeout)
 	for time.Now().Before(deadline) {
 		status, statusErr := task.Status(ctx)
 		if statusErr == nil && status.Status != cntr.Running {
@@ -383,7 +389,7 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(stopPollInterval):
 		}
 	}
 	_ = task.Kill(ctx, syscall.SIGKILL)
@@ -849,6 +855,18 @@ func (d *Driver) runtimeStateAfterStart(ctx context.Context, container cntr.Cont
 		Status:      models.SandboxStatusStarted,
 	}, nil
 }
+
+// defaultCreateReadyWait waits for toolbox readiness on the create-time socket.
+func defaultCreateReadyWait(ctx context.Context, rl *dockerpkg.ReadyListener) error {
+	if rl == nil {
+		return nil
+	}
+	return rl.Wait(ctx)
+}
+
+// createReadyWaitFn waits for toolbox readiness on the create-time socket.
+// Tests stub it to avoid a live handshake (mirrors parkReadyWaitFn).
+var createReadyWaitFn = defaultCreateReadyWait
 
 func (d *Driver) waitToolboxHTTP(ctx context.Context, containerIP, toolboxToken string) error {
 	_ = toolboxToken

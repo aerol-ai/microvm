@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -191,6 +193,8 @@ type fakeGroupHost struct {
 	loadErr  error
 	loadGate chan struct{} // if non-nil, Load blocks on it (teardown-race test)
 	inLoad   chan struct{} // if non-nil, closed once Load is entered
+	invokeFn func(ctx context.Context, id string, r *http.Request) (*http.Response, error)
+	egress   map[string]EgressPolicy
 }
 
 func newFakeGroupHost() *fakeGroupHost { return &fakeGroupHost{loaded: map[string]bool{}} }
@@ -232,7 +236,23 @@ func (h *fakeGroupHost) LoadedCount() int {
 	return len(h.loaded)
 }
 func (h *fakeGroupHost) Invoke(ctx context.Context, id string, r *http.Request) (*http.Response, error) {
-	return nil, errors.New("fake: no invoke")
+	if h.invokeFn != nil {
+		return h.invokeFn(ctx, id, r)
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("ok")),
+		Header:     make(http.Header),
+	}, nil
+}
+
+func (h *fakeGroupHost) SetEgressPolicy(id string, p EgressPolicy) {
+	h.mu.Lock()
+	if h.egress == nil {
+		h.egress = make(map[string]EgressPolicy)
+	}
+	h.egress[id] = p
+	h.mu.Unlock()
 }
 func (h *fakeGroupHost) Stop() error {
 	h.mu.Lock()
@@ -491,6 +511,29 @@ func shortRunDirDriver(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
+}
+
+func TestStartAfterIdleReap(t *testing.T) {
+	sup := &fakeSupervisor{}
+	d := newCreateDriver(t, GroupPerTenant, sup)
+	d.cfg.IdleTTL = time.Minute
+	ctx := context.Background()
+	if _, err := d.Create(ctx, models.CreateSandboxRequest{ModuleRef: "a.js", TenantID: "acme"}, "sb-1", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	d.groupsMu.Lock()
+	for _, g := range d.groups {
+		g.lastUsed = time.Now().Add(-2 * time.Minute)
+	}
+	d.groupsMu.Unlock()
+	d.reapIdleGroups(time.Minute)
+	st, err := d.Start(ctx, "sb-1")
+	if err != nil || st == nil || st.Status != models.SandboxStatusStarted {
+		t.Fatalf("Start after reap = %+v err=%v", st, err)
+	}
+	if sup.spawnCount() != 2 {
+		t.Fatalf("spawns = %d, want 2 (reloaded group)", sup.spawnCount())
+	}
 }
 
 func TestFromDaemonConfig(t *testing.T) {

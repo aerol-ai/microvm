@@ -1856,8 +1856,12 @@ func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error)
 // modify the host-side inode the link points at; the Phase 2 service
 // rejects deletion-while-referenced so a guest can't pull the rootfs
 // out from under another guest.
+// linkRootfsFn is os.Link in production; tests swap it to force the EXDEV
+// copy fallback without needing two real mount points.
+var linkRootfsFn = os.Link
+
 func linkOrCopyRootfs(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
+	if err := linkRootfsFn(src, dst); err == nil {
 		return nil
 	} else if !errors.Is(err, syscall.EXDEV) && !errors.Is(err, os.ErrPermission) {
 		// EXDEV → fall through to copy. ErrPermission also falls through

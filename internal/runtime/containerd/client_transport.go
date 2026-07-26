@@ -37,6 +37,7 @@ type rawAPI interface {
 	Subscribe(ctx context.Context, filters ...string) (<-chan *events.Envelope, <-chan error)
 	ContentStore() content.Store
 	ContentProvider() content.Provider
+	Version(ctx context.Context) (cntr.Version, error)
 }
 
 // cntrClientRaw adapts *cntr.Client to rawAPI (flattening EventService.Subscribe).
@@ -58,6 +59,13 @@ func (c cntrClientRaw) ContentProvider() content.Provider {
 		return nil
 	}
 	return c.ContentStore()
+}
+
+func (c cntrClientRaw) Version(ctx context.Context) (cntr.Version, error) {
+	if c.Client == nil {
+		return cntr.Version{}, errors.New("containerd client is nil")
+	}
+	return c.Client.Version(ctx)
 }
 
 type liveTransport struct {

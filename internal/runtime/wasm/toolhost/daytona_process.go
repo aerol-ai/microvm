@@ -808,9 +808,12 @@ func (h *Host) runDaytonaSessionCommand(sess *sessions.Session, state *daytonaSe
 	}, nil
 }
 
+// daytonaRandRead is the entropy source for command IDs; swapped in tests.
+var daytonaRandRead = rand.Read
+
 func newDaytonaCommandID() (string, error) {
 	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := daytonaRandRead(buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil

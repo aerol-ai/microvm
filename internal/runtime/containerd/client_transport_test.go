@@ -77,6 +77,30 @@ func (s stubRawAPI) ContentStore() content.Store { return s.ft.contentStore() }
 
 func (s stubRawAPI) ContentProvider() content.Provider { return s.ft.contentProvider() }
 
+func (s stubRawAPI) Version(context.Context) (cntr.Version, error) {
+	return cntr.Version{Version: "1.7.13"}, nil
+}
+
+type versionStub struct {
+	stubRawAPI
+	version  string
+	verr     error
+	closeErr error
+}
+
+func (v versionStub) Version(context.Context) (cntr.Version, error) {
+	if v.verr != nil {
+		return cntr.Version{}, v.verr
+	}
+	return cntr.Version{Version: v.version}, nil
+}
+func (v versionStub) Close() error {
+	if v.closeErr != nil {
+		return v.closeErr
+	}
+	return v.stubRawAPI.Close()
+}
+
 func TestLiveTransportDelegatesToStub(t *testing.T) {
 	ft := newFakeTransport()
 	ft.emitEvents = true

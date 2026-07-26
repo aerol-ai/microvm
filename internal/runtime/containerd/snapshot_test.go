@@ -151,20 +151,24 @@ func TestNilClientContentAccessors(t *testing.T) {
 }
 
 type fakeSnapshotBackend struct {
-	container    cntr.Container
-	diffDesc     ocispec.Descriptor
-	baseManifest ocispec.Manifest
-	baseConfig   ocispec.Image
-	diffIDVal    digest.Digest
-	blobLabels   map[string]map[string]string // blob digest -> gc labels
-	blobTypes    map[string]string            // blob digest -> media type
-	createErr    error
-	created      images.Image
-	createdArg   images.Image
-	getImg       images.Image
-	getErr       error
-	unpacked     bool
-	unpackErr    error
+	container     cntr.Container
+	diffDesc      ocispec.Descriptor
+	baseManifest  ocispec.Manifest
+	baseConfig    ocispec.Image
+	diffIDVal     digest.Digest
+	blobLabels    map[string]map[string]string // blob digest -> gc labels
+	blobTypes     map[string]string            // blob digest -> media type
+	createErr     error
+	created       images.Image
+	createdArg    images.Image
+	getImg        images.Image
+	getErr        error
+	unpacked      bool
+	unpackErr     error
+	createDiffErr error
+	manifestErr   error
+	diffIDErr     error
+	writeBlobErr  error
 }
 
 func (f *fakeSnapshotBackend) loadContainer(context.Context, *Client, string) (cntr.Container, error) {
@@ -174,15 +178,27 @@ func (f *fakeSnapshotBackend) loadContainer(context.Context, *Client, string) (c
 	return f.container, nil
 }
 func (f *fakeSnapshotBackend) createDiff(context.Context, string, string, cntr.Container) (ocispec.Descriptor, error) {
+	if f.createDiffErr != nil {
+		return ocispec.Descriptor{}, f.createDiffErr
+	}
 	return f.diffDesc, nil
 }
 func (f *fakeSnapshotBackend) baseManifestAndConfig(context.Context, ocispec.Descriptor) (ocispec.Manifest, ocispec.Image, error) {
+	if f.manifestErr != nil {
+		return ocispec.Manifest{}, ocispec.Image{}, f.manifestErr
+	}
 	return f.baseManifest, f.baseConfig, nil
 }
 func (f *fakeSnapshotBackend) diffID(context.Context, ocispec.Descriptor) (digest.Digest, error) {
+	if f.diffIDErr != nil {
+		return "", f.diffIDErr
+	}
 	return f.diffIDVal, nil
 }
 func (f *fakeSnapshotBackend) writeBlob(_ context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error) {
+	if f.writeBlobErr != nil {
+		return ocispec.Descriptor{}, f.writeBlobErr
+	}
 	if f.blobLabels == nil {
 		f.blobLabels = map[string]map[string]string{}
 		f.blobTypes = map[string]string{}

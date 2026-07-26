@@ -1,8 +1,12 @@
 package statekv
 
 import (
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/store"
 )
 
 func TestValidateKey(t *testing.T) {
@@ -86,6 +90,44 @@ func TestErrNotFound(t *testing.T) {
 	}
 	if ErrNotFound.Error() == "" {
 		t.Fatal("ErrNotFound should have a message")
+	}
+}
+
+func TestSQLiteStore_CRUD(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	kv := NewSQLiteStore(st)
+	const sandboxID = "sb-kv"
+
+	if err := kv.Set(ctx, sandboxID, "counter", []byte("1")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got, ok, err := kv.Get(ctx, sandboxID, "counter")
+	if err != nil || !ok || string(got) != "1" {
+		t.Fatalf("Get = %q ok=%v err=%v", got, ok, err)
+	}
+	got, ok, err = kv.Get(ctx, sandboxID, "missing")
+	if err != nil || ok {
+		t.Fatalf("Get missing = %q ok=%v err=%v", got, ok, err)
+	}
+	if err := kv.Set(ctx, sandboxID, "other", []byte("x")); err != nil {
+		t.Fatalf("Set other: %v", err)
+	}
+	keys, err := kv.ListKeys(ctx, sandboxID)
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("ListKeys = %v err=%v", keys, err)
+	}
+	if err := kv.Delete(ctx, sandboxID, "counter"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	_, ok, err = kv.Get(ctx, sandboxID, "counter")
+	if err != nil || ok {
+		t.Fatalf("Get after delete = ok=%v err=%v", ok, err)
 	}
 }
 

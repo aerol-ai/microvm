@@ -509,6 +509,19 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	return nil
 }
 
+// copyFileDst is the destination open used by copyFile. Production opens a
+// real file; tests swap it to inject Sync/Close/Write failures that real
+// filesystems almost never surface.
+type copyFileDest interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
+var copyFileOpenDst = func(path string, perm os.FileMode) (copyFileDest, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+}
+
 func copyFile(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -522,7 +535,7 @@ func copyFile(src, dst string) error {
 		return fmt.Errorf("open %s: %w", src, err)
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	out, err := copyFileOpenDst(dst, info.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}

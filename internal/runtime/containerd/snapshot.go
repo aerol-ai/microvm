@@ -25,6 +25,15 @@ var snapshotCommitFn = (*Driver).commitContainerSnapshotLive
 // testSnapshotBackend, when non-nil, replaces live containerd snapshot services.
 var testSnapshotBackend snapshotBackend
 
+// snapshotContentStoreFn resolves the content store for snapshot commits.
+// Tests override to supply an in-memory store without a live daemon.
+var snapshotContentStoreFn = func(client *Client) content.Store {
+	if client == nil || client.Raw() == nil {
+		return nil
+	}
+	return client.Raw().ContentStore()
+}
+
 // snapshotBackend is the live containerd surface CreateSnapshot needs.
 type snapshotBackend interface {
 	loadContainer(ctx context.Context, client *Client, containerRef string) (cntr.Container, error)
@@ -85,11 +94,10 @@ func (b *rawSnapshotBackend) getImage(ctx context.Context, name string) (images.
 }
 
 func (b *rawSnapshotBackend) baseManifestAndConfig(ctx context.Context, target ocispec.Descriptor) (ocispec.Manifest, ocispec.Image, error) {
-	raw := b.client.Raw()
-	if raw == nil {
+	cs := snapshotContentStoreFn(b.client)
+	if cs == nil {
 		return ocispec.Manifest{}, ocispec.Image{}, errors.New("snapshot base read requires live containerd")
 	}
-	cs := raw.ContentStore()
 	manifest, err := images.Manifest(ctx, cs, target, platforms.Default())
 	if err != nil {
 		return ocispec.Manifest{}, ocispec.Image{}, fmt.Errorf("read base manifest: %w", err)
@@ -106,16 +114,16 @@ func (b *rawSnapshotBackend) baseManifestAndConfig(ctx context.Context, target o
 }
 
 func (b *rawSnapshotBackend) diffID(ctx context.Context, desc ocispec.Descriptor) (digest.Digest, error) {
-	raw := b.client.Raw()
-	if raw == nil {
+	cs := snapshotContentStoreFn(b.client)
+	if cs == nil {
 		return "", errors.New("snapshot diff id requires live containerd")
 	}
-	return images.GetDiffID(ctx, raw.ContentStore(), desc)
+	return images.GetDiffID(ctx, cs, desc)
 }
 
 func (b *rawSnapshotBackend) writeBlob(ctx context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error) {
-	raw := b.client.Raw()
-	if raw == nil {
+	cs := snapshotContentStoreFn(b.client)
+	if cs == nil {
 		return ocispec.Descriptor{}, errors.New("snapshot write blob requires live containerd")
 	}
 	desc := ocispec.Descriptor{
@@ -128,7 +136,7 @@ func (b *rawSnapshotBackend) writeBlob(ctx context.Context, mediaType string, da
 	if len(labels) > 0 {
 		opts = append(opts, content.WithLabels(labels))
 	}
-	if err := content.WriteBlob(ctx, raw.ContentStore(), ref, bytes.NewReader(data), desc, opts...); err != nil {
+	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(data), desc, opts...); err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("write %s blob: %w", mediaType, err)
 	}
 	return desc, nil

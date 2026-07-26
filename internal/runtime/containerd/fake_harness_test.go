@@ -37,10 +37,13 @@ import (
 type fakeTransport struct {
 	mu              sync.Mutex
 	containers      map[string]*fakeContainer
+	pendingTaskErr  map[string]error
+	pendingStartErr map[string]error
 	image           cntr.Image
 	getImageFn      func(context.Context, string) (cntr.Image, error)
 	pullImageFn     func(context.Context, string, ...cntr.RemoteOpt) (cntr.Image, error)
 	loadContainerFn func(context.Context, string) (cntr.Container, error)
+	newContainerFn  func(context.Context, string, ...cntr.NewContainerOpts) (cntr.Container, error)
 	emitEvents      bool
 	provider        content.Provider
 }
@@ -69,13 +72,26 @@ func (f *fakeTransport) loadContainer(ctx context.Context, id string) (cntr.Cont
 	return c, nil
 }
 
-func (f *fakeTransport) newContainer(_ context.Context, id string, _ ...cntr.NewContainerOpts) (cntr.Container, error) {
+func (f *fakeTransport) newContainer(ctx context.Context, id string, opts ...cntr.NewContainerOpts) (cntr.Container, error) {
+	if f.newContainerFn != nil {
+		return f.newContainerFn(ctx, id, opts...)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, exists := f.containers[id]; exists {
 		return nil, errdefs.ErrAlreadyExists
 	}
 	c := &fakeContainer{id: id}
+	if f.pendingTaskErr != nil {
+		if err, ok := f.pendingTaskErr[id]; ok {
+			c.newTaskErr = err
+		}
+	}
+	if f.pendingStartErr != nil {
+		if err, ok := f.pendingStartErr[id]; ok {
+			c.task = &fakeTask{status: cntr.Stopped, startErr: err}
+		}
+	}
 	f.containers[id] = c
 	return c, nil
 }
@@ -157,34 +173,69 @@ func (f *fakeImage) Platform() platforms.MatchComparer                { return n
 func (f *fakeImage) Spec(context.Context) (ocispec.Image, error)      { return ocispec.Image{}, nil }
 
 type fakeContainer struct {
-	id      string
-	task    *fakeTask
-	taskErr error
-	labels  map[string]string
+	id           string
+	task         *fakeTask
+	taskErr      error
+	labels       map[string]string
+	infoErr      error
+	snapshotKey  string
+	snapshotter  string
+	baseImage    string
+	labelsErr    error
+	noSnapshot   bool
+	newTaskErr   error
+	specOverride *oci.Spec
+	setLabelsErr error
 }
 
 func (c *fakeContainer) ID() string { return c.id }
 func (c *fakeContainer) Info(context.Context, ...cntr.InfoOpts) (containers.Container, error) {
+	if c.infoErr != nil {
+		return containers.Container{}, c.infoErr
+	}
 	labels := map[string]string{managedLabelKey: "true"}
 	for k, v := range c.labels {
 		labels[k] = v
 	}
+	snapKey := c.id + "-snap"
+	if c.snapshotKey != "" {
+		snapKey = c.snapshotKey
+	}
+	if c.noSnapshot {
+		snapKey = ""
+	}
+	snapper := "overlayfs"
+	if c.snapshotter != "" {
+		snapper = c.snapshotter
+	}
+	img := "alpine:3.20"
+	if c.baseImage != "" {
+		img = c.baseImage
+	}
 	return containers.Container{
 		ID:          c.id,
-		Image:       "alpine:3.20",
+		Image:       img,
 		Labels:      labels,
-		SnapshotKey: c.id + "-snap",
-		Snapshotter: "overlayfs",
+		SnapshotKey: snapKey,
+		Snapshotter: snapper,
 	}, nil
 }
 func (c *fakeContainer) Delete(context.Context, ...cntr.DeleteOpts) error { return nil }
 func (c *fakeContainer) NewTask(context.Context, cio.Creator, ...cntr.NewTaskOpts) (cntr.Task, error) {
+	if c.newTaskErr != nil {
+		return nil, c.newTaskErr
+	}
 	if c.task == nil {
 		c.task = &fakeTask{status: cntr.Running}
 	}
 	return c.task, nil
 }
-func (c *fakeContainer) Spec(context.Context) (*oci.Spec, error) { return &oci.Spec{}, nil }
+func (c *fakeContainer) Spec(context.Context) (*oci.Spec, error) {
+	if c.specOverride != nil {
+		return c.specOverride, nil
+	}
+	return &oci.Spec{}, nil
+}
 func (c *fakeContainer) Task(context.Context, cio.Attach) (cntr.Task, error) {
 	if c.taskErr != nil {
 		return nil, c.taskErr
@@ -198,6 +249,9 @@ func (c *fakeContainer) Image(context.Context) (cntr.Image, error) {
 	return &fakeImage{name: "alpine:3.20"}, nil
 }
 func (c *fakeContainer) Labels(context.Context) (map[string]string, error) {
+	if c.labelsErr != nil {
+		return nil, c.labelsErr
+	}
 	out := map[string]string{managedLabelKey: "true"}
 	for k, v := range c.labels {
 		out[k] = v
@@ -205,6 +259,9 @@ func (c *fakeContainer) Labels(context.Context) (map[string]string, error) {
 	return out, nil
 }
 func (c *fakeContainer) SetLabels(_ context.Context, labels map[string]string) (map[string]string, error) {
+	if c.setLabelsErr != nil {
+		return nil, c.setLabelsErr
+	}
 	c.labels = make(map[string]string, len(labels))
 	for k, v := range labels {
 		c.labels[k] = v
@@ -223,11 +280,16 @@ type fakeTask struct {
 	status    cntr.ProcessStatus
 	statusErr error
 	pids      []cntr.ProcessInfo
+	pauseErr  error
+	startErr  error
 }
 
 func (t *fakeTask) Pid() uint32 { return 0 }
 func (t *fakeTask) ID() string  { return "init" }
 func (t *fakeTask) Start(context.Context) error {
+	if t.startErr != nil {
+		return t.startErr
+	}
 	t.status = cntr.Running
 	return nil
 }
@@ -236,8 +298,13 @@ func (t *fakeTask) Delete(context.Context, ...cntr.ProcessDeleteOpts) (*cntr.Exi
 	return &cntr.ExitStatus{}, nil
 }
 func (t *fakeTask) Kill(context.Context, syscall.Signal, ...cntr.KillOpts) error { return nil }
-func (t *fakeTask) Pause(context.Context) error                                  { return nil }
-func (t *fakeTask) Resume(context.Context) error                                 { return nil }
+func (t *fakeTask) Pause(context.Context) error {
+	if t.pauseErr != nil {
+		return t.pauseErr
+	}
+	return nil
+}
+func (t *fakeTask) Resume(context.Context) error { return nil }
 func (t *fakeTask) Status(context.Context) (cntr.Status, error) {
 	if t.statusErr != nil {
 		return cntr.Status{}, t.statusErr
@@ -279,6 +346,9 @@ type harnessNetns struct {
 }
 
 func (h *harnessNetns) Provision(context.Context, string) (string, string, error) {
+	if h.failCreate {
+		return "", "", errors.New("provision failed")
+	}
 	return h.path, h.ip, nil
 }
 func (h *harnessNetns) Release(context.Context, string) error {

@@ -2,7 +2,6 @@ package containerd
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,11 +20,14 @@ import (
 
 const adoptReadyTimeout = 2 * time.Second
 
-// parkReadyWaitFn waits for the parked hello on the ready socket. Tests stub
-// it so the park path can complete offline without a guest toolbox.
-var parkReadyWaitFn = func(ctx context.Context, pl *dockerpkg.ParkedListener) error {
+// defaultParkReadyWait waits for the parked hello on the ready socket.
+func defaultParkReadyWait(ctx context.Context, pl *dockerpkg.ParkedListener) error {
 	return pl.WaitParked(ctx)
 }
+
+// parkReadyWaitFn waits for the parked hello on the ready socket. Tests stub
+// it so the park path can complete offline without a guest toolbox.
+var parkReadyWaitFn = defaultParkReadyWait
 
 // PoolSpawner implements containerdpool.Spawner against the containerd driver.
 type PoolSpawner struct {
@@ -300,7 +302,8 @@ func imageDigestString(image cntr.Image) (string, error) {
 
 func mintBootstrapToken() (string, error) {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	// Reuse randReadFn so tests can simulate entropy failure without stubbing crypto/rand.
+	if _, err := randReadFn(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil

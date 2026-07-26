@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -94,8 +95,11 @@ func (d *Driver) releaseImageLease(ctx context.Context, client *Client, labels m
 
 func randomLeaseID(prefix string) (string, error) {
 	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := randReadFn(b); err != nil {
 		return "", err
 	}
 	return prefix + hex.EncodeToString(b), nil
 }
+
+// randReadFn is crypto/rand.Read; tests override to simulate entropy failure.
+var randReadFn = func(b []byte) (int, error) { return io.ReadFull(rand.Reader, b) }

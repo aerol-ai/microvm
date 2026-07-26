@@ -126,13 +126,16 @@ func (d *Driver) SetClient(c *Client) {
 	d.client = c
 }
 
+// connectFn dials containerd; tests override to avoid a live socket.
+var connectFn = Connect
+
 func (d *Driver) ensureClient() (*Client, error) {
 	d.clientMu.Lock()
 	defer d.clientMu.Unlock()
 	if d.client != nil {
 		return d.client, nil
 	}
-	c, err := Connect(d.cfg.Socket, d.cfg.Namespace)
+	c, err := connectFn(d.cfg.Socket, d.cfg.Namespace)
 	if err != nil {
 		return nil, err
 	}

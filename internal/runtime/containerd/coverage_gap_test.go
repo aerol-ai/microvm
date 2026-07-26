@@ -385,7 +385,8 @@ func TestPinImageLeaseNoDigest(t *testing.T) {
 
 func shortReadyDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "rd")
+	// macOS sun_path is 104 bytes; /tmp/r* keeps room for sandboxID.nonce.sock.
+	dir, err := os.MkdirTemp("/tmp", "r")
 	if err != nil {
 		t.Fatal(err)
 	}
