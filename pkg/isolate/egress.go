@@ -223,8 +223,9 @@ func egressAllowed(p EgressPolicy, host string) bool {
 // dial Control hook runs AFTER DNS resolution with the concrete IP, so it
 // blocks special-use destinations even when reached via a hostname (or a
 // rebound one) — the authoritative SSRF guard behind the literal check in
-// serveEgress.
-var egressTransport = &http.Transport{
+// serveEgress. Typed as RoundTripper so offline tests can swap in a fake
+// without dialing the network.
+var egressTransport http.RoundTripper = &http.Transport{
 	DialContext: (&net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
