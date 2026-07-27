@@ -35,6 +35,9 @@ type volumeMetaStore interface {
 // is per-call so a node that joins/leaves a cluster picks up the right backing
 // without re-wiring the service.
 func (s *Service) volumeMeta() volumeMetaStore {
+	if s != nil && s.testVolumeMeta != nil {
+		return s.testVolumeMeta
+	}
 	if s.cfg.EnableCluster {
 		if c := s.Cluster(); c != nil {
 			return clusterVolumeMeta{c: c}

@@ -22,6 +22,15 @@ var ErrVolumeExists = errors.New("volume already exists for this tenant")
 // returned idempotently and do not consume quota again.
 var ErrVolumeQuotaExceeded = errors.New("tenant volume quota exceeded")
 
+// afterVolumeMissSelect is set only by tests to plant a conflicting row on
+// the open transaction between the existence SELECT and INSERT (same-tx
+// unique conflict). Cross-connection writers hit SQLITE_BUSY_SNAPSHOT under
+// the DEFERRED transaction GetOrCreateVolume uses.
+var afterVolumeMissSelect func(tx *sql.Tx)
+
+// afterVolumeBeforeCount is set only by tests to break the quota COUNT query.
+var afterVolumeBeforeCount func(tx *sql.Tx)
+
 // CreateVolume inserts a new volume row. The (tenant, name) unique index makes
 // this the idempotency boundary: a duplicate returns ErrVolumeExists rather
 // than a second row. CreatedAt is stamped here when the caller leaves it zero.
@@ -94,6 +103,9 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 	}
 
 	if maxPerTenant > 0 {
+		if afterVolumeBeforeCount != nil {
+			afterVolumeBeforeCount(tx)
+		}
 		var count int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM volumes WHERE tenant = ?`, tenant).Scan(&count); err != nil {
 			return nil, false, fmt.Errorf("count volumes: %w", err)
@@ -116,6 +128,11 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 		created = time.Now().UTC()
 	}
 	source := strings.TrimSpace(v.Source)
+	// Test-only yield point so coverage can plant a same-tx conflicting row
+	// between the miss SELECT and this INSERT.
+	if afterVolumeMissSelect != nil {
+		afterVolumeMissSelect(tx)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO volumes (id, tenant, name, backend, source, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)

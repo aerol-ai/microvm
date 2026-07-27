@@ -2276,10 +2276,19 @@ func (c Config) DockerReadySocketDir() string {
 	return filepath.Join(base, "docker", "ready")
 }
 
+// envClearSentinel forces getEnv to return "" even when a non-empty fallback
+// is configured. Unset and blank both map to the fallback (so clearEnv-style
+// tests keep working); without a sentinel the required-when-enabled empty
+// checks in Load are unreachable dead code.
+const envClearSentinel = "__CLEAR__"
+
 func getEnv(key, fallback string) string {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
 		return fallback
+	}
+	if value == envClearSentinel {
+		return ""
 	}
 	return value
 }

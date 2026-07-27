@@ -47,7 +47,11 @@ func (s *Service) StopByOwner(ctx context.Context, ownerRef string) error {
 		if sb == nil || sb.Status != models.SandboxStatusStarted {
 			continue
 		}
-		if err := s.store.SetFleetSuspended(ctx, sb.ID, true); err != nil && !errors.Is(err, store.ErrNotFound) {
+		err := s.store.SetFleetSuspended(ctx, sb.ID, true)
+		if s.testForceFleetSuspendErr != nil {
+			err = s.testForceFleetSuspendErr
+		}
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			errs = append(errs, err)
 			continue
 		}

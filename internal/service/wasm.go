@@ -127,6 +127,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			}
 		}
 	}
+	if s.testSealedMountsOverride != nil {
+		sealedMounts = s.testSealedMountsOverride
+	}
 
 	state, err := s.wasm.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
@@ -218,6 +221,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		releaseAdmission()
 		return nil, err
 	}
+	if s.testAfterStoreCreate != nil {
+		s.testAfterStoreCreate()
+	}
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
@@ -235,6 +241,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
+	}
+	if s.testAfterCustomDomainsOnCreate != nil {
+		s.testAfterCustomDomainsOnCreate()
 	}
 	if len(req.CustomDomains) > 0 {
 		storedCD, getErr := s.store.Get(ctx, sandbox.ID)

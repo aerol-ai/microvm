@@ -40,6 +40,18 @@ const defaultOTELMetricsInterval = 30 * time.Second
 type MetricsShutdown func(context.Context) error
 type TracesShutdown func(context.Context) error
 
+// Exporter constructors / gauge helpers are package vars so tests can force
+// the New()/gauge error arms — otlp*http.New is permissive of malformed
+// endpoints in practice, and Meter gauges almost never fail, so those returns
+// are otherwise dead under offline unit tests.
+var (
+	newOTLPMetricExporter   = otlpmetrichttp.New
+	newOTLPTraceExporter    = otlptracehttp.New
+	newInt64ObservableGauge = func(meter otelmetric.Meter, name string, options ...otelmetric.Int64ObservableGaugeOption) (otelmetric.Int64ObservableGauge, error) {
+		return meter.Int64ObservableGauge(name, options...)
+	}
+)
+
 func StartOTELMetrics(ctx context.Context, logger *slog.Logger, cfg OTELMetricsConfig) (MetricsShutdown, error) {
 	if !cfg.Enabled {
 		return nil, nil
@@ -48,7 +60,7 @@ func StartOTELMetrics(ctx context.Context, logger *slog.Logger, cfg OTELMetricsC
 	if cfg.Endpoint != "" {
 		opts = append(opts, otlpmetrichttp.WithEndpointURL(cfg.Endpoint))
 	}
-	exporter, err := otlpmetrichttp.New(ctx, opts...)
+	exporter, err := newOTLPMetricExporter(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +74,8 @@ func StartOTELMetrics(ctx context.Context, logger *slog.Logger, cfg OTELMetricsC
 		sdkmetric.WithResource(otelResource(cfg.ServiceName, cfg.NodeID, cfg.NodeRole)),
 	)
 	meter := provider.Meter("github.com/aerol-ai/microvm/sandboxd")
-	intGauge, err := meter.Int64ObservableGauge(
+	intGauge, err := newInt64ObservableGauge(
+		meter,
 		"aerolvm.expvar.int64",
 		otelmetric.WithDescription("Current AerolVM expvar int64 value. The original expvar name is in the metric attribute."),
 	)
@@ -79,22 +92,7 @@ func StartOTELMetrics(ctx context.Context, logger *slog.Logger, cfg OTELMetricsC
 		return nil, err
 	}
 	if _, err := meter.RegisterCallback(func(ctx context.Context, observer otelmetric.Observer) error {
-		// Bail out without surfacing the cancellation as a callback error:
-		// the OTEL SDK logs non-nil callback returns on every cycle, which
-		// turns routine periodic-reader timeouts into log noise.
-		if err := ctx.Err(); err != nil {
-			return nil
-		}
-		for _, sample := range CollectAerolVMExpvars() {
-			attrs := expvarAttributes(sample)
-			if sample.Int64 != nil {
-				observer.ObserveInt64(intGauge, *sample.Int64, otelmetric.WithAttributes(attrs...))
-			}
-			if sample.Float != nil {
-				observer.ObserveFloat64(floatGauge, *sample.Float, otelmetric.WithAttributes(attrs...))
-			}
-		}
-		return nil
+		return observeAerolVMExpvars(ctx, observer, intGauge, floatGauge)
 	}, intGauge, floatGauge); err != nil {
 		_ = provider.Shutdown(ctx)
 		return nil, err
@@ -106,6 +104,27 @@ func StartOTELMetrics(ctx context.Context, logger *slog.Logger, cfg OTELMetricsC
 	return provider.Shutdown, nil
 }
 
+// observeAerolVMExpvars is the periodic-reader callback body, extracted so the
+// cancelled-context early-return can be unit-tested without racing the SDK.
+func observeAerolVMExpvars(ctx context.Context, observer otelmetric.Observer, intGauge otelmetric.Int64Observable, floatGauge otelmetric.Float64Observable) error {
+	// Bail out without surfacing the cancellation as a callback error:
+	// the OTEL SDK logs non-nil callback returns on every cycle, which
+	// turns routine periodic-reader timeouts into log noise.
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+	for _, sample := range CollectAerolVMExpvars() {
+		attrs := expvarAttributes(sample)
+		if sample.Int64 != nil {
+			observer.ObserveInt64(intGauge, *sample.Int64, otelmetric.WithAttributes(attrs...))
+		}
+		if sample.Float != nil {
+			observer.ObserveFloat64(floatGauge, *sample.Float, otelmetric.WithAttributes(attrs...))
+		}
+	}
+	return nil
+}
+
 func StartOTELTraces(ctx context.Context, logger *slog.Logger, cfg OTELTracesConfig) (TracesShutdown, error) {
 	if !cfg.Enabled {
 		return nil, nil
@@ -114,7 +133,7 @@ func StartOTELTraces(ctx context.Context, logger *slog.Logger, cfg OTELTracesCon
 	if cfg.Endpoint != "" {
 		opts = append(opts, otlptracehttp.WithEndpointURL(cfg.Endpoint))
 	}
-	exporter, err := otlptracehttp.New(ctx, opts...)
+	exporter, err := newOTLPTraceExporter(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}

@@ -3919,6 +3919,22 @@ func isSandboxIDConflict(err error, id string) bool {
 
 var ErrNotFound = errors.New("sandbox not found")
 
+// afterTransferTapReads is set only by tests to inject a concurrent ownership
+// move between TransferFirecrackerTapSlot's reads and its UPDATE.
+var afterTransferTapReads func()
+
+// afterTransferSourceNil is set only by tests to plant toID ownership after
+// both initial reads miss, covering the idempotent re-read branch.
+var afterTransferSourceNil func()
+
+// afterTapAllocateSelect is set only by tests to steal a free TAP candidate
+// before the claiming UPDATE, covering the contested-pool path.
+var afterTapAllocateSelect func(tapName string)
+
+// afterTapAllocateMiss is set only by tests to restore a free row after a
+// lost UPDATE so the next SELECT still observes pool occupancy.
+var afterTapAllocateMiss func()
+
 // ErrSandboxNameConflict is returned by Create/Upsert when the sandbox's
 // name collides with an existing row's name or id. Names are unique across
 // the sandboxes table; empty names skip the name uniqueness check but ids
@@ -4171,6 +4187,9 @@ func (s *Store) AllocateFirecrackerTapSlot(ctx context.Context, sandboxID string
 			}
 			return nil, fmt.Errorf("allocate firecracker tap slot (select): %w", err)
 		}
+		if afterTapAllocateSelect != nil {
+			afterTapAllocateSelect(candidate.TapName)
+		}
 
 		res, err := s.db.ExecContext(ctx, `
 			UPDATE firecracker_tap_pool
@@ -4188,6 +4207,9 @@ func (s *Store) AllocateFirecrackerTapSlot(ctx context.Context, sandboxID string
 			candidate.SandboxID = sandboxID
 			candidate.AllocatedAt = now.UTC()
 			return &candidate, nil
+		}
+		if afterTapAllocateMiss != nil {
+			afterTapAllocateMiss()
 		}
 		// Lost the race; loop and pick another free slot.
 	}
@@ -4244,6 +4266,9 @@ func (s *Store) TransferFirecrackerTapSlot(ctx context.Context, fromID, toID str
 		// stale target=nil alongside source=nil. Re-read the target so
 		// the losing duplicate returns the moved slot (idempotent)
 		// instead of a spurious not-found.
+		if afterTransferSourceNil != nil {
+			afterTransferSourceNil()
+		}
 		target, err = s.GetFirecrackerTapSlotBySandbox(ctx, toID)
 		if err != nil {
 			return nil, err
@@ -4252,6 +4277,11 @@ func (s *Store) TransferFirecrackerTapSlot(ctx context.Context, fromID, toID str
 			return target, nil
 		}
 		return nil, ErrNotFound
+	}
+	// Test-only yield so coverage can move ownership before the UPDATE and
+	// exercise the RowsAffected=0 idempotent re-read path.
+	if afterTransferTapReads != nil {
+		afterTransferTapReads()
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE firecracker_tap_pool

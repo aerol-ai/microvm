@@ -270,6 +270,9 @@ func (k netstatsServiceSink) handleNetworkSamples(ctx context.Context, samples [
 				"sandbox_id", sample.SandboxID, "error", err)
 			continue
 		}
+		if k.svc.testAfterNetstatsUpdate != nil {
+			k.svc.testAfterNetstatsUpdate()
+		}
 
 		// After persisting deltas, re-read the row so the quota check works
 		// against the post-update cumulative — including any concurrent

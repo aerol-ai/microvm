@@ -507,6 +507,9 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 		s.logger.Warn("template gc list failed", "error", err)
 		return
 	}
+	if s.testAfterTemplateGCList != nil {
+		s.testAfterTemplateGCList()
+	}
 	for _, t := range templates {
 		// Double-check IsTemplateReferenced under the same context — a
 		// CreateSandbox(template_id=t.id) that landed between the list
@@ -521,6 +524,9 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 		if referenced {
 			continue
 		}
+		if s.testAfterTemplateGCSandboxRefCheck != nil {
+			s.testAfterTemplateGCSandboxRefCheck()
+		}
 		vmmReferenced, err := s.store.IsTemplateReferencedByVMM(ctx, t.ID)
 		if err != nil {
 			s.logger.Warn("template gc vmm reference check failed", "template_id", t.ID, "error", err)
@@ -528,6 +534,9 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 		}
 		if vmmReferenced {
 			continue
+		}
+		if s.testAfterTemplateGCVMMRefCheck != nil {
+			s.testAfterTemplateGCVMMRefCheck()
 		}
 		// Release the per-template CID before the row goes. Same shape as
 		// DeleteTemplate — the GC sweeper's responsibilities are a strict

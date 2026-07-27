@@ -405,6 +405,78 @@ type Service struct {
 	// nil falls back to the package-level probeContainerPort. Overridden in
 	// tests to avoid real TCP dials against non-routable container IPs.
 	probeContainerPortFn func(ctx context.Context, containerIP string, port int) error
+
+	// testSealedMountsOverride, when non-nil, replaces sealedMounts after
+	// sealMounts on create paths so PutMounts rollback can be exercised
+	// offline without FUSE MountAll. Nil in production.
+	testSealedMountsOverride []byte
+	// testForcePlatformAttachments, when non-nil, is appended after store.Create
+	// so PutAttachments rollback can be forced offline without MountAll.
+	// Nil in production.
+	testForcePlatformAttachments []models.VolumeAttachment
+	// testAfterStoreCreate runs after a successful store.Create on docker/wasm
+	// create paths. Tests close the DB here so PutMounts / custom-domain
+	// persist failure arms run without a store wrapper. Nil in production.
+	testAfterStoreCreate func()
+	// testAfterCustomDomainsOnCreate runs after persistCustomDomainsOnCreate
+	// succeeds on the wasm create path so the subsequent Get/sync failure
+	// rollbacks can be forced. Nil in production.
+	testAfterCustomDomainsOnCreate func()
+	// testAfterHTTPPortInstall runs after installHTTPPortRoute succeeds in
+	// exposePort's HTTP path so UpsertPort / recordClusterExposedPort
+	// rollback arms can be forced (e.g. by closing the store). Nil in production.
+	testAfterHTTPPortInstall func()
+	// testAfterRuntimeDestroy runs after rt.Destroy succeeds in DestroySandbox
+	// so store.Delete / UnmountAll failure arms can be forced. Nil in production.
+	testAfterRuntimeDestroy func()
+	// testAfterStoreDeleteOnDestroy runs after a successful store.Delete in
+	// DestroySandbox so attachment / wasm-cleanup / cluster-secret failure
+	// arms can be forced (e.g. by closing the store). Nil in production.
+	testAfterStoreDeleteOnDestroy func()
+	// testAfterTemplateGCList runs after ListGCEligibleTemplates succeeds in
+	// runTemplateGC so IsTemplateReferenced / VMM-ref failure arms can be
+	// forced. Nil in production.
+	testAfterTemplateGCList func()
+	// testAfterTemplateGCSandboxRefCheck runs after IsTemplateReferenced
+	// succeeds with referenced=false so the VMM-ref / delete failure arms
+	// can be forced by closing the store. Nil in production.
+	testAfterTemplateGCSandboxRefCheck func()
+	// testAfterTemplateGCVMMRefCheck runs after IsTemplateReferencedByVMM
+	// succeeds with referenced=false so DeleteTemplate failure can be forced
+	// without skipping via the VMM-check warn arm. Nil in production.
+	testAfterTemplateGCVMMRefCheck func()
+	// testAfterPendingImageGCList runs after ListPendingImageGCDue succeeds
+	// so per-entry HasActiveImageRef / row-clear failure arms can be forced.
+	// Nil in production.
+	testAfterPendingImageGCList func()
+	// testL4ActivityInterval, when >0, overrides l4WakeActivityInterval in
+	// touchDuringL4Activity so unit tests don't wait 30s. Zero in production.
+	testL4ActivityInterval time.Duration
+	// testAfterLifecycleScopedGet runs after UpdateLifecycle's scopedGet
+	// succeeds so store.UpdateLifecycle failure can be forced. Nil in production.
+	testAfterLifecycleScopedGet func()
+	// testForceUnmountErr, when non-nil, replaces the UnmountAll result in
+	// DestroySandbox so the warn arm is reachable offline. Nil in production.
+	testForceUnmountErr error
+	// testBeforeStoreCreateSnapshot runs after normalize/initial push state and
+	// before store.CreateSnapshot so conflict / GetSnapshot arms can be forced
+	// under the snapshotMu lock. Nil in production.
+	testBeforeStoreCreateSnapshot func(*models.SandboxSnapshot)
+	// testNormalizeSnapshotErr, when non-nil, is returned from
+	// normalizeSnapshotImageDistribution so CreateSnapshotWithOwnership's
+	// normalize failure arm is reachable. Nil in production.
+	testNormalizeSnapshotErr error
+	// testVolumeMeta, when non-nil, replaces volumeMeta() so reclaim / attach
+	// failure arms can be forced without a store wrapper. Nil in production.
+	testVolumeMeta volumeMetaStore
+	// testForceFleetSuspendErr, when non-nil, replaces SetFleetSuspended's
+	// result in StopByOwner so the non-NotFound error arm is reachable.
+	// Nil in production.
+	testForceFleetSuspendErr error
+	// testAfterNetstatsUpdate runs after a successful UpdateSandboxNetCounters
+	// in handleNetworkSamples so the subsequent Get failure arm can be forced.
+	// Nil in production.
+	testAfterNetstatsUpdate func()
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -1238,6 +1310,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, err
 	}
+	if s.testSealedMountsOverride != nil {
+		sealedMounts = s.testSealedMountsOverride
+	}
 
 	toolboxToken, err := generateToolboxToken()
 	if err != nil {
@@ -1306,7 +1381,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, fmt.Errorf("mount external storage: %w", err)
 	}
 	cleanupMounts := func() {
-		if err := s.mounts.UnmountAll(sandboxID); err != nil {
+		if s.mounts == nil {
+			return
+		}
+		err := s.mounts.UnmountAll(sandboxID)
+		if s.testForceUnmountErr != nil {
+			err = s.testForceUnmountErr
+		}
+		if err != nil {
 			s.logger.Warn("cleanup unmount failed", "sandbox_id", sandboxID, "error", err)
 		}
 	}
@@ -1444,6 +1526,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 		releaseAdmission()
 		return nil, err
+	}
+	if s.testAfterStoreCreate != nil {
+		s.testAfterStoreCreate()
+	}
+	if len(s.testForcePlatformAttachments) > 0 {
+		platformAttachments = append(platformAttachments, s.testForcePlatformAttachments...)
 	}
 
 	if len(platformAttachments) > 0 {
@@ -2109,13 +2197,25 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
+	if s.testAfterRuntimeDestroy != nil {
+		s.testAfterRuntimeDestroy()
+	}
 	if s.mounts != nil {
-		if err := s.mounts.UnmountAll(id); err != nil {
+		err := s.mounts.UnmountAll(id)
+		if s.testForceUnmountErr != nil {
+			err = s.testForceUnmountErr
+		}
+		if err != nil {
 			s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", err)
 		}
+	} else if s.testForceUnmountErr != nil {
+		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", s.testForceUnmountErr)
 	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
+	}
+	if s.testAfterStoreDeleteOnDestroy != nil {
+		s.testAfterStoreDeleteOnDestroy()
 	}
 	if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, id); err != nil {
 		if s.logger != nil {
@@ -2273,6 +2373,9 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 	snapshot.PushState = s.initialSnapshotPushState(snapshot)
+	if s.testBeforeStoreCreateSnapshot != nil {
+		s.testBeforeStoreCreateSnapshot(snapshot)
+	}
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
 			existing, getErr := s.store.GetSnapshot(ctx, name)
@@ -2499,6 +2602,9 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err != nil {
 		return nil, err
 	}
+	if s.testAfterLifecycleScopedGet != nil {
+		s.testAfterLifecycleScopedGet()
+	}
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
 	}
@@ -2620,6 +2726,9 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		publicURL := s.caddy.PortPublicURL(id, port)
 		if err := s.installHTTPPortRoute(ctx, sandbox, port); err != nil {
 			return models.ExposePortResponse{}, err
+		}
+		if s.testAfterHTTPPortInstall != nil {
+			s.testAfterHTTPPortInstall()
 		}
 		exposure := models.ExposedPort{
 			SandboxID: id,
@@ -3926,9 +4035,15 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				}
 			}
 			if s.mounts != nil {
-				if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
+				err := s.mounts.UnmountAll(sandbox.ID)
+				if s.testForceUnmountErr != nil {
+					err = s.testForceUnmountErr
+				}
+				if err != nil {
 					s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
 				}
+			} else if s.testForceUnmountErr != nil {
+				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", s.testForceUnmountErr)
 			}
 			// store.Delete must happen BEFORE schedulePendingImageGC. The
 			// pending-image janitor uses HasActiveImageRef to decide whether
@@ -4713,6 +4828,9 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 	if err != nil {
 		s.logger.Warn("pending image gc list failed", "error", err)
 		return
+	}
+	if s.testAfterPendingImageGCList != nil {
+		s.testAfterPendingImageGCList()
 	}
 	for _, entry := range entries {
 		image := entry.Image

@@ -79,6 +79,9 @@ func (s *Store) ReserveContainerNetnsSlot(ctx context.Context, sandboxID string,
 			}
 			return nil, fmt.Errorf("reserve container netns slot (select): %w", err)
 		}
+		if afterNetnsFreeSelect != nil {
+			afterNetnsFreeSelect(candidate.SlotID)
+		}
 		res, err := s.db.ExecContext(ctx, `
 			UPDATE container_netns_slots
 			SET sandbox_id = ?, state = ?, updated_at = ?
@@ -97,12 +100,23 @@ func (s *Store) ReserveContainerNetnsSlot(ctx context.Context, sandboxID string,
 			candidate.UpdatedAt = now
 			return &candidate, nil
 		}
+		if afterNetnsFreeMiss != nil {
+			afterNetnsFreeMiss()
+		}
 	}
 	return nil, errors.New("reserve container netns slot: pool contested after 8 attempts")
 }
 
 // ErrNoPooledContainerNetnsSlot means no prewarmed slot is available for claim.
 var ErrNoPooledContainerNetnsSlot = errors.New("container netns pool: no pooled slot")
+
+// afterNetnsFreeSelect is set only by tests to steal a free/pooled candidate
+// before the claiming UPDATE (BeginPrewarm / ClaimPooled / Reserve).
+var afterNetnsFreeSelect func(slotID string)
+
+// afterNetnsFreeMiss restores a free/pooled row after a lost UPDATE so the
+// next SELECT can still observe a candidate (contested-path coverage).
+var afterNetnsFreeMiss func()
 
 // BeginPrewarmContainerNetnsSlot reserves a free slot under its own slot_id so
 // the refill ticker can CNI-realize it without a sandbox owner yet.
@@ -123,6 +137,9 @@ func (s *Store) BeginPrewarmContainerNetnsSlot(ctx context.Context, now time.Tim
 			}
 			return nil, fmt.Errorf("begin prewarm (select): %w", err)
 		}
+		if afterNetnsFreeSelect != nil {
+			afterNetnsFreeSelect(candidate.SlotID)
+		}
 		res, err := s.db.ExecContext(ctx, `
 			UPDATE container_netns_slots
 			SET sandbox_id = ?, state = ?, updated_at = ?
@@ -140,6 +157,9 @@ func (s *Store) BeginPrewarmContainerNetnsSlot(ctx context.Context, now time.Tim
 			candidate.State = NetnsSlotStateReserved
 			candidate.UpdatedAt = now
 			return &candidate, nil
+		}
+		if afterNetnsFreeMiss != nil {
+			afterNetnsFreeMiss()
 		}
 	}
 	return nil, errors.New("begin prewarm: pool contested after 8 attempts")
@@ -201,6 +221,9 @@ func (s *Store) ClaimPooledContainerNetnsSlot(ctx context.Context, sandboxID str
 			}
 			return nil, fmt.Errorf("claim pooled (select): %w", err)
 		}
+		if afterNetnsFreeSelect != nil {
+			afterNetnsFreeSelect(candidate.SlotID)
+		}
 		res, err := s.db.ExecContext(ctx, `
 			UPDATE container_netns_slots
 			SET sandbox_id = ?, state = ?, updated_at = ?
@@ -218,6 +241,9 @@ func (s *Store) ClaimPooledContainerNetnsSlot(ctx context.Context, sandboxID str
 			candidate.State = NetnsSlotStateAdopted
 			candidate.UpdatedAt = now
 			return &candidate, nil
+		}
+		if afterNetnsFreeMiss != nil {
+			afterNetnsFreeMiss()
 		}
 	}
 	return nil, errors.New("claim pooled: pool contested after 8 attempts")

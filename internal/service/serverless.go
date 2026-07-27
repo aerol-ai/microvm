@@ -178,8 +178,16 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
-	if err := s.mounts.UnmountAll(id); err != nil {
-		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
+	if s.mounts != nil {
+		err := s.mounts.UnmountAll(id)
+		if s.testForceUnmountErr != nil {
+			err = s.testForceUnmountErr
+		}
+		if err != nil {
+			s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
+		}
+	} else if s.testForceUnmountErr != nil {
+		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", s.testForceUnmountErr)
 	}
 
 	// Drop the Caddy routes while the container is down so requests hit the

@@ -339,7 +339,11 @@ func (s *Service) releaseL4Active(id string) {
 }
 
 func (s *Service) touchDuringL4Activity(id string, generation uint64) {
-	ticker := time.NewTicker(l4WakeActivityInterval)
+	interval := l4WakeActivityInterval
+	if s.testL4ActivityInterval > 0 {
+		interval = s.testL4ActivityInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		<-ticker.C

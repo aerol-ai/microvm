@@ -139,6 +139,9 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 }
 
 func (s *Service) normalizeSnapshotImageDistribution(ctx context.Context, snapshot *models.SandboxSnapshot, forceLocal bool) error {
+	if s != nil && s.testNormalizeSnapshotErr != nil {
+		return s.testNormalizeSnapshotErr
+	}
 	if snapshot == nil {
 		return nil
 	}

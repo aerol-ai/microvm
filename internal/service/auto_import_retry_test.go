@@ -23,6 +23,7 @@ type fakePendingStore struct {
 	sandbox  map[string]*models.Sandbox
 	pending  map[string]bool
 	getErr   map[string]error
+	setErr   error
 	setCalls atomic.Int64
 }
 
@@ -77,6 +78,9 @@ func (f *fakePendingStore) Get(ctx context.Context, id string) (*models.Sandbox,
 
 func (f *fakePendingStore) SetAutoImportPending(ctx context.Context, id string, pending bool) error {
 	f.setCalls.Add(1)
+	if f.setErr != nil {
+		return f.setErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pending[id] = pending
