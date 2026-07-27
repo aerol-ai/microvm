@@ -32,4 +32,8 @@ func TestNonLinuxStubs(t *testing.T) {
 	if err := stub.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+
+	announceReady(slog.Default(), "sb", "tok", "nonce", "")
+	scrubReadyEnv()
+	runParkedReadyHandshake(slog.Default(), &server{}, "sock", "tok", "nonce")
 }

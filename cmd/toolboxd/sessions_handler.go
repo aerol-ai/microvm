@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -213,15 +214,13 @@ func copyToResponse(w http.ResponseWriter, f *os.File) (int64, error) {
 			}
 		}
 		if err != nil {
-			if errors.Is(err, errEOF) {
+			if errors.Is(err, io.EOF) {
 				return total, nil
 			}
 			return total, err
 		}
 	}
 }
-
-var errEOF = errors.New("EOF")
 
 func (s *server) handleSessionAttach(w http.ResponseWriter, r *http.Request, id string) {
 	if s.sessions == nil {

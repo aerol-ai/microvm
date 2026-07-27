@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -240,8 +239,8 @@ func TestCopyToResponseAndAttachmentErrorBranches(t *testing.T) {
 		t.Fatalf("Seek: %v", err)
 	}
 	rec := httptest.NewRecorder()
-	if total, err := copyToResponse(rec, f); !errors.Is(err, io.EOF) || total == 0 {
-		t.Fatalf("copyToResponse success = (%d, %v), want bytes with EOF", total, err)
+	if total, err := copyToResponse(rec, f); err != nil || total == 0 {
+		t.Fatalf("copyToResponse success = (%d, %v), want bytes with nil error", total, err)
 	}
 
 	srv := newDaytonaTestServer(t)

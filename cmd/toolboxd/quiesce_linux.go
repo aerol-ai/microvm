@@ -153,7 +153,7 @@ func (linuxQuiesceOps) ConfigureNetwork(cfg guestNetworkConfig) error {
 }
 
 func firstNonLoopbackInterface() (string, error) {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := readNetClassDir()
 	if err != nil {
 		return "", fmt.Errorf("read /sys/class/net: %w", err)
 	}
@@ -164,6 +164,12 @@ func firstNonLoopbackInterface() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no non-loopback interface found")
+}
+
+// readNetClassDir is the /sys/class/net listing seam so tests can force
+// empty/error results without a network namespace.
+var readNetClassDir = func() ([]os.DirEntry, error) {
+	return os.ReadDir("/sys/class/net")
 }
 
 func runNetworkCmd(name string, args ...string) error {

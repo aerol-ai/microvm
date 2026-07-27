@@ -159,3 +159,70 @@ func TestMainWasmWorkerError(t *testing.T) {
 		t.Fatalf("stderr = %q, want worker boom", stderr.String())
 	}
 }
+
+func TestMainWasmResidentHostSuccess(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", "--wasm-resident-host", "/tmp/resident.sock"}
+
+	origHost := runWasmResidentHostCLI
+	t.Cleanup(func() { runWasmResidentHostCLI = origHost })
+	called := false
+	runWasmResidentHostCLI = func(args []string) error {
+		called = true
+		if len(args) != 1 || args[0] != "/tmp/resident.sock" {
+			t.Fatalf("RunCLIResident args = %v", args)
+		}
+		return nil
+	}
+
+	origExit := osExit
+	exited := false
+	osExit = func(int) { exited = true }
+	t.Cleanup(func() { osExit = origExit })
+
+	main()
+
+	if !called {
+		t.Fatal("expected wasm resident host CLI to run")
+	}
+	if exited {
+		t.Fatal("expected main not to exit on resident host success")
+	}
+}
+
+func TestMainWasmResidentHostError(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", "--wasm-resident-host", "/tmp/resident.sock"}
+
+	origHost := runWasmResidentHostCLI
+	t.Cleanup(func() { runWasmResidentHostCLI = origHost })
+	runWasmResidentHostCLI = func([]string) error { return errors.New("resident boom") }
+
+	origExit := osExit
+	exitCode := -1
+	osExit = func(code int) { exitCode = code }
+	t.Cleanup(func() { osExit = origExit })
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
+
+	main()
+
+	_ = w.Close()
+	var stderr bytes.Buffer
+	_, _ = io.Copy(&stderr, r)
+
+	if exitCode != 1 {
+		t.Fatalf("expected osExit(1), got %d", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "resident boom") {
+		t.Fatalf("stderr = %q, want resident boom", stderr.String())
+	}
+}
