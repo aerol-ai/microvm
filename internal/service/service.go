@@ -931,6 +931,15 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // Only placements whose create spec opted into failover.policy=recreate reach
 // this path; default sandboxes remain non-HA and are orphaned on owner death.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
+	_, err := s.RecreateSandboxReport(ctx, id, spec, secrets, exposedPorts)
+	return err
+}
+
+// RecreateSandboxReport implements cluster.SandboxRecreateReporter. attempted
+// is false when a watcher tick finds an already-materialized sandbox and all
+// idempotent route replay work is already healthy. This keeps the failover
+// recreate counter from becoming a constant five-second polling rate.
+func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
 	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
 		nodeID := ""
 		if c := s.Cluster(); c != nil {
@@ -938,20 +947,25 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 		}
 		merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
 		if err != nil {
-			return fmt.Errorf("recreate %s: %w", id, err)
+			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
-		if err := s.recreateWasmDurableSandbox(ctx, id, merged, exposedPorts); err != nil {
-			return err
+		attempted, err := s.recreateWasmDurableSandbox(ctx, id, merged, exposedPorts)
+		if err != nil {
+			return true, err
 		}
-		s.logger.Info("cluster: recreated durable wasm sandbox after failover",
-			"sandbox_id", id, "replayed_ports", len(exposedPorts))
-		return nil
+		if attempted {
+			s.logger.Info("cluster: recreated durable wasm sandbox after failover",
+				"sandbox_id", id, "replayed_ports", len(exposedPorts))
+		}
+		return attempted, nil
 	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		attempted := false
 		if s.isWasmSandbox(existing) && existing.Durability == models.DurabilityDurable &&
-			(existing.Status == models.SandboxStatusPassivated || existing.Status == models.SandboxStatusAwaitingRuntime) {
+			existing.Status == models.SandboxStatusPassivated {
+			attempted = true
 			if _, err := s.rehydrateWasmIfNeeded(ctx, existing, nil); err != nil {
-				return fmt.Errorf("recreate %s: rehydrate wasm: %w", id, err)
+				return true, fmt.Errorf("recreate %s: rehydrate wasm: %w", id, err)
 			}
 		}
 		// D1 reconstruction: on owner change, a Serverless && stopped row
@@ -960,7 +974,10 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 		// wake-aware route shape is in place when replayClusterExposedPorts
 		// touches HTTP exposures.
 		s.ReconstructWakeArmedIfNeeded(ctx, existing)
-		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
+		if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
+			return true, err
+		}
+		return attempted, nil
 	}
 	nodeID := ""
 	if c := s.Cluster(); c != nil {
@@ -968,7 +985,7 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 	}
 	merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
 	if err != nil {
-		return fmt.Errorf("recreate %s: %w", id, err)
+		return true, fmt.Errorf("recreate %s: %w", id, err)
 	}
 	// A replicated spec written before the private-by-default flip carries a
 	// nil flag, and store-backed rows always materialize the tri-state — so a
@@ -980,14 +997,14 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 		merged.AllowPublicTraffic = &public
 	}
 	if _, err := s.CreateSandboxWithID(ctx, merged, id); err != nil {
-		return err
+		return true, err
 	}
 	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
-		return err
+		return true, err
 	}
 	s.logger.Info("cluster: recreated sandbox after failover",
 		"sandbox_id", id, "replayed_ports", len(exposedPorts))
-	return nil
+	return true, nil
 }
 
 func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, exposedPorts map[int]cluster.ExposedPortRoute) error {
@@ -4122,11 +4139,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 						"sandbox_id", sandbox.ID,
 						"error", err,
 					)
-				} else if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+				} else if inserted, err := reapplyNetworkBlockAll(cr, sandbox.ContainerIP); err != nil {
+					networkBlockReapplyErrors.Add(1)
 					s.logger.Warn("reconcile reapply network block failed",
 						"sandbox_id", sandbox.ID,
 						"ip", sandbox.ContainerIP,
 						"error", err,
+					)
+				} else if inserted {
+					// Rule was gone and we put it back — the sandbox was
+					// un-isolated for at least one reconcile interval.
+					networkBlockReapplyTotal.Add(1)
+					s.logger.Warn("reconcile reapplied missing network block",
+						"sandbox_id", sandbox.ID,
+						"ip", sandbox.ContainerIP,
 					)
 				}
 			}

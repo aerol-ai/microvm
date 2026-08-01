@@ -47,6 +47,12 @@ func ensureWasip1HTTPWasm(t *testing.T) string {
 	if err != nil {
 		t.Skip(err)
 	}
+	// A missing toolchain is an environment limitation, not a defect under
+	// test — same class as Windows above. Checked before the build so the
+	// failure mode is a clear skip rather than a confusing exec error.
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable; cannot compile wasip1-http.wasm")
+	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		t.Fatal(err)
 	}

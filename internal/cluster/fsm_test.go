@@ -977,3 +977,115 @@ func TestFSMSnapshotIsolatedFromExposedPortMutations(t *testing.T) {
 		t.Fatalf("snapshot leaked ExposedPortRoutes[443]: %+v", got.ExposedPortRoutes)
 	}
 }
+
+// TestFSMReassignFailoverReportsOnlyRealTransitions is the regression test for
+// counting failover reassigns off the raft ack instead of the FSM transition.
+// The ack is wrong in both directions:
+//
+//   - Overcount: opReassign against a deleted placement hits the no-op branch
+//     and returns success, so an ack-counting caller records a reassign that
+//     never happened.
+//   - Undercount: a forwarded opReassign can commit on the leader while its
+//     HTTP acknowledgment is lost, so an ack-counting caller misses a reassign
+//     that did happen.
+//
+// Applying straight to the FSM here proves that the leader wrapper receives
+// an authoritative changed bit. It also models follower replay: direct FSM
+// application must not increment the process-local counter.
+func TestFSMReassignFailoverReportsOnlyRealTransitions(t *testing.T) {
+	fsm := newPlacementFSM()
+
+	// Raced delete: reassign a placement that isn't there. The FSM no-ops
+	// ("delete wins") and must not count it.
+	missing, _ := encodeCommand(command{
+		Op: opReassign, SandboxID: "sb-gone", OwnerNodeID: "nodeB",
+		ReassignCause: reassignCauseFailover,
+	})
+	before := clusterFailoverReassignTotal.Value()
+	got, ok := fsm.Apply(&raft.Log{Index: 1, Data: missing}).(reassignApplyResult)
+	if !ok || got.Changed {
+		t.Fatalf("missing reassign result = %+v ok=%v, want Changed=false", got, ok)
+	}
+	if got := clusterFailoverReassignTotal.Value() - before; got != 0 {
+		t.Fatalf("direct FSM apply changed metric by %d, want 0", got)
+	}
+
+	// Real transition: place, then reassign. The FSM reports changed, while
+	// the leader wrapper remains responsible for the one process-local count.
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA"})
+	fsm.Apply(&raft.Log{Index: 2, Data: place})
+
+	real, _ := encodeCommand(command{
+		Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB",
+		ReassignCause: reassignCauseFailover,
+	})
+	before = clusterFailoverReassignTotal.Value()
+	got, ok = fsm.Apply(&raft.Log{Index: 3, Data: real}).(reassignApplyResult)
+	if !ok || !got.Changed {
+		t.Fatalf("real reassign result = %+v ok=%v, want Changed=true", got, ok)
+	}
+	if got := clusterFailoverReassignTotal.Value() - before; got != 0 {
+		t.Fatalf("direct FSM apply changed metric by %d, want 0", got)
+	}
+	if p, ok := fsm.get("sb1"); !ok || p.OwnerNodeID != "nodeB" {
+		t.Fatalf("ownership did not move: %+v ok=%v", p, ok)
+	}
+}
+
+// TestFSMReassignMetricIgnoresOperatorReassign pins the scope of the counter.
+// opReassign has four producers: two failover paths and two operator /
+// live-migration paths (Cluster.ReassignPlacement, Agent.ReassignPlacement).
+// Only the failover ones tag a cause, so a WASM live migration must not inflate
+// aerolvm_cluster_failover_reassign_total.
+func TestFSMReassignMetricIgnoresOperatorReassign(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA"})
+	fsm.Apply(&raft.Log{Index: 1, Data: place})
+
+	// No ReassignCause — what ReassignPlacement emits.
+	operator, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB"})
+	before := clusterFailoverReassignTotal.Value()
+	fsm.Apply(&raft.Log{Index: 2, Data: operator})
+
+	if got := clusterFailoverReassignTotal.Value() - before; got != 0 {
+		t.Fatalf("failover reassign delta = %d for an operator reassign, want 0", got)
+	}
+	if p, ok := fsm.get("sb1"); !ok || p.OwnerNodeID != "nodeB" {
+		t.Fatalf("operator reassign must still move ownership: %+v ok=%v", p, ok)
+	}
+}
+
+// TestFSMReassignCauseIsReplaySafe pins the mixed-version / replay contract:
+// ReassignCause is observability-only, so a log entry written by a node that
+// predates the field (or any entry that simply omits it) must produce exactly
+// the same placement state as a tagged one. Only the metric differs.
+func TestFSMReassignCauseIsReplaySafe(t *testing.T) {
+	apply := func(cause string) Placement {
+		t.Helper()
+		fsm := newPlacementFSM()
+		place, _ := encodeCommand(command{
+			Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a:8080",
+		})
+		fsm.Apply(&raft.Log{Index: 1, Data: place})
+		reassign, _ := encodeCommand(command{
+			Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB",
+			OwnerAPIURL: "http://b:8080", ReassignCause: cause,
+		})
+		fsm.Apply(&raft.Log{Index: 2, Data: reassign})
+		p, ok := fsm.get("sb1")
+		if !ok {
+			t.Fatal("placement missing after reassign")
+		}
+		return p
+	}
+
+	untagged := apply("")                  // pre-upgrade entry
+	tagged := apply(reassignCauseFailover) // post-upgrade entry
+
+	if untagged.OwnerNodeID != tagged.OwnerNodeID ||
+		untagged.OwnerAPIURL != tagged.OwnerAPIURL ||
+		untagged.OwnerState != tagged.OwnerState ||
+		untagged.Version != tagged.Version {
+		t.Fatalf("ReassignCause changed the applied state:\n untagged=%+v\n tagged=%+v", untagged, tagged)
+	}
+}

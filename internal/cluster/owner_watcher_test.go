@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -14,9 +15,10 @@ import (
 // recordingRecreator captures every RecreateSandbox call so a test can assert
 // the cluster owner watcher fired with the expected (id, spec, ports) tuple.
 type recordingRecreator struct {
-	mu    sync.Mutex
-	calls map[string]recordedRecreate
-	err   error
+	mu        sync.Mutex
+	calls     map[string]recordedRecreate
+	attempted bool
+	err       error
 }
 
 type recordedRecreate struct {
@@ -26,14 +28,26 @@ type recordedRecreate struct {
 }
 
 func newRecordingRecreator() *recordingRecreator {
-	return &recordingRecreator{calls: make(map[string]recordedRecreate)}
+	return &recordingRecreator{calls: make(map[string]recordedRecreate), attempted: true}
 }
 
-func (r *recordingRecreator) RecreateSandbox(_ context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) error {
+func (r *recordingRecreator) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) error {
+	_, err := r.RecreateSandboxReport(ctx, id, spec, secrets, ports)
+	return err
+}
+
+func (r *recordingRecreator) RecreateSandboxReport(_ context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls[id] = recordedRecreate{spec: spec, secrets: secrets, ports: ports}
-	return r.err
+	return r.attempted, r.err
+}
+
+func (r *recordingRecreator) setOutcome(attempted bool, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.attempted = attempted
+	r.err = err
 }
 
 func (r *recordingRecreator) get(id string) (recordedRecreate, bool) {
@@ -317,5 +331,116 @@ func recreateCandidate(nodeID, role string, freeCPU float64) Member {
 			AvailableMemoryMB: 65536,
 			CanAdmit:          true,
 		},
+	}
+}
+
+// TestFailoverRecreateMetricsMoveOnOwnerDeath is the regression test for the
+// failover observability gap: before these counters, a fleet-wide recreate
+// storm was visible only as log lines on whichever node happened to pick up
+// the placement. Drives a real owner-death → reassign → recreate sequence and
+// asserts each counter moves exactly once per event.
+func TestFailoverRecreateMetricsMoveOnOwnerDeath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
+
+	rec := newRecordingRecreator()
+	c.AttachRecreator(rec)
+
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-metrics", OwnerNodeID: "dead-node",
+		OwnerAPIURL: "http://gone", Spec: failoverRecreateSpec(),
+	}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	beforeReassign := clusterFailoverReassignTotal.Value()
+	c.evictDeadOwner(ctx, "dead-node")
+	if got := clusterFailoverReassignTotal.Value() - beforeReassign; got != 1 {
+		t.Fatalf("reassign delta = %d, want 1", got)
+	}
+
+	// Successful recreate: attempt counted, no error recorded.
+	beforeRecreate := clusterFailoverRecreateTotal.Value()
+	beforeErrors := expvarMapValue(clusterFailoverRecreateErrors, "error")
+	c.recreateOwnedSandboxes(ctx)
+	if got := clusterFailoverRecreateTotal.Value() - beforeRecreate; got != 1 {
+		t.Fatalf("recreate delta = %d, want 1", got)
+	}
+	if got := expvarMapValue(clusterFailoverRecreateErrors, "error") - beforeErrors; got != 0 {
+		t.Fatalf("recreate error delta = %d on success, want 0", got)
+	}
+
+	// A later watcher pass sees the already-materialized sandbox. The service
+	// reports this successful steady-state replay as a no-op, so the metric
+	// must stay flat instead of increasing every five seconds forever.
+	rec.setOutcome(false, nil)
+	beforeRecreate = clusterFailoverRecreateTotal.Value()
+	c.recreateOwnedSandboxes(ctx)
+	if got := clusterFailoverRecreateTotal.Value() - beforeRecreate; got != 0 {
+		t.Fatalf("recreate delta on steady-state no-op = %d, want 0", got)
+	}
+
+	// Failing recreate: still one attempt, plus one classified error. This is
+	// the counter that feeds the maxRecreateFailuresBeforeReassign escalation.
+	rec.setOutcome(true, errors.New("docker: no such image"))
+	beforeRecreate = clusterFailoverRecreateTotal.Value()
+	beforeErrors = expvarMapValue(clusterFailoverRecreateErrors, "error")
+	c.recreateOwnedSandboxes(ctx)
+	if got := clusterFailoverRecreateTotal.Value() - beforeRecreate; got != 1 {
+		t.Fatalf("recreate delta on failure = %d, want 1", got)
+	}
+	if got := expvarMapValue(clusterFailoverRecreateErrors, "error") - beforeErrors; got != 1 {
+		t.Fatalf("recreate error delta = %d, want 1", got)
+	}
+}
+
+// TestFailoverRecreateMetricsStayZeroWithoutOptIn pins the no-op contract: a
+// placement that never opted into failover recreate must not move the
+// counters, so a fleet running the default policy reads a flat zero.
+func TestFailoverRecreateMetricsStayZeroWithoutOptIn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
+
+	c.AttachRecreator(newRecordingRecreator())
+
+	// No Failover block — the default "leave it stopped" policy.
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-no-optin", OwnerNodeID: "dead-node",
+		OwnerAPIURL: "http://gone",
+		Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512},
+	}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	beforeRecreate := clusterFailoverRecreateTotal.Value()
+	beforeReassign := clusterFailoverReassignTotal.Value()
+	c.evictDeadOwner(ctx, "dead-node")
+	c.recreateOwnedSandboxes(ctx)
+
+	if got := clusterFailoverRecreateTotal.Value() - beforeRecreate; got != 0 {
+		t.Errorf("recreate delta = %d without opt-in, want 0", got)
+	}
+	if got := clusterFailoverReassignTotal.Value() - beforeReassign; got != 0 {
+		t.Errorf("reassign delta = %d without opt-in, want 0", got)
 	}
 }

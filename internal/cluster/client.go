@@ -1049,9 +1049,16 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err er
 		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
 		return err
 	}
-	if appErr, ok := f.Response().(error); ok && appErr != nil {
+	response := f.Response()
+	if appErr, ok := response.(error); ok && appErr != nil {
 		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
 		return err
+	}
+	if result, ok := response.(reassignApplyResult); ok && result.Changed {
+		// This runs once on the leader after its FSM confirms the ownership
+		// transition. Followers apply the same log entry but never execute this
+		// wrapper, and a lost HTTP acknowledgement cannot erase the count.
+		recordFailoverReassign()
 	}
 	return nil
 }

@@ -89,6 +89,19 @@ type command struct {
 	// identical keys cluster-wide.
 	Hostname string `json:"hostname,omitempty"`
 
+	// ReassignCause tags WHY an opReassign was issued. Observability only —
+	// the FSM's state transition is identical regardless of cause, so an
+	// entry replayed from an older node (which never set the field) applies
+	// exactly the same placement change. Additive + omitempty, so mixed-
+	// version clusters and pre-upgrade log entries decode cleanly to "".
+	//
+	// It exists because opReassign has four producers: two failover paths and
+	// two operator/live-migration paths (Cluster.ReassignPlacement,
+	// Agent.ReassignPlacement). The failover counter must not silently absorb
+	// a WASM live migration, so the cause has to ride with the command rather
+	// than be inferred at apply time.
+	ReassignCause string `json:"reassign_cause,omitempty"`
+
 	// Reservations is populated by opReserveBatch. The single opReserve fields
 	// above are retained for wire compatibility and the normal one-create path.
 	Reservations []reservationCommand `json:"reservations,omitempty"`
@@ -114,6 +127,14 @@ type reservationCommand struct {
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
 	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
+}
+
+// reassignApplyResult is returned only for failover-tagged opReassign entries.
+// Raft exposes the leader FSM's response to applyEncodedLocal, allowing that
+// single authoritative apply path to count a real transition without counting
+// the same replicated log entry again on every follower.
+type reassignApplyResult struct {
+	Changed bool
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -556,6 +577,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if !exists {
 			// Reassigning a non-existent placement is a no-op (could happen
 			// if a delete and a reassign race; delete wins).
+			if cmd.ReassignCause == reassignCauseFailover {
+				return reassignApplyResult{}
+			}
 			return nil
 		}
 		wasReserved := existing.IsReserved()
@@ -590,6 +614,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.claimPendingReservationLocked(cmd.SandboxID, existing)
 		} else {
 			f.claimOwnerLocked(cmd.SandboxID, existing)
+		}
+		if cmd.ReassignCause == reassignCauseFailover {
+			return reassignApplyResult{Changed: true}
 		}
 		return nil
 	case opOrphanOwner:

@@ -21,10 +21,17 @@ func (d *Driver) ClearNetworkRules(containerIP string) error {
 }
 
 func (d *Driver) ApplyNetworkBlockAll(containerIP string) error {
+	_, err := d.ApplyNetworkBlockAllReport(containerIP)
+	return err
+}
+
+// ApplyNetworkBlockAllReport implements runtime.NetworkBlockReporter. See the
+// docker client's copy for why reconcile needs the inserted flag.
+func (d *Driver) ApplyNetworkBlockAllReport(containerIP string) (bool, error) {
 	if d.networkRules == nil {
-		return nil
+		return false, nil
 	}
-	return d.networkRules.BlockAllEgress(containerIP)
+	return d.networkRules.BlockAllEgressReport(containerIP)
 }
 
 func (d *Driver) ApplyNetworkBlockIngress(containerIP string) error {

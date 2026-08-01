@@ -178,25 +178,37 @@ func (m *Manager) lockIP(ip string) func() {
 // any rule appended directly to FORWARD. This works on iptables-legacy and
 // on Docker 28+/iptables-nft (which writes through to nftables) alike.
 func (m *Manager) BlockAllEgress(containerIP string) error {
+	_, err := m.BlockAllEgressReport(containerIP)
+	return err
+}
+
+// BlockAllEgressReport is BlockAllEgress with the idempotency outcome
+// surfaced: inserted is true only when the rule was genuinely absent and had
+// to be re-installed. Reconcile reapplies unconditionally (the Exists guard
+// below is what makes that safe), so "we called Apply" is a constant rate and
+// useless as a signal — "the rule was missing when we looked" is the actual
+// isolation-drift event worth counting. Disabled manager and empty IP report
+// inserted=false: nothing was installed, so nothing drifted.
+func (m *Manager) BlockAllEgressReport(containerIP string) (bool, error) {
 	if !m.Enabled() || containerIP == "" {
-		return nil
+		return false, nil
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
 
 	exists, err := m.ipt.Exists("filter", m.filterChain(), "-s", containerIP, "-j", "DROP")
 	if err != nil {
-		return fmt.Errorf("check existing egress rule: %w", err)
+		return false, fmt.Errorf("check existing egress rule: %w", err)
 	}
 	if exists {
-		return nil
+		return false, nil
 	}
 
 	if err := m.ipt.Insert("filter", m.filterChain(), 1, "-s", containerIP, "-j", "DROP"); err != nil {
-		return fmt.Errorf("insert egress rule: %w", err)
+		return false, fmt.Errorf("insert egress rule: %w", err)
 	}
 
-	return nil
+	return true, nil
 }
 
 func (m *Manager) ClearBlockAllEgress(containerIP string) error {

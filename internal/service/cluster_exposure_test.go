@@ -99,11 +99,14 @@ func TestRecreateSandboxReplaysPortsForExistingSandbox(t *testing.T) {
 		t.Fatalf("seed sandbox: %v", err)
 	}
 
-	err := svc.RecreateSandbox(ctx, sandboxID, models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
+	attempted, err := svc.RecreateSandboxReport(ctx, sandboxID, models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
 		3000: {Protocol: models.ExposedPortProtocolHTTP},
 	})
 	if err != nil {
 		t.Fatalf("RecreateSandbox existing replay: %v", err)
+	}
+	if attempted {
+		t.Fatal("existing healthy sandbox replay reported a recreate attempt")
 	}
 	got, err := st.Get(ctx, sandboxID)
 	if err != nil {

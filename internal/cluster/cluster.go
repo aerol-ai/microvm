@@ -396,6 +396,15 @@ type SandboxRecreator interface {
 	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute) error
 }
 
+// SandboxRecreateReporter is the optional outcome-reporting form of
+// SandboxRecreator. attempted is false only for a successful steady-state
+// no-op where the sandbox and its replicated routes were already present.
+// Failures always report attempted=true so retry/error metrics retain the
+// signal that drives stuck-placement reassignment.
+type SandboxRecreateReporter interface {
+	RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute) (attempted bool, err error)
+}
+
 // Client is the surface the rest of the daemon (Service, API handlers)
 // interacts with. Both *Cluster and *Noop satisfy it so callsites stay
 // unconditional.

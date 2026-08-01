@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -60,6 +61,16 @@ var (
 	// trips. wake_circuit_open is a gauge tracking how many sandboxes
 	// currently have an open breaker — recorded inline by the wake
 	// helper as ids enter/leave the open set.
+	// Isolation-drift signal. Reconcile reapplies the NetworkBlockAll DROP
+	// rule on every pass, so call count says nothing; these only move when
+	// the rule was found *missing* and had to be re-installed — i.e. a host
+	// reboot, an iptables flush, or a chain rebuild dropped a tenant's
+	// isolation. Any non-zero rate is worth an operator's attention;
+	// reapply_errors_total means the heal itself is failing and the sandbox
+	// is currently un-isolated, which is page-worthy.
+	networkBlockReapplyTotal  = expvar.NewInt("aerolvm_network_block_reapply_total")
+	networkBlockReapplyErrors = expvar.NewInt("aerolvm_network_block_reapply_errors_total")
+
 	wakeRequestsTotal   = expvar.NewInt("aerolvm_wake_requests_total")
 	wakeColdStartsTotal = expvar.NewInt("aerolvm_wake_cold_starts_total")
 	wakeFailuresTotal   = expvar.NewMap("aerolvm_wake_failures_total")
@@ -159,6 +170,17 @@ func beginClusterSecretOpen() func(error) {
 
 func recordClusterSecretKeyMismatch() {
 	clusterSecretKeyMismatches.Add(1)
+}
+
+// reapplyNetworkBlockAll heals the per-IP isolation rule and reports whether
+// it was actually missing. Drivers that can't answer (anything not backed by
+// netrules) still get healed — they just report inserted=false, so the drift
+// counter under-reports rather than the heal silently not happening.
+func reapplyNetworkBlockAll(cr runtime.ContainerRuntime, containerIP string) (bool, error) {
+	if reporter, ok := runtime.AsNetworkBlockReporter(cr); ok {
+		return reporter.ApplyNetworkBlockAllReport(containerIP)
+	}
+	return false, cr.ApplyNetworkBlockAll(containerIP)
 }
 
 // beginWakeMetric tags the start of an EnsureSandboxAwakeForHTTP call.

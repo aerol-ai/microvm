@@ -28,8 +28,13 @@ type failingRecreator struct {
 }
 
 func (r *failingRecreator) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) error {
-	r.recordingRecreator.RecreateSandbox(ctx, id, spec, secrets, ports)
+	_, _ = r.recordingRecreator.RecreateSandboxReport(ctx, id, spec, secrets, ports)
 	return errors.New("simulated failure")
+}
+
+func (r *failingRecreator) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) (bool, error) {
+	_, _ = r.recordingRecreator.RecreateSandboxReport(ctx, id, spec, secrets, ports)
+	return true, errors.New("simulated failure")
 }
 
 func TestOwnerWatcherRecreateFailureAndReassign(t *testing.T) {
