@@ -10,6 +10,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/hashicorp/raft"
 )
 
 // recordingRecreator captures every RecreateSandbox call so a test can assert
@@ -25,6 +26,18 @@ type recordedRecreate struct {
 	spec    models.CreateSandboxRequest
 	secrets PlacementSecrets
 	ports   map[int]ExposedPortRoute
+}
+
+// legacyRecreator exercises compatibility with implementations that predate
+// SandboxRecreateReporter. Production uses the reporting service, but the
+// optional interface must never make the original hook stop running.
+type legacyRecreator struct {
+	calls int
+}
+
+func (r *legacyRecreator) RecreateSandbox(context.Context, string, models.CreateSandboxRequest, PlacementSecrets, map[int]ExposedPortRoute) error {
+	r.calls++
+	return nil
 }
 
 func newRecordingRecreator() *recordingRecreator {
@@ -392,7 +405,9 @@ func TestFailoverRecreateMetricsMoveOnOwnerDeath(t *testing.T) {
 
 	// Failing recreate: still one attempt, plus one classified error. This is
 	// the counter that feeds the maxRecreateFailuresBeforeReassign escalation.
-	rec.setOutcome(true, errors.New("docker: no such image"))
+	// attempted=false is deliberately defensive: any error is an attempt even
+	// if a reporter violates the documented outcome contract.
+	rec.setOutcome(false, errors.New("docker: no such image"))
 	beforeRecreate = clusterFailoverRecreateTotal.Value()
 	beforeErrors = expvarMapValue(clusterFailoverRecreateErrors, "error")
 	c.recreateOwnedSandboxes(ctx)
@@ -401,6 +416,34 @@ func TestFailoverRecreateMetricsMoveOnOwnerDeath(t *testing.T) {
 	}
 	if got := expvarMapValue(clusterFailoverRecreateErrors, "error") - beforeErrors; got != 1 {
 		t.Fatalf("recreate error delta = %d, want 1", got)
+	}
+}
+
+func TestOwnerWatcherFallsBackToLegacyRecreator(t *testing.T) {
+	fsm := newPlacementFSM()
+	payload, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-legacy-recreator", OwnerNodeID: "self",
+		Spec: failoverRecreateSpec(),
+	})
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: payload}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+
+	rec := &legacyRecreator{}
+	c := &Cluster{
+		nodeID:           "self",
+		fsm:              fsm,
+		recreator:        rec,
+		recreateFailures: &recreateFailureTracker{counts: make(map[string]int)},
+	}
+	before := clusterFailoverRecreateTotal.Value()
+	c.recreateOwnedSandboxes(context.Background())
+
+	if rec.calls != 1 {
+		t.Fatalf("legacy recreate calls = %d, want 1", rec.calls)
+	}
+	if got := clusterFailoverRecreateTotal.Value() - before; got != 1 {
+		t.Fatalf("legacy recreate metric delta = %d, want 1", got)
 	}
 }
 

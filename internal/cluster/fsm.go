@@ -589,6 +589,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.releaseOwnerLocked(cmd.SandboxID, existing)
 		previousOwner := existing.OwnerNodeID
+		ownerChanged := previousOwner != cmd.OwnerNodeID
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
 		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
@@ -616,7 +617,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.claimOwnerLocked(cmd.SandboxID, existing)
 		}
 		if cmd.ReassignCause == reassignCauseFailover {
-			return reassignApplyResult{Changed: true}
+			return reassignApplyResult{Changed: ownerChanged}
 		}
 		return nil
 	case opOrphanOwner:

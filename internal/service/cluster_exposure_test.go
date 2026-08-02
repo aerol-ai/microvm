@@ -118,6 +118,46 @@ func TestRecreateSandboxReplaysPortsForExistingSandbox(t *testing.T) {
 	}
 }
 
+func TestRecreateSandboxExistingReplayFailureCountsAttempt(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	svc.cfg.NodeRole = config.NodeRoleWorker
+	svc.cfg.L4PortRangeStart = 30500
+	svc.cfg.L4PortRangeEnd = 30510
+	svc.AttachCluster(&hostPortReserveCluster{
+		Noop:     cluster.NewNoop("self", "http://self", ""),
+		reserved: map[int]bool{30505: true},
+	})
+
+	now := time.Now().UTC()
+	const sandboxID = "sb-existing-replay-failure"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:          sandboxID,
+		Image:       "alpine",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-existing-replay-failure",
+		ContainerIP: "10.0.0.23",
+		CPU:         1,
+		MemoryMB:    512,
+		Runtime:     models.RuntimeDocker,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	attempted, err := svc.RecreateSandboxReport(ctx, sandboxID, models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
+		5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 30505},
+	})
+	if !attempted {
+		t.Fatal("failed existing route replay reported attempted=false")
+	}
+	if err == nil || !errors.Is(err, ErrPreferredHostPortUnavailable) {
+		t.Fatalf("RecreateSandboxReport error = %v, want ErrPreferredHostPortUnavailable", err)
+	}
+}
+
 func TestRecreateSandboxRejectsMissingImageSpec(t *testing.T) {
 	ctx := context.Background()
 	rt := &recordingRuntime{}

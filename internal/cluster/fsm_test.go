@@ -1030,6 +1030,17 @@ func TestFSMReassignFailoverReportsOnlyRealTransitions(t *testing.T) {
 	if p, ok := fsm.get("sb1"); !ok || p.OwnerNodeID != "nodeB" {
 		t.Fatalf("ownership did not move: %+v ok=%v", p, ok)
 	}
+
+	// A retry that targets the owner already installed by the first command is
+	// an idempotent state refresh, not another failover reassignment.
+	redundant, _ := encodeCommand(command{
+		Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB",
+		ReassignCause: reassignCauseFailover,
+	})
+	got, ok = fsm.Apply(&raft.Log{Index: 4, Data: redundant}).(reassignApplyResult)
+	if !ok || got.Changed {
+		t.Fatalf("redundant reassign result = %+v ok=%v, want Changed=false", got, ok)
+	}
 }
 
 // TestFSMReassignMetricIgnoresOperatorReassign pins the scope of the counter.
