@@ -20,14 +20,7 @@ import (
 // if the injected fd disagreed with where the listener actually landed, the guest
 // would Accept on the /work directory fd and this request would fail loudly.
 func TestDriverWasip1HTTPServeWhileWorkPreopen(t *testing.T) {
-	modPath := filepath.Join("..", "..", "..", "pkg", "wasm", "testdata", "wasip1-http.wasm")
-	if st, err := os.Stat(modPath); err != nil || st.Size() == 0 {
-		t.Skip("wasip1-http.wasm testdata missing")
-	}
-	absMod, err := filepath.Abs(modPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
 	runDir := filepath.Join(os.TempDir(), "aw-http-work")

@@ -144,12 +144,16 @@ func TestRecreateWasmDurableSandbox_ExistingPassivatedRehydrates(t *testing.T) {
 	svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
 	svc.SetWasmRuntime(rt)
 
-	if err := svc.recreateWasmDurableSandbox(ctx, "sb-failover-1", models.CreateSandboxRequest{
+	attempted, err := svc.recreateWasmDurableSandbox(ctx, "sb-failover-1", models.CreateSandboxRequest{
 		Runtime:    models.RuntimeWasm,
 		Durability: models.DurabilityDurable,
 		ModuleRef:  "file:///tmp/demo.wasm",
-	}, nil); err != nil {
+	}, nil)
+	if err != nil {
 		t.Fatalf("recreateWasmDurableSandbox: %v", err)
+	}
+	if !attempted {
+		t.Fatal("passivated durable WASM recreate reported attempted=false")
 	}
 	if len(rt.rehydrated) != 1 || rt.rehydrated[0] != "sb-failover-1" {
 		t.Fatalf("rehydrated = %v", rt.rehydrated)
@@ -160,6 +164,152 @@ func TestRecreateWasmDurableSandbox_ExistingPassivatedRehydrates(t *testing.T) {
 	}
 	if got.Status != models.SandboxStatusStarted {
 		t.Fatalf("status = %q, want started", got.Status)
+	}
+}
+
+func TestRecreateWasmDurableSandbox_ExistingStartedIsNoop(t *testing.T) {
+	ctx := context.Background()
+	modulesDir := t.TempDir()
+	checkpointPath := filepath.Join(modulesDir, "sb-started", "mem.snap")
+	seedWasmSnapshot(t, checkpointPath, "gen-started")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:             "sb-started",
+		Runtime:        models.RuntimeWasm,
+		Durability:     models.DurabilityDurable,
+		ModuleRef:      "file:///tmp/demo.wasm",
+		Status:         models.SandboxStatusStarted,
+		CheckpointPath: checkpointPath,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	rt := &fakeWasmRecreateRuntime{}
+	svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.SetWasmRuntime(rt)
+
+	attempted, err := svc.recreateWasmDurableSandbox(ctx, "sb-started", models.CreateSandboxRequest{
+		Runtime:    models.RuntimeWasm,
+		Durability: models.DurabilityDurable,
+		ModuleRef:  "file:///tmp/demo.wasm",
+	}, nil)
+	if err != nil {
+		t.Fatalf("recreateWasmDurableSandbox: %v", err)
+	}
+	if attempted {
+		t.Fatal("already-started durable WASM sandbox reported a recreate attempt")
+	}
+	if len(rt.rehydrated) != 0 {
+		t.Fatalf("unexpected rehydrate calls: %v", rt.rehydrated)
+	}
+}
+
+func TestRecreateWasmDurableSandbox_AwaitingRuntimeIsNoop(t *testing.T) {
+	ctx := context.Background()
+	modulesDir := t.TempDir()
+	checkpointPath := filepath.Join(modulesDir, "sb-awaiting", "mem.snap")
+	seedWasmSnapshot(t, checkpointPath, "gen-awaiting")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:             "sb-awaiting",
+		Runtime:        models.RuntimeWasm,
+		Durability:     models.DurabilityDurable,
+		ModuleRef:      "file:///tmp/demo.wasm",
+		Status:         models.SandboxStatusAwaitingRuntime,
+		CheckpointPath: checkpointPath,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	rt := &fakeWasmRecreateRuntime{}
+	svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.SetWasmRuntime(rt)
+
+	attempted, err := svc.recreateWasmDurableSandbox(ctx, "sb-awaiting", models.CreateSandboxRequest{
+		Runtime:    models.RuntimeWasm,
+		Durability: models.DurabilityDurable,
+		ModuleRef:  "file:///tmp/demo.wasm",
+	}, nil)
+	if err != nil {
+		t.Fatalf("recreateWasmDurableSandbox: %v", err)
+	}
+	if attempted {
+		t.Fatal("awaiting_runtime row reported a recreate attempt")
+	}
+	if len(rt.rehydrated) != 0 {
+		t.Fatalf("awaiting_runtime unexpectedly rehydrated: %v", rt.rehydrated)
+	}
+}
+
+func TestRecreateSandboxReport_LegacyPassivatedRowCountsAttempt(t *testing.T) {
+	tests := []struct {
+		name      string
+		rehydrate error
+		wantErr   bool
+	}{
+		{name: "rehydrates", wantErr: false},
+		{name: "rehydrate fails", rehydrate: errors.New("rehydrate failed"), wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			modulesDir := t.TempDir()
+			checkpointPath := filepath.Join(modulesDir, "sb-legacy", "mem.snap")
+			seedWasmSnapshot(t, checkpointPath, "gen-legacy")
+
+			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+			if err != nil {
+				t.Fatalf("store open: %v", err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+
+			now := time.Now().UTC()
+			if err := st.Create(ctx, &models.Sandbox{
+				ID:             "sb-legacy",
+				Runtime:        models.RuntimeWasm,
+				Durability:     models.DurabilityDurable,
+				ModuleRef:      "file:///tmp/demo.wasm",
+				Status:         models.SandboxStatusPassivated,
+				CheckpointPath: checkpointPath,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+
+			rt := &fakeWasmRecreateRuntime{rehydrateErr: tc.rehydrate}
+			svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+			svc.SetWasmRuntime(rt)
+
+			// A legacy replicated spec may omit runtime/durability even though
+			// the local row has enough information to recover.
+			attempted, err := svc.RecreateSandboxReport(ctx, "sb-legacy", models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, nil)
+			if attempted != true {
+				t.Fatal("passivated legacy row reported attempted=false")
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("RecreateSandboxReport error = %v, wantErr=%v", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -190,8 +340,12 @@ func TestRecreateWasmDurableSandbox_AOCRPullThenRehydrates(t *testing.T) {
 		NetworkAllowOut:    []string{"10.0.0.0/24"},
 		AllowPublicTraffic: &denyPublic,
 	}
-	if err := svc.recreateWasmDurableSandbox(ctx, "sb-failover-pull", spec, nil); err != nil {
+	attempted, err := svc.recreateWasmDurableSandbox(ctx, "sb-failover-pull", spec, nil)
+	if err != nil {
 		t.Fatalf("recreateWasmDurableSandbox: %v", err)
+	}
+	if !attempted {
+		t.Fatal("new durable WASM recreate reported attempted=false")
 	}
 	if puller.pulled != 1 {
 		t.Fatalf("pull count = %d, want 1", puller.pulled)
@@ -455,7 +609,7 @@ func TestRecreateWasmDurableSandboxEdgeBranches(t *testing.T) {
 			t.Fatalf("store.Close: %v", err)
 		}
 		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, &fakeWasmRecreateRuntime{}, nil, nil, nil, nil, nil)
-		if err := svc.recreateWasmDurableSandbox(ctx, "sb-closed", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-closed", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
 			t.Fatal("expected store get error")
 		}
 	})
@@ -467,7 +621,7 @@ func TestRecreateWasmDurableSandboxEdgeBranches(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = st.Close() })
 		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, &fakeWasmRecreateRuntime{}, nil, nil, nil, nil, nil)
-		if err := svc.recreateWasmDurableSandbox(ctx, "sb-missing-ref", models.CreateSandboxRequest{Runtime: models.RuntimeWasm}, nil); err == nil {
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-missing-ref", models.CreateSandboxRequest{Runtime: models.RuntimeWasm}, nil); err == nil {
 			t.Fatal("expected missing module_ref error")
 		}
 	})
@@ -482,7 +636,7 @@ func TestRecreateWasmDurableSandboxEdgeBranches(t *testing.T) {
 		rt := &fakeWasmRecreateRuntime{}
 		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
 		svc.AttachWasmCheckpointPusher(puller)
-		if err := svc.recreateWasmDurableSandbox(ctx, "sb-pull-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-pull-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
 			t.Fatal("expected checkpoint pull failure")
 		}
 	})
@@ -504,7 +658,7 @@ func TestRecreateWasmDurableSandboxEdgeBranches(t *testing.T) {
 		rt := &fakeWasmRecreateRuntime{}
 		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
 		svc.AttachWasmCheckpointPusher(puller)
-		if err := svc.recreateWasmDurableSandbox(ctx, "sb-upsert-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-upsert-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
 			t.Fatal("expected store upsert failure")
 		}
 	})
@@ -522,8 +676,89 @@ func TestRecreateWasmDurableSandboxEdgeBranches(t *testing.T) {
 		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
 		svc.SetWasmRuntime(rt)
 		svc.AttachWasmCheckpointPusher(puller)
-		if err := svc.recreateWasmDurableSandbox(ctx, "sb-rehydrate-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-rehydrate-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
 			t.Fatal("expected rehydrate failure")
+		}
+	})
+
+	t.Run("existing rehydrate failure", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		checkpointPath := filepath.Join(modulesDir, "sb-existing-rehydrate-fail", "mem.snap")
+		seedWasmSnapshot(t, checkpointPath, "gen-existing-rehydrate")
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID: "sb-existing-rehydrate-fail", Runtime: models.RuntimeWasm,
+			Durability: models.DurabilityDurable, Status: models.SandboxStatusPassivated,
+			ModuleRef: "file:///tmp/demo.wasm", CheckpointPath: checkpointPath,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		rt := &fakeWasmRecreateRuntime{rehydrateErr: errors.New("rehydrate failed")}
+		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+		svc.SetWasmRuntime(rt)
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-existing-rehydrate-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+			t.Fatal("expected existing rehydrate failure")
+		}
+	})
+
+	t.Run("existing replay failure", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		checkpointPath := filepath.Join(modulesDir, "sb-existing-replay-fail", "mem.snap")
+		seedWasmSnapshot(t, checkpointPath, "gen-existing-replay")
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID: "sb-existing-replay-fail", Runtime: models.RuntimeWasm,
+			Durability: models.DurabilityDurable, Status: models.SandboxStatusStarted,
+			ModuleRef: "file:///tmp/demo.wasm", CheckpointPath: checkpointPath,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "caddy unavailable", http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(server.Close)
+		rt := &fakeWasmRecreateRuntime{}
+		svc := New(config.Config{EnableWasm: true, EnableCaddy: true, Domain: "wasm.test", WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+		svc.SetWasmRuntime(rt)
+		svc.caddy = caddy.New(config.Config{CaddyAdminURL: server.URL, EnableCaddy: true, Domain: "wasm.test", HTTPClientTimeout: time.Second})
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-existing-replay-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, map[int]cluster.ExposedPortRoute{
+			8080: {Protocol: models.ExposedPortProtocolHTTP},
+		}); err == nil {
+			t.Fatal("expected existing port replay failure")
+		}
+	})
+
+	t.Run("new replay failure", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		remoteSnap := filepath.Join(t.TempDir(), "remote-mem.snap")
+		seedWasmSnapshot(t, remoteSnap, "gen-new-replay")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "caddy unavailable", http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(server.Close)
+		rt := &fakeWasmRecreateRuntime{}
+		svc := New(config.Config{EnableWasm: true, EnableCaddy: true, Domain: "wasm.test", WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+		svc.SetWasmRuntime(rt)
+		svc.AttachWasmCheckpointPusher(&fakeWasmCheckpointStore{pullSrc: remoteSnap})
+		svc.caddy = caddy.New(config.Config{CaddyAdminURL: server.URL, EnableCaddy: true, Domain: "wasm.test", HTTPClientTimeout: time.Second})
+		if _, err := svc.recreateWasmDurableSandbox(ctx, "sb-new-replay-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, map[int]cluster.ExposedPortRoute{
+			8080: {Protocol: models.ExposedPortProtocolHTTP},
+		}); err == nil {
+			t.Fatal("expected new port replay failure")
 		}
 	})
 }

@@ -222,10 +222,18 @@ func (c *Client) ClearNetworkRules(containerIP string) error {
 // drops the rule on the stop event), and reconcile (to heal after host-side
 // state loss).
 func (c *Client) ApplyNetworkBlockAll(containerIP string) error {
+	_, err := c.ApplyNetworkBlockAllReport(containerIP)
+	return err
+}
+
+// ApplyNetworkBlockAllReport implements runtime.NetworkBlockReporter. inserted
+// is true only when the rule was found missing — reconcile uses that to count
+// isolation drift without paying an extra iptables probe per pass.
+func (c *Client) ApplyNetworkBlockAllReport(containerIP string) (bool, error) {
 	if containerIP == "" {
-		return nil
+		return false, nil
 	}
-	return c.networkRules.BlockAllEgress(containerIP)
+	return c.networkRules.BlockAllEgressReport(containerIP)
 }
 
 // ContainerPID returns the host PID of a running container's init process.

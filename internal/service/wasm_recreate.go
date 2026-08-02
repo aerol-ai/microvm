@@ -15,25 +15,29 @@ import (
 
 // recreateWasmDurableSandbox restores a durable WASM sandbox on a new owner
 // after cluster failover: pull mem.snap from AOCR when needed, rehydrate, replay ports.
-func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, exposedPorts map[int]cluster.ExposedPortRoute) error {
+func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
 	existing, err := s.store.Get(ctx, id)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return err
+		return true, err
 	}
 	if existing != nil {
+		attempted := existing.Status == models.SandboxStatusPassivated
 		if _, err := s.ensureWasmCheckpointLocal(ctx, existing); err != nil {
-			return fmt.Errorf("recreate %s: %w", id, err)
+			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
 		if _, err := s.rehydrateWasmIfNeeded(ctx, existing, nil); err != nil {
-			return fmt.Errorf("recreate %s: rehydrate: %w", id, err)
+			return true, fmt.Errorf("recreate %s: rehydrate: %w", id, err)
 		}
 		s.ReconstructWakeArmedIfNeeded(ctx, existing)
-		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
+		if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
+			return true, err
+		}
+		return attempted, nil
 	}
 
 	moduleRef := models.ModuleRefForCreate(spec)
 	if moduleRef == "" {
-		return fmt.Errorf("recreate %s: module_ref required for wasm", id)
+		return true, fmt.Errorf("recreate %s: module_ref required for wasm", id)
 	}
 	checkpointPath := wasmCheckpointDir(s.cfg.WasmModulesDir, id)
 	seed := &models.Sandbox{
@@ -46,7 +50,7 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spe
 		AllowPublicTraffic: spec.AllowPublicTraffic,
 	}
 	if _, err := s.ensureWasmCheckpointLocal(ctx, seed); err != nil {
-		return fmt.Errorf("recreate %s: pull checkpoint: %w", id, err)
+		return true, fmt.Errorf("recreate %s: pull checkpoint: %w", id, err)
 	}
 	if snap, readErr := wasmengine.ReadSnapshotDir(checkpointPath, wasmengine.EngineNameWazero()); readErr == nil {
 		seed.CloneGeneration = snap.Config.CloneGeneration
@@ -68,10 +72,13 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spe
 	seed.UpdatedAt = now
 	seed.OwnerRef = ownerRefForCreate(ctx)
 	if err := s.store.Upsert(ctx, seed); err != nil {
-		return fmt.Errorf("recreate %s: persist row: %w", id, err)
+		return true, fmt.Errorf("recreate %s: persist row: %w", id, err)
 	}
 	if _, err := s.rehydrateWasmIfNeeded(ctx, seed, nil); err != nil {
-		return fmt.Errorf("recreate %s: rehydrate: %w", id, err)
+		return true, fmt.Errorf("recreate %s: rehydrate: %w", id, err)
 	}
-	return s.replayClusterExposedPorts(ctx, id, exposedPorts)
+	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
+		return true, err
+	}
+	return true, nil
 }

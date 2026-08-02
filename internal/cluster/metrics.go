@@ -47,6 +47,18 @@ var (
 
 	clusterReservationsExpired = expvar.NewInt("aerolvm_cluster_reservations_expired_total")
 
+	// Failover-recreate observability. Recreate outcome used to live only in
+	// logs and the in-memory recreateFailureTracker, so operators had no time
+	// series for "how often does failover fire across the fleet, and how often
+	// does it fail". recreate_errors feeds the
+	// maxRecreateFailuresBeforeReassign escalation, so a rising error rate is
+	// the leading indicator of a reassign storm. reassign covers both paths
+	// that hand a placement to a new owner: the stuck-placement escalation
+	// (owner_watcher.go) and the dead-owner sweep (dead_owner.go).
+	clusterFailoverRecreateTotal  = expvar.NewInt("aerolvm_cluster_failover_recreate_total")
+	clusterFailoverRecreateErrors = expvar.NewMap("aerolvm_cluster_failover_recreate_errors_total")
+	clusterFailoverReassignTotal  = expvar.NewInt("aerolvm_cluster_failover_reassign_total")
+
 	schedulerDecisions        = expvar.NewMap("aerolvm_scheduler_decisions_total")
 	schedulerCandidateRejects = expvar.NewMap("aerolvm_scheduler_candidate_rejects_total")
 	schedulerCandidatesLast   = expvar.NewInt("aerolvm_scheduler_candidates_last")
@@ -129,6 +141,25 @@ func recordOwnerForwardTargetMiss(reason string) {
 
 func recordExpiredReservation() {
 	clusterReservationsExpired.Add(1)
+}
+
+// recordFailoverRecreate counts one attempt to re-materialize an opted-in
+// sandbox on a new owner. Successful steady-state watcher no-ops are excluded;
+// a placement that genuinely fails four times before escalating contributes
+// four attempts and four errors, which is the shape operators want when tuning
+// maxRecreateFailuresBeforeReassign.
+func recordFailoverRecreate(err error) {
+	clusterFailoverRecreateTotal.Add(1)
+	if err != nil {
+		scaleobs.Add(clusterFailoverRecreateErrors, classifyClusterMetricError(err), 1)
+	}
+}
+
+// recordFailoverReassign counts one placement handed to a different owner.
+// Only the leader's apply wrapper calls this after the FSM reports a changed
+// placement, so follower replication and successful no-ops do not overcount.
+func recordFailoverReassign() {
+	clusterFailoverReassignTotal.Add(1)
 }
 
 func recordSchedulerDecision(reason string, candidates int, rejects map[string]int64) {

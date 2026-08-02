@@ -33,6 +33,11 @@ type fakeReconcileRuntime struct {
 	removeImageHits       atomic.Int32
 	networkBlockAllCalls  []string
 	allowPushAllowedPorts bool
+	// networkBlockAllInserted / networkBlockAllErr drive the isolation-drift
+	// reporting path: inserted=true means reconcile found the DROP rule
+	// missing and reinstalled it.
+	networkBlockAllInserted bool
+	networkBlockAllErr      error
 }
 
 func (f *fakeReconcileRuntime) ListManaged(_ context.Context) (map[string]*models.SandboxRuntimeState, error) {
@@ -87,8 +92,20 @@ func (f *fakeReconcileRuntime) ClearNetworkRules(string) error {
 func (f *fakeReconcileRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
 func (f *fakeReconcileRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
 func (f *fakeReconcileRuntime) ApplyNetworkBlockAll(containerIP string) error {
+	_, err := f.ApplyNetworkBlockAllReport(containerIP)
+	return err
+}
+
+// ApplyNetworkBlockAllReport makes the fake satisfy runtime.NetworkBlockReporter
+// so reconcile takes the drift-counting path rather than the plain fallback.
+// networkBlockAllInserted models "the rule was found missing"; leaving it false
+// models the steady state where the rule is already installed.
+func (f *fakeReconcileRuntime) ApplyNetworkBlockAllReport(containerIP string) (bool, error) {
 	f.networkBlockAllCalls = append(f.networkBlockAllCalls, containerIP)
-	return nil
+	if f.networkBlockAllErr != nil {
+		return false, f.networkBlockAllErr
+	}
+	return f.networkBlockAllInserted, nil
 }
 func (f *fakeReconcileRuntime) ApplyNetworkBlockIngress(string) error {
 	return nil
@@ -126,6 +143,9 @@ func TestReconcileReappliesNetworkBlockAllWithCurrentContainerIP(t *testing.T) {
 	})
 	rt := &fakeReconcileRuntime{
 		allowPushAllowedPorts: true,
+		// The rule was found missing — this pass is an actual isolation-drift
+		// heal, so the reapply counter must move.
+		networkBlockAllInserted: true,
 		managed: map[string]*models.SandboxRuntimeState{
 			"sb-blocked": {
 				SandboxID:   "sb-blocked",
@@ -135,6 +155,7 @@ func TestReconcileReappliesNetworkBlockAllWithCurrentContainerIP(t *testing.T) {
 			},
 		},
 	}
+	beforeReapply := networkBlockReapplyTotal.Value()
 	svc := &Service{
 		// schedulePendingImageGC checks ImageBuildGCEnabled — leave it on
 		// so the destroy branches produce the expected ledger rows.
@@ -180,6 +201,109 @@ func TestReconcileReappliesNetworkBlockAllWithCurrentContainerIP(t *testing.T) {
 	}
 	if !refreshed.NetworkBlockAll {
 		t.Fatal("NetworkBlockAll flag was lost during reconcile")
+	}
+	if got := networkBlockReapplyTotal.Value() - beforeReapply; got != 1 {
+		t.Fatalf("network block reapply delta = %d, want 1", got)
+	}
+}
+
+// TestReconcileNetworkBlockReapplyMetricOnlyCountsDrift pins the whole point of
+// the counter: reconcile calls ApplyNetworkBlockAll on every pass for every
+// blocked sandbox, so a counter that moved per call would be a constant rate
+// and useless for alerting. It must move only when the rule was genuinely
+// missing, and the error counter must move when the heal itself fails.
+func TestReconcileNetworkBlockReapplyMetricOnlyCountsDrift(t *testing.T) {
+	tests := []struct {
+		name         string
+		inserted     bool
+		applyErr     error
+		wantReapply  int64
+		wantReErrors int64
+	}{
+		{name: "steady state, rule already present", inserted: false, wantReapply: 0, wantReErrors: 0},
+		{name: "drift healed", inserted: true, wantReapply: 1, wantReErrors: 0},
+		{name: "heal failed", applyErr: errors.New("iptables: permission denied"), wantReapply: 0, wantReErrors: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+			if err != nil {
+				t.Fatalf("store.Open: %v", err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+
+			mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
+				RootDir:     filepath.Join(t.TempDir(), "mounts"),
+				CredDir:     filepath.Join(t.TempDir(), "cred"),
+				WaitTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatalf("mounts.New: %v", err)
+			}
+			t.Cleanup(mgr.Close)
+
+			rt := &fakeReconcileRuntime{
+				allowPushAllowedPorts:   true,
+				networkBlockAllInserted: tc.inserted,
+				networkBlockAllErr:      tc.applyErr,
+				managed: map[string]*models.SandboxRuntimeState{
+					"sb-blocked": {
+						SandboxID:   "sb-blocked",
+						ContainerID: "ctr-1",
+						ContainerIP: "10.0.0.42",
+						Status:      models.SandboxStatusStarted,
+					},
+				},
+			}
+			svc := &Service{
+				cfg:    config.Config{},
+				logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+				store:  st,
+				docker: rt,
+				caddy:  caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second}),
+				mounts: mgr,
+			}
+
+			now := time.Now().UTC()
+			if err := st.Create(ctx, &models.Sandbox{
+				ID:              "sb-blocked",
+				Image:           "ubuntu:22.04",
+				Status:          models.SandboxStatusStarted,
+				ContainerID:     "ctr-1",
+				ContainerIP:     "10.0.0.42",
+				CPU:             1,
+				MemoryMB:        512,
+				Runtime:         models.RuntimeDocker,
+				NetworkBlockAll: true,
+				CreatedAt:       now,
+				UpdatedAt:       now,
+				LastActiveAt:    now,
+			}); err != nil {
+				t.Fatalf("seed sandbox: %v", err)
+			}
+
+			beforeReapply := networkBlockReapplyTotal.Value()
+			beforeErrors := networkBlockReapplyErrors.Value()
+
+			if err := svc.Reconcile(ctx); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			// The heal must be attempted regardless of outcome — a failing
+			// reapply is still a reapply attempt, never a skipped one.
+			if len(rt.networkBlockAllCalls) != 1 {
+				t.Fatalf("ApplyNetworkBlockAll calls = %v, want exactly 1", rt.networkBlockAllCalls)
+			}
+			if got := networkBlockReapplyTotal.Value() - beforeReapply; got != tc.wantReapply {
+				t.Errorf("reapply delta = %d, want %d", got, tc.wantReapply)
+			}
+			if got := networkBlockReapplyErrors.Value() - beforeErrors; got != tc.wantReErrors {
+				t.Errorf("reapply error delta = %d, want %d", got, tc.wantReErrors)
+			}
+		})
 	}
 }
 

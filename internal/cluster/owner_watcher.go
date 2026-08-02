@@ -96,7 +96,17 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 		ports := exposedPortRoutesForPlacement(p)
 		// Pass the secret provider handle through unchanged — only the service
 		// is allowed to resolve and merge credentials.
-		if err := r.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports); err != nil {
+		attempted := true
+		var err error
+		if reporter, ok := r.(SandboxRecreateReporter); ok {
+			attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, secretsFromPlacement(p), ports)
+		} else {
+			err = r.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports)
+		}
+		if attempted || err != nil {
+			recordFailoverRecreate(err)
+		}
+		if err != nil {
 			fails := c.recreateFailures.record(id)
 			c.logger.Warn("cluster: recreate owned sandbox failed",
 				"sandbox_id", id, "consecutive_failures", fails, "err", err)
@@ -131,12 +141,16 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 		OwnerNodeID:        target.NodeID,
 		OwnerAPIURL:        target.APIURL,
 		OwnerDataPlaneHost: target.DataPlaneHost,
+		ReassignCause:      reassignCauseFailover,
 	}
 	if err := c.applyCommand(ctx, cmd); err != nil {
 		c.logger.Warn("cluster: reassign stuck placement failed; will retry on next tick",
 			"sandbox_id", id, "target", target.NodeID, "err", err)
 		return
 	}
+	// The leader apply wrapper increments the metric only when its FSM reports
+	// a real transition. This acknowledgement is deliberately not used as the
+	// metric signal because this path can forward to a remote leader.
 	c.recreateFailures.clear(id)
 	c.logger.Warn("cluster: reassigned stuck placement to alternate owner",
 		"sandbox_id", id, "from", c.nodeID, "to", target.NodeID)

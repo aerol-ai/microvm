@@ -185,12 +185,16 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 			OwnerNodeID:        newOwnerID,
 			OwnerAPIURL:        newOwnerURL,
 			OwnerDataPlaneHost: newOwnerDataPlaneHost,
+			ReassignCause:      reassignCauseFailover,
 		}
 		if err := c.applyCommand(ctx, cmd); err != nil {
 			c.logger.Warn("cluster: reassign placement failed; will retry next tick",
 				"sandbox_id", id, "dead_node", nodeID, "new_owner", newOwnerID, "err", err)
 			return
 		}
+		// The leader apply wrapper increments the metric only when the FSM
+		// reports a real transition. reassigned is a local log counter and
+		// deliberately still counts successful acknowledgements.
 		reassigned++
 	}
 	orphaned := len(c.fsm.idsOwnedBy(nodeID))

@@ -130,3 +130,24 @@ func AsContainerRuntime(rt Runtime) (ContainerRuntime, bool) {
 	cr, ok := rt.(ContainerRuntime)
 	return cr, ok
 }
+
+// NetworkBlockReporter is the reporting variant of
+// ContainerRuntime.ApplyNetworkBlockAll: same install, but it also says
+// whether the rule was actually missing. Kept as a separate optional
+// interface rather than widening ApplyNetworkBlockAll's signature so drivers
+// that can't answer the question (Firecracker, which doesn't implement per-IP
+// rules at all) stay untouched.
+//
+// Only reconcile needs the answer — it reapplies on every pass, so the raw
+// call count is a constant, not a drift signal.
+type NetworkBlockReporter interface {
+	ApplyNetworkBlockAllReport(containerIP string) (inserted bool, err error)
+}
+
+// AsNetworkBlockReporter returns the reporting surface when cr implements it.
+// Callers must fall back to plain ApplyNetworkBlockAll when this returns
+// false — the healing behavior is mandatory, the metric is not.
+func AsNetworkBlockReporter(cr ContainerRuntime) (NetworkBlockReporter, bool) {
+	r, ok := cr.(NetworkBlockReporter)
+	return r, ok
+}

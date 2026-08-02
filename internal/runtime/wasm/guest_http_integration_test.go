@@ -115,14 +115,7 @@ func (c *listenPortRecordingClient) ResolvedListenPort(string) (int, error) {
 }
 
 func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
-	modPath := filepath.Join("..", "..", "..", "pkg", "wasm", "testdata", "wasip1-http.wasm")
-	absMod, err := filepath.Abs(modPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st, err := os.Stat(absMod); err != nil || st.Size() == 0 {
-		t.Skip("wasip1-http.wasm testdata missing")
-	}
+	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
 	runDir := filepath.Join(os.TempDir(), "aw-http-baseline")
@@ -171,14 +164,7 @@ func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
 }
 
 func TestSetListenPortAfterColdInstantiate(t *testing.T) {
-	modPath := filepath.Join("..", "..", "..", "pkg", "wasm", "testdata", "wasip1-http.wasm")
-	absMod, err := filepath.Abs(modPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st, err := os.Stat(absMod); err != nil || st.Size() == 0 {
-		t.Skip("wasip1-http.wasm testdata missing")
-	}
+	absMod := ensureWasip1HTTPWasm(t)
 	dir := t.TempDir()
 	runDir := filepath.Join(os.TempDir(), "aw-http-setlisten")
 	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
@@ -227,14 +213,7 @@ func TestSetListenPortAfterColdInstantiate(t *testing.T) {
 }
 
 func TestDriverWasip1HTTPExposeEndToEnd(t *testing.T) {
-	modPath := filepath.Join("..", "..", "..", "pkg", "wasm", "testdata", "wasip1-http.wasm")
-	if st, err := os.Stat(modPath); err != nil || st.Size() == 0 {
-		t.Skip("wasip1-http.wasm testdata missing")
-	}
-	absMod, err := filepath.Abs(modPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
 	runDir := filepath.Join(os.TempDir(), "aw-http-e2e")

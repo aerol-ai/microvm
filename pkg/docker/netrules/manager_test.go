@@ -728,3 +728,62 @@ func TestBackendSelectionMetric(t *testing.T) {
 		}
 	}
 }
+
+// TestBlockAllEgressReportDistinguishesInsertFromNoop is the load-bearing test
+// for the isolation-drift counter: the whole signal depends on the report
+// telling "I had to install it" apart from "it was already there". Reconcile
+// calls this on every pass, so a report that always said true would turn the
+// drift metric into a constant rate.
+func TestBlockAllEgressReportDistinguishesInsertFromNoop(t *testing.T) {
+	be := &memBackend{}
+	mgr := &Manager{enabled: true, ipt: be, userChain: ChainAerolvmUser}
+
+	inserted, err := mgr.BlockAllEgressReport("10.0.0.5")
+	if err != nil {
+		t.Fatalf("first BlockAllEgressReport: %v", err)
+	}
+	if !inserted {
+		t.Fatal("first call must report inserted=true (rule was absent)")
+	}
+
+	// Steady state: the rule is present, so every subsequent reapply is a
+	// no-op and must not be counted as drift.
+	for i := 0; i < 3; i++ {
+		inserted, err = mgr.BlockAllEgressReport("10.0.0.5")
+		if err != nil {
+			t.Fatalf("reapply %d: %v", i, err)
+		}
+		if inserted {
+			t.Fatalf("reapply %d reported inserted=true; want false (rule already present)", i)
+		}
+	}
+	if got := be.ruleCount(); got != 1 {
+		t.Fatalf("rule count = %d, want 1 (reapply must stay idempotent)", got)
+	}
+
+	// Simulate the drift the counter exists to catch: an out-of-band flush.
+	if err := be.Delete("filter", ChainAerolvmUser, "-s", "10.0.0.5", "-j", "DROP"); err != nil {
+		t.Fatalf("simulate flush: %v", err)
+	}
+	inserted, err = mgr.BlockAllEgressReport("10.0.0.5")
+	if err != nil {
+		t.Fatalf("post-flush reapply: %v", err)
+	}
+	if !inserted {
+		t.Fatal("post-flush reapply must report inserted=true")
+	}
+}
+
+// TestBlockAllEgressReportDisabledAndEmptyIP pins that a no-op manager reports
+// no drift — nothing was installed, so nothing went missing.
+func TestBlockAllEgressReportDisabledAndEmptyIP(t *testing.T) {
+	disabled := &Manager{enabled: false, ipt: &memBackend{}, userChain: ChainAerolvmUser}
+	if inserted, err := disabled.BlockAllEgressReport("10.0.0.5"); err != nil || inserted {
+		t.Fatalf("disabled manager = (%v, %v), want (false, nil)", inserted, err)
+	}
+
+	enabled := &Manager{enabled: true, ipt: &memBackend{}, userChain: ChainAerolvmUser}
+	if inserted, err := enabled.BlockAllEgressReport(""); err != nil || inserted {
+		t.Fatalf("empty IP = (%v, %v), want (false, nil)", inserted, err)
+	}
+}
