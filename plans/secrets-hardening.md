@@ -74,7 +74,7 @@ off the table. (The 2026-08-02 draft listed it as an option; deleted.)
 |---|---|
 | D2 | One plan, all phases. Not split. |
 | D3 | Seal to a recipient **set** (owner + N failover candidates) and push the sealed row to those peers. Preserves recipient binding; keeps bytes out of Raft. |
-| D4 | Sync fan-out, **only** for `failover.policy=recreate`. Default creates byte-for-byte unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
+| D4 | ~~Sync~~ **ASYNC** fan-out (superseded 2026-08-07 — see §3e), **only** for `failover.policy=recreate`. Default creates byte-for-byte unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
 | D5 | Stale recipient sets after membership change = **documented known limitation**, point operators at KMS. No placement filter. |
 | D6 | One seal+fanout helper with an explicit strict / best-effort policy argument. |
 | D7 | One shared contract suite runs against **both** providers (offline fake for KMS); live KMS behind the `integration` tag. |
@@ -125,7 +125,7 @@ KMS removes WALL 2 (recipient binding). It does nothing about WALL 1.
 | Ciphertext storage | `cluster_secrets` row | `cluster_secrets` row — **same**, KMS stores nothing |
 | Distribution | sync peer fan-out at create | **sync peer fan-out at create** — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
-| Boot cost (HA creates only) | one peer fan-out | one peer fan-out **+ one KMS wrap** (network round-trip — measure it) |
+| Boot cost (HA creates only) | **none — fan-out is async (§3e)**; local seal only | **none on the caller**; the KMS wrap rides the async fan-out, not the create |
 | Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
 | Offline `make test` | native | fake; live behind `integration` tag |
 
@@ -201,9 +201,15 @@ Seal failure currently has three undocumented policies across four sites:
 | `clustercreate.go:255` | rollback + return | **strict** |
 | `overlap.go:139` | error into channel | **strict** |
 
-Partial fan-out (2 of 3 peers) needs a documented rule — CLAUDE.md
-non-negotiable #4. Recommend: strict treats partial as failure and rolls back;
-best-effort records how many recipients actually hold the secret.
+**Scope note after §3e:** the policy argument governs the **local seal only**,
+which is still synchronous. The fan-out is asynchronous and never fails a
+create, so "strict" now means *the local sealed row and its ref must exist
+before the create succeeds* — not *every peer must have acknowledged*.
+
+Partial fan-out is therefore no longer a create-time rollback question. Its rule
+is **3d-2**: owner + at least one backup constitutes success, the actual holder
+count is recorded, and `failover_ready` reports it. CLAUDE.md non-negotiable #4
+is satisfied by that rule plus the delete-fanout cleanup in **3d-3**.
 
 ### 3c. Known limitation (D5)
 
@@ -446,6 +452,125 @@ but C touches `internal/cluster` + `pkg/api/clustercreate` while D touches
   - Files: `docs/src/content/docs/`, `docs/src/content.config.ts`
   - Verify: `make docs-build`
 
+## Slice-0 decisions — DECIDED 2026-08-07
+
+The four gates that blocked slice 1, plus one supersession. All four are now
+decided; slice 1 may start.
+
+### 3d-1. Who computes the recipient set — the router, at reserve time
+
+**The router picks. The target obeys. Nobody recomputes.**
+
+`SelectPlacement` (`internal/cluster/placement.go:85-140`) already builds a
+filtered `candidates` slice — excluding dead nodes, ineligible roles, members
+with no advertised API URL, stale capacity heartbeats, and drained nodes — and
+then discards everything except the one node `pickTwo` returns. That discarded
+list is exactly the recipient set, already filtered for exactly the properties a
+recipient needs.
+
+```
+ROUTER node                                    TARGET node
+───────────                                    ───────────
+SelectPlacement() ─► candidates[] (filtered)
+                     pickTwo → target
+                     recipients = target + N from candidates
+ReserveOnTarget(..., Recipients) ── opReserve through raft ──┐
+                                                             │
+                                     forwarded create ───────┤
+                                                             ▼
+                                        seal to the RECORDED recipient set
+                                        RecordPlacement(...) ── opPlace
+```
+
+Why this seam:
+
+- The candidate list already exists and is already correctly filtered.
+- `opReserve` goes through Raft, so it is **serialized on the leader**. Two
+  racing creates cannot produce disagreeing sets — that is the race the gate
+  existed for, closed by construction rather than by convention.
+- `reservationCommand` (`internal/cluster/fsm.go`) is a JSON struct of
+  `omitempty` fields, so `Recipients []string` is **additive and
+  wire-compatible** — the same shape as `ReassignCause`, which was added
+  additively with an explicit mixed-version-safety comment.
+
+**N defaults to owner + 2 backups**, configurable. A cluster smaller than that
+uses every eligible candidate. Boot replay (`cluster_ownership.go:149`) has no
+reservation, so it seals for self and widens on the next mutation — it is a
+backfill path, not a create.
+
+### 3d-2. Partial fan-out — holder count, not a boolean
+
+Neither "fail the create" nor "accept silent half-HA." **Success requires the
+owner plus at least one backup to hold the secret; the actual holder count is
+recorded and surfaced.**
+
+Strict-all lets one flaky peer fail creates that would have been perfectly
+recoverable. Silent partial is worse: the sandbox reports success and looks
+highly available, but whether it survives depends on which specific node dies —
+unpredictable and untestable.
+
+Owner + ≥1 gives real redundancy and fails loudly when it cannot. E1a's
+`failover_ready` reports the **actual holder count** rather than a boolean, so
+"HA with 2 of 3 holders" becomes a true statement monitoring can act on.
+
+### 3d-3. Failed-create leftovers — delete-fanout, not attempt-unique refs
+
+**Delete-fanout on rollback and on destroy. Refs stay deterministic.**
+
+Two reasons. Delete-fanout is required regardless: outside-voice #4 established
+that peer rows are never cleaned up on sandbox *destroy* either, since
+`DeleteClusterSecretsForSandbox` is local-only. And the collision risk is
+smaller than it first appeared — `PutClusterSecret` is an upsert
+(`store.go:4004`, `sealed_payload = excluded.sealed_payload`), so a retry that
+reaches a peer **overwrites** the stale row rather than reading it. The real
+leak is only peers a retry does not reach, which delete-fanout fixes and
+attempt-unique refs would merely orphan under a new name.
+
+Keeping refs derivable from `(sandboxID, version)` is worth preserving.
+
+### 3d-4. `Provider.Open` takes the sandbox ID explicitly
+
+```go
+Open(ctx context.Context, sandboxID string, h Handle, nodeID string) (Secrets, error)
+```
+
+Requiring handles to encode the sandbox ID would dictate opaque-token structure
+to AWS KMS and Vault, which we neither control nor should constrain. The caller
+always has the sandbox ID — it is how the handle was obtained. And the case that
+decides it is the one that cannot work otherwise: a **not-found** audit event,
+where the handle resolved to nothing and there is no payload to decode.
+
+Explicit over clever.
+
+### 3e. SUPERSEDES D4 — the fan-out is ASYNCHRONOUS
+
+**The caller does not wait for key distribution.** Create returns as soon as the
+sandbox is up. The fan-out runs in the background, retries with bounded backoff,
+and logs plus increments a metric on failure. Nobody blocks on it.
+
+This reverses D4's synchronous choice, which was made before E1a existed.
+**E1a is what makes async defensible now**, and the pairing is load-bearing:
+
+- `failover_ready` starts **false** and flips true only when the owner plus at
+  least one backup actually hold the secret (3d-2).
+- The system therefore never claims a guarantee it does not yet have. The window
+  between `201 Created` and fan-out completion is *visible*, not silent.
+- Because nobody is waiting, retries are cheap — use bounded backoff rather than
+  a single attempt.
+- Fan-out failure emits `aerolvm_secret_fanout_failures_total` plus a log line
+  carrying sandbox ID, target peer, and error class, and feeds the operator
+  alert from the §8 decision.
+
+**The cost, stated plainly:** a sandbox that dies inside the fan-out window loses
+its credentials and cannot be recreated elsewhere. The mitigation is not that the
+window is small — it is that `failover_ready` reports false for its duration, so
+nothing and nobody is misled. If that field is not shipped, this decision is not
+safe. **E1a therefore moves from slice 3 into slice 1**, alongside the fan-out it
+now guards.
+
+Boot-path consequence, and it is a good one: HA creates are now **also**
+unchanged. No sync peer calls on any create path.
+
 ## Re-review decisions (eng review #2, 2026-08-07)
 
 Delta-focused re-review after the CEO scope expansion. Two reversals, two
@@ -527,9 +652,14 @@ folded, four of them (#3 atomicity, #4 peer deletes, #5 ref collisions, #7
 reassign churn) are **required work that gates T3 or T7** and had no coverage in
 any prior pass.
 
+**RESOLVED 2026-08-07** — the four slice-1 gates are closed (§3d): recipient-set
+selection (router picks at reserve time, recorded in `opReserve`); partial
+fan-out (owner + ≥1 backup, holder count surfaced); failed-create leftovers
+(delete-fanout, deterministic refs); `Provider.Open` takes `sandboxID`
+explicitly. Plus §3e supersedes D4: the fan-out is **asynchronous** and E1a
+`failover_ready` moves into slice 1 to guard it. **Slice 1 is unblocked.**
+
 **UNRESOLVED DECISIONS:**
-- Recipient-set selection across the reserve/promote race — gates slice 1
-- Partial fan-out rollback rule — plan §3b still says "Recommend:", not "Decided" — gates slice 1
 - Cluster-mode audit reads: node-local, owner-forwarded, or fan-out — gates E1b in slice 3; must also survive a dead node's disk
 - KMS wrapping-material cache TTL and its threat-model change — gates T10 in slice 4
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
@@ -537,6 +667,4 @@ any prior pass.
 - E5's guest-credential fork: does the raw credential ever enter the guest — answer before quoting any number
 - `toolbox_token` plaintext at rest: write the deferral rationale or pull it into scope
 - Owners, dates, and per-slice rollback plans
-- Codex #5: delete-fanout on rollback vs attempt-unique refs — pick one, gates T3
-- Codex #8: does `Provider.Open` take a sandbox ID, or must handles encode it — gates T1
 - Per-peer identity across all seven `/v1/cluster/internal/...` endpoints — separate work, not this plan

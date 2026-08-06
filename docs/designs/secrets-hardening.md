@@ -291,10 +291,10 @@ verification checklist and a documented rollback.
 
 | Slice | Contents | Exit criterion |
 |---|---|---|
-| 0 | **Decide before coding:** recipient-set selection across the reserve/promote race; partial fan-out rollback rule; cluster-read model for E1b; KMS wrapping-cache TTL | Each written into `plans/secrets-hardening.md` as decided, not "recommend" |
-| 1 | T1-T4, T11, T12 + peer-push gossip auth + flags + HA-create benchmark | Cross-node failover regression green; default create latency unmoved; unsigned peer push rejected |
+| 0 | **DONE 2026-08-07.** Recipient-set selection, partial fan-out rule, failed-create leftovers, and `Provider.Open`'s signature are decided in `plans/secrets-hardening.md` §3d. Still open: cluster-read model for E1b (gates slice 3), KMS wrapping-cache TTL (gates slice 4). | Four gates closed; slice 1 unblocked |
+| 1 | T1-T4, T11, T12, **E1a** + peer-push PAT auth + flags + HA-create benchmark | Cross-node failover regression green; default create latency unmoved; unauthenticated peer push rejected; **`failover_ready` reports live holder count** |
 | 2 | T5-T6, E2a, E4 (E2a's substrate gates T6) + provider-agnostic error classes + audit drop counter/gap marker | One audit event per secret read, no plaintext; canary reports at boot; a forced overflow produces a counted gap marker and fires the alert |
-| 3 | T7-T9, T13, E1a, E1b + operator dashboard/alerts/runbook | Env sealed at rest; `Get`/`List` omit env; `failover_ready` observable; D5 limitation published, `make docs-build` green; no silent empty env on mixed-version rollout |
+| 3 | T7-T9, T13, E1b + operator dashboard/alerts/runbook (**E1a moved to slice 1** — it guards the async fan-out) | Env sealed at rest; `Get`/`List` omit env; D5 limitation published, `make docs-build` green; no silent empty env on mixed-version rollout |
 | 4 | T10 (demand-gated), E3a + integration chaos case | Both providers pass one contract suite; attribution emits for wasm + isolate + netstats totals; kill-owner-mid-fan-out leaves no half-sealed sandbox |
 | 5 | E3b, E2b (auditor-gated) | Kernel-level IP capture for docker/containerd |
 | 6 | E5 | Own eng review; not started until slice 4 lands |
