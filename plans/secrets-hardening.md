@@ -671,6 +671,52 @@ cluster-wide amplification vector reachable by any authorized caller. That makes
 the limiter a **security control**, not a nicety — and it is why it ships with
 E1b rather than after it.
 
+## KMS wrapping-material cache — DECIDED 2026-08-07: no cache
+
+**Every open calls KMS. No unwrapped DEK is ever cached, in memory or on disk.**
+
+### The volume does not justify a cache
+
+Verified against the call sites:
+
+- **KMS unwraps happen only on failover recreate.** `Provider.Open` is reached
+  from `RecreateSandboxReport` (`service.go:948`, `:986`), driven by the owner
+  watcher. The *frequent* decrypt path — `StartSandbox` → `loadMounts`
+  (`service.go:2038`, `:2070`) and `UnsealRegistry` (`:1903`) — reads
+  locally-sealed blobs through `s.cipher`, not cluster secrets, and D10 routes
+  only cluster secrets through `Provider`. **KMS is never on the hot path.**
+- **The burst is small.** `ownerWatcherInterval = 5s` and
+  `maxRecreateFailuresBeforeReassign = 5` (`owner_watcher.go:16,25`). A node
+  dying with 100 HA sandboxes is ~100 Decrypt calls on the happy path; the
+  pathological case where every recreate fails is 100 × 5 = 500 calls over ~25
+  seconds, about **20 req/s**. AWS KMS Decrypt quotas run to tens of thousands
+  per second — roughly **0.1% of quota**.
+- **§3e already removed the latency argument.** The async fan-out took the KMS
+  wrap off the create path, which was the original reason to consider caching.
+
+### The cost is the two properties KMS was adopted for
+
+A cached plaintext DEK is key material KMS can no longer revoke. Disable the key
+or pull the IAM grant, and any node with a warm cache keeps decrypting for the
+cache lifetime. That defeats centralized revocation.
+
+It also makes **CloudTrail incomplete**. KMS's own access log is part of the
+evidence story this plan is built around, and a cache means it records a fraction
+of actual reads.
+
+That is the same failure mode as silent audit drops (D14) and silent partial
+history (E1b), both rejected earlier today. The through-line of this plan is that
+**a record must not imply completeness it does not have.** Caching DEKs would
+violate it on the one log we do not control and cannot annotate.
+
+### Escape hatch, gated on evidence
+
+If a real deployment ever hits KMS throttling, add a short in-process TTL **then,
+with measurements in hand** — not speculatively. Record the observed call rate
+and the quota it approached in this section before adding it. A cache introduced
+without that evidence is trading a proven security property for an unproven
+performance one.
+
 ## Re-review decisions (eng review #2, 2026-08-07)
 
 Delta-focused re-review after the CEO scope expansion. Two reversals, two
@@ -761,11 +807,12 @@ explicitly. Plus §3e supersedes D4: the fan-out is **asynchronous** and E1a
 Also resolved: the E1b cluster-read model — local log authoritative, fan-out with
 an explicit coverage block, rate-limited, `controlplane.Reporter` additive and
 never required, dead-disk durability **not claimed** on the open-source build.
-New accepted gap recorded: **GAP-1**, the async fan-out window (§10).
+And the KMS wrapping-material cache: **no cache**, every open calls KMS, so
+revocation stays instant and CloudTrail stays complete. New accepted gap
+recorded: **GAP-1**, the async fan-out window (§10).
 
 **UNRESOLVED DECISIONS:**
 - Rate-limit dimension for E1b — per-token, per-caller, or per-sandbox — settle when E1b is built (the machinery itself is decided; only the dimension is open)
-- KMS wrapping-material cache TTL and its threat-model change — gates T10 in slice 4
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - E2b trust boundary / external witness — or downgrade the tamper-evidence claim
 - E5's guest-credential fork: does the raw credential ever enter the guest — answer before quoting any number

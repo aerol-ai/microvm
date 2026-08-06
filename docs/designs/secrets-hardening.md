@@ -353,8 +353,13 @@ decision before its slice starts:
   "Recommend:", not "Decided". Gates slice 1.
 - **Cluster-mode audit reads** — node-local, owner-forwarded via
   `internal/cluster/forward.go`, or fan-out? Gates E1b in slice 3.
-- **KMS wrapping-material cache TTL** and its threat-model change (Codex #6) —
-  gates T10 in slice 4.
+- ~~KMS wrapping-material cache TTL~~ **DECIDED 2026-08-07: no cache.** Every
+  open calls KMS, so revocation is instant and CloudTrail is complete. Justified
+  by volume: KMS unwraps occur only on failover recreate (the frequent
+  `StartSandbox` path uses local `s.cipher`, not the Provider), and a 100-sandbox
+  node loss is ~100 calls, ~20 req/s worst case — about 0.1% of KMS quota.
+  Caching would make CloudTrail incomplete, the same failure mode as silent audit
+  drops and silent partial history. Revisit only with measured throttling.
 - **SOC 2 observation window** (3/6/12 months) and auditor engagement status —
   E2a has no business date without it; E2b is gated on an auditor ask.
 - **E2b trust boundary / external witness** — or downgrade the claim.
