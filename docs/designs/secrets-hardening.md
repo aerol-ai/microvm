@@ -209,13 +209,20 @@ with a counter metric. Not SQLite — it is single-writer (`MaxOpenConns=1`) and
 already serves every create, start, and expose_port, plus netstats per-tick
 writes. E2 and E3 share this store and this format (JSON Lines).
 
-**E2b's trust boundary must be stated or the property is theatre.** If the chain
-and its segment heads are both written by sandboxd on one host, whoever can
-rewrite the log can rewrite the heads. Tamper-evidence exists only against an
-external witness: co-signed heads shipped off-node, WORM storage, or a signing
-key the daemon cannot read. Pick one, or downgrade the claim to "append-only with
-integrity checksums." Retention conflicts with the chain unless heads are
-anchored per window and retained indefinitely.
+**E2b's trust boundary — DECIDED 2026-08-07: external witness, Reporter-first.**
+Chain heads ship off-node when a real control-plane sink is configured;
+verification recomputes the local head and compares it to the last witnessed one.
+Open-source build keeps append-only plus checksums for operations but **does not
+claim tamper-evidence** until a sink is wired — the same claim-gating rule as
+E1b. **The product goal is not downgraded**; the witness channel is
+Reporter-first, with WORM-backed head storage and daemon-unreadable signing keys
+as follow-ups.
+
+Two properties to state rather than imply: this detects **retroactive** tampering
+only — a daemon compromised at write time can emit a self-consistent forgery —
+and **detection granularity equals ship cadence**, so the witness interval is a
+security parameter, not a tuning knob. Full detail in
+`plans/secrets-hardening.md` §E2b.
 
 **E4 is fail-open with an opt-in strict mode.** A KMS canary is a network
 round-trip on every restart; fail-closed risks a fleet-wide outage during a

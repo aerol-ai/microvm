@@ -795,6 +795,78 @@ brokering, Vault-backed customer secret storage, or transparent interception.
    env vars visible inside the sandbox; E5 would have departed from that. The
    differentiation argument for departing is withdrawn with it.
 
+## E2b tamper-evidence — DECIDED 2026-08-07: external witness, Reporter-first
+
+**The product goal stays "tamper-evident." It is not downgraded.** What is
+scoped is the witness channel: start with an off-node witness over the
+control-plane seam, and add stronger stores later.
+
+### v1 — witness over the control-plane seam
+
+- Ship hash-chain **heads** (and optionally signed audit batches) off-node when
+  a real control-plane sink is configured.
+- **Verification** recomputes the local chain head and compares it to the last
+  witnessed head. A mismatch means the local log was altered after that head
+  was witnessed.
+- **Open-source build (no-op sink):** local append-only plus integrity
+  checksums still work for operations, but **do not claim tamper-evidence**
+  until a real sink is wired. Managed and customer builds that configure a sink
+  get the claim.
+
+This mirrors the E1b rule exactly: the mechanism is additive, the *claim* is
+gated on a real sink existing.
+
+### Mechanical finding — `Reporter` cannot carry a head as it stands
+
+`controlplane.Sample` is a **usage-metering** record: `Value float64`,
+`Unit string`, `WindowStart/End time.Time`, with a doc comment stating it
+"carries units, never money." A chain head is a hex digest. There is no field it
+fits without abusing documented semantics, and `Report(ctx, batch []Sample)
+error` returns only an error — no receipt, no witness-side timestamp.
+
+**Recorded shape:** a sibling `Witness` interface in `pkg/controlplane`,
+alongside `Reporter`, using the same no-op-by-default pattern the package
+already establishes:
+
+```go
+// Witness records audit-chain heads off-node so retroactive tampering with a
+// node's local log is detectable. No-op in the open-source build.
+type Witness interface {
+    WitnessHeads(ctx context.Context, heads []AuditHead) (WitnessReceipt, error)
+}
+```
+
+The receipt matters: a witness that cannot tell you *when it recorded* a head
+lets an attacker who later compromises the host backdate a forged chain.
+Confirm this shape at build time — it is an implementation of the decision
+above, not a change to it.
+
+### The precise security property, stated so nobody overstates it
+
+Reporter-first witnessing detects **retroactive** tampering: an attacker who
+compromises the host *after* a head was witnessed cannot rewrite history covered
+by that head without producing a mismatch.
+
+It does **not** defend against a daemon that was already compromised when it
+wrote. Such a daemon controls both the local chain and what it ships, so it can
+emit a self-consistent forgery from the start. That is exactly the bar the
+follow-ups raise.
+
+**Detection granularity equals ship cadence.** Records written since the last
+witnessed head can be rewritten undetected. The witness interval is therefore a
+security parameter, not a performance tuning knob, and must be documented as
+such.
+
+### Follow-ups — stronger stores, same goal
+
+- **WORM-backed head store**, so heads cannot be deleted or rewritten even by
+  someone holding the sink credential.
+- **Signatures from a key the daemon cannot read** — HSM or a separate signer
+  process — so a compromised reporter credential is not sufficient to forge.
+
+Either follow-up may land in this plan or the next. Neither is required for the
+v1 claim, and neither changes the goal.
+
 ## Re-review decisions (eng review #2, 2026-08-07)
 
 Delta-focused re-review after the CEO scope expansion. Two reversals, two
@@ -895,6 +967,5 @@ recorded: **GAP-1**, the async fan-out window (§10).
 **UNRESOLVED DECISIONS:**
 - Rate-limit dimension for E1b — per-token, per-caller, or per-sandbox — settle when E1b is built (the machinery itself is decided; only the dimension is open)
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
-- E2b trust boundary / external witness — or downgrade the tamper-evidence claim
 - Owners, dates, and per-slice rollback plans
 - Per-peer identity across all seven `/v1/cluster/internal/...` endpoints — separate work, not this plan
