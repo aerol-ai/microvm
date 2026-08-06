@@ -694,6 +694,49 @@ pattern (eight-plus call sites — `dead_owner.go:119`, `capacity_lease.go:128`,
 `client.go:737`, `agent.go:767`) and the only topology that can find records whose
 location is unrecorded.
 
+### Rate-limit dimension — DECIDED 2026-08-07: per-identity **plus** a per-node ceiling
+
+**Two limits, not one.**
+
+1. **Per-identity bucket**, keyed to the resolved `Access`: the operator PAT gets
+   its own, and in managed builds each `Identity.OwnerRef` gets its own.
+   **Keyed to `OwnerRef`, not to the token** — a tenant must not be able to
+   multiply its budget by minting more tokens.
+2. **Global per-node ceiling** on total audit fan-out, independent of who is
+   asking.
+
+**Why both.** `requireAuth` (`pkg/api/middleware.go:67`) has exactly two
+outcomes: a PAT authenticates as operator with unscoped fleet-wide access, and
+any other bearer token goes to the `controlplane.Validator`. Under
+`controlplane.Noop()` — **the open-source default** — the validator rejects
+every non-PAT token, so **the OSS build has exactly one caller identity.** A
+per-identity limit therefore does nothing there; the ceiling is the only part
+that protects an open-source cluster. Conversely, per-identity is what stops one
+tenant starving the rest in a managed build, which a ceiling alone cannot do.
+
+**The two eliminated candidates, and why:**
+
+- **Per-token** — meaningless in OSS (one token exists) and wrong in managed,
+  because tokens are mintable and `OwnerRef` is the stable identity.
+- **Per-sandbox** — wrong threat model. It bounds queries about a single
+  sandbox while a caller sweeping a thousand different sandbox IDs gets a
+  thousand times the fan-out unimpeded. The thing being protected is the
+  cluster, not the sandbox.
+
+**Design notes for build time:**
+
+- The **operator bucket must be generous.** Operators run incident response, and
+  a limiter that throttles someone diagnosing an outage has made things worse.
+  Bound it, but do not tune it like a tenant.
+- **On rejection: `429` with `Retry-After`.** Never a silent truncation.
+- **Throttled internal fan-out composes with the coverage block.** A peer whose
+  internal request was shed simply did not answer, so it appears as missing
+  coverage — the existing E1b mechanism already reports it, and no separate
+  signal is needed. Say this explicitly so nobody adds one.
+- The ceiling is a **security parameter** (it bounds amplification), not a
+  throughput tuning knob. Document it as such in `setup/config-defaults.md`
+  when it ships.
+
 ### Rate-limiting is NEW machinery — scope it, do not assume it
 
 Verified 2026-08-07: **there is no rate-limiting anywhere in `pkg/api` or
@@ -965,7 +1008,6 @@ claim is withdrawn. New accepted gap
 recorded: **GAP-1**, the async fan-out window (§10).
 
 **UNRESOLVED DECISIONS:**
-- Rate-limit dimension for E1b — per-token, per-caller, or per-sandbox — settle when E1b is built (the machinery itself is decided; only the dimension is open)
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - Owners, dates, and per-slice rollback plans
 - Per-peer identity across all seven `/v1/cluster/internal/...` endpoints — separate work, not this plan

@@ -167,8 +167,18 @@ last failover.
 **Rate-limiting is new machinery**, not a config toggle — there is no limiter
 anywhere in `pkg/api` today and `golang.org/x/time/rate` is not a dependency.
 It ships with E1b because fan-out turns one request into N cluster-wide, making
-the limiter a security control against amplification rather than a nicety. The
-limit *dimension* (per-token / per-caller / per-sandbox) is still open.
+the limiter a security control against amplification rather than a nicety.
+
+**Dimension DECIDED 2026-08-07: per-identity plus a per-node ceiling.** Each
+resolved `Access` gets a bucket (operator PAT, and each `OwnerRef` in managed
+builds — keyed to `OwnerRef` not the token, so minting tokens cannot multiply a
+budget), *and* a global per-node ceiling bounds total fan-out regardless of
+caller. Both are needed: under `controlplane.Noop()` the open-source build has
+exactly one caller identity (`middleware.go:67`), so per-identity limiting does
+nothing there and the ceiling is the only real protection — while per-identity is
+the only thing that stops one tenant starving others in a managed build.
+Per-token and per-sandbox were eliminated: tokens are mintable, and per-sandbox
+bounds the wrong axis entirely.
 
 Server-only operator API: **no SDK method, no five-tab `.mdx`** this slice. If
 that changes, re-estimate against CLAUDE.md's SDK rule.
