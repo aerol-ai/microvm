@@ -19,7 +19,7 @@ calendar-gated. All estimates assume the measured ~95% package coverage bar
 
 | Ref | Meaning |
 |---|---|
-| T1-T4 | Provider seam (ref→plaintext) + recipient-set sealing + sync peer fan-out + one seal/fanout helper. Fixes the confirmed failover defect. |
+| T1-T4 | Provider seam (ref→plaintext) + recipient-set sealing + **async** peer fan-out + one seal/fanout helper. Fixes the confirmed failover defect. |
 | T5-T6 | Typed sentinel errors + audit events on every provider secret read (#82). |
 | T7-T9 | Env to its own sealed row + env opt-in on `Get`/`List` (breaking, 5 SDKs) + redact env from the Raft spec with a writer capability gate. |
 | T10 | KMS provider + offline fake + shared contract suite. |
@@ -37,9 +37,24 @@ Process decisions, renamed to avoid colliding with the plan's own D-numbers:
 
 ## Vision
 
-**AerolVM can answer what a given agent actually did.** The moment that matters
-is a security reviewer asking *"show me what sandbox `sb-abc123` touched last
-Tuesday."* Today there is no answer.
+**Scope correction 2026-08-07 — read this before the vision below.** E5
+(credential brokering) is **out of scope**, and with it the claim that AerolVM
+can tell you what an agent did with its credentials. Customer application
+secrets arrive at create time from the customer's own systems; AerolVM seals
+them at rest for failover and does not broker, mint, or store them as a product
+feature. Once a secret is inside the sandbox, its use is invisible to us **by
+construction**.
+
+What AerolVM can honestly answer is narrower and still worth having:
+*which credentials the daemon opened on a sandbox's behalf, when, and on which
+node* — plus, on host-mediated runtimes, *where that sandbox egressed*. That is
+the claim. Any wording stronger than it is wrong.
+
+The moment that still matters is a security reviewer asking *"show me what
+sandbox `sb-abc123` touched last Tuesday."* Today there is no answer at all. The
+answer this plan builds is a partial one — daemon-side credential access plus
+egress destinations where the runtime mediates them — and it must be sold as
+partial.
 
 ### What actually exists (verified; corrected twice)
 
@@ -78,7 +93,8 @@ secret-policy symbol) and nothing in scope creates one.
 - SOC 2 Type 2 is a hard requirement at enterprise procurement; vendors lacking
   it are noted as having extended sales cycles.
 - Competitors inject secrets as env vars visible in the sandbox. Env-as-secret is
-  the category norm — E5 departs from it.
+  the category norm, and **AerolVM now stays on that norm** — E5, which would have
+  departed from it, is out of scope.
 - Comparisons do not discuss KMS/BYOK. Weak evidence either way; read it as "not
   a category talking point," not "an open differentiator."
 - Daytona raised $24M Series A (Feb 2026).
@@ -96,9 +112,9 @@ exist only where they were written).
 |---|---|---|
 | Key custody | node-local AES key file | KMS wraps the data key |
 | Ciphertext storage | `cluster_secrets` row | `cluster_secrets` row — **same**, KMS stores nothing |
-| Distribution | sync peer fan-out at create | **sync peer fan-out at create** — shared machinery |
+| Distribution | **async** peer fan-out after create | **async peer fan-out after create** — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
-| Boot cost (HA creates) | one peer fan-out | one peer fan-out + one KMS wrap |
+| Boot cost (HA creates) | **none on the caller** — fan-out is async | **none on the caller**; the KMS wrap rides the async fan-out |
 | Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
 | Offline `make test` | native | fake; live behind `integration` tag |
 
@@ -124,8 +140,8 @@ decided; the doc must not claim KMS makes it disappear.
 | E3b | Kernel-level capture (docker/containerd/firecracker): NFLOG/conntrack → IPs | 15 / 3 | ACCEPTED, own justification required |
 | E3c | Hostname resolution (DNS or TLS-SNI capture) for E3b | 10 / 2 | **DEFERRED** — separate deliverable, not an alternative |
 | E4 | Boot-time provider self-test + metric + alert rule + defaults rationale | 2 / 0.5 | ACCEPTED |
-| E5 | Secret brokering into sandboxes | **TBD — own eng review** | ACCEPTED in principle, excluded from totals |
-| final | E5 / T8 breaking-change overlap | — | Ship all as assembled (recommendation was to hold T8; user accepted two breaking changes) |
+| E5 | Secret brokering into sandboxes | — | **OUT OF SCOPE 2026-08-07** — reverses the earlier acceptance. See below. |
+| final | ~~E5 / T8 breaking-change overlap~~ | — | **Moot.** With E5 gone there is only one breaking change (T8), not two. |
 
 **E1a `failover_ready` is provider-dependent and must be defined per provider.**
 Local: derived from the recipient set in the envelope header
@@ -156,6 +172,36 @@ limit *dimension* (per-token / per-caller / per-sandbox) is still open.
 
 Server-only operator API: **no SDK method, no five-tab `.mdx`** this slice. If
 that changes, re-estimate against CLAUDE.md's SDK rule.
+
+### E5 — OUT OF SCOPE (2026-08-07)
+
+**Reverses the earlier acceptance.** Do not build credential brokering,
+Vault-backed customer secret storage, or transparent interception.
+
+- Customer application secrets are provided **at create time**, from the
+  customer's own systems. AerolVM may seal them at rest so they survive failover
+  (slices 1-3) and must not require storing them in an AerolVM-operated
+  Vault/KMS as a product feature.
+- **Platform KMS/Vault is only for AerolVM's own wrapping keys** — the DEK that
+  protects cluster secrets. It is not a customer secret store. This is a
+  clarification of T10's purpose, not a change to it.
+- **Drop the "every use attributed" and "guest never holds the secret" claims**
+  from this plan and from any external material derived from it.
+- Revisit only on an explicit customer ask.
+
+Three consequences worth stating rather than leaving implicit:
+
+1. **The audit claim narrows.** T6 records what the *daemon* did — which
+   credentials it opened, when, on which node. It cannot record what the agent
+   did with a secret once that secret is inside the sandbox. Outside-voice #4
+   flagged this as an overclaim risk; with E5 gone it is simply the truth and
+   the docs must say so.
+2. **There is now only one breaking change, not two.** The T8/E5 overlap that
+   the CEO review accepted as a cost has disappeared. T8's own rationale
+   survives untouched — env still carries customer credentials, so keeping it
+   out of `Get`/`List` responses is still right.
+3. **Totals are unaffected.** E5 was already excluded pending its own estimate,
+   so no arithmetic changes. Slice 6 is removed outright.
 
 **E2 storage substrate — decided, not deferred:** append-only file per node with
 a serialized in-process writer behind a bounded channel; drop policy on overflow
@@ -189,7 +235,7 @@ path on a background ticker, **not** create.
 |---|---|---|
 | T6 audit | `UnsealRegistry` (`service.go:1903`, via `attachWasmRegistryAuth`) and `loadMounts` (`service.go:2038`, via `StartSandbox`) | Audit writes must be buffered/async or start latency moves. State the choice. |
 | T7 | Env to its own row = +1 INSERT + AES-GCM seal per create on a `MaxOpenConns=1` connection. Env is present on nearly every create. | Measured before/after on default create. **Required.** |
-| T1-T4 | Default creates unchanged; `failover.policy=recreate` creates +1 sync fan-out | Extend the existing `cluster_seal` stage timer. |
+| T1-T4 | Default creates unchanged; HA creates also unchanged — **the fan-out is async** (plan §3e) | Extend the existing `cluster_seal` stage timer to cover the local seal. |
 | E3 | Event emission | Must not be synchronous on create. |
 | E4 | Daemon boot only | First-call KMS round-trip; off the create path. |
 
@@ -210,31 +256,37 @@ Affects only `failover.policy=recreate` sandboxes. Full detail in
 
 ## Known tensions accepted by the user
 
-1. **Two breaking SDK changes.** T8 hides env from `Get`/`List`; E5 may change
-   the credential model again. The second break is **unspecified** — scope it at
-   E5's eng review rather than asserting it now.
+1. **One breaking SDK change, not two.** T8 hides env from `Get`/`List`. The
+   second break was going to come from E5, which is now out of scope, so this
+   tension is resolved rather than accepted. T8's rationale is unchanged: env
+   carries customer credentials and should not come back from a read API.
 2. **D5 stands.** Stale recipient sets remain documented, not fixed; E1a makes
-   the consequence observable.
-3. **KMS (T10) and E5 are both unvalidated bets** with no named customer. They do
-   not validate each other — E5 makes KMS more *useful* if both ship, which is a
-   coherence argument, not demand. **T10 carries a demand gate:** revisit at the
-   start of slice 4; if no prospect has asked by then, drop it to the deferred
-   list rather than building on schedule.
+   the consequence observable — and after the KMS correction, KMS was never the
+   clean escape hatch the original framing implied.
+3. **T10 (KMS) remains an unvalidated bet** with no named customer, and E5 no
+   longer exists to make it more useful. Its purpose is now narrower and
+   clearer: wrapping AerolVM's own DEKs, not storing customer secrets. **The
+   demand gate stands** — revisit at the start of slice 4; if no prospect has
+   asked, drop it to deferred rather than building on schedule.
 4. **This is a program, not a fix.** The confirmed P1 defect is T3. Ship slice 1
    independently and early.
+5. **GAP-1 is accepted, not solved.** The async fan-out window is a real hole in
+   the HA guarantee, bounded only by `failover_ready` being honest about it.
 
 ## External dependency
 
 **PR #223 (AGPL relicense + cluster-mode commercial restriction), open since
 2026-06-20 (~6.5 weeks).** Cluster mode is the intended paid tier. Not every task
 here is cluster-mode work: T7/T8 (env), T11 (messages), T13 (docs), E4, and E3a's
-wasm path all apply single-node. Genuinely cluster-gated: T1-T4, T10, E5. #223
-blocks E5 in particular.
+wasm path all apply single-node. Genuinely cluster-gated: T1-T4 and T10. With E5
+out of scope, #223 no longer blocks any item in this plan on its own — it remains
+a business question about the paid tier these features serve.
 
 ## Deferred
 
 From `plans/secrets-hardening.md` §8 — all rows except credential brokering,
-which was promoted to E5:
+plus credential brokering, which was briefly promoted to E5 and is now returned
+to deferred:
 
 - Placement filter for stale recipient sets (D5 chose docs + KMS).
 - Resealing protocol on membership change (needs a live decryptor; the dead owner
@@ -328,12 +380,12 @@ verification checklist and a documented rollback.
 | 3 | T7-T9, T13, E1b + operator dashboard/alerts/runbook (**E1a moved to slice 1** — it guards the async fan-out) | Env sealed at rest; `Get`/`List` omit env; D5 limitation published, `make docs-build` green; no silent empty env on mixed-version rollout |
 | 4 | T10 (demand-gated), E3a + integration chaos case | Both providers pass one contract suite; attribution emits for wasm + isolate + netstats totals; kill-owner-mid-fan-out leaves no half-sealed sandbox |
 | 5 | E3b, E2b (auditor-gated) | Kernel-level IP capture for docker/containerd |
-| 6 | E5 | Own eng review; not started until slice 4 lands |
 
 **Totals, slices 0-5:** ~81 eng-days ≈ **16 engineer-weeks**; ~17 CC-days of
 authoring. At 1.5 engineers that is ~11 calendar weeks of build, plus live-AWS
 verification cycles and any audit engagement — call it **one quarter calendar**
-with those gates included. E5 excluded pending its own estimate.
+with those gates included. E5 is out of scope entirely (2026-08-07), so slice 6
+is removed rather than deferred.
 
 Treat E1b, E3b, and T10 as placeholders (outside voice #12) — re-estimate each at
 the start of its slice rather than treating this total as a commitment.
@@ -363,8 +415,7 @@ decision before its slice starts:
 - **SOC 2 observation window** (3/6/12 months) and auditor engagement status —
   E2a has no business date without it; E2b is gated on an auditor ask.
 - **E2b trust boundary / external witness** — or downgrade the claim.
-- **E5's guest-credential fork:** does the raw credential ever enter the guest? If
-  yes, "every use attributed" is unachievable by construction. Answer before
-  quoting a number. Delivery also differs across five runtimes, plus Vault auth
-  method, lease renewal, and revocation-on-destroy including the crash path.
+- ~~E5's guest-credential fork~~ **CLOSED 2026-08-07 by putting E5 out of
+  scope.** Customer secrets arrive at create time; AerolVM does not broker them.
+  The "every use attributed" claim is withdrawn accordingly.
 - **Owners, dates, per-slice rollback plans.**

@@ -80,7 +80,7 @@ off the table. (The 2026-08-02 draft listed it as an option; deleted.)
 | D7 | One shared contract suite runs against **both** providers (offline fake for KMS); live KMS behind the `integration` tag. |
 | D8 | Sealed env lives in its **own row, read on demand**, mirroring `sealMounts`/`loadMounts`/`GetMounts`. The hot row scanner never carries env. |
 | D9 | `Get`/`List` **omit env by default**; an explicit opt-in returns it, and that read is audited. |
-| D10 | The `Provider` interface owns **ref → plaintext**, not crypto. `Put(secret) → ref`, `Open(ref, nodeID) → plaintext`. |
+| D10 | The `Provider` interface owns **ref → plaintext**, not crypto. `Put(secret) → ref`, `Open(sandboxID, ref, nodeID) → plaintext` (signature settled in 3d-4). |
 
 ### Corrections to the 2026-08-02 draft
 
@@ -106,8 +106,10 @@ type Provider interface {
     // by every recipient. Returns a log-safe handle.
     Put(ctx context.Context, sandboxID string, s Secrets, recipients []string) (Handle, error)
     // Open resolves a handle to plaintext for nodeID, by whatever means the
-    // backend allows — local row, peer fetch, or a KMS call.
-    Open(ctx context.Context, h Handle, nodeID string) (Secrets, error)
+    // backend allows — local row, peer fetch, or a KMS call. sandboxID is
+    // explicit (3d-4): the audit event needs it, and a not-found cannot
+    // recover it from a handle that resolved to nothing.
+    Open(ctx context.Context, sandboxID string, h Handle, nodeID string) (Secrets, error)
     Delete(ctx context.Context, sandboxID string) error
 }
 ```
@@ -123,7 +125,7 @@ KMS removes WALL 2 (recipient binding). It does nothing about WALL 1.
 |---|---|---|
 | Key custody | node-local AES key file | KMS wraps the data key into the existing `WrappedKey` field (envelope v3, `cluster_secrets.go:65-70` — **no format change**) |
 | Ciphertext storage | `cluster_secrets` row | `cluster_secrets` row — **same**, KMS stores nothing |
-| Distribution | sync peer fan-out at create | **sync peer fan-out at create** — shared machinery |
+| Distribution | **async** peer fan-out after create (§3e) | **async peer fan-out after create** — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
 | Boot cost (HA creates only) | **none — fan-out is async (§3e)**; local seal only | **none on the caller**; the KMS wrap rides the async fan-out, not the create |
 | Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
@@ -717,6 +719,39 @@ and the quota it approached in this section before adding it. A cache introduced
 without that evidence is trading a proven security property for an unproven
 performance one.
 
+## E5 credential brokering — OUT OF SCOPE (2026-08-07)
+
+**Reverses the acceptance made during the CEO review.** Do not build credential
+brokering, Vault-backed customer secret storage, or transparent interception.
+
+- Customer application secrets are provided **at create time**, from the
+  customer's own systems. AerolVM may seal them at rest so they survive failover
+  (slices 1-3). It must **not** require storing customer application secrets in
+  an AerolVM-operated Vault or KMS as a product feature.
+- **Platform KMS/Vault is only for AerolVM's own wrapping keys** — the DEK that
+  protects cluster secrets. It is not a customer secret store. This narrows and
+  clarifies T10's purpose rather than changing its design.
+- **The "every use attributed" and "guest never holds the secret" claims are
+  withdrawn** from this plan and from anything derived from it.
+- Revisit only on an explicit customer ask.
+
+### What this changes elsewhere
+
+1. **The audit claim narrows, and the docs must say so.** T6 records what the
+   *daemon* did: which credentials it opened, when, on which node. It cannot
+   record what an agent does with a secret once that secret is inside the
+   sandbox — that is invisible **by construction**, not by omission.
+   Outside-voice #4 flagged the overclaim risk; it is now simply the truth.
+2. **One breaking change, not two.** The T8/E5 overlap the CEO review accepted
+   as a cost no longer exists. T8's own rationale is untouched: env still
+   carries customer credentials, so keeping it out of `Get`/`List` responses is
+   still correct.
+3. **Slice 6 is removed**, not deferred. Totals are unaffected — E5 was already
+   excluded pending its own estimate.
+4. **AerolVM stays on the category norm.** Every competitor injects secrets as
+   env vars visible inside the sandbox; E5 would have departed from that. The
+   differentiation argument for departing is withdrawn with it.
+
 ## Re-review decisions (eng review #2, 2026-08-07)
 
 Delta-focused re-review after the CEO scope expansion. Two reversals, two
@@ -808,14 +843,16 @@ Also resolved: the E1b cluster-read model — local log authoritative, fan-out w
 an explicit coverage block, rate-limited, `controlplane.Reporter` additive and
 never required, dead-disk durability **not claimed** on the open-source build.
 And the KMS wrapping-material cache: **no cache**, every open calls KMS, so
-revocation stays instant and CloudTrail stays complete. New accepted gap
+revocation stays instant and CloudTrail stays complete. **E5 credential
+brokering is out of scope** — customer secrets arrive at create time, platform
+KMS covers only AerolVM's own wrapping keys, and the "every use attributed"
+claim is withdrawn. New accepted gap
 recorded: **GAP-1**, the async fan-out window (§10).
 
 **UNRESOLVED DECISIONS:**
 - Rate-limit dimension for E1b — per-token, per-caller, or per-sandbox — settle when E1b is built (the machinery itself is decided; only the dimension is open)
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - E2b trust boundary / external witness — or downgrade the tamper-evidence claim
-- E5's guest-credential fork: does the raw credential ever enter the guest — answer before quoting any number
 - `toolbox_token` plaintext at rest: write the deferral rationale or pull it into scope
 - Owners, dates, and per-slice rollback plans
 - Per-peer identity across all seven `/v1/cluster/internal/...` endpoints — separate work, not this plan
