@@ -372,17 +372,55 @@ need a regression test next to the file they change plus a PR call-out.
 
 | Failure | Test? | Handled? | User sees |
 |---|---|---|---|
+| **GAP-1: owner dies inside the async fan-out window** | yes (chaos case) | **accepted, not fixed** — bounded by `failover_ready=false` | sandbox is unrecoverable; `failover_ready` was false throughout |
 | Failover node not in recipient set | yes (D5 case) | must be distinct error | clear error — **required**, not a decrypt failure |
-| Partial fan-out | yes | D6 documented rule | create fails (strict) |
-| Peer unreachable at create | yes | strict → rollback | create fails |
+| Partial fan-out | yes | 3d-2 holder-count rule | create succeeds at owner + ≥1; holder count surfaced |
+| Peer unreachable during fan-out | yes | async retry + backoff + metric | nothing at create; `failover_ready` stays false |
 | Ownership replay seal failure | yes | best-effort + metric | sandbox marked not-HA |
 | **Old node re-merges env it cannot read** | yes | writer capability gate | **must fail loudly** — silent empty env is the critical gap |
-| KMS unreachable at create | yes (fake) | strict | create fails |
+| KMS unreachable during fan-out | yes (fake) | async retry + backoff | nothing at create; `failover_ready` stays false |
 | Legacy plaintext env row | yes | lazy fallback | transparent |
 
-The one critical gap to design against: a sandbox created with a silently empty
-environment. It boots, looks healthy, and misbehaves. §5c's capability gate is
-what prevents it.
+### GAP-1 — the async fan-out window (ACCEPTED, not fixed)
+
+**There is a window between `201 Created` and fan-out completion during which
+the sandbox is running but no backup node holds its credentials. If the owner
+dies in that window, failover fails and the sandbox cannot be recreated
+anywhere.**
+
+This is a direct and accepted consequence of the §3e decision to make key
+distribution asynchronous so callers never block on it. It is a real gap, not a
+theoretical one, and it is recorded here rather than in a design section so it
+cannot be missed.
+
+What bounds it:
+
+- `failover_ready` reads **false** for the entire window (E1a, moved into slice
+  1 specifically for this). The system never claims a guarantee it does not
+  have, so no operator or automation is misled into believing the sandbox is
+  recoverable.
+- Fan-out retries with bounded backoff, so transient peer failures close the
+  window on their own rather than leaving it open indefinitely.
+- Failures emit `aerolvm_secret_fanout_failures_total` and feed the operator
+  alert, so a window that is *not* closing becomes visible.
+
+What does **not** bound it: window length. There is no upper bound on how long
+a fan-out can take when peers are unreachable, and no create-time guarantee of
+any kind. A sandbox can be live and permanently not-failover-ready.
+
+Who is affected: only `failover.policy=recreate` sandboxes, since no other
+sandbox fans out at all. Non-HA sandboxes are explicitly orphaned on owner death
+regardless (`service.go:929`), so nothing changes for them.
+
+**If `failover_ready` does not ship in slice 1, this gap becomes silent and §3e
+is not safe.** That coupling is the reason E1a moved out of slice 3.
+
+Accepted trade: callers never wait on peer I/O during create.
+
+### The other critical gap
+
+A sandbox created with a silently empty environment. It boots, looks healthy,
+and misbehaves. §5c's writer capability gate is what prevents it.
 
 ## 11. Parallelization
 
@@ -571,6 +609,68 @@ now guards.
 Boot-path consequence, and it is a good one: HA creates are now **also**
 unchanged. No sync peer calls on any create path.
 
+## E1b cluster-read model — DECIDED 2026-08-07
+
+**Local log is authoritative. Fan-out serves reads. The off-node sink is
+additive, never required.**
+
+Four parts, all of them load-bearing:
+
+1. **Always** write audit events to the local node's append-only log. That log
+   is the source of truth on every build.
+2. **Always** serve `/v1/sandboxes/{id}/audit` by live fan-out to reachable
+   members, merged by timestamp, with an **explicit coverage block** naming
+   which nodes answered and which did not. **Rate-limited** (see below).
+3. **Additionally**, best-effort `Report(...)` audit events through
+   `controlplane.Reporter` when a real reporter is configured — the managed or
+   customer sink path.
+4. If the Reporter is no-op or unset (**the open-source default**), skip the
+   off-node ship entirely. Reads stay fan-out plus local.
+
+### The claim is gated on the sink, and this is not optional wording
+
+**Do not claim dead-disk durability unless a real sink is wired.** On the
+open-source build a node's disk loss is permanent record loss, and the docs must
+say so plainly rather than implying the fan-out protects against it. Fan-out is
+a *discovery* mechanism, not a durability one — it finds records whose location
+nothing tracks; it cannot find records that no longer exist.
+
+This is the same honesty rule as GAP-1 and the D14 gap marker: state the
+boundary rather than let a reader infer a stronger guarantee than exists.
+
+### Why fan-out, and why owner-forwarding was eliminated
+
+The FSM stores a single `OwnerNodeID` and `opPlace` overwrites it
+(`internal/cluster/fsm.go:427`). **No owner history is retained anywhere.** After
+a failover, nothing in the system knows which node held the sandbox last week, so
+forwarding to the current owner returns only that node's slice and silently drops
+everything before it. Fan-out to `c.gossip.members()` is both the established
+pattern (eight-plus call sites — `dead_owner.go:119`, `capacity_lease.go:128`,
+`client.go:737`, `agent.go:767`) and the only topology that can find records whose
+location is unrecorded.
+
+### Rate-limiting is NEW machinery — scope it, do not assume it
+
+Verified 2026-08-07: **there is no rate-limiting anywhere in `pkg/api` or
+`internal/service`, and `golang.org/x/time/rate` is not in `go.mod`.** This is
+not "add a limiter to the audit route." It is introducing rate-limiting to a
+codebase that has none, which means:
+
+- A new dependency. `golang.org/x/time/rate` is the boring, standard choice
+  (**[Layer 1]** — do not hand-roll a token bucket).
+- A new middleware sitting alongside `d.Auth` in the `pkg/api/v1` chain.
+- A decision on the limit dimension — per-token, per-caller, or per-sandbox —
+  which is **not yet made** and should be settled when E1b is built.
+- Scope discipline: this decision rate-limits **the audit endpoint only.**
+  Introducing the machinery will invite applying it elsewhere; that is separate
+  work with its own review.
+
+The rationale is not politeness, it is amplification. One audit request becomes
+N internal requests across the cluster, so an unthrottled endpoint is a
+cluster-wide amplification vector reachable by any authorized caller. That makes
+the limiter a **security control**, not a nicety — and it is why it ships with
+E1b rather than after it.
+
 ## Re-review decisions (eng review #2, 2026-08-07)
 
 Delta-focused re-review after the CEO scope expansion. Two reversals, two
@@ -658,9 +758,13 @@ fan-out (owner + ≥1 backup, holder count surfaced); failed-create leftovers
 (delete-fanout, deterministic refs); `Provider.Open` takes `sandboxID`
 explicitly. Plus §3e supersedes D4: the fan-out is **asynchronous** and E1a
 `failover_ready` moves into slice 1 to guard it. **Slice 1 is unblocked.**
+Also resolved: the E1b cluster-read model — local log authoritative, fan-out with
+an explicit coverage block, rate-limited, `controlplane.Reporter` additive and
+never required, dead-disk durability **not claimed** on the open-source build.
+New accepted gap recorded: **GAP-1**, the async fan-out window (§10).
 
 **UNRESOLVED DECISIONS:**
-- Cluster-mode audit reads: node-local, owner-forwarded, or fan-out — gates E1b in slice 3; must also survive a dead node's disk
+- Rate-limit dimension for E1b — per-token, per-caller, or per-sandbox — settle when E1b is built (the machinery itself is decided; only the dimension is open)
 - KMS wrapping-material cache TTL and its threat-model change — gates T10 in slice 4
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - E2b trust boundary / external witness — or downgrade the tamper-evidence claim

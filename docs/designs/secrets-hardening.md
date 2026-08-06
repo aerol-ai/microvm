@@ -135,11 +135,27 @@ lands — E1a therefore ships *after* T3, and is computed on read, never persist
 and never inside the shared row scanner (#70). KMS: no recipient set exists;
 define it as always-true or not-applicable.
 
-**E1b is gated on the cluster-read decision** (below). Shipping a cursor format
-before deciding node-local vs owner-forwarded vs fan-out bakes in something the
-answer may break — and post-failover history spans nodes, which is the case the
-endpoint exists for. Server-only operator API: **no SDK method, no five-tab
-`.mdx`** this slice. If that changes, re-estimate against CLAUDE.md's SDK rule.
+**E1b cluster-read model — DECIDED 2026-08-07.** Local append-only log is
+authoritative on every build. Reads fan out to reachable members, merged by
+timestamp, with an **explicit coverage block** naming which nodes answered.
+`controlplane.Reporter` ships events off-node **best-effort when a real reporter
+is configured**, and is skipped entirely when it is a no-op — the open-source
+default. **Dead-disk durability is not claimed unless a real sink is wired**;
+fan-out discovers records, it does not preserve them.
+
+Owner-forwarding was eliminated on evidence: the FSM keeps a single
+`OwnerNodeID` that `opPlace` overwrites (`fsm.go:427`), so no owner history
+exists and forwarding to the current owner silently drops everything before the
+last failover.
+
+**Rate-limiting is new machinery**, not a config toggle — there is no limiter
+anywhere in `pkg/api` today and `golang.org/x/time/rate` is not a dependency.
+It ships with E1b because fan-out turns one request into N cluster-wide, making
+the limiter a security control against amplification rather than a nicety. The
+limit *dimension* (per-token / per-caller / per-sandbox) is still open.
+
+Server-only operator API: **no SDK method, no five-tab `.mdx`** this slice. If
+that changes, re-estimate against CLAUDE.md's SDK rule.
 
 **E2 storage substrate — decided, not deferred:** append-only file per node with
 a serialized in-process writer behind a bounded channel; drop policy on overflow
@@ -176,6 +192,21 @@ path on a background ticker, **not** create.
 | T1-T4 | Default creates unchanged; `failover.policy=recreate` creates +1 sync fan-out | Extend the existing `cluster_seal` stage timer. |
 | E3 | Event emission | Must not be synchronous on create. |
 | E4 | Daemon boot only | First-call KMS round-trip; off the create path. |
+
+## Known gaps
+
+**GAP-1 — the async fan-out window.** Key distribution is asynchronous so callers
+never block on peer I/O during create. The consequence: between `201 Created` and
+fan-out completion, the sandbox runs while no backup node holds its credentials.
+An owner death in that window means the sandbox cannot be recreated anywhere.
+
+Bounded by `failover_ready` reading false for the whole window (E1a, moved into
+slice 1 for exactly this reason), bounded retries with backoff, and a metric plus
+alert when a window is not closing. **Not** bounded in length — a sandbox can be
+live and permanently not-failover-ready if peers stay unreachable.
+
+Affects only `failover.policy=recreate` sandboxes. Full detail in
+`plans/secrets-hardening.md` §10 GAP-1.
 
 ## Known tensions accepted by the user
 
