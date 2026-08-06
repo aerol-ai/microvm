@@ -253,7 +253,8 @@ path on a background ticker, **not** create.
 | T6 audit | `UnsealRegistry` (`service.go:1903`, via `attachWasmRegistryAuth`) and `loadMounts` (`service.go:2038`, via `StartSandbox`) | Audit writes must be buffered/async or start latency moves. State the choice. |
 | T7 | Env to its own row = +1 INSERT + AES-GCM seal per create on a `MaxOpenConns=1` connection. Env is present on nearly every create. | Measured before/after on default create. **Required.** |
 | T1-T4 | Default creates unchanged; HA creates also unchanged — **the fan-out is async** (plan §3e) | Extend the existing `cluster_seal` stage timer to cover the local seal. |
-| E3 | Event emission | Must not be synchronous on create. |
+| E3a | Event emission | Must not be synchronous on create. |
+| **E3b** | **Per-sandbox NFLOG/conntrack rule installation lands where netrules already runs during sandbox setup** (`pkg/docker/client.go:213-282`, `BlockAllEgress`/`ClearBlockAllEgress` keyed by container IP) | **+1 rule per sandbox on the create path. Measure it. Was missing from this table until 2026-08-07.** |
 | E4 | Daemon boot only | First-call KMS round-trip; off the create path. |
 
 ## Known gaps

@@ -334,15 +334,45 @@ need a regression test next to the file they change plus a PR call-out.
 
 ## 7. Performance
 
-- **Boot path.** Default creates: unchanged, and the PR must say so with
-  numbers. HA creates: +1 sync fan-out. `overlap.go:141` already records a
-  `cluster_seal` stage — extend it to cover the fan-out so the cost is
-  measurable for free.
-- **KMS on create (Codex #6).** Envelope encryption still calls
-  `GenerateDataKey`/`Encrypt` per new secret unless wrapping material is cached
-  locally. Caching changes the threat model — decide the TTL and state the
-  tradeoff explicitly rather than hand-waving "don't round-trip."
-- **Env reads.** D8 keeps them off the scanner. D9 keeps them off `List`.
+### Create-path cost, item by item (authoritative — updated 2026-08-07)
+
+| Item | Create-path cost | Note |
+|---|---|---|
+| T1-T4 | **~0** | Fan-out is async (§3e). Recipient set reuses the list `SelectPlacement` already builds. `opReserve` is written either way. |
+| T5 | 0 | Pure refactor. |
+| T6 audit | **0 *if* async** | Hot sites are `UnsealRegistry` (`service.go:1903`) and `loadMounts` (`service.go:2038`, via `StartSandbox`). Requirement, not a guarantee — see below. |
+| **T7 env row** | **+1 INSERT + AES-GCM seal, on nearly every create** | **The one real cost.** Calibrated: `PutMounts` (`store.go:4053`) is the identical shape and already runs on the create path at `service.go:1585` and `wasm.go:228`. |
+| T8 | 0 | Read path. Actually *removes* work from `List`. |
+| T9 | ~0 | Map copy plus a version check. |
+| T10 KMS | 0 | The wrap rides the async fan-out. No cache means no warm-up either. |
+| T11-T13 | 0 | Messages, a deletion, docs. |
+| E1a | 0 | Computed on read from live memberlist, never persisted, never in the row scanner. |
+| E1b | 0 | New read endpoint. |
+| E2a / E2b | **0 *if* async** | Chain append is serialized, but off the request path behind the bounded channel. |
+| E3a | **0 *if* async** | Event emission must not be synchronous on create. |
+| **E3b** | **+1 rule per sandbox** | **Added 2026-08-07 — this table previously omitted it.** NFLOG/conntrack rule installation lands where per-sandbox netrules already run during sandbox setup (`pkg/docker/client.go:213-282`, `BlockAllEgress`/`ClearBlockAllEgress` keyed by container IP). Measure it. |
+| E4 | 0 on create | Daemon boot only; first-call KMS round-trip is off the create path. |
+
+### The actual risk is discipline, not design
+
+**Four items are "must be async" requirements rather than guarantees** — T6,
+E2a, E2b, E3a. Nothing in the code will stop an implementer writing a
+synchronous audit append into `StartSandbox`; only review will. If create
+latency regresses during this program, that is overwhelmingly the likely cause.
+
+What catches it: CLAUDE.md non-negotiable #2 makes the boot-latency call-out
+mandatory on every PR touching this path; `overlap.go:141` already records a
+`cluster_seal` stage to carry the measurement; slice 1's exit criterion is
+literally *"default create latency unmoved"*; and the HA-create benchmark case
+gives the regression signal.
+
+### Other performance notes
+
+- **Env reads.** D8 keeps them off the shared row scanner. D9 keeps them off
+  `List`.
+- **KMS call volume.** Decided: no cache. Unwraps happen only on failover
+  recreate, ~20 req/s worst case — about 0.1% of quota. See the KMS cache
+  section.
 - **CI.** `internal/cluster` runs ~4.5 min; D7 roughly doubles the credential
   suite. Acceptable, but watch it.
 
