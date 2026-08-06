@@ -291,8 +291,12 @@ to deferred:
 - Placement filter for stale recipient sets (D5 chose docs + KMS).
 - Resealing protocol on membership change (needs a live decryptor; the dead owner
   had it).
-- **`toolbox_token` plaintext at rest** (`store.go:766`) — same exposure class as
-  `env_json`, still unaddressed. Explicitly out of scope.
+- **`toolbox_token` plaintext at rest** (`store.go:766`) — **deferred with a
+  written rationale**, see `plans/secrets-hardening.md` §8a. It is a
+  platform-minted control-plane credential, not a customer secret, and is tagged
+  `json:"-"` (`types.go:711`) so it cannot reach the Raft spec even accidentally
+  — a different problem from `env_json`, which was leaking. The plan explicitly
+  does **not** claim all secret-bearing columns are sealed.
 - Issue #70 (full-table scan per tick) — D8 and E1a avoid worsening it.
 
 Added here:

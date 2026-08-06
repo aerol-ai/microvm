@@ -354,10 +354,53 @@ need a regression test next to the file they change plus a PR call-out.
 |---|---|
 | Placement filter for stale recipient sets | D5 chose documentation + KMS instead |
 | Resealing protocol on membership change | Needs a live decryptor; the dead owner is the one that had it |
-| `toolbox_token` at rest | Same plaintext class as `env_json` (`store.go:766`), but a separate change |
+| `toolbox_token` at rest | Platform control-plane credential, not a customer secret — full rationale in §8a |
 | Fixing issue #70 (full-table scan) | D8 avoids making it worse; fixing it is its own work |
 | `internal/cluster` test flake | Captured in TODOS.md instead |
-| Credential brokering into sandboxes | The real enterprise product. Own plan, own eng review. |
+| Credential brokering into sandboxes | **Out of scope 2026-08-07** — customer secrets arrive at create time; revisit only on an explicit customer ask |
+
+### 8a. `toolbox_token` — deferred, with the reasoning
+
+`toolbox_token` remains plaintext in the sandbox row, protected by DB file mode
+0600 (`store.go:766`), exactly as today.
+
+**Why deferred**
+
+- It is a **platform control-plane credential** for toolboxd auth, not a customer
+  application secret supplied at create time. AerolVM mints it per sandbox —
+  `generateToolboxToken()` at `service.go:1334`, `service.go:1697`, and
+  `wasm.go:60`.
+- This plan's threat model for env sealing is specific: customer credentials in
+  `env_json` and the cluster secret bag must not sit as plain JSON, and must
+  survive HA failover. `toolbox_token` meets neither condition — it is
+  AerolVM-minted, scoped to a single sandbox, and **not** carried on the
+  recipient-set path (it does not appear in `cluster_secrets.go` at all).
+- **Verified structural property:** the field is tagged `json:"-"`
+  (`pkg/models/types.go:711`), so it is excluded from JSON marshalling entirely
+  and therefore **cannot ride the Raft-replicated spec even by accident.** That
+  is a guarantee by construction, not a convention — and it is the strongest
+  single reason this is a different problem from `env_json`, which *was* leaking
+  into the log.
+- Sealing it is a separate change with its own shape: every hot path that loads
+  the sandbox row to dial toolbox would need unseal-on-read — confirmed at
+  `internal/service/toolbox_proxy.go:140` and `service.go:5364`
+  (`PushAllowedPorts`) — plus rotate-on-recreate behaviour, without adding
+  create-path latency. Real work, but orthogonal to the failover, env-row, and
+  audit slices.
+
+**What we are not claiming**
+
+- This plan does **not** claim "all secret-bearing columns are sealed."
+- A host compromise able to read the SQLite file can still read `toolbox_token`
+  until a follow-up seals or relocates it. Anyone citing this plan in a security
+  review must say so rather than imply full coverage.
+
+**Optional follow-up**
+
+Seal `toolbox_token` at rest, or derive it from a host-only key plus the sandbox
+ID so the database never stores a reusable bearer secret at all. The derived
+form is the stronger option — it removes the stored credential rather than
+protecting it — but it changes rotation semantics and belongs in its own plan.
 
 ## 9. What already exists — reuse, do not rebuild
 
@@ -853,6 +896,5 @@ recorded: **GAP-1**, the async fan-out window (§10).
 - Rate-limit dimension for E1b — per-token, per-caller, or per-sandbox — settle when E1b is built (the machinery itself is decided; only the dimension is open)
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - E2b trust boundary / external witness — or downgrade the tamper-evidence claim
-- `toolbox_token` plaintext at rest: write the deferral rationale or pull it into scope
 - Owners, dates, and per-slice rollback plans
 - Per-peer identity across all seven `/v1/cluster/internal/...` endpoints — separate work, not this plan
