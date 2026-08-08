@@ -260,6 +260,7 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
 		return nil, sealErr
 	}
+	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
 	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)

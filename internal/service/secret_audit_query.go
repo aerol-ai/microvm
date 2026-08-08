@@ -85,8 +85,9 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 		limit = maxSecretAuditLimit
 	}
 	var after time.Time
+	var afterKey string
 	if c := strings.TrimSpace(opts.Cursor); c != "" {
-		after, err = time.Parse(time.RFC3339Nano, c)
+		after, afterKey, err = parseSecretAuditCursor(c)
 		if err != nil {
 			return nil, "", fmt.Errorf("invalid cursor: %w", err)
 		}
@@ -107,6 +108,7 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 	defer f.Close()
 
 	var matched []SecretAuditEvent
+	var malformed int
 	sc := bufio.NewScanner(f)
 	// Audit lines are small (metadata only); 1MiB is ample.
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -117,30 +119,51 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 		}
 		var ev SecretAuditEvent
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			malformed++
 			continue
 		}
-		if ev.SandboxID != sandboxID && ev.Result != secretAuditResultGap {
+		isGap := ev.Result == secretAuditResultGap || ev.Kind == secretAuditKindGap
+		if !isGap && ev.SandboxID != sandboxID {
 			continue
 		}
-		if !secretAuditKindMatches(ev.Kind, opts.Kind) {
+		if !isGap && !secretAuditKindMatches(ev.Kind, opts.Kind) {
 			continue
 		}
-		if !after.IsZero() && !ev.Time.After(after) {
-			continue
+		key := secretAuditEventCursorKey(ev)
+		if !after.IsZero() {
+			if ev.Time.Before(after) {
+				continue
+			}
+			if ev.Time.Equal(after) && (afterKey == "" || key <= afterKey) {
+				continue
+			}
 		}
 		matched = append(matched, ev)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, "", err
 	}
+	if malformed > 0 {
+		matched = append(matched, SecretAuditEvent{
+			Time:      time.Now().UTC(),
+			SandboxID: sandboxID,
+			Result:    secretAuditResultGap,
+			Reason:    "malformed_jsonl",
+			Kind:      secretAuditKindGap,
+		})
+	}
 	sort.SliceStable(matched, func(i, j int) bool {
+		if matched[i].Time.Equal(matched[j].Time) {
+			return secretAuditEventCursorKey(matched[i]) < secretAuditEventCursorKey(matched[j])
+		}
 		return matched[i].Time.Before(matched[j].Time)
 	})
 	if len(matched) > limit {
 		matched = matched[:limit]
 	}
 	if len(matched) == limit {
-		nextCursor = matched[len(matched)-1].Time.UTC().Format(time.RFC3339Nano)
+		last := matched[len(matched)-1]
+		nextCursor = formatSecretAuditCursor(last)
 	}
 	return matched, nextCursor, nil
 }
@@ -351,17 +374,58 @@ func secretAuditEventFromDTO(dto cluster.AuditEventDTO) SecretAuditEvent {
 
 // secretAuditKindMatches reports whether storedKind satisfies a query filter.
 // Empty filter matches everything. Query "secret_open" also matches empty Kind
-// (legacy secret-open lines).
+// (legacy secret-open lines). Gap markers always match so kind-filtered pages
+// cannot hide silent drops.
 func secretAuditKindMatches(storedKind, filter string) bool {
 	filter = strings.TrimSpace(filter)
 	if filter == "" {
 		return true
 	}
 	storedKind = strings.TrimSpace(storedKind)
+	if storedKind == secretAuditKindGap {
+		return true
+	}
 	if storedKind == "" {
 		storedKind = secretAuditKindSecretOpen
 	}
 	return storedKind == filter
+}
+
+const secretAuditCursorSep = "\x1f"
+
+func secretAuditEventCursorKey(ev SecretAuditEvent) string {
+	return strings.Join([]string{
+		ev.SandboxID,
+		ev.Kind,
+		ev.Result,
+		ev.Actor,
+		ev.CorrelationID,
+		ev.Ref,
+		ev.Destination,
+	}, secretAuditCursorSep)
+}
+
+func formatSecretAuditCursor(ev SecretAuditEvent) string {
+	return ev.Time.UTC().Format(time.RFC3339Nano) + secretAuditCursorSep + secretAuditEventCursorKey(ev)
+}
+
+func parseSecretAuditCursor(raw string) (time.Time, string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, "", nil
+	}
+	if i := strings.Index(raw, secretAuditCursorSep); i >= 0 {
+		ts, err := time.Parse(time.RFC3339Nano, raw[:i])
+		if err != nil {
+			return time.Time{}, "", err
+		}
+		return ts, raw[i+len(secretAuditCursorSep):], nil
+	}
+	ts, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	return ts, "", nil
 }
 
 func dedupeSecretAuditEvents(events []SecretAuditEvent) []SecretAuditEvent {

@@ -40,11 +40,11 @@ func (f *fakePeerPusher) PushSecretBlobToPeers(_ context.Context, blob secrets.S
 	return append([]string(nil), f.acked...), f.pushErr
 }
 
-func (f *fakePeerPusher) DeleteSecretOnPeers(_ context.Context, sandboxID string, _ []string) error {
+func (f *fakePeerPusher) DeleteSecretOnPeers(_ context.Context, sandboxID string, recipients []string, _ int64) (acked, pending []string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, sandboxID)
-	return nil
+	return append([]string(nil), recipients...), nil, nil
 }
 
 func openSealTestStore(t *testing.T) *storepkg.Store {
@@ -285,7 +285,9 @@ func (s *slowPeerPusher) PushSecretBlobToPeers(ctx context.Context, _ secrets.Se
 	return append([]string(nil), s.acked...), nil
 }
 
-func (s *slowPeerPusher) DeleteSecretOnPeers(context.Context, string, []string) error { return nil }
+func (s *slowPeerPusher) DeleteSecretOnPeers(context.Context, string, []string, int64) ([]string, []string, error) {
+	return nil, nil, nil
+}
 
 func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	ctx := context.Background()
@@ -311,11 +313,19 @@ func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	if _, err := svc.SealAndDistribute(ctx, "sb-refan", req, []string{"node-a", "node-b"}, SealStrict); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
+	// Drain the seal-time async fan-out before mutating pusher.done (race detector).
+	select {
+	case <-pusher.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected initial seal fan-out")
+	}
 	clearSecretFanoutHolders("sb-refan")
 	if secretHolderCount("sb-refan") != 0 {
 		t.Fatal("expected cleared holders")
 	}
+	pusher.mu.Lock()
 	pusher.done = make(chan struct{})
+	pusher.mu.Unlock()
 	if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
 		t.Fatalf("refanout: %v", err)
 	}
@@ -353,9 +363,22 @@ func TestComputeFailoverReady(t *testing.T) {
 		t.Fatalf("holders=1 multi → want false, got %v", ready)
 	}
 	addSecretHolderNodes("sb1", "node-b")
+	// Self is counted only when the local sealed row exists.
+	st := openSealTestStore(t)
+	svc.store = st
+	svc.cipher = newTestCipher(t)
+	svc.secretProvider = secrets.NewLocalProvider(svc.cipher, newSecretBlobStore(st))
+	if _, err := svc.SealAndDistribute(context.Background(), "sb1", models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}, []string{"node-a", "node-b"}, SealStrict); err != nil {
+		t.Fatalf("seal for ready: %v", err)
+	}
+	addSecretHolderNodes("sb1", "node-a", "node-b")
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || !*ready {
-		t.Fatalf("holders=2 live → want true, got %v", ready)
+		t.Fatalf("holders=2 live with local row → want true, got %v", ready)
 	}
 	// Dead backup must flip ready false even if historically ACK'd.
 	svc.cluster = &placementRecipientsCluster{

@@ -306,3 +306,12 @@ func (m *memBlobStore) DeleteForSandbox(_ context.Context, sandboxID string) err
 	}
 	return nil
 }
+func (m *memBlobStore) NextSealGeneration(_ context.Context, sandboxID string) (int64, error) {
+	var max int64
+	for _, rec := range m.byRef {
+		if rec.SandboxID == sandboxID && rec.SealGeneration > max {
+			max = rec.SealGeneration
+		}
+	}
+	return max + 1, nil
+}

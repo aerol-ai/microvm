@@ -23,7 +23,11 @@ const (
 	RefVersion             = 1
 	RefVersionEnv          = 2
 	MaxSupportedRefVersion = RefVersionEnv
-	EnvelopeVersion        = 3
+	// EnvelopeVersion 4 binds sandbox identity into AEAD AAD (and KMS
+	// EncryptionContext on the KMS path) so ciphertext cannot be relabeled
+	// across sandboxes when recipient sets match.
+	EnvelopeVersion   = 4
+	EnvelopeVersionV3 = 3
 )
 
 // HandleVersionFor returns the provider handle version for s. Env-bearing
@@ -39,13 +43,42 @@ func HandleVersionFor(s Secrets) int {
 type sealedSecretsEnvelope struct {
 	Version    int      `json:"version"`
 	Recipients []string `json:"recipients,omitempty"`
+	SandboxID  string   `json:"sandbox_id,omitempty"`
+	Ref        string   `json:"ref,omitempty"`
+	RefVersion int      `json:"ref_version,omitempty"`
+	Generation int64    `json:"generation,omitempty"`
 	WrappedKey []byte   `json:"wrapped_key,omitempty"`
 	Payload    []byte   `json:"payload"`
+}
+
+// SealBinding authenticates ciphertext to a specific sandbox handle.
+type SealBinding struct {
+	SandboxID  string
+	Ref        string
+	Version    int
+	Generation int64
+}
+
+func (b SealBinding) normalized() SealBinding {
+	b.SandboxID = strings.TrimSpace(b.SandboxID)
+	b.Ref = strings.TrimSpace(b.Ref)
+	if b.Version <= 0 {
+		b.Version = RefVersion
+	}
+	if b.Generation <= 0 {
+		b.Generation = 1
+	}
+	return b
 }
 
 // SealEnvelope marshals s and seals it for recipients. Returns nil/nil when s
 // is empty so callers can short-circuit without writing a row.
 func SealEnvelope(c *Cipher, s Secrets, recipients []string) ([]byte, error) {
+	return SealEnvelopeBound(c, s, recipients, SealBinding{})
+}
+
+// SealEnvelopeBound marshals s and seals it bound to sandbox identity.
+func SealEnvelopeBound(c *Cipher, s Secrets, recipients []string, binding SealBinding) ([]byte, error) {
 	if s.IsEmpty() {
 		return nil, nil
 	}
@@ -56,15 +89,20 @@ func SealEnvelope(c *Cipher, s Secrets, recipients []string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal cluster secrets: %w", err)
 	}
-	return SealRawEnvelope(c, plain, recipients)
+	return SealRawEnvelopeBound(c, plain, recipients, binding)
 }
 
 // OpenEnvelope opens a sealed envelope and unmarshals the Secrets bag.
 func OpenEnvelope(c *Cipher, sealed []byte, nodeID string) (Secrets, error) {
+	return OpenEnvelopeBound(c, sealed, nodeID, SealBinding{})
+}
+
+// OpenEnvelopeBound opens a sealed envelope and verifies sandbox binding for v4.
+func OpenEnvelopeBound(c *Cipher, sealed []byte, nodeID string, expect SealBinding) (Secrets, error) {
 	if len(sealed) == 0 {
 		return Secrets{}, nil
 	}
-	plain, err := OpenRawEnvelope(c, sealed, nodeID)
+	plain, err := OpenRawEnvelopeBound(c, sealed, nodeID, expect)
 	if err != nil {
 		return Secrets{}, err
 	}
@@ -79,23 +117,38 @@ func OpenEnvelope(c *Cipher, sealed []byte, nodeID string) (Secrets, error) {
 // Uses crypto/rand.Reader (not package randReader) so service tests that inject
 // entropy via crypto/rand.Reader keep working.
 func SealRawEnvelope(c *Cipher, plain []byte, recipients []string) ([]byte, error) {
+	return SealRawEnvelopeBound(c, plain, recipients, SealBinding{})
+}
+
+// SealRawEnvelopeBound seals plaintext into a v4 identity-bound envelope.
+func SealRawEnvelopeBound(c *Cipher, plain []byte, recipients []string, binding SealBinding) ([]byte, error) {
 	if c == nil {
 		return nil, fmt.Errorf("cluster secrets cipher is not configured")
 	}
 	recipients = NormalizeRecipients(recipients)
-	return SealRawEnvelopeWrapped(plain, recipients, func(dek []byte) ([]byte, error) {
+	binding = binding.normalized()
+	return SealRawEnvelopeWrappedBound(plain, recipients, binding, func(dek []byte) ([]byte, error) {
+		if binding.SandboxID != "" {
+			return c.EncryptWithAAD(dek, KeyAADBound(recipients, binding))
+		}
 		return c.EncryptWithAAD(dek, KeyAAD(recipients))
 	})
 }
 
-// SealRawEnvelopeWrapped seals plaintext with a fresh DEK and stores wrap(dek)
+// SealRawEnvelopeWrapped seals plaintext with a fresh DEK (legacy v3 helper).
+func SealRawEnvelopeWrapped(plain []byte, recipients []string, wrap func(dek []byte) ([]byte, error)) ([]byte, error) {
+	return SealRawEnvelopeWrappedBound(plain, recipients, SealBinding{}, wrap)
+}
+
+// SealRawEnvelopeWrappedBound seals plaintext with a fresh DEK and stores wrap(dek)
 // in WrappedKey. Recipients are still recorded for fan-out targeting even when
 // the wrap backend (KMS) does not enforce recipient binding on Open.
-func SealRawEnvelopeWrapped(plain []byte, recipients []string, wrap func(dek []byte) ([]byte, error)) ([]byte, error) {
+func SealRawEnvelopeWrappedBound(plain []byte, recipients []string, binding SealBinding, wrap func(dek []byte) ([]byte, error)) ([]byte, error) {
 	if wrap == nil {
 		return nil, fmt.Errorf("cluster secret key wrap function is required")
 	}
 	recipients = NormalizeRecipients(recipients)
+	binding = binding.normalized()
 	dek := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
 		return nil, fmt.Errorf("generate cluster secret data key: %w", err)
@@ -112,7 +165,11 @@ func SealRawEnvelopeWrapped(plain []byte, recipients []string, wrap func(dek []b
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("cluster secret data nonce: %w", err)
 	}
-	payload := append(nonce, gcm.Seal(nil, nonce, plain, PayloadAAD(recipients))...)
+	payloadAAD := PayloadAAD(recipients)
+	if binding.SandboxID != "" {
+		payloadAAD = PayloadAADBound(recipients, binding)
+	}
+	payload := append(nonce, gcm.Seal(nil, nonce, plain, payloadAAD)...)
 	wrappedKey, err := wrap(dek)
 	if err != nil {
 		return nil, fmt.Errorf("wrap cluster secret data key: %w", err)
@@ -120,6 +177,10 @@ func SealRawEnvelopeWrapped(plain []byte, recipients []string, wrap func(dek []b
 	envelope, err := json.Marshal(sealedSecretsEnvelope{
 		Version:    EnvelopeVersion,
 		Recipients: recipients,
+		SandboxID:  binding.SandboxID,
+		Ref:        binding.Ref,
+		RefVersion: binding.Version,
+		Generation: binding.Generation,
 		WrappedKey: wrappedKey,
 		Payload:    payload,
 	})
@@ -132,24 +193,37 @@ func SealRawEnvelopeWrapped(plain []byte, recipients []string, wrap func(dek []b
 // OpenRawEnvelope decrypts a sealed envelope (v3, v2, or legacy raw) to plaintext bytes.
 // Enforces recipient binding (WALL 2) for the local Cipher path.
 func OpenRawEnvelope(c *Cipher, sealed []byte, nodeID string) ([]byte, error) {
+	return OpenRawEnvelopeBound(c, sealed, nodeID, SealBinding{})
+}
+
+// OpenRawEnvelopeBound opens a sealed envelope, enforcing v4 identity binding when present.
+func OpenRawEnvelopeBound(c *Cipher, sealed []byte, nodeID string, expect SealBinding) ([]byte, error) {
 	if c == nil {
 		return nil, fmt.Errorf("cluster secrets cipher is not configured")
 	}
-	return openRawEnvelope(sealed, nodeID, true, func(wrapped []byte, recipients []string) ([]byte, error) {
+	return openRawEnvelope(sealed, nodeID, true, expect, func(wrapped []byte, recipients []string, binding SealBinding) ([]byte, error) {
+		if binding.SandboxID != "" {
+			return c.DecryptWithAAD(wrapped, KeyAADBound(recipients, binding))
+		}
 		return c.DecryptWithAAD(wrapped, KeyAAD(recipients))
 	}, func(payload []byte, recipients []string) ([]byte, error) {
 		return c.DecryptWithAAD(payload, V2AAD(recipients))
 	}, c.Decrypt)
 }
 
-// OpenRawEnvelopeExternal opens a v3 envelope by unwrapping the DEK via unwrap.
+// OpenRawEnvelopeExternal opens a v4/v3 envelope by unwrapping the DEK via unwrap.
 // Skips recipient binding: authorization is the wrap backend (IAM / KMS policy).
 // Legacy v2/raw envelopes are not supported on this path.
 func OpenRawEnvelopeExternal(sealed []byte, unwrap func(wrapped []byte) ([]byte, error)) ([]byte, error) {
+	return OpenRawEnvelopeExternalBound(sealed, SealBinding{}, unwrap)
+}
+
+// OpenRawEnvelopeExternalBound opens with an expected sandbox binding for v4 AAD.
+func OpenRawEnvelopeExternalBound(sealed []byte, expect SealBinding, unwrap func(wrapped []byte) ([]byte, error)) ([]byte, error) {
 	if unwrap == nil {
 		return nil, fmt.Errorf("cluster secret key unwrap function is required")
 	}
-	return openRawEnvelope(sealed, "", false, func(wrapped []byte, _ []string) ([]byte, error) {
+	return openRawEnvelope(sealed, "", false, expect, func(wrapped []byte, _ []string, _ SealBinding) ([]byte, error) {
 		return unwrap(wrapped)
 	}, nil, nil)
 }
@@ -158,7 +232,8 @@ func openRawEnvelope(
 	sealed []byte,
 	nodeID string,
 	checkRecipient bool,
-	unwrapV3 func(wrapped []byte, recipients []string) ([]byte, error),
+	expect SealBinding,
+	unwrapV3 func(wrapped []byte, recipients []string, binding SealBinding) ([]byte, error),
 	decryptV2 func(payload []byte, recipients []string) ([]byte, error),
 	decryptLegacy func(sealed []byte) ([]byte, error),
 ) ([]byte, error) {
@@ -168,24 +243,46 @@ func openRawEnvelope(
 		if checkRecipient && !RecipientAllowed(recipients, nodeID) {
 			return nil, fmt.Errorf("%w: recipient %q is not allowed to open this cluster secret", ErrRecipientDenied, nodeID)
 		}
+		binding := SealBinding{
+			SandboxID:  envelope.SandboxID,
+			Ref:        envelope.Ref,
+			Version:    envelope.RefVersion,
+			Generation: envelope.Generation,
+		}.normalized()
+		if envelope.Version >= EnvelopeVersion && expect.SandboxID != "" && binding.SandboxID != "" {
+			want := expect.normalized()
+			if binding.SandboxID != want.SandboxID || binding.Ref != want.Ref || binding.Version != want.Version {
+				return nil, fmt.Errorf("%w: cluster secret binding mismatch", ErrDecryptFailed)
+			}
+			// Generation may be filled from the store row when envelope omits it.
+			if want.Generation > 0 && binding.Generation > 0 && binding.Generation != want.Generation {
+				return nil, fmt.Errorf("%w: cluster secret generation mismatch", ErrDecryptFailed)
+			}
+			binding = want
+		} else if expect.SandboxID != "" && binding.SandboxID == "" {
+			// Legacy/unbound envelope: do not force identity AAD; still prefer
+			// the caller's sandbox id for telemetry/audit callers.
+			binding = SealBinding{}
+		}
 		switch envelope.Version {
-		case EnvelopeVersion:
+		case EnvelopeVersion, EnvelopeVersionV3:
 			if len(envelope.WrappedKey) == 0 {
 				return nil, fmt.Errorf("%w: cluster secret envelope missing wrapped data key", ErrDecryptFailed)
 			}
 			if unwrapV3 == nil {
 				return nil, fmt.Errorf("%w: cluster secret unwrap function is required", ErrDecryptFailed)
 			}
-			dek, err := unwrapV3(envelope.WrappedKey, recipients)
+			dek, err := unwrapV3(envelope.WrappedKey, recipients, binding)
 			if err != nil {
-				// Preserve typed provider failures (throttle/deny/unavailable)
-				// so callers can errors.Is without string-matching.
 				if errors.Is(err, ErrProviderUnavailable) ||
 					errors.Is(err, ErrProviderThrottled) ||
 					errors.Is(err, ErrProviderDenied) {
 					return nil, err
 				}
 				return nil, fmt.Errorf("%w: unwrap cluster secret data key: %v", ErrDecryptFailed, err)
+			}
+			if envelope.Version >= EnvelopeVersion && binding.SandboxID != "" {
+				return OpenEnvelopePayloadBound(dek, envelope.Payload, recipients, binding)
 			}
 			return OpenEnvelopePayload(dek, envelope.Payload, recipients)
 		case 2:
@@ -199,8 +296,6 @@ func openRawEnvelope(
 			return plain, nil
 		}
 	}
-	// Legacy raw nonce||ciphertext blob. Kept for rolling upgrades and
-	// snapshots written before v2 recipient envelopes existed.
 	if decryptLegacy == nil {
 		return nil, fmt.Errorf("%w: legacy raw envelope not supported by this provider", ErrDecryptFailed)
 	}
@@ -211,9 +306,13 @@ func openRawEnvelope(
 	return plain, nil
 }
 
-// OpenEnvelopePayload decrypts a v3 payload with a raw data key. Exported for
-// service coverage tests that exercise the DEK/payload path directly.
+// OpenEnvelopePayload decrypts a v3 payload with a raw data key.
 func OpenEnvelopePayload(dek []byte, sealed []byte, recipients []string) ([]byte, error) {
+	return OpenEnvelopePayloadBound(dek, sealed, recipients, SealBinding{})
+}
+
+// OpenEnvelopePayloadBound decrypts a v3/v4 payload with a raw data key.
+func OpenEnvelopePayloadBound(dek []byte, sealed []byte, recipients []string, binding SealBinding) ([]byte, error) {
 	block, err := aes.NewCipher(dek)
 	if err != nil {
 		return nil, fmt.Errorf("%w: cluster secret data cipher: %v", ErrDecryptFailed, err)
@@ -226,7 +325,11 @@ func OpenEnvelopePayload(dek []byte, sealed []byte, recipients []string) ([]byte
 		return nil, fmt.Errorf("%w: cluster secret payload too short", ErrDecryptFailed)
 	}
 	nonce, body := sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():]
-	plain, err := gcm.Open(nil, nonce, body, PayloadAAD(recipients))
+	aad := PayloadAAD(recipients)
+	if binding.SandboxID != "" {
+		aad = PayloadAADBound(recipients, binding)
+	}
+	plain, err := gcm.Open(nil, nonce, body, aad)
 	if err != nil {
 		return nil, fmt.Errorf("%w: decrypt cluster secret payload: %v", ErrDecryptFailed, err)
 	}
@@ -302,4 +405,29 @@ func KeyAAD(recipients []string) []byte {
 // PayloadAAD authenticates the ciphertext for v3 envelopes.
 func PayloadAAD(recipients []string) []byte {
 	return []byte("aerolvm-cluster-secrets-v3-payload\x00" + strings.Join(NormalizeRecipients(recipients), "\x00"))
+}
+
+// KeyAADBound authenticates the wrapped data-key for v4 envelopes.
+func KeyAADBound(recipients []string, b SealBinding) []byte {
+	b = b.normalized()
+	return []byte(fmt.Sprintf("aerolvm-cluster-secrets-v4-key\x00%s\x00%s\x00%d\x00%d\x00%s",
+		b.SandboxID, b.Ref, b.Version, b.Generation, strings.Join(NormalizeRecipients(recipients), "\x00")))
+}
+
+// PayloadAADBound authenticates the ciphertext for v4 envelopes.
+func PayloadAADBound(recipients []string, b SealBinding) []byte {
+	b = b.normalized()
+	return []byte(fmt.Sprintf("aerolvm-cluster-secrets-v4-payload\x00%s\x00%s\x00%d\x00%d\x00%s",
+		b.SandboxID, b.Ref, b.Version, b.Generation, strings.Join(NormalizeRecipients(recipients), "\x00")))
+}
+
+// EncryptionContextForBinding is the AWS KMS EncryptionContext for v4 wraps.
+func EncryptionContextForBinding(b SealBinding) map[string]string {
+	b = b.normalized()
+	return map[string]string{
+		"aerolvm.sandbox_id": b.SandboxID,
+		"aerolvm.ref":        b.Ref,
+		"aerolvm.version":    fmt.Sprintf("%d", b.Version),
+		"aerolvm.generation": fmt.Sprintf("%d", b.Generation),
+	}
 }

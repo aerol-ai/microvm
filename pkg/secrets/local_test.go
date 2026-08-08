@@ -48,6 +48,18 @@ func (m *memBlobStore) DeleteForSandbox(_ context.Context, sandboxID string) err
 	return nil
 }
 
+func (m *memBlobStore) NextSealGeneration(_ context.Context, sandboxID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var max int64
+	for _, rec := range m.byRef {
+		if rec.SandboxID == sandboxID && rec.SealGeneration > max {
+			max = rec.SealGeneration
+		}
+	}
+	return max + 1, nil
+}
+
 type errBlobStore struct {
 	putErr error
 	getErr error
@@ -57,7 +69,8 @@ func (e errBlobStore) Put(context.Context, SecretBlob) error { return e.putErr }
 func (e errBlobStore) Get(context.Context, string) (*SecretBlob, error) {
 	return nil, e.getErr
 }
-func (e errBlobStore) DeleteForSandbox(context.Context, string) error { return nil }
+func (e errBlobStore) DeleteForSandbox(context.Context, string) error            { return nil }
+func (e errBlobStore) NextSealGeneration(context.Context, string) (int64, error) { return 1, nil }
 
 func testCipher(t *testing.T) *Cipher {
 	t.Helper()

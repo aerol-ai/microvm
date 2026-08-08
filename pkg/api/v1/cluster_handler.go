@@ -264,7 +264,9 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
-	reserveSecrets := cluster.PlacementSecrets{}
+	reserveSecrets := cluster.PlacementSecrets{
+		OwnerRef: service.OwnerRefForCreate(r.Context()),
+	}
 	// Router picks the recipient set at reserve time (§3d-1). Target seals to
 	// the recorded set and must not recompute. Empty when flag off / non-HA.
 	if h.deps.Service.WantsSecretRecipientFanout(req) {
@@ -402,6 +404,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(sealErr))
 		return
 	}
+	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
 	promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
 
@@ -1274,9 +1277,18 @@ func (h *handlers) clusterInternalSecretDelete(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
 		return
 	}
+	var generation int64 = 1
+	if raw := strings.TrimSpace(r.URL.Query().Get("generation")); raw != "" {
+		g, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || g <= 0 {
+			apihttp.WriteError(w, http.StatusBadRequest, "invalid generation")
+			return
+		}
+		generation = g
+	}
 	// Local delete only — this IS the peer delete-fanout receiver. Do not
 	// re-fanout from here (would loop).
-	if err := h.deps.Service.DeleteClusterSecretsLocal(r.Context(), sandboxID); err != nil {
+	if err := h.deps.Service.DeleteClusterSecretsLocal(r.Context(), sandboxID, generation); err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

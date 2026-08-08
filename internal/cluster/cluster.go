@@ -187,6 +187,10 @@ type PlacementSecrets struct {
 	// clusters wire-compatible. RecordPlacement leaves this empty so opPlace
 	// preserves the reservation's set.
 	Recipients []string `json:"recipients,omitempty"`
+	// OwnerRef is the control-plane tenant account for this sandbox. Not
+	// secret material — rides Place/Reserve so failover recreate preserves
+	// tenancy when the owner-watcher uses an unscoped internal context.
+	OwnerRef string `json:"owner_ref,omitempty"`
 }
 
 func (s PlacementSecrets) hasUpdate() bool {
@@ -202,6 +206,7 @@ func secretsFromPlacement(p Placement) PlacementSecrets {
 		Ref:        p.SecretRef,
 		Version:    p.SecretVersion,
 		Recipients: recipients,
+		OwnerRef:   p.OwnerRef,
 	}
 }
 
@@ -260,7 +265,10 @@ type Placement struct {
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. Additive omitempty — wire-compatible with older peers.
-	SecretRecipients  []string                 `json:"secret_recipients,omitempty"`
+	SecretRecipients []string `json:"secret_recipients,omitempty"`
+	// OwnerRef is the control-plane tenant account (tenancy). Distinct from
+	// OwnerNodeID (which cluster node hosts the sandbox).
+	OwnerRef          string                   `json:"owner_ref,omitempty"`
 	ExposedPorts      map[int]string           `json:"exposed_ports,omitempty"`
 	ExposedPortRoutes map[int]ExposedPortRoute `json:"exposed_port_routes,omitempty"`
 	// CustomHostnames is the replicated set of user-bound hostnames pointing at

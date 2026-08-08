@@ -46,13 +46,15 @@ type BlobStore interface {
 	Put(ctx context.Context, rec SecretBlob) error
 	Get(ctx context.Context, ref string) (*SecretBlob, error)
 	DeleteForSandbox(ctx context.Context, sandboxID string) error
+	NextSealGeneration(ctx context.Context, sandboxID string) (int64, error)
 }
 
 // SecretBlob is one sealed cluster-secret row addressed by ref.
 type SecretBlob struct {
-	Ref           string
-	SandboxID     string
-	Version       int
-	Recipients    []string
-	SealedPayload []byte
+	Ref            string
+	SandboxID      string
+	Version        int
+	Recipients     []string
+	SealedPayload  []byte
+	SealGeneration int64
 }

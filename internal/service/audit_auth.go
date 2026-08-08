@@ -11,8 +11,11 @@ import (
 
 // AuthorizeSandboxAuditAccess checks tenant/operator scope for GET …/audit
 // without requiring a local sandbox row. Ingress and non-owner workers resolve
-// OwnerRef from the placement owner (secure peer meta) so fan-out can stay on
-// the entry node (plans/secrets-hardening E1b + P1 ingress fix).
+// OwnerRef from Placement.OwnerRef / the placement owner (secure peer meta) so
+// fan-out can stay on the entry node (plans/secrets-hardening E1b + P1 ingress).
+//
+// After sandbox deletion, retained history stays readable via sandbox_audit_acl
+// (and Placement.OwnerRef while placement remains).
 func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if s == nil || sandboxID == "" {
@@ -21,6 +24,9 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 	if s.store != nil {
 		sb, err := s.store.Get(ctx, sandboxID)
 		if err == nil {
+			if ref := strings.TrimSpace(sb.OwnerRef); ref != "" {
+				_ = s.store.UpsertSandboxAuditACL(ctx, sandboxID, ref)
+			}
 			return enforceOwner(ctx, sb)
 		}
 		if !errors.Is(err, store.ErrNotFound) {
@@ -30,27 +36,54 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 
 	owner, scoped := ownerScope(ctx)
 	c := s.Cluster()
-	if c == nil {
-		return store.ErrNotFound
-	}
-	p, ok := c.PlacementOf(sandboxID)
-	if !ok || strings.TrimSpace(p.OwnerNodeID) == "" {
-		return store.ErrNotFound
-	}
+
 	if !scoped {
-		// Operator/PAT: placement existence is enough.
-		return nil
+		if c != nil {
+			if _, ok := c.PlacementOf(sandboxID); ok {
+				return nil
+			}
+		}
+		if s.store != nil {
+			if ref, err := s.store.GetSandboxAuditACLOwnerRef(ctx, sandboxID); err == nil && ref != "" {
+				return nil
+			}
+		}
+		return store.ErrNotFound
 	}
 
-	// Tenant on a non-owner node: fetch OwnerRef from the placement owner.
-	ownerRef, err := s.fetchSandboxOwnerRef(ctx, p)
-	if err != nil {
-		return err
+	if c != nil {
+		if p, ok := c.PlacementOf(sandboxID); ok {
+			if ref := strings.TrimSpace(p.OwnerRef); ref != "" {
+				if ref == owner {
+					return nil
+				}
+				return store.ErrNotFound
+			}
+			if strings.TrimSpace(p.OwnerNodeID) != "" {
+				ownerRef, err := s.fetchSandboxOwnerRef(ctx, p)
+				if err != nil {
+					return err
+				}
+				if ownerRef == owner {
+					return nil
+				}
+				return store.ErrNotFound
+			}
+		}
 	}
-	if ownerRef != owner {
-		return store.ErrNotFound
+	if s.store != nil {
+		ref, err := s.store.GetSandboxAuditACLOwnerRef(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if ref != "" {
+			if ref == owner {
+				return nil
+			}
+			return store.ErrNotFound
+		}
 	}
-	return nil
+	return store.ErrNotFound
 }
 
 func (s *Service) fetchSandboxOwnerRef(ctx context.Context, p cluster.Placement) (string, error) {

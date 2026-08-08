@@ -86,6 +86,23 @@ func clearSecretFanoutHolders(sandboxID string) {
 	secretFanoutHolders.Delete(sandboxID)
 }
 
+// pruneDeadSecretHolders drops holders that are not currently alive so a peer
+// that rejoins after losing its DB is not counted until it ACKs again.
+func pruneDeadSecretHolders(sandboxID string, alive map[string]struct{}) {
+	v, ok := secretFanoutHolders.Load(sandboxID)
+	if !ok {
+		return
+	}
+	hs := v.(*holderNodeSet)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	for id := range hs.nodes {
+		if _, ok := alive[id]; !ok {
+			delete(hs.nodes, id)
+		}
+	}
+}
+
 // SealAndDistribute seals to recipients, stores locally, and fans out when
 // the feature flag is on, the sandbox is recreate-HA, and len(recipients) > 1.
 // Policy governs LOCAL seal only.
@@ -337,12 +354,21 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 		return fmt.Errorf("%w: receiving node %q is not an intended recipient", secrets.ErrRecipientDenied, selfID)
 	}
 	if s.store != nil {
-		tomb, err := s.store.HasClusterSecretTomb(ctx, sandboxID)
+		tombGen, err := s.store.ClusterSecretTombGeneration(ctx, sandboxID)
 		if err != nil {
 			return err
 		}
-		if tomb {
-			return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone)", ErrInvalidClusterSecretBlob, sandboxID)
+		if tombGen > 0 {
+			if blob.SealGeneration > 0 && blob.SealGeneration <= tombGen {
+				return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrInvalidClusterSecretBlob, sandboxID, tombGen)
+			}
+			if blob.SealGeneration == 0 {
+				return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone)", ErrInvalidClusterSecretBlob, sandboxID)
+			}
+			// Newer seal generation supersedes the tomb (reseal after destroy+recreate).
+			if err := s.store.ClearClusterSecretTomb(ctx, sandboxID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -449,7 +475,10 @@ func (s *Service) assertEnvSealWriterGate(bag secrets.Secrets, recipients []stri
 
 // computeFailoverReady implements E1a: omit for non-recreate; otherwise true
 // when live holders >= 2 or the recipient set is single-node (len <= 1).
-// Holder node IDs are intersected with current alive membership.
+//
+// Holders are pruned to currently-alive members so a peer that lost its SQLite
+// DB and rejoined is not counted until it ACKs again. Self is counted only when
+// the local sealed row is present for the current generation.
 func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil
@@ -468,17 +497,23 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 			alive[selfID] = struct{}{}
 		}
 	}
+	pruneDeadSecretHolders(sb.ID, alive)
 	holders := secretHolderNodeIDs(sb.ID)
-	if len(holders) == 0 && len(recipients) > 0 {
-		// Restart amnesia: local sealed row implies this node holds the blob.
+	localHolds := s.localHoldsSealedSecret(ctx, sb.ID)
+	if len(holders) == 0 && len(recipients) > 0 && localHolds && selfID != "" {
+		// Restart recovery: seed self only when the sealed row is actually present.
 		addSecretHolderNodes(sb.ID, selfID)
 		holders = secretHolderNodeIDs(sb.ID)
 	}
 	liveHolders := 0
 	for _, id := range holders {
-		if _, ok := alive[id]; ok {
-			liveHolders++
+		if _, ok := alive[id]; !ok {
+			continue
 		}
+		if id == selfID && !localHolds {
+			continue
+		}
+		liveHolders++
 	}
 	ready := false
 	switch {
@@ -490,6 +525,19 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 		ready = false
 	}
 	return &ready
+}
+
+func (s *Service) localHoldsSealedSecret(ctx context.Context, sandboxID string) bool {
+	if s == nil || s.store == nil || strings.TrimSpace(sandboxID) == "" {
+		return false
+	}
+	ref := secrets.FormatRef(sandboxID, secrets.RefVersion)
+	blob, err := newSecretBlobStore(s.store).Get(ctx, ref)
+	if err == nil && blob != nil && len(blob.SealedPayload) > 0 {
+		return true
+	}
+	blob, err = newSecretBlobStore(s.store).Get(ctx, secrets.FormatRef(sandboxID, secrets.RefVersionEnv))
+	return err == nil && blob != nil && len(blob.SealedPayload) > 0
 }
 
 func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID string) []string {

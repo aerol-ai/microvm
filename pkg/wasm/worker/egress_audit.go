@@ -64,8 +64,9 @@ func installDefaultEgressObserver(m *NetMediator) {
 		select {
 		case workerEgressCh <- job:
 		default:
-			slog.Warn("wasm egress audit queue full; dropping attribution",
+			slog.Warn("wasm egress audit queue full; writing gap marker",
 				"sandbox_id", sandboxID, "destination", address)
+			appendWorkerEgressGap(path, node, sandboxID)
 		}
 	})
 }
@@ -108,6 +109,25 @@ func appendWorkerEgressAudit(path, node, sandboxID, network, address string) {
 		Destination: address,
 		Network:     strings.TrimSpace(network),
 	}
+	appendWorkerEgressEvent(path, ev)
+}
+
+func appendWorkerEgressGap(path, node, sandboxID string) {
+	if path == "" {
+		return
+	}
+	appendWorkerEgressEvent(path, workerEgressAuditEvent{
+		Time:      time.Now().UTC(),
+		Actor:     node,
+		SandboxID: strings.TrimSpace(sandboxID),
+		Result:    "gap",
+		Reason:    "overflow",
+		NodeID:    node,
+		Kind:      "gap",
+	})
+}
+
+func appendWorkerEgressEvent(path string, ev workerEgressAuditEvent) {
 	line, err := json.Marshal(ev)
 	if err != nil {
 		slog.Warn("wasm egress audit marshal failed", "err", err)

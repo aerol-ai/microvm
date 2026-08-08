@@ -1228,7 +1228,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// create, not per request) so the auth hot path stays write-free; it is
 	// best-effort because attribution on the sandbox row is the source of
 	// truth, and a noop store/owner-less create has nothing to record.
-	ownerRef := ownerRefForCreate(ctx)
+	ownerRef := s.ownerRefForCreateOrRecreate(ctx, idOverride)
 	if ownerRef != "" {
 		access, _ := controlplane.AccessFromContext(ctx)
 		if err := s.store.UpsertAccountMapping(ctx, ownerRef, access.Identity.ExternalID); err != nil {
@@ -1892,9 +1892,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 	}
 
-	// Same owner attribution as the docker path; createSandbox already
-	// refreshed the account mapping before dispatching here.
-	sandbox.OwnerRef = ownerRefForCreate(ctx)
+	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, idOverride)
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
@@ -1997,14 +1995,26 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
 	}
+	var err error
 	if !s.cfg.SecretEnvSealEnabled {
-		return s.store.Create(ctx, sandbox)
+		err = s.store.Create(ctx, sandbox)
+	} else {
+		var sealed []byte
+		sealed, err = s.sealEnv(sandbox.Env)
+		if err != nil {
+			return err
+		}
+		err = s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
 	}
-	sealed, err := s.sealEnv(sandbox.Env)
 	if err != nil {
 		return err
 	}
-	return s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
+	if sandbox != nil {
+		if ref := strings.TrimSpace(sandbox.OwnerRef); ref != "" {
+			_ = s.store.UpsertSandboxAuditACL(ctx, sandbox.ID, ref)
+		}
+	}
+	return nil
 }
 
 // sealEnv marshals env and encrypts it for at-rest storage. Returns nil when
@@ -2496,6 +2506,11 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	s.forgetNetstatsActivity(id)
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
+	}
+	if s.store != nil && sandbox != nil {
+		if ref := strings.TrimSpace(sandbox.OwnerRef); ref != "" {
+			_ = s.store.UpsertSandboxAuditACL(ctx, id, ref)
+		}
 	}
 	if s.admitter != nil {
 		s.admitter.Release(id)

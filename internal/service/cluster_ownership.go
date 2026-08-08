@@ -155,6 +155,7 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 			spec = &redacted
 		}
 	}
+	secrets.OwnerRef = sb.OwnerRef
 	return cluster.LocalSandboxState{
 		ID:              sb.ID,
 		Spec:            spec,

@@ -37,43 +37,43 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 		return Handle{}, fmt.Errorf("cluster secret sandbox id is required")
 	}
 	recipients = NormalizeRecipients(recipients)
-	sealed, err := SealEnvelope(p.cipher, s, recipients)
+	version := HandleVersionFor(s)
+	ref := FormatRef(sandboxID, version)
+	gen, err := p.store.NextSealGeneration(ctx, sandboxID)
+	if err != nil {
+		return Handle{}, err
+	}
+	binding := SealBinding{SandboxID: sandboxID, Ref: ref, Version: version, Generation: gen}
+	sealed, err := SealEnvelopeBound(p.cipher, s, recipients, binding)
 	if err != nil {
 		return Handle{}, err
 	}
 	if len(sealed) == 0 {
 		return Handle{}, nil
 	}
-	version := HandleVersionFor(s)
-	ref := FormatRef(sandboxID, version)
 	if err := p.store.Put(ctx, SecretBlob{
-		Ref:           ref,
-		SandboxID:     sandboxID,
-		Version:       version,
-		Recipients:    recipients,
-		SealedPayload: sealed,
+		Ref:            ref,
+		SandboxID:      sandboxID,
+		Version:        version,
+		Recipients:     recipients,
+		SealedPayload:  sealed,
+		SealGeneration: gen,
 	}); err != nil {
 		return Handle{}, err
 	}
 	return Handle{Ref: ref, Version: version}, nil
 }
 
-// Open resolves h to plaintext for nodeID. sandboxID is accepted for the
-// Provider contract (audit in T6); lookup is by ref.
-//
-// Lookup runs before the cipher nil-check so a missing ref still surfaces as
-// ErrNotFound when the store is present but the cipher is not yet wired
-// (matches prior OpenClusterSecretsForNode behavior).
+// Open resolves h to plaintext for nodeID. sandboxID is verified against the
+// v4 envelope binding so ciphertext cannot be relabeled across sandboxes.
 func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, nodeID string) (Secrets, error) {
-	_ = sandboxID
+	sandboxID = strings.TrimSpace(sandboxID)
 	if h.Ref == "" {
 		return Secrets{}, nil
 	}
 	if p == nil || p.store == nil {
 		return Secrets{}, fmt.Errorf("cluster secret store is not configured")
 	}
-	// Loud reject for future handle versions this binary cannot re-merge
-	// (env-sealed bags are v2; v3+ must fail closed, never silent env loss).
 	if h.Version > MaxSupportedRefVersion {
 		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q version %d unsupported (max %d)", ErrVersionMismatch, h.Ref, h.Version, MaxSupportedRefVersion)
 	}
@@ -84,16 +84,25 @@ func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, no
 		}
 		return Secrets{}, err
 	}
-	if rec.Version > MaxSupportedRefVersion {
-		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q store version %d unsupported (max %d)", ErrVersionMismatch, h.Ref, rec.Version, MaxSupportedRefVersion)
-	}
 	if h.Version != 0 && rec.Version != h.Version {
 		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q version mismatch: placement=%d store=%d", ErrVersionMismatch, h.Ref, h.Version, rec.Version)
+	}
+	if sandboxID != "" && rec.SandboxID != "" && sandboxID != rec.SandboxID {
+		return Secrets{}, fmt.Errorf("%w: cluster secret sandbox_id mismatch", ErrDecryptFailed)
+	}
+	if sandboxID == "" {
+		sandboxID = rec.SandboxID
 	}
 	if p.cipher == nil {
 		return Secrets{}, fmt.Errorf("cluster secrets cipher is not configured")
 	}
-	bag, err := OpenEnvelope(p.cipher, rec.SealedPayload, nodeID)
+	binding := SealBinding{
+		SandboxID:  sandboxID,
+		Ref:        rec.Ref,
+		Version:    rec.Version,
+		Generation: rec.SealGeneration,
+	}
+	bag, err := OpenEnvelopeBound(p.cipher, rec.SealedPayload, nodeID, binding)
 	if err != nil {
 		return Secrets{}, fmt.Errorf("decrypt cluster secrets: %w", err)
 	}

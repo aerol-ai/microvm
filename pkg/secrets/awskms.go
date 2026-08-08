@@ -46,14 +46,18 @@ func NewAWSKMSWithClient(client kmsAPI, keyID string) *AWSKMS {
 }
 
 // Wrap implements DataKeyWrapper via KMS Encrypt.
-func (a *AWSKMS) Wrap(ctx context.Context, dek []byte) ([]byte, error) {
+func (a *AWSKMS) Wrap(ctx context.Context, dek []byte, encCtx map[string]string) ([]byte, error) {
 	if a == nil || a.client == nil {
 		return nil, fmt.Errorf("%w: aws kms client is not configured", ErrProviderUnavailable)
 	}
-	out, err := a.client.Encrypt(ctx, &kms.EncryptInput{
+	in := &kms.EncryptInput{
 		KeyId:     aws.String(a.keyID),
 		Plaintext: dek,
-	})
+	}
+	if len(encCtx) > 0 {
+		in.EncryptionContext = encCtx
+	}
+	out, err := a.client.Encrypt(ctx, in)
 	if err != nil {
 		return nil, mapAWSKMSError(err)
 	}
@@ -64,14 +68,18 @@ func (a *AWSKMS) Wrap(ctx context.Context, dek []byte) ([]byte, error) {
 }
 
 // Unwrap implements DataKeyWrapper via KMS Decrypt.
-func (a *AWSKMS) Unwrap(ctx context.Context, wrapped []byte) ([]byte, error) {
+func (a *AWSKMS) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]string) ([]byte, error) {
 	if a == nil || a.client == nil {
 		return nil, fmt.Errorf("%w: aws kms client is not configured", ErrProviderUnavailable)
 	}
-	out, err := a.client.Decrypt(ctx, &kms.DecryptInput{
+	in := &kms.DecryptInput{
 		CiphertextBlob: wrapped,
 		KeyId:          aws.String(a.keyID),
-	})
+	}
+	if len(encCtx) > 0 {
+		in.EncryptionContext = encCtx
+	}
+	out, err := a.client.Decrypt(ctx, in)
 	if err != nil {
 		return nil, mapAWSKMSError(err)
 	}

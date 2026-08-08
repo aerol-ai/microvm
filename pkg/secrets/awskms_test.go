@@ -43,11 +43,11 @@ func TestAWSKMSWrapUnwrapStub(t *testing.T) {
 	ctx := context.Background()
 	stub := &stubKMS{ciphertext: []byte("wrapped"), plaintext: []byte("dek-bytes-32!!!!!!!!!!!!!!!!!")}
 	a := NewAWSKMSWithClient(stub, "alias/test")
-	got, err := a.Wrap(ctx, []byte("dek-bytes-32!!!!!!!!!!!!!!!!!"))
+	got, err := a.Wrap(ctx, []byte("dek-bytes-32!!!!!!!!!!!!!!!!!"), nil)
 	if err != nil || string(got) != "wrapped" {
 		t.Fatalf("Wrap = %q %v", got, err)
 	}
-	plain, err := a.Unwrap(ctx, []byte("wrapped"))
+	plain, err := a.Unwrap(ctx, []byte("wrapped"), nil)
 	if err != nil || string(plain) != "dek-bytes-32!!!!!!!!!!!!!!!!!" {
 		t.Fatalf("Unwrap = %q %v", plain, err)
 	}
@@ -79,10 +79,10 @@ func TestMapAWSKMSError(t *testing.T) {
 
 func TestAWSKMSNilClient(t *testing.T) {
 	a := &AWSKMS{}
-	if _, err := a.Wrap(context.Background(), []byte("x")); !errors.Is(err, ErrProviderUnavailable) {
+	if _, err := a.Wrap(context.Background(), []byte("x"), nil); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("Wrap nil = %v", err)
 	}
-	if _, err := a.Unwrap(context.Background(), []byte("x")); !errors.Is(err, ErrProviderUnavailable) {
+	if _, err := a.Unwrap(context.Background(), []byte("x"), nil); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("Unwrap nil = %v", err)
 	}
 }

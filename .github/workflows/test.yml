@@ -77,10 +77,10 @@ jobs:
           go tool cover -func=coverage.out | tail -n 1
 
       - name: Race (audit + secrets hot paths)
-        run: go test -race -count=1 -timeout 10m ./internal/service/ -run 'SecretAudit|ListSecretAudit|Seal|Fanout|EnvSeal|Egress'
+        run: go test -race -count=1 -timeout 10m ./internal/service/ -run 'SecretAudit|ListSecretAudit|Seal|Fanout|EnvSeal|Egress|ClosePrune|ReFanout|FailoverReady|DeleteClusterSecrets'
 
       - name: Scale gates
-        run: AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -run 'TestScaleGate' ./internal/cluster ./internal/service
+        run: AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -run 'TestScaleGate|TestScaleHarness' ./internal/cluster ./internal/service
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7

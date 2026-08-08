@@ -271,6 +271,7 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		OwnerRef:           secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -285,6 +286,7 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		OwnerRef:           secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -410,6 +412,7 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
 		SecretRecipients:   append([]string(nil), secrets.Recipients...),
+		OwnerRef:           secrets.OwnerRef,
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	})
 }

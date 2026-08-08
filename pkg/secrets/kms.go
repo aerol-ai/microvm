@@ -10,9 +10,12 @@ import (
 // DataKeyWrapper wraps and unwraps per-secret data encryption keys (DEKs).
 // Local Cipher uses AES-GCM with AAD; AWS KMS / FakeKMS implement the same
 // seam so KMSProvider never talks to a concrete backend.
+//
+// encCtx is optional additional authenticated context (AWS KMS EncryptionContext
+// / FakeKMS AAD). Pass nil for canaries and legacy callers.
 type DataKeyWrapper interface {
-	Wrap(ctx context.Context, dek []byte) (wrapped []byte, err error)
-	Unwrap(ctx context.Context, wrapped []byte) (dek []byte, err error)
+	Wrap(ctx context.Context, dek []byte, encCtx map[string]string) (wrapped []byte, err error)
+	Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]string) (dek []byte, err error)
 }
 
 // CanaryWrapUnwrap exercises Wrap+Unwrap with a random 32-byte DEK. Used at
@@ -25,11 +28,12 @@ func CanaryWrapUnwrap(ctx context.Context, w DataKeyWrapper) error {
 	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
 		return fmt.Errorf("generate secret provider canary key: %w", err)
 	}
-	wrapped, err := w.Wrap(ctx, dek)
+	encCtx := map[string]string{"aerolvm.canary": "1"}
+	wrapped, err := w.Wrap(ctx, dek, encCtx)
 	if err != nil {
 		return fmt.Errorf("secret provider canary wrap: %w", err)
 	}
-	got, err := w.Unwrap(ctx, wrapped)
+	got, err := w.Unwrap(ctx, wrapped, encCtx)
 	if err != nil {
 		return fmt.Errorf("secret provider canary unwrap: %w", err)
 	}

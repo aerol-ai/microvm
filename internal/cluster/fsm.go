@@ -72,10 +72,12 @@ type command struct {
 	// SecretRecipients rides opReserve (and is preserved by opPlace). Additive
 	// omitempty — mixed-version clusters decode missing field as nil.
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
-	Port             int      `json:"port,omitempty"`
-	Protocol         string   `json:"protocol,omitempty"`
-	HostPort         int      `json:"host_port,omitempty"`
-	PublicURL        string   `json:"public_url,omitempty"`
+	// OwnerRef is the control-plane tenant account. Additive omitempty.
+	OwnerRef  string `json:"owner_ref,omitempty"`
+	Port      int    `json:"port,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+	HostPort  int    `json:"host_port,omitempty"`
+	PublicURL string `json:"public_url,omitempty"`
 	// ExpiresUnix is set on opReserve to bound how long a reservation holds
 	// capacity before the leader GC sweep cancels it. Ignored by every other
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
@@ -130,6 +132,7 @@ type reservationCommand struct {
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
 	SecretRecipients   []string                     `json:"secret_recipients,omitempty"`
+	OwnerRef           string                       `json:"owner_ref,omitempty"`
 	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
 }
 
@@ -170,6 +173,7 @@ func reservationFromCommand(c command) reservationCommand {
 		SecretRef:          c.SecretRef,
 		SecretVersion:      c.SecretVersion,
 		SecretRecipients:   append([]string(nil), c.SecretRecipients...),
+		OwnerRef:           c.OwnerRef,
 		ExpiresUnix:        c.ExpiresUnix,
 	}
 }
@@ -185,6 +189,7 @@ func commandFromReservation(r reservationCommand) command {
 		SecretRef:          r.SecretRef,
 		SecretVersion:      r.SecretVersion,
 		SecretRecipients:   append([]string(nil), r.SecretRecipients...),
+		OwnerRef:           r.OwnerRef,
 		ExpiresUnix:        r.ExpiresUnix,
 	}
 }
@@ -464,6 +469,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		var portRoutes map[int]ExposedPortRoute
 		var customHostnames []string
 		var secretRecipients []string
+		ownerRef := strings.TrimSpace(cmd.OwnerRef)
 		if exists {
 			// Same preservation rule as Spec: opPlace is the "owner + spec"
 			// write and must not erase the port intents accumulated by
@@ -477,6 +483,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// Preserve the reserve-time recipient set unless the command
 			// explicitly supplies a new one (normal promote leaves it empty).
 			secretRecipients = append([]string(nil), existing.SecretRecipients...)
+			if ownerRef == "" {
+				ownerRef = existing.OwnerRef
+			}
 		}
 		if len(cmd.SecretRecipients) > 0 {
 			secretRecipients = append([]string(nil), cmd.SecretRecipients...)
@@ -509,6 +518,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			SecretRef:          secrets.Ref,
 			SecretVersion:      secrets.Version,
 			SecretRecipients:   secretRecipients,
+			OwnerRef:           ownerRef,
 			ExposedPorts:       ports,
 			ExposedPortRoutes:  portRoutes,
 			CustomHostnames:    customHostnames,
@@ -1071,6 +1081,9 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			if len(cmd.SecretRecipients) > 0 {
 				existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
 			}
+			if ref := strings.TrimSpace(cmd.OwnerRef); ref != "" {
+				existing.OwnerRef = ref
+			}
 			if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 				return err
 			}
@@ -1105,6 +1118,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
 		SecretRecipients:   append([]string(nil), cmd.SecretRecipients...),
+		OwnerRef:           strings.TrimSpace(cmd.OwnerRef),
 		State:              PlacementStateReserved,
 		ExpiresUnix:        cmd.ExpiresUnix,
 	}

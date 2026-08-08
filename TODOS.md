@@ -264,28 +264,32 @@ passed, zero-deployments premise re-verified in-tree). Branch
   HTTP client; decide mTLS on `:7002` vs identity on the public API URL;
   one auth model for the whole family.
 
-## Durable secret-delete outbox / ACK ledger (cluster secrets) — interim landed 2026-08-08
+## Durable secret-delete outbox / ACK ledger (cluster secrets) — landed 2026-08-09
 
 - **What:** Generation-scoped tombstones + persistent cleanup outbox so peer
   DELETE fan-out survives daemon crash, retries until every recipient ACKs,
-  and rejects stale PUTs on the originator until reseal.
-- **Landed:** `cluster_secret_delete_outbox` + boot `ReconcileSecretDeleteOutbox`;
-  peer DELETE clears rows without tombstones so same-ID reseal can land;
-  originator tombs with generation and clears tomb only after successful Put.
-- **Residual:** no multi-ACK ledger under long partitions; offline peers retain
-  rows until reconcile succeeds; KMS delete path still best-effort.
+  and rejects stale PUTs until a newer seal generation clears the tomb.
+- **Landed:** originator tomb+row-delete+outbox in one SQLite TX; per-recipient
+  pending shrink (offline peers stay pending, never treated as success);
+  DELETE carries `generation`; peer tombs with seal_generation gating so stale
+  DELETEs cannot wipe a reseal; boot + 30s periodic reconcile (O(1) per job);
+  reseal clears tomb+outbox and accepts peer PUTs with higher seal_generation.
+- **Residual:** long partitions still need operator visibility into outbox
+  attempts; full multi-node possession probe for `failover_ready` peer holders
+  is still ACK∩alive (self requires local row); KMS CMK policy is separate.
 - **Where:** `internal/store` outbox/tombs, `internal/service/cluster_secrets.go`,
-  daemon boot after `ReFanoutClusterSecrets`.
+  `internal/cluster/secret_replication.go`, daemon boot + ticker.
 
-## Indexed / central secret-audit store (scale) — parked residual 2026-08-08
+## Indexed / central secret-audit store (scale) — parked residual 2026-08-09
 
 - **What:** Replace full JSONL scan + sequential all-member fan-out with an
-  indexed durable store or central sink; compound cursor pagination; E2b witness.
-- **Interim landed:** sidecar flock before open; Close/Prune `sendMu`; gap
-  markers included in per-sandbox queries; dead preferred recipients in
-  Coverage.Missing; bounded wasm egress worker pool.
-- **Residual:** 1,024-event drop-under-load; full-file scan; timestamp-only
-  cursor can still skip same-timestamp ties; no off-node witness.
+  indexed durable store or central sink; E2b witness.
+- **Interim landed:** sidecar flock; Close/Prune `sendMu`; gap markers with
+  `kind=gap` (included in kind-filtered pages); compound cursor; malformed
+  JSONL → gap event; wasm queue-full writes a durable gap marker; post-delete
+  ACL via `sandbox_audit_acl` + Placement.OwnerRef.
+- **Residual:** full-file scan; no off-node witness; WASM still dual-writes
+  JSONL (bounded IPC remains follow-up).
 - **Start:** `internal/service/secret_audit_query.go`; E2b witness sink may
   double as the central store.
 
@@ -295,6 +299,6 @@ passed, zero-deployments premise re-verified in-tree). Branch
   authoritative audit writer (bounded channel, drop counter, gap markers)
   instead of opening `secrets.jsonl` themselves.
 - **Interim:** stable sidecar lock file + bounded worker pool (no per-dial
-  goroutine); retention shares the same lock.
+  goroutine); retention shares the same lock; queue-full emits gap marker.
 - **Start:** `pkg/wasm/worker/egress_audit.go`, spawn env for a unix socket
   path owned by `fileAuditSink`.

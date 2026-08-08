@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,12 +32,13 @@ func (c *Cluster) PushSecretBlobToPeers(ctx context.Context, blob secrets.Secret
 }
 
 // DeleteSecretOnPeers DELETEs the sandbox's cluster_secrets rows on peers that
-// may hold a fan-out copy. Best-effort; never required for local destroy.
-func (c *Cluster) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string) error {
+// may hold a fan-out copy. Returns acked vs still-pending recipients. Offline /
+// missing peers stay pending — never treated as success.
+func (c *Cluster) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
 	if c == nil || c.gossip == nil || c.httpClient == nil {
-		return nil
+		return nil, append([]string(nil), recipients...), nil
 	}
-	return deleteSecretOnPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, sandboxID, recipients)
+	return deleteSecretOnPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, sandboxID, recipients, generation)
 }
 
 // Agent mirrors for worker nodes that seal locally and need to fan out.
@@ -46,18 +49,18 @@ func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBl
 	return pushSecretBlobToPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, blob, recipients)
 }
 
-func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string) error {
+func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
 	if a == nil || a.gossip == nil || a.httpClient == nil {
-		return nil
+		return nil, append([]string(nil), recipients...), nil
 	}
-	return deleteSecretOnPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, sandboxID, recipients)
+	return deleteSecretOnPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, sandboxID, recipients, generation)
 }
 
 // SecretPeerPusher is the narrow seam Service uses for async fan-out so tests
 // can inject a fake without a full Cluster.
 type SecretPeerPusher interface {
 	PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error)
-	DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string) error
+	DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error)
 }
 
 func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
@@ -99,39 +102,45 @@ func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.C
 	return acked, firstErr
 }
 
-func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string) error {
+func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
 	if client == nil || strings.TrimSpace(sandboxID) == "" {
-		return nil
+		return nil, append([]string(nil), recipients...), nil
 	}
-	want := make(map[string]struct{}, len(recipients))
+	if generation <= 0 {
+		generation = 1
+	}
+	byID := make(map[string]Member, len(members))
+	for _, m := range members {
+		if m.NodeID == "" {
+			continue
+		}
+		byID[m.NodeID] = m
+	}
+	var firstErr error
 	for _, id := range recipients {
 		id = strings.TrimSpace(id)
 		if id == "" || id == selfID {
 			continue
 		}
-		want[id] = struct{}{}
-	}
-	// When recipients are unknown (local row already gone), best-effort delete
-	// on every live peer that isn't self — destroy must not leave orphan rows.
-	fanAll := len(want) == 0
-	var firstErr error
-	for _, m := range members {
-		if m.NodeID == "" || m.NodeID == selfID || !m.Alive || m.APIURL == "" {
+		m, ok := byID[id]
+		if !ok || !m.Alive || strings.TrimSpace(m.APIURL) == "" {
+			pending = append(pending, id)
 			continue
 		}
-		if !fanAll {
-			if _, ok := want[m.NodeID]; !ok {
-				continue
-			}
-		}
-		endpoint := strings.TrimRight(m.APIURL, "/") + PublicInternalSecretPath + "/" + sandboxID
-		if err := withSecretFanoutBackoff(ctx, func() error {
+		endpoint := strings.TrimRight(m.APIURL, "/") + PublicInternalSecretPath + "/" + url.PathEscape(sandboxID)
+		endpoint += "?generation=" + strconv.FormatInt(generation, 10)
+		if delErr := withSecretFanoutBackoff(ctx, func() error {
 			return deleteSecretBlob(ctx, client, endpoint, pat)
-		}); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("delete secret on %s: %w", m.NodeID, err)
+		}); delErr != nil {
+			pending = append(pending, id)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("delete secret on %s: %w", id, delErr)
+			}
+			continue
 		}
+		acked = append(acked, id)
 	}
-	return firstErr
+	return acked, pending, firstErr
 }
 
 func withSecretFanoutBackoff(ctx context.Context, fn func() error) error {

@@ -23,11 +23,12 @@ func newSecretBlobStore(st *store.Store) secrets.BlobStore {
 
 func (a secretBlobStoreAdapter) Put(ctx context.Context, rec secrets.SecretBlob) error {
 	return a.store.PutClusterSecret(ctx, store.ClusterSecretRecord{
-		Ref:           rec.Ref,
-		SandboxID:     rec.SandboxID,
-		Version:       rec.Version,
-		Recipients:    rec.Recipients,
-		SealedPayload: rec.SealedPayload,
+		Ref:            rec.Ref,
+		SandboxID:      rec.SandboxID,
+		Version:        rec.Version,
+		Recipients:     rec.Recipients,
+		SealedPayload:  rec.SealedPayload,
+		SealGeneration: rec.SealGeneration,
 	})
 }
 
@@ -40,14 +41,19 @@ func (a secretBlobStoreAdapter) Get(ctx context.Context, ref string) (*secrets.S
 		return nil, err
 	}
 	return &secrets.SecretBlob{
-		Ref:           rec.Ref,
-		SandboxID:     rec.SandboxID,
-		Version:       rec.Version,
-		Recipients:    rec.Recipients,
-		SealedPayload: rec.SealedPayload,
+		Ref:            rec.Ref,
+		SandboxID:      rec.SandboxID,
+		Version:        rec.Version,
+		Recipients:     rec.Recipients,
+		SealedPayload:  rec.SealedPayload,
+		SealGeneration: rec.SealGeneration,
 	}, nil
 }
 
 func (a secretBlobStoreAdapter) DeleteForSandbox(ctx context.Context, sandboxID string) error {
 	return a.store.DeleteClusterSecretsForSandbox(ctx, sandboxID)
+}
+
+func (a secretBlobStoreAdapter) NextSealGeneration(ctx context.Context, sandboxID string) (int64, error) {
+	return a.store.NextClusterSecretSealGeneration(ctx, sandboxID)
 }

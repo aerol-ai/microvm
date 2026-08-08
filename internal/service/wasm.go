@@ -196,7 +196,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			})
 		}
 	}
-	sandbox.OwnerRef = ownerRefForCreate(ctx)
+	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, sandboxID)
 
 	// Private sandboxes skip caddy on the boot path; see the docker path.
 	if sandboxAllowsPublicTraffic(sandbox) {

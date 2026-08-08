@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -42,7 +44,7 @@ func NewFakeKMS() (*FakeKMS, error) {
 }
 
 // Wrap implements DataKeyWrapper.
-func (f *FakeKMS) Wrap(ctx context.Context, dek []byte) ([]byte, error) {
+func (f *FakeKMS) Wrap(ctx context.Context, dek []byte, encCtx map[string]string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -56,11 +58,11 @@ func (f *FakeKMS) Wrap(ctx context.Context, dek []byte) ([]byte, error) {
 		return nil, fmt.Errorf("fake kms nonce: %w", err)
 	}
 	f.wrap++
-	return append(nonce, f.gcm.Seal(nil, nonce, dek, nil)...), nil
+	return append(nonce, f.gcm.Seal(nil, nonce, dek, encryptionContextAAD(encCtx))...), nil
 }
 
 // Unwrap implements DataKeyWrapper.
-func (f *FakeKMS) Unwrap(ctx context.Context, wrapped []byte) ([]byte, error) {
+func (f *FakeKMS) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -73,11 +75,30 @@ func (f *FakeKMS) Unwrap(ctx context.Context, wrapped []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: fake kms wrapped key too short", ErrDecryptFailed)
 	}
 	nonce, body := wrapped[:f.gcm.NonceSize()], wrapped[f.gcm.NonceSize():]
-	plain, err := f.gcm.Open(nil, nonce, body, nil)
+	plain, err := f.gcm.Open(nil, nonce, body, encryptionContextAAD(encCtx))
 	if err != nil {
 		return nil, fmt.Errorf("%w: fake kms unwrap: %v", ErrDecryptFailed, err)
 	}
 	return plain, nil
+}
+
+func encryptionContextAAD(encCtx map[string]string) []byte {
+	if len(encCtx) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(encCtx))
+	for k := range encCtx {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte(0)
+		b.WriteString(encCtx[k])
+		b.WriteByte(0)
+	}
+	return []byte(b.String())
 }
 
 func (f *FakeKMS) injectedLocked() error {

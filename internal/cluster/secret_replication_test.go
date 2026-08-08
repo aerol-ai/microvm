@@ -74,20 +74,32 @@ func TestPushSecretBlobUnauthenticatedRejected(t *testing.T) {
 
 func TestDeleteSecretOnPeers(t *testing.T) {
 	var deletes atomic.Int32
+	var gotGen string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			t.Fatalf("method = %s", r.Method)
 		}
+		gotGen = r.URL.Query().Get("generation")
 		deletes.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
 	members := []Member{{NodeID: "peer", Alive: true, APIURL: srv.URL}}
-	if err := deleteSecretOnPeers(context.Background(), members, srv.Client(), "pat", "self", "sb-del", []string{"peer"}); err != nil {
+	acked, pending, err := deleteSecretOnPeers(context.Background(), members, srv.Client(), "pat", "self", "sb-del", []string{"peer", "offline"}, 7)
+	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if deletes.Load() != 1 {
 		t.Fatalf("deletes = %d", deletes.Load())
+	}
+	if gotGen != "7" {
+		t.Fatalf("generation query = %q, want 7", gotGen)
+	}
+	if len(acked) != 1 || acked[0] != "peer" {
+		t.Fatalf("acked = %v", acked)
+	}
+	if len(pending) != 1 || pending[0] != "offline" {
+		t.Fatalf("pending = %v, want offline still pending", pending)
 	}
 }
 

@@ -13,6 +13,9 @@ import (
 // the payload. Open skips recipient binding: any node that holds the row and
 // can Unwrap via IAM may decrypt (removes WALL 2). Fan-out is still required
 // for WALL 1 (bytes must reach the failover node).
+//
+// v4 envelopes bind sandbox identity into payload AAD and KMS EncryptionContext
+// so ciphertext cannot be relabeled across sandboxes.
 type KMSProvider struct {
 	wrapper DataKeyWrapper
 	store   BlobStore
@@ -44,32 +47,39 @@ func (p *KMSProvider) Put(ctx context.Context, sandboxID string, s Secrets, reci
 	if err != nil {
 		return Handle{}, fmt.Errorf("marshal cluster secrets: %w", err)
 	}
-	sealed, err := SealRawEnvelopeWrapped(plain, recipients, func(dek []byte) ([]byte, error) {
-		return p.wrapper.Wrap(ctx, dek)
+	version := HandleVersionFor(s)
+	ref := FormatRef(sandboxID, version)
+	gen, err := p.store.NextSealGeneration(ctx, sandboxID)
+	if err != nil {
+		return Handle{}, err
+	}
+	binding := SealBinding{SandboxID: sandboxID, Ref: ref, Version: version, Generation: gen}
+	encCtx := EncryptionContextForBinding(binding)
+	sealed, err := SealRawEnvelopeWrappedBound(plain, recipients, binding, func(dek []byte) ([]byte, error) {
+		return p.wrapper.Wrap(ctx, dek, encCtx)
 	})
 	if err != nil {
 		return Handle{}, mapProviderWrapError(err)
 	}
-	ref := FormatRef(sandboxID, HandleVersionFor(s))
-	version := HandleVersionFor(s)
 	if err := p.store.Put(ctx, SecretBlob{
-		Ref:           ref,
-		SandboxID:     sandboxID,
-		Version:       version,
-		Recipients:    recipients,
-		SealedPayload: sealed,
+		Ref:            ref,
+		SandboxID:      sandboxID,
+		Version:        version,
+		Recipients:     recipients,
+		SealedPayload:  sealed,
+		SealGeneration: gen,
 	}); err != nil {
 		return Handle{}, err
 	}
 	return Handle{Ref: ref, Version: version}, nil
 }
 
-// Open resolves h to plaintext. nodeID is accepted for the Provider contract
-// (audit) but is not checked against the envelope recipient set — KMS IAM is
-// the authorization boundary.
+// Open resolves h to plaintext. sandboxID is verified against the v4 binding;
+// nodeID is accepted for the Provider contract (audit) but is not checked
+// against the envelope recipient set — KMS IAM is the authorization boundary.
 func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, nodeID string) (Secrets, error) {
-	_ = sandboxID
 	_ = nodeID
+	sandboxID = strings.TrimSpace(sandboxID)
 	if h.Ref == "" {
 		return Secrets{}, nil
 	}
@@ -86,11 +96,24 @@ func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, node
 	if h.Version != 0 && rec.Version != h.Version {
 		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q version mismatch: placement=%d store=%d", ErrVersionMismatch, h.Ref, h.Version, rec.Version)
 	}
+	if sandboxID != "" && rec.SandboxID != "" && sandboxID != rec.SandboxID {
+		return Secrets{}, fmt.Errorf("%w: cluster secret sandbox_id mismatch", ErrDecryptFailed)
+	}
+	if sandboxID == "" {
+		sandboxID = rec.SandboxID
+	}
 	if p.wrapper == nil {
 		return Secrets{}, fmt.Errorf("%w: secret provider wrap backend is not configured", ErrProviderUnavailable)
 	}
-	plain, err := OpenRawEnvelopeExternal(rec.SealedPayload, func(wrapped []byte) ([]byte, error) {
-		return p.wrapper.Unwrap(ctx, wrapped)
+	binding := SealBinding{
+		SandboxID:  sandboxID,
+		Ref:        rec.Ref,
+		Version:    rec.Version,
+		Generation: rec.SealGeneration,
+	}
+	encCtx := EncryptionContextForBinding(binding)
+	plain, err := OpenRawEnvelopeExternalBound(rec.SealedPayload, binding, func(wrapped []byte) ([]byte, error) {
+		return p.wrapper.Unwrap(ctx, wrapped, encCtx)
 	})
 	if err != nil {
 		return Secrets{}, mapProviderWrapError(fmt.Errorf("decrypt cluster secrets: %w", err))

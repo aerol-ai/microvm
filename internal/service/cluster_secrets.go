@@ -194,39 +194,35 @@ func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) er
 	return err
 }
 
-// deleteClusterSecretsOriginator tombs + enqueues durable outbox, then deletes
-// local rows. Peer receivers use DeleteClusterSecretsLocal (no tomb).
+// deleteClusterSecretsOriginator tombs, deletes local rows, and enqueues the
+// peer-delete outbox in one SQLite transaction when fan-out is enabled.
 func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID string, recipients []string) error {
 	if s == nil {
 		return nil
 	}
-	var err error
-	if p := s.provider(); p != nil {
-		err = p.Delete(ctx, sandboxID)
-	} else if s.store != nil {
-		err = s.store.DeleteClusterSecretsForSandbox(ctx, sandboxID)
-	}
 	clearSecretFanoutHolders(sandboxID)
 	if s.store != nil && s.cfg.SecretRecipientFanoutEnabled {
-		gen, _ := s.store.ClusterSecretTombGeneration(ctx, sandboxID)
-		if gen == 0 {
-			gen = 1
-		}
-		_ = s.store.UpsertSecretDeleteOutbox(ctx, sandboxID, recipients, gen)
+		_, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, sandboxID, recipients)
+		return err
 	}
-	return err
+	if p := s.provider(); p != nil {
+		return p.Delete(ctx, sandboxID)
+	}
+	if s.store != nil {
+		return s.store.DeleteClusterSecretsForSandbox(ctx, sandboxID)
+	}
+	return nil
 }
 
-// DeleteClusterSecretsLocal removes local rows only — used by the peer
-// delete-fanout receiver so it does not re-broadcast or tombstone (reseal
-// PUTs must succeed on backups after a destroy+recreate of the same ID).
-func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID string) error {
+// DeleteClusterSecretsLocal applies a peer DELETE with generation gating and
+// a local tombstone so delayed PUTs cannot resurrect deleted credentials.
+func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID string, generation int64) error {
 	if s == nil {
 		return nil
 	}
 	var err error
 	if s.store != nil {
-		err = s.store.DeleteClusterSecretsRowsOnly(ctx, sandboxID)
+		err = s.store.ApplyPeerSecretDelete(ctx, sandboxID, generation)
 	} else if p := s.provider(); p != nil {
 		err = p.Delete(ctx, sandboxID)
 	}
@@ -234,7 +230,8 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID strin
 	return err
 }
 
-// ReconcileSecretDeleteOutbox retries durable peer DELETEs after boot / crash.
+// ReconcileSecretDeleteOutbox retries durable peer DELETEs after boot / crash
+// and on the periodic ticker. Per-job lookup is O(1) (not re-list for each row).
 func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
 		return nil
@@ -252,6 +249,28 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 	return nil
 }
 
+// StartSecretDeleteOutboxReconcile runs periodic peer-delete retries so offline
+// recipients are not permanently abandoned after the boot pass.
+func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
+	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.ReconcileSecretDeleteOutbox(ctx); err != nil && s.logger != nil {
+					s.logger.Warn("cluster: secret delete-outbox reconcile failed", "err", err)
+				}
+			}
+		}
+	}()
+}
+
 func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
 	if s == nil || s.store == nil {
 		return
@@ -260,34 +279,25 @@ func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
 	if pusher == nil {
 		return
 	}
-	rows, err := s.store.ListSecretDeleteOutbox(context.Background())
-	if err != nil {
-		return
-	}
-	var recipients []string
-	found := false
-	for _, rec := range rows {
-		if rec.SandboxID == sandboxID {
-			recipients = rec.Recipients
-			found = true
-			break
-		}
-	}
-	if !found {
+	rec, err := s.store.GetSecretDeleteOutbox(context.Background(), sandboxID)
+	if err != nil || rec == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if err := pusher.DeleteSecretOnPeers(ctx, sandboxID, recipients); err != nil {
+	_, pending, delErr := pusher.DeleteSecretOnPeers(ctx, sandboxID, rec.Recipients, rec.Generation)
+	_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+	if delErr != nil {
 		recordSecretFanoutFailure()
-		_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
 		if s.logger != nil {
 			s.logger.Warn("cluster: secret delete-outbox incomplete",
-				"sandbox_id", sandboxID, "err", err)
+				"sandbox_id", sandboxID, "pending", len(pending), "err", delErr)
 		}
-		return
 	}
-	_ = s.store.DeleteSecretDeleteOutbox(context.Background(), sandboxID)
+	if err := s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, pending); err != nil && s.logger != nil {
+		s.logger.Warn("cluster: secret delete-outbox recipient update failed",
+			"sandbox_id", sandboxID, "err", err)
+	}
 }
 
 func (s *Service) maybeAsyncDeleteFanout(sandboxID string, recipients []string) {

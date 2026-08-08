@@ -1,6 +1,9 @@
 package cluster
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"sort"
 )
@@ -146,7 +149,7 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 
 	shards := make([]int, 0, DefaultPlacementShardCount/len(ids)+1)
 	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
-		if shard%len(ids) == selfIndex {
+		if rendezvousIngressOwnerIndex(shard, ids) == selfIndex {
 			shards = append(shards, shard)
 		}
 	}
@@ -176,8 +179,36 @@ func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRout
 		route.Owners = owners
 		return route
 	}
-	route.Owners = append(route.Owners, owners[shard%len(owners)])
+	ownerIdx := rendezvousIngressOwnerIndex(shard, ingressShardNodeIDs(members))
+	if ownerIdx >= 0 && ownerIdx < len(owners) {
+		route.Owners = append(route.Owners, owners[ownerIdx])
+	}
 	return route
+}
+
+// rendezvousIngressOwnerIndex picks a stable shard owner via highest-random-weight
+// hashing so membership N→N-1 remaps ~1/N shards instead of ~99%.
+func rendezvousIngressOwnerIndex(shard int, nodeIDs []string) int {
+	if len(nodeIDs) == 0 {
+		return -1
+	}
+	best := 0
+	bestScore := uint64(0)
+	for i, id := range nodeIDs {
+		score := rendezvousScore(shard, id)
+		if i == 0 || score > bestScore || (score == bestScore && id < nodeIDs[best]) {
+			best = i
+			bestScore = score
+		}
+	}
+	return best
+}
+
+func rendezvousScore(shard int, nodeID string) uint64 {
+	// SHA-256 avoids FNV clustering on sequential node IDs (ing-00..ing-N)
+	// which left some owners with zero shards under naive FNV-HRW.
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%s", shard, nodeID)))
+	return binary.BigEndian.Uint64(sum[:8])
 }
 
 func ingressShardNodeIDs(members []Member) []string {

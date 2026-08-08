@@ -157,6 +157,9 @@ func OverlapCreateAndPromote(
 		}
 		return nil, &OverlapFailure{Phase: OverlapPhaseSeal, Err: sr.err}
 	}
+	if cr.resp != nil {
+		sr.secrets.OwnerRef = cr.resp.Sandbox.OwnerRef
+	}
 
 	promoteStart := time.Now()
 	var promoteErr error

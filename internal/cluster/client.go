@@ -373,6 +373,7 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		OwnerRef:           secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -392,6 +393,7 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		OwnerRef:           secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -580,6 +582,7 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
 		SecretRecipients:   append([]string(nil), secrets.Recipients...),
+		OwnerRef:           secrets.OwnerRef,
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	}
 	return c.applyCommand(ctx, cmd)
@@ -609,6 +612,7 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 			SecretRef:          r.Secrets.Ref,
 			SecretVersion:      r.Secrets.Version,
 			SecretRecipients:   append([]string(nil), r.Secrets.Recipients...),
+			OwnerRef:           r.Secrets.OwnerRef,
 			ExpiresUnix:        now.Add(r.TTL).Unix(),
 		})
 	}

@@ -38,6 +38,7 @@ const (
 	// guest-side secret use from these records.
 	secretAuditKindSecretOpen = "secret_open"
 	secretAuditKindEgress     = "egress"
+	secretAuditKindGap        = "gap"
 
 	defaultSecretAuditBuffer = 1024
 	secretAuditFileName      = "secrets.jsonl"
@@ -201,6 +202,7 @@ func (s *fileAuditSink) loop() {
 				Time:   time.Now().UTC(),
 				Result: secretAuditResultGap,
 				Reason: secretAuditReasonOverflow,
+				Kind:   secretAuditKindGap,
 			})
 		}
 		if req.pruneDone != nil {
@@ -218,6 +220,7 @@ func (s *fileAuditSink) loop() {
 			Time:   time.Now().UTC(),
 			Result: secretAuditResultGap,
 			Reason: secretAuditReasonOverflow,
+			Kind:   secretAuditKindGap,
 		})
 	}
 }

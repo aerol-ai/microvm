@@ -615,6 +615,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
 					logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
 				}
+				svc.StartSecretDeleteOutboxReconcile(ctx)
 			}
 		}
 		if cfg.IsIngress() {
