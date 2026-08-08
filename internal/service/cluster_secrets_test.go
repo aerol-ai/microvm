@@ -15,8 +15,8 @@ import (
 
 // newTestCipher gives us a real Cipher backed by a fresh keyfile. We bind to
 // a temp dir so each test gets isolated key material — important because
-// SealClusterSecrets / UnsealClusterSecrets are Service methods and we want
-// to assert real round-tripping, not just that we wired the JSON.
+// SealClusterSecretsForRecipient / UnsealClusterSecrets are Service methods
+// and we want to assert real round-tripping, not just that we wired the JSON.
 func newTestCipher(t *testing.T) *secrets.Cipher {
 	t.Helper()
 	c, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "key"))
@@ -43,9 +43,10 @@ func TestSealClusterSecretsRoundTrip(t *testing.T) {
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 	}
 
-	sealed, err := s.SealClusterSecrets(req)
+	// Wildcard recipient preserves UnsealClusterSecrets("", nodeID) behavior.
+	sealed, err := s.SealClusterSecretsForRecipient(req, "*")
 	if err != nil {
-		t.Fatalf("SealClusterSecrets: %v", err)
+		t.Fatalf("SealClusterSecretsForRecipient: %v", err)
 	}
 	if len(sealed) == 0 {
 		t.Fatal("sealed bag empty for request with credentials")
@@ -102,9 +103,9 @@ func TestSealClusterSecretsRoundTrip(t *testing.T) {
 	}
 }
 
-// SealClusterSecrets must return nil/nil for credential-free requests so we
-// don't end up with a non-empty FSM column for every plain-public-image
-// sandbox.
+// SealClusterSecretsForRecipient must return nil/nil for credential-free
+// requests so we don't end up with a non-empty FSM column for every
+// plain-public-image sandbox.
 func TestSealClusterSecretsEmpty(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
 	cases := []models.CreateSandboxRequest{
@@ -113,9 +114,9 @@ func TestSealClusterSecretsEmpty(t *testing.T) {
 		{Image: "alpine", Mounts: []models.MountSpec{{Type: models.MountTypeNFS, Target: "/srv", Source: "x:/y"}}},
 	}
 	for i, req := range cases {
-		sealed, err := s.SealClusterSecrets(req)
+		sealed, err := s.SealClusterSecretsForRecipient(req, "*")
 		if err != nil {
-			t.Fatalf("case %d: SealClusterSecrets: %v", i, err)
+			t.Fatalf("case %d: SealClusterSecretsForRecipient: %v", i, err)
 		}
 		if sealed != nil {
 			t.Fatalf("case %d: expected nil sealed bag for credential-free req, got %d bytes", i, len(sealed))
@@ -191,7 +192,7 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 
 	redacted := RedactClusterSecrets(req)
 	beforeDenied := clusterSecretRecipientDenies.Value()
-	if _, err := s.OpenClusterSecretsForNode(ctx, redacted, handle, "node-b"); err == nil {
+	if _, err := s.OpenClusterSecretsForNode(ctx, "sb-secret-ref", redacted, handle, "node-b"); err == nil {
 		t.Fatal("wrong recipient opened cluster secret ref")
 	}
 	if got := clusterSecretRecipientDenies.Value() - beforeDenied; got != 1 {
@@ -200,13 +201,13 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 	mismatched := handle
 	mismatched.Version++
 	beforeMismatch := clusterSecretKeyMismatches.Value()
-	if _, err := s.OpenClusterSecretsForNode(ctx, redacted, mismatched, "node-a"); err == nil {
+	if _, err := s.OpenClusterSecretsForNode(ctx, "sb-secret-ref", redacted, mismatched, "node-a"); err == nil {
 		t.Fatal("version mismatch opened cluster secret ref")
 	}
 	if got := clusterSecretKeyMismatches.Value() - beforeMismatch; got != 1 {
 		t.Fatalf("key mismatch metric delta = %d, want 1", got)
 	}
-	merged, err := s.OpenClusterSecretsForNode(ctx, redacted, handle, "node-a")
+	merged, err := s.OpenClusterSecretsForNode(ctx, "sb-secret-ref", redacted, handle, "node-a")
 	if err != nil {
 		t.Fatalf("OpenClusterSecretsForNode: %v", err)
 	}

@@ -214,7 +214,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			return nil, err
 		}
 	}
-	if err := s.store.Create(ctx, sandbox); err != nil {
+	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
 		_ = s.wasm.Destroy(ctx, sandbox)
 		cleanupMounts()

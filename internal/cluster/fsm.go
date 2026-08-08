@@ -69,10 +69,13 @@ type command struct {
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
-	Port               int                          `json:"port,omitempty"`
-	Protocol           string                       `json:"protocol,omitempty"`
-	HostPort           int                          `json:"host_port,omitempty"`
-	PublicURL          string                       `json:"public_url,omitempty"`
+	// SecretRecipients rides opReserve (and is preserved by opPlace). Additive
+	// omitempty — mixed-version clusters decode missing field as nil.
+	SecretRecipients []string `json:"secret_recipients,omitempty"`
+	Port             int      `json:"port,omitempty"`
+	Protocol         string   `json:"protocol,omitempty"`
+	HostPort         int      `json:"host_port,omitempty"`
+	PublicURL        string   `json:"public_url,omitempty"`
 	// ExpiresUnix is set on opReserve to bound how long a reservation holds
 	// capacity before the leader GC sweep cancels it. Ignored by every other
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
@@ -126,6 +129,7 @@ type reservationCommand struct {
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
+	SecretRecipients   []string                     `json:"secret_recipients,omitempty"`
 	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
 }
 
@@ -165,6 +169,7 @@ func reservationFromCommand(c command) reservationCommand {
 		Spec:               c.Spec,
 		SecretRef:          c.SecretRef,
 		SecretVersion:      c.SecretVersion,
+		SecretRecipients:   append([]string(nil), c.SecretRecipients...),
 		ExpiresUnix:        c.ExpiresUnix,
 	}
 }
@@ -179,6 +184,7 @@ func commandFromReservation(r reservationCommand) command {
 		Spec:               r.Spec,
 		SecretRef:          r.SecretRef,
 		SecretVersion:      r.SecretVersion,
+		SecretRecipients:   append([]string(nil), r.SecretRecipients...),
 		ExpiresUnix:        r.ExpiresUnix,
 	}
 }
@@ -457,6 +463,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		var ports map[int]string
 		var portRoutes map[int]ExposedPortRoute
 		var customHostnames []string
+		var secretRecipients []string
 		if exists {
 			// Same preservation rule as Spec: opPlace is the "owner + spec"
 			// write and must not erase the port intents accumulated by
@@ -467,6 +474,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// promote must not drop user-bound hostnames that
 			// opAddCustomDomain installed earlier in the log.
 			customHostnames = existing.CustomHostnames
+			// Preserve the reserve-time recipient set unless the command
+			// explicitly supplies a new one (normal promote leaves it empty).
+			secretRecipients = append([]string(nil), existing.SecretRecipients...)
+		}
+		if len(cmd.SecretRecipients) > 0 {
+			secretRecipients = append([]string(nil), cmd.SecretRecipients...)
 		}
 		dataPlaneHost := cmd.OwnerDataPlaneHost
 		if dataPlaneHost == "" && exists {
@@ -495,6 +508,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			Spec:               spec,
 			SecretRef:          secrets.Ref,
 			SecretVersion:      secrets.Version,
+			SecretRecipients:   secretRecipients,
 			ExposedPorts:       ports,
 			ExposedPortRoutes:  portRoutes,
 			CustomHostnames:    customHostnames,
@@ -1048,11 +1062,15 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
 		// Re-reserve from the same owner before expiry is an idempotent retry —
-		// refresh the TTL and treat it as a no-op otherwise.
+		// refresh the TTL (and recipient set when supplied) and treat it as a
+		// no-op otherwise.
 		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
 			existing.UpdatedUnix = now
+			if len(cmd.SecretRecipients) > 0 {
+				existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
+			}
 			if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 				return err
 			}
@@ -1086,6 +1104,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		Spec:               cmd.Spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		SecretRecipients:   append([]string(nil), cmd.SecretRecipients...),
 		State:              PlacementStateReserved,
 		ExpiresUnix:        cmd.ExpiresUnix,
 	}
@@ -2212,6 +2231,9 @@ func cloneHotPlacement(p Placement) Placement {
 	p.Spec = nil
 	p.SecretRef = ""
 	p.SecretVersion = 0
+	if len(p.SecretRecipients) > 0 {
+		p.SecretRecipients = append([]string(nil), p.SecretRecipients...)
+	}
 	if len(p.ExposedPorts) > 0 {
 		ports := make(map[int]string, len(p.ExposedPorts))
 		for k, v := range p.ExposedPorts {
@@ -2239,6 +2261,9 @@ func clonePlacementRecovery(r placementRecovery) placementRecovery {
 
 func clonePlacement(p Placement) Placement {
 	p.Spec = cloneCreateSandboxRequest(p.Spec)
+	if len(p.SecretRecipients) > 0 {
+		p.SecretRecipients = append([]string(nil), p.SecretRecipients...)
+	}
 	if len(p.ExposedPorts) > 0 {
 		ports := make(map[int]string, len(p.ExposedPorts))
 		for k, v := range p.ExposedPorts {

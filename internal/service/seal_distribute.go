@@ -1,0 +1,284 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
+)
+
+// SealPolicy governs LOCAL seal behaviour only. Async peer fan-out never
+// fails a create (plans/secrets-hardening §3e / D6).
+type SealPolicy int
+
+const (
+	// SealStrict: local seal must succeed or return error (API create paths).
+	SealStrict SealPolicy = iota
+	// SealBestEffort: local seal failure → metric + continue without ref
+	// (boot ownership replay backfill).
+	SealBestEffort
+)
+
+// secretFanoutHolders tracks successful holder count per sandbox (local put
+// counts as 1; each peer ACK increments). In-memory for v1 — lost on restart
+// (Get then reports not-ready for multi-recipient until a future re-fanout).
+var secretFanoutHolders sync.Map // sandboxID -> int
+
+// SealAndDistribute seals to recipients, stores locally, and kicks async
+// fan-out when the feature flag is on, the sandbox is recreate-HA, and
+// len(recipients) > 1. Policy governs LOCAL seal only.
+//
+// Boot-path note: default creates are unchanged (seal-to-self, no fan-out).
+// HA creates pay only the local seal on the create path; peer POST retries
+// run off-path after the handler returns.
+func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, policy SealPolicy) (cluster.PlacementSecrets, error) {
+	if len(recipients) == 0 {
+		if c := s.Cluster(); c != nil {
+			recipients = []string{c.SelfNodeID()}
+		}
+	}
+	out, err := s.putClusterSecretsForRecipients(ctx, sandboxID, req, recipients)
+	if err != nil {
+		if policy == SealBestEffort {
+			recordClusterSecretSealBestEffortFailure()
+			if s.logger != nil {
+				s.logger.Warn("cluster: seal best-effort failed; placement will ship without secret ref",
+					"sandbox_id", sandboxID, "err", err)
+			}
+			return cluster.PlacementSecrets{}, nil
+		}
+		return cluster.PlacementSecrets{}, err
+	}
+	if out.Ref == "" {
+		return out, nil
+	}
+	secretFanoutHolders.Store(sandboxID, 1)
+	s.maybeAsyncFanoutSecret(sandboxID, req, recipients, out)
+	return out, nil
+}
+
+func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string) (cluster.PlacementSecrets, error) {
+	bag := s.secretsFromRequest(req)
+	if bag.IsEmpty() {
+		return cluster.PlacementSecrets{}, nil
+	}
+	p := s.provider()
+	if p == nil {
+		if s == nil || s.cipher == nil {
+			return cluster.PlacementSecrets{}, errors.New("cluster secrets cipher is not configured")
+		}
+		return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured")
+	}
+	h, err := p.Put(ctx, sandboxID, bag, recipients)
+	if err != nil {
+		return cluster.PlacementSecrets{}, err
+	}
+	return cluster.PlacementSecrets{Ref: h.Ref, Version: h.Version, Recipients: append([]string(nil), recipients...)}, nil
+}
+
+func (s *Service) maybeAsyncFanoutSecret(sandboxID string, req models.CreateSandboxRequest, recipients []string, handle cluster.PlacementSecrets) {
+	if s == nil || !s.cfg.SecretRecipientFanoutEnabled {
+		return
+	}
+	if req.Failover == nil || !req.Failover.ShouldRecreate() {
+		return
+	}
+	if len(recipients) <= 1 || handle.Ref == "" {
+		return
+	}
+	pusher := s.secretPeerPusher()
+	if pusher == nil {
+		return
+	}
+	// Capture sealed bytes now so the goroutine doesn't race a rollback delete.
+	blob, err := s.loadSecretBlob(context.Background(), handle.Ref)
+	if err != nil || blob == nil {
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret fan-out skipped; local blob missing after put",
+				"sandbox_id", sandboxID, "ref", handle.Ref, "err", err)
+		}
+		return
+	}
+	go s.runSecretFanout(sandboxID, *blob, recipients, pusher)
+}
+
+func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, recipients []string, pusher cluster.SecretPeerPusher) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	acked, err := pusher.PushSecretBlobToPeers(ctx, blob, recipients)
+	if acked > 0 {
+		bumpSecretFanoutHolders(sandboxID, acked)
+	}
+	if err != nil {
+		recordSecretFanoutFailure()
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret fan-out incomplete",
+				"sandbox_id", sandboxID, "acked", acked, "err", err)
+		}
+	}
+}
+
+func (s *Service) secretPeerPusher() cluster.SecretPeerPusher {
+	if s == nil {
+		return nil
+	}
+	if s.testSecretPeerPusher != nil {
+		return s.testSecretPeerPusher
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	if p, ok := c.(cluster.SecretPeerPusher); ok {
+		return p
+	}
+	return nil
+}
+
+func (s *Service) loadSecretBlob(ctx context.Context, ref string) (*secrets.SecretBlob, error) {
+	if s == nil || s.store == nil || ref == "" {
+		return nil, nil
+	}
+	adapter := newSecretBlobStore(s.store)
+	if adapter == nil {
+		return nil, nil
+	}
+	return adapter.Get(ctx, ref)
+}
+
+// UpsertClusterSecretBlob stores a peer-pushed sealed blob without re-sealing.
+// Idempotent (store UPSERT). Used by POST /v1/cluster/internal/secrets.
+func (s *Service) UpsertClusterSecretBlob(ctx context.Context, blob secrets.SecretBlob) error {
+	if s == nil || s.store == nil {
+		return errors.New("cluster secret store is not configured")
+	}
+	return newSecretBlobStore(s.store).Put(ctx, blob)
+}
+
+// SecretRecipientsForSeal returns the recorded Placement.SecretRecipients when
+// present, otherwise [self]. Used by create-on-target seal sites.
+func (s *Service) SecretRecipientsForSeal(sandboxID string) []string {
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
+		return append([]string(nil), p.SecretRecipients...)
+	}
+	return []string{c.SelfNodeID()}
+}
+
+// WantsSecretRecipientFanout reports whether reserve/seal should use a
+// multi-recipient set for this create request.
+func (s *Service) WantsSecretRecipientFanout(req models.CreateSandboxRequest) bool {
+	if s == nil || !s.cfg.SecretRecipientFanoutEnabled {
+		return false
+	}
+	return req.Failover != nil && req.Failover.ShouldRecreate()
+}
+
+// SecretRecipientBackupCount returns the configured backup count (default 2).
+func (s *Service) SecretRecipientBackupCount() int {
+	if s == nil {
+		return 2
+	}
+	n := s.cfg.SecretRecipientBackupCount
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// SecretEnvSealEnabled reports whether sealed sandbox_env + Raft Env redaction
+// are active (SB_SECRET_ENV_SEAL_ENABLED).
+func (s *Service) SecretEnvSealEnabled() bool {
+	return s != nil && s.cfg.SecretEnvSealEnabled
+}
+
+// RedactClusterSecretsConfigured applies RedactClusterSecretsOpts using this
+// service's SecretEnvSealEnabled flag.
+func (s *Service) RedactClusterSecretsConfigured(req models.CreateSandboxRequest) models.CreateSandboxRequest {
+	return s.redactClusterSecrets(req)
+}
+
+func bumpSecretFanoutHolders(sandboxID string, delta int) {
+	if delta <= 0 || sandboxID == "" {
+		return
+	}
+	for {
+		curAny, _ := secretFanoutHolders.LoadOrStore(sandboxID, 1)
+		cur, _ := curAny.(int)
+		if secretFanoutHolders.CompareAndSwap(sandboxID, cur, cur+delta) {
+			return
+		}
+	}
+}
+
+func secretHolderCount(sandboxID string) int {
+	if v, ok := secretFanoutHolders.Load(sandboxID); ok {
+		if n, ok := v.(int); ok {
+			return n
+		}
+	}
+	return 0
+}
+
+func clearSecretFanoutHolders(sandboxID string) {
+	secretFanoutHolders.Delete(sandboxID)
+}
+
+// computeFailoverReady implements E1a: omit for non-recreate; otherwise true
+// when holders >= 2 or the recipient set is single-node (len <= 1).
+func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
+	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
+		return nil
+	}
+	recipients := s.secretRecipientsForSandbox(ctx, sb.ID)
+	holders := secretHolderCount(sb.ID)
+	ready := false
+	switch {
+	case len(recipients) <= 1:
+		// Single-node / seal-to-self: HA N/A but report ready so operators
+		// aren't stuck on false for non-HA recipient sets.
+		ready = true
+	case holders >= 2:
+		ready = true
+	default:
+		ready = false
+	}
+	return &ready
+}
+
+func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID string) []string {
+	if c := s.Cluster(); c != nil {
+		if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
+			return p.SecretRecipients
+		}
+	}
+	if s.store == nil {
+		return nil
+	}
+	ref := secrets.FormatRef(sandboxID, secrets.RefVersion)
+	blob, err := newSecretBlobStore(s.store).Get(ctx, ref)
+	if err != nil || blob == nil {
+		return nil
+	}
+	return blob.Recipients
+}
+
+func (s *Service) attachFailoverReady(ctx context.Context, sb *models.Sandbox) {
+	if sb == nil {
+		return
+	}
+	sb.FailoverReady = s.computeFailoverReady(ctx, sb)
+}
+
+func (s *Service) attachFailoverReadyAll(ctx context.Context, sandboxes []*models.Sandbox) {
+	for _, sb := range sandboxes {
+		s.attachFailoverReady(ctx, sb)
+	}
+}

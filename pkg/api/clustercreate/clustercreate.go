@@ -110,7 +110,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{}, false
 	}
 
-	target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
+	target, candidates, err := c.SelectPlacementWithCandidates(CapacityRequestFromCreate(req))
 	if err != nil {
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
@@ -133,9 +133,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			return Decision{}, false
 		}
 	}
-	redacted := service.RedactClusterSecrets(req)
+	redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
+	reserveSecrets := cluster.PlacementSecrets{}
+	if svc != nil && svc.WantsSecretRecipientFanout(req) {
+		reserveSecrets.Recipients = cluster.SelectSecretRecipients(candidates, target.NodeID, svc.SecretRecipientBackupCount())
+	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, cluster.PlacementSecrets{}, ReservationTTL)
+	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
 	if err != nil {
 		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
@@ -251,12 +255,12 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
+	secrets, sealErr := svc.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, svc.SecretRecipientsForSeal(resp.Sandbox.ID), service.SealStrict)
 	if sealErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
 		return nil, sealErr
 	}
-	redacted := service.RedactClusterSecrets(req)
+	redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
 	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
 		return nil, promoteErr

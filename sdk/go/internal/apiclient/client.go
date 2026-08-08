@@ -253,8 +253,13 @@ func (c *Client) BuildImageWithPush(ctx context.Context, dockerfile string, push
 }
 
 func (c *Client) List(ctx context.Context, tags map[string]string) ([]*Sandbox, error) {
+	return c.ListWithOptions(ctx, tags, false)
+}
+
+// ListWithOptions lists sandboxes; includeEnv appends ?include_env=true.
+func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
 	var response []models.Sandbox
-	path := c.versionPrefix + "/sandboxes" + buildTagQuery(tags)
+	path := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 		return nil, err
 	}
@@ -271,19 +276,32 @@ func (c *Client) List(ctx context.Context, tags map[string]string) ([]*Sandbox, 
 // get percent-encoded. An empty or nil map returns "" so the URL is identical
 // to the pre-filter call (no stray trailing "?").
 func buildTagQuery(tags map[string]string) string {
-	if len(tags) == 0 {
-		return ""
-	}
-	values := make(url.Values, len(tags))
+	return buildSandboxQuery(tags, false)
+}
+
+func buildSandboxQuery(tags map[string]string, includeEnv bool) string {
+	values := make(url.Values)
 	for k, v := range tags {
 		values.Set("tag."+k, v)
+	}
+	if includeEnv {
+		values.Set("include_env", "true")
+	}
+	if len(values) == 0 {
+		return ""
 	}
 	return "?" + values.Encode()
 }
 
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
+	return c.GetWithOptions(ctx, id, false)
+}
+
+// GetWithOptions fetches a sandbox; includeEnv appends ?include_env=true.
+func (c *Client) GetWithOptions(ctx context.Context, id string, includeEnv bool) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id, nil, &response); err != nil {
+	path := c.versionPrefix + "/sandboxes/" + id + buildSandboxQuery(nil, includeEnv)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil

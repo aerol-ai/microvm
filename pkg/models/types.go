@@ -718,6 +718,10 @@ type Sandbox struct {
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle         `json:"lifecycle"`
 	Failover         *Failover         `json:"failover,omitempty"`
+	// FailoverReady is set on Get/List when failover.policy=recreate: true iff
+	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
+	// set is single-node (len≤1). Omitted for non-recreate sandboxes.
+	FailoverReady *bool `json:"failover_ready,omitempty"`
 	// Name is the optional unique identifier set at create time. Empty when
 	// the sandbox was created without one (the common path on /v1 today).
 	Name string `json:"name,omitempty"`

@@ -235,7 +235,7 @@ func TestClusterSecretsErrorArmsWave8(t *testing.T) {
 	}
 
 	s := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	if _, err := s.SealClusterSecrets(req); err == nil || !strings.Contains(err.Error(), "cipher") {
+	if _, err := s.SealClusterSecretsForRecipient(req, "*"); err == nil || !strings.Contains(err.Error(), "cipher") {
 		t.Fatalf("nil cipher = %v", err)
 	}
 

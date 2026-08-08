@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 const (
@@ -240,7 +241,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := c.SelectPlacement(capacityRequestFromCreate(req))
+	target, candidates, err := c.SelectPlacementWithCandidates(capacityRequestFromCreate(req))
 	if err != nil {
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
@@ -262,10 +263,16 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
 		return
 	}
-	redacted := service.RedactClusterSecrets(req)
+	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
+	reserveSecrets := cluster.PlacementSecrets{}
+	// Router picks the recipient set at reserve time (§3d-1). Target seals to
+	// the recorded set and must not recompute. Empty when flag off / non-HA.
+	if h.deps.Service.WantsSecretRecipientFanout(req) {
+		reserveSecrets.Recipients = cluster.SelectSecretRecipients(candidates, target.NodeID, h.deps.Service.SecretRecipientBackupCount())
+	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	if err := c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, cluster.PlacementSecrets{}, clusterReservationTTL); err != nil {
+	if err := c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, clusterReservationTTL); err != nil {
 		// Name collision: deterministic 409 so clients can distinguish
 		// "pick a different name" from "cluster degraded, retry."
 		if errors.Is(err, cluster.ErrNameConflict) {
@@ -374,7 +381,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	secrets, sealErr := h.deps.Service.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
+	secrets, sealErr := h.deps.Service.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, h.deps.Service.SecretRecipientsForSeal(resp.Sandbox.ID), service.SealStrict)
 	if sealErr != nil {
 		h.deps.Logger.Error("cluster: store secret ref failed; rolling back create",
 			"sandbox_id", resp.Sandbox.ID, "err", sealErr)
@@ -395,7 +402,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(sealErr))
 		return
 	}
-	redacted := service.RedactClusterSecrets(req)
+	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
 	promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
 
 	if promoteErr != nil {
@@ -1225,12 +1232,47 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	target, err := c.SelectPlacement(req.Request)
+	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
 	if err != nil {
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})
+}
+
+// clusterInternalSecretPut upserts a peer-fanout sealed secret blob into the
+// local store. Idempotent (store UPSERT). No-op semantics under Noop cluster
+// still accept the write so a misrouted POST doesn't 5xx — the row is local.
+func (h *handlers) clusterInternalSecretPut(w http.ResponseWriter, r *http.Request) {
+	var blob secrets.SecretBlob
+	if err := apihttp.DecodeJSON(w, r, &blob); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(blob.Ref) == "" || strings.TrimSpace(blob.SandboxID) == "" || len(blob.SealedPayload) == 0 {
+		apihttp.WriteError(w, http.StatusBadRequest, "ref, sandbox_id, and sealed_payload are required")
+		return
+	}
+	if err := h.deps.Service.UpsertClusterSecretBlob(r.Context(), blob); err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) clusterInternalSecretDelete(w http.ResponseWriter, r *http.Request) {
+	sandboxID := strings.TrimSpace(r.PathValue("sandboxID"))
+	if sandboxID == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	// Local delete only — this IS the peer delete-fanout receiver. Do not
+	// re-fanout from here (would loop).
+	if err := h.deps.Service.DeleteClusterSecretsLocal(r.Context(), sandboxID); err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handlers) clusterInternalDrainState(w http.ResponseWriter, r *http.Request) {

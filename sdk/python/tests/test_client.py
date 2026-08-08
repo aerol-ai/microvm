@@ -914,6 +914,14 @@ class ListFilterTests(unittest.TestCase):
         for _, path, _ in captured["paths"]:
             self.assertEqual(path, "/v1/sandboxes")
 
+    def test_get_and_list_include_env(self):
+        client, captured = self._client_capturing()
+        client.get("sb-1", include_env=True)
+        client.list(tags={"team": "a"}, include_env=True)
+        self.assertEqual(captured["paths"][0][1], "/v1/sandboxes/sb-1?include_env=true")
+        self.assertIn("tag.team=a", captured["paths"][1][1])
+        self.assertIn("include_env=true", captured["paths"][1][1])
+
 
 class CustomDomainsTests(unittest.TestCase):
     """Mirrors the wire shape of the custom-domains endpoints

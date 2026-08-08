@@ -93,7 +93,7 @@ func TestClusterSecretsUnsealBranchesWave12(t *testing.T) {
 	if _, err := s.UnsealClusterSecrets(req, []byte("not-json")); err == nil {
 		t.Fatal("expected bad json")
 	}
-	out, err := s.SealClusterSecrets(models.CreateSandboxRequest{Image: "x"})
+	out, err := s.SealClusterSecretsForRecipient(models.CreateSandboxRequest{Image: "x"}, "*")
 	if err != nil || out != nil {
 		t.Fatalf("empty seal = %v %v", out, err)
 	}

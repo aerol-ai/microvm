@@ -33,6 +33,7 @@ type Server struct {
 	containerEngine string
 	patToken        string
 	validator       controlplane.Validator
+	auditLimiter    *apiv1.AuditRateLimiter
 	mux             *http.ServeMux
 }
 
@@ -64,7 +65,12 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,
 		validator:       validator,
-		mux:             http.NewServeMux(),
+		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
+			IdentityRate: cfg.AuditRateLimitIdentity,
+			OperatorRate: cfg.AuditRateLimitOperator,
+			NodeRate:     cfg.AuditRateLimitNode,
+		}),
+		mux: http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -100,6 +106,7 @@ func (s *Server) routes() {
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
+		AuditLimiter:    s.auditLimiter,
 		Builder:         s.builder,
 		Build:           apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
 		ContainerEngine: s.containerEngine,

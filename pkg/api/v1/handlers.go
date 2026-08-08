@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -98,7 +99,8 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), parseTagFilter(r))
+	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	sandboxes, err := h.deps.Service.ListSandboxesWithOptions(r.Context(), parseTagFilter(r), opts)
 	if err != nil {
 		h.deps.Logger.Warn("list sandboxes failed", "error", err)
 		apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
@@ -134,12 +136,19 @@ func parseTagFilter(r *http.Request) map[string]string {
 }
 
 func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
+	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	sandbox, err := h.deps.Service.GetSandboxWithOptions(r.Context(), r.PathValue("id"), opts)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
+}
+
+// parseIncludeEnv accepts include_env=true|1|yes (case-insensitive).
+func parseIncludeEnv(r *http.Request) bool {
+	v := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("include_env")))
+	return v == "true" || v == "1" || v == "yes"
 }
 
 func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {

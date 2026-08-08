@@ -102,11 +102,20 @@ func (s *clusterStub) CancelReservation(_ context.Context, _ string) error {
 }
 
 func (s *clusterStub) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	target, _, err := s.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (s *clusterStub) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	s.selectReqs = append(s.selectReqs, req)
 	if s.selectErr != nil {
-		return cluster.PlacementTarget{}, s.selectErr
+		return cluster.PlacementTarget{}, nil, s.selectErr
 	}
-	return s.selectTarget, nil
+	cands := s.members
+	if len(cands) == 0 {
+		cands = []cluster.Member{{NodeID: s.selectTarget.NodeID, APIURL: s.selectTarget.APIURL, Alive: true}}
+	}
+	return s.selectTarget, cands, nil
 }
 
 func (s *clusterStub) IsNodeDrained(_ string) bool {

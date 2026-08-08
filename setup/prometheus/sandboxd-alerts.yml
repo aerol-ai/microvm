@@ -370,3 +370,44 @@ groups:
           summary: "Firecracker template artifact pulls are failing"
           description: "Peer-side template fetches have been failing for 5 minutes. Sandbox creates that resolve to a remote-built template will block on the pull retry on the affected nodes until the pull path recovers."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md"
+
+  - name: sandboxd.secrets-audit
+    interval: 30s
+    rules:
+      # Buffer overflow on the async audit writer. Gap markers are written so
+      # the JSONL stays honest, but dropped events are gone on that node.
+      - alert: SandboxdAuditEventsDropped
+        expr: increase(aerolvm_audit_events_dropped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret audit events are being dropped"
+          description: "aerolvm_audit_events_dropped_total increased in the last 5 minutes. The local audit stream has gap markers; history on this node is incomplete."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # Async sealed-blob peer push/delete failures. Creates do not wait on
+      # fan-out; failover_ready stays false until copies land.
+      - alert: SandboxdSecretFanoutFailures
+        expr: increase(aerolvm_secret_fanout_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret peer fan-out is failing"
+          description: "aerolvm_secret_fanout_failures_total increased in the last 10 minutes. HA sandboxes may remain failover_ready=false; check peer health and credentials."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # Provider boot/runtime canary (local always ok; awskms wrap/unwrap).
+      - alert: SandboxdSecretProviderCanaryFailing
+        expr: aerolvm_secret_provider_canary_ok == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret provider canary is failing"
+          description: "aerolvm_secret_provider_canary_ok has been 0 for 10 minutes. New wraps/opens may fail; for awskms check IAM/KMS reachability."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"

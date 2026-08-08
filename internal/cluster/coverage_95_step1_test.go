@@ -275,7 +275,7 @@ func TestNoopExtraBranches(t *testing.T) {
 	if got := n.SpecOf("sb-1"); got != nil {
 		t.Fatalf("SpecOf should be nil, got %+v", got)
 	}
-	if got := n.SecretsOf("sb-1"); got != (PlacementSecrets{}) {
+	if got := n.SecretsOf("sb-1"); got.Ref != "" || got.Version != 0 || len(got.Recipients) != 0 {
 		t.Fatalf("SecretsOf=%+v", got)
 	}
 	if err := n.AddExposedPort(ctx, "sb-1", 8080, ExposedPortRoute{Protocol: "http"}); err != nil {

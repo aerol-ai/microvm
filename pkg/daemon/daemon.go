@@ -148,6 +148,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer db.Close()
+	// When env sealing is on, hot List scanners must not project plaintext
+	// env_json (D8 / netstats). loadEnv reads sealed rows on demand.
+	db.SetOmitEnvFromScanner(cfg.SecretEnvSealEnabled)
 
 	// The dockerd driver ALWAYS drives DOCKER-USER, independent of the host
 	// engine choice. On a node flipped to containerd, pre-flip engine=docker
@@ -276,6 +279,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	if err := svc.ConfigureSecretProvider(ctx); err != nil {
+		return fmt.Errorf("configure secret provider: %w", err)
+	}
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {

@@ -16,6 +16,7 @@ type workerdSupervisor struct {
 	runDir         string
 	useJail        bool
 	egressPoolSize int
+	egressObserver pkgisolate.EgressObserver
 }
 
 // NewHostSupervisor builds the production supervisor over the isolate config.
@@ -26,6 +27,15 @@ func NewHostSupervisor(cfg Config) HostSupervisor {
 		useJail:        cfg.UseJail,
 		egressPoolSize: cfg.EgressPoolSize,
 	}
+}
+
+// SetEgressObserver installs host-mediated egress attribution on every group
+// host this supervisor spawns (including warm-pool blanks).
+func (s *workerdSupervisor) SetEgressObserver(obs pkgisolate.EgressObserver) {
+	if s == nil {
+		return
+	}
+	s.egressObserver = obs
 }
 
 func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (GroupHost, error) {
@@ -47,6 +57,9 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 	})
 	if err != nil {
 		return nil, err
+	}
+	if s.egressObserver != nil {
+		host.SetEgressObserver(s.egressObserver)
 	}
 	if err := host.Start(ctx); err != nil {
 		return nil, err

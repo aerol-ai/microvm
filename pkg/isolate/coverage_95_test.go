@@ -111,7 +111,7 @@ func TestProxyEgressSuccessAndUpstreamError(t *testing.T) {
 	h := &Host{}
 	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/v1", nil)
 	rec := httptest.NewRecorder()
-	h.proxyEgress(rec, req, EgressPolicy{})
+	h.proxyEgress(rec, req, "sb-proxy", EgressPolicy{})
 	if rec.Code != http.StatusTeapot || rec.Body.String() != "proxied" || rec.Header().Get("X-Up") != "1" {
 		t.Fatalf("proxy success = %d %q hdr=%v", rec.Code, rec.Body.String(), rec.Header())
 	}
@@ -120,7 +120,7 @@ func TestProxyEgressSuccessAndUpstreamError(t *testing.T) {
 		return nil, context.Canceled
 	})
 	rec = httptest.NewRecorder()
-	h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil), EgressPolicy{})
+	h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil), "sb-proxy", EgressPolicy{})
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("upstream err = %d, want 502", rec.Code)
 	}

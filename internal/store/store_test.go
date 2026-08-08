@@ -2176,7 +2176,7 @@ func TestStoreHelperCases(t *testing.T) {
 			0,  // fleet_suspended
 			"", // tenant_id
 		}}
-		_, err := scanSandbox(row)
+		_, err := (&Store{}).scanSandbox(row)
 		if err == nil {
 			t.Fatalf("expected scanSandbox() error")
 		}

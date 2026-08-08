@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 var (
@@ -46,6 +47,15 @@ var (
 	clusterSecretLastOpenNanos   = expvar.NewInt("aerolvm_secret_decrypt_last_nanos")
 	clusterSecretOpenLatency     = scaleobs.NewDurationBuckets("aerolvm_secret_decrypt_latency_seconds_bucket")
 	clusterSecretRecipientDenies = expvar.NewInt("aerolvm_secret_recipient_denied_total")
+	// Async peer fan-out failures (push or delete). Create never fails on
+	// these — failover_ready stays false until holders catch up.
+	secretFanoutFailuresTotal = expvar.NewInt("aerolvm_secret_fanout_failures_total")
+	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.
+	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
+	// Best-effort local seal failures (ownership replay backfill).
+	clusterSecretSealBestEffortFailures = expvar.NewInt("aerolvm_secret_seal_best_effort_failures_total")
+	// Lazy migration: sealed sandbox_env missing, plaintext env_json used.
+	envPlaintextFallbackTotal = expvar.NewInt("aerolvm_env_plaintext_fallback_total")
 
 	// Promote-retract counter for overlapped reserved-path create
 	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
@@ -172,6 +182,26 @@ func recordClusterSecretKeyMismatch() {
 	clusterSecretKeyMismatches.Add(1)
 }
 
+func recordSecretFanoutFailure() {
+	secretFanoutFailuresTotal.Add(1)
+}
+
+func recordSecretProviderCanary(ok bool) {
+	if ok {
+		secretProviderCanaryOK.Set(1)
+		return
+	}
+	secretProviderCanaryOK.Set(0)
+}
+
+func recordClusterSecretSealBestEffortFailure() {
+	clusterSecretSealBestEffortFailures.Add(1)
+}
+
+func recordEnvPlaintextFallback() {
+	envPlaintextFallbackTotal.Add(1)
+}
+
 // reapplyNetworkBlockAll heals the per-IP isolation rule and reports whether
 // it was actually missing. Drivers that can't answer (anything not backed by
 // netrules) still get healed — they just report inserted=false, so the drift
@@ -263,6 +293,22 @@ func classifyServiceMetricError(err error) string {
 func classifySecretMetricError(err error) string {
 	if err == nil {
 		return ""
+	}
+	switch {
+	case errors.Is(err, secrets.ErrVersionMismatch):
+		return "key_version_mismatch"
+	case errors.Is(err, secrets.ErrRecipientDenied):
+		return "recipient_denied"
+	case errors.Is(err, secrets.ErrNotFound):
+		return "ref_not_found"
+	case errors.Is(err, secrets.ErrDecryptFailed):
+		return "decrypt_failed"
+	case errors.Is(err, secrets.ErrProviderUnavailable):
+		return "provider_unavailable"
+	case errors.Is(err, secrets.ErrProviderThrottled):
+		return "provider_throttled"
+	case errors.Is(err, secrets.ErrProviderDenied):
+		return "provider_denied"
 	}
 	msg := strings.ToLower(err.Error())
 	switch {

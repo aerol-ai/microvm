@@ -1,6 +1,8 @@
 # Secrets hardening: cross-node failover, audit trail, env sealing, and the provider seam
 
-Status: **ENG-REVIEWED 2026-08-06** — decisions below are the build contract.
+Status: **IMPLEMENTED 2026-08-08** (T1–T13 + E1a/E1b/E2a/E3a/E4) — ENG-REVIEWED 2026-08-06
+decisions below remain the build contract. Remaining gated/out-of-scope: E2b
+(auditor ask), E3b (own justification), E3c (deferred), E5 (out of scope).
 Supersedes the 2026-08-02 draft, whose Phase 0 premise is now proven and whose
 provider-seam and env-storage designs were both wrong (see §Corrections).
 
@@ -16,11 +18,11 @@ then deleted. Both nodes shared **one** `*secrets.Cipher`, so nothing below is
 a key-distribution problem:
 
 ```
-STEP 0  redacted spec → raft ............. env=map[OPENAI_API_KEY:sk-live-...]
-STEP 1  node-a (owner) open .............. OK, password recovered
-STEP 2  node-b, payload NOT replicated ... cluster secret ref "..." not found
-STEP 3  node-b, payload REPLICATED ....... recipient "node-b" is not allowed to open
-STEP 4  node-b, legacy empty-nodeID ...... recipient "" is not allowed to open
+STEP 0  redacted spec → raft ............. env=map[OPENAI_API_KEY:REDACTED_EXAMPLE]
+        STEP 1  node-a (owner) open .............. OK, password recovered
+        STEP 2  node-b, payload NOT replicated ... cluster secret ref "..." not found
+        STEP 3  node-b, payload REPLICATED ....... recipient "node-b" is not allowed to open
+        STEP 4  node-b, legacy empty-nodeID ...... recipient "" is not allowed to open
 ```
 
 Two independent walls block cross-node failover, not one:
@@ -89,7 +91,10 @@ off the table. (The 2026-08-02 draft listed it as an option; deleted.)
 3. "#80 is demand-gated, do not start without a customer" — **reversed by D4**. KMS ships.
 4. The `Seal(plaintext, recipient string)` sketch was single-recipient — **wrong**, bakes in the bug (D3 needs sets).
 5. The crypto-only provider seam was **wrong** — a KMS provider under it would still need local bytes and would not fix failover (D10).
-6. "Keep the package at ~85%" was **wrong**. Measured 2026-08-06: `internal/service` 95.1%, `internal/store` 95.1%, `internal/cluster` 95.9%, `pkg/secrets` 96.5%. The real bar is ~95%.
+6. "Keep the package at ~85%" undersells these packages. Measured 2026-08-06:
+   `internal/service` 95.1%, `internal/store` 95.1%, `internal/cluster` 95.9%,
+   `pkg/secrets` 96.5%. CLAUDE.md's floor remains ~85%; for this program hold
+   these packages at their measured baseline (~95%), not the floor.
 7. Env-at-rest proposed mutating `env_json` in place — **wrong**, that column is projected by the shared row scanner on six read paths (D8).
 
 ---
@@ -187,10 +192,13 @@ detail.
   already v3 with a `Recipients` field — no format invention needed.
 - Compute the set **only** when `failover.policy=recreate`. Otherwise seal to
   self exactly as today and skip the fan-out entirely.
-- Fan out synchronously before create returns, so a 201 means the HA guarantee
-  is already true.
+- Fan out **asynchronously** after create returns (§3e supersedes the earlier
+  sync choice). A 201 does **not** mean the HA guarantee is already true —
+  `failover_ready` starts false and flips true only when owner + ≥1 backup
+  hold the secret (E1a / 3d-2). Bounded backoff + metric on failure.
 - New peer-receive endpoint in `internal/cluster/`: idempotent on retry,
-  rejects unauthenticated/foreign pushes, no-op under `Noop`.
+  rejects **unauthenticated** pushes (PAT + `d.Auth`; per-peer identity is
+  separate work), no-op under `Noop`.
 
 ### 3b. One helper, explicit policy (D6)
 
@@ -303,7 +311,8 @@ must fail loudly rather than create a sandbox with a silently empty environment.
 
 ## 6. Test plan
 
-Baselines measured 2026-08-06 — new code holds ~95%, not 85%.
+Baselines measured 2026-08-06 — hold these packages at their measured ~95%
+baseline (CLAUDE.md floor remains ~85%).
 
 **CRITICAL / mandatory regression test:** cross-node failover open. A node in
 the recipient set opens a sandbox sealed by a different node. This is the test
@@ -512,55 +521,55 @@ but C touches `internal/cluster` + `pkg/api/clustercreate` while D touches
 
 ## Implementation Tasks
 
-- [ ] **T1 (P1, human: ~1d / CC: ~2h)** — pkg/secrets — Extract the `Provider` interface (ref → plaintext, D10)
+- [x] **T1 (P1, human: ~1d / CC: ~2h)** — pkg/secrets — Extract the `Provider` interface (ref → plaintext, D10)
   - Surfaced by: Codex #5 — crypto-only seam preserves the cross-node failure
   - Files: `pkg/secrets/`, `internal/service/cluster_secrets.go`
   - Verify: `go test ./pkg/secrets/... ./internal/service/...`, no behavior change
-- [ ] **T2 (P1, human: ~4h / CC: ~45m)** — internal/service — Answer recipient-set selection before coding §3
+- [x] **T2 (P1, human: ~4h / CC: ~45m)** — internal/service — Answer recipient-set selection before coding §3
   - Surfaced by: Codex #11 — reserve writes spec before sealing on target
   - Files: `pkg/api/clustercreate/clustercreate.go:136`, `overlap.go:139`
   - Verify: written decision in this plan + a determinism test
-- [ ] **T3 (P1, human: ~1w / CC: ~1-2d)** — internal/service+cluster — Recipient-set sealing + sync peer fan-out
+- [x] **T3 (P1, human: ~1w / CC: ~1-2d)** — internal/service+cluster — Recipient-set sealing + async peer fan-out
   - Surfaced by: §0 WALL 1 + WALL 2, both proven
   - Files: `cluster_secrets.go`, `internal/cluster/`, 4 seal call sites
   - Verify: CRITICAL cross-node failover regression test
-- [ ] **T4 (P1, human: ~2d / CC: ~3h)** — internal/service — One seal+fanout helper with policy arg (D6)
+- [x] **T4 (P1, human: ~2d / CC: ~3h)** — internal/service — One seal+fanout helper with policy arg (D6)
   - Surfaced by: Code quality — 3 undocumented failure policies across 4 sites
   - Files: `cluster_ownership.go:149`, `cluster_handler.go:377`, `clustercreate.go:254`, `overlap.go:139`
   - Verify: strict/best-effort/partial cases
-- [ ] **T5 (P2, human: ~3h / CC: ~30m)** — internal/service — Typed sentinel errors
+- [x] **T5 (P2, human: ~3h / CC: ~30m)** — internal/service — Typed sentinel errors
   - Surfaced by: Audit `Reason` has nothing to switch on
   - Files: `cluster_secrets.go:115,174,177,202,353,379`
   - Verify: each class asserted
-- [ ] **T6 (P2, human: ~1d / CC: ~2h)** — internal/service — Audit events on every provider read (#82)
+- [x] **T6 (P2, human: ~1d / CC: ~2h)** — internal/service — Audit events on every provider read (#82)
   - Surfaced by: #82 partial — metrics exist, per-event records do not
   - Files: `metrics.go:153`, `cluster_secrets.go:199`, `service.go:1883`, `service.go:1941`
   - Verify: one event per path, no plaintext
-- [ ] **T7 (P2, human: ~2d / CC: ~4h)** — internal/store — Env to its own sealed row + lazy migration (D8)
+- [x] **T7 (P2, human: ~2d / CC: ~4h)** — internal/store — Env to its own sealed row + lazy migration (D8)
   - Surfaced by: Performance — scanner + `netstats.go:219` per-tick decrypt
   - Files: `store.go`, `internal/service/service.go`
   - Verify: round-trip, plaintext fallback, fallback metric
-- [ ] **T8 (P2, human: ~3d / CC: ~5h)** — pkg/api+sdk — Env opt-in on `Get`/`List` (D9)
+- [x] **T8 (P2, human: ~3d / CC: ~5h)** — pkg/api+sdk — Env opt-in on `Get`/`List` (D9)
   - Surfaced by: Codex #8 — breaking API contract decision
   - Files: `pkg/api/v1/`, all five SDKs, docs `.mdx`
   - Verify: default omits, opt-in returns + audits
-- [ ] **T9 (P2, human: ~2d / CC: ~4h)** — internal/service — Redact env from spec + writer capability gate (§5c)
+- [x] **T9 (P2, human: ~2d / CC: ~4h)** — internal/service — Redact env from spec + writer capability gate (§5c)
   - Surfaced by: Codex #10 — placement vs envelope version conflated
   - Files: `cluster_secrets.go:60,211,265`
   - Verify: old reader fails loudly, never silent empty env
-- [ ] **T10 (P2, human: ~3d / CC: ~5h)** — pkg/secrets — KMS provider + offline fake + shared contract suite (D7)
+- [x] **T10 (P2, human: ~3d / CC: ~5h)** — pkg/secrets — KMS provider + offline fake + shared contract suite (D7)
   - Surfaced by: D4 — both backends ship
   - Files: `pkg/secrets/`, `internal/config/config.go`, `integration-tests/`
   - Verify: both providers pass one suite; live KMS behind `integration`
-- [ ] **T11 (P3, human: ~1h / CC: ~10m)** — docs+config — Fix the two wrong operator messages
+- [x] **T11 (P3, human: ~1h / CC: ~10m)** — docs+config — Fix the two wrong operator messages
   - Surfaced by: Architecture A3/A4
   - Files: `service.go:920`, `config.go:2047`
   - Verify: review
-- [ ] **T12 (P3, human: ~30m / CC: ~5m)** — internal/service — Delete legacy wildcard `SealClusterSecrets`
+- [x] **T12 (P3, human: ~30m / CC: ~5m)** — internal/service — Delete legacy wildcard `SealClusterSecrets`
   - Surfaced by: Code quality — zero production callers, seals to `"*"`
   - Files: `cluster_secrets.go:84`
   - Verify: `make test`
-- [ ] **T13 (P3, human: ~1d / CC: ~2h)** — docs — Operator docs: provider choice + D5 limitation
+- [x] **T13 (P3, human: ~1d / CC: ~2h)** — docs — Operator docs: provider choice + D5 limitation
   - Surfaced by: D5 — limitation must be operator-visible
   - Files: `docs/src/content/docs/`, `docs/src/content.config.ts`
   - Verify: `make docs-build`

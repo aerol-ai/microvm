@@ -57,7 +57,13 @@ func (n *Noop) OwnerOfName(name string) (string, OwnerInfo, error) {
 }
 
 func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
-	return PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}, nil
+	target, _, err := n.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (n *Noop) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
+	self := PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}
+	return self, []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}, nil
 }
 
 func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {

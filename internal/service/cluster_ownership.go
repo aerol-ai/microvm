@@ -146,15 +146,12 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 	spec := s.specFromSandbox(ctx, sb)
 	var secrets cluster.PlacementSecrets
 	if spec != nil {
-		handle, err := s.PutClusterSecretsForRecipient(ctx, sb.ID, *spec, c.SelfNodeID())
-		if err != nil {
-			if s.logger != nil {
-				s.logger.Warn("cluster: store secret ref during ownership replay failed; placement will ship without secret ref",
-					"sandbox_id", sb.ID, "err", err)
-			}
-		} else {
+		// Boot replay has no reservation — seal for self only (backfill).
+		// Widens on the next HA create; SealBestEffort matches prior warn+continue.
+		handle, _ := s.SealAndDistribute(ctx, sb.ID, *spec, []string{c.SelfNodeID()}, SealBestEffort)
+		if handle.Ref != "" {
 			secrets = handle
-			redacted := RedactClusterSecrets(*spec)
+			redacted := s.redactClusterSecrets(*spec)
 			spec = &redacted
 		}
 	}
@@ -198,7 +195,7 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) *mode
 		spec.Failover = nil
 	}
 
-	auth, err := s.UnsealRegistry(sb.RegistryAuthSealed)
+	auth, err := s.UnsealRegistry(sb.ID, sb.RegistryAuthSealed)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Warn("cluster: unseal registry auth failed; spec backfill will omit credentials",
@@ -216,6 +213,17 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) *mode
 			}
 		} else if len(mounts) > 0 {
 			spec.Mounts = mounts
+		}
+		// When env-seal is on, scanner/Get leave Env empty — load for backfill.
+		if s.cfg.SecretEnvSealEnabled {
+			if env, envErr := s.loadEnv(ctx, sb.ID); envErr != nil {
+				if s.logger != nil {
+					s.logger.Warn("cluster: load sandbox env failed; spec backfill will omit env",
+						"sandbox_id", sb.ID, "err", envErr)
+				}
+			} else if len(env) > 0 {
+				spec.Env = env
+			}
 		}
 	}
 	return spec

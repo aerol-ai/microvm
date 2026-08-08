@@ -18,6 +18,21 @@ import (
 
 type Store struct {
 	db *sql.DB
+	// omitEnvFromScanner, when true, leaves Sandbox.Env nil/empty on Get/List
+	// paths even though env_json may still hold plaintext during the T7
+	// migration window. Service.loadEnv reads sealed sandbox_env (or the
+	// plaintext column via GetEnvJSON) on demand. Default false preserves
+	// pre-env-seal scanner behavior for rollback.
+	omitEnvFromScanner bool
+}
+
+// SetOmitEnvFromScanner toggles whether scanSandbox projects env_json into
+// Sandbox.Env. Wired from SB_SECRET_ENV_SEAL_ENABLED at daemon boot.
+func (s *Store) SetOmitEnvFromScanner(omit bool) {
+	if s == nil {
+		return
+	}
+	s.omitEnvFromScanner = omit
 }
 
 const sqliteBusyTimeoutMS = 5000
@@ -110,6 +125,15 @@ func Open(path string) (*Store, error) {
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_mounts (
+			sandbox_id TEXT PRIMARY KEY,
+			sealed_blob BLOB NOT NULL,
+			created_at DATETIME NOT NULL,
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
+		// sandbox_env mirrors sandbox_mounts: sealed env lives off the hot
+		// row so List/netstats scanners never AES-GCM-open every sandbox
+		// (plans/secrets-hardening D8). FK CASCADE on destroy.
+		`CREATE TABLE IF NOT EXISTS sandbox_env (
 			sandbox_id TEXT PRIMARY KEY,
 			sealed_blob BLOB NOT NULL,
 			created_at DATETIME NOT NULL,
@@ -797,7 +821,46 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+type dbExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
+	return s.insertSandbox(ctx, s.db, sandbox)
+}
+
+// CreateWithSealedEnv inserts the sandbox row and optional sealed env blob in
+// one transaction so a crash cannot leave a healthy sandbox with empty env
+// (plans/secrets-hardening outside-voice #3). Empty sealedEnv skips the env
+// write (same as Create).
+func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox, sealedEnv []byte) error {
+	if len(sealedEnv) == 0 {
+		return s.Create(ctx, sandbox)
+	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin create+env tx: %w", err)
+	}
+	defer tx.Rollback()
+	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
+		return err
+	}
+	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit create+env tx: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *models.Sandbox) error {
 	envJSON, err := marshalJSON(sandbox.Env, "{}")
 	if err != nil {
 		return err
@@ -814,11 +877,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
-	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
-		return err
-	}
 
-	_, err = s.db.ExecContext(ctx, `
+	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
@@ -1147,7 +1207,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 		WHERE id = ?
 	`, id)
 
-	sandbox, err := scanSandbox(row)
+	sandbox, err := s.scanSandbox(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1202,7 +1262,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	var sandboxes []*models.Sandbox
 	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
-		sandbox, err := scanSandbox(rows)
+		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1270,7 +1330,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 
 	var sandboxes []*models.Sandbox
 	for rows.Next() {
-		sandbox, err := scanSandbox(rows)
+		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1322,7 +1382,7 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 
 	var sandboxes []*models.Sandbox
 	for rows.Next() {
-		sandbox, err := scanSandbox(rows)
+		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -3546,7 +3606,7 @@ func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.Expos
 	return ports, nil
 }
 
-func scanSandbox(scanner interface {
+func (s *Store) scanSandbox(scanner interface {
 	Scan(dest ...any) error
 }) (*models.Sandbox, error) {
 	var sandbox models.Sandbox
@@ -3639,7 +3699,10 @@ func scanSandbox(scanner interface {
 	sandbox.AutoImportPending = autoImportPending == 1
 	sandbox.WakeArmed = wakeArmed == 1
 
-	if envJSON != "" {
+	// When omitEnvFromScanner is set (SB_SECRET_ENV_SEAL_ENABLED), leave Env
+	// empty so hot List paths (netstats) never carry plaintext. loadEnv reads
+	// the sealed row / plaintext fallback on demand.
+	if !s.omitEnvFromScanner && envJSON != "" {
 		if err := json.Unmarshal([]byte(envJSON), &sandbox.Env); err != nil {
 			return nil, fmt.Errorf("decode sandbox env: %w", err)
 		}
@@ -4060,6 +4123,72 @@ func (s *Store) PutMounts(ctx context.Context, sandboxID string, sealed []byte) 
 	`, sandboxID, sealed, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("upsert sandbox mounts: %w", err)
+	}
+	return nil
+}
+
+// PutEnv stores an encrypted env blob for a sandbox (opaque to the store).
+func (s *Store) PutEnv(ctx context.Context, sandboxID string, sealed []byte) error {
+	return putEnvExec(ctx, s.db, sandboxID, sealed)
+}
+
+func putEnvExec(ctx context.Context, exec dbExecer, sandboxID string, sealed []byte) error {
+	_, err := exec.ExecContext(ctx, `
+		INSERT INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			sealed_blob = excluded.sealed_blob,
+			created_at = excluded.created_at
+	`, sandboxID, sealed, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("upsert sandbox env: %w", err)
+	}
+	return nil
+}
+
+// GetEnv returns the encrypted env blob, or ErrNotFound if no row exists.
+func (s *Store) GetEnv(ctx context.Context, sandboxID string) ([]byte, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT sealed_blob FROM sandbox_env WHERE sandbox_id = ?`, sandboxID)
+	var blob []byte
+	if err := row.Scan(&blob); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get sandbox env: %w", err)
+	}
+	return blob, nil
+}
+
+// GetEnvJSON returns the plaintext env_json column for lazy migration
+// fallback when no sealed sandbox_env row exists yet.
+func (s *Store) GetEnvJSON(ctx context.Context, sandboxID string) (map[string]string, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT env_json FROM sandboxes WHERE id = ?`, sandboxID)
+	var envJSON string
+	if err := row.Scan(&envJSON); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get sandbox env_json: %w", err)
+	}
+	if envJSON == "" || envJSON == "{}" {
+		return map[string]string{}, nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(envJSON), &env); err != nil {
+		return nil, fmt.Errorf("decode sandbox env_json: %w", err)
+	}
+	if env == nil {
+		env = map[string]string{}
+	}
+	return env, nil
+}
+
+// DeleteEnv removes sealed env for a sandbox. Cascade on sandboxes covers
+// destroy; explicit deletes are for replace paths.
+func (s *Store) DeleteEnv(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_env WHERE sandbox_id = ?`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete sandbox env: %w", err)
 	}
 	return nil
 }

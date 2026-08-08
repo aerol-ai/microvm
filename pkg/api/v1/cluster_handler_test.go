@@ -51,12 +51,21 @@ type reserveCall struct {
 }
 
 func (c *createForwardCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	target, _, err := c.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (c *createForwardCluster) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	c.selectPlacementHit++
 	c.selectRequests = append(c.selectRequests, req)
 	if c.selectErr != nil {
-		return cluster.PlacementTarget{}, c.selectErr
+		return cluster.PlacementTarget{}, nil, c.selectErr
 	}
-	return c.target, nil
+	cands := c.members
+	if len(cands) == 0 {
+		cands = []cluster.Member{{NodeID: c.target.NodeID, APIURL: c.target.APIURL, Alive: true}}
+	}
+	return c.target, cands, nil
 }
 
 func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, secrets cluster.PlacementSecrets, ttl time.Duration) error {

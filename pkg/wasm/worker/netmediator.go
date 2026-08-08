@@ -11,6 +11,11 @@ import (
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
+// EgressObserver is notified after a successful DialContext. Implementations
+// must be non-blocking (or fire-and-forget); the dial path must not wait on
+// audit I/O. Destination is host or host:port — never credentials.
+type EgressObserver func(sandboxID, network, address string)
+
 // NetMediator is the host-mediated TCP egress surface for UC-43. Guest WASI
 // sockets (when wired) and host-side proxies dial through here so bytes and
 // quota blocks are observable per sandbox.
@@ -19,6 +24,8 @@ type NetMediator struct {
 	// sandboxID -> block flags
 	blocked map[string]struct{ ingress, egress bool }
 	usage   map[string]*workerNetUsage
+	// observer is called after a successful dial (destination attribution).
+	observer EgressObserver
 }
 
 func newNetMediator() *NetMediator {
@@ -26,6 +33,23 @@ func newNetMediator() *NetMediator {
 		blocked: make(map[string]struct{ ingress, egress bool }),
 		usage:   make(map[string]*workerNetUsage),
 	}
+}
+
+// SetEgressObserver installs (or clears, when nil) the post-dial attribution
+// callback. Safe to call concurrently with DialContext.
+func (m *NetMediator) SetEgressObserver(obs EgressObserver) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.observer = obs
+	m.mu.Unlock()
+}
+
+func (m *NetMediator) egressObserver() EgressObserver {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.observer
 }
 
 func (m *NetMediator) usageFor(sandboxID string) *workerNetUsage {
@@ -65,6 +89,9 @@ func (m *NetMediator) ingressBlocked(sandboxID string) bool {
 }
 
 // DialContext dials address when egress is allowed and counts bytes in/out.
+// On success, the EgressObserver (if any) is invoked asynchronously with the
+// destination — attribution must not block the dial path. Per-destination
+// bytes stay best-effort; aggregate totals use DrainUsage / netstats.
 func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, address string) (net.Conn, error) {
 	if m.egressBlocked(sandboxID) {
 		return nil, wasmengine.ErrNetworkEgressBlocked
@@ -73,6 +100,10 @@ func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, addre
 	conn, err := d.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
+	}
+	if obs := m.egressObserver(); obs != nil {
+		sid, netw, addr := sandboxID, network, address
+		go obs(sid, netw, addr)
 	}
 	u := m.usageFor(sandboxID)
 	return &meteredConn{Conn: conn, usage: u}, nil

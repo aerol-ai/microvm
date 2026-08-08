@@ -37,6 +37,8 @@ feature is still mid-rollout.
 | `SB_FIRECRACKER_SNAPSHOT_ENABLED` | true |
 | `SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD` | true |
 | `SB_FIRECRACKER_OVERLAY_ENABLED` | true |
+| `SB_SECRET_RECIPIENT_FANOUT_ENABLED` | true — defect fix for cross-node failover open (recipient-set sealing + async peer fan-out). Set false only while diagnosing. |
+| `SB_EGRESS_ATTRIBUTION_ENABLED` | true — host-mediated egress destinations (wasm + isolate) into audit JSONL; dial-path only, never create. Set false to disable. |
 
 ## 🔴 Must stay off — security / safety
 | Env var | Why off is correct |
@@ -46,9 +48,34 @@ feature is still mid-rollout.
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
 | `SB_RESOURCE_LIMITS_DISABLED` | *Disables* cgroup limits; `false` already = limits ON. |
 
+## Secret provider (SB_SECRET_PROVIDER)
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault`. Off-state is `local` — never contacts AWS/Vault unless explicitly set. See `docs/.../cluster-secrets.mdx`. |
+| `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. |
+| `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start on awskms boot-canary failure. Default fail-open with a warning. |
+| `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
+| `SB_SECRET_ENV_SEAL_ENABLED` | `false` | Sealed `sandbox_env` rows + Raft Env redaction (RefVersionEnv=2). Format change — enable only after every node can merge Env from the provider bag. Removal criterion: `aerolvm_env_plaintext_fallback_total` stays zero for a release and plaintext `env_json` is dropped. |
+| `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` retention. Pruned daily (and on sink start). `0` disables prune. |
+| `SB_EGRESS_ATTRIBUTION_ENABLED` | `true` | Wasm/isolate egress destination records in the same audit JSONL (`kind=egress`). Observational; off create path. |
+
+### Audit rate limits (security parameters)
+
+These bound amplification on `GET /v1/sandboxes/{id}/audit` (one client call → N peer reads). They are **security parameters**, not throughput knobs. On reject the API returns `429` with `Retry-After` — never silent truncation.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_RATE_LIMIT_IDENTITY` | `10` | Per-`OwnerRef` token rate (req/s). Burst 20. |
+| `SB_AUDIT_RATE_LIMIT_OPERATOR` | `50` | Operator PAT bucket (req/s). Burst 100 — generous for incident response. |
+| `SB_AUDIT_RATE_LIMIT_NODE` | `50` | Global per-node ceiling (req/s). Burst 100. The only effective bound on OSS (single operator identity). |
+
+`vault` is accepted as a known name but **fails boot** with a not-implemented error (no silent fallback to local).
+
 ## 🟡 Opt-in — needs external config/hardware, would break or no-op if forced on
 | Env var | Blocker |
 |---|---|
+| `SB_SECRET_PROVIDER=awskms` | Needs `SB_SECRET_AWS_KMS_KEY_ID` + AWS credentials / IAM. Default remains `local`. |
 | `SB_ENABLE_FIRECRACKER` | Needs KVM/metal host; rejects create otherwise. |
 | `SB_ENABLE_WASM` | Needs a provisioned wasm modules dir. |
 | `SB_CONTAINER_ENGINE` | Code fallback is `docker` (empty/unknown → docker, so a bare host or the local `install.sh` stays dockerd). **Server deployments now default to `containerd`**: the shipped `config/cluster.yml`, Terraform, and Ansible all set `containerd` — set `container_engine: docker` there to keep a legacy dockerd host. This is the docker→containerd migration target; per-sandbox rows record their owning engine so a flip never strands existing sandboxes. containerd is live-validated on the t3 cluster topology (`cluster-3-mixed-containerd`); metal/arm64 provisioning is not yet live-proven (`plans/containerd-engine.md`). |

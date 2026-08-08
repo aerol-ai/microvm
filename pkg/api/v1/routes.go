@@ -47,6 +47,9 @@ type Deps struct {
 	// pkg/api so all versions share one auth contract; the version package
 	// only decides which routes need it.
 	Auth func(http.Handler) http.Handler
+	// AuditLimiter rate-limits GET /v1/sandboxes/{id}/audit only (E1b
+	// amplification bound). Nil disables limiting (tests).
+	AuditLimiter *AuditRateLimiter
 	// Builder is optional. When nil, POST /v1/images/build responds 503.
 	Builder ImageBuilder
 	Build   BuildConfig
@@ -109,6 +112,9 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
+	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
+	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Auth(withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
@@ -179,4 +185,18 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
 	mux.Handle("GET "+cluster.PublicInternalVolumePath, d.Auth(http.HandlerFunc(h.clusterInternalVolume)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
+	// Peer secret fan-out: POST upserts a sealed blob; DELETE removes by sandbox.
+	// Auth is PAT + d.Auth (same as other internal routes). Unauthenticated
+	// rejected; we do not claim foreign-node identity verification.
+	mux.Handle("POST "+cluster.PublicInternalSecretPath, d.Auth(http.HandlerFunc(h.clusterInternalSecretPut)))
+	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", d.Auth(http.HandlerFunc(h.clusterInternalSecretDelete)))
+	// Peer-local audit slice (no fan-out). Used by ListSecretAudit fan-out.
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", d.Auth(http.HandlerFunc(h.clusterInternalSandboxAudit)))
+}
+
+func withAuditLimit(d Deps, next http.Handler) http.Handler {
+	if d.AuditLimiter == nil {
+		return next
+	}
+	return d.AuditLimiter.Middleware(next)
 }

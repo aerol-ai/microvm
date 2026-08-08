@@ -181,6 +181,12 @@ func (p Placement) IsOrphaned() bool {
 type PlacementSecrets struct {
 	Ref     string `json:"ref,omitempty"`
 	Version int    `json:"version,omitempty"`
+	// Recipients is the seal recipient set chosen at reserve time for
+	// failover.policy=recreate. It rides opReserve onto Placement.SecretRecipients
+	// (node IDs only — never ciphertext). Omitempty keeps mixed-version
+	// clusters wire-compatible. RecordPlacement leaves this empty so opPlace
+	// preserves the reservation's set.
+	Recipients []string `json:"recipients,omitempty"`
 }
 
 func (s PlacementSecrets) hasUpdate() bool {
@@ -188,9 +194,14 @@ func (s PlacementSecrets) hasUpdate() bool {
 }
 
 func secretsFromPlacement(p Placement) PlacementSecrets {
+	var recipients []string
+	if len(p.SecretRecipients) > 0 {
+		recipients = append([]string(nil), p.SecretRecipients...)
+	}
 	return PlacementSecrets{
-		Ref:     p.SecretRef,
-		Version: p.SecretVersion,
+		Ref:        p.SecretRef,
+		Version:    p.SecretVersion,
+		Recipients: recipients,
 	}
 }
 
@@ -242,12 +253,16 @@ type Placement struct {
 	// RecoveryRef points at the out-of-snapshot recovery payload for this row.
 	// Spec/secret fields are hydrated from that store only for point lookups and
 	// recreate flows.
-	RecoveryRef       string                       `json:"-"`
-	Spec              *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef         string                       `json:"secret_ref,omitempty"`
-	SecretVersion     int                          `json:"secret_version,omitempty"`
-	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
-	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	RecoveryRef   string                       `json:"-"`
+	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef     string                       `json:"secret_ref,omitempty"`
+	SecretVersion int                          `json:"secret_version,omitempty"`
+	// SecretRecipients is the seal recipient set recorded at reserve time
+	// (owner + N backups). The create target seals to this set and must not
+	// recompute it. Additive omitempty — wire-compatible with older peers.
+	SecretRecipients  []string                 `json:"secret_recipients,omitempty"`
+	ExposedPorts      map[int]string           `json:"exposed_ports,omitempty"`
+	ExposedPortRoutes map[int]ExposedPortRoute `json:"exposed_port_routes,omitempty"`
 	// CustomHostnames is the replicated set of user-bound hostnames pointing at
 	// this sandbox. Kept sorted and lower-cased so snapshot bytes are stable
 	// across rebuilds and every node derives the same Caddy matcher order. The
@@ -342,7 +357,8 @@ type PlacementTarget struct {
 
 // PlacementReservation is one item in a leader-side batch reservation request.
 // Redacted MUST have plaintext credentials stripped before the caller passes it
-// in; Secrets carries only a provider handle or legacy sealed bytes.
+// in; Secrets carries only a provider handle (and optional Recipients for the
+// reserve-time seal set).
 type PlacementReservation struct {
 	SandboxID string
 	Target    PlacementTarget
@@ -427,6 +443,11 @@ type Client interface {
 	// SelectPlacement chooses a node to host a new sandbox with the given
 	// resource request. In single-node mode it always returns self.
 	SelectPlacement(req capacity.Request) (PlacementTarget, error)
+
+	// SelectPlacementWithCandidates is SelectPlacement plus the filtered
+	// candidate slice used to build the secret recipient set at reserve time.
+	// Callers that only need the winner keep using SelectPlacement.
+	SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error)
 
 	// RecordPlacement commits sandboxID -> self into the FSM along with the
 	// (optional) creation spec used to re-materialize the sandbox after a

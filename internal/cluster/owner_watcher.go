@@ -2,10 +2,12 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // ownerWatcherInterval is the polling cadence for the owner watcher loop. The
@@ -31,7 +33,7 @@ const maxRecreateFailuresBeforeReassign = 5
 // opts into failover.policy=recreate are materialized; all others remain
 // ordinary non-HA sandboxes and are orphaned when their owner dies.
 func (c *Cluster) startOwnerWatcher() {
-	c.recreateFailures = &recreateFailureTracker{counts: make(map[string]int)}
+	c.recreateFailures = &recreateFailureTracker{counts: make(map[string]int), permanent: make(map[string]struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ownerWatcherStop = cancel
 	go func() {
@@ -50,10 +52,12 @@ func (c *Cluster) startOwnerWatcher() {
 
 // recreateFailureTracker counts consecutive recreate failures per sandbox so
 // the watcher can escalate from "retry locally" to "ask for reassignment"
-// instead of looping forever on a permanent failure.
+// instead of looping forever on a permanent failure. permanent holds ids that
+// must not be reassigned (e.g. recipient-denied — walking the fleet cannot help).
 type recreateFailureTracker struct {
-	mu     sync.Mutex
-	counts map[string]int
+	mu        sync.Mutex
+	counts    map[string]int
+	permanent map[string]struct{}
 }
 
 func (t *recreateFailureTracker) record(id string) int {
@@ -67,6 +71,23 @@ func (t *recreateFailureTracker) clear(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.counts, id)
+}
+
+func (t *recreateFailureTracker) markPermanent(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.permanent == nil {
+		t.permanent = make(map[string]struct{})
+	}
+	t.permanent[id] = struct{}{}
+	delete(t.counts, id)
+}
+
+func (t *recreateFailureTracker) isPermanent(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.permanent[id]
+	return ok
 }
 
 // recreateOwnedSandboxes scans the FSM for placements where this node is the
@@ -83,6 +104,9 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 	placements := c.fsm.fullPlacementsForOwner(c.nodeID)
 	for id, p := range placements {
 		if !placementWantsFailoverRecreate(p) {
+			continue
+		}
+		if c.recreateFailures != nil && c.recreateFailures.isPermanent(id) {
 			continue
 		}
 		if p.Spec == nil {
@@ -107,6 +131,16 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 			recordFailoverRecreate(err)
 		}
 		if err != nil {
+			// Recipient-denied cannot be fixed by reassigning to another
+			// arbitrary node (D5 / outside-voice #7) — stop churn permanently.
+			if errors.Is(err, secrets.ErrRecipientDenied) {
+				if c.recreateFailures != nil {
+					c.recreateFailures.markPermanent(id)
+				}
+				c.logger.Error("cluster: recreate permanently failed: recipient denied; not reassigning",
+					"sandbox_id", id, "err", err)
+				continue
+			}
 			fails := c.recreateFailures.record(id)
 			c.logger.Warn("cluster: recreate owned sandbox failed",
 				"sandbox_id", id, "consecutive_failures", fails, "err", err)

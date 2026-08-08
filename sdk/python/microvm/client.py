@@ -515,13 +515,19 @@ class MicroVM:
         pushed: Optional[str] = str(pushed_value) if pushed_value else None
         return BuildImageResult(image=image_tag, pushed=pushed)
 
-    def list(self, *, tags: Optional[Dict[str, str]] = None) -> List[Sandbox]:
-        path = self._versioned("/sandboxes") + _build_tag_query(tags)
+    def list(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+    ) -> List[Sandbox]:
+        path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
         sandboxes = self._do_json("GET", path, None)
         return [self._wrap_sandbox(item) for item in sandboxes]
 
-    def get(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
+    def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:
+        path = f"{self._version_prefix}/sandboxes/{sandbox_id}" + _build_sandbox_query(None, include_env)
+        sandbox = self._do_json("GET", path, None)
         return self._wrap_sandbox(sandbox)
 
     def start(self, sandbox_id: str) -> Sandbox:
@@ -1066,17 +1072,25 @@ def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_tag_query(tags: Optional[Dict[str, str]]) -> str:
-    # Renders the tag filter as the server's `?tag.<key>=<value>` wire format.
+    return _build_sandbox_query(tags, False)
+
+
+def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = False) -> str:
+    # Renders tag filters and optional include_env as the server's wire format.
     # The `tag.` prefix is literal — the server's parseTagFilter inspects the
     # decoded query key — so only the user-supplied key and value get
-    # percent-encoded. An empty or missing map returns "" so the request URL is
+    # percent-encoded. An empty query returns "" so the request URL is
     # byte-identical to the pre-filter call (no stray trailing "?").
-    if not tags:
+    parts: List[str] = []
+    if tags:
+        parts.extend(
+            f"tag.{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(str(value), safe='')}"
+            for key, value in tags.items()
+        )
+    if include_env:
+        parts.append("include_env=true")
+    if not parts:
         return ""
-    parts = [
-        f"tag.{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(str(value), safe='')}"
-        for key, value in tags.items()
-    ]
     return "?" + "&".join(parts)
 
 

@@ -81,6 +81,33 @@ type Host struct {
 	bundleSrv     *http.Server
 	egressDenySrv *http.Server
 	ctrlClient    *http.Client
+
+	// egressObserver records host-mediated destinations (E3a). Guarded by mu.
+	egressObserver EgressObserver
+}
+
+// SetEgressObserver installs (or clears) the async egress attribution callback.
+func (h *Host) SetEgressObserver(obs EgressObserver) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.egressObserver = obs
+	h.mu.Unlock()
+}
+
+func (h *Host) observeEgress(sandboxID, network, destination string) {
+	if h == nil {
+		return
+	}
+	h.mu.RLock()
+	obs := h.egressObserver
+	h.mu.RUnlock()
+	if obs == nil {
+		return
+	}
+	sid, netw, dest := sandboxID, network, destination
+	go obs(sid, netw, dest)
 }
 
 // NewHost prepares (does not start) a group host.

@@ -41,6 +41,9 @@ func (s *Server) netUsageFor(sandboxID string) *workerNetUsage {
 func (s *Server) mediator() *NetMediator {
 	if s.net == nil {
 		s.net = newNetMediator()
+		// Worker process: append egress destinations to the daemon's audit JSONL
+		// (cannot import internal/service). Dial-path only; never create.
+		installDefaultEgressObserver(s.net)
 	}
 	return s.net
 }

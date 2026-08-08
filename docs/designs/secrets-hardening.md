@@ -11,9 +11,10 @@ on top of it, not a replacement.
 **Units.** Effort is quoted as **eng-days** (engineer-days) and **CC-days**
 (Claude Code agent-authoring days). CC-days exclude live-AWS verification,
 integration-tagged runs, and external audit cycles — all human- and
-calendar-gated. All estimates assume the measured ~95% package coverage bar
-(`internal/service` 95.1%, `internal/store` 95.1%, `internal/cluster` 95.9%,
-`pkg/secrets` 96.5%), not the 85% floor CLAUDE.md states.
+calendar-gated. CLAUDE.md's coverage floor remains ~85%; for this program hold
+the touched packages at their measured baselines (`internal/service` 95.1%,
+`internal/store` 95.1%, `internal/cluster` 95.9%, `pkg/secrets` 96.5%), not
+the floor.
 
 ## Glossary
 
@@ -396,12 +397,12 @@ verification checklist and a documented rollback.
 
 | Slice | Contents | Exit criterion |
 |---|---|---|
-| 0 | **DONE 2026-08-07.** Recipient-set selection, partial fan-out rule, failed-create leftovers, and `Provider.Open`'s signature are decided in `plans/secrets-hardening.md` §3d. Still open: cluster-read model for E1b (gates slice 3), KMS wrapping-cache TTL (gates slice 4). | Four gates closed; slice 1 unblocked |
-| 1 | T1-T4, T11, T12, **E1a** + peer-push PAT auth + flags + HA-create benchmark | Cross-node failover regression green; default create latency unmoved; unauthenticated peer push rejected; **`failover_ready` reports live holder count** |
-| 2 | T5-T6, E2a, E4 (E2a's substrate gates T6) + provider-agnostic error classes + audit drop counter/gap marker | One audit event per secret read, no plaintext; canary reports at boot; a forced overflow produces a counted gap marker and fires the alert |
-| 3 | T7-T9, T13, E1b + operator dashboard/alerts/runbook (**E1a moved to slice 1** — it guards the async fan-out) | Env sealed at rest; `Get`/`List` omit env; D5 limitation published, `make docs-build` green; no silent empty env on mixed-version rollout |
-| 4 | T10 (demand-gated), E3a + integration chaos case | Both providers pass one contract suite; attribution emits for wasm + isolate + netstats totals; kill-owner-mid-fan-out leaves no half-sealed sandbox |
-| 5 | E3b, E2b (auditor-gated) | Kernel-level IP capture for docker/containerd |
+| 0 | **DONE 2026-08-07.** Recipient-set selection, partial fan-out rule, failed-create leftovers, and `Provider.Open`'s signature are decided in `plans/secrets-hardening.md` §3d. | Four gates closed; slice 1 unblocked |
+| 1 | **DONE 2026-08-07.** T1-T4, T11, T12, E1a + peer-push PAT auth + flags | Cross-node failover regression green; default create latency unmoved; unauthenticated peer push rejected; `failover_ready` reports live holder count |
+| 2 | **DONE 2026-08-08.** T5-T6, E2a (correlation + retention), E4 (canary + alerts + runbook) + audit drop counter/gap marker | One audit event per secret read, no plaintext; canary reports at boot; overflow produces counted gap marker + alert |
+| 3 | **DONE 2026-08-08.** T7-T9, T13, E1b + operator alerts/runbook | Env sealed at rest (flag default-off); `Get`/`List` omit env; D5 limitation published; audit API with fan-out + coverage + rate limit |
+| 4 | **DONE 2026-08-08 (T10 + E3a).** T10 shipped; E3a wasm/isolate egress attribution into shared audit JSONL. Integration chaos case (kill-owner-mid-fan-out) still operator-run behind `integration` tag. | Both providers pass contract suite; attribution emits for wasm + isolate; netstats totals unchanged |
+| 5 | **NOT STARTED.** E3b (own justification required); E2b (auditor-gated) | Kernel-level IP capture for docker/containerd; tamper-evident chain only if an auditor asks |
 
 **Totals, slices 0-5:** ~81 eng-days ≈ **16 engineer-weeks**; ~17 CC-days of
 authoring. At 1.5 engineers that is ~11 calendar weeks of build, plus live-AWS

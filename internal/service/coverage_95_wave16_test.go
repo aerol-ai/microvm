@@ -250,9 +250,9 @@ func TestWasmCheckpointPushBestEffortWave16(t *testing.T) {
 
 func TestSealClusterSecretsMarshalEmptyCipherWave16(t *testing.T) {
 	s := &Service{}
-	_, err := s.SealClusterSecrets(models.CreateSandboxRequest{
+	_, err := s.SealClusterSecretsForRecipient(models.CreateSandboxRequest{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	})
+	}, "*")
 	if err == nil {
 		t.Fatal("expected nil cipher")
 	}

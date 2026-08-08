@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEgressAllowedAndHostMatches(t *testing.T) {
@@ -69,7 +70,7 @@ func TestProxyEgressBlocksLiteralSSRF(t *testing.T) {
 	for _, target := range []string{"http://127.0.0.1:21212/v1/sandboxes", "http://169.254.169.254/latest/meta-data/"} {
 		req := httptest.NewRequest(http.MethodGet, target, nil)
 		rec := httptest.NewRecorder()
-		h.proxyEgress(rec, req, EgressPolicy{}) // allow-all policy
+		h.proxyEgress(rec, req, "sb-ssrf", EgressPolicy{}) // allow-all policy
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("egress to %s = %d, want 403 (blocked)", target, rec.Code)
 		}
@@ -88,7 +89,7 @@ func TestProxyEgressPolicyDeny(t *testing.T) {
 	// Host not in the allowlist → 403 by policy.
 	req := httptest.NewRequest(http.MethodGet, "http://other.example/x", nil)
 	rec := httptest.NewRecorder()
-	h.proxyEgress(rec, req, EgressPolicy{Allow: []string{"only.example"}})
+	h.proxyEgress(rec, req, "sb-1", EgressPolicy{Allow: []string{"only.example"}})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("non-allowlisted host = %d, want 403", rec.Code)
 	}
@@ -101,9 +102,65 @@ func TestProxyEgressPolicyDeny(t *testing.T) {
 	req.Host = ""
 	req.URL.Host = ""
 	rec = httptest.NewRecorder()
-	h.proxyEgress(rec, req, EgressPolicy{})
+	h.proxyEgress(rec, req, "sb-1", EgressPolicy{})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("no-host = %d, want 403", rec.Code)
+	}
+}
+
+// TestProxyEgressObserverCapturesHost proves a successful proxy records the
+// destination on the EgressObserver (E3a). Denied paths must not fire it.
+func TestProxyEgressObserverCapturesHost(t *testing.T) {
+	prev := egressTransport
+	t.Cleanup(func() { egressTransport = prev })
+
+	egressTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	var got struct {
+		sandboxID, network, dest string
+		n                        int
+	}
+	done := make(chan struct{}, 1)
+	h := &Host{}
+	h.SetEgressObserver(func(sandboxID, network, destination string) {
+		got.sandboxID, got.network, got.dest = sandboxID, network, destination
+		got.n++
+		done <- struct{}{}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.com:8443/v1", nil)
+	req.Host = "api.example.com:8443"
+	rec := httptest.NewRecorder()
+	h.proxyEgress(rec, req, "sb-obs", EgressPolicy{})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("observer not called")
+	}
+	if got.n != 1 || got.sandboxID != "sb-obs" || got.network != "tcp" || got.dest != "api.example.com:8443" {
+		t.Fatalf("observer got %+v", got)
+	}
+
+	// Policy deny must not observe.
+	got.n = 0
+	rec = httptest.NewRecorder()
+	h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, "http://other.example/", nil), "sb-obs",
+		EgressPolicy{Allow: []string{"only.example"}})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("deny status = %d", rec.Code)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got.n != 0 {
+		t.Fatalf("observer fired on deny: %+v", got)
 	}
 }
 

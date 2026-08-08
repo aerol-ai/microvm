@@ -215,7 +215,7 @@ func TestSealMountsNilCipherWave12(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected sealMounts nil cipher failure")
 	}
-	_, err = svc.UnsealRegistry([]byte{1, 2, 3})
+	_, err = svc.UnsealRegistry("sb", []byte{1, 2, 3})
 	if err == nil {
 		t.Fatal("expected unseal failure")
 	}

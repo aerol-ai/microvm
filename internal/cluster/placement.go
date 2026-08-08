@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -83,12 +84,20 @@ func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
 // "place locally" is the existing single-node behavior; we only forward when
 // a peer is genuinely better.
 func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
+	target, _, err := c.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+// SelectPlacementWithCandidates is SelectPlacement plus the filtered candidate
+// slice the router uses to record the secret recipient set at reserve time
+// (plans/secrets-hardening §3d-1). The target is always one of candidates.
+func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
 	all := c.membersWithCapacity()
 	rejects := make(map[string]int64)
 	if err := LargeClusterTopologyError(all); err != nil {
 		rejects["topology"] = 1
 		recordSchedulerDecision("invalid_topology", 0, rejects)
-		return PlacementTarget{}, err
+		return PlacementTarget{}, nil, err
 	}
 	// Subtract still-in-flight reservations (router wrote opReserve but the
 	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
@@ -137,7 +146,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, ErrNoPlacementTarget
+		return PlacementTarget{}, nil, ErrNoPlacementTarget
 	}
 
 	// Power-of-two-choices.
@@ -149,7 +158,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 
 	if winner.NodeID == c.nodeID {
 		recordSchedulerDecision("self", len(candidates), rejects)
-		return self, nil
+		return self, candidates, nil
 	}
 	recordSchedulerDecision("remote", len(candidates), rejects)
 	return PlacementTarget{
@@ -158,7 +167,41 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		DataPlaneHost: winner.DataPlaneHost,
 		InternalURL:   winner.InternalURL,
 		IsSelf:        false,
-	}, nil
+	}, candidates, nil
+}
+
+// SelectSecretRecipients builds the seal recipient set: owner first, then up
+// to maxBackups other candidates sorted by NodeID for deterministic stability.
+// When the cluster is smaller than owner+maxBackups, every eligible candidate
+// is included. Empty ownerID or candidates yields nil.
+func SelectSecretRecipients(candidates []Member, ownerID string, maxBackups int) []string {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" || len(candidates) == 0 {
+		return nil
+	}
+	if maxBackups < 0 {
+		maxBackups = 0
+	}
+	seen := map[string]struct{}{ownerID: {}}
+	out := []string{ownerID}
+	rest := make([]string, 0, len(candidates))
+	for _, m := range candidates {
+		id := strings.TrimSpace(m.NodeID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		rest = append(rest, id)
+	}
+	sort.Strings(rest)
+	if maxBackups > len(rest) {
+		maxBackups = len(rest)
+	}
+	out = append(out, rest[:maxBackups]...)
+	return out
 }
 
 // nodeFits returns true if the member could plausibly accept req based on its

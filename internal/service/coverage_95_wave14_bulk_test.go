@@ -389,7 +389,7 @@ func TestPublicTrafficAndRouteHelpersWave14(t *testing.T) {
 func TestSealUnsealRegistryFailWave14(t *testing.T) {
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cipher = newTestCipher(t)
-	_, err := svc.UnsealRegistry([]byte("not-a-valid-sealed-blob"))
+	_, err := svc.UnsealRegistry("sb", []byte("not-a-valid-sealed-blob"))
 	if err == nil {
 		t.Fatal("expected unseal fail")
 	}

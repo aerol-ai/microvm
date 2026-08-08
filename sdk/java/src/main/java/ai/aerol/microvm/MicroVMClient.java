@@ -205,7 +205,7 @@ public class MicroVMClient {
     }
 
     public List<Sandbox> list() {
-        return list(Collections.emptyMap());
+        return list(Collections.emptyMap(), false);
     }
 
     /**
@@ -216,7 +216,15 @@ public class MicroVMClient {
      * keeping fixtures and request matchers stable.
      */
     public List<Sandbox> list(java.util.Map<String, String> tags) {
-        String path = versioned("/sandboxes") + buildTagQuery(tags);
+        return list(tags, false);
+    }
+
+    /**
+     * Lists sandboxes with optional {@code include_env=true}. Env is omitted
+     * from get/list by default; opt-in reads are audited server-side.
+     */
+    public List<Sandbox> list(java.util.Map<String, String> tags, boolean includeEnv) {
+        String path = versioned("/sandboxes") + buildSandboxQuery(tags, includeEnv);
         SandboxData[] response = doJson("GET", path, null, SandboxData[].class);
         if (response == null) {
             return Collections.emptyList();
@@ -230,26 +238,44 @@ public class MicroVMClient {
     // percent-encoded. Returns "" for null/empty so the URL stays
     // byte-identical to the pre-filter call (no stray trailing "?").
     private static String buildTagQuery(java.util.Map<String, String> tags) {
-        if (tags == null || tags.isEmpty()) {
+        return buildSandboxQuery(tags, false);
+    }
+
+    private static String buildSandboxQuery(java.util.Map<String, String> tags, boolean includeEnv) {
+        boolean hasTags = tags != null && !tags.isEmpty();
+        if (!hasTags && !includeEnv) {
             return "";
         }
         StringBuilder out = new StringBuilder("?");
         boolean first = true;
-        for (java.util.Map.Entry<String, String> entry : tags.entrySet()) {
+        if (hasTags) {
+            for (java.util.Map.Entry<String, String> entry : tags.entrySet()) {
+                if (!first) {
+                    out.append('&');
+                }
+                first = false;
+                out.append("tag.");
+                out.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8));
+                out.append('=');
+                out.append(URLEncoder.encode(entry.getValue(), StandardCharsets.UTF_8));
+            }
+        }
+        if (includeEnv) {
             if (!first) {
                 out.append('&');
             }
-            first = false;
-            out.append("tag.");
-            out.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8));
-            out.append('=');
-            out.append(URLEncoder.encode(entry.getValue(), StandardCharsets.UTF_8));
+            out.append("include_env=true");
         }
         return out.toString();
     }
 
     public Sandbox get(String sandboxId) {
-        return wrap(doJson("GET", sandboxPath(sandboxId), null, SandboxData.class));
+        return get(sandboxId, false);
+    }
+
+    /** Fetches a sandbox; when {@code includeEnv} is true, appends {@code ?include_env=true}. */
+    public Sandbox get(String sandboxId, boolean includeEnv) {
+        return wrap(doJson("GET", sandboxPath(sandboxId) + buildSandboxQuery(null, includeEnv), null, SandboxData.class));
     }
 
     public Sandbox start(String sandboxId) {

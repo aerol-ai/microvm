@@ -55,11 +55,11 @@ func TestOpenClusterSecretsWrapperAndV2AAD(t *testing.T) {
 			Server: "ghcr.io", Username: "u", Password: "legacy-secret",
 		},
 	}
-	// SealClusterSecrets binds recipients to "*" so the empty-nodeID
-	// OpenClusterSecrets wrapper can open it (recipient-specific seals deny "").
-	sealed, err := s.SealClusterSecrets(req)
+	// Wildcard recipient so the empty-nodeID OpenClusterSecrets wrapper can
+	// open it (recipient-specific seals deny "").
+	sealed, err := s.SealClusterSecretsForRecipient(req, "*")
 	if err != nil || len(sealed) == 0 {
-		t.Fatalf("SealClusterSecrets: %v", err)
+		t.Fatalf("SealClusterSecretsForRecipient: %v", err)
 	}
 	ref := clusterSecretRef("sb-open", 1)
 	if err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{

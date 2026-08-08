@@ -16,6 +16,7 @@ import type {
   HealthStatus,
   IngressTarget,
   Lifecycle,
+  GetOptions,
   ListOptions,
   MountSpecRedacted,
   RegisterSnapshotOptions,
@@ -89,8 +90,8 @@ export class MicroVM {
     return sandboxes.map((sandbox) => this.wrap(sandbox.toJSON()));
   }
 
-  async get(id: string): Promise<Sandbox> {
-    const sandbox = await this.client.get(id);
+  async get(id: string, options?: GetOptions): Promise<Sandbox> {
+    const sandbox = await this.client.get(id, options);
     return this.wrap(sandbox.toJSON());
   }
 

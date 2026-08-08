@@ -548,6 +548,31 @@ test("MicroVM.list URL-encodes tag keys and values", async () => {
   assert.equal(url.searchParams.get("tag.needs=encode"), "v&v");
 });
 
+test("MicroVM.get and list include_env opt-in", async () => {
+  const urls: string[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      urls.push(new Request(input).url);
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/sandboxes")) {
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ id: "sb-1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  await sdk.get("sb-1", { includeEnv: true });
+  await sdk.list({ tags: { team: "a" }, includeEnv: true });
+  assert.equal(urls[0], "https://api.example.com/v1/sandboxes/sb-1?include_env=true");
+  const listURL = new URL(urls[1]);
+  assert.equal(listURL.searchParams.get("tag.team"), "a");
+  assert.equal(listURL.searchParams.get("include_env"), "true");
+});
+
 // Backward-compat: list() with no options and list({}) must produce the
 // pre-filter URL byte-for-byte so existing fixtures, request matchers, and
 // proxies don't see a stray "?".

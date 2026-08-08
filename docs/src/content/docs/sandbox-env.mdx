@@ -1,0 +1,127 @@
+---
+title: Sandbox Environment Variables
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Environment variables set at create time are secrets. `get` and `list` **omit `env` by default**. Pass an explicit opt-in to load them; those reads are audited on the daemon.
+
+Create responses may still echo the env you just supplied. After create, treat get/list as redacted unless you opt in.
+
+## Get a sandbox with env
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.get(id, { includeEnv: true })
+    console.log(sandbox.env?.API_KEY)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.get(sandbox_id, include_env=True)
+    print(sandbox.get('env', {}).get('API_KEY'))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Get(ctx, id, microvm.WithGetIncludeEnv())
+    if err != nil {
+        return err
+    }
+    fmt.Println(sandbox.Env["API_KEY"])
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.get_with_options(&id, true)?;
+    println!("{:?}", sandbox.data.env);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.get(id, true);
+    System.out.println(sandbox.env.get("API_KEY"));
+    ```
+  </TabItem>
+</Tabs>
+
+## List sandboxes with env
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandboxes = await client.list({
+      tags: { tenant: 'acme' },
+      includeEnv: true,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandboxes = client.list(
+        tags={'tenant': 'acme'},
+        include_env=True,
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandboxes, err := client.List(ctx,
+        microvm.WithTags(map[string]string{"tenant": "acme"}),
+        microvm.WithIncludeEnv(),
+    )
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mut tags = std::collections::HashMap::new();
+    tags.insert("tenant".into(), "acme".into());
+    let sandboxes = client.list_with_options(&tags, true)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    java.util.Map<String, String> tags = new java.util.HashMap<>();
+    tags.put("tenant", "acme");
+    java.util.List<Sandbox> sandboxes = client.list(tags, true);
+    ```
+  </TabItem>
+</Tabs>
+
+## Default get/list (no env)
+
+Omit the opt-in flag — responses do not include `env`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.get(id)
+    // sandbox.env is undefined / empty
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.get(sandbox_id)
+    # sandbox has no env (or empty)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Get(ctx, id)
+    // sandbox.Env is nil / empty
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.get(&id)?;
+    // sandbox.data.env is None / empty
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.get(id);
+    // sandbox.env is null / empty
+    ```
+  </TabItem>
+</Tabs>

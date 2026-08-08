@@ -136,7 +136,9 @@ func OverlapCreateAndPromote(
 			}
 		}()
 		start := time.Now()
-		secrets, err := svc.PutClusterSecretsForRecipient(commitCtx, reservationID, req, c.SelfNodeID())
+		// HA creates: local seal only on this path; async fan-out is off-path
+		// (plans/secrets-hardening §3e). cluster_seal timing stays local seal.
+		secrets, err := svc.SealAndDistribute(commitCtx, reservationID, req, svc.SecretRecipientsForSeal(reservationID), service.SealStrict)
 		if opts.Timing != nil {
 			opts.Timing.RecordStage("cluster_seal", time.Since(start))
 		}
@@ -159,7 +161,7 @@ func OverlapCreateAndPromote(
 	promoteStart := time.Now()
 	var promoteErr error
 	if opts.PromoteWithSpec {
-		redacted := service.RedactClusterSecrets(req)
+		redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
 		promoteErr = c.RecordPlacement(commitCtx, reservationID, &redacted, sr.secrets)
 	} else {
 		promoteErr = c.RecordPlacement(commitCtx, reservationID, nil, sr.secrets)

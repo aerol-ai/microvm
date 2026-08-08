@@ -36,6 +36,7 @@ import type {
   HealthStatus,
   IngressTarget,
   Lifecycle,
+  GetOptions,
   ListOptions,
   MountSpec,
   MountSpecRedacted,
@@ -490,13 +491,14 @@ export class APIClient {
   }
 
   async list(options?: ListOptions): Promise<SandboxResource[]> {
-    const path = this.versioned("/sandboxes") + buildTagQuery(options?.tags);
+    const path = this.versioned("/sandboxes") + buildSandboxListQuery(options);
     const response = await this.doJSON<ApiSandbox[]>("GET", path);
     return response.map((item) => this.wrap(item));
   }
 
-  async get(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${id}`);
+  async get(id: string, options?: GetOptions): Promise<SandboxResource> {
+    const q = buildIncludeEnvQuery(options?.includeEnv);
+    const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${id}${q}`);
     return this.wrap(response);
   }
 
@@ -1473,6 +1475,21 @@ function buildTagQuery(tags: Record<string, string> | undefined): string {
     ([key, value]) => `tag.${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
   );
   return "?" + parts.join("&");
+}
+
+function buildIncludeEnvQuery(includeEnv: boolean | undefined): string {
+  return includeEnv ? "?include_env=true" : "";
+}
+
+function buildSandboxListQuery(options?: ListOptions): string {
+  const tags = buildTagQuery(options?.tags);
+  if (!options?.includeEnv) {
+    return tags;
+  }
+  if (tags === "") {
+    return "?include_env=true";
+  }
+  return tags + "&include_env=true";
 }
 
 function cloneSandbox(sandbox: Sandbox): Sandbox {

@@ -182,7 +182,7 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// sandbox as host-mediated (same posture as WASM). Public L7 routing is
 	// opt-in via expose_port — creates stay private-by-default.
 	sandbox.ContainerIP = "127.0.0.1"
-	if err := s.store.Create(ctx, sandbox); err != nil {
+	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		if errors.Is(err, models.ErrSandboxExists) {
 			// A concurrent create with the same id won the INSERT. Both callers
 			// ran the full driver create for the SAME id — host.Load, the group

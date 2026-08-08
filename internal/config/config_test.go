@@ -828,6 +828,52 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("secret_provider_defaults_local", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.SecretProvider != "local" {
+			t.Fatalf("SecretProvider = %q, want local", cfg.SecretProvider)
+		}
+		if cfg.SecretAuditRetentionDays != 30 {
+			t.Fatalf("SecretAuditRetentionDays = %d, want 30", cfg.SecretAuditRetentionDays)
+		}
+		if !cfg.EgressAttributionEnabled {
+			t.Fatal("EgressAttributionEnabled default = false, want true")
+		}
+		if cfg.AuditRateLimitIdentity != 10 || cfg.AuditRateLimitOperator != 50 || cfg.AuditRateLimitNode != 50 {
+			t.Fatalf("audit rate defaults = %v/%v/%v", cfg.AuditRateLimitIdentity, cfg.AuditRateLimitOperator, cfg.AuditRateLimitNode)
+		}
+	})
+
+	t.Run("secret_provider_awskms_requires_key", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "awskms")
+		t.Setenv("SB_SECRET_AWS_KMS_KEY_ID", "")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_SECRET_AWS_KMS_KEY_ID") {
+			t.Fatalf("expected AWS KMS key error, got %v", err)
+		}
+	})
+
+	t.Run("secret_provider_vault_not_implemented", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "vault")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "not implemented") {
+			t.Fatalf("expected vault not-implemented error, got %v", err)
+		}
+	})
+
 	t.Run("accepts_explicit_data_plane_host", func(t *testing.T) {
 		dir := t.TempDir()
 		setClusterDefaults(t, filepath.Join(dir, "cred.key"))

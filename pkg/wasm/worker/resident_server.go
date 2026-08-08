@@ -33,6 +33,7 @@ func (s *ResidentServer) mediator() *NetMediator {
 	defer s.mu.Unlock()
 	if s.net == nil {
 		s.net = newNetMediator()
+		installDefaultEgressObserver(s.net)
 	}
 	return s.net
 }

@@ -1045,15 +1045,63 @@ type Config struct {
 	ClusterInsecureGossip bool
 	// ClusterInsecureCredentials opts out of the shared-credential-key
 	// requirement in cluster mode. Without a key shared across nodes, sealed
-	// registry passwords and per-mount credentials replicated via raft cannot
-	// be decrypted by a failover owner — recovered sandboxes lose access to
-	// private registries and credentialed mounts. Default false: the daemon
-	// refuses to boot in cluster mode unless either SB_CREDENTIAL_ENCRYPTION_KEY
-	// is set explicitly or a key file already exists at
-	// SB_CREDENTIAL_ENCRYPTION_KEY_PATH (the operator may have distributed it
-	// out of band). Set true only for ephemeral test setups that don't use
-	// sealed creds. SB_CLUSTER_INSECURE_CREDENTIALS.
+	// registry passwords and per-mount credentials cannot be opened by a
+	// failover owner even after recipient-set fan-out (local AES key still
+	// must match). Default false: the daemon refuses to boot in cluster mode
+	// unless either SB_CREDENTIAL_ENCRYPTION_KEY is set explicitly or a key
+	// file already exists at SB_CREDENTIAL_ENCRYPTION_KEY_PATH. Set true only
+	// for ephemeral test setups that don't use sealed creds.
+	// SB_CLUSTER_INSECURE_CREDENTIALS.
 	ClusterInsecureCredentials bool
+
+	// SecretRecipientFanoutEnabled gates recipient-set sealing + async peer
+	// fan-out for failover.policy=recreate sandboxes (plans/secrets-hardening
+	// Slice 1). DEFAULT ON — these are defect fixes for the confirmed
+	// cross-node open walls (sealed row never left the owner; envelope was
+	// recipient-bound to self only). Set SB_SECRET_RECIPIENT_FANOUT_ENABLED=false
+	// to force seal-to-self / no fan-out while diagnosing.
+	SecretRecipientFanoutEnabled bool
+	// SecretRecipientBackupCount is how many non-owner candidates join the
+	// seal recipient set (N = owner + this many backups). Default 2 → 3 total.
+	// Clusters smaller than N use every eligible SelectPlacement candidate.
+	// SB_SECRET_RECIPIENT_BACKUP_COUNT.
+	SecretRecipientBackupCount int
+
+	// SecretProvider selects the secrets.Provider backend: "local" (default —
+	// node-local AES key, never contacts AWS/Vault), "awskms", or "vault".
+	// The off-state is local, not "no provider". SB_SECRET_PROVIDER.
+	SecretProvider string
+	// SecretAWSkmsKeyID is the CMK id/arn/alias used when SecretProvider=awskms.
+	// SB_SECRET_AWS_KMS_KEY_ID.
+	SecretAWSkmsKeyID string
+	// SecretProviderStrictBoot fails daemon start when the awskms boot canary
+	// (wrap/unwrap) fails. Default false = fail-open with a warning (E4 lite).
+	// SB_SECRET_PROVIDER_STRICT_BOOT.
+	SecretProviderStrictBoot bool
+	// SecretEnvSealEnabled gates sealed sandbox_env rows + Raft Env redaction
+	// (plans/secrets-hardening T7/T9). DEFAULT OFF — env storage is a format
+	// change; enable only after every cluster node is on a binary that merges
+	// env from the provider bag (RefVersionEnv=2). SB_SECRET_ENV_SEAL_ENABLED.
+	SecretEnvSealEnabled bool
+	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
+	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
+	SecretAuditRetentionDays int
+	// EgressAttributionEnabled records host-mediated egress destinations
+	// (wasm NetMediator + isolate proxy) into the secret-audit JSONL. Default
+	// ON — observational, dial-path only, never on create. Escape hatch:
+	// SB_EGRESS_ATTRIBUTION_ENABLED=false.
+	EgressAttributionEnabled bool
+	// AuditRateLimitIdentity is the per-OwnerRef token rate (req/s) for
+	// GET /v1/sandboxes/{id}/audit. Security parameter (amplification bound).
+	// SB_AUDIT_RATE_LIMIT_IDENTITY. Default 10.
+	AuditRateLimitIdentity float64
+	// AuditRateLimitOperator is the operator-PAT bucket rate (req/s). Generous
+	// so incident response is not throttled like a tenant. Default 50.
+	// SB_AUDIT_RATE_LIMIT_OPERATOR.
+	AuditRateLimitOperator float64
+	// AuditRateLimitNode is the global per-node ceiling (req/s) on audit
+	// fan-out requests. Default 50. SB_AUDIT_RATE_LIMIT_NODE.
+	AuditRateLimitNode float64
 
 	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
 	// any other future cluster-internal RPC) ride over a separate HTTPS listener
@@ -1547,34 +1595,49 @@ func Load() (Config, error) {
 		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
 		ClusterInsecureCredentials:       getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
-		ClusterTLSDir:                    strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
-		ClusterInternalListenAddr:        getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
-		ClusterInternalAdvertiseURL:      strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
-		ImageBuildContextEnabled:         getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
-		ImageBuildTimeout:                getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
-		ImageBuildGCEnabled:              getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
-		ImageBuildGCInterval:             getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", 24*time.Hour),
-		ImageGCWhitelist:                 parseImageGCWhitelist(os.Getenv("SB_IMAGE_GC_WHITELIST")),
-		ImageDistributionAOCRHost:        strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
-		ImagePullMaxConcurrent:           getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
-		ImagePullFailureBackoff:          getEnvDuration("SB_IMAGE_PULL_FAILURE_BACKOFF", 30*time.Second),
-		AutoImportEnabled:                getEnvBool("SB_AUTO_IMPORT_ENABLED", false),
-		AutoImportHooksBaseURL:           strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_HOOKS_URL")),
-		AutoImportClusterID:              strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_CLUSTER_ID")),
-		AutoImportClusterPATPath:         strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_CLUSTER_PAT_PATH")),
-		AutoImportRetentionSuffix:        strings.TrimSpace(getEnv("SB_AUTO_IMPORT_RETENTION_SUFFIX", "--idle-90d")),
-		AutoImportRequestTimeout:         getEnvDuration("SB_AUTO_IMPORT_REQUEST_TIMEOUT", 15*time.Second),
-		AutoImportReconcileInterval:      getEnvDuration("SB_AUTO_IMPORT_RECONCILE_INTERVAL", 5*time.Minute),
-		AutoImportMaxInFlight:            getEnvInt("SB_AUTO_IMPORT_MAX_IN_FLIGHT", 4),
-		MirrorHost:                       strings.TrimSpace(os.Getenv("SB_MIRROR_HOST")),
-		MirrorPushHost:                   strings.TrimSpace(os.Getenv("SB_MIRROR_PUSH_HOST")),
-		MirrorUpstreams:                  parseMirrorUpstreams(getEnv("SB_MIRROR_UPSTREAMS", "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s")),
-		UpstreamWrapKeyPath:              strings.TrimSpace(os.Getenv("SB_UPSTREAM_WRAP_KEY_PATH")),
-		SnapshotPushEnabled:              getEnvBool("SB_SNAPSHOT_PUSH_ENABLED", false),
-		SnapshotPushReconcileInterval:    getEnvDuration("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL", 5*time.Minute),
-		SnapshotPushMaxInFlight:          getEnvInt("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT", 2),
-		SnapshotPushTagSuffix:            strings.TrimSpace(getEnv("SB_SNAPSHOT_PUSH_TAG_SUFFIX", "")),
+		// Defect-fix flag: default ON (house pattern matches
+		// SB_WASM_RESIDENT_HOST_ENABLED). See plans/secrets-hardening §3e / re-review.
+		SecretRecipientFanoutEnabled: getEnvBool("SB_SECRET_RECIPIENT_FANOUT_ENABLED", true),
+		SecretRecipientBackupCount:   getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
+		SecretProvider:               strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
+		SecretAWSkmsKeyID:            strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
+		SecretProviderStrictBoot:     getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
+		// Format-change flag: default OFF until the fleet is rolled
+		// (house pattern matches SB_PLATFORM_VOLUMES_ENABLED).
+		SecretEnvSealEnabled:          getEnvBool("SB_SECRET_ENV_SEAL_ENABLED", false),
+		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
+		EgressAttributionEnabled:      getEnvBool("SB_EGRESS_ATTRIBUTION_ENABLED", true),
+		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
+		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
+		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
+		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
+		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
+		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
+		ImageBuildContextEnabled:      getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:             getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:          getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:               getEnvDuration("SB_IMAGE_BUILD_GC_TTL", 24*time.Hour),
+		ImageGCWhitelist:              parseImageGCWhitelist(os.Getenv("SB_IMAGE_GC_WHITELIST")),
+		ImageDistributionAOCRHost:     strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
+		ImagePullMaxConcurrent:        getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
+		ImagePullFailureBackoff:       getEnvDuration("SB_IMAGE_PULL_FAILURE_BACKOFF", 30*time.Second),
+		AutoImportEnabled:             getEnvBool("SB_AUTO_IMPORT_ENABLED", false),
+		AutoImportHooksBaseURL:        strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_HOOKS_URL")),
+		AutoImportClusterID:           strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_CLUSTER_ID")),
+		AutoImportClusterPATPath:      strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_CLUSTER_PAT_PATH")),
+		AutoImportRetentionSuffix:     strings.TrimSpace(getEnv("SB_AUTO_IMPORT_RETENTION_SUFFIX", "--idle-90d")),
+		AutoImportRequestTimeout:      getEnvDuration("SB_AUTO_IMPORT_REQUEST_TIMEOUT", 15*time.Second),
+		AutoImportReconcileInterval:   getEnvDuration("SB_AUTO_IMPORT_RECONCILE_INTERVAL", 5*time.Minute),
+		AutoImportMaxInFlight:         getEnvInt("SB_AUTO_IMPORT_MAX_IN_FLIGHT", 4),
+		MirrorHost:                    strings.TrimSpace(os.Getenv("SB_MIRROR_HOST")),
+		MirrorPushHost:                strings.TrimSpace(os.Getenv("SB_MIRROR_PUSH_HOST")),
+		MirrorUpstreams:               parseMirrorUpstreams(getEnv("SB_MIRROR_UPSTREAMS", "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s")),
+		UpstreamWrapKeyPath:           strings.TrimSpace(os.Getenv("SB_UPSTREAM_WRAP_KEY_PATH")),
+		SnapshotPushEnabled:           getEnvBool("SB_SNAPSHOT_PUSH_ENABLED", false),
+		SnapshotPushReconcileInterval: getEnvDuration("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL", 5*time.Minute),
+		SnapshotPushMaxInFlight:       getEnvInt("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT", 2),
+		SnapshotPushTagSuffix:         strings.TrimSpace(getEnv("SB_SNAPSHOT_PUSH_TAG_SUFFIX", "")),
 
 		FleetControlPlaneEnabled:         getEnvBool("SB_FLEET_ENABLED", false),
 		FleetControlPlaneEndpoint:        strings.TrimSpace(os.Getenv("SB_FLEET_ENDPOINT")),
@@ -2034,21 +2097,50 @@ func Load() (Config, error) {
 		if cfg.ClusterGossipSecretKey == "" && !cfg.ClusterInsecureGossip {
 			return Config{}, errors.New("SB_GOSSIP_SECRET_KEY is required when SB_ENABLE_CLUSTER=true (set SB_CLUSTER_INSECURE_GOSSIP=true to opt out — only safe on a fully isolated network)")
 		}
-		// Sealed registry passwords and per-mount credentials replicated via
-		// raft are decrypted with this key on the failover owner. If every
-		// node lazy-generates its own key (the default in single-node mode),
-		// recovered sandboxes silently lose access to private registries and
-		// credentialed mounts. Accept either an explicit env var or an
-		// already-distributed key file on disk; refuse boot otherwise unless
-		// the operator has acknowledged the trade-off via the insecure flag.
+		// Sealed registry/mount credentials use this node-local AES key. A
+		// shared key is necessary but not sufficient for HA failover: the
+		// sealed row must also be fanout to recipient peers (or a KMS
+		// provider used) — see SB_SECRET_RECIPIENT_FANOUT_ENABLED. Accept
+		// either an explicit env var or an already-distributed key file;
+		// refuse boot otherwise unless the operator opts out.
 		if cfg.CredentialEncryptionKey == "" && !cfg.ClusterInsecureCredentials {
 			if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
 				if os.IsNotExist(err) {
-					return Config{}, fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — sealed registry/mount creds will not survive failover without a shared key)", cfg.CredentialEncryptionKeyPath)
+					return Config{}, fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
 				}
 				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
 			}
 		}
+		if cfg.SecretRecipientBackupCount < 0 {
+			return Config{}, errors.New("SB_SECRET_RECIPIENT_BACKUP_COUNT must be >= 0")
+		}
+	}
+
+	switch cfg.SecretProvider {
+	case "", "local":
+		cfg.SecretProvider = "local"
+	case "awskms":
+		if cfg.SecretAWSkmsKeyID == "" {
+			return Config{}, errors.New("SB_SECRET_AWS_KMS_KEY_ID is required when SB_SECRET_PROVIDER=awskms")
+		}
+	case "vault":
+		// Honest reject: vault is a reserved value on the same Provider seam
+		// but is not implemented. Never silently fall back to local.
+		return Config{}, errors.New("SB_SECRET_PROVIDER=vault is not implemented yet; use local or awskms")
+	default:
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, or vault (got %q)", cfg.SecretProvider)
+	}
+	if cfg.SecretAuditRetentionDays < 0 {
+		return Config{}, errors.New("SB_SECRET_AUDIT_RETENTION_DAYS must be >= 0")
+	}
+	if cfg.AuditRateLimitIdentity <= 0 {
+		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_IDENTITY must be > 0")
+	}
+	if cfg.AuditRateLimitOperator <= 0 {
+		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_OPERATOR must be > 0")
+	}
+	if cfg.AuditRateLimitNode <= 0 {
+		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_NODE must be > 0")
 	}
 
 	if cfg.EnableServerless {

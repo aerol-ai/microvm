@@ -270,6 +270,36 @@ class MicroVMClientTest {
     }
 
     @Test
+    void getAndListIncludeEnvQuery() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenQuery = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            seenQuery.set(exchange.getRequestURI().getRawQuery());
+            if (exchange.getRequestURI().getPath().endsWith("/sandboxes")) {
+                writeResponse(exchange, 200, "application/json", "[]".getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("id", "sb-1"));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            client.get("sb-1", true);
+            assertEquals("/v1/sandboxes/sb-1", seenPath.get());
+            assertEquals("include_env=true", seenQuery.get());
+
+            Map<String, String> tags = new HashMap<>();
+            tags.put("team", "a");
+            client.list(tags, true);
+            assertEquals("/v1/sandboxes", seenPath.get());
+            assertTrue(seenQuery.get().contains("include_env=true"));
+            assertTrue(seenQuery.get().contains("tag.team=a"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void createMapsRequestAndResponseShapes() throws Exception {
         AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
         HttpServer server = startServer(exchange -> {

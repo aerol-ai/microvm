@@ -579,6 +579,7 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		Spec:               redacted,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		SecretRecipients:   append([]string(nil), secrets.Recipients...),
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	}
 	return c.applyCommand(ctx, cmd)
@@ -607,6 +608,7 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 			Spec:               r.Redacted,
 			SecretRef:          r.Secrets.Ref,
 			SecretVersion:      r.Secrets.Version,
+			SecretRecipients:   append([]string(nil), r.Secrets.Recipients...),
 			ExpiresUnix:        now.Add(r.TTL).Unix(),
 		})
 	}

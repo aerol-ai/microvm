@@ -662,8 +662,17 @@ impl Client {
         &self,
         tags: &std::collections::HashMap<String, String>,
     ) -> Result<Vec<Sandbox>, Error> {
+        self.list_with_options(tags, false)
+    }
+
+    /// Lists sandboxes with optional `include_env=true` (env omitted by default).
+    pub fn list_with_options(
+        &self,
+        tags: &std::collections::HashMap<String, String>,
+        include_env: bool,
+    ) -> Result<Vec<Sandbox>, Error> {
         let mut path = format!("{}/sandboxes", self.version_prefix());
-        path.push_str(&build_tag_query(tags));
+        path.push_str(&build_sandbox_query(tags, include_env));
         let raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
         Ok(raw
             .into_iter()
@@ -672,11 +681,17 @@ impl Client {
     }
 
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(
-            Method::GET,
-            &format!("{}/sandboxes/{}", self.version_prefix(), id),
-            None,
-        )?;
+        self.get_with_options(id, false)
+    }
+
+    /// Fetches a sandbox; when `include_env` is true, appends `?include_env=true`.
+    pub fn get_with_options(&self, id: &str, include_env: bool) -> Result<Sandbox, Error> {
+        let mut path = format!("{}/sandboxes/{}", self.version_prefix(), id);
+        path.push_str(&build_sandbox_query(
+            &std::collections::HashMap::new(),
+            include_env,
+        ));
+        let raw = self.do_json::<(), SandboxData>(Method::GET, &path, None)?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
@@ -1698,8 +1713,8 @@ async fn run_session_attach(
 // the pre-filter call (no stray trailing "?"). Map iteration order is
 // unspecified; the server treats every `tag.*` pair as an AND clause so the
 // emitted order does not affect the response.
-fn build_tag_query(tags: &std::collections::HashMap<String, String>) -> String {
-    if tags.is_empty() {
+fn build_sandbox_query(tags: &std::collections::HashMap<String, String>, include_env: bool) -> String {
+    if tags.is_empty() && !include_env {
         return String::new();
     }
     let mut out = String::from("?");
@@ -1713,6 +1728,12 @@ fn build_tag_query(tags: &std::collections::HashMap<String, String>) -> String {
         out.push_str(&urlencoding::encode(key));
         out.push('=');
         out.push_str(&urlencoding::encode(value));
+    }
+    if include_env {
+        if !first {
+            out.push('&');
+        }
+        out.push_str("include_env=true");
     }
     out
 }
@@ -3113,6 +3134,58 @@ mod tests {
             request.starts_with("GET /v1/sandboxes?tag.user%2Fid=alice%20bob HTTP/1.1\r\n"),
             "unexpected request: {}",
             request
+        );
+    }
+
+    #[test]
+    fn get_and_list_include_env() {
+        // Only assert wire query for include_env; list returns [] so we avoid
+        // needing a full Sandbox decode fixture for get.
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("team".to_string(), "a".to_string());
+        client
+            .list_with_options(&tags, true)
+            .expect("list_with_options should succeed");
+        let list_req = request_rx.recv().expect("list request");
+        assert!(
+            list_req.contains("include_env=true") && list_req.contains("tag.team=a"),
+            "unexpected list request: {}",
+            list_req
+        );
+
+        // get_with_options shares build_sandbox_query; assert path via a raw
+        // request capture with a minimal valid Sandbox payload.
+        let body = serde_json::json!({
+            "id": "sb-1",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-1.example.com",
+            "container_id": "c1",
+            "container_ip": "10.0.0.1",
+            "cpu": 1,
+            "memory_mb": 512,
+            "disk_gb": 5,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "last_active_at": "2024-01-01T00:00:00Z",
+            "lifecycle": {}
+        })
+        .to_string();
+        let (url2, request_rx2) = spawn_json_server(body);
+        let client2 = Client::new(Some(&url2), Some("pat-token")).expect("client should build");
+        client2
+            .get_with_options("sb-1", true)
+            .expect("get_with_options should succeed");
+        let get_req = request_rx2.recv().expect("get request");
+        assert!(
+            get_req.starts_with("GET /v1/sandboxes/sb-1?include_env=true HTTP/1.1\r\n"),
+            "unexpected get request: {}",
+            get_req
         );
     }
 

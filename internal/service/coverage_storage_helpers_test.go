@@ -283,9 +283,9 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
 		}
 
-		sealed, err := svc.SealClusterSecrets(req)
+		sealed, err := svc.SealClusterSecretsForRecipient(req, "*")
 		if err != nil {
-			t.Fatalf("SealClusterSecrets: %v", err)
+			t.Fatalf("SealClusterSecretsForRecipient: %v", err)
 		}
 		if len(sealed) == 0 {
 			t.Fatal("expected sealed payload")
@@ -334,7 +334,7 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		if _, err := (&Service{cipher: newTestCipher(t)}).PutClusterSecretsForRecipient(ctx, "sb", req, "node-a"); err == nil {
 			t.Fatal("storeless PutClusterSecretsForRecipient accepted")
 		}
-		if _, err := (&Service{cipher: newTestCipher(t)}).OpenClusterSecretsForNode(ctx, redacted, cluster.PlacementSecrets{Ref: "cluster-secret://sandbox/sb/v1", Version: 1}, "node-a"); err == nil {
+		if _, err := (&Service{cipher: newTestCipher(t)}).OpenClusterSecretsForNode(ctx, "sb", redacted, cluster.PlacementSecrets{Ref: "cluster-secret://sandbox/sb/v1", Version: 1}, "node-a"); err == nil {
 			t.Fatal("storeless OpenClusterSecretsForNode accepted")
 		}
 		if _, err := openClusterSecretEnvelopePayload([]byte("bad"), []byte("short"), []string{"node-a"}); err == nil {
@@ -664,15 +664,15 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 func TestClusterSecretAndCustomDomainRollbackBranches(t *testing.T) {
 	ctx := context.Background()
 
-	if _, err := (&Service{}).SealClusterSecrets(models.CreateSandboxRequest{
+	if _, err := (&Service{}).SealClusterSecretsForRecipient(models.CreateSandboxRequest{
 		Image: "alpine",
 		Registry: &models.RegistryAuth{
 			Server:   "ghcr.io",
 			Username: "alice",
 			Password: "secret",
 		},
-	}); err == nil || !strings.Contains(err.Error(), "cipher is not configured") {
-		t.Fatalf("SealClusterSecrets without cipher = %v, want configured-cipher error", err)
+	}, "*"); err == nil || !strings.Contains(err.Error(), "cipher is not configured") {
+		t.Fatalf("SealClusterSecretsForRecipient without cipher = %v, want configured-cipher error", err)
 	}
 
 	cryptoSvc := &Service{cipher: newTestCipher(t)}

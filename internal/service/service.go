@@ -152,9 +152,23 @@ type Service struct {
 	dockerAux *docker.Client
 	caddy     *caddy.Client
 	cipher    *secrets.Cipher
-	mounts    *mounts.Manager
-	admitter  *capacity.Admitter
-	images    ImageDistributionProvider
+	// secretProvider owns cluster-secret Put/Open/Delete (ref → plaintext).
+	// Lazily built from cipher+store when tests construct &Service{...}
+	// without New; mount/registry seal paths still use cipher directly.
+	secretProvider secrets.Provider
+	// secretAudit records every secret decrypt/open (cluster provider,
+	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
+	// unless tests inject a sink. Writes are async/buffered — never on the
+	// StartSandbox / create hot path.
+	secretAudit          SecretAuditSink
+	secretAuditFile      *fileAuditSink // non-nil when the sink is the file writer
+	secretAuditOnce      sync.Once
+	secretAuditPruneStop chan struct{}
+	// testAuditFetcher overrides peer audit fan-out in tests.
+	testAuditFetcher cluster.AuditPeerFetcher
+	mounts           *mounts.Manager
+	admitter         *capacity.Admitter
+	images           ImageDistributionProvider
 	// volumeReclaimer deletes the backing bytes (S3 prefix / NFS dir) of deleted
 	// platform volumes. Non-nil only when the daemon wired a backend reclaimer;
 	// nil leaves the pending_volume_deletions ledger for an external reconciler.
@@ -458,6 +472,9 @@ type Service struct {
 	// testForceUnmountErr, when non-nil, replaces the UnmountAll result in
 	// DestroySandbox so the warn arm is reachable offline. Nil in production.
 	testForceUnmountErr error
+	// testSecretPeerPusher overrides cluster secret fan-out in tests. Nil in
+	// production (SealAndDistribute type-asserts the live Cluster/Agent).
+	testSecretPeerPusher cluster.SecretPeerPusher
 	// testBeforeStoreCreateSnapshot runs after normalize/initial push state and
 	// before store.CreateSnapshot so conflict / GetSnapshot arms can be forced
 	// under the snapshotMu lock. Nil in production.
@@ -499,9 +516,58 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		cluster:     cluster.NewNoop("standalone", "", cfg.EffectivePublicHost()),
 		dnsResolver: &DefaultDNSResolver{},
 	}
+	// Default to local provider when cipher+store are present. Non-local
+	// backends (awskms) are wired by ConfigureSecretProvider at daemon boot
+	// so AWS client construction / boot canary stay off the New() path used
+	// by unit tests.
+	if cipher != nil && db != nil && secrets.NormalizeProviderName(cfg.SecretProvider) == secrets.ProviderLocal {
+		s.secretProvider = secrets.NewLocalProvider(cipher, newSecretBlobStore(db))
+	}
+	s.ensureSecretAuditSink()
 	s.ensureTouchCoalescer()
 	s.ensureCaddyCoalescer()
 	return s
+}
+
+// ConfigureSecretProvider selects the secrets.Provider from cfg.SecretProvider.
+// For awskms it builds the AWS client, runs an optional wrap/unwrap canary
+// (E4 lite), and fails open unless cfg.SecretProviderStrictBoot. Safe to call
+// when the provider is already local — it is a no-op refresh for that case.
+func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
+	opts := secrets.ProviderOptions{
+		Name:        name,
+		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
+		Cipher:      s.cipher,
+		Store:       newSecretBlobStore(s.store),
+	}
+	p, wrapper, err := secrets.NewProvider(ctx, opts)
+	if err != nil {
+		return err
+	}
+	s.secretProvider = p
+	if name != secrets.ProviderAWSKMS || wrapper == nil {
+		return nil
+	}
+	if err := secrets.CanaryWrapUnwrap(ctx, wrapper); err != nil {
+		recordSecretProviderCanary(false)
+		if s.cfg.SecretProviderStrictBoot {
+			return fmt.Errorf("secret provider boot canary failed (SB_SECRET_PROVIDER_STRICT_BOOT=true): %w", err)
+		}
+		if s.logger != nil {
+			s.logger.Warn("secret provider boot canary failed; continuing (set SB_SECRET_PROVIDER_STRICT_BOOT=true to fail closed)",
+				"provider", name, "err", err)
+		}
+		return nil
+	}
+	recordSecretProviderCanary(true)
+	if s.logger != nil {
+		s.logger.Info("secret provider boot canary ok", "provider", name)
+	}
+	return nil
 }
 
 // ensureTouchCoalescer is the lazy init path TouchSandbox uses. Direct
@@ -919,10 +985,12 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // secrets is the provider handle that can rehydrate the redacted spec; we
 // resolve and re-merge it here via OpenClusterSecretsForNode so the recreated
 // container can pull from the same private registry / mount the same external
-// storage. A decrypt failure is
-// fatal to this attempt but non-fatal globally — the watcher's retry loop
-// (now with reassign-after-K-failures) will eventually move the placement
-// to a node whose key matches.
+// storage. Two walls historically blocked cross-node open: the sealed
+// cluster_secrets row lived only on the sealing node, and the envelope was
+// recipient-bound to that node alone. Recipient-set sealing plus async peer
+// fan-out (SB_SECRET_RECIPIENT_FANOUT_ENABLED) fix both. A decrypt failure is
+// fatal to this attempt; ErrRecipientDenied is permanent for this node (the
+// owner watcher must not reassign-churn the fleet).
 //
 // Port replay tries every port but returns an error when any replay failed so
 // the owner watcher keeps retrying and can eventually reassign the placement.
@@ -945,7 +1013,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		if c := s.Cluster(); c != nil {
 			nodeID = c.SelfNodeID()
 		}
-		merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
+		merged, err := s.OpenClusterSecretsForNode(ctx, id, spec, secrets, nodeID)
 		if err != nil {
 			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
@@ -983,7 +1051,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	if c := s.Cluster(); c != nil {
 		nodeID = c.SelfNodeID()
 	}
-	merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
+	merged, err := s.OpenClusterSecretsForNode(ctx, id, spec, secrets, nodeID)
 	if err != nil {
 		return true, fmt.Errorf("recreate %s: %w", id, err)
 	}
@@ -1365,8 +1433,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// blocked by a spec that barely fit without it. Cost: one JSON encode +
 	// SHA-256 of ≤4KiB (~µs), cluster mode only.
 	if s.cfg.EnableCluster {
-		redacted := RedactClusterSecrets(req)
-		handle := cluster.PlacementSecrets{Ref: clusterSecretRef(sandboxID, clusterSecretVersion), Version: clusterSecretVersion}
+		redacted := s.redactClusterSecrets(req)
+		ver := clusterSecretVersion
+		if s.cfg.SecretEnvSealEnabled && len(req.Env) > 0 {
+			ver = secrets.RefVersionEnv
+		}
+		handle := cluster.PlacementSecrets{Ref: clusterSecretRef(sandboxID, ver), Version: ver}
 		if err := cluster.ValidateRecoveryPayloadSize(sandboxID, &redacted, handle); err != nil {
 			return nil, fmt.Errorf("sandbox spec too large to replicate across the cluster (image, env, labels, and mount definitions all count): %w", err)
 		}
@@ -1531,7 +1603,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
-	if err := s.store.Create(ctx, sandbox); err != nil {
+	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		rollbackDestroy(sandbox)
 		cleanupMounts()
@@ -1820,7 +1892,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// Same owner attribution as the docker path; createSandbox already
 	// refreshed the account mapping before dispatching here.
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
-	if err := s.store.Create(ctx, sandbox); err != nil {
+	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
@@ -1875,20 +1947,25 @@ func (s *Service) sealRegistry(auth *models.RegistryAuth) ([]byte, error) {
 // UnsealRegistry decrypts a previously sealed RegistryAuth. Returns nil/nil
 // when the input is empty (no credentials persisted). Exported for the
 // boot-time backfill in cmd/sandboxd that rebuilds CreateSandboxRequest from
-// the persisted Sandbox row.
-func (s *Service) UnsealRegistry(sealed []byte) (*models.RegistryAuth, error) {
+// the persisted Sandbox row. sandboxID is audit-only (ref registry:{id}).
+func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.RegistryAuth, err error) {
 	if len(sealed) == 0 {
 		return nil, nil
 	}
-	plain, err := s.cipher.Decrypt(sealed)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt registry auth: %w", err)
+	done := beginSecretAudit(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "")
+	defer func() { done(err) }()
+	if s == nil || s.cipher == nil {
+		return nil, fmt.Errorf("%w: registry auth cipher is not configured", secrets.ErrDecryptFailed)
 	}
-	var auth models.RegistryAuth
-	if err := json.Unmarshal(plain, &auth); err != nil {
-		return nil, fmt.Errorf("unmarshal registry auth: %w", err)
+	plain, decErr := s.cipher.Decrypt(sealed)
+	if decErr != nil {
+		return nil, fmt.Errorf("%w: decrypt registry auth: %v", secrets.ErrDecryptFailed, decErr)
 	}
-	return &auth, nil
+	var out models.RegistryAuth
+	if err := json.Unmarshal(plain, &out); err != nil {
+		return nil, fmt.Errorf("%w: unmarshal registry auth: %v", secrets.ErrDecryptFailed, err)
+	}
+	return &out, nil
 }
 
 // attachWasmRegistryAuth unseals the sandbox's persisted registry creds into
@@ -1900,7 +1977,7 @@ func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) {
 	if sandbox == nil || len(sandbox.RegistryAuthSealed) == 0 {
 		return
 	}
-	auth, err := s.UnsealRegistry(sandbox.RegistryAuthSealed)
+	auth, err := s.UnsealRegistry(sandbox.ID, sandbox.RegistryAuthSealed)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Warn("wasm: unseal registry auth failed; private module pull may fail on this node",
@@ -1909,6 +1986,84 @@ func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) {
 		return
 	}
 	sandbox.RegistryAuth = auth
+}
+
+// persistSandboxCreate writes the sandbox row, and when env-seal is enabled
+// also the sealed sandbox_env blob in the same store transaction.
+func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || s.store == nil {
+		return errors.New("store is not configured")
+	}
+	if !s.cfg.SecretEnvSealEnabled {
+		return s.store.Create(ctx, sandbox)
+	}
+	sealed, err := s.sealEnv(sandbox.Env)
+	if err != nil {
+		return err
+	}
+	return s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
+}
+
+// sealEnv marshals env and encrypts it for at-rest storage. Returns nil when
+// env is empty (no sandbox_env row).
+func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
+	if len(env) == 0 {
+		return nil, nil
+	}
+	plain, err := json.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("marshal env: %w", err)
+	}
+	if s.cipher == nil {
+		return nil, fmt.Errorf("env cipher is not configured")
+	}
+	sealed, err := s.cipher.Encrypt(plain)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt env: %w", err)
+	}
+	return sealed, nil
+}
+
+// loadEnv reads sealed sandbox_env, falling back to plaintext env_json for
+// lazy migration. Explicit loads are audited (D9 / T6).
+func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string]string, err error) {
+	done := beginSecretAudit(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx))
+	defer func() { done(err) }()
+
+	sealed, getErr := s.store.GetEnv(ctx, sandboxID)
+	if getErr == nil && len(sealed) > 0 {
+		if s.cipher == nil {
+			return nil, fmt.Errorf("%w: env cipher is not configured", secrets.ErrDecryptFailed)
+		}
+		plain, decErr := s.cipher.Decrypt(sealed)
+		if decErr != nil {
+			return nil, fmt.Errorf("%w: decrypt env: %v", secrets.ErrDecryptFailed, decErr)
+		}
+		var out map[string]string
+		if umErr := json.Unmarshal(plain, &out); umErr != nil {
+			return nil, fmt.Errorf("%w: unmarshal env: %v", secrets.ErrDecryptFailed, umErr)
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		return out, nil
+	}
+	if getErr != nil && !errors.Is(getErr, store.ErrNotFound) {
+		return nil, getErr
+	}
+
+	// Lazy migration: sealed row missing → plaintext env_json fallback.
+	plainEnv, plainErr := s.store.GetEnvJSON(ctx, sandboxID)
+	if plainErr != nil {
+		if errors.Is(plainErr, store.ErrNotFound) {
+			return map[string]string{}, nil
+		}
+		return nil, plainErr
+	}
+	if len(plainEnv) > 0 {
+		recordEnvPlaintextFallback()
+	}
+	return plainEnv, nil
 }
 
 // sealMounts marshals the user's mount specs and encrypts the JSON for
@@ -1929,22 +2084,31 @@ func (s *Service) sealMounts(specs []models.MountSpec) ([]byte, error) {
 }
 
 // loadMounts reads, decrypts, and unmarshals a sandbox's stored mount specs.
-// Returns nil, nil when the sandbox has no mounts.
-func (s *Service) loadMounts(ctx context.Context, sandboxID string) ([]models.MountSpec, error) {
-	sealed, err := s.store.GetMounts(ctx, sandboxID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+// Returns nil, nil when the sandbox has no mounts. Decrypt attempts are
+// audited under ref mounts:{sandboxID}.
+func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []models.MountSpec, err error) {
+	sealed, getErr := s.store.GetMounts(ctx, sandboxID)
+	if getErr != nil {
+		if errors.Is(getErr, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, getErr
 	}
-	plain, err := s.cipher.Decrypt(sealed)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt mounts: %w", err)
+	if len(sealed) == 0 {
+		return nil, nil
+	}
+	done := beginSecretAudit(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx))
+	defer func() { done(err) }()
+	if s.cipher == nil {
+		return nil, fmt.Errorf("%w: mounts cipher is not configured", secrets.ErrDecryptFailed)
+	}
+	plain, decErr := s.cipher.Decrypt(sealed)
+	if decErr != nil {
+		return nil, fmt.Errorf("%w: decrypt mounts: %v", secrets.ErrDecryptFailed, decErr)
 	}
 	var file models.MountSpecFile
-	if err := json.Unmarshal(plain, &file); err != nil {
-		return nil, fmt.Errorf("unmarshal mounts: %w", err)
+	if umErr := json.Unmarshal(plain, &file); umErr != nil {
+		return nil, fmt.Errorf("%w: unmarshal mounts: %v", secrets.ErrDecryptFailed, umErr)
 	}
 	return file.Mounts, nil
 }
@@ -1984,8 +2148,36 @@ func generateSandboxSSHKeys() (authorizedKey, privateKeyPEM string, err error) {
 	return authorizedKey, privateKeyPEM, nil
 }
 
+// GetSandboxOptions controls public Get/List env materialization (D9).
+type GetSandboxOptions struct {
+	IncludeEnv bool
+	// CorrelationID is attached to the audited include_env load when set
+	// (typically from X-Correlation-ID / X-Request-ID).
+	CorrelationID string
+}
+
 func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	return s.scopedGet(ctx, id)
+	return s.GetSandboxWithOptions(ctx, id, GetSandboxOptions{})
+}
+
+// GetSandboxWithOptions returns a sandbox. Env is omitted unless IncludeEnv
+// is set; that opt-in path loads via loadEnv and is audited.
+func (s *Service) GetSandboxWithOptions(ctx context.Context, id string, opts GetSandboxOptions) (*models.Sandbox, error) {
+	sb, err := s.scopedGet(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	s.attachFailoverReady(ctx, sb)
+	if opts.IncludeEnv {
+		env, loadErr := s.loadEnv(ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID), id)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		sb.Env = env
+	} else {
+		sb.Env = nil
+	}
+	return sb, nil
 }
 
 // ListSandboxes returns sandboxes whose Tags match every entry in tagFilter.
@@ -1995,7 +2187,13 @@ func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, e
 // extra hop worth it. The filter exists so an external control plane can ask
 // "give me the sandboxes belonging to user X" without round-tripping every
 // sandbox in the cluster (see plans/multi-tenancy-via-control-plane.md).
+// Env is always omitted (D9); use ListSandboxesWithOptions to opt in.
 func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string) ([]*models.Sandbox, error) {
+	return s.ListSandboxesWithOptions(ctx, tagFilter, GetSandboxOptions{})
+}
+
+// ListSandboxesWithOptions is ListSandboxes with optional IncludeEnv (audited).
+func (s *Service) ListSandboxesWithOptions(ctx context.Context, tagFilter map[string]string, opts GetSandboxOptions) ([]*models.Sandbox, error) {
 	sandboxes, err := s.store.List(ctx)
 	if err != nil {
 		return nil, err
@@ -2005,6 +2203,10 @@ func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string
 	// can't tag-probe across owners.
 	sandboxes = filterByOwnerScope(ctx, sandboxes)
 	if len(tagFilter) == 0 {
+		s.attachFailoverReadyAll(ctx, sandboxes)
+		if err := s.applyListEnvOptions(ctx, sandboxes, opts); err != nil {
+			return nil, err
+		}
 		return sandboxes, nil
 	}
 	filtered := sandboxes[:0]
@@ -2013,7 +2215,34 @@ func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string
 			filtered = append(filtered, sb)
 		}
 	}
+	s.attachFailoverReadyAll(ctx, filtered)
+	if err := s.applyListEnvOptions(ctx, filtered, opts); err != nil {
+		return nil, err
+	}
 	return filtered, nil
+}
+
+func (s *Service) applyListEnvOptions(ctx context.Context, sandboxes []*models.Sandbox, opts GetSandboxOptions) error {
+	if opts.IncludeEnv {
+		loadCtx := ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID)
+		for _, sb := range sandboxes {
+			if sb == nil {
+				continue
+			}
+			env, err := s.loadEnv(loadCtx, sb.ID)
+			if err != nil {
+				return err
+			}
+			sb.Env = env
+		}
+		return nil
+	}
+	for _, sb := range sandboxes {
+		if sb != nil {
+			sb.Env = nil
+		}
+	}
+	return nil
 }
 
 // sandboxMatchesTags returns true iff every key in want is present on sb.Tags

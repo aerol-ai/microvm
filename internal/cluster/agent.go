@@ -25,17 +25,24 @@ import (
 )
 
 const (
-	PublicInternalApplyPath             = "/v1/cluster/internal/apply"
-	PublicInternalPlacementPath         = "/v1/cluster/internal/placement/"
-	PublicInternalPlacementByNamePath   = "/v1/cluster/internal/placement-by-name/"
-	PublicInternalPlacementsPath        = "/v1/cluster/internal/placements"
-	PublicInternalPlacementsQueryPath   = "/v1/cluster/internal/placements/query"
-	PublicInternalPlacementsPagePath    = "/v1/cluster/internal/placements/page"
-	PublicInternalRecoveryPath          = "/v1/cluster/internal/recovery/"
-	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
-	PublicInternalVolumePath            = "/v1/cluster/internal/volume"
-	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
-	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
+	PublicInternalApplyPath           = "/v1/cluster/internal/apply"
+	PublicInternalPlacementPath       = "/v1/cluster/internal/placement/"
+	PublicInternalPlacementByNamePath = "/v1/cluster/internal/placement-by-name/"
+	PublicInternalPlacementsPath      = "/v1/cluster/internal/placements"
+	PublicInternalPlacementsQueryPath = "/v1/cluster/internal/placements/query"
+	PublicInternalPlacementsPagePath  = "/v1/cluster/internal/placements/page"
+	PublicInternalRecoveryPath        = "/v1/cluster/internal/recovery/"
+	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
+	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
+	PublicInternalDrainStatePath      = "/v1/cluster/internal/drain/"
+	PublicInternalClusterLeaderPath   = "/v1/cluster/leader"
+	// PublicInternalSecretPath receives peer fan-out of sealed secret blobs
+	// (POST upsert) and delete-fanout (DELETE .../{sandboxID}). Auth is PAT +
+	// d.Auth like every other /v1/cluster/internal/... route.
+	PublicInternalSecretPath = "/v1/cluster/internal/secrets"
+	// PublicInternalSandboxAuditPath is the prefix for peer-local secret audit
+	// reads. Full path: .../sandboxes/{id}/audit
+	PublicInternalSandboxAuditPath      = "/v1/cluster/internal/sandboxes/"
 	controlPlaneRequestTimeout          = 5 * time.Second
 	controlPlanePlacementRequestTimeout = 10 * time.Second
 )
@@ -52,8 +59,9 @@ type SelectPlacementRequest struct {
 }
 
 type SelectPlacementResponse struct {
-	Target PlacementTarget `json:"target"`
-	Error  string          `json:"error,omitempty"`
+	Target     PlacementTarget `json:"target"`
+	Candidates []Member        `json:"candidates,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 type DrainStateResponse struct {
@@ -224,20 +232,25 @@ func (a *Agent) OwnerOfName(name string) (string, OwnerInfo, error) {
 }
 
 func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
+	target, _, err := a.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (a *Agent) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
 	var resp SelectPlacementResponse
 	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalSelectPlacementPath, PublicInternalSelectPlacementPath, SelectPlacementRequest{Request: req}, &resp); err != nil {
-		return PlacementTarget{}, err
+		return PlacementTarget{}, nil, err
 	}
 	if resp.Error != "" {
 		if resp.Error == ErrNoPlacementTarget.Error() {
-			return PlacementTarget{}, ErrNoPlacementTarget
+			return PlacementTarget{}, nil, ErrNoPlacementTarget
 		}
 		if err := invalidTopologyFromMessage(resp.Error); err != nil {
-			return PlacementTarget{}, err
+			return PlacementTarget{}, nil, err
 		}
-		return PlacementTarget{}, errors.New(resp.Error)
+		return PlacementTarget{}, nil, errors.New(resp.Error)
 	}
 	if resp.Target.NodeID == a.nodeID {
 		resp.Target.APIURL = a.apiURL
@@ -245,7 +258,7 @@ func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 		resp.Target.InternalURL = a.internalURL
 		resp.Target.IsSelf = true
 	}
-	return resp.Target, nil
+	return resp.Target, resp.Candidates, nil
 }
 
 func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
@@ -396,6 +409,7 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 		Spec:               redacted,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		SecretRecipients:   append([]string(nil), secrets.Recipients...),
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	})
 }

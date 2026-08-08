@@ -86,9 +86,12 @@ Gossip is how nodes discover each other and share capacity information.
 | `SB_CLUSTER_TLS_DIR` | Recommended | Directory holding the cluster CA and this node's cert and key (`ca.crt`, `node.crt`, `node.key`). When set, internal cluster traffic uses mutual TLS so possession of a PAT alone isn't enough to forge forwarded writes. |
 | `SB_CLUSTER_INTERNAL_LISTEN` | No | Bind address for the cluster-internal mTLS listener. Default `0.0.0.0:7002`. |
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | No | HTTPS URL peers use for the internal mTLS channel - e.g. `https://10.0.0.5:7002`. Auto-derived from the node's primary IP when empty. |
-| `SB_CREDENTIAL_ENCRYPTION_KEY` | Yes | Base64-encoded 32-byte key used to encrypt sandbox credentials (registry passwords, mount secrets) before replicating them across nodes. Every node must share the same value - if they differ, sandboxes that fail over to a new host will lose access to private registries and credentialed mounts. |
+| `SB_CREDENTIAL_ENCRYPTION_KEY` | Yes (local provider) | Shared AES key for the local secrets provider. Necessary but not sufficient for HA: sealed rows must also reach recipient peers via fan-out (or use `SB_SECRET_PROVIDER=awskms`). See [Cluster Secrets Providers](/cluster-secrets). |
 | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | No | File path to load the credential key from. Default `/var/lib/sandboxd/credential_encryption.key`. |
-| `SB_CLUSTER_INSECURE_CREDENTIALS` | No | Skip the credential key requirement. **Recovered sandboxes lose access to private registries and credentialed mounts after failover** without this key. Only for test setups. Default `false`. |
+| `SB_CLUSTER_INSECURE_CREDENTIALS` | No | Skip the credential key requirement. Only for ephemeral test setups that do not use sealed creds. Default `false`. |
+| `SB_SECRET_PROVIDER` | No | `local` (default) \| `awskms` \| `vault`. See [Cluster Secrets Providers](/cluster-secrets). |
+| `SB_SECRET_AWS_KMS_KEY_ID` | When awskms | CMK id/ARN/alias for KMS wrap of per-secret data keys. |
+| `SB_SECRET_RECIPIENT_FANOUT_ENABLED` | No | Recipient-set sealing + async peer fan-out for `failover.policy=recreate`. Default `true`. |
 
 ## GPU support
 
