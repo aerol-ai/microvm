@@ -12,7 +12,8 @@ import (
 )
 
 // SealPolicy governs LOCAL seal behaviour only. Async peer fan-out never
-// fails a create (plans/secrets-hardening §3e / D6).
+// fails a create (plans/secrets-hardening §3e / D6). A short sync MinACK wait
+// may run before return to shrink GAP-1; it still never fails the create.
 type SealPolicy int
 
 const (
@@ -23,18 +24,21 @@ const (
 	SealBestEffort
 )
 
+const defaultSecretFanoutMinACKWait = 2 * time.Second
+
 // secretFanoutHolders tracks successful holder count per sandbox (local put
-// counts as 1; each peer ACK increments). In-memory for v1 — lost on restart
-// (Get then reports not-ready for multi-recipient until a future re-fanout).
+// counts as 1; each peer ACK increments). In-memory — rebuilt at boot by
+// ReFanoutClusterSecrets (local=1, then peer ACKs bump).
 var secretFanoutHolders sync.Map // sandboxID -> int
 
-// SealAndDistribute seals to recipients, stores locally, and kicks async
-// fan-out when the feature flag is on, the sandbox is recreate-HA, and
-// len(recipients) > 1. Policy governs LOCAL seal only.
+// SealAndDistribute seals to recipients, stores locally, and fans out when
+// the feature flag is on, the sandbox is recreate-HA, and len(recipients) > 1.
+// Policy governs LOCAL seal only.
 //
 // Boot-path note: default creates are unchanged (seal-to-self, no fan-out).
-// HA creates pay only the local seal on the create path; peer POST retries
-// run off-path after the handler returns.
+// HA creates: local seal + optional bounded sync wait for ≥1 peer ACK
+// (SB_SECRET_FANOUT_MIN_ACK_WAIT, default 2s) to shrink GAP-1; remaining
+// peers / retries continue asynchronously and never fail the create.
 func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, policy SealPolicy) (cluster.PlacementSecrets, error) {
 	if len(recipients) == 0 {
 		if c := s.Cluster(); c != nil {
@@ -57,7 +61,7 @@ func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req m
 		return out, nil
 	}
 	secretFanoutHolders.Store(sandboxID, 1)
-	s.maybeAsyncFanoutSecret(sandboxID, req, recipients, out)
+	s.fanoutSecretAfterSeal(ctx, sandboxID, req, recipients, out)
 	return out, nil
 }
 
@@ -80,7 +84,9 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 	return cluster.PlacementSecrets{Ref: h.Ref, Version: h.Version, Recipients: append([]string(nil), recipients...)}, nil
 }
 
-func (s *Service) maybeAsyncFanoutSecret(sandboxID string, req models.CreateSandboxRequest, recipients []string, handle cluster.PlacementSecrets) {
+// fanoutSecretAfterSeal runs a bounded sync MinACK wait (when configured),
+// then always kicks an async full fan-out for remaining peers / retries.
+func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, handle cluster.PlacementSecrets) {
 	if s == nil || !s.cfg.SecretRecipientFanoutEnabled {
 		return
 	}
@@ -94,7 +100,6 @@ func (s *Service) maybeAsyncFanoutSecret(sandboxID string, req models.CreateSand
 	if pusher == nil {
 		return
 	}
-	// Capture sealed bytes now so the goroutine doesn't race a rollback delete.
 	blob, err := s.loadSecretBlob(context.Background(), handle.Ref)
 	if err != nil || blob == nil {
 		if s.logger != nil {
@@ -103,7 +108,28 @@ func (s *Service) maybeAsyncFanoutSecret(sandboxID string, req models.CreateSand
 		}
 		return
 	}
+
+	wait := s.secretFanoutMinACKWait()
+	if wait > 0 {
+		waitCtx, cancel := context.WithTimeout(parent, wait)
+		acked, waitErr := pusher.PushSecretBlobToPeers(waitCtx, *blob, recipients)
+		cancel()
+		if acked > 0 {
+			bumpSecretFanoutHolders(sandboxID, acked)
+		}
+		if waitErr != nil && s.logger != nil && acked == 0 {
+			s.logger.Warn("cluster: secret fan-out min-ACK wait got no peer; continuing async",
+				"sandbox_id", sandboxID, "wait", wait, "err", waitErr)
+		}
+	}
 	go s.runSecretFanout(sandboxID, *blob, recipients, pusher)
+}
+
+func (s *Service) secretFanoutMinACKWait() time.Duration {
+	if s == nil {
+		return defaultSecretFanoutMinACKWait
+	}
+	return s.cfg.SecretFanoutMinACKWait
 }
 
 func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, recipients []string, pusher cluster.SecretPeerPusher) {
@@ -111,7 +137,9 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 	defer cancel()
 	acked, err := pusher.PushSecretBlobToPeers(ctx, blob, recipients)
 	if acked > 0 {
-		bumpSecretFanoutHolders(sandboxID, acked)
+		// Idempotent re-push may ACK peers already counted in the min-ACK
+		// wait. Cap at 1 (local) + number of non-self recipients.
+		setSecretFanoutHoldersAtLeast(sandboxID, 1+acked)
 	}
 	if err != nil {
 		recordSecretFanoutFailure()
@@ -120,6 +148,40 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 				"sandbox_id", sandboxID, "acked", acked, "err", err)
 		}
 	}
+}
+
+// ReFanoutClusterSecrets rebuilds in-memory holder counts from local
+// cluster_secrets rows and asynchronously re-pushes multi-recipient blobs to
+// peers. Call once after cluster attach / ownership replay on worker boot so
+// failover_ready is not stuck false forever after a restart.
+func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
+	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
+		return nil
+	}
+	rows, err := s.store.ListClusterSecrets(ctx)
+	if err != nil {
+		return err
+	}
+	pusher := s.secretPeerPusher()
+	for _, rec := range rows {
+		if len(rec.Recipients) == 0 {
+			continue
+		}
+		// Local row ⇒ this node holds the blob.
+		secretFanoutHolders.Store(rec.SandboxID, 1)
+		if len(rec.Recipients) <= 1 || pusher == nil {
+			continue
+		}
+		blob := secrets.SecretBlob{
+			Ref:           rec.Ref,
+			SandboxID:     rec.SandboxID,
+			Version:       rec.Version,
+			Recipients:    append([]string(nil), rec.Recipients...),
+			SealedPayload: append([]byte(nil), rec.SealedPayload...),
+		}
+		go s.runSecretFanout(rec.SandboxID, blob, rec.Recipients, pusher)
+	}
+	return nil
 }
 
 func (s *Service) secretPeerPusher() cluster.SecretPeerPusher {
@@ -218,6 +280,25 @@ func bumpSecretFanoutHolders(sandboxID string, delta int) {
 	}
 }
 
+func setSecretFanoutHoldersAtLeast(sandboxID string, n int) {
+	if sandboxID == "" || n <= 0 {
+		return
+	}
+	for {
+		curAny, loaded := secretFanoutHolders.LoadOrStore(sandboxID, n)
+		if !loaded {
+			return
+		}
+		cur, _ := curAny.(int)
+		if cur >= n {
+			return
+		}
+		if secretFanoutHolders.CompareAndSwap(sandboxID, cur, n) {
+			return
+		}
+	}
+}
+
 func secretHolderCount(sandboxID string) int {
 	if v, ok := secretFanoutHolders.Load(sandboxID); ok {
 		if n, ok := v.(int); ok {
@@ -239,6 +320,11 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 	}
 	recipients := s.secretRecipientsForSandbox(ctx, sb.ID)
 	holders := secretHolderCount(sb.ID)
+	if holders == 0 && len(recipients) > 0 {
+		// Restart amnesia: local sealed row implies this node holds the blob.
+		holders = 1
+		secretFanoutHolders.Store(sb.ID, 1)
+	}
 	ready := false
 	switch {
 	case len(recipients) <= 1:
@@ -265,7 +351,11 @@ func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID stri
 	ref := secrets.FormatRef(sandboxID, secrets.RefVersion)
 	blob, err := newSecretBlobStore(s.store).Get(ctx, ref)
 	if err != nil || blob == nil {
-		return nil
+		// Env-sealed bags may use RefVersionEnv=2.
+		blob, err = newSecretBlobStore(s.store).Get(ctx, secrets.FormatRef(sandboxID, secrets.RefVersionEnv))
+		if err != nil || blob == nil {
+			return nil
+		}
 	}
 	return blob.Recipients
 }

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,6 +225,12 @@ func startInternalApplyServer(t *testing.T, c *Cluster, ln net.Listener) *httpte
 
 // --- helpers below ---
 
+// testClusterMu serializes real raft/memberlist harnesses. Concurrent
+// newTestCluster* calls race on loopback port bind/teardown (memberlist
+// "use of closed network connection" / pickFreeTCPPort TOCTOU) and were the
+// dominant flake signature on clean main (TODOS.md 2026-08-06).
+var testClusterMu sync.Mutex
+
 // newTestCluster builds a real *Cluster on dynamic ports under t.TempDir().
 // bootstrap=true bootstraps a single-voter raft; peers (if non-nil) are gossip
 // addresses to join. Returns a cleanup that closes the cluster — defer it.
@@ -236,8 +243,14 @@ func newTestCluster(t *testing.T, nodeID string, bootstrap bool, gossipPeers []s
 // newTestClusterWithAPI is newTestCluster with a caller-supplied API URL — used
 // when the test needs to advertise a URL it has already pre-bound a listener
 // on (so the gossip-published URL matches an HTTP server the test will start).
+//
+// Construction and Close are serialized via testClusterMu so concurrent
+// harnesses do not race on loopback port bind/teardown (memberlist
+// "use of closed network connection" / pickFreeTCPPort TOCTOU). Multiple
+// clusters may still run concurrently after New returns (two-node tests).
 func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, apiURL string) (*Cluster, func()) {
 	t.Helper()
+	testClusterMu.Lock()
 	raftPort := pickFreeTCPPort(t)
 	gossipPort := pickFreeTCPPort(t)
 	dir := t.TempDir()
@@ -259,13 +272,19 @@ func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPe
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c, err := New(cfg, logger, nil)
+	testClusterMu.Unlock()
 	if err != nil {
 		t.Fatalf("cluster.New(%s): %v", nodeID, err)
 	}
 	return c, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
 		if err := c.Close(); err != nil {
 			t.Logf("cluster.Close(%s): %v", nodeID, err)
 		}
+		// Brief settle so memberlist UDP sockets release before the next
+		// serialized harness binds the same loopback range.
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

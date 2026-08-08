@@ -223,25 +223,21 @@ passed, zero-deployments premise re-verified in-tree). Branch
   (`plans/investor-benchmark-observability.md` §9) once that lands.
 - **Start:** `internal/service/metrics.go` (create), `internal/pool/{wasm,isolate,vmm,dockerpool}/metrics.go`.
 
-## Flaky `internal/cluster` memberlist tests (testing, `internal/cluster`)
+## Flaky `internal/cluster` memberlist tests (testing, `internal/cluster`) — mitigated 2026-08-08
 
-- **What:** Investigate and fix loopback port-binding flakiness in the
-  `internal/cluster` memberlist/SWIM tests.
-- **Why:** The cluster suite is the only guard on the highest-risk package in the
-  repo, it takes ~4.5 min, and it fails intermittently on an unmodified tree. An
-  ambiguous red trains everyone to re-run rather than read the failure — which is
-  exactly how a genuine regression gets dismissed as "probably the flake."
-  `plans/secrets-hardening.md` is about to add cluster code that needs trustworthy
-  signal.
-- **Observed:** 2026-08-06 on clean `main` (7bd7f3e). `go test ./internal/cluster/`
-  run 1 FAILed, run 2 `ok` at 275.65s (coverage 95.9%). Logs show
-  `memberlist: Initiating push/pull sync with: 127.0.0.1:<port>` followed by
-  `[ERR] memberlist: Failed to send gossip to 127.0.0.1:<port>: write udp ...:
-  use of closed network connection`. Signature of tests racing over loopback port
-  binding / teardown ordering, not a product bug.
-- **Caveat (why it's a TODO):** one observation. Could be local machine contention
-  rather than a real race — reproduce before investing in a fix.
-- **Depends on / blocked by:** nothing. Independent of the secrets-hardening work.
-- **Start:** the memberlist harness setup/teardown in `internal/cluster/cluster_test.go`;
-  check whether tests pick fixed ports or let the OS assign, and whether
-  `Shutdown()` is awaited before the next test binds.
+- **What:** Loopback port-binding flakiness in the `internal/cluster`
+  memberlist/SWIM harnesses (`use of closed network connection` after
+  push/pull sync).
+- **Why it mattered:** The cluster suite is the only guard on the highest-risk
+  package; intermittent red trained people to re-run rather than read failures.
+- **Mitigation:** Serialize construct/Close of real raft/memberlist harnesses
+  via `testClusterMu` + 50ms settle after Close in
+  `newTestClusterWithAPI`, `newTestClusterWithRole`,
+  `newTestClusterWithRoleAndGrace`, `newTestClusterWithTLSDir`,
+  `newTestAgentWithRole`, and `newTestAgentWithTLS`. Lock is **not** held for
+  cluster lifetime (multi-node tests still create two clusters concurrently).
+- **Verify:** `go test -count=1 ./internal/cluster/` (and `-count=3` if chasing).
+- **Residual:** Local machine contention can still surface; if flakes return,
+  widen settle or serialize the whole short-lived gossip pair.
+- **Depends on / blocked by:** nothing. Independent of secrets-hardening product
+  code; fixed alongside the GAP follow-ups so cluster signal stays trustworthy.

@@ -605,6 +605,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			if !replayClusterOwnership(ctx, svc, logger) {
 				startClusterOwnershipReplayRetry(ctx, svc, logger)
 			}
+			// Rebuild secret holder counts + re-push multi-recipient blobs so
+			// failover_ready is not stuck false after a restart (holders are
+			// in-memory only). Best-effort; fan-out continues async.
+			if cfg.SecretRecipientFanoutEnabled {
+				if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
+					logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
+				}
+			}
 		}
 		if cfg.IsIngress() {
 			svc.StartClusterIngressReconcile(ctx)

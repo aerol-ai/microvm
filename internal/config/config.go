@@ -1061,6 +1061,12 @@ type Config struct {
 	// recipient-bound to self only). Set SB_SECRET_RECIPIENT_FANOUT_ENABLED=false
 	// to force seal-to-self / no fan-out while diagnosing.
 	SecretRecipientFanoutEnabled bool
+	// SecretFanoutMinACKWait is how long SealAndDistribute waits synchronously
+	// for at least one peer ACK before returning (rest of fan-out stays async).
+	// Shrinks GAP-1 (owner death before any backup holds the blob). Default 2s.
+	// Zero disables the sync wait (fully async, pre-GAP-1-mitigation behavior).
+	// SB_SECRET_FANOUT_MIN_ACK_WAIT.
+	SecretFanoutMinACKWait time.Duration
 	// SecretRecipientBackupCount is how many non-owner candidates join the
 	// seal recipient set (N = owner + this many backups). Default 2 → 3 total.
 	// Clusters smaller than N use every eligible SelectPlacement candidate.
@@ -1598,6 +1604,7 @@ func Load() (Config, error) {
 		// Defect-fix flag: default ON (house pattern matches
 		// SB_WASM_RESIDENT_HOST_ENABLED). See plans/secrets-hardening §3e / re-review.
 		SecretRecipientFanoutEnabled: getEnvBool("SB_SECRET_RECIPIENT_FANOUT_ENABLED", true),
+		SecretFanoutMinACKWait:       getEnvDuration("SB_SECRET_FANOUT_MIN_ACK_WAIT", 2*time.Second),
 		SecretRecipientBackupCount:   getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
 		SecretProvider:               strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
 		SecretAWSkmsKeyID:            strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),

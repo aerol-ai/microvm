@@ -38,6 +38,7 @@ feature is still mid-rollout.
 | `SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD` | true |
 | `SB_FIRECRACKER_OVERLAY_ENABLED` | true |
 | `SB_SECRET_RECIPIENT_FANOUT_ENABLED` | true — defect fix for cross-node failover open (recipient-set sealing + async peer fan-out). Set false only while diagnosing. |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` — sync wait on HA create for ≥1 peer ACK before return (shrinks GAP-1). Remaining peers stay async. `0` = fully async. |
 | `SB_EGRESS_ATTRIBUTION_ENABLED` | true — host-mediated egress destinations (wasm + isolate) into audit JSONL; dial-path only, never create. Set false to disable. |
 
 ## 🔴 Must stay off — security / safety
@@ -56,6 +57,7 @@ feature is still mid-rollout.
 | `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. |
 | `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start on awskms boot-canary failure. Default fail-open with a warning. |
 | `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create; `0` disables (fully async). |
 | `SB_SECRET_ENV_SEAL_ENABLED` | `false` | Sealed `sandbox_env` rows + Raft Env redaction (RefVersionEnv=2). Format change — enable only after every node can merge Env from the provider bag. Removal criterion: `aerolvm_env_plaintext_fallback_total` stays zero for a release and plaintext `env_json` is dropped. |
 | `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` retention. Pruned daily (and on sink start). `0` disables prune. |
 | `SB_EGRESS_ATTRIBUTION_ENABLED` | `true` | Wasm/isolate egress destination records in the same audit JSONL (`kind=egress`). Observational; off create path. |

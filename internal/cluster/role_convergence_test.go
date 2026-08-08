@@ -19,6 +19,7 @@ import (
 // belong on newTestClusterWithCfg.
 func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap bool, gossipPeers []string, grace time.Duration) (*Cluster, func()) {
 	t.Helper()
+	testClusterMu.Lock()
 	raftPort := pickFreeTCPPort(t)
 	gossipPort := pickFreeTCPPort(t)
 	dir := t.TempDir()
@@ -43,6 +44,7 @@ func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c, err := New(cfg, logger, nil)
+	testClusterMu.Unlock()
 	if err != nil {
 		t.Fatalf("cluster.New(%s, role=%s): %v", nodeID, role, err)
 	}
@@ -52,9 +54,12 @@ func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap
 	var once sync.Once
 	return c, func() {
 		once.Do(func() {
+			testClusterMu.Lock()
+			defer testClusterMu.Unlock()
 			if err := c.Close(); err != nil {
 				t.Logf("cluster.Close(%s): %v", nodeID, err)
 			}
+			time.Sleep(50 * time.Millisecond)
 		})
 	}
 }

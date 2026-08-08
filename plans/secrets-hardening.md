@@ -132,7 +132,7 @@ KMS removes WALL 2 (recipient binding). It does nothing about WALL 1.
 | Ciphertext storage | `cluster_secrets` row | `cluster_secrets` row — **same**, KMS stores nothing |
 | Distribution | **async** peer fan-out after create (§3e) | **async peer fan-out after create** — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
-| Boot cost (HA creates only) | **none — fan-out is async (§3e)**; local seal only | **none on the caller**; the KMS wrap rides the async fan-out, not the create |
+| Boot cost (HA creates only) | **bounded sync min-ACK** (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s) then async remainder; local seal always | KMS wrap rides fan-out; first peer ACK may add ≤2s on HA create |
 | Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
 | Offline `make test` | native | fake; live behind `integration` tag |
 
@@ -456,7 +456,7 @@ protecting it — but it changes rotation semantics and belongs in its own plan.
 
 | Failure | Test? | Handled? | User sees |
 |---|---|---|---|
-| **GAP-1: owner dies inside the async fan-out window** | yes (chaos case) | **accepted, not fixed** — bounded by `failover_ready=false` | sandbox is unrecoverable; `failover_ready` was false throughout |
+| **GAP-1: owner dies inside the async fan-out window** | yes (UC-58c + unit) | **mitigated** — bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s) then async remainder; `failover_ready=false` until holders≥2 | create may wait ≤2s for ≥1 peer ACK; if 0 ACKs in window, create still succeeds with `failover_ready=false` |
 | Failover node not in recipient set | yes (D5 case) | must be distinct error | clear error — **required**, not a decrypt failure |
 | Partial fan-out | yes | 3d-2 holder-count rule | create succeeds at owner + ≥1; holder count surfaced |
 | Peer unreachable during fan-out | yes | async retry + backoff + metric | nothing at create; `failover_ready` stays false |
@@ -464,42 +464,38 @@ protecting it — but it changes rotation semantics and belongs in its own plan.
 | **Old node re-merges env it cannot read** | yes | writer capability gate | **must fail loudly** — silent empty env is the critical gap |
 | KMS unreachable during fan-out | yes (fake) | async retry + backoff | nothing at create; `failover_ready` stays false |
 | Legacy plaintext env row | yes | lazy fallback | transparent |
+| **Holder count lost on restart** | yes (ReFanout unit) | **fixed** — boot `ReFanoutClusterSecrets` rebuilds holders from local rows + async re-push | brief `failover_ready=false` until peers ACK again |
 
-### GAP-1 — the async fan-out window (ACCEPTED, not fixed)
+### GAP-1 — the async fan-out window (MITIGATED)
 
-**There is a window between `201 Created` and fan-out completion during which
-the sandbox is running but no backup node holds its credentials. If the owner
-dies in that window, failover fails and the sandbox cannot be recreated
-anywhere.**
+**There is a window between create returning and fan-out completion during which
+the sandbox may be running with fewer than HA holders.** If the owner dies in
+that window, failover fails and the sandbox cannot be recreated anywhere.
 
-This is a direct and accepted consequence of the §3e decision to make key
-distribution asynchronous so callers never block on it. It is a real gap, not a
-theoretical one, and it is recorded here rather than in a design section so it
-cannot be missed.
+Original §3e made distribution fully asynchronous so callers never blocked on
+peer I/O. That left an unbounded race. The mitigation is a **bounded sync
+min-ACK wait** (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s): create waits for
+≥1 peer ACK (or the timeout), then continues any remaining peer pushes async.
+`SecretFanoutMinACKWait=0` restores fully-async behavior.
 
-What bounds it:
+What bounds the remaining window:
 
-- `failover_ready` reads **false** for the entire window (E1a, moved into slice
-  1 specifically for this). The system never claims a guarantee it does not
-  have, so no operator or automation is misled into believing the sandbox is
-  recoverable.
-- Fan-out retries with bounded backoff, so transient peer failures close the
-  window on their own rather than leaving it open indefinitely.
-- Failures emit `aerolvm_secret_fanout_failures_total` and feed the operator
-  alert, so a window that is *not* closing becomes visible.
+- Default create waits up to ~2s for the first backup ACK — typically closes
+  the race for healthy clusters before `201` returns.
+- If 0 peers ACK in the window, create still succeeds (never fails create on
+  peer I/O); `failover_ready` stays false and async fan-out continues.
+- `failover_ready` reads **false** for the entire unreplicated window (E1a).
+- Fan-out retries with bounded backoff; failures emit
+  `aerolvm_secret_fanout_failures_total` and feed the operator alert.
+- Live chaos: integration `UC-58c` (kill-owner-mid-fan-out, `integration` +
+  disruptive gate).
 
-What does **not** bound it: window length. There is no upper bound on how long
-a fan-out can take when peers are unreachable, and no create-time guarantee of
-any kind. A sandbox can be live and permanently not-failover-ready.
+Who is affected: only `failover.policy=recreate` sandboxes. Non-HA sandboxes
+are explicitly orphaned on owner death regardless.
 
-Who is affected: only `failover.policy=recreate` sandboxes, since no other
-sandbox fans out at all. Non-HA sandboxes are explicitly orphaned on owner death
-regardless (`service.go:929`), so nothing changes for them.
-
-**If `failover_ready` does not ship in slice 1, this gap becomes silent and §3e
-is not safe.** That coupling is the reason E1a moved out of slice 3.
-
-Accepted trade: callers never wait on peer I/O during create.
+Accepted residual: when peers are unreachable for the whole min-ACK window,
+create returns with `failover_ready=false` and the HA guarantee is not yet live
+— honesty over silent half-sealing.
 
 ### The other critical gap
 
@@ -1044,7 +1040,7 @@ revocation stays instant and CloudTrail stays complete. **E5 credential
 brokering is out of scope** — customer secrets arrive at create time, platform
 KMS covers only AerolVM's own wrapping keys, and the "every use attributed"
 claim is withdrawn. New accepted gap
-recorded: **GAP-1**, the async fan-out window (§10).
+recorded: **GAP-1** (mitigated via min-ACK wait + `failover_ready`; residual when peers unreachable — §10).
 
 **UNRESOLVED DECISIONS:**
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask

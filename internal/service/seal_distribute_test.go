@@ -136,7 +136,10 @@ func TestSealAndDistributeFansOutWhenHA(t *testing.T) {
 	st := openSealTestStore(t)
 	pusher := &fakePeerPusher{acked: 1, done: make(chan struct{})}
 	svc := &Service{
-		cfg:                  config.Config{SecretRecipientFanoutEnabled: true},
+		cfg: config.Config{
+			SecretRecipientFanoutEnabled: true,
+			SecretFanoutMinACKWait:       50 * time.Millisecond,
+		},
 		cipher:               cipher,
 		store:                st,
 		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
@@ -152,15 +155,134 @@ func TestSealAndDistributeFansOutWhenHA(t *testing.T) {
 	if err != nil || handle.Ref == "" {
 		t.Fatalf("seal: %+v %v", handle, err)
 	}
+	// Min-ACK wait already called Push synchronously; holders should be ≥2.
+	if got := secretHolderCount("sb-fan"); got < 2 {
+		t.Fatalf("after min-ACK holders=%d, want >=2", got)
+	}
 	select {
 	case <-pusher.done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected async fan-out push")
+		t.Fatal("expected fan-out push")
 	}
 	pusher.mu.Lock()
 	defer pusher.mu.Unlock()
 	if pusher.pushCalls == 0 {
 		t.Fatal("pushCalls=0")
+	}
+}
+
+func TestSealAndDistributeMinACKTimeoutContinuesAsync(t *testing.T) {
+	// GAP-1 mitigation: slow peers still get async retry; create does not fail.
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	slow := &slowPeerPusher{delay: 200 * time.Millisecond, acked: 1, done: make(chan struct{})}
+	svc := &Service{
+		cfg: config.Config{
+			SecretRecipientFanoutEnabled: true,
+			SecretFanoutMinACKWait:       20 * time.Millisecond, // shorter than delay → sync gets 0
+		},
+		cipher:               cipher,
+		store:                st,
+		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: slow,
+	}
+	req := models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+	clearSecretFanoutHolders("sb-slow")
+	handle, err := svc.SealAndDistribute(ctx, "sb-slow", req, []string{"node-a", "node-b"}, SealStrict)
+	if err != nil || handle.Ref == "" {
+		t.Fatalf("seal must succeed despite min-ACK timeout: %+v %v", handle, err)
+	}
+	if got := secretHolderCount("sb-slow"); got != 1 {
+		t.Fatalf("after timed-out min-ACK holders=%d, want 1 (local only)", got)
+	}
+	select {
+	case <-slow.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected async fan-out after min-ACK timeout")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if secretHolderCount("sb-slow") >= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("async fan-out never raised holders (got %d)", secretHolderCount("sb-slow"))
+}
+
+type slowPeerPusher struct {
+	delay time.Duration
+	acked int
+	done  chan struct{}
+	mu    sync.Mutex
+	n     int
+}
+
+func (s *slowPeerPusher) PushSecretBlobToPeers(ctx context.Context, _ secrets.SecretBlob, _ []string) (int, error) {
+	timer := time.NewTimer(s.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-timer.C:
+	}
+	if s.done != nil {
+		select {
+		case <-s.done:
+		default:
+			close(s.done)
+		}
+	}
+	return s.acked, nil
+}
+
+func (s *slowPeerPusher) DeleteSecretOnPeers(context.Context, string, []string) error { return nil }
+
+func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	pusher := &fakePeerPusher{acked: 1, done: make(chan struct{})}
+	svc := &Service{
+		cfg: config.Config{
+			SecretRecipientFanoutEnabled: true,
+			SecretFanoutMinACKWait:       0, // fully async for this setup
+		},
+		cipher:               cipher,
+		store:                st,
+		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	req := models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+	if _, err := svc.SealAndDistribute(ctx, "sb-refan", req, []string{"node-a", "node-b"}, SealStrict); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	clearSecretFanoutHolders("sb-refan")
+	if secretHolderCount("sb-refan") != 0 {
+		t.Fatal("expected cleared holders")
+	}
+	pusher.done = make(chan struct{})
+	if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
+		t.Fatalf("refanout: %v", err)
+	}
+	if got := secretHolderCount("sb-refan"); got != 1 {
+		t.Fatalf("after re-fanout local holders=%d, want 1", got)
+	}
+	select {
+	case <-pusher.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected re-fanout push")
 	}
 }
 

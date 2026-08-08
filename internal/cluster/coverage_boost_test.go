@@ -536,6 +536,7 @@ func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossi
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for attempt := 0; attempt < 5; attempt++ {
+		testClusterMu.Lock()
 		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 		raftPort := pickFreeTCPPort(t)
 		gossipPort := pickFreeTCPPort(t)
@@ -557,11 +558,15 @@ func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossi
 			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
 		}
 		c, err := New(cfg, logger, nil)
+		testClusterMu.Unlock()
 		if err == nil {
 			return c, func() {
+				testClusterMu.Lock()
+				defer testClusterMu.Unlock()
 				if err := c.Close(); err != nil {
 					t.Logf("cluster.Close(%s): %v", nodeID, err)
 				}
+				time.Sleep(50 * time.Millisecond)
 			}
 		}
 		if !strings.Contains(err.Error(), "address already in use") {
@@ -582,6 +587,7 @@ func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tlsDir := writeTestClusterTLSDir(t)
 	for attempt := 0; attempt < 5; attempt++ {
+		testClusterMu.Lock()
 		gossipPort := pickFreeTCPPort(t)
 		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 		cfg := config.Config{
@@ -598,11 +604,15 @@ func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string
 			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
 		}
 		a, err := NewAgent(cfg, logger, nil)
+		testClusterMu.Unlock()
 		if err == nil {
 			return a, func() {
+				testClusterMu.Lock()
+				defer testClusterMu.Unlock()
 				if err := a.Close(); err != nil {
 					t.Logf("agent.Close(%s): %v", nodeID, err)
 				}
+				time.Sleep(50 * time.Millisecond)
 			}
 		}
 		if !strings.Contains(err.Error(), "address already in use") {

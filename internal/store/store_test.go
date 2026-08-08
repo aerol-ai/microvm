@@ -2230,6 +2230,58 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 	}
 }
 
+func TestListClusterSecrets(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	empty, err := st.ListClusterSecrets(ctx)
+	if err != nil {
+		t.Fatalf("ListClusterSecrets empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ListClusterSecrets empty = %d, want 0", len(empty))
+	}
+
+	a := ClusterSecretRecord{
+		Ref:           "cluster-secret://sandbox/sb-a/v1",
+		SandboxID:     "sb-a",
+		Version:       1,
+		Recipients:    []string{"node-a", "node-b"},
+		SealedPayload: []byte("cipher-a"),
+	}
+	b := ClusterSecretRecord{
+		Ref:           "cluster-secret://sandbox/sb-b/v1",
+		SandboxID:     "sb-b",
+		Version:       2,
+		Recipients:    []string{"node-a"},
+		SealedPayload: []byte("cipher-b"),
+	}
+	if err := st.PutClusterSecret(ctx, a); err != nil {
+		t.Fatalf("PutClusterSecret a: %v", err)
+	}
+	if err := st.PutClusterSecret(ctx, b); err != nil {
+		t.Fatalf("PutClusterSecret b: %v", err)
+	}
+
+	got, err := st.ListClusterSecrets(ctx)
+	if err != nil {
+		t.Fatalf("ListClusterSecrets: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListClusterSecrets len = %d, want 2", len(got))
+	}
+	// ORDER BY sandbox_id, ref
+	if got[0].SandboxID != "sb-a" || got[1].SandboxID != "sb-b" {
+		t.Fatalf("order = %q,%q want sb-a,sb-b", got[0].SandboxID, got[1].SandboxID)
+	}
+	if len(got[0].Recipients) != 2 || string(got[0].SealedPayload) != "cipher-a" {
+		t.Fatalf("row a = %+v", got[0])
+	}
+	if len(got[1].Recipients) != 1 || string(got[1].SealedPayload) != "cipher-b" {
+		t.Fatalf("row b = %+v", got[1])
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "state.db")

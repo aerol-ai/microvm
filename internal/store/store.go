@@ -4111,6 +4111,40 @@ func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID st
 	return nil
 }
 
+// ListClusterSecrets returns every local sealed cluster-secret row. Used at
+// boot to re-fanout multi-recipient blobs and rebuild in-memory holder counts
+// after a restart (holders are not persisted).
+func (s *Store) ListClusterSecrets(ctx context.Context) ([]ClusterSecretRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
+		FROM cluster_secrets
+		ORDER BY sandbox_id, ref
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list cluster secrets: %w", err)
+	}
+	defer rows.Close()
+	var out []ClusterSecretRecord
+	for rows.Next() {
+		var rec ClusterSecretRecord
+		var recipientsJSON string
+		if err := rows.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan cluster secret: %w", err)
+		}
+		if recipientsJSON != "" {
+			if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+				return nil, fmt.Errorf("unmarshal cluster secret recipients: %w", err)
+			}
+		}
+		rec.SealedPayload = nullableBlob(rec.SealedPayload)
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list cluster secrets: %w", err)
+	}
+	return out, nil
+}
+
 // PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
 // to the store layer; encryption / decryption happens in the service layer.
 func (s *Store) PutMounts(ctx context.Context, sandboxID string, sealed []byte) error {

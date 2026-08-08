@@ -260,15 +260,14 @@ path on a background ticker, **not** create.
 
 ## Known gaps
 
-**GAP-1 — the async fan-out window.** Key distribution is asynchronous so callers
-never block on peer I/O during create. The consequence: between `201 Created` and
-fan-out completion, the sandbox runs while no backup node holds its credentials.
-An owner death in that window means the sandbox cannot be recreated anywhere.
+**GAP-1 — the async fan-out window (mitigated).** Key distribution was fully
+async so create never blocked on peer I/O (§3e). Residual: between create
+return and HA holders≥2, an owner death can leave the sandbox unrecreateable.
 
-Bounded by `failover_ready` reading false for the whole window (E1a, moved into
-slice 1 for exactly this reason), bounded retries with backoff, and a metric plus
-alert when a window is not closing. **Not** bounded in length — a sandbox can be
-live and permanently not-failover-ready if peers stay unreachable.
+Mitigation: bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default
+2s) for ≥1 peer ACK, then async remainder; `failover_ready=false` until ready;
+boot `ReFanoutClusterSecrets` after restart; chaos coverage via UC-58c
+(integration + disruptive). Set wait to `0` to restore fully-async create.
 
 Affects only `failover.policy=recreate` sandboxes. Full detail in
 `plans/secrets-hardening.md` §10 GAP-1.
@@ -289,8 +288,9 @@ Affects only `failover.policy=recreate` sandboxes. Full detail in
    asked, drop it to deferred rather than building on schedule.
 4. **This is a program, not a fix.** The confirmed P1 defect is T3. Ship slice 1
    independently and early.
-5. **GAP-1 is accepted, not solved.** The async fan-out window is a real hole in
-   the HA guarantee, bounded only by `failover_ready` being honest about it.
+5. **GAP-1 residual remains when peers are unreachable for the whole min-ACK
+   window.** Create still returns; `failover_ready` stays honest (`false`) until
+   holders catch up. Not a silent half-seal.
 
 ## External dependency
 
