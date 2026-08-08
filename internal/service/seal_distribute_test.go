@@ -57,6 +57,49 @@ func openSealTestStore(t *testing.T) *storepkg.Store {
 	return st
 }
 
+func TestUpsertClusterSecretBlobValidatesRecipientAndRef(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	svc := &Service{
+		cfg:    config.Config{},
+		store:  st,
+		cipher: cipher,
+	}
+	svc.AttachCluster(cluster.NewNoop("node-b", "http://b", ""))
+
+	bag := secrets.Secrets{Registry: &models.RegistryAuth{Password: "p"}}
+	sealed, err := secrets.SealEnvelope(cipher, bag, []string{"node-a", "node-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok := secrets.SecretBlob{
+		Ref: secrets.FormatRef("sb-ok", 1), SandboxID: "sb-ok", Version: 1,
+		Recipients: []string{"node-a", "node-b"}, SealedPayload: sealed,
+	}
+	if err := svc.UpsertClusterSecretBlob(ctx, ok); err != nil {
+		t.Fatalf("valid upsert: %v", err)
+	}
+
+	badRef := ok
+	badRef.Ref = secrets.FormatRef("other", 1)
+	if err := svc.UpsertClusterSecretBlob(ctx, badRef); !errors.Is(err, ErrInvalidClusterSecretBlob) {
+		t.Fatalf("bad ref = %v, want ErrInvalidClusterSecretBlob", err)
+	}
+
+	foreign, err := secrets.SealEnvelope(cipher, bag, []string{"node-a", "node-c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := secrets.SecretBlob{
+		Ref: secrets.FormatRef("sb-deny", 1), SandboxID: "sb-deny", Version: 1,
+		Recipients: []string{"node-a", "node-c"}, SealedPayload: foreign,
+	}
+	if err := svc.UpsertClusterSecretBlob(ctx, denied); !errors.Is(err, secrets.ErrRecipientDenied) {
+		t.Fatalf("non-recipient = %v, want ErrRecipientDenied", err)
+	}
+}
+
 func TestSealAndDistributeStrictVsBestEffort(t *testing.T) {
 	ctx := context.Background()
 	req := models.CreateSandboxRequest{

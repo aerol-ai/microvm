@@ -185,13 +185,12 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
 	mux.Handle("GET "+cluster.PublicInternalVolumePath, d.Auth(http.HandlerFunc(h.clusterInternalVolume)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
-	// Peer secret fan-out: POST upserts a sealed blob; DELETE removes by sandbox.
-	// Auth is PAT + d.Auth (same as other internal routes). Unauthenticated
-	// rejected; we do not claim foreign-node identity verification.
-	mux.Handle("POST "+cluster.PublicInternalSecretPath, d.Auth(http.HandlerFunc(h.clusterInternalSecretPut)))
-	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", d.Auth(http.HandlerFunc(h.clusterInternalSecretDelete)))
-	// Peer-local audit slice (no fan-out). Used by ListSecretAudit fan-out.
-	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", d.Auth(http.HandlerFunc(h.clusterInternalSandboxAudit)))
+	// Peer secret fan-out + peer-local audit: PAT/operator only. Managed
+	// tenant tokens authenticate via d.Auth but must not PUT/DELETE sealed
+	// rows or read another sandbox's audit slice (P0 multi-tenant).
+	mux.Handle("POST "+cluster.PublicInternalSecretPath, withAuthOperator(d, http.HandlerFunc(h.clusterInternalSecretPut)))
+	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", withAuthOperator(d, http.HandlerFunc(h.clusterInternalSecretDelete)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", withAuthOperator(d, http.HandlerFunc(h.clusterInternalSandboxAudit)))
 }
 
 func withAuditLimit(d Deps, next http.Handler) http.Handler {

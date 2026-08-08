@@ -267,6 +267,23 @@ func RecipientAllowed(recipients []string, nodeID string) bool {
 	return false
 }
 
+// EnvelopeRecipients returns the recipient list declared in a sealed envelope
+// without decrypting the payload. Used by peer-receive validation so a node
+// can reject blobs that do not name it before storing ciphertext.
+func EnvelopeRecipients(sealed []byte) ([]string, error) {
+	if len(sealed) == 0 {
+		return nil, fmt.Errorf("empty sealed payload")
+	}
+	var envelope sealedSecretsEnvelope
+	if err := json.Unmarshal(sealed, &envelope); err != nil {
+		return nil, fmt.Errorf("unmarshal cluster secret envelope: %w", err)
+	}
+	if len(envelope.Payload) == 0 {
+		return nil, fmt.Errorf("cluster secret envelope missing payload")
+	}
+	return NormalizeRecipients(envelope.Recipients), nil
+}
+
 // FormatRef builds the stable cluster-secret://sandbox/{id}/v{version} handle.
 func FormatRef(sandboxID string, version int) string {
 	return fmt.Sprintf("cluster-secret://sandbox/%s/v%d", strings.TrimSpace(sandboxID), version)

@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -214,11 +216,73 @@ func (s *Service) loadSecretBlob(ctx context.Context, ref string) (*secrets.Secr
 
 // UpsertClusterSecretBlob stores a peer-pushed sealed blob without re-sealing.
 // Idempotent (store UPSERT). Used by POST /v1/cluster/internal/secrets.
+//
+// Rejects blobs whose ref does not match sandbox_id/version, whose declared
+// recipients omit this node, or whose sealed envelope recipients disagree /
+// omit this node — so a compromised tenant token (if it ever reached the
+// handler) cannot poison arbitrary peer rows.
 func (s *Service) UpsertClusterSecretBlob(ctx context.Context, blob secrets.SecretBlob) error {
 	if s == nil || s.store == nil {
 		return errors.New("cluster secret store is not configured")
 	}
+	if err := validatePeerSecretBlob(s, blob); err != nil {
+		return err
+	}
 	return newSecretBlobStore(s.store).Put(ctx, blob)
+}
+
+// ErrInvalidClusterSecretBlob is a client-fixable peer-push body (ref /
+// version / recipients shape). Mapped to HTTP 400 by the internal handler.
+var ErrInvalidClusterSecretBlob = errors.New("invalid cluster secret blob")
+
+func validatePeerSecretBlob(s *Service, blob secrets.SecretBlob) error {
+	sandboxID := strings.TrimSpace(blob.SandboxID)
+	ref := strings.TrimSpace(blob.Ref)
+	if sandboxID == "" || ref == "" || len(blob.SealedPayload) == 0 {
+		return fmt.Errorf("%w: ref, sandbox_id, and sealed_payload are required", ErrInvalidClusterSecretBlob)
+	}
+	if blob.Version < 1 {
+		return fmt.Errorf("%w: version must be >= 1", ErrInvalidClusterSecretBlob)
+	}
+	wantRef := secrets.FormatRef(sandboxID, blob.Version)
+	if ref != wantRef {
+		return fmt.Errorf("%w: ref %q does not match sandbox_id/version (want %q)", ErrInvalidClusterSecretBlob, ref, wantRef)
+	}
+
+	wireRecipients := secrets.NormalizeRecipients(blob.Recipients)
+	envelopeRecipients, err := secrets.EnvelopeRecipients(blob.SealedPayload)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidClusterSecretBlob, err)
+	}
+	if !sameStringSlice(wireRecipients, envelopeRecipients) {
+		return fmt.Errorf("%w: wire recipients do not match sealed envelope", ErrInvalidClusterSecretBlob)
+	}
+
+	selfID := ""
+	if c := s.Cluster(); c != nil {
+		selfID = strings.TrimSpace(c.SelfNodeID())
+	}
+	if selfID == "" {
+		// No cluster identity (misconfig / Noop without node id) — refuse
+		// rather than store an unbound peer push.
+		return fmt.Errorf("%w: receiving node identity is unknown", ErrInvalidClusterSecretBlob)
+	}
+	if !secrets.RecipientAllowed(envelopeRecipients, selfID) {
+		return fmt.Errorf("%w: receiving node %q is not an intended recipient", secrets.ErrRecipientDenied, selfID)
+	}
+	return nil
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // SecretRecipientsForSeal returns the recorded Placement.SecretRecipients when

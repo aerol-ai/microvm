@@ -200,6 +200,28 @@ func TestOpenEnvelopeBadJSONAndDecryptFailures(t *testing.T) {
 	}
 }
 
+func TestEnvelopeRecipients(t *testing.T) {
+	c := testCipher(t)
+	sealed, err := SealEnvelope(c, Secrets{Registry: &models.RegistryAuth{Password: "p"}}, []string{"node-b", "node-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := EnvelopeRecipients(sealed)
+	if err != nil {
+		t.Fatalf("EnvelopeRecipients: %v", err)
+	}
+	want := NormalizeRecipients([]string{"node-a", "node-b"})
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("got %#v want %#v", got, want)
+	}
+	if _, err := EnvelopeRecipients(nil); err == nil {
+		t.Fatal("empty sealed should error")
+	}
+	if _, err := EnvelopeRecipients([]byte(`{"version":3}`)); err == nil {
+		t.Fatal("missing payload should error")
+	}
+}
+
 func TestOpenEnvelopePayloadGCMOpenFailure(t *testing.T) {
 	c := testCipher(t)
 	sealed, err := SealRawEnvelope(c, []byte(`{"x":1}`), []string{"*"})

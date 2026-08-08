@@ -1254,6 +1254,14 @@ func (h *handlers) clusterInternalSecretPut(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := h.deps.Service.UpsertClusterSecretBlob(r.Context(), blob); err != nil {
+		if errors.Is(err, service.ErrInvalidClusterSecretBlob) {
+			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, secrets.ErrRecipientDenied) {
+			apihttp.WriteError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
