@@ -164,11 +164,14 @@ type Service struct {
 	secretAuditFile      *fileAuditSink // non-nil when the sink is the file writer
 	secretAuditOnce      sync.Once
 	secretAuditPruneStop chan struct{}
+	secretAuditPruneDone sync.WaitGroup
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
-	mounts           *mounts.Manager
-	admitter         *capacity.Admitter
-	images           ImageDistributionProvider
+	// testSandboxMetaFetcher overrides owner-ref probes for ingress audit auth.
+	testSandboxMetaFetcher cluster.SandboxMetaFetcher
+	mounts                 *mounts.Manager
+	admitter               *capacity.Admitter
+	images                 ImageDistributionProvider
 	// volumeReclaimer deletes the backing bytes (S3 prefix / NFS dir) of deleted
 	// platform volumes. Non-nil only when the daemon wired a backend reclaimer;
 	// nil leaves the pending_volume_deletions ledger for an external reconciler.
@@ -2062,6 +2065,15 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string
 	}
 	if len(plainEnv) > 0 {
 		recordEnvPlaintextFallback()
+		// Best-effort reseal when the flag is on so subsequent reads leave
+		// the sealed row as source of truth (and clear dual-write risk).
+		if s.cfg.SecretEnvSealEnabled {
+			if sealedBytes, sealErr := s.sealEnv(plainEnv); sealErr == nil && len(sealedBytes) > 0 {
+				if putErr := s.store.PutEnv(ctx, sandboxID, sealedBytes); putErr == nil {
+					_ = s.store.ClearEnvJSON(ctx, sandboxID)
+				}
+			}
+		}
 	}
 	return plainEnv, nil
 }

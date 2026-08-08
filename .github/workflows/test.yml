@@ -38,6 +38,9 @@ jobs:
               - 'pkg/**'
               - 'go.mod'
               - 'go.sum'
+              - 'integration-tests/suite/harness/**'
+              - '.github/workflows/test.yml'
+              - 'scripts/scale-gates.sh'
             go_sdk:
               - 'sdk/go/**'
               - 'go.mod'
@@ -51,7 +54,7 @@ jobs:
 
   go-tests:
     needs: changes
-    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_main == 'true'
+    if: needs.changes.outputs.go_main == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -72,6 +75,12 @@ jobs:
         run: |
           go test -count=1 -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
           go tool cover -func=coverage.out | tail -n 1
+
+      - name: Race (audit + secrets hot paths)
+        run: go test -race -count=1 -timeout 10m ./internal/service/ -run 'SecretAudit|ListSecretAudit|Seal|Fanout|EnvSeal|Egress'
+
+      - name: Scale gates
+        run: AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -run 'TestScaleGate' ./internal/cluster ./internal/service
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7
@@ -95,7 +104,7 @@ jobs:
     # test self-skips when AEROL_WASM_IT_* are unset, so forks and credential-less
     # PRs stay green. Runs only when daemon Go code changed.
     needs: changes
-    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_main == 'true'
+    if: needs.changes.outputs.go_main == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -116,7 +125,7 @@ jobs:
 
   go-sdk-tests:
     needs: changes
-    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_sdk == 'true'
+    if: needs.changes.outputs.go_sdk == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -133,7 +142,7 @@ jobs:
 
   java-sdk-tests:
     needs: changes
-    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.java_sdk == 'true'
+    if: needs.changes.outputs.java_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -155,7 +164,7 @@ jobs:
 
   python-sdk-tests:
     needs: changes
-    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.python_sdk == 'true'
+    if: needs.changes.outputs.python_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -179,7 +188,7 @@ jobs:
 
   typescript-sdk-tests:
     needs: changes
-    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.typescript_sdk == 'true'
+    if: needs.changes.outputs.typescript_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:

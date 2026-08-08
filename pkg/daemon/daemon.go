@@ -612,6 +612,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
 					logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
 				}
+				if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+					logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
+				}
 			}
 		}
 		if cfg.IsIngress() {

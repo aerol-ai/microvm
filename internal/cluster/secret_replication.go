@@ -19,11 +19,12 @@ const secretFanoutMaxAttempts = 4
 
 // PushSecretBlobToPeers POSTs the sealed blob to each non-self recipient that
 // is alive and has an APIURL. Best-effort with bounded backoff; returns the
-// first error after retries are exhausted (callers log + metric). No-op when
-// c is nil / has no gossip (Noop path never reaches here).
-func (c *Cluster) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (acked int, err error) {
+// node IDs that ACK'd (callers intersect with live membership for
+// failover_ready). No-op when c is nil / has no gossip (Noop path never
+// reaches here).
+func (c *Cluster) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
 	if c == nil || c.gossip == nil || c.httpClient == nil {
-		return 0, nil
+		return nil, nil
 	}
 	return pushSecretBlobToPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, blob, recipients)
 }
@@ -38,9 +39,9 @@ func (c *Cluster) DeleteSecretOnPeers(ctx context.Context, sandboxID string, rec
 }
 
 // Agent mirrors for worker nodes that seal locally and need to fan out.
-func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (acked int, err error) {
+func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
 	if a == nil || a.gossip == nil || a.httpClient == nil {
-		return 0, nil
+		return nil, nil
 	}
 	return pushSecretBlobToPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, blob, recipients)
 }
@@ -55,13 +56,13 @@ func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recip
 // SecretPeerPusher is the narrow seam Service uses for async fan-out so tests
 // can inject a fake without a full Cluster.
 type SecretPeerPusher interface {
-	PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (acked int, err error)
+	PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error)
 	DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string) error
 }
 
-func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) (int, error) {
+func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
 	if client == nil || len(recipients) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	want := make(map[string]struct{}, len(recipients))
 	for _, id := range recipients {
@@ -72,13 +73,13 @@ func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.C
 		want[id] = struct{}{}
 	}
 	if len(want) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	body, err := json.Marshal(blob)
 	if err != nil {
-		return 0, fmt.Errorf("cluster: marshal secret blob: %w", err)
+		return nil, fmt.Errorf("cluster: marshal secret blob: %w", err)
 	}
-	acked := 0
+	var acked []string
 	var firstErr error
 	for _, m := range members {
 		if _, ok := want[m.NodeID]; !ok || !m.Alive || m.APIURL == "" {
@@ -93,7 +94,7 @@ func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.C
 			}
 			continue
 		}
-		acked++
+		acked = append(acked, m.NodeID)
 	}
 	return acked, firstErr
 }

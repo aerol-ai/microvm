@@ -119,7 +119,7 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			continue
 		}
-		if ev.SandboxID != sandboxID {
+		if ev.SandboxID != sandboxID && ev.Result != secretAuditResultGap {
 			continue
 		}
 		if !secretAuditKindMatches(ev.Kind, opts.Kind) {
@@ -203,11 +203,16 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		apiURL string
 	}
 	var jobs []peerJob
+	deadPrefer := map[string]struct{}{}
+	for id := range prefer {
+		deadPrefer[id] = struct{}{}
+	}
 	for _, m := range members {
 		if !m.Alive || strings.TrimSpace(m.APIURL) == "" {
 			continue
 		}
 		if m.NodeID == selfID {
+			delete(deadPrefer, m.NodeID)
 			continue
 		}
 		role := strings.TrimSpace(m.Role)
@@ -219,11 +224,18 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 				continue
 			}
 		}
+		delete(deadPrefer, m.NodeID)
 		peerURL := strings.TrimRight(m.APIURL, "/")
 		if peerURL == "" || peerURL == selfURL {
 			continue
 		}
 		jobs = append(jobs, peerJob{nodeID: m.NodeID, apiURL: peerURL})
+	}
+	for id := range deadPrefer {
+		if id == selfID {
+			continue
+		}
+		coverage.Missing = append(coverage.Missing, id)
 	}
 
 	if fetcher == nil {

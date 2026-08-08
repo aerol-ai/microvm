@@ -50,17 +50,18 @@ func (p *KMSProvider) Put(ctx context.Context, sandboxID string, s Secrets, reci
 	if err != nil {
 		return Handle{}, mapProviderWrapError(err)
 	}
-	ref := FormatRef(sandboxID, RefVersion)
+	ref := FormatRef(sandboxID, HandleVersionFor(s))
+	version := HandleVersionFor(s)
 	if err := p.store.Put(ctx, SecretBlob{
 		Ref:           ref,
 		SandboxID:     sandboxID,
-		Version:       RefVersion,
+		Version:       version,
 		Recipients:    recipients,
 		SealedPayload: sealed,
 	}); err != nil {
 		return Handle{}, err
 	}
-	return Handle{Ref: ref, Version: RefVersion}, nil
+	return Handle{Ref: ref, Version: version}, nil
 }
 
 // Open resolves h to plaintext. nodeID is accepted for the Provider contract

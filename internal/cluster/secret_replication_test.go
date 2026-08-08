@@ -42,16 +42,16 @@ func TestPushSecretBlobToPeersIdempotentAndAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
-	if acked != 1 {
-		t.Fatalf("acked = %d, want 1", acked)
+	if len(acked) != 1 || acked[0] != "peer-a" {
+		t.Fatalf("acked = %v, want [peer-a]", acked)
 	}
 	if posts.Load() != 1 {
 		t.Fatalf("posts = %d, want 1", posts.Load())
 	}
 	// Retry is idempotent at the peer (handler returns 204 again).
 	acked, err = pushSecretBlobToPeers(context.Background(), members, srv.Client(), "test-pat", "self", blob, []string{"self", "peer-a"})
-	if err != nil || acked != 1 {
-		t.Fatalf("retry acked=%d err=%v", acked, err)
+	if err != nil || len(acked) != 1 {
+		t.Fatalf("retry acked=%v err=%v", acked, err)
 	}
 }
 

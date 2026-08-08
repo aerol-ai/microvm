@@ -65,7 +65,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	h := &handlers{deps: d}
 
 	mux.Handle("GET "+PathPrefix+"/capacity", d.Auth(http.HandlerFunc(h.capacity)))
-	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Auth(http.HandlerFunc(h.reconcile)))
+	mux.Handle("POST "+PathPrefix+"/admin/reconcile", withAuthOperator(d, http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.clusterBuildImageWrap)))
 
 	// POST /sandboxes is special: placement happens in the wrapper before any
@@ -105,10 +105,9 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Auth(wrap(http.HandlerFunc(h.listCustomDomains))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/custom-domains/{hostname}", d.Auth(wrap(http.HandlerFunc(h.removeCustomDomain))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains/dns", d.Auth(wrap(http.HandlerFunc(h.customDomainDNS))))
-	// Ingress DNS target — not sandbox-scoped, so no clusterForwardWrap
-	// (any node can answer from its own gossip view). Auth still required:
-	// the response reveals cluster ingress topology.
-	mux.Handle("GET "+PathPrefix+"/ingress/dns", d.Auth(http.HandlerFunc(h.ingressDNS)))
+	// Ingress DNS target — not sandbox-scoped. Operator-only: reveals cluster
+	// ingress topology to managed tenants otherwise.
+	mux.Handle("GET "+PathPrefix+"/ingress/dns", withAuthOperator(d, http.HandlerFunc(h.ingressDNS)))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
@@ -151,46 +150,37 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox", d.Auth(wrap(http.HandlerFunc(h.toolboxProxy))))
 	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox/{path...}", d.Auth(wrap(http.HandlerFunc(h.toolboxProxy))))
 
-	// Cluster observability (Phase 1). Read-only; safe to expose alongside
-	// the v1 surface without violating the v1 freeze (these are net-new
-	// paths, not changes to existing wire format).
-	mux.Handle("GET "+PathPrefix+"/cluster/members", d.Auth(http.HandlerFunc(h.clusterMembers)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", d.Auth(http.HandlerFunc(h.clusterRemoveMember)))
-	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.Auth(http.HandlerFunc(h.clusterLeader)))
-	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", d.Auth(http.HandlerFunc(h.clusterPlacement)))
-	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", d.Auth(http.HandlerFunc(h.clusterSandboxIndex)))
-	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", d.Auth(http.HandlerFunc(h.clusterIngressRoute)))
-	// Drain / uncordon are operator admission controls — they don't move
-	// existing work, they just stop SelectPlacement from sending new sandboxes
-	// to the node. PATCH-style verbs would also fit but POST keeps the surface
-	// consistent with /admin/reconcile (also a leader-side write side effect).
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", d.Auth(http.HandlerFunc(h.clusterDrainNode)))
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", d.Auth(http.HandlerFunc(h.clusterUncordonNode)))
-	mux.Handle("POST "+cluster.PublicWasmMigratePath, d.Auth(http.HandlerFunc(h.clusterWasmMigrate)))
-	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
-	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
-	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", d.Auth(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", d.Auth(http.HandlerFunc(h.clusterDeleteOrphan)))
-	// Internal endpoint: receives leader-forwarded raft commands from peer
-	// nodes that aren't the current leader. Auth-gated by the same PAT as
-	// every other route — see clusterInternalApply for the leadership-shift
-	// retry contract.
-	mux.Handle("POST "+cluster.PublicInternalApplyPath, d.Auth(http.HandlerFunc(h.clusterInternalApply)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalPlacement)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", d.Auth(http.HandlerFunc(h.clusterInternalPlacementByName)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacements)))
-	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
-	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsPage)))
-	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", d.Auth(http.HandlerFunc(h.clusterInternalRecoveryGet)))
-	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
-	mux.Handle("GET "+cluster.PublicInternalVolumePath, d.Auth(http.HandlerFunc(h.clusterInternalVolume)))
-	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
-	// Peer secret fan-out + peer-local audit: PAT/operator only. Managed
-	// tenant tokens authenticate via d.Auth but must not PUT/DELETE sealed
-	// rows or read another sandbox's audit slice (P0 multi-tenant).
-	mux.Handle("POST "+cluster.PublicInternalSecretPath, withAuthOperator(d, http.HandlerFunc(h.clusterInternalSecretPut)))
-	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", withAuthOperator(d, http.HandlerFunc(h.clusterInternalSecretDelete)))
-	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", withAuthOperator(d, http.HandlerFunc(h.clusterInternalSandboxAudit)))
+	// Cluster observability + admission controls + peer internals: operator /
+	// fleet-PAT only. Managed tenant tokens must not drain nodes, apply Raft
+	// commands, or read fleet topology (P0). Peer HTTP uses SB_PAT_TOKEN.
+	op := func(next http.Handler) http.Handler { return withAuthOperator(d, next) }
+	mux.Handle("GET "+PathPrefix+"/cluster/members", op(http.HandlerFunc(h.clusterMembers)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", op(http.HandlerFunc(h.clusterRemoveMember)))
+	mux.Handle("GET "+PathPrefix+"/cluster/leader", op(http.HandlerFunc(h.clusterLeader)))
+	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", op(http.HandlerFunc(h.clusterPlacement)))
+	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
+	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
+	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
+	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", op(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
+	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", op(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
+	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", op(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", op(http.HandlerFunc(h.clusterDeleteOrphan)))
+	mux.Handle("POST "+cluster.PublicInternalApplyPath, op(http.HandlerFunc(h.clusterInternalApply)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", op(http.HandlerFunc(h.clusterInternalPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", op(http.HandlerFunc(h.clusterInternalPlacementByName)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, op(http.HandlerFunc(h.clusterInternalPlacements)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, op(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, op(http.HandlerFunc(h.clusterInternalPlacementsPage)))
+	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", op(http.HandlerFunc(h.clusterInternalRecoveryGet)))
+	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, op(http.HandlerFunc(h.clusterInternalSelectPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalVolumePath, op(http.HandlerFunc(h.clusterInternalVolume)))
+	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", op(http.HandlerFunc(h.clusterInternalDrainState)))
+	mux.Handle("POST "+cluster.PublicInternalSecretPath, op(http.HandlerFunc(h.clusterInternalSecretPut)))
+	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", op(http.HandlerFunc(h.clusterInternalSecretDelete)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", op(http.HandlerFunc(h.clusterInternalSandboxAudit)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", op(http.HandlerFunc(h.clusterInternalSandboxMeta)))
 }
 
 func withAuditLimit(d Deps, next http.Handler) http.Handler {

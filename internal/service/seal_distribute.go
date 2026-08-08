@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -28,10 +29,62 @@ const (
 
 const defaultSecretFanoutMinACKWait = 2 * time.Second
 
-// secretFanoutHolders tracks successful holder count per sandbox (local put
-// counts as 1; each peer ACK increments). In-memory — rebuilt at boot by
-// ReFanoutClusterSecrets (local=1, then peer ACKs bump).
-var secretFanoutHolders sync.Map // sandboxID -> int
+// secretFanoutHolders tracks which node IDs have ACK'd holding a sealed blob
+// (local put seeds self). Live failover_ready intersects this set with current
+// membership — historical ACK counts alone are not enough after a backup dies.
+var secretFanoutHolders sync.Map // sandboxID -> *holderNodeSet
+
+type holderNodeSet struct {
+	mu    sync.Mutex
+	nodes map[string]struct{}
+}
+
+func holderSetFor(sandboxID string) *holderNodeSet {
+	v, _ := secretFanoutHolders.LoadOrStore(sandboxID, &holderNodeSet{nodes: make(map[string]struct{})})
+	return v.(*holderNodeSet)
+}
+
+func addSecretHolderNodes(sandboxID string, nodeIDs ...string) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	hs := holderSetFor(sandboxID)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	if hs.nodes == nil {
+		hs.nodes = make(map[string]struct{})
+	}
+	for _, id := range nodeIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		hs.nodes[id] = struct{}{}
+	}
+}
+
+func secretHolderNodeIDs(sandboxID string) []string {
+	v, ok := secretFanoutHolders.Load(sandboxID)
+	if !ok {
+		return nil
+	}
+	hs := v.(*holderNodeSet)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	out := make([]string, 0, len(hs.nodes))
+	for id := range hs.nodes {
+		out = append(out, id)
+	}
+	return out
+}
+
+func secretHolderCount(sandboxID string) int {
+	return len(secretHolderNodeIDs(sandboxID))
+}
+
+func clearSecretFanoutHolders(sandboxID string) {
+	secretFanoutHolders.Delete(sandboxID)
+}
 
 // SealAndDistribute seals to recipients, stores locally, and fans out when
 // the feature flag is on, the sandbox is recreate-HA, and len(recipients) > 1.
@@ -62,7 +115,11 @@ func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req m
 	if out.Ref == "" {
 		return out, nil
 	}
-	secretFanoutHolders.Store(sandboxID, 1)
+	selfID := ""
+	if c := s.Cluster(); c != nil {
+		selfID = c.SelfNodeID()
+	}
+	addSecretHolderNodes(sandboxID, selfID)
 	s.fanoutSecretAfterSeal(ctx, sandboxID, req, recipients, out)
 	return out, nil
 }
@@ -72,6 +129,9 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 	if bag.IsEmpty() {
 		return cluster.PlacementSecrets{}, nil
 	}
+	if err := s.assertEnvSealWriterGate(bag, recipients); err != nil {
+		return cluster.PlacementSecrets{}, err
+	}
 	p := s.provider()
 	if p == nil {
 		if s == nil || s.cipher == nil {
@@ -79,12 +139,15 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 		}
 		return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured")
 	}
-	if s.store != nil {
-		_ = s.store.ClearClusterSecretTomb(ctx, sandboxID)
-	}
 	h, err := p.Put(ctx, sandboxID, bag, recipients)
 	if err != nil {
 		return cluster.PlacementSecrets{}, err
+	}
+	// Clear tomb only after a successful reseal so a failed Put cannot open a
+	// window for peer resurrection of a deleted sandbox.
+	if s.store != nil {
+		_ = s.store.ClearClusterSecretTomb(ctx, sandboxID)
+		_ = s.store.DeleteSecretDeleteOutbox(ctx, sandboxID)
 	}
 	return cluster.PlacementSecrets{Ref: h.Ref, Version: h.Version, Recipients: append([]string(nil), recipients...)}, nil
 }
@@ -119,10 +182,10 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 		waitCtx, cancel := context.WithTimeout(parent, wait)
 		acked, waitErr := pusher.PushSecretBlobToPeers(waitCtx, *blob, recipients)
 		cancel()
-		if acked > 0 {
-			bumpSecretFanoutHolders(sandboxID, acked)
+		if len(acked) > 0 {
+			addSecretHolderNodes(sandboxID, acked...)
 		}
-		if waitErr != nil && s.logger != nil && acked == 0 {
+		if waitErr != nil && s.logger != nil && len(acked) == 0 {
 			s.logger.Warn("cluster: secret fan-out min-ACK wait got no peer; continuing async",
 				"sandbox_id", sandboxID, "wait", wait, "err", waitErr)
 		}
@@ -141,16 +204,14 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	acked, err := pusher.PushSecretBlobToPeers(ctx, blob, recipients)
-	if acked > 0 {
-		// Idempotent re-push may ACK peers already counted in the min-ACK
-		// wait. Cap at 1 (local) + number of non-self recipients.
-		setSecretFanoutHoldersAtLeast(sandboxID, 1+acked)
+	if len(acked) > 0 {
+		addSecretHolderNodes(sandboxID, acked...)
 	}
 	if err != nil {
 		recordSecretFanoutFailure()
 		if s.logger != nil {
 			s.logger.Warn("cluster: secret fan-out incomplete",
-				"sandbox_id", sandboxID, "acked", acked, "err", err)
+				"sandbox_id", sandboxID, "acked", len(acked), "err", err)
 		}
 	}
 }
@@ -173,7 +234,11 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 			continue
 		}
 		// Local row ⇒ this node holds the blob.
-		secretFanoutHolders.Store(rec.SandboxID, 1)
+		selfID := ""
+		if c := s.Cluster(); c != nil {
+			selfID = c.SelfNodeID()
+		}
+		addSecretHolderNodes(rec.SandboxID, selfID)
 		if len(rec.Recipients) <= 1 || pusher == nil {
 			continue
 		}
@@ -341,71 +406,85 @@ func (s *Service) RedactClusterSecretsConfigured(req models.CreateSandboxRequest
 	return s.redactClusterSecrets(req)
 }
 
-func bumpSecretFanoutHolders(sandboxID string, delta int) {
-	if delta <= 0 || sandboxID == "" {
-		return
+// assertEnvSealWriterGate refuses env-bearing seals when any alive non-ingress
+// recipient advertises MaxSecretRefVersion < RefVersionEnv (or 0 = pre-capability
+// peer). Prevents silent empty-env recreate on mixed-version fleets (§5c).
+func (s *Service) assertEnvSealWriterGate(bag secrets.Secrets, recipients []string) error {
+	if s == nil || len(bag.Env) == 0 || !s.cfg.SecretEnvSealEnabled {
+		return nil
 	}
-	for {
-		curAny, _ := secretFanoutHolders.LoadOrStore(sandboxID, 1)
-		cur, _ := curAny.(int)
-		if secretFanoutHolders.CompareAndSwap(sandboxID, cur, cur+delta) {
-			return
+	need := secrets.RefVersionEnv
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	alive := make(map[string]cluster.Member, len(c.Members()))
+	for _, m := range c.Members() {
+		alive[m.NodeID] = m
+	}
+	for _, id := range recipients {
+		id = strings.TrimSpace(id)
+		if id == "" || id == c.SelfNodeID() {
+			continue
+		}
+		m, ok := alive[id]
+		if !ok || !m.Alive {
+			continue
+		}
+		if strings.TrimSpace(m.Role) == config.NodeRoleIngress {
+			continue
+		}
+		// 0 means older peer without the field — treat as RefVersion only.
+		maxVer := m.MaxSecretRefVersion
+		if maxVer == 0 {
+			maxVer = secrets.RefVersion
+		}
+		if maxVer < need {
+			return fmt.Errorf("secret env seal writer gate: peer %q max_secret_ref_version=%d < %d (roll fleet before enabling SB_SECRET_ENV_SEAL_ENABLED)",
+				id, maxVer, need)
 		}
 	}
-}
-
-func setSecretFanoutHoldersAtLeast(sandboxID string, n int) {
-	if sandboxID == "" || n <= 0 {
-		return
-	}
-	for {
-		curAny, loaded := secretFanoutHolders.LoadOrStore(sandboxID, n)
-		if !loaded {
-			return
-		}
-		cur, _ := curAny.(int)
-		if cur >= n {
-			return
-		}
-		if secretFanoutHolders.CompareAndSwap(sandboxID, cur, n) {
-			return
-		}
-	}
-}
-
-func secretHolderCount(sandboxID string) int {
-	if v, ok := secretFanoutHolders.Load(sandboxID); ok {
-		if n, ok := v.(int); ok {
-			return n
-		}
-	}
-	return 0
-}
-
-func clearSecretFanoutHolders(sandboxID string) {
-	secretFanoutHolders.Delete(sandboxID)
+	return nil
 }
 
 // computeFailoverReady implements E1a: omit for non-recreate; otherwise true
-// when holders >= 2 or the recipient set is single-node (len <= 1).
+// when live holders >= 2 or the recipient set is single-node (len <= 1).
+// Holder node IDs are intersected with current alive membership.
 func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil
 	}
 	recipients := s.secretRecipientsForSandbox(ctx, sb.ID)
-	holders := secretHolderCount(sb.ID)
-	if holders == 0 && len(recipients) > 0 {
+	selfID := ""
+	alive := map[string]struct{}{}
+	if c := s.Cluster(); c != nil {
+		selfID = c.SelfNodeID()
+		for _, m := range c.Members() {
+			if m.Alive && m.NodeID != "" {
+				alive[m.NodeID] = struct{}{}
+			}
+		}
+		if selfID != "" {
+			alive[selfID] = struct{}{}
+		}
+	}
+	holders := secretHolderNodeIDs(sb.ID)
+	if len(holders) == 0 && len(recipients) > 0 {
 		// Restart amnesia: local sealed row implies this node holds the blob.
-		holders = 1
-		secretFanoutHolders.Store(sb.ID, 1)
+		addSecretHolderNodes(sb.ID, selfID)
+		holders = secretHolderNodeIDs(sb.ID)
+	}
+	liveHolders := 0
+	for _, id := range holders {
+		if _, ok := alive[id]; ok {
+			liveHolders++
+		}
 	}
 	ready := false
 	switch {
 	case len(recipients) <= 1:
-		// Single-node / seal-to-self: HA N/A but report ready so operators
-		// aren't stuck on false for non-HA recipient sets.
 		ready = true
-	case holders >= 2:
+	case liveHolders >= 2:
 		ready = true
 	default:
 		ready = false

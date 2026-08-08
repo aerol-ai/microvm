@@ -102,8 +102,8 @@ func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, addre
 		return nil, err
 	}
 	if obs := m.egressObserver(); obs != nil {
-		sid, netw, addr := sandboxID, network, address
-		go obs(sid, netw, addr)
+		// Observer is responsible for non-blocking enqueue (bounded pool).
+		obs(sandboxID, network, address)
 	}
 	u := m.usageFor(sandboxID)
 	return &meteredConn{Conn: conn, usage: u}, nil

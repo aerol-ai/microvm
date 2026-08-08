@@ -44,6 +44,18 @@ type AuditPeerFetcher interface {
 	FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error)
 }
 
+// SandboxMetaFetcher loads OwnerRef from a placement owner for ingress
+// authorization of GET /sandboxes/{id}/audit (no local SQLite row).
+type SandboxMetaFetcher interface {
+	FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID string) (ownerRef string, ok bool, err error)
+}
+
+// SandboxOwnerMeta is the peer-local owner-ref probe response.
+type SandboxOwnerMeta struct {
+	OwnerRef string `json:"owner_ref"`
+	Exists   bool   `json:"exists"`
+}
+
 // FetchSandboxAuditFromPeer GETs a peer's local audit slice for sandboxID.
 func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error) {
 	if c == nil || c.httpClient == nil {
@@ -121,4 +133,68 @@ func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, ap
 		return AuditPeerPage{}, fmt.Errorf("peer audit decode: %w", err)
 	}
 	return page, nil
+}
+
+// FetchSandboxOwnerRef GETs owner metadata from the placement owner.
+func (c *Cluster) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID string) (string, bool, error) {
+	if c == nil || c.httpClient == nil {
+		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
+	}
+	return fetchSandboxOwnerRef(ctx, c.httpClient, c.patToken, apiURL, sandboxID)
+}
+
+func (a *Agent) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID string) (string, bool, error) {
+	if a == nil || a.httpClient == nil {
+		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
+	}
+	return fetchSandboxOwnerRef(ctx, a.httpClient, a.patToken, apiURL, sandboxID)
+}
+
+func (n *Noop) FetchSandboxOwnerRef(context.Context, string, string) (string, bool, error) {
+	return "", false, fmt.Errorf("cluster: no sandbox meta fetch in single-node mode")
+}
+
+func fetchSandboxOwnerRef(ctx context.Context, client *http.Client, pat, apiURL, sandboxID string) (string, bool, error) {
+	if client == nil {
+		return "", false, fmt.Errorf("cluster: nil http client")
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	base := strings.TrimRight(strings.TrimSpace(apiURL), "/")
+	if sandboxID == "" || base == "" {
+		return "", false, fmt.Errorf("cluster: empty sandbox id or peer api url")
+	}
+	endpoint := base + PublicInternalSandboxAuditPath + url.PathEscape(sandboxID) + "/meta"
+	reqCtx := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(ctx, auditPeerFetchTimeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", false, err
+	}
+	if pat != "" {
+		req.Header.Set("Authorization", "Bearer "+pat)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusNotFound {
+		return "", false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", false, fmt.Errorf("peer %s returned %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var meta SandboxOwnerMeta
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return "", false, fmt.Errorf("peer sandbox meta decode: %w", err)
+	}
+	if !meta.Exists {
+		return "", false, nil
+	}
+	return meta.OwnerRef, true, nil
 }

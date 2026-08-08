@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
@@ -18,8 +19,9 @@ func (h *handlers) getSandboxAudit(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "missing sandbox id")
 		return
 	}
-	// Owner scope / 404 before listing. Without env — existence + tenancy only.
-	if _, err := h.deps.Service.GetSandbox(r.Context(), id); err != nil {
+	// Authorize via local row or placement-owner OwnerRef metadata so pure
+	// ingress nodes do not 404 before fan-out (P1).
+	if err := h.deps.Service.AuthorizeSandboxAuditAccess(r.Context(), id); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -65,6 +67,28 @@ func (h *handlers) clusterInternalSandboxAudit(w http.ResponseWriter, r *http.Re
 		},
 		NextCursor: next,
 	})
+}
+
+// clusterInternalSandboxMeta serves OwnerRef for ingress audit authorization.
+func (h *handlers) clusterInternalSandboxMeta(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		id = strings.TrimSpace(r.PathValue("sandboxID"))
+	}
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "missing sandbox id")
+		return
+	}
+	ownerRef, ok, err := h.deps.Service.SandboxOwnerRefLocal(r.Context(), id)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if !ok {
+		apihttp.WriteError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SandboxOwnerMeta{OwnerRef: ownerRef, Exists: true})
 }
 
 func parseSecretAuditQuery(r *http.Request) service.SecretAuditQuery {

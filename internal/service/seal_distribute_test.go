@@ -20,12 +20,12 @@ type fakePeerPusher struct {
 	pushes    []secrets.SecretBlob
 	deletes   []string
 	pushErr   error
-	acked     int
+	acked     []string
 	pushCalls int
 	done      chan struct{}
 }
 
-func (f *fakePeerPusher) PushSecretBlobToPeers(_ context.Context, blob secrets.SecretBlob, _ []string) (int, error) {
+func (f *fakePeerPusher) PushSecretBlobToPeers(_ context.Context, blob secrets.SecretBlob, _ []string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pushCalls++
@@ -37,7 +37,7 @@ func (f *fakePeerPusher) PushSecretBlobToPeers(_ context.Context, blob secrets.S
 			close(f.done)
 		}
 	}
-	return f.acked, f.pushErr
+	return append([]string(nil), f.acked...), f.pushErr
 }
 
 func (f *fakePeerPusher) DeleteSecretOnPeers(_ context.Context, sandboxID string, _ []string) error {
@@ -177,7 +177,7 @@ func TestSealAndDistributeFansOutWhenHA(t *testing.T) {
 	ctx := context.Background()
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
-	pusher := &fakePeerPusher{acked: 1, done: make(chan struct{})}
+	pusher := &fakePeerPusher{acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg: config.Config{
 			SecretRecipientFanoutEnabled: true,
@@ -219,7 +219,7 @@ func TestSealAndDistributeMinACKTimeoutContinuesAsync(t *testing.T) {
 	ctx := context.Background()
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
-	slow := &slowPeerPusher{delay: 200 * time.Millisecond, acked: 1, done: make(chan struct{})}
+	slow := &slowPeerPusher{delay: 200 * time.Millisecond, acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg: config.Config{
 			SecretRecipientFanoutEnabled: true,
@@ -261,18 +261,18 @@ func TestSealAndDistributeMinACKTimeoutContinuesAsync(t *testing.T) {
 
 type slowPeerPusher struct {
 	delay time.Duration
-	acked int
+	acked []string
 	done  chan struct{}
 	mu    sync.Mutex
 	n     int
 }
 
-func (s *slowPeerPusher) PushSecretBlobToPeers(ctx context.Context, _ secrets.SecretBlob, _ []string) (int, error) {
+func (s *slowPeerPusher) PushSecretBlobToPeers(ctx context.Context, _ secrets.SecretBlob, _ []string) ([]string, error) {
 	timer := time.NewTimer(s.delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	case <-timer.C:
 	}
 	if s.done != nil {
@@ -282,7 +282,7 @@ func (s *slowPeerPusher) PushSecretBlobToPeers(ctx context.Context, _ secrets.Se
 			close(s.done)
 		}
 	}
-	return s.acked, nil
+	return append([]string(nil), s.acked...), nil
 }
 
 func (s *slowPeerPusher) DeleteSecretOnPeers(context.Context, string, []string) error { return nil }
@@ -291,7 +291,7 @@ func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	ctx := context.Background()
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
-	pusher := &fakePeerPusher{acked: 1, done: make(chan struct{})}
+	pusher := &fakePeerPusher{acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg: config.Config{
 			SecretRecipientFanoutEnabled: true,
@@ -319,8 +319,8 @@ func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
 		t.Fatalf("refanout: %v", err)
 	}
-	if got := secretHolderCount("sb-refan"); got != 1 {
-		t.Fatalf("after re-fanout local holders=%d, want 1", got)
+	if got := secretHolderCount("sb-refan"); got < 1 {
+		t.Fatalf("after re-fanout local holders=%d, want >=1", got)
 	}
 	select {
 	case <-pusher.done:
@@ -339,19 +339,36 @@ func TestComputeFailoverReady(t *testing.T) {
 		t.Fatalf("no recipients → ready want true, got %v", ready)
 	}
 
-	secretFanoutHolders.Store("sb1", 1)
+	addSecretHolderNodes("sb1", "node-a")
 	svc.cluster = &placementRecipientsCluster{
 		Noop:       cluster.NewNoop("node-a", "", ""),
 		recipients: []string{"node-a", "node-b"},
+		members: []cluster.Member{
+			{NodeID: "node-a", Alive: true},
+			{NodeID: "node-b", Alive: true},
+		},
 	}
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || *ready {
 		t.Fatalf("holders=1 multi → want false, got %v", ready)
 	}
-	secretFanoutHolders.Store("sb1", 2)
+	addSecretHolderNodes("sb1", "node-b")
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || !*ready {
-		t.Fatalf("holders=2 → want true, got %v", ready)
+		t.Fatalf("holders=2 live → want true, got %v", ready)
+	}
+	// Dead backup must flip ready false even if historically ACK'd.
+	svc.cluster = &placementRecipientsCluster{
+		Noop:       cluster.NewNoop("node-a", "", ""),
+		recipients: []string{"node-a", "node-b"},
+		members: []cluster.Member{
+			{NodeID: "node-a", Alive: true},
+			{NodeID: "node-b", Alive: false},
+		},
+	}
+	ready = svc.computeFailoverReady(context.Background(), sb)
+	if ready == nil || *ready {
+		t.Fatalf("dead backup → want false, got %v", ready)
 	}
 
 	sbNone := &models.Sandbox{ID: "x"}
@@ -363,10 +380,18 @@ func TestComputeFailoverReady(t *testing.T) {
 type placementRecipientsCluster struct {
 	*cluster.Noop
 	recipients []string
+	members    []cluster.Member
 }
 
 func (c *placementRecipientsCluster) PlacementOf(sandboxID string) (cluster.Placement, bool) {
 	return cluster.Placement{SandboxID: sandboxID, SecretRecipients: c.recipients}, true
+}
+
+func (c *placementRecipientsCluster) Members() []cluster.Member {
+	if len(c.members) > 0 {
+		return append([]cluster.Member(nil), c.members...)
+	}
+	return c.Noop.Members()
 }
 
 func TestDeleteClusterSecretsFansOut(t *testing.T) {

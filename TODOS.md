@@ -253,7 +253,8 @@ passed, zero-deployments premise re-verified in-tree). Branch
   wasm migrate, apply, secrets, audit, …) — a secrets-only mTLS patch would
   be inconsistent theater.
 - **Current trust model (documented):** unauthenticated → 401; managed tenant
-  → 403 on secret/audit internal routes; fleet `SB_PAT_TOKEN` → operator.
+  → 403 on **all** `/v1/cluster/*` admin + `/v1/cluster/internal/*` routes
+  (plus admin reconcile / ingress DNS); fleet `SB_PAT_TOKEN` → operator.
   Operator mitigation: private networking + protect/rotate the PAT.
 - **Where documented:** `docs/src/content/docs/cluster-secrets.mdx` (known
   limitation), `setup/runbooks/secrets-and-audit.md`,
@@ -263,28 +264,28 @@ passed, zero-deployments premise re-verified in-tree). Branch
   HTTP client; decide mTLS on `:7002` vs identity on the public API URL;
   one auth model for the whole family.
 
-## Durable secret-delete outbox / ACK ledger (cluster secrets) — parked 2026-08-08
+## Durable secret-delete outbox / ACK ledger (cluster secrets) — interim landed 2026-08-08
 
 - **What:** Generation-scoped tombstones + persistent cleanup outbox so peer
   DELETE fan-out survives daemon crash, retries until every recipient ACKs,
-  and rejects stale-generation PUTs forever (not just best-effort async).
-- **Why parked:** Interim fix landed — local delete writes
-  `cluster_secret_tombs` and peer PUT rejects tombstoned sandbox IDs (blocks
-  in-flight PUT resurrection). Full outbox + boot reconciler + generation
-  clock is a separate durability program.
-- **Residual:** peer down during delete can still retain a row until something
-  retries; crash after local delete loses the async fan-out job (tomb blocks
-  resurrection on that node only).
-- **Start:** `internal/service/cluster_secrets.go` DeleteClusterSecrets,
-  `internal/store` tombs table, peer DELETE ACK protocol.
+  and rejects stale PUTs on the originator until reseal.
+- **Landed:** `cluster_secret_delete_outbox` + boot `ReconcileSecretDeleteOutbox`;
+  peer DELETE clears rows without tombstones so same-ID reseal can land;
+  originator tombs with generation and clears tomb only after successful Put.
+- **Residual:** no multi-ACK ledger under long partitions; offline peers retain
+  rows until reconcile succeeds; KMS delete path still best-effort.
+- **Where:** `internal/store` outbox/tombs, `internal/service/cluster_secrets.go`,
+  daemon boot after `ReFanoutClusterSecrets`.
 
-## Indexed / central secret-audit store (scale) — parked 2026-08-08
+## Indexed / central secret-audit store (scale) — parked residual 2026-08-08
 
 - **What:** Replace full JSONL scan + sequential all-member fan-out with an
-  indexed durable store or central sink; compound cursor pagination.
-- **Why parked:** Interim fix landed — prefer placement owner +
-  SecretRecipients, skip ingress roles, bounded parallel fan-out (16) under a
-  5s global deadline. Full 2k-node scan remains unacceptable by design.
+  indexed durable store or central sink; compound cursor pagination; E2b witness.
+- **Interim landed:** sidecar flock before open; Close/Prune `sendMu`; gap
+  markers included in per-sandbox queries; dead preferred recipients in
+  Coverage.Missing; bounded wasm egress worker pool.
+- **Residual:** 1,024-event drop-under-load; full-file scan; timestamp-only
+  cursor can still skip same-timestamp ties; no off-node witness.
 - **Start:** `internal/service/secret_audit_query.go`; E2b witness sink may
   double as the central store.
 
@@ -293,7 +294,7 @@ passed, zero-deployments premise re-verified in-tree). Branch
 - **What:** Worker subprocesses should enqueue through the daemon's
   authoritative audit writer (bounded channel, drop counter, gap markers)
   instead of opening `secrets.jsonl` themselves.
-- **Interim:** exclusive `flock` shared with retention rewrite so appends
-  cannot vanish on rename; writer errors are logged.
+- **Interim:** stable sidecar lock file + bounded worker pool (no per-dial
+  goroutine); retention shares the same lock.
 - **Start:** `pkg/wasm/worker/egress_audit.go`, spawn env for a unix socket
   path owned by `fileAuditSink`.

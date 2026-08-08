@@ -182,10 +182,22 @@ func Open(path string) (*Store, error) {
 		);`,
 		// cluster_secret_tombs blocks stale peer PUTs after local delete so an
 		// in-flight fan-out retry cannot resurrect a destroyed sandbox's row.
-		// Full durable delete-outbox / ACK ledger is parked (TODOS.md).
+		// generation bumps on each originator delete; durable peer cleanup is
+		// tracked in cluster_secret_delete_outbox (boot reconciler).
 		`CREATE TABLE IF NOT EXISTS cluster_secret_tombs (
 			sandbox_id TEXT PRIMARY KEY,
-			deleted_at DATETIME NOT NULL
+			deleted_at DATETIME NOT NULL,
+			generation INTEGER NOT NULL DEFAULT 1
+		);`,
+		// Durable delete outbox: survives daemon crash; boot reconciler retries
+		// peer DELETE until ACK'd, then drops the row (tomb remains until reseal).
+		`CREATE TABLE IF NOT EXISTS cluster_secret_delete_outbox (
+			sandbox_id TEXT PRIMARY KEY,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			generation INTEGER NOT NULL DEFAULT 1,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
@@ -626,6 +638,7 @@ func Open(path string) (*Store, error) {
 		// 'pushing' to 'active' or 'error'.
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_state TEXT NOT NULL DEFAULT 'active';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE cluster_secret_tombs ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;`,
 		// auto_import_pending is set when the post-pull AOCR auto-import
 		// (F21) failed and a background reconciler should retry. It is
 		// local-node bookkeeping only — never replicated, never user-visible.
@@ -4115,6 +4128,17 @@ func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecre
 }
 
 func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID string) error {
+	return s.deleteClusterSecretsForSandbox(ctx, sandboxID, true)
+}
+
+// DeleteClusterSecretsRowsOnly removes local sealed rows without writing a
+// tombstone. Used by peer delete-fanout receivers so a later reseal PUT is not
+// blocked on backups that never originated the delete.
+func (s *Store) DeleteClusterSecretsRowsOnly(ctx context.Context, sandboxID string) error {
+	return s.deleteClusterSecretsForSandbox(ctx, sandboxID, false)
+}
+
+func (s *Store) deleteClusterSecretsForSandbox(ctx context.Context, sandboxID string, tombstone bool) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return nil
@@ -4125,11 +4149,19 @@ func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID st
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at) VALUES (?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET deleted_at = excluded.deleted_at
-	`, sandboxID, now); err != nil {
-		return fmt.Errorf("tombstone cluster secret: %w", err)
+	if tombstone {
+		var gen int64 = 1
+		var prev sql.NullInt64
+		_ = tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev)
+		if prev.Valid {
+			gen = prev.Int64 + 1
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation) VALUES (?, ?, ?)
+			ON CONFLICT(sandbox_id) DO UPDATE SET deleted_at = excluded.deleted_at, generation = excluded.generation
+		`, sandboxID, now, gen); err != nil {
+			return fmt.Errorf("tombstone cluster secret: %w", err)
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
 		return fmt.Errorf("delete cluster secrets: %w", err)
@@ -4168,6 +4200,111 @@ func (s *Store) ClearClusterSecretTomb(ctx context.Context, sandboxID string) er
 		return fmt.Errorf("clear cluster secret tomb: %w", err)
 	}
 	return nil
+}
+
+// SecretDeleteOutboxRecord is one durable peer-delete job.
+type SecretDeleteOutboxRecord struct {
+	SandboxID  string
+	Recipients []string
+	Generation int64
+	Attempts   int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// UpsertSecretDeleteOutbox records a durable delete fan-out job.
+func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, recipients []string, generation int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	if generation <= 0 {
+		generation = 1
+	}
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal delete outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO cluster_secret_delete_outbox (sandbox_id, recipients_json, generation, attempts, created_at, updated_at)
+		VALUES (?, ?, ?, 0, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			recipients_json = excluded.recipients_json,
+			generation = excluded.generation,
+			updated_at = excluded.updated_at
+	`, sandboxID, string(raw), generation, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert secret delete outbox: %w", err)
+	}
+	return nil
+}
+
+// ListSecretDeleteOutbox returns pending delete fan-out jobs.
+func (s *Store) ListSecretDeleteOutbox(ctx context.Context) ([]SecretDeleteOutboxRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, recipients_json, generation, attempts, created_at, updated_at
+		FROM cluster_secret_delete_outbox
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list secret delete outbox: %w", err)
+	}
+	defer rows.Close()
+	var out []SecretDeleteOutboxRecord
+	for rows.Next() {
+		var rec SecretDeleteOutboxRecord
+		var recipientsJSON string
+		if err := rows.Scan(&rec.SandboxID, &recipientsJSON, &rec.Generation, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if recipientsJSON != "" {
+			_ = json.Unmarshal([]byte(recipientsJSON), &rec.Recipients)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// BumpSecretDeleteOutboxAttempt increments attempts after a retry round.
+func (s *Store) BumpSecretDeleteOutboxAttempt(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_delete_outbox
+		SET attempts = attempts + 1, updated_at = ?
+		WHERE sandbox_id = ?
+	`, time.Now().UTC(), sandboxID)
+	return err
+}
+
+// DeleteSecretDeleteOutbox drops a completed delete fan-out job.
+func (s *Store) DeleteSecretDeleteOutbox(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, sandboxID)
+	return err
+}
+
+// ClusterSecretTombGeneration returns the tomb generation (0 if none).
+func (s *Store) ClusterSecretTombGeneration(ctx context.Context, sandboxID string) (int64, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return 0, nil
+	}
+	var gen int64
+	err := s.db.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&gen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return gen, nil
 }
 
 // ListClusterSecrets returns every local sealed cluster-secret row. Used at
@@ -4266,14 +4403,27 @@ func (s *Store) GetEnvJSON(ctx context.Context, sandboxID string) (map[string]st
 	if envJSON == "" || envJSON == "{}" {
 		return map[string]string{}, nil
 	}
-	var env map[string]string
-	if err := json.Unmarshal([]byte(envJSON), &env); err != nil {
+	var out map[string]string
+	if err := json.Unmarshal([]byte(envJSON), &out); err != nil {
 		return nil, fmt.Errorf("decode sandbox env_json: %w", err)
 	}
-	if env == nil {
-		env = map[string]string{}
+	if out == nil {
+		out = map[string]string{}
 	}
-	return env, nil
+	return out, nil
+}
+
+// ClearEnvJSON blanks plaintext env_json after a successful reseal migration.
+func (s *Store) ClearEnvJSON(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET env_json = '{}' WHERE id = ?`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("clear sandbox env_json: %w", err)
+	}
+	return nil
 }
 
 // DeleteEnv removes sealed env for a sandbox. Cascade on sandboxes covers

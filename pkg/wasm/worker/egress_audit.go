@@ -15,11 +15,16 @@ import (
 
 // Worker subprocesses cannot call internal/service.emitEgressAudit. They append
 // compatible JSON Lines into the same secrets.jsonl the daemon owns, under an
-// exclusive flock shared with the daemon retention rewriter so an append
-// cannot land on a soon-to-be-renamed inode and vanish silently.
+// exclusive flock on a stable sidecar lock file acquired *before* opening the
+// data file so retention rename cannot leave writers on an unlinked inode.
 // Full bounded-IPC into the authoritative queue remains follow-up (TODOS.md).
 
-const workerEgressAuditFile = "secrets.jsonl"
+const (
+	workerEgressAuditFile = "secrets.jsonl"
+	workerEgressLockFile  = "secrets.jsonl.lock"
+	workerEgressWorkers   = 8
+	workerEgressQueue     = 1024
+)
 
 type workerEgressAuditEvent struct {
 	Time        time.Time `json:"time"`
@@ -33,7 +38,14 @@ type workerEgressAuditEvent struct {
 	Network     string    `json:"network,omitempty"`
 }
 
-var workerEgressAuditMu sync.Mutex
+type egressAuditJob struct {
+	path, node, sandboxID, network, address string
+}
+
+var (
+	workerEgressOnce sync.Once
+	workerEgressCh   chan egressAuditJob
+)
 
 // installDefaultEgressObserver wires destination attribution when
 // SB_EGRESS_ATTRIBUTION_ENABLED is unset/true and SB_DB_PATH is set (inherited
@@ -46,8 +58,28 @@ func installDefaultEgressObserver(m *NetMediator) {
 	if path == "" {
 		return
 	}
+	ensureWorkerEgressPool()
 	m.SetEgressObserver(func(sandboxID, network, address string) {
-		appendWorkerEgressAudit(path, node, sandboxID, network, address)
+		job := egressAuditJob{path: path, node: node, sandboxID: sandboxID, network: network, address: address}
+		select {
+		case workerEgressCh <- job:
+		default:
+			slog.Warn("wasm egress audit queue full; dropping attribution",
+				"sandbox_id", sandboxID, "destination", address)
+		}
+	})
+}
+
+func ensureWorkerEgressPool() {
+	workerEgressOnce.Do(func() {
+		workerEgressCh = make(chan egressAuditJob, workerEgressQueue)
+		for i := 0; i < workerEgressWorkers; i++ {
+			go func() {
+				for job := range workerEgressCh {
+					appendWorkerEgressAudit(job.path, job.node, job.sandboxID, job.network, job.address)
+				}
+			}()
+		}
 	})
 }
 
@@ -82,23 +114,30 @@ func appendWorkerEgressAudit(path, node, sandboxID, network, address string) {
 		return
 	}
 	line = append(line, '\n')
-	workerEgressAuditMu.Lock()
-	defer workerEgressAuditMu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		slog.Warn("wasm egress audit mkdir failed", "path", path, "err", err)
 		return
 	}
+	lockPath := filepath.Join(dir, workerEgressLockFile)
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		slog.Warn("wasm egress audit lock open failed", "path", lockPath, "err", err)
+		return
+	}
+	defer lf.Close()
+	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+		slog.Warn("wasm egress audit flock failed", "path", lockPath, "err", err)
+		return
+	}
+	defer func() { _ = unix.Flock(int(lf.Fd()), unix.LOCK_UN) }()
+
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		slog.Warn("wasm egress audit open failed", "path", path, "err", err)
 		return
 	}
 	defer f.Close()
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
-		slog.Warn("wasm egress audit flock failed", "path", path, "err", err)
-		return
-	}
-	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
 	if _, err := f.Write(line); err != nil {
 		slog.Warn("wasm egress audit write failed", "path", path, "err", err)
 	}

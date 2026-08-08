@@ -41,6 +41,10 @@ const (
 
 	defaultSecretAuditBuffer = 1024
 	secretAuditFileName      = "secrets.jsonl"
+	// secretAuditLockName is a stable sidecar flock target. Retention and
+	// wasm workers lock this path *before* opening secrets.jsonl so a rename
+	// during prune cannot leave writers appending to an unlinked inode.
+	secretAuditLockName = "secrets.jsonl.lock"
 )
 
 var auditEventsDroppedTotal = expvar.NewInt("aerolvm_audit_events_dropped_total")
@@ -88,12 +92,17 @@ type auditWriteReq struct {
 // fileAuditSink appends JSON Lines under {DataDir}/audit/secrets.jsonl via a
 // single writer goroutine. Emit is non-blocking: a full buffer drops the event,
 // increments aerolvm_audit_events_dropped_total, and records a gap marker.
+//
+// sendMu serializes producers against Close so Emit/Sync/Prune never send on a
+// closed channel (check-then-send race under -race / daemon shutdown).
 type fileAuditSink struct {
 	ch         chan auditWriteReq
 	pendingGap atomic.Bool
 	closed     atomic.Bool
+	sendMu     sync.Mutex
 	done       chan struct{}
 	path       string
+	lockPath   string
 	file       *os.File
 	// writeHook, when set (tests), runs before each file write and may block.
 	writeHook func()
@@ -107,22 +116,41 @@ func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
 		return nil, fmt.Errorf("secret audit mkdir: %w", err)
 	}
 	path := filepath.Join(auditDir, secretAuditFileName)
+	lockPath := filepath.Join(auditDir, secretAuditLockName)
+	// Acquire the stable sidecar lock before opening the data file so retention
+	// rename cannot race a concurrent open+append onto an unlinked inode.
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("secret audit lock open: %w", err)
+	}
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		_ = lockFile.Close()
+		return nil, fmt.Errorf("secret audit lock: %w", err)
+	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	_ = lockFile.Close()
 	if err != nil {
 		return nil, fmt.Errorf("secret audit open: %w", err)
 	}
 	s := &fileAuditSink{
-		ch:   make(chan auditWriteReq, buffer),
-		done: make(chan struct{}),
-		path: path,
-		file: f,
+		ch:       make(chan auditWriteReq, buffer),
+		done:     make(chan struct{}),
+		path:     path,
+		lockPath: lockPath,
+		file:     f,
 	}
 	go s.loop()
 	return s, nil
 }
 
 func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
-	if s == nil || s.closed.Load() {
+	if s == nil {
+		return
+	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.closed.Load() {
 		return
 	}
 	select {
@@ -136,22 +164,31 @@ func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
 // Sync blocks until every previously accepted event (and any pending gap
 // marker) has been written. No-op on a nil or closed sink.
 func (s *fileAuditSink) Sync() {
-	if s == nil || s.closed.Load() {
+	if s == nil {
 		return
 	}
 	done := make(chan struct{})
-	req := auditWriteReq{sync: done}
-	// Sync must not drop — wait for buffer space.
-	s.ch <- req
+	s.sendMu.Lock()
+	if s.closed.Load() {
+		s.sendMu.Unlock()
+		return
+	}
+	// Sync must not drop — wait for buffer space while still holding sendMu so
+	// Close cannot close(ch) mid-send.
+	s.ch <- auditWriteReq{sync: done}
+	s.sendMu.Unlock()
 	<-done
 }
 
 // Close stops the writer and closes the file. Safe to call once.
+// Callers must stop retention (and await it) before Close so Prune cannot race.
 func (s *fileAuditSink) Close() {
 	if s == nil || !s.closed.CompareAndSwap(false, true) {
 		return
 	}
+	s.sendMu.Lock()
 	close(s.ch)
+	s.sendMu.Unlock()
 	<-s.done
 }
 
@@ -188,81 +225,100 @@ func (s *fileAuditSink) loop() {
 // Prune drops events (and gap markers) older than cutoff. Serialized on the
 // writer goroutine so it cannot race appends.
 func (s *fileAuditSink) Prune(cutoff time.Time) error {
-	if s == nil || s.closed.Load() {
+	if s == nil {
 		return nil
 	}
 	done := make(chan error, 1)
+	s.sendMu.Lock()
+	if s.closed.Load() {
+		s.sendMu.Unlock()
+		return nil
+	}
 	s.ch <- auditWriteReq{pruneCutoff: cutoff, pruneDone: done}
+	s.sendMu.Unlock()
 	return <-done
+}
+
+func (s *fileAuditSink) withAuditFileLock(fn func() error) error {
+	lockPath := s.lockPath
+	if lockPath == "" {
+		lockPath = s.path + ".lock"
+	}
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lf.Close()
+	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = unix.Flock(int(lf.Fd()), unix.LOCK_UN) }()
+	return fn()
 }
 
 func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 	if cutoff.IsZero() {
 		return nil
 	}
-	// Exclusive flock coordinates with wasm worker direct-appends so a write
-	// cannot land on the pre-rename inode and be discarded (P1 audit race).
-	src, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	return s.withAuditFileLock(func() error {
+		src, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
 		}
-		return err
-	}
-	defer src.Close()
-	if err := unix.Flock(int(src.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer func() { _ = unix.Flock(int(src.Fd()), unix.LOCK_UN) }()
+		defer src.Close()
 
-	raw, err := io.ReadAll(src)
-	if err != nil {
-		return err
-	}
-	var kept [][]byte
-	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+		raw, err := io.ReadAll(src)
+		if err != nil {
+			return err
 		}
-		var ev SecretAuditEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			// Preserve unparseable lines rather than silently dropping evidence.
+		var kept [][]byte
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var ev SecretAuditEvent
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				// Preserve unparseable lines rather than silently dropping evidence.
+				kept = append(kept, []byte(line))
+				continue
+			}
+			if !ev.Time.IsZero() && ev.Time.Before(cutoff) {
+				continue
+			}
 			kept = append(kept, []byte(line))
-			continue
 		}
-		if !ev.Time.IsZero() && ev.Time.Before(cutoff) {
-			continue
+		tmp := s.path + ".tmp"
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
 		}
-		kept = append(kept, []byte(line))
-	}
-	tmp := s.path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	for _, line := range kept {
-		if _, err := f.Write(append(line, '\n')); err != nil {
-			_ = f.Close()
+		for _, line := range kept {
+			if _, err := f.Write(append(line, '\n')); err != nil {
+				_ = f.Close()
+				_ = os.Remove(tmp)
+				return err
+			}
+		}
+		if err := f.Close(); err != nil {
 			_ = os.Remove(tmp)
 			return err
 		}
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	_ = s.file.Close()
-	nf, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	s.file = nf
-	return nil
+		if err := os.Rename(tmp, s.path); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+		_ = s.file.Close()
+		nf, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		s.file = nf
+		return nil
+	})
 }
 
 func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
@@ -274,10 +330,18 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 	}
 	line, err := json.Marshal(ev)
 	if err != nil {
+		auditEventsDroppedTotal.Add(1)
+		s.pendingGap.Store(true)
 		return
 	}
 	line = append(line, '\n')
-	_, _ = s.file.Write(line)
+	if err := s.withAuditFileLock(func() error {
+		_, werr := s.file.Write(line)
+		return werr
+	}); err != nil {
+		auditEventsDroppedTotal.Add(1)
+		s.pendingGap.Store(true)
+	}
 }
 
 func (s *Service) ensureSecretAuditSink() {
@@ -308,7 +372,8 @@ func (s *Service) ensureSecretAuditSink() {
 }
 
 // startSecretAuditPruneTicker runs retention once at start and once per day.
-// Stopped by CloseSecretAuditSink.
+// Stopped by CloseSecretAuditSink — which awaits this goroutine before closing
+// the writer channel.
 func (s *Service) startSecretAuditPruneTicker() {
 	if s == nil || s.secretAuditFile == nil {
 		return
@@ -318,7 +383,9 @@ func (s *Service) startSecretAuditPruneTicker() {
 	}
 	stop := make(chan struct{})
 	s.secretAuditPruneStop = stop
+	s.secretAuditPruneDone.Add(1)
 	go func() {
+		defer s.secretAuditPruneDone.Done()
 		_ = s.PruneSecretAudit(nil)
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
@@ -360,6 +427,7 @@ func (s *Service) auditActor() string {
 }
 
 // CloseSecretAuditSink flushes and stops the file writer. Idempotent.
+// Stops retention first and awaits it so Prune cannot race Close's channel close.
 func (s *Service) CloseSecretAuditSink() {
 	if s == nil {
 		return
@@ -371,6 +439,7 @@ func (s *Service) CloseSecretAuditSink() {
 			close(stop)
 		}
 		s.secretAuditPruneStop = nil
+		s.secretAuditPruneDone.Wait()
 	}
 	if f := s.secretAuditFile; f != nil {
 		f.Close()

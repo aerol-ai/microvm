@@ -3,7 +3,7 @@ package harness
 import "testing"
 
 func TestCatalogueRegistryWellFormed(t *testing.T) {
-	const want = 297 // category table sums (plan TOTAL 287 is off by 10)
+	const want = 298 // category table sums (includes HA-07b / UC-58c)
 	if len(CatalogueRegistry) != want {
 		t.Fatalf("catalogue rows = %d, want %d", len(CatalogueRegistry), want)
 	}
