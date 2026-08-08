@@ -241,3 +241,24 @@ passed, zero-deployments premise re-verified in-tree). Branch
   widen settle or serialize the whole short-lived gossip pair.
 - **Depends on / blocked by:** nothing. Independent of secrets-hardening product
   code; fixed alongside the GAP follow-ups so cluster signal stays trustworthy.
+
+## Per-node identity for cluster-internal HTTP (security, `pkg/api` + `internal/cluster`) — parked 2026-08-08
+
+- **What:** Replace shared fleet-PAT auth on `/v1/cluster/internal/...` with
+  per-node identity (mTLS and/or SPIFFE-style short-lived node credentials) so
+  a stolen PAT is not equivalent to “every peer.”
+- **Why parked:** Secrets hardening closed the **tenant** hole (operator-only
+  on secret PUT/DELETE + peer-local audit, plus recipient/ref validation on
+  receive). True peer identity must cover **all** internal routes (recovery,
+  wasm migrate, apply, secrets, audit, …) — a secrets-only mTLS patch would
+  be inconsistent theater.
+- **Current trust model (documented):** unauthenticated → 401; managed tenant
+  → 403 on secret/audit internal routes; fleet `SB_PAT_TOKEN` → operator.
+  Operator mitigation: private networking + protect/rotate the PAT.
+- **Where documented:** `docs/src/content/docs/cluster-secrets.mdx` (known
+  limitation), `setup/runbooks/secrets-and-audit.md`,
+  `docs/designs/secrets-hardening.md` Deferred,
+  `plans/secrets-hardening.md` re-review row #6.
+- **Start (when unparked):** inventory every `PublicInternal*` route + peer
+  HTTP client; decide mTLS on `:7002` vs identity on the public API URL;
+  one auth model for the whole family.

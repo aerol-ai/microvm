@@ -323,7 +323,12 @@ Added here:
 - Grafana log/trace datasource provisioning — `setup/grafana/` is
   Prometheus/expvar-driven and there is no Loki/Tempo anywhere in `setup/`.
 - `aerolvm` CLI — no CLI exists; `cmd/` holds only `sandboxd` and `toolboxd`.
-- Flaky `internal/cluster` memberlist tests (in TODOS.md).
+- Flaky `internal/cluster` memberlist tests (in TODOS.md) — mitigated 2026-08-08.
+- **Per-node identity for `/v1/cluster/internal/...` (mTLS / SPIFFE)** —
+  parked 2026-08-08. Tenant tokens are blocked on secret/audit internal
+  routes (operator/PAT only + recipient checks). Fleet PAT remains the peer
+  credential for *all* internal cluster HTTP, same as recovery/wasm-migrate/
+  apply. Documented in `docs/.../cluster-secrets.mdx` and `TODOS.md`.
 
 ## Section-review decisions (11-section deep review)
 

@@ -17,8 +17,15 @@ On the open-source build:
 - Coverage in the API response names which members answered; `partial: true`
   means the page is incomplete — never treat a partial page as full history.
 
-See also the D5 frozen-recipient limitation in
+See also the D5 frozen-recipient limitation and the **fleet-PAT peer-auth**
+limitation in
 [`docs/.../cluster-secrets.mdx`](../../docs/src/content/docs/cluster-secrets.mdx).
+
+**Peer auth honesty:** secret PUT/DELETE and peer-local audit reject managed
+tenant tokens (operator/PAT only) and validate recipient membership on
+receive. They do **not** authenticate individual node identity. A stolen
+`SB_PAT_TOKEN` is still full operator access on every `/v1/cluster/internal/...`
+route. Per-node mTLS is parked (see `TODOS.md`).
 
 ## Alerts
 
