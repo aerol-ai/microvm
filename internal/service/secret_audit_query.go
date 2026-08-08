@@ -9,14 +9,19 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 const (
 	defaultSecretAuditLimit = 100
 	maxSecretAuditLimit     = 1000
+	// secretAuditFanoutDeadline bounds the whole peer fan-out (not per peer).
+	secretAuditFanoutDeadline = 5 * time.Second
+	secretAuditFanoutParallel = 16
 )
 
 // SecretAuditQuery pages local/cluster secret-audit history for one sandbox.
@@ -142,6 +147,11 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 
 // ListSecretAudit returns local events merged with a live fan-out to reachable
 // peers. Coverage.Missing lists peers that timed out or failed — never silent.
+//
+// Interim scale bounds (full indexed/central sink is parked in TODOS.md):
+//   - prefer placement owner + SecretRecipients when known
+//   - skip pure ingress roles (they do not host sandboxes)
+//   - bounded parallel peer fetches under a short global deadline
 func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts SecretAuditQuery) (SecretAuditPage, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -154,10 +164,21 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 	selfID := ""
 	selfURL := ""
 	var members []cluster.Member
+	prefer := map[string]struct{}{}
 	if c := s.Cluster(); c != nil {
 		selfID = c.SelfNodeID()
 		selfURL = strings.TrimRight(c.SelfAPIURL(), "/")
 		members = c.Members()
+		if p, ok := c.PlacementOf(sandboxID); ok {
+			if id := strings.TrimSpace(p.OwnerNodeID); id != "" {
+				prefer[id] = struct{}{}
+			}
+			for _, id := range p.SecretRecipients {
+				if id = strings.TrimSpace(id); id != "" {
+					prefer[id] = struct{}{}
+				}
+			}
+		}
 	}
 
 	coverage := SecretAuditCoverage{Answered: []string{}}
@@ -177,6 +198,11 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		limit = maxSecretAuditLimit
 	}
 
+	type peerJob struct {
+		nodeID string
+		apiURL string
+	}
+	var jobs []peerJob
 	for _, m := range members {
 		if !m.Alive || strings.TrimSpace(m.APIURL) == "" {
 			continue
@@ -184,26 +210,69 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		if m.NodeID == selfID {
 			continue
 		}
+		role := strings.TrimSpace(m.Role)
+		if role == config.NodeRoleIngress {
+			continue // ingress never hosts sandboxes / local audit rows
+		}
+		if len(prefer) > 0 {
+			if _, ok := prefer[m.NodeID]; !ok {
+				continue
+			}
+		}
 		peerURL := strings.TrimRight(m.APIURL, "/")
 		if peerURL == "" || peerURL == selfURL {
 			continue
 		}
-		if fetcher == nil {
-			coverage.Missing = append(coverage.Missing, m.NodeID)
-			continue
+		jobs = append(jobs, peerJob{nodeID: m.NodeID, apiURL: peerURL})
+	}
+
+	if fetcher == nil {
+		for _, j := range jobs {
+			coverage.Missing = append(coverage.Missing, j.nodeID)
 		}
-		page, fetchErr := fetcher.FetchSandboxAuditFromPeer(ctx, peerURL, sandboxID, limit, opts.Cursor, opts.Kind)
-		if fetchErr != nil {
-			coverage.Missing = append(coverage.Missing, m.NodeID)
-			continue
+	} else if len(jobs) > 0 {
+		fanCtx, cancel := context.WithTimeout(ctx, secretAuditFanoutDeadline)
+		defer cancel()
+		type peerResult struct {
+			nodeID string
+			page   cluster.AuditPeerPage
+			err    error
 		}
-		coverage.Answered = append(coverage.Answered, m.NodeID)
-		for _, dto := range page.Events {
-			ev := secretAuditEventFromDTO(dto)
-			if !secretAuditKindMatches(ev.Kind, opts.Kind) {
+		results := make(chan peerResult, len(jobs))
+		sem := make(chan struct{}, secretAuditFanoutParallel)
+		var wg sync.WaitGroup
+		for _, j := range jobs {
+			wg.Add(1)
+			go func(j peerJob) {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+				case <-fanCtx.Done():
+					results <- peerResult{nodeID: j.nodeID, err: fanCtx.Err()}
+					return
+				}
+				defer func() { <-sem }()
+				page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.apiURL, sandboxID, limit, opts.Cursor, opts.Kind)
+				results <- peerResult{nodeID: j.nodeID, page: page, err: fetchErr}
+			}(j)
+		}
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+		for r := range results {
+			if r.err != nil {
+				coverage.Missing = append(coverage.Missing, r.nodeID)
 				continue
 			}
-			merged = append(merged, ev)
+			coverage.Answered = append(coverage.Answered, r.nodeID)
+			for _, dto := range r.page.Events {
+				ev := secretAuditEventFromDTO(dto)
+				if !secretAuditKindMatches(ev.Kind, opts.Kind) {
+					continue
+				}
+				merged = append(merged, ev)
+			}
 		}
 	}
 

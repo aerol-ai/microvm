@@ -268,7 +268,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// Router picks the recipient set at reserve time (§3d-1). Target seals to
 	// the recorded set and must not recompute. Empty when flag off / non-HA.
 	if h.deps.Service.WantsSecretRecipientFanout(req) {
-		reserveSecrets.Recipients = cluster.SelectSecretRecipients(candidates, target.NodeID, h.deps.Service.SecretRecipientBackupCount())
+		reserveSecrets.Recipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, h.deps.Service.SecretRecipientBackupCount())
 	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()

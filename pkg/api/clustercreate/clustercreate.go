@@ -136,7 +136,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
 	reserveSecrets := cluster.PlacementSecrets{}
 	if svc != nil && svc.WantsSecretRecipientFanout(req) {
-		reserveSecrets.Recipients = cluster.SelectSecretRecipients(candidates, target.NodeID, svc.SecretRecipientBackupCount())
+		reserveSecrets.Recipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, svc.SecretRecipientBackupCount())
 	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)

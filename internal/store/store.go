@@ -180,6 +180,13 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
 		);`,
+		// cluster_secret_tombs blocks stale peer PUTs after local delete so an
+		// in-flight fan-out retry cannot resurrect a destroyed sandbox's row.
+		// Full durable delete-outbox / ACK ledger is parked (TODOS.md).
+		`CREATE TABLE IF NOT EXISTS cluster_secret_tombs (
+			sandbox_id TEXT PRIMARY KEY,
+			deleted_at DATETIME NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -836,6 +843,10 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 // one transaction so a crash cannot leave a healthy sandbox with empty env
 // (plans/secrets-hardening outside-voice #3). Empty sealedEnv skips the env
 // write (same as Create).
+//
+// When sealedEnv is non-empty, env_json is forced to "{}" — plaintext must
+// not dual-write beside the sealed sandbox_env row. Legacy plaintext rows
+// remain readable via GetEnvJSON / loadEnv fallback.
 func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox, sealedEnv []byte) error {
 	if len(sealedEnv) == 0 {
 		return s.Create(ctx, sandbox)
@@ -848,7 +859,10 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 		return fmt.Errorf("begin create+env tx: %w", err)
 	}
 	defer tx.Rollback()
-	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
+	// Persist without plaintext env_json; sealed row is the source of truth.
+	cleared := *sandbox
+	cleared.Env = nil
+	if err := s.insertSandbox(ctx, tx, &cleared); err != nil {
 		return err
 	}
 	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
@@ -4105,8 +4119,53 @@ func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID st
 	if sandboxID == "" {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete cluster secrets: %w", err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at) VALUES (?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET deleted_at = excluded.deleted_at
+	`, sandboxID, now); err != nil {
+		return fmt.Errorf("tombstone cluster secret: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
 		return fmt.Errorf("delete cluster secrets: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete cluster secrets: %w", err)
+	}
+	return nil
+}
+
+// HasClusterSecretTomb reports whether sandboxID was deleted and must not
+// accept peer PUT resurrection until the tomb is cleared (new seal).
+func (s *Store) HasClusterSecretTomb(ctx context.Context, sandboxID string) (bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("has cluster secret tomb: %w", err)
+	}
+	return true, nil
+}
+
+// ClearClusterSecretTomb removes a delete tombstone when a sandbox is sealed again.
+func (s *Store) ClearClusterSecretTomb(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID); err != nil {
+		return fmt.Errorf("clear cluster secret tomb: %w", err)
 	}
 	return nil
 }

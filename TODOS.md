@@ -262,3 +262,38 @@ passed, zero-deployments premise re-verified in-tree). Branch
 - **Start (when unparked):** inventory every `PublicInternal*` route + peer
   HTTP client; decide mTLS on `:7002` vs identity on the public API URL;
   one auth model for the whole family.
+
+## Durable secret-delete outbox / ACK ledger (cluster secrets) — parked 2026-08-08
+
+- **What:** Generation-scoped tombstones + persistent cleanup outbox so peer
+  DELETE fan-out survives daemon crash, retries until every recipient ACKs,
+  and rejects stale-generation PUTs forever (not just best-effort async).
+- **Why parked:** Interim fix landed — local delete writes
+  `cluster_secret_tombs` and peer PUT rejects tombstoned sandbox IDs (blocks
+  in-flight PUT resurrection). Full outbox + boot reconciler + generation
+  clock is a separate durability program.
+- **Residual:** peer down during delete can still retain a row until something
+  retries; crash after local delete loses the async fan-out job (tomb blocks
+  resurrection on that node only).
+- **Start:** `internal/service/cluster_secrets.go` DeleteClusterSecrets,
+  `internal/store` tombs table, peer DELETE ACK protocol.
+
+## Indexed / central secret-audit store (scale) — parked 2026-08-08
+
+- **What:** Replace full JSONL scan + sequential all-member fan-out with an
+  indexed durable store or central sink; compound cursor pagination.
+- **Why parked:** Interim fix landed — prefer placement owner +
+  SecretRecipients, skip ingress roles, bounded parallel fan-out (16) under a
+  5s global deadline. Full 2k-node scan remains unacceptable by design.
+- **Start:** `internal/service/secret_audit_query.go`; E2b witness sink may
+  double as the central store.
+
+## WASM egress audit via bounded IPC (not shared JSONL) — parked residual 2026-08-08
+
+- **What:** Worker subprocesses should enqueue through the daemon's
+  authoritative audit writer (bounded channel, drop counter, gap markers)
+  instead of opening `secrets.jsonl` themselves.
+- **Interim:** exclusive `flock` shared with retention rewrite so appends
+  cannot vanish on rename; writer errors are logged.
+- **Start:** `pkg/wasm/worker/egress_audit.go`, spawn env for a unix socket
+  path owned by `fileAuditSink`.

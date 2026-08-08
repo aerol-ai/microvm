@@ -79,6 +79,9 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 		}
 		return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured")
 	}
+	if s.store != nil {
+		_ = s.store.ClearClusterSecretTomb(ctx, sandboxID)
+	}
 	h, err := p.Put(ctx, sandboxID, bag, recipients)
 	if err != nil {
 		return cluster.PlacementSecrets{}, err
@@ -225,7 +228,7 @@ func (s *Service) UpsertClusterSecretBlob(ctx context.Context, blob secrets.Secr
 	if s == nil || s.store == nil {
 		return errors.New("cluster secret store is not configured")
 	}
-	if err := validatePeerSecretBlob(s, blob); err != nil {
+	if err := validatePeerSecretBlob(ctx, s, blob); err != nil {
 		return err
 	}
 	return newSecretBlobStore(s.store).Put(ctx, blob)
@@ -235,7 +238,7 @@ func (s *Service) UpsertClusterSecretBlob(ctx context.Context, blob secrets.Secr
 // version / recipients shape). Mapped to HTTP 400 by the internal handler.
 var ErrInvalidClusterSecretBlob = errors.New("invalid cluster secret blob")
 
-func validatePeerSecretBlob(s *Service, blob secrets.SecretBlob) error {
+func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.SecretBlob) error {
 	sandboxID := strings.TrimSpace(blob.SandboxID)
 	ref := strings.TrimSpace(blob.Ref)
 	if sandboxID == "" || ref == "" || len(blob.SealedPayload) == 0 {
@@ -263,12 +266,19 @@ func validatePeerSecretBlob(s *Service, blob secrets.SecretBlob) error {
 		selfID = strings.TrimSpace(c.SelfNodeID())
 	}
 	if selfID == "" {
-		// No cluster identity (misconfig / Noop without node id) — refuse
-		// rather than store an unbound peer push.
 		return fmt.Errorf("%w: receiving node identity is unknown", ErrInvalidClusterSecretBlob)
 	}
 	if !secrets.RecipientAllowed(envelopeRecipients, selfID) {
 		return fmt.Errorf("%w: receiving node %q is not an intended recipient", secrets.ErrRecipientDenied, selfID)
+	}
+	if s.store != nil {
+		tomb, err := s.store.HasClusterSecretTomb(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if tomb {
+			return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone)", ErrInvalidClusterSecretBlob, sandboxID)
+		}
 	}
 	return nil
 }

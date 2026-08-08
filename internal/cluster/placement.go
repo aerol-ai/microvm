@@ -3,6 +3,7 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"sort"
 	"strings"
@@ -171,10 +172,13 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 }
 
 // SelectSecretRecipients builds the seal recipient set: owner first, then up
-// to maxBackups other candidates sorted by NodeID for deterministic stability.
+// to maxBackups other candidates chosen by deterministic rendezvous hashing
+// over (sandboxID, nodeID). Sorting by NodeID alone hotspot-loads the
+// lexicographically first workers; HRW spreads backup rows evenly while
+// remaining stable for a given sandbox.
 // When the cluster is smaller than owner+maxBackups, every eligible candidate
 // is included. Empty ownerID or candidates yields nil.
-func SelectSecretRecipients(candidates []Member, ownerID string, maxBackups int) []string {
+func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID string, maxBackups int) []string {
 	ownerID = strings.TrimSpace(ownerID)
 	if ownerID == "" || len(candidates) == 0 {
 		return nil
@@ -184,7 +188,11 @@ func SelectSecretRecipients(candidates []Member, ownerID string, maxBackups int)
 	}
 	seen := map[string]struct{}{ownerID: {}}
 	out := []string{ownerID}
-	rest := make([]string, 0, len(candidates))
+	type scored struct {
+		id    string
+		score uint64
+	}
+	rest := make([]scored, 0, len(candidates))
 	for _, m := range candidates {
 		id := strings.TrimSpace(m.NodeID)
 		if id == "" {
@@ -194,14 +202,38 @@ func SelectSecretRecipients(candidates []Member, ownerID string, maxBackups int)
 			continue
 		}
 		seen[id] = struct{}{}
-		rest = append(rest, id)
+		rest = append(rest, scored{id: id, score: secretRecipientScore(sandboxID, id)})
 	}
-	sort.Strings(rest)
+	sort.SliceStable(rest, func(i, j int) bool {
+		if rest[i].score != rest[j].score {
+			return rest[i].score > rest[j].score
+		}
+		return rest[i].id < rest[j].id
+	})
 	if maxBackups > len(rest) {
 		maxBackups = len(rest)
 	}
-	out = append(out, rest[:maxBackups]...)
+	for i := 0; i < maxBackups; i++ {
+		out = append(out, rest[i].id)
+	}
 	return out
+}
+
+// secretRecipientScore is highest-random-weight (rendezvous) hashing so each
+// sandbox picks a stable, evenly distributed backup set. FNV alone can
+// correlate on sequential IDs; a splitmix-style finalizer removes that skew.
+func secretRecipientScore(sandboxID, nodeID string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strings.TrimSpace(sandboxID)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strings.TrimSpace(nodeID)))
+	x := h.Sum64()
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }
 
 // nodeFits returns true if the member could plausibly accept req based on its

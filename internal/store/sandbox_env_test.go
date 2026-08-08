@@ -83,6 +83,13 @@ func TestCreateWithSealedEnvAtomicCommit(t *testing.T) {
 	if string(got) != string(sealed) {
 		t.Fatalf("sealed = %q", got)
 	}
+	plain, err := st.GetEnvJSON(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("GetEnvJSON: %v", err)
+	}
+	if len(plain) != 0 {
+		t.Fatalf("sealed create left plaintext env_json = %+v, want empty", plain)
+	}
 }
 
 func TestCreateWithSealedEnvCrashBetweenWritesRollsBack(t *testing.T) {

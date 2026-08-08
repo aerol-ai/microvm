@@ -2,18 +2,22 @@ package worker
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// Worker subprocesses cannot call internal/service.emitEgressAudit, so they
-// append compatible JSON Lines into the same secrets.jsonl the daemon reads
-// ({Dir(SB_DB_PATH)}/audit/secrets.jsonl). O_APPEND keeps concurrent daemon
-// + worker writers line-safe for small records.
+// Worker subprocesses cannot call internal/service.emitEgressAudit. They append
+// compatible JSON Lines into the same secrets.jsonl the daemon owns, under an
+// exclusive flock shared with the daemon retention rewriter so an append
+// cannot land on a soon-to-be-renamed inode and vanish silently.
+// Full bounded-IPC into the authoritative queue remains follow-up (TODOS.md).
 
 const workerEgressAuditFile = "secrets.jsonl"
 
@@ -74,20 +78,30 @@ func appendWorkerEgressAudit(path, node, sandboxID, network, address string) {
 	}
 	line, err := json.Marshal(ev)
 	if err != nil {
+		slog.Warn("wasm egress audit marshal failed", "err", err)
 		return
 	}
 	line = append(line, '\n')
 	workerEgressAuditMu.Lock()
 	defer workerEgressAuditMu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		slog.Warn("wasm egress audit mkdir failed", "path", path, "err", err)
 		return
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
+		slog.Warn("wasm egress audit open failed", "path", path, "err", err)
 		return
 	}
-	_, _ = f.Write(line)
-	_ = f.Close()
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		slog.Warn("wasm egress audit flock failed", "path", path, "err", err)
+		return
+	}
+	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
+	if _, err := f.Write(line); err != nil {
+		slog.Warn("wasm egress audit write failed", "path", path, "err", err)
+	}
 }
 
 func envBoolDefaultTrue(key string) bool {

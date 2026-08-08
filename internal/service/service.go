@@ -2261,6 +2261,14 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	if err != nil {
 		return nil, err
 	}
+	// Sealed-env mode omits Env from store scans. Runtime paths (especially
+	// WASM reconstruct / passivate rehydrate) need the materialised map —
+	// public Get/List redaction must not starve internal start.
+	if env, loadErr := s.loadEnv(ctx, id); loadErr != nil {
+		return nil, loadErr
+	} else if len(env) > 0 {
+		sandbox.Env = env
+	}
 	wasmPassivated := s.isWasmSandbox(sandbox) && sandbox.Status == models.SandboxStatusPassivated
 	var wasmRehydrateBinds []mounts.ContainerBind
 	if wasmPassivated {

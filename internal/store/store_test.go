@@ -2228,6 +2228,17 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 	if _, err := st.GetClusterSecret(ctx, rec.Ref); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetClusterSecret after delete = %v, want ErrNotFound", err)
 	}
+	tomb, err := st.HasClusterSecretTomb(ctx, rec.SandboxID)
+	if err != nil || !tomb {
+		t.Fatalf("HasClusterSecretTomb = %v %v, want true", tomb, err)
+	}
+	if err := st.ClearClusterSecretTomb(ctx, rec.SandboxID); err != nil {
+		t.Fatalf("ClearClusterSecretTomb: %v", err)
+	}
+	tomb, err = st.HasClusterSecretTomb(ctx, rec.SandboxID)
+	if err != nil || tomb {
+		t.Fatalf("HasClusterSecretTomb after clear = %v %v, want false", tomb, err)
+	}
 }
 
 func TestListClusterSecrets(t *testing.T) {

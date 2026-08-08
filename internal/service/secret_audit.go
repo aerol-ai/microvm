@@ -7,6 +7,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/secrets"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -198,11 +200,23 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 	if cutoff.IsZero() {
 		return nil
 	}
-	raw, err := os.ReadFile(s.path)
+	// Exclusive flock coordinates with wasm worker direct-appends so a write
+	// cannot land on the pre-rename inode and be discarded (P1 audit race).
+	src, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
+		return err
+	}
+	defer src.Close()
+	if err := unix.Flock(int(src.Fd()), unix.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = unix.Flock(int(src.Fd()), unix.LOCK_UN) }()
+
+	raw, err := io.ReadAll(src)
+	if err != nil {
 		return err
 	}
 	var kept [][]byte
