@@ -178,6 +178,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalVolumePath, op(http.HandlerFunc(h.clusterInternalVolume)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", op(http.HandlerFunc(h.clusterInternalDrainState)))
 	mux.Handle("POST "+cluster.PublicInternalSecretPath, op(http.HandlerFunc(h.clusterInternalSecretPut)))
+	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", op(http.HandlerFunc(h.clusterInternalSecretHead)))
 	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", op(http.HandlerFunc(h.clusterInternalSecretDelete)))
 	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", op(http.HandlerFunc(h.clusterInternalSandboxAudit)))
 	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", op(http.HandlerFunc(h.clusterInternalSandboxMeta)))

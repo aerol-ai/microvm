@@ -250,7 +250,9 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 }
 
 // StartSecretDeleteOutboxReconcile runs periodic peer-delete retries so offline
-// recipients are not permanently abandoned after the boot pass.
+// recipients are not permanently abandoned after the boot pass. When membership
+// gains a newly-alive node, reconcile runs immediately and secrets are re-fanout
+// so holders re-ACK after rejoin.
 func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
 		return
@@ -258,17 +260,52 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
+		prevAlive := s.aliveMemberSet()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				alive := s.aliveMemberSet()
+				rejoined := false
+				for id := range alive {
+					if _, ok := prevAlive[id]; !ok {
+						rejoined = true
+						break
+					}
+				}
+				prevAlive = alive
 				if err := s.ReconcileSecretDeleteOutbox(ctx); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret delete-outbox reconcile failed", "err", err)
+				}
+				if rejoined {
+					if err := s.ReFanoutClusterSecrets(ctx); err != nil && s.logger != nil {
+						s.logger.Warn("cluster: secret re-fanout after member rejoin failed", "err", err)
+					}
 				}
 			}
 		}
 	}()
+}
+
+func (s *Service) aliveMemberSet() map[string]struct{} {
+	out := map[string]struct{}{}
+	if s == nil {
+		return out
+	}
+	c := s.Cluster()
+	if c == nil {
+		return out
+	}
+	for _, m := range c.Members() {
+		if m.Alive && m.NodeID != "" {
+			out[m.NodeID] = struct{}{}
+		}
+	}
+	if id := c.SelfNodeID(); id != "" {
+		out[id] = struct{}{}
+	}
+	return out
 }
 
 func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {

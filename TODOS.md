@@ -275,8 +275,9 @@ passed, zero-deployments premise re-verified in-tree). Branch
   DELETEs cannot wipe a reseal; boot + 30s periodic reconcile (O(1) per job);
   reseal clears tomb+outbox and accepts peer PUTs with higher seal_generation.
 - **Residual:** long partitions still need operator visibility into outbox
-  attempts; full multi-node possession probe for `failover_ready` peer holders
-  is still ACK∩alive (self requires local row); KMS CMK policy is separate.
+  attempts; KMS CMK policy is separate. `failover_ready` now HEAD-probes
+  remote holders for the current `seal_generation` (not ACK memory alone);
+  member rejoin triggers outbox reconcile + re-fanout.
 - **Where:** `internal/store` outbox/tombs, `internal/service/cluster_secrets.go`,
   `internal/cluster/secret_replication.go`, daemon boot + ticker.
 

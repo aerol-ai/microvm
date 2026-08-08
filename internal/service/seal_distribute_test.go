@@ -16,13 +16,15 @@ import (
 )
 
 type fakePeerPusher struct {
-	mu        sync.Mutex
-	pushes    []secrets.SecretBlob
-	deletes   []string
-	pushErr   error
-	acked     []string
-	pushCalls int
-	done      chan struct{}
+	mu           sync.Mutex
+	pushes       []secrets.SecretBlob
+	deletes      []string
+	pushErr      error
+	acked        []string
+	probeHolding []string
+	probeStrict  bool // when true, Probe returns probeHolding only (ignore recipients)
+	pushCalls    int
+	done         chan struct{}
 }
 
 func (f *fakePeerPusher) PushSecretBlobToPeers(_ context.Context, blob secrets.SecretBlob, _ []string) ([]string, error) {
@@ -45,6 +47,18 @@ func (f *fakePeerPusher) DeleteSecretOnPeers(_ context.Context, sandboxID string
 	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, sandboxID)
 	return append([]string(nil), recipients...), nil, nil
+}
+
+func (f *fakePeerPusher) ProbeSecretOnPeers(_ context.Context, _ string, recipients []string, _ int64) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.probeStrict {
+		return append([]string(nil), f.probeHolding...), nil
+	}
+	if len(f.acked) > 0 {
+		return append([]string(nil), f.acked...), nil
+	}
+	return append([]string(nil), recipients...), nil
 }
 
 func openSealTestStore(t *testing.T) *storepkg.Store {
@@ -288,6 +302,9 @@ func (s *slowPeerPusher) PushSecretBlobToPeers(ctx context.Context, _ secrets.Se
 func (s *slowPeerPusher) DeleteSecretOnPeers(context.Context, string, []string, int64) ([]string, []string, error) {
 	return nil, nil, nil
 }
+func (s *slowPeerPusher) ProbeSecretOnPeers(context.Context, string, []string, int64) ([]string, error) {
+	return nil, nil
+}
 
 func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	ctx := context.Background()
@@ -376,6 +393,7 @@ func TestComputeFailoverReady(t *testing.T) {
 		t.Fatalf("seal for ready: %v", err)
 	}
 	addSecretHolderNodes("sb1", "node-a", "node-b")
+	svc.testSecretPeerPusher = &fakePeerPusher{acked: []string{"node-b"}}
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || !*ready {
 		t.Fatalf("holders=2 live with local row → want true, got %v", ready)
@@ -415,6 +433,41 @@ func (c *placementRecipientsCluster) Members() []cluster.Member {
 		return append([]cluster.Member(nil), c.members...)
 	}
 	return c.Noop.Members()
+}
+
+func TestComputeFailoverReadyDropsUnverifiedRemoteHolders(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	svc := &Service{
+		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster: &placementRecipientsCluster{
+			Noop:       cluster.NewNoop("node-a", "", ""),
+			recipients: []string{"node-a", "node-b"},
+			members: []cluster.Member{
+				{NodeID: "node-a", Alive: true},
+				{NodeID: "node-b", Alive: true},
+			},
+		},
+		// Probe returns no holders — peer lost its SQLite but stayed Alive.
+		testSecretPeerPusher: &fakePeerPusher{probeStrict: true, probeHolding: nil},
+	}
+	sb := &models.Sandbox{ID: "sb-probe", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
+	if _, err := svc.SealAndDistribute(ctx, "sb-probe", models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}, []string{"node-a", "node-b"}, SealStrict); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	addSecretHolderNodes("sb-probe", "node-a", "node-b")
+	ready := svc.computeFailoverReady(ctx, sb)
+	if ready == nil || *ready {
+		t.Fatalf("unverified remote holder must keep ready=false, got %v", ready)
+	}
 }
 
 func TestDeleteClusterSecretsFansOut(t *testing.T) {

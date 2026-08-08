@@ -1295,6 +1295,33 @@ func (h *handlers) clusterInternalSecretDelete(w http.ResponseWriter, r *http.Re
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *handlers) clusterInternalSecretHead(w http.ResponseWriter, r *http.Request) {
+	sandboxID := strings.TrimSpace(r.PathValue("sandboxID"))
+	if sandboxID == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	var minGen int64 = 1
+	if raw := strings.TrimSpace(r.URL.Query().Get("min_generation")); raw != "" {
+		g, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || g <= 0 {
+			apihttp.WriteError(w, http.StatusBadRequest, "invalid min_generation")
+			return
+		}
+		minGen = g
+	}
+	ok, err := h.deps.Service.HasLocalSealedSecretGeneration(r.Context(), sandboxID, minGen)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *handlers) clusterInternalDrainState(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {

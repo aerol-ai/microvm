@@ -36,6 +36,7 @@ var secretFanoutHolders sync.Map // sandboxID -> *holderNodeSet
 
 type holderNodeSet struct {
 	mu    sync.Mutex
+	gen   int64
 	nodes map[string]struct{}
 }
 
@@ -61,6 +62,41 @@ func addSecretHolderNodes(sandboxID string, nodeIDs ...string) {
 		}
 		hs.nodes[id] = struct{}{}
 	}
+}
+
+// resetSecretHoldersForGeneration clears historical ACKs when the seal
+// generation advances so stale peers cannot stay "ready" after reseal.
+func resetSecretHoldersForGeneration(sandboxID string, gen int64, seed ...string) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	hs := holderSetFor(sandboxID)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	if hs.gen != gen {
+		hs.nodes = make(map[string]struct{})
+		hs.gen = gen
+	}
+	if hs.nodes == nil {
+		hs.nodes = make(map[string]struct{})
+	}
+	for _, id := range seed {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			hs.nodes[id] = struct{}{}
+		}
+	}
+}
+
+func secretHolderGeneration(sandboxID string) int64 {
+	v, ok := secretFanoutHolders.Load(sandboxID)
+	if !ok {
+		return 0
+	}
+	hs := v.(*holderNodeSet)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.gen
 }
 
 func secretHolderNodeIDs(sandboxID string) []string {
@@ -136,7 +172,11 @@ func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req m
 	if c := s.Cluster(); c != nil {
 		selfID = c.SelfNodeID()
 	}
-	addSecretHolderNodes(sandboxID, selfID)
+	gen := int64(1)
+	if blob, err := s.loadSecretBlob(ctx, out.Ref); err == nil && blob != nil && blob.SealGeneration > 0 {
+		gen = blob.SealGeneration
+	}
+	resetSecretHoldersForGeneration(sandboxID, gen, selfID)
 	s.fanoutSecretAfterSeal(ctx, sandboxID, req, recipients, out)
 	return out, nil
 }
@@ -478,7 +518,8 @@ func (s *Service) assertEnvSealWriterGate(bag secrets.Secrets, recipients []stri
 //
 // Holders are pruned to currently-alive members so a peer that lost its SQLite
 // DB and rejoined is not counted until it ACKs again. Self is counted only when
-// the local sealed row is present for the current generation.
+// the local sealed row is present. Remote ACKs are verified with a HEAD probe
+// against current seal_generation before counting toward ready.
 func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil
@@ -498,22 +539,52 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 		}
 	}
 	pruneDeadSecretHolders(sb.ID, alive)
+	localGen, localHolds := s.localSealedSecretGeneration(ctx, sb.ID)
+	if localGen > 0 && secretHolderGeneration(sb.ID) != localGen {
+		// Stale ACK memory from a prior generation — keep only verified self.
+		seed := []string{}
+		if localHolds && selfID != "" {
+			seed = []string{selfID}
+		}
+		resetSecretHoldersForGeneration(sb.ID, localGen, seed...)
+	}
 	holders := secretHolderNodeIDs(sb.ID)
-	localHolds := s.localHoldsSealedSecret(ctx, sb.ID)
 	if len(holders) == 0 && len(recipients) > 0 && localHolds && selfID != "" {
-		// Restart recovery: seed self only when the sealed row is actually present.
-		addSecretHolderNodes(sb.ID, selfID)
+		resetSecretHoldersForGeneration(sb.ID, localGen, selfID)
 		holders = secretHolderNodeIDs(sb.ID)
 	}
+
+	var remoteCandidates []string
 	liveHolders := 0
 	for _, id := range holders {
 		if _, ok := alive[id]; !ok {
 			continue
 		}
-		if id == selfID && !localHolds {
+		if id == selfID {
+			if localHolds {
+				liveHolders++
+			}
 			continue
 		}
-		liveHolders++
+		remoteCandidates = append(remoteCandidates, id)
+	}
+	if len(remoteCandidates) > 0 && localGen > 0 {
+		if pusher := s.secretPeerPusher(); pusher != nil {
+			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			holding, _ := pusher.ProbeSecretOnPeers(probeCtx, sb.ID, remoteCandidates, localGen)
+			cancel()
+			holdingSet := make(map[string]struct{}, len(holding))
+			for _, id := range holding {
+				holdingSet[id] = struct{}{}
+				liveHolders++
+			}
+			// Drop ACK memory for peers that no longer hold the generation.
+			for _, id := range remoteCandidates {
+				if _, ok := holdingSet[id]; !ok {
+					removeSecretHolderNode(sb.ID, id)
+				}
+			}
+		}
 	}
 	ready := false
 	switch {
@@ -527,17 +598,47 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 	return &ready
 }
 
-func (s *Service) localHoldsSealedSecret(ctx context.Context, sandboxID string) bool {
+func removeSecretHolderNode(sandboxID, nodeID string) {
+	v, ok := secretFanoutHolders.Load(sandboxID)
+	if !ok {
+		return
+	}
+	hs := v.(*holderNodeSet)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	delete(hs.nodes, nodeID)
+}
+
+func (s *Service) localSealedSecretGeneration(ctx context.Context, sandboxID string) (gen int64, holds bool) {
 	if s == nil || s.store == nil || strings.TrimSpace(sandboxID) == "" {
-		return false
+		return 0, false
 	}
-	ref := secrets.FormatRef(sandboxID, secrets.RefVersion)
-	blob, err := newSecretBlobStore(s.store).Get(ctx, ref)
-	if err == nil && blob != nil && len(blob.SealedPayload) > 0 {
-		return true
+	gen, err := s.store.MaxClusterSecretSealGeneration(ctx, sandboxID)
+	if err != nil || gen <= 0 {
+		return 0, false
 	}
-	blob, err = newSecretBlobStore(s.store).Get(ctx, secrets.FormatRef(sandboxID, secrets.RefVersionEnv))
-	return err == nil && blob != nil && len(blob.SealedPayload) > 0
+	return gen, true
+}
+
+func (s *Service) localHoldsSealedSecret(ctx context.Context, sandboxID string) bool {
+	_, holds := s.localSealedSecretGeneration(ctx, sandboxID)
+	return holds
+}
+
+// HasLocalSealedSecretGeneration reports whether this node holds a sealed row
+// with seal_generation >= minGeneration (peer HEAD probe target).
+func (s *Service) HasLocalSealedSecretGeneration(ctx context.Context, sandboxID string, minGeneration int64) (bool, error) {
+	if s == nil || s.store == nil {
+		return false, nil
+	}
+	if minGeneration <= 0 {
+		minGeneration = 1
+	}
+	gen, err := s.store.MaxClusterSecretSealGeneration(ctx, sandboxID)
+	if err != nil {
+		return false, err
+	}
+	return gen >= minGeneration, nil
 }
 
 func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID string) []string {

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -43,8 +44,9 @@ type egressAuditJob struct {
 }
 
 var (
-	workerEgressOnce sync.Once
-	workerEgressCh   chan egressAuditJob
+	workerEgressOnce    sync.Once
+	workerEgressCh      chan egressAuditJob
+	workerEgressDropped atomic.Int64
 )
 
 // installDefaultEgressObserver wires destination attribution when
@@ -64,8 +66,9 @@ func installDefaultEgressObserver(m *NetMediator) {
 		select {
 		case workerEgressCh <- job:
 		default:
+			workerEgressDropped.Add(1)
 			slog.Warn("wasm egress audit queue full; writing gap marker",
-				"sandbox_id", sandboxID, "destination", address)
+				"sandbox_id", sandboxID, "destination", address, "dropped_total", workerEgressDropped.Load())
 			appendWorkerEgressGap(path, node, sandboxID)
 		}
 	})

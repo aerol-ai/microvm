@@ -4436,6 +4436,24 @@ func (s *Store) NextClusterSecretSealGeneration(ctx context.Context, sandboxID s
 	return 1, nil
 }
 
+// MaxClusterSecretSealGeneration returns the highest seal_generation for
+// sandboxID, or 0 when no sealed row exists.
+func (s *Store) MaxClusterSecretSealGeneration(ctx context.Context, sandboxID string) (int64, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return 0, nil
+	}
+	var maxSeal sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal)
+	if err != nil {
+		return 0, fmt.Errorf("max seal generation: %w", err)
+	}
+	if !maxSeal.Valid {
+		return 0, nil
+	}
+	return maxSeal.Int64, nil
+}
+
 // UpsertSecretDeleteOutbox records a durable delete fan-out job.
 func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, recipients []string, generation int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)

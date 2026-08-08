@@ -41,6 +41,15 @@ func (c *Cluster) DeleteSecretOnPeers(ctx context.Context, sandboxID string, rec
 	return deleteSecretOnPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, sandboxID, recipients, generation)
 }
 
+// ProbeSecretOnPeers HEADs peer secret rows and returns nodes that currently
+// hold seal_generation >= minGeneration (authoritative possession, not ACK memory).
+func (c *Cluster) ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error) {
+	if c == nil || c.gossip == nil || c.httpClient == nil {
+		return nil, nil
+	}
+	return probeSecretOnPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, sandboxID, recipients, minGeneration)
+}
+
 // Agent mirrors for worker nodes that seal locally and need to fan out.
 func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
 	if a == nil || a.gossip == nil || a.httpClient == nil {
@@ -56,11 +65,19 @@ func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recip
 	return deleteSecretOnPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, sandboxID, recipients, generation)
 }
 
+func (a *Agent) ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error) {
+	if a == nil || a.gossip == nil || a.httpClient == nil {
+		return nil, nil
+	}
+	return probeSecretOnPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, sandboxID, recipients, minGeneration)
+}
+
 // SecretPeerPusher is the narrow seam Service uses for async fan-out so tests
 // can inject a fake without a full Cluster.
 type SecretPeerPusher interface {
 	PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error)
 	DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error)
+	ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error)
 }
 
 func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
@@ -141,6 +158,70 @@ func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Cli
 		acked = append(acked, id)
 	}
 	return acked, pending, firstErr
+}
+
+func probeSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string, minGeneration int64) ([]string, error) {
+	if client == nil || strings.TrimSpace(sandboxID) == "" {
+		return nil, nil
+	}
+	if minGeneration <= 0 {
+		minGeneration = 1
+	}
+	byID := make(map[string]Member, len(members))
+	for _, m := range members {
+		if m.NodeID != "" {
+			byID[m.NodeID] = m
+		}
+	}
+	var holding []string
+	var firstErr error
+	for _, id := range recipients {
+		id = strings.TrimSpace(id)
+		if id == "" || id == selfID {
+			continue
+		}
+		m, ok := byID[id]
+		if !ok || !m.Alive || strings.TrimSpace(m.APIURL) == "" {
+			continue
+		}
+		endpoint := strings.TrimRight(m.APIURL, "/") + PublicInternalSecretPath + "/" + url.PathEscape(sandboxID)
+		endpoint += "?min_generation=" + strconv.FormatInt(minGeneration, 10)
+		okHold, err := headSecretBlob(ctx, client, endpoint, pat)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("probe secret on %s: %w", id, err)
+			}
+			continue
+		}
+		if okHold {
+			holding = append(holding, id)
+		}
+	}
+	return holding, firstErr
+}
+
+func headSecretBlob(ctx context.Context, client *http.Client, endpoint, pat string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
+	if err != nil {
+		return false, err
+	}
+	if pat != "" {
+		req.Header.Set("Authorization", "Bearer "+pat)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return false, fmt.Errorf("peer %s returned %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
 }
 
 func withSecretFanoutBackoff(ctx context.Context, fn func() error) error {
