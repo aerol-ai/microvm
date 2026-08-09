@@ -314,14 +314,19 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 	coverage.Partial = len(coverage.Missing) > 0
 	merged = dedupeSecretAuditEvents(merged)
 	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].Time.Equal(merged[j].Time) {
+			return secretAuditEventCursorKey(merged[i]) < secretAuditEventCursorKey(merged[j])
+		}
 		return merged[i].Time.Before(merged[j].Time)
 	})
 	nextCursor := nextLocal
 	if len(merged) > limit {
 		merged = merged[:limit]
-		nextCursor = merged[len(merged)-1].Time.UTC().Format(time.RFC3339Nano)
-	} else if nextCursor == "" && len(merged) == limit {
-		nextCursor = merged[len(merged)-1].Time.UTC().Format(time.RFC3339Nano)
+	}
+	if len(merged) == limit {
+		nextCursor = formatSecretAuditCursor(merged[len(merged)-1])
+	} else if nextCursor == "" && len(merged) > 0 && len(merged) == limit {
+		nextCursor = formatSecretAuditCursor(merged[len(merged)-1])
 	}
 	return SecretAuditPage{Events: merged, Coverage: coverage, NextCursor: nextCursor}, nil
 }

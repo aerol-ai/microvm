@@ -166,8 +166,10 @@ func SealRawEnvelopeWrappedBound(plain []byte, recipients []string, binding Seal
 		return nil, fmt.Errorf("cluster secret data nonce: %w", err)
 	}
 	payloadAAD := PayloadAAD(recipients)
+	wireVersion := EnvelopeVersionV3
 	if binding.SandboxID != "" {
 		payloadAAD = PayloadAADBound(recipients, binding)
+		wireVersion = EnvelopeVersion
 	}
 	payload := append(nonce, gcm.Seal(nil, nonce, plain, payloadAAD)...)
 	wrappedKey, err := wrap(dek)
@@ -175,7 +177,7 @@ func SealRawEnvelopeWrappedBound(plain []byte, recipients []string, binding Seal
 		return nil, fmt.Errorf("wrap cluster secret data key: %w", err)
 	}
 	envelope, err := json.Marshal(sealedSecretsEnvelope{
-		Version:    EnvelopeVersion,
+		Version:    wireVersion,
 		Recipients: recipients,
 		SandboxID:  binding.SandboxID,
 		Ref:        binding.Ref,
@@ -249,20 +251,22 @@ func openRawEnvelope(
 			Version:    envelope.RefVersion,
 			Generation: envelope.Generation,
 		}.normalized()
-		if envelope.Version >= EnvelopeVersion && expect.SandboxID != "" && binding.SandboxID != "" {
-			want := expect.normalized()
-			if binding.SandboxID != want.SandboxID || binding.Ref != want.Ref || binding.Version != want.Version {
-				return nil, fmt.Errorf("%w: cluster secret binding mismatch", ErrDecryptFailed)
+		if envelope.Version >= EnvelopeVersion {
+			if binding.SandboxID == "" {
+				// v4 must carry sandbox identity; unbound v4 is rejected so a
+				// fleet-PAT holder cannot relabel ciphertext across sandboxes.
+				return nil, fmt.Errorf("%w: cluster secret envelope missing sandbox binding", ErrDecryptFailed)
 			}
-			// Generation may be filled from the store row when envelope omits it.
-			if want.Generation > 0 && binding.Generation > 0 && binding.Generation != want.Generation {
-				return nil, fmt.Errorf("%w: cluster secret generation mismatch", ErrDecryptFailed)
+			if expect.SandboxID != "" {
+				want := expect.normalized()
+				if binding.SandboxID != want.SandboxID || binding.Ref != want.Ref || binding.Version != want.Version {
+					return nil, fmt.Errorf("%w: cluster secret binding mismatch", ErrDecryptFailed)
+				}
+				if want.Generation > 0 && binding.Generation > 0 && binding.Generation != want.Generation {
+					return nil, fmt.Errorf("%w: cluster secret generation mismatch", ErrDecryptFailed)
+				}
+				binding = want
 			}
-			binding = want
-		} else if expect.SandboxID != "" && binding.SandboxID == "" {
-			// Legacy/unbound envelope: do not force identity AAD; still prefer
-			// the caller's sandbox id for telemetry/audit callers.
-			binding = SealBinding{}
 		}
 		switch envelope.Version {
 		case EnvelopeVersion, EnvelopeVersionV3:
@@ -385,6 +389,21 @@ func EnvelopeRecipients(sealed []byte) ([]string, error) {
 		return nil, fmt.Errorf("cluster secret envelope missing payload")
 	}
 	return NormalizeRecipients(envelope.Recipients), nil
+}
+
+// EnvelopeBindingMeta returns wire version and sandbox_id without decrypting.
+func EnvelopeBindingMeta(sealed []byte) (version int, sandboxID string, err error) {
+	if len(sealed) == 0 {
+		return 0, "", fmt.Errorf("empty sealed payload")
+	}
+	var envelope sealedSecretsEnvelope
+	if err := json.Unmarshal(sealed, &envelope); err != nil {
+		return 0, "", fmt.Errorf("unmarshal cluster secret envelope: %w", err)
+	}
+	if len(envelope.Payload) == 0 {
+		return 0, "", fmt.Errorf("cluster secret envelope missing payload")
+	}
+	return envelope.Version, strings.TrimSpace(envelope.SandboxID), nil
 }
 
 // FormatRef builds the stable cluster-secret://sandbox/{id}/v{version} handle.

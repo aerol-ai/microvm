@@ -4339,31 +4339,37 @@ func (s *Store) GetSecretDeleteOutbox(ctx context.Context, sandboxID string) (*S
 }
 
 // UpdateSecretDeleteOutboxRecipients replaces the pending recipient list (ACK shrink).
-// Empty recipients deletes the outbox row.
-func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxID string, recipients []string) error {
+// Empty recipients deletes the outbox row. generation fences the update so a
+// concurrent reseal/delete cannot shrink a newer outbox job.
+func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxID string, recipients []string, generation int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return nil
 	}
+	if generation <= 0 {
+		generation = 1
+	}
 	if len(recipients) == 0 {
-		return s.DeleteSecretDeleteOutbox(ctx, sandboxID)
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND generation = ?
+		`, sandboxID, generation)
+		if err != nil {
+			return fmt.Errorf("delete secret delete outbox: %w", err)
+		}
+		return nil
 	}
 	raw, err := json.Marshal(recipients)
 	if err != nil {
 		return fmt.Errorf("marshal delete outbox recipients: %w", err)
 	}
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_delete_outbox
 		SET recipients_json = ?, updated_at = ?
-		WHERE sandbox_id = ?
-	`, string(raw), now, sandboxID)
+		WHERE sandbox_id = ? AND generation = ?
+	`, string(raw), now, sandboxID, generation)
 	if err != nil {
 		return fmt.Errorf("update secret delete outbox recipients: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return nil
 	}
 	return nil
 }
@@ -4386,8 +4392,9 @@ func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID string, gen
 	defer tx.Rollback()
 	var maxSeal sql.NullInt64
 	_ = tx.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal)
-	if maxSeal.Valid && maxSeal.Int64 >= generation {
-		// Resealed after originator delete — stale DELETE must not wipe new bytes.
+	if maxSeal.Valid && maxSeal.Int64 > generation {
+		// Strictly newer reseal after originator delete — stale DELETE must not
+		// wipe new bytes. Equal generation is the row being deleted.
 		return tx.Commit()
 	}
 	now := time.Now().UTC()
@@ -4554,7 +4561,7 @@ func (s *Store) ClusterSecretTombGeneration(ctx context.Context, sandboxID strin
 // after a restart (holders are not persisted).
 func (s *Store) ListClusterSecrets(ctx context.Context) ([]ClusterSecretRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
+		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
 		FROM cluster_secrets
 		ORDER BY sandbox_id, ref
 	`)
@@ -4566,7 +4573,7 @@ func (s *Store) ListClusterSecrets(ctx context.Context) ([]ClusterSecretRecord, 
 	for rows.Next() {
 		var rec ClusterSecretRecord
 		var recipientsJSON string
-		if err := rows.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if err := rows.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.SealGeneration, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan cluster secret: %w", err)
 		}
 		if recipientsJSON != "" {

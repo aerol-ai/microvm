@@ -393,7 +393,6 @@ func TestComputeFailoverReady(t *testing.T) {
 		t.Fatalf("seal for ready: %v", err)
 	}
 	addSecretHolderNodes("sb1", "node-a", "node-b")
-	svc.testSecretPeerPusher = &fakePeerPusher{acked: []string{"node-b"}}
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || !*ready {
 		t.Fatalf("holders=2 live with local row → want true, got %v", ready)
@@ -435,7 +434,7 @@ func (c *placementRecipientsCluster) Members() []cluster.Member {
 	return c.Noop.Members()
 }
 
-func TestComputeFailoverReadyDropsUnverifiedRemoteHolders(t *testing.T) {
+func TestComputeFailoverReadyResetsStaleGenerationHolders(t *testing.T) {
 	ctx := context.Background()
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
@@ -452,8 +451,6 @@ func TestComputeFailoverReadyDropsUnverifiedRemoteHolders(t *testing.T) {
 				{NodeID: "node-b", Alive: true},
 			},
 		},
-		// Probe returns no holders — peer lost its SQLite but stayed Alive.
-		testSecretPeerPusher: &fakePeerPusher{probeStrict: true, probeHolding: nil},
 	}
 	sb := &models.Sandbox{ID: "sb-probe", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
 	if _, err := svc.SealAndDistribute(ctx, "sb-probe", models.CreateSandboxRequest{
@@ -463,10 +460,11 @@ func TestComputeFailoverReadyDropsUnverifiedRemoteHolders(t *testing.T) {
 	}, []string{"node-a", "node-b"}, SealStrict); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	addSecretHolderNodes("sb-probe", "node-a", "node-b")
+	// Stale remote ACK from a prior generation must not count until re-ACK.
+	resetSecretHoldersForGeneration("sb-probe", 99, "node-a", "node-b")
 	ready := svc.computeFailoverReady(ctx, sb)
 	if ready == nil || *ready {
-		t.Fatalf("unverified remote holder must keep ready=false, got %v", ready)
+		t.Fatalf("stale generation holders must keep ready=false, got %v", ready)
 	}
 }
 

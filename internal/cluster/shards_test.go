@@ -74,9 +74,14 @@ func TestIngressRouteForSandboxReturnsShardOwnerForLargeIngressTier(t *testing.T
 	route := IngressRouteForSandbox(members, "sb-route")
 	wantShard := PlacementShardForSandbox("sb-route", DefaultPlacementShardCount)
 	ids := ingressShardNodeIDs(members)
-	wantOwner := ids[rendezvousIngressOwnerIndex(wantShard, ids)]
-	if len(route.Owners) != 1 || route.Owners[0].NodeID != wantOwner {
-		t.Fatalf("owners = %+v, want single shard owner %q", route.Owners, wantOwner)
+	wantIdxs := rendezvousIngressOwnerIndexes(wantShard, ids, 2)
+	if len(route.Owners) != len(wantIdxs) {
+		t.Fatalf("owners = %+v, want %d shard owners", route.Owners, len(wantIdxs))
+	}
+	for i, idx := range wantIdxs {
+		if route.Owners[i].NodeID != ids[idx] {
+			t.Fatalf("owners[%d] = %q, want %q", i, route.Owners[i].NodeID, ids[idx])
+		}
 	}
 }
 

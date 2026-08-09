@@ -144,8 +144,8 @@ func TestIngressShardFilterAppendsSelfAndDedups(t *testing.T) {
 		t.Fatalf("expected sharded filter for oversized ingress + self, got %+v", filter)
 	}
 	route := IngressRouteForSandbox(members, "sb-1")
-	if len(route.Owners) != 1 {
-		t.Fatalf("large tier route owners=%+v", route.Owners)
+	if len(route.Owners) != 2 {
+		t.Fatalf("large tier route owners=%+v, want primary+replica", route.Owners)
 	}
 }
 

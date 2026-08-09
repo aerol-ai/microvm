@@ -149,8 +149,11 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 
 	shards := make([]int, 0, DefaultPlacementShardCount/len(ids)+1)
 	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
-		if rendezvousIngressOwnerIndex(shard, ids) == selfIndex {
-			shards = append(shards, shard)
+		for _, idx := range rendezvousIngressOwnerIndexes(shard, ids, 2) {
+			if idx == selfIndex {
+				shards = append(shards, shard)
+				break
+			}
 		}
 	}
 	return PlacementShardFilter{
@@ -161,7 +164,8 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 
 // IngressRouteForSandbox returns the ingress owner set an upstream router
 // should target for sandboxID. Small ingress tiers all own every sandbox route;
-// very large ingress tiers return the stable shard owner.
+// very large ingress tiers return the primary shard owner plus one failover
+// replica so a single ingress death does not create a traffic vacuum.
 func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRoute {
 	shardCount := DefaultPlacementShardCount
 	shard := PlacementShardForSandbox(sandboxID, shardCount)
@@ -179,9 +183,11 @@ func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRout
 		route.Owners = owners
 		return route
 	}
-	ownerIdx := rendezvousIngressOwnerIndex(shard, ingressShardNodeIDs(members))
-	if ownerIdx >= 0 && ownerIdx < len(owners) {
-		route.Owners = append(route.Owners, owners[ownerIdx])
+	ids := ingressShardNodeIDs(members)
+	for _, idx := range rendezvousIngressOwnerIndexes(shard, ids, 2) {
+		if idx >= 0 && idx < len(owners) {
+			route.Owners = append(route.Owners, owners[idx])
+		}
 	}
 	return route
 }
@@ -189,19 +195,41 @@ func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRout
 // rendezvousIngressOwnerIndex picks a stable shard owner via highest-random-weight
 // hashing so membership N→N-1 remaps ~1/N shards instead of ~99%.
 func rendezvousIngressOwnerIndex(shard int, nodeIDs []string) int {
-	if len(nodeIDs) == 0 {
+	idxs := rendezvousIngressOwnerIndexes(shard, nodeIDs, 1)
+	if len(idxs) == 0 {
 		return -1
 	}
-	best := 0
-	bestScore := uint64(0)
-	for i, id := range nodeIDs {
-		score := rendezvousScore(shard, id)
-		if i == 0 || score > bestScore || (score == bestScore && id < nodeIDs[best]) {
-			best = i
-			bestScore = score
-		}
+	return idxs[0]
+}
+
+// rendezvousIngressOwnerIndexes returns up to n distinct HRW owners for shard.
+func rendezvousIngressOwnerIndexes(shard int, nodeIDs []string, n int) []int {
+	if len(nodeIDs) == 0 || n <= 0 {
+		return nil
 	}
-	return best
+	type scored struct {
+		idx   int
+		score uint64
+		id    string
+	}
+	all := make([]scored, 0, len(nodeIDs))
+	for i, id := range nodeIDs {
+		all = append(all, scored{idx: i, score: rendezvousScore(shard, id), id: id})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].score == all[j].score {
+			return all[i].id < all[j].id
+		}
+		return all[i].score > all[j].score
+	})
+	if n > len(all) {
+		n = len(all)
+	}
+	out := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, all[i].idx)
+	}
+	return out
 }
 
 func rendezvousScore(shard int, nodeID string) uint64 {

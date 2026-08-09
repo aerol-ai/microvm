@@ -300,11 +300,15 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 			continue
 		}
 		blob := secrets.SecretBlob{
-			Ref:           rec.Ref,
-			SandboxID:     rec.SandboxID,
-			Version:       rec.Version,
-			Recipients:    append([]string(nil), rec.Recipients...),
-			SealedPayload: append([]byte(nil), rec.SealedPayload...),
+			Ref:            rec.Ref,
+			SandboxID:      rec.SandboxID,
+			Version:        rec.Version,
+			Recipients:     append([]string(nil), rec.Recipients...),
+			SealedPayload:  append([]byte(nil), rec.SealedPayload...),
+			SealGeneration: rec.SealGeneration,
+		}
+		if blob.SealGeneration <= 0 {
+			blob.SealGeneration = 1
 		}
 		go s.runSecretFanout(rec.SandboxID, blob, rec.Recipients, pusher)
 	}
@@ -381,6 +385,14 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	}
 	if !sameStringSlice(wireRecipients, envelopeRecipients) {
 		return fmt.Errorf("%w: wire recipients do not match sealed envelope", ErrInvalidClusterSecretBlob)
+	}
+	if ver, bindSandbox, bindErr := secrets.EnvelopeBindingMeta(blob.SealedPayload); bindErr == nil {
+		if ver >= secrets.EnvelopeVersion && strings.TrimSpace(bindSandbox) == "" {
+			return fmt.Errorf("%w: v4 envelope missing sandbox binding", ErrInvalidClusterSecretBlob)
+		}
+		if ver >= secrets.EnvelopeVersion && bindSandbox != sandboxID {
+			return fmt.Errorf("%w: envelope sandbox_id does not match wire sandbox_id", ErrInvalidClusterSecretBlob)
+		}
 	}
 
 	selfID := ""
@@ -516,10 +528,12 @@ func (s *Service) assertEnvSealWriterGate(bag secrets.Secrets, recipients []stri
 // computeFailoverReady implements E1a: omit for non-recreate; otherwise true
 // when live holders >= 2 or the recipient set is single-node (len <= 1).
 //
-// Holders are pruned to currently-alive members so a peer that lost its SQLite
-// DB and rejoined is not counted until it ACKs again. Self is counted only when
-// the local sealed row is present. Remote ACKs are verified with a HEAD probe
-// against current seal_generation before counting toward ready.
+// Intentionally synchronous-probe-free: Get/List must not pay N×peer RTT.
+// Correctness comes from (1) local sealed-row possession for self, (2) pruning
+// dead members out of ACK memory so a rejoined empty-DB peer is not counted
+// until it ACKs again, and (3) generation-scoped holder resets on reseal.
+// Optional HEAD probes remain available via ProbeSecretOnPeers for operators /
+// background reconcile, not the request path.
 func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil
@@ -541,7 +555,6 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 	pruneDeadSecretHolders(sb.ID, alive)
 	localGen, localHolds := s.localSealedSecretGeneration(ctx, sb.ID)
 	if localGen > 0 && secretHolderGeneration(sb.ID) != localGen {
-		// Stale ACK memory from a prior generation — keep only verified self.
 		seed := []string{}
 		if localHolds && selfID != "" {
 			seed = []string{selfID}
@@ -554,37 +567,15 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 		holders = secretHolderNodeIDs(sb.ID)
 	}
 
-	var remoteCandidates []string
 	liveHolders := 0
 	for _, id := range holders {
 		if _, ok := alive[id]; !ok {
 			continue
 		}
-		if id == selfID {
-			if localHolds {
-				liveHolders++
-			}
+		if id == selfID && !localHolds {
 			continue
 		}
-		remoteCandidates = append(remoteCandidates, id)
-	}
-	if len(remoteCandidates) > 0 && localGen > 0 {
-		if pusher := s.secretPeerPusher(); pusher != nil {
-			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			holding, _ := pusher.ProbeSecretOnPeers(probeCtx, sb.ID, remoteCandidates, localGen)
-			cancel()
-			holdingSet := make(map[string]struct{}, len(holding))
-			for _, id := range holding {
-				holdingSet[id] = struct{}{}
-				liveHolders++
-			}
-			// Drop ACK memory for peers that no longer hold the generation.
-			for _, id := range remoteCandidates {
-				if _, ok := holdingSet[id]; !ok {
-					removeSecretHolderNode(sb.ID, id)
-				}
-			}
-		}
+		liveHolders++
 	}
 	ready := false
 	switch {
@@ -596,17 +587,6 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 		ready = false
 	}
 	return &ready
-}
-
-func removeSecretHolderNode(sandboxID, nodeID string) {
-	v, ok := secretFanoutHolders.Load(sandboxID)
-	if !ok {
-		return
-	}
-	hs := v.(*holderNodeSet)
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	delete(hs.nodes, nodeID)
 }
 
 func (s *Service) localSealedSecretGeneration(ctx context.Context, sandboxID string) (gen int64, holds bool) {

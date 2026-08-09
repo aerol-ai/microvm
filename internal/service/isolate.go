@@ -177,6 +177,10 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 		TenantID:             req.TenantID,
 	}
 	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, sandbox.ID)
+	// Loopback IP so syncAllowedPorts / expose_port probe gating treat the
+	// sandbox as host-mediated (same posture as WASM). Public L7 routing is
+	// opt-in via expose_port — creates stay private-by-default.
+	sandbox.ContainerIP = "127.0.0.1"
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		if errors.Is(err, models.ErrSandboxExists) {
 			// A concurrent create with the same id won the INSERT. Both callers
