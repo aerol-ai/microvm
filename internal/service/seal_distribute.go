@@ -29,38 +29,66 @@ const (
 
 const defaultSecretFanoutMinACKWait = 2 * time.Second
 
+// secretHolderACKTTL bounds how long an in-memory peer ACK counts toward
+// failover_ready without a fresh push ACK or background possession probe.
+// Alive=true alone is not enough: a peer can lose SQLite without flapping.
+const secretHolderACKTTL = 90 * time.Second
+
 // secretFanoutHolders tracks which node IDs have ACK'd holding a sealed blob
 // (local put seeds self). Live failover_ready intersects this set with current
 // membership — historical ACK counts alone are not enough after a backup dies.
-var secretFanoutHolders sync.Map // sandboxID -> *holderNodeSet
+var (
+	secretFanoutHolders sync.Map // sandboxID -> *holderNodeSet
+	secretSandboxOpMu   sync.Map // sandboxID -> *sync.Mutex
+)
 
 type holderNodeSet struct {
 	mu    sync.Mutex
 	gen   int64
-	nodes map[string]struct{}
+	nodes map[string]time.Time // nodeID -> last ACK / possession confirm
+}
+
+func lockSecretSandboxOps(sandboxID string) func() {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return func() {}
+	}
+	v, _ := secretSandboxOpMu.LoadOrStore(sandboxID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func holderSetFor(sandboxID string) *holderNodeSet {
-	v, _ := secretFanoutHolders.LoadOrStore(sandboxID, &holderNodeSet{nodes: make(map[string]struct{})})
+	v, _ := secretFanoutHolders.LoadOrStore(sandboxID, &holderNodeSet{nodes: make(map[string]time.Time)})
 	return v.(*holderNodeSet)
 }
 
-func addSecretHolderNodes(sandboxID string, nodeIDs ...string) {
+// addSecretHolderNodes records generation-scoped ACKs. Stale-generation ACKs
+// are ignored so delayed gen1 fan-out cannot keep failover_ready true for gen2.
+func addSecretHolderNodes(sandboxID string, gen int64, nodeIDs ...string) {
 	if strings.TrimSpace(sandboxID) == "" {
 		return
 	}
 	hs := holderSetFor(sandboxID)
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
-	if hs.nodes == nil {
-		hs.nodes = make(map[string]struct{})
+	if gen > 0 && hs.gen != 0 && gen != hs.gen {
+		return
 	}
+	if gen > 0 && hs.gen == 0 {
+		hs.gen = gen
+	}
+	if hs.nodes == nil {
+		hs.nodes = make(map[string]time.Time)
+	}
+	now := time.Now()
 	for _, id := range nodeIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
-		hs.nodes[id] = struct{}{}
+		hs.nodes[id] = now
 	}
 }
 
@@ -74,16 +102,17 @@ func resetSecretHoldersForGeneration(sandboxID string, gen int64, seed ...string
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
 	if hs.gen != gen {
-		hs.nodes = make(map[string]struct{})
+		hs.nodes = make(map[string]time.Time)
 		hs.gen = gen
 	}
 	if hs.nodes == nil {
-		hs.nodes = make(map[string]struct{})
+		hs.nodes = make(map[string]time.Time)
 	}
+	now := time.Now()
 	for _, id := range seed {
 		id = strings.TrimSpace(id)
 		if id != "" {
-			hs.nodes[id] = struct{}{}
+			hs.nodes[id] = now
 		}
 	}
 }
@@ -107,8 +136,13 @@ func secretHolderNodeIDs(sandboxID string) []string {
 	hs := v.(*holderNodeSet)
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
+	now := time.Now()
 	out := make([]string, 0, len(hs.nodes))
-	for id := range hs.nodes {
+	for id, at := range hs.nodes {
+		if !at.IsZero() && now.Sub(at) > secretHolderACKTTL {
+			delete(hs.nodes, id)
+			continue
+		}
 		out = append(out, id)
 	}
 	return out
@@ -132,11 +166,22 @@ func pruneDeadSecretHolders(sandboxID string, alive map[string]struct{}) {
 	hs := v.(*holderNodeSet)
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
-	for id := range hs.nodes {
+	now := time.Now()
+	for id, at := range hs.nodes {
 		if _, ok := alive[id]; !ok {
+			delete(hs.nodes, id)
+			continue
+		}
+		if !at.IsZero() && now.Sub(at) > secretHolderACKTTL {
 			delete(hs.nodes, id)
 		}
 	}
+}
+
+// touchSecretHolderNodes refreshes ACK timestamps after a successful possession
+// probe (same generation only).
+func touchSecretHolderNodes(sandboxID string, gen int64, nodeIDs ...string) {
+	addSecretHolderNodes(sandboxID, gen, nodeIDs...)
 }
 
 // SealAndDistribute seals to recipients, stores locally, and fans out when
@@ -153,6 +198,8 @@ func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req m
 			recipients = []string{c.SelfNodeID()}
 		}
 	}
+	unlock := lockSecretSandboxOps(sandboxID)
+	defer unlock()
 	out, err := s.putClusterSecretsForRecipients(ctx, sandboxID, req, recipients)
 	if err != nil {
 		if policy == SealBestEffort {
@@ -196,15 +243,10 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 		}
 		return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured")
 	}
+	// PutClusterSecret atomically clears tomb+outbox with the row write.
 	h, err := p.Put(ctx, sandboxID, bag, recipients)
 	if err != nil {
 		return cluster.PlacementSecrets{}, err
-	}
-	// Clear tomb only after a successful reseal so a failed Put cannot open a
-	// window for peer resurrection of a deleted sandbox.
-	if s.store != nil {
-		_ = s.store.ClearClusterSecretTomb(ctx, sandboxID)
-		_ = s.store.DeleteSecretDeleteOutbox(ctx, sandboxID)
 	}
 	return cluster.PlacementSecrets{Ref: h.Ref, Version: h.Version, Recipients: append([]string(nil), recipients...)}, nil
 }
@@ -240,7 +282,7 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 		acked, waitErr := pusher.PushSecretBlobToPeers(waitCtx, *blob, recipients)
 		cancel()
 		if len(acked) > 0 {
-			addSecretHolderNodes(sandboxID, acked...)
+			addSecretHolderNodes(sandboxID, blob.SealGeneration, acked...)
 		}
 		if waitErr != nil && s.logger != nil && len(acked) == 0 {
 			s.logger.Warn("cluster: secret fan-out min-ACK wait got no peer; continuing async",
@@ -262,7 +304,7 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 	defer cancel()
 	acked, err := pusher.PushSecretBlobToPeers(ctx, blob, recipients)
 	if len(acked) > 0 {
-		addSecretHolderNodes(sandboxID, acked...)
+		addSecretHolderNodes(sandboxID, blob.SealGeneration, acked...)
 	}
 	if err != nil {
 		recordSecretFanoutFailure()
@@ -295,7 +337,11 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 		if c := s.Cluster(); c != nil {
 			selfID = c.SelfNodeID()
 		}
-		addSecretHolderNodes(rec.SandboxID, selfID)
+		gen := rec.SealGeneration
+		if gen <= 0 {
+			gen = 1
+		}
+		resetSecretHoldersForGeneration(rec.SandboxID, gen, selfID)
 		if len(rec.Recipients) <= 1 || pusher == nil {
 			continue
 		}
@@ -305,10 +351,7 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 			Version:        rec.Version,
 			Recipients:     append([]string(nil), rec.Recipients...),
 			SealedPayload:  append([]byte(nil), rec.SealedPayload...),
-			SealGeneration: rec.SealGeneration,
-		}
-		if blob.SealGeneration <= 0 {
-			blob.SealGeneration = 1
+			SealGeneration: gen,
 		}
 		go s.runSecretFanout(rec.SandboxID, blob, rec.Recipients, pusher)
 	}
@@ -354,6 +397,13 @@ func (s *Service) UpsertClusterSecretBlob(ctx context.Context, blob secrets.Secr
 	if s == nil || s.store == nil {
 		return errors.New("cluster secret store is not configured")
 	}
+	unlock := lockSecretSandboxOps(blob.SandboxID)
+	defer unlock()
+	if blob.SealGeneration <= 0 {
+		if meta, err := secrets.EnvelopeBinding(blob.SealedPayload); err == nil && meta.Generation > 0 {
+			blob.SealGeneration = meta.Generation
+		}
+	}
 	if err := validatePeerSecretBlob(ctx, s, blob); err != nil {
 		return err
 	}
@@ -386,13 +436,29 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	if !sameStringSlice(wireRecipients, envelopeRecipients) {
 		return fmt.Errorf("%w: wire recipients do not match sealed envelope", ErrInvalidClusterSecretBlob)
 	}
-	if ver, bindSandbox, bindErr := secrets.EnvelopeBindingMeta(blob.SealedPayload); bindErr == nil {
-		if ver >= secrets.EnvelopeVersion && strings.TrimSpace(bindSandbox) == "" {
-			return fmt.Errorf("%w: v4 envelope missing sandbox binding", ErrInvalidClusterSecretBlob)
-		}
-		if ver >= secrets.EnvelopeVersion && bindSandbox != sandboxID {
-			return fmt.Errorf("%w: envelope sandbox_id does not match wire sandbox_id", ErrInvalidClusterSecretBlob)
-		}
+	meta, bindErr := secrets.EnvelopeBinding(blob.SealedPayload)
+	if bindErr != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidClusterSecretBlob, bindErr)
+	}
+	// Peer ingress requires authenticated v4 binding. Legacy unbound v3 is
+	// still openable locally for rolling upgrades, but must not poison peer rows.
+	if meta.Version < secrets.EnvelopeVersion || strings.TrimSpace(meta.SandboxID) == "" {
+		return fmt.Errorf("%w: peer secret ingress requires bound v4 envelope", ErrInvalidClusterSecretBlob)
+	}
+	if meta.SandboxID != sandboxID {
+		return fmt.Errorf("%w: envelope sandbox_id does not match wire sandbox_id", ErrInvalidClusterSecretBlob)
+	}
+	if strings.TrimSpace(meta.Ref) != "" && meta.Ref != ref {
+		return fmt.Errorf("%w: envelope ref does not match wire ref", ErrInvalidClusterSecretBlob)
+	}
+	if meta.VersionField > 0 && meta.VersionField != blob.Version {
+		return fmt.Errorf("%w: envelope ref version does not match wire version", ErrInvalidClusterSecretBlob)
+	}
+	if meta.Generation > 0 && blob.SealGeneration > 0 && meta.Generation != blob.SealGeneration {
+		return fmt.Errorf("%w: envelope generation does not match wire seal_generation", ErrInvalidClusterSecretBlob)
+	}
+	if blob.SealGeneration <= 0 && meta.Generation <= 0 {
+		return fmt.Errorf("%w: seal_generation is required for peer secret ingress", ErrInvalidClusterSecretBlob)
 	}
 
 	selfID := ""
@@ -417,10 +483,14 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 			if blob.SealGeneration == 0 {
 				return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone)", ErrInvalidClusterSecretBlob, sandboxID)
 			}
-			// Newer seal generation supersedes the tomb (reseal after destroy+recreate).
-			if err := s.store.ClearClusterSecretTomb(ctx, sandboxID); err != nil {
-				return err
-			}
+			// Newer seal clears tomb atomically inside PutClusterSecret.
+		}
+		maxGen, err := s.store.MaxClusterSecretSealGeneration(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if maxGen > 0 && blob.SealGeneration > 0 && blob.SealGeneration < maxGen {
+			return fmt.Errorf("%w: stale seal_generation %d < local %d", ErrInvalidClusterSecretBlob, blob.SealGeneration, maxGen)
 		}
 	}
 	return nil
@@ -531,9 +601,9 @@ func (s *Service) assertEnvSealWriterGate(bag secrets.Secrets, recipients []stri
 // Intentionally synchronous-probe-free: Get/List must not pay N×peer RTT.
 // Correctness comes from (1) local sealed-row possession for self, (2) pruning
 // dead members out of ACK memory so a rejoined empty-DB peer is not counted
-// until it ACKs again, and (3) generation-scoped holder resets on reseal.
-// Optional HEAD probes remain available via ProbeSecretOnPeers for operators /
-// background reconcile, not the request path.
+// until it ACKs again, (3) generation-scoped holder resets on reseal, and
+// (4) ACK TTL so a peer that loses SQLite without an Alive=false flap stops
+// counting until a fresh ACK / background possession refresh.
 func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil

@@ -4091,14 +4091,39 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 	if rec.UpdatedAt.IsZero() {
 		rec.UpdatedAt = now
 	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin put cluster secret: %w", err)
+	}
+	defer tx.Rollback()
+
 	if rec.SealGeneration <= 0 {
-		gen, genErr := s.NextClusterSecretSealGeneration(ctx, rec.SandboxID)
+		gen, genErr := nextClusterSecretSealGenerationTx(ctx, tx, rec.SandboxID)
 		if genErr != nil {
 			return fmt.Errorf("next seal generation: %w", genErr)
 		}
 		rec.SealGeneration = gen
 	}
-	_, err = s.db.ExecContext(ctx, `
+
+	// Reject out-of-order peer fan-out that would downgrade a newer seal.
+	var existingGen sql.NullInt64
+	_ = tx.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets WHERE ref = ?
+	`, rec.Ref).Scan(&existingGen)
+	if existingGen.Valid && existingGen.Int64 > rec.SealGeneration {
+		return nil // idempotent ACK; keep the newer row
+	}
+	var maxOther sql.NullInt64
+	_ = tx.QueryRowContext(ctx, `
+		SELECT MAX(seal_generation) FROM cluster_secrets
+		WHERE sandbox_id = ? AND ref != ?
+	`, rec.SandboxID, rec.Ref).Scan(&maxOther)
+	if maxOther.Valid && maxOther.Int64 > rec.SealGeneration {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cluster_secrets (
 			ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -4109,9 +4134,20 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 			sealed_payload = excluded.sealed_payload,
 			seal_generation = excluded.seal_generation,
 			updated_at = excluded.updated_at
-	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.SealGeneration, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC())
-	if err != nil {
+		WHERE excluded.seal_generation >= cluster_secrets.seal_generation
+	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.SealGeneration, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC()); err != nil {
 		return fmt.Errorf("put cluster secret: %w", err)
+	}
+	// Atomic with put: clear delete tomb + outbox so a concurrent destroy
+	// cannot leave a handle whose cleanup job was wiped without a row.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+		return fmt.Errorf("clear cluster secret tomb on put: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+		return fmt.Errorf("clear secret delete outbox on put: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit put cluster secret: %w", err)
 	}
 	return nil
 }
@@ -4166,11 +4202,9 @@ func (s *Store) deleteClusterSecretsForSandbox(ctx context.Context, sandboxID st
 	defer tx.Rollback()
 	now := time.Now().UTC()
 	if tombstone {
-		var gen int64 = 1
-		var prev sql.NullInt64
-		_ = tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev)
-		if prev.Valid {
-			gen = prev.Int64 + 1
+		gen, genErr := nextClusterSecretDeleteGenerationTx(ctx, tx, sandboxID)
+		if genErr != nil {
+			return genErr
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation) VALUES (?, ?, ?)
@@ -4278,11 +4312,9 @@ func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sa
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
-	generation = 1
-	var prev sql.NullInt64
-	_ = tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev)
-	if prev.Valid {
-		generation = prev.Int64 + 1
+	generation, err = nextClusterSecretDeleteGenerationTx(ctx, tx, sandboxID)
+	if err != nil {
+		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation) VALUES (?, ?, ?)
@@ -4312,6 +4344,44 @@ func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sa
 		return 0, fmt.Errorf("commit delete cluster secrets originator: %w", err)
 	}
 	return generation, nil
+}
+
+// nextClusterSecretDeleteGenerationTx returns a monotonic delete generation that
+// survives reseal (which clears the tomb but leaves a higher seal_generation).
+func nextClusterSecretDeleteGenerationTx(ctx context.Context, tx *sql.Tx, sandboxID string) (int64, error) {
+	var hwm int64
+	var prev sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read cluster secret tomb generation: %w", err)
+	}
+	if prev.Valid && prev.Int64 > hwm {
+		hwm = prev.Int64
+	}
+	var maxSeal sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal); err != nil {
+		return 0, fmt.Errorf("read max seal generation: %w", err)
+	}
+	if maxSeal.Valid && maxSeal.Int64 > hwm {
+		hwm = maxSeal.Int64
+	}
+	return hwm + 1, nil
+}
+
+func nextClusterSecretSealGenerationTx(ctx context.Context, tx *sql.Tx, sandboxID string) (int64, error) {
+	var prev sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	if prev.Valid {
+		return prev.Int64 + 1, nil
+	}
+	var maxSeal sql.NullInt64
+	_ = tx.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal)
+	if maxSeal.Valid && maxSeal.Int64 > 0 {
+		return maxSeal.Int64 + 1, nil
+	}
+	return 1, nil
 }
 
 // GetSecretDeleteOutbox returns one outbox row when present.

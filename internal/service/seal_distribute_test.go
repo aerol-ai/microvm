@@ -83,13 +83,14 @@ func TestUpsertClusterSecretBlobValidatesRecipientAndRef(t *testing.T) {
 	svc.AttachCluster(cluster.NewNoop("node-b", "http://b", ""))
 
 	bag := secrets.Secrets{Registry: &models.RegistryAuth{Password: "p"}}
-	sealed, err := secrets.SealEnvelope(cipher, bag, []string{"node-a", "node-b"})
+	binding := secrets.SealBinding{SandboxID: "sb-ok", Ref: secrets.FormatRef("sb-ok", 1), Version: 1, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(cipher, bag, []string{"node-a", "node-b"}, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ok := secrets.SecretBlob{
 		Ref: secrets.FormatRef("sb-ok", 1), SandboxID: "sb-ok", Version: 1,
-		Recipients: []string{"node-a", "node-b"}, SealedPayload: sealed,
+		Recipients: []string{"node-a", "node-b"}, SealedPayload: sealed, SealGeneration: 1,
 	}
 	if err := svc.UpsertClusterSecretBlob(ctx, ok); err != nil {
 		t.Fatalf("valid upsert: %v", err)
@@ -101,13 +102,28 @@ func TestUpsertClusterSecretBlobValidatesRecipientAndRef(t *testing.T) {
 		t.Fatalf("bad ref = %v, want ErrInvalidClusterSecretBlob", err)
 	}
 
-	foreign, err := secrets.SealEnvelope(cipher, bag, []string{"node-a", "node-c"})
+	// Unbound v3 must be rejected on peer ingress (local open still supports it).
+	legacy, err := secrets.SealEnvelope(cipher, bag, []string{"node-a", "node-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3 := secrets.SecretBlob{
+		Ref: secrets.FormatRef("sb-v3", 1), SandboxID: "sb-v3", Version: 1,
+		Recipients: []string{"node-a", "node-b"}, SealedPayload: legacy, SealGeneration: 1,
+	}
+	if err := svc.UpsertClusterSecretBlob(ctx, v3); !errors.Is(err, ErrInvalidClusterSecretBlob) {
+		t.Fatalf("unbound v3 upsert = %v, want ErrInvalidClusterSecretBlob", err)
+	}
+
+	foreign, err := secrets.SealEnvelopeBound(cipher, bag, []string{"node-a", "node-c"}, secrets.SealBinding{
+		SandboxID: "sb-deny", Ref: secrets.FormatRef("sb-deny", 1), Version: 1, Generation: 1,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	denied := secrets.SecretBlob{
 		Ref: secrets.FormatRef("sb-deny", 1), SandboxID: "sb-deny", Version: 1,
-		Recipients: []string{"node-a", "node-c"}, SealedPayload: foreign,
+		Recipients: []string{"node-a", "node-c"}, SealedPayload: foreign, SealGeneration: 1,
 	}
 	if err := svc.UpsertClusterSecretBlob(ctx, denied); !errors.Is(err, secrets.ErrRecipientDenied) {
 		t.Fatalf("non-recipient = %v, want ErrRecipientDenied", err)
@@ -366,7 +382,7 @@ func TestComputeFailoverReady(t *testing.T) {
 		t.Fatalf("no recipients → ready want true, got %v", ready)
 	}
 
-	addSecretHolderNodes("sb1", "node-a")
+	addSecretHolderNodes("sb1", 1, "node-a")
 	svc.cluster = &placementRecipientsCluster{
 		Noop:       cluster.NewNoop("node-a", "", ""),
 		recipients: []string{"node-a", "node-b"},
@@ -379,7 +395,7 @@ func TestComputeFailoverReady(t *testing.T) {
 	if ready == nil || *ready {
 		t.Fatalf("holders=1 multi → want false, got %v", ready)
 	}
-	addSecretHolderNodes("sb1", "node-b")
+	addSecretHolderNodes("sb1", 1, "node-b")
 	// Self is counted only when the local sealed row exists.
 	st := openSealTestStore(t)
 	svc.store = st
@@ -392,7 +408,7 @@ func TestComputeFailoverReady(t *testing.T) {
 	}, []string{"node-a", "node-b"}, SealStrict); err != nil {
 		t.Fatalf("seal for ready: %v", err)
 	}
-	addSecretHolderNodes("sb1", "node-a", "node-b")
+	addSecretHolderNodes("sb1", secretHolderGeneration("sb1"), "node-a", "node-b")
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || !*ready {
 		t.Fatalf("holders=2 live with local row → want true, got %v", ready)
@@ -432,6 +448,45 @@ func (c *placementRecipientsCluster) Members() []cluster.Member {
 		return append([]cluster.Member(nil), c.members...)
 	}
 	return c.Noop.Members()
+}
+
+func TestComputeFailoverReadyExpiresStaleACKWithoutAliveFlap(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	svc := &Service{
+		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster: &placementRecipientsCluster{
+			Noop:       cluster.NewNoop("node-a", "", ""),
+			recipients: []string{"node-a", "node-b"},
+			members: []cluster.Member{
+				{NodeID: "node-a", Alive: true},
+				{NodeID: "node-b", Alive: true},
+			},
+		},
+	}
+	sb := &models.Sandbox{ID: "sb-ttl", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
+	if _, err := svc.SealAndDistribute(ctx, "sb-ttl", models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}, []string{"node-a", "node-b"}, SealStrict); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	gen := secretHolderGeneration("sb-ttl")
+	addSecretHolderNodes("sb-ttl", gen, "node-b")
+	// Simulate peer losing SQLite without Alive=false: age the remote ACK past TTL.
+	hs := holderSetFor("sb-ttl")
+	hs.mu.Lock()
+	hs.nodes["node-b"] = time.Now().Add(-secretHolderACKTTL - time.Second)
+	hs.mu.Unlock()
+	ready := svc.computeFailoverReady(ctx, sb)
+	if ready == nil || *ready {
+		t.Fatalf("expired remote ACK without Alive flap must keep ready=false, got %v", ready)
+	}
 }
 
 func TestComputeFailoverReadyResetsStaleGenerationHolders(t *testing.T) {

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -230,6 +232,40 @@ func TestUnsealClusterSecretsEmpty(t *testing.T) {
 	}
 	if out.Image != "alpine" {
 		t.Fatalf("passthrough lost spec: %+v", out)
+	}
+}
+
+func TestDeleteClusterSecretsStandaloneLeavesNoTomb(t *testing.T) {
+	ctx := context.Background()
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	s := &Service{
+		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cipher:         newTestCipher(t),
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(newTestCipher(t), newSecretBlobStore(st)),
+		cluster:        cluster.NewNoop("standalone", "http://localhost", ""),
+	}
+	if _, err := s.PutClusterSecretsForRecipient(ctx, "sb-solo", models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+	}, "standalone"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteClusterSecrets(ctx, "sb-solo"); err != nil {
+		t.Fatal(err)
+	}
+	tomb, err := st.HasClusterSecretTomb(ctx, "sb-solo")
+	if err != nil || tomb {
+		t.Fatalf("standalone delete must not leave tomb: %v %v", tomb, err)
+	}
+	outbox, err := st.GetSecretDeleteOutbox(ctx, "sb-solo")
+	if err != nil || outbox != nil {
+		t.Fatalf("standalone delete must not leave outbox: %+v %v", outbox, err)
 	}
 }
 

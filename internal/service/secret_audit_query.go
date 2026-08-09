@@ -403,10 +403,15 @@ func secretAuditEventCursorKey(ev SecretAuditEvent) string {
 		ev.SandboxID,
 		ev.Kind,
 		ev.Result,
+		ev.Reason,
 		ev.Actor,
 		ev.CorrelationID,
 		ev.Ref,
 		ev.Destination,
+		ev.NodeID,
+		ev.Network,
+		fmt.Sprintf("%d", ev.BytesIn),
+		fmt.Sprintf("%d", ev.BytesOut),
 	}, secretAuditCursorSep)
 }
 
@@ -437,21 +442,10 @@ func dedupeSecretAuditEvents(events []SecretAuditEvent) []SecretAuditEvent {
 	if len(events) == 0 {
 		return events
 	}
-	type key struct {
-		t, ref, result, actor, corr, kind, dest string
-	}
-	seen := make(map[key]struct{}, len(events))
+	seen := make(map[string]struct{}, len(events))
 	out := make([]SecretAuditEvent, 0, len(events))
 	for _, ev := range events {
-		k := key{
-			t:      ev.Time.UTC().Format(time.RFC3339Nano),
-			ref:    ev.Ref,
-			result: ev.Result,
-			actor:  ev.Actor,
-			corr:   ev.CorrelationID,
-			kind:   ev.Kind,
-			dest:   ev.Destination,
-		}
+		k := ev.Time.UTC().Format(time.RFC3339Nano) + secretAuditCursorSep + secretAuditEventCursorKey(ev)
 		if _, ok := seen[k]; ok {
 			continue
 		}

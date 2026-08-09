@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -181,6 +182,8 @@ func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) er
 	if s == nil {
 		return nil
 	}
+	unlock := lockSecretSandboxOps(sandboxID)
+	defer unlock()
 	// Capture recipients before local delete so durable outbox / fan-out knows
 	// which peers may hold a copy.
 	var recipients []string
@@ -189,7 +192,7 @@ func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) er
 	}
 	err := s.deleteClusterSecretsOriginator(ctx, sandboxID, recipients)
 	if s.cfg.SecretRecipientFanoutEnabled {
-		go s.reconcileSecretDeleteOutboxOnce(sandboxID)
+		s.maybeAsyncDeleteFanout(sandboxID, recipients)
 	}
 	return err
 }
@@ -197,13 +200,18 @@ func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) er
 // deleteClusterSecretsOriginator tombs, deletes local rows, and enqueues the
 // peer-delete outbox in one SQLite transaction when fan-out is enabled and
 // there is at least one non-self recipient. Standalone destroys must not leave
-// forever-pending outbox rows.
+// forever-pending outbox rows or permanent tombs.
 func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID string, recipients []string) error {
 	if s == nil {
 		return nil
 	}
 	clearSecretFanoutHolders(sandboxID)
-	peers := nonSelfRecipients(recipients, s.selfNodeID())
+	var peers []string
+	if len(recipients) > 0 {
+		// Avoid SelfNodeID() when there is nothing to filter — rollback/test
+		// stubs may panic on identity lookup during seal-failure retract.
+		peers = nonSelfRecipients(recipients, s.selfNodeID())
+	}
 	if s.store != nil && s.cfg.SecretRecipientFanoutEnabled && len(peers) > 0 {
 		_, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, sandboxID, peers)
 		return err
@@ -212,7 +220,7 @@ func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID 
 		return p.Delete(ctx, sandboxID)
 	}
 	if s.store != nil {
-		return s.store.DeleteClusterSecretsForSandbox(ctx, sandboxID)
+		return s.store.DeleteClusterSecretsRowsOnly(ctx, sandboxID)
 	}
 	return nil
 }
@@ -281,6 +289,7 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 				if err := s.ReconcileSecretDeleteOutbox(ctx); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret delete-outbox reconcile failed", "err", err)
 				}
+				s.refreshSecretHolderPossession(ctx)
 				if rejoined {
 					if err := s.ReFanoutClusterSecrets(ctx); err != nil && s.logger != nil {
 						s.logger.Warn("cluster: secret re-fanout after member rejoin failed", "err", err)
@@ -311,6 +320,67 @@ func (s *Service) aliveMemberSet() map[string]struct{} {
 	return out
 }
 
+// refreshSecretHolderPossession re-probes known holders so a peer that lost
+// its SQLite without an Alive flap is dropped before ACK TTL alone would.
+func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
+	if s == nil || s.store == nil {
+		return
+	}
+	pusher := s.secretPeerPusher()
+	if pusher == nil {
+		return
+	}
+	rows, err := s.store.ListClusterSecrets(ctx)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	selfID := s.selfNodeID()
+	for _, rec := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		gen := rec.SealGeneration
+		if gen <= 0 {
+			gen = 1
+		}
+		peers := nonSelfRecipients(rec.Recipients, selfID)
+		if len(peers) == 0 {
+			continue
+		}
+		holding, probeErr := pusher.ProbeSecretOnPeers(ctx, rec.SandboxID, peers, gen)
+		if probeErr != nil && s.logger != nil {
+			s.logger.Warn("cluster: secret holder possession probe incomplete",
+				"sandbox_id", rec.SandboxID, "err", probeErr)
+		}
+		// Replace remote ACKs for this generation with confirmed holders only.
+		hs := holderSetFor(rec.SandboxID)
+		hs.mu.Lock()
+		if hs.gen == gen || hs.gen == 0 {
+			hs.gen = gen
+			if hs.nodes == nil {
+				hs.nodes = make(map[string]time.Time)
+			}
+			for id := range hs.nodes {
+				if id == selfID {
+					continue
+				}
+				delete(hs.nodes, id)
+			}
+			now := time.Now()
+			if selfID != "" {
+				hs.nodes[selfID] = now
+			}
+			for _, id := range holding {
+				id = strings.TrimSpace(id)
+				if id != "" {
+					hs.nodes[id] = now
+				}
+			}
+		}
+		hs.mu.Unlock()
+	}
+}
+
 func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
 	if s == nil || s.store == nil {
 		return
@@ -321,7 +391,8 @@ func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
 	}
 	// Standalone / no non-self recipients: nothing to fan out — drop the job
 	// so destroy does not accumulate forever-reconciled tomb+outbox rows.
-	peers := nonSelfRecipients(rec.Recipients, s.selfNodeID())
+	selfID := s.selfNodeID()
+	peers := nonSelfRecipients(rec.Recipients, selfID)
 	if len(peers) == 0 {
 		_ = s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, nil, rec.Generation)
 		return
@@ -370,9 +441,37 @@ func nonSelfRecipients(recipients []string, selfID string) []string {
 	return out
 }
 
+// deleteReconcileWorkers caps concurrent peer-delete retries so a mass destroy
+// wave cannot spawn one long-lived goroutine per sandbox.
+const deleteReconcileWorkers = 64
+
+var (
+	deleteReconcileSem      = make(chan struct{}, deleteReconcileWorkers)
+	deleteReconcileInflight sync.Map // sandboxID -> struct{}
+)
+
 func (s *Service) maybeAsyncDeleteFanout(sandboxID string, recipients []string) {
 	_ = recipients
-	go s.reconcileSecretDeleteOutboxOnce(sandboxID)
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return
+	}
+	if _, loaded := deleteReconcileInflight.LoadOrStore(sandboxID, struct{}{}); loaded {
+		return
+	}
+	select {
+	case deleteReconcileSem <- struct{}{}:
+		go func() {
+			defer func() {
+				<-deleteReconcileSem
+				deleteReconcileInflight.Delete(sandboxID)
+			}()
+			s.reconcileSecretDeleteOutboxOnce(sandboxID)
+		}()
+	default:
+		deleteReconcileInflight.Delete(sandboxID)
+		// Saturated: durable outbox remains for the periodic reconciler.
+	}
 }
 
 // RedactClusterSecrets returns a copy of req with credentials stripped — safe

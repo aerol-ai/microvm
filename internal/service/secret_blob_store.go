@@ -51,7 +51,10 @@ func (a secretBlobStoreAdapter) Get(ctx context.Context, ref string) (*secrets.S
 }
 
 func (a secretBlobStoreAdapter) DeleteForSandbox(ctx context.Context, sandboxID string) error {
-	return a.store.DeleteClusterSecretsForSandbox(ctx, sandboxID)
+	// Provider deletes are local row cleanup only. Originator peer-fanout
+	// tombs+outbox go through DeleteClusterSecretsOriginatorWithOutbox so
+	// standalone/local destroys do not leave permanent cluster_secret_tombs.
+	return a.store.DeleteClusterSecretsRowsOnly(ctx, sandboxID)
 }
 
 func (a secretBlobStoreAdapter) NextSealGeneration(ctx context.Context, sandboxID string) (int64, error) {

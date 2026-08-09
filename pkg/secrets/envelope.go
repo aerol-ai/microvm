@@ -393,17 +393,42 @@ func EnvelopeRecipients(sealed []byte) ([]string, error) {
 
 // EnvelopeBindingMeta returns wire version and sandbox_id without decrypting.
 func EnvelopeBindingMeta(sealed []byte) (version int, sandboxID string, err error) {
+	b, err := EnvelopeBinding(sealed)
+	if err != nil {
+		return 0, "", err
+	}
+	return b.Version, b.SandboxID, nil
+}
+
+// EnvelopeBindingFields is the authenticated identity carried on a sealed envelope
+// (v4). Parsed without decrypting so peer ingress can reject mismatches closed.
+type EnvelopeBindingFields struct {
+	Version      int // wire envelope version (3/4)
+	SandboxID    string
+	Ref          string
+	VersionField int // handle version (RefVersion)
+	Generation   int64
+}
+
+// EnvelopeBinding returns full wire binding metadata without decrypting.
+func EnvelopeBinding(sealed []byte) (EnvelopeBindingFields, error) {
 	if len(sealed) == 0 {
-		return 0, "", fmt.Errorf("empty sealed payload")
+		return EnvelopeBindingFields{}, fmt.Errorf("empty sealed payload")
 	}
 	var envelope sealedSecretsEnvelope
 	if err := json.Unmarshal(sealed, &envelope); err != nil {
-		return 0, "", fmt.Errorf("unmarshal cluster secret envelope: %w", err)
+		return EnvelopeBindingFields{}, fmt.Errorf("unmarshal cluster secret envelope: %w", err)
 	}
 	if len(envelope.Payload) == 0 {
-		return 0, "", fmt.Errorf("cluster secret envelope missing payload")
+		return EnvelopeBindingFields{}, fmt.Errorf("cluster secret envelope missing payload")
 	}
-	return envelope.Version, strings.TrimSpace(envelope.SandboxID), nil
+	return EnvelopeBindingFields{
+		Version:      envelope.Version,
+		SandboxID:    strings.TrimSpace(envelope.SandboxID),
+		Ref:          strings.TrimSpace(envelope.Ref),
+		VersionField: envelope.RefVersion,
+		Generation:   envelope.Generation,
+	}, nil
 }
 
 // FormatRef builds the stable cluster-secret://sandbox/{id}/v{version} handle.
