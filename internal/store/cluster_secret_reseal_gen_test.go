@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -81,6 +82,42 @@ func TestPutClusterSecretRejectsDowngrade(t *testing.T) {
 	}
 	if got.SealGeneration != 2 || string(got.SealedPayload) != "gen2" {
 		t.Fatalf("downgraded row: gen=%d payload=%q", got.SealGeneration, got.SealedPayload)
+	}
+}
+
+func TestPutClusterSecretBlockedByTombInsideTx(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-race/v1", SandboxID: "sb-race", Version: 1,
+		Recipients: []string{"a"}, SealedPayload: []byte("live"),
+		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-race", 2); err != nil {
+		t.Fatal(err)
+	}
+	err = st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-race/v1", SandboxID: "sb-race", Version: 1,
+		Recipients: []string{"a"}, SealedPayload: []byte("stale"),
+		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
+	})
+	if err == nil || !errors.Is(err, ErrClusterSecretTombBlocksPut) {
+		t.Fatalf("equal-gen put after delete = %v, want ErrClusterSecretTombBlocksPut", err)
+	}
+	tomb, err := st.HasClusterSecretTomb(ctx, "sb-race")
+	if err != nil || !tomb {
+		t.Fatalf("tomb must remain after blocked put: %v %v", tomb, err)
+	}
+	if _, err := st.GetClusterSecret(ctx, "cluster-secret://sandbox/sb-race/v1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale put must not resurrect row: %v", err)
 	}
 }
 

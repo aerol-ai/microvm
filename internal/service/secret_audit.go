@@ -61,6 +61,9 @@ type SecretAuditEvent struct {
 	Result        string    `json:"result"`
 	Reason        string    `json:"reason,omitempty"`
 	CorrelationID string    `json:"correlation_id,omitempty"`
+	// EventID uniquely identifies one emitted record so equal-timestamp twins
+	// cannot collapse under compound cursor pagination.
+	EventID string `json:"event_id,omitempty"`
 	// NodeID is the node that wrote the event (same as Actor when set).
 	NodeID string `json:"node_id,omitempty"`
 	// Kind is "secret_open" (default/empty for back-compat) or "egress".
@@ -324,6 +327,16 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 	})
 }
 
+var secretAuditEventSeq atomic.Uint64
+
+func ensureSecretAuditEventID(ev *SecretAuditEvent) {
+	if ev == nil || strings.TrimSpace(ev.EventID) != "" {
+		return
+	}
+	// Monotonic per-process id; unique even when Time and all other fields match.
+	ev.EventID = fmt.Sprintf("ae-%d", secretAuditEventSeq.Add(1))
+}
+
 func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 	if s.writeHook != nil {
 		s.writeHook()
@@ -331,6 +344,7 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 	if ev.Time.IsZero() {
 		ev.Time = time.Now().UTC()
 	}
+	ensureSecretAuditEventID(&ev)
 	line, err := json.Marshal(ev)
 	if err != nil {
 		auditEventsDroppedTotal.Add(1)
@@ -622,6 +636,10 @@ type memSecretAuditSink struct {
 func (m *memSecretAuditSink) Emit(ev SecretAuditEvent) {
 	if m == nil {
 		return
+	}
+	ensureSecretAuditEventID(&ev)
+	if ev.Time.IsZero() {
+		ev.Time = time.Now().UTC()
 	}
 	m.mu.Lock()
 	m.events = append(m.events, ev)

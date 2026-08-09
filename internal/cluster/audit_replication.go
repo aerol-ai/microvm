@@ -24,6 +24,7 @@ type AuditEventDTO struct {
 	Result        string    `json:"result"`
 	Reason        string    `json:"reason,omitempty"`
 	CorrelationID string    `json:"correlation_id,omitempty"`
+	EventID       string    `json:"event_id,omitempty"`
 	NodeID        string    `json:"node_id,omitempty"`
 	Kind          string    `json:"kind,omitempty"`
 	Destination   string    `json:"destination,omitempty"`

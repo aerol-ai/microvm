@@ -1,12 +1,16 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func requireServiceScaleGates(t *testing.T) {
@@ -36,8 +40,12 @@ func TestScaleGateIngressShardAssignmentAt10KMembers(t *testing.T) {
 	if len(filter.Shards) == 0 {
 		t.Fatal("10k ingress member assignment gave this node zero shards")
 	}
-	if len(filter.Shards) > 3 {
-		t.Fatalf("10k ingress member assignment too wide: got %d shards", len(filter.Shards))
+	// RF=2 (primary+replica) ⇒ expected load ≈ 2*ShardCount/N ≈ 3.3; allow
+	// hash skew so the gate tracks the replication factor, not RF=1's old max=3.
+	const ingressRF = 2
+	maxExpected := (cluster.DefaultPlacementShardCount*ingressRF)/members + 3
+	if len(filter.Shards) > maxExpected {
+		t.Fatalf("10k ingress member assignment too wide: got %d shards, max expected %d (RF=%d)", len(filter.Shards), maxExpected, ingressRF)
 	}
 }
 
@@ -69,5 +77,47 @@ func TestScaleGateIngressDeltaAt100KPlacements(t *testing.T) {
 	ops, _ = svc.planClusterIngressDelta(desired)
 	if len(ops) > 3 {
 		t.Fatalf("one placement mutation produced %d route ops, want <=3", len(ops))
+	}
+}
+
+func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
+	requireServiceScaleGates(t)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	svc := &Service{
+		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:        cluster.NewNoop("node-a", "http://a", ""),
+	}
+	const n = 1000
+	var wg sync.WaitGroup
+	errCh := make(chan error, n*2)
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := fmt.Sprintf("seal-del-%04d", i)
+			req := models.CreateSandboxRequest{
+				Image:    "alpine",
+				Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+				Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+			}
+			if _, err := svc.SealAndDistribute(ctx, id, req, []string{"node-a", "node-b"}, SealStrict); err != nil {
+				errCh <- err
+				return
+			}
+			if err := svc.DeleteClusterSecrets(ctx, id); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent seal/delete: %v", err)
 	}
 }

@@ -368,6 +368,7 @@ func secretAuditEventFromDTO(dto cluster.AuditEventDTO) SecretAuditEvent {
 		Result:        dto.Result,
 		Reason:        dto.Reason,
 		CorrelationID: dto.CorrelationID,
+		EventID:       dto.EventID,
 		NodeID:        dto.NodeID,
 		Kind:          dto.Kind,
 		Destination:   dto.Destination,
@@ -400,6 +401,7 @@ const secretAuditCursorSep = "\x1f"
 
 func secretAuditEventCursorKey(ev SecretAuditEvent) string {
 	return strings.Join([]string{
+		ev.EventID,
 		ev.SandboxID,
 		ev.Kind,
 		ev.Result,

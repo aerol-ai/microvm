@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -38,9 +40,15 @@ const secretHolderACKTTL = 90 * time.Second
 // (local put seeds self). Live failover_ready intersects this set with current
 // membership — historical ACK counts alone are not enough after a backup dies.
 var (
-	secretFanoutHolders sync.Map // sandboxID -> *holderNodeSet
-	secretSandboxOpMu   sync.Map // sandboxID -> *sync.Mutex
+	secretFanoutHolders  sync.Map // sandboxID -> *holderNodeSet
+	secretSandboxOpMu    sync.Map // sandboxID -> *sandboxOpLock
+	secretSandboxOpEvict sync.Mutex
 )
+
+type sandboxOpLock struct {
+	mu   sync.Mutex
+	refs atomic.Int32
+}
 
 type holderNodeSet struct {
 	mu    sync.Mutex
@@ -53,10 +61,20 @@ func lockSecretSandboxOps(sandboxID string) func() {
 	if sandboxID == "" {
 		return func() {}
 	}
-	v, _ := secretSandboxOpMu.LoadOrStore(sandboxID, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	secretSandboxOpEvict.Lock()
+	v, _ := secretSandboxOpMu.LoadOrStore(sandboxID, &sandboxOpLock{})
+	l := v.(*sandboxOpLock)
+	l.refs.Add(1)
+	secretSandboxOpEvict.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		secretSandboxOpEvict.Lock()
+		if l.refs.Add(-1) == 0 {
+			secretSandboxOpMu.Delete(sandboxID)
+		}
+		secretSandboxOpEvict.Unlock()
+	}
 }
 
 func holderSetFor(sandboxID string) *holderNodeSet {
@@ -407,7 +425,13 @@ func (s *Service) UpsertClusterSecretBlob(ctx context.Context, blob secrets.Secr
 	if err := validatePeerSecretBlob(ctx, s, blob); err != nil {
 		return err
 	}
-	return newSecretBlobStore(s.store).Put(ctx, blob)
+	if err := newSecretBlobStore(s.store).Put(ctx, blob); err != nil {
+		if errors.Is(err, store.ErrClusterSecretTombBlocksPut) {
+			return fmt.Errorf("%w: %v", ErrInvalidClusterSecretBlob, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // ErrInvalidClusterSecretBlob is a client-fixable peer-push body (ref /
@@ -448,17 +472,26 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	if meta.SandboxID != sandboxID {
 		return fmt.Errorf("%w: envelope sandbox_id does not match wire sandbox_id", ErrInvalidClusterSecretBlob)
 	}
-	if strings.TrimSpace(meta.Ref) != "" && meta.Ref != ref {
+	if strings.TrimSpace(meta.Ref) == "" {
+		return fmt.Errorf("%w: v4 envelope missing authenticated ref", ErrInvalidClusterSecretBlob)
+	}
+	if meta.Ref != ref {
 		return fmt.Errorf("%w: envelope ref does not match wire ref", ErrInvalidClusterSecretBlob)
 	}
-	if meta.VersionField > 0 && meta.VersionField != blob.Version {
+	if meta.VersionField <= 0 {
+		return fmt.Errorf("%w: v4 envelope missing authenticated ref_version", ErrInvalidClusterSecretBlob)
+	}
+	if meta.VersionField != blob.Version {
 		return fmt.Errorf("%w: envelope ref version does not match wire version", ErrInvalidClusterSecretBlob)
 	}
-	if meta.Generation > 0 && blob.SealGeneration > 0 && meta.Generation != blob.SealGeneration {
-		return fmt.Errorf("%w: envelope generation does not match wire seal_generation", ErrInvalidClusterSecretBlob)
+	if meta.Generation <= 0 {
+		return fmt.Errorf("%w: v4 envelope missing authenticated generation", ErrInvalidClusterSecretBlob)
 	}
-	if blob.SealGeneration <= 0 && meta.Generation <= 0 {
+	if blob.SealGeneration <= 0 {
 		return fmt.Errorf("%w: seal_generation is required for peer secret ingress", ErrInvalidClusterSecretBlob)
+	}
+	if meta.Generation != blob.SealGeneration {
+		return fmt.Errorf("%w: envelope generation does not match wire seal_generation", ErrInvalidClusterSecretBlob)
 	}
 
 	selfID := ""
@@ -477,11 +510,8 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 			return err
 		}
 		if tombGen > 0 {
-			if blob.SealGeneration > 0 && blob.SealGeneration <= tombGen {
+			if blob.SealGeneration <= tombGen {
 				return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrInvalidClusterSecretBlob, sandboxID, tombGen)
-			}
-			if blob.SealGeneration == 0 {
-				return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone)", ErrInvalidClusterSecretBlob, sandboxID)
 			}
 			// Newer seal clears tomb atomically inside PutClusterSecret.
 		}
@@ -489,7 +519,7 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 		if err != nil {
 			return err
 		}
-		if maxGen > 0 && blob.SealGeneration > 0 && blob.SealGeneration < maxGen {
+		if maxGen > 0 && blob.SealGeneration < maxGen {
 			return fmt.Errorf("%w: stale seal_generation %d < local %d", ErrInvalidClusterSecretBlob, blob.SealGeneration, maxGen)
 		}
 	}

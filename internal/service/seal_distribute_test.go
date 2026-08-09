@@ -128,6 +128,21 @@ func TestUpsertClusterSecretBlobValidatesRecipientAndRef(t *testing.T) {
 	if err := svc.UpsertClusterSecretBlob(ctx, denied); !errors.Is(err, secrets.ErrRecipientDenied) {
 		t.Fatalf("non-recipient = %v, want ErrRecipientDenied", err)
 	}
+
+	// Empty authenticated ref must be rejected even when sandbox_id is set.
+	emptyRefPayload, err := secrets.SealEnvelopeBound(cipher, bag, []string{"node-a", "node-b"}, secrets.SealBinding{
+		SandboxID: "sb-empty-ref", Ref: "", Version: 1, Generation: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyRef := secrets.SecretBlob{
+		Ref: secrets.FormatRef("sb-empty-ref", 1), SandboxID: "sb-empty-ref", Version: 1,
+		Recipients: []string{"node-a", "node-b"}, SealedPayload: emptyRefPayload, SealGeneration: 1,
+	}
+	if err := svc.UpsertClusterSecretBlob(ctx, emptyRef); !errors.Is(err, ErrInvalidClusterSecretBlob) {
+		t.Fatalf("empty authenticated ref = %v, want ErrInvalidClusterSecretBlob", err)
+	}
 }
 
 func TestSealAndDistributeStrictVsBestEffort(t *testing.T) {
@@ -520,6 +535,66 @@ func TestComputeFailoverReadyResetsStaleGenerationHolders(t *testing.T) {
 	ready := svc.computeFailoverReady(ctx, sb)
 	if ready == nil || *ready {
 		t.Fatalf("stale generation holders must keep ready=false, got %v", ready)
+	}
+}
+
+func TestPeerPutDeleteRaceDoesNotResurrect(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	svc := &Service{
+		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:        cluster.NewNoop("node-b", "http://b", ""),
+	}
+	req := models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+	}
+	handle, err := svc.SealAndDistribute(ctx, "sb-race", req, []string{"node-a", "node-b"}, SealStrict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := svc.loadSecretBlob(ctx, handle.Ref)
+	if err != nil || blob == nil {
+		t.Fatalf("load blob: %v", err)
+	}
+	gen := blob.SealGeneration
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = svc.DeleteClusterSecretsLocal(ctx, "sb-race", gen)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = svc.UpsertClusterSecretBlob(ctx, *blob)
+		}()
+	}
+	wg.Wait()
+
+	tomb, err := st.HasClusterSecretTomb(ctx, "sb-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, getErr := st.GetClusterSecret(ctx, handle.Ref)
+	// After concurrent put/delete, either tomb wins (no row) or a strictly newer
+	// reseal exists. Equal-gen resurrection with no tomb must not occur.
+	if !tomb && errors.Is(getErr, storepkg.ErrNotFound) {
+		t.Fatal("credentials missing without tomb — inconsistent delete state")
+	}
+	if !tomb {
+		got, err := st.GetClusterSecret(ctx, handle.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.SealGeneration <= gen {
+			t.Fatalf("resurrected equal/stale generation %d without tomb", got.SealGeneration)
+		}
 	}
 }
 

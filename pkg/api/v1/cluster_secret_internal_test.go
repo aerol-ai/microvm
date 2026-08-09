@@ -61,16 +61,20 @@ func newSecretInternalTestMux(t *testing.T, nodeID string) (*http.ServeMux, *ser
 func mustSealBlob(t *testing.T, cipher *secrets.Cipher, sandboxID, nodeID string, recipients []string) secrets.SecretBlob {
 	t.Helper()
 	bag := secrets.Secrets{Registry: &models.RegistryAuth{Server: "ghcr.io", Username: "u", Password: "p"}}
-	sealed, err := secrets.SealEnvelope(cipher, bag, recipients)
+	ref := secrets.FormatRef(sandboxID, 1)
+	binding := secrets.SealBinding{SandboxID: sandboxID, Ref: ref, Version: 1, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(cipher, bag, recipients, binding)
 	if err != nil {
-		t.Fatalf("SealEnvelope: %v", err)
+		t.Fatalf("SealEnvelopeBound: %v", err)
 	}
+	_ = nodeID
 	return secrets.SecretBlob{
-		Ref:           secrets.FormatRef(sandboxID, 1),
-		SandboxID:     sandboxID,
-		Version:       1,
-		Recipients:    recipients,
-		SealedPayload: sealed,
+		Ref:            ref,
+		SandboxID:      sandboxID,
+		Version:        1,
+		Recipients:     recipients,
+		SealedPayload:  sealed,
+		SealGeneration: 1,
 	}
 }
 

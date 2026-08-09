@@ -231,6 +231,8 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID strin
 	if s == nil {
 		return nil
 	}
+	unlock := lockSecretSandboxOps(sandboxID)
+	defer unlock()
 	var err error
 	if s.store != nil {
 		err = s.store.ApplyPeerSecretDelete(ctx, sandboxID, generation)
@@ -242,7 +244,8 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID strin
 }
 
 // ReconcileSecretDeleteOutbox retries durable peer DELETEs after boot / crash
-// and on the periodic ticker. Per-job lookup is O(1) (not re-list for each row).
+// and on the periodic ticker. Work is dispatched through the bounded delete
+// fan-out pool so a large outbox cannot serialize the reconciler for minutes.
 func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
 		return nil
@@ -255,7 +258,7 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s.reconcileSecretDeleteOutboxOnce(rec.SandboxID)
+		s.maybeAsyncDeleteFanout(rec.SandboxID, rec.Recipients)
 	}
 	return nil
 }
@@ -320,43 +323,68 @@ func (s *Service) aliveMemberSet() map[string]struct{} {
 	return out
 }
 
-// refreshSecretHolderPossession re-probes known holders so a peer that lost
-// its SQLite without an Alive flap is dropped before ACK TTL alone would.
+// refreshSecretHolderPossession re-probes in-memory remote holders that are
+// approaching ACK TTL. It deliberately does not scan the full cluster_secrets
+// table (that would be O(sandboxes)×RF probes per tick at fleet scale).
 func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
-	if s == nil || s.store == nil {
+	if s == nil {
 		return
 	}
 	pusher := s.secretPeerPusher()
 	if pusher == nil {
 		return
 	}
-	rows, err := s.store.ListClusterSecrets(ctx)
-	if err != nil || len(rows) == 0 {
-		return
-	}
 	selfID := s.selfNodeID()
-	for _, rec := range rows {
+	type job struct {
+		sandboxID string
+		gen       int64
+		peers     []string
+	}
+	var jobs []job
+	refreshBefore := time.Now().Add(secretHolderACKTTL / 3)
+	secretFanoutHolders.Range(func(key, val any) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		sandboxID, _ := key.(string)
+		hs, _ := val.(*holderNodeSet)
+		if sandboxID == "" || hs == nil {
+			return true
+		}
+		hs.mu.Lock()
+		gen := hs.gen
+		peers := make([]string, 0, len(hs.nodes))
+		needsProbe := false
+		for id, at := range hs.nodes {
+			if id == "" || id == selfID {
+				continue
+			}
+			peers = append(peers, id)
+			if at.IsZero() || at.Before(refreshBefore) {
+				needsProbe = true
+			}
+		}
+		hs.mu.Unlock()
+		if !needsProbe || len(peers) == 0 || gen <= 0 {
+			return true
+		}
+		jobs = append(jobs, job{sandboxID: sandboxID, gen: gen, peers: peers})
+		// Hard cap per tick so a partitioned peer cannot stretch past ACK TTL.
+		return len(jobs) < deleteReconcileWorkers
+	})
+	for _, j := range jobs {
 		if ctx.Err() != nil {
 			return
 		}
-		gen := rec.SealGeneration
-		if gen <= 0 {
-			gen = 1
-		}
-		peers := nonSelfRecipients(rec.Recipients, selfID)
-		if len(peers) == 0 {
-			continue
-		}
-		holding, probeErr := pusher.ProbeSecretOnPeers(ctx, rec.SandboxID, peers, gen)
+		holding, probeErr := pusher.ProbeSecretOnPeers(ctx, j.sandboxID, j.peers, j.gen)
 		if probeErr != nil && s.logger != nil {
 			s.logger.Warn("cluster: secret holder possession probe incomplete",
-				"sandbox_id", rec.SandboxID, "err", probeErr)
+				"sandbox_id", j.sandboxID, "err", probeErr)
 		}
-		// Replace remote ACKs for this generation with confirmed holders only.
-		hs := holderSetFor(rec.SandboxID)
+		hs := holderSetFor(j.sandboxID)
 		hs.mu.Lock()
-		if hs.gen == gen || hs.gen == 0 {
-			hs.gen = gen
+		if hs.gen == j.gen || hs.gen == 0 {
+			hs.gen = j.gen
 			if hs.nodes == nil {
 				hs.nodes = make(map[string]time.Time)
 			}

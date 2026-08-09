@@ -4016,6 +4016,10 @@ func isSandboxIDConflict(err error, id string) bool {
 
 var ErrNotFound = errors.New("sandbox not found")
 
+// ErrClusterSecretTombBlocksPut is returned when a peer/originator PUT carries
+// seal_generation <= an active delete tomb generation.
+var ErrClusterSecretTombBlocksPut = errors.New("cluster secret tomb blocks put")
+
 // afterTransferTapReads is set only by tests to inject a concurrent ownership
 // move between TransferFirecrackerTapSlot's reads and its UPDATE.
 var afterTransferTapReads func()
@@ -4123,6 +4127,14 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 		return nil
 	}
 
+	// Recheck tomb inside the write TX so a peer DELETE that committed after
+	// pre-validation cannot be erased by a stale/equal-generation PUT.
+	var tombGen sql.NullInt64
+	_ = tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID).Scan(&tombGen)
+	if tombGen.Valid && tombGen.Int64 > 0 && rec.SealGeneration <= tombGen.Int64 {
+		return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrClusterSecretTombBlocksPut, rec.SandboxID, tombGen.Int64)
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cluster_secrets (
 			ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
@@ -4138,8 +4150,7 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.SealGeneration, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC()); err != nil {
 		return fmt.Errorf("put cluster secret: %w", err)
 	}
-	// Atomic with put: clear delete tomb + outbox so a concurrent destroy
-	// cannot leave a handle whose cleanup job was wiped without a row.
+	// Only a strictly newer seal may clear tomb/outbox (atomic with the row write).
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
 		return fmt.Errorf("clear cluster secret tomb on put: %w", err)
 	}
