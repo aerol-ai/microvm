@@ -2006,15 +2006,7 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 		}
 		err = s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
 	}
-	if err != nil {
-		return err
-	}
-	if sandbox != nil {
-		if ref := strings.TrimSpace(sandbox.OwnerRef); ref != "" {
-			_ = s.store.UpsertSandboxAuditACL(ctx, sandbox.ID, ref)
-		}
-	}
-	return nil
+	return err
 }
 
 // sealEnv marshals env and encrypts it for at-rest storage. Returns nil when
@@ -2487,6 +2479,16 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	} else if s.testForceUnmountErr != nil {
 		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", s.testForceUnmountErr)
 	}
+	// Refresh the retained audit authorization before deleting the authoritative
+	// sandbox row. If this fails, keep the sandbox so audit access cannot fall
+	// into an ownerless gap after a crash or later cleanup error.
+	if sandbox != nil {
+		if ref := strings.TrimSpace(sandbox.OwnerRef); ref != "" {
+			if err := s.store.UpsertSandboxAuditACL(ctx, id, ref); err != nil {
+				return err
+			}
+		}
+	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
@@ -2506,11 +2508,6 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	s.forgetNetstatsActivity(id)
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
-	}
-	if s.store != nil && sandbox != nil {
-		if ref := strings.TrimSpace(sandbox.OwnerRef); ref != "" {
-			_ = s.store.UpsertSandboxAuditACL(ctx, id, ref)
-		}
 	}
 	if s.admitter != nil {
 		s.admitter.Release(id)

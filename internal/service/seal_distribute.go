@@ -51,9 +51,11 @@ type sandboxOpLock struct {
 }
 
 type holderNodeSet struct {
-	mu    sync.Mutex
-	gen   int64
-	nodes map[string]time.Time // nodeID -> last ACK / possession confirm
+	mu        sync.Mutex
+	gen       int64
+	nodes     map[string]time.Time // nodeID -> last ACK / possession confirm
+	targets   map[string]struct{}  // intended recipients, retained across probe failures
+	lastProbe time.Time            // fair scheduling independent of holder ACK time
 }
 
 func lockSecretSandboxOps(sandboxID string) func() {
@@ -78,7 +80,10 @@ func lockSecretSandboxOps(sandboxID string) func() {
 }
 
 func holderSetFor(sandboxID string) *holderNodeSet {
-	v, _ := secretFanoutHolders.LoadOrStore(sandboxID, &holderNodeSet{nodes: make(map[string]time.Time)})
+	v, _ := secretFanoutHolders.LoadOrStore(sandboxID, &holderNodeSet{
+		nodes:   make(map[string]time.Time),
+		targets: make(map[string]struct{}),
+	})
 	return v.(*holderNodeSet)
 }
 
@@ -100,6 +105,9 @@ func addSecretHolderNodes(sandboxID string, gen int64, nodeIDs ...string) {
 	if hs.nodes == nil {
 		hs.nodes = make(map[string]time.Time)
 	}
+	if hs.targets == nil {
+		hs.targets = make(map[string]struct{})
+	}
 	now := time.Now()
 	for _, id := range nodeIDs {
 		id = strings.TrimSpace(id)
@@ -107,6 +115,7 @@ func addSecretHolderNodes(sandboxID string, gen int64, nodeIDs ...string) {
 			continue
 		}
 		hs.nodes[id] = now
+		hs.targets[id] = struct{}{}
 	}
 }
 
@@ -121,16 +130,53 @@ func resetSecretHoldersForGeneration(sandboxID string, gen int64, seed ...string
 	defer hs.mu.Unlock()
 	if hs.gen != gen {
 		hs.nodes = make(map[string]time.Time)
+		hs.targets = make(map[string]struct{})
+		hs.lastProbe = time.Time{}
 		hs.gen = gen
 	}
 	if hs.nodes == nil {
 		hs.nodes = make(map[string]time.Time)
+	}
+	if hs.targets == nil {
+		hs.targets = make(map[string]struct{})
 	}
 	now := time.Now()
 	for _, id := range seed {
 		id = strings.TrimSpace(id)
 		if id != "" {
 			hs.nodes[id] = now
+			hs.targets[id] = struct{}{}
+		}
+	}
+}
+
+// setSecretHolderTargets records the intended recipient set separately from
+// confirmed holders. Probe failures may age holder ACKs out, but must not erase
+// the nodes that need to be retried.
+func setSecretHolderTargets(sandboxID string, gen int64, nodeIDs []string) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	hs := holderSetFor(sandboxID)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	if gen > 0 && hs.gen != 0 && hs.gen != gen {
+		hs.nodes = make(map[string]time.Time)
+		hs.lastProbe = time.Time{}
+	}
+	if gen > 0 {
+		hs.gen = gen
+	}
+	targets := make(map[string]struct{}, len(nodeIDs))
+	for _, id := range nodeIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			targets[id] = struct{}{}
+		}
+	}
+	hs.targets = targets
+	for id := range hs.nodes {
+		if _, ok := targets[id]; !ok {
+			delete(hs.nodes, id)
 		}
 	}
 }
@@ -196,12 +242,6 @@ func pruneDeadSecretHolders(sandboxID string, alive map[string]struct{}) {
 	}
 }
 
-// touchSecretHolderNodes refreshes ACK timestamps after a successful possession
-// probe (same generation only).
-func touchSecretHolderNodes(sandboxID string, gen int64, nodeIDs ...string) {
-	addSecretHolderNodes(sandboxID, gen, nodeIDs...)
-}
-
 // SealAndDistribute seals to recipients, stores locally, and fans out when
 // the feature flag is on, the sandbox is recreate-HA, and len(recipients) > 1.
 // Policy governs LOCAL seal only.
@@ -242,6 +282,7 @@ func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req m
 		gen = blob.SealGeneration
 	}
 	resetSecretHoldersForGeneration(sandboxID, gen, selfID)
+	setSecretHolderTargets(sandboxID, gen, recipients)
 	s.fanoutSecretAfterSeal(ctx, sandboxID, req, recipients, out)
 	return out, nil
 }
@@ -360,6 +401,7 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 			gen = 1
 		}
 		resetSecretHoldersForGeneration(rec.SandboxID, gen, selfID)
+		setSecretHolderTargets(rec.SandboxID, gen, rec.Recipients)
 		if len(rec.Recipients) <= 1 || pusher == nil {
 			continue
 		}
@@ -661,6 +703,9 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 		}
 		resetSecretHoldersForGeneration(sb.ID, localGen, seed...)
 	}
+	if localGen > 0 {
+		setSecretHolderTargets(sb.ID, localGen, recipients)
+	}
 	holders := secretHolderNodeIDs(sb.ID)
 	if len(holders) == 0 && len(recipients) > 0 && localHolds && selfID != "" {
 		resetSecretHoldersForGeneration(sb.ID, localGen, selfID)
@@ -698,11 +743,6 @@ func (s *Service) localSealedSecretGeneration(ctx context.Context, sandboxID str
 		return 0, false
 	}
 	return gen, true
-}
-
-func (s *Service) localHoldsSealedSecret(ctx context.Context, sandboxID string) bool {
-	_, holds := s.localSealedSecretGeneration(ctx, sandboxID)
-	return holds
 }
 
 // HasLocalSealedSecretGeneration reports whether this node holds a sealed row

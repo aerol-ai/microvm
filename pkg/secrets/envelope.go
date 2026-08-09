@@ -391,15 +391,6 @@ func EnvelopeRecipients(sealed []byte) ([]string, error) {
 	return NormalizeRecipients(envelope.Recipients), nil
 }
 
-// EnvelopeBindingMeta returns wire version and sandbox_id without decrypting.
-func EnvelopeBindingMeta(sealed []byte) (version int, sandboxID string, err error) {
-	b, err := EnvelopeBinding(sealed)
-	if err != nil {
-		return 0, "", err
-	}
-	return b.Version, b.SandboxID, nil
-}
-
 // EnvelopeBindingFields is the authenticated identity carried on a sealed envelope
 // (v4). Parsed without decrypting so peer ingress can reject mismatches closed.
 type EnvelopeBindingFields struct {

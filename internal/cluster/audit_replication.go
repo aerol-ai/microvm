@@ -10,28 +10,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
 
 const auditPeerFetchTimeout = 5 * time.Second
 
 // AuditEventDTO is the wire shape of one secret-audit event on the peer
 // internal endpoint. Kept in cluster to avoid an import cycle with service.
-type AuditEventDTO struct {
-	Time          time.Time `json:"time"`
-	Actor         string    `json:"actor,omitempty"`
-	SandboxID     string    `json:"sandbox_id,omitempty"`
-	Ref           string    `json:"ref,omitempty"`
-	Result        string    `json:"result"`
-	Reason        string    `json:"reason,omitempty"`
-	CorrelationID string    `json:"correlation_id,omitempty"`
-	EventID       string    `json:"event_id,omitempty"`
-	NodeID        string    `json:"node_id,omitempty"`
-	Kind          string    `json:"kind,omitempty"`
-	Destination   string    `json:"destination,omitempty"`
-	Network       string    `json:"network,omitempty"`
-	BytesIn       int64     `json:"bytes_in,omitempty"`
-	BytesOut      int64     `json:"bytes_out,omitempty"`
-}
+type AuditEventDTO = auditlog.Event
 
 // AuditPeerPage is the JSON body returned by the internal audit endpoint.
 type AuditPeerPage struct {

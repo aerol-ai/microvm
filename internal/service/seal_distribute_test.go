@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -22,7 +23,10 @@ type fakePeerPusher struct {
 	pushErr      error
 	acked        []string
 	probeHolding []string
+	probeErr     error
 	probeStrict  bool // when true, Probe returns probeHolding only (ignore recipients)
+	probeCalls   int
+	probeByID    map[string]int
 	pushCalls    int
 	done         chan struct{}
 }
@@ -49,16 +53,121 @@ func (f *fakePeerPusher) DeleteSecretOnPeers(_ context.Context, sandboxID string
 	return append([]string(nil), recipients...), nil, nil
 }
 
-func (f *fakePeerPusher) ProbeSecretOnPeers(_ context.Context, _ string, recipients []string, _ int64) ([]string, error) {
+func (f *fakePeerPusher) ProbeSecretOnPeers(_ context.Context, sandboxID string, recipients []string, _ int64) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.probeCalls++
+	if f.probeByID == nil {
+		f.probeByID = make(map[string]int)
+	}
+	f.probeByID[sandboxID]++
 	if f.probeStrict {
-		return append([]string(nil), f.probeHolding...), nil
+		return append([]string(nil), f.probeHolding...), f.probeErr
 	}
 	if len(f.acked) > 0 {
-		return append([]string(nil), f.acked...), nil
+		return append([]string(nil), f.acked...), f.probeErr
 	}
-	return append([]string(nil), recipients...), nil
+	return append([]string(nil), recipients...), f.probeErr
+}
+
+func TestRefreshSecretHolderPossessionRetriesAfterProbeFailure(t *testing.T) {
+	clearSecretFanoutHolders("sb-probe-retry")
+	t.Cleanup(func() { clearSecretFanoutHolders("sb-probe-retry") })
+	pusher := &fakePeerPusher{probeStrict: true, probeErr: errors.New("temporary partition")}
+	svc := &Service{
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	resetSecretHoldersForGeneration("sb-probe-retry", 7, "node-a", "node-b")
+	setSecretHolderTargets("sb-probe-retry", 7, []string{"node-a", "node-b"})
+	hs := holderSetFor("sb-probe-retry")
+	hs.mu.Lock()
+	hs.nodes["node-b"] = time.Now().Add(-secretHolderACKTTL)
+	hs.mu.Unlock()
+
+	svc.refreshSecretHolderPossession(context.Background())
+	hs.mu.Lock()
+	_, targetKept := hs.targets["node-b"]
+	hs.mu.Unlock()
+	if !targetKept {
+		t.Fatal("failed probe erased intended recipient")
+	}
+
+	// Simulate readiness pruning the expired ACK, then let the peer recover.
+	_ = secretHolderNodeIDs("sb-probe-retry")
+	pusher.mu.Lock()
+	pusher.probeErr = nil
+	pusher.probeHolding = []string{"node-b"}
+	pusher.mu.Unlock()
+	svc.refreshSecretHolderPossession(context.Background())
+
+	hs.mu.Lock()
+	_, recovered := hs.nodes["node-b"]
+	hs.mu.Unlock()
+	if !recovered {
+		t.Fatal("recovered peer was not re-probed after its ACK expired")
+	}
+}
+
+func TestRefreshSecretHolderPossessionSkipsFreshACK(t *testing.T) {
+	clearSecretFanoutHolders("sb-probe-fresh")
+	t.Cleanup(func() { clearSecretFanoutHolders("sb-probe-fresh") })
+	pusher := &fakePeerPusher{probeStrict: true, probeHolding: []string{"node-b"}}
+	svc := &Service{
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	resetSecretHoldersForGeneration("sb-probe-fresh", 8, "node-a", "node-b")
+	setSecretHolderTargets("sb-probe-fresh", 8, []string{"node-a", "node-b"})
+	svc.refreshSecretHolderPossession(context.Background())
+	pusher.mu.Lock()
+	calls := pusher.probeCalls
+	pusher.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("fresh ACK probes=%d, want 0", calls)
+	}
+}
+
+func TestRefreshSecretHolderPossessionBatchIsFair(t *testing.T) {
+	pusher := &fakePeerPusher{}
+	svc := &Service{
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	const total = secretHolderRefreshBatch + 1
+	ids := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("sb-fair-%04d", i)
+		ids = append(ids, id)
+		resetSecretHoldersForGeneration(id, 1, "node-a", "node-b")
+		setSecretHolderTargets(id, 1, []string{"node-a", "node-b"})
+		hs := holderSetFor(id)
+		hs.mu.Lock()
+		hs.nodes["node-b"] = time.Now().Add(-secretHolderACKTTL)
+		hs.mu.Unlock()
+	}
+	t.Cleanup(func() {
+		for _, id := range ids {
+			clearSecretFanoutHolders(id)
+		}
+	})
+
+	svc.refreshSecretHolderPossession(context.Background())
+	pusher.mu.Lock()
+	firstCalls := pusher.probeCalls
+	lastFirst := pusher.probeByID[ids[len(ids)-1]]
+	pusher.mu.Unlock()
+	if firstCalls != secretHolderRefreshBatch || lastFirst != 0 {
+		t.Fatalf("first refresh calls=%d last=%d, want %d and 0", firstCalls, lastFirst, secretHolderRefreshBatch)
+	}
+
+	svc.refreshSecretHolderPossession(context.Background())
+	pusher.mu.Lock()
+	lastSecond := pusher.probeByID[ids[len(ids)-1]]
+	pusher.mu.Unlock()
+	if lastSecond != 1 {
+		t.Fatalf("deferred holder probes=%d, want 1 on next fair pass", lastSecond)
+	}
 }
 
 func openSealTestStore(t *testing.T) *storepkg.Store {

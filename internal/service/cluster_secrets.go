@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -250,7 +251,7 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
 		return nil
 	}
-	rows, err := s.store.ListSecretDeleteOutbox(ctx)
+	rows, err := s.store.ListSecretDeleteOutboxBatch(ctx, secretDeleteReconcileBatch)
 	if err != nil {
 		return err
 	}
@@ -323,9 +324,15 @@ func (s *Service) aliveMemberSet() map[string]struct{} {
 	return out
 }
 
-// refreshSecretHolderPossession re-probes in-memory remote holders that are
-// approaching ACK TTL. It deliberately does not scan the full cluster_secrets
-// table (that would be O(sandboxes)×RF probes per tick at fleet scale).
+const (
+	secretHolderRefreshBatch   = 512
+	secretHolderRefreshWorkers = 64
+	secretHolderProbeTimeout   = 5 * time.Second
+)
+
+// refreshSecretHolderPossession re-probes intended remote recipients that are
+// approaching ACK TTL. Targets are independent from confirmed ACKs, so a
+// timeout or 404 can recover on a later pass without a membership flap.
 func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	if s == nil {
 		return
@@ -339,9 +346,13 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		sandboxID string
 		gen       int64
 		peers     []string
+		lastProbe time.Time
 	}
 	var jobs []job
-	refreshBefore := time.Now().Add(secretHolderACKTTL / 3)
+	now := time.Now()
+	// Refresh after two thirds of the TTL, leaving one full ticker interval to
+	// retry before an ACK expires.
+	refreshBefore := now.Add(-(secretHolderACKTTL * 2 / 3))
 	secretFanoutHolders.Range(func(key, val any) bool {
 		if ctx.Err() != nil {
 			return false
@@ -353,59 +364,125 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		}
 		hs.mu.Lock()
 		gen := hs.gen
-		peers := make([]string, 0, len(hs.nodes))
+		peers := make([]string, 0, len(hs.targets))
 		needsProbe := false
-		for id, at := range hs.nodes {
+		for id := range hs.targets {
 			if id == "" || id == selfID {
 				continue
 			}
 			peers = append(peers, id)
+			at := hs.nodes[id]
 			if at.IsZero() || at.Before(refreshBefore) {
 				needsProbe = true
 			}
 		}
+		lastProbe := hs.lastProbe
 		hs.mu.Unlock()
 		if !needsProbe || len(peers) == 0 || gen <= 0 {
 			return true
 		}
-		jobs = append(jobs, job{sandboxID: sandboxID, gen: gen, peers: peers})
-		// Hard cap per tick so a partitioned peer cannot stretch past ACK TTL.
-		return len(jobs) < deleteReconcileWorkers
+		sort.Strings(peers)
+		jobs = append(jobs, job{sandboxID: sandboxID, gen: gen, peers: peers, lastProbe: lastProbe})
+		return true
 	})
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i].lastProbe.Equal(jobs[j].lastProbe) {
+			return jobs[i].sandboxID < jobs[j].sandboxID
+		}
+		if jobs[i].lastProbe.IsZero() {
+			return true
+		}
+		if jobs[j].lastProbe.IsZero() {
+			return false
+		}
+		return jobs[i].lastProbe.Before(jobs[j].lastProbe)
+	})
+	if len(jobs) > secretHolderRefreshBatch {
+		jobs = jobs[:secretHolderRefreshBatch]
+	}
+	for _, j := range jobs {
+		if v, ok := secretFanoutHolders.Load(j.sandboxID); ok {
+			hs := v.(*holderNodeSet)
+			hs.mu.Lock()
+			if hs.gen == j.gen {
+				hs.lastProbe = now
+			}
+			hs.mu.Unlock()
+		}
+	}
+
+	sem := make(chan struct{}, secretHolderRefreshWorkers)
+	var wg sync.WaitGroup
+	var probeFailures struct {
+		sync.Mutex
+		count int
+		first error
+	}
 	for _, j := range jobs {
 		if ctx.Err() != nil {
+			break
+		}
+		j := j
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
 			return
 		}
-		holding, probeErr := pusher.ProbeSecretOnPeers(ctx, j.sandboxID, j.peers, j.gen)
-		if probeErr != nil && s.logger != nil {
-			s.logger.Warn("cluster: secret holder possession probe incomplete",
-				"sandbox_id", j.sandboxID, "err", probeErr)
-		}
-		hs := holderSetFor(j.sandboxID)
-		hs.mu.Lock()
-		if hs.gen == j.gen || hs.gen == 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			probeCtx, cancel := context.WithTimeout(ctx, secretHolderProbeTimeout)
+			holding, probeErr := pusher.ProbeSecretOnPeers(probeCtx, j.sandboxID, j.peers, j.gen)
+			cancel()
+			if probeErr != nil {
+				probeFailures.Lock()
+				probeFailures.count++
+				if probeFailures.first == nil {
+					probeFailures.first = probeErr
+				}
+				probeFailures.Unlock()
+			}
+			hs := holderSetFor(j.sandboxID)
+			hs.mu.Lock()
+			defer hs.mu.Unlock()
+			if hs.gen != j.gen && hs.gen != 0 {
+				return
+			}
 			hs.gen = j.gen
 			if hs.nodes == nil {
 				hs.nodes = make(map[string]time.Time)
 			}
-			for id := range hs.nodes {
-				if id == selfID {
+			confirmed := make(map[string]struct{}, len(holding))
+			for _, id := range holding {
+				if id = strings.TrimSpace(id); id != "" {
+					confirmed[id] = struct{}{}
+				}
+			}
+			confirmedAt := time.Now()
+			if selfID != "" {
+				hs.nodes[selfID] = confirmedAt
+			}
+			for _, id := range j.peers {
+				if _, ok := hs.targets[id]; !ok {
 					continue
 				}
-				delete(hs.nodes, id)
-			}
-			now := time.Now()
-			if selfID != "" {
-				hs.nodes[selfID] = now
-			}
-			for _, id := range holding {
-				id = strings.TrimSpace(id)
-				if id != "" {
-					hs.nodes[id] = now
+				if _, ok := confirmed[id]; ok {
+					hs.nodes[id] = confirmedAt
+				} else if probeErr == nil {
+					delete(hs.nodes, id)
 				}
 			}
-		}
-		hs.mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	probeFailures.Lock()
+	failureCount, firstProbeErr := probeFailures.count, probeFailures.first
+	probeFailures.Unlock()
+	if failureCount > 0 && s.logger != nil {
+		s.logger.Warn("cluster: secret holder possession refresh incomplete",
+			"failed_sandboxes", failureCount, "attempted_sandboxes", len(jobs), "first_error", firstProbeErr)
 	}
 }
 
@@ -430,7 +507,7 @@ func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
 		// No cluster transport yet; keep the durable job for a later tick.
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), secretDeleteAttemptTimeout)
 	defer cancel()
 	_, pending, delErr := pusher.DeleteSecretOnPeers(ctx, sandboxID, peers, rec.Generation)
 	_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
@@ -472,6 +549,15 @@ func nonSelfRecipients(recipients []string, selfID string) []string {
 // deleteReconcileWorkers caps concurrent peer-delete retries so a mass destroy
 // wave cannot spawn one long-lived goroutine per sandbox.
 const deleteReconcileWorkers = 64
+
+// One retry must not monopolize a worker across multiple 30-second scheduler
+// passes. Cluster-internal DELETE is idempotent; slower peers remain durable
+// pending work and are retried fairly.
+const secretDeleteAttemptTimeout = 15 * time.Second
+
+// Scan beyond the worker count so already-inflight rows do not prevent free
+// slots from being filled. Attempted rows move to the back via updated_at.
+const secretDeleteReconcileBatch = deleteReconcileWorkers * 4
 
 var (
 	deleteReconcileSem      = make(chan struct{}, deleteReconcileWorkers)

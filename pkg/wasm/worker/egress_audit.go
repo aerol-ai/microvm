@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"golang.org/x/sys/unix"
 )
 
@@ -27,17 +28,7 @@ const (
 	workerEgressQueue     = 1024
 )
 
-type workerEgressAuditEvent struct {
-	Time        time.Time `json:"time"`
-	Actor       string    `json:"actor,omitempty"`
-	SandboxID   string    `json:"sandbox_id,omitempty"`
-	Result      string    `json:"result"`
-	Reason      string    `json:"reason,omitempty"`
-	NodeID      string    `json:"node_id,omitempty"`
-	Kind        string    `json:"kind,omitempty"`
-	Destination string    `json:"destination,omitempty"`
-	Network     string    `json:"network,omitempty"`
-}
+type workerEgressAuditEvent = auditlog.Event
 
 type egressAuditJob struct {
 	path, node, sandboxID, network, address string
@@ -131,6 +122,7 @@ func appendWorkerEgressGap(path, node, sandboxID string) {
 }
 
 func appendWorkerEgressEvent(path string, ev workerEgressAuditEvent) {
+	auditlog.EnsureEventID(&ev)
 	line, err := json.Marshal(ev)
 	if err != nil {
 		slog.Warn("wasm egress audit marshal failed", "err", err)

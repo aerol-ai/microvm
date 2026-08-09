@@ -30,6 +30,9 @@ func TestAppendWorkerEgressAudit(t *testing.T) {
 	if ev.Time.IsZero() || time.Since(ev.Time) > time.Minute {
 		t.Fatalf("time = %v", ev.Time)
 	}
+	if ev.EventID == "" {
+		t.Fatalf("event_id missing: %+v", ev)
+	}
 }
 
 func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {

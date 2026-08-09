@@ -856,7 +856,21 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
 		return err
 	}
-	return s.insertSandbox(ctx, s.db, sandbox)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sandbox create: %w", err)
+	}
+	defer tx.Rollback()
+	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
+		return err
+	}
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox create: %w", err)
+	}
+	return nil
 }
 
 // CreateWithSealedEnv inserts the sandbox row and optional sealed env blob in
@@ -886,6 +900,9 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 		return err
 	}
 	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
+		return err
+	}
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, time.Now().UTC()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -4271,8 +4288,16 @@ func (s *Store) UpsertSandboxAuditACL(ctx context.Context, sandboxID, ownerRef s
 	if sandboxID == "" {
 		return nil
 	}
-	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	return upsertSandboxAuditACLExec(ctx, s.db, sandboxID, ownerRef, time.Now().UTC())
+}
+
+func upsertSandboxAuditACLExec(ctx context.Context, exec dbExecer, sandboxID, ownerRef string, now time.Time) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	ownerRef = strings.TrimSpace(ownerRef)
+	if sandboxID == "" || ownerRef == "" {
+		return nil
+	}
+	_, err := exec.ExecContext(ctx, `
 		INSERT INTO sandbox_audit_acl (sandbox_id, owner_ref, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(sandbox_id) DO UPDATE SET owner_ref = excluded.owner_ref, updated_at = excluded.updated_at
 	`, sandboxID, ownerRef, now)
@@ -4280,6 +4305,30 @@ func (s *Store) UpsertSandboxAuditACL(ctx context.Context, sandboxID, ownerRef s
 		return fmt.Errorf("upsert sandbox audit acl: %w", err)
 	}
 	return nil
+}
+
+// PruneSandboxAuditACL removes post-delete authorization metadata after its
+// audit retention window. ACLs for live sandboxes are never removed, even if
+// their creation timestamp is older than the cutoff.
+func (s *Store) PruneSandboxAuditACL(ctx context.Context, cutoff time.Time) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM sandbox_audit_acl
+		WHERE updated_at < ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM sandboxes WHERE sandboxes.id = sandbox_audit_acl.sandbox_id
+		  )
+	`, cutoff.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("prune sandbox audit acl: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count pruned sandbox audit acl: %w", err)
+	}
+	return n, nil
 }
 
 // GetSandboxAuditACLOwnerRef returns the retained audit OwnerRef, or "" if none.
@@ -4542,41 +4591,25 @@ func (s *Store) MaxClusterSecretSealGeneration(ctx context.Context, sandboxID st
 	return maxSeal.Int64, nil
 }
 
-// UpsertSecretDeleteOutbox records a durable delete fan-out job.
-func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, recipients []string, generation int64) error {
-	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
-		return nil
-	}
-	if generation <= 0 {
-		generation = 1
-	}
-	raw, err := json.Marshal(recipients)
-	if err != nil {
-		return fmt.Errorf("marshal delete outbox recipients: %w", err)
-	}
-	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO cluster_secret_delete_outbox (sandbox_id, recipients_json, generation, attempts, created_at, updated_at)
-		VALUES (?, ?, ?, 0, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET
-			recipients_json = excluded.recipients_json,
-			generation = excluded.generation,
-			updated_at = excluded.updated_at
-	`, sandboxID, string(raw), generation, now, now)
-	if err != nil {
-		return fmt.Errorf("upsert secret delete outbox: %w", err)
-	}
-	return nil
+// ListSecretDeleteOutbox returns every pending delete fan-out job. Retry order
+// uses updated_at so an attempted oldest job moves behind work that has not yet
+// received a turn.
+func (s *Store) ListSecretDeleteOutbox(ctx context.Context) ([]SecretDeleteOutboxRecord, error) {
+	return s.ListSecretDeleteOutboxBatch(ctx, 0)
 }
 
-// ListSecretDeleteOutbox returns pending delete fan-out jobs.
-func (s *Store) ListSecretDeleteOutbox(ctx context.Context) ([]SecretDeleteOutboxRecord, error) {
+// ListSecretDeleteOutboxBatch returns at most limit pending jobs in fair retry
+// order. A non-positive limit preserves the all-rows behavior for diagnostics.
+func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]SecretDeleteOutboxRecord, error) {
+	if limit <= 0 {
+		limit = int(^uint(0) >> 1)
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT sandbox_id, recipients_json, generation, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
-		ORDER BY created_at ASC
-	`)
+		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
+		LIMIT ?
+	`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list secret delete outbox: %w", err)
 	}

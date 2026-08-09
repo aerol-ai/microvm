@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"golang.org/x/sys/unix"
 )
@@ -53,28 +54,7 @@ var auditEventsDroppedTotal = expvar.NewInt("aerolvm_audit_events_dropped_total"
 // SecretAuditEvent is one audit record (secret-open by default, or host-mediated
 // egress). Never carry plaintext, credentials, PII, or wrapped error strings
 // (those may embed caller input). Destination must never include credentials.
-type SecretAuditEvent struct {
-	Time          time.Time `json:"time"`
-	Actor         string    `json:"actor,omitempty"`
-	SandboxID     string    `json:"sandbox_id,omitempty"`
-	Ref           string    `json:"ref,omitempty"`
-	Result        string    `json:"result"`
-	Reason        string    `json:"reason,omitempty"`
-	CorrelationID string    `json:"correlation_id,omitempty"`
-	// EventID uniquely identifies one emitted record so equal-timestamp twins
-	// cannot collapse under compound cursor pagination.
-	EventID string `json:"event_id,omitempty"`
-	// NodeID is the node that wrote the event (same as Actor when set).
-	NodeID string `json:"node_id,omitempty"`
-	// Kind is "secret_open" (default/empty for back-compat) or "egress".
-	Kind string `json:"kind,omitempty"`
-	// Destination is host or host:port for Kind=egress. Never credentials.
-	Destination string `json:"destination,omitempty"`
-	// Network is tcp/udp when known (egress only).
-	Network  string `json:"network,omitempty"`
-	BytesIn  int64  `json:"bytes_in,omitempty"`
-	BytesOut int64  `json:"bytes_out,omitempty"`
-}
+type SecretAuditEvent = auditlog.Event
 
 // SecretAuditSink receives secret-read events. Emit must be non-blocking.
 // A nil sink is a no-op and must not panic.
@@ -327,14 +307,8 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 	})
 }
 
-var secretAuditEventSeq atomic.Uint64
-
 func ensureSecretAuditEventID(ev *SecretAuditEvent) {
-	if ev == nil || strings.TrimSpace(ev.EventID) != "" {
-		return
-	}
-	// Monotonic per-process id; unique even when Time and all other fields match.
-	ev.EventID = fmt.Sprintf("ae-%d", secretAuditEventSeq.Add(1))
+	auditlog.EnsureEventID(ev)
 }
 
 func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {

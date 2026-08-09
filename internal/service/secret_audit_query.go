@@ -48,10 +48,10 @@ type SecretAuditPage struct {
 	NextCursor string              `json:"next_cursor,omitempty"`
 }
 
-// PruneSecretAudit rewrites the local JSONL dropping events older than
-// SB_SECRET_AUDIT_RETENTION_DAYS. No-op when retention is 0 or the file sink
-// is not configured.
-func (s *Service) PruneSecretAudit(_ context.Context) error {
+// PruneSecretAudit drops audit state older than
+// SB_SECRET_AUDIT_RETENTION_DAYS. The JSONL rewrite is skipped when the file
+// sink is unavailable, but retained post-delete ACL metadata is still pruned.
+func (s *Service) PruneSecretAudit(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
@@ -61,11 +61,20 @@ func (s *Service) PruneSecretAudit(_ context.Context) error {
 	}
 	s.ensureSecretAuditSink()
 	f := s.secretAuditFile
-	if f == nil {
+	cutoff := time.Now().UTC().AddDate(0, 0, -days)
+	if f != nil {
+		if err := f.Prune(cutoff); err != nil {
+			return err
+		}
+	}
+	if s.store == nil {
 		return nil
 	}
-	cutoff := time.Now().UTC().AddDate(0, 0, -days)
-	return f.Prune(cutoff)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := s.store.PruneSandboxAuditACL(ctx, cutoff)
+	return err
 }
 
 // ListSecretAuditLocal scans the authoritative local JSONL for sandboxID.

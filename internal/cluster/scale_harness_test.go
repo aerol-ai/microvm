@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -15,9 +14,10 @@ import (
 )
 
 // TestScaleGateEnterpriseTopologyCreateSealDeletePlanes exercises the
-// requested enterprise gate shape: 2,000 live members (100 ingress), and
-// 100,000 concurrent reservation admits across the placement plane. Seal/delete
-// concurrency for credentials is covered by TestScaleGateConcurrentSealDeletePlane.
+// requested enterprise gate shape: 2,000 live members (100 ingress), and a
+// 100,000-sandbox reservation burst driven by 64 concurrent submitters across
+// the placement plane. Credential lifecycle concurrency is covered separately
+// by TestScaleGateConcurrentSealDeletePlane.
 func TestScaleGateEnterpriseTopologyCreateSealDeletePlanes(t *testing.T) {
 	requireScaleGates(t)
 
@@ -63,15 +63,13 @@ func TestScaleGateEnterpriseTopologyCreateSealDeletePlanes(t *testing.T) {
 		batch []reservationCommand
 	}
 	perWorker := creates / workers
-	if perWorker < 1 {
-		perWorker = 1
-	}
+	remainder := creates % workers
 	jobs := make([]batchJob, 0, workers)
 	remaining := creates
 	for worker := 0; worker < workers && remaining > 0; worker++ {
 		n := perWorker
-		if worker == workers-1 || n > remaining {
-			n = remaining
+		if worker < remainder {
+			n++
 		}
 		owner := fmt.Sprintf("worker-%04d", worker)
 		batch := make([]reservationCommand, 0, n)
@@ -105,14 +103,10 @@ func TestScaleGateEnterpriseTopologyCreateSealDeletePlanes(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			mu.Lock()
-			defer mu.Unlock()
-			pending := fsm.pendingReservationsByNode(expiry - 1)
-			counts := map[string]int{job.owner: fsm.livePendingReservationCount(job.owner, expiry-1)}
-			if err := admitReservationCommands(members, pending, counts, len(job.batch), job.batch); err != nil {
-				if !errors.Is(err, ErrCreateBackpressure) && !errors.Is(err, ErrNoPlacementTarget) {
-					admitFail.Add(1)
-				}
+			// Every batch targets a distinct owner, so admission and encoding can run
+			// concurrently. Only Raft FSM Apply is serialized, matching production.
+			if err := admitReservationCommands(members, nil, map[string]int{job.owner: 0}, len(job.batch), job.batch); err != nil {
+				admitFail.Add(1)
 				return
 			}
 			payload, err := encodeCommand(command{Op: opReserveBatch, Reservations: job.batch})
@@ -120,12 +114,15 @@ func TestScaleGateEnterpriseTopologyCreateSealDeletePlanes(t *testing.T) {
 				applyFail.Add(1)
 				return
 			}
+			mu.Lock()
 			idx := logIndex
 			logIndex++
 			if got := fsm.Apply(&raft.Log{Index: idx, Data: payload}); got != nil {
+				mu.Unlock()
 				applyFail.Add(1)
 				return
 			}
+			mu.Unlock()
 			accepted.Add(int32(len(job.batch)))
 		}()
 	}
@@ -133,8 +130,8 @@ func TestScaleGateEnterpriseTopologyCreateSealDeletePlanes(t *testing.T) {
 	if admitFail.Load() > 0 || applyFail.Load() > 0 {
 		t.Fatalf("concurrent plane failures: admit=%d apply=%d", admitFail.Load(), applyFail.Load())
 	}
-	if got := int(accepted.Load()); got < creates/2 {
-		t.Fatalf("accepted reservations=%d, want at least %d under concurrent submit", got, creates/2)
+	if got := int(accepted.Load()); got != creates {
+		t.Fatalf("accepted reservations=%d, want exactly %d under concurrent submit", got, creates)
 	}
 	if got := len(fsm.pendingReservationClaims); got != int(accepted.Load()) {
 		t.Fatalf("pending claims=%d, want %d", got, accepted.Load())
