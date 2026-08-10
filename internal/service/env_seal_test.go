@@ -92,6 +92,41 @@ func TestLoadEnvPlaintextFallbackMetric(t *testing.T) {
 	}
 }
 
+func TestSealLegacySandboxEnvBootMigration(t *testing.T) {
+	svc, st, audit := testEnvService(t, true)
+	ctx := context.Background()
+	seedEnvSandbox(t, st, "sb-env-legacy", map[string]string{"TOKEN": "secret"})
+
+	migrated, err := svc.SealLegacySandboxEnv(ctx)
+	if err != nil {
+		t.Fatalf("SealLegacySandboxEnv: %v", err)
+	}
+	if migrated != 1 {
+		t.Fatalf("migrated = %d, want 1", migrated)
+	}
+	if again, err := svc.SealLegacySandboxEnv(ctx); err != nil || again != 0 {
+		t.Fatalf("idempotent migration = %d, %v", again, err)
+	}
+	plain, err := st.GetEnvJSON(ctx, "sb-env-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain) != 0 {
+		t.Fatalf("plaintext env remains: %+v", plain)
+	}
+	got, err := svc.loadEnv(ctx, "sb-env-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["TOKEN"] != "secret" {
+		t.Fatalf("opened env = %+v", got)
+	}
+	events := audit.Events()
+	if len(events) < 2 || events[0].Result != secretAuditResultSuccess {
+		t.Fatalf("migration/load audit = %+v", events)
+	}
+}
+
 func TestUpsertPreservesSealedEnv(t *testing.T) {
 	svc, st, _ := testEnvService(t, true)
 	ctx := context.Background()

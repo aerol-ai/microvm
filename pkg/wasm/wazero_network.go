@@ -20,6 +20,22 @@ type wazeroNetHost struct {
 	closed bool
 }
 
+// closeConns interrupts all active mediated I/O without permanently closing
+// the host. It is used before an instance is stopped or replaced so a guest
+// blocked in tcpRead/tcpWrite can unwind before runtime state is released.
+func (h *wazeroNetHost) closeConns() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	conns := h.conns
+	h.conns = make(map[uint64]net.Conn)
+	h.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
 func (e *wazeroEngine) SetNetworkHook(hook *NetworkHook) {
 	e.netHook = hook
 }

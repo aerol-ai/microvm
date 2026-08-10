@@ -121,3 +121,61 @@ func TestPostSecretBlobRoundTripBody(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+func TestSecretReplicationPrefersInternalTransportWithoutPublicDowngrade(t *testing.T) {
+	var internalHits atomic.Int32
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		internalHits.Add(1)
+		http.Error(w, "internal unavailable", http.StatusServiceUnavailable)
+	}))
+	defer internal.Close()
+
+	var publicHits atomic.Int32
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		publicHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer public.Close()
+
+	members := []Member{{
+		NodeID:      "peer",
+		Alive:       true,
+		APIURL:      public.URL,
+		InternalURL: internal.URL,
+	}}
+	blob := secrets.SecretBlob{Ref: "r", SandboxID: "s", SealedPayload: []byte("x")}
+	acked, err := pushSecretBlobToPeersWithInternal(
+		context.Background(), members, public.Client(), internal.Client(), "pat", "self", blob, []string{"peer"},
+	)
+	if err == nil {
+		t.Fatal("expected the internal transport error")
+	}
+	if len(acked) != 0 {
+		t.Fatalf("acked = %v, want none", acked)
+	}
+	if internalHits.Load() != secretFanoutMaxAttempts {
+		t.Fatalf("internal hits = %d, want %d retries", internalHits.Load(), secretFanoutMaxAttempts)
+	}
+	if publicHits.Load() != 0 {
+		t.Fatalf("public hits = %d, secret replication downgraded after internal failure", publicHits.Load())
+	}
+}
+
+func TestSecretReplicationSupportsInternalOnlyMember(t *testing.T) {
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer internal.Close()
+
+	members := []Member{{NodeID: "peer", Alive: true, InternalURL: internal.URL}}
+	blob := secrets.SecretBlob{Ref: "r", SandboxID: "s", SealedPayload: []byte("x")}
+	acked, err := pushSecretBlobToPeersWithInternal(
+		context.Background(), members, nil, internal.Client(), "pat", "self", blob, []string{"peer"},
+	)
+	if err != nil {
+		t.Fatalf("push over internal-only transport: %v", err)
+	}
+	if len(acked) != 1 || acked[0] != "peer" {
+		t.Fatalf("acked = %v, want [peer]", acked)
+	}
+}

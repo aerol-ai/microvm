@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 
@@ -164,6 +166,82 @@ func TestFSMDelete(t *testing.T) {
 	}
 	// Idempotent.
 	fsm.Apply(&raft.Log{Data: d})
+}
+
+func TestFSMDeleteRetainsAndPrunesAuditACL(t *testing.T) {
+	fsm := newPlacementFSM()
+	expires := time.Now().UTC().Add(time.Hour).Unix()
+	place, _ := encodeCommand(command{
+		Op:          opPlace,
+		SandboxID:   "sb-audit",
+		OwnerNodeID: "node-a",
+		OwnerRef:    "tenant-a",
+	})
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: place}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+	reassign, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb-audit", OwnerNodeID: "node-b"})
+	if got := fsm.Apply(&raft.Log{Index: 2, Data: reassign}); got != nil {
+		t.Fatalf("reassign: %v", got)
+	}
+	del, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb-audit", ExpiresUnix: expires})
+	if got := fsm.Apply(&raft.Log{Index: 3, Data: del}); got != nil {
+		t.Fatalf("delete: %v", got)
+	}
+	if _, ok := fsm.get("sb-audit"); ok {
+		t.Fatal("placement should be gone after delete")
+	}
+	acl, ok := fsm.auditACLForSandbox("sb-audit", expires-1)
+	if !ok || acl.OwnerRef != "tenant-a" || acl.ExpiresUnix != expires {
+		t.Fatalf("retained ACL = %+v, %v", acl, ok)
+	}
+	if got, want := acl.AuditNodeIDs, []string{"node-a", "node-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("retained audit nodes = %v, want %v", got, want)
+	}
+	if _, ok := fsm.auditACLForSandbox("sb-audit", expires); ok {
+		t.Fatal("expired ACL must not authorize access before its prune sweep")
+	}
+
+	snap, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	restored := newPlacementFSM()
+	if err := restored.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if acl, ok := restored.auditACLForSandbox("sb-audit", expires-1); !ok || acl.OwnerRef != "tenant-a" {
+		t.Fatalf("restored ACL = %+v, %v", acl, ok)
+	}
+
+	if acl, ok := restored.auditACLForSandbox("sb-audit", expires-1); !ok || !reflect.DeepEqual(acl.AuditNodeIDs, []string{"node-a", "node-b"}) {
+		t.Fatalf("restored audit nodes = %+v, %v", acl, ok)
+	}
+
+	prune, _ := encodeCommand(command{Op: opPruneAuditACL, ExpiresUnix: expires})
+	if got := restored.Apply(&raft.Log{Index: 4, Data: prune}); got != nil {
+		t.Fatalf("prune: %v", got)
+	}
+	if _, ok := restored.auditACLForSandbox("sb-audit", expires-1); ok {
+		t.Fatal("prune should remove the expired retained ACL")
+	}
+}
+
+func TestPlacementAuditNodeHistoryBoundIsFailOpenForCoverage(t *testing.T) {
+	p := Placement{}
+	for i := 0; i <= maxPlacementAuditNodes; i++ {
+		recordPlacementAuditNode(&p, fmt.Sprintf("node-%03d", i))
+	}
+	if len(p.AuditNodeIDs) != maxPlacementAuditNodes {
+		t.Fatalf("history len = %d, want %d", len(p.AuditNodeIDs), maxPlacementAuditNodes)
+	}
+	if !p.AuditNodesTruncated {
+		t.Fatal("overflow must mark history truncated so readers use full fan-out")
+	}
 }
 
 // TestFSMPlaceCarriesSpec verifies the spec payload survives an opPlace round

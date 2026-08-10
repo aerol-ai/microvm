@@ -113,9 +113,9 @@ exist only where they were written).
 |---|---|---|
 | Key custody | node-local AES key file | KMS wraps the data key |
 | Ciphertext storage | `cluster_secrets` row | `cluster_secrets` row — **same**, KMS stores nothing |
-| Distribution | **async** peer fan-out after create | **async peer fan-out after create** — shared machinery |
+| Distribution | bounded first-backup ACK, then async remainder | the same bounded/async peer fan-out — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
-| Boot cost (HA creates) | **none on the caller** — fan-out is async | **none on the caller**; the KMS wrap rides the async fan-out |
+| Boot cost (HA creates) | bounded wait for the first backup ACK, then async remainder | KMS wrap plus the same bounded first-ACK wait |
 | Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
 | Offline `make test` | native | fake; live behind `integration` tag |
 
@@ -160,10 +160,10 @@ is configured**, and is skipped entirely when it is a no-op — the open-source
 default. **Dead-disk durability is not claimed unless a real sink is wired**;
 fan-out discovers records, it does not preserve them.
 
-Owner-forwarding was eliminated on evidence: the FSM keeps a single
-`OwnerNodeID` that `opPlace` overwrites (`fsm.go:427`), so no owner history
-exists and forwarding to the current owner silently drops everything before the
-last failover.
+Owner-forwarding was eliminated because a current owner alone cannot cover
+pre-failover history. The implemented model retains a bounded owner-node list in
+Raft and targets that list. Overflow is explicit and falls back to all-worker
+fan-out rather than silently dropping older evidence.
 
 **Rate-limiting is new machinery**, not a config toggle — there is no limiter
 anywhere in `pkg/api` today and `golang.org/x/time/rate` is not a dependency.
@@ -253,7 +253,7 @@ path on a background ticker, **not** create.
 |---|---|---|
 | T6 audit | `UnsealRegistry` (`service.go:1903`, via `attachWasmRegistryAuth`) and `loadMounts` (`service.go:2038`, via `StartSandbox`) | Audit writes must be buffered/async or start latency moves. State the choice. |
 | T7 | Env to its own row = +1 INSERT + AES-GCM seal per create on a `MaxOpenConns=1` connection. Env is present on nearly every create. | Measured before/after on default create. **Required.** |
-| T1-T4 | Default creates unchanged; HA creates also unchanged — **the fan-out is async** (plan §3e) | Extend the existing `cluster_seal` stage timer to cover the local seal. |
+| T1-T4 | Default creates unchanged; HA creates add a bounded wait for the first backup ACK, then fan out the remainder asynchronously (plan §3e) | Extend the existing `cluster_seal` stage timer to cover local seal and first-ACK latency. |
 | E3a | Event emission | Must not be synchronous on create. |
 | **E3b** | **Per-sandbox NFLOG/conntrack rule installation lands where netrules already runs during sandbox setup** (`pkg/docker/client.go:213-282`, `BlockAllEgress`/`ClearBlockAllEgress` keyed by container IP) | **+1 rule per sandbox on the create path. Measure it. Was missing from this table until 2026-08-07.** |
 | E4 | Daemon boot only | First-call KMS round-trip; off the create path. |
@@ -267,7 +267,9 @@ return and HA holders≥2, an owner death can leave the sandbox unrecreateable.
 Mitigation: bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default
 2s) for ≥1 peer ACK, then async remainder; `failover_ready=false` until ready;
 boot `ReFanoutClusterSecrets` after restart; chaos coverage via UC-58c
-(integration + disruptive). Set wait to `0` to restore fully-async create.
+(integration + disruptive). Enterprise mode fails and retracts an HA create
+when the window produces no backup ACK; non-enterprise mode retains the
+observable, fully-async fallback. Set wait to `0` only outside enterprise mode.
 
 Affects only `failover.policy=recreate` sandboxes. Full detail in
 `plans/secrets-hardening.md` §10 GAP-1.
@@ -288,9 +290,9 @@ Affects only `failover.policy=recreate` sandboxes. Full detail in
    asked, drop it to deferred rather than building on schedule.
 4. **This is a program, not a fix.** The confirmed P1 defect is T3. Ship slice 1
    independently and early.
-5. **GAP-1 residual remains when peers are unreachable for the whole min-ACK
-   window.** Create still returns; `failover_ready` stays honest (`false`) until
-   holders catch up. Not a silent half-seal.
+5. **GAP-1 residual remains only outside enterprise mode when peers are
+   unreachable for the whole min-ACK window.** Enterprise mode retracts the
+   sealed row and fails the create instead of returning a single-copy HA claim.
 
 ## External dependency
 
@@ -310,12 +312,12 @@ to deferred:
 - Placement filter for stale recipient sets (D5 chose docs + KMS).
 - Resealing protocol on membership change (needs a live decryptor; the dead owner
   had it).
-- **`toolbox_token` plaintext at rest** (`store.go:766`) — **deferred with a
-  written rationale**, see `plans/secrets-hardening.md` §8a. It is a
-  platform-minted control-plane credential, not a customer secret, and is tagged
-  `json:"-"` (`types.go:711`) so it cannot reach the Raft spec even accidentally
-  — a different problem from `env_json`, which was leaking. The plan explicitly
-  does **not** claim all secret-bearing columns are sealed.
+- **`toolbox_token` plaintext at rest** — closed. The token is encrypted in the
+  existing sandbox row (`toolbox_token_sealed`) with sandbox-bound AAD when
+  `SB_SECRET_TOOLBOX_SEAL_ENABLED=true`; enterprise mode requires the flag.
+  Keeping it in the existing table avoids a second lifecycle/GC implementation.
+  The plaintext column remains only for rolling compatibility and is written
+  empty after sealing is enabled.
 - Issue #70 (full-table scan per tick) — D8 and E1a avoid worsening it.
 
 Added here:
@@ -324,11 +326,13 @@ Added here:
   Prometheus/expvar-driven and there is no Loki/Tempo anywhere in `setup/`.
 - `aerolvm` CLI — no CLI exists; `cmd/` holds only `sandboxd` and `toolboxd`.
 - Flaky `internal/cluster` memberlist tests (in TODOS.md) — mitigated 2026-08-08.
-- **Per-node identity for `/v1/cluster/internal/...` (mTLS / SPIFFE)** —
-  parked 2026-08-08. Tenant tokens are blocked on secret/audit internal
-  routes (operator/PAT only + recipient checks). Fleet PAT remains the peer
-  credential for *all* internal cluster HTTP, same as recovery/wasm-migrate/
-  apply. Documented in `docs/.../cluster-secrets.mdx` and `TODOS.md`.
+- **Cluster-member authentication for `/v1/cluster/internal/...`** — implemented
+  with a cluster-CA mTLS listener/client path. Enterprise mode requires TLS
+  material and forbids insecure gossip/credentials; enterprise internal routes
+  reject requests on the public listener, and internal audit reads never retry
+  over plaintext after a TLS error. The fleet PAT stays as a second
+  authorization layer. Unique node-ID-bound SPIFFE identities are not
+  implemented.
 
 ## Section-review decisions (11-section deep review)
 

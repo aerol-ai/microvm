@@ -10,29 +10,38 @@ On the open-source build:
 - The local JSONL audit log (`{Dir(DBPath)}/audit/secrets.jsonl`) is
   authoritative per node.
 - **There is no dead-disk durability claim.** Losing a node's disk loses that
-  node's audit history permanently.
+  node's audit history permanently. The local writer fsyncs at least once per
+  second and again at shutdown, bounding ordinary host-crash loss without
+  pretending that a local disk is an external evidence store.
 - Cluster fan-out on `GET /v1/sandboxes/{id}/audit` is a **discovery**
-  mechanism (find records whose location is untracked). It is **not** a
+  mechanism. It targets the Raft-retained owner history and falls back to all
+  workers if that bounded history is missing or truncated. It is **not** a
   durability mechanism and cannot recover records that no longer exist.
 - Coverage in the API response names which members answered; `partial: true`
   means the page is incomplete — never treat a partial page as full history.
 
-See also the D5 frozen-recipient limitation and the **fleet-PAT peer-auth**
-limitation in
+See also the D5 frozen-recipient limitation and cluster identity requirements in
 [`docs/.../cluster-secrets.mdx`](../../docs/src/content/docs/cluster-secrets.mdx).
 
-**Peer auth honesty:** secret PUT/DELETE and peer-local audit reject managed
-tenant tokens (operator/PAT only) and validate recipient membership on
-receive. They do **not** authenticate individual node identity. A stolen
-`SB_PAT_TOKEN` is still full operator access on every `/v1/cluster/internal/...`
-route. Per-node mTLS is parked (see `TODOS.md`).
+**Peer auth honesty:** with `SB_CLUSTER_TLS_DIR` configured, internal secret,
+audit, recovery, and Raft-forward traffic prefers the dedicated mTLS listener;
+the server requires a certificate signed by the cluster CA and there is no
+retry downgrade after a TLS failure. `SB_ENTERPRISE_MODE=true` requires this
+configuration, rejects internal routes on the public listener, and rejects
+insecure gossip/credential modes. Non-enterprise
+clusters may still use the legacy public API + fleet PAT path when no cluster
+TLS directory is configured. The PAT remains an operator credential, so protect
+and rotate it even when mTLS is enabled.
 
 ## Alerts
 
 | Alert | Meaning | First action |
 |---|---|---|
+| `SandboxdSecretAuditSinkUnavailable` | The local audit writer cannot persist evidence | Restore directory/disk access; strict-boot nodes will remain down until healthy |
 | `SandboxdAuditEventsDropped` | Audit buffer overflowed; gap markers were written | Check disk / audit I/O latency; inspect JSONL for `result=gap` |
 | `SandboxdSecretFanoutFailures` | Async sealed-blob peer push/delete failed | Check peer health, PAT, and `failover_ready` on recent HA creates |
+| `SandboxdSecretDeleteOutboxStalled` | A delete job is still unacknowledged after 15 minutes | Check recipient membership, internal API auth, and network reachability |
+| `SandboxdSecretDeleteOutboxBacklogHigh` | More than 10,000 durable deletes are queued | Restore recipients and verify the bounded reconciler is draining |
 | `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down | For `awskms`, check IAM/KMS; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
 
 ## Audit drops / gap markers
@@ -48,7 +57,12 @@ route. Per-node mTLS is parked (see `TODOS.md`).
    `"reason":"overflow"`). A gap means events were dropped under backpressure —
    the stream remains honest about incompleteness.
 
-3. Mitigate: free disk, reduce decrypt storms, restart only after capturing the
+3. Check `aerolvm_secret_audit_sink_healthy` (1 = writable, 0 = unavailable).
+   The default `SB_SECRET_AUDIT_STRICT_BOOT=true` refuses daemon startup when
+   the writer cannot be opened. Setting it false is an emergency recovery mode;
+   attempted events remain counted as dropped and the critical alert remains.
+
+4. Mitigate: free disk, reduce decrypt storms, restart only after capturing the
    current JSONL for evidence.
 
 Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) prunes old lines daily.
@@ -59,10 +73,20 @@ Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) prunes old lines daily.
    `secret fanout` warnings.
 2. Confirm recipients are alive (`GET /v1/cluster/members`) and share the
    credential encryption key / KMS access.
-3. Treat `failover_ready=false` as "HA recreate is not safe yet" — wait or
-   re-seal; do not assume create success implies peer copies exist.
+3. In enterprise mode, HA create success guarantees at least one backup ACK.
+   Outside enterprise mode, treat `failover_ready=false` as "HA recreate is not
+   safe yet" — wait or re-seal.
 4. Remember D5: recipient sets are frozen at seal time; membership changes
    after create do not enlarge the set (see cluster-secrets docs).
+
+The reconciler exposes `aerolvm_secret_delete_outbox_pending`,
+`aerolvm_secret_delete_outbox_oldest_age_seconds`, and
+`aerolvm_secret_tombstones`. Tombstones are pruned in bounded batches after
+`SB_SECRET_TOMB_RETENTION_DAYS` (default 30), but never while a live sandbox,
+sealed row, or pending delete outbox still references the sandbox ID.
+After an eligible tomb is pruned, peer PUT still requires a matching live Raft
+placement and exact recorded recipient set; deleted IDs cannot be resurrected
+through the retention boundary.
 
 ## Provider canary failure
 
@@ -112,7 +136,8 @@ Notes:
 - Do **not** expect owner-forward to gather history; hit a node that has the
   sandbox row (typically the owner). That node fans out to peers.
 - Rate limits apply (identity + node ceiling). `429` includes `Retry-After`.
-- Internal peer path (PAT): `GET /v1/cluster/internal/sandboxes/{id}/audit`
+- Internal peer path (mTLS + PAT in enterprise mode):
+  `GET /v1/cluster/internal/sandboxes/{id}/audit`
   returns the local slice only.
 - Host-mediated runtimes (wasm, isolate) also append `kind=egress` events with
   `destination` (host or host:port). Filter with `?kind=egress`. This is

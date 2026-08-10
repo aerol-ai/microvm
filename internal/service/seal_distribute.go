@@ -16,9 +16,10 @@ import (
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
-// SealPolicy governs LOCAL seal behaviour only. Async peer fan-out never
-// fails a create (plans/secrets-hardening §3e / D6). A short sync MinACK wait
-// may run before return to shrink GAP-1; it still never fails the create.
+// SealPolicy governs LOCAL seal behaviour only. A short sync MinACK wait may
+// run before return to shrink GAP-1; remaining peer fan-out is asynchronous.
+// Enterprise mode retracts and fails an HA create if the bounded wait produces
+// no backup ACK (plans/secrets-hardening §3e / D6).
 type SealPolicy int
 
 const (
@@ -249,7 +250,8 @@ func pruneDeadSecretHolders(sandboxID string, alive map[string]struct{}) {
 // Boot-path note: default creates are unchanged (seal-to-self, no fan-out).
 // HA creates: local seal + optional bounded sync wait for ≥1 peer ACK
 // (SB_SECRET_FANOUT_MIN_ACK_WAIT, default 2s) to shrink GAP-1; remaining
-// peers / retries continue asynchronously and never fail the create.
+// peers / retries continue asynchronously. Enterprise mode retracts and fails
+// a zero-ACK create rather than exposing an unreplicated HA sandbox.
 func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, policy SealPolicy) (cluster.PlacementSecrets, error) {
 	if len(recipients) == 0 {
 		if c := s.Cluster(); c != nil {
@@ -283,7 +285,18 @@ func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req m
 	}
 	resetSecretHoldersForGeneration(sandboxID, gen, selfID)
 	setSecretHolderTargets(sandboxID, gen, recipients)
-	s.fanoutSecretAfterSeal(ctx, sandboxID, req, recipients, out)
+	if err := s.fanoutSecretAfterSeal(ctx, sandboxID, req, recipients, out); err != nil {
+		// Enterprise HA never acknowledges a create whose only durable copy is
+		// still on the owner. Retract the local row and durably enqueue deletes
+		// in case a peer stored the blob but its ACK was lost.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanupErr := s.deleteClusterSecretsOriginator(cleanupCtx, sandboxID, recipients)
+		cancel()
+		if cleanupErr != nil {
+			return cluster.PlacementSecrets{}, errors.Join(err, fmt.Errorf("retract unreplicated secret: %w", cleanupErr))
+		}
+		return cluster.PlacementSecrets{}, err
+	}
 	return out, nil
 }
 
@@ -312,19 +325,22 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 
 // fanoutSecretAfterSeal runs a bounded sync MinACK wait (when configured),
 // then always kicks an async full fan-out for remaining peers / retries.
-func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, handle cluster.PlacementSecrets) {
+func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, handle cluster.PlacementSecrets) error {
 	if s == nil || !s.cfg.SecretRecipientFanoutEnabled {
-		return
+		return nil
 	}
 	if req.Failover == nil || !req.Failover.ShouldRecreate() {
-		return
+		return nil
 	}
 	if len(recipients) <= 1 || handle.Ref == "" {
-		return
+		return nil
 	}
 	pusher := s.secretPeerPusher()
 	if pusher == nil {
-		return
+		if s.cfg.EnterpriseMode {
+			return errors.New("enterprise secret fan-out requires an available peer pusher")
+		}
+		return nil
 	}
 	blob, err := s.loadSecretBlob(context.Background(), handle.Ref)
 	if err != nil || blob == nil {
@@ -332,13 +348,18 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 			s.logger.Warn("cluster: secret fan-out skipped; local blob missing after put",
 				"sandbox_id", sandboxID, "ref", handle.Ref, "err", err)
 		}
-		return
+		if s.cfg.EnterpriseMode {
+			return fmt.Errorf("enterprise secret fan-out cannot load local sealed blob %q: %v", handle.Ref, err)
+		}
+		return nil
 	}
 
 	wait := s.secretFanoutMinACKWait()
+	var acked []string
 	if wait > 0 {
 		waitCtx, cancel := context.WithTimeout(parent, wait)
-		acked, waitErr := pusher.PushSecretBlobToPeers(waitCtx, *blob, recipients)
+		var waitErr error
+		acked, waitErr = pusher.PushSecretBlobToPeers(waitCtx, *blob, recipients)
 		cancel()
 		if len(acked) > 0 {
 			addSecretHolderNodes(sandboxID, blob.SealGeneration, acked...)
@@ -348,7 +369,11 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 				"sandbox_id", sandboxID, "wait", wait, "err", waitErr)
 		}
 	}
+	if s.cfg.EnterpriseMode && len(acked) == 0 {
+		return errors.New("enterprise secret fan-out received no backup ACK")
+	}
 	go s.runSecretFanout(sandboxID, *blob, recipients, pusher)
+	return nil
 }
 
 func (s *Service) secretFanoutMinACKWait() time.Duration {
@@ -545,6 +570,24 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	}
 	if !secrets.RecipientAllowed(envelopeRecipients, selfID) {
 		return fmt.Errorf("%w: receiving node %q is not an intended recipient", secrets.ErrRecipientDenied, selfID)
+	}
+	// Once a tombstone ages out, live placement intent becomes the permanent
+	// anti-resurrection fence: deleted sandboxes have no placement, and a peer
+	// may only store the exact recipient set committed before sealing. This
+	// keeps tomb GC bounded without opening a stale-PUT vacuum after retention.
+	if s.cfg.EnableCluster {
+		c := s.Cluster()
+		if c == nil {
+			return fmt.Errorf("%w: cluster placement is unavailable", ErrInvalidClusterSecretBlob)
+		}
+		placement, ok := c.PlacementOf(sandboxID)
+		if !ok || placement.IsOrphaned() {
+			return fmt.Errorf("%w: sandbox %q has no live placement", ErrInvalidClusterSecretBlob, sandboxID)
+		}
+		recordedRecipients := secrets.NormalizeRecipients(placement.SecretRecipients)
+		if len(recordedRecipients) == 0 || !sameStringSlice(recordedRecipients, wireRecipients) {
+			return fmt.Errorf("%w: recipients do not match live placement", ErrInvalidClusterSecretBlob)
+		}
 	}
 	if s.store != nil {
 		tombGen, err := s.store.ClusterSecretTombGeneration(ctx, sandboxID)

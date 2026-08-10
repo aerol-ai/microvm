@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -132,7 +133,8 @@ func (s *Service) SealClusterSecretsForRecipient(req models.CreateSandboxRequest
 
 // PutClusterSecretsForRecipient stores the credential-bearing parts of req
 // behind a provider ref for a single recipient. Prefer SealAndDistribute at
-// create sites so HA sandboxes get recipient-set sealing + async fan-out.
+// create sites so HA sandboxes get recipient-set sealing, a bounded first ACK,
+// and async fan-out of the remaining replicas.
 func (s *Service) PutClusterSecretsForRecipient(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipient string) (cluster.PlacementSecrets, error) {
 	return s.SealAndDistribute(ctx, sandboxID, req, []string{recipient}, SealStrict)
 }
@@ -248,20 +250,133 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID strin
 // and on the periodic ticker. Work is dispatched through the bounded delete
 // fan-out pool so a large outbox cannot serialize the reconciler for minutes.
 func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
-	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
+	if s == nil || s.store == nil {
 		return nil
 	}
-	rows, err := s.store.ListSecretDeleteOutboxBatch(ctx, secretDeleteReconcileBatch)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer s.refreshSecretLifecycleMetrics(ctx)
+	if !s.cfg.SecretRecipientFanoutEnabled || s.secretPeerPusher() == nil {
+		return nil
+	}
+	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
+	defer cancel()
+	for {
+		rows, err := s.store.ListSecretDeleteOutboxBatch(sweepCtx, secretDeleteReconcileBatch)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				return nil
+			}
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		jobs := make(chan string)
+		var wg sync.WaitGroup
+		var processed atomic.Int64
+		workers := min(deleteReconcileWorkers, len(rows))
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for sandboxID := range jobs {
+					if _, loaded := deleteReconcileInflight.LoadOrStore(sandboxID, struct{}{}); loaded {
+						continue
+					}
+					select {
+					case deleteReconcileSem <- struct{}{}:
+						s.reconcileSecretDeleteOutboxOnceContext(sweepCtx, sandboxID)
+						processed.Add(1)
+						<-deleteReconcileSem
+						deleteReconcileInflight.Delete(sandboxID)
+					case <-sweepCtx.Done():
+						deleteReconcileInflight.Delete(sandboxID)
+						return
+					}
+				}
+			}()
+		}
+		for _, rec := range rows {
+			select {
+			case jobs <- rec.SandboxID:
+			case <-sweepCtx.Done():
+				close(jobs)
+				wg.Wait()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return nil
+			}
+		}
+		close(jobs)
+		wg.Wait()
+		if sweepCtx.Err() != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
+		}
+		if processed.Load() == 0 || len(rows) < secretDeleteReconcileBatch {
+			return nil
+		}
+	}
+}
+
+const (
+	secretTombPruneBatch    = 1024
+	secretTombPruneInterval = 10 * time.Minute
+)
+
+func (s *Service) refreshSecretLifecycleMetrics(ctx context.Context) {
+	if s == nil || s.store == nil {
+		return
+	}
+	stats, err := s.store.SecretLifecycleStats(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret lifecycle stats failed", "err", err)
+		}
+		return
+	}
+	secretDeleteOutboxPending.Set(stats.OutboxPending)
+	secretTombstones.Set(stats.Tombstones)
+	age := int64(0)
+	if !stats.OldestOutbox.IsZero() {
+		age = int64(time.Since(stats.OldestOutbox).Seconds())
+		if age < 0 {
+			age = 0
+		}
+	}
+	secretDeleteOutboxOldestAgeSeconds.Set(age)
+}
+
+func (s *Service) pruneClusterSecretTombs(ctx context.Context) error {
+	if s == nil || s.store == nil || s.cfg.SecretTombRetentionDays <= 0 {
+		return nil
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(s.cfg.SecretTombRetentionDays) * 24 * time.Hour)
+	pruned, err := s.store.PruneClusterSecretTombs(ctx, cutoff, secretTombPruneBatch)
 	if err != nil {
 		return err
 	}
-	for _, rec := range rows {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		s.maybeAsyncDeleteFanout(rec.SandboxID, rec.Recipients)
+	if pruned > 0 && s.logger != nil {
+		s.logger.Info("cluster: pruned expired secret tombstones", "count", pruned)
 	}
+	s.refreshSecretLifecycleMetrics(ctx)
 	return nil
+}
+
+func (s *Service) pruneClusterAuditACL(ctx context.Context) error {
+	if s == nil || s.cfg.SecretAuditRetentionDays <= 0 {
+		return nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	return c.PruneAuditACL(ctx, time.Now().UTC())
 }
 
 // StartSecretDeleteOutboxReconcile runs periodic peer-delete retries so offline
@@ -269,12 +384,21 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 // gains a newly-alive node, reconcile runs immediately and secrets are re-fanout
 // so holders re-ACK after rejoin.
 func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
-	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
+	if s == nil || s.store == nil {
 		return
 	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
+		tombTicker := time.NewTicker(secretTombPruneInterval)
+		defer tombTicker.Stop()
+		if err := s.pruneClusterSecretTombs(ctx); err != nil && s.logger != nil {
+			s.logger.Warn("cluster: secret tombstone prune failed", "err", err)
+		}
+		if err := s.pruneClusterAuditACL(ctx); err != nil && s.logger != nil {
+			s.logger.Warn("cluster: retained audit ACL prune failed", "err", err)
+		}
+		s.refreshSecretLifecycleMetrics(ctx)
 		prevAlive := s.aliveMemberSet()
 		for {
 			select {
@@ -298,6 +422,13 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 					if err := s.ReFanoutClusterSecrets(ctx); err != nil && s.logger != nil {
 						s.logger.Warn("cluster: secret re-fanout after member rejoin failed", "err", err)
 					}
+				}
+			case <-tombTicker.C:
+				if err := s.pruneClusterSecretTombs(ctx); err != nil && s.logger != nil {
+					s.logger.Warn("cluster: secret tombstone prune failed", "err", err)
+				}
+				if err := s.pruneClusterAuditACL(ctx); err != nil && s.logger != nil {
+					s.logger.Warn("cluster: retained audit ACL prune failed", "err", err)
 				}
 			}
 		}
@@ -487,10 +618,17 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 }
 
 func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
+	s.reconcileSecretDeleteOutboxOnceContext(context.Background(), sandboxID)
+}
+
+func (s *Service) reconcileSecretDeleteOutboxOnceContext(parent context.Context, sandboxID string) {
 	if s == nil || s.store == nil {
 		return
 	}
-	rec, err := s.store.GetSecretDeleteOutbox(context.Background(), sandboxID)
+	if parent == nil {
+		parent = context.Background()
+	}
+	rec, err := s.store.GetSecretDeleteOutbox(parent, sandboxID)
 	if err != nil || rec == nil {
 		return
 	}
@@ -507,7 +645,7 @@ func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
 		// No cluster transport yet; keep the durable job for a later tick.
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), secretDeleteAttemptTimeout)
+	ctx, cancel := context.WithTimeout(parent, secretDeleteAttemptTimeout)
 	defer cancel()
 	_, pending, delErr := pusher.DeleteSecretOnPeers(ctx, sandboxID, peers, rec.Generation)
 	_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
@@ -555,9 +693,13 @@ const deleteReconcileWorkers = 64
 // pending work and are retried fairly.
 const secretDeleteAttemptTimeout = 15 * time.Second
 
-// Scan beyond the worker count so already-inflight rows do not prevent free
-// slots from being filled. Attempted rows move to the back via updated_at.
-const secretDeleteReconcileBatch = deleteReconcileWorkers * 4
+// A sweep keeps filling the bounded worker pool until this batch is drained or
+// its time budget expires. Attempted rows move to the back via updated_at, so
+// persistent failures cannot starve fresh work.
+const (
+	secretDeleteReconcileBatch  = 1024
+	secretDeleteReconcileBudget = 25 * time.Second
+)
 
 var (
 	deleteReconcileSem      = make(chan struct{}, deleteReconcileWorkers)

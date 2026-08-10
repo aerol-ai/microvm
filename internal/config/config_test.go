@@ -843,6 +843,12 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		if cfg.SecretAuditRetentionDays != 30 {
 			t.Fatalf("SecretAuditRetentionDays = %d, want 30", cfg.SecretAuditRetentionDays)
 		}
+		if !cfg.SecretAuditStrictBoot {
+			t.Fatal("SecretAuditStrictBoot default = false, want true")
+		}
+		if cfg.SecretTombRetentionDays != 30 {
+			t.Fatalf("SecretTombRetentionDays = %d, want 30", cfg.SecretTombRetentionDays)
+		}
 		if !cfg.EgressAttributionEnabled {
 			t.Fatal("EgressAttributionEnabled default = false, want true")
 		}
@@ -1417,5 +1423,28 @@ func TestParseMirrorUpstreams(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEnterpriseModeRequiresSecretSealing(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterprisePATBytes))
+	t.Setenv("SB_ENTERPRISE_MODE", "true")
+	t.Setenv("SB_ENABLE_CLUSTER", "false")
+	t.Setenv("SB_SECRET_ENV_SEAL_ENABLED", "false")
+	t.Setenv("SB_SECRET_TOOLBOX_SEAL_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_ENV_SEAL_ENABLED") {
+		t.Fatalf("Load error = %v, want env-seal enterprise validation", err)
+	}
+
+	t.Setenv("SB_SECRET_ENV_SEAL_ENABLED", "true")
+	if cfg, err := Load(); err != nil {
+		t.Fatalf("secure enterprise Load: %v", err)
+	} else if !cfg.EnterpriseMode || !cfg.SecretToolboxSealEnabled {
+		t.Fatalf("enterprise flags not retained: %+v", cfg)
+	}
+
+	t.Setenv("SB_PAT_TOKEN", "weak-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("Load error = %v, want weak PAT rejection", err)
 	}
 }

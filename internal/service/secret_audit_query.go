@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"container/heap"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -116,7 +117,21 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 	}
 	defer f.Close()
 
-	var matched []SecretAuditEvent
+	// Retain only the first page plus one look-ahead row. The file can contain
+	// millions of fleet events; query memory must scale with the requested page,
+	// not with retention volume or one noisy sandbox.
+	candidates := make(secretAuditEventMaxHeap, 0, limit+1)
+	heap.Init(&candidates)
+	keepCandidate := func(ev SecretAuditEvent) {
+		if len(candidates) < limit+1 {
+			heap.Push(&candidates, ev)
+			return
+		}
+		if secretAuditEventLess(ev, candidates[0]) {
+			candidates[0] = ev
+			heap.Fix(&candidates, 0)
+		}
+	}
 	var malformed int
 	sc := bufio.NewScanner(f)
 	// Audit lines are small (metadata only); 1MiB is ample.
@@ -147,13 +162,13 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 				continue
 			}
 		}
-		matched = append(matched, ev)
+		keepCandidate(ev)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, "", err
 	}
 	if malformed > 0 {
-		matched = append(matched, SecretAuditEvent{
+		keepCandidate(SecretAuditEvent{
 			Time:      time.Now().UTC(),
 			SandboxID: sandboxID,
 			Result:    secretAuditResultGap,
@@ -161,16 +176,15 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 			Kind:      secretAuditKindGap,
 		})
 	}
+	matched := append([]SecretAuditEvent(nil), candidates...)
 	sort.SliceStable(matched, func(i, j int) bool {
-		if matched[i].Time.Equal(matched[j].Time) {
-			return secretAuditEventCursorKey(matched[i]) < secretAuditEventCursorKey(matched[j])
-		}
-		return matched[i].Time.Before(matched[j].Time)
+		return secretAuditEventLess(matched[i], matched[j])
 	})
+	hasMore := len(matched) > limit
 	if len(matched) > limit {
 		matched = matched[:limit]
 	}
-	if len(matched) == limit {
+	if hasMore && len(matched) > 0 {
 		last := matched[len(matched)-1]
 		nextCursor = formatSecretAuditCursor(last)
 	}
@@ -181,7 +195,8 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 // peers. Coverage.Missing lists peers that timed out or failed — never silent.
 //
 // Interim scale bounds (full indexed/central sink is parked in TODOS.md):
-//   - prefer placement owner + SecretRecipients when known
+//   - target the bounded Raft-retained owner history when complete
+//   - fall back to all workers if history is absent/truncated (never a vacuum)
 //   - skip pure ingress roles (they do not host sandboxes)
 //   - bounded parallel peer fetches under a short global deadline
 func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts SecretAuditQuery) (SecretAuditPage, error) {
@@ -197,19 +212,25 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 	selfURL := ""
 	var members []cluster.Member
 	prefer := map[string]struct{}{}
+	preferKnown := false
 	if c := s.Cluster(); c != nil {
 		selfID = c.SelfNodeID()
 		selfURL = strings.TrimRight(c.SelfAPIURL(), "/")
 		members = c.Members()
 		if p, ok := c.PlacementOf(sandboxID); ok {
-			if id := strings.TrimSpace(p.OwnerNodeID); id != "" {
-				prefer[id] = struct{}{}
-			}
-			for _, id := range p.SecretRecipients {
-				if id = strings.TrimSpace(id); id != "" {
-					prefer[id] = struct{}{}
+			if !p.AuditNodesTruncated {
+				addPreferredAuditNode(prefer, p.OwnerNodeID)
+				addPreferredAuditNode(prefer, p.OrphanedOwnerNodeID)
+				for _, id := range p.AuditNodeIDs {
+					addPreferredAuditNode(prefer, id)
 				}
+				preferKnown = len(prefer) > 0
 			}
+		} else if acl, exists, aclErr := c.AuditACLForSandbox(ctx, sandboxID); aclErr == nil && exists && !acl.AuditNodesTruncated {
+			for _, id := range acl.AuditNodeIDs {
+				addPreferredAuditNode(prefer, id)
+			}
+			preferKnown = len(prefer) > 0
 		}
 	}
 
@@ -251,7 +272,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		if role == config.NodeRoleIngress {
 			continue // ingress never hosts sandboxes / local audit rows
 		}
-		if len(prefer) > 0 {
+		if preferKnown {
 			if _, ok := prefer[m.NodeID]; !ok {
 				continue
 			}
@@ -282,29 +303,37 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 			page   cluster.AuditPeerPage
 			err    error
 		}
-		results := make(chan peerResult, len(jobs))
-		sem := make(chan struct{}, secretAuditFanoutParallel)
+		workers := min(secretAuditFanoutParallel, len(jobs))
+		jobCh := make(chan peerJob)
+		results := make(chan peerResult, workers)
 		var wg sync.WaitGroup
-		for _, j := range jobs {
+		for range workers {
 			wg.Add(1)
-			go func(j peerJob) {
+			go func() {
 				defer wg.Done()
+				for j := range jobCh {
+					page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.apiURL, sandboxID, limit, opts.Cursor, opts.Kind)
+					results <- peerResult{nodeID: j.nodeID, page: page, err: fetchErr}
+				}
+			}()
+		}
+		go func() {
+			defer close(jobCh)
+			for _, j := range jobs {
 				select {
-				case sem <- struct{}{}:
+				case jobCh <- j:
 				case <-fanCtx.Done():
-					results <- peerResult{nodeID: j.nodeID, err: fanCtx.Err()}
 					return
 				}
-				defer func() { <-sem }()
-				page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.apiURL, sandboxID, limit, opts.Cursor, opts.Kind)
-				results <- peerResult{nodeID: j.nodeID, page: page, err: fetchErr}
-			}(j)
-		}
+			}
+		}()
 		go func() {
 			wg.Wait()
 			close(results)
 		}()
+		accounted := make(map[string]struct{}, len(jobs))
 		for r := range results {
+			accounted[r.nodeID] = struct{}{}
 			if r.err != nil {
 				coverage.Missing = append(coverage.Missing, r.nodeID)
 				continue
@@ -316,6 +345,14 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 					continue
 				}
 				merged = append(merged, ev)
+			}
+		}
+		// The global deadline may expire while jobs are still queued. Account for
+		// every unscheduled node explicitly so bounding goroutines can never turn
+		// into silent partial coverage.
+		for _, j := range jobs {
+			if _, ok := accounted[j.nodeID]; !ok {
+				coverage.Missing = append(coverage.Missing, j.nodeID)
 			}
 		}
 	}
@@ -338,6 +375,13 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		nextCursor = formatSecretAuditCursor(merged[len(merged)-1])
 	}
 	return SecretAuditPage{Events: merged, Coverage: coverage, NextCursor: nextCursor}, nil
+}
+
+func addPreferredAuditNode(prefer map[string]struct{}, nodeID string) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID != "" {
+		prefer[nodeID] = struct{}{}
+	}
 }
 
 func (s *Service) secretAuditPath() string {
@@ -369,22 +413,9 @@ func (s *Service) auditPeerFetcher() cluster.AuditPeerFetcher {
 }
 
 func secretAuditEventFromDTO(dto cluster.AuditEventDTO) SecretAuditEvent {
-	return SecretAuditEvent{
-		Time:          dto.Time,
-		Actor:         dto.Actor,
-		SandboxID:     dto.SandboxID,
-		Ref:           dto.Ref,
-		Result:        dto.Result,
-		Reason:        dto.Reason,
-		CorrelationID: dto.CorrelationID,
-		EventID:       dto.EventID,
-		NodeID:        dto.NodeID,
-		Kind:          dto.Kind,
-		Destination:   dto.Destination,
-		Network:       dto.Network,
-		BytesIn:       dto.BytesIn,
-		BytesOut:      dto.BytesOut,
-	}
+	// Both public types are aliases of auditlog.Event. Keep this assignment
+	// direct so adding a field to the shared DTO cannot silently omit it here.
+	return dto
 }
 
 // secretAuditKindMatches reports whether storedKind satisfies a query filter.
@@ -424,6 +455,33 @@ func secretAuditEventCursorKey(ev SecretAuditEvent) string {
 		fmt.Sprintf("%d", ev.BytesIn),
 		fmt.Sprintf("%d", ev.BytesOut),
 	}, secretAuditCursorSep)
+}
+
+func secretAuditEventLess(a, b SecretAuditEvent) bool {
+	if a.Time.Equal(b.Time) {
+		return secretAuditEventCursorKey(a) < secretAuditEventCursorKey(b)
+	}
+	return a.Time.Before(b.Time)
+}
+
+// secretAuditEventMaxHeap keeps the greatest retained event at index zero so
+// streaming queries can discard later rows while using O(page size) memory.
+type secretAuditEventMaxHeap []SecretAuditEvent
+
+func (h secretAuditEventMaxHeap) Len() int { return len(h) }
+func (h secretAuditEventMaxHeap) Less(i, j int) bool {
+	return secretAuditEventLess(h[j], h[i])
+}
+func (h secretAuditEventMaxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *secretAuditEventMaxHeap) Push(x any) {
+	*h = append(*h, x.(SecretAuditEvent))
+}
+func (h *secretAuditEventMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 func formatSecretAuditCursor(ev SecretAuditEvent) string {

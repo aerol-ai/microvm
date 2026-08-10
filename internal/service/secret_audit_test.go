@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -54,6 +55,21 @@ func TestEmitSecretAuditNilSinkNoPanic(t *testing.T) {
 	var sink SecretAuditSink
 	emitSecretAudit(sink, "sb", "ref", "node-a", "", secrets.ErrNotFound)
 	beginSecretAudit(nil, "sb", "ref", "node-a", "")(nil)
+}
+
+func TestSecretAuditStrictBootAndUnavailableSink(t *testing.T) {
+	s := &Service{cfg: config.Config{SecretAuditStrictBoot: true}}
+	if err := s.ValidateSecretAuditSink(); err == nil {
+		t.Fatal("ValidateSecretAuditSink error = nil, want missing DBPath failure")
+	}
+	before := auditEventsDroppedTotal.Value()
+	s.secretAuditSink().Emit(SecretAuditEvent{SandboxID: "sb"})
+	if got := auditEventsDroppedTotal.Value() - before; got != 1 {
+		t.Fatalf("dropped delta = %d, want 1", got)
+	}
+	if got := secretAuditSinkHealthy.Value(); got != 0 {
+		t.Fatalf("sink health = %d, want 0", got)
+	}
 }
 
 func TestSecretAuditSuccessAndFailureClasses(t *testing.T) {

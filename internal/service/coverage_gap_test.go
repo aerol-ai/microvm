@@ -653,10 +653,10 @@ func TestHandleL4WakeTCPConnBranches(t *testing.T) {
 		svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 		server, client := net.Pipe()
-		go func() {
-			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
-			_ = client.Close()
-		}()
+		go func(conn net.Conn) {
+			_, _ = conn.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = conn.Close()
+		}(client)
 		svc.handleL4WakeTCPConn(server)
 
 		now := time.Now().UTC()
@@ -684,10 +684,10 @@ func TestHandleL4WakeTCPConnBranches(t *testing.T) {
 			t.Fatalf("UpsertPort: %v", err)
 		}
 		server, client = net.Pipe()
-		go func() {
-			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
-			_ = client.Close()
-		}()
+		go func(conn net.Conn) {
+			_, _ = conn.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = conn.Close()
+		}(client)
 		svc.handleL4WakeTCPConn(server)
 	})
 }

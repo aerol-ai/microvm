@@ -54,7 +54,7 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	}))
 	defer internalSrv.Close()
 
-	follower.internalClient = internalSrv.Client()
+	follower.setInternalClient(internalSrv.Client())
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID:      leader.nodeID,
 		InternalURL: internalSrv.URL,
@@ -89,7 +89,7 @@ func TestForwardApplyLeaderAPIURLMissing(t *testing.T) {
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
-	follower.internalClient = nil
+	follower.setInternalClient(nil)
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID: leader.nodeID,
 		Alive:  true,
@@ -539,7 +539,7 @@ func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossi
 		testClusterMu.Lock()
 		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 		raftPort := pickFreeTCPPort(t)
-		gossipPort := pickFreeTCPPort(t)
+		gossipPort := pickFreeGossipPort(t)
 		dir := t.TempDir()
 		cfg := config.Config{
 			EnableCluster:                 true,
@@ -588,7 +588,7 @@ func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string
 	tlsDir := writeTestClusterTLSDir(t)
 	for attempt := 0; attempt < 5; attempt++ {
 		testClusterMu.Lock()
-		gossipPort := pickFreeTCPPort(t)
+		gossipPort := pickFreeGossipPort(t)
 		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 		cfg := config.Config{
 			EnableCluster:                 true,

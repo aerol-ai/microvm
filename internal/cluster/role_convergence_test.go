@@ -21,7 +21,7 @@ func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap
 	t.Helper()
 	testClusterMu.Lock()
 	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeGossipPort(t)
 	dir := t.TempDir()
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 

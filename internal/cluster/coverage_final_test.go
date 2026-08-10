@@ -362,7 +362,7 @@ func TestForwardRemoveMemberToLeaderInternalMock(t *testing.T) {
 	}))
 	defer internal.Close()
 
-	follower.internalClient = internal.Client()
+	follower.setInternalClient(internal.Client())
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID:      leader.nodeID,
 		InternalURL: internal.URL,

@@ -26,11 +26,18 @@ func (f *fakeSandboxMetaFetcher) FetchSandboxOwnerRef(context.Context, string, s
 
 type placementOnlyCluster struct {
 	*cluster.Noop
-	placement cluster.Placement
+	placement     cluster.Placement
+	auditOwner    string
+	auditExists   bool
+	auditOwnerErr error
 }
 
 func (c *placementOnlyCluster) PlacementOf(string) (cluster.Placement, bool) {
 	return c.placement, c.placement.SandboxID != ""
+}
+
+func (c *placementOnlyCluster) AuditOwnerRef(context.Context, string) (string, bool, error) {
+	return c.auditOwner, c.auditExists, c.auditOwnerErr
 }
 
 func TestAuthorizeSandboxAuditAccessViaOwnerMeta(t *testing.T) {
@@ -90,5 +97,37 @@ func TestAuthorizeSandboxAuditAccessLocalRow(t *testing.T) {
 	})
 	if err := svc.AuthorizeSandboxAuditAccess(ctx, "sb-local"); err != nil {
 		t.Fatalf("local owner: %v", err)
+	}
+}
+
+func TestAuthorizeSandboxAuditAccessAfterDeleteViaRaftACL(t *testing.T) {
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	svc := New(config.Config{}, nil, st, nil, nil, nil, nil, nil, nil)
+	svc.cluster = &placementOnlyCluster{
+		Noop:        cluster.NewNoop("ingress", "http://ingress", ""),
+		auditOwner:  "acme",
+		auditExists: true,
+	}
+
+	owner := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "acme"},
+	})
+	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted"); err != nil {
+		t.Fatalf("retained owner ACL: %v", err)
+	}
+	other := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "other"},
+	})
+	if err := svc.AuthorizeSandboxAuditAccess(other, "sb-deleted"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("foreign tenant = %v, want ErrNotFound", err)
+	}
+
+	svc.cluster.(*placementOnlyCluster).auditOwnerErr = errors.New("raft unavailable")
+	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted"); err == nil || err.Error() != "raft unavailable" {
+		t.Fatalf("raft failure = %v, want fail-closed error", err)
 	}
 }

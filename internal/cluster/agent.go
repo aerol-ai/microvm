@@ -35,6 +35,7 @@ const (
 	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
 	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
 	PublicInternalDrainStatePath      = "/v1/cluster/internal/drain/"
+	PublicInternalAuditACLPath        = "/v1/cluster/internal/audit-acl/"
 	PublicInternalClusterLeaderPath   = "/v1/cluster/leader"
 	// PublicInternalSecretPath receives peer fan-out of sealed secret blobs
 	// (POST upsert) and delete-fanout (DELETE .../{sandboxID}). Auth is PAT +
@@ -395,7 +396,28 @@ func (a *Agent) ResolveCustomDomain(hostname string) (string, bool) {
 }
 
 func (a *Agent) DeletePlacement(ctx context.Context, sandboxID string) error {
-	return a.applyCommand(ctx, command{Op: opDelete, SandboxID: sandboxID})
+	return a.applyCommand(ctx, command{Op: opDelete, SandboxID: sandboxID, ExpiresUnix: auditACLExpiryUnix(a.cfg.SecretAuditRetentionDays)})
+}
+
+func (a *Agent) AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error) {
+	acl, ok, err := a.AuditACLForSandbox(ctx, sandboxID)
+	return acl.OwnerRef, ok, err
+}
+
+func (a *Agent) AuditACLForSandbox(ctx context.Context, sandboxID string) (AuditACL, bool, error) {
+	var out AuditACLResponse
+	path := PublicInternalAuditACLPath + url.PathEscape(strings.TrimSpace(sandboxID))
+	if err := a.doControlPlaneJSON(ctx, http.MethodGet, path, path, nil, &out); err != nil {
+		return AuditACL{}, false, err
+	}
+	out.ACL.OwnerRef = strings.TrimSpace(out.ACL.OwnerRef)
+	return out.ACL, out.Exists, nil
+}
+
+func (a *Agent) PruneAuditACL(context.Context, time.Time) error {
+	// The Raft leader owns periodic ACL retention. Worker agents observe the
+	// result through control-plane reads and must not forward duplicate sweeps.
+	return nil
 }
 
 func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {

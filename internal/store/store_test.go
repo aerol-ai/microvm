@@ -2147,6 +2147,7 @@ func TestStoreHelperCases(t *testing.T) {
 			"",                          // mask_request_host
 			1,                           // toolbox_enabled
 			"",                          // toolbox_token
+			[]byte(nil),                 // toolbox_token_sealed
 			"",                          // ssh_public_key
 			"",                          // last_error
 			"[]",                        // container_command_json

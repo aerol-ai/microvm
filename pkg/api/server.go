@@ -26,15 +26,16 @@ import (
 )
 
 type Server struct {
-	logger          *slog.Logger
-	service         *service.Service
-	builder         apiv1.ImageBuilder
-	build           daytona.BuildConfig
-	containerEngine string
-	patToken        string
-	validator       controlplane.Validator
-	auditLimiter    *apiv1.AuditRateLimiter
-	mux             *http.ServeMux
+	logger              *slog.Logger
+	service             *service.Service
+	builder             apiv1.ImageBuilder
+	build               daytona.BuildConfig
+	containerEngine     string
+	requireInternalMTLS bool
+	patToken            string
+	validator           controlplane.Validator
+	auditLimiter        *apiv1.AuditRateLimiter
+	mux                 *http.ServeMux
 }
 
 // NewServer constructs the API server. validator is the second-token (non-PAT)
@@ -58,13 +59,14 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		builder = dockerClient
 	}
 	s := &Server{
-		logger:          logger,
-		service:         service,
-		builder:         builder,
-		build:           daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
-		containerEngine: cfg.ContainerEngine,
-		patToken:        patToken,
-		validator:       validator,
+		logger:              logger,
+		service:             service,
+		builder:             builder,
+		build:               daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
+		containerEngine:     cfg.ContainerEngine,
+		requireInternalMTLS: cfg.EnterpriseMode,
+		patToken:            patToken,
+		validator:           validator,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
 			IdentityRate: cfg.AuditRateLimitIdentity,
 			OperatorRate: cfg.AuditRateLimitOperator,
@@ -103,13 +105,14 @@ func (s *Server) routes() {
 	})
 
 	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
-		Service:         s.service,
-		Logger:          s.logger,
-		Auth:            s.requireAuth,
-		AuditLimiter:    s.auditLimiter,
-		Builder:         s.builder,
-		Build:           apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
-		ContainerEngine: s.containerEngine,
+		Service:             s.service,
+		Logger:              s.logger,
+		Auth:                s.requireAuth,
+		AuditLimiter:        s.auditLimiter,
+		Builder:             s.builder,
+		Build:               apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
+		ContainerEngine:     s.containerEngine,
+		RequireInternalMTLS: s.requireInternalMTLS,
 	})
 
 	// Operator dashboard + expvar. /ui is unauth (static HTML; PAT prompted

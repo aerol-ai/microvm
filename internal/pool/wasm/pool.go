@@ -41,6 +41,11 @@ type Pool struct {
 	spawner         Spawner
 	metrics         *Metrics
 	refillKick      chan struct{}
+	closeCh         chan struct{}
+	closeCtx        context.Context
+	closeCancel     context.CancelFunc
+	closed          bool
+	runWG           sync.WaitGroup
 }
 
 // New constructs a warm pool. runDir is the WASM runtime root (pool slots live under runDir/pool/).
@@ -48,19 +53,29 @@ func New(runDir string, logger *slog.Logger) *Pool {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	closeCtx, closeCancel := context.WithCancel(context.Background())
 	return &Pool{
-		logger:     logger,
-		targets:    make(map[string]string),
-		ready:      make(map[string][]*Slot),
-		spawning:   make(map[string]int),
-		runDir:     runDir,
-		metrics:    &Metrics{},
-		refillKick: make(chan struct{}, 1),
+		logger:      logger,
+		targets:     make(map[string]string),
+		ready:       make(map[string][]*Slot),
+		spawning:    make(map[string]int),
+		runDir:      runDir,
+		metrics:     &Metrics{},
+		refillKick:  make(chan struct{}, 1),
+		closeCh:     make(chan struct{}),
+		closeCtx:    closeCtx,
+		closeCancel: closeCancel,
 	}
 }
 
 // SetSpawner injects the worker spawner (production: SupervisorSpawner).
-func (p *Pool) SetSpawner(s Spawner) { p.spawner = s }
+func (p *Pool) SetSpawner(s Spawner) {
+	p.mu.Lock()
+	if !p.closed {
+		p.spawner = s
+	}
+	p.mu.Unlock()
+}
 
 // SetDefaultMemoryMB sets the guest memory cap used when warming pool slots.
 func (p *Pool) SetDefaultMemoryMB(n int) {
@@ -85,7 +100,9 @@ func (p *Pool) NoteModule(digest, modulePath string) {
 		return
 	}
 	p.mu.Lock()
-	p.targets[digest] = modulePath
+	if !p.closed {
+		p.targets[digest] = modulePath
+	}
 	p.mu.Unlock()
 }
 
@@ -115,6 +132,9 @@ func (p *Pool) Acquire(_ context.Context, digest, modulePath string, memoryMB in
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, ErrPoolClosed
+	}
 	q := p.ready[digest]
 	for i := len(q) - 1; i >= 0; i-- {
 		if q[i].MemoryMB != memoryMB {
@@ -150,6 +170,20 @@ func (p *Pool) RecordLoaded(slot *Slot) {
 		return
 	}
 	p.mu.Lock()
+	if p.closed {
+		spawner := p.spawner
+		if p.spawning[slot.ModuleDigest] > 0 {
+			p.spawning[slot.ModuleDigest]--
+		}
+		p.mu.Unlock()
+		if spawner != nil {
+			_ = spawner.Shutdown(slot.WorkerKey)
+		}
+		if slot.SocketPath != "" {
+			_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		}
+		return
+	}
 	p.ready[slot.ModuleDigest] = append(p.ready[slot.ModuleDigest], slot)
 	if p.spawning[slot.ModuleDigest] > 0 {
 		p.spawning[slot.ModuleDigest]--
@@ -217,7 +251,9 @@ func (p *Pool) DropModule(digest string) {
 		if spawner != nil {
 			_ = spawner.Shutdown(slot.WorkerKey)
 		}
-		_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		if slot.SocketPath != "" {
+			_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		}
 	}
 }
 
@@ -248,7 +284,15 @@ func (p *Pool) SlotDir(digest, slotID string) string {
 
 // WarmOne spawns a single warm slot for digest/path. Used by the refill loop.
 func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, error) {
-	if p.spawner == nil {
+	p.mu.Lock()
+	spawner := p.spawner
+	memMB := p.defaultMemoryMB
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return nil, ErrPoolClosed
+	}
+	if spawner == nil {
 		return nil, fmt.Errorf("wasm pool: spawner not configured")
 	}
 	slotID := NewSlotID()
@@ -257,8 +301,7 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 		return nil, err
 	}
 	socketPath := filepath.Join(dir, "worker.sock")
-	memMB := p.defaultMemoryMB
-	if err := p.spawner.Warm(ctx, slotID, socketPath, modulePath, memMB); err != nil {
+	if err := spawner.Warm(ctx, slotID, socketPath, modulePath, memMB); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
@@ -276,6 +319,17 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 // Close shuts down all warm slots still in the pool.
 func (p *Pool) Close() (drained int) {
 	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.closeCh)
+		p.closeCancel()
+	}
+	p.mu.Unlock()
+	// Run owns every background refill and may currently be between WarmOne
+	// and RecordLoaded. Await it so Close cannot return while a late slot is
+	// still being admitted or torn down.
+	p.runWG.Wait()
+	p.mu.Lock()
 	var slots []*Slot
 	for _, q := range p.ready {
 		slots = append(slots, q...)
@@ -288,7 +342,9 @@ func (p *Pool) Close() (drained int) {
 		if spawner != nil {
 			_ = spawner.Shutdown(slot.WorkerKey)
 		}
-		_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		if slot.SocketPath != "" {
+			_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		}
 		drained++
 	}
 	return drained

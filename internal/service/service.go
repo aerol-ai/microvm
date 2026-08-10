@@ -162,6 +162,7 @@ type Service struct {
 	// StartSandbox / create hot path.
 	secretAudit          SecretAuditSink
 	secretAuditFile      *fileAuditSink // non-nil when the sink is the file writer
+	secretAuditInitErr   error          // retained so daemon boot can fail closed
 	secretAuditOnce      sync.Once
 	secretAuditPruneStop chan struct{}
 	secretAuditPruneDone sync.WaitGroup
@@ -500,6 +501,9 @@ type Service struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
+	if db != nil && cfg.SecretToolboxSealEnabled {
+		db.SetSecretCipher(cipher)
+	}
 	s := &Service{
 		cfg:      cfg,
 		logger:   logger,
@@ -2068,16 +2072,67 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string
 	if len(plainEnv) > 0 {
 		recordEnvPlaintextFallback()
 		// Best-effort reseal when the flag is on so subsequent reads leave
-		// the sealed row as source of truth (and clear dual-write risk).
+		// the sealed row as source of truth. Put+clear is one transaction so a
+		// crash cannot leave an ambiguous dual-write.
 		if s.cfg.SecretEnvSealEnabled {
 			if sealedBytes, sealErr := s.sealEnv(plainEnv); sealErr == nil && len(sealedBytes) > 0 {
-				if putErr := s.store.PutEnv(ctx, sandboxID, sealedBytes); putErr == nil {
-					_ = s.store.ClearEnvJSON(ctx, sandboxID)
-				}
+				_ = s.store.PutEnvAndClearLegacy(ctx, sandboxID, sealedBytes)
 			}
 		}
 	}
 	return plainEnv, nil
+}
+
+// SealLegacySandboxEnv migrates every pre-feature plaintext env_json row in
+// bounded, resumable batches. Each plaintext read is audited and each row's
+// sealed write + plaintext removal commits atomically.
+func (s *Service) SealLegacySandboxEnv(ctx context.Context) (int64, error) {
+	if s == nil || s.store == nil || !s.cfg.SecretEnvSealEnabled {
+		return 0, nil
+	}
+	if s.cipher == nil {
+		return 0, errors.New("seal legacy sandbox env: cipher is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	const batchSize = 256
+	var migrated int64
+	for {
+		batch, err := s.store.ListLegacySandboxEnvBatch(ctx, batchSize)
+		if err != nil {
+			return migrated, err
+		}
+		if len(batch) == 0 {
+			return migrated, nil
+		}
+		for _, item := range batch {
+			done := beginSecretAudit(s.secretAuditSink(), item.SandboxID, envAuditRef(item.SandboxID), s.auditActor(), "")
+			var sealErr error
+			if len(item.Env) == 0 {
+				sealErr = s.store.ClearEnvJSON(ctx, item.SandboxID)
+			} else {
+				var sealed []byte
+				sealed, sealErr = s.sealEnv(item.Env)
+				if sealErr == nil {
+					sealErr = s.store.PutEnvAndClearLegacy(ctx, item.SandboxID, sealed)
+				}
+			}
+			done(sealErr)
+			if sealErr != nil {
+				return migrated, fmt.Errorf("migrate sandbox env for %q: %w", item.SandboxID, sealErr)
+			}
+			migrated++
+		}
+		if s.secretAuditFile != nil {
+			if err := s.secretAuditFile.Sync(); err != nil {
+				return migrated, fmt.Errorf("sync sandbox env migration audit: %w", err)
+			}
+		}
+		if len(batch) < batchSize {
+			return migrated, nil
+		}
+	}
 }
 
 // sealMounts marshals the user's mount specs and encrypts the JSON for

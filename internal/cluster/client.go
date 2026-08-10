@@ -38,8 +38,8 @@ type Cluster struct {
 	// regular API auth, so no new secret-distribution surface. With mTLS
 	// enabled the PAT is belt-and-braces — the TLS handshake already proved
 	// cluster membership — but we keep sending it so the receiving handler can
-	// stay symmetric with the public endpoint and so a node that briefly loses
-	// its TLS material can fall back without breaking auth.
+	// stay symmetric with the public endpoint. A selected mTLS request never
+	// downgrades to the public endpoint after a TLS error.
 	patToken   string
 	httpClient *http.Client
 	// internalURL is this node's cluster-internal mTLS advertise URL (e.g.
@@ -58,7 +58,8 @@ type Cluster struct {
 	// internalClient is an HTTPS client preconfigured with the cluster CA +
 	// our node cert. Used to dial peers' InternalURL when both sides have
 	// TLS material. nil when tls is nil.
-	internalClient *http.Client
+	internalClient   *http.Client
+	internalClientMu sync.RWMutex
 	// publicProxies caches httputil.ReverseProxy instances keyed on peer
 	// APIURL (the legacy public-API path). Shared across forwarded requests
 	// so the underlying transport's connection pool isn't rebuilt per call.
@@ -278,6 +279,26 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
 func (c *Cluster) SelfAPIURL() string { return c.apiURL }
+
+func (c *Cluster) currentInternalClient() *http.Client {
+	if c == nil {
+		return nil
+	}
+	c.internalClientMu.RLock()
+	defer c.internalClientMu.RUnlock()
+	return c.internalClient
+}
+
+// setInternalClient is used by transport tests that replace the immutable
+// production client while background capacity refreshes are running.
+func (c *Cluster) setInternalClient(client *http.Client) {
+	if c == nil {
+		return
+	}
+	c.internalClientMu.Lock()
+	c.internalClient = client
+	c.internalClientMu.Unlock()
+}
 
 // AttachRecreator wires the service-layer recreate hook used by the owner
 // watcher. Called once from cmd/sandboxd/main after both service.New and
@@ -547,8 +568,38 @@ func (c *Cluster) ResolveCustomDomain(hostname string) (string, bool) {
 
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
-	cmd := command{Op: opDelete, SandboxID: sandboxID}
+	cmd := command{Op: opDelete, SandboxID: sandboxID, ExpiresUnix: auditACLExpiryUnix(c.cfg.SecretAuditRetentionDays)}
 	return c.applyCommand(ctx, cmd)
+}
+
+func auditACLExpiryUnix(retentionDays int) int64 {
+	if retentionDays <= 0 {
+		return 0
+	}
+	return time.Now().UTC().Add(time.Duration(retentionDays) * 24 * time.Hour).Unix()
+}
+
+func (c *Cluster) AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error) {
+	acl, ok, err := c.AuditACLForSandbox(ctx, sandboxID)
+	return acl.OwnerRef, ok, err
+}
+
+func (c *Cluster) AuditACLForSandbox(_ context.Context, sandboxID string) (AuditACL, bool, error) {
+	if c == nil || c.fsm == nil {
+		return AuditACL{}, false, nil
+	}
+	acl, ok := c.fsm.auditACLForSandbox(sandboxID, time.Now().Unix())
+	return acl, ok, nil
+}
+
+func (c *Cluster) PruneAuditACL(ctx context.Context, cutoff time.Time) error {
+	// This is periodic replicated maintenance, so only the leader submits it.
+	// Followers observe the committed command through Raft; forwarding the same
+	// sweep from every service node would create an O(fleet-size) write burst.
+	if c == nil || cutoff.IsZero() || c.raft == nil || c.raft.raft == nil || c.raft.raft.State() != raft.Leader {
+		return nil
+	}
+	return c.applyCommand(ctx, command{Op: opPruneAuditACL, ExpiresUnix: cutoff.Unix()})
 }
 
 // ReserveOnTarget commits a capacity-and-name reservation for sandboxID
@@ -666,8 +717,8 @@ func (c *Cluster) ReassignPlacement(ctx context.Context, sandboxID string, targe
 func (c *Cluster) wasmMigratePAT() string { return c.patToken }
 
 func (c *Cluster) wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error) {
-	if c.internalClient != nil && internalURL != "" {
-		return c.internalClient, internalURL, nil
+	if internalClient := c.currentInternalClient(); internalClient != nil && internalURL != "" {
+		return internalClient, internalURL, nil
 	}
 	if apiURL == "" {
 		return nil, "", fmt.Errorf("cluster: peer API URL unknown")
@@ -757,9 +808,9 @@ func (c *Cluster) forwardRemoveMemberToLeader(ctx context.Context, nodeID string
 	if force {
 		path += "?force=true"
 	}
-	if c.internalClient != nil && c.gossip != nil {
+	if internalClient := c.currentInternalClient(); internalClient != nil && c.gossip != nil {
 		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
-			return c.doLeaderLifecycle(ctx, c.internalClient, strings.TrimRight(peerInternal, "/")+path, http.MethodDelete, nil)
+			return c.doLeaderLifecycle(ctx, internalClient, strings.TrimRight(peerInternal, "/")+path, http.MethodDelete, nil)
 		}
 	}
 	leaderURL := c.LeaderAPIURL()
@@ -1085,10 +1136,10 @@ func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) erro
 	}
 
 	// Prefer the cluster-internal mTLS channel when both ends are TLS-equipped.
-	if c.internalClient != nil {
+	if internalClient := c.currentInternalClient(); internalClient != nil {
 		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
 			endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
-			err := c.doLeaderApply(ctx, c.internalClient, endpoint, payload)
+			err := c.doLeaderApply(ctx, internalClient, endpoint, payload)
 			// Hard-fail (network/TLS) on the internal channel must NOT silently
 			// fall back to the public path — that would defeat the security
 			// promise. Only ErrNotLeader bubbles up so the caller retries the

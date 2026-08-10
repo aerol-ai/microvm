@@ -985,7 +985,7 @@ func TestGossipMembersFallsBackToScan(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 5*time.Second)
 
-	c.gossip.memberIndex = nil
+	c.gossip.setMemberIndex(nil)
 	members := c.gossip.members()
 	if len(members) == 0 {
 		t.Fatal("members() with nil index expected scan fallback")

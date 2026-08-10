@@ -268,7 +268,15 @@ type Placement struct {
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
 	// OwnerRef is the control-plane tenant account (tenancy). Distinct from
 	// OwnerNodeID (which cluster node hosts the sandbox).
-	OwnerRef          string                   `json:"owner_ref,omitempty"`
+	OwnerRef string `json:"owner_ref,omitempty"`
+	// AuditNodeIDs is the bounded history of nodes that have owned this
+	// sandbox and may therefore hold local audit evidence. It lets audit reads
+	// remain O(owner changes), rather than fanning out to every worker after a
+	// failover or delete. AuditNodesTruncated forces the reader to fall back to
+	// full worker fan-out so the bound can never create a silent evidence gap.
+	AuditNodeIDs        []string `json:"audit_node_ids,omitempty"`
+	AuditNodesTruncated bool     `json:"audit_nodes_truncated,omitempty"`
+
 	ExposedPorts      map[int]string           `json:"exposed_ports,omitempty"`
 	ExposedPortRoutes map[int]ExposedPortRoute `json:"exposed_port_routes,omitempty"`
 	// CustomHostnames is the replicated set of user-bound hostnames pointing at
@@ -290,6 +298,21 @@ type Placement struct {
 	// ExpiresUnix is meaningful only when State == PlacementStateReserved;
 	// the leader GC sweep cancels rows whose ExpiresUnix < now.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+}
+
+// AuditACL is the minimal post-delete authorization record retained in Raft.
+// It deliberately carries no sandbox spec, routes, secret refs, or audit data.
+type AuditACL struct {
+	SandboxID           string   `json:"sandbox_id"`
+	OwnerRef            string   `json:"owner_ref"`
+	AuditNodeIDs        []string `json:"audit_node_ids,omitempty"`
+	AuditNodesTruncated bool     `json:"audit_nodes_truncated,omitempty"`
+	ExpiresUnix         int64    `json:"expires_unix,omitempty"`
+}
+
+type AuditACLResponse struct {
+	ACL    AuditACL `json:"acl"`
+	Exists bool     `json:"exists"`
 }
 
 // Member is a snapshot of a peer's gossiped state.
@@ -541,6 +564,12 @@ type Client interface {
 
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error
+	// AuditOwnerRef resolves the minimal Raft-retained owner ACL after placement
+	// deletion. PruneAuditACL removes expired rows through a deterministic Raft
+	// command so every ingress sees the same authorization state.
+	AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error)
+	AuditACLForSandbox(ctx context.Context, sandboxID string) (AuditACL, bool, error)
+	PruneAuditACL(ctx context.Context, cutoff time.Time) error
 
 	// ReserveOnTarget writes opReserve into the FSM holding capacity + name
 	// for target before the body is forwarded to it. The reservation carries

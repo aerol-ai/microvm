@@ -20,56 +20,58 @@ import (
 const secretFanoutMaxAttempts = 4
 
 // PushSecretBlobToPeers POSTs the sealed blob to each non-self recipient that
-// is alive and has an APIURL. Best-effort with bounded backoff; returns the
+// is alive and advertises a reachable internal or public API URL. The internal
+// mTLS transport is preferred whenever it is configured. Best-effort with
+// bounded backoff; returns the
 // node IDs that ACK'd (callers intersect with live membership for
 // failover_ready). No-op when c is nil / has no gossip (Noop path never
 // reaches here).
 func (c *Cluster) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
-	if c == nil || c.gossip == nil || c.httpClient == nil {
+	if c == nil || c.gossip == nil || (c.httpClient == nil && c.currentInternalClient() == nil) {
 		return nil, nil
 	}
-	return pushSecretBlobToPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, blob, recipients)
+	return pushSecretBlobToPeersWithInternal(ctx, c.gossip.members(), c.httpClient, c.currentInternalClient(), c.patToken, c.nodeID, blob, recipients)
 }
 
 // DeleteSecretOnPeers DELETEs the sandbox's cluster_secrets rows on peers that
 // may hold a fan-out copy. Returns acked vs still-pending recipients. Offline /
 // missing peers stay pending — never treated as success.
 func (c *Cluster) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
-	if c == nil || c.gossip == nil || c.httpClient == nil {
+	if c == nil || c.gossip == nil || (c.httpClient == nil && c.currentInternalClient() == nil) {
 		return nil, append([]string(nil), recipients...), nil
 	}
-	return deleteSecretOnPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, sandboxID, recipients, generation)
+	return deleteSecretOnPeersWithInternal(ctx, c.gossip.members(), c.httpClient, c.currentInternalClient(), c.patToken, c.nodeID, sandboxID, recipients, generation)
 }
 
 // ProbeSecretOnPeers HEADs peer secret rows and returns nodes that currently
 // hold seal_generation >= minGeneration (authoritative possession, not ACK memory).
 func (c *Cluster) ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error) {
-	if c == nil || c.gossip == nil || c.httpClient == nil {
+	if c == nil || c.gossip == nil || (c.httpClient == nil && c.currentInternalClient() == nil) {
 		return nil, nil
 	}
-	return probeSecretOnPeers(ctx, c.gossip.members(), c.httpClient, c.patToken, c.nodeID, sandboxID, recipients, minGeneration)
+	return probeSecretOnPeersWithInternal(ctx, c.gossip.members(), c.httpClient, c.currentInternalClient(), c.patToken, c.nodeID, sandboxID, recipients, minGeneration)
 }
 
 // Agent mirrors for worker nodes that seal locally and need to fan out.
 func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
-	if a == nil || a.gossip == nil || a.httpClient == nil {
+	if a == nil || a.gossip == nil || (a.httpClient == nil && a.internalClient == nil) {
 		return nil, nil
 	}
-	return pushSecretBlobToPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, blob, recipients)
+	return pushSecretBlobToPeersWithInternal(ctx, a.gossip.members(), a.httpClient, a.internalClient, a.patToken, a.nodeID, blob, recipients)
 }
 
 func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
-	if a == nil || a.gossip == nil || a.httpClient == nil {
+	if a == nil || a.gossip == nil || (a.httpClient == nil && a.internalClient == nil) {
 		return nil, append([]string(nil), recipients...), nil
 	}
-	return deleteSecretOnPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, sandboxID, recipients, generation)
+	return deleteSecretOnPeersWithInternal(ctx, a.gossip.members(), a.httpClient, a.internalClient, a.patToken, a.nodeID, sandboxID, recipients, generation)
 }
 
 func (a *Agent) ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error) {
-	if a == nil || a.gossip == nil || a.httpClient == nil {
+	if a == nil || a.gossip == nil || (a.httpClient == nil && a.internalClient == nil) {
 		return nil, nil
 	}
-	return probeSecretOnPeers(ctx, a.gossip.members(), a.httpClient, a.patToken, a.nodeID, sandboxID, recipients, minGeneration)
+	return probeSecretOnPeersWithInternal(ctx, a.gossip.members(), a.httpClient, a.internalClient, a.patToken, a.nodeID, sandboxID, recipients, minGeneration)
 }
 
 // SecretPeerPusher is the narrow seam Service uses for async fan-out so tests
@@ -81,7 +83,11 @@ type SecretPeerPusher interface {
 }
 
 func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
-	if client == nil || len(recipients) == 0 {
+	return pushSecretBlobToPeersWithInternal(ctx, members, client, nil, pat, selfID, blob, recipients)
+}
+
+func pushSecretBlobToPeersWithInternal(ctx context.Context, members []Member, publicClient, internalClient *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
+	if (publicClient == nil && internalClient == nil) || len(recipients) == 0 {
 		return nil, nil
 	}
 	want := make(map[string]struct{}, len(recipients))
@@ -102,10 +108,13 @@ func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.C
 	var acked []string
 	var firstErr error
 	for _, m := range members {
-		if _, ok := want[m.NodeID]; !ok || !m.Alive || m.APIURL == "" {
+		if _, ok := want[m.NodeID]; !ok || !m.Alive || (strings.TrimSpace(m.APIURL) == "" && strings.TrimSpace(m.InternalURL) == "") {
 			continue
 		}
-		endpoint := strings.TrimRight(m.APIURL, "/") + PublicInternalSecretPath
+		client, endpoint := secretPeerTransport(m, publicClient, internalClient, PublicInternalSecretPath)
+		if client == nil || endpoint == "" {
+			continue
+		}
 		if err := withSecretFanoutBackoff(ctx, func() error {
 			return postSecretBlob(ctx, client, endpoint, pat, body)
 		}); err != nil {
@@ -120,7 +129,11 @@ func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.C
 }
 
 func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
-	if client == nil || strings.TrimSpace(sandboxID) == "" {
+	return deleteSecretOnPeersWithInternal(ctx, members, client, nil, pat, selfID, sandboxID, recipients, generation)
+}
+
+func deleteSecretOnPeersWithInternal(ctx context.Context, members []Member, publicClient, internalClient *http.Client, pat, selfID, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
+	if (publicClient == nil && internalClient == nil) || strings.TrimSpace(sandboxID) == "" {
 		return nil, append([]string(nil), recipients...), nil
 	}
 	if generation <= 0 {
@@ -140,11 +153,15 @@ func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Cli
 			continue
 		}
 		m, ok := byID[id]
-		if !ok || !m.Alive || strings.TrimSpace(m.APIURL) == "" {
+		if !ok || !m.Alive || (strings.TrimSpace(m.APIURL) == "" && strings.TrimSpace(m.InternalURL) == "") {
 			pending = append(pending, id)
 			continue
 		}
-		endpoint := strings.TrimRight(m.APIURL, "/") + PublicInternalSecretPath + "/" + url.PathEscape(sandboxID)
+		client, endpoint := secretPeerTransport(m, publicClient, internalClient, PublicInternalSecretPath+"/"+url.PathEscape(sandboxID))
+		if client == nil || endpoint == "" {
+			pending = append(pending, id)
+			continue
+		}
 		endpoint += "?generation=" + strconv.FormatInt(generation, 10)
 		if delErr := withSecretFanoutBackoff(ctx, func() error {
 			return deleteSecretBlob(ctx, client, endpoint, pat)
@@ -161,7 +178,11 @@ func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Cli
 }
 
 func probeSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string, minGeneration int64) ([]string, error) {
-	if client == nil || strings.TrimSpace(sandboxID) == "" {
+	return probeSecretOnPeersWithInternal(ctx, members, client, nil, pat, selfID, sandboxID, recipients, minGeneration)
+}
+
+func probeSecretOnPeersWithInternal(ctx context.Context, members []Member, publicClient, internalClient *http.Client, pat, selfID, sandboxID string, recipients []string, minGeneration int64) ([]string, error) {
+	if (publicClient == nil && internalClient == nil) || strings.TrimSpace(sandboxID) == "" {
 		return nil, nil
 	}
 	if minGeneration <= 0 {
@@ -181,10 +202,13 @@ func probeSecretOnPeers(ctx context.Context, members []Member, client *http.Clie
 			continue
 		}
 		m, ok := byID[id]
-		if !ok || !m.Alive || strings.TrimSpace(m.APIURL) == "" {
+		if !ok || !m.Alive || (strings.TrimSpace(m.APIURL) == "" && strings.TrimSpace(m.InternalURL) == "") {
 			continue
 		}
-		endpoint := strings.TrimRight(m.APIURL, "/") + PublicInternalSecretPath + "/" + url.PathEscape(sandboxID)
+		client, endpoint := secretPeerTransport(m, publicClient, internalClient, PublicInternalSecretPath+"/"+url.PathEscape(sandboxID))
+		if client == nil || endpoint == "" {
+			continue
+		}
 		endpoint += "?min_generation=" + strconv.FormatInt(minGeneration, 10)
 		okHold, err := headSecretBlob(ctx, client, endpoint, pat)
 		if err != nil {
@@ -198,6 +222,18 @@ func probeSecretOnPeers(ctx context.Context, members []Member, client *http.Clie
 		}
 	}
 	return holding, firstErr
+}
+
+// secretPeerTransport selects one transport before I/O. An advertised
+// InternalURL is never retried over the public channel after an mTLS failure.
+func secretPeerTransport(m Member, publicClient, internalClient *http.Client, path string) (*http.Client, string) {
+	if internalClient != nil && strings.TrimSpace(m.InternalURL) != "" {
+		return internalClient, strings.TrimRight(m.InternalURL, "/") + path
+	}
+	if publicClient != nil && strings.TrimSpace(m.APIURL) != "" {
+		return publicClient, strings.TrimRight(m.APIURL, "/") + path
+	}
+	return nil, ""
 }
 
 func headSecretBlob(ctx context.Context, client *http.Client, endpoint, pat string) (bool, error) {

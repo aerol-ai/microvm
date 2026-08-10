@@ -19,7 +19,7 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 	t.Helper()
 	testClusterMu.Lock()
 	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeGossipPort(t)
 	dir := t.TempDir()
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 
@@ -58,7 +58,7 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
 	t.Helper()
 	testClusterMu.Lock()
-	gossipPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeGossipPort(t)
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 	cfg := config.Config{
 		EnableCluster:                 true,

@@ -47,9 +47,15 @@ var (
 	clusterSecretLastOpenNanos   = expvar.NewInt("aerolvm_secret_decrypt_last_nanos")
 	clusterSecretOpenLatency     = scaleobs.NewDurationBuckets("aerolvm_secret_decrypt_latency_seconds_bucket")
 	clusterSecretRecipientDenies = expvar.NewInt("aerolvm_secret_recipient_denied_total")
-	// Async peer fan-out failures (push or delete). Create never fails on
-	// these — failover_ready stays false until holders catch up.
+	// Peer fan-out failures (push or delete). Enterprise HA create fails when
+	// its bounded first-ACK window gets no backup; non-enterprise create keeps
+	// failover_ready false until holders catch up.
 	secretFanoutFailuresTotal = expvar.NewInt("aerolvm_secret_fanout_failures_total")
+	// Durable cleanup health. Gauges are refreshed by the boot/periodic
+	// reconciler and remain cardinality-free at 100k+ concurrent sandboxes.
+	secretDeleteOutboxPending          = expvar.NewInt("aerolvm_secret_delete_outbox_pending")
+	secretDeleteOutboxOldestAgeSeconds = expvar.NewInt("aerolvm_secret_delete_outbox_oldest_age_seconds")
+	secretTombstones                   = expvar.NewInt("aerolvm_secret_tombstones")
 	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.
 	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
 	// Best-effort local seal failures (ownership replay backfill).

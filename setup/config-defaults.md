@@ -44,6 +44,7 @@ feature is still mid-rollout.
 ## 🔴 Must stay off — security / safety
 | Env var | Why off is correct |
 |---|---|
+| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes. |
 | `SB_CONTAINER_PRIVILEGED` | Privileged containers = sandbox escape. |
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
@@ -57,9 +58,12 @@ feature is still mid-rollout.
 | `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. |
 | `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start on awskms boot-canary failure. Default fail-open with a warning. |
 | `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
-| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create; `0` disables (fully async). |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create; enterprise mode requires `>0` and fails/retracts an HA create with zero ACKs. `0` is allowed only outside enterprise mode. |
 | `SB_SECRET_ENV_SEAL_ENABLED` | `false` | Sealed `sandbox_env` rows + Raft Env redaction (RefVersionEnv=2). Format change — enable only after every node can merge Env from the provider bag. Removal criterion: `aerolvm_env_plaintext_fallback_total` stays zero for a release and plaintext `env_json` is dropped. |
-| `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` retention. Pruned daily (and on sink start). `0` disables prune. |
+| `SB_SECRET_TOOLBOX_SEAL_ENABLED` | `false` | Encrypt per-sandbox toolbox bearer tokens in the existing sandbox row. Enable after every node understands `toolbox_token_sealed`; required by enterprise mode. |
+| `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` retention. Appends are fsynced at least once per second and at shutdown; pruned daily (and on sink start). `0` disables prune. |
+| `SB_SECRET_AUDIT_STRICT_BOOT` | `true` | Refuse daemon startup when the local secret-audit writer cannot be opened. |
+| `SB_SECRET_TOMB_RETENTION_DAYS` | `30` | Retain delete fences after all peer ACKs; `0` disables tombstone GC. Live/pending rows are never pruned. |
 | `SB_EGRESS_ATTRIBUTION_ENABLED` | `true` | Wasm/isolate egress destination records in the same audit JSONL (`kind=egress`). Observational; off create path. |
 
 ### Audit rate limits (security parameters)

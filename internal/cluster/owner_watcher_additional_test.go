@@ -51,7 +51,7 @@ func TestOwnerWatcherRecreateFailureAndReassign(t *testing.T) {
 		recreateCandidate("leader", "worker", 10),
 		recreateCandidate("alt-worker", "worker", 100),
 	})
-	c.gossip = &gossipNode{memberIndex: index}
+	c.gossip.memberIndex.replace(index.snapshot())
 
 	rec := &failingRecreator{recordingRecreator: newRecordingRecreator()}
 	c.AttachRecreator(rec)

@@ -76,8 +76,8 @@ off the table. (The 2026-08-02 draft listed it as an option; deleted.)
 |---|---|
 | D2 | One plan, all phases. Not split. |
 | D3 | Seal to a recipient **set** (owner + N failover candidates) and push the sealed row to those peers. Preserves recipient binding; keeps bytes out of Raft. |
-| D4 | ~~Sync~~ **ASYNC** fan-out (superseded 2026-08-07 — see §3e), **only** for `failover.policy=recreate`. Default creates byte-for-byte unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
-| D5 | Stale recipient sets after membership change = **documented known limitation**, point operators at KMS. No placement filter. |
+| D4 | **Bounded first-backup ACK, then asynchronous remainder** (see §3e), **only** for `failover.policy=recreate`. Enterprise mode fails/retracts a zero-ACK HA create; non-enterprise can retain the fully asynchronous fallback. Default non-HA creates remain unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
+| D5 | Stale recipient sets after membership change = **documented known limitation**, point operators at KMS. There is no dynamic reseal/takeover filter; inbound peer replication still validates the exact recipient set committed in the live placement. |
 | D6 | One seal+fanout helper with an explicit strict / best-effort policy argument. |
 | D7 | One shared contract suite runs against **both** providers (offline fake for KMS); live KMS behind the `integration` tag. |
 | D8 | Sealed env lives in its **own row, read on demand**, mirroring `sealMounts`/`loadMounts`/`GetMounts`. The hot row scanner never carries env. |
@@ -130,7 +130,7 @@ KMS removes WALL 2 (recipient binding). It does nothing about WALL 1.
 |---|---|---|
 | Key custody | node-local AES key file | KMS wraps the data key into the existing `WrappedKey` field (envelope v3, `cluster_secrets.go:65-70` — **no format change**) |
 | Ciphertext storage | `cluster_secrets` row | `cluster_secrets` row — **same**, KMS stores nothing |
-| Distribution | **async** peer fan-out after create (§3e) | **async peer fan-out after create** — shared machinery |
+| Distribution | bounded first-backup ACK, then async remainder (§3e) | the same bounded/async fan-out — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
 | Boot cost (HA creates only) | **bounded sync min-ACK** (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s) then async remainder; local seal always | KMS wrap rides fan-out; first peer ACK may add ≤2s on HA create |
 | Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
@@ -393,53 +393,24 @@ gives the regression signal.
 |---|---|
 | Placement filter for stale recipient sets | D5 chose documentation + KMS instead |
 | Resealing protocol on membership change | Needs a live decryptor; the dead owner is the one that had it |
-| `toolbox_token` at rest | Platform control-plane credential, not a customer secret — full rationale in §8a |
+| `toolbox_token` at rest | **Closed as enterprise follow-up** — encrypted in the existing sandbox row; see §8a |
 | Fixing issue #70 (full-table scan) | D8 avoids making it worse; fixing it is its own work |
 | `internal/cluster` test flake | Captured in TODOS.md instead |
 | Credential brokering into sandboxes | **Out of scope 2026-08-07** — customer secrets arrive at create time; revisit only on an explicit customer ask |
 
-### 8a. `toolbox_token` — deferred, with the reasoning
+### 8a. `toolbox_token` — enterprise follow-up closed
 
-`toolbox_token` remains plaintext in the sandbox row, protected by DB file mode
-0600 (`store.go:766`), exactly as today.
+The token remains a platform-minted, sandbox-scoped control-plane credential
+and remains `json:"-"`, so it cannot enter the Raft-replicated spec. When
+`SB_SECRET_TOOLBOX_SEAL_ENABLED=true`, writes encrypt it with the existing
+secret cipher and sandbox-bound AAD into `toolbox_token_sealed`; the legacy
+plaintext column is written empty. Reads authenticate and decrypt it through the
+shared sandbox scanner. Enterprise mode requires this flag.
 
-**Why deferred**
-
-- It is a **platform control-plane credential** for toolboxd auth, not a customer
-  application secret supplied at create time. AerolVM mints it per sandbox —
-  `generateToolboxToken()` at `service.go:1334`, `service.go:1697`, and
-  `wasm.go:60`.
-- This plan's threat model for env sealing is specific: customer credentials in
-  `env_json` and the cluster secret bag must not sit as plain JSON, and must
-  survive HA failover. `toolbox_token` meets neither condition — it is
-  AerolVM-minted, scoped to a single sandbox, and **not** carried on the
-  recipient-set path (it does not appear in `cluster_secrets.go` at all).
-- **Verified structural property:** the field is tagged `json:"-"`
-  (`pkg/models/types.go:711`), so it is excluded from JSON marshalling entirely
-  and therefore **cannot ride the Raft-replicated spec even by accident.** That
-  is a guarantee by construction, not a convention — and it is the strongest
-  single reason this is a different problem from `env_json`, which *was* leaking
-  into the log.
-- Sealing it is a separate change with its own shape: every hot path that loads
-  the sandbox row to dial toolbox would need unseal-on-read — confirmed at
-  `internal/service/toolbox_proxy.go:140` and `service.go:5364`
-  (`PushAllowedPorts`) — plus rotate-on-recreate behaviour, without adding
-  create-path latency. Real work, but orthogonal to the failover, env-row, and
-  audit slices.
-
-**What we are not claiming**
-
-- This plan does **not** claim "all secret-bearing columns are sealed."
-- A host compromise able to read the SQLite file can still read `toolbox_token`
-  until a follow-up seals or relocates it. Anyone citing this plan in a security
-  review must say so rather than imply full coverage.
-
-**Optional follow-up**
-
-Seal `toolbox_token` at rest, or derive it from a host-only key plus the sandbox
-ID so the database never stores a reusable bearer secret at all. The derived
-form is the stronger option — it removes the stored credential rather than
-protecting it — but it changes rotation semantics and belongs in its own plan.
+This deliberately reuses the sandbox row and lifecycle rather than adding a
+second token table, reconciliation loop, or garbage collector. The default is
+off only for mixed-version rolling compatibility; enable it after every node in
+the fleet can read the sealed column.
 
 ## 9. What already exists — reuse, do not rebuild
 
@@ -456,7 +427,7 @@ protecting it — but it changes rotation semantics and belongs in its own plan.
 
 | Failure | Test? | Handled? | User sees |
 |---|---|---|---|
-| **GAP-1: owner dies inside the async fan-out window** | yes (UC-58c + unit) | **mitigated** — bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s) then async remainder; `failover_ready=false` until holders≥2 | create may wait ≤2s for ≥1 peer ACK; if 0 ACKs in window, create still succeeds with `failover_ready=false` |
+| **GAP-1: owner dies inside the async fan-out window** | yes (UC-58c + unit) | **closed in enterprise mode** — bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s), and zero ACKs retract/fail the create; non-enterprise keeps the observable async fallback | enterprise create either has a backup ACK or fails; non-enterprise may return `failover_ready=false` |
 | Failover node not in recipient set | yes (D5 case) | must be distinct error | clear error — **required**, not a decrypt failure |
 | Partial fan-out | yes | 3d-2 holder-count rule | create succeeds at owner + ≥1; holder count surfaced |
 | Peer unreachable during fan-out | yes | async retry + backoff + metric | nothing at create; `failover_ready` stays false |
@@ -482,8 +453,9 @@ What bounds the remaining window:
 
 - Default create waits up to ~2s for the first backup ACK — typically closes
   the race for healthy clusters before `201` returns.
-- If 0 peers ACK in the window, create still succeeds (never fails create on
-  peer I/O); `failover_ready` stays false and async fan-out continues.
+- In enterprise mode, if 0 peers ACK in the window, the sealed row is retracted,
+  peer deletes are durably enqueued, and create fails. Outside enterprise mode,
+  create still succeeds with `failover_ready=false` and async fan-out continues.
 - `failover_ready` reads **false** for the entire unreplicated window (E1a).
 - Fan-out retries with bounded backoff; failures emit
   `aerolvm_secret_fanout_failures_total` and feed the operator alert.
@@ -493,9 +465,9 @@ What bounds the remaining window:
 Who is affected: only `failover.policy=recreate` sandboxes. Non-HA sandboxes
 are explicitly orphaned on owner death regardless.
 
-Accepted residual: when peers are unreachable for the whole min-ACK window,
-create returns with `failover_ready=false` and the HA guarantee is not yet live
-— honesty over silent half-sealing.
+Accepted residual outside enterprise mode: when peers are unreachable for the
+whole min-ACK window, create returns with `failover_ready=false`. Enterprise
+mode does not accept that residual.
 
 ### The other critical gap
 
@@ -662,9 +634,10 @@ Explicit over clever.
 
 ### 3e. SUPERSEDES D4 — the fan-out is ASYNCHRONOUS
 
-**The caller does not wait for key distribution.** Create returns as soon as the
-sandbox is up. The fan-out runs in the background, retries with bounded backoff,
-and logs plus increments a metric on failure. Nobody blocks on it.
+The caller waits only for the bounded first-backup ACK window; remaining
+distribution runs asynchronously with bounded backoff. Enterprise mode treats
+zero ACKs as a create failure, while non-enterprise mode keeps the historical
+observable async fallback.
 
 This reverses D4's synchronous choice, which was made before E1a existed.
 **E1a is what makes async defensible now**, and the pairing is load-bearing:
@@ -686,8 +659,9 @@ nothing and nobody is misled. If that field is not shipped, this decision is not
 safe. **E1a therefore moves from slice 3 into slice 1**, alongside the fan-out it
 now guards.
 
-Boot-path consequence, and it is a good one: HA creates are now **also**
-unchanged. No sync peer calls on any create path.
+Boot-path consequence: HA creates perform one bounded first-backup ACK wait.
+Only the remaining recipients are fully asynchronous; default/non-HA creates
+still make no peer call.
 
 ## E1b cluster-read model — DECIDED 2026-08-07
 
@@ -698,9 +672,11 @@ Four parts, all of them load-bearing:
 
 1. **Always** write audit events to the local node's append-only log. That log
    is the source of truth on every build.
-2. **Always** serve `/v1/sandboxes/{id}/audit` by live fan-out to reachable
-   members, merged by timestamp, with an **explicit coverage block** naming
-   which nodes answered and which did not. **Rate-limited** (see below).
+2. Serve `/v1/sandboxes/{id}/audit` by live fan-out to the bounded Raft-retained
+   owner-node history, merged by timestamp, with an **explicit coverage block**.
+   Missing or truncated history deliberately falls back to all reachable
+   workers, so the scale optimization cannot create an evidence vacuum.
+   **Rate-limited** (see below).
 3. **Additionally**, best-effort `Report(...)` audit events through
    `controlplane.Reporter` when a real reporter is configured — the managed or
    customer sink path.
@@ -720,14 +696,11 @@ boundary rather than let a reader infer a stronger guarantee than exists.
 
 ### Why fan-out, and why owner-forwarding was eliminated
 
-The FSM stores a single `OwnerNodeID` and `opPlace` overwrites it
-(`internal/cluster/fsm.go:427`). **No owner history is retained anywhere.** After
-a failover, nothing in the system knows which node held the sandbox last week, so
-forwarding to the current owner returns only that node's slice and silently drops
-everything before it. Fan-out to `c.gossip.members()` is both the established
-pattern (eight-plus call sites — `dead_owner.go:119`, `capacity_lease.go:128`,
-`client.go:737`, `agent.go:767`) and the only topology that can find records whose
-location is unrecorded.
+The FSM now retains a bounded `AuditNodeIDs` owner history on the live placement
+and copies it into the post-delete `AuditACL`. Normal reads are therefore
+O(owner changes), not O(cluster workers). A sticky `AuditNodesTruncated` bit
+switches reads back to all-worker fan-out if the bound is ever exceeded,
+preserving the original completeness rule.
 
 ### Rate-limit dimension — DECIDED 2026-08-07: per-identity **plus** a per-node ceiling
 
@@ -966,7 +939,7 @@ corrections, all verified against source.
 | 3 | **Env side-row write needs atomicity.** Insert row → write sealed env as two steps means a crash yields the "healthy sandbox with empty env" failure this plan calls critical. | **Required:** single transaction, plus an explicit crash-between-writes rollback test. Gates T7. |
 | 4 | **Peer secret deletes are unplanned.** Fan-out creates rows on peers; `DeleteClusterSecretsForSandbox` is local-only (`store.go:4040`) and `cluster_secrets` has no FK by design. | **Required:** delete fan-out on destroy, create rollback, partial fan-out, and promote failure. Tests for each. Gates T3. |
 | 5 | **Stale peer rows can collide.** Refs are deterministic (`cluster-secret://sandbox/<id>/v1`), so a failed create with partial fan-out leaves remote rows a later retry may reuse. | **Required:** either delete-fan-out on rollback (see #4) or attempt-unique refs. Pick one before coding T3. |
-| 6 | **"Rejects foreign pushes" is not achievable with PAT + `d.Auth` alone** — that is caller authorization, not peer identity. | **Partially closed 2026-08-08:** secret PUT/DELETE + internal audit now require **operator** (`Access.Operator` / fleet PAT) after `d.Auth`, so managed tenant tokens get 403. Receiver also validates ref↔sandbox/version and self∈envelope recipients. Per-peer mTLS identity across all `/v1/cluster/internal/...` endpoints remains separate work. |
+| 6 | **"Rejects foreign pushes" is not achievable with PAT + `d.Auth` alone** — that is caller authorization, not peer identity. | **Closed:** secret PUT/DELETE + internal audit require **operator** (`Access.Operator` / fleet PAT) after `d.Auth`; receiver validates ref↔sandbox/version, live placement recipients, and self∈envelope recipients. Cluster-CA mTLS authenticates peer membership on the internal listener; enterprise mode requires it, rejects these routes on the public listener, and does not downgrade after TLS failure. SPIFFE/node-ID certificate binding remains outside this plan. |
 | 7 | **D5 causes reassign churn.** `owner_watcher.go:109` reassigns after 5 failures to another arbitrary candidate excluding only the current node; a recipient-denied error therefore walks the fleet. | **Required:** a recipient-aware stop rule so a recipient-denied open halts reassignment instead of cycling. Gates T3; needs a regression test next to `owner_watcher.go`. |
 | 8 | **`Provider.Open(ctx, handle, nodeID)` carries no sandbox ID**, but the audit event needs one and a not-found event cannot recover it from an opaque handle. | **Required:** add `sandboxID` to the `Open` signature, or require handles to encode it. Decide at T1 — it is the interface definition. |
 | 9 | **The API change is under-scoped.** `GetSandbox`/`ListSandboxes` are thin wrappers (`service.go:1987`) and internal workflows call `store.Get/List` directly. | **Required:** separate internal "with env" reads from public response omission. A default change in the store would break internal callers. Gates T8. |
@@ -1030,8 +1003,10 @@ any prior pass.
 selection (router picks at reserve time, recorded in `opReserve`); partial
 fan-out (owner + ≥1 backup, holder count surfaced); failed-create leftovers
 (delete-fanout, deterministic refs); `Provider.Open` takes `sandboxID`
-explicitly. Plus §3e supersedes D4: the fan-out is **asynchronous** and E1a
-`failover_ready` moves into slice 1 to guard it. **Slice 1 is unblocked.**
+explicitly. Plus §3e supersedes D4: HA fan-out uses a **bounded first-backup
+ACK followed by an asynchronous remainder**; enterprise mode retracts/fails a
+zero-ACK create, while E1a `failover_ready` exposes completion. **Slice 1 is
+unblocked.**
 Also resolved: the E1b cluster-read model — local log authoritative, fan-out with
 an explicit coverage block, rate-limited, `controlplane.Reporter` additive and
 never required, dead-disk durability **not claimed** on the open-source build.
@@ -1040,9 +1015,12 @@ revocation stays instant and CloudTrail stays complete. **E5 credential
 brokering is out of scope** — customer secrets arrive at create time, platform
 KMS covers only AerolVM's own wrapping keys, and the "every use attributed"
 claim is withdrawn. New accepted gap
-recorded: **GAP-1** (mitigated via min-ACK wait + `failover_ready`; residual when peers unreachable — §10).
+recorded: **GAP-1** (closed for enterprise create; outside enterprise, mitigated
+via min-ACK wait + `failover_ready` with residual risk when peers are
+unreachable — §10).
 
 **UNRESOLVED DECISIONS:**
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - Owners, dates, and per-slice rollback plans
-- Per-peer identity across all seven `/v1/cluster/internal/...` endpoints — separate work, not this plan
+- Unique node-ID-bound peer identity (for example SPIFFE) beyond cluster-CA
+  membership across `/v1/cluster/internal/...` — separate work, not this plan

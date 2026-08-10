@@ -38,17 +38,11 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 	c := s.Cluster()
 
 	if !scoped {
-		if c != nil {
-			if _, ok := c.PlacementOf(sandboxID); ok {
-				return nil
-			}
-		}
-		if s.store != nil {
-			if ref, err := s.store.GetSandboxAuditACLOwnerRef(ctx, sandboxID); err == nil && ref != "" {
-				return nil
-			}
-		}
-		return store.ErrNotFound
+		// Operator/PAT and internal callers are fleet-wide. Do not require a
+		// live placement or a node-local ACL: after deletion, an arbitrary
+		// ingress must still be able to fan out and discover retained evidence.
+		// Tenant callers remain fenced by the owner checks below.
+		return nil
 	}
 
 	if c != nil {
@@ -78,6 +72,18 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 		}
 		if ref != "" {
 			if ref == owner {
+				return nil
+			}
+			return store.ErrNotFound
+		}
+	}
+	if c != nil {
+		ref, ok, err := c.AuditOwnerRef(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if strings.TrimSpace(ref) == owner {
 				return nil
 			}
 			return store.ErrNotFound

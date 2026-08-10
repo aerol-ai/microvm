@@ -695,29 +695,32 @@ type ResizeSandboxRequest struct {
 }
 
 type Sandbox struct {
-	ID               string            `json:"id"`
-	Image            string            `json:"image"`
-	Status           SandboxStatus     `json:"status"`
-	PublicURL        string            `json:"public_url"`
-	ContainerID      string            `json:"container_id,omitempty"`
-	ContainerIP      string            `json:"container_ip,omitempty"`
-	CPU              float64           `json:"cpu"`
-	MemoryMB         int               `json:"memory_mb"`
-	DiskGB           int               `json:"disk_gb"`
-	OSUser           string            `json:"os_user"`
-	Env              map[string]string `json:"env,omitempty"`
-	NetworkBlockAll  bool              `json:"network_block_all"`
-	ToolboxEnabled   bool              `json:"toolbox_enabled"`
-	ToolboxToken     string            `json:"-"`
-	SSHPublicKey     string            `json:"ssh_public_key,omitempty"`
-	ExposedPorts     []ExposedPort     `json:"exposed_ports,omitempty"`
-	CreatedAt        time.Time         `json:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at"`
-	LastActiveAt     time.Time         `json:"last_active_at"`
-	LastError        string            `json:"last_error,omitempty"`
-	ContainerCommand []string          `json:"container_command,omitempty"`
-	Lifecycle        Lifecycle         `json:"lifecycle"`
-	Failover         *Failover         `json:"failover,omitempty"`
+	ID              string            `json:"id"`
+	Image           string            `json:"image"`
+	Status          SandboxStatus     `json:"status"`
+	PublicURL       string            `json:"public_url"`
+	ContainerID     string            `json:"container_id,omitempty"`
+	ContainerIP     string            `json:"container_ip,omitempty"`
+	CPU             float64           `json:"cpu"`
+	MemoryMB        int               `json:"memory_mb"`
+	DiskGB          int               `json:"disk_gb"`
+	OSUser          string            `json:"os_user"`
+	Env             map[string]string `json:"env,omitempty"`
+	NetworkBlockAll bool              `json:"network_block_all"`
+	ToolboxEnabled  bool              `json:"toolbox_enabled"`
+	ToolboxToken    string            `json:"-"`
+	// ToolboxTokenSealed is the at-rest representation used by the store when
+	// toolbox-token sealing is enabled. It never crosses API or Raft payloads.
+	ToolboxTokenSealed []byte        `json:"-"`
+	SSHPublicKey       string        `json:"ssh_public_key,omitempty"`
+	ExposedPorts       []ExposedPort `json:"exposed_ports,omitempty"`
+	CreatedAt          time.Time     `json:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+	LastActiveAt       time.Time     `json:"last_active_at"`
+	LastError          string        `json:"last_error,omitempty"`
+	ContainerCommand   []string      `json:"container_command,omitempty"`
+	Lifecycle          Lifecycle     `json:"lifecycle"`
+	Failover           *Failover     `json:"failover,omitempty"`
 	// FailoverReady is set on Get/List when failover.policy=recreate: true iff
 	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
 	// set is single-node (len≤1). Omitted for non-recreate sandboxes.

@@ -91,6 +91,16 @@ func (n *Noop) RemoveCustomDomain(ctx context.Context, sandboxID, hostname strin
 func (n *Noop) CustomDomainsOf(sandboxID string) []string                   { return nil }
 func (n *Noop) ResolveCustomDomain(hostname string) (string, bool)          { return "", false }
 func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error { return nil }
+
+func (n *Noop) AuditOwnerRef(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (n *Noop) AuditACLForSandbox(context.Context, string) (AuditACL, bool, error) {
+	return AuditACL{}, false, nil
+}
+
+func (n *Noop) PruneAuditACL(context.Context, time.Time) error { return nil }
 func (n *Noop) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	return nil
 }

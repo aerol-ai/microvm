@@ -1192,6 +1192,26 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+func (h *handlers) clusterInternalAuditACL(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	acl, ok, err := c.AuditACLForSandbox(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if acl.SandboxID == "" {
+		acl.SandboxID = r.PathValue("id")
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.AuditACLResponse{
+		ACL:    acl,
+		Exists: ok,
+	})
+}
+
 // clusterRecoveryBlobStore is the read-only surface behind the recovery GET
 // endpoint. It exists so a snapshot-joined voter can fetch payloads its
 // snapshot references but its local store lacks (fetch-on-miss) — the only

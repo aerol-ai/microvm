@@ -154,6 +154,7 @@ type gossipNode struct {
 	ml                 *memberlist.Memberlist
 	delegate           *gossipDelegate
 	memberIndex        *gossipMemberIndex
+	memberIndexMu      sync.RWMutex
 	stopRefresh        context.CancelFunc
 	logger             *slog.Logger
 	bootstrapPeers     []string
@@ -566,17 +567,36 @@ func hasLiveControlPlaneMember(nodes []*memberlist.Node, selfNodeID string) bool
 // calls UpdateNode, which races with members() reads. memberlist exposes no
 // safe accessor for self's Meta, so we substitute self ourselves.
 func (g *gossipNode) members() []Member {
-	if g.memberIndex != nil {
-		return g.memberIndex.snapshot()
+	if index := g.currentMemberIndex(); index != nil {
+		return index.snapshot()
 	}
 	return g.scanMembers()
 }
 
 func (g *gossipNode) refreshMemberIndex() {
-	if g.memberIndex == nil {
+	index := g.currentMemberIndex()
+	if index == nil {
 		return
 	}
-	g.memberIndex.replace(g.scanMembers())
+	index.replace(g.scanMembers())
+}
+
+func (g *gossipNode) currentMemberIndex() *gossipMemberIndex {
+	if g == nil {
+		return nil
+	}
+	g.memberIndexMu.RLock()
+	defer g.memberIndexMu.RUnlock()
+	return g.memberIndex
+}
+
+func (g *gossipNode) setMemberIndex(index *gossipMemberIndex) {
+	if g == nil {
+		return
+	}
+	g.memberIndexMu.Lock()
+	g.memberIndex = index
+	g.memberIndexMu.Unlock()
 }
 
 func (g *gossipNode) scanMembers() []Member {

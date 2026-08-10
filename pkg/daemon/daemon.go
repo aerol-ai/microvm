@@ -279,6 +279,27 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	if err := svc.ValidateSecretAuditSink(); err != nil {
+		return err
+	}
+	if cfg.SecretEnvSealEnabled {
+		migrated, err := svc.SealLegacySandboxEnv(ctx)
+		if err != nil {
+			return fmt.Errorf("migrate sandbox env: %w", err)
+		}
+		if migrated > 0 {
+			logger.Info("sealed legacy sandbox environments", "count", migrated)
+		}
+	}
+	if cfg.SecretToolboxSealEnabled {
+		migrated, err := db.SealLegacyToolboxTokens(ctx)
+		if err != nil {
+			return fmt.Errorf("migrate toolbox tokens: %w", err)
+		}
+		if migrated > 0 {
+			logger.Info("sealed legacy toolbox tokens", "count", migrated)
+		}
+	}
 	if err := svc.ConfigureSecretProvider(ctx); err != nil {
 		return fmt.Errorf("configure secret provider: %w", err)
 	}
@@ -615,8 +636,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
 					logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
 				}
-				svc.StartSecretDeleteOutboxReconcile(ctx)
 			}
+			// Lifecycle metrics and tombstone retention remain active even when
+			// fan-out is temporarily disabled; only peer retry dispatch is gated.
+			svc.StartSecretDeleteOutboxReconcile(ctx)
 		}
 		if cfg.IsIngress() {
 			svc.StartClusterIngressReconcile(ctx)
@@ -963,8 +986,9 @@ var clusterOwnershipReplayTick = 10 * time.Second
 
 func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
 	logger.Warn("cluster: scheduling ownership replay retry")
+	interval := clusterOwnershipReplayTick
 	go func() {
-		t := time.NewTicker(clusterOwnershipReplayTick)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {

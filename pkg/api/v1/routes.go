@@ -56,6 +56,10 @@ type Deps struct {
 	// ContainerEngine is the host engine (docker|containerd). Used for
 	// Server-Timing engine tags and BuildKit-absent clear errors.
 	ContainerEngine string
+	// RequireInternalMTLS rejects cluster-internal routes unless the request
+	// arrived through the listener that completed mutual TLS. Enterprise mode
+	// sets this true; public operator routes remain PAT-authenticated.
+	RequireInternalMTLS bool
 }
 
 // RegisterRoutes mounts every v1 route onto mux. Paths are written with the
@@ -154,6 +158,9 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// fleet-PAT only. Managed tenant tokens must not drain nodes, apply Raft
 	// commands, or read fleet topology (P0). Peer HTTP uses SB_PAT_TOKEN.
 	op := func(next http.Handler) http.Handler { return withAuthOperator(d, next) }
+	internalOp := func(next http.Handler) http.Handler {
+		return withInternalMTLS(d, op(next))
+	}
 	mux.Handle("GET "+PathPrefix+"/cluster/members", op(http.HandlerFunc(h.clusterMembers)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", op(http.HandlerFunc(h.clusterRemoveMember)))
 	mux.Handle("GET "+PathPrefix+"/cluster/leader", op(http.HandlerFunc(h.clusterLeader)))
@@ -163,25 +170,39 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
 	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
-	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", op(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
-	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", op(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
+	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
+	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
 	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", op(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", op(http.HandlerFunc(h.clusterDeleteOrphan)))
-	mux.Handle("POST "+cluster.PublicInternalApplyPath, op(http.HandlerFunc(h.clusterInternalApply)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", op(http.HandlerFunc(h.clusterInternalPlacement)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", op(http.HandlerFunc(h.clusterInternalPlacementByName)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, op(http.HandlerFunc(h.clusterInternalPlacements)))
-	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, op(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
-	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, op(http.HandlerFunc(h.clusterInternalPlacementsPage)))
-	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", op(http.HandlerFunc(h.clusterInternalRecoveryGet)))
-	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, op(http.HandlerFunc(h.clusterInternalSelectPlacement)))
-	mux.Handle("GET "+cluster.PublicInternalVolumePath, op(http.HandlerFunc(h.clusterInternalVolume)))
-	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", op(http.HandlerFunc(h.clusterInternalDrainState)))
-	mux.Handle("POST "+cluster.PublicInternalSecretPath, op(http.HandlerFunc(h.clusterInternalSecretPut)))
-	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", op(http.HandlerFunc(h.clusterInternalSecretHead)))
-	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", op(http.HandlerFunc(h.clusterInternalSecretDelete)))
-	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", op(http.HandlerFunc(h.clusterInternalSandboxAudit)))
-	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", op(http.HandlerFunc(h.clusterInternalSandboxMeta)))
+	mux.Handle("POST "+cluster.PublicInternalApplyPath, internalOp(http.HandlerFunc(h.clusterInternalApply)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", internalOp(http.HandlerFunc(h.clusterInternalPlacementByName)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, internalOp(http.HandlerFunc(h.clusterInternalPlacements)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsPage)))
+	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
+	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", internalOp(http.HandlerFunc(h.clusterInternalRecoveryGet)))
+	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, internalOp(http.HandlerFunc(h.clusterInternalSelectPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalVolumePath, internalOp(http.HandlerFunc(h.clusterInternalVolume)))
+	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalDrainState)))
+	mux.Handle("POST "+cluster.PublicInternalSecretPath, internalOp(http.HandlerFunc(h.clusterInternalSecretPut)))
+	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretHead)))
+	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretDelete)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", internalOp(http.HandlerFunc(h.clusterInternalSandboxAudit)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", internalOp(http.HandlerFunc(h.clusterInternalSandboxMeta)))
+}
+
+func withInternalMTLS(d Deps, next http.Handler) http.Handler {
+	if !d.RequireInternalMTLS {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
+			http.Error(w, "cluster internal endpoint requires mTLS", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func withAuditLimit(d Deps, next http.Handler) http.Handler {

@@ -23,7 +23,10 @@ import (
 // rather than silently pushing an un-reaped tag.
 var snapshotRetentionSuffixPattern = regexp.MustCompile(`^--(ttl|idle)-[a-z0-9]+$`)
 
-const defaultToolboxPort = 2280
+const (
+	defaultToolboxPort    = 2280
+	minEnterprisePATBytes = 32
+)
 
 // DefaultContainerdRunDir is the single source of truth for the containerd
 // per-sandbox host-file workdir default (resolv.conf, hosts, task logs).
@@ -117,6 +120,11 @@ func canonicalNodeRole(roles []string) string {
 }
 
 type Config struct {
+	// EnterpriseMode enables a fail-fast production profile while leaving
+	// single-node development defaults backward compatible. It validates that
+	// secret sealing, audit durability, resource isolation, and cluster mTLS
+	// cannot be accidentally disabled. SB_ENTERPRISE_MODE.
+	EnterpriseMode              bool
 	PATToken                    string
 	APIHost                     string
 	APIPort                     int
@@ -1089,9 +1097,23 @@ type Config struct {
 	// change; enable only after every cluster node is on a binary that merges
 	// env from the provider bag (RefVersionEnv=2). SB_SECRET_ENV_SEAL_ENABLED.
 	SecretEnvSealEnabled bool
+	// SecretToolboxSealEnabled encrypts per-sandbox toolbox bearer tokens in
+	// SQLite. Default off preserves rolling downgrade compatibility; enterprise
+	// mode requires it. SB_SECRET_TOOLBOX_SEAL_ENABLED.
+	SecretToolboxSealEnabled bool
 	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
 	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
 	SecretAuditRetentionDays int
+	// SecretAuditStrictBoot refuses daemon startup when the local audit writer
+	// cannot be opened. Default true because silently running without an
+	// evidence stream is not a safe production state. Tests and embedders with
+	// no DBPath remain unaffected. SB_SECRET_AUDIT_STRICT_BOOT.
+	SecretAuditStrictBoot bool
+	// SecretTombRetentionDays bounds deletion tombstone growth after all peer
+	// delete ACKs complete. Zero disables GC. Rows with a live sandbox, sealed
+	// secret, or pending outbox are never eligible. Default 30.
+	// SB_SECRET_TOMB_RETENTION_DAYS.
+	SecretTombRetentionDays int
 	// EgressAttributionEnabled records host-mediated egress destinations
 	// (wasm NetMediator + isolate proxy) into the secret-audit JSONL. Default
 	// ON — observational, dial-path only, never on create. Escape hatch:
@@ -1438,6 +1460,7 @@ func Load() (Config, error) {
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
 	cfg := Config{
+		EnterpriseMode:                    getEnvBool("SB_ENTERPRISE_MODE", false),
 		PATToken:                          strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
 		APIHost:                           getEnv("SB_API_HOST", "0.0.0.0"),
 		APIPort:                           getEnvInt("SB_API_PORT", 21212),
@@ -1612,7 +1635,10 @@ func Load() (Config, error) {
 		// Format-change flag: default OFF until the fleet is rolled
 		// (house pattern matches SB_PLATFORM_VOLUMES_ENABLED).
 		SecretEnvSealEnabled:          getEnvBool("SB_SECRET_ENV_SEAL_ENABLED", false),
+		SecretToolboxSealEnabled:      getEnvBool("SB_SECRET_TOOLBOX_SEAL_ENABLED", false),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
+		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
+		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
 		EgressAttributionEnabled:      getEnvBool("SB_EGRESS_ATTRIBUTION_ENABLED", true),
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
@@ -2140,6 +2166,9 @@ func Load() (Config, error) {
 	if cfg.SecretAuditRetentionDays < 0 {
 		return Config{}, errors.New("SB_SECRET_AUDIT_RETENTION_DAYS must be >= 0")
 	}
+	if cfg.SecretTombRetentionDays < 0 {
+		return Config{}, errors.New("SB_SECRET_TOMB_RETENTION_DAYS must be >= 0")
+	}
 	if cfg.AuditRateLimitIdentity <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_IDENTITY must be > 0")
 	}
@@ -2148,6 +2177,46 @@ func Load() (Config, error) {
 	}
 	if cfg.AuditRateLimitNode <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_NODE must be > 0")
+	}
+	if cfg.EnterpriseMode {
+		if len([]byte(cfg.PATToken)) < minEnterprisePATBytes {
+			return Config{}, fmt.Errorf("SB_PAT_TOKEN must contain at least %d bytes when SB_ENTERPRISE_MODE=true", minEnterprisePATBytes)
+		}
+		if cfg.ContainerPrivileged {
+			return Config{}, errors.New("SB_CONTAINER_PRIVILEGED must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.ResourceLimitsOff {
+			return Config{}, errors.New("SB_RESOURCE_LIMITS_DISABLED must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if !cfg.SecretEnvSealEnabled {
+			return Config{}, errors.New("SB_SECRET_ENV_SEAL_ENABLED must be true when SB_ENTERPRISE_MODE=true")
+		}
+		if !cfg.SecretToolboxSealEnabled {
+			return Config{}, errors.New("SB_SECRET_TOOLBOX_SEAL_ENABLED must be true when SB_ENTERPRISE_MODE=true")
+		}
+		if !cfg.SecretAuditStrictBoot {
+			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SecretProvider == "awskms" && !cfg.SecretProviderStrictBoot {
+			return Config{}, errors.New("SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
+			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.EnableCluster {
+			if cfg.ClusterTLSDir == "" {
+				return Config{}, errors.New("SB_CLUSTER_TLS_DIR is required for cluster mTLS when SB_ENTERPRISE_MODE=true")
+			}
+			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {
+				return Config{}, errors.New("cluster insecure escape hatches are forbidden when SB_ENTERPRISE_MODE=true")
+			}
+			if !cfg.SecretRecipientFanoutEnabled || cfg.SecretRecipientBackupCount < 2 {
+				return Config{}, errors.New("secret recipient fan-out with at least two backups is required when SB_ENTERPRISE_MODE=true")
+			}
+			if cfg.SecretFanoutMinACKWait <= 0 {
+				return Config{}, errors.New("SB_SECRET_FANOUT_MIN_ACK_WAIT must be > 0 when SB_ENTERPRISE_MODE=true")
+			}
+		}
 	}
 
 	if cfg.EnableServerless {

@@ -252,7 +252,7 @@ func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPe
 	t.Helper()
 	testClusterMu.Lock()
 	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeGossipPort(t)
 	dir := t.TempDir()
 
 	cfg := config.Config{
@@ -300,6 +300,29 @@ func pickFreeTCPPort(t *testing.T) int {
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
 	return port
+}
+
+// pickFreeGossipPort checks both transports because memberlist binds TCP and
+// UDP to the same port. A TCP-only probe can select a port already occupied by
+// UDP, which made the full suite fail nondeterministically under load.
+func pickFreeGossipPort(t *testing.T) int {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		tcp, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pickFreeGossipPort tcp: %v", err)
+		}
+		port := tcp.Addr().(*net.TCPAddr).Port
+		udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+		if err == nil {
+			_ = udp.Close()
+			_ = tcp.Close()
+			return port
+		}
+		_ = tcp.Close()
+	}
+	t.Fatal("pickFreeGossipPort: failed to find a TCP+UDP port")
+	return 0
 }
 
 // waitForLeader blocks until the cluster reports a leader, or fails the test.

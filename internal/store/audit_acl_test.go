@@ -85,3 +85,62 @@ func TestSecretDeleteOutboxBatchRotatesAttemptedRows(t *testing.T) {
 		t.Fatalf("unattempted rows in second batch=%d, want 6", seenNew)
 	}
 }
+
+func TestClusterSecretTombPruneIsBoundedAndPreservesLiveState(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+	for _, id := range []string{"eligible-a", "eligible-b", "pending", "live", "sealed"} {
+		if _, err := st.db.ExecContext(ctx, `
+			INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation)
+			VALUES (?, ?, 1)
+		`, id, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation)
+		VALUES ('recent', ?, 1)
+	`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO cluster_secret_delete_outbox
+			(sandbox_id, recipients_json, generation, attempts, created_at, updated_at)
+		VALUES ('pending', '["peer"]', 1, 0, ?, ?)
+	`, old, old); err != nil {
+		t.Fatal(err)
+	}
+	live := sampleSandbox("live")
+	if err := st.Create(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO cluster_secrets
+			(ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at)
+		VALUES ('secret://sealed', 'sealed', 1, '[]', X'01', 1, ?, ?)
+	`, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := now.Add(-24 * time.Hour)
+	if n, err := st.PruneClusterSecretTombs(ctx, cutoff, 1); err != nil || n != 1 {
+		t.Fatalf("first prune=%d err=%v, want 1", n, err)
+	}
+	if n, err := st.PruneClusterSecretTombs(ctx, cutoff, 1); err != nil || n != 1 {
+		t.Fatalf("second prune=%d err=%v, want 1", n, err)
+	}
+	for _, id := range []string{"pending", "live", "sealed", "recent"} {
+		if exists, err := st.HasClusterSecretTomb(ctx, id); err != nil || !exists {
+			t.Fatalf("protected tomb %q exists=%v err=%v", id, exists, err)
+		}
+	}
+	stats, err := st.SecretLifecycleStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.OutboxPending != 1 || stats.Tombstones != 4 || stats.OldestOutbox.IsZero() {
+		t.Fatalf("stats = %+v, want pending=1 tombstones=4 with oldest", stats)
+	}
+}

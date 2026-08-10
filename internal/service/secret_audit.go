@@ -1,13 +1,13 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,14 +42,20 @@ const (
 	secretAuditKindGap        = "gap"
 
 	defaultSecretAuditBuffer = 1024
-	secretAuditFileName      = "secrets.jsonl"
+	// Bound the power-loss window for the local audit fallback. Enterprise
+	// deployments should still ship the stream to an external durable/WORM sink.
+	secretAuditSyncInterval = time.Second
+	secretAuditFileName     = "secrets.jsonl"
 	// secretAuditLockName is a stable sidecar flock target. Retention and
 	// wasm workers lock this path *before* opening secrets.jsonl so a rename
 	// during prune cannot leave writers appending to an unlinked inode.
 	secretAuditLockName = "secrets.jsonl.lock"
 )
 
-var auditEventsDroppedTotal = expvar.NewInt("aerolvm_audit_events_dropped_total")
+var (
+	auditEventsDroppedTotal = expvar.NewInt("aerolvm_audit_events_dropped_total")
+	secretAuditSinkHealthy  = expvar.NewInt("aerolvm_secret_audit_sink_healthy")
+)
 
 // SecretAuditEvent is one audit record (secret-open by default, or host-mediated
 // egress). Never carry plaintext, credentials, PII, or wrapped error strings
@@ -66,10 +72,19 @@ type noopSecretAuditSink struct{}
 
 func (noopSecretAuditSink) Emit(SecretAuditEvent) {}
 
+// unavailableSecretAuditSink keeps a failed writer loud after non-strict boot:
+// every event that could not be persisted is counted, and the health gauge
+// remains zero. This avoids the previous permanent, silent noop fallback.
+type unavailableSecretAuditSink struct{}
+
+func (unavailableSecretAuditSink) Emit(SecretAuditEvent) {
+	auditEventsDroppedTotal.Add(1)
+}
+
 type auditWriteReq struct {
 	ev          SecretAuditEvent
-	sync        chan struct{} // when non-nil, writer closes after draining prior work
-	pruneCutoff time.Time     // when non-zero, rewrite file dropping older events
+	sync        chan error // when non-nil, writer fsyncs after draining prior work
+	pruneCutoff time.Time  // when non-zero, rewrite file dropping older events
 	pruneDone   chan error
 }
 
@@ -146,22 +161,22 @@ func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
 }
 
 // Sync blocks until every previously accepted event (and any pending gap
-// marker) has been written. No-op on a nil or closed sink.
-func (s *fileAuditSink) Sync() {
+// marker) has been written and fsynced. No-op on a nil or closed sink.
+func (s *fileAuditSink) Sync() error {
 	if s == nil {
-		return
+		return nil
 	}
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	s.sendMu.Lock()
 	if s.closed.Load() {
 		s.sendMu.Unlock()
-		return
+		return nil
 	}
 	// Sync must not drop — wait for buffer space while still holding sendMu so
 	// Close cannot close(ch) mid-send.
 	s.ch <- auditWriteReq{sync: done}
 	s.sendMu.Unlock()
-	<-done
+	return <-done
 }
 
 // Close stops the writer and closes the file. Safe to call once.
@@ -179,7 +194,29 @@ func (s *fileAuditSink) Close() {
 func (s *fileAuditSink) loop() {
 	defer close(s.done)
 	defer func() { _ = s.file.Close() }()
-	for req := range s.ch {
+	ticker := time.NewTicker(secretAuditSyncInterval)
+	defer ticker.Stop()
+	for {
+		var req auditWriteReq
+		select {
+		case next, ok := <-s.ch:
+			if !ok {
+				if s.pendingGap.Swap(false) {
+					s.writeEvent(SecretAuditEvent{
+						Time:   time.Now().UTC(),
+						Result: secretAuditResultGap,
+						Reason: secretAuditReasonOverflow,
+						Kind:   secretAuditKindGap,
+					})
+				}
+				_ = s.syncFile()
+				return
+			}
+			req = next
+		case <-ticker.C:
+			_ = s.syncFile()
+			continue
+		}
 		if s.pendingGap.Swap(false) {
 			s.writeEvent(SecretAuditEvent{
 				Time:   time.Now().UTC(),
@@ -193,19 +230,21 @@ func (s *fileAuditSink) loop() {
 			continue
 		}
 		if req.sync != nil {
-			close(req.sync)
+			req.sync <- s.syncFile()
 			continue
 		}
 		s.writeEvent(req.ev)
 	}
-	if s.pendingGap.Swap(false) {
-		s.writeEvent(SecretAuditEvent{
-			Time:   time.Now().UTC(),
-			Result: secretAuditResultGap,
-			Reason: secretAuditReasonOverflow,
-			Kind:   secretAuditKindGap,
-		})
+}
+
+func (s *fileAuditSink) syncFile() error {
+	err := s.withAuditFileLock(s.file.Sync)
+	if err != nil {
+		secretAuditSinkHealthy.Set(0)
+		auditEventsDroppedTotal.Add(1)
+		s.pendingGap.Store(true)
 	}
+	return err
 }
 
 // Prune drops events (and gap markers) older than cutoff. Serialized on the
@@ -256,46 +295,62 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		}
 		defer src.Close()
 
-		raw, err := io.ReadAll(src)
-		if err != nil {
-			return err
-		}
-		var kept [][]byte
-		for _, line := range strings.Split(string(raw), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var ev SecretAuditEvent
-			if err := json.Unmarshal([]byte(line), &ev); err != nil {
-				// Preserve unparseable lines rather than silently dropping evidence.
-				kept = append(kept, []byte(line))
-				continue
-			}
-			if !ev.Time.IsZero() && ev.Time.Before(cutoff) {
-				continue
-			}
-			kept = append(kept, []byte(line))
-		}
 		tmp := s.path + ".tmp"
 		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
 		}
-		for _, line := range kept {
-			if _, err := f.Write(append(line, '\n')); err != nil {
-				_ = f.Close()
+		removeTmp := true
+		defer func() {
+			if removeTmp {
 				_ = os.Remove(tmp)
+			}
+		}()
+		writer := bufio.NewWriterSize(f, 64*1024)
+		scanner := bufio.NewScanner(src)
+		// Events contain metadata only. Bounding the line size prevents a corrupt
+		// file from turning retention into unbounded memory use while the streaming
+		// rewrite keeps total memory constant regardless of the audit-file size.
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var ev SecretAuditEvent
+			if err := json.Unmarshal([]byte(line), &ev); err == nil && !ev.Time.IsZero() && ev.Time.Before(cutoff) {
+				continue
+			}
+			// Preserve malformed lines rather than silently dropping evidence.
+			if _, err := writer.WriteString(line + "\n"); err != nil {
+				_ = f.Close()
 				return err
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := writer.Flush(); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return err
+		}
 		if err := f.Close(); err != nil {
-			_ = os.Remove(tmp)
 			return err
 		}
 		if err := os.Rename(tmp, s.path); err != nil {
-			_ = os.Remove(tmp)
 			return err
+		}
+		removeTmp = false
+		// Persist the directory entry as well as the temporary file contents so a
+		// crash cannot acknowledge a prune and then resurrect the pre-prune name.
+		if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
+			_ = dir.Sync()
+			_ = dir.Close()
 		}
 		_ = s.file.Close()
 		nf, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -321,6 +376,7 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 	ensureSecretAuditEventID(&ev)
 	line, err := json.Marshal(ev)
 	if err != nil {
+		secretAuditSinkHealthy.Set(0)
 		auditEventsDroppedTotal.Add(1)
 		s.pendingGap.Store(true)
 		return
@@ -330,9 +386,12 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 		_, werr := s.file.Write(line)
 		return werr
 	}); err != nil {
+		secretAuditSinkHealthy.Set(0)
 		auditEventsDroppedTotal.Add(1)
 		s.pendingGap.Store(true)
+		return
 	}
+	secretAuditSinkHealthy.Set(1)
 }
 
 func (s *Service) ensureSecretAuditSink() {
@@ -345,21 +404,46 @@ func (s *Service) ensureSecretAuditSink() {
 		}
 		dataDir := secretAuditDataDir(s.cfg.DBPath)
 		if dataDir == "" {
-			s.secretAudit = noopSecretAuditSink{}
+			s.secretAuditInitErr = errors.New("secret audit requires a non-empty DBPath")
+			secretAuditSinkHealthy.Set(0)
+			s.secretAudit = unavailableSecretAuditSink{}
 			return
 		}
 		sink, err := newFileAuditSink(filepath.Join(dataDir, "audit"), defaultSecretAuditBuffer)
 		if err != nil {
+			s.secretAuditInitErr = err
+			secretAuditSinkHealthy.Set(0)
 			if s.logger != nil {
-				s.logger.Warn("secret audit sink disabled", "err", err)
+				s.logger.Error("secret audit sink unavailable", "err", err)
 			}
-			s.secretAudit = noopSecretAuditSink{}
+			s.secretAudit = unavailableSecretAuditSink{}
 			return
 		}
+		secretAuditSinkHealthy.Set(1)
 		s.secretAudit = sink
 		s.secretAuditFile = sink
 		s.startSecretAuditPruneTicker()
 	})
+}
+
+// ValidateSecretAuditSink applies the boot policy after New has attempted to
+// open the writer. Strict mode is the production default; the explicit false
+// value remains useful to tests and emergency recovery, while metrics and drop
+// accounting still make the degraded state visible.
+func (s *Service) ValidateSecretAuditSink() error {
+	if s == nil {
+		return nil
+	}
+	s.ensureSecretAuditSink()
+	if s.secretAuditFile != nil {
+		if err := s.secretAuditFile.Sync(); err != nil {
+			s.secretAuditInitErr = fmt.Errorf("sync secret audit sink: %w", err)
+		}
+	}
+	if s.secretAuditInitErr != nil && s.cfg.SecretAuditStrictBoot {
+		return fmt.Errorf("initialize secret audit sink: %w", s.secretAuditInitErr)
+	}
+	return nil
 }
 
 // startSecretAuditPruneTicker runs retention once at start and once per day.

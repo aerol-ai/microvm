@@ -63,18 +63,22 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 		return
 	}
 	snap := c.admitter.Snapshot()
+	c.mu.RLock()
+	templateInventory := c.localTemplateInventory
+	wasmModuleInventory := c.localWasmModuleInventory
+	c.mu.RUnlock()
 	// Overlay PR-D template inventory before storing — placement reads
 	// straight off this lease, so without the overlay our own snapshot
 	// would advertise no templates and the unknown-allow rule would
 	// let creates land on peers that lack them.
-	if c.localTemplateInventory != nil {
-		if ids, known := c.localTemplateInventory(); known {
+	if templateInventory != nil {
+		if ids, known := templateInventory(); known {
 			snap.LocalTemplateInventoryKnown = true
 			snap.LocalTemplateIDs = ids
 		}
 	}
-	if c.localWasmModuleInventory != nil {
-		if refs, known := c.localWasmModuleInventory(); known {
+	if wasmModuleInventory != nil {
+		if refs, known := wasmModuleInventory(); known {
 			snap.LocalWasmModuleInventoryKnown = true
 			snap.LocalWasmModuleIDs = refs
 		}
@@ -216,8 +220,8 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 func (c *Cluster) fetchMemberCapacity(ctx context.Context, m Member) (capacity.Snapshot, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if c.internalClient != nil && m.InternalURL != "" {
-		snap, err := fetchCapacitySnapshot(reqCtx, c.internalClient, strings.TrimRight(m.InternalURL, "/")+"/v1/capacity", c.patToken)
+	if internalClient := c.currentInternalClient(); internalClient != nil && m.InternalURL != "" {
+		snap, err := fetchCapacitySnapshot(reqCtx, internalClient, strings.TrimRight(m.InternalURL, "/")+"/v1/capacity", c.patToken)
 		if err == nil {
 			return snap, nil
 		}

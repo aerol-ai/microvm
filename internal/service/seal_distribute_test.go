@@ -70,6 +70,45 @@ func (f *fakePeerPusher) ProbeSecretOnPeers(_ context.Context, sandboxID string,
 	return append([]string(nil), recipients...), f.probeErr
 }
 
+func TestReconcileSecretDeleteOutboxDrainsBeyondOneWorkerWave(t *testing.T) {
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	const total = deleteReconcileWorkers*2 + 7
+	ctx := context.Background()
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("sb-delete-backlog-%03d", i)
+		if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, id, []string{"node-b"}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	pusher := &fakePeerPusher{}
+	svc := &Service{
+		cfg:                  config.Config{SecretRecipientFanoutEnabled: true},
+		store:                st,
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	remaining, err := st.ListSecretDeleteOutbox(ctx)
+	if err != nil {
+		t.Fatalf("list remaining: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining outbox rows = %d, want 0", len(remaining))
+	}
+	pusher.mu.Lock()
+	deletes := len(pusher.deletes)
+	pusher.mu.Unlock()
+	if deletes != total {
+		t.Fatalf("peer deletes = %d, want %d", deletes, total)
+	}
+}
+
 func TestRefreshSecretHolderPossessionRetriesAfterProbeFailure(t *testing.T) {
 	clearSecretFanoutHolders("sb-probe-retry")
 	t.Cleanup(func() { clearSecretFanoutHolders("sb-probe-retry") })
@@ -365,6 +404,93 @@ func TestSealAndDistributeFansOutWhenHA(t *testing.T) {
 	defer pusher.mu.Unlock()
 	if pusher.pushCalls == 0 {
 		t.Fatal("pushCalls=0")
+	}
+}
+
+func TestEnterpriseSealRequiresBackupACKAndRetractsLocalSecret(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	pusher := &fakePeerPusher{}
+	svc := &Service{
+		cfg: config.Config{
+			EnterpriseMode:               true,
+			SecretRecipientFanoutEnabled: true,
+			SecretFanoutMinACKWait:       20 * time.Millisecond,
+		},
+		cipher:               cipher,
+		store:                st,
+		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	req := models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+	if handle, err := svc.SealAndDistribute(ctx, "sb-enterprise-no-ack", req, []string{"node-a", "node-b"}, SealStrict); err == nil || handle.Ref != "" {
+		t.Fatalf("enterprise seal = %+v, %v; want no handle and backup-ACK error", handle, err)
+	}
+	rows, err := st.ListClusterSecrets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("unreplicated local secret was not retracted: %+v", rows)
+	}
+	if tomb, err := st.HasClusterSecretTomb(ctx, "sb-enterprise-no-ack"); err != nil || !tomb {
+		t.Fatalf("retraction tomb = %v, %v", tomb, err)
+	}
+	if outbox, err := st.GetSecretDeleteOutbox(ctx, "sb-enterprise-no-ack"); err != nil || outbox == nil {
+		t.Fatalf("retraction outbox = %+v, %v", outbox, err)
+	}
+}
+
+func TestPeerSecretPutRequiresLivePlacementAfterTombGC(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	recipients := []string{"node-a", "node-b"}
+	ref := secrets.FormatRef("sb-no-vacuum", 1)
+	payload, err := secrets.SealEnvelopeBound(cipher, secrets.Secrets{
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+	}, recipients, secrets.SealBinding{SandboxID: "sb-no-vacuum", Ref: ref, Version: 1, Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := secrets.SecretBlob{
+		Ref: ref, SandboxID: "sb-no-vacuum", Version: 1, Recipients: recipients,
+		SealedPayload: payload, SealGeneration: 1,
+	}
+	placements := &placementOnlyCluster{
+		Noop: cluster.NewNoop("node-b", "http://b", ""),
+		placement: cluster.Placement{
+			SandboxID: "sb-no-vacuum", OwnerNodeID: "node-a", SecretRecipients: recipients,
+		},
+	}
+	svc := &Service{
+		cfg:            config.Config{EnableCluster: true},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:        placements,
+	}
+	if err := svc.UpsertClusterSecretBlob(ctx, blob); err != nil {
+		t.Fatalf("live placement put: %v", err)
+	}
+	if err := svc.DeleteClusterSecretsLocal(ctx, blob.SandboxID, blob.SealGeneration); err != nil {
+		t.Fatalf("peer delete: %v", err)
+	}
+	if n, err := st.PruneClusterSecretTombs(ctx, time.Now().UTC().Add(time.Hour), 1); err != nil || n != 1 {
+		t.Fatalf("prune tomb = %d, %v", n, err)
+	}
+	placements.placement = cluster.Placement{}
+	if err := svc.UpsertClusterSecretBlob(ctx, blob); !errors.Is(err, ErrInvalidClusterSecretBlob) {
+		t.Fatalf("stale put after tomb GC = %v, want invalid blob due to absent placement", err)
+	}
+	if rows, err := st.ListClusterSecrets(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("stale put resurrected rows = %+v, %v", rows, err)
 	}
 }
 

@@ -51,10 +51,10 @@ func TestRefill_KickOnMiss(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
-	for len(sp.warmed) == 0 && time.Now().Before(deadline) {
+	for sp.warmedCount() == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(sp.warmed) == 0 {
+	if sp.warmedCount() == 0 {
 		t.Fatal("expected miss-kicked refill to warm without waiting for ticker")
 	}
 }

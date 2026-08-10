@@ -130,8 +130,8 @@ func (c *Cluster) getRecoveryBlobFromMember(ctx context.Context, m Member, ref s
 	var out RecoveryBlob
 	path := recoveryBlobPath(ref)
 	var err error
-	if c.internalClient != nil && m.InternalURL != "" {
-		err = doRecoveryHTTPRequest(ctx, c.internalClient, strings.TrimRight(m.InternalURL, "/")+path, http.MethodGet, c.patToken, nil, &out)
+	if internalClient := c.currentInternalClient(); internalClient != nil && m.InternalURL != "" {
+		err = doRecoveryHTTPRequest(ctx, internalClient, strings.TrimRight(m.InternalURL, "/")+path, http.MethodGet, c.patToken, nil, &out)
 	} else if m.APIURL != "" {
 		err = doRecoveryHTTPRequest(ctx, c.httpClient, strings.TrimRight(m.APIURL, "/")+path, http.MethodGet, c.patToken, nil, &out)
 	} else {
