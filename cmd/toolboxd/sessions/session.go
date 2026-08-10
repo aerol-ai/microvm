@@ -200,18 +200,23 @@ func (s *Session) Subscribe() (<-chan Frame, func()) {
 // Write forwards bytes to the session's stdin (PTY in PTY mode, pipe stdin
 // otherwise). Returns an error if the session has exited or stdin is closed.
 func (s *Session) Write(p []byte) (int, error) {
+	s.mu.Lock()
 	if s.exited.Load() {
+		s.mu.Unlock()
 		return 0, errors.New("session has exited")
 	}
-	if s.ptmx != nil {
-		// Optionally record stdin keystrokes for replay accuracy.
-		if s.recorder != nil {
-			s.recorder.WriteInput(p)
+	ptmx := s.ptmx
+	stdin := s.stdin
+	rec := s.recorder
+	s.mu.Unlock()
+	if ptmx != nil {
+		if rec != nil {
+			rec.WriteInput(p)
 		}
-		return s.ptmx.Write(p)
+		return ptmx.Write(p)
 	}
-	if s.stdin != nil {
-		return s.stdin.Write(p)
+	if stdin != nil {
+		return stdin.Write(p)
 	}
 	return 0, errors.New("session has no writable stdin")
 }
@@ -228,9 +233,11 @@ func (s *Session) CloseStdin() error {
 	return nil
 }
 
-// Resize updates the PTY window size. No-op in pipe mode.
+// Resize updates the PTY window size. No-op in pipe mode or after exit.
 func (s *Session) Resize(cols, rows int) error {
-	if s.ptmx == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exited.Load() || s.ptmx == nil {
 		return nil
 	}
 	if cols <= 0 || rows <= 0 {
@@ -319,8 +326,12 @@ func (s *Session) finish(code int, signal string, failed bool) {
 	if s.recorder != nil {
 		_ = s.recorder.Close()
 	}
-	if s.ptmx != nil {
-		_ = s.ptmx.Close()
+	s.mu.Lock()
+	ptmx := s.ptmx
+	s.ptmx = nil
+	s.mu.Unlock()
+	if ptmx != nil {
+		_ = ptmx.Close()
 	}
 	close(s.doneCh)
 }

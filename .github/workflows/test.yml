@@ -19,6 +19,7 @@ jobs:
       java_sdk: ${{ steps.filter.outputs.java_sdk }}
       python_sdk: ${{ steps.filter.outputs.python_sdk }}
       typescript_sdk: ${{ steps.filter.outputs.typescript_sdk }}
+      rust_sdk: ${{ steps.filter.outputs.rust_sdk }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -51,6 +52,8 @@ jobs:
               - 'sdk/python/**'
             typescript_sdk:
               - 'sdk/typescript/**'
+            rust_sdk:
+              - 'sdk/rust/**'
 
   go-tests:
     needs: changes
@@ -252,3 +255,25 @@ jobs:
 
       - name: Run TypeScript SDK tests
         run: npm test
+
+  rust-sdk-tests:
+    needs: changes
+    if: needs.changes.outputs.rust_sdk == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/rust
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/rust
+
+      - name: Run Rust SDK tests
+        run: cargo test --locked

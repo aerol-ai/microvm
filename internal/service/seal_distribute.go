@@ -30,6 +30,9 @@ const (
 const (
 	defaultSecretFanoutMinACKWait = 2 * time.Second
 	secretRefanoutWorkers         = 64
+	// secretCreateFanoutQueue bounds queued create-path fan-out jobs so a
+	// create burst cannot allocate one goroutine (+ 2m timeout) per sandbox.
+	secretCreateFanoutQueue = secretRefanoutWorkers * 4
 )
 
 // secretHolderACKTTL bounds how long an in-memory peer ACK counts toward
@@ -44,7 +47,19 @@ var (
 	secretFanoutHolders  sync.Map // sandboxID -> *holderNodeSet
 	secretSandboxOpMu    sync.Map // sandboxID -> *sandboxOpLock
 	secretSandboxOpEvict sync.Mutex
+
+	secretCreateFanoutOnce     sync.Once
+	secretCreateFanoutJobs     chan secretCreateFanoutJob
+	secretCreateFanoutInflight sync.Map // sandboxID -> struct{}
 )
+
+type secretCreateFanoutJob struct {
+	svc        *Service
+	sandboxID  string
+	blob       secrets.SecretBlob
+	recipients []string
+	pusher     cluster.SecretPeerPusher
+}
 
 type sandboxOpLock struct {
 	mu   sync.Mutex
@@ -362,7 +377,7 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 	if len(acked) == 0 {
 		return errors.New("secret fan-out received no backup ACK")
 	}
-	go s.runSecretFanout(sandboxID, *blob, recipients, pusher)
+	s.enqueueSecretFanout(sandboxID, *blob, recipients, pusher)
 	return nil
 }
 
@@ -371,6 +386,47 @@ func (s *Service) secretFanoutMinACKWait() time.Duration {
 		return defaultSecretFanoutMinACKWait
 	}
 	return s.cfg.SecretFanoutMinACKWait
+}
+
+func ensureSecretCreateFanoutWorkers() {
+	secretCreateFanoutOnce.Do(func() {
+		secretCreateFanoutJobs = make(chan secretCreateFanoutJob, secretCreateFanoutQueue)
+		for range secretRefanoutWorkers {
+			go func() {
+				for job := range secretCreateFanoutJobs {
+					job.svc.runSecretFanout(job.sandboxID, job.blob, job.recipients, job.pusher)
+					secretCreateFanoutInflight.Delete(job.sandboxID)
+				}
+			}()
+		}
+	})
+}
+
+// enqueueSecretFanout schedules remaining peer pushes on the bounded create-path
+// pool (same worker cap as restart re-fanout). Per-sandbox single-flight drops
+// duplicate enqueues while a job is queued or running.
+func (s *Service) enqueueSecretFanout(sandboxID string, blob secrets.SecretBlob, recipients []string, pusher cluster.SecretPeerPusher) {
+	if s == nil || pusher == nil || strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	if _, loaded := secretCreateFanoutInflight.LoadOrStore(sandboxID, struct{}{}); loaded {
+		return
+	}
+	ensureSecretCreateFanoutWorkers()
+	job := secretCreateFanoutJob{
+		svc:        s,
+		sandboxID:  sandboxID,
+		blob:       blob,
+		recipients: append([]string(nil), recipients...),
+		pusher:     pusher,
+	}
+	select {
+	case secretCreateFanoutJobs <- job:
+	default:
+		// Queue full: block rather than spawn an unbounded goroutine. Create
+		// already has ≥1 backup ACK; this only delays remaining peer copies.
+		secretCreateFanoutJobs <- job
+	}
 }
 
 func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, recipients []string, pusher cluster.SecretPeerPusher) {

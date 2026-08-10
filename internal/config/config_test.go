@@ -1465,6 +1465,7 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterprisePATBytes))
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
 	t.Setenv("SB_ENABLE_CLUSTER", "false")
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
 	if cfg, err := Load(); err != nil {
 		t.Fatalf("secure enterprise Load: %v", err)
 	} else if !cfg.EnterpriseMode {
@@ -1474,5 +1475,11 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", "weak-token")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
 		t.Fatalf("Load error = %v, want weak PAT rejection", err)
+	}
+
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterprisePATBytes))
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "false")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_EXTERNAL_WITNESS") {
+		t.Fatalf("Load error = %v, want external witness requirement", err)
 	}
 }

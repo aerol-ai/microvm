@@ -18,13 +18,19 @@ func TestNoopProviderRejectsTokens(t *testing.T) {
 	if err := p.Admitter.Admit(ctx, "x"); err != nil {
 		t.Errorf("noop Admit = %v, want nil (admit all)", err)
 	}
+	if _, err := p.Witness.WitnessHeads(ctx, nil); err != nil {
+		t.Errorf("noop Witness = %v, want nil", err)
+	}
+	if p.HasExternalWitness() {
+		t.Error("noop provider must not report an external witness")
+	}
 	// Must not panic or block.
 	p.EnforcementFor(stubController{}).Start(ctx)
 }
 
 func TestProviderWithDefaultsFillsNils(t *testing.T) {
 	p := Provider{}.WithDefaults()
-	if p.Validator == nil || p.Reporter == nil || p.Admitter == nil || p.EnforcementFor == nil {
+	if p.Validator == nil || p.Reporter == nil || p.Admitter == nil || p.Witness == nil || p.EnforcementFor == nil {
 		t.Fatalf("WithDefaults left a nil capability: %+v", p)
 	}
 	ctx := context.Background()

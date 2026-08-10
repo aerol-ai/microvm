@@ -105,10 +105,20 @@ func pushSecretBlobToPeersWithInternal(ctx context.Context, members []Member, pu
 	if err != nil {
 		return nil, fmt.Errorf("cluster: marshal secret blob: %w", err)
 	}
+	// Index members by ID so create-path fan-out is O(recipients), not a full
+	// membership scan per seal (critical at 2k-node / 100k-create bursts).
+	byID := make(map[string]Member, len(members))
+	for _, m := range members {
+		if m.NodeID == "" {
+			continue
+		}
+		byID[m.NodeID] = m
+	}
 	var acked []string
 	var firstErr error
-	for _, m := range members {
-		if _, ok := want[m.NodeID]; !ok || !m.Alive || (strings.TrimSpace(m.APIURL) == "" && strings.TrimSpace(m.InternalURL) == "") {
+	for id := range want {
+		m, ok := byID[id]
+		if !ok || !m.Alive || (strings.TrimSpace(m.APIURL) == "" && strings.TrimSpace(m.InternalURL) == "") {
 			continue
 		}
 		client, endpoint := secretPeerTransport(m, publicClient, internalClient, PublicInternalSecretPath)

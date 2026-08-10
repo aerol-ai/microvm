@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -148,8 +149,38 @@ func sandboxIDFromFingerprint(fingerprint string) string {
 	return "sb-" + hexPart[:16]
 }
 
+// listSandboxesClusterAware merges local rows with placement-owner peers.
+func (h *handlers) listSandboxesClusterAware(r *http.Request) ([]*models.Sandbox, error) {
+	if h.deps.Service == nil {
+		return nil, nil
+	}
+	local, err := h.deps.Service.ListSandboxes(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if r.Header.Get("X-Cluster-Forwarded") == "1" {
+		return local, nil
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		return local, nil
+	}
+	peers := clusterlist.SelectPeers(c, clusterlist.OwnerRefFromContext(r.Context()))
+	return clusterlist.Merge(r.Context(), peers, clusterlist.Options{
+		AuthHeader: r.Header.Get("Authorization"),
+		RawQuery:   r.URL.RawQuery,
+		Path:       "/v1/sandboxes",
+		Local:      local,
+		Warn: func(msg, peer string, peerErr error) {
+			if h.deps.Logger != nil {
+				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
+			}
+		},
+	}), nil
+}
+
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
+	sandboxes, err := h.listSandboxesClusterAware(r)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return

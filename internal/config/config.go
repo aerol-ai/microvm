@@ -1092,6 +1092,12 @@ type Config struct {
 	// evidence stream is not a safe production state. Tests and embedders with
 	// no DBPath remain unaffected. SB_SECRET_AUDIT_STRICT_BOOT.
 	SecretAuditStrictBoot bool
+	// SecretAuditExternalWitness requires a non-noop control-plane Witness so
+	// audit chain heads leave the node. Required when SB_ENTERPRISE_MODE=true
+	// — local JSONL alone must not claim tamper-evidence. Managed builds wire
+	// a real Witness; open-source enterprise boots fail closed without one.
+	// SB_SECRET_AUDIT_EXTERNAL_WITNESS (default false; forced true in enterprise).
+	SecretAuditExternalWitness bool
 	// SecretTombRetentionDays bounds deletion tombstone growth after all peer
 	// delete ACKs complete. Zero disables GC. Rows with a live sandbox, sealed
 	// secret, or pending outbox are never eligible. Default 30.
@@ -1616,6 +1622,7 @@ func Load() (Config, error) {
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
+		SecretAuditExternalWitness:    getEnvBool("SB_SECRET_AUDIT_EXTERNAL_WITNESS", false),
 		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
 		EgressAttributionEnabled:      getEnvBool("SB_EGRESS_ATTRIBUTION_ENABLED", true),
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
@@ -2180,6 +2187,9 @@ func Load() (Config, error) {
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
+		}
+		if !cfg.SecretAuditExternalWitness {
+			return Config{}, errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS must be true when SB_ENTERPRISE_MODE=true (tamper-evidence requires an off-node witness)")
 		}
 		if cfg.EnableCluster {
 			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {

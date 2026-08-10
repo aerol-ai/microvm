@@ -28,6 +28,9 @@ type Event struct {
 	Network       string    `json:"network,omitempty"`
 	BytesIn       int64     `json:"bytes_in,omitempty"`
 	BytesOut      int64     `json:"bytes_out,omitempty"`
+	// Dropped is set on gap markers to record how many events were coalesced
+	// into this single overflow marker (lossy buffer evidence).
+	Dropped int64 `json:"dropped,omitempty"`
 }
 
 var fallbackSequence atomic.Uint64

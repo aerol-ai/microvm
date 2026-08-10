@@ -79,7 +79,7 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 		t.Fatal("expected store.Delete failure")
 	}
 
-	// Unmount warn + attachment warn + cluster-secrets fail after delete.
+	// Unmount warn + cluster-secrets fail before irreversible row delete.
 	svc2, st2, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
 	if err := st2.Create(ctx, &models.Sandbox{
 		ID: "sb-post-del", Image: "a", Status: models.SandboxStatusStarted,
@@ -88,7 +88,7 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc2.testForceUnmountErr = errors.New("fuse busy")
-	svc2.testAfterStoreDeleteOnDestroy = func() { _ = st2.Close() }
+	svc2.testAfterRuntimeDestroy = func() { _ = st2.Close() }
 	if err := svc2.DestroySandbox(ctx, "sb-post-del"); err == nil {
 		t.Fatal("expected DeleteClusterSecrets failure after store close")
 	}

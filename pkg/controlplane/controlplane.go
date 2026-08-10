@@ -127,6 +127,28 @@ type Admitter interface {
 	Admit(ctx context.Context, ownerRef string) error
 }
 
+// AuditHead is a hash-chain head shipped to an off-node witness so retroactive
+// tampering of a node's local audit log is detectable. Hex digest only — never
+// plaintext audit payloads.
+type AuditHead struct {
+	NodeID   string
+	HeadHex  string
+	EventID  string
+	Observed time.Time
+}
+
+// WitnessReceipt is the witness's acknowledgment that a head was recorded.
+type WitnessReceipt struct {
+	RecordedAt time.Time
+	ReceiptID  string
+}
+
+// Witness records audit-chain heads off-node. No-op in the open-source build;
+// enterprise mode requires a real Witness (see SB_SECRET_AUDIT_EXTERNAL_WITNESS).
+type Witness interface {
+	WitnessHeads(ctx context.Context, heads []AuditHead) (WitnessReceipt, error)
+}
+
 // Provider bundles the capabilities a build supplies to the daemon. The
 // open-source build uses Noop(); a managed build constructs one backed by the
 // private client. Passed explicitly into the API server and background wiring —
@@ -141,6 +163,7 @@ type Provider struct {
 	Validator      Validator
 	Reporter       Reporter
 	Admitter       Admitter
+	Witness        Witness
 	EnforcementFor func(FleetController) Enforcement
 }
 
@@ -153,6 +176,7 @@ func Noop() Provider {
 		Validator:      noopValidator{},
 		Reporter:       noopReporter{},
 		Admitter:       noopAdmitter{},
+		Witness:        noopWitness{},
 		EnforcementFor: func(FleetController) Enforcement { return noopEnforcement{} },
 	}
 }
@@ -170,10 +194,22 @@ func (p Provider) WithDefaults() Provider {
 	if p.Admitter == nil {
 		p.Admitter = noopAdmitter{}
 	}
+	if p.Witness == nil {
+		p.Witness = noopWitness{}
+	}
 	if p.EnforcementFor == nil {
 		p.EnforcementFor = func(FleetController) Enforcement { return noopEnforcement{} }
 	}
 	return p
+}
+
+// HasExternalWitness reports whether p.Witness is a non-noop implementation.
+func (p Provider) HasExternalWitness() bool {
+	if p.Witness == nil {
+		return false
+	}
+	_, isNoop := p.Witness.(noopWitness)
+	return !isNoop
 }
 
 type noopValidator struct{}
@@ -189,6 +225,12 @@ func (noopReporter) Report(context.Context, []Sample) error { return nil }
 type noopAdmitter struct{}
 
 func (noopAdmitter) Admit(context.Context, string) error { return nil }
+
+type noopWitness struct{}
+
+func (noopWitness) WitnessHeads(context.Context, []AuditHead) (WitnessReceipt, error) {
+	return WitnessReceipt{}, nil
+}
 
 type noopEnforcement struct{}
 

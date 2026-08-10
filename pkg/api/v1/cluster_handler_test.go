@@ -574,9 +574,14 @@ func (c *membersStubCluster) Members() []cluster.Member {
 
 var _ cluster.Client = (*membersStubCluster)(nil)
 
-func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *testing.T) {
+func TestClusterListWrapUsesPlacementOwnersAtEnterpriseScale(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
 	members := []cluster.Member{
 		{NodeID: "node-a", APIURL: "http://node-a:21212", Alive: true, Role: config.NodeRoleMixed},
 	}
@@ -598,15 +603,13 @@ func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *te
 	rr := httptest.NewRecorder()
 	h.clusterListWrap(rr, req)
 
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	// No placement view ⇒ local-only merge (200), never hard 503 at enterprise
+	// peer counts. Operators use sandbox-index for paginated fleet scans.
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%q", rr.Code, http.StatusOK, rr.Body.String())
 	}
-	body := rr.Body.String()
-	if !strings.Contains(body, "/v1/cluster/sandbox-index") {
-		t.Fatalf("body = %q, want it to point callers at the paginated index", body)
-	}
-	if strings.Contains(body, `"placements"`) {
-		t.Fatalf("body = %q, must not return the sandbox-index response shape from /v1/sandboxes", body)
+	if strings.Contains(rr.Body.String(), "sandbox-index") {
+		t.Fatalf("body = %q, must not 503-redirect list callers at enterprise scale", rr.Body.String())
 	}
 }
 

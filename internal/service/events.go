@@ -271,6 +271,13 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 
+	// Secret tomb/outbox before store.Delete / placement delete so recipients
+	// can still be resolved from the sealed row or placement. Shared with
+	// DestroySandbox and reconcile-destroyed — cluster_secrets has no FK.
+	if err := s.DeleteClusterSecrets(ctx, sandbox.ID); err != nil {
+		return fmt.Errorf("delete cluster secrets: %w", err)
+	}
+
 	// store.Delete must happen BEFORE schedulePendingImageGC. The
 	// pending-image janitor uses HasActiveImageRef at sweep time; a stale
 	// non-destroyed row here would make every future sweep skip this

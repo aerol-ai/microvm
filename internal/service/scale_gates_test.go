@@ -101,6 +101,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 				{NodeID: "node-b", Alive: true},
 			},
 		},
+		testSecretPeerPusher: &fakePeerPusher{acked: []string{"node-b"}},
 	}
 
 	const (

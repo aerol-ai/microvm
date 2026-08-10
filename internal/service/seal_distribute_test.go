@@ -759,6 +759,7 @@ func TestComputeFailoverReadyExpiresStaleACKWithoutAliveFlap(t *testing.T) {
 	ctx := context.Background()
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
+	pusher := &fakePeerPusher{acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg:            config.Config{},
 		cipher:         cipher,
@@ -772,7 +773,7 @@ func TestComputeFailoverReadyExpiresStaleACKWithoutAliveFlap(t *testing.T) {
 				{NodeID: "node-b", Alive: true},
 			},
 		},
-		testSecretPeerPusher: &fakePeerPusher{acked: []string{"node-b"}},
+		testSecretPeerPusher: pusher,
 	}
 	sb := &models.Sandbox{ID: "sb-ttl", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
 	if _, err := svc.SealAndDistribute(ctx, "sb-ttl", models.CreateSandboxRequest{
@@ -781,6 +782,11 @@ func TestComputeFailoverReadyExpiresStaleACKWithoutAliveFlap(t *testing.T) {
 		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
 	}, []string{"node-a", "node-b"}, SealStrict); err != nil {
 		t.Fatalf("seal: %v", err)
+	}
+	select {
+	case <-pusher.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for async fan-out ACK")
 	}
 	gen := secretHolderGeneration("sb-ttl")
 	addSecretHolderNodes("sb-ttl", gen, "node-b")

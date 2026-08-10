@@ -42,8 +42,11 @@ const (
 	secretAuditKindGap        = "gap"
 
 	defaultSecretAuditBuffer = 1024
+	// enterpriseSecretAuditBuffer reduces drop likelihood under burst open
+	// rates; drops are still counted and gap-marked when the buffer fills.
+	enterpriseSecretAuditBuffer = 8192
 	// Bound the power-loss window for the local audit fallback. Enterprise
-	// deployments should still ship the stream to an external durable/WORM sink.
+	// deployments must also configure an external durable/WORM witness.
 	secretAuditSyncInterval = time.Second
 	secretAuditFileName     = "secrets.jsonl"
 	// secretAuditLockName is a stable sidecar flock target. Retention and
@@ -96,7 +99,7 @@ type auditWriteReq struct {
 // closed channel (check-then-send race under -race / daemon shutdown).
 type fileAuditSink struct {
 	ch         chan auditWriteReq
-	pendingGap atomic.Bool
+	pendingGap atomic.Int64 // coalesced drop count awaiting a gap marker write
 	closed     atomic.Bool
 	sendMu     sync.Mutex
 	done       chan struct{}
@@ -156,7 +159,7 @@ func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
 	case s.ch <- auditWriteReq{ev: ev}:
 	default:
 		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Store(true)
+		s.pendingGap.Add(1)
 	}
 }
 
@@ -201,12 +204,13 @@ func (s *fileAuditSink) loop() {
 		select {
 		case next, ok := <-s.ch:
 			if !ok {
-				if s.pendingGap.Swap(false) {
+				if n := s.pendingGap.Swap(0); n > 0 {
 					s.writeEvent(SecretAuditEvent{
-						Time:   time.Now().UTC(),
-						Result: secretAuditResultGap,
-						Reason: secretAuditReasonOverflow,
-						Kind:   secretAuditKindGap,
+						Time:    time.Now().UTC(),
+						Result:  secretAuditResultGap,
+						Reason:  secretAuditReasonOverflow,
+						Kind:    secretAuditKindGap,
+						Dropped: n,
 					})
 				}
 				_ = s.syncFile()
@@ -217,12 +221,13 @@ func (s *fileAuditSink) loop() {
 			_ = s.syncFile()
 			continue
 		}
-		if s.pendingGap.Swap(false) {
+		if n := s.pendingGap.Swap(0); n > 0 {
 			s.writeEvent(SecretAuditEvent{
-				Time:   time.Now().UTC(),
-				Result: secretAuditResultGap,
-				Reason: secretAuditReasonOverflow,
-				Kind:   secretAuditKindGap,
+				Time:    time.Now().UTC(),
+				Result:  secretAuditResultGap,
+				Reason:  secretAuditReasonOverflow,
+				Kind:    secretAuditKindGap,
+				Dropped: n,
 			})
 		}
 		if req.pruneDone != nil {
@@ -242,7 +247,7 @@ func (s *fileAuditSink) syncFile() error {
 	if err != nil {
 		secretAuditSinkHealthy.Set(0)
 		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Store(true)
+		s.pendingGap.Add(1)
 	}
 	return err
 }
@@ -378,7 +383,7 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 	if err != nil {
 		secretAuditSinkHealthy.Set(0)
 		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Store(true)
+		s.pendingGap.Add(1)
 		return
 	}
 	line = append(line, '\n')
@@ -388,7 +393,7 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 	}); err != nil {
 		secretAuditSinkHealthy.Set(0)
 		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Store(true)
+		s.pendingGap.Add(1)
 		return
 	}
 	secretAuditSinkHealthy.Set(1)
@@ -409,7 +414,11 @@ func (s *Service) ensureSecretAuditSink() {
 			s.secretAudit = unavailableSecretAuditSink{}
 			return
 		}
-		sink, err := newFileAuditSink(filepath.Join(dataDir, "audit"), defaultSecretAuditBuffer)
+		buf := defaultSecretAuditBuffer
+		if s.cfg.EnterpriseMode {
+			buf = enterpriseSecretAuditBuffer
+		}
+		sink, err := newFileAuditSink(filepath.Join(dataDir, "audit"), buf)
 		if err != nil {
 			s.secretAuditInitErr = err
 			secretAuditSinkHealthy.Set(0)

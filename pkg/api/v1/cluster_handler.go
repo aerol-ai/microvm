@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -471,6 +472,12 @@ func (h *handlers) writeOverlapCreateError(w http.ResponseWriter, err error) {
 // degradation is the per-peer 5s timeout: a slow peer can't stall the
 // response past that.
 //
+// At enterprise topology (thousands of workers) peers are selected from
+// placement owners (scoped by tenant OwnerRef when present) rather than every
+// alive owner role — unbounded all-peer fan-out previously returned 503 above
+// 256 peers. Operators still use /v1/cluster/sandbox-index for paginated
+// global enumeration.
+//
 // Single-node mode (Cluster() == nil) and forwarded requests fall through to
 // the local handler unchanged so callers and tests see identical behavior to
 // the pre-cluster wire format.
@@ -489,22 +496,6 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	selfID := c.SelfNodeID()
-	peers := make([]cluster.Member, 0)
-	for _, m := range c.Members() {
-		if !m.Alive || m.NodeID == "" || m.NodeID == selfID || m.APIURL == "" {
-			continue
-		}
-		if !clusterMemberCanOwnSandbox(m.Role) {
-			continue
-		}
-		peers = append(peers, m)
-	}
-	if len(peers) > clusterListMaxFanoutPeers {
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster list fanout exceeds safe peer cap; use /v1/cluster/sandbox-index for paginated global enumeration")
-		return
-	}
-
 	tagFilter := parseTagFilter(r)
 	local, err := h.deps.Service.ListSandboxes(r.Context(), tagFilter)
 	if err != nil {
@@ -512,88 +503,16 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		local = nil
 	}
 
-	type peerResult struct {
-		nodeID    string
-		sandboxes []*models.Sandbox
-		err       error
-	}
-	results := make(chan peerResult, len(peers))
-	auth := r.Header.Get("Authorization")
-	// Forward the original query string to each peer so they apply the same
-	// tag filter locally — only matching rows traverse the network. Empty
-	// when the caller didn't pass any tag.* params.
-	peerQuery := r.URL.RawQuery
-	httpClient := &http.Client{Timeout: 5 * time.Second}
-	sem := make(chan struct{}, clusterListMaxConcurrentPeerReads)
-	for _, peer := range peers {
-		peer := peer
-		go func() {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			endpoint := strings.TrimRight(peer.APIURL, "/") + "/v1/sandboxes"
-			if peerQuery != "" {
-				endpoint += "?" + peerQuery
-			}
-			req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
-			if err != nil {
-				results <- peerResult{nodeID: peer.NodeID, err: err}
-				return
-			}
-			req.Header.Set("X-Cluster-Forwarded", "1")
-			if auth != "" {
-				req.Header.Set("Authorization", auth)
-			}
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				results <- peerResult{nodeID: peer.NodeID, err: err}
-				return
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-				results <- peerResult{nodeID: peer.NodeID, err: errors.New(strings.TrimSpace(string(body)))}
-				return
-			}
-			var sbs []*models.Sandbox
-			if err := json.NewDecoder(resp.Body).Decode(&sbs); err != nil {
-				results <- peerResult{nodeID: peer.NodeID, err: err}
-				return
-			}
-			results <- peerResult{nodeID: peer.NodeID, sandboxes: sbs}
-		}()
-	}
-
-	merged := make([]*models.Sandbox, 0, len(local))
-	seen := make(map[string]struct{}, len(local))
-	for _, sb := range local {
-		if sb == nil {
-			continue
-		}
-		seen[sb.ID] = struct{}{}
-		merged = append(merged, sb)
-	}
-	for i := 0; i < len(peers); i++ {
-		res := <-results
-		if res.err != nil {
-			h.deps.Logger.Warn("cluster list: peer query failed", "peer", res.nodeID, "error", res.err)
-			continue
-		}
-		for _, sb := range res.sandboxes {
-			if sb == nil {
-				continue
-			}
-			// Dedupe: a stopped sandbox may still appear in its previous
-			// owner's local store briefly after a failover, while the new
-			// owner already lists the recreated one under the same ID. Local
-			// wins because it's the freshest read for this node.
-			if _, dup := seen[sb.ID]; dup {
-				continue
-			}
-			seen[sb.ID] = struct{}{}
-			merged = append(merged, sb)
-		}
-	}
-
+	peers := clusterlist.SelectPeers(c, clusterlist.OwnerRefFromContext(r.Context()))
+	merged := clusterlist.Merge(r.Context(), peers, clusterlist.Options{
+		AuthHeader: r.Header.Get("Authorization"),
+		RawQuery:   r.URL.RawQuery,
+		Path:       PathPrefix + "/sandboxes",
+		Local:      local,
+		Warn: func(msg, peer string, peerErr error) {
+			h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
+		},
+	})
 	apihttp.WriteJSON(w, http.StatusOK, merged)
 }
 

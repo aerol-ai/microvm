@@ -279,6 +279,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := svc.ValidateSecretAuditSink(); err != nil {
 		return err
 	}
+	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
+		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
+	}
 	if err := svc.ConfigureSecretProvider(ctx); err != nil {
 		return fmt.Errorf("configure secret provider: %w", err)
 	}

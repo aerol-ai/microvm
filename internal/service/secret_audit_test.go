@@ -277,6 +277,9 @@ func TestFileAuditSinkOverflowDropsWithGapMarker(t *testing.T) {
 		}
 		if ev.Result == secretAuditResultGap && ev.Reason == secretAuditReasonOverflow {
 			sawGap = true
+			if ev.Dropped < 1 {
+				t.Fatalf("gap marker Dropped = %d, want >= 1", ev.Dropped)
+			}
 		}
 	}
 	if !sawGap {

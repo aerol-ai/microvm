@@ -2460,6 +2460,13 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 			}
 		}
 	}
+	// Tomb/outbox secret cleanup must succeed before the irreversible sandbox
+	// delete. cluster_secrets has no FK, so a post-delete failure leaves
+	// retries with ErrNotFound while ciphertext and peer copies remain.
+	// Shared with docker-destroy and reconcile-destroyed paths.
+	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
+		return err
+	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
@@ -2477,9 +2484,6 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
 	s.forgetNetstatsActivity(id)
-	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
-		return err
-	}
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
@@ -4293,6 +4297,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				}
 			} else if s.testForceUnmountErr != nil {
 				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", s.testForceUnmountErr)
+			}
+			// Secret tomb/outbox before store/placement delete (no FK on
+			// cluster_secrets). Same finalizer as DestroySandbox / docker events.
+			if err := s.DeleteClusterSecrets(ctx, sandbox.ID); err != nil {
+				return err
 			}
 			// store.Delete must happen BEFORE schedulePendingImageGC. The
 			// pending-image janitor uses HasActiveImageRef to decide whether
