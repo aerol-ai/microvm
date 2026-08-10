@@ -114,13 +114,7 @@ func TestGetListAttachQueryAndScanErrors(t *testing.T) {
 		if err := st.Create(ctx, sb); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.db.ExecContext(ctx, `UPDATE sandboxes SET env_json = ? WHERE id = ?`, "{not-json", sb.ID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := st.Get(ctx, sb.ID); err == nil {
-			t.Fatal("Get should fail on corrupt env_json")
-		}
-		if _, err := st.db.ExecContext(ctx, `UPDATE sandboxes SET env_json = '{}', tags_json = ? WHERE id = ?`, "{bad", sb.ID); err != nil {
+		if _, err := st.db.ExecContext(ctx, `UPDATE sandboxes SET tags_json = ? WHERE id = ?`, "{bad", sb.ID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.Get(ctx, sb.ID); err == nil {

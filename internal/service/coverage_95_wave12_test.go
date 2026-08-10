@@ -84,21 +84,6 @@ func TestEnsureSandboxAwakeSemAndStoreWave12(t *testing.T) {
 	_, _ = svc2.EnsureSandboxAwakeForHTTP(ctx, "sb-awake-close")
 }
 
-func TestClusterSecretsUnsealBranchesWave12(t *testing.T) {
-	s := &Service{cipher: newTestCipher(t)}
-	req := models.CreateSandboxRequest{Image: "x"}
-	if _, err := s.UnsealClusterSecrets(req, nil); err != nil {
-		t.Fatalf("nil sealed: %v", err)
-	}
-	if _, err := s.UnsealClusterSecrets(req, []byte("not-json")); err == nil {
-		t.Fatal("expected bad json")
-	}
-	out, err := s.SealClusterSecretsForRecipient(models.CreateSandboxRequest{Image: "x"}, "*")
-	if err != nil || out != nil {
-		t.Fatalf("empty seal = %v %v", out, err)
-	}
-}
-
 func TestCustomDomainHelpersWave12(t *testing.T) {
 	ctx := context.Background()
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})

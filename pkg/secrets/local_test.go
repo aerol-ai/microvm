@@ -179,16 +179,16 @@ func TestLocalProviderDeleteAndErrorArms(t *testing.T) {
 		t.Fatal("empty sandbox id")
 	}
 
-	h2, err := NewLocalProvider(c, store).Put(ctx, "sb-v2", Secrets{Registry: &models.RegistryAuth{Password: "q"}}, []string{"*"})
+	h2, err := NewLocalProvider(c, store).Put(ctx, "sb-version", Secrets{Registry: &models.RegistryAuth{Password: "q"}}, []string{"node-a"})
 	if err != nil {
-		t.Fatalf("Put v2: %v", err)
+		t.Fatalf("Put versioned secret: %v", err)
 	}
 	bad := h2
 	bad.Version = h2.Version + 1
-	if _, err := NewLocalProvider(c, store).Open(ctx, "sb-v2", bad, ""); !errors.Is(err, ErrVersionMismatch) {
+	if _, err := NewLocalProvider(c, store).Open(ctx, "sb-version", bad, "node-a"); !errors.Is(err, ErrVersionMismatch) {
 		t.Fatalf("version mismatch = %v", err)
 	}
-	if _, err := NewLocalProvider(nil, store).Open(ctx, "sb-v2", h2, ""); err == nil {
+	if _, err := NewLocalProvider(nil, store).Open(ctx, "sb-version", h2, "node-a"); err == nil {
 		t.Fatal("nil cipher after successful Get should fail")
 	}
 	if _, err := NewLocalProvider(c, nil).Open(ctx, "sb", Handle{Ref: "x"}, ""); err == nil {

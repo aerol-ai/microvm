@@ -339,10 +339,6 @@ type Member struct {
 	PublicHost string            `json:"public_host,omitempty"`
 	Alive      bool              `json:"alive"`
 	Capacity   capacity.Snapshot `json:"capacity"`
-	// MaxSecretRefVersion is the highest secrets.RefVersion this node can open
-	// (gossiped). Zero means a pre-capability peer — treat as RefVersion only
-	// for the env-seal writer gate (§5c).
-	MaxSecretRefVersion int `json:"max_secret_ref_version,omitempty"`
 	// CapacityUpdatedUnix is when this node's last capacity heartbeat was
 	// observed by the scheduler. CapacityStale means the last heartbeat is
 	// missing or too old for placement admission.
@@ -360,7 +356,7 @@ type Member struct {
 // Spec MUST be redacted (no plaintext registry password / mount credentials)
 // before being handed to AssertOwnership; Secrets carries the provider ref
 // that the new owner re-merges on recreate. cmd/sandboxd takes care of this
-// via service.PutClusterSecretsForRecipient + RedactClusterSecrets so the
+// via service.SealAndDistribute + RedactClusterSecrets so the
 // cluster layer never sees plaintext. Secrets may be empty when the sandbox
 // has no secrets to ship.
 type LocalSandboxState struct {

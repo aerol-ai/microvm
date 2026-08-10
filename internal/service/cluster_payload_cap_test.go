@@ -11,12 +11,11 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// oversizedClusterSpec builds a request whose redacted recovery record
-// encodes well past the raft inline cap (the Env alone exceeds 4KiB).
+// oversizedClusterSpec builds a request whose non-secret recovery record
+// encodes well past the raft inline cap.
 func oversizedClusterSpec() models.CreateSandboxRequest {
 	return models.CreateSandboxRequest{
-		Image: "alpine:3.20",
-		Env:   map[string]string{"BLOB": strings.Repeat("x", 5000)},
+		Image: "registry.example/" + strings.Repeat("x", 5000),
 	}
 }
 

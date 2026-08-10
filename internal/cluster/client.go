@@ -382,7 +382,7 @@ func (c *Cluster) AttachInternalHandler(h http.Handler) {
 // fsm.go opPlace handling.
 //
 // spec MUST be redacted before being passed in; secrets is the provider
-// handle the caller produces via service.PutClusterSecretsForRecipient.
+// handle the caller produces via service.SealAndDistribute.
 // Passing an empty handle preserves a previously-recorded handle.
 func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{

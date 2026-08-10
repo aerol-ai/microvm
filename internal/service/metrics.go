@@ -47,9 +47,9 @@ var (
 	clusterSecretLastOpenNanos   = expvar.NewInt("aerolvm_secret_decrypt_last_nanos")
 	clusterSecretOpenLatency     = scaleobs.NewDurationBuckets("aerolvm_secret_decrypt_latency_seconds_bucket")
 	clusterSecretRecipientDenies = expvar.NewInt("aerolvm_secret_recipient_denied_total")
-	// Peer fan-out failures (push or delete). Enterprise HA create fails when
-	// its bounded first-ACK window gets no backup; non-enterprise create keeps
-	// failover_ready false until holders catch up.
+	// Peer fan-out failures (push or delete). HA create fails when its bounded
+	// first-ACK window gets no backup; remaining replicas may still be converging
+	// while failover_ready is false.
 	secretFanoutFailuresTotal = expvar.NewInt("aerolvm_secret_fanout_failures_total")
 	// Durable cleanup health. Gauges are refreshed by the boot/periodic
 	// reconciler and remain cardinality-free at 100k+ concurrent sandboxes.
@@ -60,9 +60,6 @@ var (
 	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
 	// Best-effort local seal failures (ownership replay backfill).
 	clusterSecretSealBestEffortFailures = expvar.NewInt("aerolvm_secret_seal_best_effort_failures_total")
-	// Lazy migration: sealed sandbox_env missing, plaintext env_json used.
-	envPlaintextFallbackTotal = expvar.NewInt("aerolvm_env_plaintext_fallback_total")
-
 	// Promote-retract counter for overlapped reserved-path create
 	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
 	// result so a DeletePlacement failure is visible without relying on logs.
@@ -202,10 +199,6 @@ func recordSecretProviderCanary(ok bool) {
 
 func recordClusterSecretSealBestEffortFailure() {
 	clusterSecretSealBestEffortFailures.Add(1)
-}
-
-func recordEnvPlaintextFallback() {
-	envPlaintextFallbackTotal.Add(1)
 }
 
 // reapplyNetworkBlockAll heals the per-IP isolation rule and reports whether

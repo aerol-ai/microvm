@@ -120,8 +120,7 @@ func canonicalNodeRole(roles []string) string {
 }
 
 type Config struct {
-	// EnterpriseMode enables a fail-fast production profile while leaving
-	// single-node development defaults backward compatible. It validates that
+	// EnterpriseMode enables a fail-fast production profile. It validates that
 	// secret sealing, audit durability, resource isolation, and cluster mTLS
 	// cannot be accidentally disabled. SB_ENTERPRISE_MODE.
 	EnterpriseMode              bool
@@ -1062,17 +1061,10 @@ type Config struct {
 	// SB_CLUSTER_INSECURE_CREDENTIALS.
 	ClusterInsecureCredentials bool
 
-	// SecretRecipientFanoutEnabled gates recipient-set sealing + async peer
-	// fan-out for failover.policy=recreate sandboxes (plans/secrets-hardening
-	// Slice 1). DEFAULT ON — these are defect fixes for the confirmed
-	// cross-node open walls (sealed row never left the owner; envelope was
-	// recipient-bound to self only). Set SB_SECRET_RECIPIENT_FANOUT_ENABLED=false
-	// to force seal-to-self / no fan-out while diagnosing.
-	SecretRecipientFanoutEnabled bool
 	// SecretFanoutMinACKWait is how long SealAndDistribute waits synchronously
 	// for at least one peer ACK before returning (rest of fan-out stays async).
-	// Shrinks GAP-1 (owner death before any backup holds the blob). Default 2s.
-	// Zero disables the sync wait (fully async, pre-GAP-1-mitigation behavior).
+	// Shrinks GAP-1 (owner death before any backup holds the blob). Default 2s
+	// and must be positive in cluster mode.
 	// SB_SECRET_FANOUT_MIN_ACK_WAIT.
 	SecretFanoutMinACKWait time.Duration
 	// SecretRecipientBackupCount is how many non-owner candidates join the
@@ -1092,15 +1084,6 @@ type Config struct {
 	// (wrap/unwrap) fails. Default false = fail-open with a warning (E4 lite).
 	// SB_SECRET_PROVIDER_STRICT_BOOT.
 	SecretProviderStrictBoot bool
-	// SecretEnvSealEnabled gates sealed sandbox_env rows + Raft Env redaction
-	// (plans/secrets-hardening T7/T9). DEFAULT OFF — env storage is a format
-	// change; enable only after every cluster node is on a binary that merges
-	// env from the provider bag (RefVersionEnv=2). SB_SECRET_ENV_SEAL_ENABLED.
-	SecretEnvSealEnabled bool
-	// SecretToolboxSealEnabled encrypts per-sandbox toolbox bearer tokens in
-	// SQLite. Default off preserves rolling downgrade compatibility; enterprise
-	// mode requires it. SB_SECRET_TOOLBOX_SEAL_ENABLED.
-	SecretToolboxSealEnabled bool
 	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
 	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
 	SecretAuditRetentionDays int
@@ -1626,16 +1609,11 @@ func Load() (Config, error) {
 		ClusterInsecureCredentials:       getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
 		// Defect-fix flag: default ON (house pattern matches
 		// SB_WASM_RESIDENT_HOST_ENABLED). See plans/secrets-hardening §3e / re-review.
-		SecretRecipientFanoutEnabled: getEnvBool("SB_SECRET_RECIPIENT_FANOUT_ENABLED", true),
-		SecretFanoutMinACKWait:       getEnvDuration("SB_SECRET_FANOUT_MIN_ACK_WAIT", 2*time.Second),
-		SecretRecipientBackupCount:   getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
-		SecretProvider:               strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
-		SecretAWSkmsKeyID:            strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
-		SecretProviderStrictBoot:     getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
-		// Format-change flag: default OFF until the fleet is rolled
-		// (house pattern matches SB_PLATFORM_VOLUMES_ENABLED).
-		SecretEnvSealEnabled:          getEnvBool("SB_SECRET_ENV_SEAL_ENABLED", false),
-		SecretToolboxSealEnabled:      getEnvBool("SB_SECRET_TOOLBOX_SEAL_ENABLED", false),
+		SecretFanoutMinACKWait:        getEnvDuration("SB_SECRET_FANOUT_MIN_ACK_WAIT", 2*time.Second),
+		SecretRecipientBackupCount:    getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
+		SecretProvider:                strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
+		SecretAWSkmsKeyID:             strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
+		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
 		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
@@ -2132,8 +2110,8 @@ func Load() (Config, error) {
 		}
 		// Sealed registry/mount credentials use this node-local AES key. A
 		// shared key is necessary but not sufficient for HA failover: the
-		// sealed row must also be fanout to recipient peers (or a KMS
-		// provider used) — see SB_SECRET_RECIPIENT_FANOUT_ENABLED. Accept
+		// sealed row must also be fanned out to recipient peers (or a KMS
+		// provider used). Accept
 		// either an explicit env var or an already-distributed key file;
 		// refuse boot otherwise unless the operator opts out.
 		if cfg.CredentialEncryptionKey == "" && !cfg.ClusterInsecureCredentials {
@@ -2144,8 +2122,14 @@ func Load() (Config, error) {
 				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
 			}
 		}
-		if cfg.SecretRecipientBackupCount < 0 {
-			return Config{}, errors.New("SB_SECRET_RECIPIENT_BACKUP_COUNT must be >= 0")
+		if cfg.ClusterTLSDir == "" {
+			return Config{}, errors.New("SB_CLUSTER_TLS_DIR is required when SB_ENABLE_CLUSTER=true")
+		}
+		if cfg.SecretRecipientBackupCount < 1 {
+			return Config{}, errors.New("SB_SECRET_RECIPIENT_BACKUP_COUNT must be >= 1 when SB_ENABLE_CLUSTER=true")
+		}
+		if cfg.SecretFanoutMinACKWait <= 0 {
+			return Config{}, errors.New("SB_SECRET_FANOUT_MIN_ACK_WAIT must be > 0 when SB_ENABLE_CLUSTER=true")
 		}
 	}
 
@@ -2188,12 +2172,6 @@ func Load() (Config, error) {
 		if cfg.ResourceLimitsOff {
 			return Config{}, errors.New("SB_RESOURCE_LIMITS_DISABLED must be false when SB_ENTERPRISE_MODE=true")
 		}
-		if !cfg.SecretEnvSealEnabled {
-			return Config{}, errors.New("SB_SECRET_ENV_SEAL_ENABLED must be true when SB_ENTERPRISE_MODE=true")
-		}
-		if !cfg.SecretToolboxSealEnabled {
-			return Config{}, errors.New("SB_SECRET_TOOLBOX_SEAL_ENABLED must be true when SB_ENTERPRISE_MODE=true")
-		}
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")
 		}
@@ -2204,17 +2182,11 @@ func Load() (Config, error) {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
 		}
 		if cfg.EnableCluster {
-			if cfg.ClusterTLSDir == "" {
-				return Config{}, errors.New("SB_CLUSTER_TLS_DIR is required for cluster mTLS when SB_ENTERPRISE_MODE=true")
-			}
 			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {
 				return Config{}, errors.New("cluster insecure escape hatches are forbidden when SB_ENTERPRISE_MODE=true")
 			}
-			if !cfg.SecretRecipientFanoutEnabled || cfg.SecretRecipientBackupCount < 2 {
+			if cfg.SecretRecipientBackupCount < 2 {
 				return Config{}, errors.New("secret recipient fan-out with at least two backups is required when SB_ENTERPRISE_MODE=true")
-			}
-			if cfg.SecretFanoutMinACKWait <= 0 {
-				return Config{}, errors.New("SB_SECRET_FANOUT_MIN_ACK_WAIT must be > 0 when SB_ENTERPRISE_MODE=true")
 			}
 		}
 	}

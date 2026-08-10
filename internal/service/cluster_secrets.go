@@ -45,44 +45,17 @@ func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(
 	}
 }
 
-// Aliases kept so existing tests and call sites that reference the old
-// package-local constants keep compiling after the move into pkg/secrets.
-const (
-	clusterSecretVersion         = secrets.RefVersion
-	clusterSecretEnvelopeVersion = secrets.EnvelopeVersion
-)
-
-// provider returns the configured secrets.Provider, lazily building a
-// LocalProvider from store (+ cipher when present) when tests construct
-// &Service{...} without going through New. Store alone is enough to surface
-// ErrNotFound on Open; Put still requires cipher. Non-local backends must be
-// installed via ConfigureSecretProvider / secretProvider assignment.
+// provider returns the provider installed by New or ConfigureSecretProvider.
 func (s *Service) provider() secrets.Provider {
 	if s == nil {
 		return nil
 	}
-	if s.secretProvider != nil {
-		return s.secretProvider
-	}
-	if s.store == nil {
-		return nil
-	}
-	if secrets.NormalizeProviderName(s.cfg.SecretProvider) != secrets.ProviderLocal {
-		return nil
-	}
-	s.secretProvider = secrets.NewLocalProvider(s.cipher, newSecretBlobStore(s.store))
 	return s.secretProvider
 }
 
 // secretsFromRequest extracts the credential-bearing portions of req into the
-// Provider Secrets bag. MountCreds is keyed by MountSpec.Target. Env is only
-// included when includeEnv is true (SB_SECRET_ENV_SEAL_ENABLED) so default
-// creates do not suddenly get a secret ref (outside-voice #2).
+// Provider Secrets bag. MountCreds is keyed by MountSpec.Target.
 func secretsFromRequest(req models.CreateSandboxRequest) secrets.Secrets {
-	return secretsFromRequestOpts(req, false)
-}
-
-func secretsFromRequestOpts(req models.CreateSandboxRequest, includeEnv bool) secrets.Secrets {
 	var bag secrets.Secrets
 	if req.Registry != nil && req.Registry.Password != "" {
 		regCopy := *req.Registry
@@ -101,7 +74,7 @@ func secretsFromRequestOpts(req models.CreateSandboxRequest, includeEnv bool) se
 		}
 		bag.MountCreds[m.Target] = cp
 	}
-	if includeEnv && len(req.Env) > 0 {
+	if len(req.Env) > 0 {
 		env := make(map[string]string, len(req.Env))
 		for k, v := range req.Env {
 			env[k] = v
@@ -112,31 +85,7 @@ func secretsFromRequestOpts(req models.CreateSandboxRequest, includeEnv bool) se
 }
 
 func (s *Service) secretsFromRequest(req models.CreateSandboxRequest) secrets.Secrets {
-	includeEnv := s != nil && s.cfg.SecretEnvSealEnabled
-	return secretsFromRequestOpts(req, includeEnv)
-}
-
-// SealClusterSecretsForRecipient extracts secret-bearing portions of req and
-// seals them to a single recipient. Used by tests and any in-memory seal path
-// that does not persist a provider row. Prefer PutClusterSecretsForRecipient
-// for cluster placement.
-func (s *Service) SealClusterSecretsForRecipient(req models.CreateSandboxRequest, recipient string) ([]byte, error) {
-	bag := s.secretsFromRequest(req)
-	if s == nil || s.cipher == nil {
-		if bag.IsEmpty() {
-			return nil, nil
-		}
-		return nil, errors.New("cluster secrets cipher is not configured")
-	}
-	return secrets.SealEnvelope(s.cipher, bag, []string{recipient})
-}
-
-// PutClusterSecretsForRecipient stores the credential-bearing parts of req
-// behind a provider ref for a single recipient. Prefer SealAndDistribute at
-// create sites so HA sandboxes get recipient-set sealing, a bounded first ACK,
-// and async fan-out of the remaining replicas.
-func (s *Service) PutClusterSecretsForRecipient(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipient string) (cluster.PlacementSecrets, error) {
-	return s.SealAndDistribute(ctx, sandboxID, req, []string{recipient}, SealStrict)
+	return secretsFromRequest(req)
 }
 
 // OpenClusterSecretsForNode resolves a replicated secret handle and merges the
@@ -177,10 +126,6 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID strin
 	return mergeClusterSecrets(redacted, bag), nil
 }
 
-func (s *Service) OpenClusterSecrets(ctx context.Context, redacted models.CreateSandboxRequest, placement cluster.PlacementSecrets) (models.CreateSandboxRequest, error) {
-	return s.OpenClusterSecretsForNode(ctx, "", redacted, placement, "")
-}
-
 func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) error {
 	if s == nil {
 		return nil
@@ -189,14 +134,9 @@ func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) er
 	defer unlock()
 	// Capture recipients before local delete so durable outbox / fan-out knows
 	// which peers may hold a copy.
-	var recipients []string
-	if s.cfg.SecretRecipientFanoutEnabled {
-		recipients = s.secretRecipientsForSandbox(ctx, sandboxID)
-	}
+	recipients := s.secretRecipientsForSandbox(ctx, sandboxID)
 	err := s.deleteClusterSecretsOriginator(ctx, sandboxID, recipients)
-	if s.cfg.SecretRecipientFanoutEnabled {
-		s.maybeAsyncDeleteFanout(sandboxID, recipients)
-	}
+	s.maybeAsyncDeleteFanout(sandboxID, recipients)
 	return err
 }
 
@@ -215,7 +155,7 @@ func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID 
 		// stubs may panic on identity lookup during seal-failure retract.
 		peers = nonSelfRecipients(recipients, s.selfNodeID())
 	}
-	if s.store != nil && s.cfg.SecretRecipientFanoutEnabled && len(peers) > 0 {
+	if s.store != nil && len(peers) > 0 {
 		_, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, sandboxID, peers)
 		return err
 	}
@@ -257,7 +197,7 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	defer s.refreshSecretLifecycleMetrics(ctx)
-	if !s.cfg.SecretRecipientFanoutEnabled || s.secretPeerPusher() == nil {
+	if s.secretPeerPusher() == nil {
 		return nil
 	}
 	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
@@ -736,22 +676,14 @@ func (s *Service) maybeAsyncDeleteFanout(sandboxID string, recipients []string) 
 // per-entry. Maps and slices that the caller might mutate are deep-copied so
 // the original req is left untouched.
 //
-// Env is deep-copied by default (pre-env-seal). Prefer
-// RedactClusterSecretsOpts / Service.redactClusterSecrets when
-// SB_SECRET_ENV_SEAL_ENABLED so Env is cleared from the raft spec and rides
-// in the provider bag instead (§5c / T9).
+// Env is always cleared from the Raft spec and rides in the provider bag
+// instead (§5c / T9).
 //
 // Lives next to Put/Open because the two are always called as a pair: put
 // returns the provider handle, redact returns the safe-to-replicate spec, and
 // writing one without the other would either leak secrets (no redact) or lose
 // them on failover (no put).
 func RedactClusterSecrets(req models.CreateSandboxRequest) models.CreateSandboxRequest {
-	return RedactClusterSecretsOpts(req, false)
-}
-
-// RedactClusterSecretsOpts is RedactClusterSecrets with an explicit env-seal
-// switch. When sealEnv is true, out.Env is nil (plaintext must not enter Raft).
-func RedactClusterSecretsOpts(req models.CreateSandboxRequest, sealEnv bool) models.CreateSandboxRequest {
 	out := req
 	if out.Registry != nil {
 		regCopy := *out.Registry
@@ -777,15 +709,7 @@ func RedactClusterSecretsOpts(req models.CreateSandboxRequest, sealEnv bool) mod
 	if len(out.PlatformVolumes) > 0 {
 		out.PlatformVolumes = append([]models.PlatformVolumeMount(nil), out.PlatformVolumes...)
 	}
-	if sealEnv {
-		out.Env = nil
-	} else if len(out.Env) > 0 {
-		env := make(map[string]string, len(out.Env))
-		for k, v := range out.Env {
-			env[k] = v
-		}
-		out.Env = env
-	}
+	out.Env = nil
 	if out.Failover != nil {
 		failover := *out.Failover
 		out.Failover = &failover
@@ -793,53 +717,13 @@ func RedactClusterSecretsOpts(req models.CreateSandboxRequest, sealEnv bool) mod
 	return out
 }
 
-func (s *Service) redactClusterSecrets(req models.CreateSandboxRequest) models.CreateSandboxRequest {
-	sealEnv := s != nil && s.cfg.SecretEnvSealEnabled
-	return RedactClusterSecretsOpts(req, sealEnv)
-}
-
-// UnsealClusterSecrets opens a sealed bag and merges the credentials back
-// into the previously-redacted spec. Returns the merged spec; the input
-// is not mutated. An empty sealed payload returns redacted unchanged so
-// callers don't have to short-circuit themselves.
-func (s *Service) UnsealClusterSecrets(redacted models.CreateSandboxRequest, sealed []byte) (models.CreateSandboxRequest, error) {
-	return s.UnsealClusterSecretsForNode(redacted, sealed, "")
-}
-
-func (s *Service) UnsealClusterSecretsForNode(redacted models.CreateSandboxRequest, sealed []byte, nodeID string) (models.CreateSandboxRequest, error) {
-	if len(sealed) == 0 {
-		return redacted, nil
-	}
-	if s == nil || s.cipher == nil {
-		return redacted, errors.New("cluster secrets cipher is not configured")
-	}
-	bag, err := secrets.OpenEnvelope(s.cipher, sealed, nodeID)
-	if err != nil {
-		return redacted, fmt.Errorf("decrypt cluster secrets: %w", err)
-	}
-	return mergeClusterSecrets(redacted, bag), nil
-}
-
 func mergeClusterSecrets(redacted models.CreateSandboxRequest, bag secrets.Secrets) models.CreateSandboxRequest {
 	out := redacted
 	if bag.Registry != nil {
-		if out.Registry != nil {
-			ra := *out.Registry
-			if bag.Registry.Password != "" {
-				ra.Password = bag.Registry.Password
-			}
-			// Sealed payload usually mirrors Server/Username for completeness;
-			// fall back to it if redacted dropped them (older replication).
-			if ra.Server == "" {
-				ra.Server = bag.Registry.Server
-			}
-			if ra.Username == "" {
-				ra.Username = bag.Registry.Username
-			}
-			out.Registry = &ra
-		} else {
-			regCopy := *bag.Registry
-			out.Registry = &regCopy
+		if out.Registry != nil && bag.Registry.Password != "" {
+			registry := *out.Registry
+			registry.Password = bag.Registry.Password
+			out.Registry = &registry
 		}
 	}
 	if len(bag.MountCreds) > 0 && len(out.Mounts) > 0 {
@@ -865,63 +749,4 @@ func mergeClusterSecrets(redacted models.CreateSandboxRequest, bag secrets.Secre
 		out.Env = env
 	}
 	return out
-}
-
-// Thin wrappers around pkg/secrets helpers. Kept so coverage tests that call
-// the old package-local names continue to exercise the crypto path without
-// touching s.cipher for Put/Open (those go through provider()).
-
-func (s *Service) sealClusterSecretEnvelope(plain []byte, recipients []string) ([]byte, error) {
-	if s == nil || s.cipher == nil {
-		return nil, errors.New("cluster secrets cipher is not configured")
-	}
-	return secrets.SealRawEnvelope(s.cipher, plain, recipients)
-}
-
-func (s *Service) openClusterSecretPayload(sealed []byte, nodeID string) ([]byte, error) {
-	if s == nil || s.cipher == nil {
-		return nil, errors.New("cluster secrets cipher is not configured")
-	}
-	return secrets.OpenRawEnvelope(s.cipher, sealed, nodeID)
-}
-
-func openClusterSecretEnvelopePayload(dek []byte, sealed []byte, recipients []string) ([]byte, error) {
-	return secrets.OpenEnvelopePayload(dek, sealed, recipients)
-}
-
-// Type aliases so coverage tests that still construct/unmarshal the old
-// package-local shapes keep compiling after the move into pkg/secrets.
-type clusterSealedSecrets = secrets.Secrets
-
-// clusterSealedSecretsEnvelope mirrors the on-wire JSON envelope for tests
-// that craft v2/v3 payloads by hand.
-type clusterSealedSecretsEnvelope struct {
-	Version    int      `json:"version"`
-	Recipients []string `json:"recipients,omitempty"`
-	WrappedKey []byte   `json:"wrapped_key,omitempty"`
-	Payload    []byte   `json:"payload"`
-}
-
-func normalizeClusterSecretRecipients(in []string) []string {
-	return secrets.NormalizeRecipients(in)
-}
-
-func clusterSecretRecipientAllowed(recipients []string, nodeID string) bool {
-	return secrets.RecipientAllowed(recipients, nodeID)
-}
-
-func clusterSecretAAD(recipients []string) []byte {
-	return secrets.V2AAD(recipients)
-}
-
-func clusterSecretKeyAAD(recipients []string) []byte {
-	return secrets.KeyAAD(recipients)
-}
-
-func clusterSecretPayloadAAD(recipients []string) []byte {
-	return secrets.PayloadAAD(recipients)
-}
-
-func clusterSecretRef(sandboxID string, version int) string {
-	return secrets.FormatRef(sandboxID, version)
 }

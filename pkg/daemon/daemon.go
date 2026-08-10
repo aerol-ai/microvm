@@ -148,9 +148,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer db.Close()
-	// When env sealing is on, hot List scanners must not project plaintext
-	// env_json (D8 / netstats). loadEnv reads sealed rows on demand.
-	db.SetOmitEnvFromScanner(cfg.SecretEnvSealEnabled)
 
 	// The dockerd driver ALWAYS drives DOCKER-USER, independent of the host
 	// engine choice. On a node flipped to containerd, pre-flip engine=docker
@@ -281,24 +278,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
 	if err := svc.ValidateSecretAuditSink(); err != nil {
 		return err
-	}
-	if cfg.SecretEnvSealEnabled {
-		migrated, err := svc.SealLegacySandboxEnv(ctx)
-		if err != nil {
-			return fmt.Errorf("migrate sandbox env: %w", err)
-		}
-		if migrated > 0 {
-			logger.Info("sealed legacy sandbox environments", "count", migrated)
-		}
-	}
-	if cfg.SecretToolboxSealEnabled {
-		migrated, err := db.SealLegacyToolboxTokens(ctx)
-		if err != nil {
-			return fmt.Errorf("migrate toolbox tokens: %w", err)
-		}
-		if migrated > 0 {
-			logger.Info("sealed legacy toolbox tokens", "count", migrated)
-		}
 	}
 	if err := svc.ConfigureSecretProvider(ctx); err != nil {
 		return fmt.Errorf("configure secret provider: %w", err)
@@ -629,16 +608,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			// Rebuild secret holder counts + re-push multi-recipient blobs so
 			// failover_ready is not stuck false after a restart (holders are
 			// in-memory only). Best-effort; fan-out continues async.
-			if cfg.SecretRecipientFanoutEnabled {
-				if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
-					logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
-				}
-				if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
-					logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
-				}
+			if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
+				logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
 			}
-			// Lifecycle metrics and tombstone retention remain active even when
-			// fan-out is temporarily disabled; only peer retry dispatch is gated.
+			if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+				logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
+			}
 			svc.StartSecretDeleteOutboxReconcile(ctx)
 		}
 		if cfg.IsIngress() {

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
-	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/hashicorp/memberlist"
 )
 
@@ -50,9 +49,6 @@ type nodeMeta struct {
 	// running pre-PublicHost builds or with no public host set (IP-mode
 	// deployments where custom domains are disabled anyway).
 	PublicHost string `json:"public_host,omitempty"`
-	// MaxSecretRefVersion is the highest secrets handle version this node can
-	// open. Omitted (0) on older peers — writer gate treats that as RefVersion.
-	MaxSecretRefVersion int `json:"max_secret_ref_version,omitempty"`
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
@@ -94,7 +90,6 @@ func (d *gossipDelegate) refreshMeta() {
 	meta := nodeMeta{
 		NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost,
 		RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost,
-		MaxSecretRefVersion: secrets.MaxSupportedRefVersion,
 	}
 	enc, err := json.Marshal(meta)
 	if err != nil {
@@ -630,7 +625,6 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.InternalURL = meta.InternalURL
 			m.Role = meta.Role
 			m.PublicHost = meta.PublicHost
-			m.MaxSecretRefVersion = meta.MaxSecretRefVersion
 			// m.Capacity stays zero here — capacity no longer travels in
 			// nodeMeta (see the type comment). Cluster.Members and
 			// SelectPlacement overlay fresh capacity leases later.
@@ -655,17 +649,16 @@ func (g *gossipNode) selfMember() Member {
 		snap = admitter.Snapshot()
 	}
 	return Member{
-		NodeID:              meta.NodeID,
-		NodeName:            meta.NodeName,
-		APIURL:              meta.APIURL,
-		DataPlaneHost:       meta.DataPlaneHost,
-		RaftAddr:            meta.RaftAddr,
-		InternalURL:         meta.InternalURL,
-		Role:                meta.Role,
-		PublicHost:          meta.PublicHost,
-		MaxSecretRefVersion: meta.MaxSecretRefVersion,
-		Alive:               true,
-		Capacity:            snap,
+		NodeID:        meta.NodeID,
+		NodeName:      meta.NodeName,
+		APIURL:        meta.APIURL,
+		DataPlaneHost: meta.DataPlaneHost,
+		RaftAddr:      meta.RaftAddr,
+		InternalURL:   meta.InternalURL,
+		Role:          meta.Role,
+		PublicHost:    meta.PublicHost,
+		Alive:         true,
+		Capacity:      snap,
 	}
 }
 

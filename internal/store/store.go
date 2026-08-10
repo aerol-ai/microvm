@@ -18,125 +18,24 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
-	// secretCipher is opt-in so rolling fleets can retain the legacy plaintext
-	// toolbox-token format until every node understands toolbox_token_sealed.
-	secretCipher      *secrets.Cipher
-	sealToolboxTokens bool
-	// omitEnvFromScanner, when true, leaves Sandbox.Env nil/empty on Get/List
-	// paths even though env_json may still hold plaintext during the T7
-	// migration window. Service.loadEnv reads sealed sandbox_env (or the
-	// plaintext column via GetEnvJSON) on demand. Default false preserves
-	// pre-env-seal scanner behavior for rollback.
-	omitEnvFromScanner bool
+	db           *sql.DB
+	secretCipher *secrets.Cipher
 }
 
-// SetSecretCipher enables at-rest toolbox-token sealing for subsequent writes
-// and transparently opens sealed tokens on reads. Passing nil deliberately
-// leaves writes fail-closed once sealing has been enabled.
+// SetSecretCipher configures at-rest toolbox-token sealing. Production wiring
+// always supplies it; a missing cipher fails any token-bearing write or sealed
+// token read rather than falling back to plaintext.
 func (s *Store) SetSecretCipher(cipher *secrets.Cipher) {
 	if s == nil {
 		return
 	}
 	s.secretCipher = cipher
-	s.sealToolboxTokens = true
-}
-
-// SealLegacyToolboxTokens migrates plaintext toolbox bearer tokens into the
-// existing sandbox row in bounded transactions. It is idempotent and intended
-// for daemon boot after every node understands toolbox_token_sealed. A failed
-// batch rolls back as a unit; later boots safely resume remaining rows.
-func (s *Store) SealLegacyToolboxTokens(ctx context.Context) (int64, error) {
-	if s == nil || !s.sealToolboxTokens {
-		return 0, nil
-	}
-	if s.secretCipher == nil {
-		return 0, errors.New("seal legacy toolbox tokens: store cipher is not configured")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	const batchSize = 512
-	var migrated int64
-	for {
-		rows, err := s.db.QueryContext(ctx, `
-			SELECT id, toolbox_token
-			FROM sandboxes
-			WHERE toolbox_token <> ''
-			ORDER BY id
-			LIMIT ?
-		`, batchSize)
-		if err != nil {
-			return migrated, fmt.Errorf("list legacy toolbox tokens: %w", err)
-		}
-		type legacyToken struct{ id, token string }
-		batch := make([]legacyToken, 0, batchSize)
-		for rows.Next() {
-			var item legacyToken
-			if err := rows.Scan(&item.id, &item.token); err != nil {
-				_ = rows.Close()
-				return migrated, fmt.Errorf("scan legacy toolbox token: %w", err)
-			}
-			batch = append(batch, item)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return migrated, fmt.Errorf("iterate legacy toolbox tokens: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return migrated, fmt.Errorf("close legacy toolbox token rows: %w", err)
-		}
-		if len(batch) == 0 {
-			return migrated, nil
-		}
-
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return migrated, fmt.Errorf("begin legacy toolbox token migration: %w", err)
-		}
-		batchMigrated := int64(0)
-		for _, item := range batch {
-			sealed, sealErr := s.secretCipher.EncryptWithAAD([]byte(item.token), toolboxTokenAAD(item.id))
-			if sealErr != nil {
-				_ = tx.Rollback()
-				return migrated, fmt.Errorf("seal legacy toolbox token for sandbox %q: %w", item.id, sealErr)
-			}
-			result, updateErr := tx.ExecContext(ctx, `
-				UPDATE sandboxes
-				SET toolbox_token = '', toolbox_token_sealed = ?
-				WHERE id = ? AND toolbox_token = ?
-			`, sealed, item.id, item.token)
-			if updateErr != nil {
-				_ = tx.Rollback()
-				return migrated, fmt.Errorf("migrate legacy toolbox token for sandbox %q: %w", item.id, updateErr)
-			}
-			if n, rowsErr := result.RowsAffected(); rowsErr == nil {
-				batchMigrated += n
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return migrated, fmt.Errorf("commit legacy toolbox token migration: %w", err)
-		}
-		migrated += batchMigrated
-		if len(batch) < batchSize {
-			return migrated, nil
-		}
-	}
-}
-
-// SetOmitEnvFromScanner toggles whether scanSandbox projects env_json into
-// Sandbox.Env. Wired from SB_SECRET_ENV_SEAL_ENABLED at daemon boot.
-func (s *Store) SetOmitEnvFromScanner(omit bool) {
-	if s == nil {
-		return
-	}
-	s.omitEnvFromScanner = omit
 }
 
 const sqliteBusyTimeoutMS = 5000
 
 func Open(path string) (*Store, error) {
-	// The DB stores secrets (env_json, toolbox_token, sealed mount blobs).
+	// The DB stores encrypted secrets and sandbox metadata.
 	// Lock the directory and file to owner-only so a custom DBPath, a dev
 	// run on a shared host, or any setup that doesn't go through the
 	// installer can't leak them via the default 0o755 / umask-derived modes.
@@ -179,14 +78,12 @@ func Open(path string) (*Store, error) {
 			memory_mb INTEGER NOT NULL,
 			disk_gb INTEGER NOT NULL,
 			os_user TEXT NOT NULL,
-			env_json TEXT NOT NULL,
 			network_block_all INTEGER NOT NULL DEFAULT 0,
 			network_allow_out_json TEXT NOT NULL DEFAULT '[]',
 			network_deny_out_json TEXT NOT NULL DEFAULT '[]',
 			allow_public_traffic INTEGER NOT NULL DEFAULT 1,
 			mask_request_host TEXT NOT NULL DEFAULT '',
 			toolbox_enabled INTEGER NOT NULL DEFAULT 1,
-			toolbox_token TEXT NOT NULL DEFAULT '',
 			toolbox_token_sealed BLOB NOT NULL DEFAULT X'',
 			ssh_public_key TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '',
@@ -689,8 +586,6 @@ func Open(path string) (*Store, error) {
 	// swallow so cold installs (where CREATE TABLE above already includes
 	// the column) and warm upgrades (where the column is new) both succeed.
 	migrations := []string{
-		`ALTER TABLE sandboxes ADD COLUMN toolbox_token TEXT NOT NULL DEFAULT '';`,
-		`ALTER TABLE sandboxes ADD COLUMN toolbox_token_sealed BLOB NOT NULL DEFAULT X'';`,
 		`ALTER TABLE sandboxes ADD COLUMN ssh_public_key TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN stop_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
@@ -920,10 +815,13 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
 	}
+	if err := validateCurrentSecretSchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
-	// SQLite materialized the DB file (and the WAL/SHM sidecars on the
-	// first write) using the process umask — typically 0o644, leaving
-	// env_json and toolbox_token world-readable. Tighten to owner-only.
+	// SQLite materialized the DB file (and the WAL/SHM sidecars on the first
+	// write) using the process umask — typically 0o644. Tighten to owner-only.
 	// Sidecars may not exist on a fresh DB if no transaction has run yet;
 	// ignore not-found and let the next writer create them with the now
 	// owner-only directory mode protecting them in transit.
@@ -935,6 +833,40 @@ func Open(path string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+// validateCurrentSecretSchema makes the intentional one-way storage contract
+// explicit at boot. A database with plaintext secret columns or without the
+// sealed toolbox column is rejected instead of starting and failing later on
+// the first create/read.
+func validateCurrentSecretSchema(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(sandboxes)`)
+	if err != nil {
+		return fmt.Errorf("inspect sandboxes secret schema: %w", err)
+	}
+	defer rows.Close()
+	hasSealedToolbox := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan sandboxes secret schema: %w", err)
+		}
+		switch name {
+		case "env_json", "toolbox_token":
+			return fmt.Errorf("unsupported plaintext secret schema: sandboxes.%s is present", name)
+		case "toolbox_token_sealed":
+			hasSealedToolbox = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate sandboxes secret schema: %w", err)
+	}
+	if !hasSealedToolbox {
+		return errors.New("unsupported secret schema: sandboxes.toolbox_token_sealed is required")
+	}
+	return nil
 }
 
 func sqliteDSN(path string) string {
@@ -987,9 +919,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 // (plans/secrets-hardening outside-voice #3). Empty sealedEnv skips the env
 // write (same as Create).
 //
-// When sealedEnv is non-empty, env_json is forced to "{}" — plaintext must
-// not dual-write beside the sealed sandbox_env row. Legacy plaintext rows
-// remain readable via GetEnvJSON / loadEnv fallback.
+// Environment plaintext is never written to the sandbox row; sandbox_env is
+// the only at-rest representation.
 func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox, sealedEnv []byte) error {
 	if len(sealedEnv) == 0 {
 		return s.Create(ctx, sandbox)
@@ -1021,10 +952,6 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 }
 
 func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *models.Sandbox) error {
-	envJSON, err := marshalJSON(sandbox.Env, "{}")
-	if err != nil {
-		return err
-	}
 	commandJSON, err := marshalJSON(sandbox.ContainerCommand, "[]")
 	if err != nil {
 		return err
@@ -1037,7 +964,7 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 	if err != nil {
 		return err
 	}
-	toolboxToken, toolboxTokenSealed, err := s.toolboxTokenStorage(sandbox)
+	toolboxTokenSealed, err := s.toolboxTokenStorage(sandbox)
 	if err != nil {
 		return err
 	}
@@ -1045,7 +972,7 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, toolbox_token_sealed, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1063,7 +990,7 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -1075,14 +1002,12 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		sandbox.MemoryMB,
 		sandbox.DiskGB,
 		sandbox.OSUser,
-		envJSON,
 		boolToInt(sandbox.NetworkBlockAll),
 		mustMarshalStringSlice(sandbox.NetworkAllowOut),
 		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		allowPublicTrafficToInt(sandbox.AllowPublicTraffic),
 		strings.TrimSpace(sandbox.MaskRequestHost),
 		boolToInt(sandbox.ToolboxEnabled),
-		toolboxToken,
 		toolboxTokenSealed,
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
@@ -1172,24 +1097,21 @@ func toolboxTokenAAD(sandboxID string) []byte {
 	return []byte("aerolvm/toolbox-token/" + strings.TrimSpace(sandboxID))
 }
 
-func (s *Store) toolboxTokenStorage(sandbox *models.Sandbox) (string, []byte, error) {
+func (s *Store) toolboxTokenStorage(sandbox *models.Sandbox) ([]byte, error) {
 	if sandbox == nil {
-		return "", []byte{}, nil
-	}
-	if !s.sealToolboxTokens {
-		return sandbox.ToolboxToken, nullableBlob(sandbox.ToolboxTokenSealed), nil
-	}
-	if s.secretCipher == nil {
-		return "", nil, errors.New("seal toolbox token: store cipher is not configured")
+		return []byte{}, nil
 	}
 	if sandbox.ToolboxToken == "" {
-		return "", nullableBlob(sandbox.ToolboxTokenSealed), nil
+		return nullableBlob(sandbox.ToolboxTokenSealed), nil
+	}
+	if s.secretCipher == nil {
+		return nil, errors.New("seal toolbox token: store cipher is not configured")
 	}
 	sealed, err := s.secretCipher.EncryptWithAAD([]byte(sandbox.ToolboxToken), toolboxTokenAAD(sandbox.ID))
 	if err != nil {
-		return "", nil, fmt.Errorf("seal toolbox token: %w", err)
+		return nil, fmt.Errorf("seal toolbox token: %w", err)
 	}
-	return "", sealed, nil
+	return sealed, nil
 }
 
 func sandboxDurability(sandbox *models.Sandbox) string {
@@ -1211,10 +1133,6 @@ func sandboxFailoverPolicy(sandbox *models.Sandbox) string {
 }
 
 func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
-	envJSON, err := marshalJSON(sandbox.Env, "{}")
-	if err != nil {
-		return err
-	}
 	commandJSON, err := marshalJSON(sandbox.ContainerCommand, "[]")
 	if err != nil {
 		return err
@@ -1227,7 +1145,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
-	toolboxToken, toolboxTokenSealed, err := s.toolboxTokenStorage(sandbox)
+	toolboxTokenSealed, err := s.toolboxTokenStorage(sandbox)
 	if err != nil {
 		return err
 	}
@@ -1238,7 +1156,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, toolbox_token_sealed, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1256,7 +1174,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
 			tenant_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -1267,14 +1185,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			memory_mb = excluded.memory_mb,
 			disk_gb = excluded.disk_gb,
 			os_user = excluded.os_user,
-			env_json = excluded.env_json,
 			network_block_all = excluded.network_block_all,
 			network_allow_out_json = excluded.network_allow_out_json,
 			network_deny_out_json = excluded.network_deny_out_json,
 			allow_public_traffic = excluded.allow_public_traffic,
 			mask_request_host = excluded.mask_request_host,
 			toolbox_enabled = excluded.toolbox_enabled,
-			toolbox_token = excluded.toolbox_token,
 			toolbox_token_sealed = excluded.toolbox_token_sealed,
 			ssh_public_key = excluded.ssh_public_key,
 			last_error = excluded.last_error,
@@ -1320,14 +1236,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.MemoryMB,
 		sandbox.DiskGB,
 		sandbox.OSUser,
-		envJSON,
 		boolToInt(sandbox.NetworkBlockAll),
 		mustMarshalStringSlice(sandbox.NetworkAllowOut),
 		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		allowPublicTrafficToInt(sandbox.AllowPublicTraffic),
 		strings.TrimSpace(sandbox.MaskRequestHost),
 		boolToInt(sandbox.ToolboxEnabled),
-		toolboxToken,
 		toolboxTokenSealed,
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
@@ -1380,7 +1294,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, toolbox_token_sealed, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1428,7 +1342,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, toolbox_token_sealed, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1496,7 +1410,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, toolbox_token_sealed, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1548,7 +1462,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, toolbox_token_sealed, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -3805,7 +3719,6 @@ func (s *Store) scanSandbox(scanner interface {
 	Scan(dest ...any) error
 }) (*models.Sandbox, error) {
 	var sandbox models.Sandbox
-	var envJSON string
 	var networkBlocked int
 	var toolboxEnabled int
 	var toolboxTokenSealed []byte
@@ -3835,14 +3748,12 @@ func (s *Store) scanSandbox(scanner interface {
 		&sandbox.MemoryMB,
 		&sandbox.DiskGB,
 		&sandbox.OSUser,
-		&envJSON,
 		&networkBlocked,
 		&allowOutJSON,
 		&denyOutJSON,
 		&allowPublicTraffic,
 		&sandbox.MaskRequestHost,
 		&toolboxEnabled,
-		&sandbox.ToolboxToken,
 		&toolboxTokenSealed,
 		&sandbox.SSHPublicKey,
 		&sandbox.LastError,
@@ -3907,14 +3818,8 @@ func (s *Store) scanSandbox(scanner interface {
 	sandbox.AutoImportPending = autoImportPending == 1
 	sandbox.WakeArmed = wakeArmed == 1
 
-	// When omitEnvFromScanner is set (SB_SECRET_ENV_SEAL_ENABLED), leave Env
-	// empty so hot List paths (netstats) never carry plaintext. loadEnv reads
-	// the sealed row / plaintext fallback on demand.
-	if !s.omitEnvFromScanner && envJSON != "" {
-		if err := json.Unmarshal([]byte(envJSON), &sandbox.Env); err != nil {
-			return nil, fmt.Errorf("decode sandbox env: %w", err)
-		}
-	}
+	// Environment data is intentionally absent from the hot sandbox row.
+	// Explicit service reads decrypt the sandbox_env side row on demand.
 	if commandJSON != "" {
 		if err := json.Unmarshal([]byte(commandJSON), &sandbox.ContainerCommand); err != nil {
 			return nil, fmt.Errorf("decode container command: %w", err)
@@ -4987,114 +4892,6 @@ func (s *Store) GetEnv(ctx context.Context, sandboxID string) ([]byte, error) {
 		return nil, fmt.Errorf("get sandbox env: %w", err)
 	}
 	return blob, nil
-}
-
-// GetEnvJSON returns the plaintext env_json column for lazy migration
-// fallback when no sealed sandbox_env row exists yet.
-func (s *Store) GetEnvJSON(ctx context.Context, sandboxID string) (map[string]string, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT env_json FROM sandboxes WHERE id = ?`, sandboxID)
-	var envJSON string
-	if err := row.Scan(&envJSON); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("get sandbox env_json: %w", err)
-	}
-	if envJSON == "" || envJSON == "{}" {
-		return map[string]string{}, nil
-	}
-	var out map[string]string
-	if err := json.Unmarshal([]byte(envJSON), &out); err != nil {
-		return nil, fmt.Errorf("decode sandbox env_json: %w", err)
-	}
-	if out == nil {
-		out = map[string]string{}
-	}
-	return out, nil
-}
-
-// ClearEnvJSON blanks plaintext env_json after a successful reseal migration.
-func (s *Store) ClearEnvJSON(ctx context.Context, sandboxID string) error {
-	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
-		return nil
-	}
-	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET env_json = '{}' WHERE id = ?`, sandboxID)
-	if err != nil {
-		return fmt.Errorf("clear sandbox env_json: %w", err)
-	}
-	return nil
-}
-
-// LegacySandboxEnv is one plaintext env_json row awaiting sealed-row migration.
-type LegacySandboxEnv struct {
-	SandboxID string
-	Env       map[string]string
-}
-
-// ListLegacySandboxEnvBatch returns a bounded set of plaintext environment
-// rows. Callers must seal and clear them atomically with
-// PutEnvAndClearLegacy; ordering by ID makes interrupted boot migrations
-// deterministic and resumable.
-func (s *Store) ListLegacySandboxEnvBatch(ctx context.Context, limit int) ([]LegacySandboxEnv, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, env_json
-		FROM sandboxes
-		WHERE env_json <> '' AND env_json <> '{}'
-		ORDER BY id
-		LIMIT ?
-	`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list legacy sandbox env: %w", err)
-	}
-	defer rows.Close()
-	out := make([]LegacySandboxEnv, 0, limit)
-	for rows.Next() {
-		var item LegacySandboxEnv
-		var raw string
-		if err := rows.Scan(&item.SandboxID, &raw); err != nil {
-			return nil, fmt.Errorf("scan legacy sandbox env: %w", err)
-		}
-		if err := json.Unmarshal([]byte(raw), &item.Env); err != nil {
-			return nil, fmt.Errorf("decode legacy sandbox env for %q: %w", item.SandboxID, err)
-		}
-		out = append(out, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate legacy sandbox env: %w", err)
-	}
-	return out, nil
-}
-
-// PutEnvAndClearLegacy commits the sealed env row and plaintext removal in one
-// transaction. This closes the crash window in the older lazy migration path.
-func (s *Store) PutEnvAndClearLegacy(ctx context.Context, sandboxID string, sealed []byte) error {
-	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" || len(sealed) == 0 {
-		return nil
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin sandbox env migration: %w", err)
-	}
-	defer tx.Rollback()
-	if err := putEnvExec(ctx, tx, sandboxID, sealed); err != nil {
-		return err
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE sandboxes SET env_json = '{}' WHERE id = ?`, sandboxID)
-	if err != nil {
-		return fmt.Errorf("clear migrated sandbox env_json: %w", err)
-	}
-	if n, rowsErr := result.RowsAffected(); rowsErr == nil && n == 0 {
-		return ErrNotFound
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit sandbox env migration: %w", err)
-	}
-	return nil
 }
 
 // DeleteEnv removes sealed env for a sandbox. Cascade on sandboxes covers

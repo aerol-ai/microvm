@@ -6,7 +6,13 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Environment variables set at create time are secrets. `get` and `list` **omit `env` by default**. Pass an explicit opt-in to load them; those reads are audited on the daemon.
 
-Create responses may still echo the env you just supplied. After create, treat get/list as redacted unless you opt in.
+Create, get, and list responses are redacted unless the read API explicitly
+opts in to env materialization.
+
+At rest, env values exist only as an authenticated, sandbox-bound encrypted
+blob in `sandbox_env`. There is no plaintext `env_json` column, fallback read,
+or rollout flag. A missing cipher or sealed row fails closed, and a database
+that still contains a plaintext secret column is rejected at boot.
 
 ## Get a sandbox with env
 

@@ -14,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestNewTemplateArtifactPusherValidationWave17(t *testing.T) {
@@ -92,19 +93,20 @@ func TestWasmCacheAndModuleGCWave17(t *testing.T) {
 
 func TestClusterSecretsOpenEnvelopeFailWave17(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
-	sealed, err := s.SealClusterSecretsForRecipient(models.CreateSandboxRequest{
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(s.cipher, secrets.Secrets{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, "node-a")
+	}, []string{"node-a"}, binding)
 	if err != nil || len(sealed) == 0 {
 		t.Fatalf("seal: %v", err)
 	}
-	if _, err := s.UnsealClusterSecretsForNode(models.CreateSandboxRequest{Image: "x"}, sealed, "wrong-node"); err == nil {
+	if _, err := secrets.OpenEnvelopeBound(s.cipher, sealed, "wrong-node", binding); err == nil {
 		t.Fatal("expected recipient mismatch / decrypt fail")
 	}
-	if _, err := s.UnsealClusterSecretsForNode(models.CreateSandboxRequest{Image: "x"}, append([]byte{0}, sealed...), "node-a"); err == nil {
+	if _, err := secrets.OpenEnvelopeBound(s.cipher, append([]byte{0}, sealed...), "node-a", binding); err == nil {
 		t.Fatal("expected corrupt fail")
 	}
-	_, _ = openClusterSecretEnvelopePayload(make([]byte, 32), make([]byte, 64), []string{"*"})
+	_, _ = secrets.OpenEnvelopePayloadBound(make([]byte, 32), make([]byte, 64), []string{"node-a"}, binding)
 }
 
 func TestReplicateSpecPatchFailWave17(t *testing.T) {

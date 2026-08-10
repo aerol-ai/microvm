@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -134,8 +133,8 @@ func TestStoreCases(t *testing.T) {
 				if got.ID != sandbox.ID || got.Image != sandbox.Image || got.PublicURL != sandbox.PublicURL {
 					t.Fatalf("unexpected sandbox: %+v", got)
 				}
-				if !reflect.DeepEqual(got.Env, sandbox.Env) || !reflect.DeepEqual(got.ContainerCommand, sandbox.ContainerCommand) {
-					t.Fatalf("unexpected env/command: %+v", got)
+				if len(got.Env) != 0 || !reflect.DeepEqual(got.ContainerCommand, sandbox.ContainerCommand) {
+					t.Fatalf("unexpected sandbox-row env/command: %+v", got)
 				}
 				if got.Runtime != sandbox.Runtime {
 					t.Fatalf("unexpected runtime: got %q, want %q", got.Runtime, sandbox.Runtime)
@@ -2126,62 +2125,6 @@ func TestStoreHelperCases(t *testing.T) {
 		}
 	})
 
-	t.Run("scan_sandbox_invalid_env_json_returns_error", func(t *testing.T) {
-		now := time.Now()
-		row := sqlRowStub{values: []any{
-			"sb-bad",                    // id
-			"image",                     // image
-			models.SandboxStatusStarted, // status
-			"https://example.com",       // public_url
-			"container",                 // container_id
-			"10.0.0.1",                  // container_ip
-			float64(1),                  // cpu
-			1024,                        // memory_mb
-			10,                          // disk_gb
-			"root",                      // os_user
-			"{bad json",                 // env_json — triggers the failure
-			0,                           // network_blocked
-			"[]",                        // network_allow_out_json
-			"[]",                        // network_deny_out_json
-			1,                           // allow_public_traffic
-			"",                          // mask_request_host
-			1,                           // toolbox_enabled
-			"",                          // toolbox_token
-			[]byte(nil),                 // toolbox_token_sealed
-			"",                          // ssh_public_key
-			"",                          // last_error
-			"[]",                        // container_command_json
-			"",                          // name
-			"{}",                        // tags_json
-			now, now, now,               // created_at, updated_at, last_active_at
-			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
-			"",                 // failover_policy
-			"",                 // runtime
-			"docker",           // engine
-			"",                 // gpus_json
-			int64(0), int64(0), // net_bytes_in, net_bytes_out
-			int64(0), int64(0), // net_bytes_in_limit, net_bytes_out_limit
-			0,              // net_quota_exceeded
-			sql.NullTime{}, // net_quota_exceeded_at
-			[]byte(nil),    // registry_auth_sealed
-			0,              // auto_import_pending
-			0,              // serverless
-			0,              // wake_armed
-			"",             // template_id
-			0,              // overlay_size_gb
-			"passivatable", // durability
-			"", "",         // module_ref, module_digest
-			"", "", // checkpoint_path, clone_generation
-			"", "", // wasm_registry_ref, wasm_registry_digest
-			"", // owner_ref
-			0,  // fleet_suspended
-			"", // tenant_id
-		}}
-		_, err := (&Store{}).scanSandbox(row)
-		if err == nil {
-			t.Fatalf("expected scanSandbox() error")
-		}
-	})
 }
 
 type sqlRowStub struct {

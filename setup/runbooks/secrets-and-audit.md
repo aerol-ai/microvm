@@ -23,15 +23,11 @@ On the open-source build:
 See also the D5 frozen-recipient limitation and cluster identity requirements in
 [`docs/.../cluster-secrets.mdx`](../../docs/src/content/docs/cluster-secrets.mdx).
 
-**Peer auth honesty:** with `SB_CLUSTER_TLS_DIR` configured, internal secret,
-audit, recovery, and Raft-forward traffic prefers the dedicated mTLS listener;
-the server requires a certificate signed by the cluster CA and there is no
-retry downgrade after a TLS failure. `SB_ENTERPRISE_MODE=true` requires this
-configuration, rejects internal routes on the public listener, and rejects
-insecure gossip/credential modes. Non-enterprise
-clusters may still use the legacy public API + fleet PAT path when no cluster
-TLS directory is configured. The PAT remains an operator credential, so protect
-and rotate it even when mTLS is enabled.
+**Peer auth honesty:** cluster mode requires `SB_CLUSTER_TLS_DIR`. Internal
+secret, audit, recovery, and Raft-forward traffic uses the dedicated mTLS
+listener; the server requires a certificate signed by the cluster CA and there
+is no retry downgrade after a TLS failure. The fleet PAT remains a second
+operator credential, so protect and rotate it as well.
 
 ## Alerts
 
@@ -73,9 +69,9 @@ Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) prunes old lines daily.
    `secret fanout` warnings.
 2. Confirm recipients are alive (`GET /v1/cluster/members`) and share the
    credential encryption key / KMS access.
-3. In enterprise mode, HA create success guarantees at least one backup ACK.
-   Outside enterprise mode, treat `failover_ready=false` as "HA recreate is not
-   safe yet" — wait or re-seal.
+3. HA create success guarantees at least one backup ACK. Treat
+   `failover_ready=false` as "the configured replica set is not complete yet";
+   the remaining recipients continue asynchronously.
 4. Remember D5: recipient sets are frozen at seal time; membership changes
    after create do not enlarge the set (see cluster-secrets docs).
 
@@ -136,7 +132,7 @@ Notes:
 - Do **not** expect owner-forward to gather history; hit a node that has the
   sandbox row (typically the owner). That node fans out to peers.
 - Rate limits apply (identity + node ceiling). `429` includes `Retry-After`.
-- Internal peer path (mTLS + PAT in enterprise mode):
+- Internal peer path (mTLS + PAT in every cluster mode):
   `GET /v1/cluster/internal/sandboxes/{id}/audit`
   returns the local slice only.
 - Host-mediated runtimes (wasm, isolate) also append `kind=egress` events with

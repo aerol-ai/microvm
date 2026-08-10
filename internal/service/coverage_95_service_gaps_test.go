@@ -10,6 +10,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestStartSandboxEgressPolicyRequiresContainerRuntime(t *testing.T) {
@@ -143,7 +144,8 @@ func TestApplyInFluxRouteHelpers(t *testing.T) {
 func TestSealClusterSecretEnvelopeRandFailure(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
 	setRandReader(t, &scriptedRandReader{errs: []error{errors.New("no entropy")}})
-	if _, err := s.sealClusterSecretEnvelope([]byte(`{}`), []string{"*"}); err == nil {
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	if _, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{}`), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected rand failure")
 	}
 }

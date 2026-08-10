@@ -85,6 +85,7 @@ func TestDockerReadySocketEffectiveGating(t *testing.T) {
 		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 		t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+		t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 		t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "true")
 		cfg, err := Load()
 		if err != nil {
@@ -100,6 +101,7 @@ func TestDockerReadySocketEffectiveGating(t *testing.T) {
 		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 		t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+		t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 		t.Setenv("SB_DOCKER_READY_SOCKET_ENABLED", "false")
 		cfg, err := Load()
 		if err != nil {

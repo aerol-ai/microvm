@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +30,37 @@ type fakePeerPusher struct {
 	probeByID    map[string]int
 	pushCalls    int
 	done         chan struct{}
+}
+
+type blockingRefanoutPusher struct {
+	active  atomic.Int64
+	max     atomic.Int64
+	calls   atomic.Int64
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingRefanoutPusher) PushSecretBlobToPeers(context.Context, secrets.SecretBlob, []string) ([]string, error) {
+	active := p.active.Add(1)
+	for {
+		prior := p.max.Load()
+		if active <= prior || p.max.CompareAndSwap(prior, active) {
+			break
+		}
+	}
+	p.calls.Add(1)
+	p.started <- struct{}{}
+	<-p.release
+	p.active.Add(-1)
+	return []string{"node-b"}, nil
+}
+
+func (*blockingRefanoutPusher) DeleteSecretOnPeers(context.Context, string, []string, int64) ([]string, []string, error) {
+	return nil, nil, nil
+}
+
+func (*blockingRefanoutPusher) ProbeSecretOnPeers(context.Context, string, []string, int64) ([]string, error) {
+	return nil, nil
 }
 
 func (f *fakePeerPusher) PushSecretBlobToPeers(_ context.Context, blob secrets.SecretBlob, _ []string) ([]string, error) {
@@ -86,7 +118,7 @@ func TestReconcileSecretDeleteOutboxDrainsBeyondOneWorkerWave(t *testing.T) {
 	}
 	pusher := &fakePeerPusher{}
 	svc := &Service{
-		cfg:                  config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:                  config.Config{},
 		store:                st,
 		cluster:              cluster.NewNoop("node-a", "http://a", ""),
 		testSecretPeerPusher: pusher,
@@ -250,11 +282,8 @@ func TestUpsertClusterSecretBlobValidatesRecipientAndRef(t *testing.T) {
 		t.Fatalf("bad ref = %v, want ErrInvalidClusterSecretBlob", err)
 	}
 
-	// Unbound v3 must be rejected on peer ingress (local open still supports it).
-	legacy, err := secrets.SealEnvelope(cipher, bag, []string{"node-a", "node-b"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Older unbound envelope versions are rejected at peer ingress.
+	legacy := []byte(`{"version":3,"recipients":["node-a","node-b"],"wrapped_key":"YQ==","payload":"YQ=="}`)
 	v3 := secrets.SecretBlob{
 		Ref: secrets.FormatRef("sb-v3", 1), SandboxID: "sb-v3", Version: 1,
 		Recipients: []string{"node-a", "node-b"}, SealedPayload: legacy, SealGeneration: 1,
@@ -278,18 +307,10 @@ func TestUpsertClusterSecretBlobValidatesRecipientAndRef(t *testing.T) {
 	}
 
 	// Empty authenticated ref must be rejected even when sandbox_id is set.
-	emptyRefPayload, err := secrets.SealEnvelopeBound(cipher, bag, []string{"node-a", "node-b"}, secrets.SealBinding{
+	if _, err := secrets.SealEnvelopeBound(cipher, bag, []string{"node-a", "node-b"}, secrets.SealBinding{
 		SandboxID: "sb-empty-ref", Ref: "", Version: 1, Generation: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	emptyRef := secrets.SecretBlob{
-		Ref: secrets.FormatRef("sb-empty-ref", 1), SandboxID: "sb-empty-ref", Version: 1,
-		Recipients: []string{"node-a", "node-b"}, SealedPayload: emptyRefPayload, SealGeneration: 1,
-	}
-	if err := svc.UpsertClusterSecretBlob(ctx, emptyRef); !errors.Is(err, ErrInvalidClusterSecretBlob) {
-		t.Fatalf("empty authenticated ref = %v, want ErrInvalidClusterSecretBlob", err)
+	}); err == nil {
+		t.Fatal("empty authenticated ref was accepted")
 	}
 }
 
@@ -320,14 +341,15 @@ func TestSealAndDistributeCrossNodeOpenCRITICAL(t *testing.T) {
 	storeB := openSealTestStore(t)
 
 	svcA := &Service{
-		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
-		cipher:         cipher,
-		store:          storeA,
-		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(storeA)),
-		cluster:        cluster.NewNoop("node-a", "http://a", ""),
+		cfg:                  config.Config{},
+		cipher:               cipher,
+		store:                storeA,
+		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(storeA)),
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: &fakePeerPusher{acked: []string{"node-b"}},
 	}
 	svcB := &Service{
-		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:            config.Config{},
 		cipher:         cipher,
 		store:          storeB,
 		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(storeB)),
@@ -373,8 +395,7 @@ func TestSealAndDistributeFansOutWhenHA(t *testing.T) {
 	pusher := &fakePeerPusher{acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg: config.Config{
-			SecretRecipientFanoutEnabled: true,
-			SecretFanoutMinACKWait:       50 * time.Millisecond,
+			SecretFanoutMinACKWait: 50 * time.Millisecond,
 		},
 		cipher:               cipher,
 		store:                st,
@@ -414,9 +435,8 @@ func TestEnterpriseSealRequiresBackupACKAndRetractsLocalSecret(t *testing.T) {
 	pusher := &fakePeerPusher{}
 	svc := &Service{
 		cfg: config.Config{
-			EnterpriseMode:               true,
-			SecretRecipientFanoutEnabled: true,
-			SecretFanoutMinACKWait:       20 * time.Millisecond,
+			EnterpriseMode:         true,
+			SecretFanoutMinACKWait: 20 * time.Millisecond,
 		},
 		cipher:               cipher,
 		store:                st,
@@ -494,16 +514,14 @@ func TestPeerSecretPutRequiresLivePlacementAfterTombGC(t *testing.T) {
 	}
 }
 
-func TestSealAndDistributeMinACKTimeoutContinuesAsync(t *testing.T) {
-	// GAP-1 mitigation: slow peers still get async retry; create does not fail.
+func TestSealAndDistributeMinACKTimeoutRetracts(t *testing.T) {
 	ctx := context.Background()
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
 	slow := &slowPeerPusher{delay: 200 * time.Millisecond, acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg: config.Config{
-			SecretRecipientFanoutEnabled: true,
-			SecretFanoutMinACKWait:       20 * time.Millisecond, // shorter than delay → sync gets 0
+			SecretFanoutMinACKWait: 20 * time.Millisecond, // shorter than delay → sync gets 0
 		},
 		cipher:               cipher,
 		store:                st,
@@ -518,25 +536,12 @@ func TestSealAndDistributeMinACKTimeoutContinuesAsync(t *testing.T) {
 	}
 	clearSecretFanoutHolders("sb-slow")
 	handle, err := svc.SealAndDistribute(ctx, "sb-slow", req, []string{"node-a", "node-b"}, SealStrict)
-	if err != nil || handle.Ref == "" {
-		t.Fatalf("seal must succeed despite min-ACK timeout: %+v %v", handle, err)
+	if err == nil || handle.Ref != "" {
+		t.Fatalf("seal must fail without a backup ACK: %+v %v", handle, err)
 	}
-	if got := secretHolderCount("sb-slow"); got != 1 {
-		t.Fatalf("after timed-out min-ACK holders=%d, want 1 (local only)", got)
+	if rows, listErr := st.ListClusterSecrets(ctx); listErr != nil || len(rows) != 0 {
+		t.Fatalf("failed HA seal left local rows: %+v %v", rows, listErr)
 	}
-	select {
-	case <-slow.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected async fan-out after min-ACK timeout")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if secretHolderCount("sb-slow") >= 2 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("async fan-out never raised holders (got %d)", secretHolderCount("sb-slow"))
 }
 
 type slowPeerPusher struct {
@@ -579,8 +584,7 @@ func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	pusher := &fakePeerPusher{acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg: config.Config{
-			SecretRecipientFanoutEnabled: true,
-			SecretFanoutMinACKWait:       0, // fully async for this setup
+			SecretFanoutMinACKWait: 0, // fully async for this setup
 		},
 		cipher:               cipher,
 		store:                st,
@@ -622,8 +626,58 @@ func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	}
 }
 
+func TestSecretRefanoutPoolBoundsRestartConcurrency(t *testing.T) {
+	const total = secretRefanoutWorkers + 17
+	records := make([]storepkg.ClusterSecretRecord, 0, total)
+	for i := range total {
+		id := fmt.Sprintf("sb-refanout-bound-%03d", i)
+		t.Cleanup(func() { clearSecretFanoutHolders(id) })
+		records = append(records, storepkg.ClusterSecretRecord{
+			Ref:            secrets.FormatRef(id, secrets.RefVersion),
+			SandboxID:      id,
+			Version:        secrets.RefVersion,
+			Recipients:     []string{"node-a", "node-b"},
+			SealedPayload:  []byte("sealed"),
+			SealGeneration: 1,
+		})
+	}
+	pusher := &blockingRefanoutPusher{
+		started: make(chan struct{}, total),
+		release: make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() {
+		(&Service{}).runSecretRefanoutPool(records, pusher)
+		close(done)
+	}()
+	for range secretRefanoutWorkers {
+		select {
+		case <-pusher.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker pool did not reach its configured concurrency")
+		}
+	}
+	select {
+	case <-pusher.started:
+		t.Fatal("re-fanout exceeded the worker bound")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(pusher.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-fanout pool did not drain")
+	}
+	if got := pusher.max.Load(); got != secretRefanoutWorkers {
+		t.Fatalf("max concurrent pushes = %d, want %d", got, secretRefanoutWorkers)
+	}
+	if got := pusher.calls.Load(); got != total {
+		t.Fatalf("push calls = %d, want %d", got, total)
+	}
+}
+
 func TestComputeFailoverReady(t *testing.T) {
-	svc := &Service{cfg: config.Config{SecretRecipientFanoutEnabled: true}}
+	svc := &Service{cfg: config.Config{}}
 	sb := &models.Sandbox{ID: "sb1", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
 	clearSecretFanoutHolders("sb1")
 
@@ -651,6 +705,7 @@ func TestComputeFailoverReady(t *testing.T) {
 	svc.store = st
 	svc.cipher = newTestCipher(t)
 	svc.secretProvider = secrets.NewLocalProvider(svc.cipher, newSecretBlobStore(st))
+	svc.testSecretPeerPusher = &fakePeerPusher{acked: []string{"node-b"}}
 	if _, err := svc.SealAndDistribute(context.Background(), "sb1", models.CreateSandboxRequest{
 		Image:    "alpine",
 		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
@@ -705,7 +760,7 @@ func TestComputeFailoverReadyExpiresStaleACKWithoutAliveFlap(t *testing.T) {
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
 	svc := &Service{
-		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:            config.Config{},
 		cipher:         cipher,
 		store:          st,
 		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
@@ -717,6 +772,7 @@ func TestComputeFailoverReadyExpiresStaleACKWithoutAliveFlap(t *testing.T) {
 				{NodeID: "node-b", Alive: true},
 			},
 		},
+		testSecretPeerPusher: &fakePeerPusher{acked: []string{"node-b"}},
 	}
 	sb := &models.Sandbox{ID: "sb-ttl", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
 	if _, err := svc.SealAndDistribute(ctx, "sb-ttl", models.CreateSandboxRequest{
@@ -744,7 +800,7 @@ func TestComputeFailoverReadyResetsStaleGenerationHolders(t *testing.T) {
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
 	svc := &Service{
-		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:            config.Config{},
 		cipher:         cipher,
 		store:          st,
 		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
@@ -756,6 +812,7 @@ func TestComputeFailoverReadyResetsStaleGenerationHolders(t *testing.T) {
 				{NodeID: "node-b", Alive: true},
 			},
 		},
+		testSecretPeerPusher: &fakePeerPusher{acked: []string{"node-b"}},
 	}
 	sb := &models.Sandbox{ID: "sb-probe", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
 	if _, err := svc.SealAndDistribute(ctx, "sb-probe", models.CreateSandboxRequest{
@@ -778,7 +835,7 @@ func TestPeerPutDeleteRaceDoesNotResurrect(t *testing.T) {
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
 	svc := &Service{
-		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:            config.Config{},
 		cipher:         cipher,
 		store:          st,
 		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
@@ -839,7 +896,7 @@ func TestDeleteClusterSecretsFansOut(t *testing.T) {
 	st := openSealTestStore(t)
 	pusher := &fakePeerPusher{done: make(chan struct{})}
 	svc := &Service{
-		cfg:                  config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:                  config.Config{},
 		cipher:               cipher,
 		store:                st,
 		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),

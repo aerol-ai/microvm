@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,13 +84,6 @@ func TestCreateWithSealedEnvAtomicCommit(t *testing.T) {
 	if string(got) != string(sealed) {
 		t.Fatalf("sealed = %q", got)
 	}
-	plain, err := st.GetEnvJSON(ctx, sb.ID)
-	if err != nil {
-		t.Fatalf("GetEnvJSON: %v", err)
-	}
-	if len(plain) != 0 {
-		t.Fatalf("sealed create left plaintext env_json = %+v, want empty", plain)
-	}
 }
 
 func TestCreateWithSealedEnvCrashBetweenWritesRollsBack(t *testing.T) {
@@ -124,7 +118,7 @@ func TestCreateWithSealedEnvCrashBetweenWritesRollsBack(t *testing.T) {
 	}
 }
 
-func TestOmitEnvFromScanner(t *testing.T) {
+func TestSandboxRowDoesNotStoreEnvironment(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "env-omit.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -141,24 +135,43 @@ func TestOmitEnvFromScanner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.Env["SECRET"] != "value" {
-		t.Fatalf("flag-off Get Env = %+v", got.Env)
-	}
-
-	st.SetOmitEnvFromScanner(true)
-	got, err = st.Get(ctx, sb.ID)
-	if err != nil {
-		t.Fatalf("Get omit: %v", err)
-	}
 	if len(got.Env) != 0 {
-		t.Fatalf("flag-on Get Env = %+v, want empty", got.Env)
+		t.Fatalf("sandbox row projected Env = %+v, want empty", got.Env)
 	}
-	plain, err := st.GetEnvJSON(ctx, sb.ID)
+	rows, err := st.db.QueryContext(ctx, `PRAGMA table_info(sandboxes)`)
 	if err != nil {
-		t.Fatalf("GetEnvJSON: %v", err)
+		t.Fatal(err)
 	}
-	if plain["SECRET"] != "value" {
-		t.Fatalf("GetEnvJSON = %+v", plain)
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if name == "env_json" || name == "toolbox_token" {
+			t.Fatalf("plaintext compatibility column %q remains in current schema", name)
+		}
+	}
+}
+
+func TestOpenRejectsPlaintextSecretSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-secrets.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open fresh store: %v", err)
+	}
+	if _, err := st.db.Exec(`ALTER TABLE sandboxes ADD COLUMN env_json TEXT NOT NULL DEFAULT '{}'`); err != nil {
+		_ = st.Close()
+		t.Fatalf("seed plaintext schema: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "unsupported plaintext secret schema") {
+		t.Fatalf("Open plaintext schema error = %v", err)
 	}
 }
 

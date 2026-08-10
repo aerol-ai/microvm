@@ -10,16 +10,13 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
-	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
-// SealPolicy governs LOCAL seal behaviour only. A short sync MinACK wait may
-// run before return to shrink GAP-1; remaining peer fan-out is asynchronous.
-// Enterprise mode retracts and fails an HA create if the bounded wait produces
-// no backup ACK (plans/secrets-hardening §3e / D6).
+// SealPolicy governs LOCAL seal behaviour only. A short sync MinACK wait runs
+// before return to shrink GAP-1; remaining peer fan-out is asynchronous.
 type SealPolicy int
 
 const (
@@ -30,7 +27,10 @@ const (
 	SealBestEffort
 )
 
-const defaultSecretFanoutMinACKWait = 2 * time.Second
+const (
+	defaultSecretFanoutMinACKWait = 2 * time.Second
+	secretRefanoutWorkers         = 64
+)
 
 // secretHolderACKTTL bounds how long an in-memory peer ACK counts toward
 // failover_ready without a fresh push ACK or background possession probe.
@@ -244,14 +244,13 @@ func pruneDeadSecretHolders(sandboxID string, alive map[string]struct{}) {
 }
 
 // SealAndDistribute seals to recipients, stores locally, and fans out when
-// the feature flag is on, the sandbox is recreate-HA, and len(recipients) > 1.
+// the sandbox is recreate-HA and len(recipients) > 1.
 // Policy governs LOCAL seal only.
 //
 // Boot-path note: default creates are unchanged (seal-to-self, no fan-out).
 // HA creates: local seal + optional bounded sync wait for ≥1 peer ACK
 // (SB_SECRET_FANOUT_MIN_ACK_WAIT, default 2s) to shrink GAP-1; remaining
-// peers / retries continue asynchronously. Enterprise mode retracts and fails
-// a zero-ACK create rather than exposing an unreplicated HA sandbox.
+// peers / retries continue asynchronously. A zero-ACK HA create is retracted.
 func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, policy SealPolicy) (cluster.PlacementSecrets, error) {
 	if len(recipients) == 0 {
 		if c := s.Cluster(); c != nil {
@@ -305,9 +304,6 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 	if bag.IsEmpty() {
 		return cluster.PlacementSecrets{}, nil
 	}
-	if err := s.assertEnvSealWriterGate(bag, recipients); err != nil {
-		return cluster.PlacementSecrets{}, err
-	}
 	p := s.provider()
 	if p == nil {
 		if s == nil || s.cipher == nil {
@@ -326,7 +322,7 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 // fanoutSecretAfterSeal runs a bounded sync MinACK wait (when configured),
 // then always kicks an async full fan-out for remaining peers / retries.
 func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string, handle cluster.PlacementSecrets) error {
-	if s == nil || !s.cfg.SecretRecipientFanoutEnabled {
+	if s == nil {
 		return nil
 	}
 	if req.Failover == nil || !req.Failover.ShouldRecreate() {
@@ -337,10 +333,7 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 	}
 	pusher := s.secretPeerPusher()
 	if pusher == nil {
-		if s.cfg.EnterpriseMode {
-			return errors.New("enterprise secret fan-out requires an available peer pusher")
-		}
-		return nil
+		return errors.New("secret fan-out requires an available peer pusher")
 	}
 	blob, err := s.loadSecretBlob(context.Background(), handle.Ref)
 	if err != nil || blob == nil {
@@ -348,10 +341,7 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 			s.logger.Warn("cluster: secret fan-out skipped; local blob missing after put",
 				"sandbox_id", sandboxID, "ref", handle.Ref, "err", err)
 		}
-		if s.cfg.EnterpriseMode {
-			return fmt.Errorf("enterprise secret fan-out cannot load local sealed blob %q: %v", handle.Ref, err)
-		}
-		return nil
+		return fmt.Errorf("secret fan-out cannot load local sealed blob %q: %v", handle.Ref, err)
 	}
 
 	wait := s.secretFanoutMinACKWait()
@@ -369,15 +359,15 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 				"sandbox_id", sandboxID, "wait", wait, "err", waitErr)
 		}
 	}
-	if s.cfg.EnterpriseMode && len(acked) == 0 {
-		return errors.New("enterprise secret fan-out received no backup ACK")
+	if len(acked) == 0 {
+		return errors.New("secret fan-out received no backup ACK")
 	}
 	go s.runSecretFanout(sandboxID, *blob, recipients, pusher)
 	return nil
 }
 
 func (s *Service) secretFanoutMinACKWait() time.Duration {
-	if s == nil {
+	if s == nil || s.cfg.SecretFanoutMinACKWait <= 0 {
 		return defaultSecretFanoutMinACKWait
 	}
 	return s.cfg.SecretFanoutMinACKWait
@@ -404,7 +394,7 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 // peers. Call once after cluster attach / ownership replay on worker boot so
 // failover_ready is not stuck false forever after a restart.
 func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
-	if s == nil || s.store == nil || !s.cfg.SecretRecipientFanoutEnabled {
+	if s == nil || s.store == nil {
 		return nil
 	}
 	rows, err := s.store.ListClusterSecrets(ctx)
@@ -412,6 +402,7 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 		return err
 	}
 	pusher := s.secretPeerPusher()
+	jobs := make([]store.ClusterSecretRecord, 0, len(rows))
 	for _, rec := range rows {
 		if len(rec.Recipients) == 0 {
 			continue
@@ -430,17 +421,47 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 		if len(rec.Recipients) <= 1 || pusher == nil {
 			continue
 		}
-		blob := secrets.SecretBlob{
-			Ref:            rec.Ref,
-			SandboxID:      rec.SandboxID,
-			Version:        rec.Version,
-			Recipients:     append([]string(nil), rec.Recipients...),
-			SealedPayload:  append([]byte(nil), rec.SealedPayload...),
-			SealGeneration: gen,
-		}
-		go s.runSecretFanout(rec.SandboxID, blob, rec.Recipients, pusher)
+		rec.SealGeneration = gen
+		jobs = append(jobs, rec)
+	}
+	if len(jobs) > 0 {
+		go s.runSecretRefanoutPool(jobs, pusher)
 	}
 	return nil
+}
+
+// runSecretRefanoutPool bounds restart work independently of the number of
+// stored sandboxes. At the 100k-sandbox target, boot must not allocate one
+// goroutine (and one two-minute timeout) per row.
+func (s *Service) runSecretRefanoutPool(records []store.ClusterSecretRecord, pusher cluster.SecretPeerPusher) {
+	workers := secretRefanoutWorkers
+	if len(records) < workers {
+		workers = len(records)
+	}
+	jobs := make(chan store.ClusterSecretRecord, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for rec := range jobs {
+				blob := secrets.SecretBlob{
+					Ref:            rec.Ref,
+					SandboxID:      rec.SandboxID,
+					Version:        rec.Version,
+					Recipients:     append([]string(nil), rec.Recipients...),
+					SealedPayload:  append([]byte(nil), rec.SealedPayload...),
+					SealGeneration: rec.SealGeneration,
+				}
+				s.runSecretFanout(rec.SandboxID, blob, rec.Recipients, pusher)
+			}
+		}()
+	}
+	for _, rec := range records {
+		jobs <- rec
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 func (s *Service) secretPeerPusher() cluster.SecretPeerPusher {
@@ -531,9 +552,7 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	if bindErr != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidClusterSecretBlob, bindErr)
 	}
-	// Peer ingress requires authenticated v4 binding. Legacy unbound v3 is
-	// still openable locally for rolling upgrades, but must not poison peer rows.
-	if meta.Version < secrets.EnvelopeVersion || strings.TrimSpace(meta.SandboxID) == "" {
+	if meta.Version != secrets.EnvelopeVersion || strings.TrimSpace(meta.SandboxID) == "" {
 		return fmt.Errorf("%w: peer secret ingress requires bound v4 envelope", ErrInvalidClusterSecretBlob)
 	}
 	if meta.SandboxID != sandboxID {
@@ -639,7 +658,7 @@ func (s *Service) SecretRecipientsForSeal(sandboxID string) []string {
 // WantsSecretRecipientFanout reports whether reserve/seal should use a
 // multi-recipient set for this create request.
 func (s *Service) WantsSecretRecipientFanout(req models.CreateSandboxRequest) bool {
-	if s == nil || !s.cfg.SecretRecipientFanoutEnabled {
+	if s == nil {
 		return false
 	}
 	return req.Failover != nil && req.Failover.ShouldRecreate()
@@ -657,57 +676,9 @@ func (s *Service) SecretRecipientBackupCount() int {
 	return n
 }
 
-// SecretEnvSealEnabled reports whether sealed sandbox_env + Raft Env redaction
-// are active (SB_SECRET_ENV_SEAL_ENABLED).
-func (s *Service) SecretEnvSealEnabled() bool {
-	return s != nil && s.cfg.SecretEnvSealEnabled
-}
-
-// RedactClusterSecretsConfigured applies RedactClusterSecretsOpts using this
-// service's SecretEnvSealEnabled flag.
+// RedactClusterSecretsConfigured applies the current secret redaction contract.
 func (s *Service) RedactClusterSecretsConfigured(req models.CreateSandboxRequest) models.CreateSandboxRequest {
-	return s.redactClusterSecrets(req)
-}
-
-// assertEnvSealWriterGate refuses env-bearing seals when any alive non-ingress
-// recipient advertises MaxSecretRefVersion < RefVersionEnv (or 0 = pre-capability
-// peer). Prevents silent empty-env recreate on mixed-version fleets (§5c).
-func (s *Service) assertEnvSealWriterGate(bag secrets.Secrets, recipients []string) error {
-	if s == nil || len(bag.Env) == 0 || !s.cfg.SecretEnvSealEnabled {
-		return nil
-	}
-	need := secrets.RefVersionEnv
-	c := s.Cluster()
-	if c == nil {
-		return nil
-	}
-	alive := make(map[string]cluster.Member, len(c.Members()))
-	for _, m := range c.Members() {
-		alive[m.NodeID] = m
-	}
-	for _, id := range recipients {
-		id = strings.TrimSpace(id)
-		if id == "" || id == c.SelfNodeID() {
-			continue
-		}
-		m, ok := alive[id]
-		if !ok || !m.Alive {
-			continue
-		}
-		if strings.TrimSpace(m.Role) == config.NodeRoleIngress {
-			continue
-		}
-		// 0 means older peer without the field — treat as RefVersion only.
-		maxVer := m.MaxSecretRefVersion
-		if maxVer == 0 {
-			maxVer = secrets.RefVersion
-		}
-		if maxVer < need {
-			return fmt.Errorf("secret env seal writer gate: peer %q max_secret_ref_version=%d < %d (roll fleet before enabling SB_SECRET_ENV_SEAL_ENABLED)",
-				id, maxVer, need)
-		}
-	}
-	return nil
+	return RedactClusterSecrets(req)
 }
 
 // computeFailoverReady implements E1a: omit for non-recreate; otherwise true
@@ -816,11 +787,7 @@ func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID stri
 	ref := secrets.FormatRef(sandboxID, secrets.RefVersion)
 	blob, err := newSecretBlobStore(s.store).Get(ctx, ref)
 	if err != nil || blob == nil {
-		// Env-sealed bags may use RefVersionEnv=2.
-		blob, err = newSecretBlobStore(s.store).Get(ctx, secrets.FormatRef(sandboxID, secrets.RefVersionEnv))
-		if err != nil || blob == nil {
-			return nil
-		}
+		return nil
 	}
 	return blob.Recipients
 }

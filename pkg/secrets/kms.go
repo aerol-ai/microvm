@@ -12,7 +12,7 @@ import (
 // seam so KMSProvider never talks to a concrete backend.
 //
 // encCtx is optional additional authenticated context (AWS KMS EncryptionContext
-// / FakeKMS AAD). Pass nil for canaries and legacy callers.
+// / FakeKMS AAD). Boot canaries pass nil; production envelope wraps bind it.
 type DataKeyWrapper interface {
 	Wrap(ctx context.Context, dek []byte, encCtx map[string]string) (wrapped []byte, err error)
 	Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]string) (dek []byte, err error)

@@ -89,7 +89,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
 	svc := &Service{
-		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:            config.Config{},
 		cipher:         cipher,
 		store:          st,
 		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),

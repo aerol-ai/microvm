@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -235,35 +234,36 @@ func TestClusterSecretsErrorArmsWave8(t *testing.T) {
 	}
 
 	s := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	if _, err := s.SealClusterSecretsForRecipient(req, "*"); err == nil || !strings.Contains(err.Error(), "cipher") {
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil || !strings.Contains(err.Error(), "cipher") {
 		t.Fatalf("nil cipher = %v", err)
 	}
 
 	s.cipher = newTestCipher(t)
 	setRandReader(t, &scriptedRandReader{errs: []error{errors.New("dek fail")}})
-	if _, err := s.SealClusterSecretsForRecipient(req, "node-a"); err == nil {
+	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected dek entropy failure")
 	}
 
 	setRandReader(t, &scriptedRandReader{errs: []error{nil /*dek*/, errors.New("nonce fail")}})
-	if _, err := s.SealClusterSecretsForRecipient(req, "*"); err == nil {
+	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected nonce entropy failure")
 	}
 
 	// Broken cipher (zero value) fails EncryptWithAAD on wrap.
 	s.cipher = &secrets.Cipher{}
-	if _, err := s.SealClusterSecretsForRecipient(req, "*"); err == nil {
+	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected wrap failure")
 	}
 
 	s2 := &Service{cipher: newTestCipher(t), store: nil, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	if _, err := s2.PutClusterSecretsForRecipient(ctx, "sb", req, "n1"); err == nil || !strings.Contains(err.Error(), "store") {
+	if _, err := s2.SealAndDistribute(ctx, "sb", req, []string{"n1"}, SealStrict); err == nil || !strings.Contains(err.Error(), "store") {
 		t.Fatalf("nil store put = %v", err)
 	}
-	if _, err := s2.PutClusterSecretsForRecipient(ctx, "", req, "n1"); err == nil {
+	if _, err := s2.SealAndDistribute(ctx, "", req, []string{"n1"}, SealStrict); err == nil {
 		t.Fatal("expected empty sandbox id")
 	}
-	empty, err := s2.PutClusterSecretsForRecipient(ctx, "sb", models.CreateSandboxRequest{Image: "x"}, "n1")
+	empty, err := s2.SealAndDistribute(ctx, "sb", models.CreateSandboxRequest{Image: "x"}, []string{"n1"}, SealStrict)
 	if err != nil || empty.Ref != "" {
 		t.Fatalf("no secrets = %+v %v", empty, err)
 	}
@@ -571,9 +571,9 @@ func TestOpenClusterSecretsStoreMissWave8(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cipher = newTestCipher(t)
-	_, err := svc.OpenClusterSecrets(ctx, models.CreateSandboxRequest{Image: "x"}, cluster.PlacementSecrets{
+	_, err := svc.OpenClusterSecretsForNode(ctx, "sb", models.CreateSandboxRequest{Image: "x"}, cluster.PlacementSecrets{
 		Ref: "missing-ref", Version: 1,
-	})
+	}, "node-a")
 	if err == nil {
 		t.Fatal("expected missing secret ref error")
 	}
@@ -638,13 +638,14 @@ func TestGCZombieSnapshotFailWave8(t *testing.T) {
 
 func TestSealClusterSecretEnvelopeDirectWave8(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
-	out, err := s.sealClusterSecretEnvelope([]byte(`{"x":1}`), []string{"*"})
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	out, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{"x":1}`), []string{"node-a"}, binding)
 	if err != nil || len(out) == 0 {
 		t.Fatalf("seal = %v %d", err, len(out))
 	}
-	var env clusterSealedSecretsEnvelope
-	if err := json.Unmarshal(out, &env); err != nil || env.Version == 0 {
-		t.Fatalf("envelope = %+v %v", env, err)
+	meta, err := secrets.EnvelopeBinding(out)
+	if err != nil || meta.Version != secrets.EnvelopeVersion {
+		t.Fatalf("envelope = %+v %v", meta, err)
 	}
 }
 

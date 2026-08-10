@@ -13,24 +13,24 @@ import (
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
-func testEnvService(t *testing.T, sealEnabled bool) (*Service, *store.Store, *memSecretAuditSink) {
+func testEnvService(t *testing.T) (*Service, *store.Store, *memSecretAuditSink) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "svc-env.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	st.SetOmitEnvFromScanner(sealEnabled)
 	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "key"))
 	if err != nil {
 		t.Fatalf("NewCipher: %v", err)
 	}
 	audit := &memSecretAuditSink{}
 	svc := &Service{
-		cfg:         config.Config{SecretEnvSealEnabled: sealEnabled},
-		store:       st,
-		cipher:      cipher,
-		secretAudit: audit,
+		cfg:            config.Config{},
+		store:          st,
+		cipher:         cipher,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		secretAudit:    audit,
 	}
 	return svc, st, audit
 }
@@ -50,7 +50,7 @@ func seedEnvSandbox(t *testing.T, st *store.Store, id string, env map[string]str
 }
 
 func TestSealLoadEnvRoundTrip(t *testing.T) {
-	svc, st, audit := testEnvService(t, true)
+	svc, st, audit := testEnvService(t)
 	ctx := context.Background()
 	seedEnvSandbox(t, st, "sb-rt", map[string]string{"TOKEN": "secret"})
 
@@ -74,61 +74,8 @@ func TestSealLoadEnvRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLoadEnvPlaintextFallbackMetric(t *testing.T) {
-	svc, st, _ := testEnvService(t, true)
-	ctx := context.Background()
-	seedEnvSandbox(t, st, "sb-fb", map[string]string{"LEGACY": "1"})
-
-	before := envPlaintextFallbackTotal.Value()
-	got, err := svc.loadEnv(ctx, "sb-fb")
-	if err != nil {
-		t.Fatalf("loadEnv: %v", err)
-	}
-	if got["LEGACY"] != "1" {
-		t.Fatalf("fallback = %+v", got)
-	}
-	if envPlaintextFallbackTotal.Value() != before+1 {
-		t.Fatalf("fallback metric = %d, want %d", envPlaintextFallbackTotal.Value(), before+1)
-	}
-}
-
-func TestSealLegacySandboxEnvBootMigration(t *testing.T) {
-	svc, st, audit := testEnvService(t, true)
-	ctx := context.Background()
-	seedEnvSandbox(t, st, "sb-env-legacy", map[string]string{"TOKEN": "secret"})
-
-	migrated, err := svc.SealLegacySandboxEnv(ctx)
-	if err != nil {
-		t.Fatalf("SealLegacySandboxEnv: %v", err)
-	}
-	if migrated != 1 {
-		t.Fatalf("migrated = %d, want 1", migrated)
-	}
-	if again, err := svc.SealLegacySandboxEnv(ctx); err != nil || again != 0 {
-		t.Fatalf("idempotent migration = %d, %v", again, err)
-	}
-	plain, err := st.GetEnvJSON(ctx, "sb-env-legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plain) != 0 {
-		t.Fatalf("plaintext env remains: %+v", plain)
-	}
-	got, err := svc.loadEnv(ctx, "sb-env-legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got["TOKEN"] != "secret" {
-		t.Fatalf("opened env = %+v", got)
-	}
-	events := audit.Events()
-	if len(events) < 2 || events[0].Result != secretAuditResultSuccess {
-		t.Fatalf("migration/load audit = %+v", events)
-	}
-}
-
 func TestUpsertPreservesSealedEnv(t *testing.T) {
-	svc, st, _ := testEnvService(t, true)
+	svc, st, _ := testEnvService(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
@@ -158,7 +105,7 @@ func TestUpsertPreservesSealedEnv(t *testing.T) {
 }
 
 func TestGetListOmitEnvIncludeOptIn(t *testing.T) {
-	svc, st, audit := testEnvService(t, true)
+	svc, st, audit := testEnvService(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
@@ -206,16 +153,12 @@ func TestGetListOmitEnvIncludeOptIn(t *testing.T) {
 	_ = st
 }
 
-func TestRedactClusterSecretsClearsEnvWhenSealed(t *testing.T) {
+func TestRedactClusterSecretsClearsEnv(t *testing.T) {
 	req := models.CreateSandboxRequest{
 		Image: "alpine:3.19",
 		Env:   map[string]string{"A": "1"},
 	}
-	kept := RedactClusterSecrets(req)
-	if kept.Env["A"] != "1" {
-		t.Fatalf("default redact should keep Env: %+v", kept.Env)
-	}
-	cleared := RedactClusterSecretsOpts(req, true)
+	cleared := RedactClusterSecrets(req)
 	if cleared.Env != nil {
 		t.Fatalf("sealEnv redact Env = %+v, want nil", cleared.Env)
 	}
@@ -229,19 +172,15 @@ func TestMergeClusterSecretsRestoresEnv(t *testing.T) {
 	}
 }
 
-func TestSecretsFromRequestIncludesEnvWhenFlagOn(t *testing.T) {
+func TestSecretsFromRequestIncludesEnv(t *testing.T) {
 	req := models.CreateSandboxRequest{Env: map[string]string{"A": "1"}}
-	off := (&Service{}).secretsFromRequest(req)
-	if !off.IsEmpty() {
-		t.Fatalf("flag-off bag should be empty, got %+v", off)
-	}
-	on := (&Service{cfg: config.Config{SecretEnvSealEnabled: true}}).secretsFromRequest(req)
-	if on.IsEmpty() || on.Env["A"] != "1" {
-		t.Fatalf("flag-on bag = %+v", on)
+	bag := (&Service{}).secretsFromRequest(req)
+	if bag.IsEmpty() || bag.Env["A"] != "1" {
+		t.Fatalf("bag = %+v", bag)
 	}
 }
 
-func TestLocalProviderEnvUsesRefVersionEnv(t *testing.T) {
+func TestLocalProviderEnvUsesCanonicalRefVersion(t *testing.T) {
 	ctx := context.Background()
 	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "k"))
 	if err != nil {
@@ -253,8 +192,8 @@ func TestLocalProviderEnvUsesRefVersionEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if h.Version != secrets.RefVersionEnv {
-		t.Fatalf("version = %d, want %d", h.Version, secrets.RefVersionEnv)
+	if h.Version != secrets.RefVersion {
+		t.Fatalf("version = %d, want %d", h.Version, secrets.RefVersion)
 	}
 	got, err := p.Open(ctx, "sb-v2", h, "n1")
 	if err != nil {
@@ -265,32 +204,13 @@ func TestLocalProviderEnvUsesRefVersionEnv(t *testing.T) {
 	}
 
 	// Loud reject for unsupported future versions.
-	if _, err := p.Open(ctx, "sb-v2", secrets.Handle{Ref: h.Ref, Version: secrets.MaxSupportedRefVersion + 1}, "n1"); !errors.Is(err, secrets.ErrVersionMismatch) {
+	if _, err := p.Open(ctx, "sb-v2", secrets.Handle{Ref: h.Ref, Version: secrets.RefVersion + 1}, "n1"); !errors.Is(err, secrets.ErrVersionMismatch) {
 		t.Fatalf("unsupported version err = %v", err)
 	}
 }
 
-func TestPersistSandboxCreateFlagOffSkipsPutEnv(t *testing.T) {
-	svc, st, _ := testEnvService(t, false)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	sb := &models.Sandbox{
-		ID: "sb-off", Image: "alpine:3.19", Status: models.SandboxStatusStarted,
-		PublicURL: "http://x/sb-off", ContainerID: "c", ContainerIP: "10.0.0.1",
-		CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root",
-		Env:       map[string]string{"A": "1"},
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
-	}
-	if err := svc.persistSandboxCreate(ctx, sb); err != nil {
-		t.Fatalf("persist: %v", err)
-	}
-	if _, err := st.GetEnv(ctx, "sb-off"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("flag-off should not write sandbox_env: %v", err)
-	}
-}
-
 func TestOpenClusterSecretsMergesEnv(t *testing.T) {
-	svc, _, _ := testEnvService(t, true)
+	svc, _, _ := testEnvService(t)
 	ctx := context.Background()
 	req := models.CreateSandboxRequest{
 		Image: "alpine:3.19",
@@ -300,10 +220,10 @@ func TestOpenClusterSecretsMergesEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SealAndDistribute: %v", err)
 	}
-	if handle.Version != secrets.RefVersionEnv {
+	if handle.Version != secrets.RefVersion {
 		t.Fatalf("handle version = %d", handle.Version)
 	}
-	redacted := svc.redactClusterSecrets(req)
+	redacted := RedactClusterSecrets(req)
 	if redacted.Env != nil {
 		t.Fatalf("redacted Env = %+v", redacted.Env)
 	}

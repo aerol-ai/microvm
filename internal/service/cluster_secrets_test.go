@@ -3,7 +3,6 @@ package service
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -15,10 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
-// newTestCipher gives us a real Cipher backed by a fresh keyfile. We bind to
-// a temp dir so each test gets isolated key material — important because
-// SealClusterSecretsForRecipient / UnsealClusterSecrets are Service methods
-// and we want to assert real round-tripping, not just that we wired the JSON.
+// newTestCipher gives each test isolated key material.
 func newTestCipher(t *testing.T) *secrets.Cipher {
 	t.Helper()
 	c, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "key"))
@@ -28,7 +24,7 @@ func newTestCipher(t *testing.T) *secrets.Cipher {
 	return c
 }
 
-func TestSealClusterSecretsRoundTrip(t *testing.T) {
+func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
 	req := models.CreateSandboxRequest{
 		Image: "alpine",
@@ -45,10 +41,10 @@ func TestSealClusterSecretsRoundTrip(t *testing.T) {
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 	}
 
-	// Wildcard recipient preserves UnsealClusterSecrets("", nodeID) behavior.
-	sealed, err := s.SealClusterSecretsForRecipient(req, "*")
+	binding := secrets.SealBinding{SandboxID: "sb-roundtrip", Ref: secrets.FormatRef("sb-roundtrip", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding)
 	if err != nil {
-		t.Fatalf("SealClusterSecretsForRecipient: %v", err)
+		t.Fatalf("SealEnvelopeBound: %v", err)
 	}
 	if len(sealed) == 0 {
 		t.Fatal("sealed bag empty for request with credentials")
@@ -89,10 +85,11 @@ func TestSealClusterSecretsRoundTrip(t *testing.T) {
 		t.Fatal("Redact mutated the source request's platform volumes")
 	}
 
-	merged, err := s.UnsealClusterSecrets(redacted, sealed)
+	bag, err := secrets.OpenEnvelopeBound(s.cipher, sealed, "node-a", binding)
 	if err != nil {
-		t.Fatalf("UnsealClusterSecrets: %v", err)
+		t.Fatalf("OpenEnvelopeBound: %v", err)
 	}
+	merged := mergeClusterSecrets(redacted, bag)
 	if merged.Registry == nil || merged.Registry.Password != "supersecret" {
 		t.Fatalf("merged registry password lost: %+v", merged.Registry)
 	}
@@ -105,10 +102,7 @@ func TestSealClusterSecretsRoundTrip(t *testing.T) {
 	}
 }
 
-// SealClusterSecretsForRecipient must return nil/nil for credential-free
-// requests so we don't end up with a non-empty FSM column for every
-// plain-public-image sandbox.
-func TestSealClusterSecretsEmpty(t *testing.T) {
+func TestClusterSecretEnvelopeEmpty(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
 	cases := []models.CreateSandboxRequest{
 		{Image: "alpine"},
@@ -116,9 +110,10 @@ func TestSealClusterSecretsEmpty(t *testing.T) {
 		{Image: "alpine", Mounts: []models.MountSpec{{Type: models.MountTypeNFS, Target: "/srv", Source: "x:/y"}}},
 	}
 	for i, req := range cases {
-		sealed, err := s.SealClusterSecretsForRecipient(req, "*")
+		binding := secrets.SealBinding{SandboxID: "sb-empty", Ref: secrets.FormatRef("sb-empty", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+		sealed, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding)
 		if err != nil {
-			t.Fatalf("case %d: SealClusterSecretsForRecipient: %v", i, err)
+			t.Fatalf("case %d: SealEnvelopeBound: %v", i, err)
 		}
 		if sealed != nil {
 			t.Fatalf("case %d: expected nil sealed bag for credential-free req, got %d bytes", i, len(sealed))
@@ -132,18 +127,20 @@ func TestSealClusterSecretsRecipientBound(t *testing.T) {
 		Image:    "private.example.com/app:latest",
 		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: "super-secret-password"},
 	}
-	sealed, err := s.SealClusterSecretsForRecipient(req, "node-a")
+	binding := secrets.SealBinding{SandboxID: "sb-recipient", Ref: secrets.FormatRef("sb-recipient", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding)
 	if err != nil {
-		t.Fatalf("SealClusterSecretsForRecipient: %v", err)
+		t.Fatalf("SealEnvelopeBound: %v", err)
 	}
 	redacted := RedactClusterSecrets(req)
-	if _, err := s.UnsealClusterSecretsForNode(redacted, sealed, "node-b"); err == nil {
+	if _, err := secrets.OpenEnvelopeBound(s.cipher, sealed, "node-b", binding); err == nil {
 		t.Fatal("wrong recipient opened sealed cluster secrets")
 	}
-	merged, err := s.UnsealClusterSecretsForNode(redacted, sealed, "node-a")
+	bag, err := secrets.OpenEnvelopeBound(s.cipher, sealed, "node-a", binding)
 	if err != nil {
 		t.Fatalf("recipient failed to open sealed cluster secrets: %v", err)
 	}
+	merged := mergeClusterSecrets(redacted, bag)
 	if merged.Registry == nil || merged.Registry.Password != "super-secret-password" {
 		t.Fatalf("recipient merge lost registry password: %+v", merged.Registry)
 	}
@@ -157,7 +154,8 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 	}
 	defer st.Close()
 
-	s := &Service{cipher: newTestCipher(t), store: st}
+	cipher := newTestCipher(t)
+	s := &Service{cipher: cipher, store: st, secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st))}
 	req := models.CreateSandboxRequest{
 		Image:    "private.example.com/app:latest",
 		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: "super-secret-password"},
@@ -169,11 +167,11 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 		}},
 	}
 
-	handle, err := s.PutClusterSecretsForRecipient(ctx, "sb-secret-ref", req, "node-a")
+	handle, err := s.SealAndDistribute(ctx, "sb-secret-ref", req, []string{"node-a"}, SealStrict)
 	if err != nil {
-		t.Fatalf("PutClusterSecretsForRecipient: %v", err)
+		t.Fatalf("SealAndDistribute: %v", err)
 	}
-	if handle.Ref == "" || handle.Version != clusterSecretVersion {
+	if handle.Ref == "" || handle.Version != secrets.RefVersion {
 		t.Fatalf("handle = %+v, want ref/version handle", handle)
 	}
 
@@ -184,12 +182,12 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 	if bytes.Contains(rec.SealedPayload, []byte("super-secret-password")) || bytes.Contains(rec.SealedPayload, []byte("shh-secret-token")) {
 		t.Fatal("stored cluster secret payload leaks plaintext credentials")
 	}
-	var env clusterSealedSecretsEnvelope
-	if err := json.Unmarshal(rec.SealedPayload, &env); err != nil {
-		t.Fatalf("unmarshal stored envelope: %v", err)
+	meta, err := secrets.EnvelopeBinding(rec.SealedPayload)
+	if err != nil {
+		t.Fatalf("EnvelopeBinding: %v", err)
 	}
-	if env.Version != clusterSecretEnvelopeVersion || len(env.WrappedKey) == 0 || len(env.Payload) == 0 {
-		t.Fatalf("envelope = %+v, want v3 with wrapped per-secret key and payload", env)
+	if meta.Version != secrets.EnvelopeVersion || meta.SandboxID != "sb-secret-ref" || meta.Ref != handle.Ref {
+		t.Fatalf("envelope binding = %+v, want current identity-bound envelope", meta)
 	}
 
 	redacted := RedactClusterSecrets(req)
@@ -221,20 +219,6 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 	}
 }
 
-// UnsealClusterSecrets with empty input must be a passthrough — callers
-// shouldn't have to short-circuit themselves.
-func TestUnsealClusterSecretsEmpty(t *testing.T) {
-	s := &Service{cipher: newTestCipher(t)}
-	in := models.CreateSandboxRequest{Image: "alpine"}
-	out, err := s.UnsealClusterSecrets(in, nil)
-	if err != nil {
-		t.Fatalf("UnsealClusterSecrets nil: %v", err)
-	}
-	if out.Image != "alpine" {
-		t.Fatalf("passthrough lost spec: %+v", out)
-	}
-}
-
 func TestDeleteClusterSecretsStandaloneLeavesNoTomb(t *testing.T) {
 	ctx := context.Background()
 	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -244,16 +228,16 @@ func TestDeleteClusterSecretsStandaloneLeavesNoTomb(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	s := &Service{
-		cfg:            config.Config{SecretRecipientFanoutEnabled: true},
+		cfg:            config.Config{},
 		cipher:         newTestCipher(t),
 		store:          st,
 		secretProvider: secrets.NewLocalProvider(newTestCipher(t), newSecretBlobStore(st)),
 		cluster:        cluster.NewNoop("standalone", "http://localhost", ""),
 	}
-	if _, err := s.PutClusterSecretsForRecipient(ctx, "sb-solo", models.CreateSandboxRequest{
+	if _, err := s.SealAndDistribute(ctx, "sb-solo", models.CreateSandboxRequest{
 		Image:    "alpine",
 		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
-	}, "standalone"); err != nil {
+	}, []string{"standalone"}, SealStrict); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DeleteClusterSecrets(ctx, "sb-solo"); err != nil {
@@ -277,13 +261,14 @@ func TestDeleteClusterSecretsRemovesProviderRecord(t *testing.T) {
 	}
 	defer st.Close()
 
-	s := &Service{cipher: newTestCipher(t), store: st}
-	handle, err := s.PutClusterSecretsForRecipient(ctx, "sb-delete-secrets", models.CreateSandboxRequest{
+	cipher := newTestCipher(t)
+	s := &Service{cipher: cipher, store: st, secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st))}
+	handle, err := s.SealAndDistribute(ctx, "sb-delete-secrets", models.CreateSandboxRequest{
 		Image:    "private.example.com/app:latest",
 		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "alice", Password: "super-secret-password"},
-	}, "node-a")
+	}, []string{"node-a"}, SealStrict)
 	if err != nil {
-		t.Fatalf("PutClusterSecretsForRecipient: %v", err)
+		t.Fatalf("SealAndDistribute: %v", err)
 	}
 	if err := s.DeleteClusterSecrets(ctx, "sb-delete-secrets"); err != nil {
 		t.Fatalf("DeleteClusterSecrets: %v", err)
@@ -301,7 +286,7 @@ func TestDeleteClusterSecretsRemovesProviderRecord(t *testing.T) {
 	}
 }
 
-func TestClusterSecretRedactionAndEnvelopeErrorBranches(t *testing.T) {
+func TestClusterSecretRedactionCopiesNonSecretFields(t *testing.T) {
 	req := models.CreateSandboxRequest{
 		Image: "alpine",
 		Env:   map[string]string{"A": "1"},
@@ -317,37 +302,10 @@ func TestClusterSecretRedactionAndEnvelopeErrorBranches(t *testing.T) {
 	if redacted.Failover == nil || redacted.Failover == req.Failover || redacted.Failover.Policy != models.FailoverPolicyRecreate {
 		t.Fatalf("failover not deep-copied correctly: %+v", redacted.Failover)
 	}
-	if redacted.Env["A"] != "1" {
-		t.Fatalf("env not preserved: %+v", redacted.Env)
+	if len(redacted.Env) != 0 {
+		t.Fatalf("env was not redacted: %+v", redacted.Env)
 	}
 	if redacted.Mounts[0].Options["ro"] != "true" {
 		t.Fatalf("mount options not preserved: %+v", redacted.Mounts[0].Options)
-	}
-
-	s := &Service{cipher: newTestCipher(t)}
-	dek := make([]byte, 32)
-	wrapped, err := s.cipher.EncryptWithAAD(dek, clusterSecretKeyAAD([]string{"*"}))
-	if err != nil {
-		t.Fatalf("EncryptWithAAD: %v", err)
-	}
-	sealed, err := json.Marshal(clusterSealedSecretsEnvelope{
-		Version:    clusterSecretEnvelopeVersion,
-		Recipients: []string{"*"},
-		WrappedKey: wrapped,
-		Payload:    []byte{1, 2},
-	})
-	if err != nil {
-		t.Fatalf("marshal envelope: %v", err)
-	}
-	if _, err := s.openClusterSecretPayload(sealed, ""); err == nil {
-		t.Fatal("openClusterSecretPayload should reject a short sealed payload")
-	}
-
-	if _, err := s.openClusterSecretPayload([]byte(`{"version":3,"recipients":["*"],"payload":"abc"}`), ""); err == nil {
-		t.Fatal("openClusterSecretPayload should reject missing wrapped data key")
-	}
-
-	if _, err := openClusterSecretEnvelopePayload(dek, []byte{1, 2, 3}, []string{"*"}); err == nil {
-		t.Fatal("openClusterSecretEnvelopePayload should reject too-short payloads")
 	}
 }

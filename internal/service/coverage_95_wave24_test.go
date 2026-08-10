@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestNetstatsGetAfterUpdateFailWave24(t *testing.T) {
@@ -155,12 +156,10 @@ func TestL4ListenPortReturnZeroWave24(t *testing.T) {
 
 func TestCaddyCoalescerAndSecretsEntropyWave24(t *testing.T) {
 	svc := &Service{cipher: newTestCipher(t), logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	bag := secrets.Secrets{Registry: &models.RegistryAuth{Username: "u", Password: "p"}}
 	setRandReader(t, &scriptedRandReader{errs: []error{errors.New("dek")}})
-	_, _ = svc.SealClusterSecretsForRecipient(models.CreateSandboxRequest{
-		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, "node-a")
+	_, _ = secrets.SealEnvelopeBound(svc.cipher, bag, []string{"node-a"}, binding)
 	setRandReader(t, &scriptedRandReader{errs: []error{nil, errors.New("nonce")}})
-	_, _ = svc.SealClusterSecretsForRecipient(models.CreateSandboxRequest{
-		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, "node-a")
+	_, _ = secrets.SealEnvelopeBound(svc.cipher, bag, []string{"node-a"}, binding)
 }

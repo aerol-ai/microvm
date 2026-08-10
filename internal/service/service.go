@@ -501,7 +501,7 @@ type Service struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
-	if db != nil && cfg.SecretToolboxSealEnabled {
+	if db != nil {
 		db.SetSecretCipher(cipher)
 	}
 	s := &Service{
@@ -994,8 +994,8 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // container can pull from the same private registry / mount the same external
 // storage. Two walls historically blocked cross-node open: the sealed
 // cluster_secrets row lived only on the sealing node, and the envelope was
-// recipient-bound to that node alone. Recipient-set sealing plus async peer
-// fan-out (SB_SECRET_RECIPIENT_FANOUT_ENABLED) fix both. A decrypt failure is
+// recipient-bound to that node alone. Recipient-set sealing plus mandatory
+// peer fan-out fix both. A decrypt failure is
 // fatal to this attempt; ErrRecipientDenied is permanent for this node (the
 // owner watcher must not reassign-churn the fleet).
 //
@@ -1440,12 +1440,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// blocked by a spec that barely fit without it. Cost: one JSON encode +
 	// SHA-256 of ≤4KiB (~µs), cluster mode only.
 	if s.cfg.EnableCluster {
-		redacted := s.redactClusterSecrets(req)
-		ver := clusterSecretVersion
-		if s.cfg.SecretEnvSealEnabled && len(req.Env) > 0 {
-			ver = secrets.RefVersionEnv
-		}
-		handle := cluster.PlacementSecrets{Ref: clusterSecretRef(sandboxID, ver), Version: ver}
+		redacted := RedactClusterSecrets(req)
+		handle := cluster.PlacementSecrets{Ref: secrets.FormatRef(sandboxID, secrets.RefVersion), Version: secrets.RefVersion}
 		if err := cluster.ValidateRecoveryPayloadSize(sandboxID, &redacted, handle); err != nil {
 			return nil, fmt.Errorf("sandbox spec too large to replicate across the cluster (image, env, labels, and mount definitions all count): %w", err)
 		}
@@ -1993,24 +1989,17 @@ func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) {
 	sandbox.RegistryAuth = auth
 }
 
-// persistSandboxCreate writes the sandbox row, and when env-seal is enabled
-// also the sealed sandbox_env blob in the same store transaction.
+// persistSandboxCreate writes the sandbox row and its sealed environment in
+// the same transaction.
 func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
 	}
-	var err error
-	if !s.cfg.SecretEnvSealEnabled {
-		err = s.store.Create(ctx, sandbox)
-	} else {
-		var sealed []byte
-		sealed, err = s.sealEnv(sandbox.Env)
-		if err != nil {
-			return err
-		}
-		err = s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
+	sealed, err := s.sealEnv(sandbox.Env)
+	if err != nil {
+		return err
 	}
-	return err
+	return s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
 }
 
 // sealEnv marshals env and encrypts it for at-rest storage. Returns nil when
@@ -2033,8 +2022,7 @@ func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
 	return sealed, nil
 }
 
-// loadEnv reads sealed sandbox_env, falling back to plaintext env_json for
-// lazy migration. Explicit loads are audited (D9 / T6).
+// loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
 func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string]string, err error) {
 	done := beginSecretAudit(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx))
 	defer func() { done(err) }()
@@ -2057,82 +2045,10 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string
 		}
 		return out, nil
 	}
-	if getErr != nil && !errors.Is(getErr, store.ErrNotFound) {
-		return nil, getErr
+	if errors.Is(getErr, store.ErrNotFound) {
+		return map[string]string{}, nil
 	}
-
-	// Lazy migration: sealed row missing → plaintext env_json fallback.
-	plainEnv, plainErr := s.store.GetEnvJSON(ctx, sandboxID)
-	if plainErr != nil {
-		if errors.Is(plainErr, store.ErrNotFound) {
-			return map[string]string{}, nil
-		}
-		return nil, plainErr
-	}
-	if len(plainEnv) > 0 {
-		recordEnvPlaintextFallback()
-		// Best-effort reseal when the flag is on so subsequent reads leave
-		// the sealed row as source of truth. Put+clear is one transaction so a
-		// crash cannot leave an ambiguous dual-write.
-		if s.cfg.SecretEnvSealEnabled {
-			if sealedBytes, sealErr := s.sealEnv(plainEnv); sealErr == nil && len(sealedBytes) > 0 {
-				_ = s.store.PutEnvAndClearLegacy(ctx, sandboxID, sealedBytes)
-			}
-		}
-	}
-	return plainEnv, nil
-}
-
-// SealLegacySandboxEnv migrates every pre-feature plaintext env_json row in
-// bounded, resumable batches. Each plaintext read is audited and each row's
-// sealed write + plaintext removal commits atomically.
-func (s *Service) SealLegacySandboxEnv(ctx context.Context) (int64, error) {
-	if s == nil || s.store == nil || !s.cfg.SecretEnvSealEnabled {
-		return 0, nil
-	}
-	if s.cipher == nil {
-		return 0, errors.New("seal legacy sandbox env: cipher is not configured")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	const batchSize = 256
-	var migrated int64
-	for {
-		batch, err := s.store.ListLegacySandboxEnvBatch(ctx, batchSize)
-		if err != nil {
-			return migrated, err
-		}
-		if len(batch) == 0 {
-			return migrated, nil
-		}
-		for _, item := range batch {
-			done := beginSecretAudit(s.secretAuditSink(), item.SandboxID, envAuditRef(item.SandboxID), s.auditActor(), "")
-			var sealErr error
-			if len(item.Env) == 0 {
-				sealErr = s.store.ClearEnvJSON(ctx, item.SandboxID)
-			} else {
-				var sealed []byte
-				sealed, sealErr = s.sealEnv(item.Env)
-				if sealErr == nil {
-					sealErr = s.store.PutEnvAndClearLegacy(ctx, item.SandboxID, sealed)
-				}
-			}
-			done(sealErr)
-			if sealErr != nil {
-				return migrated, fmt.Errorf("migrate sandbox env for %q: %w", item.SandboxID, sealErr)
-			}
-			migrated++
-		}
-		if s.secretAuditFile != nil {
-			if err := s.secretAuditFile.Sync(); err != nil {
-				return migrated, fmt.Errorf("sync sandbox env migration audit: %w", err)
-			}
-		}
-		if len(batch) < batchSize {
-			return migrated, nil
-		}
-	}
+	return nil, getErr
 }
 
 // sealMounts marshals the user's mount specs and encrypts the JSON for

@@ -2,7 +2,14 @@ package daemon
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +39,49 @@ type runTestPaths struct {
 	bypassMarkerPath  string
 	internalL4WakeDir string
 	toolboxMountPath  string
+	clusterTLSDir     string
+}
+
+func writeTestClusterTLS(t *testing.T, rootDir string) string {
+	t.Helper()
+	dir := filepath.Join(rootDir, "cluster-tls")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir cluster tls: %v", err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate cluster tls key: %v", err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "aerolvm-test-cluster"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"aerolvm-cluster-node"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cluster tls cert: %v", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal cluster tls key: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	for name, data := range map[string][]byte{
+		"ca.crt": certPEM, "node.crt": certPEM, "node.key": keyPEM,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	return dir
 }
 
 func setBaseRunEnv(t *testing.T) runTestPaths {
@@ -57,6 +107,7 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 		internalL4WakeDir: filepath.Join(rootDir, "l4wake"),
 		toolboxMountPath:  "/usr/local/bin/toolboxd",
 	}
+	paths.clusterTLSDir = writeTestClusterTLS(t, rootDir)
 	paths.bypassMarkerPath = filepath.Join(filepath.Dir(paths.dbPath), "bypass_last_enabled")
 
 	if err := os.WriteFile(paths.clusterPATPath, []byte("cluster-pat-token\n"), 0o600); err != nil {
@@ -74,6 +125,7 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 	t.Setenv("SB_TOOLBOX_BINARY_PATH", "/bin/true")
 	t.Setenv("SB_TOOLBOX_MOUNT_PATH", paths.toolboxMountPath)
 	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", paths.keyPath)
+	t.Setenv("SB_CLUSTER_TLS_DIR", paths.clusterTLSDir)
 	t.Setenv("SB_MOUNTS_ROOT", paths.mountsRoot)
 	t.Setenv("SB_MOUNTS_CRED_DIR", paths.mountCredDir)
 	t.Setenv("SB_HTTP_CLIENT_TIMEOUT", "200ms")
@@ -306,7 +358,7 @@ func TestRun_GracefulShutdownClusterServerIngress(t *testing.T) {
 	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
 	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
 	t.Setenv("SB_CLUSTER_INTERNAL_LISTEN", fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)))
-	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)))
+	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", fmt.Sprintf("https://127.0.0.1:%d", pickFreeTCPPort(t)))
 
 	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
 		t.Fatalf("Run returned error: %v", err)

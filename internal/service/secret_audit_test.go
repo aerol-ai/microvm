@@ -81,11 +81,13 @@ func TestSecretAuditSuccessAndFailureClasses(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	mem := &memSecretAuditSink{}
+	cipher := newTestCipher(t)
 	s := &Service{
-		cipher:      newTestCipher(t),
-		store:       st,
-		secretAudit: mem,
-		cluster:     cluster.NewNoop("node-a", "", ""),
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		secretAudit:    mem,
+		cluster:        cluster.NewNoop("node-a", "", ""),
 	}
 
 	const password = "super-secret-password-value"
@@ -93,7 +95,7 @@ func TestSecretAuditSuccessAndFailureClasses(t *testing.T) {
 		Image:    "private.example.com/app:latest",
 		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: password},
 	}
-	handle, err := s.PutClusterSecretsForRecipient(ctx, "sb-audit", req, "node-a")
+	handle, err := s.SealAndDistribute(ctx, "sb-audit", req, []string{"node-a"}, SealStrict)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}

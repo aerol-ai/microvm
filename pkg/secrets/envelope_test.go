@@ -41,83 +41,78 @@ func (f *failAfterRand) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestSealOpenEnvelopeRoundTripAndEmpty(t *testing.T) {
+func testBinding() SealBinding {
+	return SealBinding{SandboxID: "sb-1", Ref: FormatRef("sb-1", RefVersion), Version: RefVersion, Generation: 1}
+}
+
+func TestSealOpenEnvelopeBoundRoundTripAndEmpty(t *testing.T) {
 	c := testCipher(t)
-	empty, err := SealEnvelope(c, Secrets{}, []string{"node-a"})
+	binding := testBinding()
+	empty, err := SealEnvelopeBound(c, Secrets{}, []string{"node-a"}, binding)
 	if err != nil || empty != nil {
-		t.Fatalf("empty SealEnvelope = %v %v", empty, err)
+		t.Fatalf("empty SealEnvelopeBound = %v %v", empty, err)
 	}
-	if _, err := SealEnvelope(nil, Secrets{Registry: &models.RegistryAuth{Password: "p"}}, nil); err == nil {
+	if _, err := SealEnvelopeBound(nil, Secrets{Registry: &models.RegistryAuth{Password: "p"}}, []string{"node-a"}, binding); err == nil {
 		t.Fatal("nil cipher should fail")
 	}
 
-	sealed, err := SealEnvelope(c, Secrets{
+	sealed, err := SealEnvelopeBound(c, Secrets{
 		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "pw"},
-	}, []string{" node-b ", "node-a", "node-b"})
+	}, []string{" node-b ", "node-a", "node-b"}, binding)
 	if err != nil || len(sealed) == 0 {
-		t.Fatalf("SealEnvelope: %v", err)
+		t.Fatalf("SealEnvelopeBound: %v", err)
 	}
-	got, err := OpenEnvelope(c, sealed, "node-a")
+	got, err := OpenEnvelopeBound(c, sealed, "node-a", binding)
 	if err != nil {
-		t.Fatalf("OpenEnvelope: %v", err)
+		t.Fatalf("OpenEnvelopeBound: %v", err)
 	}
 	if got.Registry == nil || got.Registry.Password != "pw" {
 		t.Fatalf("got = %+v", got.Registry)
 	}
-	if _, err := OpenEnvelope(c, sealed, "node-z"); !errors.Is(err, ErrRecipientDenied) {
+	if _, err := OpenEnvelopeBound(c, sealed, "node-z", binding); !errors.Is(err, ErrRecipientDenied) {
 		t.Fatalf("wrong recipient = %v", err)
 	}
-	emptyOpen, err := OpenEnvelope(c, nil, "node-a")
+	emptyOpen, err := OpenEnvelopeBound(c, nil, "node-a", binding)
 	if err != nil || emptyOpen.Registry != nil {
-		t.Fatalf("empty OpenEnvelope = %+v %v", emptyOpen, err)
+		t.Fatalf("empty OpenEnvelopeBound = %+v %v", emptyOpen, err)
 	}
 }
 
-func TestOpenRawEnvelopeV2AndLegacy(t *testing.T) {
+func TestEnvelopeRejectsDowngradeAndUnboundInputs(t *testing.T) {
 	c := testCipher(t)
-	plain := []byte(`{"registry":{"password":"v2-pass"}}`)
-	payload, err := c.EncryptWithAAD(plain, V2AAD([]string{"*"}))
-	if err != nil {
-		t.Fatal(err)
+	binding := testBinding()
+	for _, sealed := range [][]byte{
+		[]byte(`{"version":3,"recipients":["node-a"],"wrapped_key":"YQ==","payload":"YQ=="}`),
+		[]byte(`{"version":2,"recipients":["node-a"],"payload":"YQ=="}`),
+		[]byte("legacy-raw"),
+	} {
+		if _, err := OpenRawEnvelopeBound(c, sealed, "node-a", binding); !errors.Is(err, ErrDecryptFailed) {
+			t.Fatalf("downgrade payload error = %v", err)
+		}
 	}
-	v2, err := json.Marshal(sealedSecretsEnvelope{
-		Version: 2, Recipients: []string{"*"}, Payload: payload,
-	})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := SealRawEnvelopeBound(c, []byte(`{}`), nil, binding); err == nil {
+		t.Fatal("empty recipient set should fail")
 	}
-	got, err := OpenRawEnvelope(c, v2, "")
-	if err != nil || string(got) != string(plain) {
-		t.Fatalf("v2 open = %q %v", got, err)
+	if _, err := SealRawEnvelopeBound(c, []byte(`{}`), []string{"*"}, binding); err == nil {
+		t.Fatal("wildcard recipient should fail")
 	}
-	if aad := string(V2AAD([]string{"b", "a"})); aad == "" || aad[:len("aerolvm-cluster-secrets-v2")] != "aerolvm-cluster-secrets-v2" {
-		t.Fatalf("V2AAD = %q", aad)
+	if _, err := SealRawEnvelopeBound(c, []byte(`{}`), []string{"node-a"}, SealBinding{}); err == nil {
+		t.Fatal("missing binding should fail")
 	}
-
-	legacyPlain := []byte("legacy-raw")
-	raw, err := c.Encrypt(legacyPlain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := OpenRawEnvelope(c, raw, "any")
-	if err != nil || string(out) != string(legacyPlain) {
-		t.Fatalf("legacy open = %q %v", out, err)
+	if RecipientAllowed([]string{"*"}, "node-a") {
+		t.Fatal("wildcard recipient must never authorize a node")
 	}
 }
 
-func TestOpenRawEnvelopeErrorBranches(t *testing.T) {
-	c := testCipher(t)
-	if _, err := OpenRawEnvelope(nil, []byte("x"), ""); err == nil {
+func TestOpenRawEnvelopeBoundErrorBranches(t *testing.T) {
+	binding := testBinding()
+	if _, err := OpenRawEnvelopeBound(nil, []byte("x"), "node-a", binding); err == nil {
 		t.Fatal("nil cipher")
 	}
-	if _, err := OpenRawEnvelope(c, []byte(`{"version":3,"recipients":["*"],"payload":"YQ=="}`), ""); !errors.Is(err, ErrDecryptFailed) {
-		t.Fatalf("missing wrapped key = %v", err)
-	}
-	if _, err := OpenEnvelopePayload([]byte("short"), []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, []string{"*"}); !errors.Is(err, ErrDecryptFailed) {
+	if _, err := OpenEnvelopePayloadBound([]byte("short"), make([]byte, 13), []string{"node-a"}, binding); !errors.Is(err, ErrDecryptFailed) {
 		t.Fatalf("bad dek = %v", err)
 	}
-	dek := make([]byte, 32)
-	if _, err := OpenEnvelopePayload(dek, []byte{1, 2, 3}, []string{"*"}); !errors.Is(err, ErrDecryptFailed) {
+	if _, err := OpenEnvelopePayloadBound(make([]byte, 32), []byte{1, 2, 3}, []string{"node-a"}, binding); !errors.Is(err, ErrDecryptFailed) {
 		t.Fatalf("short payload = %v", err)
 	}
 }
@@ -127,65 +122,55 @@ func TestNormalizeRecipients(t *testing.T) {
 	if len(got) != 3 || got[0] != "node-a" || got[1] != "node-b" || got[2] != "node-c" {
 		t.Fatalf("NormalizeRecipients = %#v", got)
 	}
-	if got := NormalizeRecipients(nil); len(got) != 1 || got[0] != "*" {
+	if got := NormalizeRecipients(nil); len(got) != 0 {
 		t.Fatalf("nil recipients = %#v", got)
 	}
 }
 
 func TestSealRawEnvelopeEntropyFailures(t *testing.T) {
 	c := testCipher(t)
+	binding := testBinding()
 	old := rand.Reader
 	t.Cleanup(func() { rand.Reader = old })
 
 	rand.Reader = &failRand{err: errors.New("dek fail")}
-	if _, err := SealRawEnvelope(c, []byte(`{}`), []string{"*"}); err == nil {
+	if _, err := SealRawEnvelopeBound(c, []byte(`{}`), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected dek entropy failure")
 	}
 	rand.Reader = &failAfterRand{failAt: 2}
-	if _, err := SealRawEnvelope(c, []byte(`{}`), []string{"*"}); err == nil {
+	if _, err := SealRawEnvelopeBound(c, []byte(`{}`), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected nonce entropy failure")
 	}
-	if _, err := SealRawEnvelope(nil, []byte(`{}`), nil); err == nil {
-		t.Fatal("nil cipher SealRawEnvelope")
+	if _, err := SealRawEnvelopeBound(nil, []byte(`{}`), []string{"node-a"}, binding); err == nil {
+		t.Fatal("nil cipher SealRawEnvelopeBound")
 	}
-	if _, err := SealRawEnvelope(&Cipher{}, []byte(`{}`), []string{"*"}); err == nil {
+	if _, err := SealRawEnvelopeBound(&Cipher{}, []byte(`{}`), []string{"node-a"}, binding); err == nil {
 		t.Fatal("uninitialized cipher wrap should fail")
 	}
 }
 
 func TestOpenEnvelopeBadJSONAndDecryptFailures(t *testing.T) {
 	c := testCipher(t)
-	if _, err := OpenEnvelope(c, []byte("not-json"), ""); !errors.Is(err, ErrDecryptFailed) {
+	binding := testBinding()
+	if _, err := OpenEnvelopeBound(c, []byte("not-json"), "node-a", binding); !errors.Is(err, ErrDecryptFailed) {
 		t.Fatalf("bad json = %v", err)
 	}
-	// Valid v3 envelope JSON with garbage wrapped key → unwrap fails.
+	// Valid v4 envelope JSON with garbage wrapped key → unwrap fails.
 	env, err := json.Marshal(sealedSecretsEnvelope{
-		Version: EnvelopeVersion, Recipients: []string{"*"},
+		Version: EnvelopeVersion, Recipients: []string{"node-a"}, SandboxID: binding.SandboxID,
+		Ref: binding.Ref, RefVersion: binding.Version, Generation: binding.Generation,
 		WrappedKey: []byte("short"), Payload: make([]byte, 32),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenRawEnvelope(c, env, ""); !errors.Is(err, ErrDecryptFailed) {
+	if _, err := OpenRawEnvelopeBound(c, env, "node-a", binding); !errors.Is(err, ErrDecryptFailed) {
 		t.Fatalf("bad wrapped key = %v", err)
-	}
-	// v2 envelope with bad ciphertext.
-	v2, err := json.Marshal(sealedSecretsEnvelope{
-		Version: 2, Recipients: []string{"*"}, Payload: []byte("tiny"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenRawEnvelope(c, v2, ""); !errors.Is(err, ErrDecryptFailed) {
-		t.Fatalf("bad v2 = %v", err)
-	}
-	if _, err := OpenRawEnvelope(c, []byte("not-an-envelope"), ""); !errors.Is(err, ErrDecryptFailed) {
-		t.Fatalf("legacy decrypt fail = %v", err)
 	}
 
 	// Seal then open with wrong payload AAD by tampering recipients field only
 	// (keeps ciphertext but breaks recipient binding on open).
-	sealed, err := SealEnvelope(c, Secrets{Registry: &models.RegistryAuth{Password: "x"}}, []string{"node-a"})
+	sealed, err := SealEnvelopeBound(c, Secrets{Registry: &models.RegistryAuth{Password: "x"}}, []string{"node-a"}, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,14 +180,15 @@ func TestOpenEnvelopeBadJSONAndDecryptFailures(t *testing.T) {
 	}
 	wire.Recipients = []string{"node-a", "node-extra"}
 	tampered, _ := json.Marshal(wire)
-	if _, err := OpenRawEnvelope(c, tampered, "node-a"); !errors.Is(err, ErrDecryptFailed) {
+	if _, err := OpenRawEnvelopeBound(c, tampered, "node-a", binding); !errors.Is(err, ErrDecryptFailed) {
 		t.Fatalf("tampered recipients = %v", err)
 	}
 }
 
 func TestEnvelopeRecipients(t *testing.T) {
 	c := testCipher(t)
-	sealed, err := SealEnvelope(c, Secrets{Registry: &models.RegistryAuth{Password: "p"}}, []string{"node-b", "node-a"})
+	binding := testBinding()
+	sealed, err := SealEnvelopeBound(c, Secrets{Registry: &models.RegistryAuth{Password: "p"}}, []string{"node-b", "node-a"}, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,14 +203,15 @@ func TestEnvelopeRecipients(t *testing.T) {
 	if _, err := EnvelopeRecipients(nil); err == nil {
 		t.Fatal("empty sealed should error")
 	}
-	if _, err := EnvelopeRecipients([]byte(`{"version":3}`)); err == nil {
+	if _, err := EnvelopeRecipients([]byte(`{"version":4}`)); err == nil {
 		t.Fatal("missing payload should error")
 	}
 }
 
 func TestOpenEnvelopePayloadGCMOpenFailure(t *testing.T) {
 	c := testCipher(t)
-	sealed, err := SealRawEnvelope(c, []byte(`{"x":1}`), []string{"*"})
+	binding := testBinding()
+	sealed, err := SealRawEnvelopeBound(c, []byte(`{"x":1}`), []string{"node-a"}, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,12 +219,12 @@ func TestOpenEnvelopePayloadGCMOpenFailure(t *testing.T) {
 	if err := json.Unmarshal(sealed, &env); err != nil {
 		t.Fatal(err)
 	}
-	dek, err := c.DecryptWithAAD(env.WrappedKey, KeyAAD([]string{"*"}))
+	dek, err := c.DecryptWithAAD(env.WrappedKey, KeyAADBound([]string{"node-a"}, binding))
 	if err != nil {
 		t.Fatal(err)
 	}
 	env.Payload[len(env.Payload)-1] ^= 0xff
-	if _, err := OpenEnvelopePayload(dek, env.Payload, []string{"*"}); !errors.Is(err, ErrDecryptFailed) {
+	if _, err := OpenEnvelopePayloadBound(dek, env.Payload, []string{"node-a"}, binding); !errors.Is(err, ErrDecryptFailed) {
 		t.Fatalf("tampered payload = %v", err)
 	}
 }

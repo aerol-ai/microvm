@@ -91,7 +91,8 @@ Gossip is how nodes discover each other and share capacity information.
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | No | Skip the credential key requirement. Only for ephemeral test setups that do not use sealed creds. Default `false`. |
 | `SB_SECRET_PROVIDER` | No | `local` (default) \| `awskms` \| `vault`. See [Cluster Secrets Providers](/cluster-secrets). |
 | `SB_SECRET_AWS_KMS_KEY_ID` | When awskms | CMK id/ARN/alias for KMS wrap of per-secret data keys. |
-| `SB_SECRET_RECIPIENT_FANOUT_ENABLED` | No | Recipient-set sealing + async peer fan-out for `failover.policy=recreate`. Default `true`. |
+| `SB_SECRET_RECIPIENT_BACKUP_COUNT` | No | Non-owner recipients for `failover.policy=recreate`. Cluster mode requires at least one; enterprise mode requires at least two. Default `2`. |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | No | Bounded wait for the first backup ACK. Cluster mode requires a positive value. Default `2s`. |
 
 ## GPU support
 

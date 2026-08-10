@@ -322,7 +322,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 //     promote stay sequential (ID isn't fixed before create the same way).
 //   - reservationID != "": normal cluster create. The router already wrote
 //     the reservation with our redacted spec. CreateSandboxWithID runs in
-//     parallel with PutClusterSecretsForRecipient (the seal); RecordPlacement
+//     parallel with SealAndDistribute (the seal); RecordPlacement
 //     only fires after BOTH legs succeed, so the row stays Reserved — and
 //     charged to pending-create backpressure — for the whole local create.
 //     Promote-failure retract uses DeletePlacement (mandatory — the commit

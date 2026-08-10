@@ -47,7 +47,7 @@ func (p *KMSProvider) Put(ctx context.Context, sandboxID string, s Secrets, reci
 	if err != nil {
 		return Handle{}, fmt.Errorf("marshal cluster secrets: %w", err)
 	}
-	version := HandleVersionFor(s)
+	version := RefVersion
 	ref := FormatRef(sandboxID, version)
 	gen, err := p.store.NextSealGeneration(ctx, sandboxID)
 	if err != nil {
@@ -86,6 +86,12 @@ func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, node
 	if p == nil || p.store == nil {
 		return Secrets{}, fmt.Errorf("cluster secret store is not configured")
 	}
+	if h.Version != RefVersion {
+		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q version %d unsupported (want %d)", ErrVersionMismatch, h.Ref, h.Version, RefVersion)
+	}
+	if sandboxID == "" {
+		return Secrets{}, fmt.Errorf("%w: cluster secret sandbox id is required", ErrDecryptFailed)
+	}
 	rec, err := p.store.Get(ctx, h.Ref)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -93,14 +99,14 @@ func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, node
 		}
 		return Secrets{}, err
 	}
-	if h.Version != 0 && rec.Version != h.Version {
+	if rec.Ref != h.Ref || rec.Version != h.Version {
 		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q version mismatch: placement=%d store=%d", ErrVersionMismatch, h.Ref, h.Version, rec.Version)
 	}
-	if sandboxID != "" && rec.SandboxID != "" && sandboxID != rec.SandboxID {
+	if rec.SandboxID == "" || sandboxID != rec.SandboxID {
 		return Secrets{}, fmt.Errorf("%w: cluster secret sandbox_id mismatch", ErrDecryptFailed)
 	}
-	if sandboxID == "" {
-		sandboxID = rec.SandboxID
+	if rec.SealGeneration <= 0 {
+		return Secrets{}, fmt.Errorf("%w: cluster secret seal generation is required", ErrDecryptFailed)
 	}
 	if p.wrapper == nil {
 		return Secrets{}, fmt.Errorf("%w: secret provider wrap backend is not configured", ErrProviderUnavailable)

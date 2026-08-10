@@ -2,15 +2,12 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/aerol-ai/microvm/internal/cluster"
-	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -37,73 +34,6 @@ func TestSetEventsSourceAndDockerAuxClient(t *testing.T) {
 	svc.SetDockerAuxClient(aux)
 	if svc.dockerAux != aux {
 		t.Fatal("SetDockerAuxClient did not wire dockerAux")
-	}
-}
-
-func TestOpenClusterSecretsWrapperAndV2AAD(t *testing.T) {
-	ctx := context.Background()
-	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open store: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	s := &Service{cipher: newTestCipher(t), store: st}
-
-	req := models.CreateSandboxRequest{
-		Image: "alpine",
-		Registry: &models.RegistryAuth{
-			Server: "ghcr.io", Username: "u", Password: "legacy-secret",
-		},
-	}
-	// Wildcard recipient so the empty-nodeID OpenClusterSecrets wrapper can
-	// open it (recipient-specific seals deny "").
-	sealed, err := s.SealClusterSecretsForRecipient(req, "*")
-	if err != nil || len(sealed) == 0 {
-		t.Fatalf("SealClusterSecretsForRecipient: %v", err)
-	}
-	ref := clusterSecretRef("sb-open", 1)
-	if err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
-		Ref: ref, SandboxID: "sb-open", Version: 1, SealedPayload: sealed,
-	}); err != nil {
-		t.Fatalf("PutClusterSecret: %v", err)
-	}
-	handle := cluster.PlacementSecrets{Ref: ref, Version: 1}
-	redacted := RedactClusterSecrets(req)
-	merged, err := s.OpenClusterSecrets(ctx, redacted, handle)
-	if err != nil {
-		t.Fatalf("OpenClusterSecrets: %v", err)
-	}
-	if merged.Registry == nil || merged.Registry.Password != "legacy-secret" {
-		t.Fatalf("OpenClusterSecrets lost password: %+v", merged.Registry)
-	}
-
-	// Craft a v2 recipient envelope so openClusterSecretPayload hits
-	// clusterSecretAAD (kept for rolling upgrades off v2).
-	plain, err := json.Marshal(clusterSealedSecrets{
-		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "v2-pass"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, err := s.cipher.EncryptWithAAD(plain, clusterSecretAAD([]string{"*"}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	v2, err := json.Marshal(clusterSealedSecretsEnvelope{
-		Version: 2, Recipients: []string{"*"}, Payload: payload,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	opened, err := s.UnsealClusterSecrets(models.CreateSandboxRequest{Image: "x"}, v2)
-	if err != nil {
-		t.Fatalf("UnsealClusterSecrets v2: %v", err)
-	}
-	if opened.Registry == nil || opened.Registry.Password != "v2-pass" {
-		t.Fatalf("v2 unseal = %+v", opened.Registry)
-	}
-	if aad := string(clusterSecretAAD([]string{"b", "a"})); !strings.Contains(aad, "aerolvm-cluster-secrets-v2") {
-		t.Fatalf("clusterSecretAAD = %q", aad)
 	}
 }
 
@@ -185,13 +115,4 @@ func TestStartVolumeReclaimEnabled(t *testing.T) {
 	// Non-positive interval is a no-op even with a reclaimer.
 	s.cfg.PlatformVolumes.ReclaimInterval = 0
 	s.StartVolumeReclaim(context.Background())
-}
-
-func TestOpenClusterSecretsEmptyRefPassthrough(t *testing.T) {
-	ctx := context.Background()
-	req := models.CreateSandboxRequest{Image: "alpine"}
-	out, err := (&Service{}).OpenClusterSecrets(ctx, req, cluster.PlacementSecrets{})
-	if err != nil || out.Image != "alpine" {
-		t.Fatalf("empty ref OpenClusterSecrets = %+v, %v", out, err)
-	}
 }

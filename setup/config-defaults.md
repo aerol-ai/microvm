@@ -5,7 +5,7 @@ its default, and **why** it defaults the way it does. Use this when deciding
 whether a flag is safe to flip on for a deployment, or when reviewing a proposal
 to change a shipped default.
 
-Snapshot as of 2026-07-12. When you change a default in `config.go`, update the
+Snapshot as of 2026-08-11. When you change a default in `config.go`, update the
 matching row here.
 
 ## The rule for flipping a default on
@@ -37,8 +37,7 @@ feature is still mid-rollout.
 | `SB_FIRECRACKER_SNAPSHOT_ENABLED` | true |
 | `SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD` | true |
 | `SB_FIRECRACKER_OVERLAY_ENABLED` | true |
-| `SB_SECRET_RECIPIENT_FANOUT_ENABLED` | true — defect fix for cross-node failover open (recipient-set sealing + async peer fan-out). Set false only while diagnosing. |
-| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` — sync wait on HA create for ≥1 peer ACK before return (shrinks GAP-1). Remaining peers stay async. `0` = fully async. |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` — sync wait on HA create for ≥1 peer ACK before return. Cluster mode requires a positive value; remaining peers stay async. |
 | `SB_EGRESS_ATTRIBUTION_ENABLED` | true — host-mediated egress destinations (wasm + isolate) into audit JSONL; dial-path only, never create. Set false to disable. |
 
 ## 🔴 Must stay off — security / safety
@@ -58,9 +57,7 @@ feature is still mid-rollout.
 | `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. |
 | `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start on awskms boot-canary failure. Default fail-open with a warning. |
 | `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
-| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create; enterprise mode requires `>0` and fails/retracts an HA create with zero ACKs. `0` is allowed only outside enterprise mode. |
-| `SB_SECRET_ENV_SEAL_ENABLED` | `false` | Sealed `sandbox_env` rows + Raft Env redaction (RefVersionEnv=2). Format change — enable only after every node can merge Env from the provider bag. Removal criterion: `aerolvm_env_plaintext_fallback_total` stays zero for a release and plaintext `env_json` is dropped. |
-| `SB_SECRET_TOOLBOX_SEAL_ENABLED` | `false` | Encrypt per-sandbox toolbox bearer tokens in the existing sandbox row. Enable after every node understands `toolbox_token_sealed`; required by enterprise mode. |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create. Cluster mode requires `>0`; zero ACKs retract the secret and fail the create. |
 | `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` retention. Appends are fsynced at least once per second and at shutdown; pruned daily (and on sink start). `0` disables prune. |
 | `SB_SECRET_AUDIT_STRICT_BOOT` | `true` | Refuse daemon startup when the local secret-audit writer cannot be opened. |
 | `SB_SECRET_TOMB_RETENTION_DAYS` | `30` | Retain delete fences after all peer ACKs; `0` disables tombstone GC. Live/pending rows are never pruned. |
@@ -77,6 +74,12 @@ These bound amplification on `GET /v1/sandboxes/{id}/audit` (one client call →
 | `SB_AUDIT_RATE_LIMIT_NODE` | `50` | Global per-node ceiling (req/s). Burst 100. The only effective bound on OSS (single operator identity). |
 
 `vault` is accepted as a known name but **fails boot** with a not-implemented error (no silent fallback to local).
+
+Sandbox environment values are always encrypted in `sandbox_env`, and toolbox
+bearer tokens are always encrypted in `sandboxes.toolbox_token_sealed`. There
+are no plaintext storage columns or compatibility flags for either path. A
+database containing the removed plaintext columns is rejected at boot; deploy
+this schema as a coordinated, one-way change.
 
 ## 🟡 Opt-in — needs external config/hardware, would break or no-op if forced on
 | Env var | Blocker |

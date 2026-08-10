@@ -66,7 +66,7 @@ type sealLegResult struct {
 }
 
 // OverlapCreateAndPromote runs CreateSandboxWithID in parallel with
-// PutClusterSecretsForRecipient (the seal), joins both, and only then
+// SealAndDistribute (the seal), joins both, and only then
 // promotes via RecordPlacement
 // (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
 //
@@ -164,7 +164,7 @@ func OverlapCreateAndPromote(
 	promoteStart := time.Now()
 	var promoteErr error
 	if opts.PromoteWithSpec {
-		redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
+		redacted := service.RedactClusterSecrets(req)
 		promoteErr = c.RecordPlacement(commitCtx, reservationID, &redacted, sr.secrets)
 	} else {
 		promoteErr = c.RecordPlacement(commitCtx, reservationID, nil, sr.secrets)

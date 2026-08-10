@@ -186,7 +186,7 @@ func newToolboxProxyTestEnv(t *testing.T) *toolboxProxyTestEnv {
 		EnableCaddy:       false,
 		HTTPClientTimeout: 5 * time.Second,
 	}
-	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, mountManager, nil)
+	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, newDaytonaTestCipher(t), mountManager, nil)
 
 	sandboxID := "sb-proxy"
 	now := time.Now().UTC().Round(time.Second)

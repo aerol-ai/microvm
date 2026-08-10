@@ -133,7 +133,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			return Decision{}, false
 		}
 	}
-	redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
+	redacted := service.RedactClusterSecrets(req)
 	reserveSecrets := cluster.PlacementSecrets{}
 	if svc != nil && svc.WantsSecretRecipientFanout(req) {
 		reserveSecrets.Recipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, svc.SecretRecipientBackupCount())
@@ -261,7 +261,7 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		return nil, sealErr
 	}
 	secrets.OwnerRef = resp.Sandbox.OwnerRef
-	redacted := service.RedactClusterSecretsOpts(req, svc != nil && svc.SecretEnvSealEnabled())
+	redacted := service.RedactClusterSecrets(req)
 	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
 		return nil, promoteErr

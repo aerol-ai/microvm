@@ -31,7 +31,7 @@ func newSecretInternalTestMux(t *testing.T, nodeID string) (*http.ServeMux, *ser
 	if err != nil {
 		t.Fatalf("cipher: %v", err)
 	}
-	svc := service.New(config.Config{SecretRecipientFanoutEnabled: true}, logger, st, nil, nil, nil, cipher, nil, nil)
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, cipher, nil, nil)
 	svc.AttachCluster(cluster.NewNoop(nodeID, "http://"+nodeID, ""))
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
@@ -112,6 +112,7 @@ func TestClusterInternalSecretPutOperatorOK(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
+	addVerifiedClientCertificate(req)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNoContent {
@@ -121,6 +122,7 @@ func TestClusterInternalSecretPutOperatorOK(t *testing.T) {
 	// Idempotent upsert.
 	req2 := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req2.Header.Set("Authorization", "Bearer operator")
+	addVerifiedClientCertificate(req2)
 	rr2 := httptest.NewRecorder()
 	mux.ServeHTTP(rr2, req2)
 	if rr2.Code != http.StatusNoContent {
@@ -136,6 +138,7 @@ func TestClusterInternalSecretPutRejectsNonRecipient(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
+	addVerifiedClientCertificate(req)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -151,6 +154,7 @@ func TestClusterInternalSecretPutRejectsRefMismatch(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
+	addVerifiedClientCertificate(req)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {

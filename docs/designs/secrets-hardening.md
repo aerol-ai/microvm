@@ -22,7 +22,7 @@ the floor.
 |---|---|
 | T1-T4 | Provider seam (ref→plaintext) + recipient-set sealing + **async** peer fan-out + one seal/fanout helper. Fixes the confirmed failover defect. |
 | T5-T6 | Typed sentinel errors + audit events on every provider secret read (#82). |
-| T7-T9 | Env to its own sealed row + env opt-in on `Get`/`List` (breaking, 5 SDKs) + redact env from the Raft spec with a writer capability gate. |
+| T7-T9 | Env to its own sealed row + env opt-in on `Get`/`List` (breaking, 5 SDKs) + redact env from the Raft spec with strict sealed-row restore. |
 | T10 | KMS provider + offline fake + shared contract suite. |
 | T11-T13 | Fix two wrong operator messages; delete legacy wildcard seal; operator docs. |
 | D5 | Stale recipient sets after membership change = documented limitation, not a placement filter. |
@@ -267,9 +267,9 @@ return and HA holders≥2, an owner death can leave the sandbox unrecreateable.
 Mitigation: bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default
 2s) for ≥1 peer ACK, then async remainder; `failover_ready=false` until ready;
 boot `ReFanoutClusterSecrets` after restart; chaos coverage via UC-58c
-(integration + disruptive). Enterprise mode fails and retracts an HA create
-when the window produces no backup ACK; non-enterprise mode retains the
-observable, fully-async fallback. Set wait to `0` only outside enterprise mode.
+(integration + disruptive). Every cluster mode fails and retracts an HA create
+when the window produces no backup ACK, and cluster configuration rejects a
+zero wait.
 
 Affects only `failover.policy=recreate` sandboxes. Full detail in
 `plans/secrets-hardening.md` §10 GAP-1.
@@ -290,8 +290,7 @@ Affects only `failover.policy=recreate` sandboxes. Full detail in
    asked, drop it to deferred rather than building on schedule.
 4. **This is a program, not a fix.** The confirmed P1 defect is T3. Ship slice 1
    independently and early.
-5. **GAP-1 residual remains only outside enterprise mode when peers are
-   unreachable for the whole min-ACK window.** Enterprise mode retracts the
+5. **GAP-1 has no zero-ACK success mode.** Every cluster mode retracts the
    sealed row and fails the create instead of returning a single-copy HA claim.
 
 ## External dependency
@@ -312,12 +311,10 @@ to deferred:
 - Placement filter for stale recipient sets (D5 chose docs + KMS).
 - Resealing protocol on membership change (needs a live decryptor; the dead owner
   had it).
-- **`toolbox_token` plaintext at rest** — closed. The token is encrypted in the
-  existing sandbox row (`toolbox_token_sealed`) with sandbox-bound AAD when
-  `SB_SECRET_TOOLBOX_SEAL_ENABLED=true`; enterprise mode requires the flag.
-  Keeping it in the existing table avoids a second lifecycle/GC implementation.
-  The plaintext column remains only for rolling compatibility and is written
-  empty after sealing is enabled.
+- **`toolbox_token` plaintext at rest** — closed. The token is always encrypted
+  in the existing sandbox row (`toolbox_token_sealed`) with sandbox-bound AAD.
+  There is no plaintext token column or rollout flag. Keeping it in the existing
+  table avoids a second lifecycle/GC implementation.
 - Issue #70 (full-table scan per tick) — D8 and E1a avoid worsening it.
 
 Added here:
@@ -327,10 +324,10 @@ Added here:
 - `aerolvm` CLI — no CLI exists; `cmd/` holds only `sandboxd` and `toolboxd`.
 - Flaky `internal/cluster` memberlist tests (in TODOS.md) — mitigated 2026-08-08.
 - **Cluster-member authentication for `/v1/cluster/internal/...`** — implemented
-  with a cluster-CA mTLS listener/client path. Enterprise mode requires TLS
-  material and forbids insecure gossip/credentials; enterprise internal routes
-  reject requests on the public listener, and internal audit reads never retry
-  over plaintext after a TLS error. The fleet PAT stays as a second
+  with a cluster-CA mTLS listener/client path. Every cluster mode requires TLS
+  material and internal routes reject requests on the public listener; internal
+  audit reads never retry over plaintext after a TLS error. Enterprise mode also
+  forbids insecure gossip/credentials. The fleet PAT stays as a second
   authorization layer. Unique node-ID-bound SPIFFE identities are not
   implemented.
 
@@ -345,11 +342,11 @@ operator API, not an interface.
 | §2 | **KMS error taxonomy doesn't exist.** T5's sentinels were designed against the local provider; KMS fails as unreachable / throttled / IAM-denied, none of which map. Throttle needs backoff, not failure. | **Provider-agnostic classes**: `ErrProviderUnavailable`, `ErrProviderThrottled`, `ErrProviderDenied`; throttle retries with backoff. Both providers raise the same set, so D7's contract suite tests one contract. | 1 |
 | §2 | **Audit drops are silent** — a gap appears exactly under load, invisible in the record. Invalidates the evidence stream. | **Drop, but never silently**: `aerolvm_audit_events_dropped_total`, a gap marker written into the stream, and an alert. Audit I/O stays off the request path. | 1 |
 | §3 | **Peer-push endpoint has no auth model.** A new HTTP endpoint on every node accepting sealed credential blobs. Anything on the cluster network could write credential rows. **Most serious finding in the plan.** | **Reuse `SB_GOSSIP_SECRET_KEY`** — the trust boundary operators already configure and that cluster mode already requires. Reject unsigned pushes; fail closed. | 2 |
-| §1/§9 | **Nothing in T1-T10 is behind a flag, and format changes are near one-way.** A node that wrote a v4 envelope or moved env cannot be rolled back cleanly. | **Flag every behavior change, default-off** — recipient-set sealing, fan-out, env-row storage, provider selection. Each with a documented rollback and a removal criterion in the same commit. Matches the house pattern (WASM resident host, docker warm pool, isolate). Rationale to `setup/config-defaults.md`. | 3 |
+| §1/§9 | **Format changes are one-way.** | **Final decision:** do not carry mixed-version compatibility. Recipient-set sealing, fan-out, env storage, and toolbox-token sealing are mandatory; only provider selection remains configurable. | 3 |
 | §1 | **Fan-out is O(N recipients) per HA create with no batching or concurrency bound.** Fine at 10x, 300x peer traffic at 100x. | **Measure first**: ship the simple fan-out, add an HA-create latency benchmark case so the real curve is visible. No speculative batching — the Firecracker investigation is the precedent for not guessing at the lever. | 0.5 |
 | §6 | **No chaos test for owner death mid-fan-out** — the exact interleaving the feature exists to survive. UC-20's reconcile race is the precedent for what unit tests miss. | **Integration chaos case** in the existing AWS harness: kill the owner mid-fan-out, assert the sandbox is fully recoverable or cleanly failed, never half-sealed. | 3 |
 | §8 | **Zero operator signal.** 12 Grafana dashboards, 8 runbooks, and none would show provider health, fan-out success, audit drops, or failover-readiness. | **Dashboard + alerts + runbook**: one panel set, matching Prometheus rules, and a "secrets and audit" runbook. Wires up metrics D5/D6/D8/E1a already produce. | 2 |
-| §9 | **No post-deploy verification.** Flags let you roll back; nothing says when to. The SWIM 2+1 split during a rolling restart is the precedent. | **Per-slice verification checklist**: first-5-minutes and first-hour checks per slice, plus a documented rolling-restart order for cluster nodes. | 1 |
+| §9 | **No post-deploy verification.** | **Per-slice verification checklist**: first-5-minutes and first-hour checks. Strict format/storage changes require a coordinated deployment rather than a compatibility downgrade. | 1 |
 
 Added: **~13.5 eng-days ≈ 2.7 engineer-weeks.**
 
@@ -362,7 +359,7 @@ dissent.
 |---|---|---|---|
 | #1 | **KMS was specified as magic.** It stores keys, not ciphertext, so a KMS handle alone cannot rebuild plaintext after failover. T10 had no storage design. | **KMS wraps, peers still hold bytes** — fan-out is shared machinery across both providers. See the Provider model table above. | 4 |
 | #3 | **The gap marker was going into the channel that just filled.** D6's honesty mechanism failed in exactly the case it existed for. | **Reserved slot in the writer** — overflow sets a pending-gap flag the writer flushes on its next append. The counter is unqueued and always works. | 0.5 |
-| #8 | **Default-off flags mean the confirmed defect ships disabled.** Rollback plans without activation plans produce shipped-but-off infrastructure. | **Split defaults by change type**: defect fixes (T3/T4) default-ON with a kill switch; new subsystems keep D8's default-off. Every flag gets an activation criterion, not just a rollback. | 1 |
+| #8 | **Default-off flags mean the confirmed defect ships disabled.** | **Final decision:** remove the security rollout flags entirely; the fixed contract is always active. | 1 |
 
 **Folded as corrections, no decision needed:**
 - **#5** E3a "nearly free" was overstated. `serveEgressSlot` does hold `id` at
@@ -401,15 +398,15 @@ Added: **~5.5 eng-days ≈ 1.1 engineer-weeks.**
 `plans/secrets-hardening.md` §11's four lanes optimize for concurrent authoring;
 these slices optimize for shippable increments and supersede it for delivery.
 
-Every slice ships behind default-off flags (§9 decision) with a per-slice
-verification checklist and a documented rollback.
+Every slice ships with a per-slice verification checklist and a documented
+rollback. Security storage and fan-out behavior are mandatory, not feature flags.
 
 | Slice | Contents | Exit criterion |
 |---|---|---|
 | 0 | **DONE 2026-08-07.** Recipient-set selection, partial fan-out rule, failed-create leftovers, and `Provider.Open`'s signature are decided in `plans/secrets-hardening.md` §3d. | Four gates closed; slice 1 unblocked |
-| 1 | **DONE 2026-08-07.** T1-T4, T11, T12, E1a + peer-push PAT auth + flags | Cross-node failover regression green; default create latency unmoved; unauthenticated peer push rejected; `failover_ready` reports live holder count |
+| 1 | **DONE 2026-08-07.** T1-T4, T11, T12, E1a + mTLS peer auth | Cross-node failover regression green; default create latency unmoved; unauthenticated peer push rejected; `failover_ready` reports live holder count |
 | 2 | **DONE 2026-08-08.** T5-T6, E2a (correlation + retention), E4 (canary + alerts + runbook) + audit drop counter/gap marker | One audit event per secret read, no plaintext; canary reports at boot; overflow produces counted gap marker + alert |
-| 3 | **DONE 2026-08-08.** T7-T9, T13, E1b + operator alerts/runbook | Env sealed at rest (flag default-off); `Get`/`List` omit env; D5 limitation published; audit API with fan-out + coverage + rate limit |
+| 3 | **DONE 2026-08-08.** T7-T9, T13, E1b + operator alerts/runbook | Env always sealed at rest; `Get`/`List` omit env; D5 limitation published; audit API with fan-out + coverage + rate limit |
 | 4 | **DONE 2026-08-08 (T10 + E3a).** T10 shipped; E3a wasm/isolate egress attribution into shared audit JSONL. Integration chaos case (kill-owner-mid-fan-out) still operator-run behind `integration` tag. | Both providers pass contract suite; attribution emits for wasm + isolate; netstats totals unchanged |
 | 5 | **NOT STARTED.** E3b (own justification required); E2b (auditor-gated) | Kernel-level IP capture for docker/containerd; tamper-evident chain only if an auditor asks |
 

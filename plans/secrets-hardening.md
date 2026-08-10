@@ -76,7 +76,7 @@ off the table. (The 2026-08-02 draft listed it as an option; deleted.)
 |---|---|
 | D2 | One plan, all phases. Not split. |
 | D3 | Seal to a recipient **set** (owner + N failover candidates) and push the sealed row to those peers. Preserves recipient binding; keeps bytes out of Raft. |
-| D4 | **Bounded first-backup ACK, then asynchronous remainder** (see §3e), **only** for `failover.policy=recreate`. Enterprise mode fails/retracts a zero-ACK HA create; non-enterprise can retain the fully asynchronous fallback. Default non-HA creates remain unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
+| D4 | **Bounded first-backup ACK, then asynchronous remainder** (see §3e), **only** for `failover.policy=recreate`. Every cluster mode fails and retracts a zero-ACK HA create. Default non-HA creates remain unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
 | D5 | Stale recipient sets after membership change = **documented known limitation**, point operators at KMS. There is no dynamic reseal/takeover filter; inbound peer replication still validates the exact recipient set committed in the live placement. |
 | D6 | One seal+fanout helper with an explicit strict / best-effort policy argument. |
 | D7 | One shared contract suite runs against **both** providers (offline fake for KMS); live KMS behind the `integration` tag. |
@@ -128,7 +128,7 @@ KMS removes WALL 2 (recipient binding). It does nothing about WALL 1.
 
 | | `local` | `kms` |
 |---|---|---|
-| Key custody | node-local AES key file | KMS wraps the data key into the existing `WrappedKey` field (envelope v3, `cluster_secrets.go:65-70` — **no format change**) |
+| Key custody | node-local AES key file | KMS wraps the data key into the v4 envelope's `WrappedKey` field |
 | Ciphertext storage | `cluster_secrets` row | `cluster_secrets` row — **same**, KMS stores nothing |
 | Distribution | bounded first-backup ACK, then async remainder (§3e) | the same bounded/async fan-out — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
@@ -281,10 +281,8 @@ Why not in place: that column is projected by the scanner used by `Get`,
 `netstats.go:219` calls `store.List(ctx)` **every poll tick** (open issue #70).
 Sealing in place adds an AES-GCM open per sandbox per tick, forever.
 
-Migration: lazy. Read tries the sealed row, falls back to plaintext `env_json`,
-reseals on next write. Emit a fallback-read metric so we know when the backfill
-is effectively done and the plaintext path can be dropped. Do not drop it on a
-guess.
+There is no plaintext migration path. The schema has no `env_json` column;
+writes require the cipher and reads accept only the sealed `sandbox_env` row.
 
 ### 5b. API contract change (D9)
 
@@ -300,12 +298,9 @@ needs SDK work across all five languages and a docs page per CLAUDE.md
 - **Unclaimed benefit:** `Env` currently counts against the 4KiB
   `ErrRecoveryPayloadTooLarge` cap. Moving it out *shrinks* recovery records.
 
-**Rollout — Codex #10, and the draft got this wrong.** `PlacementSecrets.Version`
-(compared at `:211`) and `clusterSealedSecretsEnvelope.Version` (inside the
-ciphertext, `:65`) are different things. Bumping the envelope to v4 does **not**
-gate placement compatibility. This needs an explicit **writer capability gate**:
-N ships the reader, N+1 turns on the writer, and a node that cannot re-merge env
-must fail loudly rather than create a sandbox with a silently empty environment.
+`PlacementSecrets.Version` and the envelope version are separate invariants.
+This implementation has no mixed-version writer gate: only the current
+placement-ref version and identity-bound envelope v4 are accepted.
 
 ---
 
@@ -327,8 +322,8 @@ Shared contract suite (D7) runs every case below against **both** providers:
 | Open | owner opens; **new owner in set opens (CRITICAL)**; not in set → distinct legible error; wrong recipient denied; version mismatch |
 | Audit | success → exactly one event; each failure class → one event + reason; no plaintext in payload; nil logger/sink no panic |
 | Peer endpoint | idempotent on retry; rejects foreign push; Noop no-op |
-| Env at rest | round-trip; legacy plaintext row fallback; fallback metric; upsert preserves sealed env |
-| Env in spec | absent from redacted spec; re-merged on open; **old writer/reader → loud reject, never silent env loss** |
+| Env at rest | sealed round-trip; schema has no plaintext env column; upsert preserves sealed env |
+| Env in spec | absent from redacted spec; re-merged on open; missing or mismatched sealed state rejects loudly |
 | API | `Get`/`List` omit env by default; opt-in returns it; opt-in read is audited |
 | Boot path | **default create latency unchanged** (benchmark assertion) |
 
@@ -401,23 +396,19 @@ gives the regression signal.
 ### 8a. `toolbox_token` — enterprise follow-up closed
 
 The token remains a platform-minted, sandbox-scoped control-plane credential
-and remains `json:"-"`, so it cannot enter the Raft-replicated spec. When
-`SB_SECRET_TOOLBOX_SEAL_ENABLED=true`, writes encrypt it with the existing
-secret cipher and sandbox-bound AAD into `toolbox_token_sealed`; the legacy
-plaintext column is written empty. Reads authenticate and decrypt it through the
-shared sandbox scanner. Enterprise mode requires this flag.
+and remains `json:"-"`, so it cannot enter the Raft-replicated spec. Writes
+always encrypt it with the existing secret cipher and sandbox-bound AAD into
+`toolbox_token_sealed`; there is no plaintext token column. Reads authenticate
+and decrypt it through the shared sandbox scanner.
 
 This deliberately reuses the sandbox row and lifecycle rather than adding a
-second token table, reconciliation loop, or garbage collector. The default is
-off only for mixed-version rolling compatibility; enable it after every node in
-the fleet can read the sealed column.
+second token table, reconciliation loop, or garbage collector.
 
 ## 9. What already exists — reuse, do not rebuild
 
 - `beginClusterSecretOpen()` — the audit hook, already wrapping both paths.
 - `sealMounts`/`loadMounts`/`GetMounts` — the exact shape D8 copies.
-- `clusterSealedSecretsEnvelope.Recipients []string` at v3 — the format already
-  anticipated recipient sets.
+- The v4 envelope's explicit named recipient set and sandbox/ref binding.
 - `opts.Timing.RecordStage("cluster_seal", …)` — boot-path measurement, free.
 - Recovery store + blob GET fetch-on-miss — kept deliberately for
   snapshot-joined voters. **Read before designing the fan-out**; note it pulls
@@ -427,14 +418,13 @@ the fleet can read the sealed column.
 
 | Failure | Test? | Handled? | User sees |
 |---|---|---|---|
-| **GAP-1: owner dies inside the async fan-out window** | yes (UC-58c + unit) | **closed in enterprise mode** — bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s), and zero ACKs retract/fail the create; non-enterprise keeps the observable async fallback | enterprise create either has a backup ACK or fails; non-enterprise may return `failover_ready=false` |
+| **GAP-1: owner dies inside the async fan-out window** | yes (UC-58c + unit) | **closed for all cluster modes** — bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s), and zero ACKs retract/fail the create | create either has a backup ACK or fails |
 | Failover node not in recipient set | yes (D5 case) | must be distinct error | clear error — **required**, not a decrypt failure |
 | Partial fan-out | yes | 3d-2 holder-count rule | create succeeds at owner + ≥1; holder count surfaced |
 | Peer unreachable during fan-out | yes | async retry + backoff + metric | nothing at create; `failover_ready` stays false |
 | Ownership replay seal failure | yes | best-effort + metric | sandbox marked not-HA |
-| **Old node re-merges env it cannot read** | yes | writer capability gate | **must fail loudly** — silent empty env is the critical gap |
+| Missing sealed env during recreate | yes | strict canonical ref and required sealed row | **fails loudly**, never boots with silently empty env |
 | KMS unreachable during fan-out | yes (fake) | async retry + backoff | nothing at create; `failover_ready` stays false |
-| Legacy plaintext env row | yes | lazy fallback | transparent |
 | **Holder count lost on restart** | yes (ReFanout unit) | **fixed** — boot `ReFanoutClusterSecrets` rebuilds holders from local rows + async re-push | brief `failover_ready=false` until peers ACK again |
 
 ### GAP-1 — the async fan-out window (MITIGATED)
@@ -443,19 +433,17 @@ the fleet can read the sealed column.
 the sandbox may be running with fewer than HA holders.** If the owner dies in
 that window, failover fails and the sandbox cannot be recreated anywhere.
 
-Original §3e made distribution fully asynchronous so callers never blocked on
-peer I/O. That left an unbounded race. The mitigation is a **bounded sync
+Distribution cannot be fully asynchronous because that leaves an unbounded
+owner-loss race. The contract is a **bounded sync
 min-ACK wait** (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s): create waits for
 ≥1 peer ACK (or the timeout), then continues any remaining peer pushes async.
-`SecretFanoutMinACKWait=0` restores fully-async behavior.
 
 What bounds the remaining window:
 
 - Default create waits up to ~2s for the first backup ACK — typically closes
   the race for healthy clusters before `201` returns.
-- In enterprise mode, if 0 peers ACK in the window, the sealed row is retracted,
-  peer deletes are durably enqueued, and create fails. Outside enterprise mode,
-  create still succeeds with `failover_ready=false` and async fan-out continues.
+- If 0 peers ACK in the window, the sealed row is retracted, peer deletes are
+  durably enqueued, and create fails.
 - `failover_ready` reads **false** for the entire unreplicated window (E1a).
 - Fan-out retries with bounded backoff; failures emit
   `aerolvm_secret_fanout_failures_total` and feed the operator alert.
@@ -465,14 +453,14 @@ What bounds the remaining window:
 Who is affected: only `failover.policy=recreate` sandboxes. Non-HA sandboxes
 are explicitly orphaned on owner death regardless.
 
-Accepted residual outside enterprise mode: when peers are unreachable for the
-whole min-ACK window, create returns with `failover_ready=false`. Enterprise
-mode does not accept that residual.
+There is no zero-ACK success mode. `failover_ready=false` after a successful
+create only means the remaining configured replicas are still converging.
 
 ### The other critical gap
 
 A sandbox created with a silently empty environment. It boots, looks healthy,
-and misbehaves. §5c's writer capability gate is what prevents it.
+and misbehaves. The canonical ref, strict envelope binding, and required sealed
+row make this a hard failure instead.
 
 ## 11. Parallelization
 
@@ -513,18 +501,18 @@ but C touches `internal/cluster` + `pkg/api/clustercreate` while D touches
   - Surfaced by: #82 partial — metrics exist, per-event records do not
   - Files: `metrics.go:153`, `cluster_secrets.go:199`, `service.go:1883`, `service.go:1941`
   - Verify: one event per path, no plaintext
-- [x] **T7 (P2, human: ~2d / CC: ~4h)** — internal/store — Env to its own sealed row + lazy migration (D8)
+- [x] **T7 (P2, human: ~2d / CC: ~4h)** — internal/store — Env to its own sealed row (D8)
   - Surfaced by: Performance — scanner + `netstats.go:219` per-tick decrypt
   - Files: `store.go`, `internal/service/service.go`
-  - Verify: round-trip, plaintext fallback, fallback metric
+  - Verify: sealed round-trip, no plaintext schema column
 - [x] **T8 (P2, human: ~3d / CC: ~5h)** — pkg/api+sdk — Env opt-in on `Get`/`List` (D9)
   - Surfaced by: Codex #8 — breaking API contract decision
   - Files: `pkg/api/v1/`, all five SDKs, docs `.mdx`
   - Verify: default omits, opt-in returns + audits
-- [x] **T9 (P2, human: ~2d / CC: ~4h)** — internal/service — Redact env from spec + writer capability gate (§5c)
+- [x] **T9 (P2, human: ~2d / CC: ~4h)** — internal/service — Redact env from spec + strict sealed-row restore (§5c)
   - Surfaced by: Codex #10 — placement vs envelope version conflated
   - Files: `cluster_secrets.go:60,211,265`
-  - Verify: old reader fails loudly, never silent empty env
+  - Verify: missing or mismatched sealed state fails loudly, never silent empty env
 - [x] **T10 (P2, human: ~3d / CC: ~5h)** — pkg/secrets — KMS provider + offline fake + shared contract suite (D7)
   - Surfaced by: D4 — both backends ship
   - Files: `pkg/secrets/`, `internal/config/config.go`, `integration-tests/`
@@ -578,10 +566,8 @@ Why this seam:
 - `opReserve` goes through Raft, so it is **serialized on the leader**. Two
   racing creates cannot produce disagreeing sets — that is the race the gate
   existed for, closed by construction rather than by convention.
-- `reservationCommand` (`internal/cluster/fsm.go`) is a JSON struct of
-  `omitempty` fields, so `Recipients []string` is **additive and
-  wire-compatible** — the same shape as `ReassignCause`, which was added
-  additively with an explicit mixed-version-safety comment.
+- `reservationCommand` (`internal/cluster/fsm.go`) carries the canonical,
+  sorted `Recipients []string` set that every node must understand.
 
 **N defaults to owner + 2 backups**, configurable. A cluster smaller than that
 uses every eligible candidate. Boot replay (`cluster_ownership.go:149`) has no
@@ -635,9 +621,8 @@ Explicit over clever.
 ### 3e. SUPERSEDES D4 — the fan-out is ASYNCHRONOUS
 
 The caller waits only for the bounded first-backup ACK window; remaining
-distribution runs asynchronously with bounded backoff. Enterprise mode treats
-zero ACKs as a create failure, while non-enterprise mode keeps the historical
-observable async fallback.
+distribution runs asynchronously with bounded backoff. Every cluster mode
+treats zero ACKs as a create failure.
 
 This reverses D4's synchronous choice, which was made before E1a existed.
 **E1a is what makes async defensible now**, and the pairing is load-bearing:
@@ -926,9 +911,9 @@ corrections, all verified against source.
 | # | Finding | Decision |
 |---|---|---|
 | **REVERSAL** | **Peer-push auth: use PAT + `d.Auth`, not gossip-secret signing.** Every node-to-node HTTP call in this repo already authenticates with `Bearer <pat>` — `capacity_lease.go:242`, `agent.go:900`, `client.go:775/1116`, `recovery_replication.go:162`, `jsbundle_replication.go:75`, `wasm_migrate.go:65`. The closest analogue is the *same operation*: `recovery_replication.go:162` fetches a recovery payload from a peer with `Bearer <pat>`, received via `d.Auth(...)` at `routes.go:178`. Gossip-secret signing would be a second auth model on the same wire. | Reverses the earlier gossip-secret decision. Register the endpoint as `PublicInternalSecretPath` alongside the other six `/v1/cluster/internal/...` routes. |
-| **REVISED** | **Flag granularity: ~3 flags grouped by default posture, not 5+.** A single umbrella cannot express mixed defaults, and one-per-change is more surface than the split needs. | One flag for the default-ON defect fixes (recipient-set sealing + fan-out), one for env-row storage, one for provider selection. Each gets a `setup/config-defaults.md` row and a removal criterion in the same commit. |
+| **SUPERSEDED** | Rollout flags were proposed for mixed-version deployment. | Recipient fan-out, env sealing, toolbox-token sealing, and canonical envelope/ref validation are now mandatory. Only provider selection remains configurable. |
 | **CORRECTION** | **Boot-path table omits D13.** Under the `kms` provider an HA create costs fan-out **+ one KMS wrap** — a network round-trip on the boot path. | Add the row; measure and report it like every other boot-path change. |
-| **CORRECTION** | **D13 was over-estimated.** `clusterSealedSecretsEnvelope` already carries `WrappedKey []byte` at envelope v3 (`cluster_secrets.go:65-70`), so a KMS-wrapped DEK needs no format change. | 4 eng-days → **~2**. |
+| **CORRECTION** | **D13 was over-estimated.** The envelope carries `WrappedKey []byte`, so a KMS-wrapped DEK uses the same canonical v4 format. | 4 eng-days → **~2**. |
 
 ### Outside voice (codex, re-review pass) — 9 findings
 
@@ -939,7 +924,7 @@ corrections, all verified against source.
 | 3 | **Env side-row write needs atomicity.** Insert row → write sealed env as two steps means a crash yields the "healthy sandbox with empty env" failure this plan calls critical. | **Required:** single transaction, plus an explicit crash-between-writes rollback test. Gates T7. |
 | 4 | **Peer secret deletes are unplanned.** Fan-out creates rows on peers; `DeleteClusterSecretsForSandbox` is local-only (`store.go:4040`) and `cluster_secrets` has no FK by design. | **Required:** delete fan-out on destroy, create rollback, partial fan-out, and promote failure. Tests for each. Gates T3. |
 | 5 | **Stale peer rows can collide.** Refs are deterministic (`cluster-secret://sandbox/<id>/v1`), so a failed create with partial fan-out leaves remote rows a later retry may reuse. | **Required:** either delete-fan-out on rollback (see #4) or attempt-unique refs. Pick one before coding T3. |
-| 6 | **"Rejects foreign pushes" is not achievable with PAT + `d.Auth` alone** — that is caller authorization, not peer identity. | **Closed:** secret PUT/DELETE + internal audit require **operator** (`Access.Operator` / fleet PAT) after `d.Auth`; receiver validates ref↔sandbox/version, live placement recipients, and self∈envelope recipients. Cluster-CA mTLS authenticates peer membership on the internal listener; enterprise mode requires it, rejects these routes on the public listener, and does not downgrade after TLS failure. SPIFFE/node-ID certificate binding remains outside this plan. |
+| 6 | **"Rejects foreign pushes" is not achievable with PAT + `d.Auth` alone** — that is caller authorization, not peer identity. | **Closed:** secret PUT/DELETE + internal audit require **operator** (`Access.Operator` / fleet PAT) after `d.Auth`; receiver validates ref↔sandbox/version, live placement recipients, and self∈envelope recipients. Every cluster mode requires cluster-CA mTLS on the internal listener, rejects these routes on the public listener, and does not downgrade after TLS failure. SPIFFE/node-ID certificate binding remains outside this plan. |
 | 7 | **D5 causes reassign churn.** `owner_watcher.go:109` reassigns after 5 failures to another arbitrary candidate excluding only the current node; a recipient-denied error therefore walks the fleet. | **Required:** a recipient-aware stop rule so a recipient-denied open halts reassignment instead of cycling. Gates T3; needs a regression test next to `owner_watcher.go`. |
 | 8 | **`Provider.Open(ctx, handle, nodeID)` carries no sandbox ID**, but the audit event needs one and a not-found event cannot recover it from an opaque handle. | **Required:** add `sandboxID` to the `Open` signature, or require handles to encode it. Decide at T1 — it is the interface definition. |
 | 9 | **The API change is under-scoped.** `GetSandbox`/`ListSandboxes` are thin wrappers (`service.go:1987`) and internal workflows call `store.Get/List` directly. | **Required:** separate internal "with env" reads from public response omission. A default change in the store would break internal callers. Gates T8. |
@@ -992,9 +977,9 @@ to ~16 engineer-weeks across 6 slices. **Read it before starting any slice.**
   vs attempt-unique refs) and #8 (does `Provider.Open` take a sandbox ID). Both are
   interface-shape calls that get expensive to change after T1.
 
-**Re-review verdict (eng #2):** two reversals — peer-push auth moves to the
-existing PAT + `d.Auth` pattern rather than a second gossip-secret scheme, and
-flags group into ~3 by default posture rather than 5+. Nine further codex findings
+**Re-review verdict (eng #2):** peer-push auth moved to the existing PAT +
+`d.Auth` pattern rather than a second gossip-secret scheme. The later strict
+contract removed the proposed rollout flags. Nine further codex findings
 folded, four of them (#3 atomicity, #4 peer deletes, #5 ref collisions, #7
 reassign churn) are **required work that gates T3 or T7** and had no coverage in
 any prior pass.
@@ -1004,8 +989,8 @@ selection (router picks at reserve time, recorded in `opReserve`); partial
 fan-out (owner + ≥1 backup, holder count surfaced); failed-create leftovers
 (delete-fanout, deterministic refs); `Provider.Open` takes `sandboxID`
 explicitly. Plus §3e supersedes D4: HA fan-out uses a **bounded first-backup
-ACK followed by an asynchronous remainder**; enterprise mode retracts/fails a
-zero-ACK create, while E1a `failover_ready` exposes completion. **Slice 1 is
+ACK followed by an asynchronous remainder**; every cluster mode retracts/fails
+a zero-ACK create, while E1a `failover_ready` exposes completion. **Slice 1 is
 unblocked.**
 Also resolved: the E1b cluster-read model — local log authoritative, fan-out with
 an explicit coverage block, rate-limited, `controlplane.Reporter` additive and
@@ -1015,9 +1000,8 @@ revocation stays instant and CloudTrail stays complete. **E5 credential
 brokering is out of scope** — customer secrets arrive at create time, platform
 KMS covers only AerolVM's own wrapping keys, and the "every use attributed"
 claim is withdrawn. New accepted gap
-recorded: **GAP-1** (closed for enterprise create; outside enterprise, mitigated
-via min-ACK wait + `failover_ready` with residual risk when peers are
-unreachable — §10).
+recorded: **GAP-1** (closed for every cluster create via min-ACK wait,
+retraction, and failure when peers are unreachable — §10).
 
 **UNRESOLVED DECISIONS:**
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask

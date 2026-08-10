@@ -102,7 +102,7 @@ func newHandlerExtraTestEnv(t *testing.T) (*service.Service, *store.Store, *fake
 
 	caddyClient := caddy.New(config.Config{EnableCaddy: false})
 
-	svc := service.New(config.Config{}, logger, st, rt, nil, caddyClient, nil, mgr, nil)
+	svc := service.New(config.Config{}, logger, st, rt, nil, caddyClient, newDaytonaTestCipher(t), mgr, nil)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
 		Service: svc,

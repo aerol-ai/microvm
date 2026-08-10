@@ -768,6 +768,7 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") // 32-byte base64
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", keyPath)
+		t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 		// Clear vars the test toggles per-case so previous cases don't leak.
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "")
 		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "")
@@ -790,6 +791,39 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 		if _, err := Load(); err != nil {
 			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("refuses_cluster_without_mtls", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_CLUSTER_TLS_DIR", "")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_TLS_DIR") {
+			t.Fatalf("expected SB_CLUSTER_TLS_DIR error, got %v", err)
+		}
+	})
+
+	t.Run("refuses_cluster_without_backup_recipient", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_RECIPIENT_BACKUP_COUNT", "0")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_SECRET_RECIPIENT_BACKUP_COUNT") {
+			t.Fatalf("expected SB_SECRET_RECIPIENT_BACKUP_COUNT error, got %v", err)
+		}
+	})
+
+	t.Run("refuses_zero_first_ack_wait", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_FANOUT_MIN_ACK_WAIT", "0")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_SECRET_FANOUT_MIN_ACK_WAIT") {
+			t.Fatalf("expected SB_SECRET_FANOUT_MIN_ACK_WAIT error, got %v", err)
 		}
 	})
 
@@ -908,6 +942,7 @@ func TestNodeRoleCases(t *testing.T) {
 		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 		t.Setenv("SB_API_ADVERTISE_URL", "http://10.0.0.5:21212")
+		t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 		t.Setenv("SB_NODE_ROLE", "")
 	}
 
@@ -1426,21 +1461,14 @@ func TestParseMirrorUpstreams(t *testing.T) {
 	}
 }
 
-func TestEnterpriseModeRequiresSecretSealing(t *testing.T) {
+func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterprisePATBytes))
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
 	t.Setenv("SB_ENABLE_CLUSTER", "false")
-	t.Setenv("SB_SECRET_ENV_SEAL_ENABLED", "false")
-	t.Setenv("SB_SECRET_TOOLBOX_SEAL_ENABLED", "true")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_ENV_SEAL_ENABLED") {
-		t.Fatalf("Load error = %v, want env-seal enterprise validation", err)
-	}
-
-	t.Setenv("SB_SECRET_ENV_SEAL_ENABLED", "true")
 	if cfg, err := Load(); err != nil {
 		t.Fatalf("secure enterprise Load: %v", err)
-	} else if !cfg.EnterpriseMode || !cfg.SecretToolboxSealEnabled {
-		t.Fatalf("enterprise flags not retained: %+v", cfg)
+	} else if !cfg.EnterpriseMode {
+		t.Fatalf("enterprise mode not retained: %+v", cfg)
 	}
 
 	t.Setenv("SB_PAT_TOKEN", "weak-token")
