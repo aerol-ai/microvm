@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strings"
 )
 
 // DefaultPlacementShardCount is the stable shard space for placement-index
@@ -36,6 +37,8 @@ type PlacementPageRequest struct {
 	Limit       int                  `json:"limit,omitempty"`
 	PageToken   string               `json:"page_token,omitempty"`
 	ShardFilter PlacementShardFilter `json:"shard_filter,omitempty"`
+	// OwnerRef, when set, returns only placements for that tenant account.
+	OwnerRef string `json:"owner_ref,omitempty"`
 }
 
 type PlacementPageResponse struct {
@@ -69,6 +72,7 @@ func (r PlacementPageRequest) Normalize() PlacementPageRequest {
 		Limit:       limit,
 		PageToken:   r.PageToken,
 		ShardFilter: r.ShardFilter.Normalize(),
+		OwnerRef:    strings.TrimSpace(r.OwnerRef),
 	}
 }
 

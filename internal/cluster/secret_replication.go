@@ -30,7 +30,7 @@ func (c *Cluster) PushSecretBlobToPeers(ctx context.Context, blob secrets.Secret
 	if c == nil || c.gossip == nil || (c.httpClient == nil && c.currentInternalClient() == nil) {
 		return nil, nil
 	}
-	return pushSecretBlobToPeersWithInternal(ctx, c.gossip.members(), c.httpClient, c.currentInternalClient(), c.patToken, c.nodeID, blob, recipients)
+	return pushSecretBlobToPeersLookup(ctx, c.gossip.lookupMember, c.httpClient, c.currentInternalClient(), c.patToken, c.nodeID, blob, recipients)
 }
 
 // DeleteSecretOnPeers DELETEs the sandbox's cluster_secrets rows on peers that
@@ -57,7 +57,7 @@ func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBl
 	if a == nil || a.gossip == nil || (a.httpClient == nil && a.internalClient == nil) {
 		return nil, nil
 	}
-	return pushSecretBlobToPeersWithInternal(ctx, a.gossip.members(), a.httpClient, a.internalClient, a.patToken, a.nodeID, blob, recipients)
+	return pushSecretBlobToPeersLookup(ctx, a.gossip.lookupMember, a.httpClient, a.internalClient, a.patToken, a.nodeID, blob, recipients)
 }
 
 func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
@@ -86,38 +86,22 @@ func pushSecretBlobToPeers(ctx context.Context, members []Member, client *http.C
 	return pushSecretBlobToPeersWithInternal(ctx, members, client, nil, pat, selfID, blob, recipients)
 }
 
-func pushSecretBlobToPeersWithInternal(ctx context.Context, members []Member, publicClient, internalClient *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
-	if (publicClient == nil && internalClient == nil) || len(recipients) == 0 {
-		return nil, nil
-	}
-	want := make(map[string]struct{}, len(recipients))
-	for _, id := range recipients {
-		id = strings.TrimSpace(id)
-		if id == "" || id == selfID {
-			continue
-		}
-		want[id] = struct{}{}
-	}
-	if len(want) == 0 {
+func pushSecretBlobToPeersLookup(ctx context.Context, lookup func(string) (Member, bool), publicClient, internalClient *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
+	if (publicClient == nil && internalClient == nil) || len(recipients) == 0 || lookup == nil {
 		return nil, nil
 	}
 	body, err := json.Marshal(blob)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: marshal secret blob: %w", err)
 	}
-	// Index members by ID so create-path fan-out is O(recipients), not a full
-	// membership scan per seal (critical at 2k-node / 100k-create bursts).
-	byID := make(map[string]Member, len(members))
-	for _, m := range members {
-		if m.NodeID == "" {
-			continue
-		}
-		byID[m.NodeID] = m
-	}
 	var acked []string
 	var firstErr error
-	for id := range want {
-		m, ok := byID[id]
+	for _, id := range recipients {
+		id = strings.TrimSpace(id)
+		if id == "" || id == selfID {
+			continue
+		}
+		m, ok := lookup(id)
 		if !ok || !m.Alive || (strings.TrimSpace(m.APIURL) == "" && strings.TrimSpace(m.InternalURL) == "") {
 			continue
 		}
@@ -136,6 +120,20 @@ func pushSecretBlobToPeersWithInternal(ctx context.Context, members []Member, pu
 		acked = append(acked, m.NodeID)
 	}
 	return acked, firstErr
+}
+
+func pushSecretBlobToPeersWithInternal(ctx context.Context, members []Member, publicClient, internalClient *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
+	byID := make(map[string]Member, len(members))
+	for _, m := range members {
+		if m.NodeID == "" {
+			continue
+		}
+		byID[m.NodeID] = m
+	}
+	return pushSecretBlobToPeersLookup(ctx, func(id string) (Member, bool) {
+		m, ok := byID[id]
+		return m, ok
+	}, publicClient, internalClient, pat, selfID, blob, recipients)
 }
 
 func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {

@@ -1936,7 +1936,8 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 }
 
 func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
-	if f.placementIDs == nil {
+	if f.placementIDs == nil || strings.TrimSpace(req.OwnerRef) != "" {
+		// OwnerRef filtering scans placements; the ID tree has no tenant index.
 		return f.pagePlacementIDsByScanLocked(req, shardFilter, allShards, wantShards)
 	}
 	if allShards || shardFilter.ShardCount != DefaultPlacementShardCount || len(shardFilter.Shards) > 1024 {
@@ -1965,8 +1966,12 @@ func (f *placementFSM) pagePlacementIDsByScanLocked(req PlacementPageRequest, sh
 	if shardCount <= 0 {
 		shardCount = DefaultPlacementShardCount
 	}
-	for id := range f.placements {
+	ownerRef := strings.TrimSpace(req.OwnerRef)
+	for id, p := range f.placements {
 		if req.PageToken != "" && id <= req.PageToken {
+			continue
+		}
+		if ownerRef != "" && strings.TrimSpace(p.OwnerRef) != "" && p.OwnerRef != ownerRef {
 			continue
 		}
 		if !allShards {

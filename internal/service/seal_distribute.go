@@ -423,9 +423,15 @@ func (s *Service) enqueueSecretFanout(sandboxID string, blob secrets.SecretBlob,
 	select {
 	case secretCreateFanoutJobs <- job:
 	default:
-		// Queue full: block rather than spawn an unbounded goroutine. Create
-		// already has ≥1 backup ACK; this only delays remaining peer copies.
-		secretCreateFanoutJobs <- job
+		// Never block the create path on a saturated queue. MinACK already
+		// secured ≥1 backup; remaining peers are recovered by restart re-fanout
+		// / possession probes rather than stalling CreateSandbox for minutes.
+		secretCreateFanoutInflight.Delete(sandboxID)
+		recordSecretFanoutFailure()
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret fan-out queue full; deferring remaining peers",
+				"sandbox_id", sandboxID)
+		}
 	}
 }
 

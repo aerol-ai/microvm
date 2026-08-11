@@ -1482,4 +1482,14 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_EXTERNAL_WITNESS") {
 		t.Fatalf("Load error = %v, want external witness requirement", err)
 	}
+
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_SECRET_AUDIT_WITNESS_INTERVAL", "15s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load with witness interval: %v", err)
+	}
+	if cfg.SecretAuditWitnessInterval != 15*time.Second {
+		t.Fatalf("SecretAuditWitnessInterval = %v, want 15s", cfg.SecretAuditWitnessInterval)
+	}
 }

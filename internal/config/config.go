@@ -1098,6 +1098,10 @@ type Config struct {
 	// a real Witness; open-source enterprise boots fail closed without one.
 	// SB_SECRET_AUDIT_EXTERNAL_WITNESS (default false; forced true in enterprise).
 	SecretAuditExternalWitness bool
+	// SecretAuditWitnessInterval is how often local hash-chain heads are shipped
+	// to the configured Witness. Security parameter (detection granularity).
+	// Default 30s. SB_SECRET_AUDIT_WITNESS_INTERVAL.
+	SecretAuditWitnessInterval time.Duration
 	// SecretTombRetentionDays bounds deletion tombstone growth after all peer
 	// delete ACKs complete. Zero disables GC. Rows with a live sandbox, sealed
 	// secret, or pending outbox are never eligible. Default 30.
@@ -1623,6 +1627,7 @@ func Load() (Config, error) {
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
 		SecretAuditExternalWitness:    getEnvBool("SB_SECRET_AUDIT_EXTERNAL_WITNESS", false),
+		SecretAuditWitnessInterval:    getEnvDuration("SB_SECRET_AUDIT_WITNESS_INTERVAL", 30*time.Second),
 		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
 		EgressAttributionEnabled:      getEnvBool("SB_EGRESS_ATTRIBUTION_ENABLED", true),
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),

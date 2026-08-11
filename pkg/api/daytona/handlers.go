@@ -306,70 +306,96 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 	apihttp.WriteJSON(w, http.StatusCreated, h.toSnapshotResponse(r, registered))
 }
 
-// listSandboxesClusterAware returns local rows merged with placement-owner
-// peers when cluster mode is on. Peers serve /v1/sandboxes (canonical models).
-func (h *handlers) listSandboxesClusterAware(r *http.Request) ([]*models.Sandbox, error) {
-	if h.deps.Service == nil {
-		return nil, nil
-	}
-	local, err := h.deps.Service.ListSandboxes(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	if r.Header.Get("X-Cluster-Forwarded") == "1" {
-		return local, nil
+// listFacadeClusterItems merges local facade list items with peer facade lists
+// so remote owner nodes contribute their own compat metadata (not the ingress
+// node's empty local map).
+func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxResponse) ([]sandboxResponse, clusterlist.Coverage, string) {
+	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
+	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+		return local, cov, ""
 	}
 	c := h.deps.Service.Cluster()
 	if c == nil {
-		return local, nil
+		return local, cov, ""
 	}
-	peers := clusterlist.SelectPeers(c, clusterlist.OwnerRefFromContext(r.Context()))
-	return clusterlist.Merge(r.Context(), peers, clusterlist.Options{
+	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
+	limit, pageToken := clusterlist.ParsePageParams(r.URL)
+	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
+	if len(placements) > 0 {
+		want := make(map[string]struct{}, len(placements))
+		for _, p := range placements {
+			want[p.SandboxID] = struct{}{}
+		}
+		filtered := local[:0]
+		for _, it := range local {
+			if _, ok := want[it.ID]; ok {
+				filtered = append(filtered, it)
+			}
+		}
+		local = filtered
+	}
+	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it sandboxResponse) string { return it.ID }, clusterlist.Options{
+		OwnerRef:   ownerRef,
 		AuthHeader: r.Header.Get("Authorization"),
 		RawQuery:   r.URL.RawQuery,
-		Path:       "/v1/sandboxes",
-		Local:      local,
+		Path:       PathPrefix + "/sandbox",
+		Transport:  clusterlist.TransportFromCluster(c),
 		Warn: func(msg, peer string, peerErr error) {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
 			}
 		},
-	}), nil
+	})
+	cov.PlacementViewReady = viewReady
+	if len(missingOwners) > 0 {
+		cov.Missing = append(cov.Missing, missingOwners...)
+		cov.Partial = true
+	}
+	if !viewReady {
+		cov.Partial = true
+	}
+	return items, cov, next
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.listSandboxesClusterAware(r)
-	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
+	if h.deps.Service == nil {
+		apihttp.WriteJSON(w, http.StatusOK, []sandboxResponse{})
+		return
+	}
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	metadata, err := h.listSandboxMeta(r.Context())
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-
-	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	items, cov, next := h.listFacadeClusterItems(r, localItems)
+	clusterlist.WriteCoverageHeaders(w, cov, next)
 	apihttp.WriteJSON(w, http.StatusOK, items)
 }
 
 func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.listSandboxesClusterAware(r)
-	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.deps.Service == nil {
+		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{})
+		return
+	}
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	metadata, err := h.listSandboxMeta(r.Context())
@@ -389,7 +415,9 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	items, cov, next := h.listFacadeClusterItems(r, localItems)
+	clusterlist.WriteCoverageHeaders(w, cov, next)
 	total := len(items)
 	start := int((page - 1) * limit)
 	if start > total {

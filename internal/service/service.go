@@ -160,12 +160,17 @@ type Service struct {
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
 	// StartSandbox / create hot path.
-	secretAudit          SecretAuditSink
-	secretAuditFile      *fileAuditSink // non-nil when the sink is the file writer
-	secretAuditInitErr   error          // retained so daemon boot can fail closed
-	secretAuditOnce      sync.Once
-	secretAuditPruneStop chan struct{}
-	secretAuditPruneDone sync.WaitGroup
+	secretAudit            SecretAuditSink
+	secretAuditFile        *fileAuditSink // non-nil when the sink is the file writer
+	secretAuditInitErr     error          // retained so daemon boot can fail closed
+	secretAuditOnce        sync.Once
+	secretAuditPruneStop   chan struct{}
+	secretAuditPruneDone   sync.WaitGroup
+	auditWitnessMu         sync.Mutex
+	auditWitness           controlplane.Witness
+	secretAuditWitnessOnce sync.Once
+	secretAuditWitnessStop chan struct{}
+	secretAuditWitnessDone sync.WaitGroup
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
 	// testSandboxMetaFetcher overrides owner-ref probes for ingress audit auth.

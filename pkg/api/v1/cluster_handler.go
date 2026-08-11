@@ -496,6 +496,8 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
+	limit, pageToken := clusterlist.ParsePageParams(r.URL)
 	tagFilter := parseTagFilter(r)
 	local, err := h.deps.Service.ListSandboxes(r.Context(), tagFilter)
 	if err != nil {
@@ -503,17 +505,32 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		local = nil
 	}
 
-	peers := clusterlist.SelectPeers(c, clusterlist.OwnerRefFromContext(r.Context()))
-	merged := clusterlist.Merge(r.Context(), peers, clusterlist.Options{
+	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
+	local = clusterlist.FilterLocalToPage(local, placements)
+	result := clusterlist.Merge(r.Context(), peers, clusterlist.Options{
+		OwnerRef:   ownerRef,
 		AuthHeader: r.Header.Get("Authorization"),
 		RawQuery:   r.URL.RawQuery,
 		Path:       PathPrefix + "/sandboxes",
 		Local:      local,
+		Transport:  clusterlist.TransportFromCluster(c),
+		Limit:      limit,
+		PageToken:  pageToken,
 		Warn: func(msg, peer string, peerErr error) {
 			h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
 		},
 	})
-	apihttp.WriteJSON(w, http.StatusOK, merged)
+	result.Coverage.PlacementViewReady = viewReady
+	if len(missingOwners) > 0 {
+		result.Coverage.Missing = append(result.Coverage.Missing, missingOwners...)
+		result.Coverage.Partial = true
+	}
+	if !viewReady {
+		result.Coverage.Partial = true
+	}
+	result.NextPageToken = next
+	clusterlist.WriteCoverageHeaders(w, result.Coverage, result.NextPageToken)
+	apihttp.WriteJSON(w, http.StatusOK, result.Sandboxes)
 }
 
 func clusterMemberCanOwnSandbox(role string) bool {

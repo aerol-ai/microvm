@@ -223,10 +223,14 @@ func (s *Session) Write(p []byte) (int, error) {
 
 // CloseStdin half-closes stdin so the process sees EOF.
 func (s *Session) CloseStdin() error {
-	if s.stdin != nil {
-		return s.stdin.Close()
+	s.mu.Lock()
+	stdin := s.stdin
+	ptmx := s.ptmx
+	s.mu.Unlock()
+	if stdin != nil {
+		return stdin.Close()
 	}
-	if s.ptmx != nil {
+	if ptmx != nil {
 		// PTY half-close isn't well-defined; nothing to do.
 		return nil
 	}

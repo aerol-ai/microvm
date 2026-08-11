@@ -298,6 +298,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// controlplane.Noop() this is the no-op reporter, so the open-source build
 	// emits nothing and pays no cost.
 	svc.SetUsageReporter(cp.Reporter)
+	svc.SetWitness(cp.Witness)
 	// Wire the managed create-gate. Under Noop() this is the allow-all admitter,
 	// so the open-source build never gates a create.
 	svc.SetFleetAdmitter(cp.Admitter)

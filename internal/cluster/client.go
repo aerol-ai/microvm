@@ -280,6 +280,23 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
 func (c *Cluster) SelfAPIURL() string { return c.apiURL }
 
+// PeerHTTPClients exposes the public and cert-pinned internal HTTP clients for
+// cluster list fan-out. End-user Authorization must only ride the internal client.
+func (c *Cluster) PeerHTTPClients() (public, internal *http.Client) {
+	if c == nil {
+		return nil, nil
+	}
+	return c.httpClient, c.currentInternalClient()
+}
+
+// PeerPAT returns the fleet PAT used for internal peer RPCs and public list fallbacks.
+func (c *Cluster) PeerPAT() string {
+	if c == nil {
+		return ""
+	}
+	return c.patToken
+}
+
 func (c *Cluster) currentInternalClient() *http.Client {
 	if c == nil {
 		return nil
@@ -1225,6 +1242,15 @@ func (c *Cluster) Members() []Member {
 		return nil
 	}
 	return c.membersWithCapacity()
+}
+
+// LookupMember returns one gossip member by node ID without scanning the full
+// membership list. Used by placement-page list hydration (O(owners)).
+func (c *Cluster) LookupMember(id string) (Member, bool) {
+	if c == nil || c.gossip == nil || id == "" {
+		return Member{}, false
+	}
+	return c.gossip.lookupMember(id)
 }
 
 // IngressTargets aggregates live ingress-role members' gossiped PublicHost

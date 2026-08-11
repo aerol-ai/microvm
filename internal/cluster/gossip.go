@@ -215,6 +215,16 @@ func (i *gossipMemberIndex) replace(members []Member) {
 	i.mu.Unlock()
 }
 
+func (i *gossipMemberIndex) get(id string) (Member, bool) {
+	if i == nil || id == "" {
+		return Member{}, false
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	m, ok := i.members[id]
+	return m, ok
+}
+
 func (i *gossipMemberIndex) snapshot() []Member {
 	if i == nil {
 		return nil
@@ -226,6 +236,13 @@ func (i *gossipMemberIndex) snapshot() []Member {
 		out = append(out, m)
 	}
 	return out
+}
+
+func (g *gossipNode) lookupMember(id string) (Member, bool) {
+	if g == nil {
+		return Member{}, false
+	}
+	return g.currentMemberIndex().get(id)
 }
 
 func (i *gossipMemberIndex) recordLeaseLossesLocked(next map[string]Member) {

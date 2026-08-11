@@ -195,6 +195,22 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 }
 
 func (a *Agent) SelfNodeID() string { return a.nodeID }
+
+// PeerHTTPClients exposes public + mTLS clients for cluster list fan-out.
+func (a *Agent) PeerHTTPClients() (public, internal *http.Client) {
+	if a == nil {
+		return nil, nil
+	}
+	return a.httpClient, a.internalClient
+}
+
+// PeerPAT returns the fleet PAT for internal peer RPCs / public list fallbacks.
+func (a *Agent) PeerPAT() string {
+	if a == nil {
+		return ""
+	}
+	return a.patToken
+}
 func (a *Agent) SelfAPIURL() string { return a.apiURL }
 
 func (a *Agent) OwnerOf(sandboxID string) (OwnerInfo, error) {
@@ -622,6 +638,25 @@ func (a *Agent) Members() []Member {
 		return resp.Members
 	}
 	return a.gossip.members()
+}
+
+// LookupMember resolves one peer by ID via the local gossip index (O(1)),
+// falling back to a membership scan only when the index misses.
+func (a *Agent) LookupMember(id string) (Member, bool) {
+	if a == nil || id == "" {
+		return Member{}, false
+	}
+	if a.gossip != nil {
+		if m, ok := a.gossip.lookupMember(id); ok {
+			return m, true
+		}
+	}
+	for _, m := range a.Members() {
+		if m.NodeID == id {
+			return m, true
+		}
+	}
+	return Member{}, false
 }
 
 // IngressTargets aggregates live ingress-role members' PublicHost values.

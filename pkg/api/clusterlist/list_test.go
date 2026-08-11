@@ -2,6 +2,8 @@ package clusterlist
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -12,12 +14,46 @@ type stubListCluster struct {
 	*cluster.Noop
 	members    []cluster.Member
 	placements []cluster.Placement
+	byID       map[string]cluster.Member
 }
 
 func (c *stubListCluster) Members() []cluster.Member { return c.members }
 func (c *stubListCluster) Placements() []cluster.Placement {
 	return append([]cluster.Placement(nil), c.placements...)
 }
+func (c *stubListCluster) PlacementPage(req cluster.PlacementPageRequest) cluster.PlacementPageResponse {
+	limit := req.Limit
+	if limit <= 0 {
+		limit = DefaultPageLimit
+	}
+	out := make([]cluster.Placement, 0, limit)
+	for _, p := range c.placements {
+		if req.OwnerRef != "" && p.OwnerRef != req.OwnerRef {
+			continue
+		}
+		out = append(out, p)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return cluster.PlacementPageResponse{Placements: out}
+}
+func (c *stubListCluster) LookupMember(id string) (cluster.Member, bool) {
+	if c.byID != nil {
+		m, ok := c.byID[id]
+		return m, ok
+	}
+	for _, m := range c.members {
+		if m.NodeID == id {
+			return m, true
+		}
+	}
+	return cluster.Member{}, false
+}
+func (c *stubListCluster) PeerHTTPClients() (public, internal *http.Client) {
+	return http.DefaultClient, http.DefaultClient
+}
+func (c *stubListCluster) PeerPAT() string { return "fleet-pat" }
 
 func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 	members := make([]cluster.Member, 0, 300)
@@ -34,8 +70,10 @@ func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 	}
 	members[1].NodeID = "owner-a"
 	members[1].APIURL = "http://owner-a"
+	members[1].InternalURL = "https://owner-a.internal"
 	members[2].NodeID = "owner-b"
 	members[2].APIURL = "http://owner-b"
+	members[2].InternalURL = "https://owner-b.internal"
 
 	c := &stubListCluster{
 		Noop:    cluster.NewNoop("self", "http://self", ""),
@@ -46,9 +84,15 @@ func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 			{SandboxID: "sb-3", OwnerNodeID: "owner-a", OwnerRef: "tenant-2"},
 		},
 	}
-	peers := SelectPeers(c, "tenant-1")
+	peers, _, _, ready, missing := SelectPeersForPage(c, "tenant-1", "", DefaultPageLimit)
+	if !ready {
+		t.Fatal("expected placement view ready")
+	}
+	if len(missing) != 0 {
+		t.Fatalf("missing = %v, want none", missing)
+	}
 	if len(peers) != 2 {
-		t.Fatalf("SelectPeers(tenant-1) = %d peers, want 2", len(peers))
+		t.Fatalf("SelectPeersForPage(tenant-1) = %d peers, want 2", len(peers))
 	}
 	got := map[string]bool{}
 	for _, p := range peers {
@@ -59,7 +103,55 @@ func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 	}
 
 	c.placements = nil
-	if peers = SelectPeers(c, ""); peers != nil {
+	peers, _, _, ready, _ = SelectPeersForPage(c, "", "", DefaultPageLimit)
+	if ready {
+		t.Fatal("empty placements at large membership must mark view not ready")
+	}
+	if peers != nil {
 		t.Fatalf("empty placements at large membership: got %d peers, want nil", len(peers))
+	}
+}
+
+func TestDialPeerPrefersInternalURLAndUserAuth(t *testing.T) {
+	tr := Transport{
+		PublicClient:   http.DefaultClient,
+		InternalClient: http.DefaultClient,
+		FleetPAT:       "pat",
+	}
+	client, base, mode := dialPeer(cluster.Member{
+		NodeID:      "n1",
+		APIURL:      "http://public",
+		InternalURL: "https://internal",
+		Alive:       true,
+	}, tr)
+	if client == nil || base != "https://internal" || mode != authUser {
+		t.Fatalf("dialPeer = %v %q %v, want internal+user", client != nil, base, mode)
+	}
+	client, base, mode = dialPeer(cluster.Member{
+		NodeID: "n2",
+		APIURL: "http://public-only",
+		Alive:  true,
+	}, tr)
+	if client == nil || base != "http://public-only" || mode != authFleetPAT {
+		t.Fatalf("dialPeer fallback = %v %q %v, want public+pat", client != nil, base, mode)
+	}
+}
+
+func TestWriteCoverageHeadersMarksPartial(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteCoverageHeaders(rec, Coverage{
+		Partial:            true,
+		PlacementViewReady: false,
+		Missing:            []string{"w-1"},
+		Answered:           []string{"local"},
+	}, "tok")
+	if rec.Header().Get(HeaderPartial) != "true" {
+		t.Fatalf("partial header = %q", rec.Header().Get(HeaderPartial))
+	}
+	if rec.Header().Get(HeaderPlacementReady) != "false" {
+		t.Fatalf("ready header = %q", rec.Header().Get(HeaderPlacementReady))
+	}
+	if rec.Header().Get(HeaderNextPageToken) != "tok" {
+		t.Fatalf("next token = %q", rec.Header().Get(HeaderNextPageToken))
 	}
 }

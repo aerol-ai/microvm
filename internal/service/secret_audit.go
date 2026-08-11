@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,8 +93,11 @@ type auditWriteReq struct {
 }
 
 // fileAuditSink appends JSON Lines under {DataDir}/audit/secrets.jsonl via a
-// single writer goroutine. Emit is non-blocking: a full buffer drops the event,
-// increments aerolvm_audit_events_dropped_total, and records a gap marker.
+// single writer goroutine. When blocking is false, Emit is non-blocking: a full
+// buffer drops the event, increments aerolvm_audit_events_dropped_total, and
+// records a gap marker (count persisted to a sidecar so crashes do not lose
+// the gap). When blocking is true (enterprise), Emit waits for buffer space so
+// evidence is not silently discarded.
 //
 // sendMu serializes producers against Close so Emit/Sync/Prune never send on a
 // closed channel (check-then-send race under -race / daemon shutdown).
@@ -101,16 +105,26 @@ type fileAuditSink struct {
 	ch         chan auditWriteReq
 	pendingGap atomic.Int64 // coalesced drop count awaiting a gap marker write
 	closed     atomic.Bool
+	blocking   bool
 	sendMu     sync.Mutex
 	done       chan struct{}
 	path       string
 	lockPath   string
+	gapPath    string
+	tipPath    string
 	file       *os.File
+	chainMu    sync.Mutex
+	chainHead  string
+	chainEvent string
 	// writeHook, when set (tests), runs before each file write and may block.
 	writeHook func()
 }
 
 func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
+	return newFileAuditSinkOpts(auditDir, buffer, false)
+}
+
+func newFileAuditSinkOpts(auditDir string, buffer int, blocking bool) (*fileAuditSink, error) {
 	if buffer <= 0 {
 		buffer = defaultSecretAuditBuffer
 	}
@@ -119,6 +133,8 @@ func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
 	}
 	path := filepath.Join(auditDir, secretAuditFileName)
 	lockPath := filepath.Join(auditDir, secretAuditLockName)
+	gapPath := filepath.Join(auditDir, "secrets.gap")
+	tipPath := filepath.Join(auditDir, "secrets.tip")
 	// Acquire the stable sidecar lock before opening the data file so retention
 	// rename cannot race a concurrent open+append onto an unlinked inode.
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
@@ -135,12 +151,22 @@ func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secret audit open: %w", err)
 	}
+	head, tipEvent := loadChainTip(path, tipPath)
+	pending := loadGapCount(gapPath)
 	s := &fileAuditSink{
-		ch:       make(chan auditWriteReq, buffer),
-		done:     make(chan struct{}),
-		path:     path,
-		lockPath: lockPath,
-		file:     f,
+		ch:         make(chan auditWriteReq, buffer),
+		done:       make(chan struct{}),
+		path:       path,
+		lockPath:   lockPath,
+		gapPath:    gapPath,
+		tipPath:    tipPath,
+		file:       f,
+		blocking:   blocking,
+		chainHead:  head,
+		chainEvent: tipEvent,
+	}
+	if pending > 0 {
+		s.pendingGap.Store(pending)
 	}
 	go s.loop()
 	return s, nil
@@ -155,11 +181,17 @@ func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
 	if s.closed.Load() {
 		return
 	}
+	req := auditWriteReq{ev: ev}
+	if s.blocking {
+		s.ch <- req
+		return
+	}
 	select {
-	case s.ch <- auditWriteReq{ev: ev}:
+	case s.ch <- req:
 	default:
 		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Add(1)
+		n := s.pendingGap.Add(1)
+		persistGapCount(s.gapPath, n)
 	}
 }
 
@@ -212,6 +244,7 @@ func (s *fileAuditSink) loop() {
 						Kind:    secretAuditKindGap,
 						Dropped: n,
 					})
+					clearGapCount(s.gapPath)
 				}
 				_ = s.syncFile()
 				return
@@ -229,6 +262,7 @@ func (s *fileAuditSink) loop() {
 				Kind:    secretAuditKindGap,
 				Dropped: n,
 			})
+			clearGapCount(s.gapPath)
 		}
 		if req.pruneDone != nil {
 			req.pruneDone <- s.pruneLocked(req.pruneCutoff)
@@ -363,6 +397,13 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 			return err
 		}
 		s.file = nf
+		// Tip sidecar must track the rewritten file tip (not the pre-prune head).
+		head, eventID := loadChainTip(s.path, "")
+		s.chainMu.Lock()
+		s.chainHead = head
+		s.chainEvent = eventID
+		s.chainMu.Unlock()
+		persistChainTip(s.tipPath, head, eventID)
 		return nil
 	})
 }
@@ -379,11 +420,19 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 		ev.Time = time.Now().UTC()
 	}
 	ensureSecretAuditEventID(&ev)
+	s.chainMu.Lock()
+	prev := s.chainHead
+	if prev == "" {
+		prev = auditlog.GenesisPrevHash
+	}
+	auditlog.LinkEvent(prev, &ev)
+	s.chainMu.Unlock()
 	line, err := json.Marshal(ev)
 	if err != nil {
 		secretAuditSinkHealthy.Set(0)
 		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Add(1)
+		n := s.pendingGap.Add(1)
+		persistGapCount(s.gapPath, n)
 		return
 	}
 	line = append(line, '\n')
@@ -393,10 +442,96 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) {
 	}); err != nil {
 		secretAuditSinkHealthy.Set(0)
 		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Add(1)
+		n := s.pendingGap.Add(1)
+		persistGapCount(s.gapPath, n)
 		return
 	}
+	s.chainMu.Lock()
+	s.chainHead = ev.EventHash
+	s.chainEvent = ev.EventID
+	s.chainMu.Unlock()
+	persistChainTip(s.tipPath, ev.EventHash, ev.EventID)
 	secretAuditSinkHealthy.Set(1)
+}
+
+func (s *fileAuditSink) chainTip() (head, eventID string) {
+	if s == nil {
+		return "", ""
+	}
+	s.chainMu.Lock()
+	defer s.chainMu.Unlock()
+	return s.chainHead, s.chainEvent
+}
+
+func loadChainTip(path, tipPath string) (head, eventID string) {
+	if tipPath != "" {
+		if raw, err := os.ReadFile(tipPath); err == nil {
+			parts := strings.SplitN(strings.TrimSpace(string(raw)), "\n", 2)
+			if len(parts) >= 1 && parts[0] != "" {
+				head = parts[0]
+				if len(parts) == 2 {
+					eventID = parts[1]
+				}
+				return head, eventID
+			}
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return auditlog.GenesisPrevHash, ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	head = auditlog.GenesisPrevHash
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var ev SecretAuditEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		if ev.EventHash != "" {
+			head = ev.EventHash
+			eventID = ev.EventID
+		}
+	}
+	return head, eventID
+}
+
+func persistChainTip(path, head, eventID string) {
+	if path == "" || head == "" {
+		return
+	}
+	_ = os.WriteFile(path, []byte(head+"\n"+eventID+"\n"), 0o600)
+}
+
+func loadGapCount(path string) int64 {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func persistGapCount(path string, n int64) {
+	if path == "" {
+		return
+	}
+	_ = os.WriteFile(path, []byte(strconv.FormatInt(n, 10)+"\n"), 0o600)
+}
+
+func clearGapCount(path string) {
+	if path == "" {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 func (s *Service) ensureSecretAuditSink() {
@@ -415,10 +550,12 @@ func (s *Service) ensureSecretAuditSink() {
 			return
 		}
 		buf := defaultSecretAuditBuffer
+		blocking := false
 		if s.cfg.EnterpriseMode {
 			buf = enterpriseSecretAuditBuffer
+			blocking = true
 		}
-		sink, err := newFileAuditSink(filepath.Join(dataDir, "audit"), buf)
+		sink, err := newFileAuditSinkOpts(filepath.Join(dataDir, "audit"), buf, blocking)
 		if err != nil {
 			s.secretAuditInitErr = err
 			secretAuditSinkHealthy.Set(0)
@@ -516,6 +653,7 @@ func (s *Service) CloseSecretAuditSink() {
 	if s == nil {
 		return
 	}
+	s.stopSecretAuditWitnessLoop()
 	if stop := s.secretAuditPruneStop; stop != nil {
 		select {
 		case <-stop:

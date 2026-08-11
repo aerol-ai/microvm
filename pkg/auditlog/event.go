@@ -31,6 +31,10 @@ type Event struct {
 	// Dropped is set on gap markers to record how many events were coalesced
 	// into this single overflow marker (lossy buffer evidence).
 	Dropped int64 `json:"dropped,omitempty"`
+	// PrevHash / EventHash form the local append-only hash chain used for
+	// tamper detection once heads are witnessed off-node (E2b).
+	PrevHash  string `json:"prev_hash,omitempty"`
+	EventHash string `json:"event_hash,omitempty"`
 }
 
 var fallbackSequence atomic.Uint64

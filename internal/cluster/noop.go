@@ -332,6 +332,17 @@ func (n *Noop) Members() []Member {
 	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}}
 }
 
+// LookupMember resolves the single Noop member when id matches.
+func (n *Noop) LookupMember(id string) (Member, bool) {
+	if n == nil || id == "" || id != n.nodeID {
+		return Member{}, false
+	}
+	return Member{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}, true
+}
+
+func (n *Noop) PeerHTTPClients() (public, internal *http.Client) { return nil, nil }
+func (n *Noop) PeerPAT() string                                  { return "" }
+
 // IngressTargets reports the single-node deployment's public address as the
 // DNS target. Empty publicHost (IP-only mode) returns the Unknown source so
 // the service layer can surface a clean 412 rather than fake records.
