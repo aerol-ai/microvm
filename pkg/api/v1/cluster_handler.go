@@ -1139,6 +1139,27 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	out := c.PlacementsByIDs(req.IDs)
+	for id, p := range out {
+		redactPlacementSecretFields(&p)
+		out[id] = p
+	}
+	apihttp.WriteJSON(w, http.StatusOK, out)
+}
+
 func (h *handlers) clusterInternalAuditACL(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {

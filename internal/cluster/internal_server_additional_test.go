@@ -20,14 +20,23 @@ import (
 )
 
 func generateTestCert() (*x509.CertPool, tls.Certificate, error) {
+	return generateTestCertForNode("")
+}
+
+func generateTestCertForNode(nodeID string) (*x509.CertPool, tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, tls.Certificate{}, err
+	}
+	dns := []string{"aerolvm-cluster-node", "localhost"}
+	if nodeID != "" {
+		dns = append(dns, "node:"+nodeID)
 	}
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
 			Organization: []string{"Acme Co"},
+			CommonName:   nodeID,
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(time.Hour * 24 * 180),
@@ -35,7 +44,7 @@ func generateTestCert() (*x509.CertPool, tls.Certificate, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		DNSNames:              []string{"aerolvm-cluster-node", "localhost"},
+		DNSNames:              dns,
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 	}
 

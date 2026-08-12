@@ -228,9 +228,10 @@ func (t *ClusterTLS) clientConfig() *tls.Config {
 
 // ClientForPeer returns an HTTP client that verifies the dialed peer presents
 // DNS SAN node:<expectedNodeID> (in addition to the shared clusterServerName
-// hostname check). Legacy aerolvm-cluster-node-only certs are soft-compat:
-// allowed with a metric bump. Empty expected or a non-TLS base is a no-op.
-func ClientForPeer(base *http.Client, expectedNodeID string) *http.Client {
+// hostname check). Legacy aerolvm-cluster-node-only certs are refused when
+// rejectLegacy is true (always for production PeerDial paths).
+// Empty expected or a non-TLS base is a no-op.
+func ClientForPeer(base *http.Client, expectedNodeID string, rejectLegacy bool) *http.Client {
 	expectedNodeID = strings.TrimSpace(expectedNodeID)
 	if base == nil || expectedNodeID == "" {
 		return base
@@ -260,6 +261,9 @@ func ClientForPeer(base *http.Client, expectedNodeID string) *http.Client {
 		}
 		_, legacyOnly := ExtractPeerNodeID(cert)
 		if legacyOnly {
+			if rejectLegacy {
+				return fmt.Errorf("cluster tls: legacy peer identity rejected")
+			}
 			RecordMTLSLegacyIdentity()
 			return nil
 		}

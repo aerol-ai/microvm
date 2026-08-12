@@ -13,6 +13,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -153,6 +154,29 @@ type Witness interface {
 	LastWitnessedHead(ctx context.Context, nodeID string) (headHex string, ok bool, err error)
 }
 
+// AuditEventBatch is a JSONL-oriented batch of audit event payloads for
+// off-node export. Payloads are already-redacted JSON objects (never plaintext
+// secrets). Offset is an opaque exporter cursor.
+type AuditEventBatch struct {
+	NodeID    string
+	Offset    string
+	Events    []json.RawMessage
+	ShippedAt time.Time
+}
+
+// AuditExporter ships full audit event batches off-node (SIEM / object store).
+// Distinct from Witness (heads only). Optional; when unset, disk loss loses
+// events that were never exported.
+type AuditExporter interface {
+	ExportEvents(ctx context.Context, batch AuditEventBatch) (nextOffset string, err error)
+}
+
+// OptionalExportEvents is implemented by Witness backends that also accept
+// full event batches. Detected via type assertion at boot.
+type OptionalExportEvents interface {
+	ExportEvents(ctx context.Context, batch AuditEventBatch) (nextOffset string, err error)
+}
+
 // Provider bundles the capabilities a build supplies to the daemon. The
 // open-source build uses Noop(); a managed build constructs one backed by the
 // private client. Passed explicitly into the API server and background wiring —
@@ -168,6 +192,7 @@ type Provider struct {
 	Reporter       Reporter
 	Admitter       Admitter
 	Witness        Witness
+	AuditExporter  AuditExporter
 	EnforcementFor func(FleetController) Enforcement
 }
 
@@ -181,6 +206,7 @@ func Noop() Provider {
 		Reporter:       noopReporter{},
 		Admitter:       noopAdmitter{},
 		Witness:        noopWitness{},
+		AuditExporter:  noopAuditExporter{},
 		EnforcementFor: func(FleetController) Enforcement { return noopEnforcement{} },
 	}
 }
@@ -201,6 +227,9 @@ func (p Provider) WithDefaults() Provider {
 	if p.Witness == nil {
 		p.Witness = noopWitness{}
 	}
+	if p.AuditExporter == nil {
+		p.AuditExporter = noopAuditExporter{}
+	}
 	if p.EnforcementFor == nil {
 		p.EnforcementFor = func(FleetController) Enforcement { return noopEnforcement{} }
 	}
@@ -213,6 +242,15 @@ func (p Provider) HasExternalWitness() bool {
 		return false
 	}
 	_, isNoop := p.Witness.(noopWitness)
+	return !isNoop
+}
+
+// HasAuditExporter reports whether p.AuditExporter is a non-noop implementation.
+func (p Provider) HasAuditExporter() bool {
+	if p.AuditExporter == nil {
+		return false
+	}
+	_, isNoop := p.AuditExporter.(noopAuditExporter)
 	return !isNoop
 }
 
@@ -238,6 +276,12 @@ func (noopWitness) WitnessHeads(context.Context, []AuditHead) (WitnessReceipt, e
 
 func (noopWitness) LastWitnessedHead(context.Context, string) (string, bool, error) {
 	return "", false, nil
+}
+
+type noopAuditExporter struct{}
+
+func (noopAuditExporter) ExportEvents(context.Context, AuditEventBatch) (string, error) {
+	return "", nil
 }
 
 type noopEnforcement struct{}

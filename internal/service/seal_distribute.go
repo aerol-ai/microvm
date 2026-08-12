@@ -330,16 +330,42 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 	if incarnationID != "" {
 		ctx = secrets.ContextWithIncarnationID(ctx, incarnationID)
 	}
-	// PutClusterSecret atomically clears tomb+outbox with the row write.
+	// Crash-vacuum: journal remaining peer PUTs in the same durability domain
+	// as the sealed row (SQLite TX via BlobStore PutOutboxRecipients).
+	peers := nonSelfRecipients(recipients, s.selfNodeID())
+	if len(peers) > 0 {
+		if s.store == nil {
+			return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured for put-outbox")
+		}
+		ctx = secrets.ContextWithPutOutbox(ctx, incarnationID, peers)
+	}
+	// PutClusterSecret atomically clears tomb+delete-outbox with the row write
+	// and, when ContextWithPutOutbox is set, inserts put-outbox in the same TX.
 	h, err := p.Put(ctx, sandboxID, bag, recipients)
 	if err != nil {
 		return cluster.PlacementSecrets{}, err
 	}
+	if h.Ref == "" {
+		return cluster.PlacementSecrets{}, nil
+	}
+	gen := h.SealGeneration
+	if gen <= 0 {
+		if blob, loadErr := s.loadSecretBlob(ctx, h.Ref); loadErr == nil && blob != nil {
+			gen = blob.SealGeneration
+			if incarnationID == "" {
+				incarnationID = blob.IncarnationID
+			}
+		}
+	}
+	if gen <= 0 {
+		gen = 1
+	}
 	return cluster.PlacementSecrets{
-		Ref:           h.Ref,
-		Version:       h.Version,
-		Recipients:    append([]string(nil), recipients...),
-		IncarnationID: incarnationID,
+		Ref:            h.Ref,
+		Version:        h.Version,
+		Recipients:     append([]string(nil), recipients...),
+		IncarnationID:  incarnationID,
+		SealGeneration: gen,
 	}, nil
 }
 
@@ -385,6 +411,29 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 	}
 	if len(acked) == 0 {
 		return errors.New("secret fan-out received no backup ACK")
+	}
+	// Shrink durable put-outbox to peers still pending after MinACK. Do not
+	// delete until every non-self recipient has ACKed (or reconcile drains).
+	pending := pendingRecipientsAfterAck(recipients, acked, s.selfNodeID())
+	gen := blob.SealGeneration
+	if gen <= 0 {
+		gen = handle.SealGeneration
+	}
+	if gen <= 0 {
+		gen = 1
+	}
+	incarnationID := blob.IncarnationID
+	if incarnationID == "" {
+		incarnationID = handle.IncarnationID
+	}
+	if s.store != nil {
+		if err := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, incarnationID, pending, gen); err != nil {
+			recordSecretPutOutboxFailure()
+			if s.logger != nil {
+				s.logger.Warn("cluster: put-outbox shrink after MinACK failed",
+					"sandbox_id", sandboxID, "err", err)
+			}
+		}
 	}
 	s.enqueueSecretFanout(sandboxID, *blob, recipients, pusher)
 	return nil
@@ -432,21 +481,22 @@ func (s *Service) enqueueSecretFanout(sandboxID string, blob secrets.SecretBlob,
 	select {
 	case secretCreateFanoutJobs <- job:
 	default:
-		// Never block the create path on a saturated queue. Persist a durable
-		// put outbox so the reconciler retries remaining peers after MinACK.
-		// Note: "async retry" in plans/secrets-hardening.md means this SQLite
-		// put-outbox + ReconcileSecretPutOutbox ticker — not an unbounded
-		// in-memory retry that can silently drop when the process restarts.
+		// Never block the create path on a saturated queue. Outbox already
+		// exists from Put; keep it as the crash-recovery source of truth.
 		secretCreateFanoutInflight.Delete(sandboxID)
 		recordSecretFanoutFailure()
 		gen := blob.SealGeneration
 		if gen <= 0 {
 			gen = 1
 		}
+		pending := nonSelfRecipients(recipients, s.selfNodeID())
 		if s.store != nil {
-			if err := s.store.UpsertSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen, recipients); err != nil && s.logger != nil {
-				s.logger.Warn("cluster: secret fan-out queue full; put-outbox persist failed",
-					"sandbox_id", sandboxID, "err", err)
+			if err := s.store.UpsertSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen, pending); err != nil {
+				recordSecretPutOutboxFailure()
+				if s.logger != nil {
+					s.logger.Warn("cluster: secret fan-out queue full; put-outbox persist failed",
+						"sandbox_id", sandboxID, "err", err)
+				}
 			}
 		}
 		if s.logger != nil {
@@ -468,6 +518,9 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 	if gen <= 0 {
 		gen = 1
 	}
+	if s.store == nil {
+		return
+	}
 	if len(pending) > 0 {
 		// Incomplete fan-out (dead/missing peers, dial failures, or silent
 		// empty ACK) must leave a durable retry job — never clear outbox.
@@ -479,13 +532,21 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 			s.logger.Warn("cluster: secret fan-out incomplete",
 				"sandbox_id", sandboxID, "acked", len(acked), "pending", len(pending), "err", err)
 		}
-		if s.store != nil {
-			_ = s.store.UpsertSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen, pending)
+		if upErr := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, blob.IncarnationID, pending, gen); upErr != nil {
+			recordSecretPutOutboxFailure()
+			if s.logger != nil {
+				s.logger.Warn("cluster: secret fan-out put-outbox update failed",
+					"sandbox_id", sandboxID, "err", upErr)
+			}
 		}
 		return
 	}
-	if s.store != nil {
-		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen)
+	if delErr := s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen); delErr != nil {
+		recordSecretPutOutboxFailure()
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret fan-out put-outbox delete failed",
+				"sandbox_id", sandboxID, "err", delErr)
+		}
 	}
 }
 
@@ -572,10 +633,21 @@ func (s *Service) runSecretRefanoutPool(records []store.ClusterSecretRecord, pus
 				blob := secrets.SecretBlob{
 					Ref:            rec.Ref,
 					SandboxID:      rec.SandboxID,
+					IncarnationID:  "",
 					Version:        rec.Version,
 					Recipients:     append([]string(nil), rec.Recipients...),
 					SealedPayload:  append([]byte(nil), rec.SealedPayload...),
 					SealGeneration: rec.SealGeneration,
+				}
+				if parsed, parseErr := secrets.ParseRef(rec.Ref); parseErr == nil {
+					blob.IncarnationID = parsed.IncarnationID
+				}
+				if blob.IncarnationID == "" {
+					if c := s.Cluster(); c != nil {
+						if p, ok := c.PlacementOf(rec.SandboxID); ok {
+							blob.IncarnationID = strings.TrimSpace(p.IncarnationID)
+						}
+					}
 				}
 				s.runSecretFanout(rec.SandboxID, blob, rec.Recipients, pusher)
 			}

@@ -124,7 +124,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 			defer wg.Done()
 			for j := range jobs {
 				ref := secrets.FormatRef(j.id, 1)
-				if err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
+				if _, err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
 					Ref: ref, SandboxID: j.id, Version: 1,
 					Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
 					SealGeneration: j.gen, CreatedAt: now, UpdatedAt: now,
@@ -269,7 +269,7 @@ func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("put-outbox-%03d", i)
-		if err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
+		if _, err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
 			Ref: secrets.FormatRef(id, 1), SandboxID: id, Version: 1,
 			Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
 			SealGeneration: 1, CreatedAt: now, UpdatedAt: now,

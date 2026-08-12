@@ -16,7 +16,7 @@ func TestApplyPeerSecretDeleteEqualGenerationDeletes(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	now := time.Now().UTC()
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-eq/v1", SandboxID: "sb-eq", Version: 1,
 		Recipients: []string{"a", "b"}, SealedPayload: []byte("sealed"),
 		SealGeneration: 3, CreatedAt: now, UpdatedAt: now,
@@ -34,7 +34,7 @@ func TestApplyPeerSecretDeleteEqualGenerationDeletes(t *testing.T) {
 	if err := st.ClearClusterSecretTomb(ctx, "sb-eq"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-eq/v1", SandboxID: "sb-eq", Version: 1,
 		Recipients: []string{"a", "b"}, SealedPayload: []byte("resealed"),
 		SealGeneration: 4, CreatedAt: now, UpdatedAt: now,

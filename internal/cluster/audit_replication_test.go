@@ -29,7 +29,7 @@ func TestFetchSandboxAuditFromPeerOK(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := &Cluster{httpClient: srv.Client(), patToken: "pat"}
-	page, err := c.FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", "")
+	page, err := c.FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", "", "")
 	if err != nil {
 		t.Fatalf("FetchSandboxAuditFromPeer: %v", err)
 	}
@@ -38,11 +38,11 @@ func TestFetchSandboxAuditFromPeerOK(t *testing.T) {
 	}
 
 	a := &Agent{httpClient: srv.Client(), patToken: "pat"}
-	if _, err := a.FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", ""); err != nil {
+	if _, err := a.FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", "", ""); err != nil {
 		t.Fatalf("Agent fetch: %v", err)
 	}
 
-	if _, err := NewNoop("n", "", "").FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", ""); err == nil {
+	if _, err := NewNoop("n", "", "").FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", "", ""); err == nil {
 		t.Fatal("expected Noop fetch error")
 	}
 }
@@ -53,7 +53,7 @@ func TestFetchSandboxAuditFromPeerErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	c := &Cluster{httpClient: srv.Client(), patToken: "pat"}
-	if _, err := c.FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", ""); err == nil {
+	if _, err := c.FetchSandboxAuditFromPeer(context.Background(), srv.URL, "sb-1", 10, "", "", ""); err == nil {
 		t.Fatal("expected error")
 	}
 }

@@ -78,6 +78,13 @@ type command struct {
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
 	// IncarnationID rides opReserve and is preserved by opPlace/opReassign.
 	IncarnationID string `json:"incarnation_id,omitempty"`
+	// SecretSealGeneration is set by opUpdateSecretRecipients when coordinating
+	// a reseal. Additive omitempty.
+	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
+	// ExpectedIncarnationID / ExpectedSealGeneration are CAS pretenses for
+	// opUpdateSecretRecipients. Empty / zero skips that axis.
+	ExpectedIncarnationID  string `json:"expected_incarnation_id,omitempty"`
+	ExpectedSealGeneration int64  `json:"expected_seal_generation,omitempty"`
 	// OwnerRef is the control-plane tenant account. Additive omitempty.
 	OwnerRef  string `json:"owner_ref,omitempty"`
 	Port      int    `json:"port,omitempty"`
@@ -489,6 +496,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		var customHostnames []string
 		var secretRecipients []string
 		var incarnationID string
+		var secretSealGeneration int64
 		var auditNodeIDs []string
 		var auditNodesTruncated bool
 		ownerRef := strings.TrimSpace(cmd.OwnerRef)
@@ -506,6 +514,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// explicitly supplies a new one (normal promote leaves it empty).
 			secretRecipients = append([]string(nil), existing.SecretRecipients...)
 			incarnationID = existing.IncarnationID
+			secretSealGeneration = existing.SecretSealGeneration
 			auditNodeIDs = append([]string(nil), existing.AuditNodeIDs...)
 			auditNodesTruncated = existing.AuditNodesTruncated
 			if ownerRef == "" {
@@ -535,25 +544,26 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 		}
 		p := Placement{
-			SandboxID:           cmd.SandboxID,
-			OwnerNodeID:         cmd.OwnerNodeID,
-			OwnerAPIURL:         cmd.OwnerAPIURL,
-			OwnerDataPlaneHost:  dataPlaneHost,
-			Version:             f.version,
-			CreatedUnix:         created,
-			UpdatedUnix:         now,
-			Name:                name,
-			Spec:                spec,
-			SecretRef:           secrets.Ref,
-			SecretVersion:       secrets.Version,
-			SecretRecipients:    secretRecipients,
-			IncarnationID:       incarnationID,
-			OwnerRef:            ownerRef,
-			AuditNodeIDs:        auditNodeIDs,
-			AuditNodesTruncated: auditNodesTruncated,
-			ExposedPorts:        ports,
-			ExposedPortRoutes:   portRoutes,
-			CustomHostnames:     customHostnames,
+			SandboxID:            cmd.SandboxID,
+			OwnerNodeID:          cmd.OwnerNodeID,
+			OwnerAPIURL:          cmd.OwnerAPIURL,
+			OwnerDataPlaneHost:   dataPlaneHost,
+			Version:              f.version,
+			CreatedUnix:          created,
+			UpdatedUnix:          now,
+			Name:                 name,
+			Spec:                 spec,
+			SecretRef:            secrets.Ref,
+			SecretVersion:        secrets.Version,
+			SecretRecipients:     secretRecipients,
+			IncarnationID:        incarnationID,
+			SecretSealGeneration: secretSealGeneration,
+			OwnerRef:             ownerRef,
+			AuditNodeIDs:         auditNodeIDs,
+			AuditNodesTruncated:  auditNodesTruncated,
+			ExposedPorts:         ports,
+			ExposedPortRoutes:    portRoutes,
+			CustomHostnames:      customHostnames,
 			// opPlace is the promotion path for reservations: writing the
 			// empty State here transitions a Reserved row back to Placed.
 			// ExpiresUnix is cleared by the zero-value as well so the GC
@@ -847,11 +857,24 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if !exists || len(cmd.SecretRecipients) == 0 {
 			return nil
 		}
+		if exp := strings.TrimSpace(cmd.ExpectedIncarnationID); exp != "" {
+			if cur := strings.TrimSpace(existing.IncarnationID); cur != "" && cur != exp {
+				return fmt.Errorf("%w: incarnation want %q have %q", ErrSecretRecipientsCASMismatch, exp, cur)
+			}
+		}
+		if cmd.ExpectedSealGeneration > 0 {
+			if cur := existing.SecretSealGeneration; cur > 0 && cur != cmd.ExpectedSealGeneration {
+				return fmt.Errorf("%w: seal_generation want %d have %d", ErrSecretRecipientsCASMismatch, cmd.ExpectedSealGeneration, cur)
+			}
+		}
 		existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
 		if cmd.hasSecretUpdate() {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
+		}
+		if cmd.SecretSealGeneration > 0 {
+			existing.SecretSealGeneration = cmd.SecretSealGeneration
 		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
@@ -2047,7 +2070,7 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 	if hasMore && len(ids) > 0 {
 		next = ids[len(ids)-1]
 	}
-	return PlacementPageResponse{Placements: out, NextPageToken: next}
+	return PlacementPageResponse{Placements: out, NextPageToken: next, Authoritative: true}
 }
 
 func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
@@ -2117,7 +2140,10 @@ func (f *placementFSM) pagePlacementIDsByScanLocked(req PlacementPageRequest, sh
 		if req.PageToken != "" && id <= req.PageToken {
 			continue
 		}
-		if ownerRef != "" && strings.TrimSpace(p.OwnerRef) != "" && p.OwnerRef != ownerRef {
+		placeOwner := strings.TrimSpace(p.OwnerRef)
+		// Never match empty OwnerRef into a tenant page — partial restores can
+		// leave blank ownership that would otherwise pollute cursors.
+		if ownerRef != "" && (placeOwner == "" || placeOwner != ownerRef) {
 			continue
 		}
 		if !allShards {

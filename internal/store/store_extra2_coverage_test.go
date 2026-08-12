@@ -24,7 +24,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = st.UpsertCompatState(ctx, "sb-list", "key1", "val1")
 	_ = st.AddCustomDomain(ctx, "sb-list", "domain.com", 80)
 	_ = st.PutMounts(ctx, "sb-list", []byte("a"))
-	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{SandboxID: "sb-list"})
+	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{SandboxID: "sb-list"})
 
 	// Run List to hit Scan rows
 	_, _ = st.List(ctx)
@@ -172,7 +172,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.ListCustomDomains(ctx, "sb")
 	_, _ = st.ListAllCustomDomains(ctx)
 	_ = st.SetCustomDomainStatus(ctx, "sb", models.CustomDomainStatus("active"), "err")
-	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
+	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
 	_, _ = st.AllocateFirecrackerTapSlot(ctx, "sb", time.Now())
 	_ = st.ReleaseFirecrackerTapSlot(ctx, "sb")
 	_ = st.MarkFirecrackerVMMSlotLoaded(ctx, "id", "sb", "tap", 1, time.Now())

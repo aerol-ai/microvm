@@ -2,13 +2,18 @@ package cluster
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -507,12 +512,12 @@ func TestClusterReserveOnTargetApplyReservationPath(t *testing.T) {
 	}
 }
 
-func writeTestClusterTLSDir(t *testing.T) string {
+func writeTestClusterTLSDir(t *testing.T, nodeID string) string {
 	t.Helper()
 	dir := t.TempDir()
-	_, tlsCert, err := generateTestCert()
+	_, tlsCert, err := generateTestCertForNode(nodeID)
 	if err != nil {
-		t.Fatalf("generateTestCert: %v", err)
+		t.Fatalf("generateTestCertForNode: %v", err)
 	}
 	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsCert.Certificate[0]})
 	keyDER, err := x509.MarshalPKCS8PrivateKey(tlsCert.PrivateKey)
@@ -530,6 +535,69 @@ func writeTestClusterTLSDir(t *testing.T) string {
 		t.Fatalf("write key: %v", err)
 	}
 	return dir
+}
+
+// writeTestClusterTLSDirs mints one CA and per-node leaves so multi-node mTLS
+// tests satisfy node:<id> peer verification under a shared trust anchor.
+func writeTestClusterTLSDirs(t *testing.T, nodeIDs ...string) map[string]string {
+	t.Helper()
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("ca key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"AerolVM Test CA"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("ca cert: %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("parse ca: %v", err)
+	}
+	out := make(map[string]string, len(nodeIDs))
+	for i, nodeID := range nodeIDs {
+		nodeKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("node key: %v", err)
+		}
+		leaf := &x509.Certificate{
+			SerialNumber: big.NewInt(int64(100 + i)),
+			Subject:      pkix.Name{CommonName: nodeID, Organization: []string{"AerolVM Test Node"}},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+			DNSNames:     []string{"aerolvm-cluster-node", "localhost", "node:" + nodeID},
+			IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		}
+		leafDER, err := x509.CreateCertificate(rand.Reader, leaf, caCert, &nodeKey.PublicKey, caKey)
+		if err != nil {
+			t.Fatalf("leaf cert %s: %v", nodeID, err)
+		}
+		leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(nodeKey)})
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, tlsCAFile), caPEM, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tlsNodeCertFile), leafPEM, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tlsNodeKeyFile), keyPEM, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out[nodeID] = dir
+	}
+	return out
 }
 
 func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, tlsDir string) (*Cluster, func()) {
@@ -579,13 +647,13 @@ func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossi
 
 func newTestClusterWithTLS(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string) (*Cluster, func()) {
 	t.Helper()
-	return newTestClusterWithTLSDir(t, nodeID, bootstrap, gossipPeers, writeTestClusterTLSDir(t))
+	return newTestClusterWithTLSDir(t, nodeID, bootstrap, gossipPeers, writeTestClusterTLSDir(t, nodeID))
 }
 
 func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tlsDir := writeTestClusterTLSDir(t)
+	tlsDir := writeTestClusterTLSDir(t, nodeID)
 	for attempt := 0; attempt < 5; attempt++ {
 		testClusterMu.Lock()
 		gossipPort := pickFreeGossipPort(t)
@@ -729,8 +797,36 @@ func TestAgentPlacementPageHarness(t *testing.T) {
 	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
 
 	out := agent.PlacementPage(PlacementPageRequest{Limit: 5})
-	if out.NextPageToken != "next" || len(out.Placements) != 1 {
+	if !out.Authoritative || out.NextPageToken != "next" || len(out.Placements) != 1 {
 		t.Fatalf("PlacementPage = %+v", out)
+	}
+}
+
+func TestAgentPlacementsByIDsBatch(t *testing.T) {
+	var gotIDs []string
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != PublicInternalPlacementsByIDsPath {
+			http.NotFound(w, r)
+			return
+		}
+		var req placementsByIDsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		gotIDs = append([]string(nil), req.IDs...)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]Placement{
+			"sb-a": {SandboxID: "sb-a", Version: 9},
+			"sb-b": {SandboxID: "sb-b", Version: 10},
+		})
+	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+
+	out := agent.PlacementsByIDs([]string{"sb-a", "", "sb-b", "sb-a"})
+	if len(out) != 2 || out["sb-a"].Version != 9 || out["sb-b"].Version != 10 {
+		t.Fatalf("PlacementsByIDs = %+v", out)
+	}
+	if len(gotIDs) != 2 || gotIDs[0] != "sb-a" || gotIDs[1] != "sb-b" {
+		t.Fatalf("batch request ids = %v, want [sb-a sb-b]", gotIDs)
 	}
 }
 
@@ -789,16 +885,16 @@ func TestClusterAssertOwnershipClaimOrphanIntegration(t *testing.T) {
 	}
 }
 
-func TestFollowerForwardApplySharedTLSInternalChannel(t *testing.T) {
+func TestFollowerForwardApplyNodeBoundTLSInternalChannel(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
-	tlsDir := writeTestClusterTLSDir(t)
-	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-tls-fwd", true, nil, tlsDir)
+	dirs := writeTestClusterTLSDirs(t, "ldr-tls-fwd", "fol-tls-fwd")
+	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-tls-fwd", true, nil, dirs["ldr-tls-fwd"])
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-tls-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDir)
+	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-tls-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, dirs["fol-tls-fwd"])
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 

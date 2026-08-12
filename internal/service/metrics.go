@@ -191,6 +191,10 @@ func recordSecretFanoutFailure() {
 	secretFanoutFailuresTotal.Add(1)
 }
 
+func recordSecretPutOutboxFailure() {
+	secretPutOutboxFailuresTotal.Add(1)
+}
+
 func recordSecretProviderCanary(ok bool) {
 	if ok {
 		secretProviderCanaryOK.Set(1)

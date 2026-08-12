@@ -20,14 +20,20 @@ const (
 	defaultAuditNodeRate      = 50.0
 	defaultAuditNodeBurst     = 100
 	auditRateLimitIdentityKey = "operator"
+	auditRateLimitIdleTTL     = 30 * time.Minute
 )
+
+type auditRateBucket struct {
+	lim      *rate.Limiter
+	lastSeen time.Time
+}
 
 // AuditRateLimiter bounds GET /v1/sandboxes/{id}/audit fan-out amplification.
 // Per-identity (OwnerRef; operator PAT → "operator") plus a per-node ceiling.
 // On reject: 429 + Retry-After — never silent truncation.
 type AuditRateLimiter struct {
 	identityMu    sync.Mutex
-	identity      map[string]*rate.Limiter
+	identity      map[string]*auditRateBucket
 	identityRate  rate.Limit
 	identityBurst int
 	operatorRate  rate.Limit
@@ -58,7 +64,7 @@ func NewAuditRateLimiter(cfg AuditRateLimiterConfig) *AuditRateLimiter {
 		nodeRate = defaultAuditNodeRate
 	}
 	return &AuditRateLimiter{
-		identity:      make(map[string]*rate.Limiter),
+		identity:      make(map[string]*auditRateBucket),
 		identityRate:  rate.Limit(idRate),
 		identityBurst: defaultAuditIdentityBurst,
 		operatorRate:  rate.Limit(opRate),
@@ -124,14 +130,25 @@ func (a *AuditRateLimiter) allow(key string) (retryAfter time.Duration, ok bool)
 }
 
 func (a *AuditRateLimiter) limiterFor(key string) *rate.Limiter {
-	if lim, ok := a.identity[key]; ok {
-		return lim
+	now := time.Now()
+	a.evictIdleLocked(now)
+	if b, ok := a.identity[key]; ok {
+		b.lastSeen = now
+		return b.lim
 	}
-	r, b := a.identityRate, a.identityBurst
+	r, burst := a.identityRate, a.identityBurst
 	if key == auditRateLimitIdentityKey {
-		r, b = a.operatorRate, a.operatorBurst
+		r, burst = a.operatorRate, a.operatorBurst
 	}
-	lim := rate.NewLimiter(r, b)
-	a.identity[key] = lim
+	lim := rate.NewLimiter(r, burst)
+	a.identity[key] = &auditRateBucket{lim: lim, lastSeen: now}
 	return lim
+}
+
+func (a *AuditRateLimiter) evictIdleLocked(now time.Time) {
+	for k, b := range a.identity {
+		if now.Sub(b.lastSeen) > auditRateLimitIdleTTL {
+			delete(a.identity, k)
+		}
+	}
 }

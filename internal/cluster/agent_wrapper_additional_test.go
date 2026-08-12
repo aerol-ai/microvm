@@ -415,8 +415,8 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 		t.Fatalf("Placements() fallback = %+v, want cached full placement view", got)
 	}
 	page := agent.PlacementPage(PlacementPageRequest{})
-	if len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-page" || page.NextPageToken != "next-page" {
-		t.Fatalf("PlacementPage() = %+v, want paged response", page)
+	if !page.Authoritative || len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-page" || page.NextPageToken != "next-page" {
+		t.Fatalf("PlacementPage() = %+v, want authoritative paged response", page)
 	}
 	filters := capture.shardFiltersSnapshot()
 	if len(filters) != 2 || filters[0].ShardCount != 32 || len(filters[0].Shards) != 2 {

@@ -16,17 +16,19 @@ import (
 //
 // After sandbox deletion, retained history stays readable via sandbox_audit_acl
 // (and Placement.OwnerRef while placement remains). ACL rows are incarnation-
-// scoped; authorize matches the placement incarnation when present, else any
-// retained ACL for the sandbox (legacy empty incarnation).
-func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID string) error {
+// scoped; authorize requires an incarnation match (from query, else live
+// placement). There is no legacy any-incarnation fallback.
+func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID, incarnationID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if s == nil || sandboxID == "" {
 		return store.ErrNotFound
 	}
-	incarnationID := ""
-	if c := s.Cluster(); c != nil {
-		if p, ok := c.PlacementOf(sandboxID); ok {
-			incarnationID = strings.TrimSpace(p.IncarnationID)
+	if incarnationID == "" {
+		if c := s.Cluster(); c != nil {
+			if p, ok := c.PlacementOf(sandboxID); ok {
+				incarnationID = strings.TrimSpace(p.IncarnationID)
+			}
 		}
 	}
 	if s.store != nil {
@@ -55,6 +57,11 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 
 	if c != nil {
 		if p, ok := c.PlacementOf(sandboxID); ok {
+			// Live placement: incarnation must match when both sides are set.
+			placeInc := strings.TrimSpace(p.IncarnationID)
+			if incarnationID != "" && placeInc != "" && incarnationID != placeInc {
+				return store.ErrNotFound
+			}
 			if ref := strings.TrimSpace(p.OwnerRef); ref != "" {
 				if ref == owner {
 					return nil
@@ -83,20 +90,6 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 				return nil
 			}
 			return store.ErrNotFound
-		}
-		// Fall back to empty-incarnation ACL when placement incarnation is set
-		// but only a legacy ACL row exists.
-		if incarnationID != "" {
-			ref, err = s.store.GetSandboxAuditACLOwnerRef(ctx, sandboxID, "")
-			if err != nil {
-				return err
-			}
-			if ref != "" {
-				if ref == owner {
-					return nil
-				}
-				return store.ErrNotFound
-			}
 		}
 	}
 	if c != nil {

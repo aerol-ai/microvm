@@ -19,13 +19,15 @@ func (h *handlers) getSandboxAudit(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "missing sandbox id")
 		return
 	}
+	opts := parseSecretAuditQuery(r)
 	// Authorize via local row or placement-owner OwnerRef metadata so pure
-	// ingress nodes do not 404 before fan-out (P1).
-	if err := h.deps.Service.AuthorizeSandboxAuditAccess(r.Context(), id); err != nil {
+	// ingress nodes do not 404 before fan-out (P1). Incarnation is required
+	// for retained ACL matches (one-way format; no any-incarnation fallback).
+	if err := h.deps.Service.AuthorizeSandboxAuditAccess(r.Context(), id, opts.IncarnationID); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	page, err := h.deps.Service.ListSecretAudit(r.Context(), id, parseSecretAuditQuery(r))
+	page, err := h.deps.Service.ListSecretAudit(r.Context(), id, opts)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -93,8 +95,9 @@ func (h *handlers) clusterInternalSandboxMeta(w http.ResponseWriter, r *http.Req
 
 func parseSecretAuditQuery(r *http.Request) service.SecretAuditQuery {
 	q := service.SecretAuditQuery{
-		Cursor: strings.TrimSpace(r.URL.Query().Get("cursor")),
-		Kind:   strings.TrimSpace(r.URL.Query().Get("kind")),
+		Cursor:        strings.TrimSpace(r.URL.Query().Get("cursor")),
+		Kind:          strings.TrimSpace(r.URL.Query().Get("kind")),
+		IncarnationID: strings.TrimSpace(r.URL.Query().Get("incarnation_id")),
 	}
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil {

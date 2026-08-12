@@ -20,19 +20,26 @@ On the open-source build:
 - Coverage in the API response names which members answered; `partial: true`
   means the page is incomplete — never treat a partial page as full history.
 
-### Enterprise durability (Witness)
+### Enterprise durability (Witness + export)
 
 - **Witness heads ≠ event reconstruction.** An off-node witness
   (`pkg/controlplane.Witness`, wired via `SB_SECRET_AUDIT_EXTERNAL_WITNESS`)
   records chain heads / receipts so retroactive local-file tampering is
   detectable. It does **not** store full audit batches today and cannot rebuild
   the JSONL after disk loss.
-- Enterprise deployments **must** configure a real off-node Witness (the
-  open-source build ships a no-op). Prefer also shipping full batches to an
-  external sink (SIEM / object store) until the product grows a durable batch
-  export — honest current limit: Witness alone is not a backup.
-- See `controlplane.Witness` / `HasExternalWitness` and the enterprise boot
-  checks around `SB_SECRET_AUDIT_EXTERNAL_WITNESS`.
+- **Batch export.** Set `SB_SECRET_AUDIT_EXPORT_URL` to enable periodic HTTP
+  POST of new JSONL segments (`Content-Type: application/x-ndjson`) since the
+  local export offset. Prefer this (or a custom `controlplane.AuditExporter`)
+  when you need reconstructable history after disk loss.
+- Enterprise deployments **must** configure an off-node Witness **and/or** an
+  export URL. Honest limit: without export, disk loss loses events that were
+  never shipped; Witness alone is tamper-evidence, not a backup.
+- See `controlplane.Witness` / `AuditExporter` / `HasExternalWitness` and the
+  enterprise boot checks around `SB_SECRET_AUDIT_EXTERNAL_WITNESS` and
+  `SB_SECRET_AUDIT_EXPORT_URL`.
+
+If no export URL is configured, **disk loss loses events** that lived only on
+that node's JSONL (already the open-source honesty boundary).
 
 See also the D5 frozen-recipient limitation and cluster identity requirements in
 [`docs/.../cluster-secrets.mdx`](../../docs/src/content/docs/cluster-secrets.mdx).
@@ -52,6 +59,9 @@ operator credential, so protect and rotate it as well.
 | `SandboxdSecretFanoutFailures` | Async sealed-blob peer push/delete failed | Check peer health, PAT, and `failover_ready` on recent HA creates |
 | `SandboxdSecretDeleteOutboxStalled` | A delete job is still unacknowledged after 15 minutes | Check recipient membership, internal API auth, and network reachability |
 | `SandboxdSecretDeleteOutboxBacklogHigh` | More than 10,000 durable deletes are queued | Restore recipients and verify the bounded reconciler is draining |
+| `SandboxdSecretPutOutboxBacklogHigh` | Durable create-path peer PUTs are queued (`aerolvm_secret_put_outbox_pending`) | Check peer health/mTLS; put-outbox uses the same bounded worker pool as delete reconcile |
+| `SandboxdSecretPutOutboxFailures` | Put-outbox persist/reconcile failed (`aerolvm_secret_put_outbox_failures_total`) | Inspect disk/SQLite and peer reachability; creates retract when the initial journal fails |
+| `SandboxdClusterCertExpiring` | Node or CA certificates approach expiry | Re-run `scripts/cluster-sign-node.sh`; prefer ≤90-day leaf certs |
 | `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down | For `awskms`, check IAM/KMS; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
 
 ## Audit drops / gap markers
@@ -76,6 +86,10 @@ operator credential, so protect and rotate it as well.
    current JSONL for evidence.
 
 Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) prunes old lines daily.
+Prune drops a prefix and inserts an immutable `retention_checkpoint` (kept
+event bytes / EventHash are unchanged). Witness verification uses
+`checkpoint.WitnessedThrough` (when that head was actually shipped) plus the
+remaining chain.
 
 ## Fan-out failures / `failover_ready` false
 

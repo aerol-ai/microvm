@@ -60,17 +60,17 @@ func TestAuthorizeSandboxAuditAccessViaOwnerMeta(t *testing.T) {
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "acme"},
 	})
-	if err := svc.AuthorizeSandboxAuditAccess(ctx, "sb-remote"); err != nil {
+	if err := svc.AuthorizeSandboxAuditAccess(ctx, "sb-remote", ""); err != nil {
 		t.Fatalf("owner tenant: %v", err)
 	}
 	evil := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "evil"},
 	})
-	if err := svc.AuthorizeSandboxAuditAccess(evil, "sb-remote"); !errors.Is(err, storepkg.ErrNotFound) {
+	if err := svc.AuthorizeSandboxAuditAccess(evil, "sb-remote", ""); !errors.Is(err, storepkg.ErrNotFound) {
 		t.Fatalf("evil tenant = %v, want ErrNotFound", err)
 	}
 	op := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})
-	if err := svc.AuthorizeSandboxAuditAccess(op, "sb-remote"); err != nil {
+	if err := svc.AuthorizeSandboxAuditAccess(op, "sb-remote", ""); err != nil {
 		t.Fatalf("operator: %v", err)
 	}
 }
@@ -95,7 +95,7 @@ func TestAuthorizeSandboxAuditAccessLocalRow(t *testing.T) {
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "acme"},
 	})
-	if err := svc.AuthorizeSandboxAuditAccess(ctx, "sb-local"); err != nil {
+	if err := svc.AuthorizeSandboxAuditAccess(ctx, "sb-local", ""); err != nil {
 		t.Fatalf("local owner: %v", err)
 	}
 }
@@ -116,18 +116,18 @@ func TestAuthorizeSandboxAuditAccessAfterDeleteViaRaftACL(t *testing.T) {
 	owner := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "acme"},
 	})
-	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted"); err != nil {
+	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted", ""); err != nil {
 		t.Fatalf("retained owner ACL: %v", err)
 	}
 	other := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "other"},
 	})
-	if err := svc.AuthorizeSandboxAuditAccess(other, "sb-deleted"); !errors.Is(err, storepkg.ErrNotFound) {
+	if err := svc.AuthorizeSandboxAuditAccess(other, "sb-deleted", ""); !errors.Is(err, storepkg.ErrNotFound) {
 		t.Fatalf("foreign tenant = %v, want ErrNotFound", err)
 	}
 
 	svc.cluster.(*placementOnlyCluster).auditOwnerErr = errors.New("raft unavailable")
-	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted"); err == nil || err.Error() != "raft unavailable" {
+	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted", ""); err == nil || err.Error() != "raft unavailable" {
 		t.Fatalf("raft failure = %v, want fail-closed error", err)
 	}
 }

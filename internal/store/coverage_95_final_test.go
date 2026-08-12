@@ -131,7 +131,7 @@ func TestCreateTemplateValidationAndClusterSecret(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, `DROP TABLE cluster_secrets`); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "r", SandboxID: "sb", Version: 1, SealedPayload: []byte("x"),
 	}); err == nil {
 		t.Fatal("PutClusterSecret after drop")

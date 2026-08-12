@@ -306,6 +306,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// emits nothing and pays no cost.
 	svc.SetUsageReporter(cp.Reporter)
 	svc.SetWitness(cp.Witness)
+	if cp.HasAuditExporter() {
+		svc.SetAuditExporter(cp.AuditExporter)
+	} else {
+		svc.ConfigureHTTPAuditExporter()
+	}
+	if cfg.EnterpriseMode && !cp.HasExternalWitness() && strings.TrimSpace(cfg.SecretAuditExportURL) == "" && !cp.HasAuditExporter() {
+		logger.Warn("enterprise mode without export URL or external witness: disk loss loses audit events; set SB_SECRET_AUDIT_EXPORT_URL or wire controlplane.Witness/AuditExporter")
+	}
 	// Witness is installed after the sink opens; re-validate so enterprise +
 	// external witness fail closed at boot when the chain/receipts disagree.
 	if err := svc.ValidateSecretAuditWitness(); err != nil {

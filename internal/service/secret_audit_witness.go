@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"expvar"
@@ -251,14 +252,21 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 	witnessedHead = remoteHead
 
 	// Witnessed head must match a local receipt OR appear as some EventHash in
-	// the verified chain. Ancestry (not tip equality) is the success criterion:
-	// local tip may be ahead of the last ship.
+	// the verified chain OR equal a retention_checkpoint.WitnessedThrough.
+	// Ancestry (not tip equality) is the success criterion: local tip may be
+	// ahead of the last ship; prune may drop the witnessed prefix while
+	// recording WitnessedThrough on the checkpoint.
 	receiptOK := localReceipt == witnessedHead
 	inChain := false
 	for _, h := range hashes {
 		if h == witnessedHead {
 			inChain = true
 			break
+		}
+	}
+	if !inChain {
+		if through, ok := retentionWitnessedThrough(s.secretAuditFile.path); ok && through == witnessedHead {
+			inChain = true
 		}
 	}
 	if !receiptOK && !inChain {
@@ -271,6 +279,36 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 	}
 	secretAuditWitnessHealthy.Set(1)
 	return true, localHead, witnessedHead, nil
+}
+
+// retentionWitnessedThrough returns WitnessedThrough from the newest
+// retention_checkpoint in the JSONL (empty/false when none).
+func retentionWitnessedThrough(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var through string
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var ev SecretAuditEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		if strings.TrimSpace(ev.Kind) == secretAuditKindRetentionCheckpoint && strings.TrimSpace(ev.WitnessedThrough) != "" {
+			through = strings.TrimSpace(ev.WitnessedThrough)
+		}
+	}
+	if through == "" {
+		return "", false
+	}
+	return through, true
 }
 
 // ValidateSecretAuditWitness fails closed when a real external witness is

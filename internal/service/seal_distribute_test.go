@@ -1006,7 +1006,7 @@ func TestRunSecretFanoutDeadRecipientKeepsOutbox(t *testing.T) {
 	st := openSealTestStore(t)
 	now := time.Now().UTC()
 	const sandboxID = "sb-dead-fanout"
-	if err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
 		Ref: secrets.FormatRef(sandboxID, 1), SandboxID: sandboxID, Version: 1,
 		Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
 		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
@@ -1133,5 +1133,277 @@ func TestSelectReplacementRecipientsAndLiveSealPreference(t *testing.T) {
 	}
 	if live[0] != "owner" {
 		t.Fatalf("live set=%v, want owner first", live)
+	}
+}
+
+func TestPutOutboxExistsImmediatelyAfterPut(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	svc := &Service{
+		cfg:            config.Config{},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:        cluster.NewNoop("node-a", "http://a", ""),
+	}
+	req := models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+	}
+	handle, err := svc.putClusterSecretsForRecipients(ctx, "sb-outbox-put", req, []string{"node-a", "node-b", "node-c"})
+	if err != nil || handle.Ref == "" {
+		t.Fatalf("put: %+v %v", handle, err)
+	}
+	got, err := st.GetSecretPutOutbox(ctx, "sb-outbox-put")
+	if err != nil || got == nil {
+		t.Fatalf("expected put-outbox immediately after Put, got %#v err=%v", got, err)
+	}
+	if got.SealGeneration != handle.SealGeneration || handle.SealGeneration <= 0 {
+		t.Fatalf("outbox gen=%d handle gen=%d", got.SealGeneration, handle.SealGeneration)
+	}
+	if len(got.Recipients) != 2 {
+		t.Fatalf("outbox recipients=%v, want non-self [node-b node-c]", got.Recipients)
+	}
+	for _, id := range got.Recipients {
+		if id == "node-a" {
+			t.Fatalf("self should not be in put-outbox: %v", got.Recipients)
+		}
+	}
+}
+
+func TestPutOutboxCrashVacuumReconcileWithoutEnqueue(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	const sandboxID = "sb-crash-vacuum"
+	req := models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+	}
+	svc := &Service{
+		cfg:            config.Config{},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:        cluster.NewNoop("node-a", "http://a", ""),
+		// No enqueue — crash vacuum relies solely on durable outbox.
+		testSecretPeerPusher: &fakePeerPusher{acked: []string{"node-b"}},
+	}
+	handle, err := svc.putClusterSecretsForRecipients(ctx, sandboxID, req, []string{"node-a", "node-b"})
+	if err != nil || handle.Ref == "" {
+		t.Fatalf("put: %+v %v", handle, err)
+	}
+	got, err := st.GetSecretPutOutbox(ctx, sandboxID)
+	if err != nil || got == nil || len(got.Recipients) != 1 || got.Recipients[0] != "node-b" {
+		t.Fatalf("pre-reconcile outbox=%#v err=%v", got, err)
+	}
+	if err := svc.ReconcileSecretPutOutbox(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	remaining, err := st.GetSecretPutOutbox(ctx, sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != nil {
+		t.Fatalf("expected put-outbox drained from crash vacuum, still %#v", remaining)
+	}
+}
+
+func TestReconcileSecretPutOutboxDrainsBeyondOneWorkerWave(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	const total = deleteReconcileWorkers*2 + 7
+	now := time.Now().UTC()
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("sb-put-backlog-%03d", i)
+		if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
+			Ref: secrets.FormatRef(id, 1), SandboxID: id, Version: 1,
+			Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
+			SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed secret %s: %v", id, err)
+		}
+		if err := st.UpsertSecretPutOutbox(ctx, id, "inc-1", 1, []string{"node-b"}); err != nil {
+			t.Fatalf("seed outbox %s: %v", id, err)
+		}
+	}
+	pusher := &fakePeerPusher{acked: []string{"node-b"}}
+	svc := &Service{
+		cfg:                  config.Config{},
+		cipher:               cipher,
+		store:                st,
+		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	if err := svc.ReconcileSecretPutOutbox(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	remaining, err := st.ListSecretPutOutboxBatch(ctx, total+1)
+	if err != nil {
+		t.Fatalf("list remaining: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining put-outbox rows = %d, want 0", len(remaining))
+	}
+	pusher.mu.Lock()
+	pushes := pusher.pushCalls
+	pusher.mu.Unlock()
+	if pushes != total {
+		t.Fatalf("peer pushes = %d, want %d", pushes, total)
+	}
+}
+
+type resealPlacementCluster struct {
+	*cluster.Noop
+	mu           sync.Mutex
+	placement    cluster.Placement
+	updateCalls  int
+	lastExpected int64
+	rejectCAS    bool
+}
+
+func (c *resealPlacementCluster) PlacementOf(string) (cluster.Placement, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.placement, c.placement.SandboxID != ""
+}
+
+func (c *resealPlacementCluster) SecretsOf(string) cluster.PlacementSecrets {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return cluster.PlacementSecrets{
+		Ref:            c.placement.SecretRef,
+		Version:        c.placement.SecretVersion,
+		Recipients:     append([]string(nil), c.placement.SecretRecipients...),
+		IncarnationID:  c.placement.IncarnationID,
+		SealGeneration: c.placement.SecretSealGeneration,
+	}
+}
+
+func (c *resealPlacementCluster) Members() []cluster.Member {
+	return []cluster.Member{
+		{NodeID: "node-a", Alive: true, Role: config.NodeRoleMixed},
+		{NodeID: "dead-a", Alive: false, Role: config.NodeRoleWorker},
+		{NodeID: "dead-b", Alive: false, Role: config.NodeRoleWorker},
+		{NodeID: "live-b", Alive: true, Role: config.NodeRoleWorker},
+		{NodeID: "live-c", Alive: true, Role: config.NodeRoleWorker},
+	}
+}
+
+func (c *resealPlacementCluster) LocalMembers() []cluster.Member { return c.Members() }
+
+func (c *resealPlacementCluster) UpdatePlacementSecretRecipients(_ context.Context, sandboxID string, recipients []string, secrets cluster.PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updateCalls++
+	c.lastExpected = expectedSealGeneration
+	if c.rejectCAS && expectedSealGeneration > 0 && c.placement.SecretSealGeneration > 0 &&
+		expectedSealGeneration != c.placement.SecretSealGeneration {
+		return cluster.ErrSecretRecipientsCASMismatch
+	}
+	c.placement.SecretRecipients = append([]string(nil), recipients...)
+	if secrets.Ref != "" {
+		c.placement.SecretRef = secrets.Ref
+		c.placement.SecretVersion = secrets.Version
+	}
+	if secrets.SealGeneration > 0 {
+		c.placement.SecretSealGeneration = secrets.SealGeneration
+	}
+	if expectedIncarnationID != "" && c.placement.IncarnationID == "" {
+		c.placement.IncarnationID = expectedIncarnationID
+	}
+	_ = sandboxID
+	return nil
+}
+
+func TestExpandAndResealSkipsNonOwner(t *testing.T) {
+	ctx := context.Background()
+	cl := &resealPlacementCluster{
+		Noop: cluster.NewNoop("node-b", "http://b", ""),
+		placement: cluster.Placement{
+			SandboxID:            "sb-reseal-skip",
+			OwnerNodeID:          "node-a",
+			SecretRecipients:     []string{"node-a", "dead-a", "dead-b"},
+			IncarnationID:        "inc-1",
+			SecretSealGeneration: 1,
+			SecretRef:            secrets.FormatRef("sb-reseal-skip", 1),
+			SecretVersion:        1,
+		},
+	}
+	svc := &Service{
+		cfg:     config.Config{SecretRecipientBackupCount: 2},
+		cluster: cl,
+		store:   openSealTestStore(t),
+	}
+	clearSecretFanoutHolders("sb-reseal-skip")
+	t.Cleanup(func() { clearSecretFanoutHolders("sb-reseal-skip") })
+	resetSecretHoldersForGeneration("sb-reseal-skip", 1, "node-b")
+	setSecretHolderTargets("sb-reseal-skip", 1, []string{"node-a", "dead-a", "dead-b"})
+
+	if err := svc.expandAndResealDeadSecretTargets(ctx, "sb-reseal-skip"); err != nil {
+		t.Fatalf("non-owner reseal: %v", err)
+	}
+	cl.mu.Lock()
+	calls := cl.updateCalls
+	cl.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("non-owner triggered %d raft updates", calls)
+	}
+}
+
+func TestExpandAndResealOwnerCASRejectsStaleGeneration(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	const sandboxID = "sb-reseal-cas"
+	req := models.CreateSandboxRequest{
+		Image:    "alpine",
+		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
+	}
+	cl := &resealPlacementCluster{
+		Noop:      cluster.NewNoop("node-a", "http://a", ""),
+		rejectCAS: true,
+		placement: cluster.Placement{
+			SandboxID:            sandboxID,
+			OwnerNodeID:          "node-a",
+			SecretRecipients:     []string{"node-a", "dead-a", "dead-b"},
+			IncarnationID:        "inc-1",
+			SecretSealGeneration: 9,
+			SecretRef:            secrets.FormatRef(sandboxID, 1),
+			SecretVersion:        1,
+		},
+	}
+	svc := &Service{
+		cfg:                  config.Config{SecretRecipientBackupCount: 2},
+		cipher:               cipher,
+		store:                st,
+		secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:              cl,
+		testSecretPeerPusher: &fakePeerPusher{acked: []string{"live-b"}},
+	}
+	if _, err := svc.putClusterSecretsForRecipients(ctx, sandboxID, req, []string{"node-a", "dead-a", "dead-b"}); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+	// Align placement handle with the sealed row and force stale holder gen.
+	rec, err := st.GetClusterSecretForSandbox(ctx, sandboxID)
+	if err != nil || rec == nil {
+		t.Fatalf("load sealed: %v", err)
+	}
+	cl.mu.Lock()
+	cl.placement.SecretRef = rec.Ref
+	cl.placement.SecretVersion = rec.Version
+	cl.mu.Unlock()
+
+	clearSecretFanoutHolders(sandboxID)
+	t.Cleanup(func() { clearSecretFanoutHolders(sandboxID) })
+	resetSecretHoldersForGeneration(sandboxID, 3, "node-a") // stale vs placement gen 9
+	setSecretHolderTargets(sandboxID, 3, []string{"node-a", "dead-a", "dead-b"})
+
+	err = svc.expandAndResealDeadSecretTargets(ctx, sandboxID)
+	if err == nil || !errors.Is(err, cluster.ErrSecretRecipientsCASMismatch) {
+		t.Fatalf("reseal = %v, want wrapped ErrSecretRecipientsCASMismatch", err)
 	}
 }

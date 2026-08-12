@@ -324,6 +324,9 @@ func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxRespon
 	if c == nil {
 		return local, cov, "", true
 	}
+	if _, ok := c.(*cluster.Noop); ok {
+		return local, cov, "", true
+	}
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
 	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
@@ -357,7 +360,7 @@ func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxRespon
 }
 
 func filterFacadeLocalToPage[T any](local []T, placements []cluster.Placement, pageToken string, idFn func(T) string) []T {
-	if len(placements) == 0 {
+	if placements == nil {
 		if strings.TrimSpace(pageToken) != "" {
 			return nil
 		}
@@ -460,12 +463,15 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 
 	inCluster := clusterListMode(h.deps.Service, r)
 	if inCluster {
-		// Cluster mode is placement-cursor based. Native page>1 without an
-		// explicit page_token would slice one placement page into empty
-		// results while more placement pages remain — reject that footgun.
+		// Cluster mode is placement-cursor based. Accept pageToken as alias for
+		// page_token. Native page>1 without a cursor would slice one placement
+		// page into empty results while more pages remain — reject that footgun.
 		pageToken := strings.TrimSpace(r.URL.Query().Get("page_token"))
+		if pageToken == "" {
+			pageToken = strings.TrimSpace(r.URL.Query().Get("pageToken"))
+		}
 		if page > 1 && pageToken == "" {
-			apihttp.WriteError(w, http.StatusBadRequest, "cluster list requires page_token for page>1; use X-Cluster-List-Next-Page-Token")
+			apihttp.WriteError(w, http.StatusBadRequest, "cluster list requires pageToken/page_token for page>1; use nextPageToken or X-Cluster-List-Next-Page-Token")
 			return
 		}
 	}
@@ -482,17 +488,14 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 
 	if inCluster {
 		// Return the full placement-page hydration; do not re-slice with
-		// native page/limit. Next page is X-Cluster-List-Next-Page-Token.
-		total := len(items)
-		totalPages := float32(1)
-		if next != "" {
-			totalPages = 0 // unknown remaining; clients follow the cursor header
-		}
+		// native page/limit. Next cursor is nextPageToken (+ coverage header).
+		// totalPages is unknown in cluster mode (-1).
 		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{
-			Items:      items,
-			Total:      float32(total),
-			Page:       1,
-			TotalPages: totalPages,
+			Items:         items,
+			Total:         float32(len(items)),
+			Page:          1,
+			TotalPages:    -1,
+			NextPageToken: next,
 		})
 		return
 	}

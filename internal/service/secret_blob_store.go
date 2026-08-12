@@ -22,14 +22,21 @@ func newSecretBlobStore(st *store.Store) secrets.BlobStore {
 }
 
 func (a secretBlobStoreAdapter) Put(ctx context.Context, rec secrets.SecretBlob) error {
-	return a.store.PutClusterSecret(ctx, store.ClusterSecretRecord{
+	storeRec := store.ClusterSecretRecord{
 		Ref:            rec.Ref,
 		SandboxID:      rec.SandboxID,
 		Version:        rec.Version,
 		Recipients:     rec.Recipients,
 		SealedPayload:  rec.SealedPayload,
 		SealGeneration: rec.SealGeneration,
-	})
+	}
+	if rec.OutboxRecipients != nil {
+		peers := append([]string(nil), *rec.OutboxRecipients...)
+		storeRec.PutOutboxRecipients = &peers
+		storeRec.PutOutboxIncarnationID = rec.IncarnationID
+	}
+	_, err := a.store.PutClusterSecret(ctx, storeRec)
+	return err
 }
 
 func (a secretBlobStoreAdapter) Get(ctx context.Context, ref string) (*secrets.SecretBlob, error) {

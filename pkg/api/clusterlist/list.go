@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -68,6 +69,10 @@ type Transport struct {
 	PublicClient   *http.Client
 	InternalClient *http.Client
 	FleetPAT       string
+	EnterpriseMode bool
+	// PeerClient, when set, returns a cached per-node mTLS client (no transport
+	// clone per dial). Cluster/Agent implement this via ClientForPeer.
+	PeerClient func(nodeID string) *http.Client
 }
 
 // Options controls cluster-wide list fan-out.
@@ -86,9 +91,8 @@ type Options struct {
 	// Limit/PageToken drive PlacementPage-backed peer selection.
 	Limit     int
 	PageToken string
-	// WantIDs, when non-empty, drops peer/local rows whose ID is not on the
-	// current placement page. Peers return their full local lists; the ingress
-	// must filter to the page set so a page does not leak off-page sandboxes.
+	// WantIDs, when non-nil, drops peer/local rows whose ID is not in the set.
+	// nil means no ID filter; empty non-nil map denies every ID.
 	WantIDs map[string]struct{}
 	Warn    func(msg string, peer string, err error)
 }
@@ -97,6 +101,11 @@ type Options struct {
 type PeerDialer interface {
 	PeerHTTPClients() (public, internal *http.Client)
 	PeerPAT() string
+}
+
+// PeerClientProvider is implemented by cluster.Cluster / cluster.Agent.
+type PeerClientProvider interface {
+	ClientForPeer(nodeID string) *http.Client
 }
 
 // MemberLookup resolves one peer without scanning full membership.
@@ -109,11 +118,17 @@ func TransportFromCluster(c cluster.Client) Transport {
 	if c == nil {
 		return Transport{}
 	}
+	tr := Transport{}
 	if d, ok := c.(PeerDialer); ok {
 		pub, in := d.PeerHTTPClients()
-		return Transport{PublicClient: pub, InternalClient: in, FleetPAT: d.PeerPAT()}
+		tr.PublicClient = pub
+		tr.InternalClient = in
+		tr.FleetPAT = d.PeerPAT()
 	}
-	return Transport{}
+	if p, ok := c.(PeerClientProvider); ok {
+		tr.PeerClient = p.ClientForPeer
+	}
+	return tr
 }
 
 // OwnerRefFromContext returns the tenant OwnerRef for non-operator callers.
@@ -150,6 +165,10 @@ func ApplyOwnerRefScope(r *http.Request) context.Context {
 // SelectPeersForPage returns owner peers for one placement-index page plus the
 // placement rows and next page token. Does not load the full placement view.
 // missing lists placement owners that could not be reached (unknown/dead).
+//
+// Authoritative empty pages (tenant or fleet has zero placements) return
+// viewReady=true with peers=nil so callers respond 200 empty — not 503.
+// viewReady=false only when PlacementPage failed / FSM not ready (non-authoritative).
 func SelectPeersForPage(c cluster.Client, ownerRef, pageToken string, limit int) (peers []cluster.Member, placements []cluster.Placement, next string, viewReady bool, missing []string) {
 	if c == nil {
 		return nil, nil, "", false, nil
@@ -168,10 +187,20 @@ func SelectPeersForPage(c cluster.Client, ownerRef, pageToken string, limit int)
 	selfID := c.SelfNodeID()
 	lookup := memberLookupFn(c)
 
+	if page.Authoritative {
+		if len(page.Placements) == 0 {
+			// True empty page (including empty tenant). Return a non-nil empty
+			// placements slice so FilterLocalToPage / WantIDs deny all rows.
+			return nil, []cluster.Placement{}, page.NextPageToken, true, nil
+		}
+		return peersFromPlacements(page, selfID, lookup)
+	}
+
 	if len(page.Placements) == 0 && pageToken == "" {
-		// Placement index empty: only fan out on small fleets. Large fleets
-		// must wait for the index — returning local-only with viewReady=false
-		// so clients see incompleteness instead of a silent vacuum.
+		// Placement index not authoritative / empty: only fan out on small
+		// fleets. Large fleets must wait for the index — returning local-only
+		// with viewReady=false so clients see incompleteness instead of a
+		// silent vacuum.
 		aliveOwners := 0
 		out := make([]cluster.Member, 0, 32)
 		for _, m := range c.Members() {
@@ -193,6 +222,10 @@ func SelectPeersForPage(c cluster.Client, ownerRef, pageToken string, limit int)
 		return out, nil, "", true, nil
 	}
 
+	return peersFromPlacements(page, selfID, lookup)
+}
+
+func peersFromPlacements(page cluster.PlacementPageResponse, selfID string, lookup func(string) (cluster.Member, bool)) (peers []cluster.Member, placements []cluster.Placement, next string, viewReady bool, missing []string) {
 	want := make(map[string]struct{})
 	for _, p := range page.Placements {
 		if p.OwnerNodeID == "" || p.OwnerNodeID == selfID {
@@ -246,9 +279,10 @@ func SelectPeers(c cluster.Client, ownerRef string) []cluster.Member {
 }
 
 // PlacementWantIDs builds the WantIDs set for Merge/MergeJSON from a placement
-// page. Returns nil when placements is empty (caller should not filter).
+// page. nil placements means "no filter" (cold-start fan-out). A non-nil empty
+// slice yields an empty map that denies every ID (authoritative empty page).
 func PlacementWantIDs(placements []cluster.Placement) map[string]struct{} {
-	if len(placements) == 0 {
+	if placements == nil {
 		return nil
 	}
 	want := make(map[string]struct{}, len(placements))
@@ -261,12 +295,11 @@ func PlacementWantIDs(placements []cluster.Placement) map[string]struct{} {
 }
 
 // FilterLocalToPage keeps local rows that appear on the current placement page.
-// When placements is empty AND pageToken=="" (true cold start / small fleet),
-// all local rows are kept. When placements is empty BUT pageToken != ""
-// (terminal empty page after an exact limit boundary), returns an empty slice
-// — never the full local set.
+// nil placements AND pageToken=="" (true cold start / small fleet) keeps all
+// local rows. Non-nil empty placements (authoritative empty page) or a
+// terminal pageToken with no rows returns an empty slice.
 func FilterLocalToPage(local []*models.Sandbox, placements []cluster.Placement, pageToken string) []*models.Sandbox {
-	if len(placements) == 0 {
+	if placements == nil {
 		if strings.TrimSpace(pageToken) != "" {
 			return nil
 		}
@@ -480,7 +513,7 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 }
 
 func wantIDOK(want map[string]struct{}, id string) bool {
-	if len(want) == 0 {
+	if want == nil {
 		return true
 	}
 	_, ok := want[id]
@@ -498,7 +531,7 @@ func StripFacadePagination(rawQuery string) string {
 	if err != nil {
 		return rawQuery
 	}
-	for _, key := range []string{"page", "limit", "nextToken", "next_token", "page_token", "offset"} {
+	for _, key := range []string{"page", "limit", "nextToken", "next_token", "page_token", "pageToken", "offset", "ids"} {
 		vals.Del(key)
 	}
 	return vals.Encode()
@@ -540,8 +573,16 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 		return nil, err
 	}
 	endpoint := strings.TrimRight(base, "/") + path
-	if opts.RawQuery != "" {
-		endpoint += "?" + opts.RawQuery
+	q := opts.RawQuery
+	if ids := wantIDsQuery(opts.WantIDs); ids != "" {
+		if q == "" {
+			q = "ids=" + ids
+		} else {
+			q = q + "&ids=" + ids
+		}
+	}
+	if q != "" {
+		endpoint += "?" + q
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -578,8 +619,30 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 	return body, nil
 }
 
+func wantIDsQuery(want map[string]struct{}) string {
+	if len(want) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(want))
+	for id := range want {
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	// Stable order keeps peer URLs cache-friendly / debuggable.
+	sort.Strings(ids)
+	return url.QueryEscape(strings.Join(ids, ","))
+}
+
 func dialPeer(m cluster.Member, tr Transport) (*http.Client, string, error) {
-	client, base, err := cluster.PeerDial(m, tr.PublicClient, tr.InternalClient)
+	var cached *http.Client
+	if tr.PeerClient != nil {
+		cached = tr.PeerClient(m.NodeID)
+	}
+	client, base, err := cluster.PeerDialCached(m, tr.PublicClient, tr.InternalClient, cached, tr.EnterpriseMode)
 	if err != nil {
 		return nil, "", err
 	}
@@ -604,12 +667,17 @@ func withTimeout(c *http.Client) *http.Client {
 }
 
 // ParsePageParams reads limit/page_token from a request URL.
+// pageToken is accepted as an alias for page_token (Daytona-style clients).
 func ParsePageParams(u *url.URL) (limit int, pageToken string) {
 	if u == nil {
 		return DefaultPageLimit, ""
 	}
-	pageToken = strings.TrimSpace(u.Query().Get("page_token"))
-	if raw := strings.TrimSpace(u.Query().Get("limit")); raw != "" {
+	q := u.Query()
+	pageToken = strings.TrimSpace(q.Get("page_token"))
+	if pageToken == "" {
+		pageToken = strings.TrimSpace(q.Get("pageToken"))
+	}
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil {
 			limit = n
 		}

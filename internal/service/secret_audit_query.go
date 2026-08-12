@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"container/heap"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +35,10 @@ type SecretAuditQuery struct {
 	// Kind filters by event kind ("egress", "secret_open"). Empty = all kinds.
 	// Empty Kind on stored events matches "secret_open" (back-compat).
 	Kind string
+	// IncarnationID scopes history to one placement lifetime. When empty and
+	// the sandbox still has a live placement, ListSecretAuditLocal defaults
+	// it from Placement.IncarnationID.
+	IncarnationID string
 }
 
 // SecretAuditCoverage reports which members answered a fan-out read.
@@ -89,6 +96,14 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return nil, "", nil
+	}
+	incarnationID := strings.TrimSpace(opts.IncarnationID)
+	if incarnationID == "" {
+		if c := s.Cluster(); c != nil {
+			if p, ok := c.PlacementOf(sandboxID); ok {
+				incarnationID = strings.TrimSpace(p.IncarnationID)
+			}
+		}
 	}
 	limit := opts.Limit
 	if limit <= 0 {
@@ -161,6 +176,9 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 		if !isGap && ev.SandboxID != sandboxID {
 			continue
 		}
+		if !isGap && incarnationID != "" && strings.TrimSpace(ev.IncarnationID) != incarnationID {
+			continue
+		}
 		if !isGap && !secretAuditKindMatches(ev.Kind, opts.Kind) {
 			continue
 		}
@@ -179,12 +197,18 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 		return nil, "", err
 	}
 	if malformed > 0 {
+		// Stable time + event id so repeated queries do not invent a new gap
+		// row on every scan (hash of the malformed-line count is enough for
+		// local repeatability within one file generation).
+		stable := malformedGapTime(sandboxID, malformed)
 		keepCandidate(SecretAuditEvent{
-			Time:      time.Now().UTC(),
+			Time:      stable,
+			EventID:   "ae-malformed-" + malformedGapID(sandboxID, malformed),
 			SandboxID: sandboxID,
 			Result:    secretAuditResultGap,
 			Reason:    "malformed_jsonl",
 			Kind:      secretAuditKindGap,
+			Dropped:   int64(malformed),
 		})
 	}
 	matched := append([]SecretAuditEvent(nil), candidates...)
@@ -213,6 +237,13 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts SecretAuditQuery) (SecretAuditPage, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if strings.TrimSpace(opts.IncarnationID) == "" {
+		if c := s.Cluster(); c != nil {
+			if p, ok := c.PlacementOf(sandboxID); ok {
+				opts.IncarnationID = strings.TrimSpace(p.IncarnationID)
+			}
+		}
 	}
 	local, nextLocal, err := s.ListSecretAuditLocal(ctx, sandboxID, opts)
 	if err != nil {
@@ -323,7 +354,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 			go func() {
 				defer wg.Done()
 				for j := range jobCh {
-					page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.apiURL, sandboxID, limit, opts.Cursor, opts.Kind)
+					page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.apiURL, sandboxID, limit, opts.Cursor, opts.Kind, opts.IncarnationID)
 					results <- peerResult{nodeID: j.nodeID, page: page, err: fetchErr}
 				}
 			}()
@@ -533,4 +564,18 @@ func dedupeSecretAuditEvents(events []SecretAuditEvent) []SecretAuditEvent {
 		out = append(out, ev)
 	}
 	return out
+}
+
+func malformedGapID(sandboxID string, count int) string {
+	sum := sha256.Sum256([]byte(sandboxID + "|malformed|" + strconv.Itoa(count)))
+	return hex.EncodeToString(sum[:8])
+}
+
+// malformedGapTime is a stable synthetic timestamp so query pages do not churn
+// a fresh "now" gap on every scan of the same malformed content.
+func malformedGapTime(sandboxID string, count int) time.Time {
+	sum := sha256.Sum256([]byte(sandboxID + "|malformed-time|" + strconv.Itoa(count)))
+	// Fold into a fixed second within a far-past window (not wall-clock).
+	sec := int64(sum[0])<<24 | int64(sum[1])<<16 | int64(sum[2])<<8 | int64(sum[3])
+	return time.Unix(1_000_000_000+(sec%86_400), 0).UTC()
 }

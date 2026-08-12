@@ -164,6 +164,9 @@ func (h *handlers) listFacadeClusterItems(r *http.Request, local []listedSandbox
 	if c == nil {
 		return local, cov, "", true
 	}
+	if _, ok := c.(*cluster.Noop); ok {
+		return local, cov, "", true
+	}
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
 	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
@@ -197,7 +200,7 @@ func (h *handlers) listFacadeClusterItems(r *http.Request, local []listedSandbox
 }
 
 func filterE2BLocalToPage(local []listedSandboxResponse, placements []cluster.Placement, pageToken string) []listedSandboxResponse {
-	if len(placements) == 0 {
+	if placements == nil {
 		if strings.TrimSpace(pageToken) != "" {
 			return nil
 		}
@@ -244,12 +247,19 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	inCluster := clusterListMode(h.deps.Service, r)
 	var limit, offset int
 	if inCluster {
-		// Placement-cursor API: ignore native nextToken offset slicing. If the
-		// caller still sends nextToken without page_token, reject — that used
-		// to empty-slice one placement page while more pages remained.
-		if strings.TrimSpace(r.URL.Query().Get("nextToken")) != "" && strings.TrimSpace(r.URL.Query().Get("page_token")) == "" {
-			WriteError(w, http.StatusBadRequest, "cluster list requires page_token (not nextToken offset); use X-Cluster-List-Next-Page-Token")
-			return
+		// Placement-cursor API. Non-numeric nextToken is an opaque placement
+		// page_token (base64/cursor). Numeric nextToken without page_token is
+		// the legacy offset and is rejected in cluster mode.
+		nextTok := strings.TrimSpace(r.URL.Query().Get("nextToken"))
+		pageTok := strings.TrimSpace(r.URL.Query().Get("page_token"))
+		if pageTok == "" && nextTok != "" {
+			if _, err := strconv.Atoi(nextTok); err == nil {
+				WriteError(w, http.StatusBadRequest, "cluster list requires opaque nextToken/page_token (not integer offset); use x-next-token from prior response")
+				return
+			}
+			q := r.URL.Query()
+			q.Set("page_token", nextTok)
+			r.URL.RawQuery = q.Encode()
 		}
 	} else {
 		var err error
@@ -320,6 +330,9 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if inCluster {
+		if next != "" {
+			w.Header().Set("x-next-token", next)
+		}
 		writeJSON(w, http.StatusOK, items)
 		return
 	}

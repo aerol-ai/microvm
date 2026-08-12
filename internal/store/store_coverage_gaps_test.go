@@ -308,13 +308,13 @@ func TestClusterSecretUpsertUpdate(t *testing.T) {
 		Recipients:    []string{"node-a"},
 		SealedPayload: []byte("v1"),
 	}
-	if err := st.PutClusterSecret(ctx, rec); err != nil {
+	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret insert: %v", err)
 	}
 	rec.Version = 2
 	rec.Recipients = []string{"node-b"}
 	rec.SealedPayload = []byte("v2")
-	if err := st.PutClusterSecret(ctx, rec); err != nil {
+	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret update: %v", err)
 	}
 	got, err := st.GetClusterSecret(ctx, rec.Ref)
@@ -356,25 +356,25 @@ func TestFirecrackerTapValidation(t *testing.T) {
 func TestPutClusterSecretValidation(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{}); err == nil {
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{}); err == nil {
 		t.Fatal("expected validation error for empty record")
 	}
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		SandboxID: "sb", Version: 1, SealedPayload: []byte("x"),
 	}); err == nil {
 		t.Fatal("expected validation error for empty ref")
 	}
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "ref", Version: 1, SealedPayload: []byte("x"),
 	}); err == nil {
 		t.Fatal("expected validation error for empty sandbox id")
 	}
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "ref", SandboxID: "sb", Version: 0, SealedPayload: []byte("x"),
 	}); err == nil {
 		t.Fatal("expected validation error for non-positive version")
 	}
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "ref", SandboxID: "sb", Version: 1,
 	}); err == nil {
 		t.Fatal("expected validation error for empty sealed payload")

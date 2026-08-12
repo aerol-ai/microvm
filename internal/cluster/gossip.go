@@ -295,9 +295,10 @@ func (i *gossipMemberIndex) recordMetricsLocked(now int64) {
 }
 
 type indexedEventDelegate struct {
-	index  *gossipMemberIndex
-	logger *slog.Logger
-	next   memberlist.EventDelegate
+	index   *gossipMemberIndex
+	logger  *slog.Logger
+	next    memberlist.EventDelegate
+	onLeave func(nodeID string)
 }
 
 func (d *indexedEventDelegate) NotifyJoin(n *memberlist.Node) {
@@ -338,6 +339,9 @@ func (d *indexedEventDelegate) NotifyLeave(n *memberlist.Node) {
 			"memberlist_name", n.Name,
 			"memberlist_addr", n.Address(),
 		)
+	}
+	if d.onLeave != nil && m.NodeID != "" {
+		d.onLeave(m.NodeID)
 	}
 	if d.next != nil {
 		d.next.NotifyLeave(n)
@@ -396,6 +400,9 @@ type gossipSetupConfig struct {
 	// Events, if non-nil, receives memberlist join/leave/update notifications.
 	// Auto-voter promotion in Phase 2 plugs in here.
 	Events memberlist.EventDelegate
+	// OnLeave is invoked after the local membership index marks a peer left.
+	// Used to drop cached per-peer mTLS HTTP clients.
+	OnLeave func(nodeID string)
 }
 
 func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slog.Logger) (*gossipNode, error) {
@@ -419,7 +426,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	delegate := newGossipDelegate(cfg.NodeID, cfg.NodeName, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, cfg.PublicHost, admitter)
 	memberIndex := newGossipMemberIndex()
 	mlCfg.Delegate = delegate
-	mlCfg.Events = &indexedEventDelegate{index: memberIndex, logger: logger, next: cfg.Events}
+	mlCfg.Events = &indexedEventDelegate{index: memberIndex, logger: logger, next: cfg.Events, onLeave: cfg.OnLeave}
 	if len(cfg.SecretKey) > 0 {
 		// memberlist accepts 16/24/32-byte keys for AES-128/192/256-GCM. Anything
 		// else is rejected at construction so we surface a clear error rather

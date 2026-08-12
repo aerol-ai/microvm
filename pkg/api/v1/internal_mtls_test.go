@@ -17,7 +17,7 @@ func TestWithInternalMTLSBoundary(t *testing.T) {
 		calls++
 		w.WriteHeader(http.StatusNoContent)
 	})
-	guarded := withInternalMTLS(false, next)
+	guarded := withInternalMTLS(Deps{EnterpriseMode: false}, next)
 
 	publicReq := httptest.NewRequest(http.MethodPost, "http://public/v1/cluster/internal/secrets", nil)
 	publicRec := httptest.NewRecorder()
@@ -39,7 +39,7 @@ func TestWithInternalMTLSNodeIdentity(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	guarded := withInternalMTLS(false, next)
+	guarded := withInternalMTLS(Deps{EnterpriseMode: false}, next)
 
 	t.Run("matching_header_and_san", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "https://internal/v1/cluster/internal/secrets", nil)
@@ -81,7 +81,7 @@ func TestWithInternalMTLSNodeIdentity(t *testing.T) {
 	})
 
 	t.Run("enterprise_rejects_legacy_only", func(t *testing.T) {
-		ent := withInternalMTLS(true, next)
+		ent := withInternalMTLS(Deps{EnterpriseMode: true}, next)
 		req := httptest.NewRequest(http.MethodGet, "https://internal/v1/cluster/internal/secrets", nil)
 		addVerifiedClientCertificate(req, &x509.Certificate{
 			Subject:  pkix.Name{CommonName: "aerolvm-cluster-node"},

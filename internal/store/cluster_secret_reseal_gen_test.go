@@ -17,7 +17,7 @@ func TestDeleteGenerationSurvivesReseal(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	now := time.Now().UTC()
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-mono/v1", SandboxID: "sb-mono", Version: 1,
 		Recipients: []string{"a", "b"}, SealedPayload: []byte("sealed-1"),
 		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
@@ -29,7 +29,7 @@ func TestDeleteGenerationSurvivesReseal(t *testing.T) {
 		t.Fatalf("first delete gen=%d err=%v, want 2", gen1, err)
 	}
 	// Reseal clears tomb atomically with put, but delete gen must still advance.
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-mono/v1", SandboxID: "sb-mono", Version: 1,
 		Recipients: []string{"a", "b"}, SealedPayload: []byte("sealed-2"),
 		SealGeneration: 3, CreatedAt: now, UpdatedAt: now,
@@ -62,14 +62,14 @@ func TestPutClusterSecretRejectsDowngrade(t *testing.T) {
 
 	now := time.Now().UTC()
 	ref := "cluster-secret://sandbox/sb-ooo/v1"
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: ref, SandboxID: "sb-ooo", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("gen2"),
 		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: ref, SandboxID: "sb-ooo", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("gen1"),
 		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
@@ -94,7 +94,7 @@ func TestPutClusterSecretBlockedByTombInsideTx(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	now := time.Now().UTC()
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-race/v1", SandboxID: "sb-race", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("live"),
 		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
@@ -104,7 +104,7 @@ func TestPutClusterSecretBlockedByTombInsideTx(t *testing.T) {
 	if err := st.ApplyPeerSecretDelete(ctx, "sb-race", 2); err != nil {
 		t.Fatal(err)
 	}
-	err = st.PutClusterSecret(ctx, ClusterSecretRecord{
+	_, err = st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-race/v1", SandboxID: "sb-race", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("stale"),
 		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
@@ -130,7 +130,7 @@ func TestDeleteClusterSecretsRowsOnlyNoTomb(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	now := time.Now().UTC()
-	if err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-local/v1", SandboxID: "sb-local", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("x"),
 		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,

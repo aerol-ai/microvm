@@ -83,10 +83,36 @@ func TestLoadClusterTLS(t *testing.T) {
 
 func TestClientForPeerNoopWithoutTLS(t *testing.T) {
 	base := &http.Client{}
-	if got := ClientForPeer(base, "n1"); got != base {
+	if got := ClientForPeer(base, "n1", false); got != base {
 		t.Fatal("ClientForPeer without TLS transport should return base")
 	}
-	if got := ClientForPeer(nil, "n1"); got != nil {
+	if got := ClientForPeer(nil, "n1", false); got != nil {
 		t.Fatal("nil base should stay nil")
+	}
+}
+
+func TestPeerClientCacheSamePointer(t *testing.T) {
+	base := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		},
+	}
+	var cache peerClientCache
+	a := cache.get(base, "worker-1", false)
+	b := cache.get(base, "worker-1", false)
+	if a == nil || a == base {
+		t.Fatal("expected distinct VerifyPeer client")
+	}
+	if a != b {
+		t.Fatal("two dials for same node must return same client pointer")
+	}
+	c := cache.get(base, "worker-2", false)
+	if c == a {
+		t.Fatal("different nodes must not share the same cached client")
+	}
+	cache.invalidate("worker-1")
+	d := cache.get(base, "worker-1", false)
+	if d == a {
+		t.Fatal("invalidate must drop cached client")
 	}
 }

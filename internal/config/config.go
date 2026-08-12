@@ -1113,13 +1113,17 @@ type Config struct {
 	// SB_EGRESS_ATTRIBUTION_ENABLED=false.
 	EgressAttributionEnabled bool
 	// AuditIngestPort is the loopback HTTP port wasm workers POST egress audit
-	// events to (POST /internal/audit/egress). Default 21215.
-	// SB_AUDIT_INGEST_PORT. Workers never write secrets.jsonl tip directly.
+	// events to (POST /internal/audit/egress). Default 0 (ephemeral) so multiple
+	// local daemons do not collide. SB_AUDIT_INGEST_PORT.
 	AuditIngestPort int
 	// AuditIngestToken authenticates worker → daemon audit ingest. Empty at
 	// boot mints a random token and exports SB_AUDIT_INGEST_TOKEN for workers.
 	// SB_AUDIT_INGEST_TOKEN.
 	AuditIngestToken string
+	// SecretAuditExportURL, when set, enables periodic HTTP POST of new JSONL
+	// audit segments (off-node batch export). Empty means disk loss loses
+	// events that were never witnessed/exported. SB_SECRET_AUDIT_EXPORT_URL.
+	SecretAuditExportURL string
 	// AuditRateLimitIdentity is the per-OwnerRef token rate (req/s) for
 	// GET /v1/sandboxes/{id}/audit. Security parameter (amplification bound).
 	// SB_AUDIT_RATE_LIMIT_IDENTITY. Default 10.
@@ -1638,8 +1642,9 @@ func Load() (Config, error) {
 		SecretAuditWitnessInterval:    getEnvDuration("SB_SECRET_AUDIT_WITNESS_INTERVAL", 30*time.Second),
 		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
 		EgressAttributionEnabled:      getEnvBool("SB_EGRESS_ATTRIBUTION_ENABLED", true),
-		AuditIngestPort:               getEnvInt("SB_AUDIT_INGEST_PORT", 21215),
+		AuditIngestPort:               getEnvInt("SB_AUDIT_INGEST_PORT", 0),
 		AuditIngestToken:              strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN")),
+		SecretAuditExportURL:          strings.TrimSpace(os.Getenv("SB_SECRET_AUDIT_EXPORT_URL")),
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
@@ -2203,8 +2208,8 @@ func Load() (Config, error) {
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
 		}
-		if !cfg.SecretAuditExternalWitness {
-			return Config{}, errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS must be true when SB_ENTERPRISE_MODE=true (tamper-evidence requires an off-node witness)")
+		if !cfg.SecretAuditExternalWitness && strings.TrimSpace(cfg.SecretAuditExportURL) == "" {
+			return Config{}, errors.New("SB_ENTERPRISE_MODE=true requires SB_SECRET_AUDIT_EXTERNAL_WITNESS=true and/or SB_SECRET_AUDIT_EXPORT_URL (off-node durability; otherwise disk loss loses events)")
 		}
 		if cfg.EnableCluster {
 			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {

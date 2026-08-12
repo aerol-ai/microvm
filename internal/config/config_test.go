@@ -1479,10 +1479,19 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 
 	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterprisePATBytes))
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "false")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_EXTERNAL_WITNESS") {
-		t.Fatalf("Load error = %v, want external witness requirement", err)
+		t.Fatalf("Load error = %v, want witness/export requirement", err)
 	}
 
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	if cfg, err := Load(); err != nil {
+		t.Fatalf("enterprise with export URL only: %v", err)
+	} else if cfg.SecretAuditExportURL == "" {
+		t.Fatal("expected export URL retained")
+	}
+
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "")
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
 	t.Setenv("SB_SECRET_AUDIT_WITNESS_INTERVAL", "15s")
 	cfg, err := Load()

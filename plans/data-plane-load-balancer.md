@@ -32,6 +32,11 @@ before forwarding user traffic:
 A full in-tree LB / Envoy control-plane integration. This document is the
 operator contract; the API stub already exists under `/v1/cluster/ingress-route/{id}`.
 
+**100-ingress scale remains operator LB + `SB_CLUSTER_SHARD_AWARE_INGRESS`.**
+It is not delivered in-repo: operators must front the fleet with an external
+shard-aware router that honors the ingress-route contract above. The daemon
+only exposes the lookup API and the topology gate.
+
 ## Failure modes
 
 | Misconfiguration | Behavior |

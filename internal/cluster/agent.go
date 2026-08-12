@@ -31,6 +31,7 @@ const (
 	PublicInternalPlacementsPath      = "/v1/cluster/internal/placements"
 	PublicInternalPlacementsQueryPath = "/v1/cluster/internal/placements/query"
 	PublicInternalPlacementsPagePath  = "/v1/cluster/internal/placements/page"
+	PublicInternalPlacementsByIDsPath = "/v1/cluster/internal/placements-by-ids"
 	PublicInternalRecoveryPath        = "/v1/cluster/internal/recovery/"
 	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
 	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
@@ -92,6 +93,7 @@ type Agent struct {
 	internalClient *http.Client
 	publicProxies  *proxyCache
 	mtlsProxies    *proxyCache
+	peerClients    peerClientCache
 
 	cacheMu        sync.RWMutex
 	placementCache []Placement
@@ -183,6 +185,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
 		Events:         nil,
+		OnLeave:        a.invalidatePeerClient,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {
@@ -202,6 +205,30 @@ func (a *Agent) PeerHTTPClients() (public, internal *http.Client) {
 		return nil, nil
 	}
 	return a.httpClient, a.internalClient
+}
+
+// ClientForPeer returns a cached mTLS HTTP client that verifies DNS SAN
+// node:<nodeID>. Legacy shared-SAN-only peer certs are rejected.
+func (a *Agent) ClientForPeer(nodeID string) *http.Client {
+	if a == nil {
+		return nil
+	}
+	return a.peerClients.get(a.internalClient, nodeID, true)
+}
+
+// PeerDialMember selects the peer client/URL using the per-node mTLS cache.
+func (a *Agent) PeerDialMember(m Member) (*http.Client, string, error) {
+	if a == nil {
+		return PeerDial(m, nil, nil)
+	}
+	return PeerDialCached(m, a.httpClient, a.internalClient, a.ClientForPeer(m.NodeID), true)
+}
+
+func (a *Agent) invalidatePeerClient(nodeID string) {
+	if a == nil {
+		return
+	}
+	a.peerClients.invalidate(nodeID)
 }
 
 // PeerPAT returns the fleet PAT for internal peer RPCs / public list fallbacks.
@@ -322,17 +349,20 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 	})
 }
 
-func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets) error {
+func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
 	recipients = normalizeSecretRecipientIDs(recipients)
 	if strings.TrimSpace(sandboxID) == "" || len(recipients) == 0 {
 		return nil
 	}
 	return a.applyCommand(ctx, command{
-		Op:               opUpdateSecretRecipients,
-		SandboxID:        sandboxID,
-		SecretRecipients: recipients,
-		SecretRef:        secrets.Ref,
-		SecretVersion:    secrets.Version,
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              sandboxID,
+		SecretRecipients:       recipients,
+		SecretRef:              secrets.Ref,
+		SecretVersion:          secrets.Version,
+		SecretSealGeneration:   secrets.SealGeneration,
+		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedSealGeneration: expectedSealGeneration,
 	})
 }
 
@@ -752,8 +782,11 @@ func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	var out PlacementPageResponse
 	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsPagePath, PublicInternalPlacementsPagePath, req, &out); err != nil {
 		a.logger.Warn("cluster agent: placement page lookup failed", "err", err, "limit", req.Limit, "page_token", req.PageToken)
-		return PlacementPageResponse{}
+		// Explicit not-ready: empty + Authoritative=false so list returns 503
+		// instead of treating a CP error as an empty tenant.
+		return PlacementPageResponse{Authoritative: false}
 	}
+	out.Authoritative = true
 	a.observePlacementVersions(out.Placements)
 	return out
 }
@@ -767,18 +800,57 @@ func (a *Agent) PlacementOf(sandboxID string) (Placement, bool) {
 	return lookup.Placement, true
 }
 
-// PlacementsByIDs point-looks up each ID via the control plane. Prefer this
-// over Placements() when only a page of IDs is needed (failover_ready batch).
+// PlacementsByIDs batch-looks up IDs via a single control-plane POST.
+// Prefer this over Placements() when only a page of IDs is needed.
 func (a *Agent) PlacementsByIDs(ids []string) map[string]Placement {
-	out := make(map[string]Placement, len(ids))
+	cleaned := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
-		if p, ok := a.PlacementOf(id); ok {
-			out[id] = p
+		if _, ok := seen[id]; ok {
+			continue
 		}
+		seen[id] = struct{}{}
+		cleaned = append(cleaned, id)
+	}
+	if len(cleaned) == 0 {
+		return map[string]Placement{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
+	defer cancel()
+	var out map[string]Placement
+	req := placementsByIDsRequest{IDs: cleaned}
+	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsByIDsPath, PublicInternalPlacementsByIDsPath, req, &out); err != nil {
+		a.logger.Warn("cluster agent: placements-by-ids lookup failed; falling back to point reads", "err", err, "n", len(cleaned))
+		out = make(map[string]Placement, len(cleaned))
+		for _, id := range cleaned {
+			if p, ok := a.PlacementOf(id); ok {
+				out[id] = p
+			}
+		}
+		return out
+	}
+	if out == nil {
+		return map[string]Placement{}
+	}
+	a.observePlacementVersions(placementsMapValues(out))
+	return out
+}
+
+type placementsByIDsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func placementsMapValues(m map[string]Placement) []Placement {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]Placement, 0, len(m))
+	for _, p := range m {
+		out = append(out, p)
 	}
 	return out
 }

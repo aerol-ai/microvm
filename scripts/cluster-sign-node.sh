@@ -20,7 +20,7 @@ NODE_ID=""
 OUT=""
 TLS_DIR="/etc/sandboxd/tls"
 CLUSTER_SAN="aerolvm-cluster-node"
-DAYS="3650"
+DAYS="${CERT_DAYS:-90}"
 
 usage() {
 	cat <<'EOF'
@@ -29,6 +29,12 @@ Usage: cluster-sign-node.sh --csr <path> --node-id <id> --out <path> [options]
 Sign a joining node's certificate signing request with the seed's ca.key.
 ca.key never leaves the seed.
 
+Node certs are intentionally short-lived (default 90 days via CERT_DAYS /
+--days). Rotate by re-running cluster-join / this script with a fresh CSR.
+Revocation is pragmatic: remove the node from the cluster CA trust path
+(reissue CA or stop distributing ca.crt that chains to the old leaf) and
+reissue remaining nodes — there is no CRL/OCSP in the daemon.
+
 Required:
   --csr <path>       Path to the joiner's CSR (PEM).
   --node-id <id>     Gossip node id; minted as DNS SAN node:<id>.
@@ -36,7 +42,7 @@ Required:
 
 Optional:
   --tls-dir <path>   Directory with ca.crt + ca.key. Default: /etc/sandboxd/tls
-  --days <n>         Certificate lifetime in days. Default: 3650
+  --days <n>         Certificate lifetime in days. Default: CERT_DAYS or 90
   --help             Show this help.
 EOF
 }

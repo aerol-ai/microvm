@@ -335,10 +335,11 @@ fi
 CLUSTER_SAN="aerolvm-cluster-node"
 TLS_GENERATED="false"
 if [[ "$NO_TLS" == "true" ]]; then
-	# --no-tls is a private-overlay escape hatch only. Production clusters
-	# must mint mTLS material; do not combine --no-tls with public networks.
-	echo "WARNING: --no-tls given; cluster-internal channels will ride over the public API"
-	echo "         URL with PAT-only auth. Only safe on a fully isolated network."
+	# Cluster mode unconditionally requires SB_CLUSTER_TLS_DIR; --no-tls cannot
+	# produce a bootable env file. Refuse early instead of emitting a broken config.
+	echo "ERROR: --no-tls is unsupported. Cluster mode requires mTLS material under --tls-dir." >&2
+	echo "       Omit --no-tls (default) so cluster-init can mint ca.crt + node.{crt,key}." >&2
+	exit 1
 else
 	if ! command -v openssl >/dev/null 2>&1; then
 		echo "openssl not found — required for cluster TLS." >&2

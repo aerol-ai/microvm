@@ -108,7 +108,42 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	if want := parseSandboxIDsFilter(r); len(want) > 0 {
+		filtered := make([]*models.Sandbox, 0, len(want))
+		for _, sb := range sandboxes {
+			if sb == nil {
+				continue
+			}
+			if _, ok := want[sb.ID]; ok {
+				filtered = append(filtered, sb)
+			}
+		}
+		sandboxes = filtered
+	}
 	apihttp.WriteJSON(w, http.StatusOK, sandboxes)
+}
+
+// parseSandboxIDsFilter reads ids=a,b,c from forwarded cluster list peers so
+// owners return only the placement-page subset (smaller JSON).
+func parseSandboxIDsFilter(r *http.Request) map[string]struct{} {
+	if r == nil || r.Header.Get("X-Cluster-Forwarded") != "1" {
+		return nil
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("ids"))
+	if raw == "" {
+		return nil
+	}
+	want := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		id := strings.TrimSpace(part)
+		if id != "" {
+			want[id] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	return want
 }
 
 // applyClusterListOwnerRefScope lets a fleet-PAT forwarded list request narrow

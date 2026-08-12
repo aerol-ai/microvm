@@ -15,9 +15,10 @@ import (
 
 type stubListCluster struct {
 	*cluster.Noop
-	members    []cluster.Member
-	placements []cluster.Placement
-	byID       map[string]cluster.Member
+	members       []cluster.Member
+	placements    []cluster.Placement
+	byID          map[string]cluster.Member
+	authoritative bool
 }
 
 func (c *stubListCluster) Members() []cluster.Member { return c.members }
@@ -52,7 +53,7 @@ func (c *stubListCluster) PlacementPage(req cluster.PlacementPageRequest) cluste
 			break
 		}
 	}
-	return cluster.PlacementPageResponse{Placements: out}
+	return cluster.PlacementPageResponse{Placements: out, Authoritative: c.authoritative}
 }
 func (c *stubListCluster) LookupMember(id string) (cluster.Member, bool) {
 	if c.byID != nil {
@@ -128,6 +129,44 @@ func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 	}
 }
 
+func TestSelectPeersAuthoritativeEmptyTenantReady(t *testing.T) {
+	members := make([]cluster.Member, 0, 300)
+	members = append(members, cluster.Member{
+		NodeID: "self", APIURL: "http://self", Alive: true, Role: config.NodeRoleMixed,
+	})
+	for i := 0; i < 300; i++ {
+		members = append(members, cluster.Member{
+			NodeID: fmt.Sprintf("w-%03d", i),
+			APIURL: fmt.Sprintf("http://w-%03d", i),
+			Alive:  true,
+			Role:   config.NodeRoleWorker,
+		})
+	}
+	c := &stubListCluster{
+		Noop:       cluster.NewNoop("self", "http://self", ""),
+		members:    members,
+		placements: nil,
+	}
+	c.authoritative = true
+	peers, placements, _, ready, _ := SelectPeersForPage(c, "empty-tenant", "", DefaultPageLimit)
+	if !ready {
+		t.Fatal("authoritative empty tenant must be viewReady=true")
+	}
+	if peers != nil {
+		t.Fatalf("peers = %v, want nil", peers)
+	}
+	if placements == nil || len(placements) != 0 {
+		t.Fatalf("placements = %v, want non-nil empty", placements)
+	}
+	want := PlacementWantIDs(placements)
+	if want == nil {
+		t.Fatal("WantIDs for authoritative empty must be non-nil empty map")
+	}
+	if wantIDOK(want, "any") {
+		t.Fatal("empty WantIDs must deny all IDs")
+	}
+}
+
 func TestDialPeerRequiresInternalURLAndClient(t *testing.T) {
 	tr := Transport{
 		PublicClient:   http.DefaultClient,
@@ -172,6 +211,9 @@ func TestFilterLocalToPageTerminalEmptyPage(t *testing.T) {
 	}
 	if got := FilterLocalToPage(local, nil, "sb-last"); len(got) != 0 {
 		t.Fatalf("terminal empty page with pageToken: got %d, want 0", len(got))
+	}
+	if got := FilterLocalToPage(local, []cluster.Placement{}, ""); len(got) != 0 {
+		t.Fatalf("authoritative empty page: got %d, want 0", len(got))
 	}
 	page := []cluster.Placement{{SandboxID: "sb-2"}}
 	got := FilterLocalToPage(local, page, "")

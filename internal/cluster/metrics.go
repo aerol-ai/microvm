@@ -73,12 +73,20 @@ var (
 	// Soft-compat: peer presented only the legacy aerolvm-cluster-node SAN
 	// (no node:<id> identity). Counts rollouts that still need cert reissue.
 	mtlsLegacyIdentityTotal = expvar.NewInt("aerolvm_cluster_mtls_legacy_identity_total")
+	// Soft/enterprise: peer node id not present (or not Alive) in local membership.
+	mtlsUnknownPeerTotal = expvar.NewInt("aerolvm_cluster_mtls_unknown_peer_total")
 )
 
 // RecordMTLSLegacyIdentity increments the soft-compat counter for peers that
 // authenticate with only the legacy clusterServerName SAN.
 func RecordMTLSLegacyIdentity() {
 	mtlsLegacyIdentityTotal.Add(1)
+}
+
+// RecordMTLSUnknownPeer increments when an inbound mTLS peer id is not an
+// Alive gossip member. Soft mode warns via this metric; enterprise rejects.
+func RecordMTLSUnknownPeer() {
+	mtlsUnknownPeerTotal.Add(1)
 }
 
 func beginRaftApply() func(error) {

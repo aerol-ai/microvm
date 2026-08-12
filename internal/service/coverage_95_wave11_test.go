@@ -348,7 +348,7 @@ func TestOpenClusterSecretsBadPayloadWave11(t *testing.T) {
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cipher = newTestCipher(t)
 	ref := secrets.FormatRef("sb-bad", 1)
-	if err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
+	if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
 		Ref: ref, SandboxID: "sb-bad", Version: 1, SealedPayload: []byte("not-json"),
 	}); err != nil {
 		t.Fatal(err)

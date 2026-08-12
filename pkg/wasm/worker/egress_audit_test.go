@@ -37,6 +37,7 @@ func TestPostOrSpillWorkerEgressUsesIngest(t *testing.T) {
 	postOrSpillWorkerEgress(egressAuditJob{
 		port: port, token: "tok", node: "n1",
 		sandboxID: "sb-1", network: "tcp", address: "example.com:443",
+		eventTime: time.Now().UTC(),
 	})
 	select {
 	case m := <-gotCh:

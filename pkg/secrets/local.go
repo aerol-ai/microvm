@@ -52,7 +52,7 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 	if len(sealed) == 0 {
 		return Handle{}, nil
 	}
-	if err := p.store.Put(ctx, SecretBlob{
+	blob := SecretBlob{
 		Ref:            ref,
 		SandboxID:      sandboxID,
 		IncarnationID:  incarnationID,
@@ -60,10 +60,15 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 		Recipients:     recipients,
 		SealedPayload:  sealed,
 		SealGeneration: gen,
-	}); err != nil {
+	}
+	if _, peers, ok := PutOutboxFromContext(ctx); ok {
+		cp := append([]string(nil), peers...)
+		blob.OutboxRecipients = &cp
+	}
+	if err := p.store.Put(ctx, blob); err != nil {
 		return Handle{}, err
 	}
-	return Handle{Ref: ref, Version: version}, nil
+	return Handle{Ref: ref, Version: version, SealGeneration: gen}, nil
 }
 
 // Open resolves h to plaintext for nodeID. sandboxID is verified against the

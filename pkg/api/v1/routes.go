@@ -159,7 +159,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// commands, or read fleet topology (P0). Peer HTTP uses SB_PAT_TOKEN.
 	op := func(next http.Handler) http.Handler { return withAuthOperator(d, next) }
 	internalOp := func(next http.Handler) http.Handler {
-		return op(withInternalMTLS(d.EnterpriseMode, next))
+		return op(withInternalMTLS(d, next))
 	}
 	mux.Handle("GET "+PathPrefix+"/cluster/members", op(http.HandlerFunc(h.clusterMembers)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", op(http.HandlerFunc(h.clusterRemoveMember)))
@@ -180,6 +180,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, internalOp(http.HandlerFunc(h.clusterInternalPlacements)))
 	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
 	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsPage)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsByIDsPath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsByIDs)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
 	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", internalOp(http.HandlerFunc(h.clusterInternalRecoveryGet)))
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, internalOp(http.HandlerFunc(h.clusterInternalSelectPlacement)))
@@ -194,7 +195,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 
 const clusterPeerNodeIDHeader = cluster.PeerNodeIDHeader
 
-func withInternalMTLS(enterpriseMode bool, next http.Handler) http.Handler {
+func withInternalMTLS(d Deps, next http.Handler) http.Handler {
+	enterpriseMode := d.EnterpriseMode
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
 			http.Error(w, "cluster internal endpoint requires mTLS", http.StatusForbidden)
@@ -231,10 +233,41 @@ func withInternalMTLS(enterpriseMode bool, next http.Handler) http.Handler {
 			peerID = headerNodeID
 		}
 		if peerID != "" {
+			if !peerMemberAlive(d, peerID) {
+				cluster.RecordMTLSUnknownPeer()
+				if enterpriseMode {
+					http.Error(w, "cluster peer not in membership", http.StatusForbidden)
+					return
+				}
+			}
 			r = r.WithContext(context.WithValue(r.Context(), clusterPeerNodeIDContextKey{}, peerID))
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// peerMemberAlive reports whether peerID is an Alive gossip member when a
+// cluster client is available. Missing Cluster() skips the check (tests).
+func peerMemberAlive(d Deps, peerID string) bool {
+	if d.Service == nil || peerID == "" {
+		return true
+	}
+	c := d.Service.Cluster()
+	if c == nil {
+		return true
+	}
+	if l, ok := c.(interface {
+		LookupMember(id string) (cluster.Member, bool)
+	}); ok {
+		m, ok := l.LookupMember(peerID)
+		return ok && m.Alive
+	}
+	for _, m := range c.Members() {
+		if m.NodeID == peerID {
+			return m.Alive
+		}
+	}
+	return false
 }
 
 type clusterPeerNodeIDContextKey struct{}

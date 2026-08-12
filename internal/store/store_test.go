@@ -2149,7 +2149,7 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 		Recipients:    []string{"node-a"},
 		SealedPayload: []byte("opaque-ciphertext"),
 	}
-	if err := st.PutClusterSecret(ctx, rec); err != nil {
+	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret: %v", err)
 	}
 	got, err := st.GetClusterSecret(ctx, rec.Ref)
@@ -2211,10 +2211,10 @@ func TestListClusterSecrets(t *testing.T) {
 		Recipients:    []string{"node-a"},
 		SealedPayload: []byte("cipher-b"),
 	}
-	if err := st.PutClusterSecret(ctx, a); err != nil {
+	if _, err := st.PutClusterSecret(ctx, a); err != nil {
 		t.Fatalf("PutClusterSecret a: %v", err)
 	}
-	if err := st.PutClusterSecret(ctx, b); err != nil {
+	if _, err := st.PutClusterSecret(ctx, b); err != nil {
 		t.Fatalf("PutClusterSecret b: %v", err)
 	}
 

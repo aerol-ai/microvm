@@ -29,7 +29,7 @@ type AuditPeerPage struct {
 // AuditPeerFetcher is the narrow seam Service uses for audit fan-out so tests
 // can inject a fake without a full Cluster.
 type AuditPeerFetcher interface {
-	FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error)
+	FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error)
 }
 
 // SandboxMetaFetcher loads OwnerRef from a placement owner for ingress
@@ -45,7 +45,7 @@ type SandboxOwnerMeta struct {
 }
 
 // FetchSandboxAuditFromPeer GETs a peer's local audit slice for sandboxID.
-func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error) {
+func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
 	if c == nil || c.httpClient == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: audit fetch unavailable")
 	}
@@ -53,11 +53,11 @@ func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandbox
 	if err != nil {
 		return AuditPeerPage{}, err
 	}
-	return fetchSandboxAuditFromPeer(ctx, client, c.patToken, c.nodeID, endpoint, sandboxID, limit, cursor, kind)
+	return fetchSandboxAuditFromPeer(ctx, client, c.patToken, c.nodeID, endpoint, sandboxID, limit, cursor, kind, incarnationID)
 }
 
 // FetchSandboxAuditFromPeer GETs a peer's local audit slice (worker agent).
-func (a *Agent) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error) {
+func (a *Agent) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
 	if a == nil || a.httpClient == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: audit fetch unavailable")
 	}
@@ -65,15 +65,15 @@ func (a *Agent) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID
 	if err != nil {
 		return AuditPeerPage{}, err
 	}
-	return fetchSandboxAuditFromPeer(ctx, client, a.patToken, a.nodeID, endpoint, sandboxID, limit, cursor, kind)
+	return fetchSandboxAuditFromPeer(ctx, client, a.patToken, a.nodeID, endpoint, sandboxID, limit, cursor, kind, incarnationID)
 }
 
 // FetchSandboxAuditFromPeer on Noop always fails — single-node mode has no peers.
-func (n *Noop) FetchSandboxAuditFromPeer(context.Context, string, string, int, string, string) (AuditPeerPage, error) {
+func (n *Noop) FetchSandboxAuditFromPeer(context.Context, string, string, int, string, string, string) (AuditPeerPage, error) {
 	return AuditPeerPage{}, fmt.Errorf("cluster: no peer audit fetch in single-node mode")
 }
 
-func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, selfID, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error) {
+func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, selfID, apiURL, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
 	if client == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: nil http client")
 	}
@@ -94,6 +94,9 @@ func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, se
 	}
 	if strings.TrimSpace(kind) != "" {
 		q.Set("kind", strings.TrimSpace(kind))
+	}
+	if strings.TrimSpace(incarnationID) != "" {
+		q.Set("incarnation_id", strings.TrimSpace(incarnationID))
 	}
 	endpoint := base + PublicInternalSandboxAuditPath + url.PathEscape(sandboxID) + "/audit"
 	if enc := q.Encode(); enc != "" {

@@ -658,7 +658,8 @@ func mapKeys(m map[string]struct{}) []string {
 // majority of non-self targets are dead. Recipients are authenticated in
 // envelope AAD (KeyAADBound/PayloadAADBound), so the existing ciphertext cannot
 // be pushed to new nodes — we must Open locally, Raft-update the recipient
-// set, Put a new seal generation, then fan out.
+// set (CAS), Put a new seal generation, then fan out. Owner-only: non-owners
+// skip so concurrent ticks cannot race reseals.
 func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxID string) error {
 	if s == nil || strings.TrimSpace(sandboxID) == "" {
 		return nil
@@ -668,6 +669,18 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 		return nil
 	}
 	selfID := s.selfNodeID()
+	placement, hasPlacement := c.PlacementOf(sandboxID)
+	if hasPlacement {
+		ownerID := strings.TrimSpace(placement.OwnerNodeID)
+		// Owner-only reseal. Control-plane / empty-owner secrets may be
+		// coordinated by the Raft leader instead.
+		if ownerID != "" && ownerID != selfID {
+			return nil
+		}
+		if ownerID == "" && c.Leader() != "" && c.Leader() != selfID {
+			return nil
+		}
+	}
 	alive := s.aliveMemberSet()
 
 	hs := holderSetFor(sandboxID)
@@ -678,7 +691,12 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if !s.majoritySecretTargetsDead(frozen, alive, selfID) {
 		// Fall back to placement recipients when holder memory is empty but
 		// the FSM still lists dead backups.
-		if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
+		if hasPlacement && len(placement.SecretRecipients) > 0 {
+			frozen = append([]string(nil), placement.SecretRecipients...)
+			if !s.majoritySecretTargetsDead(frozen, alive, selfID) {
+				return nil
+			}
+		} else if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
 			frozen = append([]string(nil), p.SecretRecipients...)
 			if !s.majoritySecretTargetsDead(frozen, alive, selfID) {
 				return nil
@@ -706,39 +724,89 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if p == nil || s.store == nil {
 		return fmt.Errorf("cluster secret store is not configured")
 	}
-	placement := c.SecretsOf(sandboxID)
-	if placement.Ref == "" {
+	secretsHandle := c.SecretsOf(sandboxID)
+	if secretsHandle.Ref == "" {
 		rec, err := s.store.GetClusterSecretForSandbox(ctx, sandboxID)
 		if err != nil || rec == nil {
 			return fmt.Errorf("no local sealed secret to reseal")
 		}
-		placement.Ref = rec.Ref
-		placement.Version = rec.Version
+		secretsHandle.Ref = rec.Ref
+		secretsHandle.Version = rec.Version
 	}
-	incarnationID := s.secretIncarnationForSeal(sandboxID)
+	if hasPlacement {
+		if gen <= 0 {
+			gen = placement.SecretSealGeneration
+		}
+		if secretsHandle.IncarnationID == "" {
+			secretsHandle.IncarnationID = placement.IncarnationID
+		}
+	}
+	expectedInc := secretsHandle.IncarnationID
+	if expectedInc == "" {
+		expectedInc = s.secretIncarnationForSeal(sandboxID)
+	}
+	expectedGen := gen
+	if expectedGen <= 0 {
+		if maxGen, maxErr := s.store.MaxClusterSecretSealGeneration(ctx, sandboxID); maxErr == nil {
+			expectedGen = maxGen
+		}
+	}
+
+	previousRecipients := append([]string(nil), sortedFrozen...)
+	previousHandle := secretsHandle
+
+	// Raft-first: publish intended recipients under CAS before resealing so
+	// peers agree on the target set. Ciphertext still uses the old generation
+	// until Put succeeds.
+	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, previousHandle, expectedInc, expectedGen); err != nil {
+		return fmt.Errorf("raft update secret recipients: %w", err)
+	}
+
+	incarnationID := expectedInc
 	openCtx := ctx
 	if incarnationID != "" {
 		openCtx = secrets.ContextWithIncarnationID(ctx, incarnationID)
 	}
-	bag, err := p.Open(openCtx, sandboxID, secrets.Handle{Ref: placement.Ref, Version: placement.Version}, selfID)
+	bag, err := p.Open(openCtx, sandboxID, secrets.Handle{Ref: secretsHandle.Ref, Version: secretsHandle.Version}, selfID)
 	if err != nil {
+		_ = c.UpdatePlacementSecretRecipients(ctx, sandboxID, previousRecipients, previousHandle, expectedInc, expectedGen)
 		return fmt.Errorf("open for reseal: %w", err)
 	}
 	if bag.IsEmpty() {
+		_ = c.UpdatePlacementSecretRecipients(ctx, sandboxID, previousRecipients, previousHandle, expectedInc, expectedGen)
 		return nil
 	}
-	handle, err := p.Put(openCtx, sandboxID, bag, replacements)
+	// Journal remaining peers atomically with the resealed row so a crash
+	// between Put and the post-ACK Upsert cannot drop replication work.
+	resealPeers := nonSelfRecipients(replacements, selfID)
+	putCtx := openCtx
+	if len(resealPeers) > 0 {
+		putCtx = secrets.ContextWithPutOutbox(openCtx, incarnationID, resealPeers)
+	}
+	handle, err := p.Put(putCtx, sandboxID, bag, replacements)
 	if err != nil {
+		// Keep the old blob; revert Raft recipients so the next tick retries
+		// Open/Put against the prior recipient set pretenses.
+		if revErr := c.UpdatePlacementSecretRecipients(ctx, sandboxID, previousRecipients, previousHandle, expectedInc, expectedGen); revErr != nil && s.logger != nil {
+			s.logger.Warn("cluster: reseal put failed and raft recipient revert failed",
+				"sandbox_id", sandboxID, "put_err", err, "revert_err", revErr)
+		}
 		return fmt.Errorf("reseal put: %w", err)
 	}
-	secretsHandle := cluster.PlacementSecrets{
-		Ref:           handle.Ref,
-		Version:       handle.Version,
-		Recipients:    append([]string(nil), replacements...),
-		IncarnationID: incarnationID,
+	newHandle := cluster.PlacementSecrets{
+		Ref:            handle.Ref,
+		Version:        handle.Version,
+		Recipients:     append([]string(nil), replacements...),
+		IncarnationID:  incarnationID,
+		SealGeneration: handle.SealGeneration,
 	}
-	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, secretsHandle); err != nil {
-		return fmt.Errorf("raft update secret recipients: %w", err)
+	if newHandle.SealGeneration <= 0 {
+		if blobRec, loadErr := s.store.GetClusterSecretForSandbox(ctx, sandboxID); loadErr == nil && blobRec != nil {
+			newHandle.SealGeneration = blobRec.SealGeneration
+		}
+	}
+	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, newHandle, expectedInc, expectedGen); err != nil {
+		return fmt.Errorf("raft update secret handle after reseal: %w", err)
 	}
 
 	blobRec, err := s.store.GetClusterSecretForSandbox(ctx, sandboxID)
@@ -747,7 +815,7 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	}
 	newGen := blobRec.SealGeneration
 	if newGen <= 0 {
-		newGen = gen + 1
+		newGen = expectedGen + 1
 	}
 	resetSecretHoldersForGeneration(sandboxID, newGen, selfID)
 	setSecretHolderTargets(sandboxID, newGen, replacements)
@@ -780,11 +848,18 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	}
 	pending := pendingRecipientsAfterAck(replacements, acked, selfID)
 	if len(pending) > 0 {
-		_ = s.store.UpsertSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, newGen, pending)
+		if upErr := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, blob.IncarnationID, pending, newGen); upErr != nil {
+			recordSecretPutOutboxFailure()
+			if s.logger != nil {
+				s.logger.Warn("cluster: reseal put-outbox shrink failed",
+					"sandbox_id", sandboxID, "err", upErr)
+			}
+		}
 		if pushErr != nil {
 			recordSecretFanoutFailure()
-			secretPutOutboxFailuresTotal.Add(1)
 		}
+	} else if delErr := s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, newGen); delErr != nil {
+		recordSecretPutOutboxFailure()
 	}
 	s.enqueueSecretFanout(sandboxID, blob, replacements, pusher)
 	return nil
@@ -817,6 +892,8 @@ func setSecretHolderTargetsUnlocked(hs *holderNodeSet, gen int64, nodeIDs []stri
 
 // ReconcileSecretPutOutbox retries durable create-path peer PUTs left when the
 // in-memory fan-out queue was saturated or an async push partially failed.
+// Work is dispatched through a bounded worker pool mirroring delete reconcile
+// so a large outbox cannot serialize the reconciler for minutes.
 func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
@@ -824,8 +901,8 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	pusher := s.secretPeerPusher()
-	if pusher == nil {
+	defer s.refreshSecretLifecycleMetrics(ctx)
+	if s.secretPeerPusher() == nil {
 		return nil
 	}
 	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
@@ -841,18 +918,52 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 		if len(rows) == 0 {
 			return nil
 		}
-		processed := 0
+		jobs := make(chan string)
+		var wg sync.WaitGroup
+		var processed atomic.Int64
+		workers := min(deleteReconcileWorkers, len(rows))
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for sandboxID := range jobs {
+					if _, loaded := putReconcileInflight.LoadOrStore(sandboxID, struct{}{}); loaded {
+						continue
+					}
+					select {
+					case putReconcileSem <- struct{}{}:
+						s.reconcileSecretPutOutboxOnceContext(sweepCtx, sandboxID)
+						processed.Add(1)
+						<-putReconcileSem
+						putReconcileInflight.Delete(sandboxID)
+					case <-sweepCtx.Done():
+						putReconcileInflight.Delete(sandboxID)
+						return
+					}
+				}
+			}()
+		}
 		for _, rec := range rows {
-			if sweepCtx.Err() != nil {
+			select {
+			case jobs <- rec.SandboxID:
+			case <-sweepCtx.Done():
+				close(jobs)
+				wg.Wait()
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				return nil
 			}
-			s.reconcileSecretPutOutboxOnceContext(sweepCtx, rec.SandboxID)
-			processed++
 		}
-		if processed == 0 || len(rows) < secretDeleteReconcileBatch {
+		close(jobs)
+		wg.Wait()
+		if sweepCtx.Err() != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
+		}
+		if processed.Load() == 0 || len(rows) < secretDeleteReconcileBatch {
 			return nil
 		}
 	}
@@ -913,16 +1024,19 @@ func (s *Service) reconcileSecretPutOutboxOnceContext(parent context.Context, sa
 	}
 	if pushErr != nil {
 		recordSecretFanoutFailure()
-		secretPutOutboxFailuresTotal.Add(1)
+		recordSecretPutOutboxFailure()
 		if s.logger != nil {
 			s.logger.Warn("cluster: secret put-outbox incomplete",
 				"sandbox_id", sandboxID, "acked", len(acked), "err", pushErr)
 		}
 	}
 	pending := pendingRecipientsAfterAck(peers, acked, selfID)
-	if err := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, pending, rec.SealGeneration); err != nil && s.logger != nil {
-		s.logger.Warn("cluster: secret put-outbox recipient update failed",
-			"sandbox_id", sandboxID, "err", err)
+	if err := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, pending, rec.SealGeneration); err != nil {
+		recordSecretPutOutboxFailure()
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret put-outbox recipient update failed",
+				"sandbox_id", sandboxID, "err", err)
+		}
 	}
 }
 
@@ -1013,6 +1127,8 @@ const (
 var (
 	deleteReconcileSem      = make(chan struct{}, deleteReconcileWorkers)
 	deleteReconcileInflight sync.Map // sandboxID -> struct{}
+	putReconcileSem         = make(chan struct{}, deleteReconcileWorkers)
+	putReconcileInflight    sync.Map // sandboxID -> struct{}
 )
 
 func (s *Service) maybeAsyncDeleteFanout(sandboxID string, recipients []string) {

@@ -44,6 +44,10 @@ type PlacementPageRequest struct {
 type PlacementPageResponse struct {
 	Placements    []Placement `json:"placements"`
 	NextPageToken string      `json:"next_page_token,omitempty"`
+	// Authoritative is true when the page was produced by a ready FSM / control
+	// plane. Empty Authoritative pages mean "tenant (or fleet) has zero rows"
+	// — not "placement view unavailable". Agents set this false on CP errors.
+	Authoritative bool `json:"authoritative,omitempty"`
 }
 
 type IngressRouteOwner struct {

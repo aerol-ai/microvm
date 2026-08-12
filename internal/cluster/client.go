@@ -69,6 +69,9 @@ type Cluster struct {
 	// cluster CA + this node's cert. nil when tls is nil — owner forwarding
 	// then falls back to publicProxies + PAT auth.
 	mtlsProxies *proxyCache
+	// peerClients caches per-node mTLS HTTP clients (VerifyPeerCertificate
+	// bound to node:<id>). Invalidated on gossip leave.
+	peerClients peerClientCache
 
 	commitTimeout time.Duration
 
@@ -239,6 +242,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
 		Events:         &voterAutoJoinDelegate{c: c},
+		OnLeave:        c.invalidatePeerClient,
 	}, admitter, logger)
 	if err != nil {
 		if c.internalServer != nil {
@@ -287,6 +291,31 @@ func (c *Cluster) PeerHTTPClients() (public, internal *http.Client) {
 		return nil, nil
 	}
 	return c.httpClient, c.currentInternalClient()
+}
+
+// ClientForPeer returns a cached mTLS HTTP client that verifies DNS SAN
+// node:<nodeID>. Legacy shared-SAN-only peer certs are rejected.
+func (c *Cluster) ClientForPeer(nodeID string) *http.Client {
+	if c == nil {
+		return nil
+	}
+	return c.peerClients.get(c.currentInternalClient(), nodeID, true)
+}
+
+// PeerDialMember selects the peer client/URL using the per-node mTLS cache.
+func (c *Cluster) PeerDialMember(m Member) (*http.Client, string, error) {
+	if c == nil {
+		return PeerDial(m, nil, nil)
+	}
+	return PeerDialCached(m, c.httpClient, c.currentInternalClient(), c.ClientForPeer(m.NodeID), true)
+}
+
+// invalidatePeerClient drops a cached mTLS client after gossip leave.
+func (c *Cluster) invalidatePeerClient(nodeID string) {
+	if c == nil {
+		return
+	}
+	c.peerClients.invalidate(nodeID)
 }
 
 // PeerPAT returns the fleet PAT used for internal peer RPCs and public list fallbacks.
@@ -460,17 +489,21 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 
 // UpdatePlacementSecretRecipients commits a replacement seal recipient set
 // (and optional new provider handle after reseal). Preserves IncarnationID.
-func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets) error {
+// expectedIncarnationID / expectedSealGeneration CAS against the live placement.
+func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
 	recipients = normalizeSecretRecipientIDs(recipients)
 	if strings.TrimSpace(sandboxID) == "" || len(recipients) == 0 {
 		return nil
 	}
 	return c.applyCommand(ctx, command{
-		Op:               opUpdateSecretRecipients,
-		SandboxID:        sandboxID,
-		SecretRecipients: recipients,
-		SecretRef:        secrets.Ref,
-		SecretVersion:    secrets.Version,
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              sandboxID,
+		SecretRecipients:       recipients,
+		SecretRef:              secrets.Ref,
+		SecretVersion:          secrets.Version,
+		SecretSealGeneration:   secrets.SealGeneration,
+		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedSealGeneration: expectedSealGeneration,
 	})
 }
 
@@ -1198,7 +1231,7 @@ func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) erro
 		// fall back to the public path — that would defeat the security
 		// promise. Only ErrNotLeader bubbles up so the caller retries the
 		// new leader.
-		return c.doLeaderApply(ctx, ClientForPeer(internalClient, leader), endpoint, payload)
+		return c.doLeaderApply(ctx, c.ClientForPeer(leader), endpoint, payload)
 	}
 
 	leaderURL := c.LeaderAPIURL()

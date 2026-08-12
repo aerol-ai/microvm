@@ -174,6 +174,11 @@ type Service struct {
 	secretAuditWitnessDone sync.WaitGroup
 	auditIngestMu          sync.Mutex
 	auditIngest            *auditIngestServer
+	auditExportMu          sync.Mutex
+	auditExporter          controlplane.AuditExporter
+	secretAuditExportOnce  sync.Once
+	secretAuditExportStop  chan struct{}
+	secretAuditExportDone  sync.WaitGroup
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
 	// testSandboxMetaFetcher overrides owner-ref probes for ingress audit auth.

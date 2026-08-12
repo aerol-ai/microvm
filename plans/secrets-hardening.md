@@ -1006,5 +1006,7 @@ retraction, and failure when peers are unreachable — §10).
 **UNRESOLVED DECISIONS:**
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - Owners, dates, and per-slice rollback plans
+- Full off-node WORM/SIEM event store (Witness + HTTP export seam ship; reconstructable history still requires configuring export)
 - Unique node-ID-bound peer identity (for example SPIFFE) beyond cluster-CA
   membership across `/v1/cluster/internal/...` — separate work, not this plan
+- Live 2,000-process / 100-ingress soak remains operator-run (`plans/data-plane-load-balancer.md`)

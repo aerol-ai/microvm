@@ -20,7 +20,7 @@ import (
 
 // Worker subprocesses cannot call internal/service.emitEgressAudit. They POST
 // egress events to the daemon's loopback audit ingest
-// (SB_AUDIT_INGEST_PORT / SB_AUDIT_INGEST_TOKEN). Workers never write
+// (SB_AUDIT_INGEST_PORT + per-sandbox capability). Workers never write
 // secrets.jsonl tip. When IPC is unavailable they durable-append to
 // secrets.spill.jsonl for the parent drain path (or count a gap drop).
 
@@ -31,12 +31,15 @@ const (
 	workerEgressQueue      = 1024
 	workerEgressIngestPath = "/internal/audit/egress"
 	workerEgressTokenHdr   = "X-Aerol-Audit-Token"
+	workerEgressCapHdr     = "X-Aerol-Audit-Capability"
 )
 
 type workerEgressAuditEvent = auditlog.Event
 
 type egressAuditJob struct {
-	port, token, spillDir, node, sandboxID, network, address string
+	port, token, capability, spillDir, node    string
+	sandboxID, incarnationID, network, address string
+	eventTime                                  time.Time
 }
 
 var (
@@ -56,6 +59,8 @@ func installDefaultEgressObserver(m *NetMediator) {
 	}
 	port := strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_PORT"))
 	token := strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN"))
+	capability := strings.TrimSpace(os.Getenv("SB_AUDIT_CAPABILITY"))
+	incarnation := strings.TrimSpace(os.Getenv("SB_INCARNATION_ID"))
 	spillDir := workerEgressSpillDir()
 	if port == "" && spillDir == "" {
 		return
@@ -63,9 +68,20 @@ func installDefaultEgressObserver(m *NetMediator) {
 	node := strings.TrimSpace(os.Getenv("SB_NODE_ID"))
 	ensureWorkerEgressPool()
 	m.SetEgressObserver(func(sandboxID, network, address string) {
+		cap := capability
+		inc := incarnation
+		if cap == "" && token != "" {
+			// Mint a short-lived capability bound to this sandbox so ingest
+			// resolves incarnation from the token (not live placement).
+			minted, err := auditlog.MintEgressCapability(token, sandboxID, inc, time.Now().UTC().Add(time.Hour))
+			if err == nil {
+				cap = minted
+			}
+		}
 		job := egressAuditJob{
-			port: port, token: token, spillDir: spillDir, node: node,
-			sandboxID: sandboxID, network: network, address: address,
+			port: port, token: token, capability: cap, spillDir: spillDir, node: node,
+			sandboxID: sandboxID, incarnationID: inc, network: network, address: address,
+			eventTime: time.Now().UTC(),
 		}
 		select {
 		case workerEgressCh <- job:
@@ -73,7 +89,7 @@ func installDefaultEgressObserver(m *NetMediator) {
 			workerEgressDropped.Add(1)
 			slog.Warn("wasm egress audit queue full; writing gap marker",
 				"sandbox_id", sandboxID, "destination", address, "dropped_total", workerEgressDropped.Load())
-			appendWorkerEgressGap(spillDir, node, sandboxID)
+			appendWorkerEgressGap(spillDir, node, sandboxID, inc)
 		}
 	})
 }
@@ -105,8 +121,11 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 	if sandboxID == "" || address == "" {
 		return
 	}
-	if job.port != "" && job.token != "" {
-		if err := postWorkerEgressAudit(job.port, job.token, job.node, sandboxID, job.network, address); err == nil {
+	if job.eventTime.IsZero() {
+		job.eventTime = time.Now().UTC()
+	}
+	if job.port != "" && (job.capability != "" || job.token != "") {
+		if err := postWorkerEgressAudit(job); err == nil {
 			return
 		}
 		workerEgressIPCFail.Add(1)
@@ -114,39 +133,47 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 	// IPC unavailable — durable spill for parent import; never touch secrets.jsonl tip.
 	if job.spillDir != "" {
 		appendWorkerEgressSpill(job.spillDir, workerEgressAuditEvent{
-			Time:        time.Now().UTC(),
-			Actor:       job.node,
-			SandboxID:   sandboxID,
-			Result:      "success",
-			Reason:      "ok",
-			NodeID:      job.node,
-			Kind:        "egress",
-			Destination: address,
-			Network:     strings.TrimSpace(job.network),
+			Time:          job.eventTime,
+			Actor:         job.node,
+			SandboxID:     sandboxID,
+			Result:        "success",
+			Reason:        "ok",
+			NodeID:        job.node,
+			Kind:          "egress",
+			Destination:   address,
+			Network:       strings.TrimSpace(job.network),
+			IncarnationID: strings.TrimSpace(job.incarnationID),
 		})
 		return
 	}
 	workerEgressDropped.Add(1)
 }
 
-func postWorkerEgressAudit(port, token, node, sandboxID, network, address string) error {
-	body, err := json.Marshal(map[string]string{
-		"sandbox_id":  sandboxID,
-		"network":     strings.TrimSpace(network),
-		"destination": address,
-		"node_id":     node,
-		"kind":        "egress",
+func postWorkerEgressAudit(job egressAuditJob) error {
+	body, err := json.Marshal(map[string]any{
+		"sandbox_id":     job.sandboxID,
+		"network":        strings.TrimSpace(job.network),
+		"destination":    job.address,
+		"kind":           "egress",
+		"capability":     job.capability,
+		"incarnation_id": job.incarnationID,
+		"event_time":     job.eventTime.UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
 		return err
 	}
-	url := "http://127.0.0.1:" + port + workerEgressIngestPath
+	url := "http://127.0.0.1:" + job.port + workerEgressIngestPath
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(workerEgressTokenHdr, token)
+	if job.capability != "" {
+		req.Header.Set(workerEgressCapHdr, job.capability)
+	}
+	if job.token != "" {
+		req.Header.Set(workerEgressTokenHdr, job.token)
+	}
 	resp, err := workerEgressHTTP.Do(req)
 	if err != nil {
 		return err
@@ -164,19 +191,20 @@ func (e statusError) Error() string { return "audit ingest status " + strconv.It
 
 func errStatus(code int) error { return statusError(code) }
 
-func appendWorkerEgressGap(spillDir, node, sandboxID string) {
+func appendWorkerEgressGap(spillDir, node, sandboxID, incarnationID string) {
 	if spillDir == "" {
 		workerEgressDropped.Add(1)
 		return
 	}
 	appendWorkerEgressSpill(spillDir, workerEgressAuditEvent{
-		Time:      time.Now().UTC(),
-		Actor:     node,
-		SandboxID: strings.TrimSpace(sandboxID),
-		Result:    "gap",
-		Reason:    "overflow",
-		NodeID:    node,
-		Kind:      "gap",
+		Time:          time.Now().UTC(),
+		Actor:         node,
+		SandboxID:     strings.TrimSpace(sandboxID),
+		Result:        "gap",
+		Reason:        "overflow",
+		NodeID:        node,
+		Kind:          "gap",
+		IncarnationID: strings.TrimSpace(incarnationID),
 	})
 }
 

@@ -98,6 +98,11 @@ var ErrCreateBackpressure = errors.New("cluster: create backpressure")
 // completed sandbox or a router with a stale view.
 var ErrReservationConflict = errors.New("cluster: sandbox already placed or reserved")
 
+// ErrSecretRecipientsCASMismatch is returned when opUpdateSecretRecipients
+// carries expected incarnation / seal-generation pretenses that no longer
+// match the live placement (stale reseal loser).
+var ErrSecretRecipientsCASMismatch = errors.New("cluster: secret recipients CAS mismatch")
+
 // ErrNoPlacementTarget is returned when no alive worker-capable node can
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
@@ -194,6 +199,9 @@ type PlacementSecrets struct {
 	// IncarnationID tags this placement lifetime for secret binding. Minted
 	// at reserve; preserved across reassign. Additive omitempty.
 	IncarnationID string `json:"incarnation_id,omitempty"`
+	// SealGeneration is the seal generation last coordinated via Raft
+	// (reseal / recipient expansion). Additive omitempty — 0 on pre-field rows.
+	SealGeneration int64 `json:"seal_generation,omitempty"`
 }
 
 func (s PlacementSecrets) hasUpdate() bool {
@@ -206,11 +214,12 @@ func secretsFromPlacement(p Placement) PlacementSecrets {
 		recipients = append([]string(nil), p.SecretRecipients...)
 	}
 	return PlacementSecrets{
-		Ref:           p.SecretRef,
-		Version:       p.SecretVersion,
-		Recipients:    recipients,
-		OwnerRef:      p.OwnerRef,
-		IncarnationID: p.IncarnationID,
+		Ref:            p.SecretRef,
+		Version:        p.SecretVersion,
+		Recipients:     recipients,
+		OwnerRef:       p.OwnerRef,
+		IncarnationID:  p.IncarnationID,
+		SealGeneration: p.SecretSealGeneration,
 	}
 }
 
@@ -274,6 +283,9 @@ type Placement struct {
 	// seal bindings. Minted at reserve; preserved on reassign/promote.
 	// Additive omitempty — empty on pre-incarnation Raft rows.
 	IncarnationID string `json:"incarnation_id,omitempty"`
+	// SecretSealGeneration is the last Raft-coordinated seal generation for
+	// this placement (reseal CAS). Additive omitempty — 0 until first coordinated update.
+	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
 	// OwnerRef is the control-plane tenant account (tenancy). Distinct from
 	// OwnerNodeID (which cluster node hosts the sandbox).
 	OwnerRef string `json:"owner_ref,omitempty"`
@@ -523,10 +535,10 @@ type Client interface {
 
 	// UpdatePlacementSecretRecipients replaces Placement.SecretRecipients
 	// (and optionally the seal handle after a reseal) without touching
-	// ownership or IncarnationID. Used when a majority of frozen seal
-	// targets are dead and live replacements must be coordinated via Raft
-	// before recipient-bound AAD reseal fan-out.
-	UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets) error
+	// ownership or IncarnationID. expectedIncarnationID / expectedSealGeneration
+	// are CAS pretenses: when set and the live placement differs, the FSM
+	// rejects with ErrSecretRecipientsCASMismatch.
+	UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error
 
 	// SpecOf returns the most-recently-replicated CreateSandboxRequest for
 	// sandboxID, or nil if no spec is recorded (pre-cluster sandbox, or no

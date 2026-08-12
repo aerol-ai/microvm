@@ -424,6 +424,65 @@ func TestFSMUpdateSecretRecipientsPreservesIncarnation(t *testing.T) {
 	}
 }
 
+func TestFSMUpdateSecretRecipientsCASRejectsStaleGeneration(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-cas", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
+		Spec:             &models.CreateSandboxRequest{Image: "alpine"},
+		SecretRecipients: []string{"n1", "dead-a", "dead-b"},
+		IncarnationID:    "inc-a",
+		SecretRef:        "cluster-secret://sandbox/sb-cas/v1",
+		SecretVersion:    1,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 1, Data: place}); res != nil {
+		t.Fatalf("opPlace: %v", res)
+	}
+	seedGen, _ := encodeCommand(command{
+		Op:                   opUpdateSecretRecipients,
+		SandboxID:            "sb-cas",
+		SecretRecipients:     []string{"n1", "dead-a", "dead-b"},
+		SecretSealGeneration: 5,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 2, Data: seedGen}); res != nil {
+		t.Fatalf("seed gen: %v", res)
+	}
+	stale, _ := encodeCommand(command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              "sb-cas",
+		SecretRecipients:       []string{"n1", "live-b", "live-c"},
+		ExpectedIncarnationID:  "inc-a",
+		ExpectedSealGeneration: 4,
+		SecretSealGeneration:   6,
+	})
+	res := fsm.Apply(&raft.Log{Index: 3, Data: stale})
+	err, ok := res.(error)
+	if !ok || !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+		t.Fatalf("stale CAS = %v (%T), want ErrSecretRecipientsCASMismatch", res, res)
+	}
+	got, _ := fsm.get("sb-cas")
+	if got.SecretSealGeneration != 5 || got.SecretRecipients[1] != "dead-a" {
+		t.Fatalf("stale CAS mutated placement: gen=%d recipients=%v", got.SecretSealGeneration, got.SecretRecipients)
+	}
+
+	okCmd, _ := encodeCommand(command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              "sb-cas",
+		SecretRecipients:       []string{"n1", "live-b", "live-c"},
+		ExpectedIncarnationID:  "inc-a",
+		ExpectedSealGeneration: 5,
+		SecretSealGeneration:   6,
+		SecretRef:              "cluster-secret://sandbox/sb-cas/v1",
+		SecretVersion:          1,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 4, Data: okCmd}); res != nil {
+		t.Fatalf("matching CAS: %v", res)
+	}
+	got, _ = fsm.get("sb-cas")
+	if got.SecretSealGeneration != 6 || got.SecretRecipients[1] != "live-b" {
+		t.Fatalf("after CAS gen=%d recipients=%v", got.SecretSealGeneration, got.SecretRecipients)
+	}
+}
+
 func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
 	fsm := newPlacementFSM()
 	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
