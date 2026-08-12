@@ -16,7 +16,7 @@ func TestSandboxAuditACLAtomicCreateAndRetentionPrune(t *testing.T) {
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, sb.ID); err != nil || got != "tenant-a" {
+	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, sb.ID, ""); err != nil || got != "tenant-a" {
 		t.Fatalf("atomic create ACL=%q err=%v", got, err)
 	}
 
@@ -33,7 +33,7 @@ func TestSandboxAuditACLAtomicCreateAndRetentionPrune(t *testing.T) {
 	if n, err := st.PruneSandboxAuditACL(ctx, now.Add(-24*time.Hour)); err != nil || n != 1 {
 		t.Fatalf("deleted ACL prune=%d err=%v, want 1", n, err)
 	}
-	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, sb.ID); err != nil || got != "" {
+	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, sb.ID, ""); err != nil || got != "" {
 		t.Fatalf("ACL after retention prune=%q err=%v", got, err)
 	}
 
@@ -43,8 +43,22 @@ func TestSandboxAuditACLAtomicCreateAndRetentionPrune(t *testing.T) {
 	if err := st.CreateWithSealedEnv(ctx, sealed, []byte("sealed-env")); err != nil {
 		t.Fatalf("CreateWithSealedEnv: %v", err)
 	}
-	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, sealed.ID); err != nil || got != "tenant-b" {
+	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, sealed.ID, ""); err != nil || got != "tenant-b" {
 		t.Fatalf("sealed create ACL=%q err=%v", got, err)
+	}
+
+	// Distinct incarnations coexist under the compound PK.
+	if err := st.UpsertSandboxAuditACL(ctx, "sb-inc", "tenant-c", "inc-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSandboxAuditACL(ctx, "sb-inc", "tenant-d", "inc-b"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, "sb-inc", "inc-a"); err != nil || got != "tenant-c" {
+		t.Fatalf("inc-a ACL=%q err=%v", got, err)
+	}
+	if got, err := st.GetSandboxAuditACLOwnerRef(ctx, "sb-inc", "inc-b"); err != nil || got != "tenant-d" {
+		t.Fatalf("inc-b ACL=%q err=%v", got, err)
 	}
 }
 

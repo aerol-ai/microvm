@@ -256,13 +256,14 @@ func (c *Client) List(ctx context.Context, tags map[string]string) ([]*Sandbox, 
 	return c.ListWithOptions(ctx, tags, false)
 }
 
-const maxClusterListPages = 1000
+const maxClusterListPages = 100000
 
 // ListWithOptions lists sandboxes; includeEnv appends ?include_env=true.
 // In cluster mode the daemon pages via X-Cluster-List-Next-Page-Token; this
-// drains pages until empty (capped at maxClusterListPages). Partial coverage
-// or an unready placement view is returned as an error rather than a silent
-// incomplete list.
+// drains pages until the next token is empty. maxClusterListPages is a safety
+// cap (enough for 100k sandboxes at page size 1, or far more at default 100).
+// Partial coverage or an unready placement view is returned as an error rather
+// than a silent incomplete list.
 func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
 	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
 	var items []*Sandbox

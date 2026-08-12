@@ -75,6 +75,9 @@ func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.C
 func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
+func (n *Noop) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets) error {
+	return nil
+}
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
 func (n *Noop) SecretsOf(sandboxID string) PlacementSecrets          { return PlacementSecrets{} }
 func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error {
@@ -367,6 +370,11 @@ func (n *Noop) PlacementPage(PlacementPageRequest) PlacementPageResponse {
 // PlacementOf has no record in single-node mode — there's no FSM. Returns
 // the zero Placement and false so callers fall back to the local sandbox row.
 func (n *Noop) PlacementOf(sandboxID string) (Placement, bool) { return Placement{}, false }
+
+// PlacementsByIDs is empty in single-node mode (no FSM).
+func (n *Noop) PlacementsByIDs(ids []string) map[string]Placement {
+	return map[string]Placement{}
+}
 
 // PlacementVersion always returns 0 in single-node mode — there's no FSM and
 // no need to wake an ingress reconciler that isn't running.

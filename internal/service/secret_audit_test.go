@@ -54,9 +54,9 @@ func TestSandboxIDFromSecretRef(t *testing.T) {
 }
 
 func TestEmitSecretAuditNilSinkNoPanic(t *testing.T) {
-	emitSecretAudit(nil, "sb", "ref", "node-a", "", nil)
+	emitSecretAudit(nil, "sb", "ref", "node-a", "", "", nil)
 	var sink SecretAuditSink
-	emitSecretAudit(sink, "sb", "ref", "node-a", "", secrets.ErrNotFound)
+	emitSecretAudit(sink, "sb", "ref", "node-a", "", "", secrets.ErrNotFound)
 	beginSecretAudit(nil, "sb", "ref", "node-a", "")(nil)
 }
 
@@ -323,6 +323,72 @@ func TestFileAuditSinkEmitAsyncWhenWriterBlocked(t *testing.T) {
 	}
 	close(block)
 	sink.Sync()
+}
+
+func TestFileAuditSinkEnterpriseSpillDrainAndMalformedGap(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newFileAuditSinkOpts(dir, 1, true)
+	if err != nil {
+		t.Fatalf("newFileAuditSinkOpts: %v", err)
+	}
+	t.Cleanup(sink.Close)
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+	var startOnce sync.Once
+	sink.writeHook = func() {
+		startOnce.Do(func() { close(started) })
+		<-block
+	}
+
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "a"})
+	<-started
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "b"}) // fills buffer
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "c"}) // spill
+	// Inject a malformed spill line ahead of a valid one while writer is blocked.
+	if err := os.WriteFile(sink.spillPath, append([]byte("{not-json}\n"), mustRead(t, sink.spillPath)...), 0o600); err != nil {
+		t.Fatalf("inject malformed: %v", err)
+	}
+	close(block)
+	sink.Sync()
+
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawGap, sawC bool
+	for _, line := range nonEmptyLines(string(raw)) {
+		var ev SecretAuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if ev.Kind == secretAuditKindGap {
+			sawGap = true
+		}
+		if ev.Ref == "c" {
+			sawC = true
+		}
+	}
+	if !sawGap || !sawC {
+		t.Fatalf("expected gap+spilled event in jsonl, got:\n%s", raw)
+	}
+	if _, err := os.Stat(sink.spillPath); !os.IsNotExist(err) {
+		if b, _ := os.ReadFile(sink.spillPath); len(strings.TrimSpace(string(b))) != 0 {
+			t.Fatalf("spill should be drained, got %q", b)
+		}
+	}
+	if _, _, err := RecomputeChainHead(sink.path); err != nil {
+		t.Fatalf("chain after spill drain: %v", err)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func nonEmptyLines(s string) []string {

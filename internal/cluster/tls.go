@@ -5,10 +5,27 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// PeerNodeIDHeader is set by production peer callers so the receiver can bind
+// the mTLS leaf to the claimed gossip node id.
+const PeerNodeIDHeader = "X-Cluster-Peer-Node-ID"
+
+// SetPeerNodeIDHeader attaches this node's id for inbound withInternalMTLS checks.
+func SetPeerNodeIDHeader(req *http.Request, selfNodeID string) {
+	if req == nil {
+		return
+	}
+	selfNodeID = strings.TrimSpace(selfNodeID)
+	if selfNodeID == "" {
+		return
+	}
+	req.Header.Set(PeerNodeIDHeader, selfNodeID)
+}
 
 // TLS material lives on disk under SB_CLUSTER_TLS_DIR with these names.
 // cluster-init.sh produces the CA + this node's cert; cluster-join.sh signs a
@@ -16,7 +33,7 @@ import (
 // it loads them at boot and keeps them in memory.
 const (
 	tlsCAFile       = "ca.crt"
-	tlsCAKeyFile    = "ca.key" // present only on bootstrap node + joiners that received the bundle; not required at runtime
+	tlsCAKeyFile    = "ca.key" // seed-only; joiners never receive ca.key (cluster-sign-node.sh)
 	tlsNodeCertFile = "node.crt"
 	tlsNodeKeyFile  = "node.key"
 )
@@ -203,7 +220,57 @@ func (t *ClusterTLS) clientConfig() *tls.Config {
 		MinVersion:   tls.VersionTLS12,
 		// Decouple cert verification from network address: every node cert
 		// carries the same fixed SAN (clusterServerName), so dialing by IP or
-		// hostname both verify against that one name.
+		// hostname both verify against that one name. Per-peer node:<id>
+		// binding is added by ClientForPeer when dialing a known member.
 		ServerName: clusterServerName,
+	}
+}
+
+// ClientForPeer returns an HTTP client that verifies the dialed peer presents
+// DNS SAN node:<expectedNodeID> (in addition to the shared clusterServerName
+// hostname check). Legacy aerolvm-cluster-node-only certs are soft-compat:
+// allowed with a metric bump. Empty expected or a non-TLS base is a no-op.
+func ClientForPeer(base *http.Client, expectedNodeID string) *http.Client {
+	expectedNodeID = strings.TrimSpace(expectedNodeID)
+	if base == nil || expectedNodeID == "" {
+		return base
+	}
+	tr, ok := base.Transport.(*http.Transport)
+	if !ok || tr == nil || tr.TLSClientConfig == nil {
+		return base
+	}
+	tlsCfg := tr.TLSClientConfig.Clone()
+	parent := tlsCfg.VerifyPeerCertificate
+	want := expectedNodeID
+	tlsCfg.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		if parent != nil {
+			if err := parent(rawCerts, verifiedChains); err != nil {
+				return err
+			}
+		}
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("cluster tls: missing peer certificate")
+		}
+		cert, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("cluster tls: parse peer certificate: %w", err)
+		}
+		if VerifyPeerNodeID(cert, want) {
+			return nil
+		}
+		_, legacyOnly := ExtractPeerNodeID(cert)
+		if legacyOnly {
+			RecordMTLSLegacyIdentity()
+			return nil
+		}
+		return fmt.Errorf("cluster tls: peer node id mismatch: want node:%s", want)
+	}
+	cloned := tr.Clone()
+	cloned.TLSClientConfig = tlsCfg
+	return &http.Client{
+		Transport:     cloned,
+		CheckRedirect: base.CheckRedirect,
+		Jar:           base.Jar,
+		Timeout:       base.Timeout,
 	}
 }

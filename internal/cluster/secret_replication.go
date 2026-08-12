@@ -96,24 +96,39 @@ func pushSecretBlobToPeersLookup(ctx context.Context, lookup func(string) (Membe
 	}
 	var acked []string
 	var firstErr error
+	expected := 0
 	for _, id := range recipients {
 		id = strings.TrimSpace(id)
 		if id == "" || id == selfID {
 			continue
 		}
+		expected++
 		m, ok := lookup(id)
 		if !ok || !m.Alive {
+			// Mirror delete-path pending semantics: dead/missing peers are
+			// incomplete, never silent success. Callers must keep put-outbox.
+			if firstErr == nil {
+				if !ok {
+					firstErr = fmt.Errorf("fanout secret to %s: recipient unknown", id)
+				} else {
+					firstErr = fmt.Errorf("fanout secret to %s: recipient not alive", id)
+				}
+			}
 			continue
 		}
 		client, endpoint, dialErr := PeerDialPath(m, publicClient, internalClient, PublicInternalSecretPath)
 		if dialErr != nil || client == nil || endpoint == "" {
-			if firstErr == nil && dialErr != nil {
-				firstErr = fmt.Errorf("fanout secret to %s: %w", id, dialErr)
+			if firstErr == nil {
+				if dialErr != nil {
+					firstErr = fmt.Errorf("fanout secret to %s: %w", id, dialErr)
+				} else {
+					firstErr = fmt.Errorf("fanout secret to %s: no dial path", id)
+				}
 			}
 			continue
 		}
 		if err := withSecretFanoutBackoff(ctx, func() error {
-			return postSecretBlob(ctx, client, endpoint, pat, body)
+			return postSecretBlob(ctx, client, endpoint, pat, selfID, body)
 		}); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("fanout secret to %s: %w", m.NodeID, err)
@@ -121,6 +136,9 @@ func pushSecretBlobToPeersLookup(ctx context.Context, lookup func(string) (Membe
 			continue
 		}
 		acked = append(acked, m.NodeID)
+	}
+	if len(acked) < expected && firstErr == nil {
+		firstErr = fmt.Errorf("cluster: secret fan-out incomplete: acked %d/%d", len(acked), expected)
 	}
 	return acked, firstErr
 }
@@ -172,7 +190,7 @@ func deleteSecretOnPeersLookup(ctx context.Context, lookup func(string) (Member,
 		}
 		endpoint += "?generation=" + strconv.FormatInt(generation, 10)
 		if delErr := withSecretFanoutBackoff(ctx, func() error {
-			return deleteSecretBlob(ctx, client, endpoint, pat)
+			return deleteSecretBlob(ctx, client, endpoint, pat, selfID)
 		}); delErr != nil {
 			pending = append(pending, id)
 			if firstErr == nil {
@@ -230,7 +248,7 @@ func probeSecretOnPeersLookup(ctx context.Context, lookup func(string) (Member, 
 			continue
 		}
 		endpoint += "?min_generation=" + strconv.FormatInt(minGeneration, 10)
-		okHold, err := headSecretBlob(ctx, client, endpoint, pat)
+		okHold, err := headSecretBlob(ctx, client, endpoint, pat, selfID)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("probe secret on %s: %w", id, err)
@@ -257,11 +275,12 @@ func probeSecretOnPeersWithInternal(ctx context.Context, members []Member, publi
 	}, publicClient, internalClient, pat, selfID, sandboxID, recipients, minGeneration)
 }
 
-func headSecretBlob(ctx context.Context, client *http.Client, endpoint, pat string) (bool, error) {
+func headSecretBlob(ctx context.Context, client *http.Client, endpoint, pat, selfID string) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
 	if err != nil {
 		return false, err
 	}
+	SetPeerNodeIDHeader(req, selfID)
 	if pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}
@@ -307,12 +326,13 @@ func withSecretFanoutBackoff(ctx context.Context, fn func() error) error {
 	return last
 }
 
-func postSecretBlob(ctx context.Context, client *http.Client, endpoint, pat string, body []byte) error {
+func postSecretBlob(ctx context.Context, client *http.Client, endpoint, pat, selfID string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	SetPeerNodeIDHeader(req, selfID)
 	if pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}
@@ -328,11 +348,12 @@ func postSecretBlob(ctx context.Context, client *http.Client, endpoint, pat stri
 	return nil
 }
 
-func deleteSecretBlob(ctx context.Context, client *http.Client, endpoint, pat string) error {
+func deleteSecretBlob(ctx context.Context, client *http.Client, endpoint, pat, selfID string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
 		return err
 	}
+	SetPeerNodeIDHeader(req, selfID)
 	if pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}

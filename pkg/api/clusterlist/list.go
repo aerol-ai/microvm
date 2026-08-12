@@ -81,10 +81,16 @@ type Options struct {
 	ForwardedHeaderValue string
 	Local                []*models.Sandbox
 	Transport            Transport
+	// SelfNodeID is stamped on X-Cluster-Peer-Node-ID for inbound mTLS binding.
+	SelfNodeID string
 	// Limit/PageToken drive PlacementPage-backed peer selection.
 	Limit     int
 	PageToken string
-	Warn      func(msg string, peer string, err error)
+	// WantIDs, when non-empty, drops peer/local rows whose ID is not on the
+	// current placement page. Peers return their full local lists; the ingress
+	// must filter to the page set so a page does not leak off-page sandboxes.
+	WantIDs map[string]struct{}
+	Warn    func(msg string, peer string, err error)
 }
 
 // PeerDialer is implemented by cluster.Cluster / cluster.Agent.
@@ -239,16 +245,34 @@ func SelectPeers(c cluster.Client, ownerRef string) []cluster.Member {
 	return peers
 }
 
-// FilterLocalToPage keeps local rows that appear on the current placement page.
-// When placements is nil (small-cluster cold start), all local rows are kept.
-func FilterLocalToPage(local []*models.Sandbox, placements []cluster.Placement) []*models.Sandbox {
+// PlacementWantIDs builds the WantIDs set for Merge/MergeJSON from a placement
+// page. Returns nil when placements is empty (caller should not filter).
+func PlacementWantIDs(placements []cluster.Placement) map[string]struct{} {
 	if len(placements) == 0 {
-		return local
+		return nil
 	}
 	want := make(map[string]struct{}, len(placements))
 	for _, p := range placements {
-		want[p.SandboxID] = struct{}{}
+		if id := strings.TrimSpace(p.SandboxID); id != "" {
+			want[id] = struct{}{}
+		}
 	}
+	return want
+}
+
+// FilterLocalToPage keeps local rows that appear on the current placement page.
+// When placements is empty AND pageToken=="" (true cold start / small fleet),
+// all local rows are kept. When placements is empty BUT pageToken != ""
+// (terminal empty page after an exact limit boundary), returns an empty slice
+// — never the full local set.
+func FilterLocalToPage(local []*models.Sandbox, placements []cluster.Placement, pageToken string) []*models.Sandbox {
+	if len(placements) == 0 {
+		if strings.TrimSpace(pageToken) != "" {
+			return nil
+		}
+		return local
+	}
+	want := PlacementWantIDs(placements)
 	out := make([]*models.Sandbox, 0, len(local))
 	for _, sb := range local {
 		if sb == nil {
@@ -273,6 +297,9 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 	seen := make(map[string]struct{}, len(opts.Local))
 	for _, sb := range opts.Local {
 		if sb == nil {
+			continue
+		}
+		if !wantIDOK(opts.WantIDs, sb.ID) {
 			continue
 		}
 		seen[sb.ID] = struct{}{}
@@ -303,18 +330,28 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 	if fwdVal == "" {
 		fwdVal = "1"
 	}
+	// Acquire the semaphore before spawning so we never create unbounded
+	// goroutines under a large owner fan-out.
 	sem := make(chan struct{}, MaxConcurrentPeerReads)
+	started := 0
 	for _, peer := range peers {
 		peer := peer
+		select {
+		case sem <- struct{}{}:
+		case <-mergeCtx.Done():
+			results <- peerResult{nodeID: peer.NodeID, err: mergeCtx.Err()}
+			started++
+			continue
+		}
+		started++
 		go func() {
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			sbs, err := fetchPeerSandboxes(mergeCtx, peer, path, fwdName, fwdVal, opts)
 			results <- peerResult{nodeID: peer.NodeID, sandboxes: sbs, err: err}
 		}()
 	}
 
-	for i := 0; i < len(peers); i++ {
+	for i := 0; i < started; i++ {
 		pr := <-results
 		if pr.err != nil {
 			res.Coverage.Missing = append(res.Coverage.Missing, pr.nodeID)
@@ -327,6 +364,9 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 		res.Coverage.Answered = append(res.Coverage.Answered, pr.nodeID)
 		for _, sb := range pr.sandboxes {
 			if sb == nil {
+				continue
+			}
+			if !wantIDOK(opts.WantIDs, sb.ID) {
 				continue
 			}
 			if _, dup := seen[sb.ID]; dup {
@@ -345,14 +385,19 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 // MergeJSON merges peer JSON arrays (facade list shapes) with the same transport rules.
 func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, idFn func(T) string, opts Options) (items []T, cov Coverage) {
 	cov = Coverage{Answered: []string{"local"}, PlacementViewReady: true}
-	items = append(items, local...)
 	seen := make(map[string]struct{}, len(local))
 	for _, it := range local {
+		id := ""
 		if idFn != nil {
-			if id := idFn(it); id != "" {
-				seen[id] = struct{}{}
-			}
+			id = idFn(it)
 		}
+		if id != "" && !wantIDOK(opts.WantIDs, id) {
+			continue
+		}
+		if id != "" {
+			seen[id] = struct{}{}
+		}
+		items = append(items, it)
 	}
 	if len(peers) == 0 {
 		return items, cov
@@ -375,10 +420,18 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 		fwdVal = "1"
 	}
 	sem := make(chan struct{}, MaxConcurrentPeerReads)
+	started := 0
 	for _, peer := range peers {
 		peer := peer
+		select {
+		case sem <- struct{}{}:
+		case <-mergeCtx.Done():
+			results <- peerResult{nodeID: peer.NodeID, err: mergeCtx.Err()}
+			started++
+			continue
+		}
+		started++
 		go func() {
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			raw, err := fetchPeerJSON(mergeCtx, peer, path, fwdName, fwdVal, opts)
 			if err != nil {
@@ -393,7 +446,7 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 			results <- peerResult{nodeID: peer.NodeID, items: decoded}
 		}()
 	}
-	for i := 0; i < len(peers); i++ {
+	for i := 0; i < started; i++ {
 		pr := <-results
 		if pr.err != nil {
 			cov.Missing = append(cov.Missing, pr.nodeID)
@@ -408,6 +461,9 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 			if idFn != nil {
 				id := idFn(it)
 				if id != "" {
+					if !wantIDOK(opts.WantIDs, id) {
+						continue
+					}
 					if _, dup := seen[id]; dup {
 						continue
 					}
@@ -421,6 +477,14 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 		cov.Partial = true
 	}
 	return items, cov
+}
+
+func wantIDOK(want map[string]struct{}, id string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	_, ok := want[id]
+	return ok
 }
 
 // StripFacadePagination removes facade-specific pagination keys from a query
@@ -492,14 +556,21 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 	if ref := strings.TrimSpace(opts.OwnerRef); ref != "" {
 		req.Header.Set(OwnerRefHeader, ref)
 	}
+	cluster.SetPeerNodeIDHeader(req, opts.SelfNodeID)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	// Read one byte past the cap so a truncated 8MiB body is distinguishable
+	// from a complete response that happens to be exactly 8MiB.
+	const maxPeerBody = 8 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPeerBody+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxPeerBody {
+		return nil, errors.New("peer list response exceeds 8MiB limit")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, errors.New(strings.TrimSpace(string(body)))

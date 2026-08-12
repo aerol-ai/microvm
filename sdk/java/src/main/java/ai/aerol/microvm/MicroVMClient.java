@@ -227,7 +227,8 @@ public class MicroVMClient {
         String basePath = versioned("/sandboxes") + buildSandboxQuery(tags, includeEnv);
         java.util.ArrayList<Sandbox> items = new java.util.ArrayList<>();
         String pageToken = "";
-        for (int page = 0; page < 1000; page++) {
+        // Safety cap for cluster page drain (enough for 100k @ page size 1).
+        for (int page = 0; page < 100_000; page++) {
             String path = appendQueryParam(basePath, "page_token", pageToken);
             HttpResponse<byte[]> httpResponse = sendJsonRequest("GET", path, null);
             ensureSuccess(httpResponse);

@@ -58,8 +58,8 @@ One set of cluster-wide secrets, distributed once on first install:
 |---|---|
 | `SB_PAT_TOKEN` | API auth. Cluster-internal forwarding rides this when mTLS is off. |
 | `SB_GOSSIP_SECRET_KEY` | AES-encrypts gossip payloads; gates raft voter auto-promotion. |
-| Cluster TLS bundle (`ca.crt` + `ca.key`) | Cluster-internal mTLS. Joiners mint a per-node cert from the CA. |
-| `SB_CREDENTIAL_ENCRYPTION_KEY` | Decrypts sealed registry passwords + per-mount creds replicated via raft. **Required for failover to work for sandboxes that use these.** |
+| Cluster TLS trust (`ca.crt`) | Cluster-internal mTLS trust anchor. `ca.key` stays on the seed; joiners generate CSR and get `node.crt` via `cluster-sign-node.sh`. |
+| Credential bundle (`credential_encryption.key`) | Decrypts sealed registry passwords + per-mount creds. Ships separately from the CA trust tarball. |
 
 ---
 

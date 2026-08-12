@@ -68,21 +68,23 @@ Options:
                                 leader-forwarded raft applies). Default: 0.0.0.0:7002
   --internal-advertise <url>    HTTPS URL peers dial for the internal channel.
                                 Default: derived from primary IP + internal-bind port.
-  --tls-bundle-out <path>       Where to save the TLS bundle (tarball with CA +
-                                CA key + credential encryption key) for
-                                distribution to joining nodes.
-                                Default: ./aerolvm-tls-bundle.tar.gz
+  --tls-bundle-out <path>       Where to save the joiner TLS trust bundle
+                                (tarball with ca.crt ONLY — never ca.key).
+                                Joiners generate node.key locally and get
+                                node.crt signed via cluster-sign-node.sh on
+                                the seed. Default: ./aerolvm-tls-bundle.tar.gz
   --credential-key-path <path>  Path to the credential encryption key file.
                                 Default: SB_CREDENTIAL_ENCRYPTION_KEY_PATH from
                                 /etc/sandboxd/sandboxd.env, or
                                 /var/lib/sandboxd/credential_encryption.key.
                                 If the file is missing, a fresh 32-byte key is
                                 generated and written here.
-  --cred-bundle-out <path>      In --no-tls mode, where to save the standalone
-                                credential bundle (tarball with just the
-                                credential encryption key) for distribution to
-                                joining nodes.
+  --cred-bundle-out <path>      Standalone credential bundle (tarball with
+                                credential_encryption.key). Kept separate from
+                                the TLS trust bundle so ca.crt distribution
+                                does not also ship SB_CREDENTIALS_KEY.
                                 Default: ./aerolvm-cred-bundle.tar.gz
+                                (always emitted; required by cluster-join.sh)
   --max-auto-voters <n>         Max Raft voters auto-promoted from gossip.
                                 Additional nodes become non-voters. Default 5.
                                 Set 0 for the old unlimited behavior.
@@ -327,14 +329,14 @@ if [[ "$CRED_DECODED_LEN" != "32" ]]; then
 fi
 
 # --- Cluster TLS material (self-signed CA + per-node cert) -----------------
-# Generated once on the seed; the CA + CA key go into a tarball that the
-# operator copies to each joining node. The CA key is NOT required at daemon
-# runtime — only at join-time so cluster-join.sh can mint a fresh node cert.
-# We still keep ca.key under root-only perms to limit blast radius if a node
-# is compromised: the attacker needs root + the file to mint joiner certs.
+# Generated once on the seed. ca.key stays on the seed only — joiners receive
+# ca.crt (trust anchor) and have their CSR signed via cluster-sign-node.sh.
+# Daemon runtime needs ca.crt + node.{crt,key}; never ca.key.
 CLUSTER_SAN="aerolvm-cluster-node"
 TLS_GENERATED="false"
 if [[ "$NO_TLS" == "true" ]]; then
+	# --no-tls is a private-overlay escape hatch only. Production clusters
+	# must mint mTLS material; do not combine --no-tls with public networks.
 	echo "WARNING: --no-tls given; cluster-internal channels will ride over the public API"
 	echo "         URL with PAT-only auth. Only safe on a fully isolated network."
 else
@@ -358,9 +360,9 @@ else
 	fi
 
 	# 1. CA. 10-year lifetime — operators rotate by re-running cluster-init
-	#    with --force and re-distributing the bundle. Long-lived intentionally
+	#    with --force and re-distributing ca.crt. Long-lived intentionally
 	#    because the CA only signs cluster-internal node certs (never anything
-	#    user-visible).
+	#    user-visible). ca.key never leaves this host.
 	openssl genrsa -out "$TLS_DIR/ca.key" 4096 2>/dev/null
 	openssl req -x509 -new -nodes -key "$TLS_DIR/ca.key" -sha256 -days 3650 \
 		-subj "/CN=AerolVM Cluster CA" \
@@ -389,37 +391,29 @@ EOF
 	chmod 0600 "$TLS_DIR/ca.key" "$TLS_DIR/node.key"
 	chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.crt"
 
-	# Bundle CA + CA key + credential encryption key for joiners. Uses tar
-	# so the operator can scp/curl a single artefact. This file MUST be
-	# transferred over a secure channel — anyone with the bundle can mint
-	# a node cert and join the cluster, AND can decrypt every sandbox's
-	# sealed registry/mount credentials.
+	# Trust bundle for joiners: ca.crt ONLY. Signing stays on the seed via
+	# cluster-sign-node.sh. Credential encryption key ships separately.
 	if [[ -z "$TLS_BUNDLE_OUT" ]]; then
 		TLS_BUNDLE_OUT="$(pwd)/aerolvm-tls-bundle.tar.gz"
 	fi
-	# Stage the credential key inside TLS_DIR (root-only) so all bundle
-	# entries share one tar root. Copy rather than move — the original at
-	# CRED_KEY_PATH must remain so the daemon can keep reading it.
-	install -m 0600 "$CRED_KEY_PATH" "$TLS_DIR/credential_encryption.key"
-	tar -C "$TLS_DIR" -czf "$TLS_BUNDLE_OUT" ca.crt ca.key credential_encryption.key
-	chmod 0600 "$TLS_BUNDLE_OUT"
+	tar -C "$TLS_DIR" -czf "$TLS_BUNDLE_OUT" ca.crt
+	chmod 0644 "$TLS_BUNDLE_OUT"
 	TLS_GENERATED="true"
 fi
 
-# In --no-tls mode we still need to ship the credential key. Emit a tiny
-# standalone bundle so the joiner has a uniform extraction path.
+# Always emit a standalone credential bundle (TLS and --no-tls paths).
+# Keeping SB_CREDENTIAL_ENCRYPTION_KEY out of the CA trust tarball limits
+# blast radius if ca.crt is copied more broadly than the encryption key.
 CRED_BUNDLE_GENERATED="false"
-if [[ "$NO_TLS" == "true" ]]; then
-	if [[ -z "$CRED_BUNDLE_OUT" ]]; then
-		CRED_BUNDLE_OUT="$(pwd)/aerolvm-cred-bundle.tar.gz"
-	fi
-	CRED_STAGE_DIR="$(mktemp -d)"
-	install -m 0600 "$CRED_KEY_PATH" "$CRED_STAGE_DIR/credential_encryption.key"
-	tar -C "$CRED_STAGE_DIR" -czf "$CRED_BUNDLE_OUT" credential_encryption.key
-	chmod 0600 "$CRED_BUNDLE_OUT"
-	rm -rf "$CRED_STAGE_DIR"
-	CRED_BUNDLE_GENERATED="true"
+if [[ -z "$CRED_BUNDLE_OUT" ]]; then
+	CRED_BUNDLE_OUT="$(pwd)/aerolvm-cred-bundle.tar.gz"
 fi
+CRED_STAGE_DIR="$(mktemp -d)"
+install -m 0600 "$CRED_KEY_PATH" "$CRED_STAGE_DIR/credential_encryption.key"
+tar -C "$CRED_STAGE_DIR" -czf "$CRED_BUNDLE_OUT" credential_encryption.key
+chmod 0600 "$CRED_BUNDLE_OUT"
+rm -rf "$CRED_STAGE_DIR"
+CRED_BUNDLE_GENERATED="true"
 
 # Derive internal advertise URL when operator didn't override.
 if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
@@ -535,23 +529,33 @@ fi
 if [[ "$TLS_GENERATED" == "true" ]]; then
 	cat <<EOF
 =========================================================================
-TLS BUNDLE (CA cert + CA key + credential encryption key —
-            required by every joining node):
+TLS TRUST BUNDLE (ca.crt only — ca.key stays on this seed):
 
   $TLS_BUNDLE_OUT
 
-Copy this file to each joining node over a SECURE channel (scp, vault).
-Anyone with the bundle can mint a node cert AND decrypt every sandbox's
-sealed registry/mount credentials.
+CREDENTIAL BUNDLE (sealed-secret encryption key — separate artefact):
+
+  $CRED_BUNDLE_OUT
+
+ca.key never leaves this host. Joiners generate node.key + CSR locally;
+sign on the seed with scripts/cluster-sign-node.sh (see setup/cluster.md).
 =========================================================================
 
-To add another node, on that host:
+To add another node:
 
-  scp this-host:$TLS_BUNDLE_OUT /tmp/aerolvm-tls-bundle.tar.gz   # secure transfer
+  # On joiner — unpack ca.crt, generate CSR, then pause for signing:
+  scp this-host:$TLS_BUNDLE_OUT /tmp/aerolvm-tls-bundle.tar.gz
+  scp this-host:$CRED_BUNDLE_OUT /tmp/aerolvm-cred-bundle.tar.gz
   sudo ./cluster-join.sh \\
       --gossip-key '$GOSSIP_SECRET_KEY' \\
       --peers $GOSSIP_ADVERTISE_ADDR \\
-      --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+      --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz \\
+      --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
+
+  # cluster-join.sh prints the CSR path; copy it here and sign:
+  sudo ./cluster-sign-node.sh --csr /tmp/node.csr --node-id <joiner-id> --out /tmp/node.crt
+  # Copy /tmp/node.crt back to the joiner's /etc/sandboxd/tls/node.crt, then
+  # re-run cluster-join.sh (or restart sandboxd once the cert is in place).
 EOF
 else
 	cat <<EOF

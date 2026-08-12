@@ -17,7 +17,7 @@ func TestWithInternalMTLSBoundary(t *testing.T) {
 		calls++
 		w.WriteHeader(http.StatusNoContent)
 	})
-	guarded := withInternalMTLS(next)
+	guarded := withInternalMTLS(false, next)
 
 	publicReq := httptest.NewRequest(http.MethodPost, "http://public/v1/cluster/internal/secrets", nil)
 	publicRec := httptest.NewRecorder()
@@ -39,7 +39,7 @@ func TestWithInternalMTLSNodeIdentity(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	guarded := withInternalMTLS(next)
+	guarded := withInternalMTLS(false, next)
 
 	t.Run("matching_header_and_san", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "https://internal/v1/cluster/internal/secrets", nil)
@@ -64,7 +64,7 @@ func TestWithInternalMTLSNodeIdentity(t *testing.T) {
 	})
 
 	t.Run("legacy_san_increments_metric", func(t *testing.T) {
-		before := readExpvarIntName(t, "aerolvm_cluster_mtls_legacy_identity_total")
+		before := readExpvarIntValue(t, "aerolvm_cluster_mtls_legacy_identity_total")
 		req := httptest.NewRequest(http.MethodGet, "https://internal/v1/cluster/internal/secrets", nil)
 		addVerifiedClientCertificate(req, &x509.Certificate{
 			Subject:  pkix.Name{CommonName: "aerolvm-cluster-node"},
@@ -75,8 +75,22 @@ func TestWithInternalMTLSNodeIdentity(t *testing.T) {
 		if rec.Code != http.StatusNoContent {
 			t.Fatalf("status=%d, want 204", rec.Code)
 		}
-		if got := readExpvarIntName(t, "aerolvm_cluster_mtls_legacy_identity_total") - before; got != 1 {
+		if got := readExpvarIntValue(t, "aerolvm_cluster_mtls_legacy_identity_total") - before; got != 1 {
 			t.Fatalf("legacy identity metric delta=%d, want 1", got)
+		}
+	})
+
+	t.Run("enterprise_rejects_legacy_only", func(t *testing.T) {
+		ent := withInternalMTLS(true, next)
+		req := httptest.NewRequest(http.MethodGet, "https://internal/v1/cluster/internal/secrets", nil)
+		addVerifiedClientCertificate(req, &x509.Certificate{
+			Subject:  pkix.Name{CommonName: "aerolvm-cluster-node"},
+			DNSNames: []string{"aerolvm-cluster-node"},
+		})
+		rec := httptest.NewRecorder()
+		ent.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status=%d, want 403", rec.Code)
 		}
 	})
 }
@@ -91,7 +105,7 @@ func addVerifiedClientCertificate(req *http.Request, peerCert *x509.Certificate)
 	}
 }
 
-func readExpvarIntName(t *testing.T, name string) int64 {
+func readExpvarIntValue(t *testing.T, name string) int64 {
 	t.Helper()
 	v := expvar.Get(name)
 	if v == nil {

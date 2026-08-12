@@ -20,6 +20,20 @@ On the open-source build:
 - Coverage in the API response names which members answered; `partial: true`
   means the page is incomplete — never treat a partial page as full history.
 
+### Enterprise durability (Witness)
+
+- **Witness heads ≠ event reconstruction.** An off-node witness
+  (`pkg/controlplane.Witness`, wired via `SB_SECRET_AUDIT_EXTERNAL_WITNESS`)
+  records chain heads / receipts so retroactive local-file tampering is
+  detectable. It does **not** store full audit batches today and cannot rebuild
+  the JSONL after disk loss.
+- Enterprise deployments **must** configure a real off-node Witness (the
+  open-source build ships a no-op). Prefer also shipping full batches to an
+  external sink (SIEM / object store) until the product grows a durable batch
+  export — honest current limit: Witness alone is not a backup.
+- See `controlplane.Witness` / `HasExternalWitness` and the enterprise boot
+  checks around `SB_SECRET_AUDIT_EXTERNAL_WITNESS`.
+
 See also the D5 frozen-recipient limitation and cluster identity requirements in
 [`docs/.../cluster-secrets.mdx`](../../docs/src/content/docs/cluster-secrets.mdx).
 
@@ -72,12 +86,16 @@ Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) prunes old lines daily.
 3. HA create success guarantees at least one backup ACK. Treat
    `failover_ready=false` as "the configured replica set is not complete yet";
    the remaining recipients continue asynchronously.
-4. Remember D5: recipient sets are frozen at seal time; membership changes
-   after create do not enlarge the set (see cluster-secrets docs).
+4. Recipient sets are recorded at seal/reserve time. When a majority of frozen
+   backup targets are dead, the holder-refresh path selects live
+   worker/mixed replacements, Raft-updates `SecretRecipients`, and **reseals**
+   (recipients are in envelope AAD — old ciphertext cannot be pushed to new
+   nodes). Until that completes, `failover_ready` may stay false.
 
 The reconciler exposes `aerolvm_secret_delete_outbox_pending`,
-`aerolvm_secret_delete_outbox_oldest_age_seconds`, and
-`aerolvm_secret_tombstones`. Tombstones are pruned in bounded batches after
+`aerolvm_secret_delete_outbox_oldest_age_seconds`,
+`aerolvm_secret_put_outbox_pending`, `aerolvm_secret_put_outbox_failures_total`,
+and `aerolvm_secret_tombstones`. Tombstones are pruned in bounded batches after
 `SB_SECRET_TOMB_RETENTION_DAYS` (default 30), but never while a live sandbox,
 sealed row, or pending delete outbox still references the sandbox ID.
 After an eligible tomb is pruned, peer PUT still requires a matching live Raft

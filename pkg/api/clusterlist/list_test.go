@@ -1,6 +1,8 @@
 package clusterlist
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +10,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type stubListCluster struct {
@@ -20,6 +23,19 @@ type stubListCluster struct {
 func (c *stubListCluster) Members() []cluster.Member { return c.members }
 func (c *stubListCluster) Placements() []cluster.Placement {
 	return append([]cluster.Placement(nil), c.placements...)
+}
+func (c *stubListCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	out := make(map[string]cluster.Placement, len(ids))
+	byID := make(map[string]cluster.Placement, len(c.placements))
+	for _, p := range c.placements {
+		byID[p.SandboxID] = p
+	}
+	for _, id := range ids {
+		if p, ok := byID[id]; ok {
+			out[id] = p
+		}
+	}
+	return out
 }
 func (c *stubListCluster) PlacementPage(req cluster.PlacementPageRequest) cluster.PlacementPageResponse {
 	limit := req.Limit
@@ -146,6 +162,43 @@ func TestDialPeerRequiresInternalURLAndClient(t *testing.T) {
 	}, Transport{PublicClient: http.DefaultClient, FleetPAT: "pat"})
 	if err == nil {
 		t.Fatal("dialPeer without InternalClient: want error")
+	}
+}
+
+func TestFilterLocalToPageTerminalEmptyPage(t *testing.T) {
+	local := []*models.Sandbox{{ID: "sb-1"}, {ID: "sb-2"}}
+	if got := FilterLocalToPage(local, nil, ""); len(got) != 2 {
+		t.Fatalf("cold start empty placements: got %d, want all local", len(got))
+	}
+	if got := FilterLocalToPage(local, nil, "sb-last"); len(got) != 0 {
+		t.Fatalf("terminal empty page with pageToken: got %d, want 0", len(got))
+	}
+	page := []cluster.Placement{{SandboxID: "sb-2"}}
+	got := FilterLocalToPage(local, page, "")
+	if len(got) != 1 || got[0].ID != "sb-2" {
+		t.Fatalf("filter to page = %+v, want [sb-2]", got)
+	}
+}
+
+func TestMergeFiltersPeerRowsToWantIDs(t *testing.T) {
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*models.Sandbox{
+			{ID: "sb-on-page"},
+			{ID: "sb-off-page"},
+		})
+	}))
+	t.Cleanup(peer.Close)
+
+	res := Merge(context.Background(), []cluster.Member{{
+		NodeID: "peer-1", Alive: true, InternalURL: peer.URL, Role: config.NodeRoleWorker,
+	}}, Options{
+		Local:     []*models.Sandbox{{ID: "sb-local-off"}},
+		WantIDs:   map[string]struct{}{"sb-on-page": {}},
+		Transport: Transport{InternalClient: peer.Client(), PublicClient: peer.Client()},
+		Path:      "/v1/sandboxes",
+	})
+	if len(res.Sandboxes) != 1 || res.Sandboxes[0].ID != "sb-on-page" {
+		t.Fatalf("Merge WantIDs filter = %+v, want [sb-on-page]", res.Sandboxes)
 	}
 }
 

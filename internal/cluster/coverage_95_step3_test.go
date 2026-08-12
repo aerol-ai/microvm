@@ -255,10 +255,10 @@ func TestRecoveryReplicationUnitBranches(t *testing.T) {
 	defer srvOK.Close()
 	c.patToken = "pat"
 	c.httpClient = srvOK.Client()
-	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), srvOK.URL, http.MethodGet, "pat", nil, nil); err != nil {
+	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), srvOK.URL, http.MethodGet, "pat", "", nil, nil); err != nil {
 		t.Fatalf("nil out: %v", err)
 	}
-	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), "://bad", http.MethodGet, "", []byte(`{}`), nil); err == nil {
+	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), "://bad", http.MethodGet, "", "", []byte(`{}`), nil); err == nil {
 		t.Fatal("bad url")
 	}
 
@@ -532,7 +532,7 @@ func TestDoRecoveryHTTPDecode(t *testing.T) {
 	}))
 	defer srv.Close()
 	var out RecoveryBlob
-	if err := doRecoveryHTTPRequest(context.Background(), srv.Client(), srv.URL, http.MethodGet, "", nil, &out); err != nil || out.SandboxID != "sb" {
+	if err := doRecoveryHTTPRequest(context.Background(), srv.Client(), srv.URL, http.MethodGet, "", "", nil, &out); err != nil || out.SandboxID != "sb" {
 		t.Fatalf("decode out=%+v err=%v", out, err)
 	}
 }

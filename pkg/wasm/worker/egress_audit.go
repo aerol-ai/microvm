@@ -1,8 +1,11 @@
 package worker
 
 import (
+	"bytes"
 	"encoding/json"
+	"expvar"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,52 +18,62 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Worker subprocesses cannot call internal/service.emitEgressAudit. They append
-// compatible JSON Lines into the same secrets.jsonl the daemon owns, under an
-// exclusive flock on a stable sidecar lock file acquired *before* opening the
-// data file so retention rename cannot leave writers on an unlinked inode.
-// Full bounded-IPC into the authoritative queue remains follow-up (TODOS.md).
+// Worker subprocesses cannot call internal/service.emitEgressAudit. They POST
+// egress events to the daemon's loopback audit ingest
+// (SB_AUDIT_INGEST_PORT / SB_AUDIT_INGEST_TOKEN). Workers never write
+// secrets.jsonl tip. When IPC is unavailable they durable-append to
+// secrets.spill.jsonl for the parent drain path (or count a gap drop).
 
 const (
-	workerEgressAuditFile = "secrets.jsonl"
-	workerEgressLockFile  = "secrets.jsonl.lock"
-	workerEgressWorkers   = 8
-	workerEgressQueue     = 1024
+	workerEgressLockFile   = "secrets.jsonl.lock"
+	workerEgressSpillFile  = "secrets.spill.jsonl"
+	workerEgressWorkers    = 8
+	workerEgressQueue      = 1024
+	workerEgressIngestPath = "/internal/audit/egress"
+	workerEgressTokenHdr   = "X-Aerol-Audit-Token"
 )
 
 type workerEgressAuditEvent = auditlog.Event
 
 type egressAuditJob struct {
-	path, node, sandboxID, network, address string
+	port, token, spillDir, node, sandboxID, network, address string
 }
 
 var (
 	workerEgressOnce    sync.Once
 	workerEgressCh      chan egressAuditJob
 	workerEgressDropped atomic.Int64
+	workerEgressIPCFail = expvar.NewInt("aerolvm_wasm_egress_audit_ipc_fail_total")
+	workerEgressHTTP    = &http.Client{Timeout: 2 * time.Second}
 )
 
 // installDefaultEgressObserver wires destination attribution when
-// SB_EGRESS_ATTRIBUTION_ENABLED is unset/true and SB_DB_PATH is set (inherited
-// from the parent daemon). No-op when disabled or path unknown.
+// SB_EGRESS_ATTRIBUTION_ENABLED is unset/true. Prefers SB_AUDIT_INGEST_PORT;
+// falls back to spill under SB_DB_PATH/audit when IPC env is missing.
 func installDefaultEgressObserver(m *NetMediator) {
 	if m == nil || !envBoolDefaultTrue("SB_EGRESS_ATTRIBUTION_ENABLED") {
 		return
 	}
-	path, node := workerEgressAuditTarget()
-	if path == "" {
+	port := strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_PORT"))
+	token := strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN"))
+	spillDir := workerEgressSpillDir()
+	if port == "" && spillDir == "" {
 		return
 	}
+	node := strings.TrimSpace(os.Getenv("SB_NODE_ID"))
 	ensureWorkerEgressPool()
 	m.SetEgressObserver(func(sandboxID, network, address string) {
-		job := egressAuditJob{path: path, node: node, sandboxID: sandboxID, network: network, address: address}
+		job := egressAuditJob{
+			port: port, token: token, spillDir: spillDir, node: node,
+			sandboxID: sandboxID, network: network, address: address,
+		}
 		select {
 		case workerEgressCh <- job:
 		default:
 			workerEgressDropped.Add(1)
 			slog.Warn("wasm egress audit queue full; writing gap marker",
 				"sandbox_id", sandboxID, "destination", address, "dropped_total", workerEgressDropped.Load())
-			appendWorkerEgressGap(path, node, sandboxID)
+			appendWorkerEgressGap(spillDir, node, sandboxID)
 		}
 	})
 }
@@ -71,46 +84,92 @@ func ensureWorkerEgressPool() {
 		for i := 0; i < workerEgressWorkers; i++ {
 			go func() {
 				for job := range workerEgressCh {
-					appendWorkerEgressAudit(job.path, job.node, job.sandboxID, job.network, job.address)
+					postOrSpillWorkerEgress(job)
 				}
 			}()
 		}
 	})
 }
 
-func workerEgressAuditTarget() (path, node string) {
+func workerEgressSpillDir() string {
 	dbPath := strings.TrimSpace(os.Getenv("SB_DB_PATH"))
 	if dbPath == "" {
-		return "", ""
+		return ""
 	}
-	return filepath.Join(filepath.Dir(dbPath), "audit", workerEgressAuditFile), strings.TrimSpace(os.Getenv("SB_NODE_ID"))
+	return filepath.Join(filepath.Dir(dbPath), "audit")
 }
 
-func appendWorkerEgressAudit(path, node, sandboxID, network, address string) {
-	sandboxID = strings.TrimSpace(sandboxID)
-	address = strings.TrimSpace(address)
-	if path == "" || sandboxID == "" || address == "" {
+func postOrSpillWorkerEgress(job egressAuditJob) {
+	sandboxID := strings.TrimSpace(job.sandboxID)
+	address := strings.TrimSpace(job.address)
+	if sandboxID == "" || address == "" {
 		return
 	}
-	ev := workerEgressAuditEvent{
-		Time:        time.Now().UTC(),
-		Actor:       node,
-		SandboxID:   sandboxID,
-		Result:      "success",
-		Reason:      "ok",
-		NodeID:      node,
-		Kind:        "egress",
-		Destination: address,
-		Network:     strings.TrimSpace(network),
+	if job.port != "" && job.token != "" {
+		if err := postWorkerEgressAudit(job.port, job.token, job.node, sandboxID, job.network, address); err == nil {
+			return
+		}
+		workerEgressIPCFail.Add(1)
 	}
-	appendWorkerEgressEvent(path, ev)
+	// IPC unavailable — durable spill for parent import; never touch secrets.jsonl tip.
+	if job.spillDir != "" {
+		appendWorkerEgressSpill(job.spillDir, workerEgressAuditEvent{
+			Time:        time.Now().UTC(),
+			Actor:       job.node,
+			SandboxID:   sandboxID,
+			Result:      "success",
+			Reason:      "ok",
+			NodeID:      job.node,
+			Kind:        "egress",
+			Destination: address,
+			Network:     strings.TrimSpace(job.network),
+		})
+		return
+	}
+	workerEgressDropped.Add(1)
 }
 
-func appendWorkerEgressGap(path, node, sandboxID string) {
-	if path == "" {
+func postWorkerEgressAudit(port, token, node, sandboxID, network, address string) error {
+	body, err := json.Marshal(map[string]string{
+		"sandbox_id":  sandboxID,
+		"network":     strings.TrimSpace(network),
+		"destination": address,
+		"node_id":     node,
+		"kind":        "egress",
+	})
+	if err != nil {
+		return err
+	}
+	url := "http://127.0.0.1:" + port + workerEgressIngestPath
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(workerEgressTokenHdr, token)
+	resp, err := workerEgressHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return errStatus(resp.StatusCode)
+	}
+	return nil
+}
+
+type statusError int
+
+func (e statusError) Error() string { return "audit ingest status " + strconv.Itoa(int(e)) }
+
+func errStatus(code int) error { return statusError(code) }
+
+func appendWorkerEgressGap(spillDir, node, sandboxID string) {
+	if spillDir == "" {
+		workerEgressDropped.Add(1)
 		return
 	}
-	appendWorkerEgressEvent(path, workerEgressAuditEvent{
+	appendWorkerEgressSpill(spillDir, workerEgressAuditEvent{
 		Time:      time.Now().UTC(),
 		Actor:     node,
 		SandboxID: strings.TrimSpace(sandboxID),
@@ -121,79 +180,54 @@ func appendWorkerEgressGap(path, node, sandboxID string) {
 	})
 }
 
-func appendWorkerEgressEvent(path string, ev workerEgressAuditEvent) {
-	auditlog.EnsureEventID(&ev)
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		slog.Warn("wasm egress audit mkdir failed", "path", path, "err", err)
+// appendWorkerEgressSpill durable-appends under flock + fsync to the parent
+// spill file. Does not update secrets.tip or secrets.jsonl.
+func appendWorkerEgressSpill(spillDir string, ev workerEgressAuditEvent) {
+	if spillDir == "" {
 		return
 	}
-	lockPath := filepath.Join(dir, workerEgressLockFile)
-	tipPath := filepath.Join(dir, "secrets.tip")
+	auditlog.EnsureEventID(&ev)
+	if err := os.MkdirAll(spillDir, 0o700); err != nil {
+		slog.Warn("wasm egress spill mkdir failed", "dir", spillDir, "err", err)
+		workerEgressDropped.Add(1)
+		return
+	}
+	lockPath := filepath.Join(spillDir, workerEgressLockFile)
+	spillPath := filepath.Join(spillDir, workerEgressSpillFile)
 	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		slog.Warn("wasm egress audit lock open failed", "path", lockPath, "err", err)
+		slog.Warn("wasm egress spill lock open failed", "path", lockPath, "err", err)
+		workerEgressDropped.Add(1)
 		return
 	}
 	defer lf.Close()
 	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
-		slog.Warn("wasm egress audit flock failed", "path", lockPath, "err", err)
+		slog.Warn("wasm egress spill flock failed", "path", lockPath, "err", err)
+		workerEgressDropped.Add(1)
 		return
 	}
 	defer func() { _ = unix.Flock(int(lf.Fd()), unix.LOCK_UN) }()
 
-	// Join the daemon's hash chain under the same flock as the append so
-	// wasm dual-writes remain tamper-checkable with secrets.jsonl.
-	prev := readWorkerChainTip(path, tipPath)
-	auditlog.LinkEvent(prev, &ev)
 	line, err := json.Marshal(ev)
 	if err != nil {
-		slog.Warn("wasm egress audit marshal failed", "err", err)
+		slog.Warn("wasm egress spill marshal failed", "err", err)
+		workerEgressDropped.Add(1)
 		return
 	}
 	line = append(line, '\n')
-
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(spillPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		slog.Warn("wasm egress audit open failed", "path", path, "err", err)
+		slog.Warn("wasm egress spill open failed", "path", spillPath, "err", err)
+		workerEgressDropped.Add(1)
 		return
 	}
 	defer f.Close()
 	if _, err := f.Write(line); err != nil {
-		slog.Warn("wasm egress audit write failed", "path", path, "err", err)
+		slog.Warn("wasm egress spill write failed", "path", spillPath, "err", err)
+		workerEgressDropped.Add(1)
 		return
 	}
-	_ = os.WriteFile(tipPath, []byte(ev.EventHash+"\n"+ev.EventID+"\n"), 0o600)
-}
-
-// readWorkerChainTip returns the current secrets.jsonl tip for hash linking.
-// Prefers secrets.tip; falls back to the last EventHash line in the JSONL.
-func readWorkerChainTip(path, tipPath string) string {
-	if raw, err := os.ReadFile(tipPath); err == nil {
-		parts := strings.SplitN(strings.TrimSpace(string(raw)), "\n", 2)
-		if len(parts) >= 1 && parts[0] != "" {
-			return parts[0]
-		}
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return auditlog.GenesisPrevHash
-	}
-	prev := auditlog.GenesisPrevHash
-	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var ev workerEgressAuditEvent
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue
-		}
-		if ev.EventHash != "" {
-			prev = ev.EventHash
-		}
-	}
-	return prev
+	_ = f.Sync()
 }
 
 func envBoolDefaultTrue(key string) bool {

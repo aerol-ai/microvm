@@ -463,25 +463,29 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 	if len(acked) > 0 {
 		addSecretHolderNodes(sandboxID, blob.SealGeneration, acked...)
 	}
-	if err != nil {
+	pending := pendingRecipientsAfterAck(recipients, acked, s.selfNodeID())
+	gen := blob.SealGeneration
+	if gen <= 0 {
+		gen = 1
+	}
+	if len(pending) > 0 {
+		// Incomplete fan-out (dead/missing peers, dial failures, or silent
+		// empty ACK) must leave a durable retry job — never clear outbox.
+		if err == nil {
+			err = fmt.Errorf("cluster: secret fan-out incomplete: acked %d pending %d", len(acked), len(pending))
+		}
 		recordSecretFanoutFailure()
 		if s.logger != nil {
 			s.logger.Warn("cluster: secret fan-out incomplete",
-				"sandbox_id", sandboxID, "acked", len(acked), "err", err)
+				"sandbox_id", sandboxID, "acked", len(acked), "pending", len(pending), "err", err)
 		}
-		// Keep a durable retry job for peers that still need the blob.
-		pending := pendingRecipientsAfterAck(recipients, acked, s.selfNodeID())
-		gen := blob.SealGeneration
-		if gen <= 0 {
-			gen = 1
-		}
-		if s.store != nil && len(pending) > 0 {
+		if s.store != nil {
 			_ = s.store.UpsertSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen, pending)
 		}
 		return
 	}
 	if s.store != nil {
-		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID)
+		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen)
 	}
 }
 
@@ -733,6 +737,13 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 		if len(recordedRecipients) == 0 || !sameStringSlice(recordedRecipients, wireRecipients) {
 			return fmt.Errorf("%w: recipients do not match live placement", ErrInvalidClusterSecretBlob)
 		}
+		// Incarnation fencing: a resealed/recreated placement must not accept
+		// sealed blobs from a prior lifetime (empty blob incarnation included).
+		placeInc := strings.TrimSpace(placement.IncarnationID)
+		blobInc := strings.TrimSpace(blob.IncarnationID)
+		if placeInc != "" && placeInc != blobInc {
+			return fmt.Errorf("%w: incarnation_id does not match live placement", ErrInvalidClusterSecretBlob)
+		}
 	}
 	if s.store != nil {
 		tombGen, err := s.store.ClusterSecretTombGeneration(ctx, sandboxID)
@@ -770,15 +781,79 @@ func sameStringSlice(a, b []string) bool {
 
 // SecretRecipientsForSeal returns the recorded Placement.SecretRecipients when
 // present, otherwise [self]. Used by create-on-target seal sites.
-func (s *Service) SecretRecipientsForSeal(sandboxID string) []string {
+//
+// When preferLiveReplacement is true and a majority of frozen non-self
+// recipients are dead, returns SelectReplacementRecipients instead. Callers
+// that only need the frozen create-time set leave the flag false.
+func (s *Service) SecretRecipientsForSeal(sandboxID string, preferLiveReplacement ...bool) []string {
 	c := s.Cluster()
 	if c == nil {
 		return nil
 	}
+	liveReplace := len(preferLiveReplacement) > 0 && preferLiveReplacement[0]
 	if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
-		return append([]string(nil), p.SecretRecipients...)
+		frozen := append([]string(nil), p.SecretRecipients...)
+		if liveReplace {
+			if repl := s.SelectReplacementRecipients(sandboxID, s.SecretRecipientBackupCount()); len(repl) > 0 {
+				if s.majoritySecretTargetsDead(frozen, s.aliveMemberSet(), c.SelfNodeID()) {
+					return repl
+				}
+			}
+		}
+		return frozen
 	}
 	return []string{c.SelfNodeID()}
+}
+
+// SelectReplacementRecipients picks owner + up to maxBackups alive
+// worker/mixed members using the same HRW policy as create-time reserve.
+// Empty when cluster identity or live candidates are unavailable.
+func (s *Service) SelectReplacementRecipients(sandboxID string, maxBackups int) []string {
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	ownerID := c.SelfNodeID()
+	if p, ok := c.PlacementOf(sandboxID); ok {
+		if id := strings.TrimSpace(p.OwnerNodeID); id != "" {
+			ownerID = id
+		}
+	}
+	members := c.LocalMembers()
+	if len(members) == 0 {
+		members = c.Members()
+	}
+	candidates := make([]cluster.Member, 0, len(members))
+	for _, m := range members {
+		if !m.Alive || strings.TrimSpace(m.NodeID) == "" {
+			continue
+		}
+		if !cluster.CanOwnSandboxRole(m.Role) {
+			continue
+		}
+		candidates = append(candidates, m)
+	}
+	return cluster.SelectSecretRecipients(sandboxID, candidates, ownerID, maxBackups)
+}
+
+func (s *Service) majoritySecretTargetsDead(targets []string, alive map[string]struct{}, selfID string) bool {
+	frozenPeers := 0
+	deadPeers := 0
+	for _, id := range targets {
+		id = strings.TrimSpace(id)
+		if id == "" || id == selfID {
+			continue
+		}
+		frozenPeers++
+		if _, ok := alive[id]; !ok {
+			deadPeers++
+		}
+	}
+	return frozenPeers > 0 && deadPeers*2 > frozenPeers
 }
 
 // secretIncarnationForSeal returns Placement.IncarnationID when present.
@@ -832,14 +907,19 @@ func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) 
 	if sb == nil {
 		return nil
 	}
-	members, placements := s.failoverReadySnapshots()
+	ids := []string{}
+	if sb.ID != "" {
+		ids = []string{sb.ID}
+	}
+	members, placements := s.failoverReadySnapshots(ids)
 	return s.computeFailoverReadyCached(ctx, sb, members, placements)
 }
 
-// failoverReadySnapshots loads membership + placements once for a list/get
-// batch. Prefer LocalMembers (gossip) so agent workers do not HTTP-fan-out
-// for every row; fall back to Members() when the gossip view is empty.
-func (s *Service) failoverReadySnapshots() (members []cluster.Member, placements map[string]cluster.Placement) {
+// failoverReadySnapshots loads membership once and placement rows only for the
+// requested sandbox IDs (PlacementsByIDs). Prefer LocalMembers (gossip) so
+// agent workers do not HTTP-fan-out for every row; fall back to Members() when
+// the gossip view is empty.
+func (s *Service) failoverReadySnapshots(ids []string) (members []cluster.Member, placements map[string]cluster.Placement) {
 	placements = map[string]cluster.Placement{}
 	c := s.Cluster()
 	if c == nil {
@@ -849,11 +929,12 @@ func (s *Service) failoverReadySnapshots() (members []cluster.Member, placements
 	if len(members) == 0 {
 		members = c.Members()
 	}
-	for _, p := range c.Placements() {
-		if p.SandboxID == "" {
-			continue
-		}
-		placements[p.SandboxID] = p
+	if len(ids) == 0 {
+		return members, placements
+	}
+	placements = c.PlacementsByIDs(ids)
+	if placements == nil {
+		placements = map[string]cluster.Placement{}
 	}
 	return members, placements
 }
@@ -974,12 +1055,19 @@ func (s *Service) attachFailoverReady(ctx context.Context, sb *models.Sandbox) {
 }
 
 // failoverReadyBatch attaches failover_ready using one Members()/LocalMembers
-// snapshot and one Placements() lookup map — not per-row membership fetches.
+// snapshot and PlacementsByIDs for the page — not a full Placements() dump.
 func (s *Service) failoverReadyBatch(ctx context.Context, sandboxes []*models.Sandbox) {
 	if len(sandboxes) == 0 {
 		return
 	}
-	members, placements := s.failoverReadySnapshots()
+	ids := make([]string, 0, len(sandboxes))
+	for _, sb := range sandboxes {
+		if sb == nil || sb.ID == "" {
+			continue
+		}
+		ids = append(ids, sb.ID)
+	}
+	members, placements := s.failoverReadySnapshots(ids)
 	for _, sb := range sandboxes {
 		if sb == nil {
 			continue

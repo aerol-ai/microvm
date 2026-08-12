@@ -439,6 +439,20 @@ func (c *lifecyclePlacementCluster) Placements() []cluster.Placement {
 	return out
 }
 
+func (c *lifecyclePlacementCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	out := make(map[string]cluster.Placement, len(ids))
+	byID := make(map[string]cluster.Placement, len(c.placements))
+	for _, p := range c.placements {
+		byID[p.SandboxID] = p
+	}
+	for _, id := range ids {
+		if p, ok := byID[id]; ok {
+			out[id] = p
+		}
+	}
+	return out
+}
+
 func (c *lifecyclePlacementCluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 	return c.specs[sandboxID]
 }

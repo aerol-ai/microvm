@@ -25,25 +25,26 @@ type opCode uint8
 const (
 	maxPlacementAuditNodes = 64
 
-	opPlace              opCode = 1
-	opDelete             opCode = 2
-	opReassign           opCode = 3
-	opUpsertSpec         opCode = 4  // overwrite Placement.Spec without touching ownership
-	opAddExposedPort     opCode = 5  // record one (port, protocol) intent
-	opRemoveExposedPort  opCode = 6  // drop one port intent
-	opReserve            opCode = 7  // hold capacity + name for a chosen owner before docker
-	opCancelReserve      opCode = 8  // release a pending reservation (rollback or TTL GC)
-	opSetNodeDrainState  opCode = 9  // operator-set "exclude from placement" mark for a node
-	opOrphanOwner        opCode = 10 // atomically orphan all placements owned by a dead node
-	opClaimOrphan        opCode = 11 // reclaim an orphaned placement back to its previous owner
-	opReserveBatch       opCode = 12 // hold capacity + names for a create burst in one raft entry
-	opAddCustomDomain    opCode = 13 // bind one user hostname to a placement (cluster-wide unique)
-	opRemoveCustomDomain opCode = 14 // release one previously-bound hostname
-	opUpsertVolume       opCode = 15 // get-or-create a platform-volume metadata row (cluster-wide)
-	opDeleteVolume       opCode = 16 // remove a platform-volume metadata row
-	opPutVolumeAttach    opCode = 17 // upsert platform-volume attachment rows (cluster-wide)
-	opDeleteVolumeAttach opCode = 18 // drop all platform-volume attachments for one sandbox
-	opPruneAuditACL      opCode = 19 // bounded-retention cleanup for post-delete owner ACLs
+	opPlace                  opCode = 1
+	opDelete                 opCode = 2
+	opReassign               opCode = 3
+	opUpsertSpec             opCode = 4  // overwrite Placement.Spec without touching ownership
+	opAddExposedPort         opCode = 5  // record one (port, protocol) intent
+	opRemoveExposedPort      opCode = 6  // drop one port intent
+	opReserve                opCode = 7  // hold capacity + name for a chosen owner before docker
+	opCancelReserve          opCode = 8  // release a pending reservation (rollback or TTL GC)
+	opSetNodeDrainState      opCode = 9  // operator-set "exclude from placement" mark for a node
+	opOrphanOwner            opCode = 10 // atomically orphan all placements owned by a dead node
+	opClaimOrphan            opCode = 11 // reclaim an orphaned placement back to its previous owner
+	opReserveBatch           opCode = 12 // hold capacity + names for a create burst in one raft entry
+	opAddCustomDomain        opCode = 13 // bind one user hostname to a placement (cluster-wide unique)
+	opRemoveCustomDomain     opCode = 14 // release one previously-bound hostname
+	opUpsertVolume           opCode = 15 // get-or-create a platform-volume metadata row (cluster-wide)
+	opDeleteVolume           opCode = 16 // remove a platform-volume metadata row
+	opPutVolumeAttach        opCode = 17 // upsert platform-volume attachment rows (cluster-wide)
+	opDeleteVolumeAttach     opCode = 18 // drop all platform-volume attachments for one sandbox
+	opPruneAuditACL          opCode = 19 // bounded-retention cleanup for post-delete owner ACLs
+	opUpdateSecretRecipients opCode = 20 // replace Placement.SecretRecipients (+ optional secret handle) without touching ownership/incarnation
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -837,6 +838,24 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.claimPendingReservationLocked(cmd.SandboxID, existing)
 		}
 		return nil
+	case opUpdateSecretRecipients:
+		// Dead-target expansion / reseal coordination: replace the frozen
+		// recipient set (and optionally the seal handle) while preserving
+		// ownership and IncarnationID. Empty recipients is a no-op so a
+		// partial forward can't wipe the set.
+		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+		if !exists || len(cmd.SecretRecipients) == 0 {
+			return nil
+		}
+		existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
+		if cmd.hasSecretUpdate() {
+			secrets := applyCommandSecretUpdate(existing, true, cmd)
+			existing.SecretRef = secrets.Ref
+			existing.SecretVersion = secrets.Version
+		}
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		return f.storePlacementLocked(cmd.SandboxID, existing)
 	case opAddExposedPort:
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 		if !exists || cmd.Port <= 0 {
@@ -1806,6 +1825,27 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 	return clonePlacement(p), true
 }
 
+// placementsByIDs returns hot clones for the requested IDs. Missing IDs are
+// omitted. Holds the FSM read lock once for the whole batch.
+func (f *placementFSM) placementsByIDs(ids []string) map[string]Placement {
+	out := make(map[string]Placement, len(ids))
+	if len(ids) == 0 {
+		return out
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if p, ok := f.placements[id]; ok {
+			out[id] = cloneHotPlacement(p)
+		}
+	}
+	return out
+}
+
 // sandboxIDByCustomHostname returns the sandbox ID currently claiming
 // hostname in the replicated custom-domain index. hostname is matched
 // verbatim — callers are expected to canonicalize (lower-case, trim) before
@@ -1989,13 +2029,22 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	ids := f.pagePlacementIDsLocked(req, shardFilter, allShards, wantShards)
+	// Fetch Limit+1 so we can tell an exact-full page from a true last page.
+	peekReq := req
+	peekReq.Limit = req.Limit + 1
+	ids := f.pagePlacementIDsLocked(peekReq, shardFilter, allShards, wantShards)
+	hasMore := len(ids) > req.Limit
+	if hasMore {
+		ids = ids[:req.Limit]
+	}
 	out := make([]Placement, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, cloneHotPlacement(f.placements[id]))
 	}
 	next := ""
-	if len(ids) == req.Limit {
+	// Only emit a cursor when a later ID exists — exact limit boundaries
+	// (e.g. 100000 rows @ page size 100) must end with an empty token.
+	if hasMore && len(ids) > 0 {
 		next = ids[len(ids)-1]
 	}
 	return PlacementPageResponse{Placements: out, NextPageToken: next}

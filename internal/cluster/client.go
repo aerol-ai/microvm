@@ -458,6 +458,22 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 	return c.applyCommand(ctx, cmd)
 }
 
+// UpdatePlacementSecretRecipients commits a replacement seal recipient set
+// (and optional new provider handle after reseal). Preserves IncarnationID.
+func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets) error {
+	recipients = normalizeSecretRecipientIDs(recipients)
+	if strings.TrimSpace(sandboxID) == "" || len(recipients) == 0 {
+		return nil
+	}
+	return c.applyCommand(ctx, command{
+		Op:               opUpdateSecretRecipients,
+		SandboxID:        sandboxID,
+		SecretRecipients: recipients,
+		SecretRef:        secrets.Ref,
+		SecretVersion:    secrets.Version,
+	})
+}
+
 // SecretsOf returns a copy of the provider handle paired with SpecOf's spec.
 func (c *Cluster) SecretsOf(sandboxID string) PlacementSecrets {
 	p, ok := c.fsm.get(sandboxID)
@@ -1182,7 +1198,7 @@ func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) erro
 		// fall back to the public path — that would defeat the security
 		// promise. Only ErrNotLeader bubbles up so the caller retries the
 		// new leader.
-		return c.doLeaderApply(ctx, internalClient, endpoint, payload)
+		return c.doLeaderApply(ctx, ClientForPeer(internalClient, leader), endpoint, payload)
 	}
 
 	leaderURL := c.LeaderAPIURL()
@@ -1203,6 +1219,7 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 		return fmt.Errorf("cluster: build leader-forward request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
+	SetPeerNodeIDHeader(req, c.nodeID)
 	if c.patToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.patToken)
 	}
@@ -1345,6 +1362,14 @@ func (c *Cluster) PlacementOf(sandboxID string) (Placement, bool) {
 		return Placement{}, false
 	}
 	return c.fsm.get(sandboxID)
+}
+
+// PlacementsByIDs returns hot placement rows for the given IDs (point lookups).
+func (c *Cluster) PlacementsByIDs(ids []string) map[string]Placement {
+	if c.fsm == nil {
+		return map[string]Placement{}
+	}
+	return c.fsm.placementsByIDs(ids)
 }
 
 // PlacementVersion returns the FSM's monotonic apply counter — bumps on

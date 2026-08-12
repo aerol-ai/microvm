@@ -15,17 +15,25 @@ import (
 // fan-out can stay on the entry node (plans/secrets-hardening E1b + P1 ingress).
 //
 // After sandbox deletion, retained history stays readable via sandbox_audit_acl
-// (and Placement.OwnerRef while placement remains).
+// (and Placement.OwnerRef while placement remains). ACL rows are incarnation-
+// scoped; authorize matches the placement incarnation when present, else any
+// retained ACL for the sandbox (legacy empty incarnation).
 func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if s == nil || sandboxID == "" {
 		return store.ErrNotFound
 	}
+	incarnationID := ""
+	if c := s.Cluster(); c != nil {
+		if p, ok := c.PlacementOf(sandboxID); ok {
+			incarnationID = strings.TrimSpace(p.IncarnationID)
+		}
+	}
 	if s.store != nil {
 		sb, err := s.store.Get(ctx, sandboxID)
 		if err == nil {
 			if ref := strings.TrimSpace(sb.OwnerRef); ref != "" {
-				_ = s.store.UpsertSandboxAuditACL(ctx, sandboxID, ref)
+				_ = s.store.UpsertSandboxAuditACL(ctx, sandboxID, ref, incarnationID)
 			}
 			return enforceOwner(ctx, sb)
 		}
@@ -66,7 +74,7 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 		}
 	}
 	if s.store != nil {
-		ref, err := s.store.GetSandboxAuditACLOwnerRef(ctx, sandboxID)
+		ref, err := s.store.GetSandboxAuditACLOwnerRef(ctx, sandboxID, incarnationID)
 		if err != nil {
 			return err
 		}
@@ -75,6 +83,20 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID str
 				return nil
 			}
 			return store.ErrNotFound
+		}
+		// Fall back to empty-incarnation ACL when placement incarnation is set
+		// but only a legacy ACL row exists.
+		if incarnationID != "" {
+			ref, err = s.store.GetSandboxAuditACLOwnerRef(ctx, sandboxID, "")
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				if ref == owner {
+					return nil
+				}
+				return store.ErrNotFound
+			}
 		}
 	}
 	if c != nil {

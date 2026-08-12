@@ -73,8 +73,8 @@ func TestPutClusterSecretRejectsDowngrade(t *testing.T) {
 		Ref: ref, SandboxID: "sb-ooo", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("gen1"),
 		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("stale put should be idempotent no-op: %v", err)
+	}); !errors.Is(err, ErrClusterSecretStaleGeneration) {
+		t.Fatalf("stale put = %v, want ErrClusterSecretStaleGeneration", err)
 	}
 	got, err := st.GetClusterSecret(ctx, ref)
 	if err != nil {

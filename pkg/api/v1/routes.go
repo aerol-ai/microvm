@@ -57,6 +57,9 @@ type Deps struct {
 	// ContainerEngine is the host engine (docker|containerd). Used for
 	// Server-Timing engine tags and BuildKit-absent clear errors.
 	ContainerEngine string
+	// EnterpriseMode rejects legacy aerolvm-cluster-node-only peer certs on
+	// internal mTLS routes (require DNS SAN node:<id>).
+	EnterpriseMode bool
 }
 
 // RegisterRoutes mounts every v1 route onto mux. Paths are written with the
@@ -156,7 +159,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// commands, or read fleet topology (P0). Peer HTTP uses SB_PAT_TOKEN.
 	op := func(next http.Handler) http.Handler { return withAuthOperator(d, next) }
 	internalOp := func(next http.Handler) http.Handler {
-		return op(withInternalMTLS(next))
+		return op(withInternalMTLS(d.EnterpriseMode, next))
 	}
 	mux.Handle("GET "+PathPrefix+"/cluster/members", op(http.HandlerFunc(h.clusterMembers)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", op(http.HandlerFunc(h.clusterRemoveMember)))
@@ -189,9 +192,9 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", internalOp(http.HandlerFunc(h.clusterInternalSandboxMeta)))
 }
 
-const clusterPeerNodeIDHeader = "X-Cluster-Peer-Node-ID"
+const clusterPeerNodeIDHeader = cluster.PeerNodeIDHeader
 
-func withInternalMTLS(next http.Handler) http.Handler {
+func withInternalMTLS(enterpriseMode bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
 			http.Error(w, "cluster internal endpoint requires mTLS", http.StatusForbidden)
@@ -200,6 +203,10 @@ func withInternalMTLS(next http.Handler) http.Handler {
 		peerCert := r.TLS.PeerCertificates[0]
 		certNodeID, legacyOnly := cluster.ExtractPeerNodeID(peerCert)
 		headerNodeID := strings.TrimSpace(r.Header.Get(clusterPeerNodeIDHeader))
+		if enterpriseMode && legacyOnly && certNodeID == "" {
+			http.Error(w, "cluster peer requires node identity SAN", http.StatusForbidden)
+			return
+		}
 		if certNodeID != "" && headerNodeID != "" && certNodeID != headerNodeID {
 			http.Error(w, "cluster peer node id mismatch", http.StatusForbidden)
 			return
@@ -217,9 +224,20 @@ func withInternalMTLS(next http.Handler) http.Handler {
 		if legacyOnly && certNodeID == "" {
 			cluster.RecordMTLSLegacyIdentity()
 		}
+		// Prefer cert-bound identity; fall back to header when soft-compat
+		// legacy peers omit node:<id> but still send the claim header.
+		peerID := certNodeID
+		if peerID == "" {
+			peerID = headerNodeID
+		}
+		if peerID != "" {
+			r = r.WithContext(context.WithValue(r.Context(), clusterPeerNodeIDContextKey{}, peerID))
+		}
 		next.ServeHTTP(w, r)
 	})
 }
+
+type clusterPeerNodeIDContextKey struct{}
 
 func withAuditLimit(d Deps, next http.Handler) http.Handler {
 	if d.AuditLimiter == nil {

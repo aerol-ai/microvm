@@ -114,7 +114,7 @@ func TestPostSecretBlobRoundTripBody(t *testing.T) {
 	defer srv.Close()
 	want := secrets.SecretBlob{Ref: "r1", SandboxID: "sb", Version: 1, Recipients: []string{"a"}, SealedPayload: []byte("sealed")}
 	body, _ := json.Marshal(want)
-	if err := postSecretBlob(context.Background(), srv.Client(), srv.URL+PublicInternalSecretPath, "p", body); err != nil {
+	if err := postSecretBlob(context.Background(), srv.Client(), srv.URL+PublicInternalSecretPath, "p", "self", body); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	if got.Ref != want.Ref || got.SandboxID != want.SandboxID || string(got.SealedPayload) != "sealed" {
@@ -223,6 +223,43 @@ func TestSecretReplicationFailClosedWithoutInternalURL(t *testing.T) {
 	}
 	if publicHits.Load() != 0 {
 		t.Fatalf("public hits after delete/probe = %d, want 0", publicHits.Load())
+	}
+}
+
+func TestPushSecretBlobDeadRecipientIncomplete(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	members := []Member{
+		{NodeID: "self", Alive: true, APIURL: "http://self"},
+		{NodeID: "peer-a", Alive: true, APIURL: srv.URL},
+		{NodeID: "peer-b", Alive: false, APIURL: srv.URL},
+	}
+	blob := secrets.SecretBlob{
+		Ref: "r", SandboxID: "s", SealedPayload: []byte("x"),
+		Recipients: []string{"self", "peer-a", "peer-b"},
+	}
+	acked, err := pushSecretBlobToPeers(context.Background(), members, srv.Client(), "pat", "self", blob, []string{"self", "peer-a", "peer-b"})
+	if err == nil {
+		t.Fatal("expected incomplete fan-out when a recipient is dead")
+	}
+	if len(acked) != 1 || acked[0] != "peer-a" {
+		t.Fatalf("acked = %v, want [peer-a]", acked)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("posts = %d, want 1", posts.Load())
+	}
+
+	acked, err = pushSecretBlobToPeers(context.Background(), members, srv.Client(), "pat", "self", blob, []string{"missing"})
+	if err == nil {
+		t.Fatal("expected incomplete fan-out for unknown recipient")
+	}
+	if len(acked) != 0 {
+		t.Fatalf("acked = %v, want none", acked)
 	}
 }
 

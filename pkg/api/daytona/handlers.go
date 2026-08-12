@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
@@ -309,38 +311,37 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 // listFacadeClusterItems merges local facade list items with peer facade lists
 // so remote owner nodes contribute their own compat metadata (not the ingress
 // node's empty local map).
-func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxResponse) ([]sandboxResponse, clusterlist.Coverage, string) {
+//
+// In cluster mode this is a placement-cursor API: page_token/limit select the
+// placement page; native Daytona page/limit must not re-slice the merge. Callers
+// must 503 when viewReady is false (matches /v1/sandboxes).
+func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxResponse) ([]sandboxResponse, clusterlist.Coverage, string, bool) {
 	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
 	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
-		return local, cov, ""
+		return local, cov, "", true
 	}
 	c := h.deps.Service.Cluster()
 	if c == nil {
-		return local, cov, ""
+		return local, cov, "", true
 	}
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
 	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
-	if len(placements) > 0 {
-		want := make(map[string]struct{}, len(placements))
-		for _, p := range placements {
-			want[p.SandboxID] = struct{}{}
-		}
-		filtered := local[:0]
-		for _, it := range local {
-			if _, ok := want[it.ID]; ok {
-				filtered = append(filtered, it)
-			}
-		}
-		local = filtered
+	if !viewReady {
+		cov.PlacementViewReady = false
+		cov.Partial = true
+		return nil, cov, "", false
 	}
+	local = filterFacadeLocalToPage(local, placements, pageToken, func(it sandboxResponse) string { return it.ID })
 	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it sandboxResponse) string { return it.ID }, clusterlist.Options{
 		OwnerRef:   ownerRef,
 		AuthHeader: r.Header.Get("Authorization"),
 		// Peers must not re-apply facade page/limit — ingress paginates after merge.
-		RawQuery:  clusterlist.StripFacadePagination(r.URL.RawQuery),
-		Path:      PathPrefix + "/sandbox",
-		Transport: clusterlist.TransportFromCluster(c),
+		RawQuery:   clusterlist.StripFacadePagination(r.URL.RawQuery),
+		Path:       PathPrefix + "/sandbox",
+		Transport:  clusterlist.TransportFromCluster(c),
+		SelfNodeID: c.SelfNodeID(),
+		WantIDs:    clusterlist.PlacementWantIDs(placements),
 		Warn: func(msg, peer string, peerErr error) {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
@@ -352,10 +353,43 @@ func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxRespon
 		cov.Missing = append(cov.Missing, missingOwners...)
 		cov.Partial = true
 	}
-	if !viewReady {
-		cov.Partial = true
+	return items, cov, next, true
+}
+
+func filterFacadeLocalToPage[T any](local []T, placements []cluster.Placement, pageToken string, idFn func(T) string) []T {
+	if len(placements) == 0 {
+		if strings.TrimSpace(pageToken) != "" {
+			return nil
+		}
+		return local
 	}
-	return items, cov, next
+	want := clusterlist.PlacementWantIDs(placements)
+	out := make([]T, 0, len(local))
+	for _, it := range local {
+		if id := idFn(it); id != "" {
+			if _, ok := want[id]; ok {
+				out = append(out, it)
+			}
+		}
+	}
+	return out
+}
+
+// clusterListMode is true when a real cluster client is attached (not the
+// standalone Noop default from service.New) and this is not a forwarded peer
+// hop. Native Daytona page/limit must not re-slice placement pages in that mode.
+func clusterListMode(svc *service.Service, r *http.Request) bool {
+	if svc == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+		return false
+	}
+	c := svc.Cluster()
+	if c == nil {
+		return false
+	}
+	if _, ok := c.(*cluster.Noop); ok {
+		return false
+	}
+	return true
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -380,7 +414,13 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
-	items, cov, next := h.listFacadeClusterItems(r, localItems)
+	items, cov, next, viewReady := h.listFacadeClusterItems(r, localItems)
+	if !viewReady {
+		w.Header().Set("Retry-After", "1")
+		clusterlist.WriteCoverageHeaders(w, cov, "")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
+		return
+	}
 	clusterlist.WriteCoverageHeaders(w, cov, next)
 	apihttp.WriteJSON(w, http.StatusOK, items)
 }
@@ -418,9 +458,45 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	inCluster := clusterListMode(h.deps.Service, r)
+	if inCluster {
+		// Cluster mode is placement-cursor based. Native page>1 without an
+		// explicit page_token would slice one placement page into empty
+		// results while more placement pages remain — reject that footgun.
+		pageToken := strings.TrimSpace(r.URL.Query().Get("page_token"))
+		if page > 1 && pageToken == "" {
+			apihttp.WriteError(w, http.StatusBadRequest, "cluster list requires page_token for page>1; use X-Cluster-List-Next-Page-Token")
+			return
+		}
+	}
+
 	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
-	items, cov, next := h.listFacadeClusterItems(r, localItems)
+	items, cov, next, viewReady := h.listFacadeClusterItems(r, localItems)
+	if !viewReady {
+		w.Header().Set("Retry-After", "1")
+		clusterlist.WriteCoverageHeaders(w, cov, "")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
+		return
+	}
 	clusterlist.WriteCoverageHeaders(w, cov, next)
+
+	if inCluster {
+		// Return the full placement-page hydration; do not re-slice with
+		// native page/limit. Next page is X-Cluster-List-Next-Page-Token.
+		total := len(items)
+		totalPages := float32(1)
+		if next != "" {
+			totalPages = 0 // unknown remaining; clients follow the cursor header
+		}
+		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{
+			Items:      items,
+			Total:      float32(total),
+			Page:       1,
+			TotalPages: totalPages,
+		})
+		return
+	}
+
 	total := len(items)
 	start := int((page - 1) * limit)
 	if start > total {

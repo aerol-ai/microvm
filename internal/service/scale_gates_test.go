@@ -237,9 +237,10 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 }
 
 // TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop pins the durable create
-// fan-out contract: incomplete peer PUTs land in put-outbox, the reconciler
-// drains them, and fanout-failure metric growth without outbox is a silent-drop
-// bug. Full 2k-process soak remains operator-run (make integration-cluster-*).
+// fan-out contract: incomplete peer PUTs (including dead recipients that never
+// ACK) land in put-outbox, the reconciler drains them, and fanout-failure
+// metric growth without outbox is a silent-drop bug. Full 2k-process soak
+// remains operator-run (make integration-cluster-*).
 func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 	requireServiceScaleGates(t)
 	ctx := context.Background()
@@ -255,10 +256,11 @@ func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 			recipients: []string{"node-a", "node-b"},
 			members: []cluster.Member{
 				{NodeID: "node-a", Alive: true},
-				{NodeID: "node-b", Alive: true},
+				// Dead backup peer: Push must not treat this as success / clear outbox.
+				{NodeID: "node-b", Alive: false},
 			},
 		},
-		// Never ACK — forces durable put-outbox for remaining peers.
+		// Never ACK — forces durable put-outbox for remaining (dead) peers.
 		testSecretPeerPusher: &fakePeerPusher{acked: nil},
 	}
 
@@ -275,7 +277,7 @@ func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 			t.Fatal(err)
 		}
 		svc.enqueueSecretFanout(id, secrets.SecretBlob{
-			SandboxID: id, Version: 1, SealGeneration: 1,
+			SandboxID: id, Version: 1, SealGeneration: 1, IncarnationID: "inc-1",
 			Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
 		}, []string{"node-a", "node-b"}, svc.testSecretPeerPusher)
 	}
@@ -287,7 +289,7 @@ func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 		if err != nil {
 			t.Fatalf("list put outbox: %v", err)
 		}
-		if len(outbox) > 0 || time.Now().After(deadline) {
+		if len(outbox) >= n || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -297,7 +299,7 @@ func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 		t.Fatalf("fanout failures grew by %d with empty put-outbox (silent drop)", failures)
 	}
 	if len(outbox) == 0 {
-		t.Fatal("expected durable put-outbox rows after incomplete fan-out")
+		t.Fatal("expected durable put-outbox rows after incomplete fan-out to dead recipients")
 	}
 
 	svc.testSecretPeerPusher = &fakePeerPusher{acked: []string{"node-b"}}

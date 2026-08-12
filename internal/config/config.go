@@ -1112,6 +1112,14 @@ type Config struct {
 	// ON — observational, dial-path only, never on create. Escape hatch:
 	// SB_EGRESS_ATTRIBUTION_ENABLED=false.
 	EgressAttributionEnabled bool
+	// AuditIngestPort is the loopback HTTP port wasm workers POST egress audit
+	// events to (POST /internal/audit/egress). Default 21215.
+	// SB_AUDIT_INGEST_PORT. Workers never write secrets.jsonl tip directly.
+	AuditIngestPort int
+	// AuditIngestToken authenticates worker → daemon audit ingest. Empty at
+	// boot mints a random token and exports SB_AUDIT_INGEST_TOKEN for workers.
+	// SB_AUDIT_INGEST_TOKEN.
+	AuditIngestToken string
 	// AuditRateLimitIdentity is the per-OwnerRef token rate (req/s) for
 	// GET /v1/sandboxes/{id}/audit. Security parameter (amplification bound).
 	// SB_AUDIT_RATE_LIMIT_IDENTITY. Default 10.
@@ -1630,6 +1638,8 @@ func Load() (Config, error) {
 		SecretAuditWitnessInterval:    getEnvDuration("SB_SECRET_AUDIT_WITNESS_INTERVAL", 30*time.Second),
 		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
 		EgressAttributionEnabled:      getEnvBool("SB_EGRESS_ATTRIBUTION_ENABLED", true),
+		AuditIngestPort:               getEnvInt("SB_AUDIT_INGEST_PORT", 21215),
+		AuditIngestToken:              strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN")),
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),

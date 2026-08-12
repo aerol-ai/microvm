@@ -2,6 +2,9 @@ package worker
 
 import (
 	"encoding/json"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,62 +12,72 @@ import (
 	"time"
 )
 
-func TestAppendWorkerEgressAudit(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "audit", "secrets.jsonl")
-	appendWorkerEgressAudit(path, "node-w", "sb-1", "tcp", "example.com:443")
-	appendWorkerEgressAudit(path, "node-w", "sb-1", "tcp", "example.com:443")
-	appendWorkerEgressAudit(path, "node-w", "", "tcp", "skip") // empty sandbox — no-op
-	appendWorkerEgressAudit("", "node-w", "sb-1", "tcp", "skip")
-
-	raw, err := os.ReadFile(path)
+func TestPostOrSpillWorkerEgressUsesIngest(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("lines = %d, want 2\n%s", len(lines), raw)
+	defer ln.Close()
+	port := strings.TrimPrefix(ln.Addr().String(), "127.0.0.1:")
+	gotCh := make(chan map[string]string, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/audit/egress", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Aerol-Audit-Token") != "tok" {
+			http.Error(w, "no", http.StatusUnauthorized)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		var m map[string]string
+		_ = json.Unmarshal(raw, &m)
+		gotCh <- m
+		w.WriteHeader(http.StatusAccepted)
+	})
+	go http.Serve(ln, mux)
+
+	postOrSpillWorkerEgress(egressAuditJob{
+		port: port, token: "tok", node: "n1",
+		sandboxID: "sb-1", network: "tcp", address: "example.com:443",
+	})
+	select {
+	case m := <-gotCh:
+		if m["sandbox_id"] != "sb-1" || m["destination"] != "example.com:443" || m["kind"] != "egress" {
+			t.Fatalf("got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ingest not called")
 	}
-	var prev string
-	for i, line := range lines {
-		var ev workerEgressAuditEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			t.Fatalf("unmarshal: %v\nraw=%s", err, line)
-		}
-		if i == 0 {
-			if ev.Kind != "egress" || ev.SandboxID != "sb-1" || ev.Destination != "example.com:443" ||
-				ev.Network != "tcp" || ev.NodeID != "node-w" || ev.Result != "success" {
-				t.Fatalf("event = %+v", ev)
-			}
-			if ev.Time.IsZero() || time.Since(ev.Time) > time.Minute {
-				t.Fatalf("time = %v", ev.Time)
-			}
-			if ev.EventID == "" {
-				t.Fatalf("event_id missing: %+v", ev)
-			}
-			if ev.EventHash == "" || ev.PrevHash != "0" {
-				t.Fatalf("hash chain fields = prev=%q hash=%q", ev.PrevHash, ev.EventHash)
-			}
-			prev = ev.EventHash
-			continue
-		}
-		if ev.PrevHash != prev || ev.EventHash == "" {
-			t.Fatalf("second event chain prev=%q hash=%q want prev=%q", ev.PrevHash, ev.EventHash, prev)
-		}
-		prev = ev.EventHash
-	}
-	tipRaw, err := os.ReadFile(filepath.Join(dir, "audit", "secrets.tip"))
+}
+
+func TestPostOrSpillWorkerEgressFallsBackToSpill(t *testing.T) {
+	dir := t.TempDir()
+	postOrSpillWorkerEgress(egressAuditJob{
+		port: "1", token: "tok", spillDir: dir, node: "n1",
+		sandboxID: "sb-1", network: "tcp", address: "host:9",
+	})
+	raw, err := os.ReadFile(filepath.Join(dir, workerEgressSpillFile))
 	if err != nil {
-		t.Fatalf("secrets.tip: %v", err)
+		t.Fatal(err)
 	}
-	if !strings.HasPrefix(strings.TrimSpace(string(tipRaw)), prev) {
-		t.Fatalf("tip = %q, want prefix %q", tipRaw, prev)
+	var ev workerEgressAuditEvent
+	if err := json.Unmarshal(bytesTrimLine(raw), &ev); err != nil {
+		t.Fatalf("unmarshal: %v raw=%s", err, raw)
+	}
+	if ev.Kind != "egress" || ev.SandboxID != "sb-1" || ev.Destination != "host:9" {
+		t.Fatalf("spill event = %+v", ev)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "secrets.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("worker must not write secrets.jsonl, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "secrets.tip")); !os.IsNotExist(err) {
+		t.Fatalf("worker must not write secrets.tip, err=%v", err)
 	}
 }
 
 func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 	t.Setenv("SB_EGRESS_ATTRIBUTION_ENABLED", "false")
 	t.Setenv("SB_DB_PATH", filepath.Join(t.TempDir(), "state.db"))
+	t.Setenv("SB_AUDIT_INGEST_PORT", "21215")
+	t.Setenv("SB_AUDIT_INGEST_TOKEN", "tok")
 	m := newNetMediator()
 	installDefaultEgressObserver(m)
 	if m.egressObserver() != nil {
@@ -73,10 +86,12 @@ func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 
 	t.Setenv("SB_EGRESS_ATTRIBUTION_ENABLED", "true")
 	t.Setenv("SB_DB_PATH", "")
+	t.Setenv("SB_AUDIT_INGEST_PORT", "")
+	t.Setenv("SB_AUDIT_INGEST_TOKEN", "")
 	m2 := newNetMediator()
 	installDefaultEgressObserver(m2)
 	if m2.egressObserver() != nil {
-		t.Fatal("expected no observer without SB_DB_PATH")
+		t.Fatal("expected no observer without ingest or spill path")
 	}
 
 	dir := t.TempDir()
@@ -86,18 +101,22 @@ func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 	m3 := newNetMediator()
 	installDefaultEgressObserver(m3)
 	if m3.egressObserver() == nil {
-		t.Fatal("expected observer when enabled + DB path")
+		t.Fatal("expected observer when enabled + DB path (spill fallback)")
 	}
 	m3.egressObserver()("sb-x", "tcp", "host:9")
 	deadline := time.Now().Add(2 * time.Second)
-	path := filepath.Join(dir, "audit", "secrets.jsonl")
+	path := filepath.Join(dir, "audit", workerEgressSpillFile)
 	for {
 		if _, err := os.Stat(path); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("audit file not written")
+			t.Fatal("spill file not written")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func bytesTrimLine(raw []byte) []byte {
+	return []byte(strings.TrimSpace(string(raw)))
 }

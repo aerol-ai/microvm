@@ -524,7 +524,7 @@ class MicroVM:
         base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
         items: List[Sandbox] = []
         page_token = ""
-        for _ in range(1000):
+        for _ in range(100000):
             path = _append_query_param(base_path, "page_token", page_token)
             sandboxes, headers = self._do_json_headers("GET", path, None)
             partial = headers.get("X-Cluster-List-Partial", "")

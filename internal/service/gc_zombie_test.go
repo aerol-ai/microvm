@@ -43,6 +43,20 @@ func (s *stubIngressCluster) Placements() []cluster.Placement {
 	return s.placements
 }
 
+func (s *stubIngressCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	out := make(map[string]cluster.Placement, len(ids))
+	byID := make(map[string]cluster.Placement, len(s.placements))
+	for _, p := range s.placements {
+		byID[p.SandboxID] = p
+	}
+	for _, id := range ids {
+		if p, ok := byID[id]; ok {
+			out[id] = p
+		}
+	}
+	return out
+}
+
 func (s *stubIngressCluster) Members() []cluster.Member {
 	if len(s.members) > 0 {
 		return s.members

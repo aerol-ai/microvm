@@ -494,7 +494,9 @@ export class APIClient {
     const basePath = this.versioned("/sandboxes") + buildSandboxListQuery(options);
     const items: SandboxResource[] = [];
     let pageToken = "";
-    const maxPages = 1000;
+    // Safety cap for cluster page drain (100k sandboxes @ page size 1).
+    // Prefer stopping when X-Cluster-List-Next-Page-Token is empty.
+    const maxPages = 100000;
     for (let page = 0; page < maxPages; page++) {
       const path = appendQueryParam(basePath, "page_token", pageToken);
       const response = await this.request("GET", path);

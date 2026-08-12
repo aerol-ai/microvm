@@ -518,7 +518,7 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
 		return
 	}
-	local = clusterlist.FilterLocalToPage(local, placements)
+	local = clusterlist.FilterLocalToPage(local, placements, pageToken)
 	result := clusterlist.Merge(r.Context(), peers, clusterlist.Options{
 		OwnerRef:   ownerRef,
 		AuthHeader: r.Header.Get("Authorization"),
@@ -526,8 +526,10 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		Path:       PathPrefix + "/sandboxes",
 		Local:      local,
 		Transport:  clusterlist.TransportFromCluster(c),
+		SelfNodeID: c.SelfNodeID(),
 		Limit:      limit,
 		PageToken:  pageToken,
+		WantIDs:    clusterlist.PlacementWantIDs(placements),
 		Warn: func(msg, peer string, peerErr error) {
 			h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
 		},
@@ -1228,6 +1230,11 @@ func (h *handlers) clusterInternalSecretPut(w http.ResponseWriter, r *http.Reque
 		}
 		if errors.Is(err, secrets.ErrRecipientDenied) {
 			apihttp.WriteError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		// Stale / conflicting seal must not look like an ACK to the originator.
+		if errors.Is(err, store.ErrClusterSecretStaleGeneration) || errors.Is(err, store.ErrClusterSecretPayloadConflict) {
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
 			return
 		}
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())

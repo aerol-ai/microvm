@@ -332,8 +332,95 @@ func TestFSMHotPlacementReadsOmitRecoveryPayload(t *testing.T) {
 	if len(page.Placements) != 1 {
 		t.Fatalf("placementPage len=%d, want 1", len(page.Placements))
 	}
+	if page.NextPageToken != "" {
+		t.Fatalf("exact-full page NextPageToken=%q, want empty (no further IDs)", page.NextPageToken)
+	}
 	if page.Placements[0].Spec != nil || page.Placements[0].SecretRef != "" {
 		t.Fatalf("hot page read included recovery payload: %+v", page.Placements[0])
+	}
+}
+
+func TestPlacementPageExactLimitBoundaryClearsNextToken(t *testing.T) {
+	fsm := newPlacementFSM()
+	for i := 0; i < 3; i++ {
+		place, _ := encodeCommand(command{
+			Op:          opPlace,
+			SandboxID:   fmt.Sprintf("sb-%d", i),
+			OwnerNodeID: "node-a",
+			Spec:        &models.CreateSandboxRequest{Image: "alpine"},
+		})
+		if got := fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: place}); got != nil {
+			t.Fatalf("place %d: %v", i, got)
+		}
+	}
+	page := fsm.placementPage(PlacementPageRequest{Limit: 3})
+	if len(page.Placements) != 3 {
+		t.Fatalf("len=%d, want 3", len(page.Placements))
+	}
+	if page.NextPageToken != "" {
+		t.Fatalf("NextPageToken=%q, want empty when total==limit", page.NextPageToken)
+	}
+	mid := fsm.placementPage(PlacementPageRequest{Limit: 2})
+	if len(mid.Placements) != 2 || mid.NextPageToken == "" {
+		t.Fatalf("mid page = %+v, want 2 rows and next token", mid)
+	}
+	last := fsm.placementPage(PlacementPageRequest{Limit: 2, PageToken: mid.NextPageToken})
+	if len(last.Placements) != 1 || last.NextPageToken != "" {
+		t.Fatalf("last page = %+v, want 1 row and empty next", last)
+	}
+}
+
+func TestPlacementsByIDsPointLookup(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "n1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}, SecretRecipients: []string{"n1", "n2"},
+	})
+	fsm.Apply(&raft.Log{Index: 1, Data: place})
+	got := fsm.placementsByIDs([]string{"sb-a", "missing", ""})
+	if len(got) != 1 || got["sb-a"].OwnerNodeID != "n1" {
+		t.Fatalf("placementsByIDs = %+v", got)
+	}
+	if len(got["sb-a"].SecretRecipients) != 2 {
+		t.Fatalf("SecretRecipients = %v", got["sb-a"].SecretRecipients)
+	}
+}
+
+func TestFSMUpdateSecretRecipientsPreservesIncarnation(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-exp", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
+		Spec:             &models.CreateSandboxRequest{Image: "alpine"},
+		SecretRecipients: []string{"n1", "dead-a", "dead-b"},
+		IncarnationID:    "inc-keep",
+		SecretRef:        "cluster-secret://sandbox/sb-exp/v1",
+		SecretVersion:    1,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 1, Data: place}); res != nil {
+		t.Fatalf("opPlace: %v", res)
+	}
+	upd, _ := encodeCommand(command{
+		Op:               opUpdateSecretRecipients,
+		SandboxID:        "sb-exp",
+		SecretRecipients: []string{"n1", "live-b", "live-c"},
+		SecretRef:        "cluster-secret://sandbox/sb-exp/v1",
+		SecretVersion:    1,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 2, Data: upd}); res != nil {
+		t.Fatalf("opUpdateSecretRecipients: %v", res)
+	}
+	got, ok := fsm.get("sb-exp")
+	if !ok {
+		t.Fatal("placement missing")
+	}
+	if got.IncarnationID != "inc-keep" {
+		t.Fatalf("IncarnationID=%q, want preserved", got.IncarnationID)
+	}
+	if got.OwnerNodeID != "n1" {
+		t.Fatalf("OwnerNodeID=%q, want n1", got.OwnerNodeID)
+	}
+	if len(got.SecretRecipients) != 3 || got.SecretRecipients[1] != "live-b" {
+		t.Fatalf("SecretRecipients=%v", got.SecretRecipients)
 	}
 }
 

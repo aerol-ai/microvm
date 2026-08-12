@@ -21,7 +21,9 @@ func PeerDial(m Member, publicClient, internalClient *http.Client) (client *http
 		if internalURL == "" {
 			return nil, "", ErrPeerInternalURLRequired
 		}
-		return internalClient, internalURL, nil
+		// Bind dial verification to the expected gossip node id when the peer
+		// cert carries DNS:node:<id> (legacy-only certs remain soft-compat).
+		return ClientForPeer(internalClient, m.NodeID), internalURL, nil
 	}
 	if publicClient != nil && apiURL != "" {
 		return publicClient, apiURL, nil

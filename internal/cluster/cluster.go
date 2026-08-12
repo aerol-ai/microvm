@@ -521,6 +521,13 @@ type Client interface {
 	// explicitly.
 	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error
 
+	// UpdatePlacementSecretRecipients replaces Placement.SecretRecipients
+	// (and optionally the seal handle after a reseal) without touching
+	// ownership or IncarnationID. Used when a majority of frozen seal
+	// targets are dead and live replacements must be coordinated via Raft
+	// before recipient-bound AAD reseal fan-out.
+	UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets) error
+
 	// SpecOf returns the most-recently-replicated CreateSandboxRequest for
 	// sandboxID, or nil if no spec is recorded (pre-cluster sandbox, or no
 	// placement). The returned spec is REDACTED — no plaintext secrets. Use
@@ -712,6 +719,12 @@ type Client interface {
 	// getters (OwnerOf/ExposedPortsOf) would lose the placement.Version
 	// needed to compute "is this sandbox's route installed yet on this node".
 	PlacementOf(sandboxID string) (Placement, bool)
+
+	// PlacementsByIDs returns hot placement rows for the requested sandbox IDs
+	// without dumping the full Placements() view. Missing IDs are omitted.
+	// Used by list/get failover_ready batching so a page of N sandboxes does
+	// not pay for a full FSM scan.
+	PlacementsByIDs(ids []string) map[string]Placement
 
 	// PlacementVersion is the FSM's monotonic apply counter — bumps on every
 	// raft log entry the FSM applied. Exposed for metrics/observability and

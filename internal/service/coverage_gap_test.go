@@ -722,11 +722,9 @@ func TestProxyL4WakeConnDialError(t *testing.T) {
 		t.Fatalf("UpsertPort: %v", err)
 	}
 
-	oldDial := dialL4Upstream
-	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+	setDialL4UpstreamForTest(t, func(context.Context, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
-	}
-	defer func() { dialL4Upstream = oldDial }()
+	})
 
 	server, client := net.Pipe()
 	go func() {
@@ -767,11 +765,9 @@ func TestTLSWakeListenerAcceptBranches(t *testing.T) {
 		t.Fatalf("UpsertPort: %v", err)
 	}
 
-	oldDial := dialL4Upstream
-	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+	setDialL4UpstreamForTest(t, func(context.Context, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
-	}
-	defer func() { dialL4Upstream = oldDial }()
+	})
 
 	socketPath, err := svc.ensureTLSWakeListener("sb-tls-accept", 8443)
 	if err != nil {

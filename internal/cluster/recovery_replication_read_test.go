@@ -161,7 +161,7 @@ func TestDoRecoveryHTTPRequest(t *testing.T) {
 	ctx := context.Background()
 
 	var out RecoveryBlob
-	err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "test-token", nil, &out)
+	err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "test-token", "", nil, &out)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -170,12 +170,12 @@ func TestDoRecoveryHTTPRequest(t *testing.T) {
 	}
 
 	// auth fail
-	if err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "bad-token", nil, &out); err == nil {
+	if err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "bad-token", "", nil, &out); err == nil {
 		t.Errorf("expected error")
 	}
 
 	// transport fail (bad url)
-	if err := doRecoveryHTTPRequest(ctx, ts.Client(), "http://127.0.0.1:0", http.MethodGet, "", nil, nil); err == nil {
+	if err := doRecoveryHTTPRequest(ctx, ts.Client(), "http://127.0.0.1:0", http.MethodGet, "", "", nil, nil); err == nil {
 		t.Errorf("expected error")
 	}
 }

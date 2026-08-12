@@ -74,7 +74,7 @@ func TestListSecretAuditIncludesEgressEvents(t *testing.T) {
 	}
 	t.Cleanup(s.CloseSecretAuditSink)
 
-	emitSecretAudit(s.secretAuditSink(), "sb-1", "env:sb-1", "node-a", "corr-open", nil)
+	emitSecretAudit(s.secretAuditSink(), "sb-1", "env:sb-1", "node-a", "corr-open", "", nil)
 	s.emitEgressAudit("sb-1", "tcp", "cdn.example.com")
 	if f := s.secretAuditFile; f != nil {
 		f.Sync()

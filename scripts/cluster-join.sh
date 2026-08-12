@@ -22,6 +22,7 @@ TLS_DIR="/etc/sandboxd/tls"
 TLS_BUNDLE=""
 CRED_BUNDLE=""
 CRED_KEY_PATH=""
+SIGNED_CERT=""
 INTERNAL_BIND_ADDR="0.0.0.0:7002"
 INTERNAL_ADVERTISE_URL=""
 NO_TLS="false"
@@ -56,18 +57,18 @@ Optional:
   --raft-advertise <host:port>  Raft address peers connect to. Default: derived.
   --gossip-bind <host:port>     Gossip listen address. Default: 0.0.0.0:7001
   --gossip-advertise <host:port> Gossip address peers connect to. Default: derived.
-  --tls-bundle <path>           Path to the TLS bundle (tarball with ca.crt +
-                                ca.key + credential_encryption.key) emitted by
-                                cluster-init.sh on the seed. A fresh node cert
-                                is signed locally from the bundled CA, and the
-                                credential encryption key is installed so this
-                                node can decrypt sealed registry/mount creds
-                                replicated via raft. Required unless --no-tls.
-  --cred-bundle <path>          In --no-tls mode, path to the standalone
-                                credential bundle (tarball with just
-                                credential_encryption.key) emitted by
-                                cluster-init.sh. Required when --no-tls is
-                                set.
+  --tls-bundle <path>           Path to the TLS trust bundle (tarball with
+                                ca.crt ONLY) from cluster-init.sh. This node
+                                generates node.key + CSR locally; the seed
+                                signs via cluster-sign-node.sh (ca.key never
+                                leaves the seed). Required unless --no-tls.
+  --cred-bundle <path>          Credential encryption key bundle (tarball
+                                with credential_encryption.key). Required
+                                always (TLS and --no-tls). Kept separate from
+                                the CA trust bundle on purpose.
+  --signed-cert <path>          Pre-signed node.crt from cluster-sign-node.sh.
+                                When omitted, this script writes node.csr and
+                                exits with instructions to sign on the seed.
   --tls-dir <path>              Where to write the loaded TLS material.
                                 Default: /etc/sandboxd/tls
   --credential-key-path <path>  Where to write the shared credential
@@ -128,6 +129,7 @@ while [[ $# -gt 0 ]]; do
 		--peers)              PEERS="$2"; shift 2 ;;
 		--tls-bundle)         TLS_BUNDLE="$2"; shift 2 ;;
 		--cred-bundle)        CRED_BUNDLE="$2"; shift 2 ;;
+		--signed-cert)        SIGNED_CERT="$2"; shift 2 ;;
 		--tls-dir)            TLS_DIR="$2"; shift 2 ;;
 		--credential-key-path) CRED_KEY_PATH="$2"; shift 2 ;;
 		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
@@ -199,16 +201,14 @@ if [[ "$NO_TLS" != "true" ]] && [[ ! -f "$TLS_BUNDLE" ]]; then
 	exit 1
 fi
 
-if [[ "$NO_TLS" == "true" ]] && [[ -z "$CRED_BUNDLE" ]]; then
-	echo "--cred-bundle is required when --no-tls is set." >&2
-	echo "  cluster-init.sh --no-tls emits aerolvm-cred-bundle.tar.gz on the seed;" >&2
+if [[ -z "$CRED_BUNDLE" ]]; then
+	echo "--cred-bundle is required (credential encryption key ships separately from ca.crt)." >&2
+	echo "  cluster-init.sh emits aerolvm-cred-bundle.tar.gz on the seed;" >&2
 	echo "  copy it here and pass --cred-bundle <path>." >&2
-	echo "  Without it, this node cannot decrypt sealed registry/mount credentials" >&2
-	echo "  replicated via raft, and recovered sandboxes will fail to pull images." >&2
 	exit 1
 fi
 
-if [[ -n "$CRED_BUNDLE" ]] && [[ ! -f "$CRED_BUNDLE" ]]; then
+if [[ ! -f "$CRED_BUNDLE" ]]; then
 	echo "Credential bundle not found: $CRED_BUNDLE" >&2
 	exit 1
 fi
@@ -292,68 +292,86 @@ if [[ -z "$RAFT_ADVERTISE_ADDR" ]];   then RAFT_ADVERTISE_ADDR="$(derive_adverti
 if [[ -z "$GOSSIP_ADVERTISE_ADDR" ]]; then GOSSIP_ADVERTISE_ADDR="$(derive_advertise "$GOSSIP_BIND_ADDR")"; fi
 
 # --- Cluster TLS material -------------------------------------------------
-# Unpack the seed-emitted bundle (ca.crt + ca.key) and locally mint this
-# node's keypair + signed cert. Only ca.crt + node.{crt,key} are needed at
-# runtime; we keep ca.key on disk too (root-only) so future re-mints don't
-# need a fresh bundle copy.
+# Unpack ca.crt from the seed trust bundle, generate node.key + CSR locally.
+# Signing uses ca.key only on the seed (cluster-sign-node.sh). Never require
+# or unpack ca.key on joiners.
 CLUSTER_SAN="aerolvm-cluster-node"
 TLS_GENERATED="false"
 if [[ "$NO_TLS" == "true" ]]; then
+	# Private-overlay escape hatch only — not for production / public nets.
 	echo "WARNING: --no-tls given; cluster-internal channels will use the public"
 	echo "         API URL with PAT-only auth. Only safe on a fully isolated network."
 else
 	if ! command -v openssl >/dev/null 2>&1; then
-		echo "openssl not found — required to mint a node cert from the TLS bundle." >&2
+		echo "openssl not found — required to mint a node key/CSR." >&2
 		exit 1
 	fi
 
 	mkdir -p "$TLS_DIR"
 	chmod 0700 "$TLS_DIR"
 
-	if [[ -f "$TLS_DIR/node.crt" ]]; then
+	if [[ -f "$TLS_DIR/node.crt" && -z "$SIGNED_CERT" ]]; then
 		if [[ "$FORCE" != "true" ]]; then
 			echo "Refusing to overwrite existing TLS material in $TLS_DIR." >&2
-			echo "  Pass --force to regenerate." >&2
+			echo "  Pass --force to regenerate, or --signed-cert <path> to install a new cert." >&2
 			exit 1
 		fi
 		echo "WARNING: --force given; regenerating TLS material in $TLS_DIR"
-		rm -f "$TLS_DIR/ca.crt" "$TLS_DIR/ca.key" "$TLS_DIR/node.crt" "$TLS_DIR/node.key"
+		rm -f "$TLS_DIR/ca.crt" "$TLS_DIR/ca.key" "$TLS_DIR/node.crt" "$TLS_DIR/node.key" "$TLS_DIR/node.csr"
 	fi
 
-	# Extract bundle. tar will refuse path traversals; we restrict the file
-	# list explicitly anyway.
-	tar -C "$TLS_DIR" -xzf "$TLS_BUNDLE" ca.crt ca.key credential_encryption.key
-	if [[ ! -f "$TLS_DIR/ca.crt" ]] || [[ ! -f "$TLS_DIR/ca.key" ]]; then
-		echo "TLS bundle did not contain ca.crt + ca.key" >&2
-		exit 1
+	# Extract ca.crt only. Legacy bundles that still contain ca.key are ignored
+	# — we refuse to keep a CA private key on workers.
+	tar -C "$TLS_DIR" -xzf "$TLS_BUNDLE" ca.crt 2>/dev/null || true
+	if [[ ! -f "$TLS_DIR/ca.crt" ]]; then
+		if [[ -f "$TLS_BUNDLE" ]] && grep -q "BEGIN CERTIFICATE" "$TLS_BUNDLE" 2>/dev/null; then
+			install -m 0644 "$TLS_BUNDLE" "$TLS_DIR/ca.crt"
+		else
+			echo "TLS trust bundle did not contain ca.crt" >&2
+			exit 1
+		fi
 	fi
-	if [[ ! -f "$TLS_DIR/credential_encryption.key" ]]; then
-		echo "TLS bundle did not contain credential_encryption.key" >&2
-		echo "  Re-run cluster-init.sh on the seed with the updated script and copy" >&2
-		echo "  the regenerated bundle. Without the shared key, this node cannot" >&2
-		echo "  decrypt sealed registry/mount creds for failed-over sandboxes." >&2
-		exit 1
-	fi
+	rm -f "$TLS_DIR/ca.key"
 
-	openssl genrsa -out "$TLS_DIR/node.key" 4096 2>/dev/null
-	openssl req -new -key "$TLS_DIR/node.key" \
-		-subj "/CN=$CLUSTER_SAN" \
-		-out "$TLS_DIR/node.csr" 2>/dev/null
+	if [[ -n "$SIGNED_CERT" ]]; then
+		if [[ ! -f "$SIGNED_CERT" ]]; then
+			echo "Signed cert not found: $SIGNED_CERT" >&2
+			exit 1
+		fi
+		if [[ ! -f "$TLS_DIR/node.key" ]]; then
+			echo "node.key missing under $TLS_DIR — generate CSR first (run without --signed-cert)." >&2
+			exit 1
+		fi
+		install -m 0644 "$SIGNED_CERT" "$TLS_DIR/node.crt"
+		chmod 0600 "$TLS_DIR/node.key"
+		chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.crt"
+		rm -f "$TLS_DIR/node.csr"
+		TLS_GENERATED="true"
+	else
+		if [[ ! -f "$TLS_DIR/node.key" ]]; then
+			openssl genrsa -out "$TLS_DIR/node.key" 4096 2>/dev/null
+			chmod 0600 "$TLS_DIR/node.key"
+		fi
+		openssl req -new -key "$TLS_DIR/node.key" \
+			-subj "/CN=$CLUSTER_SAN" \
+			-out "$TLS_DIR/node.csr" 2>/dev/null
+		chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.csr"
+		cat <<EOF >&2
+=========================================================================
+CSR ready — ca.key is NOT on this host. Sign on the seed:
 
-	cat > "$TLS_DIR/node.ext" <<EOF
-subjectAltName = DNS:$CLUSTER_SAN,DNS:node:${NODE_ID}
-extendedKeyUsage = serverAuth, clientAuth
+  scp $TLS_DIR/node.csr seed:/tmp/${NODE_ID}.csr
+  # on seed:
+  sudo ./cluster-sign-node.sh --csr /tmp/${NODE_ID}.csr --node-id ${NODE_ID} --out /tmp/${NODE_ID}.crt
+  # back on this host:
+  scp seed:/tmp/${NODE_ID}.crt /tmp/node.crt
+  sudo ./cluster-join.sh ... --tls-bundle $TLS_BUNDLE --cred-bundle $CRED_BUNDLE --signed-cert /tmp/node.crt
+
+Stopping before daemon restart (node.crt not installed yet).
+=========================================================================
 EOF
-
-	openssl x509 -req -in "$TLS_DIR/node.csr" \
-		-CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" -CAcreateserial \
-		-out "$TLS_DIR/node.crt" -days 3650 -sha256 \
-		-extfile "$TLS_DIR/node.ext" 2>/dev/null
-
-	rm -f "$TLS_DIR/node.csr" "$TLS_DIR/node.ext" "$TLS_DIR/ca.srl"
-	chmod 0600 "$TLS_DIR/ca.key" "$TLS_DIR/node.key"
-	chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.crt"
-	TLS_GENERATED="true"
+		exit 2
+	fi
 fi
 
 if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
@@ -362,46 +380,32 @@ if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
 fi
 
 # --- Credential encryption key --------------------------------------------
-# Sealed registry / mount creds replicated via raft are decrypted with this
-# key on the failover owner. Every node must hold the seed-generated value.
-# Source it from the TLS bundle (TLS path) or the standalone --cred-bundle
-# (no-tls path), validate it, and install it at the daemon's configured key
-# path so re-running install.sh later does not lazy-generate a divergent
-# key file. We also write SB_CREDENTIAL_ENCRYPTION_KEY into cluster.env so
-# the env var (highest precedence in pkg/secrets) carries the same value
-# regardless of file state.
+# Always sourced from --cred-bundle (never from the ca.crt trust tarball).
 if [[ -z "$CRED_KEY_PATH" ]]; then
 	CRED_KEY_PATH="$(read_sandboxd_env_value SB_CREDENTIAL_ENCRYPTION_KEY_PATH)"
 	CRED_KEY_PATH="${CRED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key}"
 fi
 
-if [[ "$NO_TLS" == "true" ]]; then
-	CRED_STAGE_DIR="$(mktemp -d)"
-	tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key
-	if [[ ! -f "$CRED_STAGE_DIR/credential_encryption.key" ]]; then
-		rm -rf "$CRED_STAGE_DIR"
-		echo "Credential bundle did not contain credential_encryption.key" >&2
-		exit 1
-	fi
-	CRED_KEY_SOURCE="$CRED_STAGE_DIR/credential_encryption.key"
-else
-	CRED_KEY_SOURCE="$TLS_DIR/credential_encryption.key"
+CRED_STAGE_DIR="$(mktemp -d)"
+tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key
+if [[ ! -f "$CRED_STAGE_DIR/credential_encryption.key" ]]; then
+	rm -rf "$CRED_STAGE_DIR"
+	echo "Credential bundle did not contain credential_encryption.key" >&2
+	exit 1
 fi
+CRED_KEY_SOURCE="$CRED_STAGE_DIR/credential_encryption.key"
 
 CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_SOURCE")"
 CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
 if [[ "$CRED_DECODED_LEN" != "32" ]]; then
-	[[ "$NO_TLS" == "true" ]] && rm -rf "$CRED_STAGE_DIR"
+	rm -rf "$CRED_STAGE_DIR"
 	echo "Invalid credential key in bundle: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
 	exit 1
 fi
 
 mkdir -p "$(dirname "$CRED_KEY_PATH")"
 install -m 0600 "$CRED_KEY_SOURCE" "$CRED_KEY_PATH"
-
-if [[ "$NO_TLS" == "true" ]]; then
-	rm -rf "$CRED_STAGE_DIR"
-fi
+rm -rf "$CRED_STAGE_DIR"
 
 mkdir -p /etc/sandboxd
 {

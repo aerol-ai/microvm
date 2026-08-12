@@ -680,7 +680,9 @@ impl Client {
         };
         let mut items = Vec::new();
         let mut page_token = String::new();
-        for _ in 0..1000 {
+        // Safety cap: enough for 100k sandboxes at page size 1 (default page
+        // size is 100). Stop earlier when the next-page token is empty.
+        for _ in 0..100_000 {
             let path = append_query_param(&base_path, "page_token", &page_token);
             let (raw, headers) =
                 self.do_json_headers::<(), Vec<SandboxData>>(Method::GET, &path, None)?;

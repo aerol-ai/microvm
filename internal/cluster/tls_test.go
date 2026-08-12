@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -77,5 +78,15 @@ func TestLoadClusterTLS(t *testing.T) {
 	cCfg := ct.clientConfig()
 	if cCfg.ServerName != clusterServerName {
 		t.Errorf("expected clusterServerName")
+	}
+}
+
+func TestClientForPeerNoopWithoutTLS(t *testing.T) {
+	base := &http.Client{}
+	if got := ClientForPeer(base, "n1"); got != base {
+		t.Fatal("ClientForPeer without TLS transport should return base")
+	}
+	if got := ClientForPeer(nil, "n1"); got != nil {
+		t.Fatal("nil base should stay nil")
 	}
 }

@@ -322,6 +322,20 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 	})
 }
 
+func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets) error {
+	recipients = normalizeSecretRecipientIDs(recipients)
+	if strings.TrimSpace(sandboxID) == "" || len(recipients) == 0 {
+		return nil
+	}
+	return a.applyCommand(ctx, command{
+		Op:               opUpdateSecretRecipients,
+		SandboxID:        sandboxID,
+		SecretRecipients: recipients,
+		SecretRef:        secrets.Ref,
+		SecretVersion:    secrets.Version,
+	})
+}
+
 func (a *Agent) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 	lookup, ok, err := a.lookupPlacement(context.Background(), sandboxID)
 	if err != nil {
@@ -753,6 +767,22 @@ func (a *Agent) PlacementOf(sandboxID string) (Placement, bool) {
 	return lookup.Placement, true
 }
 
+// PlacementsByIDs point-looks up each ID via the control plane. Prefer this
+// over Placements() when only a page of IDs is needed (failover_ready batch).
+func (a *Agent) PlacementsByIDs(ids []string) map[string]Placement {
+	out := make(map[string]Placement, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if p, ok := a.PlacementOf(id); ok {
+			out[id] = p
+		}
+	}
+	return out
+}
+
 func (a *Agent) PlacementVersion() uint64 {
 	return a.placementVersion.Load()
 }
@@ -986,6 +1016,7 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	SetPeerNodeIDHeader(req, a.nodeID)
 	if a.patToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.patToken)
 	}

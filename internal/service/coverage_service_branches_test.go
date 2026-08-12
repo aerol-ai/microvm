@@ -108,6 +108,20 @@ func (s *serviceClusterStub) Placements() []cluster.Placement {
 	return append([]cluster.Placement(nil), s.placements...)
 }
 
+func (s *serviceClusterStub) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	out := make(map[string]cluster.Placement, len(ids))
+	byID := make(map[string]cluster.Placement, len(s.placements))
+	for _, p := range s.placements {
+		byID[p.SandboxID] = p
+	}
+	for _, id := range ids {
+		if p, ok := byID[id]; ok {
+			out[id] = p
+		}
+	}
+	return out
+}
+
 func (s *serviceClusterStub) PlacementsForShards(cluster.PlacementShardFilter) []cluster.Placement {
 	return s.Placements()
 }

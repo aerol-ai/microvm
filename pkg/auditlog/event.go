@@ -28,6 +28,9 @@ type Event struct {
 	Network       string    `json:"network,omitempty"`
 	BytesIn       int64     `json:"bytes_in,omitempty"`
 	BytesOut      int64     `json:"bytes_out,omitempty"`
+	// IncarnationID scopes the event to a placement incarnation so post-delete
+	// ACL and recreate history do not cross tenant ownership boundaries.
+	IncarnationID string `json:"incarnation_id,omitempty"`
 	// Dropped is set on gap markers to record how many events were coalesced
 	// into this single overflow marker (lossy buffer evidence).
 	Dropped int64 `json:"dropped,omitempty"`
@@ -35,6 +38,9 @@ type Event struct {
 	// tamper detection once heads are witnessed off-node (E2b).
 	PrevHash  string `json:"prev_hash,omitempty"`
 	EventHash string `json:"event_hash,omitempty"`
+	// WitnessedThrough is set on retention_checkpoint records to record the
+	// last externally witnessed head that prune dropped (optional MVP field).
+	WitnessedThrough string `json:"witnessed_through,omitempty"`
 }
 
 var fallbackSequence atomic.Uint64

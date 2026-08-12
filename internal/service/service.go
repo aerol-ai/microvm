@@ -172,6 +172,8 @@ type Service struct {
 	secretAuditWitnessOnce sync.Once
 	secretAuditWitnessStop chan struct{}
 	secretAuditWitnessDone sync.WaitGroup
+	auditIngestMu          sync.Mutex
+	auditIngest            *auditIngestServer
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
 	// testSandboxMetaFetcher overrides owner-ref probes for ingress audit auth.
@@ -1969,7 +1971,7 @@ func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.
 	if len(sealed) == 0 {
 		return nil, nil
 	}
-	done := beginSecretAudit(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "")
+	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "", s.secretIncarnationForSeal(sandboxID))
 	defer func() { done(err) }()
 	if s == nil || s.cipher == nil {
 		return nil, fmt.Errorf("%w: registry auth cipher is not configured", secrets.ErrDecryptFailed)
@@ -2040,7 +2042,7 @@ func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
 
 // loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
 func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string]string, err error) {
-	done := beginSecretAudit(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx))
+	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), s.secretIncarnationForSeal(sandboxID))
 	defer func() { done(err) }()
 
 	sealed, getErr := s.store.GetEnv(ctx, sandboxID)
@@ -2098,7 +2100,7 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []mod
 	if len(sealed) == 0 {
 		return nil, nil
 	}
-	done := beginSecretAudit(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx))
+	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), s.secretIncarnationForSeal(sandboxID))
 	defer func() { done(err) }()
 	if s.cipher == nil {
 		return nil, fmt.Errorf("%w: mounts cipher is not configured", secrets.ErrDecryptFailed)
@@ -2471,7 +2473,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	// into an ownerless gap after a crash or later cleanup error.
 	if sandbox != nil {
 		if ref := strings.TrimSpace(sandbox.OwnerRef); ref != "" {
-			if err := s.store.UpsertSandboxAuditACL(ctx, id, ref); err != nil {
+			if err := s.store.UpsertSandboxAuditACL(ctx, id, ref, s.secretIncarnationForSeal(id)); err != nil {
 				return err
 			}
 		}

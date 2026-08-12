@@ -58,7 +58,7 @@ func ValidateRecoveryPayloadSize(sandboxID string, spec *models.CreateSandboxReq
 // SHA-256 of a ≤4KiB payload (~µs) on the create path.
 func validateCommandRecoverySize(cmd command) error {
 	switch cmd.Op {
-	case opPlace, opClaimOrphan, opUpsertSpec, opReserve:
+	case opPlace, opClaimOrphan, opUpsertSpec, opUpdateSecretRecipients, opReserve:
 		if !commandCarriesRecoveryPayload(cmd.Spec, cmd.SecretRef, cmd.SecretVersion) {
 			return nil
 		}
@@ -133,7 +133,7 @@ func (c *Cluster) getRecoveryBlobFromMember(ctx context.Context, m Member, ref s
 	if err != nil {
 		return RecoveryBlob{}, false, err
 	}
-	err = doRecoveryHTTPRequest(ctx, client, strings.TrimRight(base, "/")+path, http.MethodGet, c.patToken, nil, &out)
+	err = doRecoveryHTTPRequest(ctx, client, strings.TrimRight(base, "/")+path, http.MethodGet, c.patToken, c.nodeID, nil, &out)
 	if err != nil {
 		if isStatus(err, http.StatusNotFound) {
 			return RecoveryBlob{}, false, nil
@@ -147,7 +147,7 @@ func recoveryBlobPath(ref string) string {
 	return PublicInternalRecoveryPath + url.PathEscape(ref)
 }
 
-func doRecoveryHTTPRequest(ctx context.Context, client *http.Client, endpoint, method, pat string, body []byte, out any) error {
+func doRecoveryHTTPRequest(ctx context.Context, client *http.Client, endpoint, method, pat, selfID string, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -155,6 +155,7 @@ func doRecoveryHTTPRequest(ctx context.Context, client *http.Client, endpoint, m
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	SetPeerNodeIDHeader(req, selfID)
 	if pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}

@@ -38,9 +38,10 @@ const (
 	// the same for back-compat). secretAuditKindEgress is host-mediated
 	// destination attribution (wasm NetMediator / isolate proxy) — never claim
 	// guest-side secret use from these records.
-	secretAuditKindSecretOpen = "secret_open"
-	secretAuditKindEgress     = "egress"
-	secretAuditKindGap        = "gap"
+	secretAuditKindSecretOpen          = "secret_open"
+	secretAuditKindEgress              = "egress"
+	secretAuditKindGap                 = "gap"
+	secretAuditKindRetentionCheckpoint = "retention_checkpoint"
 
 	defaultSecretAuditBuffer = 1024
 	// enterpriseSecretAuditBuffer reduces spill likelihood under burst open
@@ -51,6 +52,7 @@ const (
 	secretAuditSyncInterval = time.Second
 	secretAuditFileName     = "secrets.jsonl"
 	secretAuditSpillName    = "secrets.spill.jsonl"
+	secretAuditSpillWorking = "secrets.spill.jsonl.working"
 	// secretAuditLockName is a stable sidecar flock target. Retention and
 	// wasm workers lock this path *before* opening secrets.jsonl so a rename
 	// during prune cannot leave writers appending to an unlinked inode.
@@ -58,8 +60,9 @@ const (
 )
 
 var (
-	auditEventsDroppedTotal = expvar.NewInt("aerolvm_audit_events_dropped_total")
-	secretAuditSinkHealthy  = expvar.NewInt("aerolvm_secret_audit_sink_healthy")
+	auditEventsDroppedTotal  = expvar.NewInt("aerolvm_audit_events_dropped_total")
+	auditSpillMalformedTotal = expvar.NewInt("aerolvm_audit_spill_malformed_total")
+	secretAuditSinkHealthy   = expvar.NewInt("aerolvm_secret_audit_sink_healthy")
 )
 
 // SecretAuditEvent is one audit record (secret-open by default, or host-mediated
@@ -109,19 +112,26 @@ type fileAuditSink struct {
 	// spillEnabled (enterprise): buffer-full Emit appends to spillPath instead
 	// of dropping. Gap only if that spill write fails.
 	spillEnabled bool
-	sendMu       sync.Mutex
-	done         chan struct{}
-	path         string
-	lockPath     string
-	gapPath      string
-	tipPath      string
-	spillPath    string
-	file         *os.File
-	chainMu      sync.Mutex
-	chainHead    string
-	chainEvent   string
+	// sendMu serializes channel send vs Close. Spill file I/O uses spillMu so
+	// Emit never holds sendMu across disk waits (avoids blocking Sync/Close).
+	sendMu           sync.Mutex
+	spillMu          sync.Mutex
+	done             chan struct{}
+	path             string
+	lockPath         string
+	gapPath          string
+	tipPath          string
+	spillPath        string
+	spillWorkingPath string
+	file             *os.File
+	chainMu          sync.Mutex
+	chainHead        string
+	chainEvent       string
 	// writeHook, when set (tests), runs before each file write and may block.
 	writeHook func()
+	// afterPrune, when set (Service), ships a new witness tip after prune
+	// rotates the hash chain by re-linking retained events from genesis.
+	afterPrune func()
 }
 
 func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
@@ -140,6 +150,7 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 	gapPath := filepath.Join(auditDir, "secrets.gap")
 	tipPath := filepath.Join(auditDir, "secrets.tip")
 	spillPath := filepath.Join(auditDir, secretAuditSpillName)
+	spillWorkingPath := filepath.Join(auditDir, secretAuditSpillWorking)
 	// Acquire the stable sidecar lock before opening the data file so retention
 	// rename cannot race a concurrent open+append onto an unlinked inode.
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
@@ -161,17 +172,18 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 	head, tipEvent := loadChainTip(path, tipPath)
 	pending := loadGapCount(gapPath)
 	s := &fileAuditSink{
-		ch:           make(chan auditWriteReq, buffer),
-		done:         make(chan struct{}),
-		path:         path,
-		lockPath:     lockPath,
-		gapPath:      gapPath,
-		tipPath:      tipPath,
-		spillPath:    spillPath,
-		file:         f,
-		spillEnabled: spillEnabled,
-		chainHead:    head,
-		chainEvent:   tipEvent,
+		ch:               make(chan auditWriteReq, buffer),
+		done:             make(chan struct{}),
+		path:             path,
+		lockPath:         lockPath,
+		gapPath:          gapPath,
+		tipPath:          tipPath,
+		spillPath:        spillPath,
+		spillWorkingPath: spillWorkingPath,
+		file:             f,
+		spillEnabled:     spillEnabled,
+		chainHead:        head,
+		chainEvent:       tipEvent,
 	}
 	if pending > 0 {
 		s.pendingGap.Store(pending)
@@ -185,15 +197,20 @@ func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
 		return
 	}
 	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
 	if s.closed.Load() {
+		s.sendMu.Unlock()
 		return
 	}
 	req := auditWriteReq{ev: ev}
 	select {
 	case s.ch <- req:
+		s.sendMu.Unlock()
 	default:
-		if s.spillEnabled {
+		spill := s.spillEnabled
+		s.sendMu.Unlock()
+		// Spill I/O intentionally outside sendMu so Sync/Close are not stalled
+		// behind flock + fsync on the overflow path.
+		if spill {
 			if err := s.appendSpill(ev); err != nil {
 				auditEventsDroppedTotal.Add(1)
 				n := s.pendingGap.Add(1)
@@ -297,7 +314,7 @@ func (s *fileAuditSink) loop() {
 
 // appendSpill durable-appends one event under the audit flock when the
 // in-memory channel is full. Used by enterprise Emit so request paths never
-// block and evidence is not silently discarded.
+// block and evidence is not silently discarded. fsync bounds the loss window.
 func (s *fileAuditSink) appendSpill(ev SecretAuditEvent) error {
 	if s == nil || s.spillPath == "" {
 		return errors.New("secret audit spill path unset")
@@ -311,26 +328,45 @@ func (s *fileAuditSink) appendSpill(ev SecretAuditEvent) error {
 		return err
 	}
 	line = append(line, '\n')
+	s.spillMu.Lock()
+	defer s.spillMu.Unlock()
 	return s.withAuditFileLock(func() error {
 		f, err := os.OpenFile(s.spillPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		_, err = f.Write(line)
-		return err
+		if _, err := f.Write(line); err != nil {
+			return err
+		}
+		return f.Sync()
 	})
 }
 
 // drainSpill moves spilled events into the authoritative JSONL (with hash
-// linking). Returns true when at least one event was drained so the loop can
-// prefer spill over new channel work.
+// linking). Crash-safe order: rename spill → working, write+fsync each event
+// into secrets.jsonl, then truncate working to the unprocessed suffix (or
+// delete when empty). Never truncates spill before the authoritative write
+// succeeds. Returns true when work was performed so the loop can prefer spill
+// over new channel work.
 func (s *fileAuditSink) drainSpill() bool {
 	if s == nil || s.spillPath == "" {
 		return false
 	}
-	var events []SecretAuditEvent
+	s.spillMu.Lock()
+	defer s.spillMu.Unlock()
+
+	working := s.spillWorkingPath
+	if working == "" {
+		working = s.spillPath + ".working"
+	}
+	var lines []string
 	err := s.withAuditFileLock(func() error {
+		// Resume an interrupted drain before accepting a fresh spill rename.
+		if raw, err := os.ReadFile(working); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
+			lines = splitNonEmptyLines(string(raw))
+			return nil
+		}
 		raw, err := os.ReadFile(s.spillPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -339,28 +375,76 @@ func (s *fileAuditSink) drainSpill() bool {
 			return err
 		}
 		if len(strings.TrimSpace(string(raw))) == 0 {
+			_ = os.Remove(s.spillPath)
 			return nil
 		}
-		for _, line := range strings.Split(string(raw), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var ev SecretAuditEvent
-			if json.Unmarshal([]byte(line), &ev) != nil {
-				continue
-			}
-			events = append(events, ev)
+		// Atomic hand-off: after rename, crash recovery re-reads working.
+		if err := os.Rename(s.spillPath, working); err != nil {
+			return err
 		}
-		return os.WriteFile(s.spillPath, nil, 0o600)
+		lines = splitNonEmptyLines(string(raw))
+		return nil
 	})
-	if err != nil || len(events) == 0 {
+	if err != nil || len(lines) == 0 {
 		return false
 	}
-	for _, ev := range events {
-		s.writeEvent(ev)
+
+	for i, line := range lines {
+		var ev SecretAuditEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			auditSpillMalformedTotal.Add(1)
+			// Never silently skip: durable gap first so the hole is auditable.
+			s.writeEvent(SecretAuditEvent{
+				Time:    time.Now().UTC(),
+				Result:  secretAuditResultGap,
+				Reason:  secretAuditReasonOverflow,
+				Kind:    secretAuditKindGap,
+				Dropped: 1,
+			})
+		} else {
+			s.writeEvent(ev)
+		}
+		if err := s.syncFile(); err != nil {
+			// Leave this line and the rest for the next drain attempt.
+			_ = s.rewriteSpillWorking(working, lines[i:])
+			return true
+		}
+		// Advance past the durable line so a crash cannot replay it.
+		if err := s.rewriteSpillWorking(working, lines[i+1:]); err != nil {
+			return true
+		}
 	}
+	_ = s.withAuditFileLock(func() error {
+		_ = os.Remove(working)
+		return nil
+	})
 	return true
+}
+
+func (s *fileAuditSink) rewriteSpillWorking(working string, remaining []string) error {
+	return s.withAuditFileLock(func() error {
+		if len(remaining) == 0 {
+			return os.Remove(working)
+		}
+		var b strings.Builder
+		for _, line := range remaining {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+		return os.WriteFile(working, []byte(b.String()), 0o600)
+	})
+}
+
+func splitNonEmptyLines(raw string) []string {
+	var out []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 func (s *fileAuditSink) syncFile() error {
@@ -411,7 +495,7 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 	if cutoff.IsZero() {
 		return nil
 	}
-	return s.withAuditFileLock(func() error {
+	err := s.withAuditFileLock(func() error {
 		src, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0o600)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -438,25 +522,90 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		// file from turning retention into unbounded memory use while the streaming
 		// rewrite keeps total memory constant regardless of the audit-file size.
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+		var kept []SecretAuditEvent
+		var lastDroppedHash string
+		droppedAny := false
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
 				continue
 			}
 			var ev SecretAuditEvent
-			if err := json.Unmarshal([]byte(line), &ev); err == nil && !ev.Time.IsZero() && ev.Time.Before(cutoff) {
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				// Treat corrupt retained lines as durable gaps in the rotated chain.
+				kept = append(kept, SecretAuditEvent{
+					Time:    time.Now().UTC(),
+					Result:  secretAuditResultGap,
+					Reason:  secretAuditReasonOverflow,
+					Kind:    secretAuditKindGap,
+					Dropped: 1,
+				})
 				continue
 			}
-			// Preserve malformed lines rather than silently dropping evidence.
-			if _, err := writer.WriteString(line + "\n"); err != nil {
-				_ = f.Close()
-				return err
+			if !ev.Time.IsZero() && ev.Time.Before(cutoff) {
+				droppedAny = true
+				if ev.EventHash != "" {
+					lastDroppedHash = ev.EventHash
+				}
+				continue
 			}
+			kept = append(kept, ev)
 		}
 		if err := scanner.Err(); err != nil {
 			_ = f.Close()
 			return err
 		}
+		if !droppedAny {
+			// Nothing expired — leave the chain and tip untouched.
+			_ = f.Close()
+			removeTmp = true
+			return nil
+		}
+
+		// Prune rotates the hash chain: retained events are re-linked from
+		// genesis so the first kept event never points at a deleted PrevHash.
+		// External witness LastWitnessedHead must be updated after this rewrite
+		// (afterPrune ships the new tip).
+		chainPrev := auditlog.GenesisPrevHash
+		cp := SecretAuditEvent{
+			Time:             time.Now().UTC(),
+			Result:           secretAuditResultSuccess,
+			Reason:           "prune",
+			Kind:             secretAuditKindRetentionCheckpoint,
+			WitnessedThrough: lastDroppedHash,
+		}
+		ensureSecretAuditEventID(&cp)
+		auditlog.LinkEvent(chainPrev, &cp)
+		line, err := json.Marshal(cp)
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		if _, err := writer.Write(append(line, '\n')); err != nil {
+			_ = f.Close()
+			return err
+		}
+		chainPrev = cp.EventHash
+		for i := range kept {
+			ev := kept[i]
+			// Clear prior linkage so HashEvent recomputes cleanly.
+			ev.PrevHash = ""
+			ev.EventHash = ""
+			ensureSecretAuditEventID(&ev)
+			auditlog.LinkEvent(chainPrev, &ev)
+			line, err := json.Marshal(ev)
+			if err != nil {
+				_ = f.Close()
+				return err
+			}
+			if _, err := writer.Write(append(line, '\n')); err != nil {
+				_ = f.Close()
+				return err
+			}
+			chainPrev = ev.EventHash
+		}
+
 		if err := writer.Flush(); err != nil {
 			_ = f.Close()
 			return err
@@ -485,7 +634,6 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		}
 		s.file = nf
 		// Tip sidecar must track the rewritten file tip (not the pre-prune head).
-		// Prefer recomputation so prune cannot leave a stale tip sidecar.
 		head, eventID, err := RecomputeChainHead(s.path)
 		if err != nil {
 			// Fall back to last-line tip if the pruned file has legacy unhashed
@@ -499,6 +647,13 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		persistChainTip(s.tipPath, head, eventID)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if s.afterPrune != nil {
+		s.afterPrune()
+	}
+	return nil
 }
 
 func ensureSecretAuditEventID(ev *SecretAuditEvent) {
@@ -720,6 +875,11 @@ func (s *Service) ensureSecretAuditSink() {
 		secretAuditSinkHealthy.Set(1)
 		s.secretAudit = sink
 		s.secretAuditFile = sink
+		// Prune rotates the hash chain — ship the new tip to the external
+		// witness immediately so LastWitnessedHead tracks the re-linked head.
+		sink.afterPrune = func() {
+			_ = s.shipSecretAuditHead(context.Background())
+		}
 		s.startSecretAuditPruneTicker()
 	})
 }
@@ -828,14 +988,18 @@ func (s *Service) CloseSecretAuditSink() {
 // event when the returned closure runs. Never blocks on audit I/O.
 // correlationID may be empty — a fresh id is generated.
 func beginSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID string) func(error) {
+	return beginSecretAuditInc(sink, sandboxID, ref, actor, correlationID, "")
+}
+
+func beginSecretAuditInc(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID string) func(error) {
 	metricDone := beginClusterSecretOpen()
 	return func(err error) {
 		metricDone(err)
-		emitSecretAudit(sink, sandboxID, ref, actor, correlationID, err)
+		emitSecretAudit(sink, sandboxID, ref, actor, correlationID, incarnationID, err)
 	}
 }
 
-func emitSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID string, err error) {
+func emitSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID string, err error) {
 	if sink == nil {
 		return
 	}
@@ -851,6 +1015,7 @@ func emitSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID 
 		Reason:        secretAuditReasonOK,
 		CorrelationID: correlationID,
 		NodeID:        actor,
+		IncarnationID: strings.TrimSpace(incarnationID),
 		// Kind left empty (= secret_open) for back-compat with older readers.
 	}
 	if err != nil {
@@ -878,15 +1043,16 @@ func (s *Service) emitEgressAudit(sandboxID, network, destination string) {
 	}
 	actor := s.auditActor()
 	sink.Emit(SecretAuditEvent{
-		Time:        time.Now().UTC(),
-		Actor:       actor,
-		SandboxID:   sandboxID,
-		Result:      secretAuditResultSuccess,
-		Reason:      secretAuditReasonOK,
-		NodeID:      actor,
-		Kind:        secretAuditKindEgress,
-		Destination: destination,
-		Network:     strings.TrimSpace(network),
+		Time:          time.Now().UTC(),
+		Actor:         actor,
+		SandboxID:     sandboxID,
+		Result:        secretAuditResultSuccess,
+		Reason:        secretAuditReasonOK,
+		NodeID:        actor,
+		Kind:          secretAuditKindEgress,
+		Destination:   destination,
+		Network:       strings.TrimSpace(network),
+		IncarnationID: s.secretIncarnationForSeal(sandboxID),
 	})
 }
 

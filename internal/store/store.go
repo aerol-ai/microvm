@@ -199,22 +199,24 @@ func Open(path string) (*Store, error) {
 		);`,
 		// Durable create fan-out outbox: when the in-memory create-path queue is
 		// saturated, remaining peer PUTs are persisted and retried by the same
-		// reconciler ticker as delete outbox. incarnation_id is reserved for
-		// later binding (empty until seal paths pass it).
+		// reconciler ticker as delete outbox. Identity is (sandbox, incarnation,
+		// seal_generation) so a completed older fan-out cannot delete a newer job.
 		`CREATE TABLE IF NOT EXISTS cluster_secret_put_outbox (
-			sandbox_id TEXT PRIMARY KEY,
+			sandbox_id TEXT NOT NULL,
 			incarnation_id TEXT NOT NULL DEFAULT '',
 			seal_generation INTEGER NOT NULL DEFAULT 0,
 			recipients_json TEXT NOT NULL DEFAULT '[]',
 			attempts INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id, seal_generation)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_audit_acl (
-			sandbox_id TEXT PRIMARY KEY,
-			owner_ref TEXT NOT NULL DEFAULT '',
+			sandbox_id TEXT NOT NULL,
 			incarnation_id TEXT NOT NULL DEFAULT '',
-			updated_at DATETIME NOT NULL
+			owner_ref TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
@@ -798,25 +800,38 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
 		}
 	}
+	// Promote sandbox_audit_acl to a compound PK (sandbox_id, incarnation_id).
+	// SQLite cannot ALTER PRIMARY KEY in place; recreate when still single-key.
+	if err := migrateSandboxAuditACLCompoundPK(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// Warm upgrades that created sandbox_audit_acl before incarnation_id need
 	// the unique index after the ALTER above. Cold installs already have it
-	// from CREATE TABLE + CREATE INDEX IF NOT EXISTS in stmts.
+	// from CREATE TABLE PRIMARY KEY.
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_audit_acl_incarnation
 		ON sandbox_audit_acl(sandbox_id, incarnation_id);`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create sandbox_audit_acl incarnation index: %w", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS cluster_secret_put_outbox (
-		sandbox_id TEXT PRIMARY KEY,
+		sandbox_id TEXT NOT NULL,
 		incarnation_id TEXT NOT NULL DEFAULT '',
 		seal_generation INTEGER NOT NULL DEFAULT 0,
 		recipients_json TEXT NOT NULL DEFAULT '[]',
 		attempts INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL,
-		updated_at DATETIME NOT NULL
+		updated_at DATETIME NOT NULL,
+		PRIMARY KEY (sandbox_id, incarnation_id, seal_generation)
 	);`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create cluster_secret_put_outbox: %w", err)
+	}
+	// Warm upgrades may still have sandbox_id-only PRIMARY KEY from older
+	// schema. Recreate so a completed older fan-out cannot delete a newer job.
+	if err := migrateSecretPutOutboxPK(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_cluster_secret_put_outbox_retry
 		ON cluster_secret_put_outbox(updated_at, created_at, sandbox_id);`); err != nil {
@@ -880,6 +895,61 @@ func Open(path string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+// migrateSecretPutOutboxPK recreates cluster_secret_put_outbox when an older
+// install still uses sandbox_id-only PRIMARY KEY. Compare-and-delete fencing
+// requires the composite identity (sandbox_id, incarnation_id, seal_generation).
+func migrateSecretPutOutboxPK(db *sql.DB) error {
+	var createSQL string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='cluster_secret_put_outbox'`).Scan(&createSQL)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("inspect cluster_secret_put_outbox: %w", err)
+	}
+	if !strings.Contains(createSQL, "sandbox_id TEXT PRIMARY KEY") {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin put-outbox pk migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		CREATE TABLE cluster_secret_put_outbox_v2 (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			seal_generation INTEGER NOT NULL DEFAULT 0,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id, seal_generation)
+		);
+	`); err != nil {
+		return fmt.Errorf("create cluster_secret_put_outbox_v2: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO cluster_secret_put_outbox_v2 (
+			sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		)
+		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		FROM cluster_secret_put_outbox;
+	`); err != nil {
+		return fmt.Errorf("copy cluster_secret_put_outbox: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE cluster_secret_put_outbox`); err != nil {
+		return fmt.Errorf("drop legacy cluster_secret_put_outbox: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE cluster_secret_put_outbox_v2 RENAME TO cluster_secret_put_outbox`); err != nil {
+		return fmt.Errorf("rename cluster_secret_put_outbox_v2: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit put-outbox pk migration: %w", err)
+	}
+	return nil
 }
 
 // validateCurrentSecretSchema makes the intentional one-way storage contract
@@ -952,7 +1022,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
 		return err
 	}
-	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, time.Now().UTC()); err != nil {
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, "", time.Now().UTC()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -989,7 +1059,7 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
 		return err
 	}
-	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, time.Now().UTC()); err != nil {
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, "", time.Now().UTC()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -4150,6 +4220,11 @@ var ErrClusterSecretTombBlocksPut = errors.New("cluster secret tomb blocks put")
 // seal_generation with a different ciphertext (forked seal).
 var ErrClusterSecretPayloadConflict = errors.New("cluster secret payload conflict")
 
+// ErrClusterSecretStaleGeneration is returned when a peer/originator PUT carries
+// a seal_generation strictly older than a row already stored for the same ref
+// or sandbox. Peers must map this to a non-2xx response so Push does not ACK.
+var ErrClusterSecretStaleGeneration = errors.New("cluster secret stale generation")
+
 // afterTransferTapReads is set only by tests to inject a concurrent ownership
 // move between TransferFirecrackerTapSlot's reads and its UPDATE.
 var afterTransferTapReads func()
@@ -4241,13 +4316,15 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 	}
 
 	// Reject out-of-order peer fan-out that would downgrade a newer seal.
+	// Returning nil here used to look like an ACK to PushSecretBlobToPeers;
+	// peers must see a typed error → non-2xx so the originator keeps outbox.
 	var existingGen sql.NullInt64
 	var existingPayload []byte
 	_ = tx.QueryRowContext(ctx, `
 		SELECT seal_generation, sealed_payload FROM cluster_secrets WHERE ref = ?
 	`, rec.Ref).Scan(&existingGen, &existingPayload)
 	if existingGen.Valid && existingGen.Int64 > rec.SealGeneration {
-		return nil // idempotent ACK; keep the newer row
+		return fmt.Errorf("%w: existing seal_generation %d > %d for ref %q", ErrClusterSecretStaleGeneration, existingGen.Int64, rec.SealGeneration, rec.Ref)
 	}
 	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration {
 		if bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
@@ -4263,7 +4340,7 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 		WHERE sandbox_id = ? AND ref != ?
 	`, rec.SandboxID, rec.Ref).Scan(&maxOther)
 	if maxOther.Valid && maxOther.Int64 > rec.SealGeneration {
-		return nil
+		return fmt.Errorf("%w: sandbox %q has seal_generation %d > %d", ErrClusterSecretStaleGeneration, rec.SandboxID, maxOther.Int64, rec.SealGeneration)
 	}
 
 	// Recheck tomb inside the write TX so a peer DELETE that committed after
@@ -4452,26 +4529,28 @@ func (s *Store) ClearClusterSecretTomb(ctx context.Context, sandboxID string) er
 }
 
 // UpsertSandboxAuditACL records the tenant OwnerRef for audit authorization
-// after the sandbox row (and placement) are gone.
-func (s *Store) UpsertSandboxAuditACL(ctx context.Context, sandboxID, ownerRef string) error {
+// after the sandbox row (and placement) are gone. Rows are incarnation-scoped.
+func (s *Store) UpsertSandboxAuditACL(ctx context.Context, sandboxID, ownerRef, incarnationID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	ownerRef = strings.TrimSpace(ownerRef)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
-	return upsertSandboxAuditACLExec(ctx, s.db, sandboxID, ownerRef, time.Now().UTC())
+	return upsertSandboxAuditACLExec(ctx, s.db, sandboxID, ownerRef, incarnationID, time.Now().UTC())
 }
 
-func upsertSandboxAuditACLExec(ctx context.Context, exec dbExecer, sandboxID, ownerRef string, now time.Time) error {
+func upsertSandboxAuditACLExec(ctx context.Context, exec dbExecer, sandboxID, ownerRef, incarnationID string, now time.Time) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	ownerRef = strings.TrimSpace(ownerRef)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" || ownerRef == "" {
 		return nil
 	}
 	_, err := exec.ExecContext(ctx, `
-		INSERT INTO sandbox_audit_acl (sandbox_id, owner_ref, updated_at) VALUES (?, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET owner_ref = excluded.owner_ref, updated_at = excluded.updated_at
-	`, sandboxID, ownerRef, now)
+		INSERT INTO sandbox_audit_acl (sandbox_id, incarnation_id, owner_ref, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET owner_ref = excluded.owner_ref, updated_at = excluded.updated_at
+	`, sandboxID, incarnationID, ownerRef, now)
 	if err != nil {
 		return fmt.Errorf("upsert sandbox audit acl: %w", err)
 	}
@@ -4502,14 +4581,37 @@ func (s *Store) PruneSandboxAuditACL(ctx context.Context, cutoff time.Time) (int
 	return n, nil
 }
 
-// GetSandboxAuditACLOwnerRef returns the retained audit OwnerRef, or "" if none.
-func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID string) (string, error) {
+// GetSandboxAuditACLOwnerRef returns the retained audit OwnerRef for the
+// (sandbox, incarnation) pair. When incarnationID is empty, prefers the
+// empty-incarnation row then any row for the sandbox (legacy authorize).
+func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID, incarnationID string) (string, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return "", nil
 	}
 	var ref string
-	err := s.db.QueryRowContext(ctx, `SELECT owner_ref FROM sandbox_audit_acl WHERE sandbox_id = ?`, sandboxID).Scan(&ref)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT owner_ref FROM sandbox_audit_acl
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&ref)
+	if err == nil {
+		return strings.TrimSpace(ref), nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("get sandbox audit acl: %w", err)
+	}
+	if incarnationID != "" {
+		// Exact incarnation miss — do not fall back across incarnations.
+		return "", nil
+	}
+	// Legacy callers with empty incarnation: any retained ACL for the sandbox.
+	err = s.db.QueryRowContext(ctx, `
+		SELECT owner_ref FROM sandbox_audit_acl
+		WHERE sandbox_id = ?
+		ORDER BY incarnation_id ASC
+		LIMIT 1
+	`, sandboxID).Scan(&ref)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -4517,6 +4619,61 @@ func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID string
 		return "", fmt.Errorf("get sandbox audit acl: %w", err)
 	}
 	return strings.TrimSpace(ref), nil
+}
+
+// migrateSandboxAuditACLCompoundPK recreates sandbox_audit_acl with a compound
+// primary key when a warm upgrade still has sandbox_id-only PK.
+func migrateSandboxAuditACLCompoundPK(db *sql.DB) error {
+	var sqlText string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='sandbox_audit_acl'`).Scan(&sqlText)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("inspect sandbox_audit_acl: %w", err)
+	}
+	lower := strings.ToLower(sqlText)
+	// Already compound when PRIMARY KEY lists both columns (cold install or prior migration).
+	if strings.Contains(lower, "primary key (sandbox_id, incarnation_id)") ||
+		strings.Contains(lower, "primary key(sandbox_id, incarnation_id)") {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sandbox_audit_acl pk migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		CREATE TABLE sandbox_audit_acl_new (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id)
+		);
+	`); err != nil {
+		return fmt.Errorf("create sandbox_audit_acl_new: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO sandbox_audit_acl_new (sandbox_id, incarnation_id, owner_ref, updated_at)
+		SELECT sandbox_id, COALESCE(incarnation_id, ''), owner_ref, updated_at FROM sandbox_audit_acl
+	`); err != nil {
+		return fmt.Errorf("copy sandbox_audit_acl: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE sandbox_audit_acl`); err != nil {
+		return fmt.Errorf("drop sandbox_audit_acl: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE sandbox_audit_acl_new RENAME TO sandbox_audit_acl`); err != nil {
+		return fmt.Errorf("rename sandbox_audit_acl: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_sandbox_audit_acl_updated
+		ON sandbox_audit_acl(updated_at, sandbox_id)`); err != nil {
+		return fmt.Errorf("recreate sandbox_audit_acl updated index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox_audit_acl pk migration: %w", err)
+	}
+	return nil
 }
 
 // SecretDeleteOutboxRecord is one durable peer-delete job.
@@ -4838,38 +4995,83 @@ type SecretPutOutboxRecord struct {
 // UpsertSecretPutOutbox persists remaining peer PUT targets when the in-memory
 // create fan-out queue is saturated. Blob bytes are reloaded from
 // cluster_secrets at reconcile time by sandbox_id + seal_generation.
+//
+// Identity is (sandbox_id, incarnation_id, seal_generation). A lower
+// seal_generation never overwrites a newer job; same gen+incarnation merges
+// recipients. Other rows for the sandbox are dropped so Get stays single-row.
 func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64, recipients []string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" || sealGeneration <= 0 {
 		return nil
 	}
 	recipients = secrets.NormalizeRecipients(recipients)
 	if len(recipients) == 0 {
-		return s.DeleteSecretPutOutbox(ctx, sandboxID)
+		return s.DeleteSecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration)
 	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin upsert secret put outbox: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existingGen sql.NullInt64
+	var existingInc string
+	var existingRecipientsJSON string
+	scanErr := tx.QueryRowContext(ctx, `
+		SELECT seal_generation, incarnation_id, recipients_json
+		FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ?
+		ORDER BY seal_generation DESC, updated_at DESC
+		LIMIT 1
+	`, sandboxID).Scan(&existingGen, &existingInc, &existingRecipientsJSON)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return fmt.Errorf("read secret put outbox: %w", scanErr)
+	}
+	if existingGen.Valid && existingGen.Int64 > sealGeneration {
+		// Newer job already pending — do not clobber with a stale fan-out.
+		return nil
+	}
+	if existingGen.Valid && existingGen.Int64 == sealGeneration && strings.TrimSpace(existingInc) == incarnationID {
+		var prior []string
+		if existingRecipientsJSON != "" {
+			_ = json.Unmarshal([]byte(existingRecipientsJSON), &prior)
+		}
+		recipients = secrets.NormalizeRecipients(append(prior, recipients...))
+	}
+
+	// Keep one observable job per sandbox: drop other identities before upsert.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND NOT (incarnation_id = ? AND seal_generation = ?)
+	`, sandboxID, incarnationID, sealGeneration); err != nil {
+		return fmt.Errorf("clear stale secret put outbox: %w", err)
+	}
+
 	raw, err := json.Marshal(recipients)
 	if err != nil {
 		return fmt.Errorf("marshal put outbox recipients: %w", err)
 	}
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cluster_secret_put_outbox (
 			sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
 		) VALUES (?, ?, ?, ?, 0, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET
-			incarnation_id = excluded.incarnation_id,
-			seal_generation = excluded.seal_generation,
+		ON CONFLICT(sandbox_id, incarnation_id, seal_generation) DO UPDATE SET
 			recipients_json = excluded.recipients_json,
 			attempts = 0,
 			updated_at = excluded.updated_at
-	`, sandboxID, strings.TrimSpace(incarnationID), sealGeneration, string(raw), now, now)
-	if err != nil {
+	`, sandboxID, incarnationID, sealGeneration, string(raw), now, now); err != nil {
 		return fmt.Errorf("upsert secret put outbox: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit upsert secret put outbox: %w", err)
 	}
 	return nil
 }
 
-// GetSecretPutOutbox returns one put-outbox row when present.
+// GetSecretPutOutbox returns the highest-generation put-outbox row for sandboxID.
 func (s *Store) GetSecretPutOutbox(ctx context.Context, sandboxID string) (*SecretPutOutboxRecord, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
@@ -4877,7 +5079,10 @@ func (s *Store) GetSecretPutOutbox(ctx context.Context, sandboxID string) (*Secr
 	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
-		FROM cluster_secret_put_outbox WHERE sandbox_id = ?
+		FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ?
+		ORDER BY seal_generation DESC, updated_at DESC
+		LIMIT 1
 	`, sandboxID)
 	var rec SecretPutOutboxRecord
 	var recipientsJSON string
@@ -4901,7 +5106,7 @@ func (s *Store) ListSecretPutOutboxBatch(ctx context.Context, limit int) ([]Secr
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
 		FROM cluster_secret_put_outbox
-		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
+		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC, seal_generation ASC
 		LIMIT ?
 	`, limit)
 	if err != nil {
@@ -4924,9 +5129,10 @@ func (s *Store) ListSecretPutOutboxBatch(ctx context.Context, limit int) ([]Secr
 }
 
 // UpdateSecretPutOutboxRecipients shrinks the pending recipient list after a
-// partial ACK. Empty recipients deletes the row (generation-fenced).
-func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID string, recipients []string, sealGeneration int64) error {
+// partial ACK. Empty recipients deletes the row (identity-fenced).
+func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID, incarnationID string, recipients []string, sealGeneration int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
@@ -4934,13 +5140,7 @@ func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID s
 		sealGeneration = 1
 	}
 	if len(recipients) == 0 {
-		_, err := s.db.ExecContext(ctx, `
-			DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ? AND seal_generation = ?
-		`, sandboxID, sealGeneration)
-		if err != nil {
-			return fmt.Errorf("delete secret put outbox: %w", err)
-		}
-		return nil
+		return s.DeleteSecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration)
 	}
 	raw, err := json.Marshal(recipients)
 	if err != nil {
@@ -4950,8 +5150,8 @@ func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID s
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_put_outbox
 		SET recipients_json = ?, updated_at = ?
-		WHERE sandbox_id = ? AND seal_generation = ?
-	`, string(raw), now, sandboxID, sealGeneration)
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
+	`, string(raw), now, sandboxID, incarnationID, sealGeneration)
 	if err != nil {
 		return fmt.Errorf("update secret put outbox recipients: %w", err)
 	}
@@ -4959,35 +5159,49 @@ func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID s
 }
 
 // BumpSecretPutOutboxAttempt increments attempts after a retry round.
-func (s *Store) BumpSecretPutOutboxAttempt(ctx context.Context, sandboxID string) error {
+func (s *Store) BumpSecretPutOutboxAttempt(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
+	}
+	if sealGeneration <= 0 {
+		sealGeneration = 1
 	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_put_outbox
 		SET attempts = attempts + 1, updated_at = ?
-		WHERE sandbox_id = ?
-	`, time.Now().UTC(), sandboxID)
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
+	`, time.Now().UTC(), sandboxID, incarnationID, sealGeneration)
 	return err
 }
 
-// DeleteSecretPutOutbox drops a completed put fan-out job.
-func (s *Store) DeleteSecretPutOutbox(ctx context.Context, sandboxID string) error {
+// DeleteSecretPutOutbox drops a completed put fan-out job only when the
+// (sandbox_id, incarnation_id, seal_generation) identity still matches — so a
+// late ACK of an older fan-out cannot clear a newer reseal's outbox.
+func (s *Store) DeleteSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ?`, sandboxID)
+	if sealGeneration <= 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
+	`, sandboxID, incarnationID, sealGeneration)
 	return err
 }
 
 // SecretLifecycleStats is the bounded-cardinality operator view of durable
 // secret cleanup state. OldestOutbox is zero when no work is pending.
 type SecretLifecycleStats struct {
-	OutboxPending int64
-	OldestOutbox  time.Time
-	Tombstones    int64
+	OutboxPending    int64
+	OldestOutbox     time.Time
+	PutOutboxPending int64
+	Tombstones       int64
 }
 
 func (s *Store) SecretLifecycleStats(ctx context.Context) (SecretLifecycleStats, error) {
@@ -5011,6 +5225,9 @@ func (s *Store) SecretLifecycleStats(ctx context.Context) (SecretLifecycleStats,
 		if stats.OldestOutbox.IsZero() {
 			return stats, fmt.Errorf("secret delete outbox stats: invalid oldest timestamp %q", oldest.String)
 		}
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_secret_put_outbox`).Scan(&stats.PutOutboxPending); err != nil {
+		return stats, fmt.Errorf("secret put outbox stats: %w", err)
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_secret_tombs`).Scan(&stats.Tombstones); err != nil {
 		return stats, fmt.Errorf("secret tomb stats: %w", err)

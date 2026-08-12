@@ -53,7 +53,7 @@ func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandbox
 	if err != nil {
 		return AuditPeerPage{}, err
 	}
-	return fetchSandboxAuditFromPeer(ctx, client, c.patToken, endpoint, sandboxID, limit, cursor, kind)
+	return fetchSandboxAuditFromPeer(ctx, client, c.patToken, c.nodeID, endpoint, sandboxID, limit, cursor, kind)
 }
 
 // FetchSandboxAuditFromPeer GETs a peer's local audit slice (worker agent).
@@ -65,7 +65,7 @@ func (a *Agent) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID
 	if err != nil {
 		return AuditPeerPage{}, err
 	}
-	return fetchSandboxAuditFromPeer(ctx, client, a.patToken, endpoint, sandboxID, limit, cursor, kind)
+	return fetchSandboxAuditFromPeer(ctx, client, a.patToken, a.nodeID, endpoint, sandboxID, limit, cursor, kind)
 }
 
 // FetchSandboxAuditFromPeer on Noop always fails — single-node mode has no peers.
@@ -73,7 +73,7 @@ func (n *Noop) FetchSandboxAuditFromPeer(context.Context, string, string, int, s
 	return AuditPeerPage{}, fmt.Errorf("cluster: no peer audit fetch in single-node mode")
 }
 
-func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error) {
+func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, selfID, apiURL, sandboxID string, limit int, cursor, kind string) (AuditPeerPage, error) {
 	if client == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: nil http client")
 	}
@@ -109,6 +109,7 @@ func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, ap
 	if err != nil {
 		return AuditPeerPage{}, err
 	}
+	SetPeerNodeIDHeader(req, selfID)
 	if pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}
@@ -140,7 +141,7 @@ func (c *Cluster) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID st
 	if err != nil {
 		return "", false, err
 	}
-	return fetchSandboxOwnerRef(ctx, client, c.patToken, endpoint, sandboxID)
+	return fetchSandboxOwnerRef(ctx, client, c.patToken, c.nodeID, endpoint, sandboxID)
 }
 
 func (a *Agent) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID string) (string, bool, error) {
@@ -151,7 +152,7 @@ func (a *Agent) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID stri
 	if err != nil {
 		return "", false, err
 	}
-	return fetchSandboxOwnerRef(ctx, client, a.patToken, endpoint, sandboxID)
+	return fetchSandboxOwnerRef(ctx, client, a.patToken, a.nodeID, endpoint, sandboxID)
 }
 
 // auditPeerTransport selects the peer audit/meta dial via PeerDial. When
@@ -172,7 +173,7 @@ func (n *Noop) FetchSandboxOwnerRef(context.Context, string, string) (string, bo
 	return "", false, fmt.Errorf("cluster: no sandbox meta fetch in single-node mode")
 }
 
-func fetchSandboxOwnerRef(ctx context.Context, client *http.Client, pat, apiURL, sandboxID string) (string, bool, error) {
+func fetchSandboxOwnerRef(ctx context.Context, client *http.Client, pat, selfID, apiURL, sandboxID string) (string, bool, error) {
 	if client == nil {
 		return "", false, fmt.Errorf("cluster: nil http client")
 	}
@@ -192,6 +193,7 @@ func fetchSandboxOwnerRef(ctx context.Context, client *http.Client, pat, apiURL,
 	if err != nil {
 		return "", false, err
 	}
+	SetPeerNodeIDHeader(req, selfID)
 	if pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}

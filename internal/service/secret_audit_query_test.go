@@ -87,8 +87,8 @@ func TestListSecretAuditLocalReturnsWrittenEvents(t *testing.T) {
 	t.Cleanup(s.CloseSecretAuditSink)
 
 	sink := s.secretAuditSink()
-	emitSecretAudit(sink, "sb-1", "env:sb-1", "node-a", "corr-1", nil)
-	emitSecretAudit(sink, "sb-other", "env:sb-other", "node-a", "corr-x", nil)
+	emitSecretAudit(sink, "sb-1", "env:sb-1", "node-a", "corr-1", "", nil)
+	emitSecretAudit(sink, "sb-other", "env:sb-other", "node-a", "corr-x", "", nil)
 	if f, ok := sink.(*fileAuditSink); ok {
 		f.Sync()
 	}
@@ -181,7 +181,7 @@ func TestListSecretAuditFanoutMergeCoveragePartial(t *testing.T) {
 	}
 	t.Cleanup(s.CloseSecretAuditSink)
 
-	emitSecretAudit(s.secretAuditSink(), "sb-1", "env:sb-1", "node-a", "local-corr", nil)
+	emitSecretAudit(s.secretAuditSink(), "sb-1", "env:sb-1", "node-a", "local-corr", "", nil)
 	if f := s.secretAuditFile; f != nil {
 		f.Sync()
 	}
@@ -371,12 +371,12 @@ func TestListSecretAuditDeadlineMarksUnscheduledPeersMissing(t *testing.T) {
 
 func TestEmitSecretAuditCorrelationIDPresent(t *testing.T) {
 	mem := &memSecretAuditSink{}
-	emitSecretAudit(mem, "sb", "ref", "node-a", "explicit-id", nil)
+	emitSecretAudit(mem, "sb", "ref", "node-a", "explicit-id", "", nil)
 	evs := mem.Events()
 	if len(evs) != 1 || evs[0].CorrelationID != "explicit-id" || evs[0].NodeID != "node-a" {
 		t.Fatalf("event = %+v", evs)
 	}
-	emitSecretAudit(mem, "sb", "ref", "node-a", "", nil)
+	emitSecretAudit(mem, "sb", "ref", "node-a", "", "", nil)
 	evs = mem.Events()
 	if len(evs) != 2 || evs[1].CorrelationID == "" {
 		t.Fatalf("auto correlation missing: %+v", evs[1])
