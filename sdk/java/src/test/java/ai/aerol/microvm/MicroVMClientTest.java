@@ -1039,6 +1039,69 @@ class MicroVMClientTest {
     }
 
     @Test
+    void listErrorsOnPartialClusterCoverage() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            exchange.getResponseHeaders().set("X-Cluster-List-Partial", "true");
+            exchange.getResponseHeaders().set("X-Cluster-List-Placement-Ready", "true");
+            writeJson(exchange, 200, List.of());
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException err = assertThrows(MicroVMException.class, client::list);
+            assertTrue(err.getMessage().contains("incomplete cluster list"), err.getMessage());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listDrainsClusterPageTokens() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            int n = calls.incrementAndGet();
+            exchange.getResponseHeaders().set("X-Cluster-List-Partial", "false");
+            exchange.getResponseHeaders().set("X-Cluster-List-Placement-Ready", "true");
+            if (n == 1) {
+                exchange.getResponseHeaders().set("X-Cluster-List-Next-Page-Token", "tok-1");
+                writeJson(exchange, 200, List.of(mapOf(
+                    "id", "sb-1",
+                    "image", "alpine",
+                    "status", "started",
+                    "cpu", 1,
+                    "memory_mb", 256,
+                    "disk_gb", 1,
+                    "created_at", "2024-01-01T00:00:00Z",
+                    "updated_at", "2024-01-01T00:00:00Z"
+                )));
+                return;
+            }
+            assertEquals("page_token=tok-1", exchange.getRequestURI().getRawQuery());
+            writeJson(exchange, 200, List.of(mapOf(
+                "id", "sb-2",
+                "image", "alpine",
+                "status", "started",
+                "cpu", 1,
+                "memory_mb", 256,
+                "disk_gb", 1,
+                "created_at", "2024-01-01T00:00:00Z",
+                "updated_at", "2024-01-01T00:00:00Z"
+            )));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            List<Sandbox> items = client.list();
+            assertEquals(2, items.size());
+            assertEquals("sb-1", items.get(0).id);
+            assertEquals("sb-2", items.get(1).id);
+            assertEquals(2, calls.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void customDomainsAddListAndRemoveMapApiShapes() throws Exception {
         AtomicReference<Map<String, Object>> addBody = new AtomicReference<>();
         AtomicReference<String> deletePath = new AtomicReference<>();

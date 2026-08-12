@@ -86,12 +86,10 @@ func TestForwardHTTPFallsBackToAPIURLWithoutTLS(t *testing.T) {
 	}
 }
 
-// TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty covers the "peer has no
-// TLS material" half of the mixed-cluster contract: this node has TLS (so
-// mtlsProxies != nil) but the peer hasn't advertised an internal URL. We
-// must use the public path rather than 5xx — otherwise a TLS-equipped node
-// could never talk to a TLS-disabled one mid-rollout.
-func TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty(t *testing.T) {
+// TestForwardHTTPFailClosedWhenInternalEmpty pins mTLS fail-closed: when this
+// node has TLS (mtlsProxies != nil) but the peer has no InternalURL, we must
+// 503 rather than silently downgrade to APIURL+PAT.
+func TestForwardHTTPFailClosedWhenInternalEmpty(t *testing.T) {
 	hits := make(chan string, 1)
 	publicSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits <- "public"
@@ -104,11 +102,13 @@ func TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty(t *testing.T) {
 	r := httptest.NewRequest("GET", "/v1/sandboxes/sb-1", nil)
 	c.ForwardHTTP(Endpoint{InternalURL: "", APIURL: publicSrv.URL}, rr, r)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
 	}
-	if got := <-hits; got != "public" {
-		t.Fatalf("forward landed on %q server, expected fallback to public", got)
+	select {
+	case got := <-hits:
+		t.Fatalf("forward landed on %q; want no public dial when InternalURL empty", got)
+	default:
 	}
 }
 

@@ -337,9 +337,10 @@ func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxRespon
 	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it sandboxResponse) string { return it.ID }, clusterlist.Options{
 		OwnerRef:   ownerRef,
 		AuthHeader: r.Header.Get("Authorization"),
-		RawQuery:   r.URL.RawQuery,
-		Path:       PathPrefix + "/sandbox",
-		Transport:  clusterlist.TransportFromCluster(c),
+		// Peers must not re-apply facade page/limit — ingress paginates after merge.
+		RawQuery:  clusterlist.StripFacadePagination(r.URL.RawQuery),
+		Path:      PathPrefix + "/sandbox",
+		Transport: clusterlist.TransportFromCluster(c),
 		Warn: func(msg, peer string, peerErr error) {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
@@ -358,6 +359,7 @@ func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxRespon
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(clusterlist.ApplyOwnerRefScope(r))
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
@@ -384,6 +386,7 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(clusterlist.ApplyOwnerRefScope(r))
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())

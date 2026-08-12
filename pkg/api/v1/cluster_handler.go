@@ -506,6 +506,18 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
+	if !viewReady {
+		// Large fleet with an empty placement index: local-only would look
+		// complete. Force clients to retry once the Raft view catches up.
+		w.Header().Set("Retry-After", "1")
+		clusterlist.WriteCoverageHeaders(w, clusterlist.Coverage{
+			Partial:            true,
+			PlacementViewReady: false,
+			Answered:           []string{"local"},
+		}, "")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
+		return
+	}
 	local = clusterlist.FilterLocalToPage(local, placements)
 	result := clusterlist.Merge(r.Context(), peers, clusterlist.Options{
 		OwnerRef:   ownerRef,
@@ -523,9 +535,6 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	result.Coverage.PlacementViewReady = viewReady
 	if len(missingOwners) > 0 {
 		result.Coverage.Missing = append(result.Coverage.Missing, missingOwners...)
-		result.Coverage.Partial = true
-	}
-	if !viewReady {
 		result.Coverage.Partial = true
 	}
 	result.NextPageToken = next

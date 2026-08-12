@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -196,9 +197,23 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
 		);`,
+		// Durable create fan-out outbox: when the in-memory create-path queue is
+		// saturated, remaining peer PUTs are persisted and retried by the same
+		// reconciler ticker as delete outbox. incarnation_id is reserved for
+		// later binding (empty until seal paths pass it).
+		`CREATE TABLE IF NOT EXISTS cluster_secret_put_outbox (
+			sandbox_id TEXT PRIMARY KEY,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			seal_generation INTEGER NOT NULL DEFAULT 0,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_audit_acl (
 			sandbox_id TEXT PRIMARY KEY,
 			owner_ref TEXT NOT NULL DEFAULT '',
+			incarnation_id TEXT NOT NULL DEFAULT '',
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
@@ -288,10 +303,14 @@ func Open(path string) (*Store, error) {
 		// completed or pending secret lifecycle rows.
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secret_delete_outbox_retry
 			ON cluster_secret_delete_outbox(updated_at, created_at, sandbox_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_cluster_secret_put_outbox_retry
+			ON cluster_secret_put_outbox(updated_at, created_at, sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secret_tombs_deleted
 			ON cluster_secret_tombs(deleted_at, sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_audit_acl_updated
 			ON sandbox_audit_acl(updated_at, sandbox_id);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_audit_acl_incarnation
+			ON sandbox_audit_acl(sandbox_id, incarnation_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
@@ -769,12 +788,40 @@ func Open(path string) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
+		// Incarnation tag for post-delete audit ACL rows (empty until seal
+		// paths supply a non-empty value). Unique index is created below.
+		`ALTER TABLE sandbox_audit_acl ADD COLUMN incarnation_id TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			db.Close()
 			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
 		}
+	}
+	// Warm upgrades that created sandbox_audit_acl before incarnation_id need
+	// the unique index after the ALTER above. Cold installs already have it
+	// from CREATE TABLE + CREATE INDEX IF NOT EXISTS in stmts.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_audit_acl_incarnation
+		ON sandbox_audit_acl(sandbox_id, incarnation_id);`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandbox_audit_acl incarnation index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS cluster_secret_put_outbox (
+		sandbox_id TEXT PRIMARY KEY,
+		incarnation_id TEXT NOT NULL DEFAULT '',
+		seal_generation INTEGER NOT NULL DEFAULT 0,
+		recipients_json TEXT NOT NULL DEFAULT '[]',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	);`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create cluster_secret_put_outbox: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_cluster_secret_put_outbox_retry
+		ON cluster_secret_put_outbox(updated_at, created_at, sandbox_id);`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create cluster_secret_put_outbox index: %w", err)
 	}
 
 	// Partial unique index on host_port (only enforced when host_port > 0).
@@ -4099,6 +4146,10 @@ var ErrNotFound = errors.New("sandbox not found")
 // seal_generation <= an active delete tomb generation.
 var ErrClusterSecretTombBlocksPut = errors.New("cluster secret tomb blocks put")
 
+// ErrClusterSecretPayloadConflict is returned when a PUT repeats an existing
+// seal_generation with a different ciphertext (forked seal).
+var ErrClusterSecretPayloadConflict = errors.New("cluster secret payload conflict")
+
 // afterTransferTapReads is set only by tests to inject a concurrent ownership
 // move between TransferFirecrackerTapSlot's reads and its UPDATE.
 var afterTransferTapReads func()
@@ -4191,11 +4242,20 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 
 	// Reject out-of-order peer fan-out that would downgrade a newer seal.
 	var existingGen sql.NullInt64
+	var existingPayload []byte
 	_ = tx.QueryRowContext(ctx, `
-		SELECT seal_generation FROM cluster_secrets WHERE ref = ?
-	`, rec.Ref).Scan(&existingGen)
+		SELECT seal_generation, sealed_payload FROM cluster_secrets WHERE ref = ?
+	`, rec.Ref).Scan(&existingGen, &existingPayload)
 	if existingGen.Valid && existingGen.Int64 > rec.SealGeneration {
 		return nil // idempotent ACK; keep the newer row
+	}
+	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration {
+		if bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
+			// Same generation + same ciphertext: idempotent noop (still clear
+			// tomb/outbox below so a retrying originator seal recovers).
+		} else {
+			return fmt.Errorf("%w: seal_generation %d payload conflict for ref %q", ErrClusterSecretPayloadConflict, rec.SealGeneration, rec.Ref)
+		}
 	}
 	var maxOther sql.NullInt64
 	_ = tx.QueryRowContext(ctx, `
@@ -4214,6 +4274,21 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 		return fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrClusterSecretTombBlocksPut, rec.SandboxID, tombGen.Int64)
 	}
 
+	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
+		// Equal-generation identical payload: skip the row rewrite but still
+		// clear delete fences so create retries stay consistent.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+			return fmt.Errorf("clear cluster secret tomb on put: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+			return fmt.Errorf("clear secret delete outbox on put: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit put cluster secret: %w", err)
+		}
+		return nil
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cluster_secrets (
 			ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
@@ -4225,7 +4300,7 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 			sealed_payload = excluded.sealed_payload,
 			seal_generation = excluded.seal_generation,
 			updated_at = excluded.updated_at
-		WHERE excluded.seal_generation >= cluster_secrets.seal_generation
+		WHERE excluded.seal_generation > cluster_secrets.seal_generation
 	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.SealGeneration, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC()); err != nil {
 		return fmt.Errorf("put cluster secret: %w", err)
 	}
@@ -4235,6 +4310,9 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
 		return fmt.Errorf("clear secret delete outbox on put: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+		return fmt.Errorf("clear secret put outbox on put: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit put cluster secret: %w", err)
@@ -4259,6 +4337,37 @@ func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecre
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get cluster secret: %w", err)
+	}
+	if recipientsJSON != "" {
+		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+			return nil, fmt.Errorf("unmarshal cluster secret recipients: %w", err)
+		}
+	}
+	rec.SealedPayload = nullableBlob(rec.SealedPayload)
+	return &rec, nil
+}
+
+// GetClusterSecretForSandbox returns the highest-generation sealed row for
+// sandboxID, or ErrNotFound when none exist.
+func (s *Store) GetClusterSecretForSandbox(ctx context.Context, sandboxID string) (*ClusterSecretRecord, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil, ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
+		FROM cluster_secrets
+		WHERE sandbox_id = ?
+		ORDER BY seal_generation DESC, updated_at DESC
+		LIMIT 1
+	`, sandboxID)
+	var rec ClusterSecretRecord
+	var recipientsJSON string
+	if err := row.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.SealGeneration, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get cluster secret for sandbox: %w", err)
 	}
 	if recipientsJSON != "" {
 		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
@@ -4712,6 +4821,164 @@ func (s *Store) DeleteSecretDeleteOutbox(ctx context.Context, sandboxID string) 
 		return nil
 	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, sandboxID)
+	return err
+}
+
+// SecretPutOutboxRecord is one durable create-path peer fan-out job.
+type SecretPutOutboxRecord struct {
+	SandboxID      string
+	IncarnationID  string
+	SealGeneration int64
+	Recipients     []string
+	Attempts       int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// UpsertSecretPutOutbox persists remaining peer PUT targets when the in-memory
+// create fan-out queue is saturated. Blob bytes are reloaded from
+// cluster_secrets at reconcile time by sandbox_id + seal_generation.
+func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64, recipients []string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" || sealGeneration <= 0 {
+		return nil
+	}
+	recipients = secrets.NormalizeRecipients(recipients)
+	if len(recipients) == 0 {
+		return s.DeleteSecretPutOutbox(ctx, sandboxID)
+	}
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal put outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO cluster_secret_put_outbox (
+			sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		) VALUES (?, ?, ?, ?, 0, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			incarnation_id = excluded.incarnation_id,
+			seal_generation = excluded.seal_generation,
+			recipients_json = excluded.recipients_json,
+			attempts = 0,
+			updated_at = excluded.updated_at
+	`, sandboxID, strings.TrimSpace(incarnationID), sealGeneration, string(raw), now, now)
+	if err != nil {
+		return fmt.Errorf("upsert secret put outbox: %w", err)
+	}
+	return nil
+}
+
+// GetSecretPutOutbox returns one put-outbox row when present.
+func (s *Store) GetSecretPutOutbox(ctx context.Context, sandboxID string) (*SecretPutOutboxRecord, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil, nil
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		FROM cluster_secret_put_outbox WHERE sandbox_id = ?
+	`, sandboxID)
+	var rec SecretPutOutboxRecord
+	var recipientsJSON string
+	if err := row.Scan(&rec.SandboxID, &rec.IncarnationID, &rec.SealGeneration, &recipientsJSON, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if recipientsJSON != "" {
+		_ = json.Unmarshal([]byte(recipientsJSON), &rec.Recipients)
+	}
+	return &rec, nil
+}
+
+// ListSecretPutOutboxBatch returns at most limit pending put fan-out jobs.
+func (s *Store) ListSecretPutOutboxBatch(ctx context.Context, limit int) ([]SecretPutOutboxRecord, error) {
+	if limit <= 0 {
+		limit = int(^uint(0) >> 1)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		FROM cluster_secret_put_outbox
+		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list secret put outbox: %w", err)
+	}
+	defer rows.Close()
+	var out []SecretPutOutboxRecord
+	for rows.Next() {
+		var rec SecretPutOutboxRecord
+		var recipientsJSON string
+		if err := rows.Scan(&rec.SandboxID, &rec.IncarnationID, &rec.SealGeneration, &recipientsJSON, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if recipientsJSON != "" {
+			_ = json.Unmarshal([]byte(recipientsJSON), &rec.Recipients)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// UpdateSecretPutOutboxRecipients shrinks the pending recipient list after a
+// partial ACK. Empty recipients deletes the row (generation-fenced).
+func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID string, recipients []string, sealGeneration int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	if sealGeneration <= 0 {
+		sealGeneration = 1
+	}
+	if len(recipients) == 0 {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ? AND seal_generation = ?
+		`, sandboxID, sealGeneration)
+		if err != nil {
+			return fmt.Errorf("delete secret put outbox: %w", err)
+		}
+		return nil
+	}
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal put outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_put_outbox
+		SET recipients_json = ?, updated_at = ?
+		WHERE sandbox_id = ? AND seal_generation = ?
+	`, string(raw), now, sandboxID, sealGeneration)
+	if err != nil {
+		return fmt.Errorf("update secret put outbox recipients: %w", err)
+	}
+	return nil
+}
+
+// BumpSecretPutOutboxAttempt increments attempts after a retry round.
+func (s *Store) BumpSecretPutOutboxAttempt(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_put_outbox
+		SET attempts = attempts + 1, updated_at = ?
+		WHERE sandbox_id = ?
+	`, time.Now().UTC(), sandboxID)
+	return err
+}
+
+// DeleteSecretPutOutbox drops a completed put fan-out job.
+func (s *Store) DeleteSecretPutOutbox(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ?`, sandboxID)
 	return err
 }
 

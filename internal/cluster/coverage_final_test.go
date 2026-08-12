@@ -199,6 +199,38 @@ func TestAgentTryControlPlaneMissingAPIURL(t *testing.T) {
 	}
 }
 
+func TestAgentTryControlPlaneRequiresInternalURLWhenTLSLoaded(t *testing.T) {
+	agent := &Agent{
+		nodeID:         "worker-self",
+		httpClient:     http.DefaultClient,
+		internalClient: http.DefaultClient,
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	m := Member{NodeID: "server-1", APIURL: "http://public", Alive: true}
+	err := agent.tryControlPlaneMember(context.Background(), m, http.MethodGet, "/v1/cluster/members", InternalAPIPath, nil, nil)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("tryControlPlaneMember() = %v, want ErrPeerInternalURLRequired", err)
+	}
+}
+
+func TestAgentTryControlPlaneFailClosedWithoutInternalURL(t *testing.T) {
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("public API must not be called when internalClient is set without InternalURL")
+	}))
+	defer public.Close()
+	agent := &Agent{
+		nodeID:         "worker-self",
+		httpClient:     public.Client(),
+		internalClient: &http.Client{},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	m := Member{NodeID: "server-1", APIURL: public.URL, Alive: true}
+	err := agent.tryControlPlaneMember(context.Background(), m, http.MethodGet, "/v1/cluster/members", InternalAPIPath, nil, nil)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("tryControlPlaneMember() = %v, want ErrPeerInternalURLRequired", err)
+	}
+}
+
 func TestAgentAssertOwnershipFreshPlacementReplaysPortsAndDomains(t *testing.T) {
 	capture := &agentControlPlaneCapture{}
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {

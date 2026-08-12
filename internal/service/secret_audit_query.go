@@ -79,9 +79,12 @@ func (s *Service) PruneSecretAudit(ctx context.Context) error {
 }
 
 // ListSecretAuditLocal scans the authoritative local JSONL for sandboxID.
-func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts SecretAuditQuery) (events []SecretAuditEvent, nextCursor string, err error) {
+func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, opts SecretAuditQuery) (events []SecretAuditEvent, nextCursor string, err error) {
 	if s == nil {
 		return nil, "", nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
@@ -136,7 +139,15 @@ func (s *Service) ListSecretAuditLocal(_ context.Context, sandboxID string, opts
 	sc := bufio.NewScanner(f)
 	// Audit lines are small (metadata only); 1MiB is ample.
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	const cancelCheckEvery = 256
+	linesSeen := 0
 	for sc.Scan() {
+		linesSeen++
+		if linesSeen%cancelCheckEvery == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
+		}
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue

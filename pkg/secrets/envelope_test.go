@@ -45,6 +45,41 @@ func testBinding() SealBinding {
 	return SealBinding{SandboxID: "sb-1", Ref: FormatRef("sb-1", RefVersion), Version: RefVersion, Generation: 1}
 }
 
+func TestFormatRefAndParseRefIncarnation(t *testing.T) {
+	if got := FormatRef("sb", 1); got != "cluster-secret://sandbox/sb/v1" {
+		t.Fatalf("legacy FormatRef = %q", got)
+	}
+	if got := FormatRefInc("sb", "abc123", 2); got != "cluster-secret://sandbox/sb/i/abc123/v2" {
+		t.Fatalf("FormatRefInc = %q", got)
+	}
+	legacy, err := ParseRef("cluster-secret://sandbox/sb-1/v1")
+	if err != nil || legacy.SandboxID != "sb-1" || legacy.IncarnationID != "" || legacy.Version != 1 {
+		t.Fatalf("ParseRef legacy = %+v err=%v", legacy, err)
+	}
+	inc, err := ParseRef("cluster-secret://sandbox/sb-1/i/deadbeef/v3")
+	if err != nil || inc.SandboxID != "sb-1" || inc.IncarnationID != "deadbeef" || inc.Version != 3 {
+		t.Fatalf("ParseRef incarnation = %+v err=%v", inc, err)
+	}
+	binding := SealBinding{
+		SandboxID: "sb-1", IncarnationID: "deadbeef",
+		Ref: FormatRefInc("sb-1", "deadbeef", RefVersion), Version: RefVersion, Generation: 1,
+	}
+	c := testCipher(t)
+	sealed, err := SealEnvelopeBound(c, Secrets{Env: map[string]string{"K": "V"}}, []string{"node-a"}, binding)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	got, err := OpenEnvelopeBound(c, sealed, "node-a", binding)
+	if err != nil || got.Env["K"] != "V" {
+		t.Fatalf("open = %+v err=%v", got, err)
+	}
+	wrong := binding
+	wrong.IncarnationID = "other"
+	if _, err := OpenEnvelopeBound(c, sealed, "node-a", wrong); err == nil {
+		t.Fatal("expected incarnation mismatch")
+	}
+}
+
 func TestSealOpenEnvelopeBoundRoundTripAndEmpty(t *testing.T) {
 	c := testCipher(t)
 	binding := testBinding()

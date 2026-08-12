@@ -594,6 +594,58 @@ test("MicroVM.list omits the query string when no tags are supplied", async () =
   }
 });
 
+test("MicroVM.list drains cluster page tokens", async () => {
+  const urls: string[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      const url = new Request(input).url;
+      urls.push(url);
+      const token = new URL(url).searchParams.get("page_token");
+      if (!token) {
+        return new Response(JSON.stringify([{ id: "sb-1", image: "alpine", status: "started" }]), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "X-Cluster-List-Partial": "false",
+            "X-Cluster-List-Placement-Ready": "true",
+            "X-Cluster-List-Next-Page-Token": "tok-1",
+          },
+        });
+      }
+      return new Response(JSON.stringify([{ id: "sb-2", image: "alpine", status: "started" }]), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "X-Cluster-List-Partial": "false",
+          "X-Cluster-List-Placement-Ready": "true",
+        },
+      });
+    },
+  });
+  const items = await sdk.list();
+  assert.deepEqual(items.map((s) => s.id), ["sb-1", "sb-2"]);
+  assert.equal(urls[1], "https://api.example.com/v1/sandboxes?page_token=tok-1");
+});
+
+test("MicroVM.list errors on partial cluster coverage", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async () =>
+      new Response("[]", {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "X-Cluster-List-Partial": "true",
+          "X-Cluster-List-Placement-Ready": "true",
+        },
+      }),
+  });
+  await assert.rejects(() => sdk.list(), /incomplete cluster list/);
+});
+
 test("MicroVM health maps ssh gateway state", async () => {
   const sdk = new MicroVM({
     patToken: "pat-token",

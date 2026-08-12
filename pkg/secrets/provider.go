@@ -2,9 +2,29 @@ package secrets
 
 import (
 	"context"
+	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+type incarnationCtxKey struct{}
+
+// ContextWithIncarnationID attaches a placement incarnation to ctx for Put.
+func ContextWithIncarnationID(ctx context.Context, incarnationID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, incarnationCtxKey{}, strings.TrimSpace(incarnationID))
+}
+
+// IncarnationIDFromContext returns the Put-time incarnation, or "".
+func IncarnationIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(incarnationCtxKey{}).(string)
+	return strings.TrimSpace(v)
+}
 
 // Handle is a log-safe reference to sealed secrets. Safe to replicate through
 // Raft; it never carries ciphertext or plaintext.
@@ -50,6 +70,7 @@ type BlobStore interface {
 type SecretBlob struct {
 	Ref            string
 	SandboxID      string
+	IncarnationID  string
 	Version        int
 	Recipients     []string
 	SealedPayload  []byte

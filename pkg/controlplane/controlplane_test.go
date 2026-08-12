@@ -21,6 +21,9 @@ func TestNoopProviderRejectsTokens(t *testing.T) {
 	if _, err := p.Witness.WitnessHeads(ctx, nil); err != nil {
 		t.Errorf("noop Witness = %v, want nil", err)
 	}
+	if head, ok, err := p.Witness.LastWitnessedHead(ctx, "n1"); err != nil || ok || head != "" {
+		t.Errorf("noop LastWitnessedHead = (%q, %v, %v), want (\"\", false, nil)", head, ok, err)
+	}
 	if p.HasExternalWitness() {
 		t.Error("noop provider must not report an external witness")
 	}

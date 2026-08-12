@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -188,11 +189,33 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", internalOp(http.HandlerFunc(h.clusterInternalSandboxMeta)))
 }
 
+const clusterPeerNodeIDHeader = "X-Cluster-Peer-Node-ID"
+
 func withInternalMTLS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
 			http.Error(w, "cluster internal endpoint requires mTLS", http.StatusForbidden)
 			return
+		}
+		peerCert := r.TLS.PeerCertificates[0]
+		certNodeID, legacyOnly := cluster.ExtractPeerNodeID(peerCert)
+		headerNodeID := strings.TrimSpace(r.Header.Get(clusterPeerNodeIDHeader))
+		if certNodeID != "" && headerNodeID != "" && certNodeID != headerNodeID {
+			http.Error(w, "cluster peer node id mismatch", http.StatusForbidden)
+			return
+		}
+		if headerNodeID != "" && certNodeID == "" && !legacyOnly {
+			http.Error(w, "cluster peer node id mismatch", http.StatusForbidden)
+			return
+		}
+		if headerNodeID != "" && certNodeID != "" {
+			if !cluster.VerifyPeerNodeID(peerCert, headerNodeID) {
+				http.Error(w, "cluster peer node id mismatch", http.StatusForbidden)
+				return
+			}
+		}
+		if legacyOnly && certNodeID == "" {
+			cluster.RecordMTLSLegacyIdentity()
 		}
 		next.ServeHTTP(w, r)
 	})

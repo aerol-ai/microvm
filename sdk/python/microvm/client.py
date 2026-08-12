@@ -521,9 +521,22 @@ class MicroVM:
         tags: Optional[Dict[str, str]] = None,
         include_env: bool = False,
     ) -> List[Sandbox]:
-        path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
-        sandboxes = self._do_json("GET", path, None)
-        return [self._wrap_sandbox(item) for item in sandboxes]
+        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
+        items: List[Sandbox] = []
+        page_token = ""
+        for _ in range(1000):
+            path = _append_query_param(base_path, "page_token", page_token)
+            sandboxes, headers = self._do_json_headers("GET", path, None)
+            partial = headers.get("X-Cluster-List-Partial", "")
+            ready = headers.get("X-Cluster-List-Placement-Ready", "")
+            if partial == "true" or ready == "false":
+                raise MicroVMError("incomplete cluster list")
+            for item in sandboxes or []:
+                items.append(self._wrap_sandbox(item))
+            page_token = (headers.get("X-Cluster-List-Next-Page-Token") or "").strip()
+            if page_token == "":
+                return items
+        raise MicroVMError("incomplete cluster list: exceeded max pages")
 
     def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}" + _build_sandbox_query(None, include_env)
@@ -935,6 +948,17 @@ class MicroVM:
         return f"{self.api_url}{path}"
 
     def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None) -> bytes:
+        raw, _ = self._request_headers(method, url, body, content_type, extra_headers)
+        return raw
+
+    def _request_headers(
+        self,
+        method: str,
+        url: str,
+        body: Optional[bytes] = None,
+        content_type: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> tuple[bytes, Dict[str, str]]:
         max_retries = self._retry_config["maxRetries"]
         base_delay_ms = self._retry_config["baseDelayMs"]
         max_delay_ms = self._retry_config["maxDelayMs"]
@@ -951,7 +975,8 @@ class MicroVM:
 
             try:
                 with urllib.request.urlopen(request) as response:
-                    return response.read()
+                    headers = {k: v for k, v in response.headers.items()}
+                    return response.read(), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 if exc.code in (429, 502, 503, 504) and attempt < max_retries:
@@ -981,15 +1006,19 @@ class MicroVM:
         raise last_exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
+        data, _ = self._do_json_headers(method, path, payload)
+        return data
+
+    def _do_json_headers(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw = self._request(method, self._url(path), body, content_type)
+        raw, headers = self._request_headers(method, self._url(path), body, content_type)
         if raw == b"":
-            return {}
-        return json.loads(raw.decode("utf-8"))
+            return {}, headers
+        return json.loads(raw.decode("utf-8")), headers
 
     def _do_multipart(
         self,
@@ -1092,6 +1121,13 @@ def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = Fal
     if not parts:
         return ""
     return "?" + "&".join(parts)
+
+
+def _append_query_param(path: str, key: str, value: str) -> str:
+    if not value:
+        return path
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}{urllib.parse.quote(key, safe='')}={urllib.parse.quote(value, safe='')}"
 
 
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:

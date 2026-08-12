@@ -60,7 +60,8 @@ type stubMembersCluster struct {
 	aclExists bool
 }
 
-func (s *stubMembersCluster) Members() []cluster.Member { return s.members }
+func (s *stubMembersCluster) Members() []cluster.Member      { return s.members }
+func (s *stubMembersCluster) LocalMembers() []cluster.Member { return s.Members() }
 func (s *stubMembersCluster) PlacementOf(string) (cluster.Placement, bool) {
 	return s.placement, s.placement.SandboxID != ""
 }

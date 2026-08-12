@@ -91,6 +91,8 @@ func (c *wasmMigrationTargetClusterStub) Members() []cluster.Member {
 	return append([]cluster.Member(nil), c.members...)
 }
 
+func (c *wasmMigrationTargetClusterStub) LocalMembers() []cluster.Member { return c.Members() }
+
 func (c *wasmMigrationTargetClusterStub) IsNodeDrained(nodeID string) bool {
 	if c.drained == nil {
 		return false

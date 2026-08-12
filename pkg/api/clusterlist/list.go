@@ -2,10 +2,10 @@
 // Used by /v1/sandboxes and the Daytona/E2B facades so enterprise topologies
 // (thousands of workers) do not fan out to every alive peer.
 //
-// Security: peer fetches prefer InternalURL + the caller's cert-pinned mTLS
-// client. End-user Authorization is only sent over that mTLS channel. Public
-// APIURL fallbacks use the fleet PAT and an OwnerRef scope header — never the
-// caller's bearer token over plaintext advertise URLs.
+// Security: peer fetches require InternalURL + the caller's cert-pinned mTLS
+// client. End-user Authorization is sent only over that mTLS channel. There is
+// no public APIURL / fleet-PAT fallback (that path enabled cross-tenant
+// enumeration on Daytona/E2B facades).
 package clusterlist
 
 import (
@@ -29,11 +29,13 @@ const (
 	MaxConcurrentPeerReads = 32
 	// PeerTimeout is the per-peer HTTP budget; slow peers must not stall forever.
 	PeerTimeout = 5 * time.Second
+	// MergeTimeout caps the entire list merge across all peer waves.
+	MergeTimeout = 5 * time.Second
 	// DefaultPageLimit caps how many placement rows one list request hydrates.
 	DefaultPageLimit = 100
 	// MaxPageLimit is the hard ceiling for limit=.
 	MaxPageLimit = 500
-	// OwnerRefHeader scopes PAT-authenticated public list fallbacks to a tenant.
+	// OwnerRefHeader scopes forwarded list requests to a tenant on every facade.
 	OwnerRefHeader = "X-Cluster-List-Owner-Ref"
 	// Coverage header names keep the /v1/sandboxes body a bare array (SDK wire
 	// compat) while making partial results observable.
@@ -115,6 +117,28 @@ func OwnerRefFromContext(ctx context.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(access.Identity.OwnerRef)
+}
+
+// ApplyOwnerRefScope lets a fleet-PAT forwarded list request narrow to a
+// tenant on the local handler. Only honored for operator Access on
+// X-Cluster-Forwarded requests (v1 + Daytona/E2B facades).
+func ApplyOwnerRefScope(r *http.Request) context.Context {
+	if r == nil {
+		return context.Background()
+	}
+	ctx := r.Context()
+	ref := strings.TrimSpace(r.Header.Get(OwnerRefHeader))
+	if ref == "" || r.Header.Get("X-Cluster-Forwarded") != "1" {
+		return ctx
+	}
+	access, ok := controlplane.AccessFromContext(ctx)
+	if !ok || !access.Operator {
+		return ctx
+	}
+	return controlplane.ContextWithAccess(ctx, controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: ref},
+		Operator: false,
+	})
 }
 
 // SelectPeersForPage returns owner peers for one placement-index page plus the
@@ -258,6 +282,9 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 		return res
 	}
 
+	mergeCtx, cancel := context.WithTimeout(ctx, MergeTimeout)
+	defer cancel()
+
 	type peerResult struct {
 		nodeID    string
 		sandboxes []*models.Sandbox
@@ -282,7 +309,7 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 		go func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			sbs, err := fetchPeerSandboxes(ctx, peer, path, fwdName, fwdVal, opts)
+			sbs, err := fetchPeerSandboxes(mergeCtx, peer, path, fwdName, fwdVal, opts)
 			results <- peerResult{nodeID: peer.NodeID, sandboxes: sbs, err: err}
 		}()
 	}
@@ -309,6 +336,9 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 			res.Sandboxes = append(res.Sandboxes, sb)
 		}
 	}
+	if mergeCtx.Err() != nil {
+		res.Coverage.Partial = true
+	}
 	return res
 }
 
@@ -327,6 +357,8 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 	if len(peers) == 0 {
 		return items, cov
 	}
+	mergeCtx, cancel := context.WithTimeout(ctx, MergeTimeout)
+	defer cancel()
 	type peerResult struct {
 		nodeID string
 		items  []T
@@ -348,7 +380,7 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 		go func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			raw, err := fetchPeerJSON(ctx, peer, path, fwdName, fwdVal, opts)
+			raw, err := fetchPeerJSON(mergeCtx, peer, path, fwdName, fwdVal, opts)
 			if err != nil {
 				results <- peerResult{nodeID: peer.NodeID, err: err}
 				return
@@ -385,7 +417,27 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 			items = append(items, it)
 		}
 	}
+	if mergeCtx.Err() != nil {
+		cov.Partial = true
+	}
 	return items, cov
+}
+
+// StripFacadePagination removes facade-specific pagination keys from a query
+// string so peer fetches return full owner pages; the ingress applies facade
+// pagination exactly once after the merge.
+func StripFacadePagination(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	vals, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+	for _, key := range []string{"page", "limit", "nextToken", "next_token", "page_token", "offset"} {
+		vals.Del(key)
+	}
+	return vals.Encode()
 }
 
 // WriteCoverageHeaders exposes completeness without changing the JSON body shape.
@@ -419,9 +471,9 @@ func fetchPeerSandboxes(ctx context.Context, peer cluster.Member, path, fwdName,
 }
 
 func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdVal string, opts Options) ([]byte, error) {
-	client, base, authMode := dialPeer(peer, opts.Transport)
-	if client == nil || base == "" {
-		return nil, errors.New("no reachable peer URL")
+	client, base, err := dialPeer(peer, opts.Transport)
+	if err != nil {
+		return nil, err
 	}
 	endpoint := strings.TrimRight(base, "/") + path
 	if opts.RawQuery != "" {
@@ -432,18 +484,13 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 		return nil, err
 	}
 	req.Header.Set(fwdName, fwdVal)
-	switch authMode {
-	case authUser:
-		if opts.AuthHeader != "" {
-			req.Header.Set("Authorization", opts.AuthHeader)
-		}
-	case authFleetPAT:
-		if opts.Transport.FleetPAT != "" {
-			req.Header.Set("Authorization", "Bearer "+opts.Transport.FleetPAT)
-		}
-		if ref := strings.TrimSpace(opts.OwnerRef); ref != "" {
-			req.Header.Set(OwnerRefHeader, ref)
-		}
+	// mTLS-only: forward the caller's Authorization so tenant scope is preserved.
+	// Never substitute the fleet PAT (that was the cross-tenant enumeration hole).
+	if opts.AuthHeader != "" {
+		req.Header.Set("Authorization", opts.AuthHeader)
+	}
+	if ref := strings.TrimSpace(opts.OwnerRef); ref != "" {
+		req.Header.Set(OwnerRefHeader, ref)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -460,28 +507,17 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 	return body, nil
 }
 
-type authMode int
-
-const (
-	authNone authMode = iota
-	authUser
-	authFleetPAT
-)
-
-func dialPeer(m cluster.Member, tr Transport) (*http.Client, string, authMode) {
-	internalURL := strings.TrimSpace(m.InternalURL)
-	apiURL := strings.TrimSpace(m.APIURL)
-	if tr.InternalClient != nil && internalURL != "" {
-		return withTimeout(tr.InternalClient), internalURL, authUser
+func dialPeer(m cluster.Member, tr Transport) (*http.Client, string, error) {
+	client, base, err := cluster.PeerDial(m, tr.PublicClient, tr.InternalClient)
+	if err != nil {
+		return nil, "", err
 	}
-	// Public advertise URL: never forward end-user bearer tokens.
-	if tr.PublicClient != nil && apiURL != "" {
-		return withTimeout(tr.PublicClient), apiURL, authFleetPAT
+	// Fail closed for list: InternalClient must be present so we never hit
+	// plaintext advertise URLs with any credential.
+	if tr.InternalClient == nil {
+		return nil, "", errors.New("cluster list requires mTLS InternalClient")
 	}
-	if apiURL != "" {
-		return &http.Client{Timeout: PeerTimeout}, apiURL, authFleetPAT
-	}
-	return nil, "", authNone
+	return withTimeout(client), base, nil
 }
 
 func withTimeout(c *http.Client) *http.Client {

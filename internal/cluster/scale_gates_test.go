@@ -18,6 +18,9 @@ func requireScaleGates(t *testing.T) {
 
 func TestScaleGatePlacementPageAndShardAt100K(t *testing.T) {
 	requireScaleGates(t)
+	// Full 2k-process soak (100 ingress + live AWS) remains operator-run via
+	// make integration-cluster-* — these gates exercise the in-process FSM /
+	// outbox planes only.
 	fsm := newPlacementFSM()
 	const n = 100_000
 	for i := 0; i < n; i++ {
@@ -53,6 +56,60 @@ func TestScaleGatePlacementPageAndShardAt100K(t *testing.T) {
 		if shard != 17 && shard != 2048 && shard != 8191 {
 			t.Fatalf("placement %s returned for wrong shard %d", p.SandboxID, shard)
 		}
+	}
+}
+
+// TestScaleGatePlacementPageOwnerRefCompletePage pins the ownerRefIndex path:
+// OwnerRef pages return a full limit of matching rows without scanning the
+// entire placement map (timing optional; correctness is the gate).
+func TestScaleGatePlacementPageOwnerRefCompletePage(t *testing.T) {
+	requireScaleGates(t)
+	fsm := newPlacementFSM()
+	const (
+		n       = 50_000
+		tenantA = "tenant-a"
+		tenantB = "tenant-b"
+		ownedA  = 2_500
+	)
+	idx := uint64(1)
+	for i := 0; i < n; i++ {
+		ownerRef := tenantB
+		if i < ownedA {
+			ownerRef = tenantA
+		}
+		place, _ := encodeCommand(command{
+			Op:          opPlace,
+			SandboxID:   fmt.Sprintf("own-%06d", i),
+			OwnerNodeID: fmt.Sprintf("node-%04d", i%1_000),
+			OwnerRef:    ownerRef,
+			Spec:        &models.CreateSandboxRequest{Image: "alpine"},
+		})
+		if got := fsm.Apply(&raft.Log{Index: idx, Data: place}); got != nil {
+			t.Fatalf("place %d: %v", i, got)
+		}
+		idx++
+	}
+	page := fsm.placementPage(PlacementPageRequest{Limit: 1000, OwnerRef: tenantA})
+	if len(page.Placements) != 1000 {
+		t.Fatalf("OwnerRef page len=%d, want 1000", len(page.Placements))
+	}
+	for _, p := range page.Placements {
+		if p.OwnerRef != tenantA {
+			t.Fatalf("OwnerRef page leaked %q (sandbox %s)", p.OwnerRef, p.SandboxID)
+		}
+	}
+	seen := 0
+	token := ""
+	for {
+		p := fsm.placementPage(PlacementPageRequest{Limit: 1000, OwnerRef: tenantA, PageToken: token})
+		seen += len(p.Placements)
+		if p.NextPageToken == "" {
+			break
+		}
+		token = p.NextPageToken
+	}
+	if seen != ownedA {
+		t.Fatalf("OwnerRef complete enumeration=%d, want %d", seen, ownedA)
 	}
 }
 

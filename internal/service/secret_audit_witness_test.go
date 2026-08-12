@@ -22,6 +22,13 @@ func (w *stubWitness) WitnessHeads(_ context.Context, heads []controlplane.Audit
 	}, nil
 }
 
+func (w *stubWitness) LastWitnessedHead(_ context.Context, _ string) (string, bool, error) {
+	if len(w.heads) == 0 {
+		return "", false, nil
+	}
+	return w.heads[len(w.heads)-1].HeadHex, true, nil
+}
+
 func TestSecretAuditWitnessShipAndVerify(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "state.db")

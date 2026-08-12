@@ -50,6 +50,8 @@ func (s *stubIngressCluster) Members() []cluster.Member {
 	return s.Noop.Members()
 }
 
+func (s *stubIngressCluster) LocalMembers() []cluster.Member { return s.Members() }
+
 func (s *stubIngressCluster) PlacementsForShards(filter cluster.PlacementShardFilter) []cluster.Placement {
 	filter = filter.Normalize()
 	if len(filter.Shards) == 0 {

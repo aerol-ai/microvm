@@ -565,12 +565,23 @@ var _ cluster.Client = (*createForwardCluster)(nil)
 
 type membersStubCluster struct {
 	*cluster.Noop
-	members []cluster.Member
+	members        []cluster.Member
+	internalClient *http.Client
 }
 
 func (c *membersStubCluster) Members() []cluster.Member {
 	return c.members
 }
+
+func (c *membersStubCluster) PeerHTTPClients() (public, internal *http.Client) {
+	in := c.internalClient
+	if in == nil {
+		in = http.DefaultClient
+	}
+	return http.DefaultClient, in
+}
+
+func (c *membersStubCluster) PeerPAT() string { return "fleet-pat" }
 
 var _ cluster.Client = (*membersStubCluster)(nil)
 
@@ -603,13 +614,16 @@ func TestClusterListWrapUsesPlacementOwnersAtEnterpriseScale(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.clusterListWrap(rr, req)
 
-	// No placement view ⇒ local-only merge (200), never hard 503 at enterprise
-	// peer counts. Operators use sandbox-index for paginated fleet scans.
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d body=%q", rr.Code, http.StatusOK, rr.Body.String())
+	// No placement view on a large fleet ⇒ 503 Retry-After (never a local-only
+	// 200 that looks complete). Operators use sandbox-index for fleet scans.
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d body=%q", rr.Code, http.StatusServiceUnavailable, rr.Body.String())
 	}
-	if strings.Contains(rr.Body.String(), "sandbox-index") {
-		t.Fatalf("body = %q, must not 503-redirect list callers at enterprise scale", rr.Body.String())
+	if rr.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", rr.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(rr.Body.String(), "placement view is not ready") {
+		t.Fatalf("body = %q, want placement view not ready", rr.Body.String())
 	}
 }
 

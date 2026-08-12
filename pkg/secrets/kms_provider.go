@@ -48,12 +48,13 @@ func (p *KMSProvider) Put(ctx context.Context, sandboxID string, s Secrets, reci
 		return Handle{}, fmt.Errorf("marshal cluster secrets: %w", err)
 	}
 	version := RefVersion
-	ref := FormatRef(sandboxID, version)
+	incarnationID := IncarnationIDFromContext(ctx)
+	ref := FormatRefInc(sandboxID, incarnationID, version)
 	gen, err := p.store.NextSealGeneration(ctx, sandboxID)
 	if err != nil {
 		return Handle{}, err
 	}
-	binding := SealBinding{SandboxID: sandboxID, Ref: ref, Version: version, Generation: gen}
+	binding := SealBinding{SandboxID: sandboxID, IncarnationID: incarnationID, Ref: ref, Version: version, Generation: gen}
 	encCtx := EncryptionContextForBinding(binding)
 	sealed, err := SealRawEnvelopeWrappedBound(plain, recipients, binding, func(dek []byte) ([]byte, error) {
 		return p.wrapper.Wrap(ctx, dek, encCtx)
@@ -64,6 +65,7 @@ func (p *KMSProvider) Put(ctx context.Context, sandboxID string, s Secrets, reci
 	if err := p.store.Put(ctx, SecretBlob{
 		Ref:            ref,
 		SandboxID:      sandboxID,
+		IncarnationID:  incarnationID,
 		Version:        version,
 		Recipients:     recipients,
 		SealedPayload:  sealed,
@@ -111,11 +113,18 @@ func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, node
 	if p.wrapper == nil {
 		return Secrets{}, fmt.Errorf("%w: secret provider wrap backend is not configured", ErrProviderUnavailable)
 	}
+	incarnationID := rec.IncarnationID
+	if incarnationID == "" {
+		if parsed, parseErr := ParseRef(rec.Ref); parseErr == nil {
+			incarnationID = parsed.IncarnationID
+		}
+	}
 	binding := SealBinding{
-		SandboxID:  sandboxID,
-		Ref:        rec.Ref,
-		Version:    rec.Version,
-		Generation: rec.SealGeneration,
+		SandboxID:     sandboxID,
+		IncarnationID: incarnationID,
+		Ref:           rec.Ref,
+		Version:       rec.Version,
+		Generation:    rec.SealGeneration,
 	}
 	encCtx := EncryptionContextForBinding(binding)
 	plain, err := OpenRawEnvelopeExternalBound(rec.SealedPayload, binding, func(wrapped []byte) ([]byte, error) {

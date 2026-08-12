@@ -2,6 +2,7 @@ package v1
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -112,7 +113,7 @@ func TestClusterInternalSecretPutOperatorOK(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req)
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNoContent {
@@ -122,7 +123,7 @@ func TestClusterInternalSecretPutOperatorOK(t *testing.T) {
 	// Idempotent upsert.
 	req2 := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req2.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req2)
+	addVerifiedClientCertificate(req2, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
 	rr2 := httptest.NewRecorder()
 	mux.ServeHTTP(rr2, req2)
 	if rr2.Code != http.StatusNoContent {
@@ -138,7 +139,7 @@ func TestClusterInternalSecretPutRejectsNonRecipient(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req)
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -154,7 +155,7 @@ func TestClusterInternalSecretPutRejectsRefMismatch(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req)
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {

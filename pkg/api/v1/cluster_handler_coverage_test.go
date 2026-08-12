@@ -121,10 +121,11 @@ func TestClusterListWrap_MergesPeerResults(t *testing.T) {
 
 	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("node-a", peer.URL, ""),
+		Noop:           cluster.NewNoop("node-a", peer.URL, ""),
+		internalClient: peer.Client(),
 		members: []cluster.Member{
-			{NodeID: "node-a", APIURL: peer.URL, Alive: true, Role: config.NodeRoleMixed},
-			{NodeID: "node-b", APIURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-a", APIURL: peer.URL, InternalURL: peer.URL, Alive: true, Role: config.NodeRoleMixed},
+			{NodeID: "node-b", APIURL: peer.URL, InternalURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
 		},
 	})
 	h := &handlers{deps: Deps{Service: svc, Logger: logger}}

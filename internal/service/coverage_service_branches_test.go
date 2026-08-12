@@ -154,6 +154,8 @@ func (s *serviceClusterStub) Members() []cluster.Member {
 	return s.Noop.Members()
 }
 
+func (s *serviceClusterStub) LocalMembers() []cluster.Member { return s.Members() }
+
 func TestServiceHelperBranchesAndInventory(t *testing.T) {
 	ctx := context.Background()
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})

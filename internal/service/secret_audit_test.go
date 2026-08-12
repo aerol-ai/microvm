@@ -45,6 +45,9 @@ func TestSandboxIDFromSecretRef(t *testing.T) {
 	if got := sandboxIDFromSecretRef("cluster-secret://sandbox/sb-1/v1"); got != "sb-1" {
 		t.Fatalf("got %q, want sb-1", got)
 	}
+	if got := sandboxIDFromSecretRef("cluster-secret://sandbox/sb-1/i/abc/v1"); got != "sb-1" {
+		t.Fatalf("incarnation ref got %q, want sb-1", got)
+	}
 	if got := sandboxIDFromSecretRef("not-a-ref"); got != "" {
 		t.Fatalf("got %q, want empty", got)
 	}

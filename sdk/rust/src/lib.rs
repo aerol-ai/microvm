@@ -666,18 +666,52 @@ impl Client {
     }
 
     /// Lists sandboxes with optional `include_env=true` (env omitted by default).
+    /// Drains cluster pages via `X-Cluster-List-Next-Page-Token` and errors on
+    /// partial / unready placement coverage instead of returning a silent subset.
     pub fn list_with_options(
         &self,
         tags: &std::collections::HashMap<String, String>,
         include_env: bool,
     ) -> Result<Vec<Sandbox>, Error> {
-        let mut path = format!("{}/sandboxes", self.version_prefix());
-        path.push_str(&build_sandbox_query(tags, include_env));
-        let raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
-        Ok(raw
-            .into_iter()
-            .map(|item| Sandbox::new(self.clone(), item))
-            .collect())
+        let base_path = {
+            let mut path = format!("{}/sandboxes", self.version_prefix());
+            path.push_str(&build_sandbox_query(tags, include_env));
+            path
+        };
+        let mut items = Vec::new();
+        let mut page_token = String::new();
+        for _ in 0..1000 {
+            let path = append_query_param(&base_path, "page_token", &page_token);
+            let (raw, headers) =
+                self.do_json_headers::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
+            let partial = headers
+                .get("X-Cluster-List-Partial")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let ready = headers
+                .get("X-Cluster-List-Placement-Ready")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if partial == "true" || ready == "false" {
+                return Err(Error::Api("incomplete cluster list".into()));
+            }
+            items.extend(
+                raw.into_iter()
+                    .map(|item| Sandbox::new(self.clone(), item)),
+            );
+            page_token = headers
+                .get("X-Cluster-List-Next-Page-Token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if page_token.is_empty() {
+                return Ok(items);
+            }
+        }
+        Err(Error::Api(
+            "incomplete cluster list: exceeded max pages".into(),
+        ))
     }
 
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
@@ -1427,6 +1461,16 @@ impl Client {
         path: &str,
         payload: Option<&T>,
     ) -> Result<U, Error> {
+        let (body, _) = self.do_json_headers(method, path, payload)?;
+        Ok(body)
+    }
+
+    fn do_json_headers<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
         let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
         let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
@@ -1454,10 +1498,13 @@ impl Client {
                         // Fall through to retry logic
                     } else {
                         let response = self.handle_response(response)?;
+                        let headers = response.headers().clone();
                         if response.status() == reqwest::StatusCode::NO_CONTENT {
-                            return serde_json::from_str("null").map_err(Error::SerdeJson);
+                            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
+                            return Ok((body, headers));
                         }
-                        return response.json().map_err(Error::Reqwest);
+                        let body = response.json().map_err(Error::Reqwest)?;
+                        return Ok((body, headers));
                     }
                 }
                 Err(err) => {
@@ -1736,6 +1783,20 @@ fn build_sandbox_query(tags: &std::collections::HashMap<String, String>, include
         out.push_str("include_env=true");
     }
     out
+}
+
+fn append_query_param(path: &str, key: &str, value: &str) -> String {
+    if value.trim().is_empty() {
+        return path.to_string();
+    }
+    let sep = if path.contains('?') { '&' } else { '?' };
+    format!(
+        "{}{}{}={}",
+        path,
+        sep,
+        urlencoding::encode(key),
+        urlencoding::encode(value)
+    )
 }
 
 fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
@@ -3215,6 +3276,30 @@ mod tests {
             "unexpected request: {}",
             request2
         );
+    }
+
+    #[test]
+    fn list_errors_on_partial_cluster_coverage() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = read_http_request(&mut stream);
+            let body = b"[]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Cluster-List-Partial: true\r\nX-Cluster-List-Placement-Ready: true\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write headers");
+            stream.write_all(body).expect("write body");
+        });
+        let client =
+            Client::new(Some(&format!("http://{}", addr)), Some("pat-token")).expect("client");
+        let err = client.list().expect_err("partial list must fail");
+        match err {
+            Error::Api(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     // Custom-domains: POST returns 201 with the post-add list envelope, body

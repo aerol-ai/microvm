@@ -288,6 +288,7 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		IncarnationID:      strings.TrimSpace(secrets.IncarnationID),
 		OwnerRef:           secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
@@ -440,6 +441,14 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
 	}
+	incarnationID := strings.TrimSpace(secrets.IncarnationID)
+	if incarnationID == "" {
+		var mintErr error
+		incarnationID, mintErr = MintIncarnationID()
+		if mintErr != nil {
+			return mintErr
+		}
+	}
 	return a.applyCommand(ctx, command{
 		Op:                 opReserve,
 		SandboxID:          sandboxID,
@@ -450,6 +459,7 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
 		SecretRecipients:   append([]string(nil), secrets.Recipients...),
+		IncarnationID:      incarnationID,
 		OwnerRef:           secrets.OwnerRef,
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	})
@@ -636,6 +646,16 @@ func (a *Agent) Members() []Member {
 	}
 	if err := a.doControlPlaneJSON(ctx, http.MethodGet, "/v1/cluster/members", "/v1/cluster/members", nil, &resp); err == nil && resp.Members != nil {
 		return resp.Members
+	}
+	return a.gossip.members()
+}
+
+// LocalMembers returns the gossip view only — never the control-plane HTTP
+// members call. Used by list failover_ready so a page of sandboxes does not
+// trigger N membership RPCs.
+func (a *Agent) LocalMembers() []Member {
+	if a == nil || a.gossip == nil {
+		return nil
 	}
 	return a.gossip.members()
 }
@@ -858,15 +878,11 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 }
 
 func (a *Agent) tryControlPlaneMember(ctx context.Context, m Member, method, publicPath, internalPath string, body []byte, out any) error {
-	if a.internalClient != nil && m.InternalURL != "" {
-		err := a.doHTTPRequest(ctx, a.internalClient, strings.TrimRight(m.InternalURL, "/")+internalPath, method, body, out)
-		if err == nil {
-			return nil
+	if a.internalClient != nil {
+		if strings.TrimSpace(m.InternalURL) == "" {
+			return ErrPeerInternalURLRequired
 		}
-		if !isStatus(err, http.StatusServiceUnavailable) {
-			return err
-		}
-		return err
+		return a.doHTTPRequest(ctx, a.internalClient, strings.TrimRight(m.InternalURL, "/")+internalPath, method, body, out)
 	}
 	if m.APIURL == "" {
 		return errors.New("cluster agent: server API URL unknown for " + m.NodeID)

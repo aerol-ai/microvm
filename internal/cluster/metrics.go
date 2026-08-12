@@ -69,7 +69,17 @@ var (
 	placementCacheLatency      = scaleobs.NewDurationBuckets("aerolvm_placement_cache_refresh_latency_seconds_bucket")
 	placementCacheSize         = expvar.NewInt("aerolvm_placement_cache_size")
 	placementShardCacheEntries = expvar.NewInt("aerolvm_placement_shard_cache_entries")
+
+	// Soft-compat: peer presented only the legacy aerolvm-cluster-node SAN
+	// (no node:<id> identity). Counts rollouts that still need cert reissue.
+	mtlsLegacyIdentityTotal = expvar.NewInt("aerolvm_cluster_mtls_legacy_identity_total")
 )
+
+// RecordMTLSLegacyIdentity increments the soft-compat counter for peers that
+// authenticate with only the legacy clusterServerName SAN.
+func RecordMTLSLegacyIdentity() {
+	mtlsLegacyIdentityTotal.Add(1)
+}
 
 func beginRaftApply() func(error) {
 	raftApplyInflight.Add(1)

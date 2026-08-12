@@ -129,14 +129,11 @@ func (c *Cluster) recoveryServerMembers() []Member {
 func (c *Cluster) getRecoveryBlobFromMember(ctx context.Context, m Member, ref string) (RecoveryBlob, bool, error) {
 	var out RecoveryBlob
 	path := recoveryBlobPath(ref)
-	var err error
-	if internalClient := c.currentInternalClient(); internalClient != nil && m.InternalURL != "" {
-		err = doRecoveryHTTPRequest(ctx, internalClient, strings.TrimRight(m.InternalURL, "/")+path, http.MethodGet, c.patToken, nil, &out)
-	} else if m.APIURL != "" {
-		err = doRecoveryHTTPRequest(ctx, c.httpClient, strings.TrimRight(m.APIURL, "/")+path, http.MethodGet, c.patToken, nil, &out)
-	} else {
-		err = errors.New("cluster: recovery blob peer API URL unknown for " + m.NodeID)
+	client, base, err := PeerDial(m, c.httpClient, c.currentInternalClient())
+	if err != nil {
+		return RecoveryBlob{}, false, err
 	}
+	err = doRecoveryHTTPRequest(ctx, client, strings.TrimRight(base, "/")+path, http.MethodGet, c.patToken, nil, &out)
 	if err != nil {
 		if isStatus(err, http.StatusNotFound) {
 			return RecoveryBlob{}, false, nil

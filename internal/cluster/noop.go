@@ -332,6 +332,9 @@ func (n *Noop) Members() []Member {
 	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}}
 }
 
+// LocalMembers mirrors Members in single-node mode.
+func (n *Noop) LocalMembers() []Member { return n.Members() }
+
 // LookupMember resolves the single Noop member when id matches.
 func (n *Noop) LookupMember(id string) (Member, bool) {
 	if n == nil || id == "" || id != n.nodeID {

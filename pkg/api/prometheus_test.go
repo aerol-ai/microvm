@@ -12,11 +12,32 @@ import (
 	"testing"
 )
 
-func TestServePrometheusMetrics(t *testing.T) {
-	expvar.NewInt("aerolvm_test_counter_total").Add(1)
-	expvar.NewFloat("aerolvm_test_gauge").Add(2.5)
+func ensureExpvarInt(name string) *expvar.Int {
+	if v := expvar.Get(name); v != nil {
+		return v.(*expvar.Int)
+	}
+	return expvar.NewInt(name)
+}
 
-	m := expvar.NewMap("aerolvm_test_map")
+func ensureExpvarFloat(name string) *expvar.Float {
+	if v := expvar.Get(name); v != nil {
+		return v.(*expvar.Float)
+	}
+	return expvar.NewFloat(name)
+}
+
+func ensureExpvarMap(name string) *expvar.Map {
+	if v := expvar.Get(name); v != nil {
+		return v.(*expvar.Map)
+	}
+	return expvar.NewMap(name)
+}
+
+func TestServePrometheusMetrics(t *testing.T) {
+	ensureExpvarInt("aerolvm_test_counter_total").Add(1)
+	ensureExpvarFloat("aerolvm_test_gauge").Add(2.5)
+
+	m := ensureExpvarMap("aerolvm_test_map")
 	m.Add("foo", 10)
 
 	rw := httptest.NewRecorder()
@@ -95,6 +116,6 @@ func TestServePrometheusMetrics_Error(t *testing.T) {
 	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	rw := badResponseWriter{ResponseWriter: httptest.NewRecorder()}
 	// ensure we have at least one aerolvm_ expvar to trigger a write
-	expvar.NewInt("aerolvm_error_trigger").Add(1)
+	ensureExpvarInt("aerolvm_error_trigger").Add(1)
 	s.servePrometheusMetrics(rw, nil)
 }

@@ -237,10 +237,11 @@ func TestClusterListWrap_SkipsFailedPeerAndDedupes(t *testing.T) {
 	t.Cleanup(goodPeer.Close)
 
 	h, st := newClusterCreateHarness(t, &apiRecordingRuntime{}, &membersStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		Noop:           cluster.NewNoop("node-a", "http://node-a", ""),
+		internalClient: goodPeer.Client(),
 		members: []cluster.Member{
-			{NodeID: "node-b", APIURL: goodPeer.URL, Alive: true, Role: config.NodeRoleWorker},
-			{NodeID: "node-c", APIURL: "http://127.0.0.1:1", Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-b", APIURL: goodPeer.URL, InternalURL: goodPeer.URL, Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-c", APIURL: "http://127.0.0.1:1", InternalURL: "http://127.0.0.1:1", Alive: true, Role: config.NodeRoleWorker},
 		},
 	})
 	now := time.Now()

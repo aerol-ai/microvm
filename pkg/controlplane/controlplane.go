@@ -147,6 +147,10 @@ type WitnessReceipt struct {
 // enterprise mode requires a real Witness (see SB_SECRET_AUDIT_EXTERNAL_WITNESS).
 type Witness interface {
 	WitnessHeads(ctx context.Context, heads []AuditHead) (WitnessReceipt, error)
+	// LastWitnessedHead returns the most recent head the witness recorded for
+	// nodeID. ok is false when the witness has never recorded a head for that
+	// node (distinct from a transport error).
+	LastWitnessedHead(ctx context.Context, nodeID string) (headHex string, ok bool, err error)
 }
 
 // Provider bundles the capabilities a build supplies to the daemon. The
@@ -230,6 +234,10 @@ type noopWitness struct{}
 
 func (noopWitness) WitnessHeads(context.Context, []AuditHead) (WitnessReceipt, error) {
 	return WitnessReceipt{}, nil
+}
+
+func (noopWitness) LastWitnessedHead(context.Context, string) (string, bool, error) {
+	return "", false, nil
 }
 
 type noopEnforcement struct{}

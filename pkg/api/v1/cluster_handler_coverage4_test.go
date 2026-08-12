@@ -237,9 +237,10 @@ func TestClusterListWrap_PeerInvalidJSON(t *testing.T) {
 
 	rt := &apiRecordingRuntime{}
 	stub := &membersStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		Noop:           cluster.NewNoop("node-a", "http://node-a", ""),
+		internalClient: peer.Client(),
 		members: []cluster.Member{
-			{NodeID: "node-b", APIURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-b", APIURL: peer.URL, InternalURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
 		},
 	}
 	h, _ := newClusterCreateHarness(t, rt, stub)
@@ -267,9 +268,10 @@ func TestClusterListWrap_DedupePrefersLocal(t *testing.T) {
 
 	rt := &apiRecordingRuntime{}
 	stub := &membersStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		Noop:           cluster.NewNoop("node-a", "http://node-a", ""),
+		internalClient: peer.Client(),
 		members: []cluster.Member{
-			{NodeID: "node-b", APIURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-b", APIURL: peer.URL, InternalURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
 		},
 	}
 	h, st := newClusterCreateHarness(t, rt, stub)

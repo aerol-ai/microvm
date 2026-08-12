@@ -357,6 +357,9 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 				if err := s.ReconcileSecretDeleteOutbox(ctx); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret delete-outbox reconcile failed", "err", err)
 				}
+				if err := s.ReconcileSecretPutOutbox(ctx); err != nil && s.logger != nil {
+					s.logger.Warn("cluster: secret put-outbox reconcile failed", "err", err)
+				}
 				s.refreshSecretHolderPossession(ctx)
 				if rejoined {
 					if err := s.ReFanoutClusterSecrets(ctx); err != nil && s.logger != nil {
@@ -396,14 +399,20 @@ func (s *Service) aliveMemberSet() map[string]struct{} {
 }
 
 const (
-	secretHolderRefreshBatch   = 512
+	// secretHolderRefreshBatch caps fair-queue work per tick so a 100k fleet
+	// can still refresh within ACK TTL (90s) across ~3×30s ticks at 4096/tick.
+	secretHolderRefreshBatch   = 4096
 	secretHolderRefreshWorkers = 64
 	secretHolderProbeTimeout   = 5 * time.Second
+	secretHolderRefreshBudget  = 25 * time.Second
 )
 
 // refreshSecretHolderPossession re-probes intended remote recipients that are
 // approaching ACK TTL. Targets are independent from confirmed ACKs, so a
 // timeout or 404 can recover on a later pass without a membership flap.
+// Missing holders trigger a re-push of the local sealed blob when loadable.
+// When a majority of frozen targets are dead, targets expand to the current
+// live intended recipient set (placement / SecretRecipientsForSeal).
 func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	if s == nil {
 		return
@@ -412,7 +421,13 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	if pusher == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, secretHolderRefreshBudget)
+	defer cancel()
 	selfID := s.selfNodeID()
+	alive := s.aliveMemberSet()
 	type job struct {
 		sandboxID string
 		gen       int64
@@ -425,7 +440,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	// retry before an ACK expires.
 	refreshBefore := now.Add(-(secretHolderACKTTL * 2 / 3))
 	secretFanoutHolders.Range(func(key, val any) bool {
-		if ctx.Err() != nil {
+		if refreshCtx.Err() != nil {
 			return false
 		}
 		sandboxID, _ := key.(string)
@@ -435,6 +450,11 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		}
 		hs.mu.Lock()
 		gen := hs.gen
+		// Expand frozen targets when majority of intended peers are dead and
+		// placement/live membership offers replacements.
+		if expanded := s.expandDeadSecretTargetsLocked(sandboxID, hs, alive, selfID); len(expanded) > 0 {
+			setSecretHolderTargetsUnlocked(hs, gen, expanded)
+		}
 		peers := make([]string, 0, len(hs.targets))
 		needsProbe := false
 		for id := range hs.targets {
@@ -490,13 +510,13 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		first error
 	}
 	for _, j := range jobs {
-		if ctx.Err() != nil {
+		if refreshCtx.Err() != nil {
 			break
 		}
 		j := j
 		select {
 		case sem <- struct{}{}:
-		case <-ctx.Done():
+		case <-refreshCtx.Done():
 			wg.Wait()
 			return
 		}
@@ -504,9 +524,9 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			probeCtx, cancel := context.WithTimeout(ctx, secretHolderProbeTimeout)
+			probeCtx, probeCancel := context.WithTimeout(refreshCtx, secretHolderProbeTimeout)
 			holding, probeErr := pusher.ProbeSecretOnPeers(probeCtx, j.sandboxID, j.peers, j.gen)
-			cancel()
+			probeCancel()
 			if probeErr != nil {
 				probeFailures.Lock()
 				probeFailures.count++
@@ -515,10 +535,11 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 				}
 				probeFailures.Unlock()
 			}
+			missing := make([]string, 0)
 			hs := holderSetFor(j.sandboxID)
 			hs.mu.Lock()
-			defer hs.mu.Unlock()
 			if hs.gen != j.gen && hs.gen != 0 {
+				hs.mu.Unlock()
 				return
 			}
 			hs.gen = j.gen
@@ -543,7 +564,41 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 					hs.nodes[id] = confirmedAt
 				} else if probeErr == nil {
 					delete(hs.nodes, id)
+					missing = append(missing, id)
 				}
+			}
+			hs.mu.Unlock()
+			if len(missing) == 0 || probeErr != nil || s.store == nil {
+				return
+			}
+			rec, loadErr := s.store.GetClusterSecretForSandbox(refreshCtx, j.sandboxID)
+			if loadErr != nil || rec == nil || rec.SealGeneration < j.gen {
+				return
+			}
+			blob := secrets.SecretBlob{
+				Ref:            rec.Ref,
+				SandboxID:      rec.SandboxID,
+				Version:        rec.Version,
+				Recipients:     append([]string(nil), rec.Recipients...),
+				SealedPayload:  rec.SealedPayload,
+				SealGeneration: rec.SealGeneration,
+			}
+			if parsed, parseErr := secrets.ParseRef(rec.Ref); parseErr == nil {
+				blob.IncarnationID = parsed.IncarnationID
+			}
+			pushCtx, pushCancel := context.WithTimeout(refreshCtx, secretHolderProbeTimeout)
+			acked, pushErr := pusher.PushSecretBlobToPeers(pushCtx, blob, missing)
+			pushCancel()
+			if len(acked) > 0 {
+				addSecretHolderNodes(j.sandboxID, j.gen, acked...)
+			}
+			if pushErr != nil {
+				probeFailures.Lock()
+				probeFailures.count++
+				if probeFailures.first == nil {
+					probeFailures.first = pushErr
+				}
+				probeFailures.Unlock()
 			}
 		}()
 	}
@@ -554,6 +609,226 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	if failureCount > 0 && s.logger != nil {
 		s.logger.Warn("cluster: secret holder possession refresh incomplete",
 			"failed_sandboxes", failureCount, "attempted_sandboxes", len(jobs), "first_error", firstProbeErr)
+	}
+}
+
+// expandDeadSecretTargetsLocked returns a replacement target set when a
+// majority of frozen non-self targets are not in alive. Caller holds hs.mu.
+func (s *Service) expandDeadSecretTargetsLocked(sandboxID string, hs *holderNodeSet, alive map[string]struct{}, selfID string) []string {
+	if hs == nil || len(hs.targets) == 0 {
+		return nil
+	}
+	frozenPeers := 0
+	deadPeers := 0
+	for id := range hs.targets {
+		if id == "" || id == selfID {
+			continue
+		}
+		frozenPeers++
+		if _, ok := alive[id]; !ok {
+			deadPeers++
+		}
+	}
+	if frozenPeers == 0 || deadPeers*2 <= frozenPeers {
+		return nil
+	}
+	intended := s.SecretRecipientsForSeal(sandboxID)
+	// The [self] fallback from SecretRecipientsForSeal must not erase frozen
+	// backup targets when placement recipients are unknown (boot / Noop tests).
+	nonSelfIntended := 0
+	for _, id := range intended {
+		if id = strings.TrimSpace(id); id != "" && id != selfID {
+			nonSelfIntended++
+		}
+	}
+	if nonSelfIntended == 0 {
+		return nil
+	}
+	aliveIntended := make([]string, 0, len(intended))
+	for _, id := range intended {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if id == selfID {
+			aliveIntended = append(aliveIntended, id)
+			continue
+		}
+		if _, ok := alive[id]; ok {
+			aliveIntended = append(aliveIntended, id)
+		}
+	}
+	if len(aliveIntended) == 0 {
+		return nil
+	}
+	// Also keep any still-alive frozen targets that are not in the intended
+	// set (partial membership views during churn).
+	for id := range hs.targets {
+		if id == "" || id == selfID {
+			continue
+		}
+		if _, ok := alive[id]; !ok {
+			continue
+		}
+		found := false
+		for _, keep := range aliveIntended {
+			if keep == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			aliveIntended = append(aliveIntended, id)
+		}
+	}
+	sort.Strings(aliveIntended)
+	same := len(aliveIntended) == len(hs.targets)
+	if same {
+		for _, id := range aliveIntended {
+			if _, ok := hs.targets[id]; !ok {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		return nil
+	}
+	return aliveIntended
+}
+
+func setSecretHolderTargetsUnlocked(hs *holderNodeSet, gen int64, nodeIDs []string) {
+	if hs == nil {
+		return
+	}
+	if gen > 0 && hs.gen != 0 && hs.gen != gen {
+		hs.nodes = make(map[string]time.Time)
+		hs.lastProbe = time.Time{}
+	}
+	if gen > 0 {
+		hs.gen = gen
+	}
+	targets := make(map[string]struct{}, len(nodeIDs))
+	for _, id := range nodeIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			targets[id] = struct{}{}
+		}
+	}
+	hs.targets = targets
+	for id := range hs.nodes {
+		if _, ok := targets[id]; !ok {
+			delete(hs.nodes, id)
+		}
+	}
+}
+
+// ReconcileSecretPutOutbox retries durable create-path peer PUTs left when the
+// in-memory fan-out queue was saturated or an async push partially failed.
+func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pusher := s.secretPeerPusher()
+	if pusher == nil {
+		return nil
+	}
+	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
+	defer cancel()
+	for {
+		rows, err := s.store.ListSecretPutOutboxBatch(sweepCtx, secretDeleteReconcileBatch)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				return nil
+			}
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		processed := 0
+		for _, rec := range rows {
+			if sweepCtx.Err() != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return nil
+			}
+			s.reconcileSecretPutOutboxOnceContext(sweepCtx, rec.SandboxID)
+			processed++
+		}
+		if processed == 0 || len(rows) < secretDeleteReconcileBatch {
+			return nil
+		}
+	}
+}
+
+func (s *Service) reconcileSecretPutOutboxOnceContext(parent context.Context, sandboxID string) {
+	if s == nil || s.store == nil {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	rec, err := s.store.GetSecretPutOutbox(parent, sandboxID)
+	if err != nil || rec == nil {
+		return
+	}
+	selfID := s.selfNodeID()
+	peers := nonSelfRecipients(rec.Recipients, selfID)
+	if len(peers) == 0 {
+		_ = s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, nil, rec.SealGeneration)
+		return
+	}
+	pusher := s.secretPeerPusher()
+	if pusher == nil {
+		return
+	}
+	blobRec, loadErr := s.store.GetClusterSecretForSandbox(parent, sandboxID)
+	if loadErr != nil || blobRec == nil {
+		// Local row gone (destroy/reseal race) — drop the durable job.
+		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID)
+		return
+	}
+	if blobRec.SealGeneration > 0 && rec.SealGeneration > 0 && blobRec.SealGeneration != rec.SealGeneration {
+		// Stale outbox after reseal — drop; newer seal owns fan-out.
+		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID)
+		return
+	}
+	blob := secrets.SecretBlob{
+		Ref:            blobRec.Ref,
+		SandboxID:      blobRec.SandboxID,
+		IncarnationID:  rec.IncarnationID,
+		Version:        blobRec.Version,
+		Recipients:     append([]string(nil), blobRec.Recipients...),
+		SealedPayload:  blobRec.SealedPayload,
+		SealGeneration: blobRec.SealGeneration,
+	}
+	if blob.IncarnationID == "" {
+		if parsed, parseErr := secrets.ParseRef(blobRec.Ref); parseErr == nil {
+			blob.IncarnationID = parsed.IncarnationID
+		}
+	}
+	ctx, cancel := context.WithTimeout(parent, secretDeleteAttemptTimeout)
+	defer cancel()
+	acked, pushErr := pusher.PushSecretBlobToPeers(ctx, blob, peers)
+	_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID)
+	if len(acked) > 0 {
+		addSecretHolderNodes(sandboxID, blob.SealGeneration, acked...)
+	}
+	if pushErr != nil {
+		recordSecretFanoutFailure()
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret put-outbox incomplete",
+				"sandbox_id", sandboxID, "acked", len(acked), "err", pushErr)
+		}
+	}
+	pending := pendingRecipientsAfterAck(peers, acked, selfID)
+	if err := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, pending, rec.SealGeneration); err != nil && s.logger != nil {
+		s.logger.Warn("cluster: secret put-outbox recipient update failed",
+			"sandbox_id", sandboxID, "err", err)
 	}
 }
 

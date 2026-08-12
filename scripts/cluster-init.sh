@@ -366,16 +366,17 @@ else
 		-subj "/CN=AerolVM Cluster CA" \
 		-out "$TLS_DIR/ca.crt" 2>/dev/null
 
-	# 2. This node's keypair + cert. CN/SAN is fixed (clusterServerName in
-	#    Go); SAN intentionally doesn't include IP/hostname because the daemon
-	#    uses ServerName-based verification, not address-based.
+	# 2. This node's keypair + cert. DNS:aerolvm-cluster-node satisfies the
+	#    daemon's ServerName check; DNS:node:${NODE_ID} binds the cert to the
+	#    gossip node id (fail-closed peer identity). No IP/hostname SANs —
+	#    dial verification is name-based, not address-based.
 	openssl genrsa -out "$TLS_DIR/node.key" 4096 2>/dev/null
 	openssl req -new -key "$TLS_DIR/node.key" \
 		-subj "/CN=$CLUSTER_SAN" \
 		-out "$TLS_DIR/node.csr" 2>/dev/null
 
 	cat > "$TLS_DIR/node.ext" <<EOF
-subjectAltName = DNS:$CLUSTER_SAN
+subjectAltName = DNS:$CLUSTER_SAN,DNS:node:${NODE_ID}
 extendedKeyUsage = serverAuth, clientAuth
 EOF
 

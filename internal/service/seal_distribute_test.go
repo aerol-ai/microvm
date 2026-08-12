@@ -755,6 +755,8 @@ func (c *placementRecipientsCluster) Members() []cluster.Member {
 	return c.Noop.Members()
 }
 
+func (c *placementRecipientsCluster) LocalMembers() []cluster.Member { return c.Members() }
+
 func TestComputeFailoverReadyExpiresStaleACKWithoutAliveFlap(t *testing.T) {
 	ctx := context.Background()
 	cipher := newTestCipher(t)

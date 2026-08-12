@@ -98,8 +98,17 @@ func TestObserveAerolVMExpvarsCancelledAndHappy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expvar.NewInt("aerolvm_obs_callback_int").Set(7)
-	expvar.NewFloat("aerolvm_obs_callback_float").Set(1.25)
+	// Reuse published vars across -count>1 / race runs; New* panics on reuse.
+	if v := expvar.Get("aerolvm_obs_callback_int"); v != nil {
+		v.(*expvar.Int).Set(7)
+	} else {
+		expvar.NewInt("aerolvm_obs_callback_int").Set(7)
+	}
+	if v := expvar.Get("aerolvm_obs_callback_float"); v != nil {
+		v.(*expvar.Float).Set(1.25)
+	} else {
+		expvar.NewFloat("aerolvm_obs_callback_float").Set(1.25)
+	}
 
 	if _, err := meter.RegisterCallback(func(ctx context.Context, observer otelmetric.Observer) error {
 		return observeAerolVMExpvars(ctx, observer, intGauge, floatGauge)

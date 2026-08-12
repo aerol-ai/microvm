@@ -326,12 +326,21 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 		}
 		return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured")
 	}
+	incarnationID := s.secretIncarnationForSeal(sandboxID)
+	if incarnationID != "" {
+		ctx = secrets.ContextWithIncarnationID(ctx, incarnationID)
+	}
 	// PutClusterSecret atomically clears tomb+outbox with the row write.
 	h, err := p.Put(ctx, sandboxID, bag, recipients)
 	if err != nil {
 		return cluster.PlacementSecrets{}, err
 	}
-	return cluster.PlacementSecrets{Ref: h.Ref, Version: h.Version, Recipients: append([]string(nil), recipients...)}, nil
+	return cluster.PlacementSecrets{
+		Ref:           h.Ref,
+		Version:       h.Version,
+		Recipients:    append([]string(nil), recipients...),
+		IncarnationID: incarnationID,
+	}, nil
 }
 
 // fanoutSecretAfterSeal runs a bounded sync MinACK wait (when configured),
@@ -423,13 +432,25 @@ func (s *Service) enqueueSecretFanout(sandboxID string, blob secrets.SecretBlob,
 	select {
 	case secretCreateFanoutJobs <- job:
 	default:
-		// Never block the create path on a saturated queue. MinACK already
-		// secured ≥1 backup; remaining peers are recovered by restart re-fanout
-		// / possession probes rather than stalling CreateSandbox for minutes.
+		// Never block the create path on a saturated queue. Persist a durable
+		// put outbox so the reconciler retries remaining peers after MinACK.
+		// Note: "async retry" in plans/secrets-hardening.md means this SQLite
+		// put-outbox + ReconcileSecretPutOutbox ticker — not an unbounded
+		// in-memory retry that can silently drop when the process restarts.
 		secretCreateFanoutInflight.Delete(sandboxID)
 		recordSecretFanoutFailure()
+		gen := blob.SealGeneration
+		if gen <= 0 {
+			gen = 1
+		}
+		if s.store != nil {
+			if err := s.store.UpsertSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen, recipients); err != nil && s.logger != nil {
+				s.logger.Warn("cluster: secret fan-out queue full; put-outbox persist failed",
+					"sandbox_id", sandboxID, "err", err)
+			}
+		}
 		if s.logger != nil {
-			s.logger.Warn("cluster: secret fan-out queue full; deferring remaining peers",
+			s.logger.Warn("cluster: secret fan-out queue full; deferred remaining peers to put outbox",
 				"sandbox_id", sandboxID)
 		}
 	}
@@ -448,7 +469,44 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 			s.logger.Warn("cluster: secret fan-out incomplete",
 				"sandbox_id", sandboxID, "acked", len(acked), "err", err)
 		}
+		// Keep a durable retry job for peers that still need the blob.
+		pending := pendingRecipientsAfterAck(recipients, acked, s.selfNodeID())
+		gen := blob.SealGeneration
+		if gen <= 0 {
+			gen = 1
+		}
+		if s.store != nil && len(pending) > 0 {
+			_ = s.store.UpsertSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, gen, pending)
+		}
+		return
 	}
+	if s.store != nil {
+		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID)
+	}
+}
+
+func pendingRecipientsAfterAck(recipients, acked []string, selfID string) []string {
+	ackedSet := make(map[string]struct{}, len(acked)+1)
+	for _, id := range acked {
+		if id = strings.TrimSpace(id); id != "" {
+			ackedSet[id] = struct{}{}
+		}
+	}
+	if selfID != "" {
+		ackedSet[selfID] = struct{}{}
+	}
+	out := make([]string, 0, len(recipients))
+	for _, id := range recipients {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := ackedSet[id]; ok {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 // ReFanoutClusterSecrets rebuilds in-memory holder counts from local
@@ -597,9 +655,15 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	if blob.Version < 1 {
 		return fmt.Errorf("%w: version must be >= 1", ErrInvalidClusterSecretBlob)
 	}
-	wantRef := secrets.FormatRef(sandboxID, blob.Version)
-	if ref != wantRef {
-		return fmt.Errorf("%w: ref %q does not match sandbox_id/version (want %q)", ErrInvalidClusterSecretBlob, ref, wantRef)
+	parsed, parseErr := secrets.ParseRef(ref)
+	if parseErr != nil || parsed.SandboxID != sandboxID || parsed.Version != blob.Version {
+		return fmt.Errorf("%w: ref %q does not match sandbox_id/version (want %q or .../i/{inc}/v%d)",
+			ErrInvalidClusterSecretBlob, ref, secrets.FormatRef(sandboxID, blob.Version), blob.Version)
+	}
+	if blob.IncarnationID == "" {
+		blob.IncarnationID = parsed.IncarnationID
+	} else if parsed.IncarnationID != "" && blob.IncarnationID != parsed.IncarnationID {
+		return fmt.Errorf("%w: incarnation_id does not match ref", ErrInvalidClusterSecretBlob)
 	}
 
 	wireRecipients := secrets.NormalizeRecipients(blob.Recipients)
@@ -717,6 +781,18 @@ func (s *Service) SecretRecipientsForSeal(sandboxID string) []string {
 	return []string{c.SelfNodeID()}
 }
 
+// secretIncarnationForSeal returns Placement.IncarnationID when present.
+func (s *Service) secretIncarnationForSeal(sandboxID string) string {
+	c := s.Cluster()
+	if c == nil {
+		return ""
+	}
+	if p, ok := c.PlacementOf(sandboxID); ok {
+		return strings.TrimSpace(p.IncarnationID)
+	}
+	return ""
+}
+
 // WantsSecretRecipientFanout reports whether reserve/seal should use a
 // multi-recipient set for this create request.
 func (s *Service) WantsSecretRecipientFanout(req models.CreateSandboxRequest) bool {
@@ -753,22 +829,52 @@ func (s *Service) RedactClusterSecretsConfigured(req models.CreateSandboxRequest
 // (4) ACK TTL so a peer that loses SQLite without an Alive=false flap stops
 // counting until a fresh ACK / background possession refresh.
 func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
+	if sb == nil {
+		return nil
+	}
+	members, placements := s.failoverReadySnapshots()
+	return s.computeFailoverReadyCached(ctx, sb, members, placements)
+}
+
+// failoverReadySnapshots loads membership + placements once for a list/get
+// batch. Prefer LocalMembers (gossip) so agent workers do not HTTP-fan-out
+// for every row; fall back to Members() when the gossip view is empty.
+func (s *Service) failoverReadySnapshots() (members []cluster.Member, placements map[string]cluster.Placement) {
+	placements = map[string]cluster.Placement{}
+	c := s.Cluster()
+	if c == nil {
+		return nil, placements
+	}
+	members = c.LocalMembers()
+	if len(members) == 0 {
+		members = c.Members()
+	}
+	for _, p := range c.Placements() {
+		if p.SandboxID == "" {
+			continue
+		}
+		placements[p.SandboxID] = p
+	}
+	return members, placements
+}
+
+func (s *Service) computeFailoverReadyCached(ctx context.Context, sb *models.Sandbox, members []cluster.Member, placements map[string]cluster.Placement) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil
 	}
-	recipients := s.secretRecipientsForSandbox(ctx, sb.ID)
+	recipients := s.secretRecipientsForSandboxCached(ctx, sb.ID, placements)
 	selfID := ""
 	alive := map[string]struct{}{}
 	if c := s.Cluster(); c != nil {
 		selfID = c.SelfNodeID()
-		for _, m := range c.Members() {
-			if m.Alive && m.NodeID != "" {
-				alive[m.NodeID] = struct{}{}
-			}
+	}
+	for _, m := range members {
+		if m.Alive && m.NodeID != "" {
+			alive[m.NodeID] = struct{}{}
 		}
-		if selfID != "" {
-			alive[selfID] = struct{}{}
-		}
+	}
+	if selfID != "" {
+		alive[selfID] = struct{}{}
 	}
 	pruneDeadSecretHolders(sb.ID, alive)
 	localGen, localHolds := s.localSealedSecretGeneration(ctx, sb.ID)
@@ -838,6 +944,13 @@ func (s *Service) HasLocalSealedSecretGeneration(ctx context.Context, sandboxID 
 }
 
 func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID string) []string {
+	return s.secretRecipientsForSandboxCached(ctx, sandboxID, nil)
+}
+
+func (s *Service) secretRecipientsForSandboxCached(ctx context.Context, sandboxID string, placements map[string]cluster.Placement) []string {
+	if p, ok := placements[sandboxID]; ok && len(p.SecretRecipients) > 0 {
+		return p.SecretRecipients
+	}
 	if c := s.Cluster(); c != nil {
 		if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
 			return p.SecretRecipients
@@ -846,12 +959,11 @@ func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID stri
 	if s.store == nil {
 		return nil
 	}
-	ref := secrets.FormatRef(sandboxID, secrets.RefVersion)
-	blob, err := newSecretBlobStore(s.store).Get(ctx, ref)
-	if err != nil || blob == nil {
+	rec, err := s.store.GetClusterSecretForSandbox(ctx, sandboxID)
+	if err != nil || rec == nil {
 		return nil
 	}
-	return blob.Recipients
+	return rec.Recipients
 }
 
 func (s *Service) attachFailoverReady(ctx context.Context, sb *models.Sandbox) {
@@ -861,8 +973,21 @@ func (s *Service) attachFailoverReady(ctx context.Context, sb *models.Sandbox) {
 	sb.FailoverReady = s.computeFailoverReady(ctx, sb)
 }
 
-func (s *Service) attachFailoverReadyAll(ctx context.Context, sandboxes []*models.Sandbox) {
-	for _, sb := range sandboxes {
-		s.attachFailoverReady(ctx, sb)
+// failoverReadyBatch attaches failover_ready using one Members()/LocalMembers
+// snapshot and one Placements() lookup map — not per-row membership fetches.
+func (s *Service) failoverReadyBatch(ctx context.Context, sandboxes []*models.Sandbox) {
+	if len(sandboxes) == 0 {
+		return
 	}
+	members, placements := s.failoverReadySnapshots()
+	for _, sb := range sandboxes {
+		if sb == nil {
+			continue
+		}
+		sb.FailoverReady = s.computeFailoverReadyCached(ctx, sb, members, placements)
+	}
+}
+
+func (s *Service) attachFailoverReadyAll(ctx context.Context, sandboxes []*models.Sandbox) {
+	s.failoverReadyBatch(ctx, sandboxes)
 }

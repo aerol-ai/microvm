@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -220,19 +219,11 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 func (c *Cluster) fetchMemberCapacity(ctx context.Context, m Member) (capacity.Snapshot, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if internalClient := c.currentInternalClient(); internalClient != nil && m.InternalURL != "" {
-		snap, err := fetchCapacitySnapshot(reqCtx, internalClient, strings.TrimRight(m.InternalURL, "/")+"/v1/capacity", c.patToken)
-		if err == nil {
-			return snap, nil
-		}
-		if !isStatus(err, http.StatusServiceUnavailable) || m.APIURL == "" {
-			return capacity.Snapshot{}, err
-		}
+	client, base, err := PeerDial(m, c.httpClient, c.currentInternalClient())
+	if err != nil {
+		return capacity.Snapshot{}, err
 	}
-	if m.APIURL == "" {
-		return capacity.Snapshot{}, fmt.Errorf("node %s has no API URL for capacity heartbeat", m.NodeID)
-	}
-	return fetchCapacitySnapshot(reqCtx, c.httpClient, strings.TrimRight(m.APIURL, "/")+"/v1/capacity", c.patToken)
+	return fetchCapacitySnapshot(reqCtx, client, strings.TrimRight(base, "/")+"/v1/capacity", c.patToken)
 }
 
 func fetchCapacitySnapshot(ctx context.Context, client *http.Client, endpoint, patToken string) (capacity.Snapshot, error) {

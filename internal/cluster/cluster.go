@@ -191,6 +191,9 @@ type PlacementSecrets struct {
 	// secret material — rides Place/Reserve so failover recreate preserves
 	// tenancy when the owner-watcher uses an unscoped internal context.
 	OwnerRef string `json:"owner_ref,omitempty"`
+	// IncarnationID tags this placement lifetime for secret binding. Minted
+	// at reserve; preserved across reassign. Additive omitempty.
+	IncarnationID string `json:"incarnation_id,omitempty"`
 }
 
 func (s PlacementSecrets) hasUpdate() bool {
@@ -203,10 +206,11 @@ func secretsFromPlacement(p Placement) PlacementSecrets {
 		recipients = append([]string(nil), p.SecretRecipients...)
 	}
 	return PlacementSecrets{
-		Ref:        p.SecretRef,
-		Version:    p.SecretVersion,
-		Recipients: recipients,
-		OwnerRef:   p.OwnerRef,
+		Ref:           p.SecretRef,
+		Version:       p.SecretVersion,
+		Recipients:    recipients,
+		OwnerRef:      p.OwnerRef,
+		IncarnationID: p.IncarnationID,
 	}
 }
 
@@ -266,6 +270,10 @@ type Placement struct {
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. Additive omitempty — wire-compatible with older peers.
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
+	// IncarnationID uniquely tags this placement lifetime for secret refs /
+	// seal bindings. Minted at reserve; preserved on reassign/promote.
+	// Additive omitempty — empty on pre-incarnation Raft rows.
+	IncarnationID string `json:"incarnation_id,omitempty"`
 	// OwnerRef is the control-plane tenant account (tenancy). Distinct from
 	// OwnerNodeID (which cluster node hosts the sandbox).
 	OwnerRef string `json:"owner_ref,omitempty"`
@@ -304,6 +312,7 @@ type Placement struct {
 // It deliberately carries no sandbox spec, routes, secret refs, or audit data.
 type AuditACL struct {
 	SandboxID           string   `json:"sandbox_id"`
+	IncarnationID       string   `json:"incarnation_id,omitempty"`
 	OwnerRef            string   `json:"owner_ref"`
 	AuditNodeIDs        []string `json:"audit_node_ids,omitempty"`
 	AuditNodesTruncated bool     `json:"audit_nodes_truncated,omitempty"`
@@ -661,6 +670,12 @@ type Client interface {
 
 	// Members returns a snapshot of all known cluster members.
 	Members() []Member
+
+	// LocalMembers returns the local gossip membership view without a
+	// control-plane HTTP round-trip. Hot paths (list failover_ready) prefer
+	// this over Members() on agent nodes so a page of sandboxes does not
+	// fan out N membership RPCs.
+	LocalMembers() []Member
 
 	// IngressTargets aggregates live ingress-role nodes' gossiped PublicHost
 	// values into the set of public addresses users must point DNS at for

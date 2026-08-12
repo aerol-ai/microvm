@@ -75,6 +75,8 @@ type command struct {
 	// SecretRecipients rides opReserve (and is preserved by opPlace). Additive
 	// omitempty — mixed-version clusters decode missing field as nil.
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
+	// IncarnationID rides opReserve and is preserved by opPlace/opReassign.
+	IncarnationID string `json:"incarnation_id,omitempty"`
 	// OwnerRef is the control-plane tenant account. Additive omitempty.
 	OwnerRef  string `json:"owner_ref,omitempty"`
 	Port      int    `json:"port,omitempty"`
@@ -135,6 +137,7 @@ type reservationCommand struct {
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
 	SecretRecipients   []string                     `json:"secret_recipients,omitempty"`
+	IncarnationID      string                       `json:"incarnation_id,omitempty"`
 	OwnerRef           string                       `json:"owner_ref,omitempty"`
 	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
 }
@@ -176,6 +179,7 @@ func reservationFromCommand(c command) reservationCommand {
 		SecretRef:          c.SecretRef,
 		SecretVersion:      c.SecretVersion,
 		SecretRecipients:   append([]string(nil), c.SecretRecipients...),
+		IncarnationID:      c.IncarnationID,
 		OwnerRef:           c.OwnerRef,
 		ExpiresUnix:        c.ExpiresUnix,
 	}
@@ -192,6 +196,7 @@ func commandFromReservation(r reservationCommand) command {
 		SecretRef:          r.SecretRef,
 		SecretVersion:      r.SecretVersion,
 		SecretRecipients:   append([]string(nil), r.SecretRecipients...),
+		IncarnationID:      r.IncarnationID,
 		OwnerRef:           r.OwnerRef,
 		ExpiresUnix:        r.ExpiresUnix,
 	}
@@ -250,6 +255,10 @@ type placementFSM struct {
 	// placementIDs is a sorted sandbox ID index used by PlacementPage so a
 	// bounded page does not allocate/sort the full placement map.
 	placementIDs *btree.BTreeG[string]
+	// ownerRefIndex maps tenant OwnerRef -> sorted sandbox IDs. PlacementPage
+	// with OwnerRef uses this instead of scanning/sorting the full map under
+	// the FSM lock (enterprise multi-tenant list fan-out).
+	ownerRefIndex map[string]*btree.BTreeG[string]
 	// hostPortIndex maps a raw-TCP public host port to the placement exposure
 	// that owns it. This is the cluster-wide raw TCP capacity index: AddPort
 	// rejects collisions in O(1) under the FSM lock instead of scanning every
@@ -369,6 +378,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		nameIndex:                    make(map[string]string),
 		shardIndex:                   make(map[int]map[string]struct{}),
 		placementIDs:                 newPlacementIDIndex(),
+		ownerRefIndex:                make(map[string]*btree.BTreeG[string]),
 		hostPortIndex:                make(map[int]hostPortClaim),
 		ownerIndex:                   make(map[string]map[string]struct{}),
 		pendingReservationClaims:     make(map[string]pendingReservationClaim),
@@ -477,6 +487,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		var portRoutes map[int]ExposedPortRoute
 		var customHostnames []string
 		var secretRecipients []string
+		var incarnationID string
 		var auditNodeIDs []string
 		var auditNodesTruncated bool
 		ownerRef := strings.TrimSpace(cmd.OwnerRef)
@@ -493,6 +504,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// Preserve the reserve-time recipient set unless the command
 			// explicitly supplies a new one (normal promote leaves it empty).
 			secretRecipients = append([]string(nil), existing.SecretRecipients...)
+			incarnationID = existing.IncarnationID
 			auditNodeIDs = append([]string(nil), existing.AuditNodeIDs...)
 			auditNodesTruncated = existing.AuditNodesTruncated
 			if ownerRef == "" {
@@ -501,6 +513,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		if len(cmd.SecretRecipients) > 0 {
 			secretRecipients = append([]string(nil), cmd.SecretRecipients...)
+		}
+		if id := strings.TrimSpace(cmd.IncarnationID); id != "" {
+			incarnationID = id
 		}
 		dataPlaneHost := cmd.OwnerDataPlaneHost
 		if dataPlaneHost == "" && exists {
@@ -512,6 +527,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if exists {
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseOwnerLocked(cmd.SandboxID, existing)
+			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 			if existing.IsReserved() {
 				f.releasePendingReservationLocked(cmd.SandboxID)
 				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
@@ -530,6 +546,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			SecretRef:           secrets.Ref,
 			SecretVersion:       secrets.Version,
 			SecretRecipients:    secretRecipients,
+			IncarnationID:       incarnationID,
 			OwnerRef:            ownerRef,
 			AuditNodeIDs:        auditNodeIDs,
 			AuditNodesTruncated: auditNodesTruncated,
@@ -548,6 +565,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.claimNameLocked(cmd.SandboxID, name)
 		f.claimShardLocked(cmd.SandboxID)
+		f.claimOwnerRefLocked(cmd.SandboxID, ownerRef)
 		f.claimOwnerLocked(cmd.SandboxID, p)
 		return nil
 	case opReserve:
@@ -587,6 +605,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 		f.releaseShardLocked(cmd.SandboxID)
+		f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 		f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 		f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
 		f.releasePendingReservationLocked(cmd.SandboxID)
@@ -604,6 +623,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				}
 				f.auditACLs[cmd.SandboxID] = AuditACL{
 					SandboxID:           cmd.SandboxID,
+					IncarnationID:       existing.IncarnationID,
 					OwnerRef:            ownerRef,
 					AuditNodeIDs:        append([]string(nil), existing.AuditNodeIDs...),
 					AuditNodesTruncated: existing.AuditNodesTruncated,
@@ -612,6 +632,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
+			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 			f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
 			f.releaseOwnerLocked(cmd.SandboxID, existing)
@@ -710,6 +731,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			f.releaseNameLocked(id, placementName(existing))
 			f.releaseShardLocked(id)
+			f.releaseOwnerRefLocked(id, existing.OwnerRef)
 			f.releaseAllCustomHostnamesLocked(id, existing)
 			f.releasePendingReservationLocked(id)
 			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
@@ -1119,11 +1141,19 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			if len(cmd.SecretRecipients) > 0 {
 				existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
 			}
+			if id := strings.TrimSpace(cmd.IncarnationID); id != "" && existing.IncarnationID == "" {
+				existing.IncarnationID = id
+			}
+			oldOwnerRef := existing.OwnerRef
 			if ref := strings.TrimSpace(cmd.OwnerRef); ref != "" {
 				existing.OwnerRef = ref
 			}
 			if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 				return err
+			}
+			if existing.OwnerRef != oldOwnerRef {
+				f.releaseOwnerRefLocked(cmd.SandboxID, oldOwnerRef)
+				f.claimOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 			}
 			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 			return nil
@@ -1134,6 +1164,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
+			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 		} else {
 			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
@@ -1156,6 +1187,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
 		SecretRecipients:   append([]string(nil), cmd.SecretRecipients...),
+		IncarnationID:      strings.TrimSpace(cmd.IncarnationID),
 		OwnerRef:           strings.TrimSpace(cmd.OwnerRef),
 		State:              PlacementStateReserved,
 		ExpiresUnix:        cmd.ExpiresUnix,
@@ -1165,6 +1197,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 	}
 	f.claimNameLocked(cmd.SandboxID, name)
 	f.claimShardLocked(cmd.SandboxID)
+	f.claimOwnerRefLocked(cmd.SandboxID, p.OwnerRef)
 	f.claimPendingReservationLocked(cmd.SandboxID, p)
 	return nil
 }
@@ -1291,6 +1324,39 @@ func (f *placementFSM) releaseShardLocked(sandboxID string) {
 	}
 	if f.placementIDs != nil {
 		f.placementIDs.Delete(sandboxID)
+	}
+}
+
+func (f *placementFSM) claimOwnerRefLocked(sandboxID, ownerRef string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	ownerRef = strings.TrimSpace(ownerRef)
+	if sandboxID == "" || ownerRef == "" {
+		return
+	}
+	if f.ownerRefIndex == nil {
+		f.ownerRefIndex = make(map[string]*btree.BTreeG[string])
+	}
+	tree := f.ownerRefIndex[ownerRef]
+	if tree == nil {
+		tree = newPlacementIDIndex()
+		f.ownerRefIndex[ownerRef] = tree
+	}
+	tree.ReplaceOrInsert(sandboxID)
+}
+
+func (f *placementFSM) releaseOwnerRefLocked(sandboxID, ownerRef string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	ownerRef = strings.TrimSpace(ownerRef)
+	if sandboxID == "" || ownerRef == "" || f.ownerRefIndex == nil {
+		return
+	}
+	tree := f.ownerRefIndex[ownerRef]
+	if tree == nil {
+		return
+	}
+	tree.Delete(sandboxID)
+	if tree.Len() == 0 {
+		delete(f.ownerRefIndex, ownerRef)
 	}
 }
 
@@ -1936,8 +2002,14 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 }
 
 func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
-	if f.placementIDs == nil || strings.TrimSpace(req.OwnerRef) != "" {
-		// OwnerRef filtering scans placements; the ID tree has no tenant index.
+	if ownerRef := strings.TrimSpace(req.OwnerRef); ownerRef != "" {
+		if f.ownerRefIndex != nil {
+			return f.pagePlacementIDsByOwnerRefLocked(req, ownerRef, shardFilter, allShards, wantShards)
+		}
+		// Index missing (partial restore) — fall back to scan.
+		return f.pagePlacementIDsByScanLocked(req, shardFilter, allShards, wantShards)
+	}
+	if f.placementIDs == nil {
 		return f.pagePlacementIDsByScanLocked(req, shardFilter, allShards, wantShards)
 	}
 	if allShards || shardFilter.ShardCount != DefaultPlacementShardCount || len(shardFilter.Shards) > 1024 {
@@ -1957,6 +2029,31 @@ func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFil
 	if len(ids) > req.Limit {
 		ids = ids[:req.Limit]
 	}
+	return ids
+}
+
+func (f *placementFSM) pagePlacementIDsByOwnerRefLocked(req PlacementPageRequest, ownerRef string, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
+	tree := f.ownerRefIndex[ownerRef]
+	if tree == nil {
+		return nil
+	}
+	ids := make([]string, 0, req.Limit)
+	shardCount := shardFilter.ShardCount
+	if shardCount <= 0 {
+		shardCount = DefaultPlacementShardCount
+	}
+	tree.AscendGreaterOrEqual(req.PageToken, func(id string) bool {
+		if req.PageToken != "" && id <= req.PageToken {
+			return true
+		}
+		if !allShards {
+			if _, ok := wantShards[PlacementShardForSandbox(id, shardCount)]; !ok {
+				return true
+			}
+		}
+		ids = append(ids, id)
+		return len(ids) < req.Limit
+	})
 	return ids
 }
 
@@ -2166,6 +2263,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.nameIndex = make(map[string]string, len(payload.Placements))
 	f.shardIndex = make(map[int]map[string]struct{})
 	f.placementIDs = newPlacementIDIndex()
+	f.ownerRefIndex = make(map[string]*btree.BTreeG[string])
 	f.hostPortIndex = make(map[int]hostPortClaim)
 	f.ownerIndex = make(map[string]map[string]struct{})
 	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
@@ -2236,6 +2334,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 			f.nameIndex[name] = id
 		}
 		f.claimShardLocked(id)
+		f.claimOwnerRefLocked(id, indexed.OwnerRef)
 		for port, route := range exposedPortRoutesForPlacement(indexed) {
 			f.claimHostPortLocked(id, port, route)
 		}

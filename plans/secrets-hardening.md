@@ -421,10 +421,10 @@ second token table, reconciliation loop, or garbage collector.
 | **GAP-1: owner dies inside the async fan-out window** | yes (UC-58c + unit) | **closed for all cluster modes** — bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s), and zero ACKs retract/fail the create | create either has a backup ACK or fails |
 | Failover node not in recipient set | yes (D5 case) | must be distinct error | clear error — **required**, not a decrypt failure |
 | Partial fan-out | yes | 3d-2 holder-count rule | create succeeds at owner + ≥1; holder count surfaced |
-| Peer unreachable during fan-out | yes | async retry + backoff + metric | nothing at create; `failover_ready` stays false |
+| Peer unreachable during fan-out | yes | durable put-outbox + reconciler retry + metric (not silent in-memory drop) | nothing at create; `failover_ready` stays false |
 | Ownership replay seal failure | yes | best-effort + metric | sandbox marked not-HA |
 | Missing sealed env during recreate | yes | strict canonical ref and required sealed row | **fails loudly**, never boots with silently empty env |
-| KMS unreachable during fan-out | yes (fake) | async retry + backoff | nothing at create; `failover_ready` stays false |
+| KMS unreachable during fan-out | yes (fake) | durable put-outbox + reconciler retry | nothing at create; `failover_ready` stays false |
 | **Holder count lost on restart** | yes (ReFanout unit) | **fixed** — boot `ReFanoutClusterSecrets` rebuilds holders from local rows + async re-push | brief `failover_ready=false` until peers ACK again |
 
 ### GAP-1 — the async fan-out window (MITIGATED)

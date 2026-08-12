@@ -341,7 +341,7 @@ else
 		-out "$TLS_DIR/node.csr" 2>/dev/null
 
 	cat > "$TLS_DIR/node.ext" <<EOF
-subjectAltName = DNS:$CLUSTER_SAN
+subjectAltName = DNS:$CLUSTER_SAN,DNS:node:${NODE_ID}
 extendedKeyUsage = serverAuth, clientAuth
 EOF
 

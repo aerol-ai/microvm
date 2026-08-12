@@ -886,6 +886,10 @@ class ListFilterTests(unittest.TestCase):
                 captured["paths"].append((method, path, payload))
                 return []
 
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                captured["paths"].append((method, path, payload))
+                return [], {}
+
         return CapturingClient(), captured
 
     def test_list_with_tags_renders_tag_prefix(self):
@@ -921,6 +925,47 @@ class ListFilterTests(unittest.TestCase):
         self.assertEqual(captured["paths"][0][1], "/v1/sandboxes/sb-1?include_env=true")
         self.assertIn("tag.team=a", captured["paths"][1][1])
         self.assertIn("include_env=true", captured["paths"][1][1])
+
+    def test_list_drains_cluster_pages(self):
+        captured = {"paths": []}
+
+        class PagingClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                captured["paths"].append(path)
+                if "page_token=" not in path:
+                    return (
+                        [{"id": "sb-1", "image": "alpine", "status": "started"}],
+                        {
+                            "X-Cluster-List-Partial": "false",
+                            "X-Cluster-List-Placement-Ready": "true",
+                            "X-Cluster-List-Next-Page-Token": "tok-1",
+                        },
+                    )
+                return (
+                    [{"id": "sb-2", "image": "alpine", "status": "started"}],
+                    {
+                        "X-Cluster-List-Partial": "false",
+                        "X-Cluster-List-Placement-Ready": "true",
+                    },
+                )
+
+        items = PagingClient().list()
+        self.assertEqual([s.id for s in items], ["sb-1", "sb-2"])
+        self.assertEqual(captured["paths"][1], "/v1/sandboxes?page_token=tok-1")
+
+    def test_list_errors_on_partial_cluster_coverage(self):
+        class PartialClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                return [], {"X-Cluster-List-Partial": "true", "X-Cluster-List-Placement-Ready": "true"}
+
+        with self.assertRaisesRegex(client_module.MicroVMError, "incomplete cluster list"):
+            PartialClient().list()
 
 
 class CustomDomainsTests(unittest.TestCase):

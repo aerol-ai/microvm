@@ -112,28 +112,40 @@ func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 	}
 }
 
-func TestDialPeerPrefersInternalURLAndUserAuth(t *testing.T) {
+func TestDialPeerRequiresInternalURLAndClient(t *testing.T) {
 	tr := Transport{
 		PublicClient:   http.DefaultClient,
 		InternalClient: http.DefaultClient,
 		FleetPAT:       "pat",
 	}
-	client, base, mode := dialPeer(cluster.Member{
+	client, base, err := dialPeer(cluster.Member{
 		NodeID:      "n1",
 		APIURL:      "http://public",
 		InternalURL: "https://internal",
 		Alive:       true,
 	}, tr)
-	if client == nil || base != "https://internal" || mode != authUser {
-		t.Fatalf("dialPeer = %v %q %v, want internal+user", client != nil, base, mode)
+	if err != nil || client == nil || base != "https://internal" {
+		t.Fatalf("dialPeer = %v %q %v, want internal mTLS", client != nil, base, err)
 	}
-	client, base, mode = dialPeer(cluster.Member{
+
+	// Public-only peers must fail closed (no advertise-URL fallback).
+	_, _, err = dialPeer(cluster.Member{
 		NodeID: "n2",
 		APIURL: "http://public-only",
 		Alive:  true,
 	}, tr)
-	if client == nil || base != "http://public-only" || mode != authFleetPAT {
-		t.Fatalf("dialPeer fallback = %v %q %v, want public+pat", client != nil, base, mode)
+	if err == nil {
+		t.Fatal("dialPeer without InternalURL: want error")
+	}
+
+	_, _, err = dialPeer(cluster.Member{
+		NodeID:      "n3",
+		APIURL:      "http://public",
+		InternalURL: "https://internal",
+		Alive:       true,
+	}, Transport{PublicClient: http.DefaultClient, FleetPAT: "pat"})
+	if err == nil {
+		t.Fatal("dialPeer without InternalClient: want error")
 	}
 }
 

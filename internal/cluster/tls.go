@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // TLS material lives on disk under SB_CLUSTER_TLS_DIR with these names.
@@ -29,6 +30,10 @@ const (
 // serves the name you dialed" rule.
 const clusterServerName = "aerolvm-cluster-node"
 
+// nodeIDSANprefix is the DNS/URI SAN form minted by cluster-init/join
+// (DNS:node:${NODE_ID}) so peers can bind mTLS identity to a gossip node id.
+const nodeIDSANprefix = "node:"
+
 // ClusterTLS is the loaded TLS material the daemon uses for cluster-internal
 // channels (raft transport + leader-forwarded HTTP applies). Built once at
 // boot from the on-disk files and shared by the raft StreamLayer and the
@@ -36,6 +41,19 @@ const clusterServerName = "aerolvm-cluster-node"
 type ClusterTLS struct {
 	caPool   *x509.CertPool
 	nodeCert tls.Certificate
+	// nodeID is extracted from the local node cert when a DNS/URI SAN of the
+	// form node:<id> is present, or when CN equals a non-legacy node id.
+	// Empty for legacy aerolvm-cluster-node-only certs.
+	nodeID string
+}
+
+// NodeID returns the node-bound identity extracted from the local node cert,
+// or empty when the cert carries only the legacy clusterServerName SAN.
+func (t *ClusterTLS) NodeID() string {
+	if t == nil {
+		return ""
+	}
+	return t.nodeID
 }
 
 // loadClusterTLS reads ca.crt + node.crt/node.key from dir. Returns
@@ -61,7 +79,100 @@ func loadClusterTLS(dir string) (*ClusterTLS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster tls: load node keypair: %w", err)
 	}
-	return &ClusterTLS{caPool: pool, nodeCert: cert}, nil
+	nodeID := ""
+	if leaf, err := leafCertificate(&cert); err == nil {
+		nodeID, _ = ExtractPeerNodeID(leaf)
+	}
+	return &ClusterTLS{caPool: pool, nodeCert: cert, nodeID: nodeID}, nil
+}
+
+func leafCertificate(cert *tls.Certificate) (*x509.Certificate, error) {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return nil, errors.New("cluster tls: empty certificate")
+	}
+	if cert.Leaf != nil {
+		return cert.Leaf, nil
+	}
+	return x509.ParseCertificate(cert.Certificate[0])
+}
+
+// ExtractPeerNodeID returns the node-bound identity from a peer certificate.
+// Prefer DNS/URI SAN `node:<id>`; otherwise accept CN when it is not the
+// legacy clusterServerName. legacyOnly is true when the cert only carries
+// aerolvm-cluster-node (no node:<id> identity).
+func ExtractPeerNodeID(cert *x509.Certificate) (nodeID string, legacyOnly bool) {
+	if cert == nil {
+		return "", false
+	}
+	for _, name := range cert.DNSNames {
+		if id := parseNodeIDSAN(name); id != "" {
+			return id, false
+		}
+	}
+	for _, uri := range cert.URIs {
+		if uri == nil {
+			continue
+		}
+		if id := parseNodeIDSAN(uri.String()); id != "" {
+			return id, false
+		}
+		if id := parseNodeIDSAN(uri.Opaque); id != "" {
+			return id, false
+		}
+		if id := parseNodeIDSAN(strings.TrimPrefix(uri.Path, "/")); id != "" {
+			return id, false
+		}
+	}
+	cn := strings.TrimSpace(cert.Subject.CommonName)
+	if cn != "" && cn != clusterServerName {
+		if id := parseNodeIDSAN(cn); id != "" {
+			return id, false
+		}
+		return cn, false
+	}
+	if hasLegacyClusterSAN(cert) {
+		return "", true
+	}
+	return "", false
+}
+
+func parseNodeIDSAN(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, nodeIDSANprefix) {
+		return ""
+	}
+	id := strings.TrimSpace(strings.TrimPrefix(s, nodeIDSANprefix))
+	if id == "" || id == clusterServerName {
+		return ""
+	}
+	return id
+}
+
+func hasLegacyClusterSAN(cert *x509.Certificate) bool {
+	if cert == nil {
+		return false
+	}
+	if strings.TrimSpace(cert.Subject.CommonName) == clusterServerName {
+		return true
+	}
+	for _, name := range cert.DNSNames {
+		if strings.TrimSpace(name) == clusterServerName {
+			return true
+		}
+	}
+	return false
+}
+
+// VerifyPeerNodeID reports whether expected matches the peer cert's node-bound
+// identity. Empty expected is a no-op (returns true). Used by withInternalMTLS
+// when the caller supplies an expected peer id.
+func VerifyPeerNodeID(cert *x509.Certificate, expected string) bool {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return true
+	}
+	got, _ := ExtractPeerNodeID(cert)
+	return got != "" && got == expected
 }
 
 // serverConfig builds the *tls.Config used by both the raft TLS StreamLayer

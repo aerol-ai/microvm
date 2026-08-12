@@ -49,7 +49,10 @@ func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandbox
 	if c == nil || c.httpClient == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: audit fetch unavailable")
 	}
-	client, endpoint := auditPeerTransport(c.httpClient, c.currentInternalClient(), c.Members(), apiURL)
+	client, endpoint, err := auditPeerTransport(c.httpClient, c.currentInternalClient(), c.Members(), apiURL)
+	if err != nil {
+		return AuditPeerPage{}, err
+	}
 	return fetchSandboxAuditFromPeer(ctx, client, c.patToken, endpoint, sandboxID, limit, cursor, kind)
 }
 
@@ -58,7 +61,10 @@ func (a *Agent) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID
 	if a == nil || a.httpClient == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: audit fetch unavailable")
 	}
-	client, endpoint := auditPeerTransport(a.httpClient, a.internalClient, a.Members(), apiURL)
+	client, endpoint, err := auditPeerTransport(a.httpClient, a.internalClient, a.Members(), apiURL)
+	if err != nil {
+		return AuditPeerPage{}, err
+	}
 	return fetchSandboxAuditFromPeer(ctx, client, a.patToken, endpoint, sandboxID, limit, cursor, kind)
 }
 
@@ -130,7 +136,10 @@ func (c *Cluster) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID st
 	if c == nil || c.httpClient == nil {
 		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
 	}
-	client, endpoint := auditPeerTransport(c.httpClient, c.currentInternalClient(), c.Members(), apiURL)
+	client, endpoint, err := auditPeerTransport(c.httpClient, c.currentInternalClient(), c.Members(), apiURL)
+	if err != nil {
+		return "", false, err
+	}
 	return fetchSandboxOwnerRef(ctx, client, c.patToken, endpoint, sandboxID)
 }
 
@@ -138,24 +147,25 @@ func (a *Agent) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID stri
 	if a == nil || a.httpClient == nil {
 		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
 	}
-	client, endpoint := auditPeerTransport(a.httpClient, a.internalClient, a.Members(), apiURL)
+	client, endpoint, err := auditPeerTransport(a.httpClient, a.internalClient, a.Members(), apiURL)
+	if err != nil {
+		return "", false, err
+	}
 	return fetchSandboxOwnerRef(ctx, client, a.patToken, endpoint, sandboxID)
 }
 
-// auditPeerTransport upgrades peer audit/meta reads to the cert-pinned channel
-// whenever the target has advertised one. As with raft applies, an mTLS error
-// is returned directly; callers never silently downgrade to PAT-only HTTP.
-func auditPeerTransport(publicClient, internalClient *http.Client, members []Member, apiURL string) (*http.Client, string) {
-	if internalClient == nil {
-		return publicClient, apiURL
-	}
+// auditPeerTransport selects the peer audit/meta dial via PeerDial. When
+// internalClient is set, missing InternalURL fails closed — never PAT+APIURL.
+func auditPeerTransport(publicClient, internalClient *http.Client, members []Member, apiURL string) (*http.Client, string, error) {
 	want := strings.TrimRight(strings.TrimSpace(apiURL), "/")
+	m := Member{APIURL: apiURL}
 	for _, member := range members {
-		if strings.TrimRight(strings.TrimSpace(member.APIURL), "/") == want && strings.TrimSpace(member.InternalURL) != "" {
-			return internalClient, member.InternalURL
+		if strings.TrimRight(strings.TrimSpace(member.APIURL), "/") == want {
+			m = member
+			break
 		}
 	}
-	return publicClient, apiURL
+	return PeerDial(m, publicClient, internalClient)
 }
 
 func (n *Noop) FetchSandboxOwnerRef(context.Context, string, string) (string, bool, error) {

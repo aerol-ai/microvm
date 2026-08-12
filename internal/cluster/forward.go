@@ -78,12 +78,10 @@ var defaultPublicTransport http.RoundTripper = &http.Transport{
 // PAT bearer header is preserved (httputil.ReverseProxy passes through
 // headers by default; we only strip hop-by-hop ones).
 //
-// Channel selection: when this node has TLS material loaded AND
-// target.InternalURL is non-empty, the proxy rides the cluster-internal mTLS
-// channel — the receiving node's mTLS listener serves the same v1 API mux as
-// the public port (see AttachInternalHandler), so handlers run identically.
-// Falling back to target.APIURL (public, PAT-only) when either side lacks
-// TLS keeps mixed/legacy clusters working.
+// Channel selection: when this node has TLS material loaded (mtlsProxies !=
+// nil), InternalURL is required — empty InternalURL is an error, never a
+// silent downgrade to APIURL+PAT. Without local TLS, ForwardHTTP uses the
+// public APIURL path (legacy / private-overlay deployments).
 //
 // Forwarding loops are detected by the X-Cluster-Forwarded header and returned
 // as 421 Misdirected Request so clients retry against a refreshed placement.
@@ -110,7 +108,13 @@ func forwardHTTPWithMetrics(mtlsProxies *proxyCache, publicProxies *proxyCache, 
 		http.Error(w, "cluster: forwarding loop detected", http.StatusMisdirectedRequest)
 		return
 	}
-	if mtlsProxies != nil && target.InternalURL != "" {
+	if mtlsProxies != nil {
+		if target.InternalURL == "" {
+			err = ErrPeerInternalURLRequired
+			recordOwnerForwardTargetMiss("internal_url_required")
+			http.Error(w, ErrPeerInternalURLRequired.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		err = serveProxy(mtlsProxies, target.InternalURL, w, r)
 		return
 	}

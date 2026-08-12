@@ -256,18 +256,47 @@ func (c *Client) List(ctx context.Context, tags map[string]string) ([]*Sandbox, 
 	return c.ListWithOptions(ctx, tags, false)
 }
 
+const maxClusterListPages = 1000
+
 // ListWithOptions lists sandboxes; includeEnv appends ?include_env=true.
+// In cluster mode the daemon pages via X-Cluster-List-Next-Page-Token; this
+// drains pages until empty (capped at maxClusterListPages). Partial coverage
+// or an unready placement view is returned as an error rather than a silent
+// incomplete list.
 func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
-	var response []models.Sandbox
-	path := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
-		return nil, err
+	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
+	var items []*Sandbox
+	pageToken := ""
+	for page := 0; page < maxClusterListPages; page++ {
+		path := appendQueryParam(basePath, "page_token", pageToken)
+		var response []models.Sandbox
+		hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response)
+		if err != nil {
+			return nil, err
+		}
+		if hdrs.Get("X-Cluster-List-Partial") == "true" || hdrs.Get("X-Cluster-List-Placement-Ready") == "false" {
+			return nil, errors.New("incomplete cluster list")
+		}
+		for _, item := range response {
+			items = append(items, c.wrap(item))
+		}
+		pageToken = strings.TrimSpace(hdrs.Get("X-Cluster-List-Next-Page-Token"))
+		if pageToken == "" {
+			return items, nil
+		}
 	}
-	items := make([]*Sandbox, 0, len(response))
-	for _, item := range response {
-		items = append(items, c.wrap(item))
+	return nil, errors.New("incomplete cluster list: exceeded max pages")
+}
+
+func appendQueryParam(path, key, value string) string {
+	if strings.TrimSpace(value) == "" {
+		return path
 	}
-	return items, nil
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + url.QueryEscape(key) + "=" + url.QueryEscape(value)
 }
 
 // buildTagQuery renders the tag filter as the server's `?tag.<key>=<value>`
@@ -800,12 +829,17 @@ func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycl
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
+	_, err := c.doJSONHeaders(ctx, method, path, requestBody, responseBody)
+	return err
+}
+
+func (c *Client) doJSONHeaders(ctx context.Context, method, path string, requestBody any, responseBody any) (http.Header, error) {
 	var encoded []byte
 	var err error
 	if requestBody != nil {
 		encoded, err = json.Marshal(requestBody)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -825,17 +859,20 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return request, nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= 400 {
-		return decodeError(response)
+		return response.Header, decodeError(response)
 	}
 	if responseBody == nil || response.StatusCode == http.StatusNoContent {
-		return nil
+		return response.Header.Clone(), nil
 	}
-	return json.NewDecoder(response.Body).Decode(responseBody)
+	if err := json.NewDecoder(response.Body).Decode(responseBody); err != nil {
+		return response.Header, err
+	}
+	return response.Header.Clone(), nil
 }
 
 // isTransientTransportError loosely matches the Node.js SDK logic by checking

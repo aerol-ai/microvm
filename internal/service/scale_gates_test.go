@@ -235,3 +235,80 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 		t.Fatalf("attempted outbox rows still headed the next batch: overlap=%d", overlap)
 	}
 }
+
+// TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop pins the durable create
+// fan-out contract: incomplete peer PUTs land in put-outbox, the reconciler
+// drains them, and fanout-failure metric growth without outbox is a silent-drop
+// bug. Full 2k-process soak remains operator-run (make integration-cluster-*).
+func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
+	requireServiceScaleGates(t)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	svc := &Service{
+		cfg:            config.Config{},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster: &placementRecipientsCluster{
+			Noop:       cluster.NewNoop("node-a", "http://a", ""),
+			recipients: []string{"node-a", "node-b"},
+			members: []cluster.Member{
+				{NodeID: "node-a", Alive: true},
+				{NodeID: "node-b", Alive: true},
+			},
+		},
+		// Never ACK — forces durable put-outbox for remaining peers.
+		testSecretPeerPusher: &fakePeerPusher{acked: nil},
+	}
+
+	const n = 256
+	beforeFailures := secretFanoutFailuresTotal.Value()
+	now := time.Now().UTC()
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("put-outbox-%03d", i)
+		if err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
+			Ref: secrets.FormatRef(id, 1), SandboxID: id, Version: 1,
+			Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
+			SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		svc.enqueueSecretFanout(id, secrets.SecretBlob{
+			SandboxID: id, Version: 1, SealGeneration: 1,
+			Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
+		}, []string{"node-a", "node-b"}, svc.testSecretPeerPusher)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var outbox []store.SecretPutOutboxRecord
+	for {
+		var err error
+		outbox, err = st.ListSecretPutOutboxBatch(ctx, n+1)
+		if err != nil {
+			t.Fatalf("list put outbox: %v", err)
+		}
+		if len(outbox) > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	failures := secretFanoutFailuresTotal.Value() - beforeFailures
+	if failures > 0 && len(outbox) == 0 {
+		t.Fatalf("fanout failures grew by %d with empty put-outbox (silent drop)", failures)
+	}
+	if len(outbox) == 0 {
+		t.Fatal("expected durable put-outbox rows after incomplete fan-out")
+	}
+
+	svc.testSecretPeerPusher = &fakePeerPusher{acked: []string{"node-b"}}
+	if err := svc.ReconcileSecretPutOutbox(ctx); err != nil {
+		t.Fatalf("reconcile put outbox: %v", err)
+	}
+	remaining, err := st.ListSecretPutOutboxBatch(ctx, n+1)
+	if err != nil {
+		t.Fatalf("list put outbox after reconcile: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("put outbox remaining=%d after successful reconcile, want 0", len(remaining))
+	}
+}

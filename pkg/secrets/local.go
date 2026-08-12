@@ -38,12 +38,13 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 	}
 	recipients = NormalizeRecipients(recipients)
 	version := RefVersion
-	ref := FormatRef(sandboxID, version)
+	incarnationID := IncarnationIDFromContext(ctx)
+	ref := FormatRefInc(sandboxID, incarnationID, version)
 	gen, err := p.store.NextSealGeneration(ctx, sandboxID)
 	if err != nil {
 		return Handle{}, err
 	}
-	binding := SealBinding{SandboxID: sandboxID, Ref: ref, Version: version, Generation: gen}
+	binding := SealBinding{SandboxID: sandboxID, IncarnationID: incarnationID, Ref: ref, Version: version, Generation: gen}
 	sealed, err := SealEnvelopeBound(p.cipher, s, recipients, binding)
 	if err != nil {
 		return Handle{}, err
@@ -54,6 +55,7 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 	if err := p.store.Put(ctx, SecretBlob{
 		Ref:            ref,
 		SandboxID:      sandboxID,
+		IncarnationID:  incarnationID,
 		Version:        version,
 		Recipients:     recipients,
 		SealedPayload:  sealed,
@@ -99,11 +101,18 @@ func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, no
 	if p.cipher == nil {
 		return Secrets{}, fmt.Errorf("cluster secrets cipher is not configured")
 	}
+	incarnationID := rec.IncarnationID
+	if incarnationID == "" {
+		if parsed, parseErr := ParseRef(rec.Ref); parseErr == nil {
+			incarnationID = parsed.IncarnationID
+		}
+	}
 	binding := SealBinding{
-		SandboxID:  sandboxID,
-		Ref:        rec.Ref,
-		Version:    rec.Version,
-		Generation: rec.SealGeneration,
+		SandboxID:     sandboxID,
+		IncarnationID: incarnationID,
+		Ref:           rec.Ref,
+		Version:       rec.Version,
+		Generation:    rec.SealGeneration,
 	}
 	bag, err := OpenEnvelopeBound(p.cipher, rec.SealedPayload, nodeID, binding)
 	if err != nil {

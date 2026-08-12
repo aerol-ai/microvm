@@ -276,6 +276,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	// Close the audit sink on any return path (boot failure after New, or
+	// graceful shutdown) so the writer goroutine and witness loop do not leak.
+	defer svc.CloseSecretAuditSink()
 	if err := svc.ValidateSecretAuditSink(); err != nil {
 		return err
 	}
@@ -299,6 +302,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// emits nothing and pays no cost.
 	svc.SetUsageReporter(cp.Reporter)
 	svc.SetWitness(cp.Witness)
+	// Witness is installed after the sink opens; re-validate so enterprise +
+	// external witness fail closed at boot when the chain/receipts disagree.
+	if err := svc.ValidateSecretAuditWitness(); err != nil {
+		return err
+	}
 	// Wire the managed create-gate. Under Noop() this is the allow-all admitter,
 	// so the open-source build never gates a create.
 	svc.SetFleetAdmitter(cp.Admitter)
@@ -511,6 +519,18 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}
 		}()
 		svc.AttachCluster(clusterClient)
+		// Fail closed on oversized ingress tiers without an explicit
+		// shard-aware router opt-in. Enterprise boots refuse to start;
+		// open-source warns and skips marking ingress reconcile ready.
+		if topoErr := svc.ClusterTopologyError(); topoErr != nil {
+			if cfg.EnterpriseMode {
+				return fmt.Errorf("cluster topology: %w (set SB_CLUSTER_SHARD_AWARE_INGRESS=true only when the upstream router shards via /v1/cluster/ingress-route/{id})", topoErr)
+			}
+			logger.Error("cluster topology violation; refusing to mark ingress ready",
+				"error", topoErr,
+				"hint", "set SB_CLUSTER_SHARD_AWARE_INGRESS=true when the upstream router is shard-aware",
+			)
+		}
 		// The owner watcher needs a hook back into the service to recreate
 		// sandboxes whose placements were reassigned to this node after a
 		// dead-owner eviction. Wired here (after both objects exist) to keep
@@ -618,10 +638,18 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
 				logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
 			}
+			if err := svc.ReconcileSecretPutOutbox(ctx); err != nil {
+				logger.Warn("cluster: secret put-outbox reconcile at boot failed", "error", err)
+			}
 			svc.StartSecretDeleteOutboxReconcile(ctx)
 		}
 		if cfg.IsIngress() {
-			svc.StartClusterIngressReconcile(ctx)
+			if topoErr := svc.ClusterTopologyError(); topoErr != nil && !cfg.ClusterShardAwareIngress {
+				logger.Error("skipping cluster ingress reconcile until shard-aware ingress is configured",
+					"error", topoErr)
+			} else {
+				svc.StartClusterIngressReconcile(ctx)
+			}
 		}
 	}
 
@@ -944,6 +972,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// the last batch of route changes is not silently dropped. No-op on
 	// nodes that never started the coalescer.
 	svc.StopCaddyCoalescer()
+	// Flush/stop the secret-audit writer after HTTP is down so in-flight
+	// request Emits have finished. Idempotent with the deferred close.
+	svc.CloseSecretAuditSink()
 	return nil
 }
 

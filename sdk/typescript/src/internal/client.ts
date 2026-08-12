@@ -491,9 +491,31 @@ export class APIClient {
   }
 
   async list(options?: ListOptions): Promise<SandboxResource[]> {
-    const path = this.versioned("/sandboxes") + buildSandboxListQuery(options);
-    const response = await this.doJSON<ApiSandbox[]>("GET", path);
-    return response.map((item) => this.wrap(item));
+    const basePath = this.versioned("/sandboxes") + buildSandboxListQuery(options);
+    const items: SandboxResource[] = [];
+    let pageToken = "";
+    const maxPages = 1000;
+    for (let page = 0; page < maxPages; page++) {
+      const path = appendQueryParam(basePath, "page_token", pageToken);
+      const response = await this.request("GET", path);
+      if (!response.ok) {
+        throw await decodeError(response);
+      }
+      const partial = response.headers.get("X-Cluster-List-Partial");
+      const placementReady = response.headers.get("X-Cluster-List-Placement-Ready");
+      if (partial === "true" || placementReady === "false") {
+        throw new Error("incomplete cluster list");
+      }
+      const body = (await response.json()) as ApiSandbox[] | null;
+      for (const item of body ?? []) {
+        items.push(this.wrap(item));
+      }
+      pageToken = (response.headers.get("X-Cluster-List-Next-Page-Token") ?? "").trim();
+      if (pageToken === "") {
+        return items;
+      }
+    }
+    throw new Error("incomplete cluster list: exceeded max pages");
   }
 
   async get(id: string, options?: GetOptions): Promise<SandboxResource> {
@@ -1490,6 +1512,14 @@ function buildSandboxListQuery(options?: ListOptions): string {
     return "?include_env=true";
   }
   return tags + "&include_env=true";
+}
+
+function appendQueryParam(path: string, key: string, value: string): string {
+  if (!value) {
+    return path;
+  }
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
 }
 
 function cloneSandbox(sandbox: Sandbox): Sandbox {

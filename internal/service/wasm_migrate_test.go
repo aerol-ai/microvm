@@ -92,6 +92,8 @@ func (c *wasmMigrateClusterStub) Members() []cluster.Member {
 	}
 }
 
+func (c *wasmMigrateClusterStub) LocalMembers() []cluster.Member { return c.Members() }
+
 func (c *wasmMigrateClusterStub) SpecOf(string) *models.CreateSandboxRequest {
 	return c.spec
 }

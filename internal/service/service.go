@@ -168,6 +168,7 @@ type Service struct {
 	secretAuditPruneDone   sync.WaitGroup
 	auditWitnessMu         sync.Mutex
 	auditWitness           controlplane.Witness
+	auditWitnessShipMu     sync.Mutex // serializes ship + receipt rewrite
 	secretAuditWitnessOnce sync.Once
 	secretAuditWitnessStop chan struct{}
 	secretAuditWitnessDone sync.WaitGroup
@@ -1446,7 +1447,17 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// SHA-256 of ≤4KiB (~µs), cluster mode only.
 	if s.cfg.EnableCluster {
 		redacted := RedactClusterSecrets(req)
-		handle := cluster.PlacementSecrets{Ref: secrets.FormatRef(sandboxID, secrets.RefVersion), Version: secrets.RefVersion}
+		incarnationID := ""
+		if c := s.Cluster(); c != nil {
+			if p, ok := c.PlacementOf(sandboxID); ok {
+				incarnationID = p.IncarnationID
+			}
+		}
+		handle := cluster.PlacementSecrets{
+			Ref:           secrets.FormatRefInc(sandboxID, incarnationID, secrets.RefVersion),
+			Version:       secrets.RefVersion,
+			IncarnationID: incarnationID,
+		}
 		if err := cluster.ValidateRecoveryPayloadSize(sandboxID, &redacted, handle); err != nil {
 			return nil, fmt.Errorf("sandbox spec too large to replicate across the cluster (image, env, labels, and mount definitions all count): %w", err)
 		}

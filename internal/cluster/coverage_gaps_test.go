@@ -561,8 +561,10 @@ func TestWaitForLeaderAndHealthyForReads(t *testing.T) {
 	}
 }
 
-func TestFetchMemberCapacityFallback(t *testing.T) {
+func TestFetchMemberCapacityFailClosedNoPublicDowngrade(t *testing.T) {
+	publicHits := 0
 	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		publicHits++
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 4})
 	}))
@@ -578,17 +580,20 @@ func TestFetchMemberCapacityFallback(t *testing.T) {
 		internalClient: internal.Client(),
 		patToken:       "pat",
 	}
-	snap, err := c.fetchMemberCapacity(context.Background(), Member{
+	_, err := c.fetchMemberCapacity(context.Background(), Member{
 		NodeID:      "worker-1",
 		APIURL:      public.URL,
 		InternalURL: internal.URL,
 	})
-	if err != nil || snap.HostCPUCores != 4 {
-		t.Fatalf("fetchMemberCapacity fallback = (%+v, %v)", snap, err)
+	if err == nil {
+		t.Fatal("expected fail-closed error on internal 503")
+	}
+	if publicHits != 0 {
+		t.Fatalf("public hits = %d, want 0", publicHits)
 	}
 	_, err = c.fetchMemberCapacity(context.Background(), Member{NodeID: "worker-2"})
 	if err == nil {
-		t.Fatal("expected error without API URL")
+		t.Fatal("expected error without peer URL")
 	}
 }
 

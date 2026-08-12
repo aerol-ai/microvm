@@ -123,18 +123,13 @@ func appendWorkerEgressGap(path, node, sandboxID string) {
 
 func appendWorkerEgressEvent(path string, ev workerEgressAuditEvent) {
 	auditlog.EnsureEventID(&ev)
-	line, err := json.Marshal(ev)
-	if err != nil {
-		slog.Warn("wasm egress audit marshal failed", "err", err)
-		return
-	}
-	line = append(line, '\n')
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		slog.Warn("wasm egress audit mkdir failed", "path", path, "err", err)
 		return
 	}
 	lockPath := filepath.Join(dir, workerEgressLockFile)
+	tipPath := filepath.Join(dir, "secrets.tip")
 	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		slog.Warn("wasm egress audit lock open failed", "path", lockPath, "err", err)
@@ -147,6 +142,17 @@ func appendWorkerEgressEvent(path string, ev workerEgressAuditEvent) {
 	}
 	defer func() { _ = unix.Flock(int(lf.Fd()), unix.LOCK_UN) }()
 
+	// Join the daemon's hash chain under the same flock as the append so
+	// wasm dual-writes remain tamper-checkable with secrets.jsonl.
+	prev := readWorkerChainTip(path, tipPath)
+	auditlog.LinkEvent(prev, &ev)
+	line, err := json.Marshal(ev)
+	if err != nil {
+		slog.Warn("wasm egress audit marshal failed", "err", err)
+		return
+	}
+	line = append(line, '\n')
+
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		slog.Warn("wasm egress audit open failed", "path", path, "err", err)
@@ -155,7 +161,39 @@ func appendWorkerEgressEvent(path string, ev workerEgressAuditEvent) {
 	defer f.Close()
 	if _, err := f.Write(line); err != nil {
 		slog.Warn("wasm egress audit write failed", "path", path, "err", err)
+		return
 	}
+	_ = os.WriteFile(tipPath, []byte(ev.EventHash+"\n"+ev.EventID+"\n"), 0o600)
+}
+
+// readWorkerChainTip returns the current secrets.jsonl tip for hash linking.
+// Prefers secrets.tip; falls back to the last EventHash line in the JSONL.
+func readWorkerChainTip(path, tipPath string) string {
+	if raw, err := os.ReadFile(tipPath); err == nil {
+		parts := strings.SplitN(strings.TrimSpace(string(raw)), "\n", 2)
+		if len(parts) >= 1 && parts[0] != "" {
+			return parts[0]
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return auditlog.GenesisPrevHash
+	}
+	prev := auditlog.GenesisPrevHash
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev workerEgressAuditEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		if ev.EventHash != "" {
+			prev = ev.EventHash
+		}
+	}
+	return prev
 }
 
 func envBoolDefaultTrue(key string) bool {

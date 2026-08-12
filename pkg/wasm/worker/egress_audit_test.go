@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,6 +13,7 @@ func TestAppendWorkerEgressAudit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit", "secrets.jsonl")
 	appendWorkerEgressAudit(path, "node-w", "sb-1", "tcp", "example.com:443")
+	appendWorkerEgressAudit(path, "node-w", "sb-1", "tcp", "example.com:443")
 	appendWorkerEgressAudit(path, "node-w", "", "tcp", "skip") // empty sandbox — no-op
 	appendWorkerEgressAudit("", "node-w", "sb-1", "tcp", "skip")
 
@@ -19,19 +21,44 @@ func TestAppendWorkerEgressAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ev workerEgressAuditEvent
-	if err := json.Unmarshal(raw[:len(raw)-1], &ev); err != nil {
-		t.Fatalf("unmarshal: %v\nraw=%s", err, raw)
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2\n%s", len(lines), raw)
 	}
-	if ev.Kind != "egress" || ev.SandboxID != "sb-1" || ev.Destination != "example.com:443" ||
-		ev.Network != "tcp" || ev.NodeID != "node-w" || ev.Result != "success" {
-		t.Fatalf("event = %+v", ev)
+	var prev string
+	for i, line := range lines {
+		var ev workerEgressAuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal: %v\nraw=%s", err, line)
+		}
+		if i == 0 {
+			if ev.Kind != "egress" || ev.SandboxID != "sb-1" || ev.Destination != "example.com:443" ||
+				ev.Network != "tcp" || ev.NodeID != "node-w" || ev.Result != "success" {
+				t.Fatalf("event = %+v", ev)
+			}
+			if ev.Time.IsZero() || time.Since(ev.Time) > time.Minute {
+				t.Fatalf("time = %v", ev.Time)
+			}
+			if ev.EventID == "" {
+				t.Fatalf("event_id missing: %+v", ev)
+			}
+			if ev.EventHash == "" || ev.PrevHash != "0" {
+				t.Fatalf("hash chain fields = prev=%q hash=%q", ev.PrevHash, ev.EventHash)
+			}
+			prev = ev.EventHash
+			continue
+		}
+		if ev.PrevHash != prev || ev.EventHash == "" {
+			t.Fatalf("second event chain prev=%q hash=%q want prev=%q", ev.PrevHash, ev.EventHash, prev)
+		}
+		prev = ev.EventHash
 	}
-	if ev.Time.IsZero() || time.Since(ev.Time) > time.Minute {
-		t.Fatalf("time = %v", ev.Time)
+	tipRaw, err := os.ReadFile(filepath.Join(dir, "audit", "secrets.tip"))
+	if err != nil {
+		t.Fatalf("secrets.tip: %v", err)
 	}
-	if ev.EventID == "" {
-		t.Fatalf("event_id missing: %+v", ev)
+	if !strings.HasPrefix(strings.TrimSpace(string(tipRaw)), prev) {
+		t.Fatalf("tip = %q, want prefix %q", tipRaw, prev)
 	}
 }
 

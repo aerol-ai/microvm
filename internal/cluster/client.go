@@ -411,6 +411,7 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		Spec:               spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
+		IncarnationID:      strings.TrimSpace(secrets.IncarnationID),
 		OwnerRef:           secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
@@ -640,6 +641,14 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
 	}
+	incarnationID := strings.TrimSpace(secrets.IncarnationID)
+	if incarnationID == "" {
+		var mintErr error
+		incarnationID, mintErr = MintIncarnationID()
+		if mintErr != nil {
+			return mintErr
+		}
+	}
 	cmd := command{
 		Op:                 opReserve,
 		SandboxID:          sandboxID,
@@ -650,6 +659,7 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
 		SecretRecipients:   append([]string(nil), secrets.Recipients...),
+		IncarnationID:      incarnationID,
 		OwnerRef:           secrets.OwnerRef,
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	}
@@ -671,6 +681,14 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 		if r.TTL <= 0 {
 			return fmt.Errorf("cluster: reservation ttl must be > 0")
 		}
+		incarnationID := strings.TrimSpace(r.Secrets.IncarnationID)
+		if incarnationID == "" {
+			var mintErr error
+			incarnationID, mintErr = MintIncarnationID()
+			if mintErr != nil {
+				return mintErr
+			}
+		}
 		cmd.Reservations = append(cmd.Reservations, reservationCommand{
 			SandboxID:          r.SandboxID,
 			OwnerNodeID:        r.Target.NodeID,
@@ -680,6 +698,7 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 			SecretRef:          r.Secrets.Ref,
 			SecretVersion:      r.Secrets.Version,
 			SecretRecipients:   append([]string(nil), r.Secrets.Recipients...),
+			IncarnationID:      incarnationID,
 			OwnerRef:           r.Secrets.OwnerRef,
 			ExpiresUnix:        now.Add(r.TTL).Unix(),
 		})
@@ -1141,33 +1160,31 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err er
 // internal apply endpoint. Returns ErrNotLeader if no leader is known (so the
 // caller can surface the same retry semantics as a stale local leader-check).
 //
-// Channel selection: if both this node and the leader have advertised an
-// InternalURL (i.e. both have SB_CLUSTER_TLS_DIR set), we dial the leader's
-// mTLS listener — the TLS handshake proves cluster membership before the
-// payload is read. Otherwise we fall back to the public API URL, which only
-// validates the shared PAT and is acceptable on a private overlay.
+// Channel selection: when this node has TLS loaded, the leader's InternalURL
+// is required (fail-closed — never PAT+public). Without local TLS, dial the
+// public API URL (private-overlay / legacy deployments).
 func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) error {
 	leader := c.Leader()
 	if leader == "" {
 		return ErrNotLeader
 	}
 
-	// Prefer the cluster-internal mTLS channel when both ends are TLS-equipped.
 	if internalClient := c.currentInternalClient(); internalClient != nil {
-		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
-			endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
-			err := c.doLeaderApply(ctx, internalClient, endpoint, payload)
-			// Hard-fail (network/TLS) on the internal channel must NOT silently
-			// fall back to the public path — that would defeat the security
-			// promise. Only ErrNotLeader bubbles up so the caller retries the
-			// new leader (which may pick the public path next iteration).
-			return err
+		if c.gossip == nil {
+			return ErrPeerInternalURLRequired
 		}
+		peerInternal := c.gossip.peerInternalURL(leader)
+		if peerInternal == "" {
+			return ErrPeerInternalURLRequired
+		}
+		endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
+		// Hard-fail (network/TLS) on the internal channel must NOT silently
+		// fall back to the public path — that would defeat the security
+		// promise. Only ErrNotLeader bubbles up so the caller retries the
+		// new leader.
+		return c.doLeaderApply(ctx, internalClient, endpoint, payload)
 	}
 
-	// Fallback: public API URL with PAT-only auth. This path runs when the
-	// peer (or self) doesn't have TLS material — typically a mixed-rollout
-	// or a fully-plaintext private-network deployment.
 	leaderURL := c.LeaderAPIURL()
 	if leaderURL == "" {
 		return ErrNotLeader
@@ -1242,6 +1259,15 @@ func (c *Cluster) Members() []Member {
 		return nil
 	}
 	return c.membersWithCapacity()
+}
+
+// LocalMembers returns the gossip membership view without capacity enrichment.
+// Hot paths (list failover_ready) use this to avoid per-row Members() work.
+func (c *Cluster) LocalMembers() []Member {
+	if c == nil || c.gossip == nil {
+		return nil
+	}
+	return c.gossip.members()
 }
 
 // LookupMember returns one gossip member by node ID without scanning the full

@@ -224,12 +224,43 @@ public class MicroVMClient {
      * from get/list by default; opt-in reads are audited server-side.
      */
     public List<Sandbox> list(java.util.Map<String, String> tags, boolean includeEnv) {
-        String path = versioned("/sandboxes") + buildSandboxQuery(tags, includeEnv);
-        SandboxData[] response = doJson("GET", path, null, SandboxData[].class);
-        if (response == null) {
-            return Collections.emptyList();
+        String basePath = versioned("/sandboxes") + buildSandboxQuery(tags, includeEnv);
+        java.util.ArrayList<Sandbox> items = new java.util.ArrayList<>();
+        String pageToken = "";
+        for (int page = 0; page < 1000; page++) {
+            String path = appendQueryParam(basePath, "page_token", pageToken);
+            HttpResponse<byte[]> httpResponse = sendJsonRequest("GET", path, null);
+            ensureSuccess(httpResponse);
+            String partial = headerValue(httpResponse, "X-Cluster-List-Partial");
+            String ready = headerValue(httpResponse, "X-Cluster-List-Placement-Ready");
+            if ("true".equals(partial) || "false".equals(ready)) {
+                throw new MicroVMException("incomplete cluster list");
+            }
+            SandboxData[] response = JsonSupport.read(httpResponse.body(), SandboxData[].class);
+            if (response != null) {
+                for (SandboxData item : response) {
+                    items.add(wrap(item));
+                }
+            }
+            pageToken = headerValue(httpResponse, "X-Cluster-List-Next-Page-Token");
+            if (pageToken == null || pageToken.isBlank()) {
+                return items;
+            }
+            pageToken = pageToken.trim();
         }
-        return java.util.Arrays.stream(response).map(this::wrap).collect(Collectors.toList());
+        throw new MicroVMException("incomplete cluster list: exceeded max pages");
+    }
+
+    private static String headerValue(HttpResponse<byte[]> response, String name) {
+        return response.headers().firstValue(name).orElse("");
+    }
+
+    private static String appendQueryParam(String path, String key, String value) {
+        if (value == null || value.isBlank()) {
+            return path;
+        }
+        String sep = path.contains("?") ? "&" : "?";
+        return path + sep + encodeQueryValue(key) + "=" + encodeQueryValue(value);
     }
 
     // Renders the tag filter as the server's ?tag.<key>=<value> wire format.
