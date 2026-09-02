@@ -40,17 +40,12 @@ type Cluster struct {
 	// cluster membership — but we keep sending it so the receiving handler can
 	// stay symmetric with the public endpoint. A selected mTLS request never
 	// downgrades to the public endpoint after a TLS error.
-	patToken   string
-	httpClient *http.Client
-	// internalURL is this node's cluster-internal mTLS advertise URL (e.g.
-	// https://10.0.0.5:7002). Empty when running without SB_CLUSTER_TLS_DIR.
-	// Gossiped to peers so leader-forward can prefer the mTLS channel over
-	// the public API URL.
+	patToken string
+	// internalURL is this node's cluster-internal mTLS advertise URL.
 	internalURL string
 	// tls holds the loaded cluster CA + node keypair used by both the raft
 	// transport (via raftSetupConfig.TLS) and the internal HTTPS listener.
-	// nil when SB_CLUSTER_TLS_DIR is unset — that's the legacy plaintext path
-	// for operators on a fully isolated network.
+	// Configuration validation requires TLS in cluster mode.
 	tls *ClusterTLS
 	// internalServer is the mTLS HTTPS listener that accepts leader-forwarded
 	// raft applies from peers. nil when tls is nil. Owned by Close.
@@ -60,14 +55,7 @@ type Cluster struct {
 	// TLS material. nil when tls is nil.
 	internalClient   *http.Client
 	internalClientMu sync.RWMutex
-	// publicProxies caches httputil.ReverseProxy instances keyed on peer
-	// APIURL (the legacy public-API path). Shared across forwarded requests
-	// so the underlying transport's connection pool isn't rebuilt per call.
-	publicProxies *proxyCache
-	// mtlsProxies caches httputil.ReverseProxy instances keyed on peer
-	// InternalURL. Each proxy rides an mTLS transport configured with the
-	// cluster CA + this node's cert. nil when tls is nil — owner forwarding
-	// then falls back to publicProxies + PAT auth.
+	// mtlsProxies caches reverse proxies by peer identity and InternalURL.
 	mtlsProxies *proxyCache
 	// peerClients caches per-node mTLS HTTP clients (VerifyPeerCertificate
 	// bound to node:<id>). Invalidated on gossip leave.
@@ -144,11 +132,13 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	}
 
 	// Load cluster TLS material first — both raft transport and the internal
-	// HTTPS listener need it. Empty SB_CLUSTER_TLS_DIR keeps the legacy
-	// plaintext path for operators on a fully isolated network.
+	// HTTPS listener need it. Cluster configuration rejects an empty TLS dir.
 	clusterTLS, err := loadClusterTLS(cfg.ClusterTLSDir)
 	if err != nil {
 		return nil, fmt.Errorf("cluster.New: load tls: %w", err)
+	}
+	if clusterTLS != nil && clusterTLS.NodeID() != nodeID {
+		return nil, fmt.Errorf("cluster.New: node certificate identity %q does not match node id %q", clusterTLS.NodeID(), nodeID)
 	}
 
 	rn, err := setupRaft(raftSetupConfig{
@@ -177,11 +167,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		fsm:           fsm,
 		raft:          rn,
 		patToken:      cfg.PATToken,
-		httpClient:    &http.Client{Timeout: commitTimeout + 2*time.Second},
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
-		publicProxies: newProxyCache(defaultPublicTransport),
 	}
 	fsm.recoveryResolver = c.fetchRecoveryBlob
 
@@ -194,8 +182,8 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			Timeout:   commitTimeout + 2*time.Second,
 			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
-		c.mtlsProxies = newProxyCache(newMTLSProxyTransport(clusterTLS.clientConfig()))
-		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger)
+		c.mtlsProxies = newProxyCache()
+		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger, cfg.EnterpriseMode)
 		if err != nil {
 			_ = rn.Close()
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
@@ -252,6 +240,12 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		return nil, fmt.Errorf("cluster.New: gossip: %w", err)
 	}
 	c.gossip = gn
+	if c.internalServer != nil {
+		c.internalServer.SetPeerAuthorizer(func(nodeID string) bool {
+			m, ok := gn.lookupMember(nodeID)
+			return ok && m.Alive
+		})
+	}
 	c.capacityLeases = newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
 	c.startCapacityLeaseLoop(cfg.ClusterCapacityGossipInterval)
 
@@ -284,13 +278,13 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
 func (c *Cluster) SelfAPIURL() string { return c.apiURL }
 
-// PeerHTTPClients exposes the public and cert-pinned internal HTTP clients for
-// cluster list fan-out. End-user Authorization must only ride the internal client.
-func (c *Cluster) PeerHTTPClients() (public, internal *http.Client) {
+// PeerInternalHTTPClient exposes the cert-pinned client for cluster list
+// fan-out. End-user Authorization must only ride this internal client.
+func (c *Cluster) PeerInternalHTTPClient() *http.Client {
 	if c == nil {
-		return nil, nil
+		return nil
 	}
-	return c.httpClient, c.currentInternalClient()
+	return c.currentInternalClient()
 }
 
 // ClientForPeer returns a cached mTLS HTTP client that verifies DNS SAN
@@ -299,15 +293,15 @@ func (c *Cluster) ClientForPeer(nodeID string) *http.Client {
 	if c == nil {
 		return nil
 	}
-	return c.peerClients.get(c.currentInternalClient(), nodeID, true)
+	return c.peerClients.get(c.currentInternalClient(), nodeID)
 }
 
 // PeerDialMember selects the peer client/URL using the per-node mTLS cache.
 func (c *Cluster) PeerDialMember(m Member) (*http.Client, string, error) {
 	if c == nil {
-		return PeerDial(m, nil, nil)
+		return PeerDial(m, nil)
 	}
-	return PeerDialCached(m, c.httpClient, c.currentInternalClient(), c.ClientForPeer(m.NodeID), true)
+	return PeerDialCached(m, c.currentInternalClient(), c.ClientForPeer(m.NodeID))
 }
 
 // invalidatePeerClient drops a cached mTLS client after gossip leave.
@@ -316,14 +310,6 @@ func (c *Cluster) invalidatePeerClient(nodeID string) {
 		return
 	}
 	c.peerClients.invalidate(nodeID)
-}
-
-// PeerPAT returns the fleet PAT used for internal peer RPCs and public list fallbacks.
-func (c *Cluster) PeerPAT() string {
-	if c == nil {
-		return ""
-	}
-	return c.patToken
 }
 
 func (c *Cluster) currentInternalClient() *http.Client {
@@ -380,9 +366,7 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 		apiURL = c.gossip.peerAPIURL(p.OwnerNodeID)
 	}
 	// InternalURL is only on gossip (it isn't in the persisted Placement
-	// record — operators can toggle TLS without rewriting raft state). Empty
-	// for owners that run without SB_CLUSTER_TLS_DIR; the forwarder then
-	// falls back to apiURL + PAT.
+	// record). An empty value makes peer operations fail closed.
 	internalURL := c.gossip.peerInternalURL(p.OwnerNodeID)
 	return OwnerInfo{
 		NodeID:      p.OwnerNodeID,
@@ -410,8 +394,8 @@ func (c *Cluster) OwnerOfName(name string) (string, OwnerInfo, error) {
 
 // AttachInternalHandler wires the public API mux into the cluster-internal
 // mTLS listener so peers can reverse-proxy owner API calls over the
-// cert-pinned channel. No-op when this node has no TLS material loaded
-// (SB_CLUSTER_TLS_DIR empty) — there's no listener to attach to. Called once
+// cert-pinned channel. No-op only for the single-node/noop construction path
+// where there is no listener to attach to. Called once
 // from cmd/sandboxd after the API server is constructed; the order avoids a
 // service→cluster→api construction cycle.
 func (c *Cluster) AttachInternalHandler(h http.Handler) {
@@ -431,17 +415,27 @@ func (c *Cluster) AttachInternalHandler(h http.Handler) {
 // handle the caller produces via service.SealAndDistribute.
 // Passing an empty handle preserves a previously-recorded handle.
 func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	expectedIncarnationID := strings.TrimSpace(secrets.IncarnationID)
+	incarnationID := expectedIncarnationID
+	if incarnationID == "" {
+		var err error
+		incarnationID, err = MintIncarnationID()
+		if err != nil {
+			return err
+		}
+	}
 	cmd := command{
-		Op:                 opPlace,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        c.nodeID,
-		OwnerAPIURL:        c.apiURL,
-		OwnerDataPlaneHost: c.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		IncarnationID:      strings.TrimSpace(secrets.IncarnationID),
-		OwnerRef:           secrets.OwnerRef,
+		Op:                    opPlace,
+		SandboxID:             sandboxID,
+		OwnerNodeID:           c.nodeID,
+		OwnerAPIURL:           c.apiURL,
+		OwnerDataPlaneHost:    c.dataPlaneHost,
+		Spec:                  spec,
+		SecretRef:             secrets.Ref,
+		SecretVersion:         secrets.Version,
+		IncarnationID:         incarnationID,
+		ExpectedIncarnationID: expectedIncarnationID,
+		OwnerRef:              secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -801,16 +795,6 @@ func (c *Cluster) ReassignPlacement(ctx context.Context, sandboxID string, targe
 
 func (c *Cluster) wasmMigratePAT() string { return c.patToken }
 
-func (c *Cluster) wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error) {
-	if internalClient := c.currentInternalClient(); internalClient != nil && internalURL != "" {
-		return internalClient, internalURL, nil
-	}
-	if apiURL == "" {
-		return nil, "", fmt.Errorf("cluster: peer API URL unknown")
-	}
-	return c.httpClient, apiURL, nil
-}
-
 // RemoveMember explicitly retires nodeID from the raft configuration. It is an
 // operator lifecycle command, not gossip failure detection: the caller should
 // drain the node first, then stop/terminate it, then remove it from raft.
@@ -893,16 +877,14 @@ func (c *Cluster) forwardRemoveMemberToLeader(ctx context.Context, nodeID string
 	if force {
 		path += "?force=true"
 	}
-	if internalClient := c.currentInternalClient(); internalClient != nil && c.gossip != nil {
-		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
-			return c.doLeaderLifecycle(ctx, internalClient, strings.TrimRight(peerInternal, "/")+path, http.MethodDelete, nil)
-		}
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return ErrPeerInternalURLRequired
 	}
-	leaderURL := c.LeaderAPIURL()
-	if leaderURL == "" {
-		return ErrNotLeader
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return ErrPeerInternalURLRequired
 	}
-	return c.doLeaderLifecycle(ctx, c.httpClient, strings.TrimRight(leaderURL, "/")+path, http.MethodDelete, nil)
+	return c.doLeaderLifecycle(ctx, c.ClientForPeer(leader), strings.TrimRight(peerInternal, "/")+path, http.MethodDelete, nil)
 }
 
 func (c *Cluster) doLeaderLifecycle(ctx context.Context, client *http.Client, endpoint, method string, body []byte) error {
@@ -1209,41 +1191,25 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err er
 // internal apply endpoint. Returns ErrNotLeader if no leader is known (so the
 // caller can surface the same retry semantics as a stale local leader-check).
 //
-// Channel selection: when this node has TLS loaded, the leader's InternalURL
-// is required (fail-closed — never PAT+public). Without local TLS, dial the
-// public API URL (private-overlay / legacy deployments).
+// The leader's InternalURL and a node-pinned mTLS client are required.
 func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) error {
 	leader := c.Leader()
 	if leader == "" {
 		return ErrNotLeader
 	}
 
-	if internalClient := c.currentInternalClient(); internalClient != nil {
-		if c.gossip == nil {
-			return ErrPeerInternalURLRequired
-		}
-		peerInternal := c.gossip.peerInternalURL(leader)
-		if peerInternal == "" {
-			return ErrPeerInternalURLRequired
-		}
-		endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
-		// Hard-fail (network/TLS) on the internal channel must NOT silently
-		// fall back to the public path — that would defeat the security
-		// promise. Only ErrNotLeader bubbles up so the caller retries the
-		// new leader.
-		return c.doLeaderApply(ctx, c.ClientForPeer(leader), endpoint, payload)
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return ErrPeerInternalURLRequired
 	}
-
-	leaderURL := c.LeaderAPIURL()
-	if leaderURL == "" {
-		return ErrNotLeader
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return ErrPeerInternalURLRequired
 	}
-	endpoint := strings.TrimRight(leaderURL, "/") + "/v1/cluster/internal/apply"
-	return c.doLeaderApply(ctx, c.httpClient, endpoint, payload)
+	endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
+	return c.doLeaderApply(ctx, c.ClientForPeer(leader), endpoint, payload)
 }
 
-// doLeaderApply is the shared HTTP execution path used by both the mTLS
-// internal channel and the PAT-only public-API fallback in forwardApplyToLeader.
+// doLeaderApply executes a node-pinned mTLS leader apply.
 func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoint string, payload []byte) (err error) {
 	done := beginLeaderForwardApply()
 	defer func() { done(err) }()

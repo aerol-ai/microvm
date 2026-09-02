@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,19 +13,20 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
 
 const (
-	auditIngestPath        = "/internal/audit/egress"
-	auditIngestMaxBody     = 64 << 10
-	auditIngestHeaderToken = "X-Aerol-Audit-Token"
-	auditIngestHeaderCap   = "X-Aerol-Audit-Capability"
+	auditIngestPath      = "/internal/audit/egress"
+	auditIngestMaxBody   = 64 << 10
+	auditIngestHeaderCap = "X-Aerol-Audit-Capability"
 )
 
 var (
@@ -32,34 +34,29 @@ var (
 	auditIngestRejectedTotal = expvar.NewInt("aerolvm_audit_ingest_rejected_total")
 )
 
+var errAuditIngestBindingStale = errors.New("audit ingest capability no longer belongs to an active local sandbox")
+
 // auditIngestServer is a loopback-only HTTP listener that accepts egress audit
 // events from wasm worker subprocesses. Workers must never write secrets.jsonl
 // tip themselves — they POST here (or spill for parent drain).
 type auditIngestServer struct {
-	svc    *Service
-	token  string
-	server *http.Server
-	ln     net.Listener
-	mu     sync.Mutex
+	svc      *Service
+	token    string
+	port     string
+	spillDir string
+	server   *http.Server
+	ln       net.Listener
+	mu       sync.Mutex
 }
 
 type auditIngestRequest struct {
-	SandboxID     string    `json:"sandbox_id"`
-	Network       string    `json:"network,omitempty"`
-	Destination   string    `json:"destination"`
-	NodeID        string    `json:"node_id,omitempty"`
-	IncarnationID string    `json:"incarnation_id,omitempty"`
-	Kind          string    `json:"kind,omitempty"`
-	Result        string    `json:"result,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	Capability    string    `json:"capability,omitempty"`
-	EventTime     time.Time `json:"event_time,omitempty"`
-	Time          time.Time `json:"time,omitempty"`
+	Network     string `json:"network,omitempty"`
+	Destination string `json:"destination"`
 }
 
 // StartAuditIngestServer binds 127.0.0.1:SB_AUDIT_INGEST_PORT (0 = ephemeral)
-// and publishes SB_AUDIT_INGEST_PORT / SB_AUDIT_INGEST_TOKEN into the process
-// environment so wasm workers inherit them on spawn.
+// and publishes only SB_AUDIT_INGEST_PORT. The master signing token remains in
+// the daemon; workers receive sandbox-scoped capabilities over IPC.
 func (s *Service) StartAuditIngestServer(ctx context.Context) error {
 	if s == nil {
 		return nil
@@ -85,11 +82,17 @@ func (s *Service) StartAuditIngestServer(ctx context.Context) error {
 		return fmt.Errorf("audit ingest listen %s: %w", addr, err)
 	}
 	actualPort := ln.Addr().(*net.TCPAddr).Port
+	spillDir := ""
+	if dataDir := secretAuditDataDir(s.cfg.DBPath); dataDir != "" {
+		spillDir = filepath.Join(dataDir, "audit")
+	}
 	_ = os.Setenv("SB_AUDIT_INGEST_PORT", strconv.Itoa(actualPort))
-	_ = os.Setenv("SB_AUDIT_INGEST_TOKEN", token)
+	if spillDir != "" {
+		_ = os.Setenv("SB_AUDIT_SPILL_DIR", spillDir)
+	}
 
 	mux := http.NewServeMux()
-	ing := &auditIngestServer{svc: s, token: token}
+	ing := &auditIngestServer{svc: s, token: token, port: strconv.Itoa(actualPort), spillDir: spillDir}
 	mux.HandleFunc("POST "+auditIngestPath, ing.handleEgress)
 	srv := &http.Server{
 		Handler:           mux,
@@ -137,6 +140,12 @@ func (s *Service) StopAuditIngestServer() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ing.server.Shutdown(ctx)
+	if os.Getenv("SB_AUDIT_INGEST_PORT") == ing.port {
+		_ = os.Unsetenv("SB_AUDIT_INGEST_PORT")
+	}
+	if os.Getenv("SB_AUDIT_SPILL_DIR") == ing.spillDir {
+		_ = os.Unsetenv("SB_AUDIT_SPILL_DIR")
+	}
 }
 
 // IssueEgressAuditCapability mints a per-sandbox HMAC capability for wasm
@@ -153,6 +162,14 @@ func (s *Service) IssueEgressAuditCapability(sandboxID, incarnationID string, tt
 		ttl = auditlog.DefaultCapabilityTTL
 	}
 	return auditlog.MintEgressCapability(key, sandboxID, incarnationID, time.Now().UTC().Add(ttl))
+}
+
+// IssueEgressAuditCapabilityForSandbox resolves the current placement
+// incarnation and returns only the scoped capability needed by a worker.
+func (s *Service) IssueEgressAuditCapabilityForSandbox(sandboxID string, ttl time.Duration) (string, string, error) {
+	incarnationID := s.secretIncarnationForSeal(sandboxID)
+	capability, err := s.IssueEgressAuditCapability(sandboxID, incarnationID, ttl)
+	return capability, incarnationID, err
 }
 
 func (s *Service) auditIngestToken() string {
@@ -189,38 +206,38 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var req auditIngestRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		auditIngestRejectedTotal.Add(1)
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	capability := strings.TrimSpace(req.Capability)
-	if capability == "" {
-		capability = strings.TrimSpace(r.Header.Get(auditIngestHeaderCap))
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "single json object required", http.StatusBadRequest)
+		return
 	}
-	// Prefer per-sandbox capability. Fall back to shared ingest token only when
-	// no capability is presented (legacy tests / in-process callers).
-	sandboxID := ""
-	incarnationID := ""
-	if capability != "" {
-		sid, inc, err := auditlog.ParseAndVerifyEgressCapability(ing.token, capability, time.Now().UTC())
-		if err != nil {
-			auditIngestRejectedTotal.Add(1)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+	capability := strings.TrimSpace(r.Header.Get(auditIngestHeaderCap))
+	if capability == "" {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "sandbox capability required", http.StatusUnauthorized)
+		return
+	}
+	sandboxID, incarnationID, err := auditlog.ParseAndVerifyEgressCapability(ing.token, capability, time.Now().UTC())
+	if err != nil {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := ing.svc.validateEgressAuditBinding(r.Context(), sandboxID, incarnationID); err != nil {
+		auditIngestRejectedTotal.Add(1)
+		if errors.Is(err, errAuditIngestBindingStale) {
+			http.Error(w, "stale sandbox capability", http.StatusUnauthorized)
+		} else {
+			http.Error(w, "sandbox validation unavailable", http.StatusServiceUnavailable)
 		}
-		sandboxID, incarnationID = sid, inc
-	} else {
-		if !secureTokenEqual(r.Header.Get(auditIngestHeaderToken), ing.token) {
-			auditIngestRejectedTotal.Add(1)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		sandboxID = strings.TrimSpace(req.SandboxID)
-		// Do not trust client incarnation / placement lookup at process time
-		// when a capability is present; without capability, leave incarnation
-		// empty rather than resolving from live placement.
-		incarnationID = ""
+		return
 	}
 	destination := strings.TrimSpace(req.Destination)
 	if sandboxID == "" || destination == "" {
@@ -228,70 +245,77 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "sandbox_id and destination required", http.StatusBadRequest)
 		return
 	}
-	kind := strings.TrimSpace(req.Kind)
-	if kind == "" {
-		kind = secretAuditKindEgress
-	}
-	// Reject anything other than egress (and gap when explicitly allowed).
-	if kind != secretAuditKindEgress && kind != secretAuditKindGap {
-		auditIngestRejectedTotal.Add(1)
-		http.Error(w, "kind not allowed", http.StatusBadRequest)
-		return
-	}
-	eventTime := req.EventTime
-	if eventTime.IsZero() {
-		eventTime = req.Time
-	}
-	if eventTime.IsZero() {
-		eventTime = time.Now().UTC()
-	}
+	// Receipt time is authoritative. A worker capability authenticates the
+	// sandbox identity, but it must not let a compromised worker backdate or
+	// future-date records to influence retention ordering.
+	eventTime := time.Now().UTC()
 	actor := ing.svc.auditActor()
-	result := secretAuditResultSuccess
-	reason := secretAuditReasonOK
-	if kind == secretAuditKindGap {
-		result = secretAuditResultGap
-		reason = secretAuditReasonOverflow
-	}
-	// Ignore/overwrite client-supplied NodeID/Result/Reason/Incarnation.
+	// Actor, result, reason, sandbox, and incarnation are server-controlled.
 	sink := ing.svc.secretAuditSink()
-	if sink != nil {
-		sink.Emit(SecretAuditEvent{
-			Time:          eventTime.UTC(),
-			Actor:         actor,
-			SandboxID:     sandboxID,
-			Result:        result,
-			Reason:        reason,
-			NodeID:        actor,
-			Kind:          kind,
-			Destination:   destination,
-			Network:       strings.TrimSpace(req.Network),
-			IncarnationID: incarnationID,
-		})
+	event := SecretAuditEvent{
+		Time:          eventTime.UTC(),
+		Actor:         actor,
+		SandboxID:     sandboxID,
+		Result:        secretAuditResultSuccess,
+		Reason:        secretAuditReasonOK,
+		NodeID:        actor,
+		Kind:          secretAuditKindEgress,
+		Destination:   destination,
+		Network:       strings.TrimSpace(req.Network),
+		IncarnationID: incarnationID,
+	}
+	if durable, ok := sink.(DurableSecretAuditSink); ok {
+		if err := durable.EmitDurable(event); err != nil {
+			auditIngestRejectedTotal.Add(1)
+			http.Error(w, "audit persistence unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	} else if ing.svc.cfg.EnterpriseMode {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "durable audit sink unavailable", http.StatusServiceUnavailable)
+		return
+	} else if sink != nil {
+		sink.Emit(event)
 	}
 	auditIngestAcceptedTotal.Add(1)
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// validateEgressAuditBinding prevents a capability retained by a terminated or
+// reassigned worker from continuing to append evidence under its old sandbox.
+// Cluster placement is authoritative when enabled; standalone mode uses the
+// local sandbox row. Incarnation and owner checks also fence failover races.
+func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, incarnationID string) error {
+	if s == nil || strings.TrimSpace(sandboxID) == "" {
+		return errAuditIngestBindingStale
+	}
+	if s.cfg.EnableCluster {
+		c := s.Cluster()
+		if c == nil {
+			return errAuditIngestBindingStale
+		}
+		p, ok := c.PlacementOf(sandboxID)
+		if !ok || (strings.TrimSpace(p.OwnerNodeID) != "" && strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(c.SelfNodeID())) || strings.TrimSpace(p.IncarnationID) != strings.TrimSpace(incarnationID) {
+			return errAuditIngestBindingStale
+		}
+		return nil
+	}
+	if s.store == nil {
+		return errAuditIngestBindingStale
+	}
+	if _, err := s.store.Get(ctx, sandboxID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return errAuditIngestBindingStale
+		}
+		return err
+	}
+	return nil
+}
+
 func newAuditIngestToken() (string, error) {
-	var b [16]byte
+	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
-}
-
-func secureTokenEqual(got, want string) bool {
-	got = strings.TrimSpace(got)
-	want = strings.TrimSpace(want)
-	if want == "" {
-		return false
-	}
-	if len(got) != len(want) {
-		return false
-	}
-	var v byte
-	for i := 0; i < len(want); i++ {
-		v |= got[i] ^ want[i]
-	}
-	return v == 0
 }

@@ -346,8 +346,7 @@ func (n *Noop) LookupMember(id string) (Member, bool) {
 	return Member{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}, true
 }
 
-func (n *Noop) PeerHTTPClients() (public, internal *http.Client) { return nil, nil }
-func (n *Noop) PeerPAT() string                                  { return "" }
+func (n *Noop) PeerInternalHTTPClient() *http.Client { return nil }
 
 // IngressTargets reports the single-node deployment's public address as the
 // DNS target. Empty publicHost (IP-only mode) returns the Unknown source so

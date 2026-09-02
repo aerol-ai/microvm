@@ -327,6 +327,13 @@ func (s *Service) putClusterSecretsForRecipients(ctx context.Context, sandboxID 
 		return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured")
 	}
 	incarnationID := s.secretIncarnationForSeal(sandboxID)
+	if incarnationID == "" && s.cfg.EnableCluster {
+		var mintErr error
+		incarnationID, mintErr = cluster.MintIncarnationID()
+		if mintErr != nil {
+			return cluster.PlacementSecrets{}, mintErr
+		}
+	}
 	if incarnationID != "" {
 		ctx = secrets.ContextWithIncarnationID(ctx, incarnationID)
 	}
@@ -427,7 +434,7 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 		incarnationID = handle.IncarnationID
 	}
 	if s.store != nil {
-		if err := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, incarnationID, pending, gen); err != nil {
+		if err := s.persistSecretPutOutboxRecipients(context.Background(), sandboxID, incarnationID, pending, gen); err != nil {
 			recordSecretPutOutboxFailure()
 			if s.logger != nil {
 				s.logger.Warn("cluster: put-outbox shrink after MinACK failed",
@@ -532,7 +539,7 @@ func (s *Service) runSecretFanout(sandboxID string, blob secrets.SecretBlob, rec
 			s.logger.Warn("cluster: secret fan-out incomplete",
 				"sandbox_id", sandboxID, "acked", len(acked), "pending", len(pending), "err", err)
 		}
-		if upErr := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, blob.IncarnationID, pending, gen); upErr != nil {
+		if upErr := s.persistSecretPutOutboxRecipients(context.Background(), sandboxID, blob.IncarnationID, pending, gen); upErr != nil {
 			recordSecretPutOutboxFailure()
 			if s.logger != nil {
 				s.logger.Warn("cluster: secret fan-out put-outbox update failed",
@@ -592,6 +599,16 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 		if len(rec.Recipients) == 0 {
 			continue
 		}
+		if s.cfg.EnableCluster {
+			parsed, parseErr := secrets.ParseRef(rec.Ref)
+			if parseErr != nil || strings.TrimSpace(parsed.IncarnationID) == "" {
+				return fmt.Errorf("cluster secret %q lacks required incarnation binding", rec.Ref)
+			}
+			binding, bindErr := secrets.EnvelopeBinding(rec.SealedPayload)
+			if bindErr != nil || binding.IncarnationID != parsed.IncarnationID || binding.Ref != rec.Ref || binding.SandboxID != rec.SandboxID || binding.VersionField != rec.Version || binding.Generation != rec.SealGeneration {
+				return fmt.Errorf("cluster secret %q envelope binding does not match its durable row", rec.Ref)
+			}
+		}
 		// Local row ⇒ this node holds the blob.
 		selfID := ""
 		if c := s.Cluster(); c != nil {
@@ -641,13 +658,6 @@ func (s *Service) runSecretRefanoutPool(records []store.ClusterSecretRecord, pus
 				}
 				if parsed, parseErr := secrets.ParseRef(rec.Ref); parseErr == nil {
 					blob.IncarnationID = parsed.IncarnationID
-				}
-				if blob.IncarnationID == "" {
-					if c := s.Cluster(); c != nil {
-						if p, ok := c.PlacementOf(rec.SandboxID); ok {
-							blob.IncarnationID = strings.TrimSpace(p.IncarnationID)
-						}
-					}
 				}
 				s.runSecretFanout(rec.SandboxID, blob, rec.Recipients, pusher)
 			}
@@ -733,12 +743,12 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	}
 	parsed, parseErr := secrets.ParseRef(ref)
 	if parseErr != nil || parsed.SandboxID != sandboxID || parsed.Version != blob.Version {
-		return fmt.Errorf("%w: ref %q does not match sandbox_id/version (want %q or .../i/{inc}/v%d)",
-			ErrInvalidClusterSecretBlob, ref, secrets.FormatRef(sandboxID, blob.Version), blob.Version)
+		return fmt.Errorf("%w: ref %q does not match sandbox_id/version", ErrInvalidClusterSecretBlob, ref)
 	}
-	if blob.IncarnationID == "" {
-		blob.IncarnationID = parsed.IncarnationID
-	} else if parsed.IncarnationID != "" && blob.IncarnationID != parsed.IncarnationID {
+	if s.cfg.EnableCluster && (strings.TrimSpace(blob.IncarnationID) == "" || strings.TrimSpace(parsed.IncarnationID) == "") {
+		return fmt.Errorf("%w: incarnation_id is required in cluster mode", ErrInvalidClusterSecretBlob)
+	}
+	if blob.IncarnationID != parsed.IncarnationID {
 		return fmt.Errorf("%w: incarnation_id does not match ref", ErrInvalidClusterSecretBlob)
 	}
 
@@ -765,6 +775,9 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	}
 	if meta.Ref != ref {
 		return fmt.Errorf("%w: envelope ref does not match wire ref", ErrInvalidClusterSecretBlob)
+	}
+	if meta.IncarnationID != blob.IncarnationID {
+		return fmt.Errorf("%w: envelope incarnation_id does not match wire incarnation_id", ErrInvalidClusterSecretBlob)
 	}
 	if meta.VersionField <= 0 {
 		return fmt.Errorf("%w: v4 envelope missing authenticated ref_version", ErrInvalidClusterSecretBlob)
@@ -813,7 +826,7 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 		// sealed blobs from a prior lifetime (empty blob incarnation included).
 		placeInc := strings.TrimSpace(placement.IncarnationID)
 		blobInc := strings.TrimSpace(blob.IncarnationID)
-		if placeInc != "" && placeInc != blobInc {
+		if placeInc == "" || blobInc == "" || placeInc != blobInc {
 			return fmt.Errorf("%w: incarnation_id does not match live placement", ErrInvalidClusterSecretBlob)
 		}
 	}
@@ -1005,15 +1018,18 @@ func (s *Service) failoverReadySnapshots(ids []string) (members []cluster.Member
 		return members, placements
 	}
 	placements = c.PlacementsByIDs(ids)
-	if placements == nil {
-		placements = map[string]cluster.Placement{}
-	}
 	return members, placements
 }
 
 func (s *Service) computeFailoverReadyCached(ctx context.Context, sb *models.Sandbox, members []cluster.Member, placements map[string]cluster.Placement) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil
+	}
+	if placements == nil && s.Cluster() != nil {
+		// The control-plane batch was unavailable. Fail readiness closed without
+		// issuing an O(page-size) point-read fallback.
+		ready := false
+		return &ready
 	}
 	recipients := s.secretRecipientsForSandboxCached(ctx, sb.ID, placements)
 	selfID := ""
@@ -1101,12 +1117,15 @@ func (s *Service) secretRecipientsForSandbox(ctx context.Context, sandboxID stri
 }
 
 func (s *Service) secretRecipientsForSandboxCached(ctx context.Context, sandboxID string, placements map[string]cluster.Placement) []string {
-	if p, ok := placements[sandboxID]; ok && len(p.SecretRecipients) > 0 {
-		return p.SecretRecipients
-	}
-	if c := s.Cluster(); c != nil {
-		if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
+	if placements != nil {
+		if p, ok := placements[sandboxID]; ok && len(p.SecretRecipients) > 0 {
 			return p.SecretRecipients
+		}
+	} else {
+		if c := s.Cluster(); c != nil {
+			if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
+				return p.SecretRecipients
+			}
 		}
 	}
 	if s.store == nil {

@@ -14,9 +14,10 @@ On the open-source build:
   second and again at shutdown, bounding ordinary host-crash loss without
   pretending that a local disk is an external evidence store.
 - Cluster fan-out on `GET /v1/sandboxes/{id}/audit` is a **discovery**
-  mechanism. It targets the Raft-retained owner history and falls back to all
-  workers if that bounded history is missing or truncated. It is **not** a
-  durability mechanism and cannot recover records that no longer exist.
+  mechanism. It targets the Raft-retained owner history. If that bounded index
+  is missing or truncated, the API returns `503` instead of amplifying one
+  request into an all-worker fleet scan. It is **not** a durability mechanism
+  and cannot recover records that no longer exist.
 - Coverage in the API response names which members answered; `partial: true`
   means the page is incomplete — never treat a partial page as full history.
 
@@ -27,13 +28,19 @@ On the open-source build:
   records chain heads / receipts so retroactive local-file tampering is
   detectable. It does **not** store full audit batches today and cannot rebuild
   the JSONL after disk loss.
-- **Batch export.** Set `SB_SECRET_AUDIT_EXPORT_URL` to enable periodic HTTP
-  POST of new JSONL segments (`Content-Type: application/x-ndjson`) since the
-  local export offset. Prefer this (or a custom `controlplane.AuditExporter`)
-  when you need reconstructable history after disk loss.
-- Enterprise deployments **must** configure an off-node Witness **and/or** an
-  export URL. Honest limit: without export, disk loss loses events that were
-  never shipped; Witness alone is tamper-evidence, not a backup.
+- **Batch export.** Set an `https://` `SB_SECRET_AUDIT_EXPORT_URL` and
+  `SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN` to enable authenticated periodic POST
+  of new JSONL segments (`Content-Type: application/x-ndjson`). A custom
+  `controlplane.AuditExporter` is also supported. In enterprise mode the bearer
+  token must contain at least 32 bytes. A configured
+  `SB_AUDIT_INGEST_TOKEN` has the same minimum; leave it empty to mint a random
+  per-boot 256-bit signing key.
+  Receivers must honor `Idempotency-Key`; it includes the node, byte offset,
+  and a payload digest so retries deduplicate without colliding after retention
+  rewrites reset the local byte offset.
+- Enterprise deployments **must** configure an off-node event exporter.
+  Witness is an additional tamper-evidence control, not a substitute for the
+  reconstructable event stream.
 - See `controlplane.Witness` / `AuditExporter` / `HasExternalWitness` and the
   enterprise boot checks around `SB_SECRET_AUDIT_EXTERNAL_WITNESS` and
   `SB_SECRET_AUDIT_EXPORT_URL`.
@@ -47,8 +54,14 @@ See also the D5 frozen-recipient limitation and cluster identity requirements in
 **Peer auth honesty:** cluster mode requires `SB_CLUSTER_TLS_DIR`. Internal
 secret, audit, recovery, and Raft-forward traffic uses the dedicated mTLS
 listener; the server requires a certificate signed by the cluster CA and there
-is no retry downgrade after a TLS failure. The fleet PAT remains a second
-operator credential, so protect and rotate it as well.
+is no retry downgrade after a TLS failure. Every node certificate must carry a
+`node:<SB_NODE_ID>` SAN; common-name/shared-SAN compatibility is not accepted.
+Atomically replacing `node.crt` and `node.key` hot-reloads the pair on the next
+TLS handshake, while existing connections drain naturally. The fleet PAT
+remains a second operator credential, so protect and rotate it as well.
+Enterprise cluster startup also refuses `ca.key` in `SB_CLUSTER_TLS_DIR`.
+Keep the CA signing key with an offline signer or HSM; the daemon runtime needs
+only `ca.crt`, `node.crt`, and `node.key`.
 
 ## Alerts
 
@@ -61,7 +74,8 @@ operator credential, so protect and rotate it as well.
 | `SandboxdSecretDeleteOutboxBacklogHigh` | More than 10,000 durable deletes are queued | Restore recipients and verify the bounded reconciler is draining |
 | `SandboxdSecretPutOutboxBacklogHigh` | Durable create-path peer PUTs are queued (`aerolvm_secret_put_outbox_pending`) | Check peer health/mTLS; put-outbox uses the same bounded worker pool as delete reconcile |
 | `SandboxdSecretPutOutboxFailures` | Put-outbox persist/reconcile failed (`aerolvm_secret_put_outbox_failures_total`) | Inspect disk/SQLite and peer reachability; creates retract when the initial journal fails |
-| `SandboxdClusterCertExpiring` | Node or CA certificates approach expiry | Re-run `scripts/cluster-sign-node.sh`; prefer ≤90-day leaf certs |
+| `SandboxdSecretAuditExportFailing` | Off-node event batches are not being accepted | Restore receiver connectivity/auth before local disk loss exceeds the recovery objective |
+| `SandboxdClusterCertExpiring` | Node (<14 days) or CA (<30 days) certificate approaches expiry | Sign a fresh node pair and atomically replace `node.crt`/`node.key`; prefer ≤90-day leaf certs |
 | `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down | For `awskms`, check IAM/KMS; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
 
 ## Audit drops / gap markers

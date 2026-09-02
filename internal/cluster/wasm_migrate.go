@@ -35,7 +35,7 @@ func StreamWasmMigrateExport(ctx context.Context, c Client, owner OwnerInfo, san
 	if owner.IsSelf {
 		return "", fmt.Errorf("cluster: export requested for self owner")
 	}
-	return cloneGen, wasmMigrateHTTP(ctx, c, owner.InternalURL, owner.APIURL, http.MethodGet, wasmMigrateExportPath(sandboxID), nil, w, &cloneGen)
+	return cloneGen, wasmMigrateHTTP(ctx, c, owner.NodeID, owner.InternalURL, http.MethodGet, wasmMigrateExportPath(sandboxID), nil, w, &cloneGen)
 }
 
 // PostWasmMigrateImport pushes a mem.snap tarball to target.
@@ -43,11 +43,11 @@ func PostWasmMigrateImport(ctx context.Context, c Client, target Member, sandbox
 	if target.NodeID == c.SelfNodeID() {
 		return fmt.Errorf("cluster: import to self should be handled locally")
 	}
-	return wasmMigrateHTTP(ctx, c, target.InternalURL, target.APIURL, http.MethodPut, wasmMigrateImportPath(sandboxID), body, nil, &cloneGen)
+	return wasmMigrateHTTP(ctx, c, target.NodeID, target.InternalURL, http.MethodPut, wasmMigrateImportPath(sandboxID), body, nil, &cloneGen)
 }
 
-func wasmMigrateHTTP(ctx context.Context, c Client, internalURL, apiURL, method, path string, body io.Reader, out io.Writer, cloneGen *string) error {
-	client, base, err := wasmMigratePeerClient(c, internalURL, apiURL)
+func wasmMigrateHTTP(ctx context.Context, c Client, nodeID, internalURL, method, path string, body io.Reader, out io.Writer, cloneGen *string) error {
+	client, base, err := wasmMigratePeerClient(c, nodeID, internalURL)
 	if err != nil {
 		return err
 	}
@@ -61,6 +61,7 @@ func wasmMigrateHTTP(ctx context.Context, c Client, internalURL, apiURL, method,
 	if cloneGen != nil && *cloneGen != "" && method == http.MethodPut {
 		req.Header.Set(WasmMigrateCloneGenHeader, *cloneGen)
 	}
+	SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if pat := wasmMigratePAT(c); pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}
@@ -95,21 +96,15 @@ func wasmMigratePAT(c Client) string {
 	return ""
 }
 
-type wasmMigrateHTTPProvider interface {
-	wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error)
+type wasmMigratePeerDialer interface {
+	PeerDialMember(Member) (*http.Client, string, error)
 }
 
-func wasmMigratePeerClient(c Client, internalURL, apiURL string) (*http.Client, string, error) {
-	if p, ok := c.(wasmMigrateHTTPProvider); ok {
-		return p.wasmMigrateHTTPClient(internalURL, apiURL)
+func wasmMigratePeerClient(c Client, nodeID, internalURL string) (*http.Client, string, error) {
+	if p, ok := c.(wasmMigratePeerDialer); ok {
+		return p.PeerDialMember(Member{NodeID: nodeID, InternalURL: internalURL})
 	}
-	if internalURL != "" {
-		return http.DefaultClient, internalURL, nil
-	}
-	if apiURL == "" {
-		return nil, "", fmt.Errorf("cluster: peer API URL unknown")
-	}
-	return http.DefaultClient, apiURL, nil
+	return nil, "", ErrPeerInternalURLRequired
 }
 
 // ExportWasmMigrateLocal buffers export output for tests.

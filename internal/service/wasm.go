@@ -23,6 +23,8 @@ func (s *Service) isWasmSandbox(sandbox *models.Sandbox) bool {
 // reserve admission, dispatch to the driver, persist the row. Create on the
 // driver still returns ErrRuntimeNotImplemented until Phase 2 lands the cold path.
 func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cleanupCancel()
 	if req.GPUs != nil {
 		return nil, fmt.Errorf("runtime %q does not yet support GPUs (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)
@@ -143,6 +145,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	// mirroring the Docker image path. Nil/empty creds seal to nil.
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
+		_ = s.wasm.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -207,16 +210,16 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			// UpsertSandboxRoute loop and via syncWasmCustomDomainRoutes below,
 			// and both key on IngressCustomDomainHTTPRouteID — so the leaf delete
 			// covers both. 404 per leaf is a no-op, safe on a partial install.
-			_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
-			_ = s.wasm.Destroy(ctx, sandbox)
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.wasm.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, err
 		}
 	}
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
-		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
-		_ = s.wasm.Destroy(ctx, sandbox)
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+		_ = s.wasm.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -226,18 +229,18 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	}
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
-			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
-			_ = s.wasm.Destroy(ctx, sandbox)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.wasm.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, err
 		}
 	}
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
-		_ = s.store.Delete(ctx, sandbox.ID)
-		_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
-		_ = s.wasm.Destroy(ctx, sandbox)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+		_ = s.wasm.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -248,17 +251,17 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if len(req.CustomDomains) > 0 {
 		storedCD, getErr := s.store.Get(ctx, sandbox.ID)
 		if getErr != nil {
-			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
-			_ = s.wasm.Destroy(ctx, sandbox)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.wasm.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, getErr
 		}
 		if err := s.syncWasmCustomDomainRoutes(ctx, storedCD); err != nil {
-			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.deleteSandboxPublicRoutes(ctx, storedCD)
-			_ = s.wasm.Destroy(ctx, sandbox)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.deleteSandboxPublicRoutes(cleanupCtx, storedCD)
+			_ = s.wasm.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, err

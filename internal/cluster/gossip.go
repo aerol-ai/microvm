@@ -31,10 +31,7 @@ type nodeMeta struct {
 	APIURL        string `json:"api_url"`
 	DataPlaneHost string `json:"data_plane_host,omitempty"`
 	RaftAddr      string `json:"raft_addr,omitempty"`
-	// InternalURL is this node's cluster-internal mTLS endpoint (e.g.
-	// https://10.0.0.5:7002). Set only when the node was started with cluster
-	// TLS material — peers receiving an empty value know to fall back to the
-	// public APIURL with PAT-only auth.
+	// InternalURL is this node's required cluster-internal mTLS endpoint.
 	InternalURL string `json:"internal_url,omitempty"`
 	// Role is the gossiped SB_NODE_ROLE — the leader's voter-promotion code
 	// uses this to decline to AddVoter a peer that announced itself as
@@ -572,7 +569,7 @@ func hasLiveControlPlaneMember(nodes []*memberlist.Node, selfNodeID string) bool
 		if selfNodeID != "" && m.NodeID == selfNodeID {
 			continue
 		}
-		if m.NodeID != "" && CanServeControlPlaneRole(m.Role) && (m.APIURL != "" || m.InternalURL != "") {
+		if m.NodeID != "" && CanServeControlPlaneRole(m.Role) && m.InternalURL != "" {
 			return true
 		}
 	}
@@ -706,8 +703,8 @@ func (g *gossipNode) peerDataPlaneHost(nodeID string) string {
 }
 
 // peerInternalURL returns the gossiped cluster-internal mTLS endpoint for
-// nodeID, or "" if the peer hasn't advertised one (it's running without
-// SB_CLUSTER_TLS_DIR). Callers fall back to peerAPIURL + PAT-only auth.
+// nodeID, or "" if the peer has not advertised one. Peer RPC callers treat an
+// empty value as unavailable and never downgrade to the public API.
 func (g *gossipNode) peerInternalURL(nodeID string) string {
 	for _, m := range g.members() {
 		if m.NodeID == nodeID {

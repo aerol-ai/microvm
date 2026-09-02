@@ -274,6 +274,9 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	// Secret tomb/outbox before store.Delete / placement delete so recipients
 	// can still be resolved from the sealed row or placement. Shared with
 	// DestroySandbox and reconcile-destroyed — cluster_secrets has no FK.
+	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+		return fmt.Errorf("retain sandbox audit ACL: %w", err)
+	}
 	if err := s.DeleteClusterSecrets(ctx, sandbox.ID); err != nil {
 		return fmt.Errorf("delete cluster secrets: %w", err)
 	}

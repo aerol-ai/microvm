@@ -79,6 +79,20 @@ func (f *fakePeerPusher) PushSecretBlobToPeers(_ context.Context, blob secrets.S
 	return append([]string(nil), f.acked...), f.pushErr
 }
 
+func waitForSecretCreateFanoutIdle(t *testing.T, sandboxID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, active := secretCreateFanoutInflight.Load(sandboxID); !active {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for create fan-out to finish for %s", sandboxID)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func (f *fakePeerPusher) DeleteSecretOnPeers(_ context.Context, sandboxID string, recipients []string, _ int64) (acked, pending []string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -473,21 +487,22 @@ func TestPeerSecretPutRequiresLivePlacementAfterTombGC(t *testing.T) {
 	cipher := newTestCipher(t)
 	st := openSealTestStore(t)
 	recipients := []string{"node-a", "node-b"}
-	ref := secrets.FormatRef("sb-no-vacuum", 1)
+	const incarnationID = "inc-no-vacuum"
+	ref := secrets.FormatRefInc("sb-no-vacuum", incarnationID, 1)
 	payload, err := secrets.SealEnvelopeBound(cipher, secrets.Secrets{
 		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
-	}, recipients, secrets.SealBinding{SandboxID: "sb-no-vacuum", Ref: ref, Version: 1, Generation: 1})
+	}, recipients, secrets.SealBinding{SandboxID: "sb-no-vacuum", IncarnationID: incarnationID, Ref: ref, Version: 1, Generation: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	blob := secrets.SecretBlob{
-		Ref: ref, SandboxID: "sb-no-vacuum", Version: 1, Recipients: recipients,
+		Ref: ref, SandboxID: "sb-no-vacuum", IncarnationID: incarnationID, Version: 1, Recipients: recipients,
 		SealedPayload: payload, SealGeneration: 1,
 	}
 	placements := &placementOnlyCluster{
 		Noop: cluster.NewNoop("node-b", "http://b", ""),
 		placement: cluster.Placement{
-			SandboxID: "sb-no-vacuum", OwnerNodeID: "node-a", SecretRecipients: recipients,
+			SandboxID: "sb-no-vacuum", OwnerNodeID: "node-a", SecretRecipients: recipients, IncarnationID: incarnationID,
 		},
 	}
 	svc := &Service{
@@ -585,7 +600,7 @@ func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	pusher := &fakePeerPusher{acked: []string{"node-b"}, done: make(chan struct{})}
 	svc := &Service{
 		cfg: config.Config{
-			SecretFanoutMinACKWait: 0, // fully async for this setup
+			SecretFanoutMinACKWait: 50 * time.Millisecond,
 		},
 		cipher:               cipher,
 		store:                st,
@@ -601,12 +616,10 @@ func TestReFanoutClusterSecretsRebuildsHolders(t *testing.T) {
 	if _, err := svc.SealAndDistribute(ctx, "sb-refan", req, []string{"node-a", "node-b"}, SealStrict); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	// Drain the seal-time async fan-out before mutating pusher.done (race detector).
-	select {
-	case <-pusher.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected initial seal fan-out")
-	}
+	// Seal performs one synchronous MinACK push and then enqueues a full push.
+	// Wait on the queue's single-flight marker, which is removed only after
+	// holder ACKs and the durable outbox have both been updated.
+	waitForSecretCreateFanoutIdle(t, "sb-refan")
 	clearSecretFanoutHolders("sb-refan")
 	if secretHolderCount("sb-refan") != 0 {
 		t.Fatal("expected cleared holders")
@@ -1405,5 +1418,51 @@ func TestExpandAndResealOwnerCASRejectsStaleGeneration(t *testing.T) {
 	err = svc.expandAndResealDeadSecretTargets(ctx, sandboxID)
 	if err == nil || !errors.Is(err, cluster.ErrSecretRecipientsCASMismatch) {
 		t.Fatalf("reseal = %v, want wrapped ErrSecretRecipientsCASMismatch", err)
+	}
+}
+
+func TestExpandAndResealFinalizesInterruptedLocalGeneration(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	const sandboxID = "sb-reseal-finalize"
+	recipients := []string{"live-b", "live-c", "node-a"}
+	cl := &resealPlacementCluster{
+		Noop: cluster.NewNoop("node-a", "http://a", ""),
+		placement: cluster.Placement{
+			SandboxID:            sandboxID,
+			OwnerNodeID:          "node-a",
+			SecretRecipients:     append([]string(nil), recipients...),
+			IncarnationID:        "inc-1",
+			SecretSealGeneration: 1,
+			SecretRef:            secrets.FormatRefInc(sandboxID, "inc-1", secrets.RefVersion),
+			SecretVersion:        secrets.RefVersion,
+		},
+	}
+	svc := &Service{
+		cfg:            config.Config{SecretRecipientBackupCount: 2},
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		cluster:        cl,
+	}
+	bag := secrets.Secrets{Env: map[string]string{"TOKEN": "secret"}}
+	sealCtx := secrets.ContextWithIncarnationID(ctx, "inc-1")
+	if _, err := svc.secretProvider.Put(sealCtx, sandboxID, bag, recipients); err != nil {
+		t.Fatalf("put generation 1: %v", err)
+	}
+	if _, err := svc.secretProvider.Put(sealCtx, sandboxID, bag, recipients); err != nil {
+		t.Fatalf("put interrupted generation 2: %v", err)
+	}
+
+	// All recipients are healthy, so only the explicit generation-split
+	// recovery path can finish the interrupted Raft commit.
+	if err := svc.expandAndResealDeadSecretTargets(ctx, sandboxID); err != nil {
+		t.Fatalf("finalize interrupted reseal: %v", err)
+	}
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if cl.placement.SecretSealGeneration != 2 || cl.updateCalls != 1 {
+		t.Fatalf("placement generation=%d updates=%d, want generation=2 updates=1", cl.placement.SecretSealGeneration, cl.updateCalls)
 	}
 }

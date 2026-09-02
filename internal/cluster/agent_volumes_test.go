@@ -175,6 +175,7 @@ func startAgentControlPlaneServerWithVolumes(t *testing.T, c *Cluster, ln net.Li
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
 	})
+	c.AttachInternalHandler(mux)
 	srv := &httptest.Server{Listener: ln, Config: &http.Server{Handler: mux}}
 	srv.Start()
 	return srv

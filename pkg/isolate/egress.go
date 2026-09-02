@@ -87,9 +87,14 @@ func (h *Host) startSlotServerLocked(slot int) error {
 	if err != nil {
 		return fmt.Errorf("isolate: listen egress slot %d socket: %w", slot, err)
 	}
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.serveEgressSlot(slot, w, r)
-	})}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h.serveEgressSlot(slot, w, r)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	h.slotSrv[slot] = srv
 	go func() { _ = srv.Serve(ln) }()
 	return nil
@@ -117,9 +122,14 @@ func (h *Host) startEgressDenyServer() error {
 	if err != nil {
 		return fmt.Errorf("isolate: listen egress-deny socket: %w", err)
 	}
-	h.egressDenySrv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "egress denied: sandbox has no egress slot (block-all or pool exhausted)", http.StatusForbidden)
-	})}
+	h.egressDenySrv = &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "egress denied: sandbox has no egress slot (block-all or pool exhausted)", http.StatusForbidden)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() { _ = h.egressDenySrv.Serve(ln) }()
 	return nil
 }

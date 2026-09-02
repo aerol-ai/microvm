@@ -20,6 +20,12 @@ var wasmSnapshotTarFiles = []string{
 	"wasi-state.cbor",
 }
 
+const (
+	wasmSnapshotTarMaxEntries = 8
+	wasmSnapshotMetadataMax   = 64 << 20
+	wasmSnapshotMemoryMax     = 1 << 30
+)
+
 func writeWasmCheckpointTar(w io.Writer, memSnapDir string) error {
 	if !wasmengine.DirExists(memSnapDir) {
 		return fmt.Errorf("mem.snap missing at %s", memSnapDir)
@@ -48,6 +54,7 @@ func extractWasmCheckpointTar(r io.Reader, dstDir string) error {
 
 	tr := tar.NewReader(r)
 	seen := map[string]struct{}{}
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -57,13 +64,30 @@ func extractWasmCheckpointTar(r io.Reader, dstDir string) error {
 			cleanup()
 			return fmt.Errorf("read tar: %w", err)
 		}
+		entries++
+		if entries > wasmSnapshotTarMaxEntries {
+			cleanup()
+			return fmt.Errorf("mem.snap tar has too many entries")
+		}
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
 		base := filepath.Base(hdr.Name)
-		if !wasmSnapshotTarMember(base) {
+		if hdr.Name != base || !wasmSnapshotTarMember(base) {
 			cleanup()
 			return fmt.Errorf("unexpected tar entry %q", hdr.Name)
+		}
+		if _, duplicate := seen[base]; duplicate {
+			cleanup()
+			return fmt.Errorf("duplicate tar entry %q", hdr.Name)
+		}
+		maxBytes := int64(wasmSnapshotMetadataMax)
+		if base == "memory.zstd" {
+			maxBytes = int64(wasmSnapshotMemoryMax)
+		}
+		if hdr.Size < 0 || hdr.Size > maxBytes {
+			cleanup()
+			return fmt.Errorf("tar entry %q exceeds %d bytes", hdr.Name, maxBytes)
 		}
 		seen[base] = struct{}{}
 		outPath := filepath.Join(tmp, base)
@@ -72,10 +96,16 @@ func extractWasmCheckpointTar(r io.Reader, dstDir string) error {
 			cleanup()
 			return err
 		}
-		if _, err := io.Copy(f, tr); err != nil {
+		written, copyErr := io.Copy(f, io.LimitReader(tr, maxBytes+1))
+		if copyErr != nil {
 			_ = f.Close()
 			cleanup()
-			return err
+			return copyErr
+		}
+		if written > maxBytes {
+			_ = f.Close()
+			cleanup()
+			return fmt.Errorf("tar entry %q exceeds %d bytes", hdr.Name, maxBytes)
 		}
 		if err := f.Close(); err != nil {
 			cleanup()

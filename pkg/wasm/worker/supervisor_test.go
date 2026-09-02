@@ -5,6 +5,7 @@ import (
 
 	"context"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -116,6 +117,30 @@ func TestDefaultResidentSpawner(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("expected cmd")
+	}
+}
+
+func TestDefaultSpawnerDoesNotInheritDaemonSecrets(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "fleet-secret")
+	t.Setenv("SB_AUDIT_INGEST_TOKEN", "audit-master")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+	t.Setenv("SB_AUDIT_INGEST_PORT", "32123")
+	t.Setenv("SB_AUDIT_SPILL_DIR", "/var/lib/sandboxd/audit")
+	cmd, err := DefaultSpawner(context.Background(), "/tmp/test-filtered.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(cmd.Env, "\n")
+	for _, secretName := range []string{"SB_PAT_TOKEN=", "SB_AUDIT_INGEST_TOKEN=", "AWS_SECRET_ACCESS_KEY="} {
+		if strings.Contains(joined, secretName) {
+			t.Fatalf("worker inherited %s", secretName)
+		}
+	}
+	if !strings.Contains(joined, "SB_AUDIT_INGEST_PORT=32123") {
+		t.Fatalf("worker environment omitted audit port: %v", cmd.Env)
+	}
+	if !strings.Contains(joined, "SB_AUDIT_SPILL_DIR=/var/lib/sandboxd/audit") {
+		t.Fatalf("worker environment omitted audit spill directory: %v", cmd.Env)
 	}
 }
 

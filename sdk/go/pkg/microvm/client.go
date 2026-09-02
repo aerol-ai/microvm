@@ -194,6 +194,25 @@ func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, erro
 	return wrapped, nil
 }
 
+// ListPage fetches one bounded page and returns the server's opaque token for
+// the next page. Callers inventorying large fleets should loop until the token
+// is empty instead of materializing every sandbox in one slice.
+func (c *Client) ListPage(ctx context.Context, pageToken string, opts ...ListOption) ([]*Sandbox, string, error) {
+	var cfg listOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	items, next, err := c.inner.ListPageWithOptions(ctx, cfg.tags, cfg.includeEnv, pageToken)
+	if err != nil {
+		return nil, "", err
+	}
+	wrapped := make([]*Sandbox, 0, len(items))
+	for _, item := range items {
+		wrapped = append(wrapped, wrapSandbox(c, item))
+	}
+	return wrapped, next, nil
+}
+
 // GetOption customizes a Get call.
 type GetOption func(*getOptions)
 

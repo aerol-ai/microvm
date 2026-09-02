@@ -153,6 +153,18 @@ func TestSecretPutOutboxRejectsDowngrade(t *testing.T) {
 	}
 }
 
+func TestUpdateSecretPutOutboxMissingRowIsNotSilent(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	err = st.UpdateSecretPutOutboxRecipients(context.Background(), "missing", "inc-1", []string{"node-b"}, 1)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("UpdateSecretPutOutboxRecipients error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestPutClusterSecretEqualGenerationPayload(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "state.db"))

@@ -25,7 +25,6 @@ CRED_KEY_PATH=""
 SIGNED_CERT=""
 INTERNAL_BIND_ADDR="0.0.0.0:7002"
 INTERNAL_ADVERTISE_URL=""
-NO_TLS="false"
 FORCE="false"
 MAX_AUTO_VOTERS="5"
 NODE_ROLE=""
@@ -61,10 +60,10 @@ Optional:
                                 ca.crt ONLY) from cluster-init.sh. This node
                                 generates node.key + CSR locally; the seed
                                 signs via cluster-sign-node.sh (ca.key never
-                                leaves the seed). Required unless --no-tls.
+                                leaves the seed). Required.
   --cred-bundle <path>          Credential encryption key bundle (tarball
                                 with credential_encryption.key). Required
-                                always (TLS and --no-tls). Kept separate from
+                                always. Kept separate from
                                 the CA trust bundle on purpose.
   --signed-cert <path>          Pre-signed node.crt from cluster-sign-node.sh.
                                 When omitted, this script writes node.csr and
@@ -83,9 +82,6 @@ Optional:
   --max-auto-voters <n>         Max Raft voters auto-promoted from gossip.
                                 Additional nodes become non-voters. Default 5.
                                 Set 0 for the old unlimited behavior.
-  --no-tls                      Skip TLS. Cluster-internal channels ride over
-                                the public API URL with PAT-only auth. ONLY
-                                safe on a fully isolated network.
   --role <role>                 SB_NODE_ROLE for this daemon. One of server,
                                 worker, ingress, mixed — or a comma-separated
                                 combination of server / worker / ingress (e.g.
@@ -137,7 +133,6 @@ while [[ $# -gt 0 ]]; do
 		--max-auto-voters)    MAX_AUTO_VOTERS="$2"; shift 2 ;;
 		--role)               NODE_ROLE="$2"; shift 2 ;;
 		--ingress-advertise-host) INGRESS_ADVERTISE_HOST="$2"; shift 2 ;;
-		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
 		*) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
@@ -190,13 +185,13 @@ if [[ -z "$GOSSIP_SECRET_KEY" || -z "$PEERS" ]]; then
 	exit 1
 fi
 
-if [[ "$NO_TLS" != "true" ]] && [[ -z "$TLS_BUNDLE" ]]; then
-	echo "--tls-bundle is required (or pass --no-tls for plaintext private-network setups)." >&2
+if [[ -z "$TLS_BUNDLE" ]]; then
+	echo "--tls-bundle is required." >&2
 	echo "  The bundle is the tarball cluster-init.sh emits on the seed node." >&2
 	exit 1
 fi
 
-if [[ "$NO_TLS" != "true" ]] && [[ ! -f "$TLS_BUNDLE" ]]; then
+if [[ ! -f "$TLS_BUNDLE" ]]; then
 	echo "TLS bundle not found: $TLS_BUNDLE" >&2
 	exit 1
 fi
@@ -270,6 +265,10 @@ primary_ip() {
 if [[ -z "$NODE_ID" ]]; then
 	NODE_ID="$(hostname -s 2>/dev/null || hostname)"
 fi
+if [[ ! "$NODE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+	echo "--node-id must start with an alphanumeric and contain only alphanumerics, dot, underscore, or hyphen (max 128 characters)" >&2
+	exit 1
+fi
 
 PRIMARY_IP="$(primary_ip)"
 if [[ -z "$PRIMARY_IP" ]]; then
@@ -296,12 +295,6 @@ if [[ -z "$GOSSIP_ADVERTISE_ADDR" ]]; then GOSSIP_ADVERTISE_ADDR="$(derive_adver
 # Signing uses ca.key only on the seed (cluster-sign-node.sh). Never require
 # or unpack ca.key on joiners.
 CLUSTER_SAN="aerolvm-cluster-node"
-TLS_GENERATED="false"
-if [[ "$NO_TLS" == "true" ]]; then
-	# Private-overlay escape hatch only — not for production / public nets.
-	echo "WARNING: --no-tls given; cluster-internal channels will use the public"
-	echo "         API URL with PAT-only auth. Only safe on a fully isolated network."
-else
 	if ! command -v openssl >/dev/null 2>&1; then
 		echo "openssl not found — required to mint a node key/CSR." >&2
 		exit 1
@@ -320,18 +313,17 @@ else
 		rm -f "$TLS_DIR/ca.crt" "$TLS_DIR/ca.key" "$TLS_DIR/node.crt" "$TLS_DIR/node.key" "$TLS_DIR/node.csr"
 	fi
 
-	# Extract ca.crt only. Legacy bundles that still contain ca.key are ignored
-	# — we refuse to keep a CA private key on workers.
-	tar -C "$TLS_DIR" -xzf "$TLS_BUNDLE" ca.crt 2>/dev/null || true
-	if [[ ! -f "$TLS_DIR/ca.crt" ]]; then
-		if [[ -f "$TLS_BUNDLE" ]] && grep -q "BEGIN CERTIFICATE" "$TLS_BUNDLE" 2>/dev/null; then
-			install -m 0644 "$TLS_BUNDLE" "$TLS_DIR/ca.crt"
-		else
-			echo "TLS trust bundle did not contain ca.crt" >&2
-			exit 1
-		fi
+	# Accept exactly the generated trust-bundle shape. A bundle carrying a CA
+	# private key is a security incident, not something a worker should repair.
+	BUNDLE_ENTRIES="$(tar -tzf "$TLS_BUNDLE" 2>/dev/null)" || {
+		echo "TLS trust bundle is not a readable gzip tar archive" >&2
+		exit 1
+	}
+	if [[ "$BUNDLE_ENTRIES" != "ca.crt" ]]; then
+		echo "TLS trust bundle must contain exactly ca.crt" >&2
+		exit 1
 	fi
-	rm -f "$TLS_DIR/ca.key"
+	tar -C "$TLS_DIR" -xzf "$TLS_BUNDLE" ca.crt
 
 	if [[ -n "$SIGNED_CERT" ]]; then
 		if [[ ! -f "$SIGNED_CERT" ]]; then
@@ -346,7 +338,6 @@ else
 		chmod 0600 "$TLS_DIR/node.key"
 		chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.crt"
 		rm -f "$TLS_DIR/node.csr"
-		TLS_GENERATED="true"
 	else
 		if [[ ! -f "$TLS_DIR/node.key" ]]; then
 			openssl genrsa -out "$TLS_DIR/node.key" 4096 2>/dev/null
@@ -372,9 +363,8 @@ Stopping before daemon restart (node.crt not installed yet).
 EOF
 		exit 2
 	fi
-fi
 
-if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
+if [[ -z "$INTERNAL_ADVERTISE_URL" ]]; then
 	INTERNAL_PORT="${INTERNAL_BIND_ADDR##*:}"
 	INTERNAL_ADVERTISE_URL="https://${PRIMARY_IP}:${INTERNAL_PORT}"
 fi
@@ -434,13 +424,11 @@ EOF
 	if [[ -n "$INGRESS_ADVERTISE_HOST" ]]; then
 		echo "SB_INGRESS_ADVERTISE_HOST=$INGRESS_ADVERTISE_HOST"
 	fi
-	if [[ "$TLS_GENERATED" == "true" ]]; then
-		cat <<EOF
+	cat <<EOF
 SB_CLUSTER_TLS_DIR=$TLS_DIR
 SB_CLUSTER_INTERNAL_LISTEN=$INTERNAL_BIND_ADDR
 SB_CLUSTER_INTERNAL_ADVERTISE=$INTERNAL_ADVERTISE_URL
 EOF
-	fi
 } > /etc/sandboxd/cluster.env
 chmod 0600 /etc/sandboxd/cluster.env
 

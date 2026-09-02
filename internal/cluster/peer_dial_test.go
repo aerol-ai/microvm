@@ -8,12 +8,11 @@ import (
 
 func TestPeerDialFailClosedRequiresInternalURL(t *testing.T) {
 	internal := &http.Client{}
-	public := &http.Client{}
-	_, _, err := PeerDial(Member{NodeID: "n1", APIURL: "http://public"}, public, internal)
+	_, _, err := PeerDial(Member{NodeID: "n1", APIURL: "http://public"}, internal)
 	if !errors.Is(err, ErrPeerInternalURLRequired) {
 		t.Fatalf("PeerDial without InternalURL = %v, want ErrPeerInternalURLRequired", err)
 	}
-	_, _, err = PeerDialPath(Member{NodeID: "n1", APIURL: "http://public"}, public, internal, "/v1/x")
+	_, _, err = PeerDialPath(Member{NodeID: "n1", APIURL: "http://public"}, internal, "/v1/x")
 	if !errors.Is(err, ErrPeerInternalURLRequired) {
 		t.Fatalf("PeerDialPath without InternalURL = %v, want ErrPeerInternalURLRequired", err)
 	}
@@ -21,12 +20,11 @@ func TestPeerDialFailClosedRequiresInternalURL(t *testing.T) {
 
 func TestPeerDialUsesInternalWhenPresent(t *testing.T) {
 	internal := &http.Client{}
-	public := &http.Client{}
 	client, base, err := PeerDial(Member{
 		NodeID:      "n1",
 		APIURL:      "http://public",
 		InternalURL: "https://internal:7002",
-	}, public, internal)
+	}, internal)
 	if err != nil {
 		t.Fatalf("PeerDial: %v", err)
 	}
@@ -35,17 +33,20 @@ func TestPeerDialUsesInternalWhenPresent(t *testing.T) {
 	}
 }
 
-func TestPeerDialFallsBackToPublicWithoutTLS(t *testing.T) {
-	public := &http.Client{}
-	client, base, err := PeerDial(Member{
-		NodeID: "n1",
-		APIURL: "http://public",
-	}, public, nil)
-	if err != nil {
-		t.Fatalf("PeerDial: %v", err)
+func TestPeerDialRejectsMissingTLSClient(t *testing.T) {
+	_, _, err := PeerDial(Member{NodeID: "n1", InternalURL: "https://internal:7002"}, nil)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("PeerDial without mTLS client = %v, want ErrPeerInternalURLRequired", err)
 	}
-	if client != public || base != "http://public" {
-		t.Fatalf("got client=%v base=%q, want public", client == public, base)
+}
+
+func TestPeerDialRejectsPlaintextOrCredentialedInternalURL(t *testing.T) {
+	internal := &http.Client{}
+	for _, raw := range []string{"http://internal:7002", "https://user:pass@internal:7002", "//internal:7002", "https:///missing-host"} {
+		_, _, err := PeerDial(Member{NodeID: "n1", InternalURL: raw}, internal)
+		if !errors.Is(err, ErrPeerInternalURLInvalid) {
+			t.Fatalf("PeerDial(%q) = %v, want ErrPeerInternalURLInvalid", raw, err)
+		}
 	}
 }
 
@@ -54,7 +55,7 @@ func TestPeerDialPathAppendsSuffix(t *testing.T) {
 	client, endpoint, err := PeerDialPath(Member{
 		NodeID:      "n1",
 		InternalURL: "https://internal:7002/",
-	}, nil, internal, "/v1/cluster/internal/secrets")
+	}, internal, "/v1/cluster/internal/secrets")
 	if err != nil {
 		t.Fatalf("PeerDialPath: %v", err)
 	}

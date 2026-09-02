@@ -396,7 +396,6 @@ func clusterListMode(svc *service.Service, r *http.Request) bool {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	r = r.WithContext(clusterlist.ApplyOwnerRefScope(r))
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
@@ -429,7 +428,6 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
-	r = r.WithContext(clusterlist.ApplyOwnerRefScope(r))
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())

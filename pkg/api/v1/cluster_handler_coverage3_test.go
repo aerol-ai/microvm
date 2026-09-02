@@ -19,7 +19,7 @@ import (
 )
 
 func TestClusterListWrap_MergesPeerSandboxes(t *testing.T) {
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			http.Error(w, "missing forwarded header", http.StatusBadRequest)
 			return
@@ -379,7 +379,7 @@ func TestClusterInternalPlacements_NilCluster(t *testing.T) {
 }
 
 func TestClusterListWrap_PeerHTTPError(t *testing.T) {
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	t.Cleanup(peer.Close)

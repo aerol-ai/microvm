@@ -68,7 +68,7 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	raw, err := io.ReadAll(r.Body)
+	raw, err := apihttp.ReadJSONBody(w, r)
 	_ = r.Body.Close()
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
@@ -110,7 +110,7 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		isSelf := m.NodeID == selfID
-		if !isSelf && m.APIURL == "" {
+		if !isSelf && m.InternalURL == "" {
 			continue
 		}
 		targets = append(targets, target{member: m, self: isSelf})
@@ -124,7 +124,7 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 	var firstHeader http.Header
 	var firstBody []byte
 	for _, t := range targets {
-		status, header, body, err := h.runImageBuildOnTarget(r, raw, t.member, t.self)
+		status, header, body, err := h.runImageBuildOnTarget(c, r, raw, t.member, t.self)
 		if err != nil {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn("cluster image build fanout failed", "node", t.member.NodeID, "err", err)
@@ -147,7 +147,7 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 	_, _ = w.Write(firstBody)
 }
 
-func (h *handlers) runImageBuildOnTarget(parent *http.Request, raw []byte, m cluster.Member, self bool) (int, http.Header, []byte, error) {
+func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request, raw []byte, m cluster.Member, self bool) (int, http.Header, []byte, error) {
 	if self {
 		req := parent.Clone(parent.Context())
 		req.Body = io.NopCloser(bytes.NewReader(raw))
@@ -158,19 +158,24 @@ func (h *handlers) runImageBuildOnTarget(parent *http.Request, raw []byte, m clu
 		h.buildImage(rr, req)
 		return rr.Code, rr.Header(), rr.Body.Bytes(), nil
 	}
+	client, base, err := dialClusterPeer(c, m)
+	if err != nil {
+		return 0, nil, nil, err
+	}
 	req, err := http.NewRequestWithContext(parent.Context(), http.MethodPost,
-		clusterPeerURL(m.APIURL, PathPrefix+"/images/build"), bytes.NewReader(raw))
+		base+PathPrefix+"/images/build", bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	req.Header.Set(clusterImageBuildFanoutHeader, "1")
+	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 	if ct := parent.Header.Get("Content-Type"); ct != "" {
 		req.Header.Set("Content-Type", ct)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}

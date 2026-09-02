@@ -1462,7 +1462,7 @@ func TestParseMirrorUpstreams(t *testing.T) {
 }
 
 func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
-	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterprisePATBytes))
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
 	t.Setenv("SB_ENABLE_CLUSTER", "false")
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
@@ -1477,7 +1477,7 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 		t.Fatalf("Load error = %v, want weak PAT rejection", err)
 	}
 
-	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterprisePATBytes))
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "false")
 	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_EXTERNAL_WITNESS") {
@@ -1485,14 +1485,35 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	}
 
 	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
 	if cfg, err := Load(); err != nil {
 		t.Fatalf("enterprise with export URL only: %v", err)
 	} else if cfg.SecretAuditExportURL == "" {
 		t.Fatal("expected export URL retained")
 	}
 
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "http://audit.example/export")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("Load error = %v, want insecure audit export rejection", err)
+	}
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BEARER_TOKEN") {
+		t.Fatalf("Load error = %v, want missing export token rejection", err)
+	}
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", "weak-export-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("Load error = %v, want weak export token rejection", err)
+	}
+
 	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", "")
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_AUDIT_INGEST_TOKEN", "weak-ingest-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_AUDIT_INGEST_TOKEN") {
+		t.Fatalf("Load error = %v, want weak ingest token rejection", err)
+	}
+	t.Setenv("SB_AUDIT_INGEST_TOKEN", strings.Repeat("i", minEnterpriseCredentialBytes))
 	t.Setenv("SB_SECRET_AUDIT_WITNESS_INTERVAL", "15s")
 	cfg, err := Load()
 	if err != nil {
@@ -1500,5 +1521,44 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	}
 	if cfg.SecretAuditWitnessInterval != 15*time.Second {
 		t.Fatalf("SecretAuditWitnessInterval = %v, want 15s", cfg.SecretAuditWitnessInterval)
+	}
+}
+
+func TestEnterpriseClusterRejectsCAKeyInDaemonTLSDirectory(t *testing.T) {
+	tlsDir := t.TempDir()
+	caKeyPath := filepath.Join(tlsDir, "ca.key")
+	if err := os.WriteFile(caKeyPath, []byte("signing-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
+	t.Setenv("SB_ENTERPRISE_MODE", "true")
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_ENABLE_CLUSTER", "true")
+	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+	t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("SB_CLUSTER_TLS_DIR", tlsDir)
+	t.Setenv("SB_SECRET_RECIPIENT_BACKUP_COUNT", "2")
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "CA signing key") {
+		t.Fatalf("Load error = %v, want runtime CA key rejection", err)
+	}
+	if err := os.Remove(caKeyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load after moving CA key offline: %v", err)
+	}
+}
+
+func TestNodeIDRejectsProtocolDelimiters(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "token")
+	for _, nodeID := range []string{"node|forged", "node:forged", "node,forged", "-node", strings.Repeat("n", 129)} {
+		t.Run(nodeID, func(t *testing.T) {
+			t.Setenv("SB_NODE_ID", nodeID)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_NODE_ID") {
+				t.Fatalf("Load error = %v, want invalid node id rejection", err)
+			}
+		})
 	}
 }

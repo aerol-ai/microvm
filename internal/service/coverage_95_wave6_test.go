@@ -236,6 +236,21 @@ func TestCreateJSBundleModulesPathAndReplicatorWarn(t *testing.T) {
 	}
 }
 
+func TestCreateJSBundleEnterpriseFailsClosedOnIncompleteReplication(t *testing.T) {
+	svc := newBundleService(t)
+	svc.cfg.EnterpriseMode = true
+	svc.SetJSBundleReplicator(func(context.Context, string, models.CreateJSBundleRequest) error {
+		return errors.New("peer down")
+	})
+	_, err := svc.CreateJSBundle(context.Background(), models.CreateJSBundleRequest{
+		Name:   "enterprise",
+		Source: jsBundleSrc,
+	})
+	if err == nil || !strings.Contains(err.Error(), "replication incomplete") {
+		t.Fatalf("CreateJSBundle error = %v, want incomplete-replication failure", err)
+	}
+}
+
 func TestPlatformVolumeCRUDDisabledAndTenantErrors(t *testing.T) {
 	ctx := context.Background()
 	s := enabledVolumeService(t)

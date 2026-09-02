@@ -80,6 +80,14 @@ type SecretAuditSink interface {
 	Emit(SecretAuditEvent)
 }
 
+// DurableSecretAuditSink accepts an event only after its bytes have reached
+// durable storage. Security-boundary ingest endpoints use this interface so a
+// 202 response never means merely "queued in process memory".
+type DurableSecretAuditSink interface {
+	SecretAuditSink
+	EmitDurable(SecretAuditEvent) error
+}
+
 type noopSecretAuditSink struct{}
 
 func (noopSecretAuditSink) Emit(SecretAuditEvent) {}
@@ -95,6 +103,7 @@ func (unavailableSecretAuditSink) Emit(SecretAuditEvent) {
 
 type auditWriteReq struct {
 	ev          SecretAuditEvent
+	durable     chan error // when non-nil, report the fsynced event result
 	sync        chan error // when non-nil, writer fsyncs after draining prior work
 	pruneCutoff time.Time  // when non-zero, rewrite file dropping older events
 	pruneDone   chan error
@@ -122,6 +131,7 @@ type fileAuditSink struct {
 	// writer goroutine so Emit never holds sendMu across disk waits.
 	sendMu           sync.Mutex
 	spillMu          sync.Mutex
+	gapMu            sync.Mutex
 	done             chan struct{}
 	path             string
 	lockPath         string
@@ -134,6 +144,7 @@ type fileAuditSink struct {
 	chainMu          sync.Mutex
 	chainHead        string
 	chainEvent       string
+	writePoison      error // append outcome became ambiguous; refuse later writes
 	// writeHook, when set (tests), runs before each file write and may block.
 	writeHook func()
 	// afterPrune, when set (Service), ships a new witness tip after prune
@@ -234,13 +245,28 @@ func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
 			}
 			auditEventsDroppedTotal.Add(1)
 			n := s.pendingGap.Add(1)
-			persistGapCount(s.gapPath, n)
+			s.persistGapState(n)
 			return
 		}
 		auditEventsDroppedTotal.Add(1)
 		n := s.pendingGap.Add(1)
-		persistGapCount(s.gapPath, n)
+		s.persistGapState(n)
 	}
+}
+
+func (s *fileAuditSink) EmitDurable(ev SecretAuditEvent) error {
+	if s == nil {
+		return errors.New("secret audit sink unavailable")
+	}
+	done := make(chan error, 1)
+	s.sendMu.Lock()
+	if s.closed.Load() {
+		s.sendMu.Unlock()
+		return errors.New("secret audit sink closed")
+	}
+	s.ch <- auditWriteReq{ev: ev, durable: done}
+	s.sendMu.Unlock()
+	return <-done
 }
 
 // Sync blocks until every previously accepted event (and any pending gap
@@ -281,15 +307,29 @@ func (s *fileAuditSink) loop() {
 	ticker := time.NewTicker(secretAuditSyncInterval)
 	defer ticker.Stop()
 	flushGap := func() {
-		if n := s.pendingGap.Swap(0); n > 0 {
-			_ = s.writeEvent(SecretAuditEvent{
+		if n := s.pendingGap.Load(); n > 0 {
+			if err := s.writeEventInternal(SecretAuditEvent{
 				Time:    time.Now().UTC(),
 				Result:  secretAuditResultGap,
 				Reason:  secretAuditReasonOverflow,
 				Kind:    secretAuditKindGap,
 				Dropped: n,
-			})
-			clearGapCount(s.gapPath)
+			}, false); err != nil {
+				return
+			}
+			// Preserve drops added concurrently while the marker was written.
+			for {
+				current := s.pendingGap.Load()
+				remove := n
+				if current < remove {
+					remove = current
+				}
+				if s.pendingGap.CompareAndSwap(current, current-remove) {
+					remaining := current - remove
+					s.persistGapState(remaining)
+					break
+				}
+			}
 		}
 	}
 	for {
@@ -306,7 +346,7 @@ func (s *fileAuditSink) loop() {
 			if err := s.appendSpill(ev); err != nil {
 				auditEventsDroppedTotal.Add(1)
 				n := s.pendingGap.Add(1)
-				persistGapCount(s.gapPath, n)
+				s.persistGapState(n)
 			}
 		case next, ok := <-s.ch:
 			if !ok {
@@ -316,7 +356,7 @@ func (s *fileAuditSink) loop() {
 						if err := s.appendSpill(ev); err != nil {
 							auditEventsDroppedTotal.Add(1)
 							n := s.pendingGap.Add(1)
-							persistGapCount(s.gapPath, n)
+							s.persistGapState(n)
 						}
 					}
 					s.spillCh = nil
@@ -343,7 +383,7 @@ func (s *fileAuditSink) loop() {
 							} else if err := s.appendSpill(ev); err != nil {
 								auditEventsDroppedTotal.Add(1)
 								n := s.pendingGap.Add(1)
-								persistGapCount(s.gapPath, n)
+								s.persistGapState(n)
 							}
 							continue
 						default:
@@ -355,6 +395,10 @@ func (s *fileAuditSink) loop() {
 				}
 				flushGap()
 				next.sync <- s.syncFile()
+				continue
+			}
+			if next.durable != nil {
+				next.durable <- s.writeEvent(next.ev)
 				continue
 			}
 			_ = s.writeEvent(next.ev)
@@ -387,11 +431,15 @@ func (s *fileAuditSink) appendSpill(ev SecretAuditEvent) error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
 		if _, err := f.Write(line); err != nil {
+			_ = f.Close()
 			return err
 		}
-		return f.Sync()
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return err
+		}
+		return f.Close()
 	})
 }
 
@@ -442,7 +490,7 @@ func (s *fileAuditSink) drainSpill() bool {
 
 	f, err := os.Open(working)
 	if err != nil {
-		return true
+		return false
 	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -485,11 +533,11 @@ func (s *fileAuditSink) drainSpill() bool {
 	}
 	if writeErr != nil {
 		_ = f.Close()
-		return true // leave working intact
+		return false // leave working intact; retry on later loop activity
 	}
 	if err := s.syncFile(); err != nil {
 		_ = f.Close()
-		return true
+		return false
 	}
 
 	// Stream the unread remainder to a temp file and rename — do not Truncate
@@ -498,7 +546,7 @@ func (s *fileAuditSink) drainSpill() bool {
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		_ = f.Close()
-		return true
+		return false
 	}
 	for sc.Scan() {
 		rest := strings.TrimSpace(sc.Text())
@@ -509,13 +557,13 @@ func (s *fileAuditSink) drainSpill() bool {
 			_ = out.Close()
 			_ = f.Close()
 			_ = os.Remove(tmp)
-			return true
+			return false
 		}
 		if _, err := out.Write([]byte{'\n'}); err != nil {
 			_ = out.Close()
 			_ = f.Close()
 			_ = os.Remove(tmp)
-			return true
+			return false
 		}
 	}
 	scanErr := sc.Err()
@@ -523,82 +571,35 @@ func (s *fileAuditSink) drainSpill() bool {
 	if scanErr != nil {
 		_ = out.Close()
 		_ = os.Remove(tmp)
-		return true
+		return false
 	}
 	if err := out.Sync(); err != nil {
 		_ = out.Close()
 		_ = os.Remove(tmp)
-		return true
+		return false
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmp)
-		return true
+		return false
 	}
 	info, _ := os.Stat(tmp)
-	_ = s.withAuditFileLock(func() error {
+	if err := s.withAuditFileLock(func() error {
 		if info == nil || info.Size() == 0 {
 			_ = os.Remove(tmp)
 			_ = os.Remove(working)
 			return nil
 		}
 		return os.Rename(tmp, working)
-	})
-	return true
-}
-
-func (s *fileAuditSink) rewriteSpillWorking(working string, remaining []string) error {
-	return s.withAuditFileLock(func() error {
-		if len(remaining) == 0 {
-			return os.Remove(working)
-		}
-		tmp := working + ".tmp"
-		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-		if err != nil {
-			return err
-		}
-		for _, line := range remaining {
-			if _, err := f.WriteString(line); err != nil {
-				_ = f.Close()
-				_ = os.Remove(tmp)
-				return err
-			}
-			if _, err := f.Write([]byte{'\n'}); err != nil {
-				_ = f.Close()
-				_ = os.Remove(tmp)
-				return err
-			}
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
-			return err
-		}
-		if err := f.Close(); err != nil {
-			_ = os.Remove(tmp)
-			return err
-		}
-		return os.Rename(tmp, working)
-	})
-}
-
-func splitNonEmptyLines(raw string) []string {
-	var out []string
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		out = append(out, line)
+	}); err != nil {
+		return false
 	}
-	return out
+	return true
 }
 
 func (s *fileAuditSink) syncFile() error {
 	err := s.withAuditFileLock(s.file.Sync)
 	if err != nil {
 		secretAuditSinkHealthy.Set(0)
-		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Add(1)
 	}
 	return err
 }
@@ -625,7 +626,8 @@ func (s *fileAuditSink) withAuditFileLock(fn func() error) error {
 	if lockPath == "" {
 		lockPath = s.path + ".lock"
 	}
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	// The sidecar is only a flock target and never stores data.
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -654,28 +656,60 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		scanner := bufio.NewScanner(src)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		var lastDroppedHash string
-		droppedAny := false
+		witnessedThrough := ""
+		witnessCandidate := ""
+		if tip, tipErr := readWitnessTip(s.witnessTipPath); tipErr == nil {
+			witnessCandidate = strings.TrimSpace(tip.HeadHex)
+		}
+		droppedLines := 0
+		droppingPrefix := true
+		chainPrev := auditlog.GenesisPrevHash
+		allowChainBreak := false
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
 				continue
 			}
 			var ev SecretAuditEvent
-			if json.Unmarshal([]byte(line), &ev) != nil {
-				continue
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				_ = src.Close()
+				return fmt.Errorf("secret audit retention encountered malformed event: %w", err)
 			}
-			if !ev.Time.IsZero() && ev.Time.Before(cutoff) {
-				droppedAny = true
+			storedPrev := strings.TrimSpace(ev.PrevHash)
+			if storedPrev == "" {
+				storedPrev = chainPrev
+			}
+			if ev.EventHash == "" || ev.EventHash != auditlog.HashEvent(storedPrev, ev) {
+				_ = src.Close()
+				return fmt.Errorf("secret audit retention encountered invalid event hash")
+			}
+			if ev.Kind == secretAuditKindRetentionCheckpoint {
+				allowChainBreak = true
+			} else {
+				if storedPrev != chainPrev && !allowChainBreak {
+					_ = src.Close()
+					return fmt.Errorf("secret audit retention encountered broken hash chain")
+				}
+				allowChainBreak = false
+			}
+			chainPrev = ev.EventHash
+			if droppingPrefix && !ev.Time.IsZero() && ev.Time.Before(cutoff) {
+				droppedLines++
 				if ev.EventHash != "" {
 					lastDroppedHash = ev.EventHash
+					if ev.EventHash == witnessCandidate {
+						witnessedThrough = witnessCandidate
+					}
 				}
+				continue
 			}
+			droppingPrefix = false
 		}
 		if err := scanner.Err(); err != nil {
 			_ = src.Close()
 			return err
 		}
-		if !droppedAny {
+		if droppedLines == 0 {
 			_ = src.Close()
 			return nil
 		}
@@ -684,17 +718,14 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 			return err
 		}
 
-		// WitnessedThrough ONLY if that dropped head was actually shipped.
-		witnessedThrough := ""
-		if lastDroppedHash != "" {
-			if tip, tipErr := readWitnessTip(s.witnessTipPath); tipErr == nil && tip.HeadHex != "" {
-				if tip.HeadHex == lastDroppedHash {
-					witnessedThrough = lastDroppedHash
-				}
-			}
-		}
+		// Carry the exact witnessed ancestor when it falls anywhere in the
+		// dropped prefix. Requiring it to equal the last dropped event would make
+		// a legitimately lagging witness unverifiable after retention.
 		cp := SecretAuditEvent{
-			Time:             time.Now().UTC(),
+			// Anchor the checkpoint at the retained boundary. Using prune wall
+			// time here would pin it at the head for an entire retention window
+			// and prevent daily prefix reclamation.
+			Time:             cutoff.UTC(),
 			Result:           secretAuditResultSuccess,
 			Reason:           "prune",
 			Kind:             secretAuditKindRetentionCheckpoint,
@@ -737,41 +768,21 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		// Pass 2: stream kept lines through unchanged (no rehash).
 		scanner = bufio.NewScanner(src)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		remainingDrops := droppedLines
 		for scanner.Scan() {
 			raw := strings.TrimSpace(scanner.Text())
 			if raw == "" {
 				continue
 			}
-			var ev SecretAuditEvent
-			if err := json.Unmarshal([]byte(raw), &ev); err != nil {
-				sum := sha256.Sum256([]byte(raw))
-				gap := SecretAuditEvent{
-					Time:    time.Unix(1_000_000_000+int64(sum[0]), 0).UTC(),
-					EventID: "ae-prune-malformed-" + hex.EncodeToString(sum[:8]),
-					Result:  secretAuditResultGap,
-					Reason:  secretAuditReasonOverflow,
-					Kind:    secretAuditKindGap,
-					Dropped: 1,
-				}
-				ensureSecretAuditEventID(&gap)
-				auditlog.LinkEvent(lastKeptHash, &gap)
-				b, mErr := json.Marshal(gap)
-				if mErr != nil {
-					_ = f.Close()
-					_ = src.Close()
-					return mErr
-				}
-				if _, err := writer.Write(append(b, '\n')); err != nil {
-					_ = f.Close()
-					_ = src.Close()
-					return err
-				}
-				lastKeptHash = gap.EventHash
-				lastKeptEventID = gap.EventID
+			if remainingDrops > 0 {
+				remainingDrops--
 				continue
 			}
-			if !ev.Time.IsZero() && ev.Time.Before(cutoff) {
-				continue
+			var ev SecretAuditEvent
+			if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+				_ = f.Close()
+				_ = src.Close()
+				return fmt.Errorf("secret audit retention event changed between passes: %w", err)
 			}
 			if _, err := writer.WriteString(raw); err != nil {
 				_ = f.Close()
@@ -841,6 +852,10 @@ func ensureSecretAuditEventID(ev *SecretAuditEvent) {
 }
 
 func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) error {
+	return s.writeEventInternal(ev, true)
+}
+
+func (s *fileAuditSink) writeEventInternal(ev SecretAuditEvent, accountFailure bool) error {
 	if s.writeHook != nil {
 		s.writeHook()
 	}
@@ -849,6 +864,12 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) error {
 	}
 	ensureSecretAuditEventID(&ev)
 	lineErr := s.withAuditFileLock(func() error {
+		s.chainMu.Lock()
+		poisoned := s.writePoison
+		s.chainMu.Unlock()
+		if poisoned != nil {
+			return fmt.Errorf("secret audit writer poisoned: %w", poisoned)
+		}
 		// Prefer in-memory tip under flock; fall back to sidecar/file scan.
 		prev := s.chainHead
 		if prev == "" {
@@ -862,12 +883,31 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) error {
 		if err != nil {
 			return err
 		}
-		if _, err := s.file.Write(append(line, '\n')); err != nil {
+		before, err := s.file.Stat()
+		if err != nil {
 			return err
+		}
+		rollback := func(writeErr error) error {
+			if truncateErr := s.file.Truncate(before.Size()); truncateErr != nil {
+				s.chainMu.Lock()
+				s.writePoison = fmt.Errorf("rollback append after %v: %w", writeErr, truncateErr)
+				s.chainMu.Unlock()
+				return s.writePoison
+			}
+			if syncErr := s.file.Sync(); syncErr != nil {
+				s.chainMu.Lock()
+				s.writePoison = fmt.Errorf("sync rollback after %v: %w", writeErr, syncErr)
+				s.chainMu.Unlock()
+				return s.writePoison
+			}
+			return writeErr
+		}
+		if _, err := s.file.Write(append(line, '\n')); err != nil {
+			return rollback(err)
 		}
 		// Tip is written only AFTER the event bytes are durable.
 		if err := s.file.Sync(); err != nil {
-			return err
+			return rollback(err)
 		}
 		s.chainMu.Lock()
 		s.chainHead = ev.EventHash
@@ -881,9 +921,11 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) error {
 	})
 	if lineErr != nil {
 		secretAuditSinkHealthy.Set(0)
-		auditEventsDroppedTotal.Add(1)
-		n := s.pendingGap.Add(1)
-		persistGapCount(s.gapPath, n)
+		if accountFailure {
+			auditEventsDroppedTotal.Add(1)
+			n := s.pendingGap.Add(1)
+			s.persistGapState(n)
+		}
 		return lineErr
 	}
 	secretAuditSinkHealthy.Set(1)
@@ -1025,7 +1067,7 @@ func persistChainTipErr(path, head, eventID string) error {
 	if path == "" || head == "" {
 		return nil
 	}
-	return os.WriteFile(path, []byte(head+"\n"+eventID+"\n"), 0o600)
+	return writeFileAtomicDurable(path, []byte(head+"\n"+eventID+"\n"), 0o600)
 }
 
 func loadGapCount(path string) int64 {
@@ -1044,7 +1086,7 @@ func persistGapCount(path string, n int64) {
 	if path == "" {
 		return
 	}
-	_ = os.WriteFile(path, []byte(strconv.FormatInt(n, 10)+"\n"), 0o600)
+	_ = writeFileAtomicDurable(path, []byte(strconv.FormatInt(n, 10)+"\n"), 0o600)
 }
 
 func clearGapCount(path string) {
@@ -1052,6 +1094,60 @@ func clearGapCount(path string) {
 		return
 	}
 	_ = os.Remove(path)
+}
+
+func (s *fileAuditSink) persistGapState(n int64) {
+	if s == nil {
+		return
+	}
+	s.gapMu.Lock()
+	defer s.gapMu.Unlock()
+	if n <= 0 {
+		clearGapCount(s.gapPath)
+		return
+	}
+	persistGapCount(s.gapPath, n)
+}
+
+func writeFileAtomicDurable(path string, data []byte, perm os.FileMode) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("durable sidecar path is empty")
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	remove := true
+	defer func() {
+		_ = tmp.Close()
+		if remove {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	remove = false
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (s *Service) ensureSecretAuditSink() {

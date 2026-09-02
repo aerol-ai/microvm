@@ -36,8 +36,6 @@ const (
 	DefaultPageLimit = 100
 	// MaxPageLimit is the hard ceiling for limit=.
 	MaxPageLimit = 500
-	// OwnerRefHeader scopes forwarded list requests to a tenant on every facade.
-	OwnerRefHeader = "X-Cluster-List-Owner-Ref"
 	// Coverage header names keep the /v1/sandboxes body a bare array (SDK wire
 	// compat) while making partial results observable.
 	HeaderPartial        = "X-Cluster-List-Partial"
@@ -63,13 +61,9 @@ type Result struct {
 	NextPageToken string            `json:"next_page_token,omitempty"`
 }
 
-// Transport carries the cluster HTTP clients. InternalClient is the cert-pinned
-// mTLS client; PublicClient is the advertise-URL client (fleet PAT only).
+// Transport carries the cert-pinned cluster-internal mTLS client.
 type Transport struct {
-	PublicClient   *http.Client
 	InternalClient *http.Client
-	FleetPAT       string
-	EnterpriseMode bool
 	// PeerClient, when set, returns a cached per-node mTLS client (no transport
 	// clone per dial). Cluster/Agent implement this via ClientForPeer.
 	PeerClient func(nodeID string) *http.Client
@@ -99,8 +93,7 @@ type Options struct {
 
 // PeerDialer is implemented by cluster.Cluster / cluster.Agent.
 type PeerDialer interface {
-	PeerHTTPClients() (public, internal *http.Client)
-	PeerPAT() string
+	PeerInternalHTTPClient() *http.Client
 }
 
 // PeerClientProvider is implemented by cluster.Cluster / cluster.Agent.
@@ -120,10 +113,7 @@ func TransportFromCluster(c cluster.Client) Transport {
 	}
 	tr := Transport{}
 	if d, ok := c.(PeerDialer); ok {
-		pub, in := d.PeerHTTPClients()
-		tr.PublicClient = pub
-		tr.InternalClient = in
-		tr.FleetPAT = d.PeerPAT()
+		tr.InternalClient = d.PeerInternalHTTPClient()
 	}
 	if p, ok := c.(PeerClientProvider); ok {
 		tr.PeerClient = p.ClientForPeer
@@ -138,28 +128,6 @@ func OwnerRefFromContext(ctx context.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(access.Identity.OwnerRef)
-}
-
-// ApplyOwnerRefScope lets a fleet-PAT forwarded list request narrow to a
-// tenant on the local handler. Only honored for operator Access on
-// X-Cluster-Forwarded requests (v1 + Daytona/E2B facades).
-func ApplyOwnerRefScope(r *http.Request) context.Context {
-	if r == nil {
-		return context.Background()
-	}
-	ctx := r.Context()
-	ref := strings.TrimSpace(r.Header.Get(OwnerRefHeader))
-	if ref == "" || r.Header.Get("X-Cluster-Forwarded") != "1" {
-		return ctx
-	}
-	access, ok := controlplane.AccessFromContext(ctx)
-	if !ok || !access.Operator {
-		return ctx
-	}
-	return controlplane.ContextWithAccess(ctx, controlplane.Access{
-		Identity: controlplane.Identity{OwnerRef: ref},
-		Operator: false,
-	})
 }
 
 // SelectPeersForPage returns owner peers for one placement-index page plus the
@@ -210,12 +178,12 @@ func SelectPeersForPage(c cluster.Client, ownerRef, pageToken string, limit int)
 			if !cluster.CanOwnSandboxRole(m.Role) {
 				continue
 			}
-			if strings.TrimSpace(m.InternalURL) == "" && strings.TrimSpace(m.APIURL) == "" {
-				continue
-			}
 			aliveOwners++
 			if aliveOwners > 256 {
 				return nil, nil, "", false, nil
+			}
+			if strings.TrimSpace(m.InternalURL) == "" {
+				continue
 			}
 			out = append(out, m)
 		}
@@ -240,7 +208,7 @@ func peersFromPlacements(page cluster.PlacementPageResponse, selfID string, look
 			missing = append(missing, id)
 			continue
 		}
-		if strings.TrimSpace(m.InternalURL) == "" && strings.TrimSpace(m.APIURL) == "" {
+		if strings.TrimSpace(m.InternalURL) == "" {
 			missing = append(missing, id)
 			continue
 		}
@@ -594,9 +562,6 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 	if opts.AuthHeader != "" {
 		req.Header.Set("Authorization", opts.AuthHeader)
 	}
-	if ref := strings.TrimSpace(opts.OwnerRef); ref != "" {
-		req.Header.Set(OwnerRefHeader, ref)
-	}
 	cluster.SetPeerNodeIDHeader(req, opts.SelfNodeID)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -642,7 +607,7 @@ func dialPeer(m cluster.Member, tr Transport) (*http.Client, string, error) {
 	if tr.PeerClient != nil {
 		cached = tr.PeerClient(m.NodeID)
 	}
-	client, base, err := cluster.PeerDialCached(m, tr.PublicClient, tr.InternalClient, cached, tr.EnterpriseMode)
+	client, base, err := cluster.PeerDialCached(m, tr.InternalClient, cached)
 	if err != nil {
 		return nil, "", err
 	}

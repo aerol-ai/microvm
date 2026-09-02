@@ -131,11 +131,12 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		Noop:           cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		internalClient: remote.Client(),
 		members: []cluster.Member{
 			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 			{
@@ -182,11 +183,12 @@ func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleMixed}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("mixed-a", "http://mixed-a", ""),
+		Noop:           cluster.NewNoop("mixed-a", "http://mixed-a", ""),
+		internalClient: remote.Client(),
 		members: []cluster.Member{
 			{NodeID: "mixed-a", APIURL: "http://mixed-a", Alive: true, Role: config.NodeRoleMixed},
 			{
-				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 		},
@@ -224,11 +226,12 @@ func TestClusterBuildImageWrapReturnsBadGatewayWhenPeerBuildFails(t *testing.T) 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		Noop:           cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		internalClient: remote.Client(),
 		members: []cluster.Member{
 			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 		},

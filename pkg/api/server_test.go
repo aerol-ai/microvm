@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"expvar"
 	"fmt"
@@ -12,9 +14,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 )
+
+type apiLivePeerCluster struct {
+	*cluster.Noop
+}
+
+func (c *apiLivePeerCluster) LookupMember(id string) (cluster.Member, bool) {
+	if id == "peer-test" {
+		return cluster.Member{NodeID: id, Alive: true}, true
+	}
+	return c.Noop.LookupMember(id)
+}
 
 func TestRequireAuthCases(t *testing.T) {
 	tests := []struct {
@@ -217,6 +231,44 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestClusterControlHeadersRequireAuthenticatedPeer(t *testing.T) {
+	server := NewServer(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil, nil, nil,
+		config.Config{EnableCluster: true},
+		"pat-token",
+		nil,
+	)
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	request.Header.Set("X-Cluster-Create-Target", "node-a")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestClusterControlHeadersAllowLiveAuthenticatedPeer(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&apiLivePeerCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")})
+	server := NewServer(logger, svc, nil, nil, config.Config{EnableCluster: true}, "pat-token", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader("not-json"))
+	request.Header.Set("Authorization", "Bearer pat-token")
+	request.Header.Set("X-Cluster-Create-Target", "node-a")
+	request.Header.Set(cluster.PeerNodeIDHeader, "peer-test")
+	cert := &x509.Certificate{DNSNames: []string{"node:peer-test"}}
+	request.TLS = &tls.ConnectionState{
+		PeerCertificates: []*x509.Certificate{cert},
+		VerifiedChains:   [][]*x509.Certificate{{cert}},
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want handler's 400 after peer authentication; body=%s", response.Code, response.Body.String())
+	}
 }
 
 func TestHandleHealth(t *testing.T) {

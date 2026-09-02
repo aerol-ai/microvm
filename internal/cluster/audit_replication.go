@@ -29,13 +29,13 @@ type AuditPeerPage struct {
 // AuditPeerFetcher is the narrow seam Service uses for audit fan-out so tests
 // can inject a fake without a full Cluster.
 type AuditPeerFetcher interface {
-	FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error)
+	FetchSandboxAuditFromPeer(ctx context.Context, nodeID, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error)
 }
 
 // SandboxMetaFetcher loads OwnerRef from a placement owner for ingress
 // authorization of GET /sandboxes/{id}/audit (no local SQLite row).
 type SandboxMetaFetcher interface {
-	FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID string) (ownerRef string, ok bool, err error)
+	FetchSandboxOwnerRef(ctx context.Context, nodeID, sandboxID string) (ownerRef string, ok bool, err error)
 }
 
 // SandboxOwnerMeta is the peer-local owner-ref probe response.
@@ -45,11 +45,15 @@ type SandboxOwnerMeta struct {
 }
 
 // FetchSandboxAuditFromPeer GETs a peer's local audit slice for sandboxID.
-func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
-	if c == nil || c.httpClient == nil {
+func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, nodeID, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
+	if c == nil || c.currentInternalClient() == nil || c.gossip == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: audit fetch unavailable")
 	}
-	client, endpoint, err := auditPeerTransport(c.httpClient, c.currentInternalClient(), c.Members(), apiURL)
+	m, ok := c.gossip.lookupMember(strings.TrimSpace(nodeID))
+	if !ok || !m.Alive {
+		return AuditPeerPage{}, fmt.Errorf("cluster: audit peer %q is unavailable", nodeID)
+	}
+	client, endpoint, err := c.PeerDialMember(m)
 	if err != nil {
 		return AuditPeerPage{}, err
 	}
@@ -57,11 +61,15 @@ func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandbox
 }
 
 // FetchSandboxAuditFromPeer GETs a peer's local audit slice (worker agent).
-func (a *Agent) FetchSandboxAuditFromPeer(ctx context.Context, apiURL, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
-	if a == nil || a.httpClient == nil {
+func (a *Agent) FetchSandboxAuditFromPeer(ctx context.Context, nodeID, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
+	if a == nil || a.internalClient == nil || a.gossip == nil {
 		return AuditPeerPage{}, fmt.Errorf("cluster: audit fetch unavailable")
 	}
-	client, endpoint, err := auditPeerTransport(a.httpClient, a.internalClient, a.Members(), apiURL)
+	m, ok := a.gossip.lookupMember(strings.TrimSpace(nodeID))
+	if !ok || !m.Alive {
+		return AuditPeerPage{}, fmt.Errorf("cluster: audit peer %q is unavailable", nodeID)
+	}
+	client, endpoint, err := a.PeerDialMember(m)
 	if err != nil {
 		return AuditPeerPage{}, err
 	}
@@ -136,40 +144,34 @@ func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, se
 }
 
 // FetchSandboxOwnerRef GETs owner metadata from the placement owner.
-func (c *Cluster) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID string) (string, bool, error) {
-	if c == nil || c.httpClient == nil {
+func (c *Cluster) FetchSandboxOwnerRef(ctx context.Context, nodeID, sandboxID string) (string, bool, error) {
+	if c == nil || c.currentInternalClient() == nil || c.gossip == nil {
 		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
 	}
-	client, endpoint, err := auditPeerTransport(c.httpClient, c.currentInternalClient(), c.Members(), apiURL)
+	m, ok := c.gossip.lookupMember(strings.TrimSpace(nodeID))
+	if !ok || !m.Alive {
+		return "", false, fmt.Errorf("cluster: sandbox meta peer %q is unavailable", nodeID)
+	}
+	client, endpoint, err := c.PeerDialMember(m)
 	if err != nil {
 		return "", false, err
 	}
 	return fetchSandboxOwnerRef(ctx, client, c.patToken, c.nodeID, endpoint, sandboxID)
 }
 
-func (a *Agent) FetchSandboxOwnerRef(ctx context.Context, apiURL, sandboxID string) (string, bool, error) {
-	if a == nil || a.httpClient == nil {
+func (a *Agent) FetchSandboxOwnerRef(ctx context.Context, nodeID, sandboxID string) (string, bool, error) {
+	if a == nil || a.internalClient == nil || a.gossip == nil {
 		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
 	}
-	client, endpoint, err := auditPeerTransport(a.httpClient, a.internalClient, a.Members(), apiURL)
+	m, ok := a.gossip.lookupMember(strings.TrimSpace(nodeID))
+	if !ok || !m.Alive {
+		return "", false, fmt.Errorf("cluster: sandbox meta peer %q is unavailable", nodeID)
+	}
+	client, endpoint, err := a.PeerDialMember(m)
 	if err != nil {
 		return "", false, err
 	}
 	return fetchSandboxOwnerRef(ctx, client, a.patToken, a.nodeID, endpoint, sandboxID)
-}
-
-// auditPeerTransport selects the peer audit/meta dial via PeerDial. When
-// internalClient is set, missing InternalURL fails closed — never PAT+APIURL.
-func auditPeerTransport(publicClient, internalClient *http.Client, members []Member, apiURL string) (*http.Client, string, error) {
-	want := strings.TrimRight(strings.TrimSpace(apiURL), "/")
-	m := Member{APIURL: apiURL}
-	for _, member := range members {
-		if strings.TrimRight(strings.TrimSpace(member.APIURL), "/") == want {
-			m = member
-			break
-		}
-	}
-	return PeerDial(m, publicClient, internalClient)
 }
 
 func (n *Noop) FetchSandboxOwnerRef(context.Context, string, string) (string, bool, error) {

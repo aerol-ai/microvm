@@ -99,7 +99,7 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 			return
 		}
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
+		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
 }
 
@@ -124,7 +124,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// without consuming a placement slot — and so the test that passes a nil
 	// service still observes the same "bad request → 400" contract as the
 	// pre-cluster handler.
-	raw, err := io.ReadAll(r.Body)
+	raw, err := apihttp.ReadJSONBody(w, r)
 	_ = r.Body.Close()
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
@@ -238,7 +238,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Header.Set(clusterCreateTargetHeader, target.NodeID)
 		r.Header.Del(clusterCreateIDHeader)
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 		return
 	}
 
@@ -312,7 +312,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	service.RecordCreateReservationState("reserve_remote")
 	r.Header.Set(clusterCreateTargetHeader, target.NodeID)
 	r.Header.Set(clusterCreateIDHeader, sandboxID)
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 }
 
 // createSandboxOnSelectedNode performs the local side effect once placement has
@@ -927,9 +927,8 @@ func (h *handlers) setNodeDrainState(w http.ResponseWriter, r *http.Request, dra
 }
 
 // clusterInternalApply receives an encoded raft command from a follower and
-// applies it on this node. The handler is auth-gated by the same PAT bearer
-// as every other v1 route, so any caller able to forward here is already
-// trusted to mutate the cluster state directly. We respond 503 (and *not* a
+// applies it on this node. The handler is gated by node-bound mTLS, live gossip
+// membership, and the ordinary API auth layer. We respond 503 (and *not* a
 // generic 5xx) when raft says we're not the leader so the forwarder treats it
 // as a retry signal rather than a hard failure.
 func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) {
@@ -938,10 +937,15 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	const maxApplyBody = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxApplyBody+1))
 	_ = r.Body.Close()
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	if len(body) > maxApplyBody {
+		apihttp.WriteError(w, http.StatusRequestEntityTooLarge, "raft command body exceeds 1 MiB")
 		return
 	}
 	if len(body) == 0 {

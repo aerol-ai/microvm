@@ -311,8 +311,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	} else {
 		svc.ConfigureHTTPAuditExporter()
 	}
-	if cfg.EnterpriseMode && !cp.HasExternalWitness() && strings.TrimSpace(cfg.SecretAuditExportURL) == "" && !cp.HasAuditExporter() {
-		logger.Warn("enterprise mode without export URL or external witness: disk loss loses audit events; set SB_SECRET_AUDIT_EXPORT_URL or wire controlplane.Witness/AuditExporter")
+	if cfg.EnterpriseMode && strings.TrimSpace(cfg.SecretAuditExportURL) == "" && !cp.HasAuditExporter() {
+		return errors.New("enterprise mode requires an off-node audit exporter: set SB_SECRET_AUDIT_EXPORT_URL or wire controlplane.AuditExporter")
 	}
 	// Witness is installed after the sink opens; re-validate so enterprise +
 	// external witness fail closed at boot when the chain/receipts disagree.
@@ -645,6 +645,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			// failover_ready is not stuck false after a restart (holders are
 			// in-memory only). Best-effort; fan-out continues async.
 			if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
+				if cfg.EnterpriseMode {
+					return fmt.Errorf("cluster: validate/re-fanout durable secrets at boot: %w", err)
+				}
 				logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
 			}
 			if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {

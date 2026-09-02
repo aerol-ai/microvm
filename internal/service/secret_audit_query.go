@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,13 @@ const (
 	// secretAuditFanoutDeadline bounds the whole peer fan-out (not per peer).
 	secretAuditFanoutDeadline = 5 * time.Second
 	secretAuditFanoutParallel = 16
+)
+
+var (
+	// ErrSecretAuditIndexIncomplete refuses an unbounded all-worker scan when
+	// Raft cannot identify the nodes that owned the sandbox's evidence.
+	ErrSecretAuditIndexIncomplete = errors.New("secret audit node index is unavailable or truncated")
+	secretAuditFanoutSlots        = make(chan struct{}, 32)
 )
 
 // SecretAuditQuery pages local/cluster secret-audit history for one sandbox.
@@ -229,9 +237,9 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 // ListSecretAudit returns local events merged with a live fan-out to reachable
 // peers. Coverage.Missing lists peers that timed out or failed — never silent.
 //
-// Interim scale bounds (full indexed/central sink is parked in TODOS.md):
+// Scale bounds:
 //   - target the bounded Raft-retained owner history when complete
-//   - fall back to all workers if history is absent/truncated (never a vacuum)
+//   - fail explicitly when history is absent/truncated; never scan all workers
 //   - skip pure ingress roles (they do not host sandboxes)
 //   - bounded parallel peer fetches under a short global deadline
 func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts SecretAuditQuery) (SecretAuditPage, error) {
@@ -251,13 +259,11 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 	}
 
 	selfID := ""
-	selfURL := ""
 	var members []cluster.Member
 	prefer := map[string]struct{}{}
 	preferKnown := false
 	if c := s.Cluster(); c != nil {
 		selfID = c.SelfNodeID()
-		selfURL = strings.TrimRight(c.SelfAPIURL(), "/")
 		members = c.Members()
 		if p, ok := c.PlacementOf(sandboxID); ok {
 			if !p.AuditNodesTruncated {
@@ -274,6 +280,9 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 			}
 			preferKnown = len(prefer) > 0
 		}
+	}
+	if len(members) > 1 && !preferKnown {
+		return SecretAuditPage{}, ErrSecretAuditIndexIncomplete
 	}
 
 	coverage := SecretAuditCoverage{Answered: []string{}}
@@ -295,7 +304,6 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 
 	type peerJob struct {
 		nodeID string
-		apiURL string
 	}
 	var jobs []peerJob
 	deadPrefer := map[string]struct{}{}
@@ -303,11 +311,14 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		deadPrefer[id] = struct{}{}
 	}
 	for _, m := range members {
-		if !m.Alive || strings.TrimSpace(m.APIURL) == "" {
+		if !m.Alive {
 			continue
 		}
 		if m.NodeID == selfID {
 			delete(deadPrefer, m.NodeID)
+			continue
+		}
+		if strings.TrimSpace(m.InternalURL) == "" {
 			continue
 		}
 		role := strings.TrimSpace(m.Role)
@@ -320,11 +331,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 			}
 		}
 		delete(deadPrefer, m.NodeID)
-		peerURL := strings.TrimRight(m.APIURL, "/")
-		if peerURL == "" || peerURL == selfURL {
-			continue
-		}
-		jobs = append(jobs, peerJob{nodeID: m.NodeID, apiURL: peerURL})
+		jobs = append(jobs, peerJob{nodeID: m.NodeID})
 	}
 	for id := range deadPrefer {
 		if id == selfID {
@@ -354,7 +361,14 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 			go func() {
 				defer wg.Done()
 				for j := range jobCh {
-					page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.apiURL, sandboxID, limit, opts.Cursor, opts.Kind, opts.IncarnationID)
+					select {
+					case secretAuditFanoutSlots <- struct{}{}:
+					case <-fanCtx.Done():
+						results <- peerResult{nodeID: j.nodeID, err: fanCtx.Err()}
+						continue
+					}
+					page, fetchErr := fetcher.FetchSandboxAuditFromPeer(fanCtx, j.nodeID, sandboxID, limit, opts.Cursor, opts.Kind, opts.IncarnationID)
+					<-secretAuditFanoutSlots
 					results <- peerResult{nodeID: j.nodeID, page: page, err: fetchErr}
 				}
 			}()
@@ -412,8 +426,6 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		merged = merged[:limit]
 	}
 	if len(merged) == limit {
-		nextCursor = formatSecretAuditCursor(merged[len(merged)-1])
-	} else if nextCursor == "" && len(merged) > 0 && len(merged) == limit {
 		nextCursor = formatSecretAuditCursor(merged[len(merged)-1])
 	}
 	return SecretAuditPage{Events: merged, Coverage: coverage, NextCursor: nextCursor}, nil

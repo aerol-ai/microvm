@@ -86,7 +86,7 @@ func TestClusterTemplatePeersFiltersMembers(t *testing.T) {
 				{NodeID: "dead", APIURL: "http://dead", Alive: false, Role: config.NodeRoleWorker},
 				{NodeID: "drained", APIURL: "http://drained", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
 				{NodeID: "docker-only", APIURL: "http://docker-only", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}}},
-				{NodeID: "fc-peer", APIURL: "http://fc-peer", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
+				{NodeID: "fc-peer", APIURL: "http://fc-peer", InternalURL: "https://fc-peer:21443", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
 			},
 		},
 		drained: map[string]bool{"drained": true},
@@ -227,7 +227,7 @@ func TestRunImageBuildOnTargetCoverage(t *testing.T) {
 		h := &handlers{deps: Deps{Builder: builder, Logger: logger}}
 		parent := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
 		parent.Header.Set("Content-Type", "application/json")
-		status, header, respBody, err := h.runImageBuildOnTarget(parent, body, cluster.Member{NodeID: "self"}, true)
+		status, header, respBody, err := h.runImageBuildOnTarget(nil, parent, body, cluster.Member{NodeID: "self"}, true)
 		if err != nil || status != http.StatusOK {
 			t.Fatalf("self build: status=%d err=%v body=%s", status, err, respBody)
 		}
@@ -249,7 +249,8 @@ func TestRunImageBuildOnTargetCoverage(t *testing.T) {
 		parent := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
 		parent.Header.Set("Authorization", "Bearer tok")
 		parent.Header.Set("Content-Type", "application/json")
-		status, _, _, err := h.runImageBuildOnTarget(parent, body, cluster.Member{NodeID: "worker", APIURL: remote.URL}, false)
+		c := &membersStubCluster{Noop: cluster.NewNoop("self", "http://self", ""), internalClient: remote.Client()}
+		status, _, _, err := h.runImageBuildOnTarget(c, parent, body, cluster.Member{NodeID: "worker", InternalURL: remote.URL}, false)
 		if err != nil || status != http.StatusOK {
 			t.Fatalf("remote build: status=%d err=%v", status, err)
 		}
@@ -261,11 +262,12 @@ func TestRunImageBuildOnTargetCoverage(t *testing.T) {
 
 func dockerFanoutCluster(selfID, workerURL string) cluster.Client {
 	return &membersStubCluster{
-		Noop: cluster.NewNoop(selfID, "http://"+selfID, ""),
+		Noop:           cluster.NewNoop(selfID, "http://"+selfID, ""),
+		internalClient: http.DefaultClient,
 		members: []cluster.Member{
 			{NodeID: selfID, APIURL: "http://" + selfID, Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-docker", APIURL: workerURL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: workerURL, InternalURL: workerURL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 		},
@@ -398,7 +400,7 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		}
 		for i := 0; i <= clusterListMaxFanoutPeers; i++ {
 			members = append(members, cluster.Member{
-				NodeID: fmt.Sprintf("fc-%d", i), APIURL: fmt.Sprintf("http://fc-%d", i), Alive: true,
+				NodeID: fmt.Sprintf("fc-%d", i), APIURL: fmt.Sprintf("http://fc-%d", i), InternalURL: fmt.Sprintf("http://fc-%d", i), Alive: true,
 				Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}},
 			})
 		}

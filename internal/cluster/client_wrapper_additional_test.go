@@ -247,7 +247,7 @@ func TestClusterDoLeaderLifecycleMapsResponses(t *testing.T) {
 			}))
 			defer server.Close()
 
-			c := &Cluster{httpClient: server.Client(), patToken: "cluster-pat"}
+			c := &Cluster{patToken: "cluster-pat"}
 			err := c.doLeaderLifecycle(ctx, server.Client(), server.URL+"/v1/cluster/members/node-a", http.MethodDelete, []byte(`{"force":true}`))
 			if tt.wantErr == nil {
 				if err != nil {
@@ -269,7 +269,7 @@ func TestClusterDoLeaderLifecycleMapsResponses(t *testing.T) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer server.Close()
-	c := &Cluster{httpClient: server.Client()}
+	c := &Cluster{}
 	if err := c.doLeaderLifecycle(ctx, server.Client(), server.URL+"/v1/cluster/members/node-a", http.MethodDelete, nil); err == nil || !strings.Contains(err.Error(), "status 500") {
 		t.Fatalf("doLeaderLifecycle(500) error = %v, want status 500 message", err)
 	}

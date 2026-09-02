@@ -265,28 +265,41 @@ const maxClusterListPages = 100000
 // Partial coverage or an unready placement view is returned as an error rather
 // than a silent incomplete list.
 func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
-	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
 	var items []*Sandbox
 	pageToken := ""
 	for page := 0; page < maxClusterListPages; page++ {
-		path := appendQueryParam(basePath, "page_token", pageToken)
-		var response []models.Sandbox
-		hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response)
+		response, next, err := c.ListPageWithOptions(ctx, tags, includeEnv, pageToken)
 		if err != nil {
 			return nil, err
 		}
-		if hdrs.Get("X-Cluster-List-Partial") == "true" || hdrs.Get("X-Cluster-List-Placement-Ready") == "false" {
-			return nil, errors.New("incomplete cluster list")
-		}
-		for _, item := range response {
-			items = append(items, c.wrap(item))
-		}
-		pageToken = strings.TrimSpace(hdrs.Get("X-Cluster-List-Next-Page-Token"))
+		items = append(items, response...)
+		pageToken = next
 		if pageToken == "" {
 			return items, nil
 		}
 	}
 	return nil, errors.New("incomplete cluster list: exceeded max pages")
+}
+
+// ListPageWithOptions fetches exactly one cluster list page. The returned
+// token is opaque and empty on the final page. This is the bounded-memory path
+// for fleet inventory callers; partial/unready coverage is always an error.
+func (c *Client) ListPageWithOptions(ctx context.Context, tags map[string]string, includeEnv bool, pageToken string) ([]*Sandbox, string, error) {
+	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
+	path := appendQueryParam(basePath, "page_token", pageToken)
+	var response []models.Sandbox
+	hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response)
+	if err != nil {
+		return nil, "", err
+	}
+	if hdrs.Get("X-Cluster-List-Partial") == "true" || hdrs.Get("X-Cluster-List-Placement-Ready") == "false" {
+		return nil, "", errors.New("incomplete cluster list")
+	}
+	items := make([]*Sandbox, 0, len(response))
+	for _, item := range response {
+		items = append(items, c.wrap(item))
+	}
+	return items, strings.TrimSpace(hdrs.Get("X-Cluster-List-Next-Page-Token")), nil
 }
 
 func appendQueryParam(path, key, value string) string {

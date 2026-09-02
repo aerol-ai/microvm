@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
@@ -521,8 +521,19 @@ class MicroVM:
         tags: Optional[Dict[str, str]] = None,
         include_env: bool = False,
     ) -> List[Sandbox]:
-        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
         items: List[Sandbox] = []
+        for page in self.iter_pages(tags=tags, include_env=include_env):
+            items.extend(page)
+        return items
+
+    def iter_pages(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+    ) -> Iterator[List[Sandbox]]:
+        """Yield one server page at a time for bounded-memory fleet scans."""
+        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
         page_token = ""
         for _ in range(100000):
             path = _append_query_param(base_path, "page_token", page_token)
@@ -531,11 +542,10 @@ class MicroVM:
             ready = headers.get("X-Cluster-List-Placement-Ready", "")
             if partial == "true" or ready == "false":
                 raise MicroVMError("incomplete cluster list")
-            for item in sandboxes or []:
-                items.append(self._wrap_sandbox(item))
+            yield [self._wrap_sandbox(item) for item in sandboxes or []]
             page_token = (headers.get("X-Cluster-List-Next-Page-Token") or "").strip()
             if page_token == "":
-                return items
+                return
         raise MicroVMError("incomplete cluster list: exceeded max pages")
 
     def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:

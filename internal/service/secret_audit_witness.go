@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"expvar"
@@ -348,7 +349,7 @@ func persistWitnessReceipt(receiptPath, tipPath string, rec witnessReceiptRecord
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(tipPath, append(raw, '\n'), 0o600); err != nil {
+		if err := writeFileAtomicDurable(tipPath, append(raw, '\n'), 0o600); err != nil {
 			return err
 		}
 	}
@@ -363,34 +364,17 @@ func persistWitnessReceipt(receiptPath, tipPath string, rec witnessReceiptRecord
 	if len(prev) > secretAuditWitnessReceiptKeep {
 		prev = prev[len(prev)-secretAuditWitnessReceiptKeep:]
 	}
-	tmp := receiptPath + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
+	var buf bytes.Buffer
 	for _, r := range prev {
 		line, err := json.Marshal(r)
 		if err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
 			return err
 		}
-		if _, err := f.Write(append(line, '\n')); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
+		if _, err := buf.Write(append(line, '\n')); err != nil {
 			return err
 		}
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, receiptPath)
+	return writeFileAtomicDurable(receiptPath, buf.Bytes(), 0o600)
 }
 
 func appendWitnessReceipt(path string, rec witnessReceiptRecord) error {

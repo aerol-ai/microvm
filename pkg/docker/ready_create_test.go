@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,20 +161,27 @@ func TestCreate_RemovesReadySocketOnStartFailure(t *testing.T) {
 func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	requireLinuxUnix(t)
 	readyDir := t.TempDir()
-	healthHits := 0
+	var healthHits atomic.Int64
 	ip, port, closeFn := toolboxServer(t, func(w http.ResponseWriter, r *http.Request) {
-		healthHits++
+		healthHits.Add(1)
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	t.Cleanup(closeFn)
 
-	var captured map[string]any
+	var (
+		capturedMu sync.RWMutex
+		captured   map[string]any
+	)
 	d := fakeCreateDaemon(t)
 	base := d.transport()
 	wrapped := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodPost && r.URL.Path == "/containers/create" && r.Body != nil {
 			body, _ := io.ReadAll(r.Body)
-			_ = json.Unmarshal(body, &captured)
+			var decoded map[string]any
+			_ = json.Unmarshal(body, &decoded)
+			capturedMu.Lock()
+			captured = decoded
+			capturedMu.Unlock()
 			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		return base(r)
@@ -215,7 +223,9 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 				return
 			}
 			nonce := parts[1]
+			capturedMu.RLock()
 			pushID := envValueFromCreate(captured, "SB_SANDBOX_ID")
+			capturedMu.RUnlock()
 			if pushID == "" {
 				return
 			}
@@ -235,8 +245,8 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	if timing.Source != "socket" {
 		t.Fatalf("source = %q, want socket", timing.Source)
 	}
-	if healthHits > 0 {
-		t.Fatalf("health poll ran %d times on socket win", healthHits)
+	if hits := healthHits.Load(); hits > 0 {
+		t.Fatalf("health poll ran %d times on socket win", hits)
 	}
 }
 

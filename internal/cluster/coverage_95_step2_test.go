@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
@@ -61,24 +62,24 @@ func TestReplicateJSBundleClusterAndAgentWrappers(t *testing.T) {
 
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "self", Alive: true, APIURL: "http://self"})
-	index.upsert(Member{NodeID: "peer", Alive: true, APIURL: peer.URL})
+	index.upsert(Member{NodeID: "peer", Alive: true, Role: config.NodeRoleWorker, APIURL: peer.URL, InternalURL: peer.URL, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}}})
 	gn := &gossipNode{memberIndex: index}
 
-	c := &Cluster{nodeID: "self", gossip: gn, httpClient: peer.Client(), patToken: "tok"}
+	c := &Cluster{nodeID: "self", gossip: gn, internalClient: peer.Client(), patToken: "tok"}
 	if err := c.ReplicateJSBundle(ctx, "owner", req); err == nil || !strings.Contains(err.Error(), "peer") {
 		t.Fatalf("Cluster replicate error=%v", err)
 	}
-	a := &Agent{nodeID: "self", gossip: gn, httpClient: peer.Client(), patToken: "tok"}
+	a := &Agent{nodeID: "self", gossip: gn, internalClient: peer.Client(), patToken: "tok"}
 	if err := a.ReplicateJSBundle(ctx, "owner", req); err == nil || !strings.Contains(err.Error(), "peer") {
 		t.Fatalf("Agent replicate error=%v", err)
 	}
 
 	// nil client short-circuits fan-out.
-	if err := replicateJSBundleToPeers(ctx, []Member{{NodeID: "p", Alive: true, APIURL: peer.URL}}, nil, "", "self", "o", req); err != nil {
+	if err := replicateJSBundleToPeers(ctx, []Member{{NodeID: "p", Alive: true, Role: config.NodeRoleWorker, InternalURL: peer.URL, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}}}}, nil, "", "self", "o", req); err != nil {
 		t.Fatalf("nil client: %v", err)
 	}
 	// marshal failure
-	if err := replicateJSBundleToPeers(ctx, nil, &http.Client{}, "", "self", "o", models.CreateJSBundleRequest{}); err != nil {
+	if err := replicateJSBundleToPeers(ctx, nil, func(Member) (*http.Client, string, error) { return &http.Client{}, "", nil }, "", "self", "o", models.CreateJSBundleRequest{}); err != nil {
 		// empty source still marshals; force via invalid type through helper path already covered —
 		// keep a successful marshal path with empty members.
 		_ = err
@@ -87,18 +88,18 @@ func TestReplicateJSBundleClusterAndAgentWrappers(t *testing.T) {
 
 func TestPostJSBundleReplicaErrorBranches(t *testing.T) {
 	ctx := context.Background()
-	if err := postJSBundleReplica(ctx, &http.Client{}, "://bad", "", "o", []byte(`{}`)); err == nil {
+	if err := postJSBundleReplica(ctx, &http.Client{}, "://bad", "", "self", "o", []byte(`{}`)); err == nil {
 		t.Fatal("expected invalid URL error")
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	if err := postJSBundleReplica(ctx, srv.Client(), srv.URL, "pat", "own", []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "500") {
+	if err := postJSBundleReplica(ctx, srv.Client(), srv.URL, "pat", "self", "own", []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("status error=%v", err)
 	}
 	// network error
-	if err := postJSBundleReplica(ctx, &http.Client{Timeout: time.Millisecond}, "http://127.0.0.1:1", "", "o", []byte(`{}`)); err == nil {
+	if err := postJSBundleReplica(ctx, &http.Client{Timeout: time.Millisecond}, "http://127.0.0.1:1", "", "self", "o", []byte(`{}`)); err == nil {
 		t.Fatal("expected dial error")
 	}
 }
@@ -375,9 +376,9 @@ func (errReader) Read([]byte) (int, error) { return 0, errors.New("read boom") }
 
 func TestAgentVolumeUpsertAndQueryErrorBranches(t *testing.T) {
 	vols := map[string]models.Volume{"t1/n1": {ID: "vol-1", Tenant: "t1", Name: "n1", Backend: "s3"}}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, internalClient := newNodeBoundForwardServer(t, "worker", "cp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+		case r.Method == http.MethodPost && (r.URL.Path == PublicInternalApplyPath || r.URL.Path == InternalAPIPath):
 			var cmd command
 			body, _ := io.ReadAll(r.Body)
 			if err := decodeCommandInto(body, &cmd); err != nil {
@@ -439,15 +440,14 @@ func TestAgentVolumeUpsertAndQueryErrorBranches(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
 
 	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "cp", APIURL: server.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "cp", APIURL: server.URL, InternalURL: server.URL, Alive: true, Role: config.NodeRoleServer})
 	a := &Agent{
-		nodeID:     "worker",
-		httpClient: server.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID:         "worker",
+		internalClient: internalClient,
+		gossip:         &gossipNode{memberIndex: index},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	ctx := context.Background()
 
@@ -511,7 +511,7 @@ func TestAgentVolumeUpsertAndQueryErrorBranches(t *testing.T) {
 	defer deadRead.Close()
 	index2 := newGossipMemberIndex()
 	index2.upsert(Member{NodeID: "cp", APIURL: deadRead.URL, Alive: true, Role: config.NodeRoleServer})
-	a2 := &Agent{nodeID: "w", httpClient: deadRead.Client(), gossip: &gossipNode{memberIndex: index2}, logger: a.logger}
+	a2 := &Agent{nodeID: "w", gossip: &gossipNode{memberIndex: index2}, logger: a.logger}
 	ctxCancel, cancel := context.WithCancel(ctx)
 	cancel()
 	if _, _, err := a2.VolumeUpsert(ctxCancel, models.Volume{ID: "v", Tenant: "t", Name: "never-appear", Backend: "s3"}, 0); err == nil {

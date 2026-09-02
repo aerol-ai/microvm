@@ -250,6 +250,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 	peer := cluster.Placement{
 		SandboxID: "sb-peer", OwnerNodeID: "peer-1", OwnerAPIURL: "http://10.0.0.2:8080",
 		Version: 1,
+		Spec:    &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 			5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 25432},
 			8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -300,6 +301,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 		OwnerNodeID: "peer-2",
 		OwnerAPIURL: "http://10.0.0.3:8080",
 		Version:     2,
+		Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 			9090: {},
 		},
@@ -373,6 +375,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 			OwnerAPIURL:        "http://10.0.0.7:21212",
 			OwnerDataPlaneHost: "10.0.0.7",
 			Version:            1,
+			Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			CustomHostnames:    []string{"api.acme.com"},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -385,6 +388,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 			SandboxID:   "sb-flux",
 			OwnerNodeID: "peer-2",
 			Version:     2,
+			Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				9000: {Protocol: models.ExposedPortProtocolHTTP},
 			},

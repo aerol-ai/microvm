@@ -62,6 +62,52 @@ func TestSandboxAuditACLAtomicCreateAndRetentionPrune(t *testing.T) {
 	}
 }
 
+func TestSandboxAuditACLRetainsOwnerlessOperatorEvidence(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-operator-audit")
+	sb.OwnerRef = ""
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	exists, err := st.HasSandboxAuditACL(ctx, sb.ID, "")
+	if err != nil || !exists {
+		t.Fatalf("ownerless audit ACL exists=%v err=%v", exists, err)
+	}
+	if err := st.UpsertSandboxAuditACL(ctx, sb.ID, "", "inc-operator"); err != nil {
+		t.Fatalf("UpsertSandboxAuditACL: %v", err)
+	}
+	exists, err = st.HasSandboxAuditACL(ctx, sb.ID, "inc-operator")
+	if err != nil || !exists {
+		t.Fatalf("ownerless incarnation ACL exists=%v err=%v", exists, err)
+	}
+}
+
+func TestRollbackSandboxCreateRemovesAuditExistenceRecord(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-create-rollback")
+	sb.OwnerRef = "tenant-a"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := st.UpsertSandboxAuditACL(ctx, sb.ID, sb.OwnerRef, "inc-aborted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RollbackSandboxCreate(ctx, sb.ID); err != nil {
+		t.Fatalf("RollbackSandboxCreate: %v", err)
+	}
+	if _, err := st.Get(ctx, sb.ID); err != ErrNotFound {
+		t.Fatalf("sandbox after rollback = %v, want ErrNotFound", err)
+	}
+	for _, inc := range []string{"", "inc-aborted"} {
+		exists, err := st.HasSandboxAuditACL(ctx, sb.ID, inc)
+		if err != nil || exists {
+			t.Fatalf("audit ACL inc=%q exists=%v err=%v", inc, exists, err)
+		}
+	}
+}
+
 func TestSecretDeleteOutboxBatchRotatesAttemptedRows(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

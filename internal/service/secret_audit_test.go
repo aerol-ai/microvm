@@ -382,6 +382,155 @@ func TestFileAuditSinkEnterpriseSpillDrainAndMalformedGap(t *testing.T) {
 	}
 }
 
+func TestFileAuditSinkFailedGapFlushKeepsPendingCount(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	sink.pendingGap.Store(3)
+	persistGapCount(sink.gapPath, 3)
+	sink.chainMu.Lock()
+	sink.writePoison = errors.New("injected ambiguous append")
+	sink.chainMu.Unlock()
+	_ = sink.Sync()
+	if got := sink.pendingGap.Load(); got != 3 {
+		t.Fatalf("pending gap = %d, want 3 after failed marker write", got)
+	}
+	if got := loadGapCount(sink.gapPath); got != 3 {
+		t.Fatalf("durable gap count = %d, want 3", got)
+	}
+}
+
+func TestFileAuditSinkPruneOnlyDropsContiguousPrefix(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	now := time.Now().UTC()
+	for _, ev := range []SecretAuditEvent{
+		{Time: now, EventID: "fresh-1", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(-48 * time.Hour), EventID: "old-middle", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(time.Second), EventID: "fresh-2", SandboxID: "sb", Result: secretAuditResultSuccess},
+	} {
+		if err := sink.EmitDurable(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sink.Prune(now.Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(nonEmptyLines(string(raw))); got != 3 {
+		t.Fatalf("retained lines = %d, want 3; middle old event is not a droppable prefix", got)
+	}
+	if _, _, err := RecomputeChainHead(sink.path); err != nil {
+		t.Fatalf("chain after prefix-safe prune: %v", err)
+	}
+}
+
+func TestFileAuditSinkRetentionCheckpointDoesNotBlockNextPrune(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	now := time.Now().UTC()
+	for _, ev := range []SecretAuditEvent{
+		{Time: now.Add(-72 * time.Hour), EventID: "old", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(-36 * time.Hour), EventID: "middle", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now, EventID: "fresh", SandboxID: "sb", Result: secretAuditResultSuccess},
+	} {
+		if err := sink.EmitDurable(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sink.Prune(now.Add(-48 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Prune(now.Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"event_id":"old"`)) || bytes.Contains(raw, []byte(`"event_id":"middle"`)) {
+		t.Fatalf("successive retention left expired prefix behind: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`"event_id":"fresh"`)) {
+		t.Fatalf("successive retention removed fresh event: %s", raw)
+	}
+	if _, _, err := RecomputeChainHead(sink.path); err != nil {
+		t.Fatalf("chain after successive retention: %v", err)
+	}
+}
+
+func TestFileAuditSinkPruneCarriesWitnessedDroppedAncestor(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	now := time.Now().UTC()
+	for _, ev := range []SecretAuditEvent{
+		{Time: now.Add(-72 * time.Hour), EventID: "old-witnessed", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(-60 * time.Hour), EventID: "old-later", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now, EventID: "fresh", SandboxID: "sb", Result: secretAuditResultSuccess},
+	} {
+		if err := sink.EmitDurable(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var witnessed SecretAuditEvent
+	if err := json.Unmarshal([]byte(nonEmptyLines(string(raw))[0]), &witnessed); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistWitnessReceipt("", sink.witnessTipPath, witnessReceiptRecord{HeadHex: witnessed.EventHash}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Prune(now.Add(-48 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint SecretAuditEvent
+	if err := json.Unmarshal([]byte(nonEmptyLines(string(raw))[0]), &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.Kind != secretAuditKindRetentionCheckpoint || checkpoint.WitnessedThrough != witnessed.EventHash {
+		t.Fatalf("checkpoint = %+v, want witnessed ancestor %q", checkpoint, witnessed.EventHash)
+	}
+}
+
+func TestFileAuditSinkEmitDurablePersistsBeforeReturn(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	if err := sink.EmitDurable(SecretAuditEvent{EventID: "durable-1", SandboxID: "sb", Result: secretAuditResultSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("durable-1")) {
+		t.Fatalf("durable event absent after return: %s", raw)
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)

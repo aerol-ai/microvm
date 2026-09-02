@@ -12,9 +12,9 @@ type peerClientCache struct {
 	m sync.Map // nodeID -> *http.Client
 }
 
-func (c *peerClientCache) get(base *http.Client, nodeID string, rejectLegacy bool) *http.Client {
+func (c *peerClientCache) get(base *http.Client, nodeID string) *http.Client {
 	if c == nil {
-		return ClientForPeer(base, nodeID, rejectLegacy)
+		return ClientForPeer(base, nodeID)
 	}
 	nodeID = strings.TrimSpace(nodeID)
 	if base == nil || nodeID == "" {
@@ -25,7 +25,7 @@ func (c *peerClientCache) get(base *http.Client, nodeID string, rejectLegacy boo
 			return client
 		}
 	}
-	client := ClientForPeer(base, nodeID, rejectLegacy)
+	client := ClientForPeer(base, nodeID)
 	if client == nil || client == base {
 		return client
 	}
@@ -44,5 +44,9 @@ func (c *peerClientCache) invalidate(nodeID string) {
 	if nodeID == "" {
 		return
 	}
-	c.m.Delete(nodeID)
+	if cached, ok := c.m.LoadAndDelete(nodeID); ok {
+		if client, ok := cached.(*http.Client); ok && client != nil {
+			client.CloseIdleConnections()
+		}
+	}
 }

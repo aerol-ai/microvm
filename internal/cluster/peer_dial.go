@@ -3,6 +3,7 @@ package cluster
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -10,49 +11,49 @@ import (
 // peer has no InternalURL. Callers must not fall back to public APIURL+PAT.
 var ErrPeerInternalURLRequired = errors.New("cluster: peer InternalURL required (mTLS fail-closed)")
 
-// PeerDial selects the peer HTTP client and base URL. When internalClient is
-// non-nil (cluster TLS loaded), dial is fail-closed: InternalURL is required
-// and the public APIURL is never used. This is the single selection rule for
-// list, secret replication, audit, and other peer RPCs.
+// ErrPeerInternalURLInvalid is returned before any credentials are attached
+// when gossip advertises a non-HTTPS or malformed internal endpoint.
+var ErrPeerInternalURLInvalid = errors.New("cluster: peer InternalURL must be an absolute https URL")
+
+// PeerDial selects the peer HTTP client and internal URL. Cluster peer RPCs
+// are always mTLS and fail closed when either side is missing.
 //
 // Prefer PeerDialCached (or Cluster/Agent.PeerDialMember) so mTLS VerifyPeer
 // transport clones are reused per node.
-func PeerDial(m Member, publicClient, internalClient *http.Client) (client *http.Client, base string, err error) {
-	// Legacy shared-SAN-only certs are refused for all cluster peer dials.
-	return PeerDialCached(m, publicClient, internalClient, nil, true)
+func PeerDial(m Member, internalClient *http.Client) (client *http.Client, base string, err error) {
+	return PeerDialCached(m, internalClient, nil)
 }
 
 // PeerDialCached is PeerDial with an optional prebuilt per-peer mTLS client.
 // When cached is non-nil it is returned as-is (no transport clone). Otherwise
-// a VerifyPeerCertificate client is built via ClientForPeer. rejectLegacy
-// should be true for production peer traffic (legacy shared-SAN-only certs
-// are refused).
-func PeerDialCached(m Member, publicClient, internalClient, cached *http.Client, rejectLegacy bool) (client *http.Client, base string, err error) {
+// a VerifyPeerCertificate client is built via ClientForPeer.
+func PeerDialCached(m Member, internalClient, cached *http.Client) (client *http.Client, base string, err error) {
 	internalURL := strings.TrimSpace(m.InternalURL)
-	apiURL := strings.TrimSpace(m.APIURL)
-	if internalClient != nil {
-		if internalURL == "" {
-			return nil, "", ErrPeerInternalURLRequired
-		}
-		if cached != nil {
-			return cached, internalURL, nil
-		}
-		// Bind dial verification to the expected gossip node id when the peer
-		// cert carries DNS:node:<id>.
-		return ClientForPeer(internalClient, m.NodeID, rejectLegacy), internalURL, nil
+	if internalClient == nil || internalURL == "" {
+		return nil, "", ErrPeerInternalURLRequired
 	}
-	if publicClient != nil && apiURL != "" {
-		return publicClient, apiURL, nil
+	if err := validatePeerInternalURL(internalURL); err != nil {
+		return nil, "", ErrPeerInternalURLInvalid
 	}
-	if apiURL != "" {
-		return &http.Client{}, apiURL, nil
+	if cached != nil {
+		return cached, internalURL, nil
 	}
-	return nil, "", errors.New("cluster: no reachable peer URL")
+	// Bind dial verification to the expected gossip node id when the peer cert
+	// carries DNS:node:<id>.
+	return ClientForPeer(internalClient, m.NodeID), internalURL, nil
+}
+
+func validatePeerInternalURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !u.IsAbs() || !strings.EqualFold(u.Scheme, "https") || strings.TrimSpace(u.Host) == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return ErrPeerInternalURLInvalid
+	}
+	return nil
 }
 
 // PeerDialPath is PeerDial plus a path suffix (e.g. /v1/cluster/internal/secrets).
-func PeerDialPath(m Member, publicClient, internalClient *http.Client, path string) (*http.Client, string, error) {
-	client, base, err := PeerDial(m, publicClient, internalClient)
+func PeerDialPath(m Member, internalClient *http.Client, path string) (*http.Client, string, error) {
+	client, base, err := PeerDial(m, internalClient)
 	if err != nil {
 		return nil, "", err
 	}
@@ -60,8 +61,8 @@ func PeerDialPath(m Member, publicClient, internalClient *http.Client, path stri
 }
 
 // PeerDialPathCached is PeerDialCached plus a path suffix.
-func PeerDialPathCached(m Member, publicClient, internalClient, cached *http.Client, rejectLegacy bool, path string) (*http.Client, string, error) {
-	client, base, err := PeerDialCached(m, publicClient, internalClient, cached, rejectLegacy)
+func PeerDialPathCached(m Member, internalClient, cached *http.Client, path string) (*http.Client, string, error) {
+	client, base, err := PeerDialCached(m, internalClient, cached)
 	if err != nil {
 		return nil, "", err
 	}

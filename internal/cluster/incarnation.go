@@ -7,8 +7,8 @@ import (
 )
 
 // MintIncarnationID returns a 16-byte random hex string that uniquely tags a
-// sandbox placement lifetime. Reassign preserves the value; a fresh reserve
-// mints a new one. Empty is valid for pre-incarnation Raft rows.
+// sandbox placement lifetime. Reassign preserves the value; every fresh
+// reserve or unreserved placement mints a new one.
 func MintIncarnationID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

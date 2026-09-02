@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/aerol-ai/microvm/internal/service"
@@ -14,17 +15,22 @@ import (
 // right status. EXPERIMENTAL until the §10.1 demand checkpoint.
 
 func (h *handlers) createJSBundle(w http.ResponseWriter, r *http.Request) {
+	h.createJSBundleWithContext(w, r, r.Context())
+}
+
+// createJSBundleReplica is registered only behind operator auth + live-node
+// mTLS. Keeping it on a distinct path prevents public callers from turning a
+// header into an owner-scope override or a replication loop bypass.
+func (h *handlers) createJSBundleReplica(w http.ResponseWriter, r *http.Request) {
+	ctx := service.WithReplicatedJSBundleOwner(r.Context(), r.Header.Get(models.HeaderJSBundleOwner))
+	h.createJSBundleWithContext(w, r, ctx)
+}
+
+func (h *handlers) createJSBundleWithContext(w http.ResponseWriter, r *http.Request, ctx context.Context) {
 	var req models.CreateJSBundleRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
-	}
-	ctx := r.Context()
-	// A cluster peer replicating an uploaded bundle marks the request so the
-	// service stores it under the original owner (carried in the header) and
-	// does not fan it out again (loop guard).
-	if r.Header.Get(models.HeaderJSBundleReplicated) == "1" {
-		ctx = service.WithReplicatedJSBundleOwner(ctx, r.Header.Get(models.HeaderJSBundleOwner))
 	}
 	bundle, err := h.deps.Service.CreateJSBundle(ctx, req)
 	if err != nil {

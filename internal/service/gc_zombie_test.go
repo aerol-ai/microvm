@@ -178,8 +178,9 @@ func TestGCZombieCaddyEntries(t *testing.T) {
 	// exposure on :5432 with host_port=37412, one TLS exposure on :6379.
 	// All four MUST survive the GC pass.
 	live := &models.Sandbox{
-		ID:     "abc",
-		Status: models.SandboxStatusStarted,
+		ID:                 "abc",
+		Status:             models.SandboxStatusStarted,
+		AllowPublicTraffic: privateFlag(true),
 		ExposedPorts: []models.ExposedPort{
 			{SandboxID: "abc", Port: 3000, Protocol: models.ExposedPortProtocolHTTP, CreatedAt: time.Now().UTC()},
 			{SandboxID: "abc", Port: 5432, Protocol: models.ExposedPortProtocolTCP, HostPort: 37412, CreatedAt: time.Now().UTC()},
@@ -188,7 +189,7 @@ func TestGCZombieCaddyEntries(t *testing.T) {
 	}
 	// Stopped sandbox: keep its toolbox @id in the expected set so the GC
 	// doesn't preemptively drop it (Start re-upserts on the way back up).
-	stopped := &models.Sandbox{ID: "stp", Status: models.SandboxStatusStopped}
+	stopped := &models.Sandbox{ID: "stp", Status: models.SandboxStatusStopped, AllowPublicTraffic: privateFlag(true)}
 	// Destroyed sandboxes are excluded — anything in caddy bearing their
 	// @id is by definition zombie.
 	destroyed := &models.Sandbox{ID: "ded", Status: models.SandboxStatusDestroyed}
@@ -317,6 +318,7 @@ func TestGCZombieCaddyEntriesKeepsRemoteClusterIngressRoutes(t *testing.T) {
 			SandboxID:   "remote",
 			OwnerNodeID: "other",
 			OwnerAPIURL: "http://10.0.0.9:21212",
+			Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				3000: {Protocol: models.ExposedPortProtocolHTTP},
 				5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 22432},

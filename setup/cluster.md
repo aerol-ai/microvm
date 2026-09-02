@@ -56,7 +56,7 @@ One set of cluster-wide secrets, distributed once on first install:
 
 | Secret | Purpose |
 |---|---|
-| `SB_PAT_TOKEN` | API auth. Cluster-internal forwarding rides this when mTLS is off. |
+| `SB_PAT_TOKEN` | Public API auth. Internal cluster routes additionally require node-bound mTLS. |
 | `SB_GOSSIP_SECRET_KEY` | AES-encrypts gossip payloads; gates raft voter auto-promotion. |
 | Cluster TLS trust (`ca.crt`) | Cluster-internal mTLS trust anchor. `ca.key` stays on the seed; joiners generate CSR and get `node.crt` via `cluster-sign-node.sh`. |
 | Credential bundle (`credential_encryption.key`) | Decrypts sealed registry passwords + per-mount creds. Ships separately from the CA trust tarball. |
@@ -266,7 +266,7 @@ prereqs, `sudo`), plus:
 - Cluster-internal ports open between nodes only:
   - `7000/TCP` - raft replication
   - `7001/TCP+UDP` - gossip
-  - `7002/TCP` - internal mTLS RPC (only when TLS is enabled)
+  - `7002/TCP` - required internal mTLS RPC
 - Public ports open as in single-node: `443/TCP`, `2220/TCP`, optionally
   `22000-23000/TCP`.
 
@@ -313,7 +313,7 @@ On each node's firewall (cloud security group or `ufw`):
 ```
 ALLOW 7000/TCP       from <other-cluster-node-IPs>   # raft
 ALLOW 7001/TCP,UDP   from <other-cluster-node-IPs>   # gossip
-ALLOW 7002/TCP       from <other-cluster-node-IPs>   # internal mTLS (TLS mode only)
+ALLOW 7002/TCP       from <other-cluster-node-IPs>   # required internal mTLS
 ```
 
 **Never open these to the public internet.** Gossip carries auth tokens;
@@ -337,8 +337,9 @@ Replace `10.0.0.5` with `node-a`'s private IP. The script:
 1. Auto-generates a 32-byte gossip secret key (override with `--gossip-key`).
 2. Generates a self-signed cluster CA + this node's keypair.
 3. Reads or generates the credential encryption key.
-4. Bundles `ca.crt`, `ca.key`, and `credential_encryption.key` into
-   `aerolvm-tls-bundle.tar.gz` in the current directory.
+4. Writes two separate bundles: `aerolvm-tls-bundle.tar.gz` contains only the
+   public `ca.crt`; `aerolvm-cred-bundle.tar.gz` contains the credential
+   encryption key. The CA private key is never distributed to joiners.
 5. Writes `/etc/sandboxd/cluster.env` and a systemd drop-in.
 6. Restarts `sandboxd`.
 7. Prints the gossip key and the exact `cluster-join.sh` command for
@@ -359,15 +360,19 @@ required` errors.
 
 ### Step 4 - Securely transfer the TLS bundle
 
-The bundle contains the CA private key and the credential encryption key.
-Anyone who gets it can mint a node cert AND decrypt every sealed credential
-in the cluster. Treat it like an SSH private key.
+The TLS bundle contains only the public CA certificate. Transfer the separate
+0600 credential bundle through the same protected channel because it can
+decrypt sealed cluster credentials. The CA private key is never in either
+joiner bundle.
 
 ```bash
 # from your laptop or a jump host:
 scp node-a:/path/to/aerolvm-tls-bundle.tar.gz /tmp/
+scp node-a:/path/to/aerolvm-cred-bundle.tar.gz /tmp/
 scp /tmp/aerolvm-tls-bundle.tar.gz node-b:/tmp/
 scp /tmp/aerolvm-tls-bundle.tar.gz node-c:/tmp/
+scp /tmp/aerolvm-cred-bundle.tar.gz node-b:/tmp/
+scp /tmp/aerolvm-cred-bundle.tar.gz node-c:/tmp/
 
 # or pull directly between nodes if they have SSH between them.
 ```
@@ -461,20 +466,18 @@ placement record and reverse-proxies the HTTP request to the owner
 receiving API node chooses the owner once, then forwards a target-pinned
 create to that owner.
 
-**Channel selection.** When both this node and the owner have TLS material
-(`SB_CLUSTER_TLS_DIR` set on both), the proxy rides the cluster-internal
-mTLS channel on `:7002` - the receiving node's mTLS listener serves the
+**Internal channel.** Every cluster node requires `SB_CLUSTER_TLS_DIR`; the
+proxy rides the cluster-internal mTLS channel on `:7002`. The receiving node's
+mTLS listener serves the
 same `/v1/...` mux as its public port, so handlers run identically but the
 hop is cert-pinned end-to-end. The PAT bearer header is still forwarded
 (belt-and-braces), but possession of the PAT alone is no longer sufficient
-to forge a cross-node API hop. When either side has no TLS material, the
-proxy falls back to the public `SB_API_ADVERTISE_URL` with PAT-only auth so
-mixed rollouts (some nodes with TLS, some without) keep working.
+to forge a cross-node API hop. There is no plaintext or PAT-only downgrade
+after a TLS configuration or handshake failure.
 
 **You can put any LB or DNS scheme in front of the API path**, but every
-node's advertised API URL must still be reachable by its peers as the
-mixed-rollout fallback. The `:7002` mTLS port must be reachable between
-cluster members for the cert-pinned path to be used at all.
+node's advertised API URL must still be reachable by clients. The `:7002`
+mTLS port must be reachable between cluster members.
 
 ### Path 2 - Sandbox URLs (`<id>.sandbox.example.com`, `<id>-<port>.sandbox.example.com`)
 
@@ -1119,7 +1122,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_CREDENTIAL_ENCRYPTION_KEY` | yes | Base64 32-byte key for sealed registry/mount creds. Same on every node. |
 | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | no | Fallback file if env unset. Default `/var/lib/sandboxd/credential_encryption.key`. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | no | Opt out of shared-key requirement. **Recovered sandboxes lose private-registry/mount creds without it.** |
-| `SB_CLUSTER_TLS_DIR` | recommended | Cluster CA + this node's keypair. |
+| `SB_CLUSTER_TLS_DIR` | yes | Cluster CA trust certificate + this node's keypair. |
 | `SB_CLUSTER_INTERNAL_LISTEN` | no | mTLS listen. Default `0.0.0.0:7002`. |
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial. Auto-derived. |
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses. Empty on the seed. |
@@ -1150,7 +1153,8 @@ Same as a single-node install, plus:
 | `/etc/sandboxd/cluster.env` | Cluster env vars (mode 0600). |
 | `/etc/systemd/system/sandboxd.service.d/cluster.conf` | systemd drop-in. |
 | `/etc/sandboxd/tls/ca.crt` | Cluster CA. |
-| `/etc/sandboxd/tls/ca.key` | Cluster CA private key (seed and joiners both keep it for re-mints). Mode 0600. |
+| `/etc/sandboxd/cluster-ca/ca.key` | Seed signer key, separate from the daemon TLS directory. Move this signer directory to offline/HSM custody after provisioning. |
+| `/etc/sandboxd/cluster-ca/ca.crt` | Signer-side CA certificate paired with `ca.key`. |
 | `/etc/sandboxd/tls/node.crt` | This node's cert, signed by the cluster CA. |
 | `/etc/sandboxd/tls/node.key` | This node's private key. Mode 0600. |
 | `/var/lib/sandboxd/raft/` | Raft log + snapshots. |
@@ -1159,6 +1163,12 @@ Same as a single-node install, plus:
 The cluster TLS bundle (`aerolvm-tls-bundle.tar.gz`) is generated by
 `cluster-init.sh` for distribution and should be deleted from any host that
 isn't actively joining a node.
+
+`cluster-init.sh` puts signing material under `/etc/sandboxd/cluster-ca`, never
+under the daemon TLS directory. Move that signer directory to offline/HSM
+custody after provisioning and pass its mounted path via
+`cluster-sign-node.sh --ca-dir` during controlled issuance. The daemon needs
+only `ca.crt`, `node.crt`, and `node.key`.
 
 ---
 
@@ -1176,9 +1186,10 @@ Per-node, back up:
 5. `/var/lib/sandboxd/credential_encryption.key` - required to decrypt
    sealed credentials in the FSM.
 
-For a full cluster recovery from total destruction, you also need the
-cluster TLS bundle (CA + CA key) and the gossip key. Store these in your
-secrets manager.
+For a full cluster recovery from total destruction, you also need the public
+CA trust bundle, the separately protected CA signer key, and the gossip key.
+Store the signer key in an offline secrets system or HSM, never in a daemon
+TLS bundle.
 
 The repo includes a backup helper that packages the local SQLite DB, Raft
 state, and `/etc/sandboxd` config tree into one restricted archive:

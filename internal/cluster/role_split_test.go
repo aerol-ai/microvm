@@ -37,6 +37,8 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -70,6 +72,8 @@ func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []strin
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a, err := NewAgent(cfg, logger, nil)

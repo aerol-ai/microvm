@@ -81,8 +81,9 @@ type command struct {
 	// SecretSealGeneration is set by opUpdateSecretRecipients when coordinating
 	// a reseal. Additive omitempty.
 	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
-	// ExpectedIncarnationID / ExpectedSealGeneration are CAS pretenses for
-	// opUpdateSecretRecipients. Empty / zero skips that axis.
+	// ExpectedIncarnationID fences opPlace and opUpdateSecretRecipients from
+	// applying secret state to another sandbox lifetime. Empty skips it.
+	// ExpectedSealGeneration is the opUpdateSecretRecipients generation CAS.
 	ExpectedIncarnationID  string `json:"expected_incarnation_id,omitempty"`
 	ExpectedSealGeneration int64  `json:"expected_seal_generation,omitempty"`
 	// OwnerRef is the control-plane tenant account. Additive omitempty.
@@ -305,9 +306,10 @@ type placementFSM struct {
 	// without scanning every placement. Rebuilt on Restore from the
 	// Placement.CustomHostnames slices so older snapshots still load cleanly.
 	customHostnameIndex map[string]string
-	// auditACLs retains only tenant ownership after a placement is deleted so
-	// any ingress can authorize retained audit history without probing 2,000
-	// workers. Expiry is replicated and pruning is an explicit Raft command.
+	// auditACLs retains post-delete existence, tenant ownership when present,
+	// and the bounded evidence-node index. This lets any ingress authorize an
+	// operator or tenant query without probing 2,000 workers. Expiry is
+	// replicated and pruning is an explicit Raft command.
 	auditACLs map[string]AuditACL
 
 	// volumes holds replicated platform-volume metadata rows, keyed by
@@ -455,6 +457,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// (the reservation already holds them) — so we fall through to the
 		// write path below in that case.
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+		if exists {
+			expected := strings.TrimSpace(cmd.ExpectedIncarnationID)
+			current := strings.TrimSpace(existing.IncarnationID)
+			if expected != "" && current != "" && current != expected {
+				return fmt.Errorf("%w: want %q have %q", ErrIncarnationConflict, expected, current)
+			}
+		}
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && !cmd.hasSecretUpdate() && !existing.IsReserved() {
 			return nil
 		}
@@ -524,7 +533,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if len(cmd.SecretRecipients) > 0 {
 			secretRecipients = append([]string(nil), cmd.SecretRecipients...)
 		}
-		if id := strings.TrimSpace(cmd.IncarnationID); id != "" {
+		if id := strings.TrimSpace(cmd.IncarnationID); id != "" && incarnationID == "" {
 			incarnationID = id
 		}
 		dataPlaneHost := cmd.OwnerDataPlaneHost
@@ -628,18 +637,16 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if existing, ok := f.fullPlacementLocked(cmd.SandboxID); ok {
 			recordPlacementAuditNode(&existing, existing.OwnerNodeID)
 			recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
-			if ownerRef := strings.TrimSpace(existing.OwnerRef); ownerRef != "" {
-				if f.auditACLs == nil {
-					f.auditACLs = make(map[string]AuditACL)
-				}
-				f.auditACLs[cmd.SandboxID] = AuditACL{
-					SandboxID:           cmd.SandboxID,
-					IncarnationID:       existing.IncarnationID,
-					OwnerRef:            ownerRef,
-					AuditNodeIDs:        append([]string(nil), existing.AuditNodeIDs...),
-					AuditNodesTruncated: existing.AuditNodesTruncated,
-					ExpiresUnix:         cmd.ExpiresUnix,
-				}
+			if f.auditACLs == nil {
+				f.auditACLs = make(map[string]AuditACL)
+			}
+			f.auditACLs[cmd.SandboxID] = AuditACL{
+				SandboxID:           cmd.SandboxID,
+				IncarnationID:       existing.IncarnationID,
+				OwnerRef:            strings.TrimSpace(existing.OwnerRef),
+				AuditNodeIDs:        append([]string(nil), existing.AuditNodeIDs...),
+				AuditNodesTruncated: existing.AuditNodesTruncated,
+				ExpiresUnix:         cmd.ExpiresUnix,
 			}
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
@@ -858,12 +865,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return nil
 		}
 		if exp := strings.TrimSpace(cmd.ExpectedIncarnationID); exp != "" {
-			if cur := strings.TrimSpace(existing.IncarnationID); cur != "" && cur != exp {
+			if cur := strings.TrimSpace(existing.IncarnationID); cur != exp {
 				return fmt.Errorf("%w: incarnation want %q have %q", ErrSecretRecipientsCASMismatch, exp, cur)
 			}
 		}
 		if cmd.ExpectedSealGeneration > 0 {
-			if cur := existing.SecretSealGeneration; cur > 0 && cur != cmd.ExpectedSealGeneration {
+			if cur := existing.SecretSealGeneration; cur != cmd.ExpectedSealGeneration {
 				return fmt.Errorf("%w: seal_generation want %d have %d", ErrSecretRecipientsCASMismatch, cmd.ExpectedSealGeneration, cur)
 			}
 		}
@@ -2195,7 +2202,7 @@ func (f *placementFSM) auditACLForSandbox(sandboxID string, nowUnix int64) (Audi
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	acl, ok := f.auditACLs[strings.TrimSpace(sandboxID)]
-	if !ok || strings.TrimSpace(acl.OwnerRef) == "" {
+	if !ok {
 		return AuditACL{}, false
 	}
 	if acl.ExpiresUnix > 0 && acl.ExpiresUnix <= nowUnix {
@@ -2349,7 +2356,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.customHostnameIndex = make(map[string]string)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	for id, acl := range payload.AuditACLs {
-		if id != "" && strings.TrimSpace(acl.OwnerRef) != "" {
+		if id != "" {
 			f.auditACLs[id] = cloneAuditACL(acl)
 		}
 	}
@@ -2557,8 +2564,8 @@ func cloneAuditACL(acl AuditACL) AuditACL {
 
 // recordPlacementAuditNode retains a bounded, insertion-ordered owner history.
 // Once the bound is exceeded, AuditNodesTruncated stays sticky. Readers then
-// deliberately fan out to all workers, preserving evidence completeness while
-// keeping Raft state bounded for pathological failover churn.
+// fail with explicit incomplete-coverage status instead of performing an
+// unbounded fleet scan or silently omitting evidence.
 func recordPlacementAuditNode(p *Placement, nodeID string) {
 	if p == nil {
 		return

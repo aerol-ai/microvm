@@ -3,12 +3,16 @@ package cluster
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // PeerNodeIDHeader is set by production peer callers so the receiver can bind
@@ -27,13 +31,52 @@ func SetPeerNodeIDHeader(req *http.Request, selfNodeID string) {
 	req.Header.Set(PeerNodeIDHeader, selfNodeID)
 }
 
+// AuthenticatedPeerNodeID returns the node identity authenticated by the
+// request's verified mTLS leaf. Cluster-control headers are not credentials:
+// callers must first prove possession of a CA-signed node certificate, and an
+// optional explicit node claim must match that certificate.
+func AuthenticatedPeerNodeID(r *http.Request) (string, error) {
+	if r == nil || r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
+		return "", errors.New("cluster internal endpoint requires mTLS")
+	}
+	peerID := ExtractPeerNodeID(r.TLS.PeerCertificates[0])
+	if peerID == "" {
+		return "", errors.New("cluster peer requires node identity SAN")
+	}
+	if claimed := strings.TrimSpace(r.Header.Get(PeerNodeIDHeader)); claimed != "" && claimed != peerID {
+		return "", errors.New("cluster peer node id mismatch")
+	}
+	return peerID, nil
+}
+
+// IsLivePeer reports whether nodeID is present and alive in the caller's
+// current gossip view. It deliberately uses the local view: authenticating a
+// forwarded request must not recurse through another cluster HTTP request.
+func IsLivePeer(c Client, nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if c == nil || nodeID == "" {
+		return false
+	}
+	if lookup, ok := c.(interface {
+		LookupMember(string) (Member, bool)
+	}); ok {
+		member, found := lookup.LookupMember(nodeID)
+		return found && member.Alive
+	}
+	for _, member := range c.LocalMembers() {
+		if member.NodeID == nodeID {
+			return member.Alive
+		}
+	}
+	return false
+}
+
 // TLS material lives on disk under SB_CLUSTER_TLS_DIR with these names.
 // cluster-init.sh produces the CA + this node's cert; cluster-join.sh signs a
 // fresh node cert from the bundled CA. The daemon never writes these files —
 // it loads them at boot and keeps them in memory.
 const (
 	tlsCAFile       = "ca.crt"
-	tlsCAKeyFile    = "ca.key" // seed-only; joiners never receive ca.key (cluster-sign-node.sh)
 	tlsNodeCertFile = "node.crt"
 	tlsNodeKeyFile  = "node.key"
 )
@@ -58,14 +101,17 @@ const nodeIDSANprefix = "node:"
 type ClusterTLS struct {
 	caPool   *x509.CertPool
 	nodeCert tls.Certificate
-	// nodeID is extracted from the local node cert when a DNS/URI SAN of the
-	// form node:<id> is present, or when CN equals a non-legacy node id.
-	// Empty for legacy aerolvm-cluster-node-only certs.
+	certPath string
+	keyPath  string
+	certMu   sync.RWMutex
+	certMark string
+	current  atomic.Pointer[tls.Certificate]
+	// nodeID is extracted from the local node cert's required DNS/URI SAN of
+	// the form node:<id>.
 	nodeID string
 }
 
-// NodeID returns the node-bound identity extracted from the local node cert,
-// or empty when the cert carries only the legacy clusterServerName SAN.
+// NodeID returns the node-bound identity extracted from the local node cert.
 func (t *ClusterTLS) NodeID() string {
 	if t == nil {
 		return ""
@@ -74,9 +120,8 @@ func (t *ClusterTLS) NodeID() string {
 }
 
 // loadClusterTLS reads ca.crt + node.crt/node.key from dir. Returns
-// (nil, nil) when dir is empty so the caller can treat TLS as opt-in: an
-// unset SB_CLUSTER_TLS_DIR keeps the legacy plaintext behaviour for operators
-// who run cluster mode strictly on a private overlay.
+// (nil, nil) when dir is empty. Cluster configuration validation rejects an
+// empty directory; single-node callers can leave it unset.
 func loadClusterTLS(dir string) (*ClusterTLS, error) {
 	if dir == "" {
 		return nil, nil
@@ -89,18 +134,88 @@ func loadClusterTLS(dir string) (*ClusterTLS, error) {
 	if !pool.AppendCertsFromPEM(caBytes) {
 		return nil, errors.New("cluster tls: ca.crt did not contain any PEM certificates")
 	}
-	cert, err := tls.LoadX509KeyPair(
-		filepath.Join(dir, tlsNodeCertFile),
-		filepath.Join(dir, tlsNodeKeyFile),
-	)
+	certPath := filepath.Join(dir, tlsNodeCertFile)
+	keyPath := filepath.Join(dir, tlsNodeKeyFile)
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("cluster tls: load node keypair: %w", err)
 	}
-	nodeID := ""
-	if leaf, err := leafCertificate(&cert); err == nil {
-		nodeID, _ = ExtractPeerNodeID(leaf)
+	nodeID, leafExpiry, err := validateClusterNodeCertificate(&cert, pool)
+	if err != nil {
+		return nil, err
 	}
-	return &ClusterTLS{caPool: pool, nodeCert: cert, nodeID: nodeID}, nil
+	caExpiry, err := earliestPEMCertificateExpiry(caBytes)
+	if err != nil {
+		return nil, fmt.Errorf("cluster tls: parse CA certificate: %w", err)
+	}
+	recordClusterTLSExpiry(leafExpiry, caExpiry)
+	loaded := &ClusterTLS{
+		caPool: pool, nodeCert: cert, nodeID: nodeID,
+		certPath: certPath, keyPath: keyPath,
+	}
+	loaded.current.Store(&loaded.nodeCert)
+	return loaded, nil
+}
+
+func validateClusterNodeCertificate(cert *tls.Certificate, pool *x509.CertPool) (string, time.Time, error) {
+	leaf, err := leafCertificate(cert)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	intermediates := x509.NewCertPool()
+	for _, raw := range cert.Certificate[1:] {
+		intermediate, err := x509.ParseCertificate(raw)
+		if err != nil {
+			return "", time.Time{}, fmt.Errorf("cluster tls: parse node certificate chain: %w", err)
+		}
+		intermediates.AddCert(intermediate)
+	}
+	verify := func(usage x509.ExtKeyUsage) error {
+		_, err := leaf.Verify(x509.VerifyOptions{
+			Roots:         pool,
+			Intermediates: intermediates,
+			DNSName:       clusterServerName,
+			CurrentTime:   time.Now(),
+			KeyUsages:     []x509.ExtKeyUsage{usage},
+		})
+		return err
+	}
+	if err := verify(x509.ExtKeyUsageServerAuth); err != nil {
+		return "", time.Time{}, fmt.Errorf("cluster tls: verify node certificate for server authentication: %w", err)
+	}
+	if err := verify(x509.ExtKeyUsageClientAuth); err != nil {
+		return "", time.Time{}, fmt.Errorf("cluster tls: verify node certificate for client authentication: %w", err)
+	}
+	nodeID := ExtractPeerNodeID(leaf)
+	if nodeID == "" {
+		return "", time.Time{}, errors.New("cluster tls: node certificate requires a node:<id> SAN")
+	}
+	return nodeID, leaf.NotAfter, nil
+}
+
+func earliestPEMCertificateExpiry(raw []byte) (time.Time, error) {
+	var earliest time.Time
+	for len(raw) > 0 {
+		block, rest := pem.Decode(raw)
+		raw = rest
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if earliest.IsZero() || cert.NotAfter.Before(earliest) {
+			earliest = cert.NotAfter
+		}
+	}
+	if earliest.IsZero() {
+		return time.Time{}, errors.New("no PEM certificates")
+	}
+	return earliest, nil
 }
 
 func leafCertificate(cert *tls.Certificate) (*x509.Certificate, error) {
@@ -114,16 +229,15 @@ func leafCertificate(cert *tls.Certificate) (*x509.Certificate, error) {
 }
 
 // ExtractPeerNodeID returns the node-bound identity from a peer certificate.
-// Prefer DNS/URI SAN `node:<id>`; otherwise accept CN when it is not the
-// legacy clusterServerName. legacyOnly is true when the cert only carries
-// aerolvm-cluster-node (no node:<id> identity).
-func ExtractPeerNodeID(cert *x509.Certificate) (nodeID string, legacyOnly bool) {
+// Only DNS/URI SAN `node:<id>` is authoritative; common-name and shared-SAN
+// fallbacks are intentionally unsupported.
+func ExtractPeerNodeID(cert *x509.Certificate) string {
 	if cert == nil {
-		return "", false
+		return ""
 	}
 	for _, name := range cert.DNSNames {
 		if id := parseNodeIDSAN(name); id != "" {
-			return id, false
+			return id
 		}
 	}
 	for _, uri := range cert.URIs {
@@ -131,26 +245,16 @@ func ExtractPeerNodeID(cert *x509.Certificate) (nodeID string, legacyOnly bool) 
 			continue
 		}
 		if id := parseNodeIDSAN(uri.String()); id != "" {
-			return id, false
+			return id
 		}
 		if id := parseNodeIDSAN(uri.Opaque); id != "" {
-			return id, false
+			return id
 		}
 		if id := parseNodeIDSAN(strings.TrimPrefix(uri.Path, "/")); id != "" {
-			return id, false
+			return id
 		}
 	}
-	cn := strings.TrimSpace(cert.Subject.CommonName)
-	if cn != "" && cn != clusterServerName {
-		if id := parseNodeIDSAN(cn); id != "" {
-			return id, false
-		}
-		return cn, false
-	}
-	if hasLegacyClusterSAN(cert) {
-		return "", true
-	}
-	return "", false
+	return ""
 }
 
 func parseNodeIDSAN(s string) string {
@@ -165,21 +269,6 @@ func parseNodeIDSAN(s string) string {
 	return id
 }
 
-func hasLegacyClusterSAN(cert *x509.Certificate) bool {
-	if cert == nil {
-		return false
-	}
-	if strings.TrimSpace(cert.Subject.CommonName) == clusterServerName {
-		return true
-	}
-	for _, name := range cert.DNSNames {
-		if strings.TrimSpace(name) == clusterServerName {
-			return true
-		}
-	}
-	return false
-}
-
 // VerifyPeerNodeID reports whether expected matches the peer cert's node-bound
 // identity. Empty expected is a no-op (returns true). Used by withInternalMTLS
 // when the caller supplies an expected peer id.
@@ -188,7 +277,7 @@ func VerifyPeerNodeID(cert *x509.Certificate, expected string) bool {
 	if expected == "" {
 		return true
 	}
-	got, _ := ExtractPeerNodeID(cert)
+	got := ExtractPeerNodeID(cert)
 	return got != "" && got == expected
 }
 
@@ -201,10 +290,21 @@ func VerifyPeerNodeID(cert *x509.Certificate, expected string) bool {
 // internal apply.
 func (t *ClusterTLS) serverConfig() *tls.Config {
 	return &tls.Config{
-		Certificates: []tls.Certificate{t.nodeCert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    t.caPool,
-		MinVersion:   tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return t.certificateForHandshake()
+		},
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs:  t.caPool,
+		MinVersion: tls.VersionTLS12,
+		// Apply to both HTTP and Raft listeners: a CA-valid generic client
+		// certificate is not a node credential. Higher HTTP layers additionally
+		// bind this identity to live membership in enterprise mode.
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 || ExtractPeerNodeID(cs.PeerCertificates[0]) == "" {
+				return errors.New("cluster tls: peer certificate requires a node:<id> SAN")
+			}
+			return nil
+		},
 	}
 }
 
@@ -215,9 +315,11 @@ func (t *ClusterTLS) serverConfig() *tls.Config {
 // these channels.
 func (t *ClusterTLS) clientConfig() *tls.Config {
 	return &tls.Config{
-		Certificates: []tls.Certificate{t.nodeCert},
-		RootCAs:      t.caPool,
-		MinVersion:   tls.VersionTLS12,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return t.certificateForHandshake()
+		},
+		RootCAs:    t.caPool,
+		MinVersion: tls.VersionTLS12,
 		// Decouple cert verification from network address: every node cert
 		// carries the same fixed SAN (clusterServerName), so dialing by IP or
 		// hostname both verify against that one name. Per-peer node:<id>
@@ -226,12 +328,62 @@ func (t *ClusterTLS) clientConfig() *tls.Config {
 	}
 }
 
+// certificateForHandshake reloads an atomically replaced node.crt/node.key on
+// the next TLS handshake. Existing connections drain naturally; malformed,
+// expired, wrong-usage, or wrong-node replacements fail closed.
+func (t *ClusterTLS) certificateForHandshake() (*tls.Certificate, error) {
+	if t == nil {
+		return nil, errors.New("cluster tls: unavailable")
+	}
+	if t.certPath == "" || t.keyPath == "" {
+		return &t.nodeCert, nil
+	}
+	certInfo, err := os.Stat(t.certPath)
+	if err != nil {
+		return nil, fmt.Errorf("cluster tls: stat node certificate: %w", err)
+	}
+	keyInfo, err := os.Stat(t.keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("cluster tls: stat node key: %w", err)
+	}
+	mark := fmt.Sprintf("%d:%d:%v:%d:%d:%v",
+		certInfo.ModTime().UnixNano(), certInfo.Size(), certInfo.Sys(),
+		keyInfo.ModTime().UnixNano(), keyInfo.Size(), keyInfo.Sys())
+	t.certMu.RLock()
+	if mark == t.certMark {
+		cert := t.current.Load()
+		t.certMu.RUnlock()
+		if cert != nil {
+			return cert, nil
+		}
+		return &t.nodeCert, nil
+	}
+	t.certMu.RUnlock()
+
+	cert, err := tls.LoadX509KeyPair(t.certPath, t.keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("cluster tls: reload node keypair: %w", err)
+	}
+	nodeID, expiry, err := validateClusterNodeCertificate(&cert, t.caPool)
+	if err != nil {
+		return nil, err
+	}
+	if nodeID != t.nodeID {
+		return nil, fmt.Errorf("cluster tls: rotated certificate identity %q does not match node id %q", nodeID, t.nodeID)
+	}
+	t.certMu.Lock()
+	t.current.Store(&cert)
+	t.certMark = mark
+	t.certMu.Unlock()
+	clusterMTLSCertNotAfterUnix.Set(expiry.Unix())
+	return &cert, nil
+}
+
 // ClientForPeer returns an HTTP client that verifies the dialed peer presents
 // DNS SAN node:<expectedNodeID> (in addition to the shared clusterServerName
-// hostname check). Legacy aerolvm-cluster-node-only certs are refused when
-// rejectLegacy is true (always for production PeerDial paths).
+// hostname check).
 // Empty expected or a non-TLS base is a no-op.
-func ClientForPeer(base *http.Client, expectedNodeID string, rejectLegacy bool) *http.Client {
+func ClientForPeer(base *http.Client, expectedNodeID string) *http.Client {
 	expectedNodeID = strings.TrimSpace(expectedNodeID)
 	if base == nil || expectedNodeID == "" {
 		return base
@@ -257,14 +409,6 @@ func ClientForPeer(base *http.Client, expectedNodeID string, rejectLegacy bool) 
 			return fmt.Errorf("cluster tls: parse peer certificate: %w", err)
 		}
 		if VerifyPeerNodeID(cert, want) {
-			return nil
-		}
-		_, legacyOnly := ExtractPeerNodeID(cert)
-		if legacyOnly {
-			if rejectLegacy {
-				return fmt.Errorf("cluster tls: legacy peer identity rejected")
-			}
-			RecordMTLSLegacyIdentity()
 			return nil
 		}
 		return fmt.Errorf("cluster tls: peer node id mismatch: want node:%s", want)

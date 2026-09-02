@@ -22,7 +22,7 @@ func TestPostOrSpillWorkerEgressUsesIngest(t *testing.T) {
 	gotCh := make(chan map[string]string, 1)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/audit/egress", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Aerol-Audit-Token") != "tok" {
+		if r.Header.Get("X-Aerol-Audit-Capability") != "cap" {
 			http.Error(w, "no", http.StatusUnauthorized)
 			return
 		}
@@ -35,13 +35,13 @@ func TestPostOrSpillWorkerEgressUsesIngest(t *testing.T) {
 	go http.Serve(ln, mux)
 
 	postOrSpillWorkerEgress(egressAuditJob{
-		port: port, token: "tok", node: "n1",
+		port: port, capability: "cap", node: "n1",
 		sandboxID: "sb-1", network: "tcp", address: "example.com:443",
 		eventTime: time.Now().UTC(),
 	})
 	select {
 	case m := <-gotCh:
-		if m["sandbox_id"] != "sb-1" || m["destination"] != "example.com:443" || m["kind"] != "egress" {
+		if m["destination"] != "example.com:443" || m["kind"] != "" || m["sandbox_id"] != "" {
 			t.Fatalf("got %+v", m)
 		}
 	case <-time.After(2 * time.Second):
@@ -52,7 +52,7 @@ func TestPostOrSpillWorkerEgressUsesIngest(t *testing.T) {
 func TestPostOrSpillWorkerEgressFallsBackToSpill(t *testing.T) {
 	dir := t.TempDir()
 	postOrSpillWorkerEgress(egressAuditJob{
-		port: "1", token: "tok", spillDir: dir, node: "n1",
+		port: "1", capability: "cap", spillDir: dir, node: "n1",
 		sandboxID: "sb-1", network: "tcp", address: "host:9",
 	})
 	raw, err := os.ReadFile(filepath.Join(dir, workerEgressSpillFile))
@@ -76,7 +76,7 @@ func TestPostOrSpillWorkerEgressFallsBackToSpill(t *testing.T) {
 
 func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 	t.Setenv("SB_EGRESS_ATTRIBUTION_ENABLED", "false")
-	t.Setenv("SB_DB_PATH", filepath.Join(t.TempDir(), "state.db"))
+	t.Setenv("SB_AUDIT_SPILL_DIR", filepath.Join(t.TempDir(), "audit"))
 	t.Setenv("SB_AUDIT_INGEST_PORT", "21215")
 	t.Setenv("SB_AUDIT_INGEST_TOKEN", "tok")
 	m := newNetMediator()
@@ -86,7 +86,7 @@ func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 	}
 
 	t.Setenv("SB_EGRESS_ATTRIBUTION_ENABLED", "true")
-	t.Setenv("SB_DB_PATH", "")
+	t.Setenv("SB_AUDIT_SPILL_DIR", "")
 	t.Setenv("SB_AUDIT_INGEST_PORT", "")
 	t.Setenv("SB_AUDIT_INGEST_TOKEN", "")
 	m2 := newNetMediator()
@@ -96,8 +96,7 @@ func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "state.db")
-	t.Setenv("SB_DB_PATH", dbPath)
+	t.Setenv("SB_AUDIT_SPILL_DIR", filepath.Join(dir, "audit"))
 	t.Setenv("SB_NODE_ID", "n1")
 	m3 := newNetMediator()
 	installDefaultEgressObserver(m3)

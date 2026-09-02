@@ -227,7 +227,7 @@ func TestRecoveryReplicationUnitBranches(t *testing.T) {
 	index.upsert(Member{NodeID: "", Alive: true, Role: config.NodeRoleServer, APIURL: "http://x"})
 	index.upsert(Member{NodeID: "worker", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://w"})
 	index.upsert(Member{NodeID: "noep", Alive: true, Role: config.NodeRoleServer})
-	index.upsert(Member{NodeID: "peer", Alive: true, Role: config.NodeRoleServer, APIURL: "http://peer"})
+	index.upsert(Member{NodeID: "peer", Alive: true, Role: config.NodeRoleServer, APIURL: "http://peer", InternalURL: "https://peer"})
 	c.gossip = &gossipNode{memberIndex: index}
 	members := c.recoveryServerMembers()
 	if len(members) != 2 { // self + peer
@@ -235,12 +235,11 @@ func TestRecoveryReplicationUnitBranches(t *testing.T) {
 	}
 
 	// 404 maps to not found.
-	srv404 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv404, internalClient := newNodeBoundForwardServer(t, "self", "p", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}))
-	defer srv404.Close()
-	c.httpClient = srv404.Client()
-	blob, ok, err := c.getRecoveryBlobFromMember(context.Background(), Member{NodeID: "p", APIURL: srv404.URL}, "recovery:v1:"+strings.Repeat("a", 64))
+	c.internalClient = internalClient
+	blob, ok, err := c.getRecoveryBlobFromMember(context.Background(), Member{NodeID: "p", InternalURL: srv404.URL}, "recovery:v1:"+strings.Repeat("a", 64))
 	if err != nil || ok || blob.Ref != "" {
 		t.Fatalf("404 blob ok=%v err=%v", ok, err)
 	}
@@ -254,7 +253,6 @@ func TestRecoveryReplicationUnitBranches(t *testing.T) {
 	}))
 	defer srvOK.Close()
 	c.patToken = "pat"
-	c.httpClient = srvOK.Client()
 	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), srvOK.URL, http.MethodGet, "pat", "", nil, nil); err != nil {
 		t.Fatalf("nil out: %v", err)
 	}

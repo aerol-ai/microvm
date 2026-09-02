@@ -669,8 +669,6 @@ func Open(path string) (*Store, error) {
 		// 'pushing' to 'active' or 'error'.
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_state TEXT NOT NULL DEFAULT 'active';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
-		`ALTER TABLE cluster_secret_tombs ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;`,
-		`ALTER TABLE cluster_secrets ADD COLUMN seal_generation INTEGER NOT NULL DEFAULT 0;`,
 		// auto_import_pending is set when the post-pull AOCR auto-import
 		// (F21) failed and a background reconciler should retry. It is
 		// local-node bookkeeping only — never replicated, never user-visible.
@@ -790,9 +788,6 @@ func Open(path string) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
-		// Incarnation tag for post-delete audit ACL rows (empty until seal
-		// paths supply a non-empty value). Unique index is created below.
-		`ALTER TABLE sandbox_audit_acl ADD COLUMN incarnation_id TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -800,45 +795,6 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
 		}
 	}
-	// Promote sandbox_audit_acl to a compound PK (sandbox_id, incarnation_id).
-	// SQLite cannot ALTER PRIMARY KEY in place; recreate when still single-key.
-	if err := migrateSandboxAuditACLCompoundPK(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// Warm upgrades that created sandbox_audit_acl before incarnation_id need
-	// the unique index after the ALTER above. Cold installs already have it
-	// from CREATE TABLE PRIMARY KEY.
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_audit_acl_incarnation
-		ON sandbox_audit_acl(sandbox_id, incarnation_id);`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sandbox_audit_acl incarnation index: %w", err)
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS cluster_secret_put_outbox (
-		sandbox_id TEXT NOT NULL,
-		incarnation_id TEXT NOT NULL DEFAULT '',
-		seal_generation INTEGER NOT NULL DEFAULT 0,
-		recipients_json TEXT NOT NULL DEFAULT '[]',
-		attempts INTEGER NOT NULL DEFAULT 0,
-		created_at DATETIME NOT NULL,
-		updated_at DATETIME NOT NULL,
-		PRIMARY KEY (sandbox_id, incarnation_id, seal_generation)
-	);`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create cluster_secret_put_outbox: %w", err)
-	}
-	// Warm upgrades may still have sandbox_id-only PRIMARY KEY from older
-	// schema. Recreate so a completed older fan-out cannot delete a newer job.
-	if err := migrateSecretPutOutboxPK(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_cluster_secret_put_outbox_retry
-		ON cluster_secret_put_outbox(updated_at, created_at, sandbox_id);`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create cluster_secret_put_outbox index: %w", err)
-	}
-
 	// Partial unique index on host_port (only enforced when host_port > 0).
 	// This is the load-bearing primitive of the random-first allocator: two
 	// concurrent ExposePort calls race to INSERT a host_port row, and only
@@ -897,61 +853,6 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// migrateSecretPutOutboxPK recreates cluster_secret_put_outbox when an older
-// install still uses sandbox_id-only PRIMARY KEY. Compare-and-delete fencing
-// requires the composite identity (sandbox_id, incarnation_id, seal_generation).
-func migrateSecretPutOutboxPK(db *sql.DB) error {
-	var createSQL string
-	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='cluster_secret_put_outbox'`).Scan(&createSQL)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		return fmt.Errorf("inspect cluster_secret_put_outbox: %w", err)
-	}
-	if !strings.Contains(createSQL, "sandbox_id TEXT PRIMARY KEY") {
-		return nil
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin put-outbox pk migration: %w", err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`
-		CREATE TABLE cluster_secret_put_outbox_v2 (
-			sandbox_id TEXT NOT NULL,
-			incarnation_id TEXT NOT NULL DEFAULT '',
-			seal_generation INTEGER NOT NULL DEFAULT 0,
-			recipients_json TEXT NOT NULL DEFAULT '[]',
-			attempts INTEGER NOT NULL DEFAULT 0,
-			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL,
-			PRIMARY KEY (sandbox_id, incarnation_id, seal_generation)
-		);
-	`); err != nil {
-		return fmt.Errorf("create cluster_secret_put_outbox_v2: %w", err)
-	}
-	if _, err := tx.Exec(`
-		INSERT OR IGNORE INTO cluster_secret_put_outbox_v2 (
-			sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
-		)
-		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
-		FROM cluster_secret_put_outbox;
-	`); err != nil {
-		return fmt.Errorf("copy cluster_secret_put_outbox: %w", err)
-	}
-	if _, err := tx.Exec(`DROP TABLE cluster_secret_put_outbox`); err != nil {
-		return fmt.Errorf("drop legacy cluster_secret_put_outbox: %w", err)
-	}
-	if _, err := tx.Exec(`ALTER TABLE cluster_secret_put_outbox_v2 RENAME TO cluster_secret_put_outbox`); err != nil {
-		return fmt.Errorf("rename cluster_secret_put_outbox_v2: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit put-outbox pk migration: %w", err)
-	}
-	return nil
-}
-
 // validateCurrentSecretSchema makes the intentional one-way storage contract
 // explicit at boot. A database with plaintext secret columns or without the
 // sealed toolbox column is rejected instead of starting and failing later on
@@ -982,6 +883,68 @@ func validateCurrentSecretSchema(db *sql.DB) error {
 	}
 	if !hasSealedToolbox {
 		return errors.New("unsupported secret schema: sandboxes.toolbox_token_sealed is required")
+	}
+	// The hardening release is intentionally one-way. CREATE TABLE IF NOT
+	// EXISTS cannot repair older table shapes, so reject them here instead of
+	// booting successfully and discovering a missing generation fence or an
+	// unfenced primary key during the first secret/audit operation.
+	for table, required := range map[string]map[string]int{
+		"cluster_secrets": {
+			"ref":             1,
+			"seal_generation": 0,
+		},
+		"cluster_secret_tombs": {
+			"sandbox_id": 1,
+			"generation": 0,
+		},
+		"cluster_secret_put_outbox": {
+			"sandbox_id":      1,
+			"incarnation_id":  2,
+			"seal_generation": 3,
+			"recipients_json": 0,
+		},
+		"sandbox_audit_acl": {
+			"sandbox_id":     1,
+			"incarnation_id": 2,
+			"owner_ref":      0,
+		},
+	} {
+		if err := validateRequiredTableShape(db, table, required); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRequiredTableShape(db *sql.DB, table string, required map[string]int) error {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%q)`, table))
+	if err != nil {
+		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	defer rows.Close()
+	found := make(map[string]int, len(required))
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan %s schema: %w", table, err)
+		}
+		if _, ok := required[name]; ok {
+			found[name] = primaryKey
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s schema: %w", table, err)
+	}
+	for column, wantPK := range required {
+		gotPK, ok := found[column]
+		if !ok {
+			return fmt.Errorf("unsupported secret schema: %s.%s is required", table, column)
+		}
+		if gotPK != wantPK {
+			return fmt.Errorf("unsupported secret schema: %s.%s primary-key position is %d, want %d", table, column, gotPK, wantPK)
+		}
 	}
 	return nil
 }
@@ -2134,6 +2097,32 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// RollbackSandboxCreate removes a sandbox that never completed its create
+// transaction together with the audit existence row inserted by Create. A
+// normal Delete intentionally retains that row; using it for rollback would
+// leave a permanent audit/fan-out oracle for a sandbox clients never received.
+func (s *Store) RollbackSandboxCreate(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sandbox create rollback: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete sandbox during create rollback: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sandbox_audit_acl WHERE sandbox_id = ?`, id); err != nil {
+		return fmt.Errorf("delete sandbox audit acl during create rollback: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox create rollback: %w", err)
 	}
 	return nil
 }
@@ -4596,7 +4585,7 @@ func upsertSandboxAuditACLExec(ctx context.Context, exec dbExecer, sandboxID, ow
 	sandboxID = strings.TrimSpace(sandboxID)
 	ownerRef = strings.TrimSpace(ownerRef)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if sandboxID == "" || ownerRef == "" {
+	if sandboxID == "" {
 		return nil
 	}
 	_, err := exec.ExecContext(ctx, `
@@ -4656,59 +4645,27 @@ func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID, incar
 	return "", fmt.Errorf("get sandbox audit acl: %w", err)
 }
 
-// migrateSandboxAuditACLCompoundPK recreates sandbox_audit_acl with a compound
-// primary key when a warm upgrade still has sandbox_id-only PK.
-func migrateSandboxAuditACLCompoundPK(db *sql.DB) error {
-	var sqlText string
-	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='sandbox_audit_acl'`).Scan(&sqlText)
+// HasSandboxAuditACL reports whether the exact retained sandbox incarnation
+// exists, including operator-owned rows whose owner_ref is intentionally empty.
+func (s *Store) HasSandboxAuditACL(ctx context.Context, sandboxID, incarnationID string) (bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM sandbox_audit_acl
+		WHERE sandbox_id = ? AND incarnation_id = ?
+		LIMIT 1
+	`, sandboxID, incarnationID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		return fmt.Errorf("inspect sandbox_audit_acl: %w", err)
+		return false, fmt.Errorf("check sandbox audit acl: %w", err)
 	}
-	lower := strings.ToLower(sqlText)
-	// Already compound when PRIMARY KEY lists both columns (cold install or prior migration).
-	if strings.Contains(lower, "primary key (sandbox_id, incarnation_id)") ||
-		strings.Contains(lower, "primary key(sandbox_id, incarnation_id)") {
-		return nil
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin sandbox_audit_acl pk migration: %w", err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`
-		CREATE TABLE sandbox_audit_acl_new (
-			sandbox_id TEXT NOT NULL,
-			incarnation_id TEXT NOT NULL DEFAULT '',
-			owner_ref TEXT NOT NULL DEFAULT '',
-			updated_at DATETIME NOT NULL,
-			PRIMARY KEY (sandbox_id, incarnation_id)
-		);
-	`); err != nil {
-		return fmt.Errorf("create sandbox_audit_acl_new: %w", err)
-	}
-	if _, err := tx.Exec(`
-		INSERT OR IGNORE INTO sandbox_audit_acl_new (sandbox_id, incarnation_id, owner_ref, updated_at)
-		SELECT sandbox_id, COALESCE(incarnation_id, ''), owner_ref, updated_at FROM sandbox_audit_acl
-	`); err != nil {
-		return fmt.Errorf("copy sandbox_audit_acl: %w", err)
-	}
-	if _, err := tx.Exec(`DROP TABLE sandbox_audit_acl`); err != nil {
-		return fmt.Errorf("drop sandbox_audit_acl: %w", err)
-	}
-	if _, err := tx.Exec(`ALTER TABLE sandbox_audit_acl_new RENAME TO sandbox_audit_acl`); err != nil {
-		return fmt.Errorf("rename sandbox_audit_acl: %w", err)
-	}
-	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_sandbox_audit_acl_updated
-		ON sandbox_audit_acl(updated_at, sandbox_id)`); err != nil {
-		return fmt.Errorf("recreate sandbox_audit_acl updated index: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit sandbox_audit_acl pk migration: %w", err)
-	}
-	return nil
+	return true, nil
 }
 
 // SecretDeleteOutboxRecord is one durable peer-delete job.
@@ -5182,13 +5139,20 @@ func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID, 
 		return fmt.Errorf("marshal put outbox recipients: %w", err)
 	}
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_put_outbox
 		SET recipients_json = ?, updated_at = ?
 		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
 	`, string(raw), now, sandboxID, incarnationID, sealGeneration)
 	if err != nil {
 		return fmt.Errorf("update secret put outbox recipients: %w", err)
+	}
+	matched, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count updated secret put outbox recipients: %w", err)
+	}
+	if matched == 0 {
+		return ErrNotFound
 	}
 	return nil
 }

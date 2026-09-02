@@ -21,6 +21,8 @@ const (
 	defaultAuditNodeBurst     = 100
 	auditRateLimitIdentityKey = "operator"
 	auditRateLimitIdleTTL     = 30 * time.Minute
+	auditRateLimitEvictEvery  = time.Minute
+	auditRateLimitMaxBuckets  = 10_000
 )
 
 type auditRateBucket struct {
@@ -36,9 +38,10 @@ type AuditRateLimiter struct {
 	identity      map[string]*auditRateBucket
 	identityRate  rate.Limit
 	identityBurst int
-	operatorRate  rate.Limit
-	operatorBurst int
+	operator      *rate.Limiter
+	overflow      *rate.Limiter
 	node          *rate.Limiter
+	lastEvict     time.Time
 }
 
 // AuditRateLimiterConfig holds token-bucket rates from config.
@@ -67,8 +70,8 @@ func NewAuditRateLimiter(cfg AuditRateLimiterConfig) *AuditRateLimiter {
 		identity:      make(map[string]*auditRateBucket),
 		identityRate:  rate.Limit(idRate),
 		identityBurst: defaultAuditIdentityBurst,
-		operatorRate:  rate.Limit(opRate),
-		operatorBurst: defaultAuditOperatorBurst,
+		operator:      rate.NewLimiter(rate.Limit(opRate), defaultAuditOperatorBurst),
+		overflow:      rate.NewLimiter(rate.Limit(idRate), defaultAuditIdentityBurst),
 		node:          rate.NewLimiter(rate.Limit(nodeRate), defaultAuditNodeBurst),
 	}
 }
@@ -130,17 +133,25 @@ func (a *AuditRateLimiter) allow(key string) (retryAfter time.Duration, ok bool)
 }
 
 func (a *AuditRateLimiter) limiterFor(key string) *rate.Limiter {
+	if key == auditRateLimitIdentityKey {
+		return a.operator
+	}
 	now := time.Now()
-	a.evictIdleLocked(now)
+	if a.lastEvict.IsZero() || now.Sub(a.lastEvict) >= auditRateLimitEvictEvery {
+		a.evictIdleLocked(now)
+		a.lastEvict = now
+	}
 	if b, ok := a.identity[key]; ok {
 		b.lastSeen = now
 		return b.lim
 	}
-	r, burst := a.identityRate, a.identityBurst
-	if key == auditRateLimitIdentityKey {
-		r, burst = a.operatorRate, a.operatorBurst
+	if len(a.identity) >= auditRateLimitMaxBuckets {
+		// Do not churn the map or scan 10K buckets for every attacker-supplied
+		// identity. New identities share one bounded overflow bucket until the
+		// periodic idle sweep frees capacity.
+		return a.overflow
 	}
-	lim := rate.NewLimiter(r, burst)
+	lim := rate.NewLimiter(a.identityRate, a.identityBurst)
 	a.identity[key] = &auditRateBucket{lim: lim, lastSeen: now}
 	return lim
 }

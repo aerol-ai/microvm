@@ -181,7 +181,7 @@ boot path itself is unchanged.
 | Image build fanout | `pkg/api/v1/build.go`, `routes.go` | `clusterBuildImageWrap`; header `X-Cluster-Image-Build-Fanout: 1` |
 | Local-image create (facade) | `pkg/api/clustercreate/clustercreate.go` | `clusterCreateSelfCanOwnSandbox`; placement + `ForwardHTTP` without `HeaderID` |
 | Local-image create (v1) | `pkg/api/v1/cluster_handler.go` | Mirror of clustercreate branch; accepts target-pinned forward without `X-Cluster-Create-ID` |
-| Shared helpers | `pkg/api/v1/cluster_helpers.go` | `clusterSelfCanOwnSandbox`, `clusterMemberSupportsRuntime`, `clusterPeerURL` |
+| Shared helpers | `pkg/api/v1/cluster_helpers.go` | `clusterSelfCanOwnSandbox`, `clusterMemberSupportsRuntime`, `dialClusterPeer` (node-pinned mTLS only) |
 | Placement scoring | `pkg/api/clustercreate/clustercreate.go`, `pkg/api/v1/cluster_handler.go`, `internal/cluster/placement.go` | `CapacityRequestFromCreate` / `capacityRequestFromSpec` defaults |
 | Template cluster | `pkg/api/v1/template.go`, `routes.go` | `clusterCreateTemplateWrap`, `clusterListTemplatesWrap`, `clusterTemplateItemWrap`; header `X-Cluster-Template-Forwarded: 1` |
 | Classification (unchanged) | `internal/service/image_distribution.go` | `ImageRequiresLocalPlacement` still true for `aerolvm-build/*` |

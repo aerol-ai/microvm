@@ -3,26 +3,29 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type replicaCapture struct {
-	owner      string
-	replicated string
-	auth       string
-	body       models.CreateJSBundleRequest
+	owner  string
+	peerID string
+	auth   string
+	body   models.CreateJSBundleRequest
 }
 
-// TestReplicateJSBundleToPeers: the fan-out POSTs the bundle to every OTHER
-// live member with the replication + owner headers and PAT, and skips self,
-// dead members, and members with no API URL — the loop guard + owner
-// preservation the isolate-on-cluster fix depends on.
+// TestReplicateJSBundleToPeers: the fan-out POSTs to every other isolate
+// worker with owner + peer headers and PAT, skipping ineligible members.
 func TestReplicateJSBundleToPeers(t *testing.T) {
 	var mu sync.Mutex
 	got := map[string]replicaCapture{}
@@ -33,10 +36,10 @@ func TestReplicateJSBundleToPeers(t *testing.T) {
 			_ = json.Unmarshal(b, &req)
 			mu.Lock()
 			got[node] = replicaCapture{
-				owner:      r.Header.Get(models.HeaderJSBundleOwner),
-				replicated: r.Header.Get(models.HeaderJSBundleReplicated),
-				auth:       r.Header.Get("Authorization"),
-				body:       req,
+				owner:  r.Header.Get(models.HeaderJSBundleOwner),
+				peerID: r.Header.Get(PeerNodeIDHeader),
+				auth:   r.Header.Get("Authorization"),
+				body:   req,
 			}
 			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
@@ -47,14 +50,17 @@ func TestReplicateJSBundleToPeers(t *testing.T) {
 	defer peerC.Close()
 
 	members := []Member{
-		{NodeID: "A", Alive: true, APIURL: "http://self.invalid"}, // self -> skip
-		{NodeID: "B", Alive: true, APIURL: peerB.URL},
-		{NodeID: "C", Alive: true, APIURL: peerC.URL},
-		{NodeID: "D", Alive: false, APIURL: "http://dead.invalid"}, // dead -> skip
-		{NodeID: "E", Alive: true, APIURL: ""},                     // no URL -> skip
+		{NodeID: "A", Alive: true, InternalURL: "https://self.invalid"}, // self -> skip
+		{NodeID: "B", Alive: true, Role: "worker", InternalURL: peerB.URL, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}}},
+		{NodeID: "C", Alive: true, Role: "worker", InternalURL: peerC.URL, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}}},
+		{NodeID: "D", Alive: false, InternalURL: "https://dead.invalid"}, // dead -> skip
+		{NodeID: "E", Alive: true, InternalURL: ""},                      // no URL -> skip
+		{NodeID: "F", Alive: true, Role: "ingress", InternalURL: "https://ingress.invalid", Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}}},
+		{NodeID: "G", Alive: true, Role: "worker", InternalURL: "https://docker.invalid", Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}}},
 	}
 	req := models.CreateJSBundleRequest{Name: "hello", Source: "export default { async fetch(){return new Response('ok')} }"}
-	err := replicateJSBundleToPeers(context.Background(), members, &http.Client{}, "pat123", "A", "tenant-x", req)
+	dial := func(m Member) (*http.Client, string, error) { return http.DefaultClient, m.InternalURL, nil }
+	err := replicateJSBundleToPeers(context.Background(), members, dial, "pat123", "A", "tenant-x", req)
 	if err != nil {
 		t.Fatalf("replicate: %v", err)
 	}
@@ -69,8 +75,8 @@ func TestReplicateJSBundleToPeers(t *testing.T) {
 	}
 	for _, node := range []string{"B", "C"} {
 		c := got[node]
-		if c.replicated != "1" {
-			t.Errorf("%s: replicated header = %q, want 1", node, c.replicated)
+		if c.peerID != "A" {
+			t.Errorf("%s: peer node header = %q, want A", node, c.peerID)
 		}
 		if c.owner != "tenant-x" {
 			t.Errorf("%s: owner header = %q, want tenant-x", node, c.owner)
@@ -84,6 +90,47 @@ func TestReplicateJSBundleToPeers(t *testing.T) {
 	}
 }
 
+type concurrentReplicaTransport struct {
+	current atomic.Int32
+	max     atomic.Int32
+}
+
+func (t *concurrentReplicaTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	current := t.current.Add(1)
+	for {
+		previous := t.max.Load()
+		if current <= previous || t.max.CompareAndSwap(previous, current) {
+			break
+		}
+	}
+	time.Sleep(10 * time.Millisecond)
+	t.current.Add(-1)
+	return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+}
+
+func TestReplicateJSBundleToPeersBoundsConcurrency(t *testing.T) {
+	members := make([]Member, jsBundleReplicationConcurrency*2)
+	for i := range members {
+		members[i] = Member{
+			NodeID:      fmt.Sprintf("worker-%d", i),
+			Alive:       true,
+			Role:        "worker",
+			InternalURL: "https://worker.invalid",
+			Capacity:    capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}},
+		}
+	}
+	transport := &concurrentReplicaTransport{}
+	dial := func(Member) (*http.Client, string, error) {
+		return &http.Client{Transport: transport}, "https://worker.invalid", nil
+	}
+	if err := replicateJSBundleToPeers(context.Background(), members, dial, "pat", "self", "owner", models.CreateJSBundleRequest{Source: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := int(transport.max.Load()); got <= 1 || got > jsBundleReplicationConcurrency {
+		t.Fatalf("maximum concurrent replicas = %d, want 2..%d", got, jsBundleReplicationConcurrency)
+	}
+}
+
 // TestReplicateJSBundleToPeers_NoPeers: a lone node (only self, or no members)
 // makes zero requests and returns nil — the single-node no-op guarantee.
 func TestReplicateJSBundleToPeers_NoPeers(t *testing.T) {
@@ -92,9 +139,10 @@ func TestReplicateJSBundleToPeers_NoPeers(t *testing.T) {
 	defer srv.Close()
 	for _, members := range [][]Member{
 		nil,
-		{{NodeID: "A", Alive: true, APIURL: srv.URL}}, // only self
+		{{NodeID: "A", Alive: true, InternalURL: srv.URL}}, // only self
 	} {
-		if err := replicateJSBundleToPeers(context.Background(), members, &http.Client{}, "p", "A", "o", models.CreateJSBundleRequest{Source: "x"}); err != nil {
+		dial := func(m Member) (*http.Client, string, error) { return http.DefaultClient, m.InternalURL, nil }
+		if err := replicateJSBundleToPeers(context.Background(), members, dial, "p", "A", "o", models.CreateJSBundleRequest{Source: "x"}); err != nil {
 			t.Fatalf("no-peer replicate returned error: %v", err)
 		}
 	}

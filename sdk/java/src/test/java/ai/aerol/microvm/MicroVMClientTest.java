@@ -1011,9 +1011,8 @@ class MicroVMClientTest {
         }
     }
 
-    // Backward-compat: list() and list(emptyMap) must produce the pre-filter
-    // URL byte-for-byte. A stray trailing "?" would break HTTP fixtures and
-    // request matchers in downstream code.
+    // Empty filters should use the canonical collection URL without a stray
+    // query delimiter.
     @Test
     void listWithoutTagsOmitsQueryString() throws Exception {
         AtomicReference<String> seenQuery = new AtomicReference<>();
@@ -1096,6 +1095,27 @@ class MicroVMClientTest {
             assertEquals("sb-1", items.get(0).id);
             assertEquals("sb-2", items.get(1).id);
             assertEquals(2, calls.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listPageFetchesOnlyOnePage() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            calls.incrementAndGet();
+            exchange.getResponseHeaders().set("X-Cluster-List-Placement-Ready", "true");
+            exchange.getResponseHeaders().set("X-Cluster-List-Next-Page-Token", "tok-next");
+            writeJson(exchange, 200, List.of(Map.of("id", "sb-page", "image", "alpine", "status", "started")));
+        });
+
+        try {
+            MicroVMClient.SandboxPage page = clientFor(server).listPage(java.util.Collections.emptyMap(), false, "tok-current");
+            assertEquals(1, calls.get());
+            assertEquals(1, page.sandboxes.size());
+            assertEquals("sb-page", page.sandboxes.get(0).id);
+            assertEquals("tok-next", page.nextPageToken);
         } finally {
             server.stop(0);
         }

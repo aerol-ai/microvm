@@ -88,6 +88,9 @@ func (s *Service) CreateJSBundle(ctx context.Context, req models.CreateJSBundleR
 	// the upload — a create landing on a missed node would error and can retry.
 	if !replicated && s.jsBundleReplicator != nil {
 		if repErr := s.jsBundleReplicator(ctx, owner, req); repErr != nil {
+			if s.cfg.EnterpriseMode {
+				return nil, fmt.Errorf("js-bundle cluster replication incomplete: %w", repErr)
+			}
 			s.logger.Warn("js-bundle cluster replication incomplete", "digest", digest, "error", repErr)
 		}
 	}
@@ -101,7 +104,7 @@ type jsBundleReplicatedOwnerKey struct{}
 // WithReplicatedJSBundleOwner marks ctx as a cluster-replication write of a
 // js-bundle, carrying the original owner so CreateJSBundle stores it under that
 // owner (not the replicating peer's PAT scope) and skips re-replicating. The v1
-// handler sets this when a peer POSTs with models.HeaderJSBundleReplicated.
+// the internal handler sets this for a peer replica request.
 func WithReplicatedJSBundleOwner(ctx context.Context, owner string) context.Context {
 	return context.WithValue(ctx, jsBundleReplicatedOwnerKey{}, owner)
 }

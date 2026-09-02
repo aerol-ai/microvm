@@ -7,29 +7,35 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 )
 
-// proxyCache caches one ReverseProxy per peer URL. Building a fresh proxy per
-// request is cheap but allocating its underlying http.Transport pool every
-// time would defeat connection reuse. The cache key is the peer's base URL
-// string; entries are never evicted because the peer set is small (~10K
-// members worst case). One cache per transport (public plaintext vs. mTLS
-// pinned) so a peer that participates on both channels gets two independent
-// proxies — keepalive state and TLS sessions never mix.
+// proxyCache caches one ReverseProxy per peer identity and URL. The transport
+// is supplied by the node-pinned HTTP client cache so connection reuse never
+// crosses peer identities.
 type proxyCache struct {
-	mu        sync.RWMutex
-	proxies   map[string]*httputil.ReverseProxy
-	transport http.RoundTripper
+	mu      sync.RWMutex
+	proxies map[string]*httputil.ReverseProxy
 }
 
-func newProxyCache(rt http.RoundTripper) *proxyCache {
-	return &proxyCache{proxies: make(map[string]*httputil.ReverseProxy), transport: rt}
+func newProxyCache() *proxyCache {
+	return &proxyCache{proxies: make(map[string]*httputil.ReverseProxy)}
 }
 
-func (pc *proxyCache) get(baseURL string) (*httputil.ReverseProxy, error) {
+// getForPeer keeps the cache identity-bound: the same URL reached for a
+// different expected node must not reuse a transport pinned to another leaf.
+func (pc *proxyCache) getForPeer(nodeID, baseURL string, rt http.RoundTripper) (*httputil.ReverseProxy, error) {
+	if strings.TrimSpace(nodeID) == "" {
+		return nil, errors.New("cluster: peer node id required")
+	}
+	if err := validatePeerInternalURL(baseURL); err != nil {
+		return nil, err
+	}
+	if rt == nil {
+		return nil, errors.New("cluster: peer mTLS transport unavailable")
+	}
+	cacheKey := strings.TrimSpace(nodeID) + "\x00" + baseURL
 	pc.mu.RLock()
-	if p, ok := pc.proxies[baseURL]; ok {
+	if p, ok := pc.proxies[cacheKey]; ok {
 		pc.mu.RUnlock()
 		return p, nil
 	}
@@ -37,7 +43,7 @@ func (pc *proxyCache) get(baseURL string) (*httputil.ReverseProxy, error) {
 
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-	if p, ok := pc.proxies[baseURL]; ok {
+	if p, ok := pc.proxies[cacheKey]; ok {
 		return p, nil
 	}
 	target, err := url.Parse(baseURL)
@@ -55,33 +61,21 @@ func (pc *proxyCache) get(baseURL string) (*httputil.ReverseProxy, error) {
 			// if it sees the header AND would forward again.
 			req.Header.Set("X-Cluster-Forwarded", "1")
 		},
-		Transport: pc.transport,
+		Transport: rt,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, "cluster: forward to "+baseURL+" failed: "+err.Error(), http.StatusBadGateway)
 		},
 	}
-	pc.proxies[baseURL] = rp
+	pc.proxies[cacheKey] = rp
 	return rp, nil
-}
-
-// defaultPublicTransport is the plaintext/public-API transport shared by every
-// Cluster instance (the underlying pool is the only state worth sharing). The
-// mTLS transport lives per-Cluster because it needs the per-cluster CA + node
-// cert from ClusterTLS.
-var defaultPublicTransport http.RoundTripper = &http.Transport{
-	MaxIdleConns:        100,
-	MaxIdleConnsPerHost: 10,
-	IdleConnTimeout:     90 * time.Second,
 }
 
 // ForwardHTTP reverse-proxies r to target and writes the response into w. The
 // PAT bearer header is preserved (httputil.ReverseProxy passes through
 // headers by default; we only strip hop-by-hop ones).
 //
-// Channel selection: when this node has TLS material loaded (mtlsProxies !=
-// nil), InternalURL is required — empty InternalURL is an error, never a
-// silent downgrade to APIURL+PAT. Without local TLS, ForwardHTTP uses the
-// public APIURL path (legacy / private-overlay deployments).
+// NodeID and InternalURL are required. The proxy transport is taken from the
+// per-peer client cache, which pins the TLS leaf to node:<NodeID>.
 //
 // Forwarding loops are detected by the X-Cluster-Forwarded header and returned
 // as 421 Misdirected Request so clients retry against a refreshed placement.
@@ -92,10 +86,11 @@ var defaultPublicTransport http.RoundTripper = &http.Transport{
 // surfaces such failures as 502 to the original caller, who can then retry
 // against a different peer.
 func (c *Cluster) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request) {
-	forwardHTTPWithMetrics(c.mtlsProxies, c.publicProxies, target, w, r)
+	SetPeerNodeIDHeader(r, c.nodeID)
+	forwardHTTPWithMetrics(c.mtlsProxies, c.ClientForPeer, target, w, r)
 }
 
-func forwardHTTPWithMetrics(mtlsProxies *proxyCache, publicProxies *proxyCache, target Endpoint, w http.ResponseWriter, r *http.Request) {
+func forwardHTTPWithMetrics(mtlsProxies *proxyCache, peerClient func(string) *http.Client, target Endpoint, w http.ResponseWriter, r *http.Request) {
 	var err error
 	done := beginOwnerForward()
 	defer func() { done(err) }()
@@ -108,31 +103,28 @@ func forwardHTTPWithMetrics(mtlsProxies *proxyCache, publicProxies *proxyCache, 
 		http.Error(w, "cluster: forwarding loop detected", http.StatusMisdirectedRequest)
 		return
 	}
-	if mtlsProxies != nil {
-		if target.InternalURL == "" {
-			err = ErrPeerInternalURLRequired
-			recordOwnerForwardTargetMiss("internal_url_required")
-			http.Error(w, ErrPeerInternalURLRequired.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		err = serveProxy(mtlsProxies, target.InternalURL, w, r)
+	if mtlsProxies == nil || peerClient == nil || strings.TrimSpace(target.NodeID) == "" || strings.TrimSpace(target.InternalURL) == "" {
+		err = ErrPeerInternalURLRequired
+		recordOwnerForwardTargetMiss("node_bound_internal_url_required")
+		http.Error(w, ErrPeerInternalURLRequired.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	if target.APIURL == "" {
-		err = errors.New("cluster: peer API URL unknown")
-		recordOwnerForwardTargetMiss("api_url_unknown")
-		http.Error(w, "cluster: peer API URL unknown", http.StatusServiceUnavailable)
+	client := peerClient(target.NodeID)
+	if client == nil || client.Transport == nil {
+		err = errors.New("cluster: node-pinned mTLS client unavailable")
+		recordOwnerForwardTargetMiss("peer_client_unavailable")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	err = serveProxy(publicProxies, target.APIURL, w, r)
+	err = servePeerProxy(mtlsProxies, target.NodeID, target.InternalURL, client.Transport, w, r)
 }
 
-func serveProxy(cache *proxyCache, baseURL string, w http.ResponseWriter, r *http.Request) error {
-	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
-		http.Error(w, "cluster: peer URL must include scheme", http.StatusBadGateway)
-		return errors.New("cluster: peer URL must include scheme")
+func servePeerProxy(cache *proxyCache, nodeID, baseURL string, transport http.RoundTripper, w http.ResponseWriter, r *http.Request) error {
+	if err := validatePeerInternalURL(baseURL); err != nil {
+		http.Error(w, ErrPeerInternalURLInvalid.Error(), http.StatusBadGateway)
+		return err
 	}
-	proxy, err := cache.get(baseURL)
+	proxy, err := cache.getForPeer(nodeID, baseURL, transport)
 	if err != nil {
 		http.Error(w, "cluster: invalid peer URL: "+err.Error(), http.StatusBadGateway)
 		return err

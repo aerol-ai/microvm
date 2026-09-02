@@ -28,6 +28,7 @@ type placementOnlyCluster struct {
 	*cluster.Noop
 	placement     cluster.Placement
 	auditOwner    string
+	auditInc      string
 	auditExists   bool
 	auditOwnerErr error
 }
@@ -38,6 +39,10 @@ func (c *placementOnlyCluster) PlacementOf(string) (cluster.Placement, bool) {
 
 func (c *placementOnlyCluster) AuditOwnerRef(context.Context, string) (string, bool, error) {
 	return c.auditOwner, c.auditExists, c.auditOwnerErr
+}
+
+func (c *placementOnlyCluster) AuditACLForSandbox(context.Context, string) (cluster.AuditACL, bool, error) {
+	return cluster.AuditACL{OwnerRef: c.auditOwner, IncarnationID: c.auditInc}, c.auditExists, c.auditOwnerErr
 }
 
 func TestAuthorizeSandboxAuditAccessViaOwnerMeta(t *testing.T) {
@@ -100,6 +105,31 @@ func TestAuthorizeSandboxAuditAccessLocalRow(t *testing.T) {
 	}
 }
 
+func TestRetainSandboxAuditACLUsesCurrentIncarnationForOwnerlessSandbox(t *testing.T) {
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	svc := New(config.Config{}, nil, st, nil, nil, nil, nil, nil, nil)
+	svc.cluster = &placementOnlyCluster{
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		placement: cluster.Placement{
+			SandboxID:     "sb-ownerless-finalizer",
+			OwnerNodeID:   "node-a",
+			IncarnationID: "inc-current",
+		},
+	}
+	sb := &models.Sandbox{ID: "sb-ownerless-finalizer"}
+	if err := svc.retainSandboxAuditACL(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	exists, err := st.HasSandboxAuditACL(context.Background(), sb.ID, "inc-current")
+	if err != nil || !exists {
+		t.Fatalf("incarnation ACL exists=%v err=%v", exists, err)
+	}
+}
+
 func TestAuthorizeSandboxAuditAccessAfterDeleteViaRaftACL(t *testing.T) {
 	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -110,6 +140,7 @@ func TestAuthorizeSandboxAuditAccessAfterDeleteViaRaftACL(t *testing.T) {
 	svc.cluster = &placementOnlyCluster{
 		Noop:        cluster.NewNoop("ingress", "http://ingress", ""),
 		auditOwner:  "acme",
+		auditInc:    "inc-retained",
 		auditExists: true,
 	}
 
@@ -118,6 +149,13 @@ func TestAuthorizeSandboxAuditAccessAfterDeleteViaRaftACL(t *testing.T) {
 	})
 	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted", ""); err != nil {
 		t.Fatalf("retained owner ACL: %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(owner, "sb-deleted", "inc-other"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("wrong retained incarnation = %v, want ErrNotFound", err)
+	}
+	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})
+	if err := svc.AuthorizeSandboxAuditAccess(operator, "sb-deleted", "inc-other"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("operator wrong retained incarnation = %v, want ErrNotFound", err)
 	}
 	other := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "other"},

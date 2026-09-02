@@ -265,25 +265,22 @@ func TestCreateSandboxOptInPublicInstallsRoute(t *testing.T) {
 	}
 }
 
-func TestRecreateSandboxLegacyNilSpecStaysPublic(t *testing.T) {
+func TestRecreateSandboxNilPublicFlagFailsPrivate(t *testing.T) {
 	ctx := context.Background()
 	rt := &recordingRuntime{}
 	svc, st, _ := newServiceRuntimeHarness(t, rt)
 
-	// A replicated spec written before the private-by-default flip has a nil
-	// flag; failover recreate must pin it to public rather than letting the
-	// createSandbox normalization silently flip reachability.
-	err := svc.RecreateSandbox(ctx, "sb-legacy-nil-flag", models.CreateSandboxRequest{
+	err := svc.RecreateSandbox(ctx, "sb-nil-public-flag", models.CreateSandboxRequest{
 		Image: "alpine:3.20",
 	}, cluster.PlacementSecrets{}, nil)
 	if err != nil {
 		t.Fatalf("RecreateSandbox() error = %v", err)
 	}
-	stored, err := st.Get(ctx, "sb-legacy-nil-flag")
+	stored, err := st.Get(ctx, "sb-nil-public-flag")
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
-	if stored.AllowPublicTraffic == nil || !*stored.AllowPublicTraffic {
-		t.Fatalf("stored AllowPublicTraffic = %v, want explicit true for a legacy nil spec", stored.AllowPublicTraffic)
+	if stored.AllowPublicTraffic == nil || *stored.AllowPublicTraffic {
+		t.Fatalf("stored AllowPublicTraffic = %v, want explicit false", stored.AllowPublicTraffic)
 	}
 }

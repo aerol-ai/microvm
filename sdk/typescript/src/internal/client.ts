@@ -491,13 +491,18 @@ export class APIClient {
   }
 
   async list(options?: ListOptions): Promise<SandboxResource[]> {
-    const basePath = this.versioned("/sandboxes") + buildSandboxListQuery(options);
     const items: SandboxResource[] = [];
+    for await (const page of this.listPages(options)) {
+      items.push(...page);
+    }
+    return items;
+  }
+
+  /** Streams bounded cluster-list pages and never accumulates the full fleet. */
+  async *listPages(options?: ListOptions): AsyncGenerator<SandboxResource[]> {
+    const basePath = this.versioned("/sandboxes") + buildSandboxListQuery(options);
     let pageToken = "";
-    // Safety cap for cluster page drain (100k sandboxes @ page size 1).
-    // Prefer stopping when X-Cluster-List-Next-Page-Token is empty.
-    const maxPages = 100000;
-    for (let page = 0; page < maxPages; page++) {
+    for (let page = 0; page < 100000; page++) {
       const path = appendQueryParam(basePath, "page_token", pageToken);
       const response = await this.request("GET", path);
       if (!response.ok) {
@@ -509,12 +514,10 @@ export class APIClient {
         throw new Error("incomplete cluster list");
       }
       const body = (await response.json()) as ApiSandbox[] | null;
-      for (const item of body ?? []) {
-        items.push(this.wrap(item));
-      }
+      yield (body ?? []).map((item) => this.wrap(item));
       pageToken = (response.headers.get("X-Cluster-List-Next-Page-Token") ?? "").trim();
       if (pageToken === "") {
-        return items;
+        return;
       }
     }
     throw new Error("incomplete cluster list: exceeded max pages");

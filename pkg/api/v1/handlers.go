@@ -11,7 +11,6 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
-	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -100,7 +99,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	ctx := applyClusterListOwnerRefScope(r)
+	ctx := r.Context()
 	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
 	sandboxes, err := h.deps.Service.ListSandboxesWithOptions(ctx, parseTagFilter(r), opts)
 	if err != nil {
@@ -144,13 +143,6 @@ func parseSandboxIDsFilter(r *http.Request) map[string]struct{} {
 		return nil
 	}
 	return want
-}
-
-// applyClusterListOwnerRefScope lets a fleet-PAT forwarded list request narrow
-// to a tenant without carrying the end-user bearer over a public advertise URL.
-// Only honored for operator Access on X-Cluster-Forwarded requests.
-func applyClusterListOwnerRefScope(r *http.Request) context.Context {
-	return clusterlist.ApplyOwnerRefScope(r)
 }
 
 // parseTagFilter pulls every query parameter of the form `tag.<key>=<value>`

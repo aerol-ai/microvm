@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -66,7 +65,7 @@ func TestFetchCapacitySnapshot(t *testing.T) {
 func TestFetchMemberCapacityNoUrl(t *testing.T) {
 	c := &Cluster{}
 	_, err := c.fetchMemberCapacity(context.Background(), Member{NodeID: "m1", APIURL: ""})
-	if err == nil || !strings.Contains(err.Error(), "no reachable peer URL") {
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
 		t.Errorf("expected missing url error, got %v", err)
 	}
 }
@@ -86,7 +85,6 @@ func TestFetchMemberCapacityFailClosedOnInternal503(t *testing.T) {
 	defer public.Close()
 
 	c := &Cluster{
-		httpClient:     public.Client(),
 		internalClient: internal.Client(),
 	}
 	_, err := c.fetchMemberCapacity(context.Background(), Member{
@@ -122,7 +120,6 @@ func TestRefreshCapacityLeasesHandlesErrorsAndFallbacks(t *testing.T) {
 
 	c := &Cluster{
 		nodeID:         "self",
-		httpClient:     public.Client(),
 		internalClient: &http.Client{}, // shared dialer; PeerDial selects each peer's InternalURL
 		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),

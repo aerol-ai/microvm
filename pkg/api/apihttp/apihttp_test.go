@@ -56,6 +56,14 @@ func TestWriteError(t *testing.T) {
 	}
 }
 
+func TestReadJSONBodyEnforcesSharedLimit(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(strings.Repeat("x", MaxJSONBodyBytes+1)))
+	if _, err := ReadJSONBody(rr, req); err == nil {
+		t.Fatal("expected oversized JSON body rejection")
+	}
+}
+
 func storeAwareErr(t *testing.T, err error) (int, string) {
 	t.Helper()
 	rr := httptest.NewRecorder()

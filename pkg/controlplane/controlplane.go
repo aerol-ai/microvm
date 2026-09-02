@@ -158,8 +158,12 @@ type Witness interface {
 // off-node export. Payloads are already-redacted JSON objects (never plaintext
 // secrets). Offset is an opaque exporter cursor.
 type AuditEventBatch struct {
-	NodeID    string
-	Offset    string
+	NodeID string
+	Offset string
+	// BatchID is deterministic for node + local offset + payload. Including the
+	// payload digest prevents retention rewrites from reusing an old offset's
+	// idempotency key.
+	BatchID   string
 	Events    []json.RawMessage
 	ShippedAt time.Time
 }

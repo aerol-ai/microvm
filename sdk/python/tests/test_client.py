@@ -956,6 +956,29 @@ class ListFilterTests(unittest.TestCase):
         self.assertEqual([s.id for s in items], ["sb-1", "sb-2"])
         self.assertEqual(captured["paths"][1], "/v1/sandboxes?page_token=tok-1")
 
+    def test_iter_pages_is_incremental(self):
+        calls = []
+
+        class PagingClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                calls.append(path)
+                number = len(calls)
+                headers = {"X-Cluster-List-Placement-Ready": "true"}
+                if number == 1:
+                    headers["X-Cluster-List-Next-Page-Token"] = "tok-1"
+                return [{"id": f"sb-{number}", "image": "alpine", "status": "started"}], headers
+
+        pages = PagingClient().iter_pages()
+        self.assertEqual([s.id for s in next(pages)], ["sb-1"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([s.id for s in next(pages)], ["sb-2"])
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(StopIteration):
+            next(pages)
+
     def test_list_errors_on_partial_cluster_coverage(self):
         class PartialClient(MicroVM):
             def __init__(self) -> None:

@@ -269,10 +269,15 @@ func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("put-outbox-%03d", i)
+		pending := []string{"node-b"}
 		if _, err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
 			Ref: secrets.FormatRef(id, 1), SandboxID: id, Version: 1,
 			Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
-			SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
+			SealGeneration:         1,
+			PutOutboxIncarnationID: "inc-1",
+			PutOutboxRecipients:    &pending,
+			CreatedAt:              now,
+			UpdatedAt:              now,
 		}); err != nil {
 			t.Fatal(err)
 		}

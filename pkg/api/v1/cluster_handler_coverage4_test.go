@@ -176,7 +176,7 @@ func TestClusterCreateWrap_DrainedNodeLocalOnlyImage(t *testing.T) {
 
 func TestClusterListWrap_SkipsNonWorkerPeers(t *testing.T) {
 	peerCalled := false
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		peerCalled = true
 		_ = json.NewEncoder(w).Encode([]*models.Sandbox{{ID: "sb-remote"}})
 	}))
@@ -225,7 +225,7 @@ func TestClusterListWrap_LocalListFailure(t *testing.T) {
 }
 
 func TestClusterListWrap_PeerInvalidJSON(t *testing.T) {
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			http.Error(w, "missing forwarded header", http.StatusBadRequest)
 			return
@@ -254,7 +254,7 @@ func TestClusterListWrap_PeerInvalidJSON(t *testing.T) {
 }
 
 func TestClusterListWrap_DedupePrefersLocal(t *testing.T) {
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			http.Error(w, "missing forwarded header", http.StatusBadRequest)
 			return

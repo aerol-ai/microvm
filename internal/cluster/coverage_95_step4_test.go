@@ -202,21 +202,9 @@ func TestDeriveInternalAdvertiseURLBranches(t *testing.T) {
 
 func TestWasmMigrateHTTPErrorBranches(t *testing.T) {
 	ctx := context.Background()
-	err := wasmMigrateHTTP(ctx, NewNoop("n", "http://x", ""), "", "", http.MethodGet, "/p", nil, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "peer API URL unknown") {
-		t.Fatalf("empty urls=%v", err)
-	}
-	err = wasmMigrateHTTP(ctx, NewNoop("n", "http://x", ""), "", "http://127.0.0.1:1", http.MethodGet, "/p", nil, nil, nil)
-	if err == nil {
-		t.Fatal("expected dial error")
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "nope", 502)
-	}))
-	defer srv.Close()
-	err = wasmMigrateHTTP(ctx, NewNoop("n", "http://x", ""), "", srv.URL, http.MethodGet, "/p", nil, nil, nil)
-	if err == nil || !isStatus(err, 502) {
-		t.Fatalf("status err=%v", err)
+	err := wasmMigrateHTTP(ctx, NewNoop("n", "http://x", ""), "peer-1", "https://internal", http.MethodGet, "/p", nil, nil, nil)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("provider-less client error=%v", err)
 	}
 }
 

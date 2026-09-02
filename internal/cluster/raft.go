@@ -49,8 +49,8 @@ type raftSetupConfig struct {
 	// TLS, when non-nil, switches the transport from plaintext TCP to mTLS via
 	// a custom StreamLayer. Both peer connect AND peer accept require a cert
 	// chained to the cluster CA — the same property the cluster-internal HTTP
-	// listener uses. nil keeps the legacy plaintext behaviour for operators on
-	// a fully isolated network.
+	// listener uses. nil is reserved for isolated unit tests; cluster
+	// configuration requires TLS.
 	TLS *ClusterTLS
 }
 

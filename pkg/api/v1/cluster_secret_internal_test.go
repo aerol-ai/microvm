@@ -20,6 +20,17 @@ import (
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
+type secretInternalTestCluster struct {
+	*cluster.Noop
+}
+
+func (c *secretInternalTestCluster) LookupMember(id string) (cluster.Member, bool) {
+	if id == "peer-test" {
+		return cluster.Member{NodeID: id, Alive: true, Role: config.NodeRoleWorker}, true
+	}
+	return c.Noop.LookupMember(id)
+}
+
 func newSecretInternalTestMux(t *testing.T, nodeID string) (*http.ServeMux, *service.Service, *secrets.Cipher) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -33,7 +44,7 @@ func newSecretInternalTestMux(t *testing.T, nodeID string) (*http.ServeMux, *ser
 		t.Fatalf("cipher: %v", err)
 	}
 	svc := service.New(config.Config{}, logger, st, nil, nil, nil, cipher, nil, nil)
-	svc.AttachCluster(cluster.NewNoop(nodeID, "http://"+nodeID, ""))
+	svc.AttachCluster(&secretInternalTestCluster{Noop: cluster.NewNoop(nodeID, "http://"+nodeID, "")})
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
 		Service: svc,
@@ -113,7 +124,7 @@ func TestClusterInternalSecretPutOperatorOK(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node", "node:peer-test"}})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNoContent {
@@ -123,7 +134,7 @@ func TestClusterInternalSecretPutOperatorOK(t *testing.T) {
 	// Idempotent upsert.
 	req2 := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req2.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req2, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
+	addVerifiedClientCertificate(req2, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node", "node:peer-test"}})
 	rr2 := httptest.NewRecorder()
 	mux.ServeHTTP(rr2, req2)
 	if rr2.Code != http.StatusNoContent {
@@ -139,7 +150,7 @@ func TestClusterInternalSecretPutRejectsNonRecipient(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node", "node:peer-test"}})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -155,7 +166,7 @@ func TestClusterInternalSecretPutRejectsRefMismatch(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer operator")
-	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}})
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node", "node:peer-test"}})
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {

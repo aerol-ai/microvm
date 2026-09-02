@@ -118,7 +118,7 @@ func (c *Cluster) recoveryServerMembers() []Member {
 		if m.NodeID == "" || !m.Alive || !CanServeControlPlaneRole(m.Role) {
 			continue
 		}
-		if m.NodeID != c.nodeID && m.APIURL == "" && m.InternalURL == "" {
+		if m.NodeID != c.nodeID && m.InternalURL == "" {
 			continue
 		}
 		out = append(out, m)
@@ -129,7 +129,7 @@ func (c *Cluster) recoveryServerMembers() []Member {
 func (c *Cluster) getRecoveryBlobFromMember(ctx context.Context, m Member, ref string) (RecoveryBlob, bool, error) {
 	var out RecoveryBlob
 	path := recoveryBlobPath(ref)
-	client, base, err := PeerDial(m, c.httpClient, c.currentInternalClient())
+	client, base, err := c.PeerDialMember(m)
 	if err != nil {
 		return RecoveryBlob{}, false, err
 	}

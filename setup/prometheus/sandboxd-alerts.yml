@@ -434,6 +434,50 @@ groups:
           description: "More than 10,000 durable peer-delete jobs are pending on this node. Check recipient reachability before the backlog threatens retention objectives."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      - alert: SandboxdSecretPutOutboxBacklogHigh
+        expr: aerolvm_secret_put_outbox_pending > 10000
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret-put backlog is high"
+          description: "More than 10,000 durable secret PUT deliveries are pending. HA sandboxes may remain failover_ready=false until recipients recover."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdSecretPutOutboxFailures
+        expr: increase(aerolvm_secret_put_outbox_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret-put reconciliation is failing"
+          description: "The durable secret PUT outbox reported failures. Check SQLite health, mTLS identity, and recipient reachability."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdSecretAuditExportFailing
+        expr: increase(aerolvm_secret_audit_export_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd off-node audit export is failing"
+          description: "Audit batches are not reaching the configured off-node receiver. Local evidence continues to grow but disk loss can exceed the recovery objective."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdClusterCertExpiring
+        expr: ((aerolvm_cluster_mtls_cert_not_after_unix - time()) < 1209600 and aerolvm_cluster_mtls_cert_not_after_unix > time()) or ((aerolvm_cluster_mtls_ca_not_after_unix - time()) < 2592000 and aerolvm_cluster_mtls_ca_not_after_unix > time())
+        for: 5m
+        labels:
+          severity: warning
+          component: cluster-mtls
+        annotations:
+          summary: "sandboxd cluster mTLS certificate is nearing expiry"
+          description: "A node leaf has less than 14 days or the cluster CA less than 30 days remaining. Rotate node.crt/node.key atomically; new handshakes hot-reload the pair."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Provider boot/runtime canary (local always ok; awskms wrap/unwrap).
       - alert: SandboxdSecretProviderCanaryFailing
         expr: aerolvm_secret_provider_canary_ok == 0

@@ -38,16 +38,16 @@ func TestWasmMigratePathsAndLocalExport(t *testing.T) {
 }
 
 func TestWasmMigratePeerClientAndPAT(t *testing.T) {
-	client, base, err := wasmMigratePeerClient(nil, "https://internal", "")
-	if err != nil || base != "https://internal" || client == nil {
-		t.Fatalf("internal URL client = (%v, %q, %v)", client, base, err)
+	client, base, err := wasmMigratePeerClient(nil, "peer-1", "https://internal")
+	if !errors.Is(err, ErrPeerInternalURLRequired) || base != "" || client != nil {
+		t.Fatalf("provider-less client = (%v, %q, %v)", client, base, err)
 	}
 	_, _, err = wasmMigratePeerClient(nil, "", "")
 	if err == nil {
 		t.Fatal("expected error when both URLs empty")
 	}
 
-	agent := &Agent{patToken: "pat-token", httpClient: http.DefaultClient}
+	agent := &Agent{patToken: "pat-token"}
 	if got := wasmMigratePAT(agent); got != "pat-token" {
 		t.Fatalf("wasmMigratePAT(agent) = %q", got)
 	}
@@ -55,16 +55,16 @@ func TestWasmMigratePeerClientAndPAT(t *testing.T) {
 		t.Fatal("noop should not provide PAT")
 	}
 	agent.internalClient = http.DefaultClient
-	client, base, err = agent.wasmMigrateHTTPClient("https://internal", "http://api")
+	client, base, err = agent.PeerDialMember(Member{NodeID: "peer-1", InternalURL: "https://internal"})
 	if err != nil || base != "https://internal" {
 		t.Fatalf("agent internal client = (%v, %q, %v)", client, base, err)
 	}
 	agent.internalClient = nil
-	client, base, err = agent.wasmMigrateHTTPClient("", "http://api")
-	if err != nil || base != "http://api" {
-		t.Fatalf("agent api client = (%v, %q, %v)", client, base, err)
+	client, base, err = agent.PeerDialMember(Member{NodeID: "peer-1"})
+	if !errors.Is(err, ErrPeerInternalURLRequired) || client != nil || base != "" {
+		t.Fatalf("agent missing internal URL = (%v, %q, %v)", client, base, err)
 	}
-	_, _, err = agent.wasmMigrateHTTPClient("", "")
+	_, _, err = agent.PeerDialMember(Member{})
 	if err == nil {
 		t.Fatal("expected agent peer URL error")
 	}
@@ -72,8 +72,10 @@ func TestWasmMigratePeerClientAndPAT(t *testing.T) {
 
 func TestWasmMigrateHTTPRoundTrip(t *testing.T) {
 	const cloneGen = "clone-gen-42"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, internalClient := newNodeBoundForwardServer(t, "agent-self", "owner-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.Contains(r.URL.Path, "/bad/"):
+			http.Error(w, "nope", http.StatusBadGateway)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/export"):
 			if got := r.Header.Get("Authorization"); got != "Bearer pat" {
 				t.Fatalf("export auth = %q", got)
@@ -93,13 +95,11 @@ func TestWasmMigrateHTTPRoundTrip(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer srv.Close()
 
 	agent := &Agent{
 		nodeID:         "agent-self",
 		patToken:       "pat",
-		httpClient:     srv.Client(),
-		internalClient: srv.Client(),
+		internalClient: internalClient,
 	}
 
 	var buf bytes.Buffer
@@ -120,15 +120,11 @@ func TestWasmMigrateHTTPRoundTrip(t *testing.T) {
 	if err := PostWasmMigrateImport(context.Background(), agent, Member{NodeID: "agent-self", InternalURL: srv.URL}, "sb-migrate", cloneGen, strings.NewReader("import")); err == nil {
 		t.Fatal("self import expected error")
 	}
-	if err := PostWasmMigrateImport(context.Background(), agent, Member{NodeID: "peer-1", InternalURL: srv.URL}, "sb-migrate", cloneGen, strings.NewReader("import")); err != nil {
+	if err := PostWasmMigrateImport(context.Background(), agent, Member{NodeID: "owner-1", InternalURL: srv.URL}, "sb-migrate", cloneGen, strings.NewReader("import")); err != nil {
 		t.Fatalf("PostWasmMigrateImport: %v", err)
 	}
 
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "nope", http.StatusBadGateway)
-	}))
-	defer bad.Close()
-	_, err = StreamWasmMigrateExport(context.Background(), agent, OwnerInfo{InternalURL: bad.URL}, "sb-migrate", &buf)
+	_, err = StreamWasmMigrateExport(context.Background(), agent, OwnerInfo{NodeID: "owner-1", InternalURL: srv.URL}, "bad", &buf)
 	if err == nil {
 		t.Fatal("expected status error on export failure")
 	}
@@ -397,7 +393,6 @@ func TestAgentTryControlPlaneMemberInternalPath(t *testing.T) {
 	index.upsert(Member{NodeID: "server-1", APIURL: "http://dead", InternalURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
 		nodeID:         "worker-self",
-		httpClient:     srv.Client(),
 		internalClient: srv.Client(),
 		gossip:         &gossipNode{memberIndex: index},
 		logger:         slog.Default(),
@@ -436,7 +431,7 @@ func TestClusterWasmMigrateAndReassignWrappers(t *testing.T) {
 	if wasmMigratePAT(c) != c.patToken {
 		t.Fatal("cluster wasmMigratePAT mismatch")
 	}
-	if _, _, err := c.wasmMigrateHTTPClient("", ""); err == nil {
+	if _, _, err := c.PeerDialMember(Member{}); err == nil {
 		t.Fatal("expected peer URL error")
 	}
 
@@ -576,7 +571,6 @@ func TestFetchMemberCapacityFailClosedNoPublicDowngrade(t *testing.T) {
 	defer internal.Close()
 
 	c := &Cluster{
-		httpClient:     public.Client(),
 		internalClient: internal.Client(),
 		patToken:       "pat",
 	}

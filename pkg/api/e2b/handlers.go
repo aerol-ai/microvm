@@ -233,7 +233,6 @@ func clusterListMode(svc *svcmetrics.Service, r *http.Request) bool {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	r = r.WithContext(clusterlist.ApplyOwnerRefScope(r))
 	if h.deps.Service == nil {
 		writeJSON(w, http.StatusOK, []listedSandboxResponse{})
 		return

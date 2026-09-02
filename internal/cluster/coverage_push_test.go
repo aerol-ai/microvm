@@ -311,10 +311,9 @@ func TestAgentAssertOwnershipLookupErrorPreservesFirstErr(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -489,10 +488,9 @@ func TestAgentAssertOwnershipRecordPlacementFailureOnFresh(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -538,10 +536,9 @@ func TestAgentAssertOwnershipUpsertSpecFailureOnSelfOwned(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -696,10 +693,9 @@ func newAgentAssertOwnershipTestServer(
 		}
 	}))
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -872,10 +868,9 @@ func TestAgentAssertOwnershipAddExposedPortFailureOnSelfOwned(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},

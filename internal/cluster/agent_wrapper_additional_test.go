@@ -32,7 +32,7 @@ func (c *agentControlPlaneCapture) handler(t *testing.T, extra func(http.Respons
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+		case r.Method == http.MethodPost && (r.URL.Path == PublicInternalApplyPath || r.URL.Path == InternalAPIPath):
 			payload, err := io.ReadAll(r.Body)
 			if err != nil {
 				t.Fatalf("read apply payload: %v", err)
@@ -429,16 +429,16 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 }
 
 func TestAgentMiscWrappers(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	target, internalClient := newNodeBoundForwardServer(t, "agent-1", "peer-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			t.Fatalf("forwarded request missing loop-detection header")
 		}
 		_, _ = w.Write([]byte("forwarded"))
 	}))
-	defer target.Close()
 
 	agent := &Agent{
-		publicProxies:  newProxyCache(defaultPublicTransport),
+		internalClient: internalClient,
+		mtlsProxies:    newProxyCache(),
 		internalServer: &internalServer{},
 		placementCache: []Placement{{SandboxID: "sb-cache"}},
 		shardCache: map[string][]Placement{
@@ -448,7 +448,7 @@ func TestAgentMiscWrappers(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-cache", nil)
 	rr := httptest.NewRecorder()
-	agent.ForwardHTTP(Endpoint{APIURL: target.URL}, rr, req)
+	agent.ForwardHTTP(Endpoint{NodeID: "peer-1", InternalURL: target.URL}, rr, req)
 	if rr.Code != http.StatusOK || rr.Body.String() != "forwarded" {
 		t.Fatalf("ForwardHTTP() = (%d, %q), want (200, forwarded)", rr.Code, rr.Body.String())
 	}

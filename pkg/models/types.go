@@ -1311,17 +1311,9 @@ type PushWasmModuleResponse struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
-// JS-bundle cluster-replication headers. Isolate's bundle store is per-node, so
-// the node that receives an upload fans the bundle out to its peers (otherwise
-// an isolate create placed on a different node fails "bundle not found"). The
-// replicated POST carries these so the receiver stores the bundle under the
-// ORIGINAL owner (not the replication PAT's scope) and does NOT fan out again
-// (loop guard). Defined here because both pkg/api/v1 (reader) and
-// internal/cluster (writer) import models but not each other.
-const (
-	HeaderJSBundleReplicated = "X-Cluster-Bundle-Replicated"
-	HeaderJSBundleOwner      = "X-Cluster-Bundle-Owner"
-)
+// HeaderJSBundleOwner carries the original tenant on the dedicated internal
+// mTLS replica endpoint. It is never interpreted by the public bundle route.
+const HeaderJSBundleOwner = "X-Cluster-Bundle-Owner"
 
 // CreateJSBundleRequest is the body for POST /v1/js-bundles — the "no image,
 // no registry" upload path for the isolate runtime (plans/isolate-runtime.md

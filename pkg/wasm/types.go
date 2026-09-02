@@ -14,6 +14,10 @@ type Capabilities struct {
 	// When unset, use -1 to disable.
 	WASIListenPort int    `json:"wasi_listen_port,omitempty"`
 	WASIListenHost string `json:"wasi_listen_host,omitempty"`
+	// AuditCapability is host control metadata, never exposed in guest Env.
+	// It binds worker egress reports to exactly one sandbox incarnation.
+	AuditCapability  string `json:"audit_capability,omitempty"`
+	AuditIncarnation string `json:"audit_incarnation,omitempty"`
 }
 
 // ListenEnabled reports whether wasip1 pre-open TCP listeners are active.

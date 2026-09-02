@@ -573,15 +573,22 @@ func (c *membersStubCluster) Members() []cluster.Member {
 	return c.members
 }
 
-func (c *membersStubCluster) PeerHTTPClients() (public, internal *http.Client) {
+func (c *membersStubCluster) PeerInternalHTTPClient() *http.Client {
 	in := c.internalClient
 	if in == nil {
 		in = http.DefaultClient
 	}
-	return http.DefaultClient, in
+	return in
 }
 
-func (c *membersStubCluster) PeerPAT() string { return "fleet-pat" }
+func (c *membersStubCluster) ClientForPeer(string) *http.Client { return c.PeerInternalHTTPClient() }
+
+func (c *membersStubCluster) PeerDialMember(m cluster.Member) (*http.Client, string, error) {
+	if c.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {
+		return nil, "", cluster.ErrPeerInternalURLRequired
+	}
+	return c.internalClient, m.InternalURL, nil
+}
 
 var _ cluster.Client = (*membersStubCluster)(nil)
 

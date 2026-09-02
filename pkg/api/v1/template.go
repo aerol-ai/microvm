@@ -2,11 +2,14 @@ package v1
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -16,6 +19,11 @@ import (
 )
 
 const clusterTemplateForwardedHeader = "X-Cluster-Template-Forwarded"
+
+const (
+	clusterTemplateListConcurrency = 32
+	clusterTemplateListMaxBytes    = 16 << 20
+)
 
 // Template handlers — POST/GET/LIST/DELETE for the Firecracker template
 // pipeline (plans/snapshot-clone-fast-boot.md Phase 2). Template artifacts
@@ -36,7 +44,7 @@ func (h *handlers) clusterCreateTemplateWrap(w http.ResponseWriter, r *http.Requ
 		h.createTemplate(w, r)
 		return
 	}
-	raw, err := io.ReadAll(r.Body)
+	raw, err := apihttp.ReadJSONBody(w, r)
 	_ = r.Body.Close()
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
@@ -64,7 +72,7 @@ func (h *handlers) clusterCreateTemplateWrap(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	r.Header.Set(clusterTemplateForwardedHeader, "1")
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 }
 
 func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Request) {
@@ -101,58 +109,104 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 		merged = append(merged, tpl)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	for _, peer := range peers {
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
-			clusterPeerURL(peer.APIURL, r.URL.RequestURI()), nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set(clusterTemplateForwardedHeader, "1")
-		if auth := r.Header.Get("Authorization"); auth != "" {
-			req.Header.Set("Authorization", auth)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
+	for result := range listTemplatesFromPeers(r, c, peers) {
+		if result.err != nil {
 			if h.deps.Logger != nil {
-				h.deps.Logger.Warn("cluster templates: peer list failed", "peer", peer.NodeID, "err", err)
+				h.deps.Logger.Warn("cluster templates: peer list failed", "peer", result.peerID, "err", result.err)
 			}
 			continue
 		}
-		func() {
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-				if h.deps.Logger != nil {
-					h.deps.Logger.Warn("cluster templates: peer list returned error",
-						"peer", peer.NodeID, "status", resp.StatusCode, "body", strings.TrimSpace(string(body)))
-				}
-				return
+		for _, tpl := range result.rows {
+			if tpl == nil {
+				continue
 			}
-			var rows []*models.Template
-			if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
-				if h.deps.Logger != nil {
-					h.deps.Logger.Warn("cluster templates: decode peer list failed", "peer", peer.NodeID, "err", err)
-				}
-				return
+			if _, ok := seen[tpl.ID]; ok {
+				continue
 			}
-			for _, tpl := range rows {
-				if tpl == nil {
-					continue
-				}
-				if _, ok := seen[tpl.ID]; ok {
-					continue
-				}
-				seen[tpl.ID] = struct{}{}
-				merged = append(merged, tpl)
-			}
-		}()
+			seen[tpl.ID] = struct{}{}
+			merged = append(merged, tpl)
+		}
 	}
 	if localErr != nil && len(merged) == 0 {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, localErr)
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, merged)
+}
+
+type templateListPeerResult struct {
+	peerID string
+	rows   []*models.Template
+	err    error
+}
+
+func listTemplatesFromPeers(parent *http.Request, c cluster.Client, peers []cluster.Member) <-chan templateListPeerResult {
+	results := make(chan templateListPeerResult, len(peers))
+	if len(peers) == 0 {
+		close(results)
+		return results
+	}
+	workers := min(clusterTemplateListConcurrency, len(peers))
+	jobs := make(chan cluster.Member)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for peer := range jobs {
+				rows, err := listTemplatesFromPeer(parent, c, peer)
+				results <- templateListPeerResult{peerID: peer.NodeID, rows: rows, err: err}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, peer := range peers {
+			select {
+			case jobs <- peer:
+			case <-parent.Context().Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	return results
+}
+
+func listTemplatesFromPeer(parent *http.Request, c cluster.Client, peer cluster.Member) ([]*models.Template, error) {
+	client, base, err := dialClusterPeer(c, peer)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(parent.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+parent.URL.RequestURI(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(clusterTemplateForwardedHeader, "1")
+	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
+	if auth := parent.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var rows []*models.Template
+	dec := json.NewDecoder(io.LimitReader(resp.Body, clusterTemplateListMaxBytes+1))
+	if err := dec.Decode(&rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (h *handlers) clusterTemplateItemWrap(local http.Handler) http.HandlerFunc {
@@ -170,14 +224,14 @@ func (h *handlers) clusterTemplateItemWrap(local http.Handler) http.HandlerFunc 
 			local.ServeHTTP(w, r)
 			return
 		}
-		raw, err := io.ReadAll(r.Body)
+		raw, err := apihttp.ReadJSONBody(w, r)
 		_ = r.Body.Close()
 		if err != nil {
 			apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
 			return
 		}
 		for _, peer := range clusterTemplatePeers(c) {
-			status, header, body, err := templatePeerRequest(r, raw, peer)
+			status, header, body, err := templatePeerRequest(c, r, raw, peer)
 			if err != nil {
 				if h.deps.Logger != nil {
 					h.deps.Logger.Warn("cluster templates: peer request failed",
@@ -206,7 +260,7 @@ func clusterTemplatePeers(c cluster.Client) []cluster.Member {
 	selfID := c.SelfNodeID()
 	out := make([]cluster.Member, 0)
 	for _, m := range c.Members() {
-		if !m.Alive || m.NodeID == "" || m.NodeID == selfID || m.APIURL == "" {
+		if !m.Alive || m.NodeID == "" || m.NodeID == selfID || m.InternalURL == "" {
 			continue
 		}
 		if !clusterMemberCanOwnSandbox(m.Role) || !clusterMemberSupportsRuntime(m, models.RuntimeFirecracker) {
@@ -220,20 +274,25 @@ func clusterTemplatePeers(c cluster.Client) []cluster.Member {
 	return out
 }
 
-func templatePeerRequest(parent *http.Request, raw []byte, peer cluster.Member) (int, http.Header, []byte, error) {
+func templatePeerRequest(c cluster.Client, parent *http.Request, raw []byte, peer cluster.Member) (int, http.Header, []byte, error) {
+	client, base, err := dialClusterPeer(c, peer)
+	if err != nil {
+		return 0, nil, nil, err
+	}
 	req, err := http.NewRequestWithContext(parent.Context(), parent.Method,
-		clusterPeerURL(peer.APIURL, parent.URL.RequestURI()), bytes.NewReader(raw))
+		base+parent.URL.RequestURI(), bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	req.Header.Set(clusterTemplateForwardedHeader, "1")
+	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 	if ct := parent.Header.Get("Content-Type"); ct != "" {
 		req.Header.Set("Content-Type", ct)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}

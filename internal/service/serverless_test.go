@@ -1251,17 +1251,19 @@ func TestGCZombieKeepsWakeRouteForServerlessSandbox(t *testing.T) {
 	}
 
 	serverless := &models.Sandbox{
-		ID:        "sl",
-		Status:    models.SandboxStatusStopped,
-		Lifecycle: models.Lifecycle{Serverless: true},
-		WakeArmed: true,
+		ID:                 "sl",
+		Status:             models.SandboxStatusStopped,
+		AllowPublicTraffic: privateFlag(true),
+		Lifecycle:          models.Lifecycle{Serverless: true},
+		WakeArmed:          true,
 		ExposedPorts: []models.ExposedPort{{
 			SandboxID: "sl", Port: 3000, Protocol: models.ExposedPortProtocolHTTP, CreatedAt: time.Now().UTC(),
 		}},
 	}
 	plain := &models.Sandbox{
-		ID:     "plain",
-		Status: models.SandboxStatusStarted,
+		ID:                 "plain",
+		Status:             models.SandboxStatusStarted,
+		AllowPublicTraffic: privateFlag(true),
 		ExposedPorts: []models.ExposedPort{{
 			SandboxID: "plain", Port: 3000, Protocol: models.ExposedPortProtocolHTTP, CreatedAt: time.Now().UTC(),
 		}},

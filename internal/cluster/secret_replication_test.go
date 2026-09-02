@@ -13,7 +13,7 @@ import (
 
 func TestPushSecretBlobToPeersIdempotentAndAuth(t *testing.T) {
 	var posts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, internalClient := newNodeBoundForwardServer(t, "self", "peer-a", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != PublicInternalSecretPath {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
@@ -24,12 +24,11 @@ func TestPushSecretBlobToPeersIdempotentAndAuth(t *testing.T) {
 		posts.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	defer srv.Close()
 
 	members := []Member{
 		{NodeID: "self", Alive: true, APIURL: "http://self"},
-		{NodeID: "peer-a", Alive: true, APIURL: srv.URL},
-		{NodeID: "peer-b", Alive: false, APIURL: srv.URL},
+		{NodeID: "peer-a", Alive: true, InternalURL: srv.URL},
+		{NodeID: "peer-b", Alive: false, InternalURL: srv.URL},
 	}
 	blob := secrets.SecretBlob{
 		Ref:           "cluster-secret://sandbox/sb1/v1",
@@ -38,7 +37,7 @@ func TestPushSecretBlobToPeersIdempotentAndAuth(t *testing.T) {
 		Recipients:    []string{"self", "peer-a"},
 		SealedPayload: []byte(`{}`),
 	}
-	acked, err := pushSecretBlobToPeers(context.Background(), members, srv.Client(), "test-pat", "self", blob, []string{"self", "peer-a"})
+	acked, err := pushSecretBlobToPeers(context.Background(), members, internalClient, "test-pat", "self", blob, []string{"self", "peer-a"})
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -49,24 +48,23 @@ func TestPushSecretBlobToPeersIdempotentAndAuth(t *testing.T) {
 		t.Fatalf("posts = %d, want 1", posts.Load())
 	}
 	// Retry is idempotent at the peer (handler returns 204 again).
-	acked, err = pushSecretBlobToPeers(context.Background(), members, srv.Client(), "test-pat", "self", blob, []string{"self", "peer-a"})
+	acked, err = pushSecretBlobToPeers(context.Background(), members, internalClient, "test-pat", "self", blob, []string{"self", "peer-a"})
 	if err != nil || len(acked) != 1 {
 		t.Fatalf("retry acked=%v err=%v", acked, err)
 	}
 }
 
 func TestPushSecretBlobUnauthenticatedRejected(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, internalClient := newNodeBoundForwardServer(t, "self", "peer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	defer srv.Close()
-	members := []Member{{NodeID: "peer", Alive: true, APIURL: srv.URL}}
+	members := []Member{{NodeID: "peer", Alive: true, InternalURL: srv.URL}}
 	blob := secrets.SecretBlob{Ref: "r", SandboxID: "s", SealedPayload: []byte("x")}
-	_, err := pushSecretBlobToPeers(context.Background(), members, srv.Client(), "", "self", blob, []string{"peer"})
+	_, err := pushSecretBlobToPeers(context.Background(), members, internalClient, "", "self", blob, []string{"peer"})
 	if err == nil {
 		t.Fatal("expected unauthenticated push to fail")
 	}
@@ -75,7 +73,7 @@ func TestPushSecretBlobUnauthenticatedRejected(t *testing.T) {
 func TestDeleteSecretOnPeers(t *testing.T) {
 	var deletes atomic.Int32
 	var gotGen string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, internalClient := newNodeBoundForwardServer(t, "self", "peer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			t.Fatalf("method = %s", r.Method)
 		}
@@ -83,9 +81,8 @@ func TestDeleteSecretOnPeers(t *testing.T) {
 		deletes.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	defer srv.Close()
-	members := []Member{{NodeID: "peer", Alive: true, APIURL: srv.URL}}
-	acked, pending, err := deleteSecretOnPeers(context.Background(), members, srv.Client(), "pat", "self", "sb-del", []string{"peer", "offline"}, 7)
+	members := []Member{{NodeID: "peer", Alive: true, InternalURL: srv.URL}}
+	acked, pending, err := deleteSecretOnPeers(context.Background(), members, internalClient, "pat", "self", "sb-del", []string{"peer", "offline"}, 7)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -124,11 +121,10 @@ func TestPostSecretBlobRoundTripBody(t *testing.T) {
 
 func TestSecretReplicationPrefersInternalTransportWithoutPublicDowngrade(t *testing.T) {
 	var internalHits atomic.Int32
-	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	internal, internalClient := newNodeBoundForwardServer(t, "self", "peer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		internalHits.Add(1)
 		http.Error(w, "internal unavailable", http.StatusServiceUnavailable)
 	}))
-	defer internal.Close()
 
 	var publicHits atomic.Int32
 	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -144,8 +140,8 @@ func TestSecretReplicationPrefersInternalTransportWithoutPublicDowngrade(t *test
 		InternalURL: internal.URL,
 	}}
 	blob := secrets.SecretBlob{Ref: "r", SandboxID: "s", SealedPayload: []byte("x")}
-	acked, err := pushSecretBlobToPeersWithInternal(
-		context.Background(), members, public.Client(), internal.Client(), "pat", "self", blob, []string{"peer"},
+	acked, err := pushSecretBlobToPeers(
+		context.Background(), members, internalClient, "pat", "self", blob, []string{"peer"},
 	)
 	if err == nil {
 		t.Fatal("expected the internal transport error")
@@ -162,15 +158,14 @@ func TestSecretReplicationPrefersInternalTransportWithoutPublicDowngrade(t *test
 }
 
 func TestSecretReplicationSupportsInternalOnlyMember(t *testing.T) {
-	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	internal, internalClient := newNodeBoundForwardServer(t, "self", "peer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	defer internal.Close()
 
 	members := []Member{{NodeID: "peer", Alive: true, InternalURL: internal.URL}}
 	blob := secrets.SecretBlob{Ref: "r", SandboxID: "s", SealedPayload: []byte("x")}
-	acked, err := pushSecretBlobToPeersWithInternal(
-		context.Background(), members, nil, internal.Client(), "pat", "self", blob, []string{"peer"},
+	acked, err := pushSecretBlobToPeers(
+		context.Background(), members, internalClient, "pat", "self", blob, []string{"peer"},
 	)
 	if err != nil {
 		t.Fatalf("push over internal-only transport: %v", err)
@@ -190,8 +185,8 @@ func TestSecretReplicationFailClosedWithoutInternalURL(t *testing.T) {
 
 	members := []Member{{NodeID: "peer", Alive: true, APIURL: public.URL}}
 	blob := secrets.SecretBlob{Ref: "r", SandboxID: "s", SealedPayload: []byte("x")}
-	acked, err := pushSecretBlobToPeersWithInternal(
-		context.Background(), members, public.Client(), public.Client(), "pat", "self", blob, []string{"peer"},
+	acked, err := pushSecretBlobToPeers(
+		context.Background(), members, public.Client(), "pat", "self", blob, []string{"peer"},
 	)
 	if err == nil {
 		t.Fatal("expected fail-closed dial when internal client is set without InternalURL")
@@ -203,8 +198,8 @@ func TestSecretReplicationFailClosedWithoutInternalURL(t *testing.T) {
 		t.Fatalf("public hits = %d, want 0 (no APIURL fallback)", publicHits.Load())
 	}
 
-	acked, pending, delErr := deleteSecretOnPeersWithInternal(
-		context.Background(), members, public.Client(), public.Client(), "pat", "self", "sb", []string{"peer"}, 1,
+	acked, pending, delErr := deleteSecretOnPeers(
+		context.Background(), members, public.Client(), "pat", "self", "sb", []string{"peer"}, 1,
 	)
 	if delErr == nil {
 		t.Fatal("expected delete fail-closed dial error")
@@ -212,8 +207,8 @@ func TestSecretReplicationFailClosedWithoutInternalURL(t *testing.T) {
 	if len(acked) != 0 || len(pending) != 1 || pending[0] != "peer" {
 		t.Fatalf("acked=%v pending=%v", acked, pending)
 	}
-	holding, probeErr := probeSecretOnPeersWithInternal(
-		context.Background(), members, public.Client(), public.Client(), "pat", "self", "sb", []string{"peer"}, 1,
+	holding, probeErr := probeSecretOnPeers(
+		context.Background(), members, public.Client(), "pat", "self", "sb", []string{"peer"}, 1,
 	)
 	if probeErr == nil {
 		t.Fatal("expected probe fail-closed dial error")
@@ -228,22 +223,21 @@ func TestSecretReplicationFailClosedWithoutInternalURL(t *testing.T) {
 
 func TestPushSecretBlobDeadRecipientIncomplete(t *testing.T) {
 	var posts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, internalClient := newNodeBoundForwardServer(t, "self", "peer-a", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		posts.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	defer srv.Close()
 
 	members := []Member{
 		{NodeID: "self", Alive: true, APIURL: "http://self"},
-		{NodeID: "peer-a", Alive: true, APIURL: srv.URL},
-		{NodeID: "peer-b", Alive: false, APIURL: srv.URL},
+		{NodeID: "peer-a", Alive: true, InternalURL: srv.URL},
+		{NodeID: "peer-b", Alive: false, InternalURL: srv.URL},
 	}
 	blob := secrets.SecretBlob{
 		Ref: "r", SandboxID: "s", SealedPayload: []byte("x"),
 		Recipients: []string{"self", "peer-a", "peer-b"},
 	}
-	acked, err := pushSecretBlobToPeers(context.Background(), members, srv.Client(), "pat", "self", blob, []string{"self", "peer-a", "peer-b"})
+	acked, err := pushSecretBlobToPeers(context.Background(), members, internalClient, "pat", "self", blob, []string{"self", "peer-a", "peer-b"})
 	if err == nil {
 		t.Fatal("expected incomplete fan-out when a recipient is dead")
 	}
@@ -254,7 +248,7 @@ func TestPushSecretBlobDeadRecipientIncomplete(t *testing.T) {
 		t.Fatalf("posts = %d, want 1", posts.Load())
 	}
 
-	acked, err = pushSecretBlobToPeers(context.Background(), members, srv.Client(), "pat", "self", blob, []string{"missing"})
+	acked, err = pushSecretBlobToPeers(context.Background(), members, internalClient, "pat", "self", blob, []string{"missing"})
 	if err == nil {
 		t.Fatal("expected incomplete fan-out for unknown recipient")
 	}
@@ -265,7 +259,7 @@ func TestPushSecretBlobDeadRecipientIncomplete(t *testing.T) {
 
 func TestDeleteAndProbeSecretOnPeersLookup(t *testing.T) {
 	var deletes, heads atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, internalClient := newNodeBoundForwardServer(t, "self", "peer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodDelete:
 			deletes.Add(1)
@@ -277,21 +271,20 @@ func TestDeleteAndProbeSecretOnPeersLookup(t *testing.T) {
 			t.Fatalf("method = %s", r.Method)
 		}
 	}))
-	defer srv.Close()
 	lookup := func(id string) (Member, bool) {
 		if id != "peer" {
 			return Member{}, false
 		}
-		return Member{NodeID: "peer", Alive: true, APIURL: srv.URL}, true
+		return Member{NodeID: "peer", Alive: true, InternalURL: srv.URL}, true
 	}
-	acked, pending, err := deleteSecretOnPeersLookup(context.Background(), lookup, srv.Client(), nil, "pat", "self", "sb", []string{"peer", "missing"}, 3)
+	acked, pending, err := deleteSecretOnPeersLookup(context.Background(), lookup, internalClient, "pat", "self", "sb", []string{"peer", "missing"}, 3)
 	if err != nil {
 		t.Fatalf("delete lookup: %v", err)
 	}
 	if deletes.Load() != 1 || len(acked) != 1 || acked[0] != "peer" || len(pending) != 1 || pending[0] != "missing" {
 		t.Fatalf("acked=%v pending=%v deletes=%d", acked, pending, deletes.Load())
 	}
-	holding, err := probeSecretOnPeersLookup(context.Background(), lookup, srv.Client(), nil, "pat", "self", "sb", []string{"peer", "missing"}, 3)
+	holding, err := probeSecretOnPeersLookup(context.Background(), lookup, internalClient, "pat", "self", "sb", []string{"peer", "missing"}, 3)
 	if err != nil {
 		t.Fatalf("probe lookup: %v", err)
 	}

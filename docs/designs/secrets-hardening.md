@@ -328,8 +328,9 @@ Added here:
   material and internal routes reject requests on the public listener; internal
   audit reads never retry over plaintext after a TLS error. Enterprise mode also
   forbids insecure gossip/credentials. The fleet PAT stays as a second
-  authorization layer. Unique node-ID-bound SPIFFE identities are not
-  implemented.
+  authorization layer. Every leaf is bound to its gossip identity through a
+  required `node:<SB_NODE_ID>` SAN; shared-SAN/common-name fallbacks are
+  rejected.
 
 ## Section-review decisions (11-section deep review)
 
@@ -408,7 +409,7 @@ rollback. Security storage and fan-out behavior are mandatory, not feature flags
 | 2 | **DONE 2026-08-08.** T5-T6, E2a (correlation + retention), E4 (canary + alerts + runbook) + audit drop counter/gap marker | One audit event per secret read, no plaintext; canary reports at boot; overflow produces counted gap marker + alert |
 | 3 | **DONE 2026-08-08.** T7-T9, T13, E1b + operator alerts/runbook | Env always sealed at rest; `Get`/`List` omit env; D5 limitation published; audit API with fan-out + coverage + rate limit |
 | 4 | **DONE 2026-08-08 (T10 + E3a).** T10 shipped; E3a wasm/isolate egress attribution into shared audit JSONL. Integration chaos case (kill-owner-mid-fan-out) still operator-run behind `integration` tag. | Both providers pass contract suite; attribution emits for wasm + isolate; netstats totals unchanged |
-| 5 | **PARTIAL.** Witness heads + `SB_SECRET_AUDIT_EXPORT_URL` batch export seam ship; E3b (kernel IP) and auditor-gated E2b remain optional | Export/Witness configured on enterprise; full WORM/SIEM still operator-owned |
+| 5 | **PARTIAL.** Witness heads + authenticated HTTPS batch export ship; E3b (kernel IP) and auditor-gated E2b remain optional | Event exporter required on enterprise; receiver retention/WORM policy remains operator-owned |
 
 **Totals, slices 0-5:** ~81 eng-days ≈ **16 engineer-weeks**; ~17 CC-days of
 authoring. At 1.5 engineers that is ~11 calendar weeks of build, plus live-AWS

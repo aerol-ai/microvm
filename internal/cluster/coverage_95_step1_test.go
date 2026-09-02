@@ -59,8 +59,8 @@ func TestGossipAndVoterDelegateNoopMethods(t *testing.T) {
 func TestControlPlaneDiagnosticsHelpers(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "self", Role: config.NodeRoleWorker, Alive: true})
-	index.upsert(Member{NodeID: "dead-srv", Role: config.NodeRoleServer, Alive: false, APIURL: "http://x"})
-	index.upsert(Member{NodeID: "ok-srv", Role: config.NodeRoleServer, Alive: true, APIURL: "http://ok"})
+	index.upsert(Member{NodeID: "dead-srv", Role: config.NodeRoleServer, Alive: false, APIURL: "http://x", InternalURL: "https://x"})
+	index.upsert(Member{NodeID: "ok-srv", Role: config.NodeRoleServer, Alive: true, APIURL: "http://ok", InternalURL: "https://ok"})
 	a := &Agent{
 		nodeID: "self",
 		gossip: &gossipNode{memberIndex: index},
@@ -126,9 +126,9 @@ func TestRecoveryStoreHelpersAndErrors(t *testing.T) {
 
 func TestAgentVolumeMethodsAndQueryBranches(t *testing.T) {
 	vols := map[string]models.Volume{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, internalClient := newNodeBoundForwardServer(t, "worker", "cp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+		case r.Method == http.MethodPost && (r.URL.Path == PublicInternalApplyPath || r.URL.Path == InternalAPIPath):
 			var cmd command
 			body, _ := io.ReadAll(r.Body)
 			if err := decodeCommandInto(body, &cmd); err != nil {
@@ -171,15 +171,14 @@ func TestAgentVolumeMethodsAndQueryBranches(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
 
 	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "cp", APIURL: server.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "cp", APIURL: server.URL, InternalURL: server.URL, Alive: true, Role: config.NodeRoleServer})
 	a := &Agent{
-		nodeID:     "worker",
-		httpClient: server.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID:         "worker",
+		internalClient: internalClient,
+		gossip:         &gossipNode{memberIndex: index},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -365,7 +364,7 @@ func TestGossipHelpersAdditionalBranches(t *testing.T) {
 		t.Fatalf("nil gossip node members=%v", got)
 	}
 
-	encodedServer, err := json.Marshal(nodeMeta{NodeID: "server-1", Role: config.NodeRoleServer, APIURL: "http://cp"})
+	encodedServer, err := json.Marshal(nodeMeta{NodeID: "server-1", Role: config.NodeRoleServer, APIURL: "http://cp", InternalURL: "https://cp"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,20 +409,19 @@ func TestGossipHelpersAdditionalBranches(t *testing.T) {
 
 func TestClusterWasmMigrateHTTPClientBranchesStep1(t *testing.T) {
 	internalClient := &http.Client{Timeout: 100 * time.Millisecond}
-	publicClient := &http.Client{Timeout: 100 * time.Millisecond}
-	c := &Cluster{internalClient: internalClient, httpClient: publicClient}
+	c := &Cluster{internalClient: internalClient}
 
-	client, endpoint, err := c.wasmMigrateHTTPClient("https://internal", "https://public")
+	client, endpoint, err := c.PeerDialMember(Member{NodeID: "peer-1", InternalURL: "https://internal"})
 	if err != nil || client != internalClient || endpoint != "https://internal" {
 		t.Fatalf("internal path client=%p endpoint=%q err=%v", client, endpoint, err)
 	}
 
-	client, endpoint, err = c.wasmMigrateHTTPClient("", "https://public")
-	if err != nil || client != publicClient || endpoint != "https://public" {
-		t.Fatalf("public fallback client=%p endpoint=%q err=%v", client, endpoint, err)
+	client, endpoint, err = c.PeerDialMember(Member{NodeID: "peer-1"})
+	if !errors.Is(err, ErrPeerInternalURLRequired) || client != nil || endpoint != "" {
+		t.Fatalf("missing internal URL client=%p endpoint=%q err=%v", client, endpoint, err)
 	}
 
-	if _, _, err := c.wasmMigrateHTTPClient("", ""); err == nil {
+	if _, _, err := c.PeerDialMember(Member{}); err == nil {
 		t.Fatal("expected error when both internal and public endpoints are empty")
 	}
 }
@@ -434,7 +432,7 @@ func TestAgentControlPlaneMembersAndPlacementCacheHelpers(t *testing.T) {
 	index.upsert(Member{NodeID: "dead", Alive: false, Role: config.NodeRoleServer, APIURL: "http://dead"})
 	index.upsert(Member{NodeID: "worker", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://worker"})
 	index.upsert(Member{NodeID: "no-endpoint", Alive: true, Role: config.NodeRoleServer})
-	index.upsert(Member{NodeID: "cp", Alive: true, Role: config.NodeRoleServer, APIURL: "http://cp"})
+	index.upsert(Member{NodeID: "cp", Alive: true, Role: config.NodeRoleServer, APIURL: "http://cp", InternalURL: "https://cp"})
 
 	a := &Agent{
 		nodeID: "self",
@@ -602,7 +600,7 @@ func TestAgentDiagnosticSnapshotTruncationAndNilGuards(t *testing.T) {
 
 	index := newGossipMemberIndex()
 	for i := 0; i < 20; i++ {
-		index.upsert(Member{NodeID: fmt.Sprintf("cp-%d", i), Alive: true, Role: config.NodeRoleServer, APIURL: "http://cp"})
+		index.upsert(Member{NodeID: fmt.Sprintf("cp-%d", i), Alive: true, Role: config.NodeRoleServer, APIURL: "http://cp", InternalURL: "https://cp"})
 	}
 	a := &Agent{nodeID: "self", gossip: &gossipNode{memberIndex: index}}
 	_, _, _, _, _, _, _, _, visible = a.controlPlaneDiagnosticSnapshot()
@@ -612,7 +610,7 @@ func TestAgentDiagnosticSnapshotTruncationAndNilGuards(t *testing.T) {
 }
 
 func TestControlPlaneMemberDiagnosticCandidateAndThrottlePath(t *testing.T) {
-	diag := controlPlaneMemberDiagnostic(Member{NodeID: "cp-a", Alive: true, Role: config.NodeRoleServer, APIURL: "http://cp"}, "self")
+	diag := controlPlaneMemberDiagnostic(Member{NodeID: "cp-a", Alive: true, Role: config.NodeRoleServer, APIURL: "http://cp", InternalURL: "https://cp"}, "self")
 	if !strings.Contains(diag, "candidate") {
 		t.Fatalf("candidate diagnostic=%q", diag)
 	}

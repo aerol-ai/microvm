@@ -659,9 +659,10 @@ Four parts, all of them load-bearing:
    is the source of truth on every build.
 2. Serve `/v1/sandboxes/{id}/audit` by live fan-out to the bounded Raft-retained
    owner-node history, merged by timestamp, with an **explicit coverage block**.
-   Missing or truncated history deliberately falls back to all reachable
-   workers, so the scale optimization cannot create an evidence vacuum.
-   **Rate-limited** (see below).
+   **Revised 2026-08-13 for the 2,000-node target:** missing or truncated index
+   state fails explicitly (`503`) instead of launching an all-worker scan. The
+   off-node exporter is mandatory in enterprise mode, so completeness does not
+   depend on an unbounded discovery query. **Rate-limited** (see below).
 3. **Additionally**, best-effort `Report(...)` audit events through
    `controlplane.Reporter` when a real reporter is configured — the managed or
    customer sink path.
@@ -684,8 +685,8 @@ boundary rather than let a reader infer a stronger guarantee than exists.
 The FSM now retains a bounded `AuditNodeIDs` owner history on the live placement
 and copies it into the post-delete `AuditACL`. Normal reads are therefore
 O(owner changes), not O(cluster workers). A sticky `AuditNodesTruncated` bit
-switches reads back to all-worker fan-out if the bound is ever exceeded,
-preserving the original completeness rule.
+makes the discovery API return `503`; the enterprise exporter is the complete
+off-node record and avoids a fleet-wide amplification fallback.
 
 ### Rate-limit dimension — DECIDED 2026-08-07: per-identity **plus** a per-node ceiling
 
@@ -924,7 +925,7 @@ corrections, all verified against source.
 | 3 | **Env side-row write needs atomicity.** Insert row → write sealed env as two steps means a crash yields the "healthy sandbox with empty env" failure this plan calls critical. | **Required:** single transaction, plus an explicit crash-between-writes rollback test. Gates T7. |
 | 4 | **Peer secret deletes are unplanned.** Fan-out creates rows on peers; `DeleteClusterSecretsForSandbox` is local-only (`store.go:4040`) and `cluster_secrets` has no FK by design. | **Required:** delete fan-out on destroy, create rollback, partial fan-out, and promote failure. Tests for each. Gates T3. |
 | 5 | **Stale peer rows can collide.** Refs are deterministic (`cluster-secret://sandbox/<id>/v1`), so a failed create with partial fan-out leaves remote rows a later retry may reuse. | **Required:** either delete-fan-out on rollback (see #4) or attempt-unique refs. Pick one before coding T3. |
-| 6 | **"Rejects foreign pushes" is not achievable with PAT + `d.Auth` alone** — that is caller authorization, not peer identity. | **Closed:** secret PUT/DELETE + internal audit require **operator** (`Access.Operator` / fleet PAT) after `d.Auth`; receiver validates ref↔sandbox/version, live placement recipients, and self∈envelope recipients. Every cluster mode requires cluster-CA mTLS on the internal listener, rejects these routes on the public listener, and does not downgrade after TLS failure. SPIFFE/node-ID certificate binding remains outside this plan. |
+| 6 | **"Rejects foreign pushes" is not achievable with PAT + `d.Auth` alone** — that is caller authorization, not peer identity. | **Closed:** secret PUT/DELETE + internal audit require **operator** (`Access.Operator` / fleet PAT) after `d.Auth`; receiver validates ref↔sandbox/version, live placement recipients, and self∈envelope recipients. Every cluster mode requires cluster-CA mTLS on the internal listener, rejects these routes on the public listener, does not downgrade after TLS failure, and binds every leaf to `node:<SB_NODE_ID>`. Generic SPIFFE identities are unnecessary for this contract. |
 | 7 | **D5 causes reassign churn.** `owner_watcher.go:109` reassigns after 5 failures to another arbitrary candidate excluding only the current node; a recipient-denied error therefore walks the fleet. | **Required:** a recipient-aware stop rule so a recipient-denied open halts reassignment instead of cycling. Gates T3; needs a regression test next to `owner_watcher.go`. |
 | 8 | **`Provider.Open(ctx, handle, nodeID)` carries no sandbox ID**, but the audit event needs one and a not-found event cannot recover it from an opaque handle. | **Required:** add `sandboxID` to the `Open` signature, or require handles to encode it. Decide at T1 — it is the interface definition. |
 | 9 | **The API change is under-scoped.** `GetSandbox`/`ListSandboxes` are thin wrappers (`service.go:1987`) and internal workflows call `store.Get/List` directly. | **Required:** separate internal "with env" reads from public response omission. A default change in the store would break internal callers. Gates T8. |
@@ -1007,6 +1008,8 @@ retraction, and failure when peers are unreachable — §10).
 - SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
 - Owners, dates, and per-slice rollback plans
 - Full off-node WORM/SIEM event store (Witness + HTTP export seam ship; reconstructable history still requires configuring export)
-- Unique node-ID-bound peer identity (for example SPIFFE) beyond cluster-CA
-  membership across `/v1/cluster/internal/...` — separate work, not this plan
+- Automated certificate issuance/renewal and revocation distribution for the
+  existing node-ID-bound cluster certificates remains an operational follow-up.
+  Atomically replaced leaf pairs hot-reload on the next handshake and expiry
+  metrics/alerts are shipped; CA rotation remains a coordinated operation.
 - Live 2,000-process / 100-ingress soak remains operator-run (`plans/data-plane-load-balancer.md`)

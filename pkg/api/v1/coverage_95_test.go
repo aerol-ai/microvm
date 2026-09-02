@@ -59,10 +59,11 @@ func (h v1WasmMigrateHost) MigrateSandbox(_ context.Context, sandbox *models.San
 
 type v1WasmMigrateCluster struct {
 	*cluster.Noop
-	selfID    string
-	targetID  string
-	targetURL string
-	spec      *models.CreateSandboxRequest
+	selfID       string
+	targetID     string
+	targetURL    string
+	importClient *http.Client
+	spec         *models.CreateSandboxRequest
 }
 
 func (c *v1WasmMigrateCluster) OwnerOf(string) (cluster.OwnerInfo, error) {
@@ -76,12 +77,19 @@ func (c *v1WasmMigrateCluster) Members() []cluster.Member {
 	}
 	return []cluster.Member{
 		{NodeID: c.selfID, APIURL: "http://self", Alive: true, Role: config.NodeRoleWorker},
-		{NodeID: c.targetID, APIURL: targetURL, Alive: true, Role: config.NodeRoleWorker},
+		{NodeID: c.targetID, APIURL: targetURL, InternalURL: targetURL, Alive: true, Role: config.NodeRoleWorker},
 	}
 }
 
 func (c *v1WasmMigrateCluster) SpecOf(string) *models.CreateSandboxRequest {
 	return c.spec
+}
+
+func (c *v1WasmMigrateCluster) PeerDialMember(m cluster.Member) (*http.Client, string, error) {
+	if c.targetURL == "" || m.NodeID != c.targetID {
+		return nil, "", cluster.ErrPeerInternalURLRequired
+	}
+	return c.importClient, c.targetURL, nil
 }
 
 func seedV1WasmSandbox(t *testing.T, st *store.Store, id string) {
@@ -125,14 +133,17 @@ func newV1WasmMigrateHarness(t *testing.T, importServer *httptest.Server) (*hand
 	svc := service.New(config.Config{EnableWasm: true, WasmModulesDir: t.TempDir()}, logger, st, nil, nil, nil, nil, nil, nil)
 	svc.SetWasmRuntime(v1WasmMigrateHost{snapDir: src, cloneGen: "gen-handoff"})
 	targetURL := ""
+	var importClient *http.Client
 	if importServer != nil {
 		targetURL = importServer.URL
+		importClient = importServer.Client()
 	}
 	svc.AttachCluster(&v1WasmMigrateCluster{
-		Noop:      cluster.NewNoop("node-a", "http://self", ""),
-		selfID:    "node-a",
-		targetID:  "node-b",
-		targetURL: targetURL,
+		Noop:         cluster.NewNoop("node-a", "http://self", ""),
+		selfID:       "node-a",
+		targetID:     "node-b",
+		targetURL:    targetURL,
+		importClient: importClient,
 		spec: &models.CreateSandboxRequest{
 			Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm",
 		},
@@ -278,16 +289,15 @@ func TestListAndDeleteJSBundleStoreErrors(t *testing.T) {
 	}
 }
 
-func TestCreateJSBundleReplicatedHeader(t *testing.T) {
+func TestCreateJSBundleReplicaEndpointRequiresMTLS(t *testing.T) {
 	h := newJSBundleV1TestEnv(t)
 	body, _ := json.Marshal(models.CreateJSBundleRequest{Name: "peer-hook", Source: jsHandlerBody})
-	req := httptest.NewRequest(http.MethodPost, "/v1/js-bundles", bytes.NewReader(body))
-	req.Header.Set(models.HeaderJSBundleReplicated, "1")
+	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalJSBundlesPath, bytes.NewReader(body))
 	req.Header.Set(models.HeaderJSBundleOwner, "node-a")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rr.Code, rr.Body.String())
 	}
 }
 

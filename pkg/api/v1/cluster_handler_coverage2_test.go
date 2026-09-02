@@ -224,7 +224,7 @@ func TestClusterForwardWrap_SelfOwnerRunsLocalHandler(t *testing.T) {
 }
 
 func TestClusterListWrap_SkipsFailedPeerAndDedupes(t *testing.T) {
-	goodPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	goodPeer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			http.Error(w, "missing forward header", http.StatusBadRequest)
 			return
@@ -241,7 +241,7 @@ func TestClusterListWrap_SkipsFailedPeerAndDedupes(t *testing.T) {
 		internalClient: goodPeer.Client(),
 		members: []cluster.Member{
 			{NodeID: "node-b", APIURL: goodPeer.URL, InternalURL: goodPeer.URL, Alive: true, Role: config.NodeRoleWorker},
-			{NodeID: "node-c", APIURL: "http://127.0.0.1:1", InternalURL: "http://127.0.0.1:1", Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-c", APIURL: "http://127.0.0.1:1", InternalURL: "https://127.0.0.1:1", Alive: true, Role: config.NodeRoleWorker},
 		},
 	})
 	now := time.Now()

@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,10 @@ func (h *handlers) getSandboxAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := h.deps.Service.ListSecretAudit(r.Context(), id, opts)
 	if err != nil {
+		if errors.Is(err, service.ErrSecretAuditIndexIncomplete) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}

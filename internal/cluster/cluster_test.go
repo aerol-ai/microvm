@@ -268,6 +268,8 @@ func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPe
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

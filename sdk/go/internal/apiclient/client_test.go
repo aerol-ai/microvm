@@ -530,6 +530,30 @@ func TestListDrainsClusterPages(t *testing.T) {
 	}
 }
 
+func TestListPageWithOptionsReturnsOnePage(t *testing.T) {
+	ctx := context.Background()
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if got := r.URL.Query().Get("page_token"); got != "tok-0" {
+			t.Fatalf("page_token = %q, want tok-0", got)
+		}
+		w.Header().Set("X-Cluster-List-Placement-Ready", "true")
+		w.Header().Set("X-Cluster-List-Next-Page-Token", "tok-1")
+		_, _ = w.Write([]byte(`[{"id":"sb-page","image":"alpine","status":"started"}]`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	items, next, err := client.ListPageWithOptions(ctx, nil, false, "tok-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || len(items) != 1 || items[0].ID != "sb-page" || next != "tok-1" {
+		t.Fatalf("calls=%d items=%+v next=%q", calls, items, next)
+	}
+}
+
 func TestListErrorsOnPartialClusterCoverage(t *testing.T) {
 	ctx := context.Background()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

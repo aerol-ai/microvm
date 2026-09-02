@@ -103,6 +103,10 @@ var ErrReservationConflict = errors.New("cluster: sandbox already placed or rese
 // match the live placement (stale reseal loser).
 var ErrSecretRecipientsCASMismatch = errors.New("cluster: secret recipients CAS mismatch")
 
+// ErrIncarnationConflict fences a placement update carrying secret state for
+// a different lifetime of the same sandbox ID.
+var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
+
 // ErrNoPlacementTarget is returned when no alive worker-capable node can
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
@@ -320,8 +324,9 @@ type Placement struct {
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
 }
 
-// AuditACL is the minimal post-delete authorization record retained in Raft.
-// It deliberately carries no sandbox spec, routes, secret refs, or audit data.
+// AuditACL is the minimal post-delete existence/authorization and evidence-node
+// record retained in Raft. OwnerRef may be empty for operator-owned local
+// workflows. It deliberately carries no spec, routes, secret refs, or events.
 type AuditACL struct {
 	SandboxID           string   `json:"sandbox_id"`
 	IncarnationID       string   `json:"incarnation_id,omitempty"`
@@ -345,10 +350,8 @@ type Member struct {
 	APIURL        string `json:"api_url"`
 	DataPlaneHost string `json:"data_plane_host,omitempty"`
 	RaftAddr      string `json:"raft_addr,omitempty"`
-	// InternalURL is the cluster-internal mTLS endpoint used for raft
-	// leader-forward applies. Empty when the peer is running without
-	// SB_CLUSTER_TLS_DIR — the forwarder falls back to APIURL with PAT-only
-	// auth in that case.
+	// InternalURL is the required cluster-internal mTLS endpoint used for peer
+	// RPC and leader-forwarded applies.
 	InternalURL string `json:"internal_url,omitempty"`
 	// Role is the peer's gossiped SB_NODE_ROLE. Empty for older builds that
 	// pre-date the field; callers treat empty as the legacy "mixed" default.
@@ -399,10 +402,7 @@ type PlacementTarget struct {
 	NodeID        string
 	APIURL        string
 	DataPlaneHost string
-	// InternalURL is the peer's cluster-internal mTLS URL (e.g. https://10.0.0.5:7002).
-	// Empty when the peer is running without SB_CLUSTER_TLS_DIR or hasn't yet
-	// gossiped its advertise URL. Cross-node create-forwarding uses this in
-	// preference to APIURL so the hop rides the cert-pinned channel.
+	// InternalURL is the peer's required cluster-internal mTLS URL.
 	InternalURL string
 	IsSelf      bool
 }
@@ -423,18 +423,15 @@ type PlacementReservation struct {
 type OwnerInfo struct {
 	NodeID string
 	APIURL string
-	// InternalURL is the owner's cluster-internal mTLS URL. Empty when the
-	// owner has no TLS material (mixed/legacy cluster). Owner API forwarding
-	// uses this in preference to APIURL so the cross-node hop is cert-pinned.
+	// InternalURL is the owner's required cluster-internal mTLS URL.
 	InternalURL string
 	IsSelf      bool
 }
 
-// Endpoint pairs a peer's optional cluster-internal mTLS URL with its public
-// API URL. Passed to ForwardHTTP so the forwarder can transparently pick the
-// cert-pinned internal channel when both ends have TLS material, falling back
-// to the public APIURL (PAT-authenticated) otherwise.
+// Endpoint binds a peer identity to its cluster-internal mTLS URL. APIURL is
+// response metadata; ForwardHTTP never uses it as a downgrade.
 type Endpoint struct {
+	NodeID      string
 	InternalURL string
 	APIURL      string
 }
@@ -673,11 +670,8 @@ type Client interface {
 	// boot. Idempotent.
 	AssertOwnership(ctx context.Context, local []LocalSandboxState) error
 
-	// ForwardHTTP reverse-proxies r to the given peer, copying response back to
-	// w. Used by the API layer when OwnerOf != self. When target.InternalURL is
-	// non-empty AND this node has its own TLS material loaded, the proxy rides
-	// the cert-pinned mTLS channel; otherwise it falls back to target.APIURL
-	// with PAT-only auth (the legacy public-API path).
+	// ForwardHTTP reverse-proxies r to the given peer. Target NodeID and
+	// InternalURL are required and the TLS leaf is pinned to node:<NodeID>.
 	ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request)
 
 	// AttachInternalHandler wires the API server's HTTP handler into the

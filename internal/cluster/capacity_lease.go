@@ -207,7 +207,7 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 		if m.NodeID == "" || m.NodeID == c.nodeID || !m.Alive || !CanOwnSandboxRole(m.Role) {
 			continue
 		}
-		if m.APIURL == "" && m.InternalURL == "" {
+		if m.InternalURL == "" {
 			continue
 		}
 		jobs <- m
@@ -219,7 +219,7 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 func (c *Cluster) fetchMemberCapacity(ctx context.Context, m Member) (capacity.Snapshot, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	client, base, err := PeerDial(m, c.httpClient, c.currentInternalClient())
+	client, base, err := c.PeerDialMember(m)
 	if err != nil {
 		return capacity.Snapshot{}, err
 	}

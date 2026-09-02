@@ -175,6 +175,53 @@ func TestOpenRejectsPlaintextSecretSchema(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsObsoleteSecretGenerationSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "obsolete-secret-generation.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open fresh store: %v", err)
+	}
+	if _, err := st.db.Exec(`ALTER TABLE cluster_secrets DROP COLUMN seal_generation`); err != nil {
+		_ = st.Close()
+		t.Fatalf("seed obsolete schema: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "cluster_secrets.seal_generation is required") {
+		t.Fatalf("Open obsolete schema error = %v", err)
+	}
+}
+
+func TestOpenRejectsUnfencedSecretPutOutboxPrimaryKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "obsolete-put-outbox.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open fresh store: %v", err)
+	}
+	if _, err := st.db.Exec(`
+		DROP TABLE cluster_secret_put_outbox;
+		CREATE TABLE cluster_secret_put_outbox (
+			sandbox_id TEXT PRIMARY KEY,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			seal_generation INTEGER NOT NULL DEFAULT 0,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);
+	`); err != nil {
+		_ = st.Close()
+		t.Fatalf("seed unfenced outbox schema: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "primary-key position") {
+		t.Fatalf("Open unfenced outbox schema error = %v", err)
+	}
+}
+
 func TestDestroyCascadesSandboxEnv(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "env-cascade.db"))
 	if err != nil {

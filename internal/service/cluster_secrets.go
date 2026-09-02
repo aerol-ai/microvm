@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -681,6 +682,42 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 			return nil
 		}
 	}
+
+	// A reseal is a two-phase Raft/local operation. If the process crashed after
+	// Put committed generation G+1 (and its outbox) but before the final Raft
+	// handle update, finish that commit before evaluating recipient health. The
+	// new recipient set may be entirely healthy, so the dead-target trigger alone
+	// would otherwise never repair this generation split.
+	unlock := lockSecretSandboxOps(sandboxID)
+	defer unlock()
+	if hasPlacement && s.store != nil && placement.SecretSealGeneration > 0 {
+		local, err := s.store.GetClusterSecretForSandbox(ctx, sandboxID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("load local secret generation: %w", err)
+		}
+		if local != nil && local.SealGeneration > placement.SecretSealGeneration {
+			parsed, parseErr := secrets.ParseRef(local.Ref)
+			localRecipients := secrets.NormalizeRecipients(local.Recipients)
+			placementRecipients := secrets.NormalizeRecipients(placement.SecretRecipients)
+			if parseErr == nil && parsed.IncarnationID == placement.IncarnationID &&
+				(placement.SecretRef == "" || local.Ref == placement.SecretRef) &&
+				sameStringSlice(localRecipients, placementRecipients) {
+				handle := cluster.PlacementSecrets{
+					Ref:            local.Ref,
+					Version:        local.Version,
+					Recipients:     append([]string(nil), localRecipients...),
+					IncarnationID:  placement.IncarnationID,
+					SealGeneration: local.SealGeneration,
+				}
+				if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, localRecipients, handle, placement.IncarnationID, placement.SecretSealGeneration); err != nil {
+					return fmt.Errorf("finalize interrupted secret reseal: %w", err)
+				}
+				resetSecretHoldersForGeneration(sandboxID, local.SealGeneration, selfID)
+				setSecretHolderTargets(sandboxID, local.SealGeneration, localRecipients)
+				return nil
+			}
+		}
+	}
 	alive := s.aliveMemberSet()
 
 	hs := holderSetFor(sandboxID)
@@ -716,9 +753,6 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if sameStringSlice(sortedFrozen, replacements) {
 		return nil
 	}
-
-	unlock := lockSecretSandboxOps(sandboxID)
-	defer unlock()
 
 	p := s.provider()
 	if p == nil || s.store == nil {
@@ -848,7 +882,7 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	}
 	pending := pendingRecipientsAfterAck(replacements, acked, selfID)
 	if len(pending) > 0 {
-		if upErr := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, blob.IncarnationID, pending, newGen); upErr != nil {
+		if upErr := s.persistSecretPutOutboxRecipients(context.Background(), sandboxID, blob.IncarnationID, pending, newGen); upErr != nil {
 			recordSecretPutOutboxFailure()
 			if s.logger != nil {
 				s.logger.Warn("cluster: reseal put-outbox shrink failed",
@@ -863,6 +897,21 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	}
 	s.enqueueSecretFanout(sandboxID, blob, replacements, pusher)
 	return nil
+}
+
+// persistSecretPutOutboxRecipients normally shrinks the row atomically created
+// with the sealed blob. If an interrupted operation left no matching row,
+// recreate it rather than treating a zero-row UPDATE as durable success and
+// losing the remaining replication work.
+func (s *Service) persistSecretPutOutboxRecipients(ctx context.Context, sandboxID, incarnationID string, recipients []string, sealGeneration int64) error {
+	if s == nil || s.store == nil {
+		return fmt.Errorf("cluster secret store is not configured")
+	}
+	err := s.store.UpdateSecretPutOutboxRecipients(ctx, sandboxID, incarnationID, recipients, sealGeneration)
+	if errors.Is(err, store.ErrNotFound) && len(recipients) > 0 {
+		return s.store.UpsertSecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration, recipients)
+	}
+	return err
 }
 
 func setSecretHolderTargetsUnlocked(hs *holderNodeSet, gen int64, nodeIDs []string) {
@@ -1031,7 +1080,7 @@ func (s *Service) reconcileSecretPutOutboxOnceContext(parent context.Context, sa
 		}
 	}
 	pending := pendingRecipientsAfterAck(peers, acked, selfID)
-	if err := s.store.UpdateSecretPutOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, pending, rec.SealGeneration); err != nil {
+	if err := s.persistSecretPutOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, pending, rec.SealGeneration); err != nil {
 		recordSecretPutOutboxFailure()
 		if s.logger != nil {
 			s.logger.Warn("cluster: secret put-outbox recipient update failed",

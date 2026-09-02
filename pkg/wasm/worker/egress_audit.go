@@ -30,17 +30,23 @@ const (
 	workerEgressWorkers    = 8
 	workerEgressQueue      = 1024
 	workerEgressIngestPath = "/internal/audit/egress"
-	workerEgressTokenHdr   = "X-Aerol-Audit-Token"
 	workerEgressCapHdr     = "X-Aerol-Audit-Capability"
 )
 
 type workerEgressAuditEvent = auditlog.Event
 
 type egressAuditJob struct {
-	port, token, capability, spillDir, node    string
+	port, capability, spillDir, node           string
 	sandboxID, incarnationID, network, address string
 	eventTime                                  time.Time
 }
+
+type egressAuditBinding struct {
+	capability    string
+	incarnationID string
+}
+
+type egressAuditBindingResolver func(sandboxID string) (egressAuditBinding, bool)
 
 var (
 	workerEgressOnce    sync.Once
@@ -53,34 +59,32 @@ var (
 // installDefaultEgressObserver wires destination attribution when
 // SB_EGRESS_ATTRIBUTION_ENABLED is unset/true. Prefers SB_AUDIT_INGEST_PORT;
 // falls back to spill under SB_DB_PATH/audit when IPC env is missing.
-func installDefaultEgressObserver(m *NetMediator) {
+func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindingResolver) {
 	if m == nil || !envBoolDefaultTrue("SB_EGRESS_ATTRIBUTION_ENABLED") {
 		return
 	}
 	port := strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_PORT"))
-	token := strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN"))
-	capability := strings.TrimSpace(os.Getenv("SB_AUDIT_CAPABILITY"))
-	incarnation := strings.TrimSpace(os.Getenv("SB_INCARNATION_ID"))
-	spillDir := workerEgressSpillDir()
+	var resolve egressAuditBindingResolver
+	if len(resolvers) > 0 {
+		resolve = resolvers[0]
+	}
+	spillDir := ""
+	if port == "" {
+		spillDir = workerEgressSpillDir()
+	}
 	if port == "" && spillDir == "" {
 		return
 	}
 	node := strings.TrimSpace(os.Getenv("SB_NODE_ID"))
 	ensureWorkerEgressPool()
 	m.SetEgressObserver(func(sandboxID, network, address string) {
-		cap := capability
-		inc := incarnation
-		if cap == "" && token != "" {
-			// Mint a short-lived capability bound to this sandbox so ingest
-			// resolves incarnation from the token (not live placement).
-			minted, err := auditlog.MintEgressCapability(token, sandboxID, inc, time.Now().UTC().Add(time.Hour))
-			if err == nil {
-				cap = minted
-			}
+		binding := egressAuditBinding{}
+		if resolve != nil {
+			binding, _ = resolve(sandboxID)
 		}
 		job := egressAuditJob{
-			port: port, token: token, capability: cap, spillDir: spillDir, node: node,
-			sandboxID: sandboxID, incarnationID: inc, network: network, address: address,
+			port: port, capability: binding.capability, spillDir: spillDir, node: node,
+			sandboxID: sandboxID, incarnationID: binding.incarnationID, network: network, address: address,
 			eventTime: time.Now().UTC(),
 		}
 		select {
@@ -89,7 +93,7 @@ func installDefaultEgressObserver(m *NetMediator) {
 			workerEgressDropped.Add(1)
 			slog.Warn("wasm egress audit queue full; writing gap marker",
 				"sandbox_id", sandboxID, "destination", address, "dropped_total", workerEgressDropped.Load())
-			appendWorkerEgressGap(spillDir, node, sandboxID, inc)
+			appendWorkerEgressGap(spillDir, node, sandboxID, binding.incarnationID)
 		}
 	})
 }
@@ -108,11 +112,7 @@ func ensureWorkerEgressPool() {
 }
 
 func workerEgressSpillDir() string {
-	dbPath := strings.TrimSpace(os.Getenv("SB_DB_PATH"))
-	if dbPath == "" {
-		return ""
-	}
-	return filepath.Join(filepath.Dir(dbPath), "audit")
+	return strings.TrimSpace(os.Getenv("SB_AUDIT_SPILL_DIR"))
 }
 
 func postOrSpillWorkerEgress(job egressAuditJob) {
@@ -124,7 +124,7 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 	if job.eventTime.IsZero() {
 		job.eventTime = time.Now().UTC()
 	}
-	if job.port != "" && (job.capability != "" || job.token != "") {
+	if job.port != "" && job.capability != "" {
 		if err := postWorkerEgressAudit(job); err == nil {
 			return
 		}
@@ -151,13 +151,8 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 
 func postWorkerEgressAudit(job egressAuditJob) error {
 	body, err := json.Marshal(map[string]any{
-		"sandbox_id":     job.sandboxID,
-		"network":        strings.TrimSpace(job.network),
-		"destination":    job.address,
-		"kind":           "egress",
-		"capability":     job.capability,
-		"incarnation_id": job.incarnationID,
-		"event_time":     job.eventTime.UTC().Format(time.RFC3339Nano),
+		"network":     strings.TrimSpace(job.network),
+		"destination": job.address,
 	})
 	if err != nil {
 		return err
@@ -170,9 +165,6 @@ func postWorkerEgressAudit(job egressAuditJob) error {
 	req.Header.Set("Content-Type", "application/json")
 	if job.capability != "" {
 		req.Header.Set(workerEgressCapHdr, job.capability)
-	}
-	if job.token != "" {
-		req.Header.Set(workerEgressTokenHdr, job.token)
 	}
 	resp, err := workerEgressHTTP.Do(req)
 	if err != nil {
@@ -222,7 +214,9 @@ func appendWorkerEgressSpill(spillDir string, ev workerEgressAuditEvent) {
 	}
 	lockPath := filepath.Join(spillDir, workerEgressLockFile)
 	spillPath := filepath.Join(spillDir, workerEgressSpillFile)
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	// The lock sidecar carries no data. Open it read-only so close cannot hide
+	// a buffered-write failure; flock only needs a stable file descriptor.
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDONLY, 0o600)
 	if err != nil {
 		slog.Warn("wasm egress spill lock open failed", "path", lockPath, "err", err)
 		workerEgressDropped.Add(1)
@@ -249,13 +243,22 @@ func appendWorkerEgressSpill(spillDir string, ev workerEgressAuditEvent) {
 		workerEgressDropped.Add(1)
 		return
 	}
-	defer f.Close()
 	if _, err := f.Write(line); err != nil {
+		_ = f.Close()
 		slog.Warn("wasm egress spill write failed", "path", spillPath, "err", err)
 		workerEgressDropped.Add(1)
 		return
 	}
-	_ = f.Sync()
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		slog.Warn("wasm egress spill sync failed", "path", spillPath, "err", err)
+		workerEgressDropped.Add(1)
+		return
+	}
+	if err := f.Close(); err != nil {
+		slog.Warn("wasm egress spill close failed", "path", spillPath, "err", err)
+		workerEgressDropped.Add(1)
+	}
 }
 
 func envBoolDefaultTrue(key string) bool {

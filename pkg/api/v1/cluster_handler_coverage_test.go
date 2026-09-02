@@ -105,7 +105,7 @@ func (c *internalPlacementStubCluster) OwnerOfName(name string) (string, cluster
 }
 
 func TestClusterListWrap_MergesPeerResults(t *testing.T) {
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			http.Error(w, "missing forward header", http.StatusBadRequest)
 			return

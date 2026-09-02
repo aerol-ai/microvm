@@ -249,11 +249,12 @@ func TestClusterTemplateItemWrapFallsBackLocalAfterPeer404(t *testing.T) {
 
 func templateMembersCluster(selfID, peerURL string) cluster.Client {
 	return &membersStubCluster{
-		Noop: cluster.NewNoop(selfID, "http://"+selfID, ""),
+		Noop:           cluster.NewNoop(selfID, "http://"+selfID, ""),
+		internalClient: http.DefaultClient,
 		members: []cluster.Member{
 			{NodeID: selfID, APIURL: "http://" + selfID, Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-fc", APIURL: peerURL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-fc", APIURL: peerURL, InternalURL: peerURL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}},
 			},
 		},

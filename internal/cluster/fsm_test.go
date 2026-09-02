@@ -231,6 +231,33 @@ func TestFSMDeleteRetainsAndPrunesAuditACL(t *testing.T) {
 	}
 }
 
+func TestFSMDeleteRetainsOwnerlessAuditNodeIndex(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, err := encodeCommand(command{
+		Op:            opPlace,
+		SandboxID:     "sb-operator-audit",
+		OwnerNodeID:   "node-a",
+		IncarnationID: "inc-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: place}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+	del, err := encodeCommand(command{Op: opDelete, SandboxID: "sb-operator-audit", ExpiresUnix: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 2, Data: del}); got != nil {
+		t.Fatalf("delete: %v", got)
+	}
+	acl, ok := fsm.auditACLForSandbox("sb-operator-audit", time.Now().Unix())
+	if !ok || acl.OwnerRef != "" || acl.IncarnationID != "inc-a" || !reflect.DeepEqual(acl.AuditNodeIDs, []string{"node-a"}) {
+		t.Fatalf("ownerless audit ACL = %+v ok=%v", acl, ok)
+	}
+}
+
 func TestPlacementAuditNodeHistoryBoundIsFailOpenForCoverage(t *testing.T) {
 	p := Placement{}
 	for i := 0; i <= maxPlacementAuditNodes; i++ {
@@ -421,6 +448,44 @@ func TestFSMUpdateSecretRecipientsPreservesIncarnation(t *testing.T) {
 	}
 	if len(got.SecretRecipients) != 3 || got.SecretRecipients[1] != "live-b" {
 		t.Fatalf("SecretRecipients=%v", got.SecretRecipients)
+	}
+}
+
+func TestFSMPlacePreservesAndFencesIncarnation(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-inc-place", OwnerNodeID: "n1",
+		IncarnationID: "inc-a", SecretRef: "ref-a", SecretVersion: 1,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 1, Data: place}); res != nil {
+		t.Fatalf("initial opPlace: %v", res)
+	}
+
+	// An ownership replay without a source incarnation may carry a freshly
+	// minted candidate. The FSM must preserve the authoritative lifetime.
+	replay, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-inc-place", OwnerNodeID: "n1",
+		IncarnationID: "candidate-only",
+	})
+	if res := fsm.Apply(&raft.Log{Index: 2, Data: replay}); res != nil {
+		t.Fatalf("replay opPlace: %v", res)
+	}
+	if got, _ := fsm.get("sb-inc-place"); got.IncarnationID != "inc-a" {
+		t.Fatalf("replay changed incarnation to %q", got.IncarnationID)
+	}
+
+	stale, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-inc-place", OwnerNodeID: "n1",
+		IncarnationID: "inc-b", ExpectedIncarnationID: "inc-b",
+		SecretRef: "ref-b", SecretVersion: 2,
+	})
+	res := fsm.Apply(&raft.Log{Index: 3, Data: stale})
+	if err, ok := res.(error); !ok || !errors.Is(err, ErrIncarnationConflict) {
+		t.Fatalf("stale opPlace result = %v, want ErrIncarnationConflict", res)
+	}
+	got, _ := fsm.get("sb-inc-place")
+	if got.IncarnationID != "inc-a" || got.SecretRef != "ref-a" || got.SecretVersion != 1 {
+		t.Fatalf("stale opPlace mutated placement: %+v", got)
 	}
 }
 

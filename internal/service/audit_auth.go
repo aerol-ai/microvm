@@ -7,7 +7,15 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+func (s *Service) retainSandboxAuditACL(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || s.store == nil || sandbox == nil {
+		return nil
+	}
+	return s.store.UpsertSandboxAuditACL(ctx, sandbox.ID, strings.TrimSpace(sandbox.OwnerRef), s.secretIncarnationForSeal(sandbox.ID))
+}
 
 // AuthorizeSandboxAuditAccess checks tenant/operator scope for GET …/audit
 // without requiring a local sandbox row. Ingress and non-owner workers resolve
@@ -34,9 +42,7 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID, in
 	if s.store != nil {
 		sb, err := s.store.Get(ctx, sandboxID)
 		if err == nil {
-			if ref := strings.TrimSpace(sb.OwnerRef); ref != "" {
-				_ = s.store.UpsertSandboxAuditACL(ctx, sandboxID, ref, incarnationID)
-			}
+			_ = s.store.UpsertSandboxAuditACL(ctx, sandboxID, strings.TrimSpace(sb.OwnerRef), incarnationID)
 			return enforceOwner(ctx, sb)
 		}
 		if !errors.Is(err, store.ErrNotFound) {
@@ -48,11 +54,36 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID, in
 	c := s.Cluster()
 
 	if !scoped {
-		// Operator/PAT and internal callers are fleet-wide. Do not require a
-		// live placement or a node-local ACL: after deletion, an arbitrary
-		// ingress must still be able to fan out and discover retained evidence.
-		// Tenant callers remain fenced by the owner checks below.
-		return nil
+		// Operators are fleet-wide but still require an existence proof. Allowing
+		// arbitrary IDs here turns every request into a cluster fan-out oracle.
+		if c != nil {
+			if p, ok := c.PlacementOf(sandboxID); ok {
+				placeInc := strings.TrimSpace(p.IncarnationID)
+				if incarnationID == "" || placeInc == "" || incarnationID == placeInc {
+					return nil
+				}
+				return store.ErrNotFound
+			}
+		}
+		if s.store != nil {
+			exists, err := s.store.HasSandboxAuditACL(ctx, sandboxID, incarnationID)
+			if err != nil {
+				return err
+			}
+			if exists {
+				return nil
+			}
+		}
+		if c != nil {
+			acl, exists, err := c.AuditACLForSandbox(ctx, sandboxID)
+			if err != nil {
+				return err
+			}
+			if exists && (incarnationID == "" || strings.TrimSpace(acl.IncarnationID) == incarnationID) {
+				return nil
+			}
+		}
+		return store.ErrNotFound
 	}
 
 	if c != nil {
@@ -93,12 +124,12 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID, in
 		}
 	}
 	if c != nil {
-		ref, ok, err := c.AuditOwnerRef(ctx, sandboxID)
+		acl, ok, err := c.AuditACLForSandbox(ctx, sandboxID)
 		if err != nil {
 			return err
 		}
-		if ok {
-			if strings.TrimSpace(ref) == owner {
+		if ok && (incarnationID == "" || strings.TrimSpace(acl.IncarnationID) == incarnationID) {
+			if strings.TrimSpace(acl.OwnerRef) == owner {
 				return nil
 			}
 			return store.ErrNotFound
@@ -112,11 +143,11 @@ func (s *Service) fetchSandboxOwnerRef(ctx context.Context, p cluster.Placement)
 	if fetcher == nil {
 		return "", store.ErrNotFound
 	}
-	apiURL := strings.TrimSpace(p.OwnerAPIURL)
-	if apiURL == "" {
+	nodeID := strings.TrimSpace(p.OwnerNodeID)
+	if nodeID == "" {
 		return "", store.ErrNotFound
 	}
-	ref, ok, err := fetcher.FetchSandboxOwnerRef(ctx, apiURL, p.SandboxID)
+	ref, ok, err := fetcher.FetchSandboxOwnerRef(ctx, nodeID, p.SandboxID)
 	if err != nil {
 		return "", err
 	}

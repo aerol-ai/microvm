@@ -18,7 +18,7 @@ set -euo pipefail
 CSR=""
 NODE_ID=""
 OUT=""
-TLS_DIR="/etc/sandboxd/tls"
+CA_DIR="/etc/sandboxd/cluster-ca"
 CLUSTER_SAN="aerolvm-cluster-node"
 DAYS="${CERT_DAYS:-90}"
 
@@ -41,7 +41,7 @@ Required:
   --out <path>       Where to write the signed node.crt.
 
 Optional:
-  --tls-dir <path>   Directory with ca.crt + ca.key. Default: /etc/sandboxd/tls
+  --ca-dir <path>    Directory with ca.crt + ca.key. Default: /etc/sandboxd/cluster-ca
   --days <n>         Certificate lifetime in days. Default: CERT_DAYS or 90
   --help             Show this help.
 EOF
@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
 		--csr)      CSR="$2"; shift 2 ;;
 		--node-id)  NODE_ID="$2"; shift 2 ;;
 		--out)      OUT="$2"; shift 2 ;;
-		--tls-dir)  TLS_DIR="$2"; shift 2 ;;
+		--ca-dir)   CA_DIR="$2"; shift 2 ;;
 		--days)     DAYS="$2"; shift 2 ;;
 		--help|-h)  usage; exit 0 ;;
 		*) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -64,12 +64,20 @@ if [[ -z "$CSR" || -z "$NODE_ID" || -z "$OUT" ]]; then
 	usage >&2
 	exit 1
 fi
+if [[ ! "$NODE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+	echo "--node-id must start with an alphanumeric and contain only alphanumerics, dot, underscore, or hyphen (max 128 characters)" >&2
+	exit 1
+fi
+if [[ ! "$DAYS" =~ ^[1-9][0-9]*$ ]]; then
+	echo "--days must be a positive integer" >&2
+	exit 1
+fi
 if [[ ! -f "$CSR" ]]; then
 	echo "CSR not found: $CSR" >&2
 	exit 1
 fi
-if [[ ! -f "$TLS_DIR/ca.crt" || ! -f "$TLS_DIR/ca.key" ]]; then
-	echo "Seed CA material missing under $TLS_DIR (need ca.crt + ca.key)." >&2
+if [[ ! -f "$CA_DIR/ca.crt" || ! -f "$CA_DIR/ca.key" ]]; then
+	echo "Seed CA material missing under $CA_DIR (need ca.crt + ca.key)." >&2
 	exit 1
 fi
 if ! command -v openssl >/dev/null 2>&1; then
@@ -85,10 +93,10 @@ extendedKeyUsage = serverAuth, clientAuth
 EOF
 
 openssl x509 -req -in "$CSR" \
-	-CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" -CAcreateserial \
+	-CA "$CA_DIR/ca.crt" -CAkey "$CA_DIR/ca.key" -CAcreateserial \
 	-out "$OUT" -days "$DAYS" -sha256 \
 	-extfile "$EXT" 2>/dev/null
 
 chmod 0644 "$OUT"
-rm -f "$TLS_DIR/ca.srl" 2>/dev/null || true
+rm -f "$CA_DIR/ca.srl" 2>/dev/null || true
 echo "Signed node cert for node:$NODE_ID -> $OUT"

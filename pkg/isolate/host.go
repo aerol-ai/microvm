@@ -295,7 +295,12 @@ func (h *Host) startBundleServer() error {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(wire)
 	})
-	h.bundleSrv = &http.Server{Handler: mux}
+	h.bundleSrv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() { _ = h.bundleSrv.Serve(ln) }()
 	return nil
 }

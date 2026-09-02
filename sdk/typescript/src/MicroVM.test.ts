@@ -573,9 +573,8 @@ test("MicroVM.get and list include_env opt-in", async () => {
   assert.equal(listURL.searchParams.get("include_env"), "true");
 });
 
-// Backward-compat: list() with no options and list({}) must produce the
-// pre-filter URL byte-for-byte so existing fixtures, request matchers, and
-// proxies don't see a stray "?".
+// Empty filters should produce the canonical collection URL without a stray
+// query delimiter.
 test("MicroVM.list omits the query string when no tags are supplied", async () => {
   const urls: string[] = [];
   const sdk = new MicroVM({
@@ -627,6 +626,35 @@ test("MicroVM.list drains cluster page tokens", async () => {
   const items = await sdk.list();
   assert.deepEqual(items.map((s) => s.id), ["sb-1", "sb-2"]);
   assert.equal(urls[1], "https://api.example.com/v1/sandboxes?page_token=tok-1");
+});
+
+test("MicroVM.listPages yields without accumulating later pages", async () => {
+  let calls = 0;
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async () => {
+      calls++;
+      return new Response(JSON.stringify([{ id: `sb-${calls}`, image: "alpine", status: "started" }]), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "X-Cluster-List-Placement-Ready": "true",
+          ...(calls === 1 ? { "X-Cluster-List-Next-Page-Token": "tok-1" } : {}),
+        },
+      });
+    },
+  });
+  const pages = sdk.listPages();
+  const first = await pages.next();
+  if (first.done) throw new Error("first page missing");
+  assert.equal(calls, 1);
+  assert.deepEqual(first.value.map((s) => s.id), ["sb-1"]);
+  const second = await pages.next();
+  if (second.done) throw new Error("second page missing");
+  assert.equal(calls, 2);
+  assert.deepEqual(second.value.map((s) => s.id), ["sb-2"]);
+  assert.equal((await pages.next()).done, true);
 });
 
 test("MicroVM.list errors on partial cluster coverage", async () => {

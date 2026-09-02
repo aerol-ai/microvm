@@ -106,7 +106,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		r.Header.Set(HeaderTarget, target.NodeID)
 		r.Header.Del(HeaderID)
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 		return Decision{}, false
 	}
 
@@ -189,7 +189,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 	return Decision{}, false
 }
 
@@ -208,7 +208,7 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 		writeError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 		return true, false
 	}
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	return true, false
 }
 

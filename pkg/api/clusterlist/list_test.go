@@ -67,10 +67,7 @@ func (c *stubListCluster) LookupMember(id string) (cluster.Member, bool) {
 	}
 	return cluster.Member{}, false
 }
-func (c *stubListCluster) PeerHTTPClients() (public, internal *http.Client) {
-	return http.DefaultClient, http.DefaultClient
-}
-func (c *stubListCluster) PeerPAT() string { return "fleet-pat" }
+func (c *stubListCluster) PeerInternalHTTPClient() *http.Client { return http.DefaultClient }
 
 func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 	members := make([]cluster.Member, 0, 300)
@@ -79,10 +76,11 @@ func TestSelectPeersUsesPlacementOwnersNotFullMembership(t *testing.T) {
 	})
 	for i := 0; i < 300; i++ {
 		members = append(members, cluster.Member{
-			NodeID: fmt.Sprintf("w-%03d", i),
-			APIURL: fmt.Sprintf("http://w-%03d", i),
-			Alive:  true,
-			Role:   config.NodeRoleWorker,
+			NodeID:      fmt.Sprintf("w-%03d", i),
+			APIURL:      fmt.Sprintf("http://w-%03d", i),
+			InternalURL: fmt.Sprintf("https://w-%03d.internal", i),
+			Alive:       true,
+			Role:        config.NodeRoleWorker,
 		})
 	}
 	members[1].NodeID = "owner-a"
@@ -169,9 +167,7 @@ func TestSelectPeersAuthoritativeEmptyTenantReady(t *testing.T) {
 
 func TestDialPeerRequiresInternalURLAndClient(t *testing.T) {
 	tr := Transport{
-		PublicClient:   http.DefaultClient,
 		InternalClient: http.DefaultClient,
-		FleetPAT:       "pat",
 	}
 	client, base, err := dialPeer(cluster.Member{
 		NodeID:      "n1",
@@ -198,7 +194,7 @@ func TestDialPeerRequiresInternalURLAndClient(t *testing.T) {
 		APIURL:      "http://public",
 		InternalURL: "https://internal",
 		Alive:       true,
-	}, Transport{PublicClient: http.DefaultClient, FleetPAT: "pat"})
+	}, Transport{})
 	if err == nil {
 		t.Fatal("dialPeer without InternalClient: want error")
 	}
@@ -223,7 +219,7 @@ func TestFilterLocalToPageTerminalEmptyPage(t *testing.T) {
 }
 
 func TestMergeFiltersPeerRowsToWantIDs(t *testing.T) {
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*models.Sandbox{
 			{ID: "sb-on-page"},
 			{ID: "sb-off-page"},
@@ -236,7 +232,7 @@ func TestMergeFiltersPeerRowsToWantIDs(t *testing.T) {
 	}}, Options{
 		Local:     []*models.Sandbox{{ID: "sb-local-off"}},
 		WantIDs:   map[string]struct{}{"sb-on-page": {}},
-		Transport: Transport{InternalClient: peer.Client(), PublicClient: peer.Client()},
+		Transport: Transport{InternalClient: peer.Client(), PeerClient: func(string) *http.Client { return peer.Client() }},
 		Path:      "/v1/sandboxes",
 	})
 	if len(res.Sandboxes) != 1 || res.Sandboxes[0].ID != "sb-on-page" {

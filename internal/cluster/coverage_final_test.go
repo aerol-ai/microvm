@@ -39,16 +39,15 @@ func TestGossipDelegateUnusedMethodsCallable(t *testing.T) {
 
 func TestClusterWasmMigrateHTTPClientBranches(t *testing.T) {
 	c := &Cluster{
-		httpClient:     http.DefaultClient,
 		internalClient: http.DefaultClient,
 	}
-	if client, base, err := c.wasmMigrateHTTPClient("https://internal", "http://api"); err != nil || client != c.internalClient || base != "https://internal" {
+	if client, base, err := c.PeerDialMember(Member{NodeID: "peer-1", InternalURL: "https://internal"}); err != nil || client != c.internalClient || base != "https://internal" {
 		t.Fatalf("internal path = (%p, %q, %v), want internal client", client, base, err)
 	}
-	if client, base, err := c.wasmMigrateHTTPClient("", "http://api"); err != nil || client != c.httpClient || base != "http://api" {
-		t.Fatalf("public path = (%p, %q, %v)", client, base, err)
+	if client, base, err := c.PeerDialMember(Member{NodeID: "peer-1"}); !errors.Is(err, ErrPeerInternalURLRequired) || client != nil || base != "" {
+		t.Fatalf("missing internal path = (%p, %q, %v)", client, base, err)
 	}
-	if _, _, err := c.wasmMigrateHTTPClient("", ""); err == nil {
+	if _, _, err := c.PeerDialMember(Member{}); err == nil {
 		t.Fatal("expected error when both URLs are empty")
 	}
 }
@@ -175,7 +174,6 @@ func TestAgentTryControlPlaneInternal503DoesNotFallback(t *testing.T) {
 
 	agent := &Agent{
 		nodeID:         "worker-self",
-		httpClient:     public.Client(),
 		internalClient: internal.Client(),
 		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -188,21 +186,19 @@ func TestAgentTryControlPlaneInternal503DoesNotFallback(t *testing.T) {
 
 func TestAgentTryControlPlaneMissingAPIURL(t *testing.T) {
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: http.DefaultClient,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID: "worker-self",
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	m := Member{NodeID: "server-1", Alive: true}
 	err := agent.tryControlPlaneMember(context.Background(), m, http.MethodGet, "/v1/cluster/members", "/v1/internal/cluster/members", nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "API URL unknown") {
-		t.Fatalf("tryControlPlaneMember() = %v, want missing API URL error", err)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("tryControlPlaneMember() = %v, want missing internal URL error", err)
 	}
 }
 
 func TestAgentTryControlPlaneRequiresInternalURLWhenTLSLoaded(t *testing.T) {
 	agent := &Agent{
 		nodeID:         "worker-self",
-		httpClient:     http.DefaultClient,
 		internalClient: http.DefaultClient,
 		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -220,7 +216,6 @@ func TestAgentTryControlPlaneFailClosedWithoutInternalURL(t *testing.T) {
 	defer public.Close()
 	agent := &Agent{
 		nodeID:         "worker-self",
-		httpClient:     public.Client(),
 		internalClient: &http.Client{},
 		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -626,11 +621,10 @@ func TestAgentAssertOwnershipClaimOrphanErrorIsReturned(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     "http://worker-self",
-		httpClient: srv.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID: "worker-self",
+		apiURL: "http://worker-self",
+		gossip: &gossipNode{memberIndex: index},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
@@ -643,7 +637,8 @@ func TestAgentAssertOwnershipClaimOrphanErrorIsReturned(t *testing.T) {
 }
 
 func TestAgentPlacementPageSuccessAndFailure(t *testing.T) {
-	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dirs := writeTestClusterTLSDirs(t, "worker-self", "server-1")
+	okSrv, internalClient := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsPagePath {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(PlacementPageResponse{
@@ -653,15 +648,14 @@ func TestAgentPlacementPageSuccessAndFailure(t *testing.T) {
 		}
 		http.NotFound(w, r)
 	}))
-	defer okSrv.Close()
 
 	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "server-1", APIURL: okSrv.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "server-1", APIURL: okSrv.URL, InternalURL: okSrv.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: okSrv.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID:         "worker-self",
+		internalClient: internalClient,
+		gossip:         &gossipNode{memberIndex: index},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	page := agent.PlacementPage(PlacementPageRequest{Limit: 10})
 	if len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-page" {
@@ -671,12 +665,10 @@ func TestAgentPlacementPageSuccessAndFailure(t *testing.T) {
 		t.Fatalf("PlacementVersion() = %d, want 3", agent.PlacementVersion())
 	}
 
-	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	failSrv, _ := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
-	defer failSrv.Close()
-	index.upsert(Member{NodeID: "server-1", APIURL: failSrv.URL, Alive: true, Role: config.NodeRoleServer})
-	agent.httpClient = failSrv.Client()
+	index.upsert(Member{NodeID: "server-1", APIURL: failSrv.URL, InternalURL: failSrv.URL, Alive: true, Role: config.NodeRoleServer})
 	if got := agent.PlacementPage(PlacementPageRequest{Limit: 5}); len(got.Placements) != 0 {
 		t.Fatalf("PlacementPage() on failure = %+v, want empty", got)
 	}

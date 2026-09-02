@@ -175,6 +175,7 @@ type Service struct {
 	auditIngestMu          sync.Mutex
 	auditIngest            *auditIngestServer
 	auditExportMu          sync.Mutex
+	auditExportRunMu       sync.Mutex // serializes cursor/read/export/prune reset
 	auditExporter          controlplane.AuditExporter
 	secretAuditExportOnce  sync.Once
 	secretAuditExportStop  chan struct{}
@@ -1075,15 +1076,6 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	if err != nil {
 		return true, fmt.Errorf("recreate %s: %w", id, err)
 	}
-	// A replicated spec written before the private-by-default flip carries a
-	// nil flag, and store-backed rows always materialize the tri-state — so a
-	// nil here can only be a legacy replica from when public WAS the default.
-	// Pin it to true so failover never silently changes a sandbox's
-	// reachability; createSandbox would otherwise normalize nil to private.
-	if merged.AllowPublicTraffic == nil {
-		public := true
-		merged.AllowPublicTraffic = &public
-	}
 	if _, err := s.CreateSandboxWithID(ctx, merged, id); err != nil {
 		return true, err
 	}
@@ -1222,14 +1214,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 	// Private-by-default: a create that doesn't opt in with
 	// allow_public_traffic=true gets no public ingress route (and ExposePort
-	// refuses). The default is pinned to an explicit false HERE, not inside
-	// allowPublicTrafficEnabled, because nil must keep meaning "public" for
-	// store rows written before the default flipped. Unconditional on purpose:
-	// cluster-mode creates arrive via CreateSandboxWithID (reserved ID), so an
-	// idOverride guard would silently exempt every cluster create. The one
-	// caller that must NOT re-interpret a legacy nil — the failover recreate
-	// replaying a pre-flag replicated spec — pins it to true in
-	// RecreateSandbox before calling in.
+	// refuses). Normalize to explicit false so persisted and replicated state
+	// remains unambiguous. This applies equally to failover recreation.
 	if req.AllowPublicTraffic == nil {
 		private := false
 		req.AllowPublicTraffic = &private
@@ -1654,7 +1640,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			platformAttachments[i].SandboxID = sandbox.ID
 		}
 		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
-			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
@@ -1681,7 +1667,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
-			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
@@ -1693,7 +1679,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		// Same rollback chain as a mount-persist failure. ErrCustomDomainConflict
 		// flows through unchanged so the API layer can map it to 409.
-		_ = s.store.Delete(ctx, sandbox.ID)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		rollbackDestroy(sandbox)
 		cleanupMounts()
@@ -1924,7 +1910,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	}
 
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
-		_ = s.store.Delete(ctx, sandbox.ID)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
@@ -2476,12 +2462,8 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	// Refresh the retained audit authorization before deleting the authoritative
 	// sandbox row. If this fails, keep the sandbox so audit access cannot fall
 	// into an ownerless gap after a crash or later cleanup error.
-	if sandbox != nil {
-		if ref := strings.TrimSpace(sandbox.OwnerRef); ref != "" {
-			if err := s.store.UpsertSandboxAuditACL(ctx, id, ref, s.secretIncarnationForSeal(id)); err != nil {
-				return err
-			}
-		}
+	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+		return err
 	}
 	// Tomb/outbox secret cleanup must succeed before the irreversible sandbox
 	// delete. cluster_secrets has no FK, so a post-delete failure leaves
@@ -4323,6 +4305,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 			// Secret tomb/outbox before store/placement delete (no FK on
 			// cluster_secrets). Same finalizer as DestroySandbox / docker events.
+			if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+				return err
+			}
 			if err := s.DeleteClusterSecrets(ctx, sandbox.ID); err != nil {
 				return err
 			}

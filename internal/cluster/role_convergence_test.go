@@ -40,6 +40,8 @@ func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterDeadOwnerGrace:         grace,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

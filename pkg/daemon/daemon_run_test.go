@@ -62,7 +62,7 @@ func writeTestClusterTLS(t *testing.T, rootDir string) string {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		DNSNames:              []string{"aerolvm-cluster-node"},
+		DNSNames:              []string{"aerolvm-cluster-node", "node:aerolvm-test-cluster"},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -118,6 +118,7 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 	}
 
 	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_NODE_ID", "aerolvm-test-cluster")
 	t.Setenv("SB_PUBLIC_HOST", "127.0.0.1")
 	t.Setenv("SB_API_HOST", "127.0.0.1")
 	t.Setenv("SB_API_PORT", "0")

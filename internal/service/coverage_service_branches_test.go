@@ -279,6 +279,7 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 				{
 					SandboxID:   "sb-orphan",
 					OwnerNodeID: "",
+					Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},
@@ -288,6 +289,7 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 				{
 					SandboxID:       "sb-peer",
 					OwnerNodeID:     "peer",
+					Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					CustomHostnames: []string{"api.external.test", "www.external.test"},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -334,6 +336,7 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 				{
 					SandboxID:   "sb-direct",
 					OwnerNodeID: "peer",
+					Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},

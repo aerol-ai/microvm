@@ -42,14 +42,14 @@ func (f *boundedAuditFetcher) FetchSandboxAuditFromPeer(ctx context.Context, _ s
 	}
 }
 
-func (f *fakeAuditFetcher) FetchSandboxAuditFromPeer(_ context.Context, apiURL, _ string, _ int, _, _, _ string) (cluster.AuditPeerPage, error) {
-	if err, ok := f.errs[apiURL]; ok {
+func (f *fakeAuditFetcher) FetchSandboxAuditFromPeer(_ context.Context, nodeID, _ string, _ int, _, _, _ string) (cluster.AuditPeerPage, error) {
+	if err, ok := f.errs[nodeID]; ok {
 		return cluster.AuditPeerPage{}, err
 	}
-	if page, ok := f.pages[apiURL]; ok {
+	if page, ok := f.pages[nodeID]; ok {
 		return page, nil
 	}
-	return cluster.AuditPeerPage{}, fmt.Errorf("unexpected peer %s", apiURL)
+	return cluster.AuditPeerPage{}, fmt.Errorf("unexpected peer %s", nodeID)
 }
 
 type stubMembersCluster struct {
@@ -157,25 +157,29 @@ func TestListSecretAuditFanoutMergeCoveragePartial(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	peerURL := "http://peer-b.example"
 	noop := cluster.NewNoop("node-a", "http://self", "")
 	s := &Service{
 		cfg:   config.Config{DBPath: dbPath},
 		store: st,
-		cluster: &stubMembersCluster{Noop: noop, members: []cluster.Member{
-			{NodeID: "node-a", APIURL: "http://self", Alive: true},
-			{NodeID: "node-b", APIURL: peerURL, Alive: true},
-			{NodeID: "node-c", APIURL: "http://dead.invalid", Alive: true},
-		}},
+		cluster: &stubMembersCluster{
+			Noop: noop,
+			members: []cluster.Member{
+				{NodeID: "node-a", APIURL: "http://self", Alive: true},
+				{NodeID: "node-b", InternalURL: "https://peer-b.example", Alive: true},
+				{NodeID: "node-c", InternalURL: "https://dead.invalid", Alive: true},
+			},
+			acl:       cluster.AuditACL{SandboxID: "sb-1", AuditNodeIDs: []string{"node-a", "node-b", "node-c"}},
+			aclExists: true,
+		},
 		testAuditFetcher: &fakeAuditFetcher{
 			pages: map[string]cluster.AuditPeerPage{
-				peerURL: {Events: []cluster.AuditEventDTO{{
+				"node-b": {Events: []cluster.AuditEventDTO{{
 					Time: time.Unix(2, 0).UTC(), Actor: "node-b", SandboxID: "sb-1",
 					Ref: "env:sb-1", Result: secretAuditResultSuccess, CorrelationID: "peer-corr", NodeID: "node-b",
 				}}},
 			},
 			errs: map[string]error{
-				"http://dead.invalid": errors.New("dial timeout"),
+				"node-c": errors.New("dial timeout"),
 			},
 		},
 	}
@@ -218,9 +222,9 @@ func TestListSecretAuditAfterDeleteTargetsRetainedOwnerHistory(t *testing.T) {
 			Noop: noop,
 			members: []cluster.Member{
 				{NodeID: "node-self", APIURL: "http://self", Alive: true},
-				{NodeID: "node-old", APIURL: "http://old", Alive: true},
-				{NodeID: "node-current", APIURL: "http://current", Alive: true},
-				{NodeID: "node-unrelated", APIURL: "http://unrelated", Alive: true},
+				{NodeID: "node-old", InternalURL: "https://old", Alive: true},
+				{NodeID: "node-current", InternalURL: "https://current", Alive: true},
+				{NodeID: "node-unrelated", InternalURL: "https://unrelated", Alive: true},
 			},
 			acl: cluster.AuditACL{
 				SandboxID:    "sb-deleted",
@@ -230,8 +234,8 @@ func TestListSecretAuditAfterDeleteTargetsRetainedOwnerHistory(t *testing.T) {
 			aclExists: true,
 		},
 		testAuditFetcher: &fakeAuditFetcher{pages: map[string]cluster.AuditPeerPage{
-			"http://old":     {Events: []cluster.AuditEventDTO{{Time: time.Unix(1, 0), SandboxID: "sb-deleted", EventID: "old"}}},
-			"http://current": {Events: []cluster.AuditEventDTO{{Time: time.Unix(2, 0), SandboxID: "sb-deleted", EventID: "current"}}},
+			"node-old":     {Events: []cluster.AuditEventDTO{{Time: time.Unix(1, 0), SandboxID: "sb-deleted", EventID: "old"}}},
+			"node-current": {Events: []cluster.AuditEventDTO{{Time: time.Unix(2, 0), SandboxID: "sb-deleted", EventID: "current"}}},
 		}},
 	}
 	t.Cleanup(s.CloseSecretAuditSink)
@@ -248,7 +252,7 @@ func TestListSecretAuditAfterDeleteTargetsRetainedOwnerHistory(t *testing.T) {
 	}
 }
 
-func TestListSecretAuditTruncatedHistoryFallsBackToAllWorkers(t *testing.T) {
+func TestListSecretAuditTruncatedHistoryFailsWithoutFleetScan(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "state.db")
 	st, err := storepkg.Open(dbPath)
@@ -265,8 +269,8 @@ func TestListSecretAuditTruncatedHistoryFallsBackToAllWorkers(t *testing.T) {
 			Noop: noop,
 			members: []cluster.Member{
 				{NodeID: "node-self", APIURL: "http://self", Alive: true},
-				{NodeID: "node-a", APIURL: "http://a", Alive: true},
-				{NodeID: "node-b", APIURL: "http://b", Alive: true},
+				{NodeID: "node-a", InternalURL: "https://a", Alive: true},
+				{NodeID: "node-b", InternalURL: "https://b", Alive: true},
 			},
 			acl: cluster.AuditACL{
 				SandboxID:           "sb-truncated",
@@ -276,18 +280,15 @@ func TestListSecretAuditTruncatedHistoryFallsBackToAllWorkers(t *testing.T) {
 			aclExists: true,
 		},
 		testAuditFetcher: &fakeAuditFetcher{pages: map[string]cluster.AuditPeerPage{
-			"http://a": {},
-			"http://b": {},
+			"node-a": {},
+			"node-b": {},
 		}},
 	}
 	t.Cleanup(s.CloseSecretAuditSink)
 
-	page, err := s.ListSecretAudit(context.Background(), "sb-truncated", SecretAuditQuery{})
-	if err != nil {
-		t.Fatalf("ListSecretAudit: %v", err)
-	}
-	if page.Coverage.Partial || len(page.Coverage.Answered) != 3 {
-		t.Fatalf("coverage = %+v, truncated history must query every worker", page.Coverage)
+	_, err = s.ListSecretAudit(context.Background(), "sb-truncated", SecretAuditQuery{})
+	if !errors.Is(err, ErrSecretAuditIndexIncomplete) {
+		t.Fatalf("ListSecretAudit error = %v, want ErrSecretAuditIndexIncomplete", err)
 	}
 }
 
@@ -305,16 +306,23 @@ func TestListSecretAuditFanoutHasBoundedWorkersAndCompleteCoverage(t *testing.T)
 	members = append(members, cluster.Member{NodeID: "self", APIURL: "http://self", Alive: true})
 	for i := range peerCount {
 		members = append(members, cluster.Member{
-			NodeID: fmt.Sprintf("worker-%03d", i),
-			APIURL: fmt.Sprintf("http://worker-%03d", i),
-			Alive:  true,
+			NodeID:      fmt.Sprintf("worker-%03d", i),
+			InternalURL: fmt.Sprintf("https://worker-%03d", i),
+			Alive:       true,
 		})
+	}
+	auditNodes := make([]string, 0, peerCount)
+	for i := range peerCount {
+		auditNodes = append(auditNodes, fmt.Sprintf("worker-%03d", i))
 	}
 	fetcher := &boundedAuditFetcher{delay: 2 * time.Millisecond}
 	s := &Service{
-		cfg:              config.Config{DBPath: dbPath},
-		store:            st,
-		cluster:          &stubMembersCluster{Noop: cluster.NewNoop("self", "http://self", ""), members: members},
+		cfg:   config.Config{DBPath: dbPath},
+		store: st,
+		cluster: &stubMembersCluster{
+			Noop: cluster.NewNoop("self", "http://self", ""), members: members,
+			acl: cluster.AuditACL{SandboxID: "sb-scale", AuditNodeIDs: auditNodes}, aclExists: true,
+		},
 		testAuditFetcher: fetcher,
 	}
 	t.Cleanup(s.CloseSecretAuditSink)
@@ -345,15 +353,22 @@ func TestListSecretAuditDeadlineMarksUnscheduledPeersMissing(t *testing.T) {
 	members = append(members, cluster.Member{NodeID: "self", APIURL: "http://self", Alive: true})
 	for i := range peerCount {
 		members = append(members, cluster.Member{
-			NodeID: fmt.Sprintf("worker-%03d", i),
-			APIURL: fmt.Sprintf("http://worker-%03d", i),
-			Alive:  true,
+			NodeID:      fmt.Sprintf("worker-%03d", i),
+			InternalURL: fmt.Sprintf("https://worker-%03d", i),
+			Alive:       true,
 		})
 	}
+	auditNodes := make([]string, 0, peerCount)
+	for i := range peerCount {
+		auditNodes = append(auditNodes, fmt.Sprintf("worker-%03d", i))
+	}
 	s := &Service{
-		cfg:              config.Config{DBPath: dbPath},
-		store:            st,
-		cluster:          &stubMembersCluster{Noop: cluster.NewNoop("self", "http://self", ""), members: members},
+		cfg:   config.Config{DBPath: dbPath},
+		store: st,
+		cluster: &stubMembersCluster{
+			Noop: cluster.NewNoop("self", "http://self", ""), members: members,
+			acl: cluster.AuditACL{SandboxID: "sb-timeout", AuditNodeIDs: auditNodes}, aclExists: true,
+		},
 		testAuditFetcher: &boundedAuditFetcher{delay: time.Second},
 	}
 	t.Cleanup(s.CloseSecretAuditSink)

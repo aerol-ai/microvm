@@ -176,6 +176,13 @@ pub struct Sandbox {
     pub ssh_private_key: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SandboxPage {
+    pub sandboxes: Vec<Sandbox>,
+    /// Opaque token to pass to the next call; `None` marks the final page.
+    pub next_page_token: Option<String>,
+}
+
 pub struct ExecStreamHandle {
     control_tx: UnboundedSender<ControlMessage>,
     done_rx: mpsc::Receiver<Result<ExecExitInfo, Error>>,
@@ -673,47 +680,59 @@ impl Client {
         tags: &std::collections::HashMap<String, String>,
         include_env: bool,
     ) -> Result<Vec<Sandbox>, Error> {
-        let base_path = {
-            let mut path = format!("{}/sandboxes", self.version_prefix());
-            path.push_str(&build_sandbox_query(tags, include_env));
-            path
-        };
         let mut items = Vec::new();
         let mut page_token = String::new();
         // Safety cap: enough for 100k sandboxes at page size 1 (default page
         // size is 100). Stop earlier when the next-page token is empty.
         for _ in 0..100_000 {
-            let path = append_query_param(&base_path, "page_token", &page_token);
-            let (raw, headers) =
-                self.do_json_headers::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
-            let partial = headers
-                .get("X-Cluster-List-Partial")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let ready = headers
-                .get("X-Cluster-List-Placement-Ready")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if partial == "true" || ready == "false" {
-                return Err(Error::Api("incomplete cluster list".into()));
-            }
-            items.extend(
-                raw.into_iter()
-                    .map(|item| Sandbox::new(self.clone(), item)),
-            );
-            page_token = headers
-                .get("X-Cluster-List-Next-Page-Token")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if page_token.is_empty() {
-                return Ok(items);
+            let page = self.list_page_with_options(tags, include_env, &page_token)?;
+            items.extend(page.sandboxes);
+            match page.next_page_token {
+                Some(next) => page_token = next,
+                None => return Ok(items),
             }
         }
         Err(Error::Api(
             "incomplete cluster list: exceeded max pages".into(),
         ))
+    }
+
+    /// Fetches exactly one cluster-list page for bounded-memory fleet scans.
+    pub fn list_page_with_options(
+        &self,
+        tags: &std::collections::HashMap<String, String>,
+        include_env: bool,
+        page_token: &str,
+    ) -> Result<SandboxPage, Error> {
+        let mut base_path = format!("{}/sandboxes", self.version_prefix());
+        base_path.push_str(&build_sandbox_query(tags, include_env));
+        let path = append_query_param(&base_path, "page_token", page_token);
+        let (raw, headers) =
+            self.do_json_headers::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
+        let partial = headers
+            .get("X-Cluster-List-Partial")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let ready = headers
+            .get("X-Cluster-List-Placement-Ready")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if partial == "true" || ready == "false" {
+            return Err(Error::Api("incomplete cluster list".into()));
+        }
+        let next = headers
+            .get("X-Cluster-List-Next-Page-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Ok(SandboxPage {
+            sandboxes: raw
+                .into_iter()
+                .map(|item| Sandbox::new(self.clone(), item))
+                .collect(),
+            next_page_token: if next.is_empty() { None } else { Some(next) },
+        })
     }
 
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
@@ -3252,9 +3271,8 @@ mod tests {
         );
     }
 
-    // Backward-compat: list() and list_with_tags(&empty) must produce the
-    // pre-filter URL byte-for-byte — no stray trailing "?" — so fixtures and
-    // request matchers in downstream code keep working.
+    // Empty filters should produce the canonical collection URL without a
+    // stray query delimiter.
     #[test]
     fn list_without_tags_omits_query_string() {
         let (url, request_rx) = spawn_json_server("[]".to_string());
@@ -3278,6 +3296,42 @@ mod tests {
             "unexpected request: {}",
             request2
         );
+    }
+
+    #[test]
+    fn list_page_fetches_only_one_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read_http_request(&mut stream);
+            request_tx.send(request).expect("send request");
+            let body = serde_json::json!([{
+                "id": "sb-page", "image": "alpine", "status": "started",
+                "public_url": "", "container_id": null, "container_ip": null,
+                "cpu": 1, "memory_mb": 256, "disk_gb": 1, "os_user": "root",
+                "network_block_all": false, "toolbox_enabled": true,
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "last_active_at": "2024-01-01T00:00:00Z", "lifecycle": {}
+            }]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Cluster-List-Placement-Ready: true\r\nX-Cluster-List-Next-Page-Token: tok-next\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).expect("write response");
+        });
+        let client = Client::new(Some(&format!("http://{}", addr)), Some("pat-token"))
+            .expect("client");
+        let page = client
+            .list_page_with_options(&std::collections::HashMap::new(), false, "tok-current")
+            .expect("list page");
+        assert_eq!(page.sandboxes.len(), 1);
+        assert_eq!(page.sandboxes[0].data.id, "sb-page");
+        assert_eq!(page.next_page_token.as_deref(), Some("tok-next"));
+        let request = request_rx.recv().expect("request");
+        assert!(request.starts_with("GET /v1/sandboxes?page_token=tok-current HTTP/1.1\r\n"));
     }
 
     #[test]

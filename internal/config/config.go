@@ -23,9 +23,13 @@ import (
 // rather than silently pushing an un-reaped tag.
 var snapshotRetentionSuffixPattern = regexp.MustCompile(`^--(ttl|idle)-[a-z0-9]+$`)
 
+// Node IDs cross certificate SANs, HTTP headers, gossip, and capability
+// payloads. Keep one delimiter-safe grammar at the configuration boundary.
+var clusterNodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
 const (
-	defaultToolboxPort    = 2280
-	minEnterprisePATBytes = 32
+	defaultToolboxPort           = 2280
+	minEnterpriseCredentialBytes = 32
 )
 
 // DefaultContainerdRunDir is the single source of truth for the containerd
@@ -1116,14 +1120,19 @@ type Config struct {
 	// events to (POST /internal/audit/egress). Default 0 (ephemeral) so multiple
 	// local daemons do not collide. SB_AUDIT_INGEST_PORT.
 	AuditIngestPort int
-	// AuditIngestToken authenticates worker → daemon audit ingest. Empty at
-	// boot mints a random token and exports SB_AUDIT_INGEST_TOKEN for workers.
+	// AuditIngestToken is the daemon-only signing key for scoped worker
+	// capabilities. Empty at boot mints a random key. It is never exported to
+	// worker subprocesses.
 	// SB_AUDIT_INGEST_TOKEN.
 	AuditIngestToken string
 	// SecretAuditExportURL, when set, enables periodic HTTP POST of new JSONL
 	// audit segments (off-node batch export). Empty means disk loss loses
 	// events that were never witnessed/exported. SB_SECRET_AUDIT_EXPORT_URL.
 	SecretAuditExportURL string
+	// SecretAuditExportBearerToken authenticates the daemon to the HTTP audit
+	// receiver. Required with SecretAuditExportURL in enterprise mode.
+	// SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN.
+	SecretAuditExportBearerToken string
 	// AuditRateLimitIdentity is the per-OwnerRef token rate (req/s) for
 	// GET /v1/sandboxes/{id}/audit. Security parameter (amplification bound).
 	// SB_AUDIT_RATE_LIMIT_IDENTITY. Default 10.
@@ -1143,10 +1152,9 @@ type Config struct {
 	// auth — fine on a private overlay, but a client-cert pin is the right
 	// default for any internet-adjacent deployment.
 	//
-	// ClusterTLSDir holds ca.crt, ca.key (only on the bootstrap node and any
-	// joiner that received the bundle), node.crt, node.key. cluster-init.sh
-	// generates the CA and a node cert; cluster-join.sh signs a fresh node
-	// cert from the bundled CA. SB_CLUSTER_TLS_DIR.
+	// ClusterTLSDir holds ca.crt, node.crt, and node.key. The CA signing key
+	// must not be distributed to joiners or retained in this daemon runtime
+	// directory in enterprise mode. SB_CLUSTER_TLS_DIR.
 	ClusterTLSDir string
 	// ClusterInternalListenAddr is the bind address for the mTLS internal
 	// listener. SB_CLUSTER_INTERNAL_LISTEN. Default 0.0.0.0:7002.
@@ -1645,6 +1653,7 @@ func Load() (Config, error) {
 		AuditIngestPort:               getEnvInt("SB_AUDIT_INGEST_PORT", 0),
 		AuditIngestToken:              strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN")),
 		SecretAuditExportURL:          strings.TrimSpace(os.Getenv("SB_SECRET_AUDIT_EXPORT_URL")),
+		SecretAuditExportBearerToken:  strings.TrimSpace(os.Getenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN")),
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
@@ -1791,6 +1800,9 @@ func Load() (Config, error) {
 
 	if cfg.PATToken == "" {
 		return Config{}, errors.New("SB_PAT_TOKEN is required")
+	}
+	if cfg.NodeID != "" && !clusterNodeIDPattern.MatchString(cfg.NodeID) {
+		return Config{}, errors.New("SB_NODE_ID must start with an alphanumeric character and contain only alphanumerics, dot, underscore, or hyphen (maximum 128 characters)")
 	}
 
 	if err := cfg.PlatformVolumes.Validate(); err != nil {
@@ -2189,9 +2201,27 @@ func Load() (Config, error) {
 	if cfg.AuditRateLimitNode <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_NODE must be > 0")
 	}
+	if raw := strings.TrimSpace(cfg.SecretAuditExportURL); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" || u.User != nil {
+			return Config{}, errors.New("SB_SECRET_AUDIT_EXPORT_URL must be an absolute URL without userinfo")
+		}
+		if cfg.EnterpriseMode && !strings.EqualFold(u.Scheme, "https") {
+			return Config{}, errors.New("SB_SECRET_AUDIT_EXPORT_URL must use https when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.EnterpriseMode && strings.TrimSpace(cfg.SecretAuditExportBearerToken) == "" {
+			return Config{}, errors.New("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN is required with SB_SECRET_AUDIT_EXPORT_URL when SB_ENTERPRISE_MODE=true")
+		}
+	}
 	if cfg.EnterpriseMode {
-		if len([]byte(cfg.PATToken)) < minEnterprisePATBytes {
-			return Config{}, fmt.Errorf("SB_PAT_TOKEN must contain at least %d bytes when SB_ENTERPRISE_MODE=true", minEnterprisePATBytes)
+		if len([]byte(cfg.PATToken)) < minEnterpriseCredentialBytes {
+			return Config{}, fmt.Errorf("SB_PAT_TOKEN must contain at least %d bytes when SB_ENTERPRISE_MODE=true", minEnterpriseCredentialBytes)
+		}
+		if token := strings.TrimSpace(cfg.AuditIngestToken); token != "" && len([]byte(token)) < minEnterpriseCredentialBytes {
+			return Config{}, fmt.Errorf("SB_AUDIT_INGEST_TOKEN must contain at least %d bytes when SB_ENTERPRISE_MODE=true", minEnterpriseCredentialBytes)
+		}
+		if cfg.SecretAuditExportURL != "" && len([]byte(strings.TrimSpace(cfg.SecretAuditExportBearerToken))) < minEnterpriseCredentialBytes {
+			return Config{}, fmt.Errorf("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN must contain at least %d bytes when SB_ENTERPRISE_MODE=true", minEnterpriseCredentialBytes)
 		}
 		if cfg.ContainerPrivileged {
 			return Config{}, errors.New("SB_CONTAINER_PRIVILEGED must be false when SB_ENTERPRISE_MODE=true")
@@ -2214,6 +2244,12 @@ func Load() (Config, error) {
 		if cfg.EnableCluster {
 			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {
 				return Config{}, errors.New("cluster insecure escape hatches are forbidden when SB_ENTERPRISE_MODE=true")
+			}
+			caKeyPath := filepath.Join(cfg.ClusterTLSDir, "ca.key")
+			if _, err := os.Stat(caKeyPath); err == nil {
+				return Config{}, fmt.Errorf("enterprise cluster refuses CA signing key in daemon TLS directory: move %s to an offline signer or HSM before startup", caKeyPath)
+			} else if !os.IsNotExist(err) {
+				return Config{}, fmt.Errorf("inspect enterprise cluster CA signing key path %s: %w", caKeyPath, err)
 			}
 			if cfg.SecretRecipientBackupCount < 2 {
 				return Config{}, errors.New("secret recipient fan-out with at least two backups is required when SB_ENTERPRISE_MODE=true")

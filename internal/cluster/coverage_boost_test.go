@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,8 +107,8 @@ func TestForwardApplyLeaderAPIURLMissing(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	err = follower.forwardApplyToLeader(context.Background(), payload)
-	if !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("forwardApplyToLeader missing API URL = %v, want ErrNotLeader", err)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("forwardApplyToLeader missing internal URL = %v, want ErrPeerInternalURLRequired", err)
 	}
 }
 
@@ -190,19 +191,18 @@ func TestAgentDoHTTPRequestErrorBranches(t *testing.T) {
 	}
 
 	for i, tc := range cases {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv, internalClient := newNodeBoundForwardServer(t, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, tc.body, tc.status)
 		}))
 		index := newGossipMemberIndex()
-		index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
+		index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, InternalURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
 		agent := &Agent{
-			nodeID:     "worker-self",
-			httpClient: srv.Client(),
-			gossip:     &gossipNode{memberIndex: index},
-			logger:     slog.Default(),
+			nodeID:         "worker-self",
+			internalClient: internalClient,
+			gossip:         &gossipNode{memberIndex: index},
+			logger:         slog.Default(),
 		}
 		err := agent.RemoveMember(context.Background(), "ghost", false)
-		srv.Close()
 		if !tc.check(err) {
 			t.Fatalf("case %d status=%d: err=%v", i, tc.status, err)
 		}
@@ -210,24 +210,23 @@ func TestAgentDoHTTPRequestErrorBranches(t *testing.T) {
 }
 
 func TestAgentControlPlaneFailoverAfterNotLeader(t *testing.T) {
-	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dirs := writeTestClusterTLSDirs(t, "worker-self", "server-1", "server-2")
+	srv1, internalClient := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, ErrNotLeader.Error(), http.StatusServiceUnavailable)
 	}))
-	defer srv1.Close()
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv2, _ := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-2", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"leader": "server-2"})
 	}))
-	defer srv2.Close()
 
 	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "server-1", APIURL: srv1.URL, Alive: true, Role: config.NodeRoleServer})
-	index.upsert(Member{NodeID: "server-2", APIURL: srv2.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "server-1", APIURL: srv1.URL, InternalURL: srv1.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "server-2", APIURL: srv2.URL, InternalURL: srv2.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: http.DefaultClient,
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.Default(),
+		nodeID:         "worker-self",
+		internalClient: internalClient,
+		gossip:         &gossipNode{memberIndex: index},
+		logger:         slog.Default(),
 	}
 	for range 8 {
 		if got := agent.Leader(); got == "server-2" {
@@ -261,7 +260,6 @@ func TestAgentTryControlPlaneInternalSuccess(t *testing.T) {
 	})
 	agent := &Agent{
 		nodeID:         "worker-self",
-		httpClient:     public.Client(),
 		internalClient: internal.Client(),
 		gossip:         &gossipNode{memberIndex: index},
 		logger:         slog.Default(),
@@ -349,10 +347,9 @@ func TestAgentSecretsOfAndExposedPortsLookupFailure(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: srv.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.Default(),
+		nodeID: "worker-self",
+		gossip: &gossipNode{memberIndex: index},
+		logger: slog.Default(),
 	}
 	if got := agent.SecretsOf("sb-x"); got.Ref != "" || got.Version != 0 {
 		t.Fatalf("SecretsOf on error = %+v", got)
@@ -512,23 +509,61 @@ func TestClusterReserveOnTargetApplyReservationPath(t *testing.T) {
 	}
 }
 
+var (
+	sharedTestCAOnce sync.Once
+	sharedTestCAKey  *rsa.PrivateKey
+	sharedTestCACert *x509.Certificate
+	sharedTestCAPEM  []byte
+	sharedTestCAErr  error
+)
+
+func initSharedTestCA() {
+	sharedTestCAKey, sharedTestCAErr = rsa.GenerateKey(rand.Reader, 2048)
+	if sharedTestCAErr != nil {
+		return
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{Organization: []string{"AerolVM Shared Test CA"}},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &sharedTestCAKey.PublicKey, sharedTestCAKey)
+	if err != nil {
+		sharedTestCAErr = err
+		return
+	}
+	sharedTestCACert, sharedTestCAErr = x509.ParseCertificate(der)
+	sharedTestCAPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
 func writeTestClusterTLSDir(t *testing.T, nodeID string) string {
 	t.Helper()
+	sharedTestCAOnce.Do(initSharedTestCA)
+	if sharedTestCAErr != nil {
+		t.Fatalf("shared test CA: %v", sharedTestCAErr)
+	}
 	dir := t.TempDir()
-	_, tlsCert, err := generateTestCertForNode(nodeID)
+	nodeKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		t.Fatalf("generateTestCertForNode: %v", err)
+		t.Fatalf("node key: %v", err)
 	}
-	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsCert.Certificate[0]})
-	keyDER, err := x509.MarshalPKCS8PrivateKey(tlsCert.PrivateKey)
+	leaf := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: nodeID},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:    []string{"aerolvm-cluster-node", "localhost", "node:" + nodeID}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leaf, sharedTestCACert, &nodeKey.PublicKey, sharedTestCAKey)
 	if err != nil {
-		t.Fatalf("marshal key: %v", err)
+		t.Fatalf("node cert: %v", err)
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := os.WriteFile(filepath.Join(dir, tlsCAFile), caPEM, 0o644); err != nil {
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(nodeKey)})
+	if err := os.WriteFile(filepath.Join(dir, tlsCAFile), sharedTestCAPEM, 0o644); err != nil {
 		t.Fatalf("write ca: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, tlsNodeCertFile), caPEM, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, tlsNodeCertFile), leafPEM, 0o644); err != nil {
 		t.Fatalf("write cert: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, tlsNodeKeyFile), keyPEM, 0o644); err != nil {

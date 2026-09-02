@@ -390,6 +390,9 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 		Preopens:       append([]wasmengine.Preopen(nil), inst.preopens...),
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, memoryMB, d.cfg.DefaultWallTimeout)
+	if err := d.bindAuditCapability(sandboxID, &caps); err != nil {
+		return nil, err
+	}
 
 	instStart := time.Now()
 	if err := client.Instantiate(sandboxID, caps); err != nil {
@@ -460,6 +463,9 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 		Preopens:       append([]wasmengine.Preopen(nil), inst.preopens...),
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, inst.memoryMB, d.cfg.DefaultWallTimeout)
+	if err := d.bindAuditCapability(inst.sandboxID, &caps); err != nil {
+		return err
+	}
 	if err := client.Instantiate(inst.sandboxID, caps); err != nil {
 		_ = d.supervisor.Stop(inst.sandboxID)
 		return fmt.Errorf("cold instantiate: %w", err)

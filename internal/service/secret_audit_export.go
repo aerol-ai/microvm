@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +26,11 @@ const (
 	secretAuditExportOffset   = "export_offset"
 )
 
+type auditExportCursor struct {
+	Generation string `json:"generation"`
+	Offset     int64  `json:"offset"`
+}
+
 var (
 	secretAuditExportOK       = expvar.NewInt("aerolvm_secret_audit_export_ok")
 	secretAuditExportFailures = expvar.NewInt("aerolvm_secret_audit_export_failures_total")
@@ -30,18 +38,25 @@ var (
 
 // httpAuditBatchExporter POSTs JSONL segments to SB_SECRET_AUDIT_EXPORT_URL.
 type httpAuditBatchExporter struct {
-	url    string
-	client *http.Client
+	url         string
+	bearerToken string
+	client      *http.Client
 }
 
-func newHTTPAuditBatchExporter(url string) *httpAuditBatchExporter {
+func newHTTPAuditBatchExporter(url, bearerToken string) *httpAuditBatchExporter {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		return nil
 	}
 	return &httpAuditBatchExporter{
-		url:    url,
-		client: &http.Client{Timeout: 15 * time.Second},
+		url:         url,
+		bearerToken: strings.TrimSpace(bearerToken),
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -63,19 +78,39 @@ func (e *httpAuditBatchExporter) ExportEvents(ctx context.Context, batch control
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	req.Header.Set("X-Aerol-Audit-Offset", batch.Offset)
 	req.Header.Set("X-Aerol-Node-ID", batch.NodeID)
+	batchID := strings.TrimSpace(batch.BatchID)
+	if batchID == "" {
+		batchID = auditExportBatchID(batch.NodeID, batch.Offset, batch.Events)
+	}
+	req.Header.Set("Idempotency-Key", batchID)
+	req.Header.Set("X-Aerol-Audit-Batch-ID", batchID)
+	if e.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+e.bearerToken)
+	}
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("audit export status %d", resp.StatusCode)
 	}
-	next := strings.TrimSpace(resp.Header.Get("X-Aerol-Audit-Next-Offset"))
-	if next == "" {
-		next = batch.Offset
+	// The receiver acknowledges only success or failure. It never controls the
+	// local evidence cursor, so return the submitted offset deterministically.
+	return batch.Offset, nil
+}
+
+func auditExportBatchID(nodeID, offset string, events []json.RawMessage) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(strings.TrimSpace(nodeID)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strings.TrimSpace(offset)))
+	for _, event := range events {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(event)
 	}
-	return next, nil
+	return fmt.Sprintf("%s:%s:%x", strings.TrimSpace(nodeID), strings.TrimSpace(offset), h.Sum(nil)[:16])
 }
 
 // SetAuditExporter installs the off-node audit batch exporter.
@@ -152,40 +187,67 @@ func (s *Service) exportSecretAuditBatch(ctx context.Context) error {
 	if ex == nil || !(controlplane.Provider{AuditExporter: ex}).HasAuditExporter() {
 		return nil
 	}
+	s.auditExportRunMu.Lock()
+	defer s.auditExportRunMu.Unlock()
 	offsetPath := filepath.Join(filepath.Dir(s.secretAuditFile.path), secretAuditExportOffset)
-	offset := loadExportOffset(offsetPath)
-	f, err := os.Open(s.secretAuditFile.path)
+	cursor := loadAuditExportCursor(offsetPath)
+	var (
+		generation string
+		offset     int64
+		bytesRead  int64
+		events     []json.RawMessage
+	)
+	// Snapshot a complete batch under the same flock used by append and prune.
+	// The network call happens after unlock, so slow receivers never stall the
+	// writer. A concurrent prune can then cause only a safe duplicate: its new
+	// generation will force the following export back to byte zero.
+	err := s.secretAuditFile.withAuditFileLock(func() error {
+		f, err := os.Open(s.secretAuditFile.path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		generation, err = auditFileGeneration(f)
+		if err != nil {
+			return err
+		}
+		offset = cursor.Offset
+		if cursor.Generation != generation {
+			offset = 0
+		}
+		if st, statErr := f.Stat(); statErr != nil {
+			return statErr
+		} else if offset > st.Size() {
+			offset = 0
+		}
+		if offset > 0 {
+			if _, err := f.Seek(offset, io.SeekStart); err != nil {
+				return err
+			}
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := bytes.TrimSpace(sc.Bytes())
+			lineBytes := int64(len(sc.Bytes()) + 1) // audit writer always appends newline
+			bytesRead += lineBytes
+			if len(line) == 0 {
+				continue
+			}
+			if !json.Valid(line) {
+				return errors.New("audit export encountered malformed JSONL")
+			}
+			events = append(events, append(json.RawMessage(nil), line...))
+			if len(events) >= secretAuditExportBatchMax {
+				break
+			}
+		}
+		return sc.Err()
+	})
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		secretAuditExportFailures.Add(1)
-		return err
-	}
-	defer f.Close()
-	if offset > 0 {
-		if _, err := f.Seek(offset, 0); err != nil {
-			secretAuditExportFailures.Add(1)
-			return err
-		}
-	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	var events []json.RawMessage
-	var bytesRead int64
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		lineBytes := int64(len(sc.Bytes()) + 1) // + newline
-		bytesRead += lineBytes
-		if line == "" {
-			continue
-		}
-		events = append(events, json.RawMessage(line))
-		if len(events) >= secretAuditExportBatchMax {
-			break
-		}
-	}
-	if err := sc.Err(); err != nil {
 		secretAuditExportFailures.Add(1)
 		return err
 	}
@@ -202,9 +264,11 @@ func (s *Service) exportSecretAuditBatch(ctx context.Context) error {
 	}
 	shipCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	next, err := ex.ExportEvents(shipCtx, controlplane.AuditEventBatch{
+	offsetText := strconv.FormatInt(offset, 10)
+	_, err = ex.ExportEvents(shipCtx, controlplane.AuditEventBatch{
 		NodeID:    nodeID,
-		Offset:    strconv.FormatInt(offset, 10),
+		Offset:    offsetText,
+		BatchID:   auditExportBatchID(nodeID, offsetText, events),
 		Events:    events,
 		ShippedAt: time.Now().UTC(),
 	})
@@ -217,10 +281,9 @@ func (s *Service) exportSecretAuditBatch(ctx context.Context) error {
 		return err
 	}
 	newOffset := offset + bytesRead
-	if n, err := strconv.ParseInt(strings.TrimSpace(next), 10, 64); err == nil && n > offset {
-		newOffset = n
-	}
-	if err := os.WriteFile(offsetPath, []byte(strconv.FormatInt(newOffset, 10)+"\n"), 0o600); err != nil {
+	// The receiver acknowledges the batch but never controls our local byte
+	// cursor; trusting a remote offset could skip unexported evidence.
+	if err := persistAuditExportCursor(offsetPath, auditExportCursor{Generation: generation, Offset: newOffset}); err != nil {
 		secretAuditExportFailures.Add(1)
 		return err
 	}
@@ -228,16 +291,53 @@ func (s *Service) exportSecretAuditBatch(ctx context.Context) error {
 	return nil
 }
 
-func loadExportOffset(path string) int64 {
+func auditFileGeneration(f *os.File) (string, error) {
+	if f == nil {
+		return "", errors.New("audit export file unavailable")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	first := []byte(nil)
+	for sc.Scan() {
+		if line := bytes.TrimSpace(sc.Bytes()); len(line) > 0 {
+			first = append(first, line...)
+			break
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	if len(first) == 0 {
+		return "empty", nil
+	}
+	sum := sha256.Sum256(first)
+	return fmt.Sprintf("%x", sum[:16]), nil
+}
+
+func loadAuditExportCursor(path string) auditExportCursor {
+	var cursor auditExportCursor
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return cursor
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
-	if err != nil || n < 0 {
-		return 0
+	if json.Unmarshal(raw, &cursor) != nil || cursor.Offset < 0 || strings.TrimSpace(cursor.Generation) == "" {
+		return auditExportCursor{}
 	}
-	return n
+	return cursor
+}
+
+func persistAuditExportCursor(path string, cursor auditExportCursor) error {
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomicDurable(path, append(raw, '\n'), 0o600)
 }
 
 // ConfigureHTTPAuditExporter wires SB_SECRET_AUDIT_EXPORT_URL when set.
@@ -249,5 +349,5 @@ func (s *Service) ConfigureHTTPAuditExporter() {
 	if url == "" {
 		return
 	}
-	s.SetAuditExporter(newHTTPAuditBatchExporter(url))
+	s.SetAuditExporter(newHTTPAuditBatchExporter(url, s.cfg.SecretAuditExportBearerToken))
 }
