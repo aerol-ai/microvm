@@ -1466,11 +1466,19 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
 	t.Setenv("SB_ENABLE_CLUSTER", "false")
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
 	if cfg, err := Load(); err != nil {
 		t.Fatalf("secure enterprise Load: %v", err)
 	} else if !cfg.EnterpriseMode {
 		t.Fatalf("enterprise mode not retained: %+v", cfg)
 	}
+
+	t.Setenv("SB_ENABLE_ISOLATE", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ENABLE_ISOLATE") {
+		t.Fatalf("Load error = %v, want isolate-forbidden-in-enterprise", err)
+	}
+	t.Setenv("SB_ENABLE_ISOLATE", "false")
 
 	t.Setenv("SB_PAT_TOKEN", "weak-token")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
@@ -1480,8 +1488,8 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "false")
 	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_EXTERNAL_WITNESS") {
-		t.Fatalf("Load error = %v, want witness/export requirement", err)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_EXPORT_URL") {
+		t.Fatalf("Load error = %v, want exporter requirement", err)
 	}
 
 	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
@@ -1506,8 +1514,8 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 		t.Fatalf("Load error = %v, want weak export token rejection", err)
 	}
 
-	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "")
-	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", "")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
 	t.Setenv("SB_AUDIT_INGEST_TOKEN", "weak-ingest-token")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_AUDIT_INGEST_TOKEN") {
@@ -1533,6 +1541,8 @@ func TestEnterpriseClusterRejectsCAKeyInDaemonTLSDirectory(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
 	t.Setenv("SB_ENABLE_CLUSTER", "true")
 	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 	t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")

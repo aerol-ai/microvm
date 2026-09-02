@@ -123,7 +123,7 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode remote request: %v", err)
 		}
-		apiResp := buildImageResponse{Image: docker.BuildTagFor(req.DockerfileContent, nil)}
+		apiResp := buildImageResponse{Image: docker.BuildTagForNode(req.DockerfileContent, nil, "worker-docker")}
 		_ = json.NewEncoder(w).Encode(apiResp)
 	}))
 	defer remote.Close()
@@ -133,6 +133,9 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 	svc.AttachCluster(&membersStubCluster{
 		Noop:           cluster.NewNoop("ingress-a", "http://ingress-a", ""),
 		internalClient: remote.Client(),
+		placement: cluster.PlacementTarget{
+			NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL,
+		},
 		members: []cluster.Member{
 			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			{
@@ -166,7 +169,7 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if want := docker.BuildTagFor(dockerfile, nil); resp.Image != want {
+	if want := docker.BuildTagForNode(dockerfile, nil, "worker-docker"); resp.Image != want {
 		t.Fatalf("Image = %q, want %q", resp.Image, want)
 	}
 }
@@ -228,6 +231,9 @@ func TestClusterBuildImageWrapReturnsBadGatewayWhenPeerBuildFails(t *testing.T) 
 	svc.AttachCluster(&membersStubCluster{
 		Noop:           cluster.NewNoop("ingress-a", "http://ingress-a", ""),
 		internalClient: remote.Client(),
+		placement: cluster.PlacementTarget{
+			NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL,
+		},
 		members: []cluster.Member{
 			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			{

@@ -567,6 +567,8 @@ type membersStubCluster struct {
 	*cluster.Noop
 	members        []cluster.Member
 	internalClient *http.Client
+	placement      cluster.PlacementTarget
+	placementErr   error
 }
 
 func (c *membersStubCluster) Members() []cluster.Member {
@@ -582,6 +584,21 @@ func (c *membersStubCluster) PeerInternalHTTPClient() *http.Client {
 }
 
 func (c *membersStubCluster) ClientForPeer(string) *http.Client { return c.PeerInternalHTTPClient() }
+
+func (c *membersStubCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	target, _, err := c.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (c *membersStubCluster) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
+	if c.placementErr != nil {
+		return cluster.PlacementTarget{}, nil, c.placementErr
+	}
+	if c.placement.NodeID != "" {
+		return c.placement, append([]cluster.Member(nil), c.members...), nil
+	}
+	return c.Noop.SelectPlacementWithCandidates(req)
+}
 
 func (c *membersStubCluster) PeerDialMember(m cluster.Member) (*http.Client, string, error) {
 	if c.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {

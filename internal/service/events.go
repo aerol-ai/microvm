@@ -281,6 +281,13 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		return fmt.Errorf("delete cluster secrets: %w", err)
 	}
 
+	// WASM state is child data without an FK, so it must be finalized before the
+	// parent row disappears. Failed registry deletes remain as durable push rows
+	// and become eligible for the orphan-ref sweep after parent deletion.
+	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+		return err
+	}
+
 	// store.Delete must happen BEFORE schedulePendingImageGC. The
 	// pending-image janitor uses HasActiveImageRef at sweep time; a stale
 	// non-destroyed row here would make every future sweep skip this
@@ -289,10 +296,6 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
-	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
-		return err
-	}
-
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}

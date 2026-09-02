@@ -41,7 +41,6 @@ type SecretAuditQuery struct {
 	Limit  int    // default 100, max 1000
 	Cursor string // exclusive lower bound time (RFC3339Nano), or empty = from start
 	// Kind filters by event kind ("egress", "secret_open"). Empty = all kinds.
-	// Empty Kind on stored events matches "secret_open" (back-compat).
 	Kind string
 	// IncarnationID scopes history to one placement lifetime. When empty and
 	// the sandbox still has a live placement, ListSecretAuditLocal defaults
@@ -79,6 +78,17 @@ func (s *Service) PruneSecretAudit(ctx context.Context) error {
 	f := s.secretAuditFile
 	cutoff := time.Now().UTC().AddDate(0, 0, -days)
 	if f != nil {
+		if s.cfg.EnterpriseMode || strings.TrimSpace(s.cfg.SecretAuditExportURL) != "" {
+			exported, err := s.secretAuditFullyExported()
+			if err != nil {
+				return fmt.Errorf("verify audit export watermark before prune: %w", err)
+			}
+			if !exported {
+				// The exporter loop will advance the watermark; retaining extra
+				// local history is safer than deleting unexported evidence.
+				return nil
+			}
+		}
 		if err := f.Prune(cutoff); err != nil {
 			return err
 		}
@@ -473,9 +483,9 @@ func secretAuditEventFromDTO(dto cluster.AuditEventDTO) SecretAuditEvent {
 }
 
 // secretAuditKindMatches reports whether storedKind satisfies a query filter.
-// Empty filter matches everything. Query "secret_open" also matches empty Kind
-// (legacy secret-open lines). Gap markers always match so kind-filtered pages
-// cannot hide silent drops.
+// Empty filter matches everything. Gap markers always match so kind-filtered
+// pages cannot hide silent drops. Stored rows must carry an explicit kind; the
+// audit format has no compatibility interpretation for missing fields.
 func secretAuditKindMatches(storedKind, filter string) bool {
 	filter = strings.TrimSpace(filter)
 	if filter == "" {
@@ -484,9 +494,6 @@ func secretAuditKindMatches(storedKind, filter string) bool {
 	storedKind = strings.TrimSpace(storedKind)
 	if storedKind == secretAuditKindGap {
 		return true
-	}
-	if storedKind == "" {
-		storedKind = secretAuditKindSecretOpen
 	}
 	return storedKind == filter
 }
@@ -554,11 +561,7 @@ func parseSecretAuditCursor(raw string) (time.Time, string, error) {
 		}
 		return ts, raw[i+len(secretAuditCursorSep):], nil
 	}
-	ts, err := time.Parse(time.RFC3339Nano, raw)
-	if err != nil {
-		return time.Time{}, "", err
-	}
-	return ts, "", nil
+	return time.Time{}, "", errors.New("audit cursor is missing its event key")
 }
 
 func dedupeSecretAuditEvents(events []SecretAuditEvent) []SecretAuditEvent {

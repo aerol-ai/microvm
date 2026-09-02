@@ -62,6 +62,9 @@ func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 }
 
 func (n *Noop) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
+	if req.RequiredNodeID != "" && req.RequiredNodeID != n.nodeID {
+		return PlacementTarget{}, nil, ErrNoPlacementTarget
+	}
 	self := PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}
 	return self, []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}, nil
 }

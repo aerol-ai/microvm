@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -234,6 +235,46 @@ func BuildTagFor(dockerfile string, contextHashes []string) string {
 	}
 	digest := hex.EncodeToString(h.Sum(nil))[:16]
 	return BuiltImageNamespace + "/" + digest + ":latest"
+}
+
+// BuildTagForNode returns a content-addressed tag whose repository also binds
+// the image to the cluster worker that built it. Local build tags are not
+// portable between workers; carrying the owner in the tag lets the create
+// scheduler route to exactly one worker instead of pre-building on the fleet.
+func BuildTagForNode(dockerfile string, contextHashes []string, nodeID string) string {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return BuildTagFor(dockerfile, contextHashes)
+	}
+	base := BuildTagFor(dockerfile, contextHashes)
+	digest := strings.TrimPrefix(base, BuiltImageNamespace+"/")
+	encodedNode := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(nodeID)))
+	return BuiltImageNamespace + "/node-" + encodedNode + "/" + digest
+}
+
+// BuiltImagePlacementNode extracts the worker affinity from a tag produced by
+// BuildTagForNode. Ordinary single-node build tags intentionally return false.
+func BuiltImagePlacementNode(imageRef string) (string, bool) {
+	const prefix = BuiltImageNamespace + "/node-"
+	trimmed := strings.TrimSpace(imageRef)
+	if !strings.HasPrefix(trimmed, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(trimmed, prefix)
+	separator := strings.IndexByte(rest, '/')
+	if separator <= 0 || separator == len(rest)-1 {
+		return "", false
+	}
+	encoded := strings.ToUpper(rest[:separator])
+	raw, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(encoded)
+	if err != nil || len(raw) == 0 || len(raw) > 128 {
+		return "", false
+	}
+	nodeID := string(raw)
+	if strings.TrimSpace(nodeID) != nodeID {
+		return "", false
+	}
+	return nodeID, true
 }
 
 // PushImageRequest is the input to (*Client).PushImage. SourceTag is the

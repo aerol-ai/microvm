@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -72,7 +73,8 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{}, false
 	}
 	if service.ImageRequiresLocalPlacement(req) {
-		if clusterCreateSelfCanOwnSandbox(c) {
+		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
+		if clusterCreateSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
 			if c.IsNodeDrained(c.SelfNodeID()) {
 				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return Decision{}, false
@@ -323,6 +325,9 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		Runtime:    runtimeName,
 		TemplateID: templateID,
 		ModuleRef:  models.ModuleRefForCreate(req),
+	}
+	if nodeID, ok := docker.BuiltImagePlacementNode(req.Image); ok {
+		out.RequiredNodeID = nodeID
 	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8

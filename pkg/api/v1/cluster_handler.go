@@ -202,7 +202,8 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	r.ContentLength = int64(len(normalizedRaw))
 
 	if service.ImageRequiresLocalPlacement(req) {
-		if clusterSelfCanOwnSandbox(c) {
+		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
+		if clusterSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
 			if c.IsNodeDrained(c.SelfNodeID()) {
 				apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return
@@ -499,7 +500,11 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
 	tagFilter := parseTagFilter(r)
-	local, err := h.deps.Service.ListSandboxes(r.Context(), tagFilter)
+	listOpts := service.GetSandboxOptions{
+		IncludeEnv:    parseIncludeEnv(r),
+		CorrelationID: correlationIDFromRequest(r),
+	}
+	local, err := h.deps.Service.ListSandboxesWithOptions(r.Context(), tagFilter, listOpts)
 	if err != nil {
 		h.deps.Logger.Warn("cluster list: local list failed", "error", err)
 		local = nil
@@ -1580,6 +1585,9 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		Runtime:    runtimeName,
 		TemplateID: templateID,
 		ModuleRef:  models.ModuleRefForCreate(req),
+	}
+	if nodeID, ok := docker.BuiltImagePlacementNode(req.Image); ok {
+		out.RequiredNodeID = nodeID
 	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8

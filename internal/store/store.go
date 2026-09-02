@@ -4678,6 +4678,39 @@ type SecretDeleteOutboxRecord struct {
 	UpdatedAt  time.Time
 }
 
+// UpsertSecretDeleteOutbox journals deletion from recipients retired by a
+// reseal without deleting or tombstoning the active local generation.
+func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, recipients []string, generation int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	recipients = secrets.NormalizeRecipients(recipients)
+	if sandboxID == "" || len(recipients) == 0 {
+		return nil
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal secret delete outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO cluster_secret_delete_outbox
+			(sandbox_id, recipients_json, generation, attempts, created_at, updated_at)
+		VALUES (?, ?, ?, 0, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			recipients_json = excluded.recipients_json,
+			generation = excluded.generation,
+			attempts = 0,
+			updated_at = excluded.updated_at
+		WHERE excluded.generation >= cluster_secret_delete_outbox.generation
+	`, sandboxID, string(raw), generation, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert secret delete outbox: %w", err)
+	}
+	return nil
+}
+
 // DeleteClusterSecretsOriginatorWithOutbox tombs, deletes local rows, and
 // enqueues the peer-delete outbox in one transaction so a crash cannot leave
 // peer credentials without a cleanup job.
@@ -5195,11 +5228,13 @@ func (s *Store) DeleteSecretPutOutbox(ctx context.Context, sandboxID, incarnatio
 }
 
 // SecretLifecycleStats is the bounded-cardinality operator view of durable
-// secret cleanup state. OldestOutbox is zero when no work is pending.
+// secret cleanup state. OldestOutbox/OldestPutOutbox are zero when their
+// corresponding queues have no work pending.
 type SecretLifecycleStats struct {
 	OutboxPending    int64
 	OldestOutbox     time.Time
 	PutOutboxPending int64
+	OldestPutOutbox  time.Time
 	Tombstones       int64
 }
 
@@ -5225,8 +5260,23 @@ func (s *Store) SecretLifecycleStats(ctx context.Context) (SecretLifecycleStats,
 			return stats, fmt.Errorf("secret delete outbox stats: invalid oldest timestamp %q", oldest.String)
 		}
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_secret_put_outbox`).Scan(&stats.PutOutboxPending); err != nil {
+	oldest = sql.NullString{}
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(created_at) FROM cluster_secret_put_outbox
+	`).Scan(&stats.PutOutboxPending, &oldest); err != nil {
 		return stats, fmt.Errorf("secret put outbox stats: %w", err)
+	}
+	if oldest.Valid {
+		for _, layout := range sqlite3.SQLiteTimestampFormats {
+			parsed, parseErr := time.Parse(layout, oldest.String)
+			if parseErr == nil {
+				stats.OldestPutOutbox = parsed.UTC()
+				break
+			}
+		}
+		if stats.OldestPutOutbox.IsZero() {
+			return stats, fmt.Errorf("secret put outbox stats: invalid oldest timestamp %q", oldest.String)
+		}
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_secret_tombs`).Scan(&stats.Tombstones); err != nil {
 		return stats, fmt.Errorf("secret tomb stats: %w", err)
@@ -6358,6 +6408,32 @@ func (s *Store) DeleteAllWasmStateKV(ctx context.Context, sandboxID string) erro
 	return nil
 }
 
+// DeleteOrphanedWasmStateKV removes host-KV rows whose sandbox no longer
+// exists. There is no FK from wasm_state_kv to sandboxes, so destroy must
+// delete children first; this sweep closes any crash or historical vacuum.
+func (s *Store) DeleteOrphanedWasmStateKV(ctx context.Context, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 1024
+	}
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM wasm_state_kv
+		WHERE rowid IN (
+			SELECT kv.rowid
+			FROM wasm_state_kv kv
+			LEFT JOIN sandboxes s ON s.id = kv.sandbox_id
+			WHERE s.id IS NULL
+			LIMIT ?
+		)`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete orphaned wasm state kv: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // ListWasmStateKVKeys lists keys for a sandbox.
 func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]string, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
@@ -6403,6 +6479,29 @@ func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, registr
 		return 0, err
 	}
 	return id, nil
+}
+
+// EnsureWasmCheckpointCleanupRef durably records an external ref before a
+// destroy path attempts to delete it. It is idempotent for a sandbox/ref pair,
+// allowing the orphan sweep to finish cleanup after the sandbox row is gone.
+func (s *Store) EnsureWasmCheckpointCleanupRef(ctx context.Context, sandboxID, registryRef string) (int64, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	registryRef = strings.TrimSpace(registryRef)
+	if sandboxID == "" || registryRef == "" {
+		return 0, errors.New("wasm cleanup ref requires sandbox id and registry ref")
+	}
+	var id int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ? AND registry_ref = ?
+		ORDER BY id DESC LIMIT 1`, sandboxID, registryRef).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("find wasm cleanup ref: %w", err)
+	}
+	return s.InsertWasmCheckpointPush(ctx, sandboxID, registryRef, "cleanup-only")
 }
 
 // ListWasmCheckpointPushes returns push history newest-first.

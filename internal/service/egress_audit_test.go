@@ -139,8 +139,8 @@ func TestSecretAuditKindMatches(t *testing.T) {
 	if !secretAuditKindMatches("", "") {
 		t.Fatal("empty filter should match")
 	}
-	if !secretAuditKindMatches("", secretAuditKindSecretOpen) {
-		t.Fatal("empty stored kind matches secret_open filter")
+	if secretAuditKindMatches("", secretAuditKindSecretOpen) {
+		t.Fatal("missing stored kind must not be reinterpreted")
 	}
 	if secretAuditKindMatches("", secretAuditKindEgress) {
 		t.Fatal("empty stored kind must not match egress filter")

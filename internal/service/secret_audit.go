@@ -37,10 +37,10 @@ const (
 	secretAuditReasonError           = "error"
 	secretAuditReasonOverflow        = "overflow"
 
-	// secretAuditKindSecretOpen is the default event kind (empty Kind is treated
-	// the same for back-compat). secretAuditKindEgress is host-mediated
-	// destination attribution (wasm NetMediator / isolate proxy) — never claim
-	// guest-side secret use from these records.
+	// secretAuditKindSecretOpen is an explicit stored kind. Missing Kind is not
+	// reinterpreted. secretAuditKindEgress is host-mediated destination
+	// attribution (wasm NetMediator / isolate proxy) — never claim guest-side
+	// secret use from these records.
 	secretAuditKindSecretOpen          = "secret_open"
 	secretAuditKindEgress              = "egress"
 	secretAuditKindGap                 = "gap"
@@ -244,13 +244,11 @@ func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
 				s.sendMu.Unlock()
 			}
 			auditEventsDroppedTotal.Add(1)
-			n := s.pendingGap.Add(1)
-			s.persistGapState(n)
+			s.pendingGap.Add(1)
 			return
 		}
 		auditEventsDroppedTotal.Add(1)
-		n := s.pendingGap.Add(1)
-		s.persistGapState(n)
+		s.pendingGap.Add(1)
 	}
 }
 
@@ -372,8 +370,7 @@ func (s *fileAuditSink) loop() {
 				next.pruneDone <- s.pruneLocked(next.pruneCutoff)
 				continue
 			}
-			if next.sync != nil {
-				// Sync must observe spilled events: flush spillCh → spill file → JSONL.
+			flushSpill := func() {
 				if s.spillCh != nil {
 					for {
 						select {
@@ -393,16 +390,53 @@ func (s *fileAuditSink) loop() {
 				}
 				for s.drainSpill() {
 				}
+			}
+			if next.sync != nil {
+				// Sync must observe spilled events: flush spillCh → spill file → JSONL.
+				flushSpill()
 				flushGap()
 				next.sync <- s.syncFile()
 				continue
 			}
-			if next.durable != nil {
-				next.durable <- s.writeEvent(next.ev)
-				continue
+			// Drain the currently queued event burst and group-commit it. Control
+			// requests split batches so Sync/Prune retain their ordering contract.
+			queued := []auditWriteReq{next}
+			for n := len(s.ch); n > 0; n-- {
+				queued = append(queued, <-s.ch)
 			}
-			_ = s.writeEvent(next.ev)
+			for len(queued) > 0 {
+				if queued[0].sync != nil || queued[0].pruneDone != nil {
+					control := queued[0]
+					queued = queued[1:]
+					if control.sync != nil {
+						flushSpill()
+						flushGap()
+						control.sync <- s.syncFile()
+					} else {
+						control.pruneDone <- s.pruneLocked(control.pruneCutoff)
+					}
+					continue
+				}
+				end := 0
+				durable := false
+				for end < len(queued) && queued[end].sync == nil && queued[end].pruneDone == nil {
+					durable = durable || queued[end].durable != nil
+					end++
+				}
+				events := make([]SecretAuditEvent, end)
+				for i := range end {
+					events[i] = queued[i].ev
+				}
+				err := s.writeEventBatch(events, durable, true)
+				for i := range end {
+					if queued[i].durable != nil {
+						queued[i].durable <- err
+					}
+				}
+				queued = queued[end:]
+			}
 		case <-ticker.C:
+			flushGap()
 			_ = s.syncFile()
 		}
 	}
@@ -443,12 +477,10 @@ func (s *fileAuditSink) appendSpill(ev SecretAuditEvent) error {
 	})
 }
 
-// drainSpill moves spilled events into the authoritative JSONL (with hash
-// linking). Crash-safe order: rename spill → working, stream each line into
-// secrets.jsonl via writeEvent, and only then drop the line (temp+rename of
-// the remaining suffix). Never truncates spill before the authoritative write
-// succeeds. Returns true when work was performed so the loop can prefer spill
-// over new channel work.
+// drainSpill moves one immutable spill segment into the authoritative JSONL.
+// It streams and group-commits the segment in bounded batches, then removes the
+// segment only after every batch is durable. A crash may replay a batch (event
+// IDs make that detectable/idempotent downstream), but cannot lose evidence.
 func (s *fileAuditSink) drainSpill() bool {
 	if s == nil || s.spillPath == "" {
 		return false
@@ -488,108 +520,68 @@ func (s *fileAuditSink) drainSpill() bool {
 		return false
 	}
 
+	offsetPath := working + ".off"
+	start := loadSpillOffset(offsetPath)
 	f, err := os.Open(working)
 	if err != nil {
 		return false
 	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	if !sc.Scan() {
-		_ = f.Close()
-		_ = s.withAuditFileLock(func() error {
-			_ = os.Remove(working)
-			return nil
-		})
-		return true
-	}
-	line := strings.TrimSpace(sc.Text())
-	for line == "" && sc.Scan() {
-		line = strings.TrimSpace(sc.Text())
-	}
-	if line == "" {
-		_ = f.Close()
-		_ = s.withAuditFileLock(func() error {
-			_ = os.Remove(working)
-			return nil
-		})
-		return true
-	}
-
-	var writeErr error
-	var ev SecretAuditEvent
-	if json.Unmarshal([]byte(line), &ev) != nil {
-		auditSpillMalformedTotal.Add(1)
-		sum := sha256.Sum256([]byte(line))
-		writeErr = s.writeEvent(SecretAuditEvent{
-			Time:    time.Unix(1_000_000_000+int64(sum[0]), 0).UTC(),
-			EventID: "ae-spill-malformed-" + hex.EncodeToString(sum[:8]),
-			Result:  secretAuditResultGap,
-			Reason:  secretAuditReasonOverflow,
-			Kind:    secretAuditKindGap,
-			Dropped: 1,
-		})
-	} else {
-		writeErr = s.writeEvent(ev)
-	}
-	if writeErr != nil {
-		_ = f.Close()
-		return false // leave working intact; retry on later loop activity
-	}
-	if err := s.syncFile(); err != nil {
-		_ = f.Close()
-		return false
-	}
-
-	// Stream the unread remainder to a temp file and rename — do not Truncate
-	// the working file in place and do not buffer the whole spill in memory.
-	tmp := working + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		_ = f.Close()
-		return false
-	}
-	for sc.Scan() {
-		rest := strings.TrimSpace(sc.Text())
-		if rest == "" {
-			continue
-		}
-		if _, err := out.WriteString(rest); err != nil {
-			_ = out.Close()
-			_ = f.Close()
-			_ = os.Remove(tmp)
-			return false
-		}
-		if _, err := out.Write([]byte{'\n'}); err != nil {
-			_ = out.Close()
-			_ = f.Close()
-			_ = os.Remove(tmp)
+	defer f.Close()
+	if start > 0 {
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			return false
 		}
 	}
-	scanErr := sc.Err()
-	_ = f.Close()
-	if scanErr != nil {
-		_ = out.Close()
-		_ = os.Remove(tmp)
+	br := bufio.NewReaderSize(f, 64*1024)
+	var consumed int64
+	batch := make([]SecretAuditEvent, 0, 256)
+	flush := func() bool {
+		if len(batch) == 0 {
+			return true
+		}
+		if err := s.writeEventBatch(batch, true, false); err != nil {
+			return false
+		}
+		if err := persistSpillOffset(offsetPath, start+consumed); err != nil {
+			return false
+		}
+		batch = batch[:0]
+		return true
+	}
+	for {
+		line, readErr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			consumed += int64(len(line))
+			text := strings.TrimSpace(string(line))
+			if text != "" {
+				var ev SecretAuditEvent
+				if json.Unmarshal([]byte(text), &ev) != nil {
+					auditSpillMalformedTotal.Add(1)
+					sum := sha256.Sum256([]byte(text))
+					ev = SecretAuditEvent{
+						Time: time.Unix(1_000_000_000+int64(sum[0]), 0).UTC(), EventID: "ae-spill-malformed-" + hex.EncodeToString(sum[:8]),
+						Result: secretAuditResultGap, Reason: secretAuditReasonOverflow, Kind: secretAuditKindGap, Dropped: 1,
+					}
+				}
+				batch = append(batch, ev)
+				if len(batch) == cap(batch) && !flush() {
+					return false
+				}
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return false
+		}
+	}
+	if !flush() {
 		return false
 	}
-	if err := out.Sync(); err != nil {
-		_ = out.Close()
-		_ = os.Remove(tmp)
-		return false
-	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	info, _ := os.Stat(tmp)
 	if err := s.withAuditFileLock(func() error {
-		if info == nil || info.Size() == 0 {
-			_ = os.Remove(tmp)
-			_ = os.Remove(working)
-			return nil
-		}
-		return os.Rename(tmp, working)
+		_ = os.Remove(offsetPath)
+		return os.Remove(working)
 	}); err != nil {
 		return false
 	}
@@ -597,7 +589,13 @@ func (s *fileAuditSink) drainSpill() bool {
 }
 
 func (s *fileAuditSink) syncFile() error {
-	err := s.withAuditFileLock(s.file.Sync)
+	err := s.withAuditFileLock(func() error {
+		if err := s.file.Sync(); err != nil {
+			return err
+		}
+		head, eventID := s.chainTip()
+		return persistChainTipErr(s.tipPath, head, eventID)
+	})
 	if err != nil {
 		secretAuditSinkHealthy.Set(0)
 	}
@@ -856,13 +854,21 @@ func (s *fileAuditSink) writeEvent(ev SecretAuditEvent) error {
 }
 
 func (s *fileAuditSink) writeEventInternal(ev SecretAuditEvent, accountFailure bool) error {
-	if s.writeHook != nil {
-		s.writeHook()
+	return s.writeEventBatch([]SecretAuditEvent{ev}, true, accountFailure)
+}
+
+// writeEventBatch links and appends a batch under one flock and, when durable,
+// one fsync. This preserves the hash chain while avoiding one disk barrier per
+// concurrent enterprise request.
+func (s *fileAuditSink) writeEventBatch(events []SecretAuditEvent, durable, accountFailure bool) error {
+	if len(events) == 0 {
+		return nil
 	}
-	if ev.Time.IsZero() {
-		ev.Time = time.Now().UTC()
+	for range events {
+		if s.writeHook != nil {
+			s.writeHook()
+		}
 	}
-	ensureSecretAuditEventID(&ev)
 	lineErr := s.withAuditFileLock(func() error {
 		s.chainMu.Lock()
 		poisoned := s.writePoison
@@ -878,10 +884,21 @@ func (s *fileAuditSink) writeEventInternal(ev SecretAuditEvent, accountFailure b
 		if prev == "" {
 			prev = auditlog.GenesisPrevHash
 		}
-		auditlog.LinkEvent(prev, &ev)
-		line, err := json.Marshal(ev)
-		if err != nil {
-			return err
+		var encoded []byte
+		for i := range events {
+			ev := &events[i]
+			if ev.Time.IsZero() {
+				ev.Time = time.Now().UTC()
+			}
+			ensureSecretAuditEventID(ev)
+			auditlog.LinkEvent(prev, ev)
+			line, err := json.Marshal(ev)
+			if err != nil {
+				return err
+			}
+			encoded = append(encoded, line...)
+			encoded = append(encoded, '\n')
+			prev = ev.EventHash
 		}
 		before, err := s.file.Stat()
 		if err != nil {
@@ -902,28 +919,31 @@ func (s *fileAuditSink) writeEventInternal(ev SecretAuditEvent, accountFailure b
 			}
 			return writeErr
 		}
-		if _, err := s.file.Write(append(line, '\n')); err != nil {
+		if _, err := s.file.Write(encoded); err != nil {
 			return rollback(err)
 		}
-		// Tip is written only AFTER the event bytes are durable.
-		if err := s.file.Sync(); err != nil {
-			return rollback(err)
+		if durable {
+			if err := s.file.Sync(); err != nil {
+				return rollback(err)
+			}
 		}
+		last := events[len(events)-1]
 		s.chainMu.Lock()
-		s.chainHead = ev.EventHash
-		s.chainEvent = ev.EventID
+		s.chainHead = last.EventHash
+		s.chainEvent = last.EventID
 		s.chainMu.Unlock()
-		if tipErr := persistChainTipErr(s.tipPath, ev.EventHash, ev.EventID); tipErr != nil {
-			auditTipWriteFailTotal.Add(1)
-			// In-memory chain remains the source of truth until the next tip write.
+		if durable {
+			if tipErr := persistChainTipErr(s.tipPath, last.EventHash, last.EventID); tipErr != nil {
+				auditTipWriteFailTotal.Add(1)
+			}
 		}
 		return nil
 	})
 	if lineErr != nil {
 		secretAuditSinkHealthy.Set(0)
 		if accountFailure {
-			auditEventsDroppedTotal.Add(1)
-			n := s.pendingGap.Add(1)
+			auditEventsDroppedTotal.Add(int64(len(events)))
+			n := s.pendingGap.Add(int64(len(events)))
 			s.persistGapState(n)
 		}
 		return lineErr
@@ -1087,6 +1107,20 @@ func persistGapCount(path string, n int64) {
 		return
 	}
 	_ = writeFileAtomicDurable(path, []byte(strconv.FormatInt(n, 10)+"\n"), 0o600)
+}
+
+func loadSpillOffset(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	return loadGapCount(path)
+}
+
+func persistSpillOffset(path string, offset int64) error {
+	if path == "" || offset < 0 {
+		return errors.New("audit spill offset path or value is invalid")
+	}
+	return writeFileAtomicDurable(path, []byte(strconv.FormatInt(offset, 10)+"\n"), 0o600)
 }
 
 func clearGapCount(path string) {

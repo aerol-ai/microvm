@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -51,6 +52,9 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 		Runtime:    runtimeName,
 		TemplateID: templateID,
 		ModuleRef:  models.ModuleRefForCreate(*spec),
+	}
+	if nodeID, ok := docker.BuiltImagePlacementNode(spec.Image); ok {
+		out.RequiredNodeID = nodeID
 	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
@@ -121,6 +125,10 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 		}
 		if !CanOwnSandboxRole(m.Role) {
 			rejects["role"]++
+			continue
+		}
+		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
+			rejects["artifact_affinity"]++
 			continue
 		}
 		// Only consider members that have advertised an APIURL — others may

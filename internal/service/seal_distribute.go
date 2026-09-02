@@ -938,7 +938,10 @@ func (s *Service) majoritySecretTargetsDead(targets []string, alive map[string]s
 			deadPeers++
 		}
 	}
-	return frozenPeers > 0 && deadPeers*2 > frozenPeers
+	// Restore the configured replication factor as soon as any intended backup
+	// is lost. Waiting for a strict majority means one dead node in the default
+	// two-backup set is never replaced and its put-outbox retries forever.
+	return frozenPeers > 0 && deadPeers > 0
 }
 
 // secretIncarnationForSeal returns Placement.IncarnationID when present.

@@ -227,6 +227,9 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		if !CanOwnSandboxRole(m.Role) {
 			continue
 		}
+		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
+			continue
+		}
 		if drained[m.NodeID] {
 			continue
 		}

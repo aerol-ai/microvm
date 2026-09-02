@@ -98,6 +98,9 @@ type Request struct {
 	// ModuleRef, when set alongside Runtime="wasm", lets cluster placement
 	// prefer peers that already have the module cached locally.
 	ModuleRef string
+	// RequiredNodeID pins non-portable local artifacts (for example an image
+	// built on one worker) to the only node that can satisfy the request.
+	RequiredNodeID string
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP

@@ -56,6 +56,7 @@ var (
 	secretDeleteOutboxPending          = expvar.NewInt("aerolvm_secret_delete_outbox_pending")
 	secretDeleteOutboxOldestAgeSeconds = expvar.NewInt("aerolvm_secret_delete_outbox_oldest_age_seconds")
 	secretPutOutboxPending             = expvar.NewInt("aerolvm_secret_put_outbox_pending")
+	secretPutOutboxOldestAgeSeconds    = expvar.NewInt("aerolvm_secret_put_outbox_oldest_age_seconds")
 	secretPutOutboxFailuresTotal       = expvar.NewInt("aerolvm_secret_put_outbox_failures_total")
 	secretTombstones                   = expvar.NewInt("aerolvm_secret_tombstones")
 	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.

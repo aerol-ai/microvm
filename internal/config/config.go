@@ -2238,8 +2238,11 @@ func Load() (Config, error) {
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
 		}
-		if !cfg.SecretAuditExternalWitness && strings.TrimSpace(cfg.SecretAuditExportURL) == "" {
-			return Config{}, errors.New("SB_ENTERPRISE_MODE=true requires SB_SECRET_AUDIT_EXTERNAL_WITNESS=true and/or SB_SECRET_AUDIT_EXPORT_URL (off-node durability; otherwise disk loss loses events)")
+		if strings.TrimSpace(cfg.SecretAuditExportURL) == "" {
+			return Config{}, errors.New("SB_ENTERPRISE_MODE=true requires SB_SECRET_AUDIT_EXPORT_URL so reconstructable audit events are durable off-node")
+		}
+		if cfg.EnableIsolate {
+			return Config{}, errors.New("SB_ENABLE_ISOLATE is experimental fleet-wide bundle replication and is forbidden when SB_ENTERPRISE_MODE=true")
 		}
 		if cfg.EnableCluster {
 			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {

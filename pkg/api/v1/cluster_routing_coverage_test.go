@@ -174,7 +174,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("no_docker_workers_falls_back_local", func(t *testing.T) {
+	t.Run("no_docker_workers_rejects_unusable_ingress_build", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(&membersStubCluster{
 			Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
@@ -185,8 +185,8 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
-		if rr.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rr.Code)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rr.Code)
 		}
 	})
 
@@ -264,6 +264,9 @@ func dockerFanoutCluster(selfID, workerURL string) cluster.Client {
 	return &membersStubCluster{
 		Noop:           cluster.NewNoop(selfID, "http://"+selfID, ""),
 		internalClient: http.DefaultClient,
+		placement: cluster.PlacementTarget{
+			NodeID: "worker-docker", APIURL: workerURL, InternalURL: workerURL,
+		},
 		members: []cluster.Member{
 			{NodeID: selfID, APIURL: "http://" + selfID, Alive: true, Role: config.NodeRoleServer},
 			{
@@ -393,7 +396,7 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("list_fanout_cap_exceeded", func(t *testing.T) {
+	t.Run("list_fanout_above_legacy_peer_cap", func(t *testing.T) {
 		env := newTemplateV1TestEnv(t)
 		members := []cluster.Member{
 			{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
@@ -407,8 +410,11 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		env.svc.AttachCluster(&membersStubCluster{Noop: cluster.NewNoop("server-a", "http://server-a", ""), members: members})
 		rr := httptest.NewRecorder()
 		env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates", nil))
-		if rr.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status = %d, want 503", rr.Code)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 without a hard 256-worker cap", rr.Code)
+		}
+		if rr.Header().Get("X-Aerol-Partial") != "true" {
+			t.Fatal("unreachable workers should mark the template list partial")
 		}
 	})
 

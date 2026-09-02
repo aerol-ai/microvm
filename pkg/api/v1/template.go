@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +22,9 @@ import (
 const clusterTemplateForwardedHeader = "X-Cluster-Template-Forwarded"
 
 const (
-	clusterTemplateListConcurrency = 32
+	clusterTemplateListConcurrency = 64
 	clusterTemplateListMaxBytes    = 16 << 20
+	clusterTemplatePeerTimeout     = 5 * time.Second
 )
 
 // Template handlers — POST/GET/LIST/DELETE for the Firecracker template
@@ -90,10 +92,6 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	peers := clusterTemplatePeers(c)
-	if len(peers) > clusterListMaxFanoutPeers {
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster template list fanout exceeds safe peer cap")
-		return
-	}
 
 	local, localErr := h.deps.Service.ListTemplates(r.Context())
 	if localErr != nil && h.deps.Logger != nil {
@@ -109,8 +107,10 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 		merged = append(merged, tpl)
 	}
 
+	failedPeers := 0
 	for result := range listTemplatesFromPeers(r, c, peers) {
 		if result.err != nil {
+			failedPeers++
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn("cluster templates: peer list failed", "peer", result.peerID, "err", result.err)
 			}
@@ -130,6 +130,10 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 	if localErr != nil && len(merged) == 0 {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, localErr)
 		return
+	}
+	if failedPeers > 0 {
+		w.Header().Set("X-Aerol-Partial", "true")
+		w.Header().Set("X-Aerol-Missing-Template-Peers", fmt.Sprint(failedPeers))
 	}
 	apihttp.WriteJSON(w, http.StatusOK, merged)
 }
@@ -181,7 +185,7 @@ func listTemplatesFromPeer(parent *http.Request, c cluster.Client, peer cluster.
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(parent.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent.Context(), clusterTemplatePeerTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+parent.URL.RequestURI(), nil)
 	if err != nil {
@@ -230,26 +234,79 @@ func (h *handlers) clusterTemplateItemWrap(local http.Handler) http.HandlerFunc 
 			apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
 			return
 		}
-		for _, peer := range clusterTemplatePeers(c) {
-			status, header, body, err := templatePeerRequest(c, r, raw, peer)
-			if err != nil {
-				if h.deps.Logger != nil {
-					h.deps.Logger.Warn("cluster templates: peer request failed",
-						"peer", peer.NodeID, "method", r.Method, "path", r.URL.Path, "err", err)
+		// Check local state first. The common owner-worker path remains O(1).
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
+		localReq := r.Clone(r.Context())
+		localReq.Body = io.NopCloser(bytes.NewReader(raw))
+		localReq.ContentLength = int64(len(raw))
+		localRR := httptest.NewRecorder()
+		local.ServeHTTP(localRR, localReq)
+		if localRR.Code != http.StatusNotFound {
+			copyHeaderValues(w.Header(), localRR.Header())
+			w.WriteHeader(localRR.Code)
+			_, _ = w.Write(localRR.Body.Bytes())
+			return
+		}
+
+		// IDs are currently worker-local, so discover a remote owner with bounded
+		// concurrency instead of serially multiplying the per-peer timeout by the
+		// fleet size. The first non-404 response wins and cancels outstanding RPCs.
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		type result struct {
+			status int
+			header http.Header
+			body   []byte
+			peer   string
+			err    error
+		}
+		peers := clusterTemplatePeers(c)
+		results := make(chan result, len(peers))
+		jobs := make(chan cluster.Member)
+		workers := min(clusterTemplateListConcurrency, len(peers))
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for range workers {
+			go func() {
+				defer wg.Done()
+				for peer := range jobs {
+					req := r.Clone(ctx)
+					status, header, body, err := templatePeerRequest(c, req, raw, peer)
+					results <- result{status: status, header: header, body: body, peer: peer.NodeID, err: err}
+				}
+			}()
+		}
+		go func() {
+			defer close(jobs)
+			for _, peer := range peers {
+				select {
+				case jobs <- peer:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		go func() { wg.Wait(); close(results) }()
+		for result := range results {
+			if result.err != nil {
+				if h.deps.Logger != nil && !errors.Is(result.err, context.Canceled) {
+					h.deps.Logger.Warn("cluster templates: peer request failed", "peer", result.peer, "err", result.err)
 				}
 				continue
 			}
-			if status == http.StatusNotFound {
+			if result.status == http.StatusNotFound {
 				continue
 			}
-			copyHeaderValues(w.Header(), header)
-			w.WriteHeader(status)
-			_, _ = w.Write(body)
+			cancel()
+			copyHeaderValues(w.Header(), result.header)
+			w.WriteHeader(result.status)
+			_, _ = w.Write(result.body)
 			return
 		}
-		r.Body = io.NopCloser(bytes.NewReader(raw))
-		r.ContentLength = int64(len(raw))
-		local.ServeHTTP(w, r)
+		copyHeaderValues(w.Header(), localRR.Header())
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write(localRR.Body.Bytes())
 	}
 }
 
@@ -279,7 +336,9 @@ func templatePeerRequest(c cluster.Client, parent *http.Request, raw []byte, pee
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	req, err := http.NewRequestWithContext(parent.Context(), parent.Method,
+	ctx, cancel := context.WithTimeout(parent.Context(), clusterTemplatePeerTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, parent.Method,
 		base+parent.URL.RequestURI(), bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, nil, err

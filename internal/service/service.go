@@ -1981,21 +1981,19 @@ func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.
 // attachWasmRegistryAuth unseals the sandbox's persisted registry creds into
 // its transient RegistryAuth field, so the WASM runtime can re-pull a private
 // oci:// module under the tenant's identity on a node that lacks it (codex C4).
-// Best-effort: an unseal failure is logged and leaves RegistryAuth nil, which
-// degrades to a public/system-identity pull rather than blocking start.
-func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) {
+// Fail closed when persisted credentials cannot be opened. Falling through to
+// the node's ambient registry identity would cross the tenant authorization
+// boundary and make credential revocation ineffective.
+func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) error {
 	if sandbox == nil || len(sandbox.RegistryAuthSealed) == 0 {
-		return
+		return nil
 	}
 	auth, err := s.UnsealRegistry(sandbox.ID, sandbox.RegistryAuthSealed)
 	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("wasm: unseal registry auth failed; private module pull may fail on this node",
-				"sandbox_id", sandbox.ID, "err", err)
-		}
-		return
+		return fmt.Errorf("wasm: unseal registry auth for %s: %w", sandbox.ID, err)
 	}
 	sandbox.RegistryAuth = auth
+	return nil
 }
 
 // persistSandboxCreate writes the sandbox row and its sealed environment in
@@ -2322,7 +2320,12 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			// Unseal per-tenant registry creds so a private oci:// module
 			// re-pulls under the tenant's identity if this node lacks it
 			// (codex C4). Transient: never persisted or serialized.
-			s.attachWasmRegistryAuth(sandbox)
+			if err := s.attachWasmRegistryAuth(sandbox); err != nil {
+				_ = s.mounts.UnmountAll(id)
+				releaseAdmission()
+				_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+				return nil, err
+			}
 			state, err = host.StartSandbox(ctx, sandbox, hostBinds)
 			if err != nil {
 				_ = s.mounts.UnmountAll(id)
@@ -2472,6 +2475,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
 	}
+	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+		return err
+	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
@@ -2482,9 +2488,6 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		if s.logger != nil {
 			s.logger.Warn("platform volume attachment cleanup after destroy failed", "sandbox_id", id, "error", err)
 		}
-	}
-	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
-		return err
 	}
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
@@ -4311,6 +4314,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if err := s.DeleteClusterSecrets(ctx, sandbox.ID); err != nil {
 				return err
 			}
+			if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+				return err
+			}
 			// store.Delete must happen BEFORE schedulePendingImageGC. The
 			// pending-image janitor uses HasActiveImageRef to decide whether
 			// to actually call docker.RemoveImage at sweep time; a stale row
@@ -4327,9 +4333,6 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.admitter.Release(sandbox.ID)
 			}
 			s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "reconcile-destroyed")
-			if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
-				return err
-			}
 			if !s.isWasmSandbox(sandbox) {
 				s.schedulePendingImageGC(ctx, sandbox.Image)
 			}

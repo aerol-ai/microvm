@@ -162,7 +162,12 @@ func TestClusterTLSReloadRejectsWrongNodeIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := loaded.certificateForHandshake(); err == nil || !strings.Contains(err.Error(), "does not match node id") {
-		t.Fatalf("rotated identity error = %v", err)
+	before := loaded.current.Load()
+	got, err := loaded.certificateForHandshake()
+	if err != nil {
+		t.Fatalf("invalid replacement should retain last-good pair: %v", err)
+	}
+	if got != before {
+		t.Fatal("wrong-node replacement displaced the last-good certificate")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"expvar"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,6 +19,8 @@ import (
 // PeerNodeIDHeader is set by production peer callers so the receiver can bind
 // the mTLS leaf to the claimed gossip node id.
 const PeerNodeIDHeader = "X-Cluster-Peer-Node-ID"
+
+var clusterTLSReloadFailures = expvar.NewInt("aerolvm_cluster_mtls_reload_failures_total")
 
 // SetPeerNodeIDHeader attaches this node's id for inbound withInternalMTLS checks.
 func SetPeerNodeIDHeader(req *http.Request, selfNodeID string) {
@@ -340,11 +343,11 @@ func (t *ClusterTLS) certificateForHandshake() (*tls.Certificate, error) {
 	}
 	certInfo, err := os.Stat(t.certPath)
 	if err != nil {
-		return nil, fmt.Errorf("cluster tls: stat node certificate: %w", err)
+		return t.lastGoodCertificate(fmt.Errorf("cluster tls: stat node certificate: %w", err))
 	}
 	keyInfo, err := os.Stat(t.keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("cluster tls: stat node key: %w", err)
+		return t.lastGoodCertificate(fmt.Errorf("cluster tls: stat node key: %w", err))
 	}
 	mark := fmt.Sprintf("%d:%d:%v:%d:%d:%v",
 		certInfo.ModTime().UnixNano(), certInfo.Size(), certInfo.Sys(),
@@ -362,14 +365,14 @@ func (t *ClusterTLS) certificateForHandshake() (*tls.Certificate, error) {
 
 	cert, err := tls.LoadX509KeyPair(t.certPath, t.keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("cluster tls: reload node keypair: %w", err)
+		return t.lastGoodCertificate(fmt.Errorf("cluster tls: reload node keypair: %w", err))
 	}
 	nodeID, expiry, err := validateClusterNodeCertificate(&cert, t.caPool)
 	if err != nil {
-		return nil, err
+		return t.lastGoodCertificate(err)
 	}
 	if nodeID != t.nodeID {
-		return nil, fmt.Errorf("cluster tls: rotated certificate identity %q does not match node id %q", nodeID, t.nodeID)
+		return t.lastGoodCertificate(fmt.Errorf("cluster tls: rotated certificate identity %q does not match node id %q", nodeID, t.nodeID))
 	}
 	t.certMu.Lock()
 	t.current.Store(&cert)
@@ -377,6 +380,18 @@ func (t *ClusterTLS) certificateForHandshake() (*tls.Certificate, error) {
 	t.certMu.Unlock()
 	clusterMTLSCertNotAfterUnix.Set(expiry.Unix())
 	return &cert, nil
+}
+
+// lastGoodCertificate keeps new handshakes available while an operator is in
+// the unavoidable two-rename window of node.crt/node.key replacement. Invalid
+// material is never served; the last fully validated pair remains active and
+// the failure counter makes a stuck rotation alertable.
+func (t *ClusterTLS) lastGoodCertificate(reloadErr error) (*tls.Certificate, error) {
+	clusterTLSReloadFailures.Add(1)
+	if current := t.current.Load(); current != nil {
+		return current, nil
+	}
+	return nil, reloadErr
 }
 
 // ClientForPeer returns an HTTP client that verifies the dialed peer presents

@@ -66,22 +66,31 @@ func TestAttachWasmRegistryAuth(t *testing.T) {
 	}
 	svc := &Service{cipher: cipher, logger: harness.logger}
 
-	svc.attachWasmRegistryAuth(nil)
-	svc.attachWasmRegistryAuth(&models.Sandbox{})
+	if err := svc.attachWasmRegistryAuth(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.attachWasmRegistryAuth(&models.Sandbox{}); err != nil {
+		t.Fatal(err)
+	}
 
 	sealed, err := svc.sealRegistry(&models.RegistryAuth{Server: "ghcr.io", Username: "u", Password: "p"})
 	if err != nil || len(sealed) == 0 {
 		t.Fatalf("sealRegistry: %v", err)
 	}
 	sb := &models.Sandbox{ID: "sb-wasm-auth", RegistryAuthSealed: sealed}
-	svc.attachWasmRegistryAuth(sb)
+	if err := svc.attachWasmRegistryAuth(sb); err != nil {
+		t.Fatal(err)
+	}
 	if sb.RegistryAuth == nil || sb.RegistryAuth.Password != "p" {
 		t.Fatalf("RegistryAuth = %+v", sb.RegistryAuth)
 	}
 
-	// Corrupt seal → warn path, leave RegistryAuth nil (degrade to public pull).
+	// Corrupt persisted credentials fail closed; callers must not fall through
+	// to the node's ambient registry identity.
 	bad := &models.Sandbox{ID: "sb-bad", RegistryAuthSealed: []byte("not-sealed")}
-	svc.attachWasmRegistryAuth(bad)
+	if err := svc.attachWasmRegistryAuth(bad); err == nil {
+		t.Fatal("corrupt registry credential should fail closed")
+	}
 	if bad.RegistryAuth != nil {
 		t.Fatalf("corrupt seal should leave RegistryAuth nil, got %+v", bad.RegistryAuth)
 	}

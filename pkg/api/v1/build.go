@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -96,55 +97,48 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	type target struct {
-		member cluster.Member
-		self   bool
-	}
-	selfID := c.SelfNodeID()
-	targets := make([]target, 0)
-	for _, m := range c.Members() {
-		if !m.Alive || m.NodeID == "" || c.IsNodeDrained(m.NodeID) {
-			continue
+	// A built image is local to one worker. Select that worker once and encode
+	// its identity in the returned tag; the follow-up create request decodes the
+	// affinity and routes back to the same worker. This keeps one SDK build at
+	// O(1) work instead of broadcasting it to every Docker worker.
+	target, err := c.SelectPlacement(capacity.Request{
+		CPU: models.DefaultCPU, MemoryMB: models.DefaultMemoryMB,
+		DiskGB: models.DefaultDiskGB, Runtime: models.RuntimeDocker,
+	})
+	if err != nil || target.IsSelf || target.NodeID == "" {
+		if err == nil {
+			err = cluster.ErrNoPlacementTarget
 		}
-		if !clusterMemberCanOwnSandbox(m.Role) || !clusterMemberSupportsRuntime(m, models.RuntimeDocker) {
-			continue
-		}
-		isSelf := m.NodeID == selfID
-		if !isSelf && m.InternalURL == "" {
-			continue
-		}
-		targets = append(targets, target{member: m, self: isSelf})
-	}
-	if len(targets) == 0 || (len(targets) == 1 && targets[0].self) {
-		h.buildImage(w, r)
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster image build placement: "+err.Error())
 		return
 	}
-
-	var firstStatus int
-	var firstHeader http.Header
-	var firstBody []byte
-	for _, t := range targets {
-		status, header, body, err := h.runImageBuildOnTarget(c, r, raw, t.member, t.self)
-		if err != nil {
-			if h.deps.Logger != nil {
-				h.deps.Logger.Warn("cluster image build fanout failed", "node", t.member.NodeID, "err", err)
-			}
-			apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+t.member.NodeID+": "+err.Error())
-			return
-		}
-		if status != http.StatusOK {
-			apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+t.member.NodeID+": "+strings.TrimSpace(string(body)))
-			return
-		}
-		if firstStatus == 0 {
-			firstStatus = status
-			firstHeader = header
-			firstBody = body
-		}
+	member := cluster.Member{
+		NodeID: target.NodeID, APIURL: target.APIURL, InternalURL: target.InternalURL,
 	}
-	copyHeaderValues(w.Header(), firstHeader)
-	w.WriteHeader(firstStatus)
-	_, _ = w.Write(firstBody)
+	status, header, body, err := h.runImageBuildOnTarget(c, r, raw, member, false)
+	if err != nil {
+		if h.deps.Logger != nil {
+			h.deps.Logger.Warn("cluster image build failed", "node", target.NodeID, "err", err)
+		}
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+target.NodeID+": "+err.Error())
+		return
+	}
+	if status != http.StatusOK {
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+target.NodeID+": "+strings.TrimSpace(string(body)))
+		return
+	}
+	var built buildImageResponse
+	if err := json.Unmarshal(body, &built); err != nil {
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build returned an invalid response")
+		return
+	}
+	if owner, ok := docker.BuiltImagePlacementNode(built.Image); !ok || owner != target.NodeID {
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build returned an unbound image tag")
+		return
+	}
+	copyHeaderValues(w.Header(), header)
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request, raw []byte, m cluster.Member, self bool) (int, http.Header, []byte, error) {
@@ -223,6 +217,11 @@ func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tag := docker.BuildTagFor(dockerfile, req.ContextHashes)
+	if h.deps.Service != nil {
+		if c := h.deps.Service.Cluster(); c != nil {
+			tag = docker.BuildTagForNode(dockerfile, req.ContextHashes, c.SelfNodeID())
+		}
+	}
 	exists, err := h.deps.Builder.ImageExists(r.Context(), tag)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check built image cache: %v", err))

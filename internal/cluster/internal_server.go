@@ -97,6 +97,13 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 	// "longest prefix wins" rule still routes POST /internal/apply to the
 	// dedicated handler above.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// The internal listener is a node-to-node trust boundary, regardless of
+		// which public-API-shaped route is delegated below. Authorize the mTLS
+		// identity before examining headers; otherwise a removed node can omit
+		// X-Cluster-* markers and exercise operator routes with the shared PAT.
+		if !is.authorizePeerRequest(w, r) {
+			return
+		}
 		hp := is.extra.Load()
 		if hp == nil || *hp == nil {
 			// Boot-window: peer forwarded to us before AttachInternalHandler

@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	secretAuditExportInterval = 30 * time.Second
-	secretAuditExportBatchMax = 256
-	secretAuditExportOffset   = "export_offset"
+	secretAuditExportInterval   = time.Second
+	secretAuditExportBatchMax   = 4096
+	secretAuditExportDrainLimit = 256
+	secretAuditExportOffset     = "export_offset"
 )
 
 type auditExportCursor struct {
@@ -153,13 +154,13 @@ func (s *Service) startSecretAuditExportLoop() {
 			defer s.secretAuditExportDone.Done()
 			ticker := time.NewTicker(secretAuditExportInterval)
 			defer ticker.Stop()
-			_ = s.exportSecretAuditBatch(context.Background())
+			_ = s.drainSecretAuditExport(context.Background())
 			for {
 				select {
 				case <-stop:
 					return
 				case <-ticker.C:
-					_ = s.exportSecretAuditBatch(context.Background())
+					_ = s.drainSecretAuditExport(context.Background())
 				}
 			}
 		}()
@@ -180,12 +181,33 @@ func (s *Service) stopSecretAuditExportLoop() {
 }
 
 func (s *Service) exportSecretAuditBatch(ctx context.Context) error {
+	_, err := s.exportSecretAuditBatchOnce(ctx)
+	return err
+}
+
+// drainSecretAuditExport sends consecutive batches until the current file is
+// caught up. The cap prevents a permanently hot producer from monopolizing a
+// goroutine; the one-second scheduler resumes immediately on the next tick.
+func (s *Service) drainSecretAuditExport(ctx context.Context) error {
+	for range secretAuditExportDrainLimit {
+		n, err := s.exportSecretAuditBatchOnce(ctx)
+		if err != nil {
+			return err
+		}
+		if n < secretAuditExportBatchMax {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 	if s == nil || s.secretAuditFile == nil {
-		return nil
+		return 0, nil
 	}
 	ex := s.getAuditExporter()
 	if ex == nil || !(controlplane.Provider{AuditExporter: ex}).HasAuditExporter() {
-		return nil
+		return 0, nil
 	}
 	s.auditExportRunMu.Lock()
 	defer s.auditExportRunMu.Unlock()
@@ -246,14 +268,14 @@ func (s *Service) exportSecretAuditBatch(ctx context.Context) error {
 	})
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return 0, nil
 		}
 		secretAuditExportFailures.Add(1)
-		return err
+		return 0, err
 	}
 	if len(events) == 0 {
 		secretAuditExportOK.Set(1)
-		return nil
+		return 0, nil
 	}
 	nodeID := ""
 	if c := s.Cluster(); c != nil {
@@ -278,17 +300,57 @@ func (s *Service) exportSecretAuditBatch(ctx context.Context) error {
 		if s.logger != nil {
 			s.logger.Warn("secret audit export failed", "err", err)
 		}
-		return err
+		return 0, err
 	}
 	newOffset := offset + bytesRead
 	// The receiver acknowledges the batch but never controls our local byte
 	// cursor; trusting a remote offset could skip unexported evidence.
 	if err := persistAuditExportCursor(offsetPath, auditExportCursor{Generation: generation, Offset: newOffset}); err != nil {
 		secretAuditExportFailures.Add(1)
-		return err
+		return 0, err
 	}
 	secretAuditExportOK.Set(1)
-	return nil
+	return len(events), nil
+}
+
+// secretAuditFullyExported reports whether the locally persisted exporter
+// cursor covers the complete current generation. Retention must never rotate
+// the file before this is true or the unexported prefix becomes unrecoverable.
+func (s *Service) secretAuditFullyExported() (bool, error) {
+	if s == nil || s.secretAuditFile == nil {
+		return true, nil
+	}
+	offsetPath := filepath.Join(filepath.Dir(s.secretAuditFile.path), secretAuditExportOffset)
+	cursor := loadAuditExportCursor(offsetPath)
+	var generation string
+	var size int64
+	err := s.secretAuditFile.withAuditFileLock(func() error {
+		f, err := os.Open(s.secretAuditFile.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		defer f.Close()
+		generation, err = auditFileGeneration(f)
+		if err != nil {
+			return err
+		}
+		st, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		size = st.Size()
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if size == 0 {
+		return true, nil
+	}
+	return cursor.Generation == generation && cursor.Offset >= size, nil
 }
 
 func auditFileGeneration(f *os.File) (string, error) {

@@ -156,6 +156,39 @@ func TestReconcileSecretDeleteOutboxDrainsBeyondOneWorkerWave(t *testing.T) {
 	}
 }
 
+func TestReconcileSecretDeleteOutboxDropsDecommissionedRecipients(t *testing.T) {
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, "sb-retired", []string{"retired-node"}); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+	pusher := &fakePeerPusher{}
+	svc := &Service{
+		cfg:                  config.Config{EnableCluster: true},
+		store:                st,
+		cluster:              cluster.NewNoop("node-a", "http://a", ""),
+		testSecretPeerPusher: pusher,
+	}
+	svc.reconcileSecretDeleteOutboxOnce("sb-retired")
+	remaining, err := st.GetSecretDeleteOutbox(ctx, "sb-retired")
+	if err != nil {
+		t.Fatalf("get outbox: %v", err)
+	}
+	if remaining != nil {
+		t.Fatalf("decommissioned recipient must not pin delete outbox: %+v", remaining)
+	}
+	pusher.mu.Lock()
+	deletes := len(pusher.deletes)
+	pusher.mu.Unlock()
+	if deletes != 0 {
+		t.Fatalf("peer deletes = %d, want 0 for a node that has left membership", deletes)
+	}
+}
+
 func TestRefreshSecretHolderPossessionRetriesAfterProbeFailure(t *testing.T) {
 	clearSecretFanoutHolders("sb-probe-retry")
 	t.Cleanup(func() { clearSecretFanoutHolders("sb-probe-retry") })
@@ -1445,6 +1478,10 @@ func TestExpandAndResealFinalizesInterruptedLocalGeneration(t *testing.T) {
 		store:          st,
 		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
 		cluster:        cl,
+		testSecretPeerPusher: &fakePeerPusher{
+			probeStrict:  true,
+			probeHolding: []string{"live-b"},
+		},
 	}
 	bag := secrets.Secrets{Env: map[string]string{"TOKEN": "secret"}}
 	sealCtx := secrets.ContextWithIncarnationID(ctx, "inc-1")
