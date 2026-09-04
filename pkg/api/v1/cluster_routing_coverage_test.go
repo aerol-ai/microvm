@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
@@ -332,6 +333,11 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		env.handler.ServeHTTP(rr, req)
 		if rr.Code != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202: %s", rr.Code, rr.Body.String())
+		}
+		select {
+		case <-env.builder.done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("template builder did not finish")
 		}
 	})
 
