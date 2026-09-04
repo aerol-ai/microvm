@@ -18,8 +18,6 @@ import (
 func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, gossipPeers []string) (*Cluster, func()) {
 	t.Helper()
 	testClusterMu.Lock()
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeGossipPort(t)
 	dir := t.TempDir()
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 
@@ -27,18 +25,18 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
 		NodeRole:                      role,
-		RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
-		RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
+		RaftBindAddr:                  "127.0.0.1:0",
+		RaftAdvertiseAddr:             "127.0.0.1:0",
 		RaftDataDir:                   filepath.Join(dir, "raft"),
-		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
 		BootstrapPeers:                gossipPeers,
 		ClusterBootstrap:              bootstrap,
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
-		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -60,20 +58,19 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
 	t.Helper()
 	testClusterMu.Lock()
-	gossipPort := pickFreeGossipPort(t)
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 	cfg := config.Config{
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
 		NodeRole:                      role,
-		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
 		BootstrapPeers:                gossipPeers,
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
-		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a, err := NewAgent(cfg, logger, nil)

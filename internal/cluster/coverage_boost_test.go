@@ -639,46 +639,35 @@ func writeTestClusterTLSDirs(t *testing.T, nodeIDs ...string) map[string]string 
 func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, tlsDir string) (*Cluster, func()) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for attempt := 0; attempt < 5; attempt++ {
-		testClusterMu.Lock()
-		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
-		raftPort := pickFreeTCPPort(t)
-		gossipPort := pickFreeGossipPort(t)
-		dir := t.TempDir()
-		cfg := config.Config{
-			EnableCluster:                 true,
-			NodeID:                        nodeID,
-			RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
-			RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
-			RaftDataDir:                   filepath.Join(dir, "raft"),
-			GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			BootstrapPeers:                gossipPeers,
-			ClusterBootstrap:              bootstrap,
-			SelfAPIAdvertiseURL:           apiURL,
-			ClusterRaftCommitTimeout:      2 * time.Second,
-			ClusterCapacityGossipInterval: time.Second,
-			ClusterTLSDir:                 tlsDir,
-			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
-		}
-		c, err := New(cfg, logger, nil)
-		testClusterMu.Unlock()
-		if err == nil {
-			return c, func() {
-				testClusterMu.Lock()
-				defer testClusterMu.Unlock()
-				if err := c.Close(); err != nil {
-					t.Logf("cluster.Close(%s): %v", nodeID, err)
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-		if !strings.Contains(err.Error(), "address already in use") {
-			t.Fatalf("cluster.New(%s, tls): %v", nodeID, err)
-		}
+	testClusterMu.Lock()
+	c, err := New(config.Config{
+		EnableCluster:                 true,
+		NodeID:                        nodeID,
+		RaftBindAddr:                  "127.0.0.1:0",
+		RaftAdvertiseAddr:             "127.0.0.1:0",
+		RaftDataDir:                   filepath.Join(t.TempDir(), "raft"),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
+		BootstrapPeers:                gossipPeers,
+		ClusterBootstrap:              bootstrap,
+		SelfAPIAdvertiseURL:           fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)),
+		ClusterRaftCommitTimeout:      2 * time.Second,
+		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 tlsDir,
+		ClusterInternalListenAddr:     "127.0.0.1:0",
+	}, logger, nil)
+	testClusterMu.Unlock()
+	if err != nil {
+		t.Fatalf("cluster.New(%s, tls): %v", nodeID, err)
 	}
-	t.Fatalf("cluster.New(%s, tls): failed after retries due to port collisions", nodeID)
-	return nil, nil
+	return c, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
+		if err := c.Close(); err != nil {
+			t.Logf("cluster.Close(%s): %v", nodeID, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func newTestClusterWithTLS(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string) (*Cluster, func()) {
@@ -689,42 +678,32 @@ func newTestClusterWithTLS(t *testing.T, nodeID string, bootstrap bool, gossipPe
 func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tlsDir := writeTestClusterTLSDir(t, nodeID)
-	for attempt := 0; attempt < 5; attempt++ {
-		testClusterMu.Lock()
-		gossipPort := pickFreeGossipPort(t)
-		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
-		cfg := config.Config{
-			EnableCluster:                 true,
-			NodeID:                        nodeID,
-			NodeRole:                      role,
-			GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			BootstrapPeers:                gossipPeers,
-			SelfAPIAdvertiseURL:           apiURL,
-			ClusterRaftCommitTimeout:      2 * time.Second,
-			ClusterCapacityGossipInterval: time.Second,
-			ClusterTLSDir:                 tlsDir,
-			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
-		}
-		a, err := NewAgent(cfg, logger, nil)
-		testClusterMu.Unlock()
-		if err == nil {
-			return a, func() {
-				testClusterMu.Lock()
-				defer testClusterMu.Unlock()
-				if err := a.Close(); err != nil {
-					t.Logf("agent.Close(%s): %v", nodeID, err)
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-		if !strings.Contains(err.Error(), "address already in use") {
-			t.Fatalf("cluster.NewAgent(%s, tls): %v", nodeID, err)
-		}
+	testClusterMu.Lock()
+	a, err := NewAgent(config.Config{
+		EnableCluster:                 true,
+		NodeID:                        nodeID,
+		NodeRole:                      role,
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
+		BootstrapPeers:                gossipPeers,
+		SelfAPIAdvertiseURL:           fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)),
+		ClusterRaftCommitTimeout:      2 * time.Second,
+		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
+	}, logger, nil)
+	testClusterMu.Unlock()
+	if err != nil {
+		t.Fatalf("cluster.NewAgent(%s, tls): %v", nodeID, err)
 	}
-	t.Fatalf("cluster.NewAgent(%s, tls): failed after retries due to port collisions", nodeID)
-	return nil, nil
+	return a, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
+		if err := a.Close(); err != nil {
+			t.Logf("agent.Close(%s): %v", nodeID, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func TestClusterBootstrapWithTLSInternalServer(t *testing.T) {

@@ -225,10 +225,9 @@ func startInternalApplyServer(t *testing.T, c *Cluster, ln net.Listener) *httpte
 
 // --- helpers below ---
 
-// testClusterMu serializes real raft/memberlist harnesses. Concurrent
-// newTestCluster* calls race on loopback port bind/teardown (memberlist
-// "use of closed network connection" / pickFreeTCPPort TOCTOU) and were the
-// dominant flake signature on clean main (TODOS.md 2026-08-06).
+// testClusterMu serializes real raft/memberlist harness teardown. Memberlist
+// shutdown is asynchronous enough that overlapping create/close operations
+// can otherwise report "use of closed network connection" in tests.
 var testClusterMu sync.Mutex
 
 // newTestCluster builds a real *Cluster on dynamic ports under t.TempDir().
@@ -245,31 +244,28 @@ func newTestCluster(t *testing.T, nodeID string, bootstrap bool, gossipPeers []s
 // on (so the gossip-published URL matches an HTTP server the test will start).
 //
 // Construction and Close are serialized via testClusterMu so concurrent
-// harnesses do not race on loopback port bind/teardown (memberlist
-// "use of closed network connection" / pickFreeTCPPort TOCTOU). Multiple
-// clusters may still run concurrently after New returns (two-node tests).
+// harnesses do not overlap memberlist teardown. Multiple clusters may still
+// run concurrently after New returns (two-node tests).
 func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, apiURL string) (*Cluster, func()) {
 	t.Helper()
 	testClusterMu.Lock()
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeGossipPort(t)
 	dir := t.TempDir()
 
 	cfg := config.Config{
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
-		RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
-		RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
+		RaftBindAddr:                  "127.0.0.1:0",
+		RaftAdvertiseAddr:             "127.0.0.1:0",
 		RaftDataDir:                   filepath.Join(dir, "raft"),
-		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
 		BootstrapPeers:                gossipPeers,
 		ClusterBootstrap:              bootstrap,
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
-		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -302,29 +298,6 @@ func pickFreeTCPPort(t *testing.T) int {
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
 	return port
-}
-
-// pickFreeGossipPort checks both transports because memberlist binds TCP and
-// UDP to the same port. A TCP-only probe can select a port already occupied by
-// UDP, which made the full suite fail nondeterministically under load.
-func pickFreeGossipPort(t *testing.T) int {
-	t.Helper()
-	for attempt := 0; attempt < 20; attempt++ {
-		tcp, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("pickFreeGossipPort tcp: %v", err)
-		}
-		port := tcp.Addr().(*net.TCPAddr).Port
-		udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
-		if err == nil {
-			_ = udp.Close()
-			_ = tcp.Close()
-			return port
-		}
-		_ = tcp.Close()
-	}
-	t.Fatal("pickFreeGossipPort: failed to find a TCP+UDP port")
-	return 0
 }
 
 // waitForLeader blocks until the cluster reports a leader, or fails the test.

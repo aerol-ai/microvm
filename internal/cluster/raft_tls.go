@@ -46,6 +46,19 @@ func newTLSStreamLayer(bindAddr string, advertise net.Addr, serverCfg, clientCfg
 	if err != nil {
 		return nil, fmt.Errorf("cluster raft tls: listen on %q: %w", bindAddr, err)
 	}
+	// Port zero asks the kernel to select a free port atomically. Preserve the
+	// configured advertise IP, but publish the actual bound port to Raft so a
+	// bootstrapped node never records an unusable address ending in ":0".
+	if tcpAdvertise, ok := advertise.(*net.TCPAddr); ok && tcpAdvertise.Port == 0 {
+		bound, ok := ln.Addr().(*net.TCPAddr)
+		if !ok || bound.Port == 0 {
+			_ = ln.Close()
+			return nil, fmt.Errorf("cluster raft tls: dynamic bind on %q returned invalid address %q", bindAddr, ln.Addr())
+		}
+		resolved := *tcpAdvertise
+		resolved.Port = bound.Port
+		advertise = &resolved
+	}
 	return &tlsStreamLayer{
 		listener:  ln,
 		advertise: advertise,
