@@ -34,6 +34,9 @@ var (
 	// Raft cannot identify the nodes that owned the sandbox's evidence.
 	ErrSecretAuditIndexIncomplete = errors.New("secret audit node index is unavailable or truncated")
 	secretAuditFanoutSlots        = make(chan struct{}, 32)
+	// Public rate limits are per ingress. This worker-side bound also covers
+	// requests amplified through many ingress nodes over the internal endpoint.
+	secretAuditLocalQuerySlots = make(chan struct{}, 8)
 )
 
 // SecretAuditQuery pages local/cluster secret-audit history for one sandbox.
@@ -114,6 +117,12 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return nil, "", nil
+	}
+	select {
+	case secretAuditLocalQuerySlots <- struct{}{}:
+		defer func() { <-secretAuditLocalQuerySlots }()
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
 	}
 	incarnationID := strings.TrimSpace(opts.IncarnationID)
 	if incarnationID == "" {

@@ -77,7 +77,7 @@ off the table. (The 2026-08-02 draft listed it as an option; deleted.)
 | D2 | One plan, all phases. Not split. |
 | D3 | Seal to a recipient **set** (owner + N failover candidates) and push the sealed row to those peers. Preserves recipient binding; keeps bytes out of Raft. |
 | D4 | **Bounded first-backup ACK, then asynchronous remainder** (see §3e), **only** for `failover.policy=recreate`. Every cluster mode fails and retracts a zero-ACK HA create. Default non-HA creates remain unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
-| D5 | Stale recipient sets after membership change = **documented known limitation**, point operators at KMS. There is no dynamic reseal/takeover filter; inbound peer replication still validates the exact recipient set committed in the live placement. |
+| D5 | Recipient drift is repaired by an owner/leader-coordinated, generation-fenced reseal. The new sealed row and retired-recipient cleanup journal commit atomically before the Raft CAS; cleanup is released only after the promoted generation is visible. |
 | D6 | One seal+fanout helper with an explicit strict / best-effort policy argument. |
 | D7 | One shared contract suite runs against **both** providers (offline fake for KMS); live KMS behind the `integration` tag. |
 | D8 | Sealed env lives in its **own row, read on demand**, mirroring `sealMounts`/`loadMounts`/`GetMounts`. The hot row scanner never carries env. |
@@ -133,7 +133,7 @@ KMS removes WALL 2 (recipient binding). It does nothing about WALL 1.
 | Distribution | bounded first-backup ACK, then async remainder (§3e) | the same bounded/async fan-out — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
 | Boot cost (HA creates only) | **bounded sync min-ACK** (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default 2s) then async remainder; local seal always | KMS wrap rides fan-out; first peer ACK may add ≤2s on HA create |
-| Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
+| Membership drift | owner/leader reseals to live replacements; requires one current holder | same distribution repair; KMS removes recipient-bound decrypt restrictions but still needs the bytes |
 | Offline `make test` | native | fake; live behind `integration` tag |
 
 The fan-out is therefore **shared across both providers**, not a local-provider
@@ -158,12 +158,11 @@ Concretely, without KMS:
 - **Nothing else in slices 1-3 touches a provider boundary** beyond the seam
   itself.
 
-What you give up without it: **D5's escape hatch.** Stale recipient sets after
-cluster membership change stay a documented limitation with no alternative
-remedy — E1a's `failover_ready` makes the degradation visible but does not
-repair it. Note this is a smaller loss than the earlier framing implied: KMS
-removes recipient binding but the ciphertext still travels by the same fan-out,
-so the recipient list matters either way.
+What you give up without it is centralized key custody and the ability for any
+IAM-authorized node that holds the ciphertext to decrypt it. The local provider
+now repairs recipient drift by resealing from a live holder, so KMS is not a
+substitute for distribution or cleanup. `failover_ready` remains false until a
+replacement holder ACKs the current generation.
 
 The only item that genuinely requires an external KMS or Vault by nature is
 **E5** (brokering short-lived credentials from the customer's vault), which is
@@ -221,12 +220,17 @@ is **3d-2**: owner + at least one backup constitutes success, the actual holder
 count is recorded, and `failover_ready` reports it. CLAUDE.md non-negotiable #4
 is satisfied by that rule plus the delete-fanout cleanup in **3d-3**.
 
-### 3c. Known limitation (D5)
+### 3c. Membership repair and no-vacuum retirement (D5)
 
-Recipient sets are frozen at create. Add a node, drain the sealed ones, and
-failover can pick a node that provably cannot decrypt. **Documented, not
-fixed** — operators who need HA that survives membership change use the KMS
-provider. This goes in operator docs, not just a code comment.
+Recipient sets are generation-bound, not permanently frozen. When any intended
+recipient dies, the owner (or leader for ownerless records) opens the current
+generation, seals to live replacements, and requires a replacement ACK before
+the Raft CAS. The sealed row and an `awaiting_promotion` retired-recipient
+journal are one SQLite transaction. Peer deletion starts only after Raft shows
+the new generation, so a crash cannot create either a recovery vacuum or a
+forgotten ciphertext copy. Removed/decommissioned node IDs remain pending in
+the delete outbox until their authenticated generation-scoped DELETE ACKs;
+membership disappearance is never treated as cleanup success.
 
 ### 3d. Corrections that ride along
 
@@ -328,8 +332,8 @@ Shared contract suite (D7) runs every case below against **both** providers:
 | Boot path | **default create latency unchanged** (benchmark assertion) |
 
 Integration-tagged (`integration`): kill owner → recreate with creds, on each
-provider; add node after create → non-recipient failover (proves D5's
-limitation is real and legible); live KMS.
+provider; add/drain nodes after create → reseal, replacement ACK, promoted
+generation, and old-recipient cleanup; live KMS.
 
 Per CLAUDE.md: `internal/cluster`, `internal/store`, and the boot path each
 need a regression test next to the file they change plus a PR call-out.
@@ -386,8 +390,8 @@ gives the regression signal.
 
 | Deferred | Why |
 |---|---|
-| Placement filter for stale recipient sets | D5 chose documentation + KMS instead |
-| Resealing protocol on membership change | Needs a live decryptor; the dead owner is the one that had it |
+| Placement filter for stale recipient sets | **Closed:** placement uses the promoted recipient set and drift triggers reseal |
+| Resealing protocol on membership change | **Closed:** live-holder reseal with generation CAS, staged retirement, and replacement ACK |
 | `toolbox_token` at rest | **Closed as enterprise follow-up** — encrypted in the existing sandbox row; see §8a |
 | Fixing issue #70 (full-table scan) | D8 avoids making it worse; fixing it is its own work |
 | `internal/cluster` test flake | Captured in TODOS.md instead |
@@ -525,8 +529,8 @@ but C touches `internal/cluster` + `pkg/api/clustercreate` while D touches
   - Surfaced by: Code quality — zero production callers, seals to `"*"`
   - Files: `cluster_secrets.go:84`
   - Verify: `make test`
-- [x] **T13 (P3, human: ~1d / CC: ~2h)** — docs — Operator docs: provider choice + D5 limitation
-  - Surfaced by: D5 — limitation must be operator-visible
+- [x] **T13 (P3, human: ~1d / CC: ~2h)** — docs — Operator docs: provider choice + D5 recipient repair
+  - Surfaced by: D5 — repair and its live-holder boundary must be operator-visible
   - Files: `docs/src/content/docs/`, `docs/src/content.config.ts`
   - Verify: `make docs-build`
 
@@ -650,8 +654,8 @@ still make no peer call.
 
 ## E1b cluster-read model — DECIDED 2026-08-07
 
-**Local log is authoritative. Fan-out serves reads. The off-node sink is
-additive, never required.**
+**Local log is the operational copy. Bounded owner-history fan-out serves OSS
+reads. The off-node exporter is mandatory in enterprise mode.**
 
 Four parts, all of them load-bearing:
 
@@ -663,11 +667,11 @@ Four parts, all of them load-bearing:
    state fails explicitly (`503`) instead of launching an all-worker scan. The
    off-node exporter is mandatory in enterprise mode, so completeness does not
    depend on an unbounded discovery query. **Rate-limited** (see below).
-3. **Additionally**, best-effort `Report(...)` audit events through
-   `controlplane.Reporter` when a real reporter is configured — the managed or
-   customer sink path.
-4. If the Reporter is no-op or unset (**the open-source default**), skip the
-   off-node ship entirely. Reads stay fan-out plus local.
+3. Authenticated HTTPS batch export advances a daemon-owned durable watermark;
+   receiver-controlled cursors cannot skip local records.
+4. Open-source mode may omit the exporter and use bounded owner-history reads.
+   `SB_ENTERPRISE_MODE=true` fails boot unless an HTTPS export URL and strong
+   bearer credential are configured.
 
 ### The claim is gated on the sink, and this is not optional wording
 
@@ -993,9 +997,10 @@ explicitly. Plus §3e supersedes D4: HA fan-out uses a **bounded first-backup
 ACK followed by an asynchronous remainder**; every cluster mode retracts/fails
 a zero-ACK create, while E1a `failover_ready` exposes completion. **Slice 1 is
 unblocked.**
-Also resolved: the E1b cluster-read model — local log authoritative, fan-out with
-an explicit coverage block, rate-limited, `controlplane.Reporter` additive and
-never required, dead-disk durability **not claimed** on the open-source build.
+Also resolved: the E1b cluster-read model — local hash-chained operational log,
+bounded owner-history reads with explicit coverage and rate limiting, and a
+mandatory authenticated exporter in enterprise mode. Dead-disk durability is
+**not claimed** on the open-source build without that exporter.
 And the KMS wrapping-material cache: **no cache**, every open calls KMS, so
 revocation stays instant and CloudTrail stays complete. **E5 credential
 brokering is out of scope** — customer secrets arrive at create time, platform

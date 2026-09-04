@@ -117,16 +117,17 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
-	// Phase 2). Templates are per-worker artifacts, so the wrapper routes
-	// creates to a Firecracker-capable worker and fans per-id operations to
-	// those workers when the caller hits an ingress/server node.
-	mux.Handle("POST "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.clusterCreateTemplateWrap)))
-	mux.Handle("GET "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.clusterListTemplatesWrap)))
-	mux.Handle("GET "+PathPrefix+"/templates/{id}", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.getTemplate))))
-	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.deleteTemplate))))
+	// Phase 2). Templates are global operator-managed, per-worker artifacts; no
+	// tenant owner model exists. The wrapper routes creates to one Firecracker
+	// worker, item operations through the leader's all-status worker catalogue,
+	// and cluster-wide lists through a coalescing leader aggregate.
+	mux.Handle("POST "+PathPrefix+"/templates", withAuthOperator(d, http.HandlerFunc(h.clusterCreateTemplateWrap)))
+	mux.Handle("GET "+PathPrefix+"/templates", withAuthOperator(d, http.HandlerFunc(h.clusterListTemplatesWrap)))
+	mux.Handle("GET "+PathPrefix+"/templates/{id}", withAuthOperator(d, h.clusterTemplateItemWrap(http.HandlerFunc(h.getTemplate))))
+	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", withAuthOperator(d, h.clusterTemplateItemWrap(http.HandlerFunc(h.deleteTemplate))))
 	// Operator-triggered snapshot rebuild (Phase 6 follow-up). Idempotent
 	// under concurrent retry — see RequestTemplateRebuild for the CAS gate.
-	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.rebuildTemplate))))
+	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", withAuthOperator(d, h.clusterTemplateItemWrap(http.HandlerFunc(h.rebuildTemplate))))
 
 	// WASM module catalogue (plans/wasm-runtime.md). Per-host like templates.
 	mux.Handle("POST "+PathPrefix+"/wasm-modules", d.Auth(http.HandlerFunc(h.createWasmModule)))
@@ -187,7 +188,6 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretDelete)))
 	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", internalOp(http.HandlerFunc(h.clusterInternalSandboxAudit)))
 	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", internalOp(http.HandlerFunc(h.clusterInternalSandboxMeta)))
-	mux.Handle("POST "+cluster.PublicInternalJSBundlesPath, internalOp(http.HandlerFunc(h.createJSBundleReplica)))
 }
 
 const clusterPeerNodeIDHeader = cluster.PeerNodeIDHeader

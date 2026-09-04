@@ -867,8 +867,8 @@ func sameStringSlice(a, b []string) bool {
 // SecretRecipientsForSeal returns the recorded Placement.SecretRecipients when
 // present, otherwise [self]. Used by create-on-target seal sites.
 //
-// When preferLiveReplacement is true and a majority of frozen non-self
-// recipients are dead, returns SelectReplacementRecipients instead. Callers
+// When preferLiveReplacement is true and any frozen non-self recipient is
+// dead, returns SelectReplacementRecipients instead. Callers
 // that only need the frozen create-time set leave the flag false.
 func (s *Service) SecretRecipientsForSeal(sandboxID string, preferLiveReplacement ...bool) []string {
 	c := s.Cluster()
@@ -880,7 +880,7 @@ func (s *Service) SecretRecipientsForSeal(sandboxID string, preferLiveReplacemen
 		frozen := append([]string(nil), p.SecretRecipients...)
 		if liveReplace {
 			if repl := s.SelectReplacementRecipients(sandboxID, s.SecretRecipientBackupCount()); len(repl) > 0 {
-				if s.majoritySecretTargetsDead(frozen, s.aliveMemberSet(), c.SelfNodeID()) {
+				if s.anySecretTargetDead(frozen, s.aliveMemberSet(), c.SelfNodeID()) {
 					return repl
 				}
 			}
@@ -925,7 +925,7 @@ func (s *Service) SelectReplacementRecipients(sandboxID string, maxBackups int) 
 	return cluster.SelectSecretRecipients(sandboxID, candidates, ownerID, maxBackups)
 }
 
-func (s *Service) majoritySecretTargetsDead(targets []string, alive map[string]struct{}, selfID string) bool {
+func (s *Service) anySecretTargetDead(targets []string, alive map[string]struct{}, selfID string) bool {
 	frozenPeers := 0
 	deadPeers := 0
 	for _, id := range targets {

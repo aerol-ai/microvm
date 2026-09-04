@@ -358,8 +358,11 @@ func TestRun_GracefulShutdownClusterServerIngress(t *testing.T) {
 	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
 	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
 	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
-	t.Setenv("SB_CLUSTER_INTERNAL_LISTEN", fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)))
-	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", fmt.Sprintf("https://127.0.0.1:%d", pickFreeTCPPort(t)))
+	// Let the kernel allocate the internal-listener port atomically. Picking a
+	// free port and closing the probe socket creates a TOCTOU race with other CI
+	// jobs and was intermittently colliding before Run could bind it.
+	t.Setenv("SB_CLUSTER_INTERNAL_LISTEN", "127.0.0.1:0")
+	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", "https://127.0.0.1:21443")
 
 	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
 		t.Fatalf("Run returned error: %v", err)

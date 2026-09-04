@@ -106,11 +106,6 @@ type Service struct {
 	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
 	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
 	isolateBundles *jsbundle.Store
-	// jsBundleReplicator fans a newly-uploaded bundle out to cluster peers so an
-	// isolate create placed on any node resolves it locally (isolate's bundle
-	// store is per-node). Nil in single-node mode (no-op) and set by pkg/daemon
-	// to (*cluster).ReplicateJSBundle only when EnableCluster && EnableIsolate.
-	jsBundleReplicator func(ctx context.Context, owner string, req models.CreateJSBundleRequest) error
 	// isolateStaging refcounts content digests staged by an in-flight isolate
 	// create but not yet pinned by a persisted store row, so the bundle GC does
 	// not reap them mid-create (pinStagingDigest / stagingDigests).
@@ -229,6 +224,7 @@ type Service struct {
 	// worst case. Lazily populated on first Capacity() call.
 	localReadyTemplateIDsMu        sync.Mutex
 	localReadyTemplateIDsCache     []string
+	localTemplateCatalogIDsCache   []string
 	localReadyTemplateIDsKnown     bool
 	localReadyTemplateIDsExpires   time.Time
 	localReadyWasmModuleIDsMu      sync.Mutex
@@ -853,6 +849,12 @@ func (s *Service) Cluster() cluster.Client {
 	s.clusterMu.Lock()
 	defer s.clusterMu.Unlock()
 	return s.cluster
+}
+
+// ClusterEnabled distinguishes a configured cluster from the single-node Noop
+// client, which intentionally implements the same interface.
+func (s *Service) ClusterEnabled() bool {
+	return s != nil && s.cfg.EnableCluster
 }
 
 // ClusterTopologyError returns a production-topology violation for the current
@@ -3923,6 +3925,10 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalTemplateInventoryKnown = true
 		snap.LocalTemplateIDs = ids
 	}
+	if ids, known := s.LocalTemplateCatalogInventory(context.Background()); known {
+		snap.LocalTemplateCatalogInventoryKnown = true
+		snap.LocalTemplateCatalogIDs = ids
+	}
 	if refs, known := s.LocalReadyWasmModuleInventory(context.Background()); known {
 		snap.LocalWasmModuleInventoryKnown = true
 		snap.LocalWasmModuleIDs = refs
@@ -3958,7 +3964,7 @@ func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bo
 	}
 	s.localReadyTemplateIDsMu.Unlock()
 
-	ids, err := s.store.ListReadyTemplateIDs(ctx)
+	ids, catalogIDs, err := s.store.ListTemplateInventoryIDs(ctx)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Warn("local ready template ids: list failed",
@@ -3975,11 +3981,27 @@ func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bo
 	}
 	s.localReadyTemplateIDsMu.Lock()
 	s.localReadyTemplateIDsCache = ids
+	s.localTemplateCatalogIDsCache = catalogIDs
 	s.localReadyTemplateIDsKnown = true
 	s.localReadyTemplateIDsExpires = now.Add(5 * time.Second)
 	out := append([]string(nil), ids...)
 	s.localReadyTemplateIDsMu.Unlock()
 	return out, true
+}
+
+// LocalTemplateCatalogInventory returns every template row on this worker,
+// including pending and failed rows. It shares the ready-inventory refresh so
+// capacity heartbeats still perform only one small SQLite query per TTL.
+func (s *Service) LocalTemplateCatalogInventory(ctx context.Context) ([]string, bool) {
+	if s == nil || s.store == nil {
+		return nil, false
+	}
+	// Refreshes both cache slices when expired.
+	_, known := s.LocalReadyTemplateInventory(ctx)
+	s.localReadyTemplateIDsMu.Lock()
+	out := append([]string(nil), s.localTemplateCatalogIDsCache...)
+	s.localReadyTemplateIDsMu.Unlock()
+	return out, known
 }
 
 // LocalReadyTemplateIDs returns only the template IDs from

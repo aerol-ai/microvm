@@ -17,20 +17,57 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"golang.org/x/sync/singleflight"
 )
 
-const clusterTemplateForwardedHeader = "X-Cluster-Template-Forwarded"
+const (
+	clusterTemplateForwardedHeader  = "X-Cluster-Template-Forwarded"
+	clusterTemplateAggregateHeader  = "X-Cluster-Template-Aggregate"
+	clusterTemplateItemLeaderHeader = "X-Cluster-Template-Item-Leader"
+)
 
 const (
-	clusterTemplateListConcurrency = 64
-	clusterTemplateListMaxBytes    = 16 << 20
-	clusterTemplatePeerTimeout     = 5 * time.Second
+	clusterTemplateListConcurrency  = 64
+	clusterTemplateListMaxBytes     = 16 << 20
+	clusterTemplatePeerTimeout      = 5 * time.Second
+	clusterTemplateAggregateTimeout = 10 * time.Second
+	clusterTemplateListCacheTTL     = 2 * time.Second
 )
 
 // Template handlers — POST/GET/LIST/DELETE for the Firecracker template
 // pipeline (plans/snapshot-clone-fast-boot.md Phase 2). Template artifacts
-// live on the worker that built them, so cluster mode routes creates to a
-// Firecracker-capable worker and fans reads/mutations across those workers.
+// are global operator-managed infrastructure and live on the worker that built
+// them. Cluster mode routes creates to a Firecracker-capable worker, routes
+// item operations from advertised inventory, and coalesces cluster-wide lists
+// on the Raft leader.
+
+type templateListAggregate struct {
+	rows        []*models.Template
+	failedPeers int
+}
+
+type templateListCache struct {
+	mu      sync.RWMutex
+	expires time.Time
+	value   templateListAggregate
+	group   singleflight.Group
+}
+
+func (c *templateListCache) get(now time.Time) (templateListAggregate, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.expires.IsZero() || !now.Before(c.expires) {
+		return templateListAggregate{}, false
+	}
+	return c.value, true
+}
+
+func (c *templateListCache) put(now time.Time, value templateListAggregate) {
+	c.mu.Lock()
+	c.value = value
+	c.expires = now.Add(clusterTemplateListCacheTTL)
+	c.mu.Unlock()
+}
 
 func (h *handlers) clusterCreateTemplateWrap(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get(clusterTemplateForwardedHeader) == "1" {
@@ -91,7 +128,96 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 		h.listTemplates(w, r)
 		return
 	}
+	if r.Header.Get(clusterTemplateAggregateHeader) != "1" && h.forwardTemplateToLeader(w, r, c, clusterTemplateAggregateHeader) {
+		return
+	}
+
+	aggregate, err := h.cachedTemplateList(r, c)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if aggregate.failedPeers > 0 {
+		w.Header().Set("X-Aerol-Partial", "true")
+		w.Header().Set("X-Aerol-Missing-Template-Peers", fmt.Sprint(aggregate.failedPeers))
+	}
+	apihttp.WriteJSON(w, http.StatusOK, aggregate.rows)
+}
+
+func (h *handlers) forwardTemplateToLeader(w http.ResponseWriter, r *http.Request, c cluster.Client, routedHeader string) bool {
+	leaderID := strings.TrimSpace(c.Leader())
+	if leaderID == "" {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster leader unavailable")
+		return true
+	}
+	if leaderID == c.SelfNodeID() {
+		return false
+	}
+	member, found := templateMemberByID(c, leaderID)
+	if !found {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster leader not present in membership")
+		return true
+	}
+	if !member.Alive || strings.TrimSpace(member.InternalURL) == "" {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster leader internal endpoint unavailable")
+		return true
+	}
+	r.Header.Set(routedHeader, "1")
+	c.ForwardHTTP(cluster.Endpoint{
+		NodeID: member.NodeID, InternalURL: member.InternalURL, APIURL: member.APIURL,
+	}, w, r)
+	return true
+}
+
+// templateMemberByID uses the O(1) gossip index exposed by production cluster
+// clients. The Members fallback supports small test/custom clients only; both
+// Cluster and Agent implement LookupMember.
+func templateMemberByID(c cluster.Client, nodeID string) (cluster.Member, bool) {
+	if lookup, ok := c.(interface {
+		LookupMember(string) (cluster.Member, bool)
+	}); ok {
+		if member, found := lookup.LookupMember(nodeID); found {
+			return member, true
+		}
+	}
+	for _, member := range c.Members() {
+		if member.NodeID == nodeID {
+			return member, true
+		}
+	}
+	return cluster.Member{}, false
+}
+
+func (h *handlers) cachedTemplateList(r *http.Request, c cluster.Client) (templateListAggregate, error) {
+	if cached, ok := h.templateLists.get(time.Now()); ok {
+		return cached, nil
+	}
+	value, err, _ := h.templateLists.group.Do("all", func() (any, error) {
+		if cached, ok := h.templateLists.get(time.Now()); ok {
+			return cached, nil
+		}
+		// Finish the bounded aggregate even if the first ingress caller leaves;
+		// other concurrent callers share this work through singleflight.
+		ctx, cancel := context.WithTimeout(context.Background(), clusterTemplateAggregateTimeout)
+		defer cancel()
+		request := r.Clone(ctx)
+		request.Header = r.Header.Clone()
+		aggregate, err := h.aggregateTemplateList(request, c)
+		if err != nil {
+			return templateListAggregate{}, err
+		}
+		h.templateLists.put(time.Now(), aggregate)
+		return aggregate, nil
+	})
+	if err != nil {
+		return templateListAggregate{}, err
+	}
+	return value.(templateListAggregate), nil
+}
+
+func (h *handlers) aggregateTemplateList(r *http.Request, c cluster.Client) (templateListAggregate, error) {
 	peers := clusterTemplatePeers(c)
+	unavailablePeers := clusterTemplateUnavailablePeerCount(c)
 
 	local, localErr := h.deps.Service.ListTemplates(r.Context())
 	if localErr != nil && h.deps.Logger != nil {
@@ -107,15 +233,15 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 		merged = append(merged, tpl)
 	}
 
-	failedPeers := 0
+	successfulPeers := 0
 	for result := range listTemplatesFromPeers(r, c, peers) {
 		if result.err != nil {
-			failedPeers++
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn("cluster templates: peer list failed", "peer", result.peerID, "err", result.err)
 			}
 			continue
 		}
+		successfulPeers++
 		for _, tpl := range result.rows {
 			if tpl == nil {
 				continue
@@ -128,14 +254,16 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	if localErr != nil && len(merged) == 0 {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, localErr)
-		return
+		return templateListAggregate{}, localErr
 	}
-	if failedPeers > 0 {
-		w.Header().Set("X-Aerol-Partial", "true")
-		w.Header().Set("X-Aerol-Missing-Template-Peers", fmt.Sprint(failedPeers))
+	// The aggregate context may expire before every peer is dispatched. Count
+	// every peer without a successful response as missing so a partial response
+	// can never under-report its coverage gap.
+	failedPeers := unavailablePeers + len(peers) - successfulPeers
+	if localErr != nil {
+		failedPeers++
 	}
-	apihttp.WriteJSON(w, http.StatusOK, merged)
+	return templateListAggregate{rows: merged, failedPeers: failedPeers}, nil
 }
 
 type templateListPeerResult struct {
@@ -228,6 +356,9 @@ func (h *handlers) clusterTemplateItemWrap(local http.Handler) http.HandlerFunc 
 			local.ServeHTTP(w, r)
 			return
 		}
+		if r.Header.Get(clusterTemplateItemLeaderHeader) != "1" && h.forwardTemplateToLeader(w, r, c, clusterTemplateItemLeaderHeader) {
+			return
+		}
 		raw, err := apihttp.ReadJSONBody(w, r)
 		_ = r.Body.Close()
 		if err != nil {
@@ -249,86 +380,96 @@ func (h *handlers) clusterTemplateItemWrap(local http.Handler) http.HandlerFunc 
 			return
 		}
 
-		// IDs are currently worker-local, so discover a remote owner with bounded
-		// concurrency instead of serially multiplying the per-peer timeout by the
-		// fleet size. The first non-404 response wins and cancels outstanding RPCs.
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
-		type result struct {
-			status int
-			header http.Header
-			body   []byte
-			peer   string
-			err    error
-		}
-		peers := clusterTemplatePeers(c)
-		results := make(chan result, len(peers))
-		jobs := make(chan cluster.Member)
-		workers := min(clusterTemplateListConcurrency, len(peers))
-		var wg sync.WaitGroup
-		wg.Add(workers)
-		for range workers {
-			go func() {
-				defer wg.Done()
-				for peer := range jobs {
-					req := r.Clone(ctx)
-					status, header, body, err := templatePeerRequest(c, req, raw, peer)
-					results <- result{status: status, header: header, body: body, peer: peer.NodeID, err: err}
-				}
-			}()
-		}
-		go func() {
-			defer close(jobs)
-			for _, peer := range peers {
-				select {
-				case jobs <- peer:
-				case <-ctx.Done():
-					return
-				}
+		peer, inventoryUnknown, ok := templateOwnerFromInventory(c, r.PathValue("id"))
+		if !ok {
+			if inventoryUnknown {
+				apihttp.WriteError(w, http.StatusServiceUnavailable, "template inventory has not converged")
+				return
 			}
-		}()
-		go func() { wg.Wait(); close(results) }()
-		for result := range results {
-			if result.err != nil {
-				if h.deps.Logger != nil && !errors.Is(result.err, context.Canceled) {
-					h.deps.Logger.Warn("cluster templates: peer request failed", "peer", result.peer, "err", result.err)
-				}
-				continue
-			}
-			if result.status == http.StatusNotFound {
-				continue
-			}
-			cancel()
-			copyHeaderValues(w.Header(), result.header)
-			w.WriteHeader(result.status)
-			_, _ = w.Write(result.body)
+			copyHeaderValues(w.Header(), localRR.Header())
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write(localRR.Body.Bytes())
 			return
 		}
-		copyHeaderValues(w.Header(), localRR.Header())
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write(localRR.Body.Bytes())
+		if !peer.Alive || strings.TrimSpace(peer.InternalURL) == "" {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "template owner is unavailable")
+			return
+		}
+		status, header, body, err := templatePeerRequest(c, r, raw, peer)
+		if err != nil {
+			if h.deps.Logger != nil {
+				h.deps.Logger.Warn("cluster templates: owner request failed", "peer", peer.NodeID, "err", err)
+			}
+			apihttp.WriteError(w, http.StatusBadGateway, "template owner unavailable")
+			return
+		}
+		copyHeaderValues(w.Header(), header)
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
 	}
+}
+
+func templateOwnerFromInventory(c cluster.Client, templateID string) (cluster.Member, bool, bool) {
+	var owner cluster.Member
+	unknown := false
+	if c == nil {
+		return owner, false, false
+	}
+	for _, member := range c.Members() {
+		if !clusterTemplateMemberEligible(c, member) {
+			continue
+		}
+		if !member.Capacity.LocalTemplateCatalogInventoryKnown {
+			unknown = true
+			continue
+		}
+		for _, id := range member.Capacity.LocalTemplateCatalogIDs {
+			if id == templateID && (owner.NodeID == "" || member.NodeID < owner.NodeID) {
+				owner = member
+			}
+		}
+	}
+	return owner, unknown, owner.NodeID != ""
 }
 
 func clusterTemplatePeers(c cluster.Client) []cluster.Member {
 	if c == nil {
 		return nil
 	}
-	selfID := c.SelfNodeID()
 	out := make([]cluster.Member, 0)
 	for _, m := range c.Members() {
-		if !m.Alive || m.NodeID == "" || m.NodeID == selfID || m.InternalURL == "" {
-			continue
-		}
-		if !clusterMemberCanOwnSandbox(m.Role) || !clusterMemberSupportsRuntime(m, models.RuntimeFirecracker) {
-			continue
-		}
-		if c.IsNodeDrained(m.NodeID) {
+		if !clusterTemplateMemberEligible(c, m) || !m.Alive || strings.TrimSpace(m.InternalURL) == "" {
 			continue
 		}
 		out = append(out, m)
 	}
 	return out
+}
+
+func clusterTemplateUnavailablePeerCount(c cluster.Client) int {
+	if c == nil {
+		return 0
+	}
+	count := 0
+	for _, member := range c.Members() {
+		if !clusterTemplateMemberEligible(c, member) {
+			continue
+		}
+		if !member.Alive || strings.TrimSpace(member.InternalURL) == "" {
+			count++
+		}
+	}
+	return count
+}
+
+// clusterTemplateMemberEligible identifies workers whose template inventory
+// belongs in the cluster control-plane view. Drain state intentionally does not
+// apply: draining prevents new sandbox placement, not administration of
+// artifacts already owned by that worker.
+func clusterTemplateMemberEligible(c cluster.Client, member cluster.Member) bool {
+	return c != nil && member.NodeID != "" && member.NodeID != c.SelfNodeID() &&
+		clusterMemberCanOwnSandbox(member.Role) &&
+		clusterMemberSupportsRuntime(member, models.RuntimeFirecracker)
 }
 
 func templatePeerRequest(c cluster.Client, parent *http.Request, raw []byte, peer cluster.Member) (int, http.Header, []byte, error) {

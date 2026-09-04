@@ -433,6 +433,7 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		Spec:                  spec,
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
+		SecretSealGeneration:  secrets.SealGeneration,
 		IncarnationID:         incarnationID,
 		ExpectedIncarnationID: expectedIncarnationID,
 		OwnerRef:              secrets.OwnerRef,
@@ -447,15 +448,16 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 // sandbox.
 func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{
-		Op:                 opClaimOrphan,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        c.nodeID,
-		OwnerAPIURL:        c.apiURL,
-		OwnerDataPlaneHost: c.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		OwnerRef:           secrets.OwnerRef,
+		Op:                   opClaimOrphan,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          c.nodeID,
+		OwnerAPIURL:          c.apiURL,
+		OwnerDataPlaneHost:   c.dataPlaneHost,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		OwnerRef:             secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -472,11 +474,12 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 		return nil
 	}
 	cmd := command{
-		Op:            opUpsertSpec,
-		SandboxID:     sandboxID,
-		Spec:          spec,
-		SecretRef:     secrets.Ref,
-		SecretVersion: secrets.Version,
+		Op:                   opUpsertSpec,
+		SandboxID:            sandboxID,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -693,18 +696,19 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		}
 	}
 	cmd := command{
-		Op:                 opReserve,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
-		Spec:               redacted,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		SecretRecipients:   append([]string(nil), secrets.Recipients...),
-		IncarnationID:      incarnationID,
-		OwnerRef:           secrets.OwnerRef,
-		ExpiresUnix:        time.Now().Add(ttl).Unix(),
+		Op:                   opReserve,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          target.NodeID,
+		OwnerAPIURL:          target.APIURL,
+		OwnerDataPlaneHost:   target.DataPlaneHost,
+		Spec:                 redacted,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		SecretRecipients:     append([]string(nil), secrets.Recipients...),
+		IncarnationID:        incarnationID,
+		OwnerRef:             secrets.OwnerRef,
+		ExpiresUnix:          time.Now().Add(ttl).Unix(),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -733,17 +737,18 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 			}
 		}
 		cmd.Reservations = append(cmd.Reservations, reservationCommand{
-			SandboxID:          r.SandboxID,
-			OwnerNodeID:        r.Target.NodeID,
-			OwnerAPIURL:        r.Target.APIURL,
-			OwnerDataPlaneHost: r.Target.DataPlaneHost,
-			Spec:               r.Redacted,
-			SecretRef:          r.Secrets.Ref,
-			SecretVersion:      r.Secrets.Version,
-			SecretRecipients:   append([]string(nil), r.Secrets.Recipients...),
-			IncarnationID:      incarnationID,
-			OwnerRef:           r.Secrets.OwnerRef,
-			ExpiresUnix:        now.Add(r.TTL).Unix(),
+			SandboxID:            r.SandboxID,
+			OwnerNodeID:          r.Target.NodeID,
+			OwnerAPIURL:          r.Target.APIURL,
+			OwnerDataPlaneHost:   r.Target.DataPlaneHost,
+			Spec:                 r.Redacted,
+			SecretRef:            r.Secrets.Ref,
+			SecretVersion:        r.Secrets.Version,
+			SecretSealGeneration: r.Secrets.SealGeneration,
+			SecretRecipients:     append([]string(nil), r.Secrets.Recipients...),
+			IncarnationID:        incarnationID,
+			OwnerRef:             r.Secrets.OwnerRef,
+			ExpiresUnix:          now.Add(r.TTL).Unix(),
 		})
 	}
 	return c.applyCommand(ctx, cmd)
@@ -1317,6 +1322,15 @@ func (c *Cluster) SetLocalTemplateIDsProvider(fn func() ([]string, bool)) {
 		return
 	}
 	c.capacityLeases.SetLocalTemplateIDsProvider(fn)
+}
+
+// SetLocalTemplateCatalogProvider registers the all-lifecycle template
+// catalogue callback used by administrative item routing.
+func (c *Cluster) SetLocalTemplateCatalogProvider(fn func() ([]string, bool)) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetLocalTemplateCatalogProvider(fn)
 }
 
 // SetLocalWasmModuleIDsProvider registers the WASM module inventory callback.

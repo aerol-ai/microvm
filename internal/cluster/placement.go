@@ -56,6 +56,11 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	if nodeID, ok := docker.BuiltImagePlacementNode(spec.Image); ok {
 		out.RequiredNodeID = nodeID
 	}
+	if runtimeName == models.RuntimeIsolate {
+		if nodeID, _, ok := models.ParseJSBundleNodeRef(out.ModuleRef); ok {
+			out.RequiredNodeID = nodeID
+		}
+	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
 	}

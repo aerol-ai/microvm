@@ -325,6 +325,46 @@ func TestFileAuditSinkEmitAsyncWhenWriterBlocked(t *testing.T) {
 	sink.Sync()
 }
 
+func TestFileAuditSinkStartupIgnoresStaleTipAndContinuesVerifiedChain(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newFileAuditSink(dir, 4)
+	if err != nil {
+		t.Fatalf("newFileAuditSink: %v", err)
+	}
+	if err := sink.writeEvent(SecretAuditEvent{Result: secretAuditResultSuccess, Ref: "first"}); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	sink.Close()
+
+	// Simulate a crash after the JSONL fsync but before the sidecar tip update.
+	if err := os.WriteFile(filepath.Join(dir, "secrets.tip"), []byte("0\n\n"), 0o600); err != nil {
+		t.Fatalf("write stale tip: %v", err)
+	}
+	reopened, err := newFileAuditSink(dir, 4)
+	if err != nil {
+		t.Fatalf("reopen with stale tip: %v", err)
+	}
+	if err := reopened.writeEvent(SecretAuditEvent{Result: secretAuditResultSuccess, Ref: "second"}); err != nil {
+		t.Fatalf("write second: %v", err)
+	}
+	reopened.Close()
+	if _, _, err := RecomputeChainHead(filepath.Join(dir, secretAuditFileName)); err != nil {
+		t.Fatalf("chain forked after stale sidecar: %v", err)
+	}
+}
+
+func TestFileAuditSinkStartupFailsClosedOnCorruptChain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, secretAuditFileName)
+	if err := os.WriteFile(path, []byte("{not-json}\n"), 0o600); err != nil {
+		t.Fatalf("write corrupt chain: %v", err)
+	}
+	if sink, err := newFileAuditSink(dir, 4); err == nil {
+		sink.Close()
+		t.Fatal("newFileAuditSink accepted corrupt audit evidence")
+	}
+}
+
 func TestFileAuditSinkEnterpriseSpillDrainAndMalformedGap(t *testing.T) {
 	dir := t.TempDir()
 	sink, err := newFileAuditSinkOpts(dir, 1, true)

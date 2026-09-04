@@ -23,10 +23,6 @@ import (
 // rather than silently pushing an un-reaped tag.
 var snapshotRetentionSuffixPattern = regexp.MustCompile(`^--(ttl|idle)-[a-z0-9]+$`)
 
-// Node IDs cross certificate SANs, HTTP headers, gossip, and capability
-// payloads. Keep one delimiter-safe grammar at the configuration boundary.
-var clusterNodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-
 const (
 	defaultToolboxPort           = 2280
 	minEnterpriseCredentialBytes = 32
@@ -1801,7 +1797,7 @@ func Load() (Config, error) {
 	if cfg.PATToken == "" {
 		return Config{}, errors.New("SB_PAT_TOKEN is required")
 	}
-	if cfg.NodeID != "" && !clusterNodeIDPattern.MatchString(cfg.NodeID) {
+	if cfg.NodeID != "" && !models.ValidClusterNodeID(cfg.NodeID) {
 		return Config{}, errors.New("SB_NODE_ID must start with an alphanumeric character and contain only alphanumerics, dot, underscore, or hyphen (maximum 128 characters)")
 	}
 

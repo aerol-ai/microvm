@@ -84,7 +84,7 @@ func TestClusterTemplatePeersFiltersMembers(t *testing.T) {
 			members: []cluster.Member{
 				{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
 				{NodeID: "dead", APIURL: "http://dead", Alive: false, Role: config.NodeRoleWorker},
-				{NodeID: "drained", APIURL: "http://drained", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
+				{NodeID: "drained", APIURL: "http://drained", InternalURL: "https://drained:21443", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
 				{NodeID: "docker-only", APIURL: "http://docker-only", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}}},
 				{NodeID: "fc-peer", APIURL: "http://fc-peer", InternalURL: "https://fc-peer:21443", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
 			},
@@ -92,8 +92,11 @@ func TestClusterTemplatePeersFiltersMembers(t *testing.T) {
 		drained: map[string]bool{"drained": true},
 	}
 	peers := clusterTemplatePeers(c)
-	if len(peers) != 1 || peers[0].NodeID != "fc-peer" {
-		t.Fatalf("peers = %+v, want only fc-peer", peers)
+	if len(peers) != 2 || peers[0].NodeID != "drained" || peers[1].NodeID != "fc-peer" {
+		t.Fatalf("peers = %+v, want drained and fc-peer", peers)
+	}
+	if got := clusterTemplateUnavailablePeerCount(c); got != 1 {
+		t.Fatalf("unavailable template peers = %d, want dead worker", got)
 	}
 }
 
@@ -103,10 +106,10 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	builder := &fakeImageBuilder{}
 
-	t.Run("fanout_header_bypass", func(t *testing.T) {
+	t.Run("routed_header_runs_local", func(t *testing.T) {
 		h := &handlers{deps: Deps{Builder: builder, Logger: logger}}
 		req := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
-		req.Header.Set(clusterImageBuildFanoutHeader, "1")
+		req.Header.Set(clusterImageBuildRoutedHeader, "1")
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, req)
 		if rr.Code != http.StatusOK {
@@ -147,7 +150,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("push_skips_fanout", func(t *testing.T) {
+	t.Run("push_routes_to_worker", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(dockerFanoutCluster("ingress-a", "http://worker.invalid"))
 		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
@@ -157,27 +160,28 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 		})
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(pushBody))))
-		if rr.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rr.Code)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 for unreachable selected worker", rr.Code)
 		}
 	})
 
-	t.Run("context_hashes_skip_fanout", func(t *testing.T) {
+	t.Run("context_hashes_route_to_worker", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(dockerFanoutCluster("ingress-a", "http://127.0.0.1:1"))
 		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
 		ctxBody, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile, ContextHashes: []string{"abc"}})
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(ctxBody))))
-		if rr.Code == http.StatusBadGateway {
-			t.Fatalf("context_hashes build should skip fanout; got 502")
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 for unreachable selected worker", rr.Code)
 		}
 	})
 
 	t.Run("no_docker_workers_rejects_unusable_ingress_build", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(&membersStubCluster{
-			Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+			Noop:         cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+			placementErr: cluster.ErrNoPlacementTarget,
 			members: []cluster.Member{
 				{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			},
@@ -458,13 +462,13 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("item_peer_request_error_falls_back_local", func(t *testing.T) {
+	t.Run("item_owner_request_error_is_gateway_failure", func(t *testing.T) {
 		env := newTemplateV1TestEnv(t)
 		env.svc.AttachCluster(templateMembersCluster("server-a", "http://127.0.0.1:1"))
 		rr := httptest.NewRecorder()
 		env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates/missing-tpl", nil))
-		if rr.Code != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404", rr.Code)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", rr.Code)
 		}
 	})
 }

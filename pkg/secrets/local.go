@@ -65,6 +65,10 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 		cp := append([]string(nil), peers...)
 		blob.OutboxRecipients = &cp
 	}
+	if retired, ok := RetiredRecipientsFromContext(ctx); ok {
+		cp := append([]string(nil), retired...)
+		blob.RetiredRecipients = &cp
+	}
 	if err := p.store.Put(ctx, blob); err != nil {
 		return Handle{}, err
 	}
@@ -102,6 +106,9 @@ func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, no
 	}
 	if rec.SealGeneration <= 0 {
 		return Secrets{}, fmt.Errorf("%w: cluster secret seal generation is required", ErrDecryptFailed)
+	}
+	if h.SealGeneration <= 0 || h.SealGeneration != rec.SealGeneration {
+		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q generation mismatch: placement=%d store=%d", ErrVersionMismatch, h.Ref, h.SealGeneration, rec.SealGeneration)
 	}
 	if p.cipher == nil {
 		return Secrets{}, fmt.Errorf("cluster secrets cipher is not configured")

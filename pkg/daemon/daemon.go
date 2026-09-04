@@ -553,17 +553,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}); ok {
 			withRecreator.AttachRecreator(svc)
 		}
-		// Isolate's JS-bundle store is per-node, so an uploaded bundle must be
-		// fanned out to peers or an isolate create placed on another node fails
-		// "bundle not found". Wire the fan-out only in cluster mode (both
-		// *Cluster and *Agent implement ReplicateJSBundle); single-node leaves
-		// the replicator nil (no-op). Harmless when isolate is off — no bundles
-		// are ever uploaded.
-		if withRep, ok := clusterClient.(interface {
-			ReplicateJSBundle(context.Context, string, models.CreateJSBundleRequest) error
-		}); ok {
-			svc.SetJSBundleReplicator(withRep.ReplicateJSBundle)
-		}
 		// Phase 6 PR-D: template-aware placement. The capacity lease
 		// cache asks the service for the local "ready" template
 		// inventory at every heartbeat tick; the result is overlaid
@@ -581,6 +570,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}); ok {
 				withTemplates.SetLocalTemplateIDsProvider(func() ([]string, bool) {
 					return svc.LocalReadyTemplateInventory(context.Background())
+				})
+			}
+			if withTemplateCatalog, ok := clusterClient.(interface {
+				SetLocalTemplateCatalogProvider(func() ([]string, bool))
+			}); ok {
+				withTemplateCatalog.SetLocalTemplateCatalogProvider(func() ([]string, bool) {
+					return svc.LocalTemplateCatalogInventory(context.Background())
 				})
 			}
 		}

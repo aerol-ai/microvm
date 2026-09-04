@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -160,38 +161,20 @@ func TestCreateIsolateResolvesUploadedBundleName(t *testing.T) {
 	}
 }
 
-// TestCreateJSBundleClusterReplication covers the isolate-on-cluster fix: a
-// normal upload fans out to peers exactly once, while a peer's replicated write
-// stores under the explicit owner and does NOT fan out again (loop guard).
-func TestCreateJSBundleClusterReplication(t *testing.T) {
+func TestCreateJSBundleClusterRefIsNodeBound(t *testing.T) {
 	svc := newBundleService(t)
 	ctx := context.Background()
-
-	var replicatedNames []string
-	svc.SetJSBundleReplicator(func(_ context.Context, owner string, req models.CreateJSBundleRequest) error {
-		replicatedNames = append(replicatedNames, req.Name)
-		return nil
-	})
-
-	// Normal upload → replicator invoked once.
-	if _, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "a", Source: jsBundleSrc}); err != nil {
-		t.Fatal(err)
-	}
-	if len(replicatedNames) != 1 || replicatedNames[0] != "a" {
-		t.Fatalf("replicator calls = %v, want [a]", replicatedNames)
-	}
-
-	// A replicated write (peer fan-out) must NOT re-replicate, and must store
-	// under the explicit owner carried in ctx (not the caller's scope).
-	rctx := WithReplicatedJSBundleOwner(ctx, "tenant-z")
-	got, err := svc.CreateJSBundle(rctx, models.CreateJSBundleRequest{Name: "b", Source: `export default { async fetch(){ return new Response("z"); } };`})
+	svc.cfg.EnableCluster = true
+	svc.AttachCluster(cluster.NewNoop("worker-a", "http://worker-a", ""))
+	got, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "a", Source: jsBundleSrc})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(replicatedNames) != 1 {
-		t.Fatalf("replicated write re-replicated (calls=%v); loop guard failed", replicatedNames)
+	nodeID, localRef, ok := models.ParseJSBundleNodeRef(got.ModuleRef)
+	if !ok || nodeID != "worker-a" || localRef != "sha256:"+got.Digest {
+		t.Fatalf("node-bound module ref = %q (%q, %q, %v)", got.ModuleRef, nodeID, localRef, ok)
 	}
-	if !svc.isolateBundles.TenantOwns("tenant-z", got.Digest) {
-		t.Error("replicated bundle not stored under explicit owner tenant-z")
+	if fetched, err := svc.GetJSBundle(ctx, got.ModuleRef); err != nil || fetched.Digest != got.Digest {
+		t.Fatalf("GetJSBundle(node ref) = %+v, %v", fetched, err)
 	}
 }

@@ -322,6 +322,7 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		Spec:                  spec,
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
+		SecretSealGeneration:  secrets.SealGeneration,
 		IncarnationID:         incarnationID,
 		ExpectedIncarnationID: expectedIncarnationID,
 		OwnerRef:              secrets.OwnerRef,
@@ -331,15 +332,16 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 
 func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{
-		Op:                 opClaimOrphan,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        a.nodeID,
-		OwnerAPIURL:        a.apiURL,
-		OwnerDataPlaneHost: a.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		OwnerRef:           secrets.OwnerRef,
+		Op:                   opClaimOrphan,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          a.nodeID,
+		OwnerAPIURL:          a.apiURL,
+		OwnerDataPlaneHost:   a.dataPlaneHost,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		OwnerRef:             secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -349,11 +351,12 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 		return nil
 	}
 	return a.applyCommand(ctx, command{
-		Op:            opUpsertSpec,
-		SandboxID:     sandboxID,
-		Spec:          spec,
-		SecretRef:     secrets.Ref,
-		SecretVersion: secrets.Version,
+		Op:                   opUpsertSpec,
+		SandboxID:            sandboxID,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
 	})
 }
 
@@ -502,18 +505,19 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 		}
 	}
 	return a.applyCommand(ctx, command{
-		Op:                 opReserve,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
-		Spec:               redacted,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		SecretRecipients:   append([]string(nil), secrets.Recipients...),
-		IncarnationID:      incarnationID,
-		OwnerRef:           secrets.OwnerRef,
-		ExpiresUnix:        time.Now().Add(ttl).Unix(),
+		Op:                   opReserve,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          target.NodeID,
+		OwnerAPIURL:          target.APIURL,
+		OwnerDataPlaneHost:   target.DataPlaneHost,
+		Spec:                 redacted,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		SecretRecipients:     append([]string(nil), secrets.Recipients...),
+		IncarnationID:        incarnationID,
+		OwnerRef:             secrets.OwnerRef,
+		ExpiresUnix:          time.Now().Add(ttl).Unix(),
 	})
 }
 

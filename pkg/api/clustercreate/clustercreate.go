@@ -72,6 +72,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
+	if svc.ClusterEnabled() {
+		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+	}
 	if service.ImageRequiresLocalPlacement(req) {
 		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
 		if clusterCreateSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
@@ -328,6 +334,11 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	}
 	if nodeID, ok := docker.BuiltImagePlacementNode(req.Image); ok {
 		out.RequiredNodeID = nodeID
+	}
+	if runtimeName == models.RuntimeIsolate {
+		if nodeID, _, ok := models.ParseJSBundleNodeRef(out.ModuleRef); ok {
+			out.RequiredNodeID = nodeID
+		}
 	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8

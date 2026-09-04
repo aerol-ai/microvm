@@ -9,6 +9,7 @@ import (
 
 type incarnationCtxKey struct{}
 type putOutboxCtxKey struct{}
+type retireRecipientsCtxKey struct{}
 
 type putOutboxHint struct {
 	IncarnationID string
@@ -55,6 +56,28 @@ func PutOutboxFromContext(ctx context.Context) (incarnationID string, recipients
 		return "", nil, false
 	}
 	return v.IncarnationID, append([]string(nil), v.Recipients...), true
+}
+
+// ContextWithRetiredRecipients attaches the peers removed by a reseal. The
+// blob store journals them atomically with the new sealed generation, but the
+// delete reconciler must wait until Raft publishes that generation.
+func ContextWithRetiredRecipients(ctx context.Context, recipients []string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, retireRecipientsCtxKey{}, NormalizeRecipients(recipients))
+}
+
+// RetiredRecipientsFromContext returns the optional reseal-retirement journal.
+func RetiredRecipientsFromContext(ctx context.Context) (recipients []string, ok bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	v, ok := ctx.Value(retireRecipientsCtxKey{}).([]string)
+	if !ok {
+		return nil, false
+	}
+	return append([]string(nil), v...), true
 }
 
 // Handle is a log-safe reference to sealed secrets. Safe to replicate through
@@ -112,4 +135,8 @@ type SecretBlob struct {
 	// put-outbox beyond the default clear-on-put". Empty slice clears pending
 	// peers after a fully-local seal.
 	OutboxRecipients *[]string
+	// RetiredRecipients, when non-nil, is staged in the delete outbox in the
+	// same transaction as the sealed generation. The staged row is not eligible
+	// for peer deletion until the service confirms Raft promotion.
+	RetiredRecipients *[]string
 }

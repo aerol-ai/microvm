@@ -25,7 +25,7 @@ the floor.
 | T7-T9 | Env to its own sealed row + env opt-in on `Get`/`List` (breaking, 5 SDKs) + redact env from the Raft spec with strict sealed-row restore. |
 | T10 | KMS provider + offline fake + shared contract suite. |
 | T11-T13 | Fix two wrong operator messages; delete legacy wildcard seal; operator docs. |
-| D5 | Stale recipient sets after membership change = documented limitation, not a placement filter. |
+| D5 | Generation-fenced recipient repair with atomic staged retirement and Raft promotion. |
 | D8 | Sealed env lives in its own row read on demand (mirrors `sealMounts`/`loadMounts`), never in the shared row scanner. |
 | D9 | `Get`/`List` omit env by default; explicit opt-in returns it. |
 | D10 | The `Provider` interface owns ref→plaintext, not crypto. |
@@ -116,18 +116,18 @@ exist only where they were written).
 | Distribution | bounded first-backup ACK, then async remainder | the same bounded/async peer fan-out — shared machinery |
 | Who can take over | only pre-sealed recipients | any node with IAM access **that received the bytes** |
 | Boot cost (HA creates) | bounded wait for the first backup ACK, then async remainder | KMS wrap plus the same bounded first-ACK wait |
-| Membership drift | **degrades — see D5** | immune to recipient staleness; still needs the bytes |
+| Membership drift | live holder reseals to replacements | same distribution repair; KMS still needs the bytes |
 | Offline `make test` | native | fake; live behind `integration` tag |
 
 The fan-out is therefore **shared across both providers**, not a local-provider
 workaround. That is what makes the D10 seam earn its keep: providers differ in key
 custody and who may decrypt, not in whether distribution is needed.
 
-**This weakens D5's escape hatch.** D5 accepted stale recipient sets as a
-documented limitation on the grounds that operators needing real HA could use
-KMS. KMS does remove the recipient-staleness problem — but only for nodes that
-received the bytes, so the fan-out target list still matters. D5 stands as
-decided; the doc must not claim KMS makes it disappear.
+**KMS is not a distribution escape hatch.** Both providers require a live
+ciphertext holder and the same fan-out/ACK machinery. Recipient drift is now
+repaired from a live holder: the new generation and retired-recipient journal
+commit atomically, a replacement ACK precedes the Raft CAS, and peer deletion
+waits until the promoted generation is visible.
 
 ## Scope decisions
 
@@ -145,25 +145,23 @@ decided; the doc must not claim KMS makes it disappear.
 | final | ~~E5 / T8 breaking-change overlap~~ | — | **Moot.** With E5 gone there is only one breaking change (T8), not two. |
 
 **E1a `failover_ready` is provider-dependent and must be defined per provider.**
-Local: derived from the recipient set in the envelope header
-(`cluster_secrets.go:65-67`) versus live memberlist. That row exists **only on the
-sealing node** pre-T3 (WALL 1), so the field is wrong on non-owners until T3
-lands — E1a therefore ships *after* T3, and is computed on read, never persisted,
-and never inside the shared row scanner (#70). KMS: no recipient set exists;
-define it as always-true or not-applicable.
+Local and KMS: derived from the promoted seal generation's intended recipients
+and authoritative peer possession probes. It is computed on read, never
+persisted, and never inside the shared row scanner (#70). A replacement does
+not count until it ACKs the current generation.
 
-**E1b cluster-read model — DECIDED 2026-08-07.** Local append-only log is
-authoritative on every build. Reads fan out to reachable members, merged by
-timestamp, with an **explicit coverage block** naming which nodes answered.
-`controlplane.Reporter` ships events off-node **best-effort when a real reporter
-is configured**, and is skipped entirely when it is a no-op — the open-source
-default. **Dead-disk durability is not claimed unless a real sink is wired**;
-fan-out discovers records, it does not preserve them.
+**E1b cluster-read model — IMPLEMENTED.** Every build keeps a hash-chained local
+JSONL operational copy. Reads target only the bounded Raft-retained owner
+history, merge by compound cursor, and include an explicit coverage block.
+Enterprise configuration fails boot without an authenticated HTTPS batch
+exporter; open-source mode may omit it and therefore does not claim dead-disk
+durability.
 
 Owner-forwarding was eliminated because a current owner alone cannot cover
 pre-failover history. The implemented model retains a bounded owner-node list in
-Raft and targets that list. Overflow is explicit and falls back to all-worker
-fan-out rather than silently dropping older evidence.
+Raft and targets that list. Truncation is sticky and returns `503`; it never
+falls back to a fleet-wide scan. The enterprise exporter remains the complete
+off-node stream.
 
 **Rate-limiting is new machinery**, not a config toggle — there is no limiter
 anywhere in `pkg/api` today and `golang.org/x/time/rate` is not a dependency.
@@ -280,9 +278,9 @@ Affects only `failover.policy=recreate` sandboxes. Full detail in
    second break was going to come from E5, which is now out of scope, so this
    tension is resolved rather than accepted. T8's rationale is unchanged: env
    carries customer credentials and should not come back from a read API.
-2. **D5 stands.** Stale recipient sets remain documented, not fixed; E1a makes
-   the consequence observable — and after the KMS correction, KMS was never the
-   clean escape hatch the original framing implied.
+2. **D5 is closed.** Recipient drift triggers generation-fenced live-holder
+   reseal; atomic staged retirement prevents both recovery vacuum and forgotten
+   old copies across a crash.
 3. **T10 (KMS) remains an unvalidated bet** with no named customer, and E5 no
    longer exists to make it more useful. Its purpose is now narrower and
    clearer: wrapping AerolVM's own DEKs, not storing customer secrets. **The
@@ -308,9 +306,11 @@ From `plans/secrets-hardening.md` §8 — all rows except credential brokering,
 plus credential brokering, which was briefly promoted to E5 and is now returned
 to deferred:
 
-- Placement filter for stale recipient sets (D5 chose docs + KMS).
-- Resealing protocol on membership change (needs a live decryptor; the dead owner
-  had it).
+- Placement filter for stale recipient sets — **closed** by promoted-recipient
+  placement and automatic drift repair.
+- Resealing protocol on membership change — **closed** when a live holder
+  exists; otherwise no system can recover ciphertext/key material that no
+  surviving node possesses.
 - **`toolbox_token` plaintext at rest** — closed. The token is always encrypted
   in the existing sandbox row (`toolbox_token_sealed`) with sandbox-bound AAD.
   There is no plaintext token column or rollout flag. Keeping it in the existing
@@ -407,7 +407,7 @@ rollback. Security storage and fan-out behavior are mandatory, not feature flags
 | 0 | **DONE 2026-08-07.** Recipient-set selection, partial fan-out rule, failed-create leftovers, and `Provider.Open`'s signature are decided in `plans/secrets-hardening.md` §3d. | Four gates closed; slice 1 unblocked |
 | 1 | **DONE 2026-08-07.** T1-T4, T11, T12, E1a + mTLS peer auth | Cross-node failover regression green; default create latency unmoved; unauthenticated peer push rejected; `failover_ready` reports live holder count |
 | 2 | **DONE 2026-08-08.** T5-T6, E2a (correlation + retention), E4 (canary + alerts + runbook) + audit drop counter/gap marker | One audit event per secret read, no plaintext; canary reports at boot; overflow produces counted gap marker + alert |
-| 3 | **DONE 2026-08-08.** T7-T9, T13, E1b + operator alerts/runbook | Env always sealed at rest; `Get`/`List` omit env; D5 limitation published; audit API with fan-out + coverage + rate limit |
+| 3 | **DONE 2026-08-08.** T7-T9, T13, E1b + operator alerts/runbook | Env always sealed at rest; `Get`/`List` omit env; recipient repair documented; audit API has bounded owner-history coverage + rate limit |
 | 4 | **DONE 2026-08-08 (T10 + E3a).** T10 shipped; E3a wasm/isolate egress attribution into shared audit JSONL. Integration chaos case (kill-owner-mid-fan-out) still operator-run behind `integration` tag. | Both providers pass contract suite; attribution emits for wasm + isolate; netstats totals unchanged |
 | 5 | **PARTIAL.** Witness heads + authenticated HTTPS batch export ship; E3b (kernel IP) and auditor-gated E2b remain optional | Event exporter required on enterprise; receiver retention/WORM policy remains operator-owned |
 

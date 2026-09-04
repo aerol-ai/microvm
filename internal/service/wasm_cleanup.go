@@ -98,7 +98,7 @@ func (s *Service) cleanupWasmSandboxArtifacts(ctx context.Context, sandbox *mode
 // rows for these refs before deletion so a transient registry failure remains
 // visible to the orphan sweep after the sandbox row is removed.
 func (s *Service) untrackedWasmRefs(sandbox *models.Sandbox, pushes []store.WasmCheckpointPushRecord) []string {
-	tracked := make(map[string]struct{}, len(pushes))
+	tracked := make(map[string]struct{}, len(pushes)+2)
 	for _, p := range pushes {
 		if ref := strings.TrimSpace(p.RegistryRef); ref != "" {
 			tracked[ref] = struct{}{}
@@ -108,11 +108,13 @@ func (s *Service) untrackedWasmRefs(sandbox *models.Sandbox, pushes []store.Wasm
 	if latest := strings.TrimSpace(s.wasmCheckpointPusher.DestRefTagged(sandbox.ID, "latest")); latest != "" {
 		if _, ok := tracked[latest]; !ok {
 			out = append(out, latest)
+			tracked[latest] = struct{}{}
 		}
 	}
 	if ref := strings.TrimSpace(sandbox.WasmRegistryRef); ref != "" {
 		if _, ok := tracked[ref]; !ok {
 			out = append(out, ref)
+			tracked[ref] = struct{}{}
 		}
 	}
 	return out

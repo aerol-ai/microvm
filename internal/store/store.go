@@ -193,6 +193,7 @@ func Open(path string) (*Store, error) {
 			sandbox_id TEXT PRIMARY KEY,
 			recipients_json TEXT NOT NULL DEFAULT '[]',
 			generation INTEGER NOT NULL DEFAULT 1,
+			awaiting_promotion INTEGER NOT NULL DEFAULT 0,
 			attempts INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
@@ -788,6 +789,9 @@ func Open(path string) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
+		// Reseal retirement is staged atomically with the local encrypted row,
+		// then made eligible only after the matching Raft generation commits.
+		`ALTER TABLE cluster_secret_delete_outbox ADD COLUMN awaiting_promotion INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -2649,6 +2653,9 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 	if id == "" {
 		return errors.New("create template: id is required")
 	}
+	if !models.ValidTemplateID(id) {
+		return errors.New("create template: invalid id")
+	}
 	image := strings.TrimSpace(template.Image)
 	if image == "" {
 		return errors.New("create template: image is required")
@@ -3076,41 +3083,42 @@ func (s *Store) ListTemplatesReadyBefore(ctx context.Context, cutoff time.Time) 
 	return items, nil
 }
 
-// ListReadyTemplateIDs returns the IDs of every template whose
-// artifacts are usable on this host: `status IN ('ready',
-// 'ready_no_snapshot')`. The Phase 6 PR-D capacity heartbeat hands this
-// list to peers so placement can prefer the node that already has the
-// template's artifacts cached.
-//
-// Returns IDs only (no payload columns) — the snapshot is gossiped
-// every few seconds and a full row projection would balloon heartbeats
-// once a cluster has hundreds of templates. The unknown-allow rule in
-// placement.go nodeFits means a momentary "empty list" mid-startup is
-// safe: peers fall back to "any host" placement until the heartbeat
-// catches up.
-func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
+// ListTemplateInventoryIDs returns both the ready-only placement inventory and
+// the all-lifecycle administrative catalogue in one lightweight query. Keeping
+// these sets distinct prevents a pending or failed template from looking
+// absent to item routing without making it eligible for sandbox placement.
+func (s *Store) ListTemplateInventoryIDs(ctx context.Context) (readyIDs, catalogIDs []string, err error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id
+		SELECT id, status
 		FROM firecracker_templates
-		WHERE status IN (?, ?)
 		ORDER BY id ASC
-	`, string(models.TemplateStatusReady), string(models.TemplateStatusReadyNoSnapshot))
+	`)
 	if err != nil {
-		return nil, fmt.Errorf("list ready template ids: %w", err)
+		return nil, nil, fmt.Errorf("list template inventory ids: %w", err)
 	}
 	defer rows.Close()
-	var ids []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan template id: %w", err)
+		var id, status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return nil, nil, fmt.Errorf("scan template inventory id: %w", err)
 		}
-		ids = append(ids, id)
+		catalogIDs = append(catalogIDs, id)
+		if status == string(models.TemplateStatusReady) || status == string(models.TemplateStatusReadyNoSnapshot) {
+			readyIDs = append(readyIDs, id)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate template ids: %w", err)
+		return nil, nil, fmt.Errorf("iterate template inventory ids: %w", err)
 	}
-	return ids, nil
+	return readyIDs, catalogIDs, nil
+
+}
+
+// ListReadyTemplateIDs returns the IDs whose artifacts are usable on this
+// host. The administrative catalogue is intentionally discarded here.
+func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
+	ready, _, err := s.ListTemplateInventoryIDs(ctx)
+	return ready, err
 }
 
 // SetTemplatePushState is a narrow single-column update used by the
@@ -4265,6 +4273,9 @@ type ClusterSecretRecord struct {
 	// in the same transaction as the sealed row when PutOutboxRecipients != nil.
 	PutOutboxIncarnationID string
 	PutOutboxRecipients    *[]string
+	// RetireRecipients stages peer deletion atomically with a resealed row.
+	// Reconciliation waits for Raft to publish SealGeneration first.
+	RetireRecipients *[]string
 }
 
 // PutClusterSecret upserts a sealed row and returns the seal_generation that
@@ -4323,8 +4334,8 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 	}
 	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration {
 		if bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
-			// Same generation + same ciphertext: idempotent noop (still clear
-			// tomb/outbox below so a retrying originator seal recovers).
+			// Same generation + same ciphertext: idempotent noop (still apply
+			// tomb and outbox transitions below so an originator retry recovers).
 		} else {
 			return 0, fmt.Errorf("%w: seal_generation %d payload conflict for ref %q", ErrClusterSecretPayloadConflict, rec.SealGeneration, rec.Ref)
 		}
@@ -4348,12 +4359,12 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 
 	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
 		// Equal-generation identical payload: skip the row rewrite but still
-		// clear delete fences so create retries stay consistent.
+		// apply the generation's tomb and outbox transitions.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
 			return 0, fmt.Errorf("clear cluster secret tomb on put: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
-			return 0, fmt.Errorf("clear secret delete outbox on put: %w", err)
+		if err := applySecretRetirementInTx(ctx, tx, rec); err != nil {
+			return 0, err
 		}
 		if err := applyPutOutboxInTx(ctx, tx, rec); err != nil {
 			return 0, err
@@ -4383,8 +4394,8 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
 		return 0, fmt.Errorf("clear cluster secret tomb on put: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
-		return 0, fmt.Errorf("clear secret delete outbox on put: %w", err)
+	if err := applySecretRetirementInTx(ctx, tx, rec); err != nil {
+		return 0, err
 	}
 	if err := applyPutOutboxInTx(ctx, tx, rec); err != nil {
 		return 0, err
@@ -4393,6 +4404,17 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 		return 0, fmt.Errorf("commit put cluster secret: %w", err)
 	}
 	return rec.SealGeneration, nil
+}
+
+// applySecretRetirementInTx stages recipients removed by a reseal in the same
+// transaction as the new encrypted generation. Ordinary puts preserve an older
+// delete job: generation fencing makes it harmless to a newer replica, while
+// clearing it could strand ciphertext on a peer excluded from the new set.
+func applySecretRetirementInTx(ctx context.Context, tx *sql.Tx, rec ClusterSecretRecord) error {
+	if rec.RetireRecipients == nil {
+		return nil
+	}
+	return upsertSecretDeleteOutboxTx(ctx, tx, rec.SandboxID, *rec.RetireRecipients, rec.Recipients, rec.SealGeneration, true)
 }
 
 // applyPutOutboxInTx journals or clears put-outbox inside an open Put TX.
@@ -4673,9 +4695,12 @@ type SecretDeleteOutboxRecord struct {
 	SandboxID  string
 	Recipients []string
 	Generation int64
-	Attempts   int
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// AwaitingPromotion prevents a staged reseal retirement from deleting the
+	// only usable old replica before Raft publishes the new generation.
+	AwaitingPromotion bool
+	Attempts          int
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // UpsertSecretDeleteOutbox journals deletion from recipients retired by a
@@ -4689,26 +4714,126 @@ func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, 
 	if generation <= 0 {
 		return errors.New("secret delete outbox generation must be positive")
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin secret delete outbox: %w", err)
+	}
+	defer tx.Rollback()
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, recipients, nil, generation, false); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit secret delete outbox: %w", err)
+	}
+	return nil
+}
+
+func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID string, recipients, protectedRecipients []string, generation int64, awaitingPromotion bool) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	recipients = secrets.NormalizeRecipients(recipients)
+	if sandboxID == "" || len(recipients) == 0 {
+		return nil
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	var (
+		existingRaw   string
+		existingGen   int64
+		existingAwait int
+		createdAt     time.Time
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT recipients_json, generation, awaiting_promotion, created_at
+		FROM cluster_secret_delete_outbox WHERE sandbox_id = ?
+	`, sandboxID).Scan(&existingRaw, &existingGen, &existingAwait, &createdAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read secret delete outbox for merge: %w", err)
+	}
+	if err == nil {
+		var existing []string
+		if unmarshalErr := json.Unmarshal([]byte(existingRaw), &existing); unmarshalErr != nil {
+			return fmt.Errorf("decode secret delete outbox for merge: %w", unmarshalErr)
+		}
+		recipients = secrets.NormalizeRecipients(append(existing, recipients...))
+		switch {
+		case generation < existingGen:
+			generation = existingGen
+			awaitingPromotion = existingAwait != 0
+		case generation == existingGen:
+			// A confirmed promotion wins over another staged write.
+			awaitingPromotion = awaitingPromotion && existingAwait != 0
+		}
+	}
+	if len(protectedRecipients) > 0 {
+		protected := make(map[string]struct{}, len(protectedRecipients))
+		for _, id := range secrets.NormalizeRecipients(protectedRecipients) {
+			protected[id] = struct{}{}
+		}
+		kept := recipients[:0]
+		for _, id := range recipients {
+			if _, current := protected[id]; !current {
+				kept = append(kept, id)
+			}
+		}
+		recipients = kept
+	}
+	if len(recipients) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, sandboxID); err != nil {
+			return fmt.Errorf("clear obsolete secret delete outbox: %w", err)
+		}
+		return nil
+	}
 	raw, err := json.Marshal(recipients)
 	if err != nil {
 		return fmt.Errorf("marshal secret delete outbox recipients: %w", err)
 	}
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	awaiting := 0
+	if awaitingPromotion {
+		awaiting = 1
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO cluster_secret_delete_outbox
-			(sandbox_id, recipients_json, generation, attempts, created_at, updated_at)
-		VALUES (?, ?, ?, 0, ?, ?)
+			(sandbox_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?)
 		ON CONFLICT(sandbox_id) DO UPDATE SET
 			recipients_json = excluded.recipients_json,
 			generation = excluded.generation,
+			awaiting_promotion = excluded.awaiting_promotion,
 			attempts = 0,
 			updated_at = excluded.updated_at
-		WHERE excluded.generation >= cluster_secret_delete_outbox.generation
-	`, sandboxID, string(raw), generation, now, now)
+	`, sandboxID, string(raw), generation, awaiting, createdAt, now)
 	if err != nil {
 		return fmt.Errorf("upsert secret delete outbox: %w", err)
 	}
 	return nil
+}
+
+// MarkSecretDeleteOutboxPromoted makes a staged retirement eligible after the
+// matching Raft generation is visible. The exact-generation fence prevents an
+// old completion from releasing a newer staged transition. promoted=false
+// means a concurrent writer replaced the row and the caller must reload it.
+func (s *Store) MarkSecretDeleteOutboxPromoted(ctx context.Context, sandboxID string, generation int64) (promoted bool, err error) {
+	if strings.TrimSpace(sandboxID) == "" || generation <= 0 {
+		return false, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_delete_outbox
+		SET awaiting_promotion = 0, updated_at = ?
+		WHERE sandbox_id = ? AND generation = ? AND awaiting_promotion = 1
+	`, time.Now().UTC(), strings.TrimSpace(sandboxID), generation)
+	if err != nil {
+		return false, fmt.Errorf("mark secret delete outbox promoted: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark secret delete outbox promoted rows affected: %w", err)
+	}
+	return rows == 1, nil
 }
 
 // DeleteClusterSecretsOriginatorWithOutbox tombs, deletes local rows, and
@@ -4738,20 +4863,8 @@ func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sa
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
 		return 0, fmt.Errorf("delete cluster secrets: %w", err)
 	}
-	raw, err := json.Marshal(recipients)
-	if err != nil {
-		return 0, fmt.Errorf("marshal delete outbox recipients: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO cluster_secret_delete_outbox (sandbox_id, recipients_json, generation, attempts, created_at, updated_at)
-		VALUES (?, ?, ?, 0, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET
-			recipients_json = excluded.recipients_json,
-			generation = excluded.generation,
-			attempts = 0,
-			updated_at = excluded.updated_at
-	`, sandboxID, string(raw), generation, now, now); err != nil {
-		return 0, fmt.Errorf("upsert secret delete outbox: %w", err)
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, recipients, nil, generation, false); err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit delete cluster secrets originator: %w", err)
@@ -4804,19 +4917,21 @@ func (s *Store) GetSecretDeleteOutbox(ctx context.Context, sandboxID string) (*S
 		return nil, nil
 	}
 	row := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, recipients_json, generation, attempts, created_at, updated_at
+		SELECT sandbox_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox WHERE sandbox_id = ?
 	`, sandboxID)
 	var rec SecretDeleteOutboxRecord
 	var recipientsJSON string
-	if err := row.Scan(&rec.SandboxID, &recipientsJSON, &rec.Generation, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	if err := row.Scan(&rec.SandboxID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
 	if recipientsJSON != "" {
-		_ = json.Unmarshal([]byte(recipientsJSON), &rec.Recipients)
+		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+			return nil, fmt.Errorf("decode secret delete outbox recipients: %w", err)
+		}
 	}
 	return &rec, nil
 }
@@ -4958,7 +5073,7 @@ func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]S
 		limit = int(^uint(0) >> 1)
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, recipients_json, generation, attempts, created_at, updated_at
+		SELECT sandbox_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
 		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
 		LIMIT ?
@@ -4971,11 +5086,13 @@ func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]S
 	for rows.Next() {
 		var rec SecretDeleteOutboxRecord
 		var recipientsJSON string
-		if err := rows.Scan(&rec.SandboxID, &recipientsJSON, &rec.Generation, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if err := rows.Scan(&rec.SandboxID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if recipientsJSON != "" {
-			_ = json.Unmarshal([]byte(recipientsJSON), &rec.Recipients)
+			if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+				return nil, fmt.Errorf("decode secret delete outbox recipients for %q: %w", rec.SandboxID, err)
+			}
 		}
 		out = append(out, rec)
 	}
@@ -5061,7 +5178,9 @@ func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnatio
 	if existingGen.Valid && existingGen.Int64 == sealGeneration && strings.TrimSpace(existingInc) == incarnationID {
 		var prior []string
 		if existingRecipientsJSON != "" {
-			_ = json.Unmarshal([]byte(existingRecipientsJSON), &prior)
+			if err := json.Unmarshal([]byte(existingRecipientsJSON), &prior); err != nil {
+				return fmt.Errorf("decode secret put outbox recipients for merge: %w", err)
+			}
 		}
 		recipients = secrets.NormalizeRecipients(append(prior, recipients...))
 	}
@@ -5118,7 +5237,9 @@ func (s *Store) GetSecretPutOutbox(ctx context.Context, sandboxID string) (*Secr
 		return nil, err
 	}
 	if recipientsJSON != "" {
-		_ = json.Unmarshal([]byte(recipientsJSON), &rec.Recipients)
+		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+			return nil, fmt.Errorf("decode secret put outbox recipients: %w", err)
+		}
 	}
 	return &rec, nil
 }
@@ -5146,7 +5267,9 @@ func (s *Store) ListSecretPutOutboxBatch(ctx context.Context, limit int) ([]Secr
 			return nil, err
 		}
 		if recipientsJSON != "" {
-			_ = json.Unmarshal([]byte(recipientsJSON), &rec.Recipients)
+			if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+				return nil, fmt.Errorf("decode secret put outbox recipients for %q: %w", rec.SandboxID, err)
+			}
 		}
 		out = append(out, rec)
 	}
@@ -6490,18 +6613,37 @@ func (s *Store) EnsureWasmCheckpointCleanupRef(ctx context.Context, sandboxID, r
 	if sandboxID == "" || registryRef == "" {
 		return 0, errors.New("wasm cleanup ref requires sandbox id and registry ref")
 	}
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_checkpoint_pushes (sandbox_id, registry_ref, digest, pushed_at)
+		SELECT ?, ?, 'cleanup-only', ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM wasm_checkpoint_pushes
+			WHERE sandbox_id = ? AND registry_ref = ?
+		)`, sandboxID, registryRef, now, sandboxID, registryRef)
+	if err != nil {
+		return 0, fmt.Errorf("ensure wasm cleanup ref: %w", err)
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("ensure wasm cleanup ref rows affected: %w", err)
+	}
+	if inserted == 1 {
+		id, err := res.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("ensure wasm cleanup ref id: %w", err)
+		}
+		return id, nil
+	}
 	var id int64
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		SELECT id FROM wasm_checkpoint_pushes
 		WHERE sandbox_id = ? AND registry_ref = ?
 		ORDER BY id DESC LIMIT 1`, sandboxID, registryRef).Scan(&id)
-	if err == nil {
-		return id, nil
+	if err != nil {
+		return 0, fmt.Errorf("find ensured wasm cleanup ref: %w", err)
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("find wasm cleanup ref: %w", err)
-	}
-	return s.InsertWasmCheckpointPush(ctx, sandboxID, registryRef, "cleanup-only")
+	return id, nil
 }
 
 // ListWasmCheckpointPushes returns push history newest-first.

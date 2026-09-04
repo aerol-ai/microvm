@@ -112,7 +112,9 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID strin
 	if p == nil {
 		return redacted, errors.New("cluster secret store is not configured")
 	}
-	bag, openErr := p.Open(ctx, sandboxID, secrets.Handle{Ref: placement.Ref, Version: placement.Version}, nodeID)
+	bag, openErr := p.Open(ctx, sandboxID, secrets.Handle{
+		Ref: placement.Ref, Version: placement.Version, SealGeneration: placement.SealGeneration,
+	}, nodeID)
 	if openErr != nil {
 		if errors.Is(openErr, secrets.ErrVersionMismatch) {
 			recordClusterSecretKeyMismatch()
@@ -420,7 +422,7 @@ const (
 // approaching ACK TTL. Targets are independent from confirmed ACKs, so a
 // timeout or 404 can recover on a later pass without a membership flap.
 // Missing holders trigger a re-push of the local sealed blob when loadable.
-// When a majority of frozen targets are dead, recipients are replaced via
+// When any frozen target is dead, recipients are replaced via
 // Raft + recipient-bound AAD reseal (SelectReplacementRecipients) before
 // holder targets advance — pushing the old ciphertext would fail Open.
 func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
@@ -455,7 +457,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			return true
 		}
 		hs.mu.Lock()
-		needs := s.majoritySecretTargetsDead(mapKeys(hs.targets), alive, selfID)
+		needs := s.anySecretTargetDead(mapKeys(hs.targets), alive, selfID)
 		hs.mu.Unlock()
 		if needs {
 			expandIDs = append(expandIDs, sandboxID)
@@ -660,12 +662,13 @@ func mapKeys(m map[string]struct{}) []string {
 	return out
 }
 
-// expandAndResealDeadSecretTargets replaces frozen seal recipients when a
-// majority of non-self targets are dead. Recipients are authenticated in
+// expandAndResealDeadSecretTargets replaces frozen seal recipients when any
+// non-self target is dead. Recipients are authenticated in
 // envelope AAD (KeyAADBound/PayloadAADBound), so the existing ciphertext cannot
-// be pushed to new nodes — we must Open locally, Raft-update the recipient
-// set (CAS), Put a new seal generation, then fan out. Owner-only: non-owners
-// skip so concurrent ticks cannot race reseals.
+// be pushed to new nodes. We Open locally, atomically stage the new seal and
+// retired-recipient cleanup, ACK a replacement, Raft-CAS the recipient set,
+// promote cleanup, and then fan out the remainder. Owner-only: non-owners skip
+// so concurrent ticks cannot race reseals.
 func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxID string) error {
 	if s == nil || strings.TrimSpace(sandboxID) == "" {
 		return nil
@@ -688,7 +691,7 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 		}
 	}
 
-	// A reseal is a two-phase Raft/local operation. If the process crashed after
+	// A reseal is a two-phase local/peer/Raft operation. If the process crashed after
 	// Put committed generation G+1 (and its outbox) but before the final Raft
 	// handle update, finish that commit before evaluating recipient health. The
 	// new recipient set may be entirely healthy, so the dead-target trigger alone
@@ -715,17 +718,17 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	frozen := mapKeys(hs.targets)
 	gen := hs.gen
 	hs.mu.Unlock()
-	if !s.majoritySecretTargetsDead(frozen, alive, selfID) {
+	if !s.anySecretTargetDead(frozen, alive, selfID) {
 		// Fall back to placement recipients when holder memory is empty but
 		// the FSM still lists dead backups.
 		if hasPlacement && len(placement.SecretRecipients) > 0 {
 			frozen = append([]string(nil), placement.SecretRecipients...)
-			if !s.majoritySecretTargetsDead(frozen, alive, selfID) {
+			if !s.anySecretTargetDead(frozen, alive, selfID) {
 				return nil
 			}
 		} else if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
 			frozen = append([]string(nil), p.SecretRecipients...)
-			if !s.majoritySecretTargetsDead(frozen, alive, selfID) {
+			if !s.anySecretTargetDead(frozen, alive, selfID) {
 				return nil
 			}
 		} else {
@@ -756,6 +759,7 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 		}
 		secretsHandle.Ref = rec.Ref
 		secretsHandle.Version = rec.Version
+		secretsHandle.SealGeneration = rec.SealGeneration
 	}
 	if hasPlacement {
 		if gen <= 0 {
@@ -783,7 +787,9 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if incarnationID != "" {
 		openCtx = secrets.ContextWithIncarnationID(ctx, incarnationID)
 	}
-	bag, err := p.Open(openCtx, sandboxID, secrets.Handle{Ref: secretsHandle.Ref, Version: secretsHandle.Version}, selfID)
+	bag, err := p.Open(openCtx, sandboxID, secrets.Handle{
+		Ref: secretsHandle.Ref, Version: secretsHandle.Version, SealGeneration: secretsHandle.SealGeneration,
+	}, selfID)
 	if err != nil {
 		return fmt.Errorf("open for reseal: %w", err)
 	}
@@ -796,6 +802,10 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	putCtx := openCtx
 	if len(resealPeers) > 0 {
 		putCtx = secrets.ContextWithPutOutbox(openCtx, incarnationID, resealPeers)
+	}
+	retired := retiredSecretRecipients(previousRecipients, replacements, selfID)
+	if len(retired) > 0 {
+		putCtx = secrets.ContextWithRetiredRecipients(putCtx, retired)
 	}
 	handle, err := p.Put(putCtx, sandboxID, bag, replacements)
 	if err != nil {
@@ -879,7 +889,7 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	} else if delErr := s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, blob.IncarnationID, newGen); delErr != nil {
 		recordSecretPutOutboxFailure()
 	}
-	if retired := retiredSecretRecipients(previousRecipients, replacements, selfID); len(retired) > 0 {
+	if len(retired) > 0 {
 		if err := s.store.UpsertSecretDeleteOutbox(ctx, sandboxID, retired, newGen); err != nil {
 			return fmt.Errorf("journal retired secret recipients: %w", err)
 		}
@@ -1165,10 +1175,45 @@ func (s *Service) reconcileSecretDeleteOutboxOnceContext(parent context.Context,
 	if err != nil || rec == nil {
 		return
 	}
+	if rec.AwaitingPromotion {
+		// A reseal stages this row before the Raft CAS so a post-CAS crash cannot
+		// forget retired holders. Never act on it while the old placement is still
+		// authoritative; the old replicas may be the only recoverable copies.
+		c := s.Cluster()
+		if c == nil {
+			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+			return
+		}
+		placement, ok := c.PlacementOf(sandboxID)
+		if !ok || placement.SecretSealGeneration < rec.Generation {
+			// Yield this deferred row to the back of the oldest-first queue so
+			// a full batch of unpromoted reseals cannot starve actionable deletes.
+			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+			return
+		}
+		promoted, err := s.store.MarkSecretDeleteOutboxPromoted(parent, sandboxID, rec.Generation)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("cluster: mark staged secret retirement promoted", "sandbox_id", sandboxID, "err", err)
+			}
+			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+			return
+		}
+		if !promoted {
+			// A concurrent reseal/destroy replaced this generation. Reload on the
+			// next tick rather than acting on a stale recipient snapshot.
+			return
+		}
+		rec.AwaitingPromotion = false
+	}
 	// Standalone / no non-self recipients: nothing to fan out — drop the job
 	// so destroy does not accumulate forever-reconciled tomb+outbox rows.
 	selfID := s.selfNodeID()
-	peers := s.retainKnownSecretRecipients(nonSelfRecipients(rec.Recipients, selfID))
+	// Never discard an obligation merely because membership no longer returns
+	// the peer. A removed node may still have a disk containing the ciphertext
+	// and may later rejoin; the cluster transport keeps unknown/dead recipients
+	// pending until an authenticated delete ACK is received.
+	peers := nonSelfRecipients(rec.Recipients, selfID)
 	if len(peers) == 0 {
 		_ = s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, nil, rec.Generation)
 		return
@@ -1203,40 +1248,6 @@ func (s *Service) selfNodeID() string {
 		return strings.TrimSpace(c.SelfNodeID())
 	}
 	return ""
-}
-
-// retainKnownSecretRecipients drops recipients that have left cluster
-// membership. Temporarily dead members stay in Members() and remain pending;
-// a decommissioned node must not pin the delete outbox (and therefore tombs)
-// forever. An empty membership view is treated as "unknown", not "everyone left".
-func (s *Service) retainKnownSecretRecipients(recipients []string) []string {
-	if s == nil || !s.cfg.EnableCluster {
-		return recipients
-	}
-	c := s.Cluster()
-	if c == nil {
-		return recipients
-	}
-	members := c.Members()
-	if len(members) == 0 {
-		return recipients
-	}
-	known := make(map[string]struct{}, len(members)+1)
-	if id := strings.TrimSpace(c.SelfNodeID()); id != "" {
-		known[id] = struct{}{}
-	}
-	for _, m := range members {
-		if id := strings.TrimSpace(m.NodeID); id != "" {
-			known[id] = struct{}{}
-		}
-	}
-	var keep []string
-	for _, id := range secrets.NormalizeRecipients(recipients) {
-		if _, ok := known[id]; ok {
-			keep = append(keep, id)
-		}
-	}
-	return keep
 }
 
 func nonSelfRecipients(recipients []string, selfID string) []string {

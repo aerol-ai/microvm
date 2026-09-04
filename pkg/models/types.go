@@ -1,8 +1,10 @@
 package models
 
 import (
+	"encoding/base32"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -1311,9 +1313,83 @@ type PushWasmModuleResponse struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
-// HeaderJSBundleOwner carries the original tenant on the dedicated internal
-// mTLS replica endpoint. It is never interpreted by the public bundle route.
-const HeaderJSBundleOwner = "X-Cluster-Bundle-Owner"
+const jsBundleNodeRefPrefix = "node:"
+
+var clusterNodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+var templateIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// ValidClusterNodeID is the single delimiter-safe grammar for identities that
+// cross certificates, headers, gossip, and node-bound artifact references.
+func ValidClusterNodeID(nodeID string) bool {
+	return clusterNodeIDPattern.MatchString(nodeID)
+}
+
+// ValidTemplateID keeps operator-supplied IDs safe as SQL keys, filesystem
+// path components, URL segments, and registry repository components. Requiring
+// an alphanumeric first byte excludes dot-segment traversal.
+func ValidTemplateID(templateID string) bool {
+	return templateIDPattern.MatchString(templateID)
+}
+
+// EncodeNodeAffinity returns the URL/tag-safe encoding shared by node-bound
+// artifacts. Invalid node IDs are rejected at this boundary as well as config.
+func EncodeNodeAffinity(nodeID string) (string, bool) {
+	nodeID = strings.TrimSpace(nodeID)
+	if !ValidClusterNodeID(nodeID) {
+		return "", false
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(nodeID))), true
+}
+
+// DecodeNodeAffinity reverses EncodeNodeAffinity and reapplies the node-ID
+// grammar so caller-supplied references cannot introduce protocol delimiters.
+func DecodeNodeAffinity(encoded string) (string, bool) {
+	raw, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.TrimSpace(encoded)))
+	if err != nil || len(raw) == 0 || len(raw) > 128 {
+		return "", false
+	}
+	nodeID := string(raw)
+	if !ValidClusterNodeID(nodeID) || strings.TrimSpace(nodeID) != nodeID {
+		return "", false
+	}
+	return nodeID, true
+}
+
+// JSBundleRefForNode binds a node-local isolate bundle reference to its owner
+// worker. The node ID is base32-encoded so the reference remains safe in JSON,
+// URLs, and CLI arguments without accepting delimiter injection.
+func JSBundleRefForNode(localRef, nodeID string) string {
+	localRef = strings.TrimSpace(localRef)
+	nodeID = strings.TrimSpace(nodeID)
+	if localRef == "" || nodeID == "" {
+		return localRef
+	}
+	encoded, ok := EncodeNodeAffinity(nodeID)
+	if !ok {
+		return localRef
+	}
+	return jsBundleNodeRefPrefix + encoded + ":" + localRef
+}
+
+// ParseJSBundleNodeRef returns the required worker and the worker-local ref.
+// Cluster upload responses use this encoding so later create placement remains
+// O(1) and never probes or replicates a bundle across the fleet.
+func ParseJSBundleNodeRef(ref string) (nodeID, localRef string, ok bool) {
+	ref = strings.TrimSpace(ref)
+	if !strings.HasPrefix(ref, jsBundleNodeRefPrefix) {
+		return "", ref, false
+	}
+	rest := strings.TrimPrefix(ref, jsBundleNodeRefPrefix)
+	encoded, localRef, found := strings.Cut(rest, ":")
+	if !found || encoded == "" || strings.TrimSpace(localRef) == "" {
+		return "", ref, false
+	}
+	nodeID, ok = DecodeNodeAffinity(encoded)
+	if !ok {
+		return "", ref, false
+	}
+	return nodeID, strings.TrimSpace(localRef), true
+}
 
 // CreateJSBundleRequest is the body for POST /v1/js-bundles — the "no image,
 // no registry" upload path for the isolate runtime (plans/isolate-runtime.md

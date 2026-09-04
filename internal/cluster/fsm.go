@@ -78,8 +78,8 @@ type command struct {
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
 	// IncarnationID rides opReserve and is preserved by opPlace/opReassign.
 	IncarnationID string `json:"incarnation_id,omitempty"`
-	// SecretSealGeneration is set by opUpdateSecretRecipients when coordinating
-	// a reseal. Additive omitempty.
+	// SecretSealGeneration accompanies the provider handle on initial place and
+	// later recipient reseals. Additive omitempty.
 	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
 	// ExpectedIncarnationID fences opPlace and opUpdateSecretRecipients from
 	// applying secret state to another sandbox lifetime. Empty skips it.
@@ -138,17 +138,18 @@ type command struct {
 }
 
 type reservationCommand struct {
-	SandboxID          string                       `json:"sandbox_id"`
-	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
-	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
-	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
-	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef          string                       `json:"secret_ref,omitempty"`
-	SecretVersion      int                          `json:"secret_version,omitempty"`
-	SecretRecipients   []string                     `json:"secret_recipients,omitempty"`
-	IncarnationID      string                       `json:"incarnation_id,omitempty"`
-	OwnerRef           string                       `json:"owner_ref,omitempty"`
-	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
+	SandboxID            string                       `json:"sandbox_id"`
+	OwnerNodeID          string                       `json:"owner_node_id,omitempty"`
+	OwnerAPIURL          string                       `json:"owner_api_url,omitempty"`
+	OwnerDataPlaneHost   string                       `json:"owner_data_plane_host,omitempty"`
+	Spec                 *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef            string                       `json:"secret_ref,omitempty"`
+	SecretVersion        int                          `json:"secret_version,omitempty"`
+	SecretSealGeneration int64                        `json:"secret_seal_generation,omitempty"`
+	SecretRecipients     []string                     `json:"secret_recipients,omitempty"`
+	IncarnationID        string                       `json:"incarnation_id,omitempty"`
+	OwnerRef             string                       `json:"owner_ref,omitempty"`
+	ExpiresUnix          int64                        `json:"expires_unix,omitempty"`
 }
 
 // reassignApplyResult is returned only for failover-tagged opReassign entries.
@@ -173,41 +174,44 @@ func decodeCommand(b []byte) (command, error) {
 
 func (c command) placementSecrets() PlacementSecrets {
 	return PlacementSecrets{
-		Ref:     c.SecretRef,
-		Version: c.SecretVersion,
+		Ref:            c.SecretRef,
+		Version:        c.SecretVersion,
+		SealGeneration: c.SecretSealGeneration,
 	}
 }
 
 func reservationFromCommand(c command) reservationCommand {
 	return reservationCommand{
-		SandboxID:          c.SandboxID,
-		OwnerNodeID:        c.OwnerNodeID,
-		OwnerAPIURL:        c.OwnerAPIURL,
-		OwnerDataPlaneHost: c.OwnerDataPlaneHost,
-		Spec:               c.Spec,
-		SecretRef:          c.SecretRef,
-		SecretVersion:      c.SecretVersion,
-		SecretRecipients:   append([]string(nil), c.SecretRecipients...),
-		IncarnationID:      c.IncarnationID,
-		OwnerRef:           c.OwnerRef,
-		ExpiresUnix:        c.ExpiresUnix,
+		SandboxID:            c.SandboxID,
+		OwnerNodeID:          c.OwnerNodeID,
+		OwnerAPIURL:          c.OwnerAPIURL,
+		OwnerDataPlaneHost:   c.OwnerDataPlaneHost,
+		Spec:                 c.Spec,
+		SecretRef:            c.SecretRef,
+		SecretVersion:        c.SecretVersion,
+		SecretSealGeneration: c.SecretSealGeneration,
+		SecretRecipients:     append([]string(nil), c.SecretRecipients...),
+		IncarnationID:        c.IncarnationID,
+		OwnerRef:             c.OwnerRef,
+		ExpiresUnix:          c.ExpiresUnix,
 	}
 }
 
 func commandFromReservation(r reservationCommand) command {
 	return command{
-		Op:                 opReserve,
-		SandboxID:          r.SandboxID,
-		OwnerNodeID:        r.OwnerNodeID,
-		OwnerAPIURL:        r.OwnerAPIURL,
-		OwnerDataPlaneHost: r.OwnerDataPlaneHost,
-		Spec:               r.Spec,
-		SecretRef:          r.SecretRef,
-		SecretVersion:      r.SecretVersion,
-		SecretRecipients:   append([]string(nil), r.SecretRecipients...),
-		IncarnationID:      r.IncarnationID,
-		OwnerRef:           r.OwnerRef,
-		ExpiresUnix:        r.ExpiresUnix,
+		Op:                   opReserve,
+		SandboxID:            r.SandboxID,
+		OwnerNodeID:          r.OwnerNodeID,
+		OwnerAPIURL:          r.OwnerAPIURL,
+		OwnerDataPlaneHost:   r.OwnerDataPlaneHost,
+		Spec:                 r.Spec,
+		SecretRef:            r.SecretRef,
+		SecretVersion:        r.SecretVersion,
+		SecretSealGeneration: r.SecretSealGeneration,
+		SecretRecipients:     append([]string(nil), r.SecretRecipients...),
+		IncarnationID:        r.IncarnationID,
+		OwnerRef:             r.OwnerRef,
+		ExpiresUnix:          r.ExpiresUnix,
 	}
 }
 
@@ -226,7 +230,11 @@ func applyCommandSecretUpdate(existing Placement, exists bool, cmd command) Plac
 	if !cmd.hasSecretUpdate() && exists {
 		return secretsFromPlacement(existing)
 	}
-	return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion}
+	generation := cmd.SecretSealGeneration
+	if generation <= 0 && exists {
+		generation = existing.SecretSealGeneration
+	}
+	return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion, SealGeneration: generation}
 }
 
 // placementFSM is the raft.FSM implementation. It keeps hot routing/admission
@@ -530,6 +538,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				ownerRef = existing.OwnerRef
 			}
 		}
+		if secrets.SealGeneration > 0 {
+			secretSealGeneration = secrets.SealGeneration
+		}
 		if len(cmd.SecretRecipients) > 0 {
 			secretRecipients = append([]string(nil), cmd.SecretRecipients...)
 		}
@@ -794,6 +805,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
+			existing.SecretSealGeneration = secrets.SealGeneration
 		}
 		recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
 		existing.OwnerNodeID = cmd.OwnerNodeID
@@ -841,6 +853,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
+			existing.SecretSealGeneration = secrets.SealGeneration
 		}
 		wasReserved := existing.IsReserved()
 		if wasReserved {
@@ -1224,22 +1237,23 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 	}
 	secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
 	p := Placement{
-		SandboxID:          cmd.SandboxID,
-		OwnerNodeID:        cmd.OwnerNodeID,
-		OwnerAPIURL:        cmd.OwnerAPIURL,
-		OwnerDataPlaneHost: cmd.OwnerDataPlaneHost,
-		Version:            f.version,
-		CreatedUnix:        now,
-		UpdatedUnix:        now,
-		Name:               name,
-		Spec:               cmd.Spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		SecretRecipients:   append([]string(nil), cmd.SecretRecipients...),
-		IncarnationID:      strings.TrimSpace(cmd.IncarnationID),
-		OwnerRef:           strings.TrimSpace(cmd.OwnerRef),
-		State:              PlacementStateReserved,
-		ExpiresUnix:        cmd.ExpiresUnix,
+		SandboxID:            cmd.SandboxID,
+		OwnerNodeID:          cmd.OwnerNodeID,
+		OwnerAPIURL:          cmd.OwnerAPIURL,
+		OwnerDataPlaneHost:   cmd.OwnerDataPlaneHost,
+		Version:              f.version,
+		CreatedUnix:          now,
+		UpdatedUnix:          now,
+		Name:                 name,
+		Spec:                 cmd.Spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		SecretRecipients:     append([]string(nil), cmd.SecretRecipients...),
+		IncarnationID:        strings.TrimSpace(cmd.IncarnationID),
+		OwnerRef:             strings.TrimSpace(cmd.OwnerRef),
+		State:                PlacementStateReserved,
+		ExpiresUnix:          cmd.ExpiresUnix,
 	}
 	if err := f.storePlacementLocked(cmd.SandboxID, p); err != nil {
 		return err

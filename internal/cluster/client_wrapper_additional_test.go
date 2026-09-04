@@ -31,12 +31,13 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 	})
 
 	applyOp(t, c.fsm, command{
-		Op:            opPlace,
-		SandboxID:     "sb-demo",
-		OwnerNodeID:   "owner-node",
-		Spec:          &models.CreateSandboxRequest{Name: "demo", Image: "alpine:3.20"},
-		SecretRef:     "cluster-secret://sandbox/sb-demo/v1",
-		SecretVersion: 1,
+		Op:                   opPlace,
+		SandboxID:            "sb-demo",
+		OwnerNodeID:          "owner-node",
+		Spec:                 &models.CreateSandboxRequest{Name: "demo", Image: "alpine:3.20"},
+		SecretRef:            "cluster-secret://sandbox/sb-demo/v1",
+		SecretVersion:        1,
+		SecretSealGeneration: 4,
 	})
 	applyOp(t, c.fsm, command{Op: opAddExposedPort, SandboxID: "sb-demo", Port: 8080, Protocol: "http"})
 	applyOp(t, c.fsm, command{Op: opSetNodeDrainState, NodeID: "drained-node", Drained: true})
@@ -73,7 +74,7 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 	}
 
 	secrets := c.SecretsOf("sb-demo")
-	if secrets.Ref != "cluster-secret://sandbox/sb-demo/v1" || secrets.Version != 1 {
+	if secrets.Ref != "cluster-secret://sandbox/sb-demo/v1" || secrets.Version != 1 || secrets.SealGeneration != 4 {
 		t.Fatalf("SecretsOf() = %+v, want stored secret handle", secrets)
 	}
 	routes := c.ExposedPortsOf("sb-demo")
@@ -133,8 +134,13 @@ func TestClusterClientReservationAndMutationWrappers(t *testing.T) {
 	c.capacityLeases.set(c.nodeID, admitter.Snapshot(), time.Now())
 
 	ctx := context.Background()
-	if err := c.RecordPlacement(ctx, "sb-expose", nil, PlacementSecrets{}); err != nil {
+	if err := c.RecordPlacement(ctx, "sb-expose", nil, PlacementSecrets{
+		Ref: "cluster-secret://sandbox/sb-expose/v1", Version: 1, SealGeneration: 3,
+	}); err != nil {
 		t.Fatalf("RecordPlacement() error = %v", err)
+	}
+	if got := c.SecretsOf("sb-expose"); got.SealGeneration != 3 {
+		t.Fatalf("RecordPlacement secret handle = %+v, want seal generation 3", got)
 	}
 	if err := c.AddExposedPort(ctx, "sb-expose", 8080, ExposedPortRoute{Protocol: "http"}); err != nil {
 		t.Fatalf("AddExposedPort() error = %v", err)

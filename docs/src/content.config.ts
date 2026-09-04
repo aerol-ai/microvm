@@ -91,7 +91,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
                 type: 'link',
                 href: '/cluster-secrets',
                 label: 'Secrets Providers',
-                description: 'Local vs AWS KMS for sealed cluster credentials, fan-out, and the D5 recipient-set limitation.',
+                description: 'Local vs AWS KMS for sealed cluster credentials, fan-out, and generation-fenced recipient repair.',
               },
             ],
           },

@@ -33,6 +33,30 @@ func TestFSMApplyPlace(t *testing.T) {
 	}
 }
 
+func TestFSMInitialPlacementPreservesSecretSealGeneration(t *testing.T) {
+	fsm := newPlacementFSM()
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-secret-gen", OwnerNodeID: "node-a",
+		SecretRef: "cluster-secret://sandbox/sb-secret-gen/v1", SecretVersion: 1,
+		SecretSealGeneration: 7,
+	}
+	payload, err := encodeCommand(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: payload}); got != nil {
+		t.Fatalf("apply returned %v", got)
+	}
+	placement, ok := fsm.get("sb-secret-gen")
+	if !ok || placement.SecretSealGeneration != 7 {
+		t.Fatalf("placement = %+v, want seal generation 7", placement)
+	}
+	handle := secretsFromPlacement(placement)
+	if handle.SealGeneration != 7 {
+		t.Fatalf("handle = %+v, want seal generation 7", handle)
+	}
+}
+
 func TestFSMPlaceIdempotent(t *testing.T) {
 	fsm := newPlacementFSM()
 	cmd := command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a:8080"}

@@ -48,7 +48,7 @@ On the open-source build:
 If no export URL is configured, **disk loss loses events** that lived only on
 that node's JSONL (already the open-source honesty boundary).
 
-See also the D5 frozen-recipient limitation and cluster identity requirements in
+See also recipient-set repair and cluster identity requirements in
 [`docs/.../cluster-secrets.mdx`](../../docs/src/content/docs/cluster-secrets.mdx).
 
 **Peer auth honesty:** cluster mode requires `SB_CLUSTER_TLS_DIR`. Internal
@@ -114,11 +114,17 @@ remaining chain.
 3. HA create success guarantees at least one backup ACK. Treat
    `failover_ready=false` as "the configured replica set is not complete yet";
    the remaining recipients continue asynchronously.
-4. Recipient sets are recorded at seal/reserve time. When a majority of frozen
-   backup targets are dead, the holder-refresh path selects live
-   worker/mixed replacements, Raft-updates `SecretRecipients`, and **reseals**
-   (recipients are in envelope AAD — old ciphertext cannot be pushed to new
-   nodes). Until that completes, `failover_ready` may stay false.
+4. Recipient sets are recorded at seal/reserve time. When any intended backup
+   target is dead, the holder-refresh path selects live worker/mixed
+   replacements and **reseals** (recipients are in envelope AAD — old
+   ciphertext cannot be pushed to new nodes). It atomically stages the sealed
+   generation and retired-recipient journal, obtains a replacement ACK, then
+   Raft-CASes `SecretRecipients` and releases cleanup. Until that completes,
+   `failover_ready` may stay false.
+5. Decommissioned recipient IDs remain in the delete outbox until they return
+   an authenticated generation-scoped DELETE ACK. Permanently destroyed nodes
+   therefore leave a visible cleanup obligation; membership disappearance is
+   never accepted as evidence that their disks no longer contain ciphertext.
 
 The reconciler exposes `aerolvm_secret_delete_outbox_pending`,
 `aerolvm_secret_delete_outbox_oldest_age_seconds`,

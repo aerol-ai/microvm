@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -20,7 +21,8 @@ import (
 // signature. Handlers are intentionally thin — wire decode → service call →
 // wire encode — so the version boundary stays at this layer.
 type handlers struct {
-	deps Deps
+	deps          Deps
+	templateLists templateListCache
 }
 
 func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +35,18 @@ func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
-	apihttp.WriteJSON(w, http.StatusOK, h.deps.Service.Capacity())
+	snapshot := h.deps.Service.Capacity()
+	access, ok := controlplane.AccessFromContext(r.Context())
+	if !ok || !access.Operator {
+		// Template administration is operator-only. Capacity remains useful to
+		// managed callers, but template identifiers can encode internal workload
+		// names and must not leak through this otherwise tenant-visible endpoint.
+		snapshot.LocalTemplateInventoryKnown = false
+		snapshot.LocalTemplateIDs = nil
+		snapshot.LocalTemplateCatalogInventoryKnown = false
+		snapshot.LocalTemplateCatalogIDs = nil
+	}
+	apihttp.WriteJSON(w, http.StatusOK, snapshot)
 }
 
 func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docker.CreateTiming, containerEngine string) {

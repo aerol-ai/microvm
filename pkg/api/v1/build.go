@@ -19,7 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-const clusterImageBuildFanoutHeader = "X-Cluster-Image-Build-Fanout"
+const clusterImageBuildRoutedHeader = "X-Cluster-Image-Build-Routed"
 
 // buildContextWithTimeout returns a child context with the configured build
 // timeout. A timeout of zero falls back to plain cancel — the parent's
@@ -55,7 +55,7 @@ type buildImageResponse struct {
 }
 
 func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get(clusterImageBuildFanoutHeader) == "1" {
+	if r.Header.Get(clusterImageBuildRoutedHeader) == "1" {
 		h.buildImage(w, r)
 		return
 	}
@@ -64,7 +64,7 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	c := h.deps.Service.Cluster()
-	if c == nil {
+	if c == nil || !h.deps.Service.ClusterEnabled() {
 		h.buildImage(w, r)
 		return
 	}
@@ -85,18 +85,6 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
 
-	// Explicit push/context builds have their own distribution semantics. The
-	// fanout is for the SDK CreateWithImage path, which returns a local-only
-	// aerolvm-build/* tag and immediately creates a Docker sandbox from it.
-	if parsed.Push != nil || len(parsed.ContextHashes) > 0 {
-		h.buildImage(w, r)
-		return
-	}
-	if clusterSelfCanOwnSandbox(c) {
-		h.buildImage(w, r)
-		return
-	}
-
 	// A built image is local to one worker. Select that worker once and encode
 	// its identity in the returned tag; the follow-up create request decodes the
 	// affinity and routes back to the same worker. This keeps one SDK build at
@@ -105,11 +93,15 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 		CPU: models.DefaultCPU, MemoryMB: models.DefaultMemoryMB,
 		DiskGB: models.DefaultDiskGB, Runtime: models.RuntimeDocker,
 	})
-	if err != nil || target.IsSelf || target.NodeID == "" {
+	if err != nil || target.NodeID == "" {
 		if err == nil {
 			err = cluster.ErrNoPlacementTarget
 		}
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster image build placement: "+err.Error())
+		return
+	}
+	if target.IsSelf {
+		h.buildImage(w, r)
 		return
 	}
 	member := cluster.Member{
@@ -147,7 +139,7 @@ func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request,
 		req.Body = io.NopCloser(bytes.NewReader(raw))
 		req.ContentLength = int64(len(raw))
 		req.Header = parent.Header.Clone()
-		req.Header.Set(clusterImageBuildFanoutHeader, "1")
+		req.Header.Set(clusterImageBuildRoutedHeader, "1")
 		rr := httptest.NewRecorder()
 		h.buildImage(rr, req)
 		return rr.Code, rr.Header(), rr.Body.Bytes(), nil
@@ -161,7 +153,7 @@ func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request,
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	req.Header.Set(clusterImageBuildFanoutHeader, "1")
+	req.Header.Set(clusterImageBuildRoutedHeader, "1")
 	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
@@ -217,7 +209,7 @@ func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tag := docker.BuildTagFor(dockerfile, req.ContextHashes)
-	if h.deps.Service != nil {
+	if h.deps.Service != nil && h.deps.Service.ClusterEnabled() {
 		if c := h.deps.Service.Cluster(); c != nil {
 			tag = docker.BuildTagForNode(dockerfile, req.ContextHashes, c.SelfNodeID())
 		}

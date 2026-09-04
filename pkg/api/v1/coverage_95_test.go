@@ -3,7 +3,6 @@ package v1
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -286,18 +285,6 @@ func TestListAndDeleteJSBundleStoreErrors(t *testing.T) {
 	handler.deleteJSBundle(delRR, req)
 	if delRR.Code == http.StatusNoContent {
 		t.Fatal("expected delete failure with closed store")
-	}
-}
-
-func TestCreateJSBundleReplicaEndpointRequiresMTLS(t *testing.T) {
-	h := newJSBundleV1TestEnv(t)
-	body, _ := json.Marshal(models.CreateJSBundleRequest{Name: "peer-hook", Source: jsHandlerBody})
-	req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalJSBundlesPath, bytes.NewReader(body))
-	req.Header.Set(models.HeaderJSBundleOwner, "node-a")
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403; body=%s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -289,6 +289,7 @@ func TestListReadyTemplateIDsAndCompatScan(t *testing.T) {
 	now := time.Now().UTC()
 
 	_ = st.CreateTemplate(ctx, &models.Template{ID: "tpl-ready", Image: "img", Status: models.TemplateStatusReady})
+	_ = st.CreateTemplate(ctx, &models.Template{ID: "tpl-pending", Image: "img", Status: models.TemplateStatusPending})
 	if _, err := st.db.ExecContext(ctx, `
 		UPDATE firecracker_templates SET status = ? WHERE id = ?
 	`, string(models.TemplateStatusReady), "tpl-ready"); err != nil {
@@ -297,6 +298,10 @@ func TestListReadyTemplateIDsAndCompatScan(t *testing.T) {
 	ids, err := st.ListReadyTemplateIDs(ctx)
 	if err != nil || len(ids) == 0 {
 		t.Fatalf("ListReadyTemplateIDs = %v err=%v", ids, err)
+	}
+	ready, catalog, err := st.ListTemplateInventoryIDs(ctx)
+	if err != nil || len(ready) != 1 || len(catalog) != 2 {
+		t.Fatalf("ListTemplateInventoryIDs = ready:%v catalog:%v err=%v", ready, catalog, err)
 	}
 
 	_ = st.Create(ctx, sampleSandbox("sb-cs2"))

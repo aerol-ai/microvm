@@ -37,6 +37,7 @@ type capacityLeaseCache struct {
 	// Firecracker disabled, and the placement path naturally degrades
 	// to "no template gate" via the unknown-allow rule.
 	localTemplateInventory   func() ([]string, bool)
+	localTemplateCatalog     func() ([]string, bool)
 	localWasmModuleInventory func() ([]string, bool)
 }
 
@@ -64,6 +65,7 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	snap := c.admitter.Snapshot()
 	c.mu.RLock()
 	templateInventory := c.localTemplateInventory
+	templateCatalog := c.localTemplateCatalog
 	wasmModuleInventory := c.localWasmModuleInventory
 	c.mu.RUnlock()
 	// Overlay PR-D template inventory before storing — placement reads
@@ -74,6 +76,12 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 		if ids, known := templateInventory(); known {
 			snap.LocalTemplateInventoryKnown = true
 			snap.LocalTemplateIDs = ids
+		}
+	}
+	if templateCatalog != nil {
+		if ids, known := templateCatalog(); known {
+			snap.LocalTemplateCatalogInventoryKnown = true
+			snap.LocalTemplateCatalogIDs = ids
 		}
 	}
 	if wasmModuleInventory != nil {
@@ -96,6 +104,18 @@ func (c *capacityLeaseCache) SetLocalTemplateIDsProvider(fn func() ([]string, bo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.localTemplateInventory = fn
+}
+
+// SetLocalTemplateCatalogProvider installs the all-lifecycle template
+// catalogue used for direct administrative item routing. It is deliberately
+// separate from the ready-only placement inventory.
+func (c *capacityLeaseCache) SetLocalTemplateCatalogProvider(fn func() ([]string, bool)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localTemplateCatalog = fn
 }
 
 // SetLocalWasmModuleIDsProvider installs the WASM module inventory callback.

@@ -111,13 +111,13 @@ func TestBuildImageReturnsContentAddressedTag(t *testing.T) {
 	}
 }
 
-func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
+func TestClusterBuildImageWrapRoutesToOneDockerWorker(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo hi"
 	var remoteSeen bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remoteSeen = true
-		if got := r.Header.Get(clusterImageBuildFanoutHeader); got != "1" {
-			t.Fatalf("%s = %q, want 1", clusterImageBuildFanoutHeader, got)
+		if got := r.Header.Get(clusterImageBuildRoutedHeader); got != "1" {
+			t.Fatalf("%s = %q, want 1", clusterImageBuildRoutedHeader, got)
 		}
 		var req buildImageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -163,7 +163,7 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
 	}
 	if !remoteSeen {
-		t.Fatal("remote docker worker did not receive build fanout")
+		t.Fatal("remote docker worker did not receive routed build")
 	}
 	var resp buildImageResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
@@ -174,7 +174,7 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 	}
 }
 
-func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
+func TestClusterBuildImageWrapBuildsLocallyWhenPlacementSelectsSelf(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo local"
 	var remoteSeen bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -188,6 +188,9 @@ func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
 	svc.AttachCluster(&membersStubCluster{
 		Noop:           cluster.NewNoop("mixed-a", "http://mixed-a", ""),
 		internalClient: remote.Client(),
+		placement: cluster.PlacementTarget{
+			NodeID: "mixed-a", APIURL: "http://mixed-a", IsSelf: true,
+		},
 		members: []cluster.Member{
 			{NodeID: "mixed-a", APIURL: "http://mixed-a", Alive: true, Role: config.NodeRoleMixed},
 			{
@@ -213,7 +216,7 @@ func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
 	}
 	if remoteSeen {
-		t.Fatal("remote worker received build fanout even though this node can own the follow-up create")
+		t.Fatal("remote worker received build even though placement selected self")
 	}
 	if len(builder.builds) != 1 {
 		t.Fatalf("local build calls = %d, want 1", len(builder.builds))

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -248,7 +247,10 @@ func BuildTagForNode(dockerfile string, contextHashes []string, nodeID string) s
 	}
 	base := BuildTagFor(dockerfile, contextHashes)
 	digest := strings.TrimPrefix(base, BuiltImageNamespace+"/")
-	encodedNode := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(nodeID)))
+	encodedNode, ok := models.EncodeNodeAffinity(nodeID)
+	if !ok {
+		return base
+	}
 	return BuiltImageNamespace + "/node-" + encodedNode + "/" + digest
 }
 
@@ -265,13 +267,8 @@ func BuiltImagePlacementNode(imageRef string) (string, bool) {
 	if separator <= 0 || separator == len(rest)-1 {
 		return "", false
 	}
-	encoded := strings.ToUpper(rest[:separator])
-	raw, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(encoded)
-	if err != nil || len(raw) == 0 || len(raw) > 128 {
-		return "", false
-	}
-	nodeID := string(raw)
-	if strings.TrimSpace(nodeID) != nodeID {
+	nodeID, ok := models.DecodeNodeAffinity(rest[:separator])
+	if !ok {
 		return "", false
 	}
 	return nodeID, true

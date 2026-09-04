@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
@@ -37,72 +36,6 @@ func (failPutRecoveryStore) GetRecord(string) (placementRecoveryStoreRecord, boo
 }
 func (failPutRecoveryStore) Delete(string) error               { return nil }
 func (failPutRecoveryStore) RetainSnapshotRefs([]string) error { return nil }
-
-func TestReplicateJSBundleClusterAndAgentWrappers(t *testing.T) {
-	ctx := context.Background()
-	req := models.CreateJSBundleRequest{Name: "b", Source: "export default {}"}
-
-	if err := (*Cluster)(nil).ReplicateJSBundle(ctx, "o", req); err != nil {
-		t.Fatalf("nil Cluster: %v", err)
-	}
-	if err := (&Cluster{}).ReplicateJSBundle(ctx, "o", req); err != nil {
-		t.Fatalf("Cluster nil gossip: %v", err)
-	}
-	if err := (*Agent)(nil).ReplicateJSBundle(ctx, "o", req); err != nil {
-		t.Fatalf("nil Agent: %v", err)
-	}
-	if err := (&Agent{}).ReplicateJSBundle(ctx, "o", req); err != nil {
-		t.Fatalf("Agent nil gossip: %v", err)
-	}
-
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusBadGateway)
-	}))
-	defer peer.Close()
-
-	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "self", Alive: true, APIURL: "http://self"})
-	index.upsert(Member{NodeID: "peer", Alive: true, Role: config.NodeRoleWorker, APIURL: peer.URL, InternalURL: peer.URL, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}}})
-	gn := &gossipNode{memberIndex: index}
-
-	c := &Cluster{nodeID: "self", gossip: gn, internalClient: peer.Client(), patToken: "tok"}
-	if err := c.ReplicateJSBundle(ctx, "owner", req); err == nil || !strings.Contains(err.Error(), "peer") {
-		t.Fatalf("Cluster replicate error=%v", err)
-	}
-	a := &Agent{nodeID: "self", gossip: gn, internalClient: peer.Client(), patToken: "tok"}
-	if err := a.ReplicateJSBundle(ctx, "owner", req); err == nil || !strings.Contains(err.Error(), "peer") {
-		t.Fatalf("Agent replicate error=%v", err)
-	}
-
-	// nil client short-circuits fan-out.
-	if err := replicateJSBundleToPeers(ctx, []Member{{NodeID: "p", Alive: true, Role: config.NodeRoleWorker, InternalURL: peer.URL, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeIsolate}}}}, nil, "", "self", "o", req); err != nil {
-		t.Fatalf("nil client: %v", err)
-	}
-	// marshal failure
-	if err := replicateJSBundleToPeers(ctx, nil, func(Member) (*http.Client, string, error) { return &http.Client{}, "", nil }, "", "self", "o", models.CreateJSBundleRequest{}); err != nil {
-		// empty source still marshals; force via invalid type through helper path already covered —
-		// keep a successful marshal path with empty members.
-		_ = err
-	}
-}
-
-func TestPostJSBundleReplicaErrorBranches(t *testing.T) {
-	ctx := context.Background()
-	if err := postJSBundleReplica(ctx, &http.Client{}, "://bad", "", "self", "o", []byte(`{}`)); err == nil {
-		t.Fatal("expected invalid URL error")
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "nope", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	if err := postJSBundleReplica(ctx, srv.Client(), srv.URL, "pat", "self", "own", []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "500") {
-		t.Fatalf("status error=%v", err)
-	}
-	// network error
-	if err := postJSBundleReplica(ctx, &http.Client{Timeout: time.Millisecond}, "http://127.0.0.1:1", "", "self", "o", []byte(`{}`)); err == nil {
-		t.Fatal("expected dial error")
-	}
-}
 
 func TestFSMApplyUncoveredBranchesStep2(t *testing.T) {
 	fsm := newPlacementFSM()

@@ -85,6 +85,15 @@ func (c *createForwardCluster) Members() []cluster.Member {
 	return c.Noop.Members()
 }
 
+func (c *createForwardCluster) LookupMember(nodeID string) (cluster.Member, bool) {
+	for _, member := range c.Members() {
+		if member.NodeID == nodeID {
+			return member, true
+		}
+	}
+	return cluster.Member{}, false
+}
+
 func (c *createForwardCluster) IsNodeDrained(nodeID string) bool {
 	return c.drained != nil && c.drained[nodeID]
 }
@@ -209,6 +218,14 @@ func TestCapacityRequestFromCreateTreatsBuiltImagesAsDocker(t *testing.T) {
 	got := capacityRequestFromCreate(models.CreateSandboxRequest{Image: docker.BuiltImageNamespace + "/abc:latest"})
 	if got.Runtime != models.RuntimeDocker {
 		t.Fatalf("placement Runtime = %q, want docker for built local image", got.Runtime)
+	}
+}
+
+func TestCapacityRequestFromCreatePinsNodeBoundIsolateBundle(t *testing.T) {
+	ref := models.JSBundleRefForNode("sha256:abc", "isolate-a")
+	got := capacityRequestFromCreate(models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: ref})
+	if got.RequiredNodeID != "isolate-a" {
+		t.Fatalf("RequiredNodeID = %q, want isolate-a", got.RequiredNodeID)
 	}
 }
 

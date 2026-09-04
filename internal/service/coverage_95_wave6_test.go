@@ -221,11 +221,8 @@ func TestGetJSBundleNilAndScopedMiss(t *testing.T) {
 	}
 }
 
-func TestCreateJSBundleModulesPathAndReplicatorWarn(t *testing.T) {
+func TestCreateJSBundleModulesPath(t *testing.T) {
 	svc := newBundleService(t)
-	svc.SetJSBundleReplicator(func(context.Context, string, models.CreateJSBundleRequest) error {
-		return errors.New("peer down")
-	})
 	_, err := svc.CreateJSBundle(context.Background(), models.CreateJSBundleRequest{
 		Name:       "multi",
 		MainModule: "index.js",
@@ -233,21 +230,6 @@ func TestCreateJSBundleModulesPathAndReplicatorWarn(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("CreateJSBundle modules: %v", err)
-	}
-}
-
-func TestCreateJSBundleEnterpriseFailsClosedOnIncompleteReplication(t *testing.T) {
-	svc := newBundleService(t)
-	svc.cfg.EnterpriseMode = true
-	svc.SetJSBundleReplicator(func(context.Context, string, models.CreateJSBundleRequest) error {
-		return errors.New("peer down")
-	})
-	_, err := svc.CreateJSBundle(context.Background(), models.CreateJSBundleRequest{
-		Name:   "enterprise",
-		Source: jsBundleSrc,
-	})
-	if err == nil || !strings.Contains(err.Error(), "replication incomplete") {
-		t.Fatalf("CreateJSBundle error = %v, want incomplete-replication failure", err)
 	}
 }
 

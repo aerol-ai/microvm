@@ -75,6 +75,10 @@ func (p *KMSProvider) Put(ctx context.Context, sandboxID string, s Secrets, reci
 		cp := append([]string(nil), peers...)
 		blob.OutboxRecipients = &cp
 	}
+	if retired, ok := RetiredRecipientsFromContext(ctx); ok {
+		cp := append([]string(nil), retired...)
+		blob.RetiredRecipients = &cp
+	}
 	if err := p.store.Put(ctx, blob); err != nil {
 		return Handle{}, err
 	}
@@ -114,6 +118,9 @@ func (p *KMSProvider) Open(ctx context.Context, sandboxID string, h Handle, node
 	}
 	if rec.SealGeneration <= 0 {
 		return Secrets{}, fmt.Errorf("%w: cluster secret seal generation is required", ErrDecryptFailed)
+	}
+	if h.SealGeneration <= 0 || h.SealGeneration != rec.SealGeneration {
+		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q generation mismatch: placement=%d store=%d", ErrVersionMismatch, h.Ref, h.SealGeneration, rec.SealGeneration)
 	}
 	if p.wrapper == nil {
 		return Secrets{}, fmt.Errorf("%w: secret provider wrap backend is not configured", ErrProviderUnavailable)

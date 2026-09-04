@@ -88,6 +88,20 @@ func testProviderContract(t *testing.T, p Provider, opts providerContractOpts) {
 		}
 	})
 
+	t.Run("stale_generation_rejected", func(t *testing.T) {
+		h, err := p.Put(ctx, "sb-generation", Secrets{
+			Registry: &models.RegistryAuth{Password: "p"},
+		}, []string{"node-a"})
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		stale := h
+		stale.SealGeneration--
+		if _, err := p.Open(ctx, "sb-generation", stale, "node-a"); !errors.Is(err, ErrVersionMismatch) {
+			t.Fatalf("Open stale generation = %v, want ErrVersionMismatch", err)
+		}
+	})
+
 	t.Run("delete", func(t *testing.T) {
 		h, err := p.Put(ctx, "sb-del-contract", Secrets{
 			Registry: &models.RegistryAuth{Password: "p"},

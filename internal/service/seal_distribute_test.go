@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,18 +20,19 @@ import (
 )
 
 type fakePeerPusher struct {
-	mu           sync.Mutex
-	pushes       []secrets.SecretBlob
-	deletes      []string
-	pushErr      error
-	acked        []string
-	probeHolding []string
-	probeErr     error
-	probeStrict  bool // when true, Probe returns probeHolding only (ignore recipients)
-	probeCalls   int
-	probeByID    map[string]int
-	pushCalls    int
-	done         chan struct{}
+	mu            sync.Mutex
+	pushes        []secrets.SecretBlob
+	deletes       []string
+	pushErr       error
+	acked         []string
+	probeHolding  []string
+	probeErr      error
+	probeStrict   bool // when true, Probe returns probeHolding only (ignore recipients)
+	probeCalls    int
+	probeByID     map[string]int
+	pushCalls     int
+	deletePending bool
+	done          chan struct{}
 }
 
 type blockingRefanoutPusher struct {
@@ -97,6 +99,9 @@ func (f *fakePeerPusher) DeleteSecretOnPeers(_ context.Context, sandboxID string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, sandboxID)
+	if f.deletePending {
+		return nil, append([]string(nil), recipients...), nil
+	}
 	return append([]string(nil), recipients...), nil, nil
 }
 
@@ -156,7 +161,47 @@ func TestReconcileSecretDeleteOutboxDrainsBeyondOneWorkerWave(t *testing.T) {
 	}
 }
 
-func TestReconcileSecretDeleteOutboxDropsDecommissionedRecipients(t *testing.T) {
+func TestReconcileSecretDeleteOutboxDeferredRowsDoNotStarveReadyWork(t *testing.T) {
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	retired := []string{"retired-peer"}
+	for i := 0; i < secretDeleteReconcileBatch; i++ {
+		id := fmt.Sprintf("sb-staged-%04d", i)
+		if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
+			Ref: fmt.Sprintf("cluster-secret://sandbox/%s/v1", id), SandboxID: id, Version: 1,
+			Recipients: []string{"node-a", "replacement-peer"}, SealedPayload: []byte("sealed"),
+			SealGeneration: 2, RetireRecipients: &retired,
+		}); err != nil {
+			t.Fatalf("stage %s: %v", id, err)
+		}
+	}
+	if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, "sb-ready-delete", []string{"ready-peer"}); err != nil {
+		t.Fatalf("seed ready delete: %v", err)
+	}
+	pusher := &fakePeerPusher{}
+	svc := &Service{
+		cfg: config.Config{EnableCluster: true}, store: st,
+		cluster: cluster.NewNoop("node-a", "http://a", ""), testSecretPeerPusher: pusher,
+	}
+	if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rec, err := st.GetSecretDeleteOutbox(ctx, "sb-ready-delete"); err != nil || rec != nil {
+		t.Fatalf("ready delete was starved: rec=%+v err=%v", rec, err)
+	}
+	pusher.mu.Lock()
+	deletes := append([]string(nil), pusher.deletes...)
+	pusher.mu.Unlock()
+	if !slices.Contains(deletes, "sb-ready-delete") {
+		t.Fatalf("ready delete was not attempted: %v", deletes)
+	}
+}
+
+func TestReconcileSecretDeleteOutboxRetainsDecommissionedRecipients(t *testing.T) {
 	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("store: %v", err)
@@ -166,7 +211,7 @@ func TestReconcileSecretDeleteOutboxDropsDecommissionedRecipients(t *testing.T) 
 	if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, "sb-retired", []string{"retired-node"}); err != nil {
 		t.Fatalf("seed outbox: %v", err)
 	}
-	pusher := &fakePeerPusher{}
+	pusher := &fakePeerPusher{deletePending: true}
 	svc := &Service{
 		cfg:                  config.Config{EnableCluster: true},
 		store:                st,
@@ -178,14 +223,14 @@ func TestReconcileSecretDeleteOutboxDropsDecommissionedRecipients(t *testing.T) 
 	if err != nil {
 		t.Fatalf("get outbox: %v", err)
 	}
-	if remaining != nil {
-		t.Fatalf("decommissioned recipient must not pin delete outbox: %+v", remaining)
+	if remaining == nil || !sameStringSlice(remaining.Recipients, []string{"retired-node"}) {
+		t.Fatalf("decommissioned recipient cleanup obligation was lost: %+v", remaining)
 	}
 	pusher.mu.Lock()
 	deletes := len(pusher.deletes)
 	pusher.mu.Unlock()
-	if deletes != 0 {
-		t.Fatalf("peer deletes = %d, want 0 for a node that has left membership", deletes)
+	if deletes != 1 {
+		t.Fatalf("peer delete attempts = %d, want 1 with recipient retained pending", deletes)
 	}
 }
 
@@ -734,14 +779,14 @@ func TestComputeFailoverReady(t *testing.T) {
 	}
 
 	addSecretHolderNodes("sb1", 1, "node-a")
-	svc.cluster = &placementRecipientsCluster{
+	svc.AttachCluster(&placementRecipientsCluster{
 		Noop:       cluster.NewNoop("node-a", "", ""),
 		recipients: []string{"node-a", "node-b"},
 		members: []cluster.Member{
 			{NodeID: "node-a", Alive: true},
 			{NodeID: "node-b", Alive: true},
 		},
-	}
+	})
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || *ready {
 		t.Fatalf("holders=1 multi → want false, got %v", ready)
@@ -766,20 +811,21 @@ func TestComputeFailoverReady(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for async fan-out ACK before failover-ready check")
 	}
+	waitForSecretCreateFanoutIdle(t, "sb1")
 	addSecretHolderNodes("sb1", secretHolderGeneration("sb1"), "node-a", "node-b")
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || !*ready {
 		t.Fatalf("holders=2 live with local row → want true, got %v", ready)
 	}
 	// Dead backup must flip ready false even if historically ACK'd.
-	svc.cluster = &placementRecipientsCluster{
+	svc.AttachCluster(&placementRecipientsCluster{
 		Noop:       cluster.NewNoop("node-a", "", ""),
 		recipients: []string{"node-a", "node-b"},
 		members: []cluster.Member{
 			{NodeID: "node-a", Alive: true},
 			{NodeID: "node-b", Alive: false},
 		},
-	}
+	})
 	ready = svc.computeFailoverReady(context.Background(), sb)
 	if ready == nil || *ready {
 		t.Fatalf("dead backup → want false, got %v", ready)
@@ -1441,6 +1487,7 @@ func TestExpandAndResealOwnerCASRejectsStaleGeneration(t *testing.T) {
 	cl.mu.Lock()
 	cl.placement.SecretRef = rec.Ref
 	cl.placement.SecretVersion = rec.Version
+	cl.placement.SecretSealGeneration = rec.SealGeneration
 	cl.mu.Unlock()
 
 	clearSecretFanoutHolders(sandboxID)
@@ -1451,6 +1498,13 @@ func TestExpandAndResealOwnerCASRejectsStaleGeneration(t *testing.T) {
 	err = svc.expandAndResealDeadSecretTargets(ctx, sandboxID)
 	if err == nil || !errors.Is(err, cluster.ErrSecretRecipientsCASMismatch) {
 		t.Fatalf("reseal = %v, want wrapped ErrSecretRecipientsCASMismatch", err)
+	}
+	outbox, outboxErr := st.GetSecretDeleteOutbox(ctx, sandboxID)
+	if outboxErr != nil || outbox == nil || !outbox.AwaitingPromotion {
+		t.Fatalf("failed Raft CAS lost staged recipient retirement: outbox=%+v err=%v", outbox, outboxErr)
+	}
+	if !sameStringSlice(outbox.Recipients, []string{"dead-a", "dead-b"}) {
+		t.Fatalf("staged retired recipients = %v, want [dead-a dead-b]", outbox.Recipients)
 	}
 }
 
@@ -1501,5 +1555,58 @@ func TestExpandAndResealFinalizesInterruptedLocalGeneration(t *testing.T) {
 	defer cl.mu.Unlock()
 	if cl.placement.SecretSealGeneration != 2 || cl.updateCalls != 1 {
 		t.Fatalf("placement generation=%d updates=%d, want generation=2 updates=1", cl.placement.SecretSealGeneration, cl.updateCalls)
+	}
+}
+
+func TestStagedRetirementWaitsForRaftPromotion(t *testing.T) {
+	ctx := context.Background()
+	st := openSealTestStore(t)
+	const sandboxID = "sb-retirement-fence"
+	retired := []string{"dead-a"}
+	if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-retirement-fence/v1", SandboxID: sandboxID,
+		Version: 1, Recipients: []string{"node-a", "live-b"},
+		SealedPayload: []byte("sealed-generation-2"), SealGeneration: 2,
+		RetireRecipients: &retired,
+	}); err != nil {
+		t.Fatalf("stage reseal: %v", err)
+	}
+	cl := &resealPlacementCluster{
+		Noop: cluster.NewNoop("node-a", "http://a", ""),
+		placement: cluster.Placement{
+			SandboxID: sandboxID, OwnerNodeID: "node-a", IncarnationID: "inc-1",
+			SecretRecipients: []string{"node-a", "dead-a"}, SecretSealGeneration: 1,
+		},
+	}
+	pusher := &fakePeerPusher{}
+	svc := &Service{
+		cfg: config.Config{EnableCluster: true}, store: st, cluster: cl,
+		testSecretPeerPusher: pusher,
+	}
+
+	svc.reconcileSecretDeleteOutboxOnceContext(ctx, sandboxID)
+	pusher.mu.Lock()
+	deleteCalls := len(pusher.deletes)
+	pusher.mu.Unlock()
+	if deleteCalls != 0 {
+		t.Fatalf("staged retirement deleted a peer before Raft promotion")
+	}
+	if rec, err := st.GetSecretDeleteOutbox(ctx, sandboxID); err != nil || rec == nil || !rec.AwaitingPromotion {
+		t.Fatalf("staged retirement was not retained: rec=%+v err=%v", rec, err)
+	}
+
+	cl.mu.Lock()
+	cl.placement.SecretRecipients = []string{"node-a", "live-b"}
+	cl.placement.SecretSealGeneration = 2
+	cl.mu.Unlock()
+	svc.reconcileSecretDeleteOutboxOnceContext(ctx, sandboxID)
+	pusher.mu.Lock()
+	deleteCalls = len(pusher.deletes)
+	pusher.mu.Unlock()
+	if deleteCalls != 1 {
+		t.Fatalf("promoted retirement delete calls = %d, want 1", deleteCalls)
+	}
+	if rec, err := st.GetSecretDeleteOutbox(ctx, sandboxID); err != nil || rec != nil {
+		t.Fatalf("promoted retirement outbox not drained: rec=%+v err=%v", rec, err)
 	}
 }

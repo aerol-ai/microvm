@@ -8,6 +8,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TestLocalReadyTemplateIDs_CachesForTTL is the heartbeat-protection
@@ -71,12 +73,21 @@ func TestCapacity_OverlaysLocalTemplateIDs(t *testing.T) {
 	svc, st, templatesDir := newHealthHarness(t)
 	_ = seedReadyTemplate(t, st, templatesDir, "tpl-cap-1")
 	_ = seedReadyTemplate(t, st, templatesDir, "tpl-cap-2")
+	if err := st.CreateTemplate(context.Background(), &models.Template{
+		ID: "tpl-cap-pending", Image: "docker://pending", Status: models.TemplateStatusPending,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed pending template: %v", err)
+	}
 	snap := svc.Capacity()
 	if !snap.LocalTemplateInventoryKnown {
 		t.Fatal("Capacity should mark template inventory authoritative")
 	}
 	if len(snap.LocalTemplateIDs) != 2 {
 		t.Fatalf("Capacity.LocalTemplateIDs = %v, want 2 ids", snap.LocalTemplateIDs)
+	}
+	if !snap.LocalTemplateCatalogInventoryKnown || len(snap.LocalTemplateCatalogIDs) != 3 {
+		t.Fatalf("Capacity template catalogue = known:%v ids:%v, want all 3 lifecycle rows", snap.LocalTemplateCatalogInventoryKnown, snap.LocalTemplateCatalogIDs)
 	}
 }
 
@@ -88,5 +99,8 @@ func TestCapacity_EmptyTemplateInventoryIsStillAuthoritative(t *testing.T) {
 	}
 	if len(snap.LocalTemplateIDs) != 0 {
 		t.Fatalf("Capacity.LocalTemplateIDs = %v, want empty inventory", snap.LocalTemplateIDs)
+	}
+	if !snap.LocalTemplateCatalogInventoryKnown || len(snap.LocalTemplateCatalogIDs) != 0 {
+		t.Fatalf("empty template catalogue = known:%v ids:%v", snap.LocalTemplateCatalogInventoryKnown, snap.LocalTemplateCatalogIDs)
 	}
 }

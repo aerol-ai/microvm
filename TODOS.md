@@ -242,27 +242,21 @@ passed, zero-deployments premise re-verified in-tree). Branch
 - **Depends on / blocked by:** nothing. Independent of secrets-hardening product
   code; fixed alongside the GAP follow-ups so cluster signal stays trustworthy.
 
-## Per-node identity for cluster-internal HTTP (security, `pkg/api` + `internal/cluster`) — parked 2026-08-08
+## Per-node identity for cluster-internal HTTP (security, `pkg/api` + `internal/cluster`) — landed 2026-09-02
 
-- **What:** Replace shared fleet-PAT auth on `/v1/cluster/internal/...` with
-  per-node identity (mTLS and/or SPIFFE-style short-lived node credentials) so
-  a stolen PAT is not equivalent to “every peer.”
-- **Why parked:** Secrets hardening closed the **tenant** hole (operator-only
-  on secret PUT/DELETE + peer-local audit, plus recipient/ref validation on
-  receive). True peer identity must cover **all** internal routes (recovery,
-  wasm migrate, apply, secrets, audit, …) — a secrets-only mTLS patch would
-  be inconsistent theater.
-- **Current trust model (documented):** unauthenticated → 401; managed tenant
-  → 403 on **all** `/v1/cluster/*` admin + `/v1/cluster/internal/*` routes
-  (plus admin reconcile / ingress DNS); fleet `SB_PAT_TOKEN` → operator.
-  Operator mitigation: private networking + protect/rotate the PAT.
+- **Landed:** Every cluster role exposes a dedicated TLS 1.3 internal listener;
+  clients pin the peer to a required `node:<SB_NODE_ID>` SAN, servers bind that
+  identity to live membership, and every delegated internal/public-shaped route
+  is authorized before dispatch. The fleet PAT remains defense in depth.
+- **Rotation:** atomically replaced leaf/key files hot-reload for new
+  handshakes; expiry metrics and alerts are present. Automated issuance,
+  revocation distribution, and coordinated CA rotation remain operator work.
 - **Where documented:** `docs/src/content/docs/cluster-secrets.mdx` (known
   limitation), `setup/runbooks/secrets-and-audit.md`,
   `docs/designs/secrets-hardening.md` Deferred,
   `plans/secrets-hardening.md` re-review row #6.
-- **Start (when unparked):** inventory every `PublicInternal*` route + peer
-  HTTP client; decide mTLS on `:7002` vs identity on the public API URL;
-  one auth model for the whole family.
+- **Where:** `internal/cluster/{tls,internal_server,peer_dial}.go`, the global
+  `pkg/api` cluster-control-header guard, config validation, docs, and runbook.
 
 ## Durable secret-delete outbox / ACK ledger (cluster secrets) — landed 2026-08-09
 
@@ -273,9 +267,10 @@ passed, zero-deployments premise re-verified in-tree). Branch
   pending shrink (offline peers stay pending, never treated as success);
   DELETE carries `generation`; peer tombs with seal_generation gating so stale
   DELETEs cannot wipe a reseal; boot + 30s periodic reconcile (O(1) per job);
-  reseal clears tomb+outbox and accepts peer PUTs with higher seal_generation.
-- **Residual:** long partitions still need operator visibility into outbox
-  attempts; KMS CMK policy is separate. `failover_ready` now HEAD-probes
+  reseal stages retired-recipient cleanup atomically with the new sealed row,
+  gates deletion on Raft promotion, and preserves older pending recipients.
+- **Residual:** long partitions require operator action based on the shipped
+  outbox age/backlog metrics; KMS CMK policy is separate. `failover_ready` now HEAD-probes
   remote holders for the current `seal_generation` (not ACK memory alone);
   member rejoin triggers outbox reconcile + re-fanout.
 - **Where:** `internal/store` outbox/tombs, `internal/service/cluster_secrets.go`,
@@ -285,21 +280,24 @@ passed, zero-deployments premise re-verified in-tree). Branch
 
 - **What:** Replace full JSONL scan + sequential all-member fan-out with an
   indexed durable store or central sink; E2b witness.
-- **Interim landed:** sidecar flock; Close/Prune `sendMu`; gap markers with
+- **Interim landed:** sidecar flock; Close/Prune `sendMu`; verified startup chain;
+  authenticated, idempotent HTTPS batch export with durable watermark; gap markers with
   `kind=gap` (included in kind-filtered pages); compound cursor; malformed
   JSONL → gap event; wasm queue-full writes a durable gap marker; post-delete
   ACL via `sandbox_audit_acl` + Placement.OwnerRef.
-- **Residual:** full-file scan; no off-node witness; WASM still dual-writes
-  JSONL (bounded IPC remains follow-up).
+- **Residual:** local fallback queries and startup verification still scan the
+  JSONL file. Enterprise mode requires the external exporter/receiver; receiver
+  indexing, WORM retention, and operational verification remain deployment gates.
 - **Start:** `internal/service/secret_audit_query.go`; E2b witness sink may
   double as the central store.
 
-## WASM egress audit via bounded IPC (not shared JSONL) — parked residual 2026-08-08
+## WASM egress audit via bounded IPC (not shared JSONL) — landed 2026-09-02
 
-- **What:** Worker subprocesses should enqueue through the daemon's
+- **Landed:** Worker subprocesses enqueue through the daemon's
   authoritative audit writer (bounded channel, drop counter, gap markers)
   instead of opening `secrets.jsonl` themselves.
-- **Interim:** stable sidecar lock file + bounded worker pool (no per-dial
-  goroutine); retention shares the same lock; queue-full emits gap marker.
-- **Start:** `pkg/wasm/worker/egress_audit.go`, spawn env for a unix socket
-  path owned by `fileAuditSink`.
+- **Mechanism:** authenticated Unix-socket ingest, bounded worker pool, durable
+  acknowledgement through the authoritative writer, and explicit gap accounting
+  under overload. Workers no longer open the audit JSONL directly.
+- **Where:** `pkg/wasm/worker/egress_audit.go`, daemon spawn environment, and
+  `internal/service/wasm_audit_ingest.go`.

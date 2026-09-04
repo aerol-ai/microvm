@@ -35,6 +35,10 @@ func (a secretBlobStoreAdapter) Put(ctx context.Context, rec secrets.SecretBlob)
 		storeRec.PutOutboxRecipients = &peers
 		storeRec.PutOutboxIncarnationID = rec.IncarnationID
 	}
+	if rec.RetiredRecipients != nil {
+		retired := append([]string(nil), (*rec.RetiredRecipients)...)
+		storeRec.RetireRecipients = &retired
+	}
 	_, err := a.store.PutClusterSecret(ctx, storeRec)
 	return err
 }

@@ -193,6 +193,12 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if h.deps.Service.ClusterEnabled() {
+		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
+			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	normalizedRaw, err := json.Marshal(req)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
@@ -1588,6 +1594,11 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	}
 	if nodeID, ok := docker.BuiltImagePlacementNode(req.Image); ok {
 		out.RequiredNodeID = nodeID
+	}
+	if runtimeName == models.RuntimeIsolate {
+		if nodeID, _, ok := models.ParseJSBundleNodeRef(out.ModuleRef); ok {
+			out.RequiredNodeID = nodeID
+		}
 	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8

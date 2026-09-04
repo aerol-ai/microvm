@@ -180,14 +180,23 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 		return nil, fmt.Errorf("secret audit lock: %w", err)
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-	_ = lockFile.Close()
 	if err != nil {
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
 		return nil, fmt.Errorf("secret audit open: %w", err)
 	}
-	// Tip file is the fast-path for append linking under lock; verification
-	// paths must call RecomputeChainHead instead of trusting this sidecar.
-	head, tipEvent := loadChainTip(path, tipPath)
+	// Refuse to append after malformed or tampered evidence. Continuing from a
+	// stale sidecar tip would fork the chain and make every later event
+	// unverifiable, so startup derives the tip from the authoritative JSONL.
+	head, tipEvent, err := RecomputeChainHead(path)
+	if err != nil {
+		_ = f.Close()
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+		return nil, fmt.Errorf("verify secret audit chain: %w", err)
+	}
+	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	_ = lockFile.Close()
 	pending := loadGapCount(gapPath)
 	s := &fileAuditSink{
 		ch:               make(chan auditWriteReq, buffer),
@@ -876,10 +885,16 @@ func (s *fileAuditSink) writeEventBatch(events []SecretAuditEvent, durable, acco
 		if poisoned != nil {
 			return fmt.Errorf("secret audit writer poisoned: %w", poisoned)
 		}
-		// Prefer in-memory tip under flock; fall back to sidecar/file scan.
+		// Prefer the verified in-memory tip under flock. If it is ever absent,
+		// recompute from authoritative evidence and propagate corruption instead
+		// of silently restarting from genesis.
 		prev := s.chainHead
 		if prev == "" {
-			prev, _ = loadChainTip(s.path, s.tipPath)
+			var err error
+			prev, _, err = RecomputeChainHead(s.path)
+			if err != nil {
+				return fmt.Errorf("recompute secret audit chain head: %w", err)
+			}
 		}
 		if prev == "" {
 			prev = auditlog.GenesisPrevHash
@@ -959,47 +974,6 @@ func (s *fileAuditSink) chainTip() (head, eventID string) {
 	s.chainMu.Lock()
 	defer s.chainMu.Unlock()
 	return s.chainHead, s.chainEvent
-}
-
-// loadChainTip loads the fast-path tip for append linking under lock.
-// Prefer tipPath when present; otherwise scan the last EventHash without
-// verifying hashes. Verification / witness paths must use RecomputeChainHead.
-func loadChainTip(path, tipPath string) (head, eventID string) {
-	if tipPath != "" {
-		if raw, err := os.ReadFile(tipPath); err == nil {
-			parts := strings.SplitN(strings.TrimSpace(string(raw)), "\n", 2)
-			if len(parts) >= 1 && parts[0] != "" {
-				head = parts[0]
-				if len(parts) == 2 {
-					eventID = parts[1]
-				}
-				return head, eventID
-			}
-		}
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return auditlog.GenesisPrevHash, ""
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	head = auditlog.GenesisPrevHash
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		var ev SecretAuditEvent
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue
-		}
-		if ev.EventHash != "" {
-			head = ev.EventHash
-			eventID = ev.EventID
-		}
-	}
-	return head, eventID
 }
 
 // RecomputeChainHead scans secrets.jsonl and verifies every EventHash against
@@ -1362,7 +1336,7 @@ func emitSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID,
 		CorrelationID: correlationID,
 		NodeID:        actor,
 		IncarnationID: strings.TrimSpace(incarnationID),
-		// Kind left empty (= secret_open) for back-compat with older readers.
+		Kind:          secretAuditKindSecretOpen,
 	}
 	if err != nil {
 		ev.Result = secretAuditResultFailure
