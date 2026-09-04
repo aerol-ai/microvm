@@ -94,6 +94,7 @@ func TestForwardApplyLeaderAPIURLMissing(t *testing.T) {
 	follower, cleanupFollower := newTestCluster(t, "fol-missing-url", false, []string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	waitForLeader(t, follower, 10*time.Second)
 
 	follower.setInternalClient(nil)
 	follower.gossip.memberIndex.upsert(Member{
