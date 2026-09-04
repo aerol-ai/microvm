@@ -143,6 +143,9 @@ func (s *Service) runWasmCheckpointPool(ctx context.Context, sandboxes []*models
 	if len(sandboxes) == 0 {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	parallelism := s.wasmCheckpointParallelism()
 	if parallelism > len(sandboxes) {
 		parallelism = len(sandboxes)
@@ -173,6 +176,9 @@ func (s *Service) runWasmCheckpointPool(ctx context.Context, sandboxes []*models
 	close(jobs)
 	wg.Wait()
 	close(errCh)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for err := range errCh {
 		if err != nil {
 			return err
