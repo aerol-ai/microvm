@@ -292,3 +292,73 @@ func TestDeleteAndProbeSecretOnPeersLookup(t *testing.T) {
 		t.Fatalf("holding=%v heads=%d", holding, heads.Load())
 	}
 }
+
+func TestClusterAndAgentSecretReplicationWrappers(t *testing.T) {
+	var posts, deletes, heads atomic.Int32
+	srv, internalClient := newNodeBoundForwardServer(t, "self", "peer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			posts.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodDelete:
+			deletes.Add(1)
+			w.WriteHeader(http.StatusNotFound) // idempotent delete is an ACK
+		case http.MethodHead:
+			heads.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("method = %s", r.Method)
+		}
+	}))
+	index := newGossipMemberIndex()
+	index.upsert(Member{NodeID: "peer", Alive: true, InternalURL: srv.URL})
+	gossip := &gossipNode{memberIndex: index}
+	blob := secrets.SecretBlob{Ref: "r", SandboxID: "sb", Version: 1, SealedPayload: []byte("sealed")}
+
+	for name, pusher := range map[string]SecretPeerPusher{
+		"cluster": &Cluster{nodeID: "self", patToken: "pat", internalClient: internalClient, gossip: gossip},
+		"agent":   &Agent{nodeID: "self", patToken: "pat", internalClient: internalClient, gossip: gossip},
+	} {
+		t.Run(name, func(t *testing.T) {
+			acked, err := pusher.PushSecretBlobToPeers(context.Background(), blob, []string{"self", "peer"})
+			if err != nil || len(acked) != 1 || acked[0] != "peer" {
+				t.Fatalf("push acked=%v err=%v", acked, err)
+			}
+			acked, pending, err := pusher.DeleteSecretOnPeers(context.Background(), "sb", []string{"self", "peer"}, 0)
+			if err != nil || len(acked) != 1 || len(pending) != 0 {
+				t.Fatalf("delete acked=%v pending=%v err=%v", acked, pending, err)
+			}
+			holding, err := pusher.ProbeSecretOnPeers(context.Background(), "sb", []string{"self", "peer"}, 0)
+			if err != nil || len(holding) != 1 || holding[0] != "peer" {
+				t.Fatalf("probe holding=%v err=%v", holding, err)
+			}
+		})
+	}
+	if posts.Load() != 2 || deletes.Load() != 2 || heads.Load() != 2 {
+		t.Fatalf("posts=%d deletes=%d heads=%d, want 2 each", posts.Load(), deletes.Load(), heads.Load())
+	}
+}
+
+func TestNilClusterAndAgentSecretReplicationWrappers(t *testing.T) {
+	ctx := context.Background()
+	recipients := []string{"peer"}
+	blob := secrets.SecretBlob{Ref: "r", SandboxID: "sb", Version: 1, SealedPayload: []byte("sealed")}
+
+	for name, pusher := range map[string]SecretPeerPusher{
+		"cluster": (*Cluster)(nil),
+		"agent":   (*Agent)(nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if acked, err := pusher.PushSecretBlobToPeers(ctx, blob, recipients); err != nil || len(acked) != 0 {
+				t.Fatalf("nil push acked=%v err=%v", acked, err)
+			}
+			acked, pending, err := pusher.DeleteSecretOnPeers(ctx, "sb", recipients, 1)
+			if err != nil || len(acked) != 0 || len(pending) != 1 || pending[0] != "peer" {
+				t.Fatalf("nil delete acked=%v pending=%v err=%v", acked, pending, err)
+			}
+			if holding, err := pusher.ProbeSecretOnPeers(ctx, "sb", recipients, 1); err != nil || len(holding) != 0 {
+				t.Fatalf("nil probe holding=%v err=%v", holding, err)
+			}
+		})
+	}
+}

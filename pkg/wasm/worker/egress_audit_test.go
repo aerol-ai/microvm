@@ -117,6 +117,47 @@ func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 	}
 }
 
+func TestInstalledObserverSpillsWhenConfiguredIngestFails(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "audit")
+	t.Setenv("SB_EGRESS_ATTRIBUTION_ENABLED", "true")
+	t.Setenv("SB_AUDIT_INGEST_PORT", "1")
+	t.Setenv("SB_AUDIT_SPILL_DIR", dir)
+	t.Setenv("SB_NODE_ID", "node-a")
+
+	m := newNetMediator()
+	installDefaultEgressObserver(m, func(sandboxID string) (egressAuditBinding, bool) {
+		return egressAuditBinding{capability: "cap", incarnationID: "inc-1"}, sandboxID == "sb-fallback"
+	})
+	observer := m.egressObserver()
+	if observer == nil {
+		t.Fatal("expected egress observer")
+	}
+	observer("sb-fallback", "tcp", "example.com:443")
+
+	path := filepath.Join(dir, workerEgressSpillFile)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var ev workerEgressAuditEvent
+			if err := json.Unmarshal(bytesTrimLine(raw), &ev); err != nil {
+				t.Fatalf("unmarshal spill: %v", err)
+			}
+			if ev.SandboxID != "sb-fallback" || ev.IncarnationID != "inc-1" || ev.Destination != "example.com:443" {
+				t.Fatalf("spill event = %+v", ev)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("read spill: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("spill file not written after ingest failure")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func bytesTrimLine(raw []byte) []byte {
 	return []byte(strings.TrimSpace(string(raw)))
 }

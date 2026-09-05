@@ -59,12 +59,3 @@ func PeerDialPath(m Member, internalClient *http.Client, path string) (*http.Cli
 	}
 	return client, strings.TrimRight(base, "/") + path, nil
 }
-
-// PeerDialPathCached is PeerDialCached plus a path suffix.
-func PeerDialPathCached(m Member, internalClient, cached *http.Client, path string) (*http.Client, string, error) {
-	client, base, err := PeerDialCached(m, internalClient, cached)
-	if err != nil {
-		return nil, "", err
-	}
-	return client, strings.TrimRight(base, "/") + path, nil
-}

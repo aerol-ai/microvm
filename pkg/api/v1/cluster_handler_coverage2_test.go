@@ -29,6 +29,17 @@ type internalPlacementErrCluster struct {
 	ownerErr  error
 }
 
+type auditACLStubCluster struct {
+	*cluster.Noop
+	acl cluster.AuditACL
+	ok  bool
+	err error
+}
+
+func (c *auditACLStubCluster) AuditACLForSandbox(context.Context, string) (cluster.AuditACL, bool, error) {
+	return c.acl, c.ok, c.err
+}
+
 func (c *internalPlacementErrCluster) PlacementOf(string) (cluster.Placement, bool) {
 	return c.placement, c.hasPlace
 }
@@ -166,6 +177,85 @@ func TestClusterInternalPlacementsQueryAndPage(t *testing.T) {
 	h.clusterInternalPlacementsPage(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("page status = %d, want 200", rr.Code)
+	}
+}
+
+func TestClusterInternalPlacementsByIDsValidationAndRedaction(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHandlerNilCluster(t)
+	rr := httptest.NewRecorder()
+	h.clusterInternalPlacementsByIDs(rr, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ids":["sb"]}`)))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil cluster status = %d", rr.Code)
+	}
+
+	stub := &placementPageStubCluster{
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		placements: []cluster.Placement{
+			{
+				SandboxID: "sb", SecretRef: "secret-ref", SecretVersion: 1,
+				SecretRecipients: []string{"node-a"}, SecretSealGeneration: 2,
+			},
+		},
+	}
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(stub)
+	h = &handlers{deps: Deps{Service: svc, Logger: logger}}
+	rr = httptest.NewRecorder()
+	h.clusterInternalPlacementsByIDs(rr, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid JSON status = %d", rr.Code)
+	}
+	rr = httptest.NewRecorder()
+	h.clusterInternalPlacementsByIDs(rr, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ids":["sb"]}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("success status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var out map[string]cluster.Placement
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out["sb"]
+	if got.SecretRef != "" || got.SecretVersion != 0 {
+		t.Fatalf("internal placement leaked secret handle: %+v", got)
+	}
+}
+
+func TestClusterInternalAuditACLResponses(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHandlerNilCluster(t)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetPathValue("id", "sb")
+	rr := httptest.NewRecorder()
+	h.clusterInternalAuditACL(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil cluster status = %d", rr.Code)
+	}
+
+	stub := &auditACLStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", ""), err: errors.New("raft read failed")}
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(stub)
+	h = &handlers{deps: Deps{Service: svc, Logger: logger}}
+	rr = httptest.NewRecorder()
+	h.clusterInternalAuditACL(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("error status = %d", rr.Code)
+	}
+
+	stub.err = nil
+	stub.ok = true
+	stub.acl = cluster.AuditACL{OwnerRef: "tenant-a", IncarnationID: "inc-a"}
+	rr = httptest.NewRecorder()
+	h.clusterInternalAuditACL(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("success status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp cluster.AuditACLResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Exists || resp.ACL.SandboxID != "sb" || resp.ACL.OwnerRef != "tenant-a" || resp.ACL.IncarnationID != "inc-a" {
+		t.Fatalf("ACL response = %+v", resp)
 	}
 }
 

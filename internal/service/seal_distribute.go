@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -944,16 +945,127 @@ func (s *Service) anySecretTargetDead(targets []string, alive map[string]struct{
 	return frozenPeers > 0 && deadPeers > 0
 }
 
-// secretIncarnationForSeal returns Placement.IncarnationID when present.
+// secretIncarnationForSeal returns the current cluster placement or local
+// audit lifecycle incarnation. Standalone lifecycles use the retained ACL row
+// so a destroyed-and-recreated deterministic sandbox ID cannot inherit an old
+// worker capability or mix two tenants' evidence.
 func (s *Service) secretIncarnationForSeal(sandboxID string) string {
-	c := s.Cluster()
-	if c == nil {
+	if s == nil {
 		return ""
 	}
-	if p, ok := c.PlacementOf(sandboxID); ok {
-		return strings.TrimSpace(p.IncarnationID)
+	c := s.Cluster()
+	if c != nil {
+		if p, ok := c.PlacementOf(sandboxID); ok {
+			if incarnationID := strings.TrimSpace(p.IncarnationID); incarnationID != "" {
+				return incarnationID
+			}
+		}
+	}
+	s.auditIncarnationMu.RLock()
+	pending := strings.TrimSpace(s.pendingAuditIncarnation[sandboxID])
+	s.auditIncarnationMu.RUnlock()
+	if pending != "" {
+		return pending
+	}
+	if s.store != nil {
+		if sandbox, err := s.store.Get(context.Background(), sandboxID); err == nil {
+			if incarnationID := auditlog.LocalIncarnationID(sandbox.ID, sandbox.ToolboxToken); incarnationID != "" {
+				return incarnationID
+			}
+		}
+		incarnationID, err := s.store.CurrentSandboxAuditIncarnation(context.Background(), sandboxID)
+		if err == nil {
+			return strings.TrimSpace(incarnationID)
+		}
 	}
 	return ""
+}
+
+// prepareAuditIncarnation makes a lifecycle nonce available before the WASM
+// runtime asks its capability issuer. The sandbox row and ACL are persisted
+// only after runtime creation succeeds; this short-lived map bridges that
+// ordering without introducing another database table.
+func (s *Service) prepareAuditIncarnation(sandboxID, toolboxToken string) (string, error) {
+	if s == nil || strings.TrimSpace(sandboxID) == "" {
+		return "", errors.New("prepare audit incarnation: sandbox id required")
+	}
+	if c := s.Cluster(); c != nil {
+		if p, ok := c.PlacementOf(sandboxID); ok {
+			if incarnationID := strings.TrimSpace(p.IncarnationID); incarnationID != "" {
+				return incarnationID, nil
+			}
+		}
+	}
+	s.auditIncarnationMu.RLock()
+	pending := strings.TrimSpace(s.pendingAuditIncarnation[sandboxID])
+	s.auditIncarnationMu.RUnlock()
+	if pending != "" {
+		if derived := auditlog.LocalIncarnationID(sandboxID, toolboxToken); derived != "" && derived != pending {
+			return "", errors.New("prepare audit incarnation: sandbox create already in progress")
+		}
+		return pending, nil
+	}
+	if derived := auditlog.LocalIncarnationID(sandboxID, toolboxToken); derived != "" {
+		s.auditIncarnationMu.Lock()
+		if s.pendingAuditIncarnation == nil {
+			s.pendingAuditIncarnation = make(map[string]string)
+		}
+		conflict := false
+		if existing := strings.TrimSpace(s.pendingAuditIncarnation[sandboxID]); existing != "" {
+			if existing != derived {
+				conflict = true
+			} else {
+				derived = existing
+			}
+		} else {
+			s.pendingAuditIncarnation[sandboxID] = derived
+		}
+		s.auditIncarnationMu.Unlock()
+		if conflict {
+			return "", errors.New("prepare audit incarnation: sandbox create already in progress")
+		}
+		return derived, nil
+	}
+	// Reuse the current lifecycle only while its sandbox row is still live.
+	// A retained ACL without a row belongs to a deleted lifecycle and must not
+	// seed a replacement that happens to reuse the same deterministic ID.
+	if s.store != nil {
+		if _, getErr := s.store.Get(context.Background(), sandboxID); getErr == nil {
+			if existing, incErr := s.store.CurrentSandboxAuditIncarnation(context.Background(), sandboxID); incErr != nil {
+				return "", incErr
+			} else if existing = strings.TrimSpace(existing); existing != "" {
+				return existing, nil
+			}
+		} else if !errors.Is(getErr, store.ErrNotFound) {
+			return "", getErr
+		}
+	}
+	incarnationID, err := cluster.MintIncarnationID()
+	if err != nil {
+		return "", fmt.Errorf("mint sandbox audit incarnation: %w", err)
+	}
+	s.auditIncarnationMu.Lock()
+	if s.pendingAuditIncarnation == nil {
+		s.pendingAuditIncarnation = make(map[string]string)
+	}
+	if existing := strings.TrimSpace(s.pendingAuditIncarnation[sandboxID]); existing != "" {
+		incarnationID = existing
+	} else {
+		s.pendingAuditIncarnation[sandboxID] = incarnationID
+	}
+	s.auditIncarnationMu.Unlock()
+	return incarnationID, nil
+}
+
+func (s *Service) clearPendingAuditIncarnation(sandboxID, incarnationID string) {
+	if s == nil {
+		return
+	}
+	s.auditIncarnationMu.Lock()
+	if s.pendingAuditIncarnation[sandboxID] == incarnationID {
+		delete(s.pendingAuditIncarnation, sandboxID)
+	}
+	s.auditIncarnationMu.Unlock()
 }
 
 // WantsSecretRecipientFanout reports whether reserve/seal should use a

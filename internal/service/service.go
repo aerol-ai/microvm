@@ -155,26 +155,28 @@ type Service struct {
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
 	// StartSandbox / create hot path.
-	secretAudit            SecretAuditSink
-	secretAuditFile        *fileAuditSink // non-nil when the sink is the file writer
-	secretAuditInitErr     error          // retained so daemon boot can fail closed
-	secretAuditOnce        sync.Once
-	secretAuditPruneStop   chan struct{}
-	secretAuditPruneDone   sync.WaitGroup
-	auditWitnessMu         sync.Mutex
-	auditWitness           controlplane.Witness
-	auditWitnessShipMu     sync.Mutex // serializes ship + receipt rewrite
-	secretAuditWitnessOnce sync.Once
-	secretAuditWitnessStop chan struct{}
-	secretAuditWitnessDone sync.WaitGroup
-	auditIngestMu          sync.Mutex
-	auditIngest            *auditIngestServer
-	auditExportMu          sync.Mutex
-	auditExportRunMu       sync.Mutex // serializes cursor/read/export/prune reset
-	auditExporter          controlplane.AuditExporter
-	secretAuditExportOnce  sync.Once
-	secretAuditExportStop  chan struct{}
-	secretAuditExportDone  sync.WaitGroup
+	secretAudit             SecretAuditSink
+	secretAuditFile         *fileAuditSink // non-nil when the sink is the file writer
+	secretAuditInitErr      error          // retained so daemon boot can fail closed
+	secretAuditOnce         sync.Once
+	secretAuditPruneStop    chan struct{}
+	secretAuditPruneDone    sync.WaitGroup
+	auditWitnessMu          sync.Mutex
+	auditWitness            controlplane.Witness
+	auditWitnessShipMu      sync.Mutex // serializes ship + receipt rewrite
+	secretAuditWitnessOnce  sync.Once
+	secretAuditWitnessStop  chan struct{}
+	secretAuditWitnessDone  sync.WaitGroup
+	auditIngestMu           sync.Mutex
+	auditIngest             *auditIngestServer
+	auditIncarnationMu      sync.RWMutex
+	pendingAuditIncarnation map[string]string
+	auditExportMu           sync.Mutex
+	auditExportRunMu        sync.Mutex // serializes cursor/read/export/prune reset
+	auditExporter           controlplane.AuditExporter
+	secretAuditExportOnce   sync.Once
+	secretAuditExportStop   chan struct{}
+	secretAuditExportDone   sync.WaitGroup
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
 	// testSandboxMetaFetcher overrides owner-ref probes for ingress audit auth.
@@ -1642,7 +1644,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			platformAttachments[i].SandboxID = sandbox.ID
 		}
 		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
@@ -1669,7 +1671,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
@@ -1681,7 +1683,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		// Same rollback chain as a mount-persist failure. ErrCustomDomainConflict
 		// flows through unchanged so the API layer can map it to 409.
-		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		rollbackDestroy(sandbox)
 		cleanupMounts()
@@ -1912,7 +1914,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	}
 
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
-		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
@@ -2003,6 +2005,14 @@ func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) error {
 func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
+	}
+	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
+		incarnationID, err := s.prepareAuditIncarnation(sandbox.ID, sandbox.ToolboxToken)
+		if err != nil {
+			return err
+		}
+		defer s.clearPendingAuditIncarnation(sandbox.ID, incarnationID)
+		sandbox.AuditIncarnationID = incarnationID
 	}
 	sealed, err := s.sealEnv(sandbox.Env)
 	if err != nil {

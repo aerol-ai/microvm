@@ -303,11 +303,22 @@ func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, inc
 	if s.store == nil {
 		return errAuditIngestBindingStale
 	}
-	if _, err := s.store.Get(ctx, sandboxID); err != nil {
+	sandbox, err := s.store.Get(ctx, sandboxID)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return errAuditIngestBindingStale
 		}
 		return err
+	}
+	current := auditlog.LocalIncarnationID(sandbox.ID, sandbox.ToolboxToken)
+	if current == "" {
+		current, err = s.store.CurrentSandboxAuditIncarnation(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(current) == "" || strings.TrimSpace(current) != strings.TrimSpace(incarnationID) {
+		return errAuditIngestBindingStale
 	}
 	return nil
 }

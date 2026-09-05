@@ -18,6 +18,20 @@ const (
 	DefaultCapabilityTTL = 24 * time.Hour
 )
 
+// LocalIncarnationID derives a stable, non-secret lifecycle identifier from
+// the per-create toolbox token. The token is regenerated whenever a sandbox
+// ID is reused, so stale worker capabilities cannot cross into a replacement
+// lifecycle. Only the digest is retained in audit ACL/event records.
+func LocalIncarnationID(sandboxID, toolboxToken string) string {
+	sandboxID = strings.TrimSpace(sandboxID)
+	toolboxToken = strings.TrimSpace(toolboxToken)
+	if sandboxID == "" || toolboxToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("aerolvm-audit-incarnation\x00" + sandboxID + "\x00" + toolboxToken))
+	return hex.EncodeToString(sum[:])
+}
+
 // MintEgressCapability returns HMAC(sandboxID|incarnationID|expiry, key)
 // hex-encoded as sandboxID|incarnationID|expiryUnix|mac. key is typically
 // SB_AUDIT_INGEST_TOKEN (or a derived key). The mac binds the sandbox so a

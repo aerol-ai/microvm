@@ -169,3 +169,166 @@ func TestAuthorizeSandboxAuditAccessAfterDeleteViaRaftACL(t *testing.T) {
 		t.Fatalf("raft failure = %v, want fail-closed error", err)
 	}
 }
+
+func TestAuditAuthorizationNilAndLocalMetadataPaths(t *testing.T) {
+	ctx := context.Background()
+	if err := (*Service)(nil).retainSandboxAuditACL(ctx, &models.Sandbox{ID: "sb"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Service{}).retainSandboxAuditACL(ctx, &models.Sandbox{ID: "sb"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Service{store: &storepkg.Store{}}).retainSandboxAuditACL(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := (*Service)(nil).AuthorizeSandboxAuditAccess(ctx, "sb", ""); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("nil authorize = %v", err)
+	}
+	if err := (&Service{}).AuthorizeSandboxAuditAccess(ctx, " ", ""); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("blank authorize = %v", err)
+	}
+	if owner, ok, err := (*Service)(nil).SandboxOwnerRefLocal(ctx, "sb"); owner != "" || ok || err != nil {
+		t.Fatalf("nil local metadata = %q %v %v", owner, ok, err)
+	}
+	if owner, ok, err := (&Service{}).SandboxOwnerRefLocal(ctx, "sb"); owner != "" || ok || err != nil {
+		t.Fatalf("storeless local metadata = %q %v %v", owner, ok, err)
+	}
+	if got := (*Service)(nil).sandboxMetaFetcher(); got != nil {
+		t.Fatalf("nil meta fetcher = %#v", got)
+	}
+
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{store: st}
+	if owner, ok, err := svc.SandboxOwnerRefLocal(ctx, "missing"); owner != "" || ok || err != nil {
+		t.Fatalf("missing local metadata = %q %v %v", owner, ok, err)
+	}
+	now := time.Now().UTC()
+	sb := &models.Sandbox{
+		ID: "sb-meta", Image: "alpine", Status: models.SandboxStatusStarted,
+		CPU: 1, MemoryMB: 128, Runtime: models.RuntimeDocker,
+		OwnerRef: "tenant-meta", CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if owner, ok, err := svc.SandboxOwnerRefLocal(ctx, sb.ID); owner != "tenant-meta" || !ok || err != nil {
+		t.Fatalf("local metadata = %q %v %v", owner, ok, err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.SandboxOwnerRefLocal(ctx, sb.ID); err == nil {
+		t.Fatal("closed store metadata read must fail")
+	}
+	if err := svc.retainSandboxAuditACL(ctx, sb); err == nil {
+		t.Fatal("closed store ACL retention must fail")
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(ctx, sb.ID, ""); err == nil {
+		t.Fatal("closed store authorization must fail")
+	}
+}
+
+func TestSandboxOwnerRefFetchFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	p := cluster.Placement{SandboxID: "sb", OwnerNodeID: "node-a"}
+	svc := &Service{}
+	if _, err := svc.fetchSandboxOwnerRef(ctx, p); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("missing fetcher = %v", err)
+	}
+
+	fetcher := &fakeSandboxMetaFetcher{}
+	svc.testSandboxMetaFetcher = fetcher
+	if got := svc.sandboxMetaFetcher(); got != fetcher {
+		t.Fatalf("test fetcher = %#v", got)
+	}
+	if _, err := svc.fetchSandboxOwnerRef(ctx, cluster.Placement{SandboxID: "sb"}); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("missing owner node = %v", err)
+	}
+	if _, err := svc.fetchSandboxOwnerRef(ctx, p); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("absent peer sandbox = %v", err)
+	}
+	fetcher.err = errors.New("peer unavailable")
+	if _, err := svc.fetchSandboxOwnerRef(ctx, p); !errors.Is(err, fetcher.err) {
+		t.Fatalf("peer error = %v", err)
+	}
+	fetcher.err = nil
+	fetcher.ok = true
+	fetcher.ownerRef = " tenant-a "
+	if owner, err := svc.fetchSandboxOwnerRef(ctx, p); err != nil || owner != "tenant-a" {
+		t.Fatalf("peer owner = %q err=%v", owner, err)
+	}
+
+	svc.testSandboxMetaFetcher = nil
+	svc.cluster = cluster.NewNoop("node-a", "http://node-a", "")
+	if svc.sandboxMetaFetcher() == nil {
+		t.Fatal("cluster sandbox metadata capability was not discovered")
+	}
+}
+
+func TestAuthorizeSandboxAuditAccessACLAndIncarnationBranches(t *testing.T) {
+	ctx := context.Background()
+	operator := controlplane.ContextWithAccess(ctx, controlplane.Access{Operator: true})
+	tenant := controlplane.ContextWithAccess(ctx, controlplane.Access{Identity: controlplane.Identity{OwnerRef: "tenant-a"}})
+	foreign := controlplane.ContextWithAccess(ctx, controlplane.Access{Identity: controlplane.Identity{OwnerRef: "tenant-b"}})
+
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.UpsertSandboxAuditACL(ctx, "sb-retained", "tenant-a", "inc-a"); err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{store: st}
+	if err := svc.AuthorizeSandboxAuditAccess(operator, "sb-retained", "inc-a"); err != nil {
+		t.Fatalf("operator retained ACL: %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(operator, "sb-retained", "inc-b"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("operator wrong incarnation = %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(tenant, "sb-retained", "inc-a"); err != nil {
+		t.Fatalf("tenant retained ACL: %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(tenant, "sb-retained", ""); err != nil {
+		t.Fatalf("tenant retained ACL with implicit latest incarnation: %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(foreign, "sb-retained", "inc-a"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("foreign retained ACL = %v", err)
+	}
+
+	remote := &placementOnlyCluster{
+		Noop: cluster.NewNoop("ingress", "http://ingress", ""),
+		placement: cluster.Placement{
+			SandboxID: "sb-live", OwnerNodeID: "owner", OwnerRef: "tenant-a", IncarnationID: "inc-live",
+		},
+	}
+	svc = &Service{cluster: remote}
+	if err := svc.AuthorizeSandboxAuditAccess(operator, "sb-live", "inc-other"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("operator live wrong incarnation = %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(tenant, "sb-live", "inc-live"); err != nil {
+		t.Fatalf("tenant live placement: %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(foreign, "sb-live", "inc-live"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("foreign live placement = %v", err)
+	}
+
+	remote.placement = cluster.Placement{}
+	remote.auditOwner, remote.auditInc, remote.auditExists = "tenant-a", "inc-raft", true
+	if err := svc.AuthorizeSandboxAuditAccess(operator, "sb-raft", "inc-raft"); err != nil {
+		t.Fatalf("operator raft ACL: %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(tenant, "sb-raft", "inc-raft"); err != nil {
+		t.Fatalf("tenant raft ACL: %v", err)
+	}
+	if err := svc.AuthorizeSandboxAuditAccess(foreign, "sb-raft", "inc-raft"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("foreign raft ACL = %v", err)
+	}
+	remote.auditOwnerErr = errors.New("raft unavailable")
+	if err := svc.AuthorizeSandboxAuditAccess(operator, "sb-raft", "inc-raft"); !errors.Is(err, remote.auditOwnerErr) {
+		t.Fatalf("operator raft error = %v", err)
+	}
+}

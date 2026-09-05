@@ -88,10 +88,6 @@ type DurableSecretAuditSink interface {
 	EmitDurable(SecretAuditEvent) error
 }
 
-type noopSecretAuditSink struct{}
-
-func (noopSecretAuditSink) Emit(SecretAuditEvent) {}
-
 // unavailableSecretAuditSink keeps a failed writer loud after non-strict boot:
 // every event that could not be persisted is counted, and the health gauge
 // remains zero. This avoids the previous permanent, silent noop fallback.

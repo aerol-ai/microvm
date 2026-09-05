@@ -259,6 +259,19 @@ the wrapped error string, which can carry caller input.
 Event payload: timestamp, actor (node ID), ref, sandbox ID, result, reason.
 Never plaintext, never PII.
 
+**Implementation hardening verified 2026-09-05.** Cluster capabilities bind to
+the Raft placement incarnation. Standalone WASM capabilities bind to a stable
+digest of the per-create toolbox token, which rotates when a deterministic
+sandbox ID is reused. The existing compound `sandbox_audit_acl` row stores that
+incarnation; create rollback removes only the aborted incarnation, while normal
+delete retains evidence until the audit-retention prune. There is no legacy
+any-incarnation authorization fallback and no second lifecycle/GC table.
+
+Worker delivery remains asynchronous, but an available loopback ingest socket
+does not disable the spill path. Every worker carries both destinations so a
+temporary IPC failure produces a durable spill record instead of an invisible
+gap.
+
 Also cover the two non-cluster decrypt sites currently outside the seam:
 `service.go:1883` (`UnsealRegistry`) and `service.go:1941` (`loadMounts`).
 
@@ -378,6 +391,10 @@ gives the regression signal.
 
 - **Env reads.** D8 keeps them off the shared row scanner. D9 keeps them off
   `List`.
+- **Facade list hydration.** Ingress selects at most one placement page and
+  sends that exact sandbox-ID set to each owner. Daytona and E2B peers apply the
+  set before loading/serializing facade metadata, so a 100-row page cannot turn
+  into an unbounded owner inventory response at the 100,000-sandbox target.
 - **KMS call volume.** Decided: no cache. Unwraps happen only on failover
   recreate, ~20 req/s worst case — about 0.1% of quota. See the KMS cache
   section.

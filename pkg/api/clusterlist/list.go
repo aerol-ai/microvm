@@ -505,6 +505,38 @@ func StripFacadePagination(rawQuery string) string {
 	return vals.Encode()
 }
 
+// PeerWantIDs parses the exact sandbox-ID filter attached by an ingress list
+// merge. Facade peer handlers must apply this before serializing their local
+// inventory; filtering only after the response reaches ingress can turn a
+// small placement page into an unbounded peer response and trip the body cap.
+//
+// The filter is accepted only on a forwarded cluster hop. A missing ids key
+// means the cold-start small-fleet fallback intentionally requested the full
+// tenant-scoped local list; an explicitly empty ids key denies every row.
+func PeerWantIDs(r *http.Request) (map[string]struct{}, error) {
+	if r == nil || r.Header.Get("X-Cluster-Forwarded") != "1" {
+		return nil, nil
+	}
+	values, present := r.URL.Query()["ids"]
+	if !present {
+		return nil, nil
+	}
+	want := make(map[string]struct{})
+	for _, value := range values {
+		for _, rawID := range strings.Split(value, ",") {
+			id := strings.TrimSpace(rawID)
+			if id == "" {
+				continue
+			}
+			want[id] = struct{}{}
+			if len(want) > MaxPageLimit {
+				return nil, errors.New("cluster list ids exceeds page limit")
+			}
+		}
+	}
+	return want, nil
+}
+
 // WriteCoverageHeaders exposes completeness without changing the JSON body shape.
 func WriteCoverageHeaders(w http.ResponseWriter, cov Coverage, nextPageToken string) {
 	if w == nil {

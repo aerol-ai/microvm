@@ -75,6 +75,11 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}
 	}
+	auditIncarnationID, err := s.prepareAuditIncarnation(sandboxID, toolboxToken)
+	if err != nil {
+		return nil, err
+	}
+	defer s.clearPendingAuditIncarnation(sandboxID, auditIncarnationID)
 
 	if s.cfg.WasmMaxInstances > 0 {
 		managed, listErr := s.wasm.ListManaged(ctx)
@@ -171,6 +176,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
+		AuditIncarnationID:   auditIncarnationID,
 		SSHPublicKey:         authorizedKey,
 		Name:                 strings.TrimSpace(req.Name),
 		Tags:                 req.Tags,
@@ -229,7 +235,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	}
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			_ = s.wasm.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
@@ -238,7 +244,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		}
 	}
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
-		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.wasm.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
@@ -251,7 +257,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if len(req.CustomDomains) > 0 {
 		storedCD, getErr := s.store.Get(ctx, sandbox.ID)
 		if getErr != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			_ = s.wasm.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
@@ -259,7 +265,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			return nil, getErr
 		}
 		if err := s.syncWasmCustomDomainRoutes(ctx, storedCD); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, storedCD)
 			_ = s.wasm.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()

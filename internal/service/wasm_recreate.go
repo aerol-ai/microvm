@@ -71,7 +71,7 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spe
 	seed.CreatedAt = now
 	seed.UpdatedAt = now
 	seed.OwnerRef = s.tenantOwnerRefForRecreate(ctx, id)
-	if err := s.store.Upsert(ctx, seed); err != nil {
+	if err := s.persistSandboxCreate(ctx, seed); err != nil {
 		return true, fmt.Errorf("recreate %s: persist row: %w", id, err)
 	}
 	if _, err := s.rehydrateWasmIfNeeded(ctx, seed, nil); err != nil {

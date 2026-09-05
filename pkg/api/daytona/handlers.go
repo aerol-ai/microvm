@@ -817,6 +817,11 @@ func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbo
 		if sandbox == nil {
 			continue
 		}
+		if filters.IDs != nil {
+			if _, ok := filters.IDs[sandbox.ID]; !ok {
+				continue
+			}
+		}
 		meta := sandboxMetaFromNative(sandbox, metadata[sandbox.ID])
 		item := h.toSandboxResponse(r, sandbox, meta)
 		if filters.ID != "" && !strings.Contains(item.ID, filters.ID) {
@@ -936,8 +941,13 @@ func labelsMatch(labels map[string]string, wanted map[string]string) bool {
 }
 
 func parseListFilters(r *http.Request) (listFilters, error) {
+	peerIDs, err := clusterlist.PeerWantIDs(r)
+	if err != nil {
+		return listFilters{}, err
+	}
 	filters := listFilters{
 		ID:   strings.TrimSpace(r.URL.Query().Get("id")),
+		IDs:  peerIDs,
 		Name: strings.TrimSpace(r.URL.Query().Get("name")),
 	}
 	if raw := strings.TrimSpace(r.URL.Query().Get("labels")); raw != "" {

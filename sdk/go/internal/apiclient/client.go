@@ -313,15 +313,6 @@ func appendQueryParam(path, key, value string) string {
 	return path + sep + url.QueryEscape(key) + "=" + url.QueryEscape(value)
 }
 
-// buildTagQuery renders the tag filter as the server's `?tag.<key>=<value>`
-// wire format. The `tag.` prefix is literal — parseTagFilter on the server
-// inspects the *decoded* query key — so only the user-supplied key and value
-// get percent-encoded. An empty or nil map returns "" so the URL is identical
-// to the pre-filter call (no stray trailing "?").
-func buildTagQuery(tags map[string]string) string {
-	return buildSandboxQuery(tags, false)
-}
-
 func buildSandboxQuery(tags map[string]string, includeEnv bool) string {
 	values := make(url.Values)
 	for k, v := range tags {

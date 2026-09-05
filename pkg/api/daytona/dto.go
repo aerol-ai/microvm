@@ -151,6 +151,7 @@ type dirResponse struct {
 
 type listFilters struct {
 	ID     string
+	IDs    map[string]struct{}
 	Name   string
 	Labels map[string]string
 	States map[string]struct{}

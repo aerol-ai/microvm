@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -256,5 +259,168 @@ func TestWriteCoverageHeadersMarksPartial(t *testing.T) {
 	}
 	if rec.Header().Get(HeaderNextPageToken) != "tok" {
 		t.Fatalf("next token = %q", rec.Header().Get(HeaderNextPageToken))
+	}
+}
+
+type transportListCluster struct{ *stubListCluster }
+
+func (c *transportListCluster) ClientForPeer(string) *http.Client { return http.DefaultClient }
+
+func TestTransportOwnerContextAndSelectPeersHelpers(t *testing.T) {
+	if got := TransportFromCluster(nil); got.InternalClient != nil || got.PeerClient != nil {
+		t.Fatalf("nil transport = %+v", got)
+	}
+	base := &stubListCluster{
+		Noop:          cluster.NewNoop("self", "http://self", ""),
+		authoritative: true,
+		placements:    []cluster.Placement{{SandboxID: "sb", OwnerNodeID: "peer", OwnerRef: "tenant"}},
+		byID: map[string]cluster.Member{
+			"peer": {NodeID: "peer", Alive: true, Role: config.NodeRoleWorker, InternalURL: "https://peer.internal"},
+		},
+	}
+	tr := TransportFromCluster(&transportListCluster{stubListCluster: base})
+	if tr.InternalClient == nil || tr.PeerClient == nil || tr.PeerClient("peer") == nil {
+		t.Fatalf("transport = %+v", tr)
+	}
+	peers := SelectPeers(base, "tenant")
+	if len(peers) != 1 || peers[0].NodeID != "peer" {
+		t.Fatalf("SelectPeers = %+v", peers)
+	}
+	if _, ok := memberLookupFn(nil)("peer"); ok {
+		t.Fatal("nil member lookup unexpectedly found peer")
+	}
+
+	if got := OwnerRefFromContext(context.Background()); got != "" {
+		t.Fatalf("unscoped owner = %q", got)
+	}
+	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})
+	if got := OwnerRefFromContext(operator); got != "" {
+		t.Fatalf("operator owner = %q", got)
+	}
+	tenant := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Identity: controlplane.Identity{OwnerRef: " tenant "}})
+	if got := OwnerRefFromContext(tenant); got != "tenant" {
+		t.Fatalf("tenant owner = %q", got)
+	}
+}
+
+func TestMergeJSONSuccessDedupFilterAndErrors(t *testing.T) {
+	type item struct {
+		ID string `json:"id"`
+	}
+	var sawHeaders bool
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Cluster-Forwarded") == "1" && r.Header.Get("Authorization") == "Bearer tenant" && r.Header.Get(cluster.PeerNodeIDHeader) == "self" {
+			sawHeaders = true
+		}
+		switch r.URL.Path {
+		case "/good":
+			if got := r.URL.Query().Get("ids"); got != "local,peer" {
+				t.Fatalf("ids query = %q", got)
+			}
+			_ = json.NewEncoder(w).Encode([]item{{ID: "local"}, {ID: "peer"}, {ID: "off-page"}})
+		case "/bad-json":
+			_, _ = w.Write([]byte("{"))
+		case "/failure":
+			http.Error(w, "peer failed", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(peer.Close)
+	member := cluster.Member{NodeID: "peer-1", Alive: true, InternalURL: peer.URL, Role: config.NodeRoleWorker}
+	transport := Transport{InternalClient: peer.Client(), PeerClient: func(string) *http.Client { return peer.Client() }}
+	opts := Options{
+		Path:       "/good",
+		AuthHeader: "Bearer tenant",
+		SelfNodeID: "self",
+		WantIDs:    map[string]struct{}{"local": {}, "peer": {}},
+		Transport:  transport,
+	}
+	items, cov := MergeJSON(context.Background(), []cluster.Member{member}, []item{{ID: "local"}}, func(v item) string { return v.ID }, opts)
+	if !sawHeaders || cov.Partial || len(cov.Answered) != 2 || len(items) != 2 || items[0].ID != "local" || items[1].ID != "peer" {
+		t.Fatalf("items=%+v coverage=%+v sawHeaders=%v", items, cov, sawHeaders)
+	}
+
+	for _, path := range []string{"/bad-json", "/failure"} {
+		warned := false
+		opts.Path = path
+		opts.Warn = func(string, string, error) { warned = true }
+		_, cov = MergeJSON(context.Background(), []cluster.Member{member}, nil, func(v item) string { return v.ID }, opts)
+		if !cov.Partial || len(cov.Missing) != 1 || !warned {
+			t.Fatalf("path=%s coverage=%+v warned=%v", path, cov, warned)
+		}
+	}
+	items, cov = MergeJSON(context.Background(), nil, []item{{ID: ""}}, nil, Options{})
+	if len(items) != 1 || cov.Partial {
+		t.Fatalf("local-only items=%+v coverage=%+v", items, cov)
+	}
+}
+
+func TestPaginationAndCoverageHeaderHelpers(t *testing.T) {
+	if got := StripFacadePagination(""); got != "" {
+		t.Fatalf("empty stripped query = %q", got)
+	}
+	raw := "page=2&limit=20&nextToken=n&offset=5&ids=a%2Cb&keep=value"
+	if got := StripFacadePagination(raw); got != "keep=value" {
+		t.Fatalf("stripped query = %q", got)
+	}
+	malformed := "%zz"
+	if got := StripFacadePagination(malformed); got != malformed {
+		t.Fatalf("malformed query = %q", got)
+	}
+
+	if limit, token := ParsePageParams(nil); limit != DefaultPageLimit || token != "" {
+		t.Fatalf("nil params = %d %q", limit, token)
+	}
+	u, _ := url.Parse("https://example.test?limit=9999&pageToken=tok")
+	if limit, token := ParsePageParams(u); limit != MaxPageLimit || token != "tok" {
+		t.Fatalf("capped params = %d %q", limit, token)
+	}
+	u, _ = url.Parse("https://example.test?limit=bad&page_token=%20primary%20&pageToken=fallback")
+	if limit, token := ParsePageParams(u); limit != DefaultPageLimit || strings.TrimSpace(token) != "primary" {
+		t.Fatalf("default params = %d %q", limit, token)
+	}
+	WriteCoverageHeaders(nil, Coverage{}, "")
+}
+
+func TestPeerWantIDsRequiresForwardedHopAndBoundsInput(t *testing.T) {
+	public := httptest.NewRequest(http.MethodGet, "/sandboxes?ids=sb-a,sb-b", nil)
+	if got, err := PeerWantIDs(public); err != nil || got != nil {
+		t.Fatalf("public PeerWantIDs = %#v, %v; want nil, nil", got, err)
+	}
+
+	forwarded := httptest.NewRequest(http.MethodGet, "/sandboxes?ids=sb-a,sb-b&ids=sb-b,sb-c", nil)
+	forwarded.Header.Set("X-Cluster-Forwarded", "1")
+	got, err := PeerWantIDs(forwarded)
+	if err != nil {
+		t.Fatalf("PeerWantIDs() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("PeerWantIDs() = %#v, want three deduplicated IDs", got)
+	}
+	for _, id := range []string{"sb-a", "sb-b", "sb-c"} {
+		if _, ok := got[id]; !ok {
+			t.Fatalf("PeerWantIDs() missing %q: %#v", id, got)
+		}
+	}
+
+	empty := httptest.NewRequest(http.MethodGet, "/sandboxes?ids=", nil)
+	empty.Header.Set("X-Cluster-Forwarded", "1")
+	got, err = PeerWantIDs(empty)
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("empty PeerWantIDs = %#v, %v; want non-nil empty set", got, err)
+	}
+
+	tooMany := httptest.NewRequest(http.MethodGet, "/sandboxes", nil)
+	tooMany.Header.Set("X-Cluster-Forwarded", "1")
+	q := tooMany.URL.Query()
+	ids := make([]string, MaxPageLimit+1)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("sb-%d", i)
+	}
+	q.Set("ids", strings.Join(ids, ","))
+	tooMany.URL.RawQuery = q.Encode()
+	if _, err := PeerWantIDs(tooMany); err == nil {
+		t.Fatal("PeerWantIDs() accepted more than MaxPageLimit IDs")
 	}
 }

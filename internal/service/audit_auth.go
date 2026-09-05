@@ -38,11 +38,25 @@ func (s *Service) AuthorizeSandboxAuditAccess(ctx context.Context, sandboxID, in
 				incarnationID = strings.TrimSpace(p.IncarnationID)
 			}
 		}
+		if incarnationID == "" && s.store != nil {
+			var err error
+			incarnationID, err = s.store.CurrentSandboxAuditIncarnation(ctx, sandboxID)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	if s.store != nil {
 		sb, err := s.store.Get(ctx, sandboxID)
 		if err == nil {
-			_ = s.store.UpsertSandboxAuditACL(ctx, sandboxID, strings.TrimSpace(sb.OwnerRef), incarnationID)
+			currentIncarnation := s.secretIncarnationForSeal(sandboxID)
+			if incarnationID != "" && (currentIncarnation == "" || incarnationID != currentIncarnation) {
+				return store.ErrNotFound
+			}
+			if incarnationID == "" {
+				incarnationID = currentIncarnation
+			}
+			_ = s.store.UpsertSandboxAuditACL(ctx, sandboxID, strings.TrimSpace(sb.OwnerRef), currentIncarnation)
 			return enforceOwner(ctx, sb)
 		}
 		if !errors.Is(err, store.ErrNotFound) {

@@ -27,6 +27,25 @@ func TestMintAndVerifyEgressCapability(t *testing.T) {
 	}
 }
 
+func TestLocalIncarnationIDScopesSandboxLifecycle(t *testing.T) {
+	first := LocalIncarnationID("sb-1", "toolbox-token-a")
+	if len(first) != 64 {
+		t.Fatalf("LocalIncarnationID length = %d, want 64", len(first))
+	}
+	if got := LocalIncarnationID(" sb-1 ", " toolbox-token-a "); got != first {
+		t.Fatalf("trimmed LocalIncarnationID = %q, want %q", got, first)
+	}
+	if got := LocalIncarnationID("sb-1", "toolbox-token-b"); got == first {
+		t.Fatal("rotated toolbox token reused audit incarnation")
+	}
+	if got := LocalIncarnationID("sb-2", "toolbox-token-a"); got == first {
+		t.Fatal("different sandbox reused audit incarnation")
+	}
+	if LocalIncarnationID("", "token") != "" || LocalIncarnationID("sb", "") != "" {
+		t.Fatal("empty input produced an audit incarnation")
+	}
+}
+
 func splitCap(c string) []string {
 	var out []string
 	start := 0

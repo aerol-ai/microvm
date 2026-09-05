@@ -174,7 +174,7 @@ func (s *Service) ensureWasmSandboxRowForImport(ctx context.Context, sandboxID s
 	if row.Image == "" {
 		row.Image = row.ModuleRef
 	}
-	return s.store.Upsert(ctx, row)
+	return s.persistSandboxCreate(ctx, row)
 }
 
 func (s *Service) clusterSpecForImport(sandboxID string, snap wasmengine.SnapshotRestoreInput) models.CreateSandboxRequest {

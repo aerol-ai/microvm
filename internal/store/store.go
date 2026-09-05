@@ -989,7 +989,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
 		return err
 	}
-	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, "", time.Now().UTC()); err != nil {
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1026,7 +1026,7 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
 		return err
 	}
-	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, "", time.Now().UTC()); err != nil {
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -2106,11 +2106,14 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 }
 
 // RollbackSandboxCreate removes a sandbox that never completed its create
-// transaction together with the audit existence row inserted by Create. A
-// normal Delete intentionally retains that row; using it for rollback would
-// leave a permanent audit/fan-out oracle for a sandbox clients never received.
-func (s *Store) RollbackSandboxCreate(ctx context.Context, id string) error {
+// transaction together with only its explicit audit-incarnation row inserted
+// by Create. Older incarnation rows may belong to a previously deleted sandbox
+// that reused the same deterministic ID; deleting them would create a retained
+// evidence authorization vacuum. A normal Delete intentionally retains the
+// current row.
+func (s *Store) RollbackSandboxCreate(ctx context.Context, id, incarnationID string) error {
 	id = strings.TrimSpace(id)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if id == "" {
 		return nil
 	}
@@ -2122,7 +2125,7 @@ func (s *Store) RollbackSandboxCreate(ctx context.Context, id string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("delete sandbox during create rollback: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sandbox_audit_acl WHERE sandbox_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sandbox_audit_acl WHERE sandbox_id = ? AND incarnation_id = ?`, id, incarnationID); err != nil {
 		return fmt.Errorf("delete sandbox audit acl during create rollback: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -4688,6 +4691,31 @@ func (s *Store) HasSandboxAuditACL(ctx context.Context, sandboxID, incarnationID
 		return false, fmt.Errorf("check sandbox audit acl: %w", err)
 	}
 	return true, nil
+}
+
+// CurrentSandboxAuditIncarnation returns the most recently established audit
+// lifecycle for sandboxID. Old incarnation rows intentionally coexist for
+// retention; updated_at identifies the live/latest lifecycle without adding a
+// second pointer table.
+func (s *Store) CurrentSandboxAuditIncarnation(ctx context.Context, sandboxID string) (string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return "", nil
+	}
+	var incarnationID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT incarnation_id FROM sandbox_audit_acl
+		WHERE sandbox_id = ?
+		ORDER BY updated_at DESC, incarnation_id DESC
+		LIMIT 1
+	`, sandboxID).Scan(&incarnationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get current sandbox audit incarnation: %w", err)
+	}
+	return strings.TrimSpace(incarnationID), nil
 }
 
 // SecretDeleteOutboxRecord is one durable peer-delete job.

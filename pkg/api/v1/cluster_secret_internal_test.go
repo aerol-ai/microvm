@@ -174,6 +174,99 @@ func TestClusterInternalSecretPutRejectsRefMismatch(t *testing.T) {
 	}
 }
 
+func internalOperatorRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Header.Set("Authorization", "Bearer operator")
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node", "node:peer-test"}})
+	return req
+}
+
+func TestClusterInternalSecretPutValidationAndConflict(t *testing.T) {
+	mux, _, cipher := newSecretInternalTestMux(t, "node-a")
+	for name, body := range map[string]string{
+		"invalid_json": `{`,
+		"empty_ref":    `{"sandbox_id":"sb","sealed_payload":"YQ=="}`,
+		"empty_id":     `{"ref":"cluster-secret://sandbox/sb/v1","sealed_payload":"YQ=="}`,
+		"empty_sealed": `{"ref":"cluster-secret://sandbox/sb/v1","sandbox_id":"sb"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, internalOperatorRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewBufferString(body)))
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	first := mustSealBlob(t, cipher, "sb-conflict", "node-a", []string{"node-a"})
+	second := mustSealBlob(t, cipher, "sb-conflict", "node-a", []string{"node-a"})
+	for i, blob := range []secrets.SecretBlob{first, second} {
+		body, _ := json.Marshal(blob)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, internalOperatorRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body)))
+		want := http.StatusNoContent
+		if i == 1 {
+			want = http.StatusConflict
+		}
+		if rr.Code != want {
+			t.Fatalf("write %d status = %d, want %d body=%s", i, rr.Code, want, rr.Body.String())
+		}
+	}
+}
+
+func TestClusterInternalSecretHeadAndDeleteLifecycle(t *testing.T) {
+	mux, _, cipher := newSecretInternalTestMux(t, "node-a")
+	blob := mustSealBlob(t, cipher, "sb-lifecycle", "node-a", []string{"node-a"})
+	body, _ := json.Marshal(blob)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body)))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("put status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	headPath := cluster.PublicInternalSecretPath + "/sb-lifecycle"
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{
+		{want: http.StatusNoContent},
+		{query: "?min_generation=1", want: http.StatusNoContent},
+		{query: "?min_generation=2", want: http.StatusNotFound},
+		{query: "?min_generation=0", want: http.StatusBadRequest},
+		{query: "?min_generation=bad", want: http.StatusBadRequest},
+	} {
+		rr = httptest.NewRecorder()
+		mux.ServeHTTP(rr, internalOperatorRequest(http.MethodHead, headPath+tc.query, nil))
+		if rr.Code != tc.want {
+			t.Fatalf("HEAD %q status = %d, want %d body=%s", tc.query, rr.Code, tc.want, rr.Body.String())
+		}
+	}
+
+	for _, query := range []string{"?generation=0", "?generation=bad"} {
+		rr = httptest.NewRecorder()
+		mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath+query, nil))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("DELETE %q status = %d body=%s", query, rr.Code, rr.Body.String())
+		}
+	}
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath+"?generation=1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodHead, headPath, nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("post-delete HEAD status = %d", rr.Code)
+	}
+	// Peer DELETE is idempotent and must ACK retries after the row is gone.
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath, nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("idempotent delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestClusterInternalSecretDeleteTenantForbidden(t *testing.T) {
 	mux, _, _ := newSecretInternalTestMux(t, "node-a")
 	req := httptest.NewRequest(http.MethodDelete, cluster.PublicInternalSecretPath+"/sb", nil)

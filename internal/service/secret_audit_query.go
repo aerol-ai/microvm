@@ -126,11 +126,7 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 	}
 	incarnationID := strings.TrimSpace(opts.IncarnationID)
 	if incarnationID == "" {
-		if c := s.Cluster(); c != nil {
-			if p, ok := c.PlacementOf(sandboxID); ok {
-				incarnationID = strings.TrimSpace(p.IncarnationID)
-			}
-		}
+		incarnationID = s.secretIncarnationForSeal(sandboxID)
 	}
 	limit := opts.Limit
 	if limit <= 0 {
@@ -266,11 +262,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 		ctx = context.Background()
 	}
 	if strings.TrimSpace(opts.IncarnationID) == "" {
-		if c := s.Cluster(); c != nil {
-			if p, ok := c.PlacementOf(sandboxID); ok {
-				opts.IncarnationID = strings.TrimSpace(p.IncarnationID)
-			}
-		}
+		opts.IncarnationID = s.secretIncarnationForSeal(sandboxID)
 	}
 	local, nextLocal, err := s.ListSecretAuditLocal(ctx, sandboxID, opts)
 	if err != nil {

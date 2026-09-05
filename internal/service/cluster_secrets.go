@@ -985,31 +985,6 @@ func (s *Service) persistSecretPutOutboxRecipients(ctx context.Context, sandboxI
 	return err
 }
 
-func setSecretHolderTargetsUnlocked(hs *holderNodeSet, gen int64, nodeIDs []string) {
-	if hs == nil {
-		return
-	}
-	if gen > 0 && hs.gen != 0 && hs.gen != gen {
-		hs.nodes = make(map[string]time.Time)
-		hs.lastProbe = time.Time{}
-	}
-	if gen > 0 {
-		hs.gen = gen
-	}
-	targets := make(map[string]struct{}, len(nodeIDs))
-	for _, id := range nodeIDs {
-		if id = strings.TrimSpace(id); id != "" {
-			targets[id] = struct{}{}
-		}
-	}
-	hs.targets = targets
-	for id := range hs.nodes {
-		if _, ok := targets[id]; !ok {
-			delete(hs.nodes, id)
-		}
-	}
-}
-
 // ReconcileSecretPutOutbox retries durable create-path peer PUTs left when the
 // in-memory fan-out queue was saturated or an async push partially failed.
 // Work is dispatched through a bounded worker pool mirroring delete reconcile

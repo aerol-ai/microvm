@@ -278,6 +278,11 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	peerIDs, err := clusterlist.PeerWantIDs(r)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	stored, err := h.deps.Service.ListCompatState(r.Context(), models.FacadeE2B)
 	if err != nil {
@@ -289,6 +294,11 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	for _, sandbox := range sandboxes {
 		if sandbox == nil {
 			continue
+		}
+		if peerIDs != nil {
+			if _, ok := peerIDs[sandbox.ID]; !ok {
+				continue
+			}
 		}
 		var statePtr *models.SandboxCompatState
 		if s, ok := stored[sandbox.ID]; ok {

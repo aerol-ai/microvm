@@ -428,6 +428,39 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 	}
 }
 
+func TestAgentAuditACLReadsAndPruneOwnership(t *testing.T) {
+	fail := false
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != PublicInternalAuditACLPath+"sb-audit" {
+			http.NotFound(w, r)
+			return
+		}
+		if fail {
+			http.Error(w, "raft read failed", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(AuditACLResponse{
+			ACL:    AuditACL{SandboxID: "sb-audit", OwnerRef: " tenant-a ", IncarnationID: "inc-a"},
+			Exists: true,
+		})
+	}))
+	acl, ok, err := agent.AuditACLForSandbox(context.Background(), " sb-audit ")
+	if err != nil || !ok || acl.OwnerRef != "tenant-a" || acl.IncarnationID != "inc-a" {
+		t.Fatalf("AuditACLForSandbox = %+v %v %v", acl, ok, err)
+	}
+	owner, ok, err := agent.AuditOwnerRef(context.Background(), "sb-audit")
+	if err != nil || !ok || owner != "tenant-a" {
+		t.Fatalf("AuditOwnerRef = %q %v %v", owner, ok, err)
+	}
+	if err := agent.PruneAuditACL(context.Background(), time.Now()); err != nil {
+		t.Fatalf("agent prune must remain leader-owned: %v", err)
+	}
+	fail = true
+	if _, _, err := agent.AuditACLForSandbox(context.Background(), "sb-audit"); err == nil {
+		t.Fatal("control-plane ACL failure must propagate")
+	}
+}
+
 func TestAgentMiscWrappers(t *testing.T) {
 	target, internalClient := newNodeBoundForwardServer(t, "agent-1", "peer-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {

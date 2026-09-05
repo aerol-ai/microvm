@@ -711,6 +711,10 @@ type Sandbox struct {
 	NetworkBlockAll bool              `json:"network_block_all"`
 	ToolboxEnabled  bool              `json:"toolbox_enabled"`
 	ToolboxToken    string            `json:"-"`
+	// AuditIncarnationID scopes retained audit evidence to this exact sandbox
+	// lifecycle. It is persisted in sandbox_audit_acl, not on the sandbox row,
+	// and never crosses the public API or Raft recovery payload.
+	AuditIncarnationID string `json:"-"`
 	// ToolboxTokenSealed is the at-rest representation used by the store when
 	// toolbox-token sealing is enabled. It never crosses API or Raft payloads.
 	ToolboxTokenSealed []byte        `json:"-"`

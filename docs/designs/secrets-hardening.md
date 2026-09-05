@@ -218,6 +218,20 @@ with a counter metric. Not SQLite — it is single-writer (`MaxOpenConns=1`) and
 already serves every create, start, and expose_port, plus netstats per-tick
 writes. E2 and E3 share this store and this format (JSON Lines).
 
+**Lifecycle and delivery fencing — implemented 2026-09-05.** Audit capability
+authorization is incarnation-scoped in both cluster and standalone modes.
+Standalone mode derives the incarnation from the per-create toolbox token so a
+reused deterministic sandbox ID cannot accept a prior worker capability or mix
+tenant evidence. This reuses the compound `sandbox_audit_acl` and its retention
+pruner; rollback deletes only the aborted incarnation. WASM workers always carry
+the spill directory alongside loopback IPC, so a transient ingest failure still
+leaves a durable record for reconciliation.
+
+**Cluster facade hydration is page-bounded.** Ingress sends each placement
+owner the exact IDs for the current page, and Daytona/E2B apply that filter
+before metadata serialization. The response and memory cost therefore scale
+with the page size rather than an owner's full sandbox inventory.
+
 **E2b's trust boundary — DECIDED 2026-08-07: external witness, Reporter-first.**
 Chain heads ship off-node when a real control-plane sink is configured;
 verification recomputes the local head and compares it to the last witnessed one.

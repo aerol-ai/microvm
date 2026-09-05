@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
@@ -22,6 +23,63 @@ func newTestCipher(t *testing.T) *secrets.Cipher {
 		t.Fatalf("NewCipher: %v", err)
 	}
 	return c
+}
+
+type pruneRecordingCluster struct {
+	*cluster.Noop
+	calls int
+	err   error
+}
+
+func (c *pruneRecordingCluster) PruneAuditACL(context.Context, time.Time) error {
+	c.calls++
+	return c.err
+}
+
+func TestSecretLifecyclePruneAndReconcileStartup(t *testing.T) {
+	ctx := context.Background()
+	if err := (*Service)(nil).pruneClusterSecretTombs(ctx); err != nil {
+		t.Fatalf("nil tomb prune: %v", err)
+	}
+	if err := (&Service{}).pruneClusterAuditACL(ctx); err != nil {
+		t.Fatalf("disabled ACL prune: %v", err)
+	}
+	(*Service)(nil).StartSecretDeleteOutboxReconcile(ctx)
+
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-tomb", 1); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &pruneRecordingCluster{Noop: cluster.NewNoop("self", "", "")}
+	svc := &Service{
+		cfg: config.Config{
+			SecretTombRetentionDays:  1,
+			SecretAuditRetentionDays: 30,
+		},
+		store:   st,
+		cluster: recorder,
+	}
+	if err := svc.pruneClusterSecretTombs(ctx); err != nil {
+		t.Fatalf("tomb prune: %v", err)
+	}
+	if err := svc.pruneClusterAuditACL(ctx); err != nil || recorder.calls != 1 {
+		t.Fatalf("ACL prune calls=%d err=%v", recorder.calls, err)
+	}
+	recorder.err = errors.New("raft unavailable")
+	if err := svc.pruneClusterAuditACL(ctx); !errors.Is(err, recorder.err) {
+		t.Fatalf("ACL prune error = %v", err)
+	}
+
+	// A pre-cancelled context exercises startup maintenance and deterministic
+	// loop shutdown without waiting for the 30-second production ticker.
+	loopCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc.StartSecretDeleteOutboxReconcile(loopCtx)
+	time.Sleep(20 * time.Millisecond)
 }
 
 func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {

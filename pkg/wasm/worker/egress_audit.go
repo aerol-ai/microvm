@@ -57,8 +57,9 @@ var (
 )
 
 // installDefaultEgressObserver wires destination attribution when
-// SB_EGRESS_ATTRIBUTION_ENABLED is unset/true. Prefers SB_AUDIT_INGEST_PORT;
-// falls back to spill under SB_DB_PATH/audit when IPC env is missing.
+// SB_EGRESS_ATTRIBUTION_ENABLED is unset/true. Prefers SB_AUDIT_INGEST_PORT
+// and always carries the spill directory as the durable fallback when IPC is
+// unavailable or temporarily fails.
 func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindingResolver) {
 	if m == nil || !envBoolDefaultTrue("SB_EGRESS_ATTRIBUTION_ENABLED") {
 		return
@@ -68,10 +69,7 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 	if len(resolvers) > 0 {
 		resolve = resolvers[0]
 	}
-	spillDir := ""
-	if port == "" {
-		spillDir = workerEgressSpillDir()
-	}
+	spillDir := workerEgressSpillDir()
 	if port == "" && spillDir == "" {
 		return
 	}
