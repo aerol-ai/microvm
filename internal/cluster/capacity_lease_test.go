@@ -104,6 +104,27 @@ func TestCapacityLeaseCacheOverlaysKnownEmptyTemplateInventory(t *testing.T) {
 	}
 }
 
+func TestCapacityLeaseCacheOverlaysTemplateCatalogSeparately(t *testing.T) {
+	cache := newCapacityLeaseCache("self", nil, 5*time.Second, nil)
+	cache.SetLocalTemplateCatalogProvider(func() ([]string, bool) {
+		return []string{"tpl-failed", "tpl-pending", "tpl-ready"}, true
+	})
+
+	snap := capacity.Snapshot{}
+	if cache.localTemplateCatalog != nil {
+		if ids, known := cache.localTemplateCatalog(); known {
+			snap.LocalTemplateCatalogInventoryKnown = true
+			snap.LocalTemplateCatalogIDs = ids
+		}
+	}
+	if !snap.LocalTemplateCatalogInventoryKnown || len(snap.LocalTemplateCatalogIDs) != 3 {
+		t.Fatalf("catalog overlay = known:%v ids:%v", snap.LocalTemplateCatalogInventoryKnown, snap.LocalTemplateCatalogIDs)
+	}
+	if snap.LocalTemplateInventoryKnown || len(snap.LocalTemplateIDs) != 0 {
+		t.Fatal("administrative catalogue must not make templates placement-eligible")
+	}
+}
+
 func TestHasCapacitySnapshot(t *testing.T) {
 	if hasCapacitySnapshot(capacity.Snapshot{}) {
 		t.Fatal("zero snapshot should be unknown")

@@ -57,7 +57,16 @@ func (n *Noop) OwnerOfName(name string) (string, OwnerInfo, error) {
 }
 
 func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
-	return PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}, nil
+	target, _, err := n.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (n *Noop) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
+	if req.RequiredNodeID != "" && req.RequiredNodeID != n.nodeID {
+		return PlacementTarget{}, nil, ErrNoPlacementTarget
+	}
+	self := PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}
+	return self, []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}, nil
 }
 
 func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
@@ -67,6 +76,9 @@ func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.C
 	return nil
 }
 func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	return nil
+}
+func (n *Noop) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
 	return nil
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
@@ -85,6 +97,16 @@ func (n *Noop) RemoveCustomDomain(ctx context.Context, sandboxID, hostname strin
 func (n *Noop) CustomDomainsOf(sandboxID string) []string                   { return nil }
 func (n *Noop) ResolveCustomDomain(hostname string) (string, bool)          { return "", false }
 func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error { return nil }
+
+func (n *Noop) AuditOwnerRef(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (n *Noop) AuditACLForSandbox(context.Context, string) (AuditACL, bool, error) {
+	return AuditACL{}, false, nil
+}
+
+func (n *Noop) PruneAuditACL(context.Context, time.Time) error { return nil }
 func (n *Noop) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	return nil
 }
@@ -316,6 +338,19 @@ func (n *Noop) Members() []Member {
 	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}}
 }
 
+// LocalMembers mirrors Members in single-node mode.
+func (n *Noop) LocalMembers() []Member { return n.Members() }
+
+// LookupMember resolves the single Noop member when id matches.
+func (n *Noop) LookupMember(id string) (Member, bool) {
+	if n == nil || id == "" || id != n.nodeID {
+		return Member{}, false
+	}
+	return Member{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}, true
+}
+
+func (n *Noop) PeerInternalHTTPClient() *http.Client { return nil }
+
 // IngressTargets reports the single-node deployment's public address as the
 // DNS target. Empty publicHost (IP-only mode) returns the Unknown source so
 // the service layer can surface a clean 412 rather than fake records.
@@ -331,12 +366,19 @@ func (n *Noop) Placements() []Placement { return nil }
 func (n *Noop) PlacementsForShards(PlacementShardFilter) []Placement { return nil }
 
 func (n *Noop) PlacementPage(PlacementPageRequest) PlacementPageResponse {
+	// Not authoritative: single-node Noop has no placement index. List paths
+	// treat this as cold-start (keep local rows) rather than an empty tenant.
 	return PlacementPageResponse{}
 }
 
 // PlacementOf has no record in single-node mode — there's no FSM. Returns
 // the zero Placement and false so callers fall back to the local sandbox row.
 func (n *Noop) PlacementOf(sandboxID string) (Placement, bool) { return Placement{}, false }
+
+// PlacementsByIDs is empty in single-node mode (no FSM).
+func (n *Noop) PlacementsByIDs(ids []string) map[string]Placement {
+	return map[string]Placement{}
+}
 
 // PlacementVersion always returns 0 in single-node mode — there's no FSM and
 // no need to wake an ingress reconciler that isn't running.

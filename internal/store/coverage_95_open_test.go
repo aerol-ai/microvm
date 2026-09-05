@@ -112,17 +112,17 @@ func TestListScanErrorsCorruptSandboxJSON(t *testing.T) {
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.db.ExecContext(ctx, `UPDATE sandboxes SET env_json = ? WHERE id = ?`, "{bad", sb.ID); err != nil {
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandboxes SET tags_json = ? WHERE id = ?`, "{bad", sb.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.List(ctx); err == nil {
-		t.Fatal("List corrupt env_json")
+		t.Fatal("List corrupt tags_json")
 	}
 	if _, err := st.ListByOwner(ctx, "owner-bad"); err == nil {
-		t.Fatal("ListByOwner corrupt env_json")
+		t.Fatal("ListByOwner corrupt tags_json")
 	}
 	if _, err := st.ListByRuntime(ctx, "docker"); err == nil {
-		t.Fatal("ListByRuntime corrupt env_json")
+		t.Fatal("ListByRuntime corrupt tags_json")
 	}
 }
 

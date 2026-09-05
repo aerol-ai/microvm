@@ -12,17 +12,17 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/runtime"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/go-digest"
@@ -274,6 +274,9 @@ func (c *fakeContainer) Extensions(context.Context) (map[string]typeurl.Any, err
 func (c *fakeContainer) Update(context.Context, ...cntr.UpdateContainerOpts) error { return nil }
 func (c *fakeContainer) Checkpoint(context.Context, string, ...cntr.CheckpointOpts) (cntr.Image, error) {
 	return nil, errors.New("not implemented")
+}
+func (c *fakeContainer) Restore(context.Context, cio.Creator, string) (int, error) {
+	return 0, errors.New("not implemented")
 }
 
 type fakeTask struct {

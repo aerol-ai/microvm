@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/containerd/containerd/cio"
+	"github.com/containerd/containerd/v2/pkg/cio"
 )
 
 // taskLogCapBytes bounds each per-sandbox task log file. containerd does not

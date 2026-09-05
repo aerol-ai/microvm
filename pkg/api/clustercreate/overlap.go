@@ -66,7 +66,7 @@ type sealLegResult struct {
 }
 
 // OverlapCreateAndPromote runs CreateSandboxWithID in parallel with
-// PutClusterSecretsForRecipient (the seal), joins both, and only then
+// SealAndDistribute (the seal), joins both, and only then
 // promotes via RecordPlacement
 // (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
 //
@@ -136,7 +136,9 @@ func OverlapCreateAndPromote(
 			}
 		}()
 		start := time.Now()
-		secrets, err := svc.PutClusterSecretsForRecipient(commitCtx, reservationID, req, c.SelfNodeID())
+		// HA creates: local seal only on this path; async fan-out is off-path
+		// (plans/secrets-hardening §3e). cluster_seal timing stays local seal.
+		secrets, err := svc.SealAndDistribute(commitCtx, reservationID, req, svc.SecretRecipientsForSeal(reservationID), service.SealStrict)
 		if opts.Timing != nil {
 			opts.Timing.RecordStage("cluster_seal", time.Since(start))
 		}
@@ -154,6 +156,9 @@ func OverlapCreateAndPromote(
 			return nil, &OverlapFailure{Phase: OverlapPhaseCreate, Err: cr.err}
 		}
 		return nil, &OverlapFailure{Phase: OverlapPhaseSeal, Err: sr.err}
+	}
+	if cr.resp != nil {
+		sr.secrets.OwnerRef = cr.resp.Sandbox.OwnerRef
 	}
 
 	promoteStart := time.Now()

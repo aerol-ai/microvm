@@ -169,3 +169,25 @@ func TestFSMStoreRecoveryBlob(t *testing.T) {
 		t.Errorf("expected error for empty sandbox id")
 	}
 }
+
+func TestPagePlacementScanSkipsEmptyOwnerRef(t *testing.T) {
+	fsm := newPlacementFSM()
+	fsm.mu.Lock()
+	fsm.placements = map[string]Placement{
+		"sb-empty":  {SandboxID: "sb-empty", OwnerNodeID: "n1", OwnerRef: ""},
+		"sb-tenant": {SandboxID: "sb-tenant", OwnerNodeID: "n1", OwnerRef: "tenant-a"},
+		"sb-other":  {SandboxID: "sb-other", OwnerNodeID: "n1", OwnerRef: "tenant-b"},
+	}
+	// Force scan path (no ownerRefIndex).
+	fsm.ownerRefIndex = nil
+	fsm.placementIDs = nil
+	fsm.mu.Unlock()
+
+	page := fsm.placementPage(PlacementPageRequest{Limit: 10, OwnerRef: "tenant-a"})
+	if !page.Authoritative {
+		t.Fatal("FSM page must be authoritative")
+	}
+	if len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-tenant" {
+		t.Fatalf("OwnerRef filter = %+v, want only sb-tenant (empty OwnerRef must not match)", page.Placements)
+	}
+}

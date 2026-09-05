@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/remotes/docker"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
 	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/runtime-spec/specs-go"
 

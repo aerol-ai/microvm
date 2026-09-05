@@ -1,0 +1,591 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
+	storepkg "github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
+)
+
+func TestClassifySecretAuditReason(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{nil, secretAuditReasonOK},
+		{secrets.ErrNotFound, secretAuditReasonNotFound},
+		{fmt.Errorf("%w: ref", secrets.ErrNotFound), secretAuditReasonNotFound},
+		{secrets.ErrRecipientDenied, secretAuditReasonRecipientDenied},
+		{secrets.ErrVersionMismatch, secretAuditReasonVersionMismatch},
+		{secrets.ErrDecryptFailed, secretAuditReasonDecryptFailed},
+		{errors.New("decrypt: message authentication failed"), secretAuditReasonDecryptFailed},
+		{errors.New("something else"), secretAuditReasonError},
+	}
+	for _, tc := range cases {
+		if got := classifySecretAuditReason(tc.err); got != tc.want {
+			t.Fatalf("classifySecretAuditReason(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestSandboxIDFromSecretRef(t *testing.T) {
+	if got := sandboxIDFromSecretRef("cluster-secret://sandbox/sb-1/v1"); got != "sb-1" {
+		t.Fatalf("got %q, want sb-1", got)
+	}
+	if got := sandboxIDFromSecretRef("cluster-secret://sandbox/sb-1/i/abc/v1"); got != "sb-1" {
+		t.Fatalf("incarnation ref got %q, want sb-1", got)
+	}
+	if got := sandboxIDFromSecretRef("not-a-ref"); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+func TestEmitSecretAuditNilSinkNoPanic(t *testing.T) {
+	emitSecretAudit(nil, "sb", "ref", "node-a", "", "", nil)
+	var sink SecretAuditSink
+	emitSecretAudit(sink, "sb", "ref", "node-a", "", "", secrets.ErrNotFound)
+	beginSecretAudit(nil, "sb", "ref", "node-a", "")(nil)
+}
+
+func TestSecretAuditStrictBootAndUnavailableSink(t *testing.T) {
+	s := &Service{cfg: config.Config{SecretAuditStrictBoot: true}}
+	if err := s.ValidateSecretAuditSink(); err == nil {
+		t.Fatal("ValidateSecretAuditSink error = nil, want missing DBPath failure")
+	}
+	before := auditEventsDroppedTotal.Value()
+	s.secretAuditSink().Emit(SecretAuditEvent{SandboxID: "sb"})
+	if got := auditEventsDroppedTotal.Value() - before; got != 1 {
+		t.Fatalf("dropped delta = %d, want 1", got)
+	}
+	if got := secretAuditSinkHealthy.Value(); got != 0 {
+		t.Fatalf("sink health = %d, want 0", got)
+	}
+}
+
+func TestSecretAuditSuccessAndFailureClasses(t *testing.T) {
+	ctx := context.Background()
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	mem := &memSecretAuditSink{}
+	cipher := newTestCipher(t)
+	s := &Service{
+		cipher:         cipher,
+		store:          st,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+		secretAudit:    mem,
+		cluster:        cluster.NewNoop("node-a", "", ""),
+	}
+
+	const password = "super-secret-password-value"
+	req := models.CreateSandboxRequest{
+		Image:    "private.example.com/app:latest",
+		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: password},
+	}
+	handle, err := s.SealAndDistribute(ctx, "sb-audit", req, []string{"node-a"}, SealStrict)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	redacted := RedactClusterSecrets(req)
+
+	// success
+	if _, err := s.OpenClusterSecretsForNode(ctx, "sb-audit", redacted, handle, "node-a"); err != nil {
+		t.Fatalf("open success: %v", err)
+	}
+	// recipient denied
+	if _, err := s.OpenClusterSecretsForNode(ctx, "sb-audit", redacted, handle, "node-b"); err == nil {
+		t.Fatal("expected recipient denied")
+	}
+	// version mismatch
+	badVer := handle
+	badVer.Version++
+	if _, err := s.OpenClusterSecretsForNode(ctx, "sb-audit", redacted, badVer, "node-a"); err == nil {
+		t.Fatal("expected version mismatch")
+	}
+	// not found
+	missing := cluster.PlacementSecrets{Ref: "cluster-secret://sandbox/missing/v1", Version: 1}
+	if _, err := s.OpenClusterSecretsForNode(ctx, "missing", redacted, missing, "node-a"); err == nil {
+		t.Fatal("expected not found")
+	}
+
+	events := mem.Events()
+	if len(events) != 4 {
+		t.Fatalf("events = %d, want 4: %+v", len(events), events)
+	}
+	want := []struct {
+		result string
+		reason string
+	}{
+		{secretAuditResultSuccess, secretAuditReasonOK},
+		{secretAuditResultFailure, secretAuditReasonRecipientDenied},
+		{secretAuditResultFailure, secretAuditReasonVersionMismatch},
+		{secretAuditResultFailure, secretAuditReasonNotFound},
+	}
+	for i, w := range want {
+		if events[i].Result != w.result || events[i].Reason != w.reason {
+			t.Fatalf("event[%d] = {%s,%s}, want {%s,%s}", i, events[i].Result, events[i].Reason, w.result, w.reason)
+		}
+		if events[i].SandboxID == "" || events[i].Ref == "" || events[i].Actor == "" {
+			t.Fatalf("event[%d] missing fields: %+v", i, events[i])
+		}
+		raw, err := json.Marshal(events[i])
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(raw, []byte(password)) {
+			t.Fatalf("event[%d] leaked plaintext password: %s", i, raw)
+		}
+		if bytes.Contains(raw, []byte("not allowed")) || bytes.Contains(raw, []byte("version mismatch:")) {
+			t.Fatalf("event[%d] leaked wrapped error string: %s", i, raw)
+		}
+	}
+}
+
+func TestSecretAuditDecryptFailedClass(t *testing.T) {
+	mem := &memSecretAuditSink{}
+	s := &Service{
+		cipher:      newTestCipher(t),
+		secretAudit: mem,
+		cluster:     cluster.NewNoop("node-a", "", ""),
+	}
+	_, err := s.UnsealRegistry("sb-reg", []byte("not-valid-ciphertext"))
+	if err == nil {
+		t.Fatal("expected decrypt failure")
+	}
+	if !errors.Is(err, secrets.ErrDecryptFailed) {
+		t.Fatalf("err = %v, want ErrDecryptFailed", err)
+	}
+	events := mem.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	if events[0].Result != secretAuditResultFailure || events[0].Reason != secretAuditReasonDecryptFailed {
+		t.Fatalf("event = %+v", events[0])
+	}
+	if events[0].Ref != "registry:sb-reg" {
+		t.Fatalf("ref = %q", events[0].Ref)
+	}
+}
+
+func TestSecretAuditLoadMounts(t *testing.T) {
+	ctx := context.Background()
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	mem := &memSecretAuditSink{}
+	s := &Service{
+		cipher:      newTestCipher(t),
+		store:       st,
+		secretAudit: mem,
+		cluster:     cluster.NewNoop("node-a", "", ""),
+	}
+	const secret = "mount-password-should-not-appear"
+	sealed, err := s.sealMounts([]models.MountSpec{{
+		Type:        models.MountTypeS3,
+		Target:      "/data",
+		Source:      "bucket",
+		Credentials: map[string]string{"password": secret},
+	}})
+	if err != nil {
+		t.Fatalf("sealMounts: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-mnt", Image: "alpine", Status: models.SandboxStatusStarted,
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
+		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := st.PutMounts(ctx, "sb-mnt", sealed); err != nil {
+		t.Fatalf("PutMounts: %v", err)
+	}
+	got, err := s.loadMounts(ctx, "sb-mnt")
+	if err != nil {
+		t.Fatalf("loadMounts: %v", err)
+	}
+	if len(got) != 1 || got[0].Credentials["password"] != secret {
+		t.Fatalf("mounts = %+v", got)
+	}
+	events := mem.Events()
+	if len(events) != 1 || events[0].Result != secretAuditResultSuccess {
+		t.Fatalf("events = %+v", events)
+	}
+	if events[0].Ref != "mounts:sb-mnt" {
+		t.Fatalf("ref = %q", events[0].Ref)
+	}
+	raw, _ := json.Marshal(events[0])
+	if bytes.Contains(raw, []byte(secret)) {
+		t.Fatalf("leaked mount secret: %s", raw)
+	}
+}
+
+func TestFileAuditSinkOverflowDropsWithGapMarker(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newFileAuditSink(dir, 1)
+	if err != nil {
+		t.Fatalf("newFileAuditSink: %v", err)
+	}
+	block := make(chan struct{})
+	started := make(chan struct{})
+	var startOnce sync.Once
+	sink.writeHook = func() {
+		startOnce.Do(func() { close(started) })
+		<-block
+	}
+
+	droppedBefore := auditEventsDroppedTotal.Value()
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "a"})
+	<-started // writer blocked inside writeHook with channel empty
+
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "b"}) // fills buffer
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "c"}) // drop
+	if got := auditEventsDroppedTotal.Value() - droppedBefore; got != 1 {
+		t.Fatalf("dropped delta = %d, want 1", got)
+	}
+
+	close(block)
+	sink.Sync()
+	sink.Close()
+
+	raw, err := os.ReadFile(filepath.Join(dir, secretAuditFileName))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	lines := nonEmptyLines(string(raw))
+	var sawGap bool
+	for _, line := range lines {
+		var ev SecretAuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal %q: %v", line, err)
+		}
+		if ev.Result == secretAuditResultGap && ev.Reason == secretAuditReasonOverflow {
+			sawGap = true
+			if ev.Dropped < 1 {
+				t.Fatalf("gap marker Dropped = %d, want >= 1", ev.Dropped)
+			}
+		}
+	}
+	if !sawGap {
+		t.Fatalf("expected gap marker in stream, got:\n%s", raw)
+	}
+}
+
+func TestFileAuditSinkEmitAsyncWhenWriterBlocked(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newFileAuditSink(dir, 8)
+	if err != nil {
+		t.Fatalf("newFileAuditSink: %v", err)
+	}
+	t.Cleanup(sink.Close)
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+	var startOnce sync.Once
+	sink.writeHook = func() {
+		startOnce.Do(func() { close(started) })
+		<-block
+	}
+
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Ref: "first"})
+	<-started
+
+	done := make(chan struct{})
+	go func() {
+		sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Ref: "second"})
+		close(done)
+	}()
+	select {
+	case <-done:
+		// ok — Emit returned without waiting on the blocked writer
+	case <-time.After(500 * time.Millisecond):
+		close(block)
+		t.Fatal("Emit blocked while writer was stalled")
+	}
+	close(block)
+	sink.Sync()
+}
+
+func TestFileAuditSinkStartupIgnoresStaleTipAndContinuesVerifiedChain(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newFileAuditSink(dir, 4)
+	if err != nil {
+		t.Fatalf("newFileAuditSink: %v", err)
+	}
+	if err := sink.writeEvent(SecretAuditEvent{Result: secretAuditResultSuccess, Ref: "first"}); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	sink.Close()
+
+	// Simulate a crash after the JSONL fsync but before the sidecar tip update.
+	if err := os.WriteFile(filepath.Join(dir, "secrets.tip"), []byte("0\n\n"), 0o600); err != nil {
+		t.Fatalf("write stale tip: %v", err)
+	}
+	reopened, err := newFileAuditSink(dir, 4)
+	if err != nil {
+		t.Fatalf("reopen with stale tip: %v", err)
+	}
+	if err := reopened.writeEvent(SecretAuditEvent{Result: secretAuditResultSuccess, Ref: "second"}); err != nil {
+		t.Fatalf("write second: %v", err)
+	}
+	reopened.Close()
+	if _, _, err := RecomputeChainHead(filepath.Join(dir, secretAuditFileName)); err != nil {
+		t.Fatalf("chain forked after stale sidecar: %v", err)
+	}
+}
+
+func TestFileAuditSinkStartupFailsClosedOnCorruptChain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, secretAuditFileName)
+	if err := os.WriteFile(path, []byte("{not-json}\n"), 0o600); err != nil {
+		t.Fatalf("write corrupt chain: %v", err)
+	}
+	if sink, err := newFileAuditSink(dir, 4); err == nil {
+		sink.Close()
+		t.Fatal("newFileAuditSink accepted corrupt audit evidence")
+	}
+}
+
+func TestFileAuditSinkEnterpriseSpillDrainAndMalformedGap(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newFileAuditSinkOpts(dir, 1, true)
+	if err != nil {
+		t.Fatalf("newFileAuditSinkOpts: %v", err)
+	}
+	t.Cleanup(sink.Close)
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+	var startOnce sync.Once
+	sink.writeHook = func() {
+		startOnce.Do(func() { close(started) })
+		<-block
+	}
+
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "a"})
+	<-started
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "b"}) // fills buffer
+	sink.Emit(SecretAuditEvent{Result: secretAuditResultSuccess, Reason: secretAuditReasonOK, Ref: "c"}) // spill
+	// Inject a malformed spill line ahead of a valid one while writer is blocked.
+	if err := os.WriteFile(sink.spillPath, append([]byte("{not-json}\n"), mustRead(t, sink.spillPath)...), 0o600); err != nil {
+		t.Fatalf("inject malformed: %v", err)
+	}
+	close(block)
+	sink.Sync()
+
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawGap, sawC bool
+	for _, line := range nonEmptyLines(string(raw)) {
+		var ev SecretAuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if ev.Kind == secretAuditKindGap {
+			sawGap = true
+		}
+		if ev.Ref == "c" {
+			sawC = true
+		}
+	}
+	if !sawGap || !sawC {
+		t.Fatalf("expected gap+spilled event in jsonl, got:\n%s", raw)
+	}
+	if _, err := os.Stat(sink.spillPath); !os.IsNotExist(err) {
+		if b, _ := os.ReadFile(sink.spillPath); len(strings.TrimSpace(string(b))) != 0 {
+			t.Fatalf("spill should be drained, got %q", b)
+		}
+	}
+	if _, _, err := RecomputeChainHead(sink.path); err != nil {
+		t.Fatalf("chain after spill drain: %v", err)
+	}
+}
+
+func TestFileAuditSinkFailedGapFlushKeepsPendingCount(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	sink.pendingGap.Store(3)
+	persistGapCount(sink.gapPath, 3)
+	sink.chainMu.Lock()
+	sink.writePoison = errors.New("injected ambiguous append")
+	sink.chainMu.Unlock()
+	_ = sink.Sync()
+	if got := sink.pendingGap.Load(); got != 3 {
+		t.Fatalf("pending gap = %d, want 3 after failed marker write", got)
+	}
+	if got := loadGapCount(sink.gapPath); got != 3 {
+		t.Fatalf("durable gap count = %d, want 3", got)
+	}
+}
+
+func TestFileAuditSinkPruneOnlyDropsContiguousPrefix(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	now := time.Now().UTC()
+	for _, ev := range []SecretAuditEvent{
+		{Time: now, EventID: "fresh-1", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(-48 * time.Hour), EventID: "old-middle", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(time.Second), EventID: "fresh-2", SandboxID: "sb", Result: secretAuditResultSuccess},
+	} {
+		if err := sink.EmitDurable(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sink.Prune(now.Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(nonEmptyLines(string(raw))); got != 3 {
+		t.Fatalf("retained lines = %d, want 3; middle old event is not a droppable prefix", got)
+	}
+	if _, _, err := RecomputeChainHead(sink.path); err != nil {
+		t.Fatalf("chain after prefix-safe prune: %v", err)
+	}
+}
+
+func TestFileAuditSinkRetentionCheckpointDoesNotBlockNextPrune(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	now := time.Now().UTC()
+	for _, ev := range []SecretAuditEvent{
+		{Time: now.Add(-72 * time.Hour), EventID: "old", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(-36 * time.Hour), EventID: "middle", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now, EventID: "fresh", SandboxID: "sb", Result: secretAuditResultSuccess},
+	} {
+		if err := sink.EmitDurable(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sink.Prune(now.Add(-48 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Prune(now.Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"event_id":"old"`)) || bytes.Contains(raw, []byte(`"event_id":"middle"`)) {
+		t.Fatalf("successive retention left expired prefix behind: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`"event_id":"fresh"`)) {
+		t.Fatalf("successive retention removed fresh event: %s", raw)
+	}
+	if _, _, err := RecomputeChainHead(sink.path); err != nil {
+		t.Fatalf("chain after successive retention: %v", err)
+	}
+}
+
+func TestFileAuditSinkPruneCarriesWitnessedDroppedAncestor(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	now := time.Now().UTC()
+	for _, ev := range []SecretAuditEvent{
+		{Time: now.Add(-72 * time.Hour), EventID: "old-witnessed", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now.Add(-60 * time.Hour), EventID: "old-later", SandboxID: "sb", Result: secretAuditResultSuccess},
+		{Time: now, EventID: "fresh", SandboxID: "sb", Result: secretAuditResultSuccess},
+	} {
+		if err := sink.EmitDurable(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var witnessed SecretAuditEvent
+	if err := json.Unmarshal([]byte(nonEmptyLines(string(raw))[0]), &witnessed); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistWitnessReceipt("", sink.witnessTipPath, witnessReceiptRecord{HeadHex: witnessed.EventHash}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Prune(now.Add(-48 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint SecretAuditEvent
+	if err := json.Unmarshal([]byte(nonEmptyLines(string(raw))[0]), &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.Kind != secretAuditKindRetentionCheckpoint || checkpoint.WitnessedThrough != witnessed.EventHash {
+		t.Fatalf("checkpoint = %+v, want witnessed ancestor %q", checkpoint, witnessed.EventHash)
+	}
+}
+
+func TestFileAuditSinkEmitDurablePersistsBeforeReturn(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	if err := sink.EmitDurable(SecretAuditEvent{EventID: "durable-1", SandboxID: "sb", Result: secretAuditResultSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("durable-1")) {
+		t.Fatalf("durable event absent after return: %s", raw)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if strings.TrimSpace(line) != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}

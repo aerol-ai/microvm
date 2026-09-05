@@ -50,6 +50,39 @@ func (f *fakeCheckpointDrainRuntime) ListManaged(context.Context) (map[string]*m
 	return f.fakeCheckpointRuntime.ListManaged(context.Background())
 }
 
+func TestRunWasmCheckpointPoolReturnsCancellationAfterInFlightWork(t *testing.T) {
+	svc := &Service{cfg: config.Config{WasmCheckpointMaxParallel: 1}}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan error, 1)
+
+	go func() {
+		result <- svc.runWasmCheckpointPool(ctx, []*models.Sandbox{{ID: "sb-1"}}, func(*models.Sandbox) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint worker did not start")
+	}
+	cancel()
+	close(release)
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runWasmCheckpointPool = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint pool did not return after cancellation")
+	}
+}
+
 func TestDrainWasmSandboxes(t *testing.T) {
 	ctx := context.Background()
 	rt := &fakeCheckpointRuntime{

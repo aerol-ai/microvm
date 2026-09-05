@@ -12,18 +12,42 @@ import (
 // need to drive a forwarding-channel-selection test; building one inline keeps
 // these regression tests honest without bringing up a 3-node raft cluster.
 //
-// The two proxyCache fields are the load-bearing knobs that ForwardHTTP
-// inspects to pick the channel: mtlsProxies non-nil + Endpoint.InternalURL
-// set ⇒ mTLS path; else public APIURL path. The transports point at the test
-// servers so we can observe which one received the request.
-func newForwardingCluster(t *testing.T, publicTransport, mtlsTransport http.RoundTripper) *Cluster {
+// The internal client is deliberately non-TLS in unit tests unless supplied
+// by httptest.NewTLSServer; production wraps it with node-SAN verification.
+func newForwardingCluster(t *testing.T, mtlsTransport http.RoundTripper) *Cluster {
 	t.Helper()
-	c := &Cluster{}
-	c.publicProxies = newProxyCache(publicTransport)
-	if mtlsTransport != nil {
-		c.mtlsProxies = newProxyCache(mtlsTransport)
+	if mtlsTransport == nil {
+		return &Cluster{}
 	}
-	return c
+	return &Cluster{
+		internalClient: &http.Client{Transport: mtlsTransport},
+		mtlsProxies:    newProxyCache(),
+	}
+}
+
+func newNodeBoundForwardServer(t *testing.T, clientNodeID, serverNodeID string, h http.Handler) (*httptest.Server, *http.Client) {
+	t.Helper()
+	dirs := writeTestClusterTLSDirs(t, clientNodeID, serverNodeID)
+	return newNodeBoundForwardServerWithDirs(t, dirs, clientNodeID, serverNodeID, h)
+}
+
+func newNodeBoundForwardServerWithDirs(t *testing.T, dirs map[string]string, clientNodeID, serverNodeID string, h http.Handler) (*httptest.Server, *http.Client) {
+	t.Helper()
+	clientTLS, err := loadClusterTLS(dirs[clientNodeID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTLS, err := loadClusterTLS(dirs[serverNodeID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.TLS = serverTLS.serverConfig()
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	client := &http.Client{Transport: newInternalTransport(clientTLS.clientConfig())}
+	t.Cleanup(client.CloseIdleConnections)
+	return srv, client
 }
 
 // TestForwardHTTPPrefersInternalURLWhenAvailable pins the B3 fix: when the
@@ -38,16 +62,15 @@ func TestForwardHTTPPrefersInternalURLWhenAvailable(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer publicSrv.Close()
-	internalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	internalSrv, internalClient := newNodeBoundForwardServer(t, "caller-1", "owner-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits <- "internal"
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer internalSrv.Close()
 
-	c := newForwardingCluster(t, http.DefaultTransport, http.DefaultTransport)
+	c := newForwardingCluster(t, internalClient.Transport)
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/v1/sandboxes/sb-1", nil)
-	c.ForwardHTTP(Endpoint{InternalURL: internalSrv.URL, APIURL: publicSrv.URL}, rr, r)
+	c.ForwardHTTP(Endpoint{NodeID: "owner-1", InternalURL: internalSrv.URL, APIURL: publicSrv.URL}, rr, r)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
@@ -58,40 +81,27 @@ func TestForwardHTTPPrefersInternalURLWhenAvailable(t *testing.T) {
 	}
 }
 
-// TestForwardHTTPFallsBackToAPIURLWithoutTLS covers the legacy/mixed-cluster
-// case: a node without SB_CLUSTER_TLS_DIR has no mtlsProxies; ForwardHTTP MUST
-// still work by using the public APIURL+PAT path. This is the contract that
-// keeps rolling upgrades unbroken.
-func TestForwardHTTPFallsBackToAPIURLWithoutTLS(t *testing.T) {
-	hits := make(chan string, 1)
-	publicSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits <- "public"
+func TestForwardHTTPRejectsWrongNodeCertificate(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	server, internalClient := newNodeBoundForwardServer(t, "caller-1", "owner-1", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit <- struct{}{}
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer publicSrv.Close()
-
-	// mtlsProxies nil simulates the no-TLS node.
-	c := newForwardingCluster(t, http.DefaultTransport, nil)
+	c := newForwardingCluster(t, internalClient.Transport)
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest("GET", "/v1/sandboxes/sb-1", nil)
-	// Even when InternalURL is set on the target, a node without TLS can't
-	// dial it — must fall through to APIURL.
-	c.ForwardHTTP(Endpoint{InternalURL: "https://example:7002", APIURL: publicSrv.URL}, rr, r)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+	r := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-1", nil)
+	c.ForwardHTTP(Endpoint{NodeID: "owner-2", InternalURL: server.URL}, rr, r)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for wrong node certificate", rr.Code)
 	}
-	if got := <-hits; got != "public" {
-		t.Fatalf("forward landed on %q server, expected fallback to public", got)
+	select {
+	case <-hit:
+		t.Fatal("handler ran despite wrong node certificate")
+	default:
 	}
 }
 
-// TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty covers the "peer has no
-// TLS material" half of the mixed-cluster contract: this node has TLS (so
-// mtlsProxies != nil) but the peer hasn't advertised an internal URL. We
-// must use the public path rather than 5xx — otherwise a TLS-equipped node
-// could never talk to a TLS-disabled one mid-rollout.
-func TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty(t *testing.T) {
+func TestForwardHTTPFailsClosedWithoutTLS(t *testing.T) {
 	hits := make(chan string, 1)
 	publicSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits <- "public"
@@ -99,16 +109,44 @@ func TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty(t *testing.T) {
 	}))
 	defer publicSrv.Close()
 
-	c := newForwardingCluster(t, http.DefaultTransport, http.DefaultTransport)
+	c := newForwardingCluster(t, nil)
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/v1/sandboxes/sb-1", nil)
-	c.ForwardHTTP(Endpoint{InternalURL: "", APIURL: publicSrv.URL}, rr, r)
+	c.ForwardHTTP(Endpoint{NodeID: "owner-1", InternalURL: "https://example:7002", APIURL: publicSrv.URL}, rr, r)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
 	}
-	if got := <-hits; got != "public" {
-		t.Fatalf("forward landed on %q server, expected fallback to public", got)
+	select {
+	case got := <-hits:
+		t.Fatalf("forward landed on %q; want no public downgrade", got)
+	default:
+	}
+}
+
+// TestForwardHTTPFailClosedWhenInternalEmpty pins mTLS fail-closed: when this
+// node has TLS (mtlsProxies != nil) but the peer has no InternalURL, we must
+// 503 rather than silently downgrade to APIURL+PAT.
+func TestForwardHTTPFailClosedWhenInternalEmpty(t *testing.T) {
+	hits := make(chan string, 1)
+	publicSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits <- "public"
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer publicSrv.Close()
+
+	c := newForwardingCluster(t, http.DefaultTransport)
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/v1/sandboxes/sb-1", nil)
+	c.ForwardHTTP(Endpoint{NodeID: "owner-1", InternalURL: "", APIURL: publicSrv.URL}, rr, r)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	select {
+	case got := <-hits:
+		t.Fatalf("forward landed on %q; want no public dial when InternalURL empty", got)
+	default:
 	}
 }
 
@@ -117,11 +155,11 @@ func TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty(t *testing.T) {
 // view on two peers could ping-pong forever — exactly the scenario the
 // X-Cluster-Forwarded header was introduced to defuse.
 func TestForwardHTTPRejectsLoop(t *testing.T) {
-	c := newForwardingCluster(t, http.DefaultTransport, http.DefaultTransport)
+	c := newForwardingCluster(t, http.DefaultTransport)
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/v1/sandboxes/sb-1", nil)
 	r.Header.Set("X-Cluster-Forwarded", "1")
-	c.ForwardHTTP(Endpoint{InternalURL: "https://example:7002", APIURL: "http://example:21212"}, rr, r)
+	c.ForwardHTTP(Endpoint{NodeID: "owner-1", InternalURL: "https://example:7002", APIURL: "http://example:21212"}, rr, r)
 	if rr.Code != http.StatusMisdirectedRequest {
 		body, _ := io.ReadAll(rr.Result().Body)
 		t.Fatalf("status = %d, want 421 (loop detected); body=%q", rr.Code, body)
@@ -133,7 +171,7 @@ func TestForwardHTTPRejectsLoop(t *testing.T) {
 // died before announcing). 503 is the documented signal for clients to retry
 // against a refreshed placement; 5xx would mask the cause.
 func TestForwardHTTP503WhenNoUsableEndpoint(t *testing.T) {
-	c := newForwardingCluster(t, http.DefaultTransport, nil)
+	c := newForwardingCluster(t, nil)
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/v1/sandboxes/sb-1", nil)
 	c.ForwardHTTP(Endpoint{}, rr, r)

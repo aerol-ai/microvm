@@ -219,8 +219,9 @@ func TestTemplatePeerRequestForwardsAuthAndContentType(t *testing.T) {
 	parent := httptest.NewRequest(http.MethodPost, "/v1/templates/x", strings.NewReader(`{}`))
 	parent.Header.Set("Authorization", "Bearer t")
 	parent.Header.Set("Content-Type", "application/json")
-	status, _, body, err := templatePeerRequest(parent, []byte(`{}`), cluster.Member{
-		NodeID: "peer", APIURL: peer.URL, Alive: true,
+	c := &membersStubCluster{Noop: cluster.NewNoop("self", "http://self", ""), internalClient: peer.Client()}
+	status, _, body, err := templatePeerRequest(c, parent, []byte(`{}`), cluster.Member{
+		NodeID: "peer", InternalURL: peer.URL, Alive: true,
 	})
 	if err != nil || status != http.StatusOK || !strings.Contains(string(body), "ok") {
 		t.Fatalf("status=%d err=%v body=%s", status, err, body)

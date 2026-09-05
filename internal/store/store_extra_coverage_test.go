@@ -297,7 +297,7 @@ func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 	_ = st.DeleteMounts(ctx, "missing")
 	_ = st.DeleteClusterSecretsForSandbox(ctx, "missing")
 	_, _ = st.GetClusterSecret(ctx, "missing")
-	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
+	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
 	_, _ = st.GetMounts(ctx, "missing")
 	_ = st.PutMounts(ctx, "missing", []byte("a"))
 

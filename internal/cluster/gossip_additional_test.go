@@ -131,7 +131,7 @@ func TestHasLiveControlPlaneMemberRequiresUsableServer(t *testing.T) {
 		t.Fatal("hasLiveControlPlaneMember = true, want false without a live server endpoint")
 	}
 
-	nodes = append(nodes, gossipTestNode(t, "seed", config.NodeRoleServer, "http://seed:21212", "", memberlist.StateAlive))
+	nodes = append(nodes, gossipTestNode(t, "seed", config.NodeRoleServer, "http://seed:21212", "https://seed:21213", memberlist.StateAlive))
 	if !hasLiveControlPlaneMember(nodes, "self") {
 		t.Fatal("hasLiveControlPlaneMember = false, want true for live server endpoint")
 	}
@@ -173,7 +173,7 @@ func TestMaybeRejoinBootstrapPeersOnlyWithoutControlPlane(t *testing.T) {
 	}
 
 	gn.maybeRejoinBootstrapPeers([]*memberlist.Node{
-		gossipTestNode(t, "server", config.NodeRoleServer, "http://server:21212", "", memberlist.StateAlive),
+		gossipTestNode(t, "server", config.NodeRoleServer, "http://server:21212", "https://server:21213", memberlist.StateAlive),
 		gossipTestNode(t, "worker", config.NodeRoleWorker, "http://worker:21212", "", memberlist.StateAlive),
 	})
 	if calls != 2 {

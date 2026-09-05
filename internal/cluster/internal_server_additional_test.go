@@ -20,14 +20,23 @@ import (
 )
 
 func generateTestCert() (*x509.CertPool, tls.Certificate, error) {
+	return generateTestCertForNode("")
+}
+
+func generateTestCertForNode(nodeID string) (*x509.CertPool, tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, tls.Certificate{}, err
+	}
+	dns := []string{"aerolvm-cluster-node", "localhost"}
+	if nodeID != "" {
+		dns = append(dns, "node:"+nodeID)
 	}
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
 			Organization: []string{"Acme Co"},
+			CommonName:   nodeID,
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(time.Hour * 24 * 180),
@@ -35,7 +44,7 @@ func generateTestCert() (*x509.CertPool, tls.Certificate, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		DNSNames:              []string{"aerolvm-cluster-node", "localhost"},
+		DNSNames:              dns,
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 	}
 
@@ -59,14 +68,14 @@ func generateTestCert() (*x509.CertPool, tls.Certificate, error) {
 }
 
 func TestInternalServerSetup(t *testing.T) {
-	_, err := startInternalServer(":0", nil, nil, slog.Default())
+	_, err := startInternalServer(":0", nil, nil, slog.Default(), false)
 	if err == nil {
 		t.Errorf("expected error without tls")
 	}
 }
 
 func TestInternalServerHandlers(t *testing.T) {
-	pool, tlsCert, err := generateTestCert()
+	pool, tlsCert, err := generateTestCertForNode("node-test")
 	if err != nil {
 		t.Fatalf("cert gen: %v", err)
 	}
@@ -81,7 +90,7 @@ func TestInternalServerHandlers(t *testing.T) {
 		return applyErr
 	}
 
-	srv, err := startInternalServer("127.0.0.1:0", ct, handler, slog.Default())
+	srv, err := startInternalServer("127.0.0.1:0", ct, handler, slog.Default(), false)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -171,5 +180,56 @@ func TestInternalServerHandlers(t *testing.T) {
 func TestInternalServerNilCheck(t *testing.T) {
 	var s *internalServer
 	s.SetExtraHandler(nil)
+	s.SetPeerAuthorizer(nil)
 	s.Close()
+}
+
+func TestInternalServerEnterpriseApplyRequiresLiveCertIdentity(t *testing.T) {
+	pool, tlsCert, err := generateTestCertForNode("worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := &ClusterTLS{nodeCert: tlsCert, caPool: pool}
+	var calls int
+	srv, err := startInternalServer("127.0.0.1:0", ct, func(context.Context, []byte) error {
+		calls++
+		return nil
+	}, slog.Default(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: ct.clientConfig()}}
+	post := func(claim string, body []byte) int {
+		req, reqErr := http.NewRequest(http.MethodPost, "https://"+srv.Addr()+InternalAPIPath, bytes.NewReader(body))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		if claim != "" {
+			req.Header.Set(PeerNodeIDHeader, claim)
+		}
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+	if got := post("worker-1", []byte("ok")); got != http.StatusForbidden {
+		t.Fatalf("boot-window status=%d, want 403", got)
+	}
+	srv.SetPeerAuthorizer(func(id string) bool { return id == "worker-1" })
+	if got := post("worker-2", []byte("ok")); got != http.StatusForbidden {
+		t.Fatalf("mismatched identity status=%d, want 403", got)
+	}
+	if got := post("worker-1", []byte("ok")); got != http.StatusNoContent {
+		t.Fatalf("authorized identity status=%d, want 204", got)
+	}
+	if got := post("worker-1", bytes.Repeat([]byte{'x'}, (1<<20)+1)); got != http.StatusBadRequest {
+		t.Fatalf("oversized apply status=%d, want 400", got)
+	}
+	if calls != 1 {
+		t.Fatalf("apply calls=%d, want only the authorized bounded request", calls)
+	}
 }

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -584,12 +583,10 @@ func TestCoverage95RunExtendedWiringBranches(t *testing.T) {
 				t.Setenv("SB_FIRECRACKER_RUN_DIR", paths.firecrackerRunDir)
 			}
 			if tc.name == "cluster_agent_worker" || tc.name == "isolate_non_worker" || tc.name == "wasm_non_worker" {
-				raftPort := pickFreeTCPPort(t)
-				gossipPort := pickFreeTCPPort(t)
-				t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:"+strconv.Itoa(raftPort))
-				t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:"+strconv.Itoa(gossipPort))
-				t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:"+strconv.Itoa(raftPort))
-				t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:"+strconv.Itoa(gossipPort))
+				t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:0")
+				t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:0")
+				t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:0")
+				t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:0")
 				t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
 			}
 			if tc.name == "auto_import_pull_observer" {
@@ -1171,17 +1168,15 @@ func TestCoverage95MoreWiringAndRunBranches(t *testing.T) {
 		{
 			name: "cluster_wasm_inventory",
 			setup: func(t *testing.T, paths runTestPaths) {
-				raftPort := pickFreeTCPPort(t)
-				gossipPort := pickFreeTCPPort(t)
 				t.Setenv("SB_ENABLE_CLUSTER", "true")
 				t.Setenv("SB_NODE_ROLE", "mixed")
 				t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 				t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 				t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
-				t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:"+strconv.Itoa(raftPort))
-				t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:"+strconv.Itoa(gossipPort))
-				t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:"+strconv.Itoa(raftPort))
-				t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:"+strconv.Itoa(gossipPort))
+				t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:0")
+				t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:0")
+				t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:0")
+				t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:0")
 				t.Setenv("SB_RAFT_DATA_DIR", filepath.Join(paths.rootDir, "raft"))
 				t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
 				t.Setenv("SB_ENABLE_WASM", "true")

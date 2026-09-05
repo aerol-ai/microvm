@@ -15,9 +15,10 @@ import (
 // raft so a volume's id/name/source survive the tenant's API ownership moving
 // between nodes. The service selects between them with volumeMeta().
 //
-// Only the metadata row is abstracted here. The pending-deletion ledger and
-// attachment index remain in local SQLite (cluster-wide attachment visibility is
-// a tracked follow-up); the backing bytes are deterministic in S3/NFS.
+// Metadata and attachment ownership use the same abstraction: SQLite in
+// single-node mode and the cluster FSM in cluster mode. The pending-deletion
+// ledger remains local because each node deletes only its deterministic S3/NFS
+// backing path.
 type volumeMetaStore interface {
 	GetOrCreate(ctx context.Context, v *models.Volume, maxPerTenant int) (*models.Volume, bool, error)
 	ByID(ctx context.Context, tenant, id string) (*models.Volume, error)

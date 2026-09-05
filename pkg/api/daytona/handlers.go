@@ -13,9 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -305,39 +308,138 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 	apihttp.WriteJSON(w, http.StatusCreated, h.toSnapshotResponse(r, registered))
 }
 
-func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
-	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
+// listFacadeClusterItems merges local facade list items with peer facade lists
+// so remote owner nodes contribute their own compat metadata (not the ingress
+// node's empty local map).
+//
+// In cluster mode this is a placement-cursor API: page_token/limit select the
+// placement page; native Daytona page/limit must not re-slice the merge. Callers
+// must 503 when viewReady is false (matches /v1/sandboxes).
+func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxResponse) ([]sandboxResponse, clusterlist.Coverage, string, bool) {
+	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
+	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+		return local, cov, "", true
 	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		return local, cov, "", true
+	}
+	if _, ok := c.(*cluster.Noop); ok {
+		return local, cov, "", true
+	}
+	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
+	limit, pageToken := clusterlist.ParsePageParams(r.URL)
+	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
+	if !viewReady {
+		cov.PlacementViewReady = false
+		cov.Partial = true
+		return nil, cov, "", false
+	}
+	local = filterFacadeLocalToPage(local, placements, pageToken, func(it sandboxResponse) string { return it.ID })
+	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it sandboxResponse) string { return it.ID }, clusterlist.Options{
+		OwnerRef:   ownerRef,
+		AuthHeader: r.Header.Get("Authorization"),
+		// Peers must not re-apply facade page/limit — ingress paginates after merge.
+		RawQuery:   clusterlist.StripFacadePagination(r.URL.RawQuery),
+		Path:       PathPrefix + "/sandbox",
+		Transport:  clusterlist.TransportFromCluster(c),
+		SelfNodeID: c.SelfNodeID(),
+		WantIDs:    clusterlist.PlacementWantIDs(placements),
+		Warn: func(msg, peer string, peerErr error) {
+			if h.deps.Logger != nil {
+				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
+			}
+		},
+	})
+	cov.PlacementViewReady = viewReady
+	if len(missingOwners) > 0 {
+		cov.Missing = append(cov.Missing, missingOwners...)
+		cov.Partial = true
+	}
+	return items, cov, next, true
+}
 
+func filterFacadeLocalToPage[T any](local []T, placements []cluster.Placement, pageToken string, idFn func(T) string) []T {
+	if placements == nil {
+		if strings.TrimSpace(pageToken) != "" {
+			return nil
+		}
+		return local
+	}
+	want := clusterlist.PlacementWantIDs(placements)
+	out := make([]T, 0, len(local))
+	for _, it := range local {
+		if id := idFn(it); id != "" {
+			if _, ok := want[id]; ok {
+				out = append(out, it)
+			}
+		}
+	}
+	return out
+}
+
+// clusterListMode is true when a real cluster client is attached (not the
+// standalone Noop default from service.New) and this is not a forwarded peer
+// hop. Native Daytona page/limit must not re-slice placement pages in that mode.
+func clusterListMode(svc *service.Service, r *http.Request) bool {
+	if svc == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+		return false
+	}
+	c := svc.Cluster()
+	if c == nil {
+		return false
+	}
+	if _, ok := c.(*cluster.Noop); ok {
+		return false
+	}
+	return true
+}
+
+func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
+	if h.deps.Service == nil {
+		apihttp.WriteJSON(w, http.StatusOK, []sandboxResponse{})
+		return
+	}
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	metadata, err := h.listSandboxMeta(r.Context())
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-
-	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	items, cov, next, viewReady := h.listFacadeClusterItems(r, localItems)
+	if !viewReady {
+		w.Header().Set("Retry-After", "1")
+		clusterlist.WriteCoverageHeaders(w, cov, "")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
+		return
+	}
+	clusterlist.WriteCoverageHeaders(w, cov, next)
 	apihttp.WriteJSON(w, http.StatusOK, items)
 }
 
 func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
-	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-
 	filters, err := parseListFilters(r)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.deps.Service == nil {
+		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{})
+		return
+	}
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	metadata, err := h.listSandboxMeta(r.Context())
@@ -357,7 +459,45 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	inCluster := clusterListMode(h.deps.Service, r)
+	if inCluster {
+		// Cluster mode is placement-cursor based. Accept pageToken as alias for
+		// page_token. Native page>1 without a cursor would slice one placement
+		// page into empty results while more pages remain — reject that footgun.
+		pageToken := strings.TrimSpace(r.URL.Query().Get("page_token"))
+		if pageToken == "" {
+			pageToken = strings.TrimSpace(r.URL.Query().Get("pageToken"))
+		}
+		if page > 1 && pageToken == "" {
+			apihttp.WriteError(w, http.StatusBadRequest, "cluster list requires pageToken/page_token for page>1; use nextPageToken or X-Cluster-List-Next-Page-Token")
+			return
+		}
+	}
+
+	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	items, cov, next, viewReady := h.listFacadeClusterItems(r, localItems)
+	if !viewReady {
+		w.Header().Set("Retry-After", "1")
+		clusterlist.WriteCoverageHeaders(w, cov, "")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
+		return
+	}
+	clusterlist.WriteCoverageHeaders(w, cov, next)
+
+	if inCluster {
+		// Return the full placement-page hydration; do not re-slice with
+		// native page/limit. Next cursor is nextPageToken (+ coverage header).
+		// totalPages is unknown in cluster mode (-1).
+		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{
+			Items:         items,
+			Total:         float32(len(items)),
+			Page:          1,
+			TotalPages:    -1,
+			NextPageToken: next,
+		})
+		return
+	}
+
 	total := len(items)
 	start := int((page - 1) * limit)
 	if start > total {
@@ -677,6 +817,11 @@ func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbo
 		if sandbox == nil {
 			continue
 		}
+		if filters.IDs != nil {
+			if _, ok := filters.IDs[sandbox.ID]; !ok {
+				continue
+			}
+		}
 		meta := sandboxMetaFromNative(sandbox, metadata[sandbox.ID])
 		item := h.toSandboxResponse(r, sandbox, meta)
 		if filters.ID != "" && !strings.Contains(item.ID, filters.ID) {
@@ -796,8 +941,13 @@ func labelsMatch(labels map[string]string, wanted map[string]string) bool {
 }
 
 func parseListFilters(r *http.Request) (listFilters, error) {
+	peerIDs, err := clusterlist.PeerWantIDs(r)
+	if err != nil {
+		return listFilters{}, err
+	}
 	filters := listFilters{
 		ID:   strings.TrimSpace(r.URL.Query().Get("id")),
+		IDs:  peerIDs,
 		Name: strings.TrimSpace(r.URL.Query().Get("name")),
 	}
 	if raw := strings.TrimSpace(r.URL.Query().Get("labels")); raw != "" {

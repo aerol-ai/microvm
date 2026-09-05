@@ -13,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 // Driver implements runtime.Runtime for WASM sandboxes. WASM satisfies only the
@@ -21,12 +22,13 @@ type Driver struct {
 	cfg    Config
 	logger *slog.Logger
 
-	resolver        ModuleResolver
-	supervisor      WorkerSupervisor
-	newWorkerClient WorkerClientFactory
-	net             *networkGateway
-	warmPool        WarmPool
-	stateKV         statekv.Store
+	resolver              ModuleResolver
+	supervisor            WorkerSupervisor
+	newWorkerClient       WorkerClientFactory
+	net                   *networkGateway
+	warmPool              WarmPool
+	stateKV               statekv.Store
+	auditCapabilityIssuer func(sandboxID string) (capability, incarnationID string, err error)
 	// waitListenReady overrides guest TCP readiness polling (tests).
 	waitListenReady func(host string, port int) error
 
@@ -86,6 +88,25 @@ func (d *Driver) SetResidentHostSupervisor(s WorkerSupervisor) {
 // SetStateKV wires the durable host-KV store (§4.6).
 func (d *Driver) SetStateKV(kv statekv.Store) {
 	d.stateKV = kv
+}
+
+// SetAuditCapabilityIssuer installs the daemon-owned capability mint. Workers
+// receive only a sandbox-scoped token; they never inherit the master key.
+func (d *Driver) SetAuditCapabilityIssuer(issuer func(string) (string, string, error)) {
+	d.auditCapabilityIssuer = issuer
+}
+
+func (d *Driver) bindAuditCapability(sandboxID string, caps *wasmengine.Capabilities) error {
+	if d == nil || caps == nil || d.auditCapabilityIssuer == nil {
+		return nil
+	}
+	capability, incarnationID, err := d.auditCapabilityIssuer(sandboxID)
+	if err != nil {
+		return fmt.Errorf("issue egress audit capability: %w", err)
+	}
+	caps.AuditCapability = capability
+	caps.AuditIncarnation = incarnationID
+	return nil
 }
 
 func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, _ string) (string, error) {

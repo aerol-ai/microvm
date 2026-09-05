@@ -103,3 +103,13 @@ func TestWriteSnapshotDir_MkdirErr(t *testing.T) {
 		t.Error("expected error on MkdirAll failure")
 	}
 }
+
+func TestZstdDecompressRejectsOversizedOutput(t *testing.T) {
+	compressed, err := zstdCompress(make([]byte, 2048))
+	if err != nil {
+		t.Fatalf("zstdCompress: %v", err)
+	}
+	if _, err := zstdDecompressMax(compressed, 1024); err == nil {
+		t.Fatal("expected decompressed-size limit rejection")
+	}
+}

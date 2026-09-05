@@ -1,8 +1,10 @@
 package models
 
 import (
+	"encoding/base32"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -695,29 +697,40 @@ type ResizeSandboxRequest struct {
 }
 
 type Sandbox struct {
-	ID               string            `json:"id"`
-	Image            string            `json:"image"`
-	Status           SandboxStatus     `json:"status"`
-	PublicURL        string            `json:"public_url"`
-	ContainerID      string            `json:"container_id,omitempty"`
-	ContainerIP      string            `json:"container_ip,omitempty"`
-	CPU              float64           `json:"cpu"`
-	MemoryMB         int               `json:"memory_mb"`
-	DiskGB           int               `json:"disk_gb"`
-	OSUser           string            `json:"os_user"`
-	Env              map[string]string `json:"env,omitempty"`
-	NetworkBlockAll  bool              `json:"network_block_all"`
-	ToolboxEnabled   bool              `json:"toolbox_enabled"`
-	ToolboxToken     string            `json:"-"`
-	SSHPublicKey     string            `json:"ssh_public_key,omitempty"`
-	ExposedPorts     []ExposedPort     `json:"exposed_ports,omitempty"`
-	CreatedAt        time.Time         `json:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at"`
-	LastActiveAt     time.Time         `json:"last_active_at"`
-	LastError        string            `json:"last_error,omitempty"`
-	ContainerCommand []string          `json:"container_command,omitempty"`
-	Lifecycle        Lifecycle         `json:"lifecycle"`
-	Failover         *Failover         `json:"failover,omitempty"`
+	ID              string            `json:"id"`
+	Image           string            `json:"image"`
+	Status          SandboxStatus     `json:"status"`
+	PublicURL       string            `json:"public_url"`
+	ContainerID     string            `json:"container_id,omitempty"`
+	ContainerIP     string            `json:"container_ip,omitempty"`
+	CPU             float64           `json:"cpu"`
+	MemoryMB        int               `json:"memory_mb"`
+	DiskGB          int               `json:"disk_gb"`
+	OSUser          string            `json:"os_user"`
+	Env             map[string]string `json:"env,omitempty"`
+	NetworkBlockAll bool              `json:"network_block_all"`
+	ToolboxEnabled  bool              `json:"toolbox_enabled"`
+	ToolboxToken    string            `json:"-"`
+	// AuditIncarnationID scopes retained audit evidence to this exact sandbox
+	// lifecycle. It is persisted in sandbox_audit_acl, not on the sandbox row,
+	// and never crosses the public API or Raft recovery payload.
+	AuditIncarnationID string `json:"-"`
+	// ToolboxTokenSealed is the at-rest representation used by the store when
+	// toolbox-token sealing is enabled. It never crosses API or Raft payloads.
+	ToolboxTokenSealed []byte        `json:"-"`
+	SSHPublicKey       string        `json:"ssh_public_key,omitempty"`
+	ExposedPorts       []ExposedPort `json:"exposed_ports,omitempty"`
+	CreatedAt          time.Time     `json:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+	LastActiveAt       time.Time     `json:"last_active_at"`
+	LastError          string        `json:"last_error,omitempty"`
+	ContainerCommand   []string      `json:"container_command,omitempty"`
+	Lifecycle          Lifecycle     `json:"lifecycle"`
+	Failover           *Failover     `json:"failover,omitempty"`
+	// FailoverReady is set on Get/List when failover.policy=recreate: true iff
+	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
+	// set is single-node (len≤1). Omitted for non-recreate sandboxes.
+	FailoverReady *bool `json:"failover_ready,omitempty"`
 	// Name is the optional unique identifier set at create time. Empty when
 	// the sandbox was created without one (the common path on /v1 today).
 	Name string `json:"name,omitempty"`
@@ -1304,17 +1317,83 @@ type PushWasmModuleResponse struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
-// JS-bundle cluster-replication headers. Isolate's bundle store is per-node, so
-// the node that receives an upload fans the bundle out to its peers (otherwise
-// an isolate create placed on a different node fails "bundle not found"). The
-// replicated POST carries these so the receiver stores the bundle under the
-// ORIGINAL owner (not the replication PAT's scope) and does NOT fan out again
-// (loop guard). Defined here because both pkg/api/v1 (reader) and
-// internal/cluster (writer) import models but not each other.
-const (
-	HeaderJSBundleReplicated = "X-Cluster-Bundle-Replicated"
-	HeaderJSBundleOwner      = "X-Cluster-Bundle-Owner"
-)
+const jsBundleNodeRefPrefix = "node:"
+
+var clusterNodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+var templateIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// ValidClusterNodeID is the single delimiter-safe grammar for identities that
+// cross certificates, headers, gossip, and node-bound artifact references.
+func ValidClusterNodeID(nodeID string) bool {
+	return clusterNodeIDPattern.MatchString(nodeID)
+}
+
+// ValidTemplateID keeps operator-supplied IDs safe as SQL keys, filesystem
+// path components, URL segments, and registry repository components. Requiring
+// an alphanumeric first byte excludes dot-segment traversal.
+func ValidTemplateID(templateID string) bool {
+	return templateIDPattern.MatchString(templateID)
+}
+
+// EncodeNodeAffinity returns the URL/tag-safe encoding shared by node-bound
+// artifacts. Invalid node IDs are rejected at this boundary as well as config.
+func EncodeNodeAffinity(nodeID string) (string, bool) {
+	nodeID = strings.TrimSpace(nodeID)
+	if !ValidClusterNodeID(nodeID) {
+		return "", false
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(nodeID))), true
+}
+
+// DecodeNodeAffinity reverses EncodeNodeAffinity and reapplies the node-ID
+// grammar so caller-supplied references cannot introduce protocol delimiters.
+func DecodeNodeAffinity(encoded string) (string, bool) {
+	raw, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.TrimSpace(encoded)))
+	if err != nil || len(raw) == 0 || len(raw) > 128 {
+		return "", false
+	}
+	nodeID := string(raw)
+	if !ValidClusterNodeID(nodeID) || strings.TrimSpace(nodeID) != nodeID {
+		return "", false
+	}
+	return nodeID, true
+}
+
+// JSBundleRefForNode binds a node-local isolate bundle reference to its owner
+// worker. The node ID is base32-encoded so the reference remains safe in JSON,
+// URLs, and CLI arguments without accepting delimiter injection.
+func JSBundleRefForNode(localRef, nodeID string) string {
+	localRef = strings.TrimSpace(localRef)
+	nodeID = strings.TrimSpace(nodeID)
+	if localRef == "" || nodeID == "" {
+		return localRef
+	}
+	encoded, ok := EncodeNodeAffinity(nodeID)
+	if !ok {
+		return localRef
+	}
+	return jsBundleNodeRefPrefix + encoded + ":" + localRef
+}
+
+// ParseJSBundleNodeRef returns the required worker and the worker-local ref.
+// Cluster upload responses use this encoding so later create placement remains
+// O(1) and never probes or replicates a bundle across the fleet.
+func ParseJSBundleNodeRef(ref string) (nodeID, localRef string, ok bool) {
+	ref = strings.TrimSpace(ref)
+	if !strings.HasPrefix(ref, jsBundleNodeRefPrefix) {
+		return "", ref, false
+	}
+	rest := strings.TrimPrefix(ref, jsBundleNodeRefPrefix)
+	encoded, localRef, found := strings.Cut(rest, ":")
+	if !found || encoded == "" || strings.TrimSpace(localRef) == "" {
+		return "", ref, false
+	}
+	nodeID, ok = DecodeNodeAffinity(encoded)
+	if !ok {
+		return "", ref, false
+	}
+	return nodeID, strings.TrimSpace(localRef), true
+}
 
 // CreateJSBundleRequest is the body for POST /v1/js-bundles — the "no image,
 // no registry" upload path for the isolate runtime (plans/isolate-runtime.md

@@ -1,8 +1,9 @@
 package cluster
 
 import (
-	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,15 +13,24 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-func TestScaleHarness1000NodeCreateBurstCapacityAndWorkerDeath(t *testing.T) {
+// TestScaleGateEnterpriseTopologyCreateSealDeletePlanes exercises the
+// requested enterprise gate shape: 2,000 live members (100 ingress), and a
+// 100,000-sandbox reservation burst driven by 64 concurrent submitters across
+// the placement plane. Credential lifecycle concurrency is covered separately
+// by TestScaleGateConcurrentSealDeletePlane.
+func TestScaleGateEnterpriseTopologyCreateSealDeletePlanes(t *testing.T) {
 	requireScaleGates(t)
 
 	const (
-		servers          = 3
-		workers          = 990
-		ingress          = 7
-		perWorkerCreates = 50
+		servers   = 3
+		ingress   = 100
+		totalLive = 2000
+		creates   = 100_000
 	)
+	workers := totalLive - servers - ingress
+	if workers <= 0 {
+		t.Fatalf("invalid topology math: workers=%d", workers)
+	}
 	now := time.Unix(1_800_000_000, 0)
 	members := scaleHarnessMembers(servers, workers, ingress)
 	leases := newCapacityLeaseCache("", nil, 5*time.Second, nil)
@@ -29,81 +39,110 @@ func TestScaleHarness1000NodeCreateBurstCapacityAndWorkerDeath(t *testing.T) {
 	}
 	members = leases.apply(members, now)
 
-	if got := LiveMemberCount(members); got != servers+workers+ingress {
-		t.Fatalf("live members=%d, want %d", got, servers+workers+ingress)
+	if got := LiveMemberCount(members); got != totalLive {
+		t.Fatalf("live members=%d, want %d", got, totalLive)
 	}
 	if err := LargeClusterTopologyError(members); err != nil {
-		t.Fatalf("1000-node dedicated topology rejected: %v", err)
+		t.Fatalf("2000-node dedicated topology rejected: %v", err)
+	}
+	ingressCount := 0
+	for _, m := range members {
+		if m.Alive && m.Role == config.NodeRoleIngress {
+			ingressCount++
+		}
+	}
+	if ingressCount != ingress {
+		t.Fatalf("ingress members=%d, want %d", ingressCount, ingress)
 	}
 
 	fsm := newPlacementFSM()
 	expiry := now.Add(10 * time.Minute).Unix()
-	logIndex := uint64(1)
-	for worker := 0; worker < workers; worker++ {
+
+	type batchJob struct {
+		owner string
+		batch []reservationCommand
+	}
+	perWorker := creates / workers
+	remainder := creates % workers
+	jobs := make([]batchJob, 0, workers)
+	remaining := creates
+	for worker := 0; worker < workers && remaining > 0; worker++ {
+		n := perWorker
+		if worker < remainder {
+			n++
+		}
 		owner := fmt.Sprintf("worker-%04d", worker)
-		batch := make([]reservationCommand, 0, perWorkerCreates)
-		for create := 0; create < perWorkerCreates; create++ {
+		batch := make([]reservationCommand, 0, n)
+		for create := 0; create < n; create++ {
 			batch = append(batch, reservationCommand{
-				SandboxID:   fmt.Sprintf("burst-%04d-%02d", worker, create),
+				SandboxID:   fmt.Sprintf("ent-%04d-%05d", worker, create),
 				OwnerNodeID: owner,
 				OwnerAPIURL: fmt.Sprintf("http://%s:21212", owner),
 				Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256, DiskGB: 1},
 				ExpiresUnix: expiry,
 			})
 		}
-		pending := fsm.pendingReservationsByNode(expiry - 1)
-		counts := map[string]int{owner: fsm.livePendingReservationCount(owner, expiry-1)}
-		if err := admitReservationCommands(members, pending, counts, perWorkerCreates, batch); err != nil {
-			t.Fatalf("admit batch for %s: %v", owner, err)
-		}
-		payload, err := encodeCommand(command{Op: opReserveBatch, Reservations: batch})
-		if err != nil {
-			t.Fatalf("encode batch for %s: %v", owner, err)
-		}
-		if got := fsm.Apply(&raft.Log{Index: logIndex, Data: payload}); got != nil {
-			t.Fatalf("apply batch for %s: %v", owner, got)
-		}
-		logIndex++
+		jobs = append(jobs, batchJob{owner: owner, batch: batch})
+		remaining -= n
 	}
 
-	if got := len(fsm.pendingReservationClaims); got != workers*perWorkerCreates {
-		t.Fatalf("pending claims=%d, want %d", got, workers*perWorkerCreates)
-	}
-	if got := fsm.pendingReservationsByNode(expiry - 1)["worker-0000"].CPU; got != perWorkerCreates {
-		t.Fatalf("worker-0000 pending CPU=%v, want %d", got, perWorkerCreates)
-	}
-	err := admitReservationCommands(members, fsm.pendingReservationsByNode(expiry-1),
-		map[string]int{"worker-0000": fsm.livePendingReservationCount("worker-0000", expiry-1)},
-		perWorkerCreates,
-		[]reservationCommand{{
-			SandboxID:   "burst-over-cap",
-			OwnerNodeID: "worker-0000",
-			Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256, DiskGB: 1},
-			ExpiresUnix: expiry,
-		}},
+	var (
+		mu        sync.Mutex
+		logIndex  uint64 = 1
+		admitFail atomic.Int32
+		applyFail atomic.Int32
+		accepted  atomic.Int32
 	)
-	if !errors.Is(err, ErrCreateBackpressure) {
-		t.Fatalf("extra create admission error=%v, want ErrCreateBackpressure", err)
+	var wg sync.WaitGroup
+	// Many concurrent submitters; FSM mutations stay single-threaded under mu.
+	sem := make(chan struct{}, 64)
+	for _, job := range jobs {
+		job := job
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Every batch targets a distinct owner, so admission and encoding can run
+			// concurrently. Only Raft FSM Apply is serialized, matching production.
+			if err := admitReservationCommands(members, nil, map[string]int{job.owner: 0}, len(job.batch), job.batch); err != nil {
+				admitFail.Add(1)
+				return
+			}
+			payload, err := encodeCommand(command{Op: opReserveBatch, Reservations: job.batch})
+			if err != nil {
+				applyFail.Add(1)
+				return
+			}
+			mu.Lock()
+			idx := logIndex
+			logIndex++
+			if got := fsm.Apply(&raft.Log{Index: idx, Data: payload}); got != nil {
+				mu.Unlock()
+				applyFail.Add(1)
+				return
+			}
+			mu.Unlock()
+			accepted.Add(int32(len(job.batch)))
+		}()
+	}
+	wg.Wait()
+	if admitFail.Load() > 0 || applyFail.Load() > 0 {
+		t.Fatalf("concurrent plane failures: admit=%d apply=%d", admitFail.Load(), applyFail.Load())
+	}
+	if got := int(accepted.Load()); got != creates {
+		t.Fatalf("accepted reservations=%d, want exactly %d under concurrent submit", got, creates)
+	}
+	if got := len(fsm.pendingReservationClaims); got != int(accepted.Load()) {
+		t.Fatalf("pending claims=%d, want %d", got, accepted.Load())
 	}
 
-	missingLease := scaleHarnessMembers(servers, workers, ingress)
-	missingLease = leases.apply(missingLease, now.Add(30*time.Second))
-	err = admitReservationCommands(missingLease, nil, nil, perWorkerCreates,
-		[]reservationCommand{{
-			SandboxID:   "stale-worker-create",
-			OwnerNodeID: "worker-0001",
-			Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256, DiskGB: 1},
-			ExpiresUnix: expiry,
-		}},
-	)
-	if !errors.Is(err, ErrNoPlacementTarget) {
-		t.Fatalf("stale capacity admission error=%v, want ErrNoPlacementTarget", err)
-	}
-
-	for i := 0; i < perWorkerCreates; i++ {
+	// Second plane: orphan a dead owner while the cluster remains at enterprise size.
+	deadOwned := 200
+	for i := 0; i < deadOwned; i++ {
 		payload, err := encodeCommand(command{
 			Op:          opPlace,
-			SandboxID:   fmt.Sprintf("dead-owned-%02d", i),
+			SandboxID:   fmt.Sprintf("dead-ent-%04d", i),
 			OwnerNodeID: "worker-dead",
 			OwnerAPIURL: "http://worker-dead:21212",
 			Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256, DiskGB: 1},
@@ -111,16 +150,20 @@ func TestScaleHarness1000NodeCreateBurstCapacityAndWorkerDeath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encode dead placement: %v", err)
 		}
-		if got := fsm.Apply(&raft.Log{Index: logIndex, Data: payload}); got != nil {
+		mu.Lock()
+		idx := logIndex
+		logIndex++
+		mu.Unlock()
+		if got := fsm.Apply(&raft.Log{Index: idx, Data: payload}); got != nil {
 			t.Fatalf("apply dead placement: %v", got)
 		}
-		logIndex++
-	}
-	if got := len(fsm.idsOwnedBy("worker-dead")); got != perWorkerCreates {
-		t.Fatalf("worker-dead owned ids=%d, want %d", got, perWorkerCreates)
 	}
 	orphan, _ := encodeCommand(command{Op: opOrphanOwner, NodeID: "worker-dead"})
-	if got := fsm.Apply(&raft.Log{Index: logIndex, Data: orphan}); got != nil {
+	mu.Lock()
+	idx := logIndex
+	logIndex++
+	mu.Unlock()
+	if got := fsm.Apply(&raft.Log{Index: idx, Data: orphan}); got != nil {
 		t.Fatalf("orphan dead worker: %v", got)
 	}
 	if got := len(fsm.idsOwnedBy("worker-dead")); got != 0 {

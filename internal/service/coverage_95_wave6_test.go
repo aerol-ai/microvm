@@ -221,11 +221,8 @@ func TestGetJSBundleNilAndScopedMiss(t *testing.T) {
 	}
 }
 
-func TestCreateJSBundleModulesPathAndReplicatorWarn(t *testing.T) {
+func TestCreateJSBundleModulesPath(t *testing.T) {
 	svc := newBundleService(t)
-	svc.SetJSBundleReplicator(func(context.Context, string, models.CreateJSBundleRequest) error {
-		return errors.New("peer down")
-	})
 	_, err := svc.CreateJSBundle(context.Background(), models.CreateJSBundleRequest{
 		Name:       "multi",
 		MainModule: "index.js",

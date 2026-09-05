@@ -51,12 +51,21 @@ type reserveCall struct {
 }
 
 func (c *createForwardCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	target, _, err := c.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (c *createForwardCluster) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	c.selectPlacementHit++
 	c.selectRequests = append(c.selectRequests, req)
 	if c.selectErr != nil {
-		return cluster.PlacementTarget{}, c.selectErr
+		return cluster.PlacementTarget{}, nil, c.selectErr
 	}
-	return c.target, nil
+	cands := c.members
+	if len(cands) == 0 {
+		cands = []cluster.Member{{NodeID: c.target.NodeID, APIURL: c.target.APIURL, Alive: true}}
+	}
+	return c.target, cands, nil
 }
 
 func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, secrets cluster.PlacementSecrets, ttl time.Duration) error {
@@ -74,6 +83,15 @@ func (c *createForwardCluster) Members() []cluster.Member {
 		return c.members
 	}
 	return c.Noop.Members()
+}
+
+func (c *createForwardCluster) LookupMember(nodeID string) (cluster.Member, bool) {
+	for _, member := range c.Members() {
+		if member.NodeID == nodeID {
+			return member, true
+		}
+	}
+	return cluster.Member{}, false
 }
 
 func (c *createForwardCluster) IsNodeDrained(nodeID string) bool {
@@ -200,6 +218,14 @@ func TestCapacityRequestFromCreateTreatsBuiltImagesAsDocker(t *testing.T) {
 	got := capacityRequestFromCreate(models.CreateSandboxRequest{Image: docker.BuiltImageNamespace + "/abc:latest"})
 	if got.Runtime != models.RuntimeDocker {
 		t.Fatalf("placement Runtime = %q, want docker for built local image", got.Runtime)
+	}
+}
+
+func TestCapacityRequestFromCreatePinsNodeBoundIsolateBundle(t *testing.T) {
+	ref := models.JSBundleRefForNode("sha256:abc", "isolate-a")
+	got := capacityRequestFromCreate(models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: ref})
+	if got.RequiredNodeID != "isolate-a" {
+		t.Fatalf("RequiredNodeID = %q, want isolate-a", got.RequiredNodeID)
 	}
 }
 
@@ -556,18 +582,58 @@ var _ cluster.Client = (*createForwardCluster)(nil)
 
 type membersStubCluster struct {
 	*cluster.Noop
-	members []cluster.Member
+	members        []cluster.Member
+	internalClient *http.Client
+	placement      cluster.PlacementTarget
+	placementErr   error
 }
 
 func (c *membersStubCluster) Members() []cluster.Member {
 	return c.members
 }
 
+func (c *membersStubCluster) PeerInternalHTTPClient() *http.Client {
+	in := c.internalClient
+	if in == nil {
+		in = http.DefaultClient
+	}
+	return in
+}
+
+func (c *membersStubCluster) ClientForPeer(string) *http.Client { return c.PeerInternalHTTPClient() }
+
+func (c *membersStubCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	target, _, err := c.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (c *membersStubCluster) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
+	if c.placementErr != nil {
+		return cluster.PlacementTarget{}, nil, c.placementErr
+	}
+	if c.placement.NodeID != "" {
+		return c.placement, append([]cluster.Member(nil), c.members...), nil
+	}
+	return c.Noop.SelectPlacementWithCandidates(req)
+}
+
+func (c *membersStubCluster) PeerDialMember(m cluster.Member) (*http.Client, string, error) {
+	if c.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {
+		return nil, "", cluster.ErrPeerInternalURLRequired
+	}
+	return c.internalClient, m.InternalURL, nil
+}
+
 var _ cluster.Client = (*membersStubCluster)(nil)
 
-func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *testing.T) {
+func TestClusterListWrapUsesPlacementOwnersAtEnterpriseScale(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
 	members := []cluster.Member{
 		{NodeID: "node-a", APIURL: "http://node-a:21212", Alive: true, Role: config.NodeRoleMixed},
 	}
@@ -589,15 +655,16 @@ func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *te
 	rr := httptest.NewRecorder()
 	h.clusterListWrap(rr, req)
 
+	// No placement view on a large fleet ⇒ 503 Retry-After (never a local-only
+	// 200 that looks complete). Operators use sandbox-index for fleet scans.
 	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+		t.Fatalf("status = %d, want %d body=%q", rr.Code, http.StatusServiceUnavailable, rr.Body.String())
 	}
-	body := rr.Body.String()
-	if !strings.Contains(body, "/v1/cluster/sandbox-index") {
-		t.Fatalf("body = %q, want it to point callers at the paginated index", body)
+	if rr.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", rr.Header().Get("Retry-After"))
 	}
-	if strings.Contains(body, `"placements"`) {
-		t.Fatalf("body = %q, must not return the sandbox-index response shape from /v1/sandboxes", body)
+	if !strings.Contains(rr.Body.String(), "placement view is not ready") {
+		t.Fatalf("body = %q, want placement view not ready", rr.Body.String())
 	}
 }
 

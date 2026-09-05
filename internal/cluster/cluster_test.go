@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,6 +225,11 @@ func startInternalApplyServer(t *testing.T, c *Cluster, ln net.Listener) *httpte
 
 // --- helpers below ---
 
+// testClusterMu serializes real raft/memberlist harness teardown. Memberlist
+// shutdown is asynchronous enough that overlapping create/close operations
+// can otherwise report "use of closed network connection" in tests.
+var testClusterMu sync.Mutex
+
 // newTestCluster builds a real *Cluster on dynamic ports under t.TempDir().
 // bootstrap=true bootstraps a single-voter raft; peers (if non-nil) are gossip
 // addresses to join. Returns a cleanup that closes the cluster — defer it.
@@ -236,36 +242,47 @@ func newTestCluster(t *testing.T, nodeID string, bootstrap bool, gossipPeers []s
 // newTestClusterWithAPI is newTestCluster with a caller-supplied API URL — used
 // when the test needs to advertise a URL it has already pre-bound a listener
 // on (so the gossip-published URL matches an HTTP server the test will start).
+//
+// Construction and Close are serialized via testClusterMu so concurrent
+// harnesses do not overlap memberlist teardown. Multiple clusters may still
+// run concurrently after New returns (two-node tests).
 func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, apiURL string) (*Cluster, func()) {
 	t.Helper()
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
+	testClusterMu.Lock()
 	dir := t.TempDir()
 
 	cfg := config.Config{
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
-		RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
-		RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
+		RaftBindAddr:                  "127.0.0.1:0",
+		RaftAdvertiseAddr:             "127.0.0.1:0",
 		RaftDataDir:                   filepath.Join(dir, "raft"),
-		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
 		BootstrapPeers:                gossipPeers,
 		ClusterBootstrap:              bootstrap,
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c, err := New(cfg, logger, nil)
+	testClusterMu.Unlock()
 	if err != nil {
 		t.Fatalf("cluster.New(%s): %v", nodeID, err)
 	}
 	return c, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
 		if err := c.Close(); err != nil {
 			t.Logf("cluster.Close(%s): %v", nodeID, err)
 		}
+		// Brief settle so memberlist UDP sockets release before the next
+		// serialized harness binds the same loopback range.
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

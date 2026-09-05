@@ -19,8 +19,7 @@ import (
 // belong on newTestClusterWithCfg.
 func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap bool, gossipPeers []string, grace time.Duration) (*Cluster, func()) {
 	t.Helper()
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
+	testClusterMu.Lock()
 	dir := t.TempDir()
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 
@@ -28,21 +27,24 @@ func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
 		NodeRole:                      role,
-		RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
-		RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
+		RaftBindAddr:                  "127.0.0.1:0",
+		RaftAdvertiseAddr:             "127.0.0.1:0",
 		RaftDataDir:                   filepath.Join(dir, "raft"),
-		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
 		BootstrapPeers:                gossipPeers,
 		ClusterBootstrap:              bootstrap,
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterDeadOwnerGrace:         grace,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c, err := New(cfg, logger, nil)
+	testClusterMu.Unlock()
 	if err != nil {
 		t.Fatalf("cluster.New(%s, role=%s): %v", nodeID, role, err)
 	}
@@ -52,9 +54,12 @@ func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap
 	var once sync.Once
 	return c, func() {
 		once.Do(func() {
+			testClusterMu.Lock()
+			defer testClusterMu.Unlock()
 			if err := c.Close(); err != nil {
 				t.Logf("cluster.Close(%s): %v", nodeID, err)
 			}
+			time.Sleep(50 * time.Millisecond)
 		})
 	}
 }

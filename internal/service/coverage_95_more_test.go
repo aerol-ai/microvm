@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 type fakeIsolateToolboxHost struct {
@@ -201,11 +202,12 @@ func TestDestroySandboxHappyPath(t *testing.T) {
 
 func TestSealClusterSecretEnvelopeNonceFailureAndBadDEK(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
 	setRandReader(t, &scriptedRandReader{errs: []error{nil, errors.New("nonce entropy")}})
-	if _, err := s.sealClusterSecretEnvelope([]byte(`{"x":1}`), []string{"*"}); err == nil {
+	if _, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{"x":1}`), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected nonce failure")
 	}
-	if _, err := openClusterSecretEnvelopePayload([]byte("short"), []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, []string{"*"}); err == nil {
+	if _, err := secrets.OpenEnvelopePayloadBound([]byte("short"), []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected bad dek / short payload failure")
 	}
 }
@@ -328,17 +330,4 @@ func TestStartBuiltImageGCPaths(t *testing.T) {
 	cancel()
 	svc.cfg.ImageBuildGCEnabled = false
 	svc.StartBuiltImageGC(context.Background())
-}
-
-func TestOpenClusterSecretPayloadLegacyRaw(t *testing.T) {
-	s := &Service{cipher: newTestCipher(t)}
-	plain := []byte(`{"registry":{"password":"x"}}`)
-	sealed, err := s.cipher.Encrypt(plain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := s.openClusterSecretPayload(sealed, "")
-	if err != nil || string(out) != string(plain) {
-		t.Fatalf("legacy open = %q, %v", out, err)
-	}
 }

@@ -17,10 +17,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	svcmetrics "github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -148,17 +150,123 @@ func sandboxIDFromFingerprint(fingerprint string) string {
 	return "sb-" + hexPart[:16]
 }
 
+// listFacadeClusterItems merges local E2B list items with peer facade lists so
+// remote owners contribute their own compat metadata.
+//
+// Cluster mode is placement-cursor based (page_token/limit). Callers must 503
+// when viewReady is false, matching /v1/sandboxes.
+func (h *handlers) listFacadeClusterItems(r *http.Request, local []listedSandboxResponse) ([]listedSandboxResponse, clusterlist.Coverage, string, bool) {
+	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
+	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+		return local, cov, "", true
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		return local, cov, "", true
+	}
+	if _, ok := c.(*cluster.Noop); ok {
+		return local, cov, "", true
+	}
+	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
+	limit, pageToken := clusterlist.ParsePageParams(r.URL)
+	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
+	if !viewReady {
+		cov.PlacementViewReady = false
+		cov.Partial = true
+		return nil, cov, "", false
+	}
+	local = filterE2BLocalToPage(local, placements, pageToken)
+	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it listedSandboxResponse) string { return it.SandboxID }, clusterlist.Options{
+		OwnerRef:   ownerRef,
+		AuthHeader: r.Header.Get("Authorization"),
+		// Peers must not re-apply nextToken/limit — ingress paginates after merge.
+		RawQuery:   clusterlist.StripFacadePagination(r.URL.RawQuery),
+		Path:       PathPrefix + "/sandboxes",
+		Transport:  clusterlist.TransportFromCluster(c),
+		SelfNodeID: c.SelfNodeID(),
+		WantIDs:    clusterlist.PlacementWantIDs(placements),
+		Warn: func(msg, peer string, peerErr error) {
+			if h.deps.Logger != nil {
+				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
+			}
+		},
+	})
+	cov.PlacementViewReady = viewReady
+	if len(missingOwners) > 0 {
+		cov.Missing = append(cov.Missing, missingOwners...)
+		cov.Partial = true
+	}
+	return items, cov, next, true
+}
+
+func filterE2BLocalToPage(local []listedSandboxResponse, placements []cluster.Placement, pageToken string) []listedSandboxResponse {
+	if placements == nil {
+		if strings.TrimSpace(pageToken) != "" {
+			return nil
+		}
+		return local
+	}
+	want := clusterlist.PlacementWantIDs(placements)
+	out := make([]listedSandboxResponse, 0, len(local))
+	for _, it := range local {
+		if _, ok := want[it.SandboxID]; ok {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// clusterListMode is true when a real cluster client is attached (not the
+// standalone Noop default from service.New) and this is not a forwarded peer hop.
+func clusterListMode(svc *svcmetrics.Service, r *http.Request) bool {
+	if svc == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+		return false
+	}
+	c := svc.Cluster()
+	if c == nil {
+		return false
+	}
+	if _, ok := c.(*cluster.Noop); ok {
+		return false
+	}
+	return true
+}
+
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		writeJSON(w, http.StatusOK, []listedSandboxResponse{})
+		return
+	}
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
-	limit, offset, err := parsePagination(r, 100)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, err.Error())
-		return
+	inCluster := clusterListMode(h.deps.Service, r)
+	var limit, offset int
+	if inCluster {
+		// Placement-cursor API. Non-numeric nextToken is an opaque placement
+		// page_token (base64/cursor). Numeric nextToken without page_token is
+		// the legacy offset and is rejected in cluster mode.
+		nextTok := strings.TrimSpace(r.URL.Query().Get("nextToken"))
+		pageTok := strings.TrimSpace(r.URL.Query().Get("page_token"))
+		if pageTok == "" && nextTok != "" {
+			if _, err := strconv.Atoi(nextTok); err == nil {
+				WriteError(w, http.StatusBadRequest, "cluster list requires opaque nextToken/page_token (not integer offset); use x-next-token from prior response")
+				return
+			}
+			q := r.URL.Query()
+			q.Set("page_token", nextTok)
+			r.URL.RawQuery = q.Encode()
+		}
+	} else {
+		var err error
+		limit, offset, err = parsePagination(r, 100)
+		if err != nil {
+			WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	metadataFilter, err := parseMetadataFilter(r.URL.Query().Get("metadata"))
 	if err != nil {
@@ -170,6 +278,11 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	peerIDs, err := clusterlist.PeerWantIDs(r)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	stored, err := h.deps.Service.ListCompatState(r.Context(), models.FacadeE2B)
 	if err != nil {
@@ -177,10 +290,15 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := make([]listedSandboxResponse, 0, len(sandboxes))
+	localItems := make([]listedSandboxResponse, 0, len(sandboxes))
 	for _, sandbox := range sandboxes {
 		if sandbox == nil {
 			continue
+		}
+		if peerIDs != nil {
+			if _, ok := peerIDs[sandbox.ID]; !ok {
+				continue
+			}
 		}
 		var statePtr *models.SandboxCompatState
 		if s, ok := stored[sandbox.ID]; ok {
@@ -201,8 +319,17 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		if len(metadataFilter) > 0 && !metadataContains(meta.Metadata, metadataFilter) {
 			continue
 		}
-		items = append(items, h.toListedSandboxResponse(sandbox, meta))
+		localItems = append(localItems, h.toListedSandboxResponse(sandbox, meta))
 	}
+
+	items, cov, next, viewReady := h.listFacadeClusterItems(r, localItems)
+	if !viewReady {
+		w.Header().Set("Retry-After", "1")
+		clusterlist.WriteCoverageHeaders(w, cov, "")
+		WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
+		return
+	}
+	clusterlist.WriteCoverageHeaders(w, cov, next)
 
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].StartedAt == items[j].StartedAt {
@@ -210,6 +337,14 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 		return items[i].StartedAt > items[j].StartedAt
 	})
+
+	if inCluster {
+		if next != "" {
+			w.Header().Set("x-next-token", next)
+		}
+		writeJSON(w, http.StatusOK, items)
+		return
+	}
 
 	page, nextToken := paginateListedSandboxes(items, offset, limit)
 	if nextToken != "" {

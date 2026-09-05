@@ -57,6 +57,20 @@ func (c *placementPageStubCluster) Placements() []cluster.Placement {
 	return c.placements
 }
 
+func (c *placementPageStubCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	out := make(map[string]cluster.Placement, len(ids))
+	byID := make(map[string]cluster.Placement, len(c.placements))
+	for _, p := range c.placements {
+		byID[p.SandboxID] = p
+	}
+	for _, id := range ids {
+		if p, ok := byID[id]; ok {
+			out[id] = p
+		}
+	}
+	return out
+}
+
 func (c *placementPageStubCluster) PlacementPage(req cluster.PlacementPageRequest) cluster.PlacementPageResponse {
 	_ = req
 	return c.pageResp
@@ -91,7 +105,7 @@ func (c *internalPlacementStubCluster) OwnerOfName(name string) (string, cluster
 }
 
 func TestClusterListWrap_MergesPeerResults(t *testing.T) {
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			http.Error(w, "missing forward header", http.StatusBadRequest)
 			return
@@ -121,10 +135,11 @@ func TestClusterListWrap_MergesPeerResults(t *testing.T) {
 
 	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("node-a", peer.URL, ""),
+		Noop:           cluster.NewNoop("node-a", peer.URL, ""),
+		internalClient: peer.Client(),
 		members: []cluster.Member{
-			{NodeID: "node-a", APIURL: peer.URL, Alive: true, Role: config.NodeRoleMixed},
-			{NodeID: "node-b", APIURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-a", APIURL: peer.URL, InternalURL: peer.URL, Alive: true, Role: config.NodeRoleMixed},
+			{NodeID: "node-b", APIURL: peer.URL, InternalURL: peer.URL, Alive: true, Role: config.NodeRoleWorker},
 		},
 	})
 	h := &handlers{deps: Deps{Service: svc, Logger: logger}}

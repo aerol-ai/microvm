@@ -108,10 +108,11 @@ type sandboxResponse struct {
 }
 
 type paginatedSandboxesResponse struct {
-	Items      []sandboxResponse `json:"items"`
-	Total      float32           `json:"total"`
-	Page       float32           `json:"page"`
-	TotalPages float32           `json:"totalPages"`
+	Items         []sandboxResponse `json:"items"`
+	Total         float32           `json:"total"`
+	Page          float32           `json:"page"`
+	TotalPages    float32           `json:"totalPages"`
+	NextPageToken string            `json:"nextPageToken,omitempty"`
 }
 
 type toolboxProxyURLResponse struct {
@@ -150,6 +151,7 @@ type dirResponse struct {
 
 type listFilters struct {
 	ID     string
+	IDs    map[string]struct{}
 	Name   string
 	Labels map[string]string
 	States map[string]struct{}

@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
@@ -89,6 +90,8 @@ func (c *wasmMigrationTargetClusterStub) OwnerOf(string) (cluster.OwnerInfo, err
 func (c *wasmMigrationTargetClusterStub) Members() []cluster.Member {
 	return append([]cluster.Member(nil), c.members...)
 }
+
+func (c *wasmMigrationTargetClusterStub) LocalMembers() []cluster.Member { return c.Members() }
 
 func (c *wasmMigrationTargetClusterStub) IsNodeDrained(nodeID string) bool {
 	if c.drained == nil {
@@ -173,10 +176,12 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = st.Close() })
 
+		cipher := newTestCipher(t)
 		svc := &Service{
-			cfg:    config.Config{EnableCluster: true},
-			store:  st,
-			cipher: newTestCipher(t),
+			cfg:            config.Config{EnableCluster: true},
+			store:          st,
+			cipher:         cipher,
+			secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
 		}
 
 		plainRegistry := &models.RegistryAuth{Server: "ghcr.io", Username: "alice", Password: "secret"}
@@ -283,9 +288,10 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
 		}
 
-		sealed, err := svc.SealClusterSecrets(req)
+		binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+		sealed, err := secrets.SealEnvelopeBound(svc.cipher, svc.secretsFromRequest(req), []string{"node-a"}, binding)
 		if err != nil {
-			t.Fatalf("SealClusterSecrets: %v", err)
+			t.Fatalf("SealEnvelopeBound: %v", err)
 		}
 		if len(sealed) == 0 {
 			t.Fatal("expected sealed payload")
@@ -301,43 +307,44 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			t.Fatalf("RedactClusterSecrets should preserve failover: %+v", redacted.Failover)
 		}
 
-		merged, err := svc.UnsealClusterSecrets(redacted, sealed)
+		bag, err := secrets.OpenEnvelopeBound(svc.cipher, sealed, "node-a", binding)
 		if err != nil {
-			t.Fatalf("UnsealClusterSecrets: %v", err)
+			t.Fatalf("OpenEnvelopeBound: %v", err)
 		}
+		merged := mergeClusterSecrets(redacted, bag)
 		if merged.Registry == nil || merged.Registry.Password != "secret" {
-			t.Fatalf("UnsealClusterSecrets registry = %+v", merged.Registry)
+			t.Fatalf("merged cluster secrets registry = %+v", merged.Registry)
 		}
 		if merged.Mounts[0].Credentials["token"] != "mount-secret" {
-			t.Fatalf("UnsealClusterSecrets mount creds = %+v", merged.Mounts[0].Credentials)
+			t.Fatalf("merged cluster secrets mount creds = %+v", merged.Mounts[0].Credentials)
 		}
 
-		if got := normalizeClusterSecretRecipients([]string{" node-b ", "node-a", "node-b", "", "node-c"}); len(got) != 3 || got[0] != "node-a" || got[1] != "node-b" || got[2] != "node-c" {
-			t.Fatalf("normalizeClusterSecretRecipients = %#v", got)
+		if got := secrets.NormalizeRecipients([]string{" node-b ", "node-a", "node-b", "", "node-c"}); len(got) != 3 || got[0] != "node-a" || got[1] != "node-b" || got[2] != "node-c" {
+			t.Fatalf("NormalizeRecipients = %#v", got)
 		}
-		if got := normalizeClusterSecretRecipients(nil); len(got) != 1 || got[0] != "*" {
-			t.Fatalf("normalizeClusterSecretRecipients(nil) = %#v", got)
+		if got := secrets.NormalizeRecipients(nil); len(got) != 0 {
+			t.Fatalf("NormalizeRecipients(nil) = %#v", got)
 		}
-		if !clusterSecretRecipientAllowed([]string{"*"}, "") {
-			t.Fatal("wildcard recipient should be allowed")
+		if secrets.RecipientAllowed([]string{"*"}, "node-a") {
+			t.Fatal("wildcard recipient should be rejected")
 		}
-		if clusterSecretRecipientAllowed([]string{"node-a"}, "node-b") {
+		if secrets.RecipientAllowed([]string{"node-a"}, "node-b") {
 			t.Fatal("non-matching recipient should be rejected")
 		}
-		if got := clusterSecretRef(" sb ", 2); got != "cluster-secret://sandbox/sb/v2" {
-			t.Fatalf("clusterSecretRef = %q", got)
+		if got := secrets.FormatRef(" sb ", 2); got != "cluster-secret://sandbox/sb/v2" {
+			t.Fatalf("FormatRef = %q", got)
 		}
 
-		if _, err := (&Service{cipher: newTestCipher(t)}).PutClusterSecretsForRecipient(ctx, " ", req, "node-a"); err == nil {
+		if _, err := (&Service{cipher: newTestCipher(t)}).SealAndDistribute(ctx, " ", req, []string{"node-a"}, SealStrict); err == nil {
 			t.Fatal("empty sandbox id accepted")
 		}
-		if _, err := (&Service{cipher: newTestCipher(t)}).PutClusterSecretsForRecipient(ctx, "sb", req, "node-a"); err == nil {
-			t.Fatal("storeless PutClusterSecretsForRecipient accepted")
+		if _, err := (&Service{cipher: newTestCipher(t)}).SealAndDistribute(ctx, "sb", req, []string{"node-a"}, SealStrict); err == nil {
+			t.Fatal("storeless SealAndDistribute accepted")
 		}
-		if _, err := (&Service{cipher: newTestCipher(t)}).OpenClusterSecretsForNode(ctx, redacted, cluster.PlacementSecrets{Ref: "cluster-secret://sandbox/sb/v1", Version: 1}, "node-a"); err == nil {
+		if _, err := (&Service{cipher: newTestCipher(t)}).OpenClusterSecretsForNode(ctx, "sb", redacted, cluster.PlacementSecrets{Ref: "cluster-secret://sandbox/sb/v1", Version: 1}, "node-a"); err == nil {
 			t.Fatal("storeless OpenClusterSecretsForNode accepted")
 		}
-		if _, err := openClusterSecretEnvelopePayload([]byte("bad"), []byte("short"), []string{"node-a"}); err == nil {
+		if _, err := secrets.OpenEnvelopePayloadBound([]byte("bad"), []byte("short"), []string{"node-a"}, binding); err == nil {
 			t.Fatal("invalid envelope payload accepted")
 		}
 	})
@@ -664,27 +671,18 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 func TestClusterSecretAndCustomDomainRollbackBranches(t *testing.T) {
 	ctx := context.Background()
 
-	if _, err := (&Service{}).SealClusterSecrets(models.CreateSandboxRequest{
+	if _, err := (&Service{}).SealAndDistribute(ctx, "sb", models.CreateSandboxRequest{
 		Image: "alpine",
 		Registry: &models.RegistryAuth{
 			Server:   "ghcr.io",
 			Username: "alice",
 			Password: "secret",
 		},
-	}); err == nil || !strings.Contains(err.Error(), "cipher is not configured") {
-		t.Fatalf("SealClusterSecrets without cipher = %v, want configured-cipher error", err)
+	}, []string{"node-a"}, SealStrict); err == nil || !strings.Contains(err.Error(), "cipher is not configured") {
+		t.Fatalf("SealAndDistribute without cipher = %v, want configured-cipher error", err)
 	}
 
 	cryptoSvc := &Service{cipher: newTestCipher(t)}
-	plain := []byte("legacy-sealed-secret")
-	rawSealed, err := cryptoSvc.cipher.Encrypt(plain)
-	if err != nil {
-		t.Fatalf("Encrypt: %v", err)
-	}
-	if got, err := cryptoSvc.openClusterSecretPayload(rawSealed, "node-a"); err != nil || string(got) != string(plain) {
-		t.Fatalf("openClusterSecretPayload(raw) = (%q, %v), want plaintext", string(got), err)
-	}
-
 	req := models.CreateSandboxRequest{
 		Image: "alpine",
 		Registry: &models.RegistryAuth{
@@ -699,12 +697,13 @@ func TestClusterSecretAndCustomDomainRollbackBranches(t *testing.T) {
 			Credentials: map[string]string{"token": "mount-secret"},
 		}},
 	}
-	sealed, err := cryptoSvc.SealClusterSecretsForRecipient(req, "node-a")
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(cryptoSvc.cipher, cryptoSvc.secretsFromRequest(req), []string{"node-a"}, binding)
 	if err != nil {
-		t.Fatalf("SealClusterSecretsForRecipient: %v", err)
+		t.Fatalf("SealEnvelopeBound: %v", err)
 	}
-	if _, err := cryptoSvc.openClusterSecretPayload(sealed, "node-b"); err == nil || !strings.Contains(err.Error(), "not allowed") {
-		t.Fatalf("openClusterSecretPayload(recipient mismatch) = %v, want recipient denied", err)
+	if _, err := secrets.OpenEnvelopeBound(cryptoSvc.cipher, sealed, "node-b", binding); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("OpenEnvelopeBound(recipient mismatch) = %v, want recipient denied", err)
 	}
 
 	svc := &Service{cipher: newTestCipher(t)}

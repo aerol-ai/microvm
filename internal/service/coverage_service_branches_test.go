@@ -108,6 +108,20 @@ func (s *serviceClusterStub) Placements() []cluster.Placement {
 	return append([]cluster.Placement(nil), s.placements...)
 }
 
+func (s *serviceClusterStub) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	out := make(map[string]cluster.Placement, len(ids))
+	byID := make(map[string]cluster.Placement, len(s.placements))
+	for _, p := range s.placements {
+		byID[p.SandboxID] = p
+	}
+	for _, id := range ids {
+		if p, ok := byID[id]; ok {
+			out[id] = p
+		}
+	}
+	return out
+}
+
 func (s *serviceClusterStub) PlacementsForShards(cluster.PlacementShardFilter) []cluster.Placement {
 	return s.Placements()
 }
@@ -153,6 +167,8 @@ func (s *serviceClusterStub) Members() []cluster.Member {
 	}
 	return s.Noop.Members()
 }
+
+func (s *serviceClusterStub) LocalMembers() []cluster.Member { return s.Members() }
 
 func TestServiceHelperBranchesAndInventory(t *testing.T) {
 	ctx := context.Background()
@@ -263,6 +279,7 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 				{
 					SandboxID:   "sb-orphan",
 					OwnerNodeID: "",
+					Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},
@@ -272,6 +289,7 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 				{
 					SandboxID:       "sb-peer",
 					OwnerNodeID:     "peer",
+					Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					CustomHostnames: []string{"api.external.test", "www.external.test"},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -318,6 +336,7 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 				{
 					SandboxID:   "sb-direct",
 					OwnerNodeID: "peer",
+					Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},

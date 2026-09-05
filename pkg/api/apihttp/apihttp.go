@@ -7,6 +7,7 @@ package apihttp
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -39,6 +40,13 @@ const MaxJSONBodyBytes = 1 << 20 // 1 MiB
 func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes)
 	return json.NewDecoder(r.Body).Decode(dst)
+}
+
+// ReadJSONBody applies the same cap for cluster wrappers that must buffer and
+// replay a request before choosing a local or peer handler.
+func ReadJSONBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes)
+	return io.ReadAll(r.Body)
 }
 
 // WriteJSON serializes value as JSON and writes it with the given status.

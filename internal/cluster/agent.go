@@ -25,17 +25,26 @@ import (
 )
 
 const (
-	PublicInternalApplyPath             = "/v1/cluster/internal/apply"
-	PublicInternalPlacementPath         = "/v1/cluster/internal/placement/"
-	PublicInternalPlacementByNamePath   = "/v1/cluster/internal/placement-by-name/"
-	PublicInternalPlacementsPath        = "/v1/cluster/internal/placements"
-	PublicInternalPlacementsQueryPath   = "/v1/cluster/internal/placements/query"
-	PublicInternalPlacementsPagePath    = "/v1/cluster/internal/placements/page"
-	PublicInternalRecoveryPath          = "/v1/cluster/internal/recovery/"
-	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
-	PublicInternalVolumePath            = "/v1/cluster/internal/volume"
-	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
-	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
+	PublicInternalApplyPath           = "/v1/cluster/internal/apply"
+	PublicInternalPlacementPath       = "/v1/cluster/internal/placement/"
+	PublicInternalPlacementByNamePath = "/v1/cluster/internal/placement-by-name/"
+	PublicInternalPlacementsPath      = "/v1/cluster/internal/placements"
+	PublicInternalPlacementsQueryPath = "/v1/cluster/internal/placements/query"
+	PublicInternalPlacementsPagePath  = "/v1/cluster/internal/placements/page"
+	PublicInternalPlacementsByIDsPath = "/v1/cluster/internal/placements-by-ids"
+	PublicInternalRecoveryPath        = "/v1/cluster/internal/recovery/"
+	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
+	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
+	PublicInternalDrainStatePath      = "/v1/cluster/internal/drain/"
+	PublicInternalAuditACLPath        = "/v1/cluster/internal/audit-acl/"
+	PublicInternalClusterLeaderPath   = "/v1/cluster/leader"
+	// PublicInternalSecretPath receives peer fan-out of sealed secret blobs
+	// (POST upsert) and delete-fanout (DELETE .../{sandboxID}). Auth is PAT +
+	// d.Auth like every other /v1/cluster/internal/... route.
+	PublicInternalSecretPath = "/v1/cluster/internal/secrets"
+	// PublicInternalSandboxAuditPath is the prefix for peer-local secret audit
+	// reads. Full path: .../sandboxes/{id}/audit
+	PublicInternalSandboxAuditPath      = "/v1/cluster/internal/sandboxes/"
 	controlPlaneRequestTimeout          = 5 * time.Second
 	controlPlanePlacementRequestTimeout = 10 * time.Second
 )
@@ -52,8 +61,9 @@ type SelectPlacementRequest struct {
 }
 
 type SelectPlacementResponse struct {
-	Target PlacementTarget `json:"target"`
-	Error  string          `json:"error,omitempty"`
+	Target     PlacementTarget `json:"target"`
+	Candidates []Member        `json:"candidates,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 type DrainStateResponse struct {
@@ -74,15 +84,14 @@ type Agent struct {
 
 	gossip *gossipNode
 
-	patToken   string
-	httpClient *http.Client
+	patToken string
 
 	internalURL    string
 	tls            *ClusterTLS
 	internalServer *internalServer
 	internalClient *http.Client
-	publicProxies  *proxyCache
 	mtlsProxies    *proxyCache
+	peerClients    peerClientCache
 
 	cacheMu        sync.RWMutex
 	placementCache []Placement
@@ -113,6 +122,9 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	if err != nil {
 		return nil, fmt.Errorf("cluster.NewAgent: load tls: %w", err)
 	}
+	if clusterTLS != nil && clusterTLS.NodeID() != nodeID {
+		return nil, fmt.Errorf("cluster.NewAgent: node certificate identity %q does not match node id %q", clusterTLS.NodeID(), nodeID)
+	}
 
 	commitTimeout := cfg.ClusterRaftCommitTimeout
 	if commitTimeout <= 0 {
@@ -126,9 +138,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		apiURL:        cfg.SelfAPIAdvertiseURL,
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
 		patToken:      cfg.PATToken,
-		httpClient:    &http.Client{Timeout: commitTimeout + 2*time.Second},
 		tls:           clusterTLS,
-		publicProxies: newProxyCache(defaultPublicTransport),
 	}
 
 	if clusterTLS != nil {
@@ -139,8 +149,8 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 			Timeout:   commitTimeout + 2*time.Second,
 			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
-		a.mtlsProxies = newProxyCache(newMTLSProxyTransport(clusterTLS.clientConfig()))
-		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, a.ApplyEncoded, logger)
+		a.mtlsProxies = newProxyCache()
+		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, a.ApplyEncoded, logger, cfg.EnterpriseMode)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
 		}
@@ -174,6 +184,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
 		Events:         nil,
+		OnLeave:        a.invalidatePeerClient,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {
@@ -182,10 +193,49 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		return nil, fmt.Errorf("cluster.NewAgent: gossip: %w", err)
 	}
 	a.gossip = gn
+	if a.internalServer != nil {
+		a.internalServer.SetPeerAuthorizer(func(nodeID string) bool {
+			m, ok := gn.lookupMember(nodeID)
+			return ok && m.Alive
+		})
+	}
 	return a, nil
 }
 
 func (a *Agent) SelfNodeID() string { return a.nodeID }
+
+// PeerInternalHTTPClient exposes the cert-pinned client for cluster list fan-out.
+func (a *Agent) PeerInternalHTTPClient() *http.Client {
+	if a == nil {
+		return nil
+	}
+	return a.internalClient
+}
+
+// ClientForPeer returns a cached mTLS HTTP client that verifies DNS SAN
+// node:<nodeID>. Legacy shared-SAN-only peer certs are rejected.
+func (a *Agent) ClientForPeer(nodeID string) *http.Client {
+	if a == nil {
+		return nil
+	}
+	return a.peerClients.get(a.internalClient, nodeID)
+}
+
+// PeerDialMember selects the peer client/URL using the per-node mTLS cache.
+func (a *Agent) PeerDialMember(m Member) (*http.Client, string, error) {
+	if a == nil {
+		return PeerDial(m, nil)
+	}
+	return PeerDialCached(m, a.internalClient, a.ClientForPeer(m.NodeID))
+}
+
+func (a *Agent) invalidatePeerClient(nodeID string) {
+	if a == nil {
+		return
+	}
+	a.peerClients.invalidate(nodeID)
+}
+
 func (a *Agent) SelfAPIURL() string { return a.apiURL }
 
 func (a *Agent) OwnerOf(sandboxID string) (OwnerInfo, error) {
@@ -224,20 +274,25 @@ func (a *Agent) OwnerOfName(name string) (string, OwnerInfo, error) {
 }
 
 func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
+	target, _, err := a.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (a *Agent) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
 	var resp SelectPlacementResponse
 	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalSelectPlacementPath, PublicInternalSelectPlacementPath, SelectPlacementRequest{Request: req}, &resp); err != nil {
-		return PlacementTarget{}, err
+		return PlacementTarget{}, nil, err
 	}
 	if resp.Error != "" {
 		if resp.Error == ErrNoPlacementTarget.Error() {
-			return PlacementTarget{}, ErrNoPlacementTarget
+			return PlacementTarget{}, nil, ErrNoPlacementTarget
 		}
 		if err := invalidTopologyFromMessage(resp.Error); err != nil {
-			return PlacementTarget{}, err
+			return PlacementTarget{}, nil, err
 		}
-		return PlacementTarget{}, errors.New(resp.Error)
+		return PlacementTarget{}, nil, errors.New(resp.Error)
 	}
 	if resp.Target.NodeID == a.nodeID {
 		resp.Target.APIURL = a.apiURL
@@ -245,33 +300,48 @@ func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 		resp.Target.InternalURL = a.internalURL
 		resp.Target.IsSelf = true
 	}
-	return resp.Target, nil
+	return resp.Target, resp.Candidates, nil
 }
 
 func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	expectedIncarnationID := strings.TrimSpace(secrets.IncarnationID)
+	incarnationID := expectedIncarnationID
+	if incarnationID == "" {
+		var err error
+		incarnationID, err = MintIncarnationID()
+		if err != nil {
+			return err
+		}
+	}
 	cmd := command{
-		Op:                 opPlace,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        a.nodeID,
-		OwnerAPIURL:        a.apiURL,
-		OwnerDataPlaneHost: a.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
+		Op:                    opPlace,
+		SandboxID:             sandboxID,
+		OwnerNodeID:           a.nodeID,
+		OwnerAPIURL:           a.apiURL,
+		OwnerDataPlaneHost:    a.dataPlaneHost,
+		Spec:                  spec,
+		SecretRef:             secrets.Ref,
+		SecretVersion:         secrets.Version,
+		SecretSealGeneration:  secrets.SealGeneration,
+		IncarnationID:         incarnationID,
+		ExpectedIncarnationID: expectedIncarnationID,
+		OwnerRef:              secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
 }
 
 func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{
-		Op:                 opClaimOrphan,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        a.nodeID,
-		OwnerAPIURL:        a.apiURL,
-		OwnerDataPlaneHost: a.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
+		Op:                   opClaimOrphan,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          a.nodeID,
+		OwnerAPIURL:          a.apiURL,
+		OwnerDataPlaneHost:   a.dataPlaneHost,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		OwnerRef:             secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -281,11 +351,29 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 		return nil
 	}
 	return a.applyCommand(ctx, command{
-		Op:            opUpsertSpec,
-		SandboxID:     sandboxID,
-		Spec:          spec,
-		SecretRef:     secrets.Ref,
-		SecretVersion: secrets.Version,
+		Op:                   opUpsertSpec,
+		SandboxID:            sandboxID,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+	})
+}
+
+func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+	recipients = normalizeSecretRecipientIDs(recipients)
+	if strings.TrimSpace(sandboxID) == "" || len(recipients) == 0 {
+		return nil
+	}
+	return a.applyCommand(ctx, command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              sandboxID,
+		SecretRecipients:       recipients,
+		SecretRef:              secrets.Ref,
+		SecretVersion:          secrets.Version,
+		SecretSealGeneration:   secrets.SealGeneration,
+		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedSealGeneration: expectedSealGeneration,
 	})
 }
 
@@ -380,23 +468,56 @@ func (a *Agent) ResolveCustomDomain(hostname string) (string, bool) {
 }
 
 func (a *Agent) DeletePlacement(ctx context.Context, sandboxID string) error {
-	return a.applyCommand(ctx, command{Op: opDelete, SandboxID: sandboxID})
+	return a.applyCommand(ctx, command{Op: opDelete, SandboxID: sandboxID, ExpiresUnix: auditACLExpiryUnix(a.cfg.SecretAuditRetentionDays)})
+}
+
+func (a *Agent) AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error) {
+	acl, ok, err := a.AuditACLForSandbox(ctx, sandboxID)
+	return acl.OwnerRef, ok, err
+}
+
+func (a *Agent) AuditACLForSandbox(ctx context.Context, sandboxID string) (AuditACL, bool, error) {
+	var out AuditACLResponse
+	path := PublicInternalAuditACLPath + url.PathEscape(strings.TrimSpace(sandboxID))
+	if err := a.doControlPlaneJSON(ctx, http.MethodGet, path, path, nil, &out); err != nil {
+		return AuditACL{}, false, err
+	}
+	out.ACL.OwnerRef = strings.TrimSpace(out.ACL.OwnerRef)
+	return out.ACL, out.Exists, nil
+}
+
+func (a *Agent) PruneAuditACL(context.Context, time.Time) error {
+	// The Raft leader owns periodic ACL retention. Worker agents observe the
+	// result through control-plane reads and must not forward duplicate sweeps.
+	return nil
 }
 
 func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
 	}
+	incarnationID := strings.TrimSpace(secrets.IncarnationID)
+	if incarnationID == "" {
+		var mintErr error
+		incarnationID, mintErr = MintIncarnationID()
+		if mintErr != nil {
+			return mintErr
+		}
+	}
 	return a.applyCommand(ctx, command{
-		Op:                 opReserve,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
-		Spec:               redacted,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		ExpiresUnix:        time.Now().Add(ttl).Unix(),
+		Op:                   opReserve,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          target.NodeID,
+		OwnerAPIURL:          target.APIURL,
+		OwnerDataPlaneHost:   target.DataPlaneHost,
+		Spec:                 redacted,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		SecretRecipients:     append([]string(nil), secrets.Recipients...),
+		IncarnationID:        incarnationID,
+		OwnerRef:             secrets.OwnerRef,
+		ExpiresUnix:          time.Now().Add(ttl).Unix(),
 	})
 }
 
@@ -428,16 +549,6 @@ func (a *Agent) ReassignPlacement(ctx context.Context, sandboxID string, target 
 }
 
 func (a *Agent) wasmMigratePAT() string { return a.patToken }
-
-func (a *Agent) wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error) {
-	if a.internalClient != nil && internalURL != "" {
-		return a.internalClient, internalURL, nil
-	}
-	if apiURL == "" {
-		return nil, "", fmt.Errorf("cluster agent: peer API URL unknown")
-	}
-	return a.httpClient, apiURL, nil
-}
 
 func (a *Agent) RemoveMember(ctx context.Context, nodeID string, force bool) error {
 	if nodeID == "" {
@@ -560,7 +671,8 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 }
 
 func (a *Agent) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request) {
-	forwardHTTPWithMetrics(a.mtlsProxies, a.publicProxies, target, w, r)
+	SetPeerNodeIDHeader(r, a.nodeID)
+	forwardHTTPWithMetrics(a.mtlsProxies, a.ClientForPeer, target, w, r)
 }
 
 func (a *Agent) AttachInternalHandler(h http.Handler) {
@@ -583,6 +695,35 @@ func (a *Agent) Members() []Member {
 		return resp.Members
 	}
 	return a.gossip.members()
+}
+
+// LocalMembers returns the gossip view only — never the control-plane HTTP
+// members call. Used by list failover_ready so a page of sandboxes does not
+// trigger N membership RPCs.
+func (a *Agent) LocalMembers() []Member {
+	if a == nil || a.gossip == nil {
+		return nil
+	}
+	return a.gossip.members()
+}
+
+// LookupMember resolves one peer by ID via the local gossip index (O(1)),
+// falling back to a membership scan only when the index misses.
+func (a *Agent) LookupMember(id string) (Member, bool) {
+	if a == nil || id == "" {
+		return Member{}, false
+	}
+	if a.gossip != nil {
+		if m, ok := a.gossip.lookupMember(id); ok {
+			return m, true
+		}
+	}
+	for _, m := range a.Members() {
+		if m.NodeID == id {
+			return m, true
+		}
+	}
+	return Member{}, false
 }
 
 // IngressTargets aggregates live ingress-role members' PublicHost values.
@@ -644,8 +785,11 @@ func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	var out PlacementPageResponse
 	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsPagePath, PublicInternalPlacementsPagePath, req, &out); err != nil {
 		a.logger.Warn("cluster agent: placement page lookup failed", "err", err, "limit", req.Limit, "page_token", req.PageToken)
-		return PlacementPageResponse{}
+		// Explicit not-ready: empty + Authoritative=false so list returns 503
+		// instead of treating a CP error as an empty tenant.
+		return PlacementPageResponse{Authoritative: false}
 	}
+	out.Authoritative = true
 	a.observePlacementVersions(out.Placements)
 	return out
 }
@@ -657,6 +801,57 @@ func (a *Agent) PlacementOf(sandboxID string) (Placement, bool) {
 	}
 	a.observePlacementVersion(lookup.Placement.Version)
 	return lookup.Placement, true
+}
+
+// PlacementsByIDs batch-looks up IDs via a single control-plane POST.
+// Prefer this over Placements() when only a page of IDs is needed.
+func (a *Agent) PlacementsByIDs(ids []string) map[string]Placement {
+	cleaned := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		cleaned = append(cleaned, id)
+	}
+	if len(cleaned) == 0 {
+		return map[string]Placement{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
+	defer cancel()
+	var out map[string]Placement
+	req := placementsByIDsRequest{IDs: cleaned}
+	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsByIDsPath, PublicInternalPlacementsByIDsPath, req, &out); err != nil {
+		a.logger.Warn("cluster agent: placements-by-ids lookup failed", "err", err, "n", len(cleaned))
+		// nil is the explicit not-authoritative result. Never turn one failed
+		// batch into N point reads at fleet scale.
+		return nil
+	}
+	if out == nil {
+		return map[string]Placement{}
+	}
+	a.observePlacementVersions(placementsMapValues(out))
+	return out
+}
+
+type placementsByIDsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func placementsMapValues(m map[string]Placement) []Placement {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]Placement, 0, len(m))
+	for _, p := range m {
+		out = append(out, p)
+	}
+	return out
 }
 
 func (a *Agent) PlacementVersion() uint64 {
@@ -784,20 +979,10 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 }
 
 func (a *Agent) tryControlPlaneMember(ctx context.Context, m Member, method, publicPath, internalPath string, body []byte, out any) error {
-	if a.internalClient != nil && m.InternalURL != "" {
-		err := a.doHTTPRequest(ctx, a.internalClient, strings.TrimRight(m.InternalURL, "/")+internalPath, method, body, out)
-		if err == nil {
-			return nil
-		}
-		if !isStatus(err, http.StatusServiceUnavailable) {
-			return err
-		}
-		return err
+	if a.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {
+		return ErrPeerInternalURLRequired
 	}
-	if m.APIURL == "" {
-		return errors.New("cluster agent: server API URL unknown for " + m.NodeID)
-	}
-	return a.doHTTPRequest(ctx, a.httpClient, strings.TrimRight(m.APIURL, "/")+publicPath, method, body, out)
+	return a.doHTTPRequest(ctx, a.ClientForPeer(m.NodeID), strings.TrimRight(m.InternalURL, "/")+internalPath, method, body, out)
 }
 
 func (a *Agent) logNoControlPlaneMembers(method, publicPath, internalPath string) {
@@ -851,10 +1036,10 @@ func (a *Agent) controlPlaneDiagnosticSnapshot() (total, alive, serverRole, self
 		if m.NodeID == a.nodeID {
 			self++
 		}
-		if m.APIURL == "" && m.InternalURL == "" {
+		if m.InternalURL == "" {
 			missingEndpoint++
 		}
-		if m.NodeID != "" && m.NodeID != a.nodeID && m.Alive && CanServeControlPlaneRole(m.Role) && (m.APIURL != "" || m.InternalURL != "") {
+		if m.NodeID != "" && m.NodeID != a.nodeID && m.Alive && CanServeControlPlaneRole(m.Role) && m.InternalURL != "" {
 			candidates++
 		}
 	}
@@ -872,7 +1057,7 @@ func controlPlaneMemberDiagnostic(m Member, selfID string) string {
 	if !CanServeControlPlaneRole(m.Role) {
 		flags = append(flags, "role-not-control-plane")
 	}
-	if m.APIURL == "" && m.InternalURL == "" {
+	if m.InternalURL == "" {
 		flags = append(flags, "missing-endpoint")
 	}
 	if len(flags) == 0 {
@@ -896,6 +1081,7 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	SetPeerNodeIDHeader(req, a.nodeID)
 	if a.patToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.patToken)
 	}
@@ -949,7 +1135,7 @@ func (a *Agent) controlPlaneMembers() []Member {
 		if !CanServeControlPlaneRole(m.Role) {
 			continue
 		}
-		if m.APIURL == "" && m.InternalURL == "" {
+		if m.InternalURL == "" {
 			continue
 		}
 		out = append(out, m)

@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+// EgressObserver is notified when a sandbox is allowed to contact a destination
+// through the host egress proxy. Must be non-blocking. Destination is host or
+// host:port — never credentials.
+type EgressObserver func(sandboxID, network, destination string)
+
 // EgressPolicy is the per-sandbox outbound policy enforced by the host-side
 // egress proxy (plans/isolate-runtime.md §4 Phase 3). Mirrored from the
 // driver-level type so pkg/isolate does not import the runtime package.
@@ -82,9 +87,14 @@ func (h *Host) startSlotServerLocked(slot int) error {
 	if err != nil {
 		return fmt.Errorf("isolate: listen egress slot %d socket: %w", slot, err)
 	}
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.serveEgressSlot(slot, w, r)
-	})}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h.serveEgressSlot(slot, w, r)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	h.slotSrv[slot] = srv
 	go func() { _ = srv.Serve(ln) }()
 	return nil
@@ -112,9 +122,14 @@ func (h *Host) startEgressDenyServer() error {
 	if err != nil {
 		return fmt.Errorf("isolate: listen egress-deny socket: %w", err)
 	}
-	h.egressDenySrv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "egress denied: sandbox has no egress slot (block-all or pool exhausted)", http.StatusForbidden)
-	})}
+	h.egressDenySrv = &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "egress denied: sandbox has no egress slot (block-all or pool exhausted)", http.StatusForbidden)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() { _ = h.egressDenySrv.Serve(ln) }()
 	return nil
 }
@@ -136,12 +151,13 @@ func (h *Host) serveEgressSlot(slot int, w http.ResponseWriter, r *http.Request)
 		http.Error(w, "egress denied: slot has no attributed sandbox", http.StatusForbidden)
 		return
 	}
-	h.proxyEgress(w, r, p)
+	h.proxyEgress(w, r, id, p)
 }
 
 // proxyEgress enforces p (allowlist/denylist + SSRF IP-range block) and proxies
 // the request. The isolate reaches this only via its own slot socket, so p is
-// unambiguously this sandbox's policy.
+// unambiguously this sandbox's policy. sandboxID attributes the destination for
+// audit (E3a); empty id skips observation.
 //
 // workerd delivers an external egress service the request with the target
 // authority in the Host header and only path+query in the URL — and it does NOT
@@ -150,7 +166,7 @@ func (h *Host) serveEgressSlot(slot int, w http.ResponseWriter, r *http.Request)
 // from the Host header and force https: an isolate cannot make a plaintext
 // egress call, which is the safe default for an allowlist proxy and the only
 // scheme we can honor unambiguously.
-func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, p EgressPolicy) {
+func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID string, p EgressPolicy) {
 	authority := r.Host
 	if authority == "" {
 		authority = r.URL.Host
@@ -188,6 +204,8 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, p EgressPolic
 		http.Error(w, "egress proxy: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+	// Successful upstream contact — record destination (bytes stay on netstats).
+	h.observeEgress(sandboxID, "tcp", authority)
 	defer resp.Body.Close()
 	for k, vals := range resp.Header {
 		for _, v := range vals {

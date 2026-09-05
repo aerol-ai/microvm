@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
@@ -84,16 +85,19 @@ func TestClusterTemplatePeersFiltersMembers(t *testing.T) {
 			members: []cluster.Member{
 				{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
 				{NodeID: "dead", APIURL: "http://dead", Alive: false, Role: config.NodeRoleWorker},
-				{NodeID: "drained", APIURL: "http://drained", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
+				{NodeID: "drained", APIURL: "http://drained", InternalURL: "https://drained:21443", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
 				{NodeID: "docker-only", APIURL: "http://docker-only", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}}},
-				{NodeID: "fc-peer", APIURL: "http://fc-peer", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
+				{NodeID: "fc-peer", APIURL: "http://fc-peer", InternalURL: "https://fc-peer:21443", Alive: true, Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
 			},
 		},
 		drained: map[string]bool{"drained": true},
 	}
 	peers := clusterTemplatePeers(c)
-	if len(peers) != 1 || peers[0].NodeID != "fc-peer" {
-		t.Fatalf("peers = %+v, want only fc-peer", peers)
+	if len(peers) != 2 || peers[0].NodeID != "drained" || peers[1].NodeID != "fc-peer" {
+		t.Fatalf("peers = %+v, want drained and fc-peer", peers)
+	}
+	if got := clusterTemplateUnavailablePeerCount(c); got != 1 {
+		t.Fatalf("unavailable template peers = %d, want dead worker", got)
 	}
 }
 
@@ -103,10 +107,10 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	builder := &fakeImageBuilder{}
 
-	t.Run("fanout_header_bypass", func(t *testing.T) {
+	t.Run("routed_header_runs_local", func(t *testing.T) {
 		h := &handlers{deps: Deps{Builder: builder, Logger: logger}}
 		req := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
-		req.Header.Set(clusterImageBuildFanoutHeader, "1")
+		req.Header.Set(clusterImageBuildRoutedHeader, "1")
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, req)
 		if rr.Code != http.StatusOK {
@@ -147,7 +151,7 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("push_skips_fanout", func(t *testing.T) {
+	t.Run("push_routes_to_worker", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(dockerFanoutCluster("ingress-a", "http://worker.invalid"))
 		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
@@ -157,27 +161,28 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 		})
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(pushBody))))
-		if rr.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rr.Code)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 for unreachable selected worker", rr.Code)
 		}
 	})
 
-	t.Run("context_hashes_skip_fanout", func(t *testing.T) {
+	t.Run("context_hashes_route_to_worker", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(dockerFanoutCluster("ingress-a", "http://127.0.0.1:1"))
 		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
 		ctxBody, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile, ContextHashes: []string{"abc"}})
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(ctxBody))))
-		if rr.Code == http.StatusBadGateway {
-			t.Fatalf("context_hashes build should skip fanout; got 502")
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 for unreachable selected worker", rr.Code)
 		}
 	})
 
-	t.Run("no_docker_workers_falls_back_local", func(t *testing.T) {
+	t.Run("no_docker_workers_rejects_unusable_ingress_build", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		svc.AttachCluster(&membersStubCluster{
-			Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+			Noop:         cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+			placementErr: cluster.ErrNoPlacementTarget,
 			members: []cluster.Member{
 				{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			},
@@ -185,8 +190,8 @@ func TestClusterBuildImageWrapCoverageBranches(t *testing.T) {
 		h := &handlers{deps: Deps{Service: svc, Builder: builder, Logger: logger}}
 		rr := httptest.NewRecorder()
 		h.clusterBuildImageWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
-		if rr.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rr.Code)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rr.Code)
 		}
 	})
 
@@ -227,7 +232,7 @@ func TestRunImageBuildOnTargetCoverage(t *testing.T) {
 		h := &handlers{deps: Deps{Builder: builder, Logger: logger}}
 		parent := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
 		parent.Header.Set("Content-Type", "application/json")
-		status, header, respBody, err := h.runImageBuildOnTarget(parent, body, cluster.Member{NodeID: "self"}, true)
+		status, header, respBody, err := h.runImageBuildOnTarget(nil, parent, body, cluster.Member{NodeID: "self"}, true)
 		if err != nil || status != http.StatusOK {
 			t.Fatalf("self build: status=%d err=%v body=%s", status, err, respBody)
 		}
@@ -249,7 +254,8 @@ func TestRunImageBuildOnTargetCoverage(t *testing.T) {
 		parent := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body)))
 		parent.Header.Set("Authorization", "Bearer tok")
 		parent.Header.Set("Content-Type", "application/json")
-		status, _, _, err := h.runImageBuildOnTarget(parent, body, cluster.Member{NodeID: "worker", APIURL: remote.URL}, false)
+		c := &membersStubCluster{Noop: cluster.NewNoop("self", "http://self", ""), internalClient: remote.Client()}
+		status, _, _, err := h.runImageBuildOnTarget(c, parent, body, cluster.Member{NodeID: "worker", InternalURL: remote.URL}, false)
 		if err != nil || status != http.StatusOK {
 			t.Fatalf("remote build: status=%d err=%v", status, err)
 		}
@@ -261,11 +267,15 @@ func TestRunImageBuildOnTargetCoverage(t *testing.T) {
 
 func dockerFanoutCluster(selfID, workerURL string) cluster.Client {
 	return &membersStubCluster{
-		Noop: cluster.NewNoop(selfID, "http://"+selfID, ""),
+		Noop:           cluster.NewNoop(selfID, "http://"+selfID, ""),
+		internalClient: http.DefaultClient,
+		placement: cluster.PlacementTarget{
+			NodeID: "worker-docker", APIURL: workerURL, InternalURL: workerURL,
+		},
 		members: []cluster.Member{
 			{NodeID: selfID, APIURL: "http://" + selfID, Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-docker", APIURL: workerURL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: workerURL, InternalURL: workerURL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 		},
@@ -323,6 +333,11 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		env.handler.ServeHTTP(rr, req)
 		if rr.Code != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202: %s", rr.Code, rr.Body.String())
+		}
+		select {
+		case <-env.builder.done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("template builder did not finish")
 		}
 	})
 
@@ -391,22 +406,25 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("list_fanout_cap_exceeded", func(t *testing.T) {
+	t.Run("list_fanout_above_legacy_peer_cap", func(t *testing.T) {
 		env := newTemplateV1TestEnv(t)
 		members := []cluster.Member{
 			{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer},
 		}
 		for i := 0; i <= clusterListMaxFanoutPeers; i++ {
 			members = append(members, cluster.Member{
-				NodeID: fmt.Sprintf("fc-%d", i), APIURL: fmt.Sprintf("http://fc-%d", i), Alive: true,
+				NodeID: fmt.Sprintf("fc-%d", i), APIURL: fmt.Sprintf("http://fc-%d", i), InternalURL: fmt.Sprintf("http://fc-%d", i), Alive: true,
 				Role: config.NodeRoleWorker, Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}},
 			})
 		}
 		env.svc.AttachCluster(&membersStubCluster{Noop: cluster.NewNoop("server-a", "http://server-a", ""), members: members})
 		rr := httptest.NewRecorder()
 		env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates", nil))
-		if rr.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status = %d, want 503", rr.Code)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 without a hard 256-worker cap", rr.Code)
+		}
+		if rr.Header().Get("X-Aerol-Partial") != "true" {
+			t.Fatal("unreachable workers should mark the template list partial")
 		}
 	})
 
@@ -450,13 +468,13 @@ func TestClusterTemplateWrapCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("item_peer_request_error_falls_back_local", func(t *testing.T) {
+	t.Run("item_owner_request_error_is_gateway_failure", func(t *testing.T) {
 		env := newTemplateV1TestEnv(t)
 		env.svc.AttachCluster(templateMembersCluster("server-a", "http://127.0.0.1:1"))
 		rr := httptest.NewRecorder()
 		env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates/missing-tpl", nil))
-		if rr.Code != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404", rr.Code)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", rr.Code)
 		}
 	})
 }

@@ -79,7 +79,7 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 		t.Fatal("expected store.Delete failure")
 	}
 
-	// Unmount warn + attachment warn + cluster-secrets fail after delete.
+	// Unmount warn + cluster-secrets fail before irreversible row delete.
 	svc2, st2, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
 	if err := st2.Create(ctx, &models.Sandbox{
 		ID: "sb-post-del", Image: "a", Status: models.SandboxStatusStarted,
@@ -88,12 +88,14 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc2.testForceUnmountErr = errors.New("fuse busy")
-	svc2.testAfterStoreDeleteOnDestroy = func() { _ = st2.Close() }
+	svc2.testAfterRuntimeDestroy = func() { _ = st2.Close() }
 	if err := svc2.DestroySandbox(ctx, "sb-post-del"); err == nil {
 		t.Fatal("expected DeleteClusterSecrets failure after store close")
 	}
 
-	// Wasm cleanup fails after delete (closed store).
+	// WASM cleanup now runs before the irreversible sandbox-row delete. Closing
+	// the store from the post-delete hook must therefore not create a cleanup
+	// vacuum or make destroy report a late cleanup failure.
 	svc3, st3, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
 	svc3.cfg.EnableWasm = true
 	svc3.SetWasmRuntime(&recordingRuntime{})
@@ -104,8 +106,8 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc3.testAfterStoreDeleteOnDestroy = func() { _ = st3.Close() }
-	if err := svc3.DestroySandbox(ctx, "sb-wasm-del"); err == nil {
-		t.Fatal("expected wasm cleanup failure")
+	if err := svc3.DestroySandbox(ctx, "sb-wasm-del"); err != nil {
+		t.Fatalf("destroy after pre-delete wasm cleanup: %v", err)
 	}
 }
 

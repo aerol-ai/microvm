@@ -239,7 +239,7 @@ func TestCreateOnSelectedNodeCoverage95Branches(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 		rt := newFakeRuntime()
 		rt.createErr = errors.New("create boom")
-		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
 		_, err := CreateOnSelectedNode(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "", CreateOptions{})
 		if err == nil || !strings.Contains(err.Error(), "create boom") {
 			t.Fatalf("err = %v, want create boom", err)
@@ -249,7 +249,7 @@ func TestCreateOnSelectedNodeCoverage95Branches(t *testing.T) {
 
 func TestBestEffortHelpersNilClusterOnService(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc, _ := newCreateService(t, nil, false)
+	svc, _ := newCreateService(t, nil, true)
 
 	DeletePlacementBestEffort(context.Background(), svc, logger, "sb-1")
 	CancelReservationBestEffort(context.Background(), svc, logger, "sb-1")
@@ -257,7 +257,7 @@ func TestBestEffortHelpersNilClusterOnService(t *testing.T) {
 
 func TestOverlapCreateAndPromoteNilClusterSequentialPath(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc, st := newCreateService(t, nil, false)
+	svc, st := newCreateService(t, nil, true)
 	resp, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-seq-nil-cluster", OverlapOptions{})
 	if err != nil {
 		t.Fatalf("OverlapCreateAndPromote: %v", err)
@@ -276,7 +276,7 @@ func TestRetractFailedPromoteDeletePlacementFailure(t *testing.T) {
 		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 		deleteErr: errors.New("raft delete failed"),
 	}
-	svc, _ := newCreateService(t, stub, false)
+	svc, _ := newCreateService(t, stub, true)
 	if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-del-fail"); err != nil {
 		t.Fatalf("CreateSandboxWithID: %v", err)
 	}

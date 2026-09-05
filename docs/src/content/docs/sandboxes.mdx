@@ -378,6 +378,61 @@ Change CPU or memory allocation on a running sandbox without restarting it.
   </TabItem>
 </Tabs>
 
+For large fleet inventories, use the page-at-a-time API so the client does not
+retain all 100,000+ sandbox records in memory:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    for await (const page of client.listPages()) {
+      await processPage(page)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    for page in client.iter_pages():
+        process_page(page)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    token := ""
+    for {
+        page, next, err := client.ListPage(ctx, token)
+        if err != nil { return err }
+        processPage(page)
+        if next == "" { break }
+        token = next
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let tags = std::collections::HashMap::new();
+    let mut token = String::new();
+    loop {
+        let page = client.list_page_with_options(&tags, false, &token)?;
+        process_page(&page.sandboxes);
+        match page.next_page_token {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String token = "";
+    do {
+        var page = client.listPage(java.util.Collections.emptyMap(), false, token);
+        processPage(page.sandboxes);
+        token = page.nextPageToken;
+    } while (!token.isEmpty());
+    ```
+  </TabItem>
+</Tabs>
+
 ## Idle lifecycle
 
 Sandboxes can self-terminate based on age or inactivity. Lifecycle parameters can be updated at any time without restarting the sandbox.

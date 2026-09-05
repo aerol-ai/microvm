@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -71,8 +72,15 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
+	if svc.ClusterEnabled() {
+		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+	}
 	if service.ImageRequiresLocalPlacement(req) {
-		if clusterCreateSelfCanOwnSandbox(c) {
+		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
+		if clusterCreateSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
 			if c.IsNodeDrained(c.SelfNodeID()) {
 				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return Decision{}, false
@@ -106,11 +114,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		r.Header.Set(HeaderTarget, target.NodeID)
 		r.Header.Del(HeaderID)
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 		return Decision{}, false
 	}
 
-	target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
+	target, candidates, err := c.SelectPlacementWithCandidates(CapacityRequestFromCreate(req))
 	if err != nil {
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
@@ -134,8 +142,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 	}
 	redacted := service.RedactClusterSecrets(req)
+	reserveSecrets := cluster.PlacementSecrets{}
+	if svc != nil && svc.WantsSecretRecipientFanout(req) {
+		reserveSecrets.Recipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, svc.SecretRecipientBackupCount())
+	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, cluster.PlacementSecrets{}, ReservationTTL)
+	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
 	if err != nil {
 		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
@@ -185,7 +197,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 	return Decision{}, false
 }
 
@@ -204,7 +216,7 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 		writeError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 		return true, false
 	}
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	return true, false
 }
 
@@ -251,11 +263,12 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
+	secrets, sealErr := svc.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, svc.SecretRecipientsForSeal(resp.Sandbox.ID), service.SealStrict)
 	if sealErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
 		return nil, sealErr
 	}
+	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := service.RedactClusterSecrets(req)
 	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
@@ -318,6 +331,14 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		Runtime:    runtimeName,
 		TemplateID: templateID,
 		ModuleRef:  models.ModuleRefForCreate(req),
+	}
+	if nodeID, ok := docker.BuiltImagePlacementNode(req.Image); ok {
+		out.RequiredNodeID = nodeID
+	}
+	if runtimeName == models.RuntimeIsolate {
+		if nodeID, _, ok := models.ParseJSBundleNodeRef(out.ModuleRef); ok {
+			out.RequiredNodeID = nodeID
+		}
 	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8

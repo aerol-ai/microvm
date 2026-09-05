@@ -10,16 +10,16 @@ import (
 )
 
 func allowPublicTrafficEnabled(v *bool) bool {
-	return v == nil || *v
+	return v != nil && *v
 }
 
 func sandboxAllowsPublicTraffic(sandbox *models.Sandbox) bool {
-	return sandbox == nil || allowPublicTrafficEnabled(sandbox.AllowPublicTraffic)
+	return sandbox != nil && allowPublicTrafficEnabled(sandbox.AllowPublicTraffic)
 }
 
 func placementAllowsPublicTraffic(p cluster.Placement) bool {
 	if p.Spec == nil {
-		return true
+		return false
 	}
 	return allowPublicTrafficEnabled(p.Spec.AllowPublicTraffic)
 }

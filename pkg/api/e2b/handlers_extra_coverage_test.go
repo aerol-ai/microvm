@@ -287,3 +287,48 @@ func TestDefaultSandboxMeta(t *testing.T) {
 		t.Fatalf("default OnTimeout = %q, want kill", meta.OnTimeout)
 	}
 }
+
+func TestForwardedListAppliesExactPlacementIDsBeforeSerialization(t *testing.T) {
+	_, _, handler := newE2BHandlerTestEnv(t)
+	keep := createE2BSandbox(t, handler)
+	createDrop := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","timeout":121}`))
+	createDropRR := httptest.NewRecorder()
+	handler.ServeHTTP(createDropRR, createDrop)
+	if createDropRR.Code != http.StatusCreated {
+		t.Fatalf("create drop status = %d; body=%s", createDropRR.Code, createDropRR.Body.String())
+	}
+	var dropped sandboxResponse
+	if err := json.NewDecoder(createDropRR.Body).Decode(&dropped); err != nil {
+		t.Fatalf("decode drop sandbox: %v", err)
+	}
+	drop := dropped.SandboxID
+
+	req := httptest.NewRequest(http.MethodGet, "/e2b/sandboxes?ids="+keep, nil)
+	req.Header.Set("X-Cluster-Forwarded", "1")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("forwarded list status = %d; body=%s", rr.Code, rr.Body.String())
+	}
+	var items []listedSandboxResponse
+	if err := json.NewDecoder(rr.Body).Decode(&items); err != nil {
+		t.Fatalf("decode forwarded list: %v", err)
+	}
+	if len(items) != 1 || items[0].SandboxID != keep {
+		t.Fatalf("forwarded list = %+v, want only %q (excluding %q)", items, keep, drop)
+	}
+
+	publicReq := httptest.NewRequest(http.MethodGet, "/e2b/sandboxes?ids="+keep, nil)
+	publicRR := httptest.NewRecorder()
+	handler.ServeHTTP(publicRR, publicReq)
+	if publicRR.Code != http.StatusOK {
+		t.Fatalf("public list status = %d; body=%s", publicRR.Code, publicRR.Body.String())
+	}
+	items = nil
+	if err := json.NewDecoder(publicRR.Body).Decode(&items); err != nil {
+		t.Fatalf("decode public list: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("public ids query unexpectedly changed API behavior: %+v", items)
+	}
+}

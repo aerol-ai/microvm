@@ -253,37 +253,89 @@ func (c *Client) BuildImageWithPush(ctx context.Context, dockerfile string, push
 }
 
 func (c *Client) List(ctx context.Context, tags map[string]string) ([]*Sandbox, error) {
+	return c.ListWithOptions(ctx, tags, false)
+}
+
+const maxClusterListPages = 100000
+
+// ListWithOptions lists sandboxes; includeEnv appends ?include_env=true.
+// In cluster mode the daemon pages via X-Cluster-List-Next-Page-Token; this
+// drains pages until the next token is empty. maxClusterListPages is a safety
+// cap (enough for 100k sandboxes at page size 1, or far more at default 100).
+// Partial coverage or an unready placement view is returned as an error rather
+// than a silent incomplete list.
+func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
+	var items []*Sandbox
+	pageToken := ""
+	for page := 0; page < maxClusterListPages; page++ {
+		response, next, err := c.ListPageWithOptions(ctx, tags, includeEnv, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, response...)
+		pageToken = next
+		if pageToken == "" {
+			return items, nil
+		}
+	}
+	return nil, errors.New("incomplete cluster list: exceeded max pages")
+}
+
+// ListPageWithOptions fetches exactly one cluster list page. The returned
+// token is opaque and empty on the final page. This is the bounded-memory path
+// for fleet inventory callers; partial/unready coverage is always an error.
+func (c *Client) ListPageWithOptions(ctx context.Context, tags map[string]string, includeEnv bool, pageToken string) ([]*Sandbox, string, error) {
+	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
+	path := appendQueryParam(basePath, "page_token", pageToken)
 	var response []models.Sandbox
-	path := c.versionPrefix + "/sandboxes" + buildTagQuery(tags)
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
-		return nil, err
+	hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response)
+	if err != nil {
+		return nil, "", err
+	}
+	if hdrs.Get("X-Cluster-List-Partial") == "true" || hdrs.Get("X-Cluster-List-Placement-Ready") == "false" {
+		return nil, "", errors.New("incomplete cluster list")
 	}
 	items := make([]*Sandbox, 0, len(response))
 	for _, item := range response {
 		items = append(items, c.wrap(item))
 	}
-	return items, nil
+	return items, strings.TrimSpace(hdrs.Get("X-Cluster-List-Next-Page-Token")), nil
 }
 
-// buildTagQuery renders the tag filter as the server's `?tag.<key>=<value>`
-// wire format. The `tag.` prefix is literal — parseTagFilter on the server
-// inspects the *decoded* query key — so only the user-supplied key and value
-// get percent-encoded. An empty or nil map returns "" so the URL is identical
-// to the pre-filter call (no stray trailing "?").
-func buildTagQuery(tags map[string]string) string {
-	if len(tags) == 0 {
-		return ""
+func appendQueryParam(path, key, value string) string {
+	if strings.TrimSpace(value) == "" {
+		return path
 	}
-	values := make(url.Values, len(tags))
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + url.QueryEscape(key) + "=" + url.QueryEscape(value)
+}
+
+func buildSandboxQuery(tags map[string]string, includeEnv bool) string {
+	values := make(url.Values)
 	for k, v := range tags {
 		values.Set("tag."+k, v)
+	}
+	if includeEnv {
+		values.Set("include_env", "true")
+	}
+	if len(values) == 0 {
+		return ""
 	}
 	return "?" + values.Encode()
 }
 
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
+	return c.GetWithOptions(ctx, id, false)
+}
+
+// GetWithOptions fetches a sandbox; includeEnv appends ?include_env=true.
+func (c *Client) GetWithOptions(ctx context.Context, id string, includeEnv bool) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id, nil, &response); err != nil {
+	path := c.versionPrefix + "/sandboxes/" + id + buildSandboxQuery(nil, includeEnv)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -782,12 +834,17 @@ func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycl
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
+	_, err := c.doJSONHeaders(ctx, method, path, requestBody, responseBody)
+	return err
+}
+
+func (c *Client) doJSONHeaders(ctx context.Context, method, path string, requestBody any, responseBody any) (http.Header, error) {
 	var encoded []byte
 	var err error
 	if requestBody != nil {
 		encoded, err = json.Marshal(requestBody)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -807,17 +864,20 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return request, nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= 400 {
-		return decodeError(response)
+		return response.Header, decodeError(response)
 	}
 	if responseBody == nil || response.StatusCode == http.StatusNoContent {
-		return nil
+		return response.Header.Clone(), nil
 	}
-	return json.NewDecoder(response.Body).Decode(responseBody)
+	if err := json.NewDecoder(response.Body).Decode(responseBody); err != nil {
+		return response.Header, err
+	}
+	return response.Header.Clone(), nil
 }
 
 // isTransientTransportError loosely matches the Node.js SDK logic by checking

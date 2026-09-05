@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,8 +20,16 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+func templateOperatorAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: true})
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 // fakeTemplateBuilderV1 is the v1 handler-test stub for
 // service.TemplateBuilder. Touches the requested OutPath so the
@@ -83,7 +92,7 @@ func newTemplateV1TestEnv(t *testing.T) *templateV1Env {
 	RegisterRoutes(mux, Deps{
 		Service: svc,
 		Logger:  logger,
-		Auth:    func(h http.Handler) http.Handler { return h },
+		Auth:    templateOperatorAuth,
 	})
 	return &templateV1Env{svc: svc, store: st, builder: builder, handler: mux}
 }
@@ -100,7 +109,7 @@ func TestClusterCreateTemplateWrapRoutesToFirecrackerWorker(t *testing.T) {
 	RegisterRoutes(mux, Deps{
 		Service: svc,
 		Logger:  logger,
-		Auth:    func(h http.Handler) http.Handler { return h },
+		Auth:    templateOperatorAuth,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/templates", strings.NewReader(`{"image":"docker://alpine:3.20"}`))
@@ -165,6 +174,108 @@ func TestClusterListTemplatesWrapMergesAndDedupesPeers(t *testing.T) {
 	}
 	if byID["tpl-peer"] == nil {
 		t.Fatalf("merged rows missing peer template: %+v", rows)
+	}
+}
+
+func TestClusterListTemplatesWrapCoalescesConcurrentIngressRequests(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	var calls atomic.Int64
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode([]*models.Template{{ID: "tpl-peer"}})
+	}))
+	defer peer.Close()
+	env.svc.AttachCluster(templateMembersCluster("server-a", peer.URL))
+
+	const callers = 32
+	start := make(chan struct{})
+	errs := make(chan string, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for range callers {
+		go func() {
+			defer wg.Done()
+			<-start
+			rr := httptest.NewRecorder()
+			env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates", nil))
+			if rr.Code != http.StatusOK {
+				errs <- rr.Body.String()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("list failed: %s", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("peer list calls = %d, want 1 coalesced aggregate", got)
+	}
+}
+
+type templateLeaderCluster struct {
+	*membersStubCluster
+	leader              string
+	forwardedTarget     cluster.Endpoint
+	forwardedHeader     string
+	forwardedItemHeader string
+}
+
+func (c *templateLeaderCluster) Leader() string { return c.leader }
+
+func (c *templateLeaderCluster) ForwardHTTP(target cluster.Endpoint, w http.ResponseWriter, r *http.Request) {
+	c.forwardedTarget = target
+	c.forwardedHeader = r.Header.Get(clusterTemplateAggregateHeader)
+	c.forwardedItemHeader = r.Header.Get(clusterTemplateItemLeaderHeader)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func TestClusterListTemplatesWrapRoutesIngressToLeader(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	base := &membersStubCluster{
+		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		members: []cluster.Member{
+			{NodeID: "ingress-a", Alive: true, Role: config.NodeRoleIngress},
+			{NodeID: "server-leader", InternalURL: "https://server-leader:21443", Alive: true, Role: config.NodeRoleServer},
+		},
+	}
+	c := &templateLeaderCluster{membersStubCluster: base, leader: "server-leader"}
+	env.svc.AttachCluster(c)
+
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates", nil))
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want forwarded response", rr.Code)
+	}
+	if c.forwardedTarget.NodeID != "server-leader" || c.forwardedHeader != "1" {
+		t.Fatalf("forward = (%+v, header=%q), want leader aggregate", c.forwardedTarget, c.forwardedHeader)
+	}
+}
+
+func TestClusterTemplateItemWrapRoutesIngressToLeaderBeforeInventory(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	base := &membersStubCluster{
+		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		members: []cluster.Member{
+			{NodeID: "ingress-a", Alive: true, Role: config.NodeRoleIngress},
+			{NodeID: "server-leader", InternalURL: "https://server-leader:21443", Alive: true, Role: config.NodeRoleServer},
+		},
+	}
+	c := &templateLeaderCluster{membersStubCluster: base, leader: "server-leader"}
+	env.svc.AttachCluster(c)
+
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates/tpl-pending", nil))
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want forwarded response", rr.Code)
+	}
+	if c.forwardedTarget.NodeID != "server-leader" {
+		t.Fatalf("forward target = %+v, want leader", c.forwardedTarget)
+	}
+	if c.forwardedItemHeader != "1" {
+		t.Fatalf("item leader header = %q, want 1", c.forwardedItemHeader)
 	}
 }
 
@@ -249,14 +360,58 @@ func TestClusterTemplateItemWrapFallsBackLocalAfterPeer404(t *testing.T) {
 
 func templateMembersCluster(selfID, peerURL string) cluster.Client {
 	return &membersStubCluster{
-		Noop: cluster.NewNoop(selfID, "http://"+selfID, ""),
+		Noop:           cluster.NewNoop(selfID, "http://"+selfID, ""),
+		internalClient: http.DefaultClient,
 		members: []cluster.Member{
 			{NodeID: selfID, APIURL: "http://" + selfID, Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-fc", APIURL: peerURL, Alive: true, Role: config.NodeRoleWorker,
-				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}},
+				NodeID: "worker-fc", APIURL: peerURL, InternalURL: peerURL, Alive: true, Role: config.NodeRoleWorker,
+				Capacity: capacity.Snapshot{
+					SupportedRuntimes:                  []string{models.RuntimeFirecracker},
+					LocalTemplateCatalogInventoryKnown: true,
+					LocalTemplateCatalogIDs: []string{
+						"tpl-peer", "tpl-remote", "tpl-x", "missing-tpl", "x",
+					},
+				},
 			},
 		},
+	}
+}
+
+func TestTemplateOwnerFromInventoryIsDirectAndFailClosed(t *testing.T) {
+	members := []cluster.Member{
+		{NodeID: "server-a", Alive: true, Role: config.NodeRoleServer},
+		{NodeID: "unknown", InternalURL: "https://unknown", Alive: true, Role: config.NodeRoleWorker,
+			Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}}},
+		{NodeID: "worker-z", InternalURL: "https://worker-z", Alive: true, Role: config.NodeRoleWorker,
+			Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}, LocalTemplateCatalogInventoryKnown: true, LocalTemplateCatalogIDs: []string{"tpl-a"}}},
+		{NodeID: "worker-a", InternalURL: "https://worker-a", Alive: true, Role: config.NodeRoleWorker,
+			Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}, LocalTemplateCatalogInventoryKnown: true, LocalTemplateCatalogIDs: []string{"tpl-a"}}},
+	}
+	c := &membersStubCluster{Noop: cluster.NewNoop("server-a", "", ""), members: members}
+	owner, unknown, ok := templateOwnerFromInventory(c, "tpl-a")
+	if !ok || owner.NodeID != "worker-a" {
+		t.Fatalf("owner = %+v, ok=%v; want deterministic worker-a", owner, ok)
+	}
+	if !unknown {
+		t.Fatal("unknown inventory must remain visible even when an owner is found")
+	}
+	_, unknown, ok = templateOwnerFromInventory(c, "missing")
+	if ok || !unknown {
+		t.Fatalf("missing lookup = ok=%v unknown=%v, want fail-closed unknown", ok, unknown)
+	}
+}
+
+func TestTemplateOwnerFromInventoryKeepsUnavailableOwnerVisible(t *testing.T) {
+	members := []cluster.Member{
+		{NodeID: "server-a", Alive: true, Role: config.NodeRoleServer},
+		{NodeID: "worker-dead", InternalURL: "https://worker-dead", Alive: false, Role: config.NodeRoleWorker,
+			Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}, LocalTemplateCatalogInventoryKnown: true, LocalTemplateCatalogIDs: []string{"tpl-dead"}}},
+	}
+	c := &membersStubCluster{Noop: cluster.NewNoop("server-a", "", ""), members: members}
+	owner, unknown, ok := templateOwnerFromInventory(c, "tpl-dead")
+	if !ok || unknown || owner.NodeID != "worker-dead" || owner.Alive {
+		t.Fatalf("owner = %+v unknown=%v ok=%v, want visible unavailable owner", owner, unknown, ok)
 	}
 }
 

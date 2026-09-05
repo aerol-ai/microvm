@@ -290,25 +290,30 @@ curl_download() {
 
 verify_downloads() {
 	local tmp_dir="$1"
-	local sandboxd_asset="$2"
-	local toolboxd_asset="$3"
+	shift
 
 	if [[ -z "$CHECKSUMS_URL" ]]; then
-		return 0
+		echo "Checksum URL is required for prebuilt release installation" >&2
+		return 1
 	fi
 
 	if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
-		echo "Warning: failed to download checksums; skipping verification" >&2
-		return 0
+		echo "Failed to download release checksums; refusing unverified installation" >&2
+		return 1
 	fi
 
 	(
 		cd "$tmp_dir"
-		grep -E "[[:space:]](${sandboxd_asset}|${toolboxd_asset})$" checksums.txt > selected-checksums.txt || true
-		if [[ ! -s selected-checksums.txt ]]; then
-			echo "Warning: no checksum entries found for downloaded assets; skipping verification" >&2
-			exit 0
-		fi
+		: > selected-checksums.txt
+		local asset
+		for asset in "$@"; do
+			if ! awk -v name="$asset" '$2 == name { print }' checksums.txt > "checksum-${asset}.txt" \
+				|| [[ "$(wc -l < "checksum-${asset}.txt")" -ne 1 ]]; then
+				echo "Missing or ambiguous checksum for release asset: $asset" >&2
+				exit 1
+			fi
+			cat "checksum-${asset}.txt" >> selected-checksums.txt
+		done
 		sha256sum -c selected-checksums.txt
 	)
 }
@@ -709,16 +714,29 @@ install_custom_caddy() {
 
 	local tmp_binary
 	if [[ -n "$CADDY_BINARY_URL" ]]; then
-		tmp_binary="$(mktemp)"
+		local prebuilt_dir
+		local prebuilt_asset
+		prebuilt_dir="$(mktemp -d)"
+		prebuilt_asset="$(basename "${CADDY_BINARY_URL%%\?*}")"
+		tmp_binary="$prebuilt_dir/$prebuilt_asset"
 		echo "Downloading prebuilt custom Caddy from ${CADDY_BINARY_URL}"
-		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary" \
-			&& verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
+		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary"; then
+			if [[ "$CADDY_BINARY_URL_EXPLICIT" != "true" ]] \
+				&& ! verify_downloads "$prebuilt_dir" "$prebuilt_asset"; then
+				rm -rf "$prebuilt_dir"
+				echo "Prebuilt custom Caddy checksum verification failed" >&2
+				exit 1
+			fi
+			if ! verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
+				rm -rf "$prebuilt_dir"
+				exit 1
+			fi
 			systemctl stop caddy >/dev/null 2>&1 || true
 			install -m 0755 "$tmp_binary" "$caddy_path"
-			rm -f "$tmp_binary"
+			rm -rf "$prebuilt_dir"
 			return
 		fi
-		rm -f "$tmp_binary"
+		rm -rf "$prebuilt_dir"
 		if [[ "$CADDY_BINARY_URL_EXPLICIT" == "true" ]]; then
 			echo "Failed to install custom Caddy from explicit --caddy-binary-url: ${CADDY_BINARY_URL}" >&2
 			exit 1

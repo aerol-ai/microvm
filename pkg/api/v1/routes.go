@@ -47,6 +47,9 @@ type Deps struct {
 	// pkg/api so all versions share one auth contract; the version package
 	// only decides which routes need it.
 	Auth func(http.Handler) http.Handler
+	// AuditLimiter rate-limits GET /v1/sandboxes/{id}/audit only (E1b
+	// amplification bound). Nil disables limiting (tests).
+	AuditLimiter *AuditRateLimiter
 	// Builder is optional. When nil, POST /v1/images/build responds 503.
 	Builder ImageBuilder
 	Build   BuildConfig
@@ -62,7 +65,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	h := &handlers{deps: d}
 
 	mux.Handle("GET "+PathPrefix+"/capacity", d.Auth(http.HandlerFunc(h.capacity)))
-	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Auth(http.HandlerFunc(h.reconcile)))
+	mux.Handle("POST "+PathPrefix+"/admin/reconcile", withAuthOperator(d, http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.clusterBuildImageWrap)))
 
 	// POST /sandboxes is special: placement happens in the wrapper before any
@@ -102,26 +105,29 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Auth(wrap(http.HandlerFunc(h.listCustomDomains))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/custom-domains/{hostname}", d.Auth(wrap(http.HandlerFunc(h.removeCustomDomain))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains/dns", d.Auth(wrap(http.HandlerFunc(h.customDomainDNS))))
-	// Ingress DNS target — not sandbox-scoped, so no clusterForwardWrap
-	// (any node can answer from its own gossip view). Auth still required:
-	// the response reveals cluster ingress topology.
-	mux.Handle("GET "+PathPrefix+"/ingress/dns", d.Auth(http.HandlerFunc(h.ingressDNS)))
+	// Ingress DNS target — not sandbox-scoped. Operator-only: reveals cluster
+	// ingress topology to managed tenants otherwise.
+	mux.Handle("GET "+PathPrefix+"/ingress/dns", withAuthOperator(d, http.HandlerFunc(h.ingressDNS)))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
+	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
+	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Auth(withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
-	// Phase 2). Templates are per-worker artifacts, so the wrapper routes
-	// creates to a Firecracker-capable worker and fans per-id operations to
-	// those workers when the caller hits an ingress/server node.
-	mux.Handle("POST "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.clusterCreateTemplateWrap)))
-	mux.Handle("GET "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.clusterListTemplatesWrap)))
-	mux.Handle("GET "+PathPrefix+"/templates/{id}", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.getTemplate))))
-	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.deleteTemplate))))
+	// Phase 2). Templates are global operator-managed, per-worker artifacts; no
+	// tenant owner model exists. The wrapper routes creates to one Firecracker
+	// worker, item operations through the leader's all-status worker catalogue,
+	// and cluster-wide lists through a coalescing leader aggregate.
+	mux.Handle("POST "+PathPrefix+"/templates", withAuthOperator(d, http.HandlerFunc(h.clusterCreateTemplateWrap)))
+	mux.Handle("GET "+PathPrefix+"/templates", withAuthOperator(d, http.HandlerFunc(h.clusterListTemplatesWrap)))
+	mux.Handle("GET "+PathPrefix+"/templates/{id}", withAuthOperator(d, h.clusterTemplateItemWrap(http.HandlerFunc(h.getTemplate))))
+	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", withAuthOperator(d, h.clusterTemplateItemWrap(http.HandlerFunc(h.deleteTemplate))))
 	// Operator-triggered snapshot rebuild (Phase 6 follow-up). Idempotent
 	// under concurrent retry — see RequestTemplateRebuild for the CAS gate.
-	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", d.Auth(h.clusterTemplateItemWrap(http.HandlerFunc(h.rebuildTemplate))))
+	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", withAuthOperator(d, h.clusterTemplateItemWrap(http.HandlerFunc(h.rebuildTemplate))))
 
 	// WASM module catalogue (plans/wasm-runtime.md). Per-host like templates.
 	mux.Handle("POST "+PathPrefix+"/wasm-modules", d.Auth(http.HandlerFunc(h.createWasmModule)))
@@ -145,38 +151,82 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox", d.Auth(wrap(http.HandlerFunc(h.toolboxProxy))))
 	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox/{path...}", d.Auth(wrap(http.HandlerFunc(h.toolboxProxy))))
 
-	// Cluster observability (Phase 1). Read-only; safe to expose alongside
-	// the v1 surface without violating the v1 freeze (these are net-new
-	// paths, not changes to existing wire format).
-	mux.Handle("GET "+PathPrefix+"/cluster/members", d.Auth(http.HandlerFunc(h.clusterMembers)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", d.Auth(http.HandlerFunc(h.clusterRemoveMember)))
-	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.Auth(http.HandlerFunc(h.clusterLeader)))
-	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", d.Auth(http.HandlerFunc(h.clusterPlacement)))
-	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", d.Auth(http.HandlerFunc(h.clusterSandboxIndex)))
-	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", d.Auth(http.HandlerFunc(h.clusterIngressRoute)))
-	// Drain / uncordon are operator admission controls — they don't move
-	// existing work, they just stop SelectPlacement from sending new sandboxes
-	// to the node. PATCH-style verbs would also fit but POST keeps the surface
-	// consistent with /admin/reconcile (also a leader-side write side effect).
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", d.Auth(http.HandlerFunc(h.clusterDrainNode)))
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", d.Auth(http.HandlerFunc(h.clusterUncordonNode)))
-	mux.Handle("POST "+cluster.PublicWasmMigratePath, d.Auth(http.HandlerFunc(h.clusterWasmMigrate)))
-	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
-	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
-	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", d.Auth(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", d.Auth(http.HandlerFunc(h.clusterDeleteOrphan)))
-	// Internal endpoint: receives leader-forwarded raft commands from peer
-	// nodes that aren't the current leader. Auth-gated by the same PAT as
-	// every other route — see clusterInternalApply for the leadership-shift
-	// retry contract.
-	mux.Handle("POST "+cluster.PublicInternalApplyPath, d.Auth(http.HandlerFunc(h.clusterInternalApply)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalPlacement)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", d.Auth(http.HandlerFunc(h.clusterInternalPlacementByName)))
-	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacements)))
-	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
-	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsPage)))
-	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", d.Auth(http.HandlerFunc(h.clusterInternalRecoveryGet)))
-	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
-	mux.Handle("GET "+cluster.PublicInternalVolumePath, d.Auth(http.HandlerFunc(h.clusterInternalVolume)))
-	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
+	// Cluster observability + admission controls + peer internals: operator /
+	// fleet-PAT only. Managed tenant tokens must not drain nodes, apply Raft
+	// commands, or read fleet topology (P0). Peer HTTP uses SB_PAT_TOKEN.
+	op := func(next http.Handler) http.Handler { return withAuthOperator(d, next) }
+	internalOp := func(next http.Handler) http.Handler {
+		return op(withInternalMTLS(d, next))
+	}
+	mux.Handle("GET "+PathPrefix+"/cluster/members", op(http.HandlerFunc(h.clusterMembers)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", op(http.HandlerFunc(h.clusterRemoveMember)))
+	mux.Handle("GET "+PathPrefix+"/cluster/leader", op(http.HandlerFunc(h.clusterLeader)))
+	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", op(http.HandlerFunc(h.clusterPlacement)))
+	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
+	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
+	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
+	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
+	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
+	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", op(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", op(http.HandlerFunc(h.clusterDeleteOrphan)))
+	mux.Handle("POST "+cluster.PublicInternalApplyPath, internalOp(http.HandlerFunc(h.clusterInternalApply)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", internalOp(http.HandlerFunc(h.clusterInternalPlacementByName)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, internalOp(http.HandlerFunc(h.clusterInternalPlacements)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsPage)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsByIDsPath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsByIDs)))
+	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
+	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", internalOp(http.HandlerFunc(h.clusterInternalRecoveryGet)))
+	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, internalOp(http.HandlerFunc(h.clusterInternalSelectPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalVolumePath, internalOp(http.HandlerFunc(h.clusterInternalVolume)))
+	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalDrainState)))
+	mux.Handle("POST "+cluster.PublicInternalSecretPath, internalOp(http.HandlerFunc(h.clusterInternalSecretPut)))
+	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretHead)))
+	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretDelete)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", internalOp(http.HandlerFunc(h.clusterInternalSandboxAudit)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", internalOp(http.HandlerFunc(h.clusterInternalSandboxMeta)))
+}
+
+const clusterPeerNodeIDHeader = cluster.PeerNodeIDHeader
+
+func withInternalMTLS(d Deps, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peerID, err := cluster.AuthenticatedPeerNodeID(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		if !peerMemberAlive(d, peerID) {
+			cluster.RecordMTLSUnknownPeer()
+			http.Error(w, "cluster peer not in membership", http.StatusForbidden)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), clusterPeerNodeIDContextKey{}, peerID))
+		next.ServeHTTP(w, r)
+	})
+}
+
+// peerMemberAlive reports whether peerID is an Alive gossip member when a
+// cluster client is available. Missing Cluster() skips the check (tests).
+func peerMemberAlive(d Deps, peerID string) bool {
+	if d.Service == nil || peerID == "" {
+		return true
+	}
+	c := d.Service.Cluster()
+	if c == nil {
+		return true
+	}
+	return cluster.IsLivePeer(c, peerID)
+}
+
+type clusterPeerNodeIDContextKey struct{}
+
+func withAuditLimit(d Deps, next http.Handler) http.Handler {
+	if d.AuditLimiter == nil {
+		return next
+	}
+	return d.AuditLimiter.Middleware(next)
 }

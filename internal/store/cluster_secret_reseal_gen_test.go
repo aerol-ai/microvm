@@ -1,0 +1,147 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestDeleteGenerationSurvivesReseal(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-mono/v1", SandboxID: "sb-mono", Version: 1,
+		Recipients: []string{"a", "b"}, SealedPayload: []byte("sealed-1"),
+		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gen1, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, "sb-mono", []string{"b"})
+	if err != nil || gen1 != 2 {
+		t.Fatalf("first delete gen=%d err=%v, want 2", gen1, err)
+	}
+	// Reseal clears tomb atomically with put, but delete gen must still advance.
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-mono/v1", SandboxID: "sb-mono", Version: 1,
+		Recipients: []string{"a", "b"}, SealedPayload: []byte("sealed-2"),
+		SealGeneration: 3, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tomb, err := st.HasClusterSecretTomb(ctx, "sb-mono")
+	if err != nil || tomb {
+		t.Fatalf("tomb after reseal = %v %v, want false", tomb, err)
+	}
+	gen2, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, "sb-mono", []string{"b"})
+	if err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+	if gen2 <= gen1 {
+		t.Fatalf("delete generation reset after reseal: first=%d second=%d", gen1, gen2)
+	}
+	if gen2 < 4 {
+		t.Fatalf("second delete gen=%d, want >=4 (max seal 3 + 1)", gen2)
+	}
+}
+
+func TestPutClusterSecretRejectsDowngrade(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	ref := "cluster-secret://sandbox/sb-ooo/v1"
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: ref, SandboxID: "sb-ooo", Version: 1,
+		Recipients: []string{"a"}, SealedPayload: []byte("gen2"),
+		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: ref, SandboxID: "sb-ooo", Version: 1,
+		Recipients: []string{"a"}, SealedPayload: []byte("gen1"),
+		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}); !errors.Is(err, ErrClusterSecretStaleGeneration) {
+		t.Fatalf("stale put = %v, want ErrClusterSecretStaleGeneration", err)
+	}
+	got, err := st.GetClusterSecret(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SealGeneration != 2 || string(got.SealedPayload) != "gen2" {
+		t.Fatalf("downgraded row: gen=%d payload=%q", got.SealGeneration, got.SealedPayload)
+	}
+}
+
+func TestPutClusterSecretBlockedByTombInsideTx(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-race/v1", SandboxID: "sb-race", Version: 1,
+		Recipients: []string{"a"}, SealedPayload: []byte("live"),
+		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-race", 2); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-race/v1", SandboxID: "sb-race", Version: 1,
+		Recipients: []string{"a"}, SealedPayload: []byte("stale"),
+		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
+	})
+	if err == nil || !errors.Is(err, ErrClusterSecretTombBlocksPut) {
+		t.Fatalf("equal-gen put after delete = %v, want ErrClusterSecretTombBlocksPut", err)
+	}
+	tomb, err := st.HasClusterSecretTomb(ctx, "sb-race")
+	if err != nil || !tomb {
+		t.Fatalf("tomb must remain after blocked put: %v %v", tomb, err)
+	}
+	if _, err := st.GetClusterSecret(ctx, "cluster-secret://sandbox/sb-race/v1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale put must not resurrect row: %v", err)
+	}
+}
+
+func TestDeleteClusterSecretsRowsOnlyNoTomb(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-local/v1", SandboxID: "sb-local", Version: 1,
+		Recipients: []string{"a"}, SealedPayload: []byte("x"),
+		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteClusterSecretsRowsOnly(ctx, "sb-local"); err != nil {
+		t.Fatal(err)
+	}
+	tomb, err := st.HasClusterSecretTomb(ctx, "sb-local")
+	if err != nil || tomb {
+		t.Fatalf("rows-only delete must not tomb: %v %v", tomb, err)
+	}
+}

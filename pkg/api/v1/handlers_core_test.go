@@ -101,6 +101,27 @@ func TestHandlers_GetSandbox_NotFound(t *testing.T) {
 	}
 }
 
+func TestParseIncludeEnv(t *testing.T) {
+	cases := []struct {
+		q    string
+		want bool
+	}{
+		{"", false},
+		{"include_env=true", true},
+		{"include_env=1", true},
+		{"include_env=yes", true},
+		{"include_env=TRUE", true},
+		{"include_env=false", false},
+		{"include_env=0", false},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/x?"+tc.q, nil)
+		if got := parseIncludeEnv(req); got != tc.want {
+			t.Fatalf("parseIncludeEnv(%q) = %v, want %v", tc.q, got, tc.want)
+		}
+	}
+}
+
 // TestHandlers_StartSandbox_NotFound covers the 0% startSandbox → 404 path.
 func TestHandlers_StartSandbox_NotFound(t *testing.T) {
 	h := newHandlerWithStore(t)

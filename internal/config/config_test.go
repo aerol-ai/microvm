@@ -768,6 +768,7 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") // 32-byte base64
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", keyPath)
+		t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 		// Clear vars the test toggles per-case so previous cases don't leak.
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "")
 		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "")
@@ -790,6 +791,39 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 		if _, err := Load(); err != nil {
 			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("refuses_cluster_without_mtls", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_CLUSTER_TLS_DIR", "")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_TLS_DIR") {
+			t.Fatalf("expected SB_CLUSTER_TLS_DIR error, got %v", err)
+		}
+	})
+
+	t.Run("refuses_cluster_without_backup_recipient", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_RECIPIENT_BACKUP_COUNT", "0")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_SECRET_RECIPIENT_BACKUP_COUNT") {
+			t.Fatalf("expected SB_SECRET_RECIPIENT_BACKUP_COUNT error, got %v", err)
+		}
+	})
+
+	t.Run("refuses_zero_first_ack_wait", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_FANOUT_MIN_ACK_WAIT", "0")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_SECRET_FANOUT_MIN_ACK_WAIT") {
+			t.Fatalf("expected SB_SECRET_FANOUT_MIN_ACK_WAIT error, got %v", err)
 		}
 	})
 
@@ -828,6 +862,58 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("secret_provider_defaults_local", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.SecretProvider != "local" {
+			t.Fatalf("SecretProvider = %q, want local", cfg.SecretProvider)
+		}
+		if cfg.SecretAuditRetentionDays != 30 {
+			t.Fatalf("SecretAuditRetentionDays = %d, want 30", cfg.SecretAuditRetentionDays)
+		}
+		if !cfg.SecretAuditStrictBoot {
+			t.Fatal("SecretAuditStrictBoot default = false, want true")
+		}
+		if cfg.SecretTombRetentionDays != 30 {
+			t.Fatalf("SecretTombRetentionDays = %d, want 30", cfg.SecretTombRetentionDays)
+		}
+		if !cfg.EgressAttributionEnabled {
+			t.Fatal("EgressAttributionEnabled default = false, want true")
+		}
+		if cfg.AuditRateLimitIdentity != 10 || cfg.AuditRateLimitOperator != 50 || cfg.AuditRateLimitNode != 50 {
+			t.Fatalf("audit rate defaults = %v/%v/%v", cfg.AuditRateLimitIdentity, cfg.AuditRateLimitOperator, cfg.AuditRateLimitNode)
+		}
+	})
+
+	t.Run("secret_provider_awskms_requires_key", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "awskms")
+		t.Setenv("SB_SECRET_AWS_KMS_KEY_ID", "")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_SECRET_AWS_KMS_KEY_ID") {
+			t.Fatalf("expected AWS KMS key error, got %v", err)
+		}
+	})
+
+	t.Run("secret_provider_vault_not_implemented", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "vault")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "not implemented") {
+			t.Fatalf("expected vault not-implemented error, got %v", err)
+		}
+	})
+
 	t.Run("accepts_explicit_data_plane_host", func(t *testing.T) {
 		dir := t.TempDir()
 		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
@@ -856,6 +942,7 @@ func TestNodeRoleCases(t *testing.T) {
 		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 		t.Setenv("SB_API_ADVERTISE_URL", "http://10.0.0.5:21212")
+		t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 		t.Setenv("SB_NODE_ROLE", "")
 	}
 
@@ -1369,6 +1456,118 @@ func TestParseMirrorUpstreams(t *testing.T) {
 				if got[i] != c.want[i] {
 					t.Fatalf("entry %d = %+v, want %+v", i, got[i], c.want[i])
 				}
+			}
+		})
+	}
+}
+
+func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
+	t.Setenv("SB_ENTERPRISE_MODE", "true")
+	t.Setenv("SB_ENABLE_CLUSTER", "false")
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
+	if cfg, err := Load(); err != nil {
+		t.Fatalf("secure enterprise Load: %v", err)
+	} else if !cfg.EnterpriseMode {
+		t.Fatalf("enterprise mode not retained: %+v", cfg)
+	}
+
+	t.Setenv("SB_ENABLE_ISOLATE", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ENABLE_ISOLATE") {
+		t.Fatalf("Load error = %v, want isolate-forbidden-in-enterprise", err)
+	}
+	t.Setenv("SB_ENABLE_ISOLATE", "false")
+
+	t.Setenv("SB_PAT_TOKEN", "weak-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("Load error = %v, want weak PAT rejection", err)
+	}
+
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "false")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_EXPORT_URL") {
+		t.Fatalf("Load error = %v, want exporter requirement", err)
+	}
+
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
+	if cfg, err := Load(); err != nil {
+		t.Fatalf("enterprise with export URL only: %v", err)
+	} else if cfg.SecretAuditExportURL == "" {
+		t.Fatal("expected export URL retained")
+	}
+
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "http://audit.example/export")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("Load error = %v, want insecure audit export rejection", err)
+	}
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BEARER_TOKEN") {
+		t.Fatalf("Load error = %v, want missing export token rejection", err)
+	}
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", "weak-export-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("Load error = %v, want weak export token rejection", err)
+	}
+
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_AUDIT_INGEST_TOKEN", "weak-ingest-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_AUDIT_INGEST_TOKEN") {
+		t.Fatalf("Load error = %v, want weak ingest token rejection", err)
+	}
+	t.Setenv("SB_AUDIT_INGEST_TOKEN", strings.Repeat("i", minEnterpriseCredentialBytes))
+	t.Setenv("SB_SECRET_AUDIT_WITNESS_INTERVAL", "15s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load with witness interval: %v", err)
+	}
+	if cfg.SecretAuditWitnessInterval != 15*time.Second {
+		t.Fatalf("SecretAuditWitnessInterval = %v, want 15s", cfg.SecretAuditWitnessInterval)
+	}
+}
+
+func TestEnterpriseClusterRejectsCAKeyInDaemonTLSDirectory(t *testing.T) {
+	tlsDir := t.TempDir()
+	caKeyPath := filepath.Join(tlsDir, "ca.key")
+	if err := os.WriteFile(caKeyPath, []byte("signing-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_PAT_TOKEN", strings.Repeat("x", minEnterpriseCredentialBytes))
+	t.Setenv("SB_ENTERPRISE_MODE", "true")
+	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_URL", "https://audit.example/export")
+	t.Setenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", strings.Repeat("e", minEnterpriseCredentialBytes))
+	t.Setenv("SB_ENABLE_CLUSTER", "true")
+	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+	t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("SB_CLUSTER_TLS_DIR", tlsDir)
+	t.Setenv("SB_SECRET_RECIPIENT_BACKUP_COUNT", "2")
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "CA signing key") {
+		t.Fatalf("Load error = %v, want runtime CA key rejection", err)
+	}
+	if err := os.Remove(caKeyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load after moving CA key offline: %v", err)
+	}
+}
+
+func TestNodeIDRejectsProtocolDelimiters(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "token")
+	for _, nodeID := range []string{"node|forged", "node:forged", "node,forged", "-node", strings.Repeat("n", 129)} {
+		t.Run(nodeID, func(t *testing.T) {
+			t.Setenv("SB_NODE_ID", nodeID)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_NODE_ID") {
+				t.Fatalf("Load error = %v, want invalid node id rejection", err)
 			}
 		})
 	}

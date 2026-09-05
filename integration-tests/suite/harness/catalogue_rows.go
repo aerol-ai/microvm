@@ -264,6 +264,7 @@ func haRows() []CatalogueRow {
 		row("HA-05", "Uncordon restores schedulability", catHA(), "", "schedulable", scnHetero(), RTContainerd, "UC-57"),
 		row("HA-06", "Owner failover → replica serves", catHA(), "", "replica serves", scnHetero(), RTContainerd, "UC-58"),
 		row("HA-07", "Recreate-via-failover preserves identity", catHA(), "", "same id", scnHetero(), RTContainerd, "UC-58b"),
+		row("HA-07b", "Kill owner mid secret fan-out (GAP-1)", catHA(), "", "recover or clean fail", scnHetero(), RTContainerd, "UC-58c"),
 		row("HA-08", "WASM live-migrate across nodes", catHA(), "", "migrated", scnHetero(), RTWasm, "UC-59"),
 		row("HA-09", "WASM export/import round-trip", catHA(), "", "state restored", scnHetero(), RTWasm, ""),
 		row("HA-10", "Orphan reclaim-local", catHA(), "", "reclaimed", scnHetero(), RTContainerd, "UC-60"),

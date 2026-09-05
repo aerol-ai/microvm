@@ -144,8 +144,8 @@ func TestIngressShardFilterAppendsSelfAndDedups(t *testing.T) {
 		t.Fatalf("expected sharded filter for oversized ingress + self, got %+v", filter)
 	}
 	route := IngressRouteForSandbox(members, "sb-1")
-	if len(route.Owners) != 1 {
-		t.Fatalf("large tier route owners=%+v", route.Owners)
+	if len(route.Owners) != 2 {
+		t.Fatalf("large tier route owners=%+v, want primary+replica", route.Owners)
 	}
 }
 
@@ -227,7 +227,7 @@ func TestRecoveryReplicationUnitBranches(t *testing.T) {
 	index.upsert(Member{NodeID: "", Alive: true, Role: config.NodeRoleServer, APIURL: "http://x"})
 	index.upsert(Member{NodeID: "worker", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://w"})
 	index.upsert(Member{NodeID: "noep", Alive: true, Role: config.NodeRoleServer})
-	index.upsert(Member{NodeID: "peer", Alive: true, Role: config.NodeRoleServer, APIURL: "http://peer"})
+	index.upsert(Member{NodeID: "peer", Alive: true, Role: config.NodeRoleServer, APIURL: "http://peer", InternalURL: "https://peer"})
 	c.gossip = &gossipNode{memberIndex: index}
 	members := c.recoveryServerMembers()
 	if len(members) != 2 { // self + peer
@@ -235,12 +235,11 @@ func TestRecoveryReplicationUnitBranches(t *testing.T) {
 	}
 
 	// 404 maps to not found.
-	srv404 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv404, internalClient := newNodeBoundForwardServer(t, "self", "p", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}))
-	defer srv404.Close()
-	c.httpClient = srv404.Client()
-	blob, ok, err := c.getRecoveryBlobFromMember(context.Background(), Member{NodeID: "p", APIURL: srv404.URL}, "recovery:v1:"+strings.Repeat("a", 64))
+	c.internalClient = internalClient
+	blob, ok, err := c.getRecoveryBlobFromMember(context.Background(), Member{NodeID: "p", InternalURL: srv404.URL}, "recovery:v1:"+strings.Repeat("a", 64))
 	if err != nil || ok || blob.Ref != "" {
 		t.Fatalf("404 blob ok=%v err=%v", ok, err)
 	}
@@ -254,11 +253,10 @@ func TestRecoveryReplicationUnitBranches(t *testing.T) {
 	}))
 	defer srvOK.Close()
 	c.patToken = "pat"
-	c.httpClient = srvOK.Client()
-	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), srvOK.URL, http.MethodGet, "pat", nil, nil); err != nil {
+	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), srvOK.URL, http.MethodGet, "pat", "", nil, nil); err != nil {
 		t.Fatalf("nil out: %v", err)
 	}
-	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), "://bad", http.MethodGet, "", []byte(`{}`), nil); err == nil {
+	if err := doRecoveryHTTPRequest(context.Background(), srvOK.Client(), "://bad", http.MethodGet, "", "", []byte(`{}`), nil); err == nil {
 		t.Fatal("bad url")
 	}
 
@@ -532,7 +530,7 @@ func TestDoRecoveryHTTPDecode(t *testing.T) {
 	}))
 	defer srv.Close()
 	var out RecoveryBlob
-	if err := doRecoveryHTTPRequest(context.Background(), srv.Client(), srv.URL, http.MethodGet, "", nil, &out); err != nil || out.SandboxID != "sb" {
+	if err := doRecoveryHTTPRequest(context.Background(), srv.Client(), srv.URL, http.MethodGet, "", "", nil, &out); err != nil || out.SandboxID != "sb" {
 		t.Fatalf("decode out=%+v err=%v", out, err)
 	}
 }

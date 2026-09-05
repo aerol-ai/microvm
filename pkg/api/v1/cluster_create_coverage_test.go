@@ -171,46 +171,10 @@ func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster
 		capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
 		nil,
 	)
-	svc := service.New(cfg, logger, st, rt, nil, caddyClient, nil, mgr, admitter)
-	svc.AttachCluster(stub)
-	return &handlers{deps: Deps{Service: svc, Logger: logger}}, st
-}
-
-func newClusterCreateHarnessWithCipher(t *testing.T, rt *apiRecordingRuntime, stub cluster.Client) (*handlers, *storepkg.Store) {
-	t.Helper()
-	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
-		RootDir: filepath.Join(t.TempDir(), "mounts"),
-		CredDir: filepath.Join(t.TempDir(), "cred"),
-	})
-	if err != nil {
-		t.Fatalf("mounts.New: %v", err)
-	}
-	t.Cleanup(mgr.Close)
-
 	ciph, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "secrets.key"))
 	if err != nil {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{
-		Runtime:           models.RuntimeDocker,
-		ToolboxPort:       4321,
-		EnableCaddy:       false,
-		HTTPClientTimeout: time.Second,
-	}
-	caddyClient := caddy.New(cfg)
-	admitter := capacity.New(
-		capacity.HostInfo{CPUCores: 8, MemoryTotalMB: 16384},
-		capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
-		nil,
-	)
 	svc := service.New(cfg, logger, st, rt, nil, caddyClient, ciph, mgr, admitter)
 	svc.AttachCluster(stub)
 	return &handlers{deps: Deps{Service: svc, Logger: logger}}, st
@@ -409,7 +373,7 @@ func TestCreateSandboxOnSelectedNode_SelfLocalWithoutReservation(t *testing.T) {
 func TestCreateSandboxOnSelectedNode_PromoteWithRegistrySecrets(t *testing.T) {
 	rt := &apiRecordingRuntime{}
 	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-	h, _ := newClusterCreateHarnessWithCipher(t, rt, stub)
+	h, _ := newClusterCreateHarness(t, rt, stub)
 
 	req := models.CreateSandboxRequest{
 		Image: "private.example.com/app:latest",
@@ -748,7 +712,7 @@ func TestCreateSandboxOnSelectedNode_SelfWinsPromoteRollbackErrors(t *testing.T)
 		recordErr: errors.New("raft commit failed"),
 		deleteErr: errors.New("delete failed"),
 	}
-	h, _ := newClusterCreateHarnessWithCipher(t, rt, stub)
+	h, _ := newClusterCreateHarness(t, rt, stub)
 	rr := httptest.NewRecorder()
 	h.createSandboxOnSelectedNode(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), models.CreateSandboxRequest{Image: "alpine:3.20"}, "")
 	if rr.Code != http.StatusServiceUnavailable {

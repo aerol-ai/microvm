@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -19,7 +21,8 @@ import (
 // signature. Handlers are intentionally thin — wire decode → service call →
 // wire encode — so the version boundary stays at this layer.
 type handlers struct {
-	deps Deps
+	deps          Deps
+	templateLists templateListCache
 }
 
 func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {
@@ -32,7 +35,18 @@ func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
-	apihttp.WriteJSON(w, http.StatusOK, h.deps.Service.Capacity())
+	snapshot := h.deps.Service.Capacity()
+	access, ok := controlplane.AccessFromContext(r.Context())
+	if !ok || !access.Operator {
+		// Template administration is operator-only. Capacity remains useful to
+		// managed callers, but template identifiers can encode internal workload
+		// names and must not leak through this otherwise tenant-visible endpoint.
+		snapshot.LocalTemplateInventoryKnown = false
+		snapshot.LocalTemplateIDs = nil
+		snapshot.LocalTemplateCatalogInventoryKnown = false
+		snapshot.LocalTemplateCatalogIDs = nil
+	}
+	apihttp.WriteJSON(w, http.StatusOK, snapshot)
 }
 
 func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docker.CreateTiming, containerEngine string) {
@@ -98,13 +112,50 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), parseTagFilter(r))
+	ctx := r.Context()
+	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	sandboxes, err := h.deps.Service.ListSandboxesWithOptions(ctx, parseTagFilter(r), opts)
 	if err != nil {
 		h.deps.Logger.Warn("list sandboxes failed", "error", err)
 		apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	if want := parseSandboxIDsFilter(r); len(want) > 0 {
+		filtered := make([]*models.Sandbox, 0, len(want))
+		for _, sb := range sandboxes {
+			if sb == nil {
+				continue
+			}
+			if _, ok := want[sb.ID]; ok {
+				filtered = append(filtered, sb)
+			}
+		}
+		sandboxes = filtered
+	}
 	apihttp.WriteJSON(w, http.StatusOK, sandboxes)
+}
+
+// parseSandboxIDsFilter reads ids=a,b,c from forwarded cluster list peers so
+// owners return only the placement-page subset (smaller JSON).
+func parseSandboxIDsFilter(r *http.Request) map[string]struct{} {
+	if r == nil || r.Header.Get("X-Cluster-Forwarded") != "1" {
+		return nil
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("ids"))
+	if raw == "" {
+		return nil
+	}
+	want := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		id := strings.TrimSpace(part)
+		if id != "" {
+			want[id] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	return want
 }
 
 // parseTagFilter pulls every query parameter of the form `tag.<key>=<value>`
@@ -134,12 +185,19 @@ func parseTagFilter(r *http.Request) map[string]string {
 }
 
 func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
+	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	sandbox, err := h.deps.Service.GetSandboxWithOptions(r.Context(), r.PathValue("id"), opts)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
+}
+
+// parseIncludeEnv accepts include_env=true|1|yes (case-insensitive).
+func parseIncludeEnv(r *http.Request) bool {
+	v := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("include_env")))
+	return v == "true" || v == "1" || v == "yes"
 }
 
 func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {

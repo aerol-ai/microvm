@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
@@ -515,13 +515,42 @@ class MicroVM:
         pushed: Optional[str] = str(pushed_value) if pushed_value else None
         return BuildImageResult(image=image_tag, pushed=pushed)
 
-    def list(self, *, tags: Optional[Dict[str, str]] = None) -> List[Sandbox]:
-        path = self._versioned("/sandboxes") + _build_tag_query(tags)
-        sandboxes = self._do_json("GET", path, None)
-        return [self._wrap_sandbox(item) for item in sandboxes]
+    def list(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+    ) -> List[Sandbox]:
+        items: List[Sandbox] = []
+        for page in self.iter_pages(tags=tags, include_env=include_env):
+            items.extend(page)
+        return items
 
-    def get(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
+    def iter_pages(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+    ) -> Iterator[List[Sandbox]]:
+        """Yield one server page at a time for bounded-memory fleet scans."""
+        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
+        page_token = ""
+        for _ in range(100000):
+            path = _append_query_param(base_path, "page_token", page_token)
+            sandboxes, headers = self._do_json_headers("GET", path, None)
+            partial = headers.get("X-Cluster-List-Partial", "")
+            ready = headers.get("X-Cluster-List-Placement-Ready", "")
+            if partial == "true" or ready == "false":
+                raise MicroVMError("incomplete cluster list")
+            yield [self._wrap_sandbox(item) for item in sandboxes or []]
+            page_token = (headers.get("X-Cluster-List-Next-Page-Token") or "").strip()
+            if page_token == "":
+                return
+        raise MicroVMError("incomplete cluster list: exceeded max pages")
+
+    def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:
+        path = f"{self._version_prefix}/sandboxes/{sandbox_id}" + _build_sandbox_query(None, include_env)
+        sandbox = self._do_json("GET", path, None)
         return self._wrap_sandbox(sandbox)
 
     def start(self, sandbox_id: str) -> Sandbox:
@@ -929,6 +958,17 @@ class MicroVM:
         return f"{self.api_url}{path}"
 
     def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None) -> bytes:
+        raw, _ = self._request_headers(method, url, body, content_type, extra_headers)
+        return raw
+
+    def _request_headers(
+        self,
+        method: str,
+        url: str,
+        body: Optional[bytes] = None,
+        content_type: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> tuple[bytes, Dict[str, str]]:
         max_retries = self._retry_config["maxRetries"]
         base_delay_ms = self._retry_config["baseDelayMs"]
         max_delay_ms = self._retry_config["maxDelayMs"]
@@ -945,7 +985,8 @@ class MicroVM:
 
             try:
                 with urllib.request.urlopen(request) as response:
-                    return response.read()
+                    headers = {k: v for k, v in response.headers.items()}
+                    return response.read(), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 if exc.code in (429, 502, 503, 504) and attempt < max_retries:
@@ -975,15 +1016,19 @@ class MicroVM:
         raise last_exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
+        data, _ = self._do_json_headers(method, path, payload)
+        return data
+
+    def _do_json_headers(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw = self._request(method, self._url(path), body, content_type)
+        raw, headers = self._request_headers(method, self._url(path), body, content_type)
         if raw == b"":
-            return {}
-        return json.loads(raw.decode("utf-8"))
+            return {}, headers
+        return json.loads(raw.decode("utf-8")), headers
 
     def _do_multipart(
         self,
@@ -1066,18 +1111,33 @@ def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_tag_query(tags: Optional[Dict[str, str]]) -> str:
-    # Renders the tag filter as the server's `?tag.<key>=<value>` wire format.
+    return _build_sandbox_query(tags, False)
+
+
+def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = False) -> str:
+    # Renders tag filters and optional include_env as the server's wire format.
     # The `tag.` prefix is literal — the server's parseTagFilter inspects the
     # decoded query key — so only the user-supplied key and value get
-    # percent-encoded. An empty or missing map returns "" so the request URL is
+    # percent-encoded. An empty query returns "" so the request URL is
     # byte-identical to the pre-filter call (no stray trailing "?").
-    if not tags:
+    parts: List[str] = []
+    if tags:
+        parts.extend(
+            f"tag.{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(str(value), safe='')}"
+            for key, value in tags.items()
+        )
+    if include_env:
+        parts.append("include_env=true")
+    if not parts:
         return ""
-    parts = [
-        f"tag.{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(str(value), safe='')}"
-        for key, value in tags.items()
-    ]
     return "?" + "&".join(parts)
+
+
+def _append_query_param(path: str, key: str, value: str) -> str:
+    if not value:
+        return path
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}{urllib.parse.quote(key, safe='')}={urllib.parse.quote(value, safe='')}"
 
 
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:

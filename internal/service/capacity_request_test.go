@@ -144,3 +144,5 @@ type topologyCluster struct {
 func (c *topologyCluster) Members() []cluster.Member {
 	return c.members
 }
+
+func (c *topologyCluster) LocalMembers() []cluster.Member { return c.Members() }

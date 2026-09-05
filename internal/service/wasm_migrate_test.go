@@ -71,10 +71,11 @@ func copyWasmSnapshotDir(src, dst string) error {
 
 type wasmMigrateClusterStub struct {
 	*cluster.Noop
-	selfID    string
-	targetID  string
-	targetURL string
-	spec      *models.CreateSandboxRequest
+	selfID       string
+	targetID     string
+	targetURL    string
+	targetClient *http.Client
+	spec         *models.CreateSandboxRequest
 }
 
 func (c *wasmMigrateClusterStub) OwnerOf(string) (cluster.OwnerInfo, error) {
@@ -88,12 +89,21 @@ func (c *wasmMigrateClusterStub) Members() []cluster.Member {
 	}
 	return []cluster.Member{
 		{NodeID: c.selfID, APIURL: "http://self", Alive: true, Role: config.NodeRoleWorker},
-		{NodeID: c.targetID, APIURL: targetURL, Alive: true, Role: config.NodeRoleWorker},
+		{NodeID: c.targetID, APIURL: targetURL, InternalURL: targetURL, Alive: true, Role: config.NodeRoleWorker},
 	}
 }
 
+func (c *wasmMigrateClusterStub) LocalMembers() []cluster.Member { return c.Members() }
+
 func (c *wasmMigrateClusterStub) SpecOf(string) *models.CreateSandboxRequest {
 	return c.spec
+}
+
+func (c *wasmMigrateClusterStub) PeerDialMember(m cluster.Member) (*http.Client, string, error) {
+	if c.targetURL == "" || m.NodeID != c.targetID {
+		return nil, "", cluster.ErrPeerInternalURLRequired
+	}
+	return c.targetClient, c.targetURL, nil
 }
 
 func insertWasmSandbox(t *testing.T, st *store.Store, id string) {
@@ -216,10 +226,11 @@ func TestMigrateWasmSandboxToNodePostsImportToTarget(t *testing.T) {
 	svc := New(config.Config{EnableWasm: true, WasmModulesDir: t.TempDir()}, slog.Default(), st, nil, nil, nil, nil, nil, nil)
 	svc.SetWasmRuntime(&fakeWasmMigrateRuntime{snapDir: src, cloneGen: "gen-handoff"})
 	svc.AttachCluster(&wasmMigrateClusterStub{
-		Noop:      cluster.NewNoop(selfID, "http://self", ""),
-		selfID:    selfID,
-		targetID:  targetID,
-		targetURL: ts.URL,
+		Noop:         cluster.NewNoop(selfID, "http://self", ""),
+		selfID:       selfID,
+		targetID:     targetID,
+		targetURL:    ts.URL,
+		targetClient: ts.Client(),
 		spec: &models.CreateSandboxRequest{
 			Runtime:   models.RuntimeWasm,
 			ModuleRef: "file:///tmp/demo.wasm",

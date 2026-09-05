@@ -16,6 +16,7 @@ import (
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestExposePortUpsertPortRollbackViaHookWave11(t *testing.T) {
@@ -346,13 +347,13 @@ func TestOpenClusterSecretsBadPayloadWave11(t *testing.T) {
 	ctx := context.Background()
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cipher = newTestCipher(t)
-	ref := clusterSecretRef("sb-bad", 1)
-	if err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
+	ref := secrets.FormatRef("sb-bad", 1)
+	if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
 		Ref: ref, SandboxID: "sb-bad", Version: 1, SealedPayload: []byte("not-json"),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := svc.OpenClusterSecrets(ctx, models.CreateSandboxRequest{Image: "x"}, cluster.PlacementSecrets{Ref: ref, Version: 1})
+	_, err := svc.OpenClusterSecretsForNode(ctx, "sb-bad", models.CreateSandboxRequest{Image: "x"}, cluster.PlacementSecrets{Ref: ref, Version: 1}, "node-a")
 	if err == nil {
 		t.Fatal("expected bad payload error")
 	}

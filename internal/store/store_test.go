@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -134,8 +133,8 @@ func TestStoreCases(t *testing.T) {
 				if got.ID != sandbox.ID || got.Image != sandbox.Image || got.PublicURL != sandbox.PublicURL {
 					t.Fatalf("unexpected sandbox: %+v", got)
 				}
-				if !reflect.DeepEqual(got.Env, sandbox.Env) || !reflect.DeepEqual(got.ContainerCommand, sandbox.ContainerCommand) {
-					t.Fatalf("unexpected env/command: %+v", got)
+				if len(got.Env) != 0 || !reflect.DeepEqual(got.ContainerCommand, sandbox.ContainerCommand) {
+					t.Fatalf("unexpected sandbox-row env/command: %+v", got)
 				}
 				if got.Runtime != sandbox.Runtime {
 					t.Fatalf("unexpected runtime: got %q, want %q", got.Runtime, sandbox.Runtime)
@@ -2126,61 +2125,6 @@ func TestStoreHelperCases(t *testing.T) {
 		}
 	})
 
-	t.Run("scan_sandbox_invalid_env_json_returns_error", func(t *testing.T) {
-		now := time.Now()
-		row := sqlRowStub{values: []any{
-			"sb-bad",                    // id
-			"image",                     // image
-			models.SandboxStatusStarted, // status
-			"https://example.com",       // public_url
-			"container",                 // container_id
-			"10.0.0.1",                  // container_ip
-			float64(1),                  // cpu
-			1024,                        // memory_mb
-			10,                          // disk_gb
-			"root",                      // os_user
-			"{bad json",                 // env_json — triggers the failure
-			0,                           // network_blocked
-			"[]",                        // network_allow_out_json
-			"[]",                        // network_deny_out_json
-			1,                           // allow_public_traffic
-			"",                          // mask_request_host
-			1,                           // toolbox_enabled
-			"",                          // toolbox_token
-			"",                          // ssh_public_key
-			"",                          // last_error
-			"[]",                        // container_command_json
-			"",                          // name
-			"{}",                        // tags_json
-			now, now, now,               // created_at, updated_at, last_active_at
-			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
-			"",                 // failover_policy
-			"",                 // runtime
-			"docker",           // engine
-			"",                 // gpus_json
-			int64(0), int64(0), // net_bytes_in, net_bytes_out
-			int64(0), int64(0), // net_bytes_in_limit, net_bytes_out_limit
-			0,              // net_quota_exceeded
-			sql.NullTime{}, // net_quota_exceeded_at
-			[]byte(nil),    // registry_auth_sealed
-			0,              // auto_import_pending
-			0,              // serverless
-			0,              // wake_armed
-			"",             // template_id
-			0,              // overlay_size_gb
-			"passivatable", // durability
-			"", "",         // module_ref, module_digest
-			"", "", // checkpoint_path, clone_generation
-			"", "", // wasm_registry_ref, wasm_registry_digest
-			"", // owner_ref
-			0,  // fleet_suspended
-			"", // tenant_id
-		}}
-		_, err := scanSandbox(row)
-		if err == nil {
-			t.Fatalf("expected scanSandbox() error")
-		}
-	})
 }
 
 type sqlRowStub struct {
@@ -2205,7 +2149,7 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 		Recipients:    []string{"node-a"},
 		SealedPayload: []byte("opaque-ciphertext"),
 	}
-	if err := st.PutClusterSecret(ctx, rec); err != nil {
+	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret: %v", err)
 	}
 	got, err := st.GetClusterSecret(ctx, rec.Ref)
@@ -2227,6 +2171,69 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 	}
 	if _, err := st.GetClusterSecret(ctx, rec.Ref); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetClusterSecret after delete = %v, want ErrNotFound", err)
+	}
+	tomb, err := st.HasClusterSecretTomb(ctx, rec.SandboxID)
+	if err != nil || !tomb {
+		t.Fatalf("HasClusterSecretTomb = %v %v, want true", tomb, err)
+	}
+	if err := st.ClearClusterSecretTomb(ctx, rec.SandboxID); err != nil {
+		t.Fatalf("ClearClusterSecretTomb: %v", err)
+	}
+	tomb, err = st.HasClusterSecretTomb(ctx, rec.SandboxID)
+	if err != nil || tomb {
+		t.Fatalf("HasClusterSecretTomb after clear = %v %v, want false", tomb, err)
+	}
+}
+
+func TestListClusterSecrets(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	empty, err := st.ListClusterSecrets(ctx)
+	if err != nil {
+		t.Fatalf("ListClusterSecrets empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ListClusterSecrets empty = %d, want 0", len(empty))
+	}
+
+	a := ClusterSecretRecord{
+		Ref:           "cluster-secret://sandbox/sb-a/v1",
+		SandboxID:     "sb-a",
+		Version:       1,
+		Recipients:    []string{"node-a", "node-b"},
+		SealedPayload: []byte("cipher-a"),
+	}
+	b := ClusterSecretRecord{
+		Ref:           "cluster-secret://sandbox/sb-b/v1",
+		SandboxID:     "sb-b",
+		Version:       2,
+		Recipients:    []string{"node-a"},
+		SealedPayload: []byte("cipher-b"),
+	}
+	if _, err := st.PutClusterSecret(ctx, a); err != nil {
+		t.Fatalf("PutClusterSecret a: %v", err)
+	}
+	if _, err := st.PutClusterSecret(ctx, b); err != nil {
+		t.Fatalf("PutClusterSecret b: %v", err)
+	}
+
+	got, err := st.ListClusterSecrets(ctx)
+	if err != nil {
+		t.Fatalf("ListClusterSecrets: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListClusterSecrets len = %d, want 2", len(got))
+	}
+	// ORDER BY sandbox_id, ref
+	if got[0].SandboxID != "sb-a" || got[1].SandboxID != "sb-b" {
+		t.Fatalf("order = %q,%q want sb-a,sb-b", got[0].SandboxID, got[1].SandboxID)
+	}
+	if len(got[0].Recipients) != 2 || string(got[0].SealedPayload) != "cipher-a" {
+		t.Fatalf("row a = %+v", got[0])
+	}
+	if len(got[1].Recipients) != 1 || string(got[1].SealedPayload) != "cipher-b" {
+		t.Fatalf("row b = %+v", got[1])
 	}
 }
 

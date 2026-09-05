@@ -36,6 +36,7 @@ import type {
   HealthStatus,
   IngressTarget,
   Lifecycle,
+  GetOptions,
   ListOptions,
   MountSpec,
   MountSpecRedacted,
@@ -490,13 +491,41 @@ export class APIClient {
   }
 
   async list(options?: ListOptions): Promise<SandboxResource[]> {
-    const path = this.versioned("/sandboxes") + buildTagQuery(options?.tags);
-    const response = await this.doJSON<ApiSandbox[]>("GET", path);
-    return response.map((item) => this.wrap(item));
+    const items: SandboxResource[] = [];
+    for await (const page of this.listPages(options)) {
+      items.push(...page);
+    }
+    return items;
   }
 
-  async get(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${id}`);
+  /** Streams bounded cluster-list pages and never accumulates the full fleet. */
+  async *listPages(options?: ListOptions): AsyncGenerator<SandboxResource[]> {
+    const basePath = this.versioned("/sandboxes") + buildSandboxListQuery(options);
+    let pageToken = "";
+    for (let page = 0; page < 100000; page++) {
+      const path = appendQueryParam(basePath, "page_token", pageToken);
+      const response = await this.request("GET", path);
+      if (!response.ok) {
+        throw await decodeError(response);
+      }
+      const partial = response.headers.get("X-Cluster-List-Partial");
+      const placementReady = response.headers.get("X-Cluster-List-Placement-Ready");
+      if (partial === "true" || placementReady === "false") {
+        throw new Error("incomplete cluster list");
+      }
+      const body = (await response.json()) as ApiSandbox[] | null;
+      yield (body ?? []).map((item) => this.wrap(item));
+      pageToken = (response.headers.get("X-Cluster-List-Next-Page-Token") ?? "").trim();
+      if (pageToken === "") {
+        return;
+      }
+    }
+    throw new Error("incomplete cluster list: exceeded max pages");
+  }
+
+  async get(id: string, options?: GetOptions): Promise<SandboxResource> {
+    const q = buildIncludeEnvQuery(options?.includeEnv);
+    const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${id}${q}`);
     return this.wrap(response);
   }
 
@@ -1473,6 +1502,29 @@ function buildTagQuery(tags: Record<string, string> | undefined): string {
     ([key, value]) => `tag.${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
   );
   return "?" + parts.join("&");
+}
+
+function buildIncludeEnvQuery(includeEnv: boolean | undefined): string {
+  return includeEnv ? "?include_env=true" : "";
+}
+
+function buildSandboxListQuery(options?: ListOptions): string {
+  const tags = buildTagQuery(options?.tags);
+  if (!options?.includeEnv) {
+    return tags;
+  }
+  if (tags === "") {
+    return "?include_env=true";
+  }
+  return tags + "&include_env=true";
+}
+
+function appendQueryParam(path: string, key: string, value: string): string {
+  if (!value) {
+    return path;
+  }
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
 }
 
 function cloneSandbox(sandbox: Sandbox): Sandbox {

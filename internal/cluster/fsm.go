@@ -23,24 +23,28 @@ import (
 type opCode uint8
 
 const (
-	opPlace              opCode = 1
-	opDelete             opCode = 2
-	opReassign           opCode = 3
-	opUpsertSpec         opCode = 4  // overwrite Placement.Spec without touching ownership
-	opAddExposedPort     opCode = 5  // record one (port, protocol) intent
-	opRemoveExposedPort  opCode = 6  // drop one port intent
-	opReserve            opCode = 7  // hold capacity + name for a chosen owner before docker
-	opCancelReserve      opCode = 8  // release a pending reservation (rollback or TTL GC)
-	opSetNodeDrainState  opCode = 9  // operator-set "exclude from placement" mark for a node
-	opOrphanOwner        opCode = 10 // atomically orphan all placements owned by a dead node
-	opClaimOrphan        opCode = 11 // reclaim an orphaned placement back to its previous owner
-	opReserveBatch       opCode = 12 // hold capacity + names for a create burst in one raft entry
-	opAddCustomDomain    opCode = 13 // bind one user hostname to a placement (cluster-wide unique)
-	opRemoveCustomDomain opCode = 14 // release one previously-bound hostname
-	opUpsertVolume       opCode = 15 // get-or-create a platform-volume metadata row (cluster-wide)
-	opDeleteVolume       opCode = 16 // remove a platform-volume metadata row
-	opPutVolumeAttach    opCode = 17 // upsert platform-volume attachment rows (cluster-wide)
-	opDeleteVolumeAttach opCode = 18 // drop all platform-volume attachments for one sandbox
+	maxPlacementAuditNodes = 64
+
+	opPlace                  opCode = 1
+	opDelete                 opCode = 2
+	opReassign               opCode = 3
+	opUpsertSpec             opCode = 4  // overwrite Placement.Spec without touching ownership
+	opAddExposedPort         opCode = 5  // record one (port, protocol) intent
+	opRemoveExposedPort      opCode = 6  // drop one port intent
+	opReserve                opCode = 7  // hold capacity + name for a chosen owner before docker
+	opCancelReserve          opCode = 8  // release a pending reservation (rollback or TTL GC)
+	opSetNodeDrainState      opCode = 9  // operator-set "exclude from placement" mark for a node
+	opOrphanOwner            opCode = 10 // atomically orphan all placements owned by a dead node
+	opClaimOrphan            opCode = 11 // reclaim an orphaned placement back to its previous owner
+	opReserveBatch           opCode = 12 // hold capacity + names for a create burst in one raft entry
+	opAddCustomDomain        opCode = 13 // bind one user hostname to a placement (cluster-wide unique)
+	opRemoveCustomDomain     opCode = 14 // release one previously-bound hostname
+	opUpsertVolume           opCode = 15 // get-or-create a platform-volume metadata row (cluster-wide)
+	opDeleteVolume           opCode = 16 // remove a platform-volume metadata row
+	opPutVolumeAttach        opCode = 17 // upsert platform-volume attachment rows (cluster-wide)
+	opDeleteVolumeAttach     opCode = 18 // drop all platform-volume attachments for one sandbox
+	opPruneAuditACL          opCode = 19 // bounded-retention cleanup for post-delete owner ACLs
+	opUpdateSecretRecipients opCode = 20 // replace Placement.SecretRecipients (+ optional secret handle) without touching ownership/incarnation
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -69,10 +73,25 @@ type command struct {
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
-	Port               int                          `json:"port,omitempty"`
-	Protocol           string                       `json:"protocol,omitempty"`
-	HostPort           int                          `json:"host_port,omitempty"`
-	PublicURL          string                       `json:"public_url,omitempty"`
+	// SecretRecipients rides opReserve (and is preserved by opPlace). Additive
+	// omitempty — mixed-version clusters decode missing field as nil.
+	SecretRecipients []string `json:"secret_recipients,omitempty"`
+	// IncarnationID rides opReserve and is preserved by opPlace/opReassign.
+	IncarnationID string `json:"incarnation_id,omitempty"`
+	// SecretSealGeneration accompanies the provider handle on initial place and
+	// later recipient reseals. Additive omitempty.
+	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
+	// ExpectedIncarnationID fences opPlace and opUpdateSecretRecipients from
+	// applying secret state to another sandbox lifetime. Empty skips it.
+	// ExpectedSealGeneration is the opUpdateSecretRecipients generation CAS.
+	ExpectedIncarnationID  string `json:"expected_incarnation_id,omitempty"`
+	ExpectedSealGeneration int64  `json:"expected_seal_generation,omitempty"`
+	// OwnerRef is the control-plane tenant account. Additive omitempty.
+	OwnerRef  string `json:"owner_ref,omitempty"`
+	Port      int    `json:"port,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+	HostPort  int    `json:"host_port,omitempty"`
+	PublicURL string `json:"public_url,omitempty"`
 	// ExpiresUnix is set on opReserve to bound how long a reservation holds
 	// capacity before the leader GC sweep cancels it. Ignored by every other
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
@@ -119,14 +138,18 @@ type command struct {
 }
 
 type reservationCommand struct {
-	SandboxID          string                       `json:"sandbox_id"`
-	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
-	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
-	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
-	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef          string                       `json:"secret_ref,omitempty"`
-	SecretVersion      int                          `json:"secret_version,omitempty"`
-	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
+	SandboxID            string                       `json:"sandbox_id"`
+	OwnerNodeID          string                       `json:"owner_node_id,omitempty"`
+	OwnerAPIURL          string                       `json:"owner_api_url,omitempty"`
+	OwnerDataPlaneHost   string                       `json:"owner_data_plane_host,omitempty"`
+	Spec                 *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef            string                       `json:"secret_ref,omitempty"`
+	SecretVersion        int                          `json:"secret_version,omitempty"`
+	SecretSealGeneration int64                        `json:"secret_seal_generation,omitempty"`
+	SecretRecipients     []string                     `json:"secret_recipients,omitempty"`
+	IncarnationID        string                       `json:"incarnation_id,omitempty"`
+	OwnerRef             string                       `json:"owner_ref,omitempty"`
+	ExpiresUnix          int64                        `json:"expires_unix,omitempty"`
 }
 
 // reassignApplyResult is returned only for failover-tagged opReassign entries.
@@ -151,35 +174,44 @@ func decodeCommand(b []byte) (command, error) {
 
 func (c command) placementSecrets() PlacementSecrets {
 	return PlacementSecrets{
-		Ref:     c.SecretRef,
-		Version: c.SecretVersion,
+		Ref:            c.SecretRef,
+		Version:        c.SecretVersion,
+		SealGeneration: c.SecretSealGeneration,
 	}
 }
 
 func reservationFromCommand(c command) reservationCommand {
 	return reservationCommand{
-		SandboxID:          c.SandboxID,
-		OwnerNodeID:        c.OwnerNodeID,
-		OwnerAPIURL:        c.OwnerAPIURL,
-		OwnerDataPlaneHost: c.OwnerDataPlaneHost,
-		Spec:               c.Spec,
-		SecretRef:          c.SecretRef,
-		SecretVersion:      c.SecretVersion,
-		ExpiresUnix:        c.ExpiresUnix,
+		SandboxID:            c.SandboxID,
+		OwnerNodeID:          c.OwnerNodeID,
+		OwnerAPIURL:          c.OwnerAPIURL,
+		OwnerDataPlaneHost:   c.OwnerDataPlaneHost,
+		Spec:                 c.Spec,
+		SecretRef:            c.SecretRef,
+		SecretVersion:        c.SecretVersion,
+		SecretSealGeneration: c.SecretSealGeneration,
+		SecretRecipients:     append([]string(nil), c.SecretRecipients...),
+		IncarnationID:        c.IncarnationID,
+		OwnerRef:             c.OwnerRef,
+		ExpiresUnix:          c.ExpiresUnix,
 	}
 }
 
 func commandFromReservation(r reservationCommand) command {
 	return command{
-		Op:                 opReserve,
-		SandboxID:          r.SandboxID,
-		OwnerNodeID:        r.OwnerNodeID,
-		OwnerAPIURL:        r.OwnerAPIURL,
-		OwnerDataPlaneHost: r.OwnerDataPlaneHost,
-		Spec:               r.Spec,
-		SecretRef:          r.SecretRef,
-		SecretVersion:      r.SecretVersion,
-		ExpiresUnix:        r.ExpiresUnix,
+		Op:                   opReserve,
+		SandboxID:            r.SandboxID,
+		OwnerNodeID:          r.OwnerNodeID,
+		OwnerAPIURL:          r.OwnerAPIURL,
+		OwnerDataPlaneHost:   r.OwnerDataPlaneHost,
+		Spec:                 r.Spec,
+		SecretRef:            r.SecretRef,
+		SecretVersion:        r.SecretVersion,
+		SecretSealGeneration: r.SecretSealGeneration,
+		SecretRecipients:     append([]string(nil), r.SecretRecipients...),
+		IncarnationID:        r.IncarnationID,
+		OwnerRef:             r.OwnerRef,
+		ExpiresUnix:          r.ExpiresUnix,
 	}
 }
 
@@ -198,7 +230,11 @@ func applyCommandSecretUpdate(existing Placement, exists bool, cmd command) Plac
 	if !cmd.hasSecretUpdate() && exists {
 		return secretsFromPlacement(existing)
 	}
-	return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion}
+	generation := cmd.SecretSealGeneration
+	if generation <= 0 && exists {
+		generation = existing.SecretSealGeneration
+	}
+	return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion, SealGeneration: generation}
 }
 
 // placementFSM is the raft.FSM implementation. It keeps hot routing/admission
@@ -236,6 +272,10 @@ type placementFSM struct {
 	// placementIDs is a sorted sandbox ID index used by PlacementPage so a
 	// bounded page does not allocate/sort the full placement map.
 	placementIDs *btree.BTreeG[string]
+	// ownerRefIndex maps tenant OwnerRef -> sorted sandbox IDs. PlacementPage
+	// with OwnerRef uses this instead of scanning/sorting the full map under
+	// the FSM lock (enterprise multi-tenant list fan-out).
+	ownerRefIndex map[string]*btree.BTreeG[string]
 	// hostPortIndex maps a raw-TCP public host port to the placement exposure
 	// that owns it. This is the cluster-wide raw TCP capacity index: AddPort
 	// rejects collisions in O(1) under the FSM lock instead of scanning every
@@ -274,6 +314,11 @@ type placementFSM struct {
 	// without scanning every placement. Rebuilt on Restore from the
 	// Placement.CustomHostnames slices so older snapshots still load cleanly.
 	customHostnameIndex map[string]string
+	// auditACLs retains post-delete existence, tenant ownership when present,
+	// and the bounded evidence-node index. This lets any ingress authorize an
+	// operator or tenant query without probing 2,000 workers. Expiry is
+	// replicated and pruning is an explicit Raft command.
+	auditACLs map[string]AuditACL
 
 	// volumes holds replicated platform-volume metadata rows, keyed by
 	// volumeKey(tenant, id). volumeNameIndex maps volumeNameKey(tenant, name) →
@@ -351,6 +396,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		nameIndex:                    make(map[string]string),
 		shardIndex:                   make(map[int]map[string]struct{}),
 		placementIDs:                 newPlacementIDIndex(),
+		ownerRefIndex:                make(map[string]*btree.BTreeG[string]),
 		hostPortIndex:                make(map[int]hostPortClaim),
 		ownerIndex:                   make(map[string]map[string]struct{}),
 		pendingReservationClaims:     make(map[string]pendingReservationClaim),
@@ -359,6 +405,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		reservedIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
 		customHostnameIndex:          make(map[string]string),
+		auditACLs:                    make(map[string]AuditACL),
 		volumes:                      make(map[string]models.Volume),
 		volumeNameIndex:              make(map[string]string),
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
@@ -418,6 +465,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// (the reservation already holds them) — so we fall through to the
 		// write path below in that case.
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+		if exists {
+			expected := strings.TrimSpace(cmd.ExpectedIncarnationID)
+			current := strings.TrimSpace(existing.IncarnationID)
+			if expected != "" && current != "" && current != expected {
+				return fmt.Errorf("%w: want %q have %q", ErrIncarnationConflict, expected, current)
+			}
+		}
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && !cmd.hasSecretUpdate() && !existing.IsReserved() {
 			return nil
 		}
@@ -457,6 +511,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		var ports map[int]string
 		var portRoutes map[int]ExposedPortRoute
 		var customHostnames []string
+		var secretRecipients []string
+		var incarnationID string
+		var secretSealGeneration int64
+		var auditNodeIDs []string
+		var auditNodesTruncated bool
+		ownerRef := strings.TrimSpace(cmd.OwnerRef)
 		if exists {
 			// Same preservation rule as Spec: opPlace is the "owner + spec"
 			// write and must not erase the port intents accumulated by
@@ -467,6 +527,25 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// promote must not drop user-bound hostnames that
 			// opAddCustomDomain installed earlier in the log.
 			customHostnames = existing.CustomHostnames
+			// Preserve the reserve-time recipient set unless the command
+			// explicitly supplies a new one (normal promote leaves it empty).
+			secretRecipients = append([]string(nil), existing.SecretRecipients...)
+			incarnationID = existing.IncarnationID
+			secretSealGeneration = existing.SecretSealGeneration
+			auditNodeIDs = append([]string(nil), existing.AuditNodeIDs...)
+			auditNodesTruncated = existing.AuditNodesTruncated
+			if ownerRef == "" {
+				ownerRef = existing.OwnerRef
+			}
+		}
+		if secrets.SealGeneration > 0 {
+			secretSealGeneration = secrets.SealGeneration
+		}
+		if len(cmd.SecretRecipients) > 0 {
+			secretRecipients = append([]string(nil), cmd.SecretRecipients...)
+		}
+		if id := strings.TrimSpace(cmd.IncarnationID); id != "" && incarnationID == "" {
+			incarnationID = id
 		}
 		dataPlaneHost := cmd.OwnerDataPlaneHost
 		if dataPlaneHost == "" && exists {
@@ -478,26 +557,33 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if exists {
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseOwnerLocked(cmd.SandboxID, existing)
+			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 			if existing.IsReserved() {
 				f.releasePendingReservationLocked(cmd.SandboxID)
 				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
 		}
 		p := Placement{
-			SandboxID:          cmd.SandboxID,
-			OwnerNodeID:        cmd.OwnerNodeID,
-			OwnerAPIURL:        cmd.OwnerAPIURL,
-			OwnerDataPlaneHost: dataPlaneHost,
-			Version:            f.version,
-			CreatedUnix:        created,
-			UpdatedUnix:        now,
-			Name:               name,
-			Spec:               spec,
-			SecretRef:          secrets.Ref,
-			SecretVersion:      secrets.Version,
-			ExposedPorts:       ports,
-			ExposedPortRoutes:  portRoutes,
-			CustomHostnames:    customHostnames,
+			SandboxID:            cmd.SandboxID,
+			OwnerNodeID:          cmd.OwnerNodeID,
+			OwnerAPIURL:          cmd.OwnerAPIURL,
+			OwnerDataPlaneHost:   dataPlaneHost,
+			Version:              f.version,
+			CreatedUnix:          created,
+			UpdatedUnix:          now,
+			Name:                 name,
+			Spec:                 spec,
+			SecretRef:            secrets.Ref,
+			SecretVersion:        secrets.Version,
+			SecretRecipients:     secretRecipients,
+			IncarnationID:        incarnationID,
+			SecretSealGeneration: secretSealGeneration,
+			OwnerRef:             ownerRef,
+			AuditNodeIDs:         auditNodeIDs,
+			AuditNodesTruncated:  auditNodesTruncated,
+			ExposedPorts:         ports,
+			ExposedPortRoutes:    portRoutes,
+			CustomHostnames:      customHostnames,
 			// opPlace is the promotion path for reservations: writing the
 			// empty State here transitions a Reserved row back to Placed.
 			// ExpiresUnix is cleared by the zero-value as well so the GC
@@ -510,6 +596,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.claimNameLocked(cmd.SandboxID, name)
 		f.claimShardLocked(cmd.SandboxID)
+		f.claimOwnerRefLocked(cmd.SandboxID, ownerRef)
 		f.claimOwnerLocked(cmd.SandboxID, p)
 		return nil
 	case opReserve:
@@ -549,6 +636,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 		f.releaseShardLocked(cmd.SandboxID)
+		f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 		f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 		f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
 		f.releasePendingReservationLocked(cmd.SandboxID)
@@ -558,8 +646,22 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return nil
 	case opDelete:
 		if existing, ok := f.fullPlacementLocked(cmd.SandboxID); ok {
+			recordPlacementAuditNode(&existing, existing.OwnerNodeID)
+			recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
+			if f.auditACLs == nil {
+				f.auditACLs = make(map[string]AuditACL)
+			}
+			f.auditACLs[cmd.SandboxID] = AuditACL{
+				SandboxID:           cmd.SandboxID,
+				IncarnationID:       existing.IncarnationID,
+				OwnerRef:            strings.TrimSpace(existing.OwnerRef),
+				AuditNodeIDs:        append([]string(nil), existing.AuditNodeIDs...),
+				AuditNodesTruncated: existing.AuditNodesTruncated,
+				ExpiresUnix:         cmd.ExpiresUnix,
+			}
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
+			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 			f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
 			f.releaseOwnerLocked(cmd.SandboxID, existing)
@@ -571,6 +673,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
+		return nil
+	case opPruneAuditACL:
+		for id, acl := range f.auditACLs {
+			if acl.ExpiresUnix > 0 && acl.ExpiresUnix <= cmd.ExpiresUnix {
+				delete(f.auditACLs, id)
+			}
+		}
 		return nil
 	case opReassign:
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
@@ -590,6 +699,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseOwnerLocked(cmd.SandboxID, existing)
 		previousOwner := existing.OwnerNodeID
 		ownerChanged := previousOwner != cmd.OwnerNodeID
+		recordPlacementAuditNode(&existing, previousOwner)
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
 		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
@@ -630,6 +740,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				continue
 			}
 			f.releaseOwnerLocked(id, existing)
+			recordPlacementAuditNode(&existing, cmd.NodeID)
 			existing.OwnerNodeID = ""
 			existing.OwnerAPIURL = ""
 			existing.OwnerDataPlaneHost = ""
@@ -649,6 +760,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			f.releaseNameLocked(id, placementName(existing))
 			f.releaseShardLocked(id)
+			f.releaseOwnerRefLocked(id, existing.OwnerRef)
 			f.releaseAllCustomHostnamesLocked(id, existing)
 			f.releasePendingReservationLocked(id)
 			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
@@ -693,7 +805,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
+			existing.SecretSealGeneration = secrets.SealGeneration
 		}
+		recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
 		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
@@ -739,6 +853,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
+			existing.SecretSealGeneration = secrets.SealGeneration
 		}
 		wasReserved := existing.IsReserved()
 		if wasReserved {
@@ -753,6 +868,37 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.claimPendingReservationLocked(cmd.SandboxID, existing)
 		}
 		return nil
+	case opUpdateSecretRecipients:
+		// Dead-target expansion / reseal coordination: replace the frozen
+		// recipient set (and optionally the seal handle) while preserving
+		// ownership and IncarnationID. Empty recipients is a no-op so a
+		// partial forward can't wipe the set.
+		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+		if !exists || len(cmd.SecretRecipients) == 0 {
+			return nil
+		}
+		if exp := strings.TrimSpace(cmd.ExpectedIncarnationID); exp != "" {
+			if cur := strings.TrimSpace(existing.IncarnationID); cur != exp {
+				return fmt.Errorf("%w: incarnation want %q have %q", ErrSecretRecipientsCASMismatch, exp, cur)
+			}
+		}
+		if cmd.ExpectedSealGeneration > 0 {
+			if cur := existing.SecretSealGeneration; cur != cmd.ExpectedSealGeneration {
+				return fmt.Errorf("%w: seal_generation want %d have %d", ErrSecretRecipientsCASMismatch, cmd.ExpectedSealGeneration, cur)
+			}
+		}
+		existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
+		if cmd.hasSecretUpdate() {
+			secrets := applyCommandSecretUpdate(existing, true, cmd)
+			existing.SecretRef = secrets.Ref
+			existing.SecretVersion = secrets.Version
+		}
+		if cmd.SecretSealGeneration > 0 {
+			existing.SecretSealGeneration = cmd.SecretSealGeneration
+		}
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		return f.storePlacementLocked(cmd.SandboxID, existing)
 	case opAddExposedPort:
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 		if !exists || cmd.Port <= 0 {
@@ -1048,13 +1194,28 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
 		// Re-reserve from the same owner before expiry is an idempotent retry —
-		// refresh the TTL and treat it as a no-op otherwise.
+		// refresh the TTL (and recipient set when supplied) and treat it as a
+		// no-op otherwise.
 		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
 			existing.UpdatedUnix = now
+			if len(cmd.SecretRecipients) > 0 {
+				existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
+			}
+			if id := strings.TrimSpace(cmd.IncarnationID); id != "" && existing.IncarnationID == "" {
+				existing.IncarnationID = id
+			}
+			oldOwnerRef := existing.OwnerRef
+			if ref := strings.TrimSpace(cmd.OwnerRef); ref != "" {
+				existing.OwnerRef = ref
+			}
 			if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 				return err
+			}
+			if existing.OwnerRef != oldOwnerRef {
+				f.releaseOwnerRefLocked(cmd.SandboxID, oldOwnerRef)
+				f.claimOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 			}
 			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 			return nil
@@ -1065,6 +1226,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
+			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
 		} else {
 			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
@@ -1075,25 +1237,30 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 	}
 	secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
 	p := Placement{
-		SandboxID:          cmd.SandboxID,
-		OwnerNodeID:        cmd.OwnerNodeID,
-		OwnerAPIURL:        cmd.OwnerAPIURL,
-		OwnerDataPlaneHost: cmd.OwnerDataPlaneHost,
-		Version:            f.version,
-		CreatedUnix:        now,
-		UpdatedUnix:        now,
-		Name:               name,
-		Spec:               cmd.Spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		State:              PlacementStateReserved,
-		ExpiresUnix:        cmd.ExpiresUnix,
+		SandboxID:            cmd.SandboxID,
+		OwnerNodeID:          cmd.OwnerNodeID,
+		OwnerAPIURL:          cmd.OwnerAPIURL,
+		OwnerDataPlaneHost:   cmd.OwnerDataPlaneHost,
+		Version:              f.version,
+		CreatedUnix:          now,
+		UpdatedUnix:          now,
+		Name:                 name,
+		Spec:                 cmd.Spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		SecretRecipients:     append([]string(nil), cmd.SecretRecipients...),
+		IncarnationID:        strings.TrimSpace(cmd.IncarnationID),
+		OwnerRef:             strings.TrimSpace(cmd.OwnerRef),
+		State:                PlacementStateReserved,
+		ExpiresUnix:          cmd.ExpiresUnix,
 	}
 	if err := f.storePlacementLocked(cmd.SandboxID, p); err != nil {
 		return err
 	}
 	f.claimNameLocked(cmd.SandboxID, name)
 	f.claimShardLocked(cmd.SandboxID)
+	f.claimOwnerRefLocked(cmd.SandboxID, p.OwnerRef)
 	f.claimPendingReservationLocked(cmd.SandboxID, p)
 	return nil
 }
@@ -1220,6 +1387,39 @@ func (f *placementFSM) releaseShardLocked(sandboxID string) {
 	}
 	if f.placementIDs != nil {
 		f.placementIDs.Delete(sandboxID)
+	}
+}
+
+func (f *placementFSM) claimOwnerRefLocked(sandboxID, ownerRef string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	ownerRef = strings.TrimSpace(ownerRef)
+	if sandboxID == "" || ownerRef == "" {
+		return
+	}
+	if f.ownerRefIndex == nil {
+		f.ownerRefIndex = make(map[string]*btree.BTreeG[string])
+	}
+	tree := f.ownerRefIndex[ownerRef]
+	if tree == nil {
+		tree = newPlacementIDIndex()
+		f.ownerRefIndex[ownerRef] = tree
+	}
+	tree.ReplaceOrInsert(sandboxID)
+}
+
+func (f *placementFSM) releaseOwnerRefLocked(sandboxID, ownerRef string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	ownerRef = strings.TrimSpace(ownerRef)
+	if sandboxID == "" || ownerRef == "" || f.ownerRefIndex == nil {
+		return
+	}
+	tree := f.ownerRefIndex[ownerRef]
+	if tree == nil {
+		return
+	}
+	tree.Delete(sandboxID)
+	if tree.Len() == 0 {
+		delete(f.ownerRefIndex, ownerRef)
 	}
 }
 
@@ -1669,6 +1869,27 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 	return clonePlacement(p), true
 }
 
+// placementsByIDs returns hot clones for the requested IDs. Missing IDs are
+// omitted. Holds the FSM read lock once for the whole batch.
+func (f *placementFSM) placementsByIDs(ids []string) map[string]Placement {
+	out := make(map[string]Placement, len(ids))
+	if len(ids) == 0 {
+		return out
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if p, ok := f.placements[id]; ok {
+			out[id] = cloneHotPlacement(p)
+		}
+	}
+	return out
+}
+
 // sandboxIDByCustomHostname returns the sandbox ID currently claiming
 // hostname in the replicated custom-domain index. hostname is matched
 // verbatim — callers are expected to canonicalize (lower-case, trim) before
@@ -1852,19 +2073,35 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	ids := f.pagePlacementIDsLocked(req, shardFilter, allShards, wantShards)
+	// Fetch Limit+1 so we can tell an exact-full page from a true last page.
+	peekReq := req
+	peekReq.Limit = req.Limit + 1
+	ids := f.pagePlacementIDsLocked(peekReq, shardFilter, allShards, wantShards)
+	hasMore := len(ids) > req.Limit
+	if hasMore {
+		ids = ids[:req.Limit]
+	}
 	out := make([]Placement, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, cloneHotPlacement(f.placements[id]))
 	}
 	next := ""
-	if len(ids) == req.Limit {
+	// Only emit a cursor when a later ID exists — exact limit boundaries
+	// (e.g. 100000 rows @ page size 100) must end with an empty token.
+	if hasMore && len(ids) > 0 {
 		next = ids[len(ids)-1]
 	}
-	return PlacementPageResponse{Placements: out, NextPageToken: next}
+	return PlacementPageResponse{Placements: out, NextPageToken: next, Authoritative: true}
 }
 
 func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
+	if ownerRef := strings.TrimSpace(req.OwnerRef); ownerRef != "" {
+		if f.ownerRefIndex != nil {
+			return f.pagePlacementIDsByOwnerRefLocked(req, ownerRef, shardFilter, allShards, wantShards)
+		}
+		// Index missing (partial restore) — fall back to scan.
+		return f.pagePlacementIDsByScanLocked(req, shardFilter, allShards, wantShards)
+	}
 	if f.placementIDs == nil {
 		return f.pagePlacementIDsByScanLocked(req, shardFilter, allShards, wantShards)
 	}
@@ -1888,14 +2125,46 @@ func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFil
 	return ids
 }
 
+func (f *placementFSM) pagePlacementIDsByOwnerRefLocked(req PlacementPageRequest, ownerRef string, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
+	tree := f.ownerRefIndex[ownerRef]
+	if tree == nil {
+		return nil
+	}
+	ids := make([]string, 0, req.Limit)
+	shardCount := shardFilter.ShardCount
+	if shardCount <= 0 {
+		shardCount = DefaultPlacementShardCount
+	}
+	tree.AscendGreaterOrEqual(req.PageToken, func(id string) bool {
+		if req.PageToken != "" && id <= req.PageToken {
+			return true
+		}
+		if !allShards {
+			if _, ok := wantShards[PlacementShardForSandbox(id, shardCount)]; !ok {
+				return true
+			}
+		}
+		ids = append(ids, id)
+		return len(ids) < req.Limit
+	})
+	return ids
+}
+
 func (f *placementFSM) pagePlacementIDsByScanLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
 	ids := make([]string, 0, len(f.placements))
 	shardCount := shardFilter.ShardCount
 	if shardCount <= 0 {
 		shardCount = DefaultPlacementShardCount
 	}
-	for id := range f.placements {
+	ownerRef := strings.TrimSpace(req.OwnerRef)
+	for id, p := range f.placements {
 		if req.PageToken != "" && id <= req.PageToken {
+			continue
+		}
+		placeOwner := strings.TrimSpace(p.OwnerRef)
+		// Never match empty OwnerRef into a tenant page — partial restores can
+		// leave blank ownership that would otherwise pollute cursors.
+		if ownerRef != "" && (placeOwner == "" || placeOwner != ownerRef) {
 			continue
 		}
 		if !allShards {
@@ -1943,6 +2212,19 @@ func (f *placementFSM) isNodeDrained(nodeID string) bool {
 	return f.drainedNodes[nodeID]
 }
 
+func (f *placementFSM) auditACLForSandbox(sandboxID string, nowUnix int64) (AuditACL, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	acl, ok := f.auditACLs[strings.TrimSpace(sandboxID)]
+	if !ok {
+		return AuditACL{}, false
+	}
+	if acl.ExpiresUnix > 0 && acl.ExpiresUnix <= nowUnix {
+		return AuditACL{}, false
+	}
+	return cloneAuditACL(acl), true
+}
+
 // drainedNodesSnapshot returns a copy of the drained node set. SelectPlacement
 // uses this once per call instead of N isNodeDrained reads to avoid taking the
 // FSM lock for every candidate.
@@ -1972,6 +2254,7 @@ type fsmSnapshotPayload struct {
 	Placements   map[string]Placement
 	Recovery     map[string]placementRecovery
 	DrainedNodes map[string]bool
+	AuditACLs    map[string]AuditACL
 	// Volumes is the replicated platform-volume metadata. Optional; older
 	// snapshots decode it as nil and the FSM treats that as "no volumes."
 	Volumes           []models.Volume
@@ -2002,10 +2285,15 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	for k, v := range f.drainedNodes {
 		drained[k] = v
 	}
+	auditACLs := make(map[string]AuditACL, len(f.auditACLs))
+	for id, acl := range f.auditACLs {
+		auditACLs[id] = cloneAuditACL(acl)
+	}
 	return &fsmSnapshot{
 		version:           version,
 		rows:              rows,
 		drainedNodes:      drained,
+		auditACLs:         auditACLs,
 		volumes:           f.volumesSnapshotLocked(),
 		volumeAttachments: f.volumeAttachmentsSnapshotLocked(),
 		recoveryStore:     f.recoveryStore,
@@ -2071,6 +2359,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.nameIndex = make(map[string]string, len(payload.Placements))
 	f.shardIndex = make(map[int]map[string]struct{})
 	f.placementIDs = newPlacementIDIndex()
+	f.ownerRefIndex = make(map[string]*btree.BTreeG[string])
 	f.hostPortIndex = make(map[int]hostPortClaim)
 	f.ownerIndex = make(map[string]map[string]struct{})
 	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
@@ -2079,6 +2368,12 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.customHostnameIndex = make(map[string]string)
+	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
+	for id, acl := range payload.AuditACLs {
+		if id != "" {
+			f.auditACLs[id] = cloneAuditACL(acl)
+		}
+	}
 	// Rebuild the replicated volume table + name index from the snapshot.
 	f.volumes = make(map[string]models.Volume, len(payload.Volumes))
 	f.volumeNameIndex = make(map[string]string, len(payload.Volumes))
@@ -2135,6 +2430,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 			f.nameIndex[name] = id
 		}
 		f.claimShardLocked(id)
+		f.claimOwnerRefLocked(id, indexed.OwnerRef)
 		for port, route := range exposedPortRoutesForPlacement(indexed) {
 			f.claimHostPortLocked(id, port, route)
 		}
@@ -2163,6 +2459,7 @@ type fsmSnapshot struct {
 	version           uint64
 	rows              []placementSnapshotRow
 	drainedNodes      map[string]bool
+	auditACLs         map[string]AuditACL
 	volumes           []models.Volume
 	volumeAttachments []models.VolumeAttachment
 	recoveryStore     placementRecoveryStore
@@ -2180,6 +2477,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		Version:           s.version,
 		Rows:              s.rows,
 		DrainedNodes:      s.drainedNodes,
+		AuditACLs:         s.auditACLs,
 		Volumes:           s.volumes,
 		VolumeAttachments: s.volumeAttachments,
 	}); err != nil {
@@ -2212,6 +2510,12 @@ func cloneHotPlacement(p Placement) Placement {
 	p.Spec = nil
 	p.SecretRef = ""
 	p.SecretVersion = 0
+	if len(p.SecretRecipients) > 0 {
+		p.SecretRecipients = append([]string(nil), p.SecretRecipients...)
+	}
+	if len(p.AuditNodeIDs) > 0 {
+		p.AuditNodeIDs = append([]string(nil), p.AuditNodeIDs...)
+	}
 	if len(p.ExposedPorts) > 0 {
 		ports := make(map[int]string, len(p.ExposedPorts))
 		for k, v := range p.ExposedPorts {
@@ -2239,6 +2543,12 @@ func clonePlacementRecovery(r placementRecovery) placementRecovery {
 
 func clonePlacement(p Placement) Placement {
 	p.Spec = cloneCreateSandboxRequest(p.Spec)
+	if len(p.SecretRecipients) > 0 {
+		p.SecretRecipients = append([]string(nil), p.SecretRecipients...)
+	}
+	if len(p.AuditNodeIDs) > 0 {
+		p.AuditNodeIDs = append([]string(nil), p.AuditNodeIDs...)
+	}
 	if len(p.ExposedPorts) > 0 {
 		ports := make(map[int]string, len(p.ExposedPorts))
 		for k, v := range p.ExposedPorts {
@@ -2257,6 +2567,37 @@ func clonePlacement(p Placement) Placement {
 		p.CustomHostnames = append([]string(nil), p.CustomHostnames...)
 	}
 	return p
+}
+
+func cloneAuditACL(acl AuditACL) AuditACL {
+	if len(acl.AuditNodeIDs) > 0 {
+		acl.AuditNodeIDs = append([]string(nil), acl.AuditNodeIDs...)
+	}
+	return acl
+}
+
+// recordPlacementAuditNode retains a bounded, insertion-ordered owner history.
+// Once the bound is exceeded, AuditNodesTruncated stays sticky. Readers then
+// fail with explicit incomplete-coverage status instead of performing an
+// unbounded fleet scan or silently omitting evidence.
+func recordPlacementAuditNode(p *Placement, nodeID string) {
+	if p == nil {
+		return
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return
+	}
+	for _, existing := range p.AuditNodeIDs {
+		if existing == nodeID {
+			return
+		}
+	}
+	if len(p.AuditNodeIDs) >= maxPlacementAuditNodes {
+		p.AuditNodesTruncated = true
+		return
+	}
+	p.AuditNodeIDs = append(p.AuditNodeIDs, nodeID)
 }
 
 func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSandboxRequest {

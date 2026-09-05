@@ -20,12 +20,14 @@ import (
 // (expose_port/HTTP) and checkpoint/restore remain rejected — those stay on the
 // per-sandbox cold path (migrate-on-expose is PR-B).
 type ResidentServer struct {
-	mu         sync.Mutex
-	eng        *wasmengine.MultiInstanceEngine
-	loadedPath string
-	net        *NetMediator
-	workerNet  map[string]*workerNetUsage
-	lastCaps   map[string]wasmengine.Capabilities
+	mu            sync.Mutex
+	eng           *wasmengine.MultiInstanceEngine
+	loadedPath    string
+	net           *NetMediator
+	workerNet     map[string]*workerNetUsage
+	lastCaps      map[string]wasmengine.Capabilities
+	auditMu       sync.RWMutex
+	auditBindings map[string]egressAuditBinding
 }
 
 func (s *ResidentServer) mediator() *NetMediator {
@@ -33,8 +35,31 @@ func (s *ResidentServer) mediator() *NetMediator {
 	defer s.mu.Unlock()
 	if s.net == nil {
 		s.net = newNetMediator()
+		installDefaultEgressObserver(s.net, s.auditBinding)
 	}
 	return s.net
+}
+
+func (s *ResidentServer) setAuditBinding(sandboxID string, caps wasmengine.Capabilities) {
+	s.auditMu.Lock()
+	defer s.auditMu.Unlock()
+	if s.auditBindings == nil {
+		s.auditBindings = make(map[string]egressAuditBinding)
+	}
+	s.auditBindings[sandboxID] = egressAuditBinding{capability: caps.AuditCapability, incarnationID: caps.AuditIncarnation}
+}
+
+func (s *ResidentServer) auditBinding(sandboxID string) (egressAuditBinding, bool) {
+	s.auditMu.RLock()
+	defer s.auditMu.RUnlock()
+	b, ok := s.auditBindings[sandboxID]
+	return b, ok
+}
+
+func (s *ResidentServer) clearAuditBinding(sandboxID string) {
+	s.auditMu.Lock()
+	delete(s.auditBindings, sandboxID)
+	s.auditMu.Unlock()
 }
 
 func (s *ResidentServer) netUsageFor(sandboxID string) *workerNetUsage {
@@ -216,8 +241,10 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.setAuditBinding(env.SandboxID, p.Caps)
 			eng := s.engine()
 			if eng == nil {
+				s.clearAuditBinding(env.SandboxID)
 				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
 					return err
 				}
@@ -225,6 +252,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 			}
 			s.bindNetworkHook(eng, env.SandboxID)
 			if err := eng.Instantiate(ctx, env.SandboxID, p.Caps); err != nil {
+				s.clearAuditBinding(env.SandboxID)
 				s.clearNetworkHook(eng, env.SandboxID)
 				if replyErr(env.SandboxID, err) != nil {
 					return err
@@ -313,6 +341,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 					continue
 				}
 				s.clearNetworkHook(eng, env.SandboxID)
+				s.clearAuditBinding(env.SandboxID)
 				_, _ = s.mediator().DrainUsage(env.SandboxID)
 			}
 			if err := replyOK(env.SandboxID); err != nil {

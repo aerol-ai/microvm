@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestExtractTemplateArtifactsErrorArmsWave15(t *testing.T) {
@@ -76,38 +77,39 @@ func TestWriteTarHelpersErrorArmsWave15(t *testing.T) {
 }
 
 func TestClusterSecretHelpersWave15(t *testing.T) {
-	_ = normalizeClusterSecretRecipients([]string{"", " b ", "a", "a", "  "})
-	_ = normalizeClusterSecretRecipients(nil)
+	_ = secrets.NormalizeRecipients([]string{"", " b ", "a", "a", "  "})
+	_ = secrets.NormalizeRecipients(nil)
+	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
 
-	if _, err := openClusterSecretEnvelopePayload([]byte("short"), []byte("x"), nil); err == nil {
+	if _, err := secrets.OpenEnvelopePayloadBound([]byte("short"), []byte("x"), []string{"n1"}, binding); err == nil {
 		t.Fatal("expected bad dek")
 	}
 	dek := make([]byte, 32)
 	for i := range dek {
 		dek[i] = byte(i)
 	}
-	if _, err := openClusterSecretEnvelopePayload(dek, []byte("tiny"), []string{"*"}); err == nil {
+	if _, err := secrets.OpenEnvelopePayloadBound(dek, []byte("tiny"), []string{"n1"}, binding); err == nil {
 		t.Fatal("expected short payload")
 	}
 
 	s := &Service{cipher: newTestCipher(t)}
 	setRandReader(t, &scriptedRandReader{errs: []error{errors.New("no dek entropy")}})
-	if _, err := s.sealClusterSecretEnvelope([]byte(`{}`), []string{"n1"}); err == nil {
+	if _, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{}`), []string{"n1"}, binding); err == nil {
 		t.Fatal("expected dek entropy fail")
 	}
 	setRandReader(t, &scriptedRandReader{errs: []error{nil, errors.New("no nonce")}})
-	if _, err := s.sealClusterSecretEnvelope([]byte(`{}`), []string{"n1"}); err == nil {
+	if _, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{}`), []string{"n1"}, binding); err == nil {
 		t.Fatal("expected nonce entropy fail")
 	}
 
-	if _, err := s.PutClusterSecretsForRecipient(context.Background(), "", models.CreateSandboxRequest{
+	if _, err := s.SealAndDistribute(context.Background(), "", models.CreateSandboxRequest{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, "n1"); err == nil {
+	}, []string{"n1"}, SealStrict); err == nil {
 		t.Fatal("expected empty sandbox id")
 	}
-	if _, err := (&Service{}).PutClusterSecretsForRecipient(context.Background(), "sb", models.CreateSandboxRequest{
+	if _, err := (&Service{}).SealAndDistribute(context.Background(), "sb", models.CreateSandboxRequest{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, "n1"); err == nil {
+	}, []string{"n1"}, SealStrict); err == nil {
 		t.Fatal("expected nil cipher/store")
 	}
 }

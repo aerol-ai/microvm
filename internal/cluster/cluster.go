@@ -98,6 +98,15 @@ var ErrCreateBackpressure = errors.New("cluster: create backpressure")
 // completed sandbox or a router with a stale view.
 var ErrReservationConflict = errors.New("cluster: sandbox already placed or reserved")
 
+// ErrSecretRecipientsCASMismatch is returned when opUpdateSecretRecipients
+// carries expected incarnation / seal-generation pretenses that no longer
+// match the live placement (stale reseal loser).
+var ErrSecretRecipientsCASMismatch = errors.New("cluster: secret recipients CAS mismatch")
+
+// ErrIncarnationConflict fences a placement update carrying secret state for
+// a different lifetime of the same sandbox ID.
+var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
+
 // ErrNoPlacementTarget is returned when no alive worker-capable node can
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
@@ -181,6 +190,22 @@ func (p Placement) IsOrphaned() bool {
 type PlacementSecrets struct {
 	Ref     string `json:"ref,omitempty"`
 	Version int    `json:"version,omitempty"`
+	// Recipients is the seal recipient set chosen at reserve time for
+	// failover.policy=recreate. It rides opReserve onto Placement.SecretRecipients
+	// (node IDs only — never ciphertext). Omitempty keeps mixed-version
+	// clusters wire-compatible. RecordPlacement leaves this empty so opPlace
+	// preserves the reservation's set.
+	Recipients []string `json:"recipients,omitempty"`
+	// OwnerRef is the control-plane tenant account for this sandbox. Not
+	// secret material — rides Place/Reserve so failover recreate preserves
+	// tenancy when the owner-watcher uses an unscoped internal context.
+	OwnerRef string `json:"owner_ref,omitempty"`
+	// IncarnationID tags this placement lifetime for secret binding. Minted
+	// at reserve; preserved across reassign. Additive omitempty.
+	IncarnationID string `json:"incarnation_id,omitempty"`
+	// SealGeneration is the seal generation last coordinated via Raft
+	// (reseal / recipient expansion). Additive omitempty — 0 on pre-field rows.
+	SealGeneration int64 `json:"seal_generation,omitempty"`
 }
 
 func (s PlacementSecrets) hasUpdate() bool {
@@ -188,9 +213,17 @@ func (s PlacementSecrets) hasUpdate() bool {
 }
 
 func secretsFromPlacement(p Placement) PlacementSecrets {
+	var recipients []string
+	if len(p.SecretRecipients) > 0 {
+		recipients = append([]string(nil), p.SecretRecipients...)
+	}
 	return PlacementSecrets{
-		Ref:     p.SecretRef,
-		Version: p.SecretVersion,
+		Ref:            p.SecretRef,
+		Version:        p.SecretVersion,
+		Recipients:     recipients,
+		OwnerRef:       p.OwnerRef,
+		IncarnationID:  p.IncarnationID,
+		SealGeneration: p.SecretSealGeneration,
 	}
 }
 
@@ -242,12 +275,34 @@ type Placement struct {
 	// RecoveryRef points at the out-of-snapshot recovery payload for this row.
 	// Spec/secret fields are hydrated from that store only for point lookups and
 	// recreate flows.
-	RecoveryRef       string                       `json:"-"`
-	Spec              *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef         string                       `json:"secret_ref,omitempty"`
-	SecretVersion     int                          `json:"secret_version,omitempty"`
-	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
-	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	RecoveryRef   string                       `json:"-"`
+	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef     string                       `json:"secret_ref,omitempty"`
+	SecretVersion int                          `json:"secret_version,omitempty"`
+	// SecretRecipients is the seal recipient set recorded at reserve time
+	// (owner + N backups). The create target seals to this set and must not
+	// recompute it. Additive omitempty — wire-compatible with older peers.
+	SecretRecipients []string `json:"secret_recipients,omitempty"`
+	// IncarnationID uniquely tags this placement lifetime for secret refs /
+	// seal bindings. Minted at reserve; preserved on reassign/promote.
+	// Additive omitempty — empty on pre-incarnation Raft rows.
+	IncarnationID string `json:"incarnation_id,omitempty"`
+	// SecretSealGeneration is the last Raft-coordinated seal generation for
+	// this placement (reseal CAS). Additive omitempty — 0 until first coordinated update.
+	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
+	// OwnerRef is the control-plane tenant account (tenancy). Distinct from
+	// OwnerNodeID (which cluster node hosts the sandbox).
+	OwnerRef string `json:"owner_ref,omitempty"`
+	// AuditNodeIDs is the bounded history of nodes that have owned this
+	// sandbox and may therefore hold local audit evidence. It lets audit reads
+	// remain O(owner changes), rather than fanning out to every worker after a
+	// failover or delete. AuditNodesTruncated forces the reader to fall back to
+	// full worker fan-out so the bound can never create a silent evidence gap.
+	AuditNodeIDs        []string `json:"audit_node_ids,omitempty"`
+	AuditNodesTruncated bool     `json:"audit_nodes_truncated,omitempty"`
+
+	ExposedPorts      map[int]string           `json:"exposed_ports,omitempty"`
+	ExposedPortRoutes map[int]ExposedPortRoute `json:"exposed_port_routes,omitempty"`
 	// CustomHostnames is the replicated set of user-bound hostnames pointing at
 	// this sandbox. Kept sorted and lower-cased so snapshot bytes are stable
 	// across rebuilds and every node derives the same Caddy matcher order. The
@@ -269,6 +324,23 @@ type Placement struct {
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
 }
 
+// AuditACL is the minimal post-delete existence/authorization and evidence-node
+// record retained in Raft. OwnerRef may be empty for operator-owned local
+// workflows. It deliberately carries no spec, routes, secret refs, or events.
+type AuditACL struct {
+	SandboxID           string   `json:"sandbox_id"`
+	IncarnationID       string   `json:"incarnation_id,omitempty"`
+	OwnerRef            string   `json:"owner_ref"`
+	AuditNodeIDs        []string `json:"audit_node_ids,omitempty"`
+	AuditNodesTruncated bool     `json:"audit_nodes_truncated,omitempty"`
+	ExpiresUnix         int64    `json:"expires_unix,omitempty"`
+}
+
+type AuditACLResponse struct {
+	ACL    AuditACL `json:"acl"`
+	Exists bool     `json:"exists"`
+}
+
 // Member is a snapshot of a peer's gossiped state.
 type Member struct {
 	NodeID string `json:"node_id"`
@@ -278,10 +350,8 @@ type Member struct {
 	APIURL        string `json:"api_url"`
 	DataPlaneHost string `json:"data_plane_host,omitempty"`
 	RaftAddr      string `json:"raft_addr,omitempty"`
-	// InternalURL is the cluster-internal mTLS endpoint used for raft
-	// leader-forward applies. Empty when the peer is running without
-	// SB_CLUSTER_TLS_DIR — the forwarder falls back to APIURL with PAT-only
-	// auth in that case.
+	// InternalURL is the required cluster-internal mTLS endpoint used for peer
+	// RPC and leader-forwarded applies.
 	InternalURL string `json:"internal_url,omitempty"`
 	// Role is the peer's gossiped SB_NODE_ROLE. Empty for older builds that
 	// pre-date the field; callers treat empty as the legacy "mixed" default.
@@ -310,7 +380,7 @@ type Member struct {
 // Spec MUST be redacted (no plaintext registry password / mount credentials)
 // before being handed to AssertOwnership; Secrets carries the provider ref
 // that the new owner re-merges on recreate. cmd/sandboxd takes care of this
-// via service.PutClusterSecretsForRecipient + RedactClusterSecrets so the
+// via service.SealAndDistribute + RedactClusterSecrets so the
 // cluster layer never sees plaintext. Secrets may be empty when the sandbox
 // has no secrets to ship.
 type LocalSandboxState struct {
@@ -332,17 +402,15 @@ type PlacementTarget struct {
 	NodeID        string
 	APIURL        string
 	DataPlaneHost string
-	// InternalURL is the peer's cluster-internal mTLS URL (e.g. https://10.0.0.5:7002).
-	// Empty when the peer is running without SB_CLUSTER_TLS_DIR or hasn't yet
-	// gossiped its advertise URL. Cross-node create-forwarding uses this in
-	// preference to APIURL so the hop rides the cert-pinned channel.
+	// InternalURL is the peer's required cluster-internal mTLS URL.
 	InternalURL string
 	IsSelf      bool
 }
 
 // PlacementReservation is one item in a leader-side batch reservation request.
 // Redacted MUST have plaintext credentials stripped before the caller passes it
-// in; Secrets carries only a provider handle or legacy sealed bytes.
+// in; Secrets carries only a provider handle (and optional Recipients for the
+// reserve-time seal set).
 type PlacementReservation struct {
 	SandboxID string
 	Target    PlacementTarget
@@ -355,18 +423,15 @@ type PlacementReservation struct {
 type OwnerInfo struct {
 	NodeID string
 	APIURL string
-	// InternalURL is the owner's cluster-internal mTLS URL. Empty when the
-	// owner has no TLS material (mixed/legacy cluster). Owner API forwarding
-	// uses this in preference to APIURL so the cross-node hop is cert-pinned.
+	// InternalURL is the owner's required cluster-internal mTLS URL.
 	InternalURL string
 	IsSelf      bool
 }
 
-// Endpoint pairs a peer's optional cluster-internal mTLS URL with its public
-// API URL. Passed to ForwardHTTP so the forwarder can transparently pick the
-// cert-pinned internal channel when both ends have TLS material, falling back
-// to the public APIURL (PAT-authenticated) otherwise.
+// Endpoint binds a peer identity to its cluster-internal mTLS URL. APIURL is
+// response metadata; ForwardHTTP never uses it as a downgrade.
 type Endpoint struct {
+	NodeID      string
 	InternalURL string
 	APIURL      string
 }
@@ -428,6 +493,11 @@ type Client interface {
 	// resource request. In single-node mode it always returns self.
 	SelectPlacement(req capacity.Request) (PlacementTarget, error)
 
+	// SelectPlacementWithCandidates is SelectPlacement plus the filtered
+	// candidate slice used to build the secret recipient set at reserve time.
+	// Callers that only need the winner keep using SelectPlacement.
+	SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error)
+
 	// RecordPlacement commits sandboxID -> self into the FSM along with the
 	// (optional) creation spec used to re-materialize the sandbox after a
 	// failover. Idempotent — re-recording with the same owner is a no-op, and
@@ -459,6 +529,13 @@ type Client interface {
 	// are only re-shipped when the user re-runs create or rotates them
 	// explicitly.
 	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error
+
+	// UpdatePlacementSecretRecipients replaces Placement.SecretRecipients
+	// (and optionally the seal handle after a reseal) without touching
+	// ownership or IncarnationID. expectedIncarnationID / expectedSealGeneration
+	// are CAS pretenses: when set and the live placement differs, the FSM
+	// rejects with ErrSecretRecipientsCASMismatch.
+	UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error
 
 	// SpecOf returns the most-recently-replicated CreateSandboxRequest for
 	// sandboxID, or nil if no spec is recorded (pre-cluster sandbox, or no
@@ -508,6 +585,12 @@ type Client interface {
 
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error
+	// AuditOwnerRef resolves the minimal Raft-retained owner ACL after placement
+	// deletion. PruneAuditACL removes expired rows through a deterministic Raft
+	// command so every ingress sees the same authorization state.
+	AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error)
+	AuditACLForSandbox(ctx context.Context, sandboxID string) (AuditACL, bool, error)
+	PruneAuditACL(ctx context.Context, cutoff time.Time) error
 
 	// ReserveOnTarget writes opReserve into the FSM holding capacity + name
 	// for target before the body is forwarded to it. The reservation carries
@@ -587,11 +670,8 @@ type Client interface {
 	// boot. Idempotent.
 	AssertOwnership(ctx context.Context, local []LocalSandboxState) error
 
-	// ForwardHTTP reverse-proxies r to the given peer, copying response back to
-	// w. Used by the API layer when OwnerOf != self. When target.InternalURL is
-	// non-empty AND this node has its own TLS material loaded, the proxy rides
-	// the cert-pinned mTLS channel; otherwise it falls back to target.APIURL
-	// with PAT-only auth (the legacy public-API path).
+	// ForwardHTTP reverse-proxies r to the given peer. Target NodeID and
+	// InternalURL are required and the TLS leaf is pinned to node:<NodeID>.
 	ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request)
 
 	// AttachInternalHandler wires the API server's HTTP handler into the
@@ -603,6 +683,12 @@ type Client interface {
 
 	// Members returns a snapshot of all known cluster members.
 	Members() []Member
+
+	// LocalMembers returns the local gossip membership view without a
+	// control-plane HTTP round-trip. Hot paths (list failover_ready) prefer
+	// this over Members() on agent nodes so a page of sandboxes does not
+	// fan out N membership RPCs.
+	LocalMembers() []Member
 
 	// IngressTargets aggregates live ingress-role nodes' gossiped PublicHost
 	// values into the set of public addresses users must point DNS at for
@@ -639,6 +725,12 @@ type Client interface {
 	// getters (OwnerOf/ExposedPortsOf) would lose the placement.Version
 	// needed to compute "is this sandbox's route installed yet on this node".
 	PlacementOf(sandboxID string) (Placement, bool)
+
+	// PlacementsByIDs returns hot placement rows for the requested sandbox IDs
+	// without dumping the full Placements() view. Missing IDs are omitted.
+	// Used by list/get failover_ready batching so a page of N sandboxes does
+	// not pay for a full FSM scan.
+	PlacementsByIDs(ids []string) map[string]Placement
 
 	// PlacementVersion is the FSM's monotonic apply counter — bumps on every
 	// raft log entry the FSM applied. Exposed for metrics/observability and

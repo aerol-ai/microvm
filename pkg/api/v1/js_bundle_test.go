@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -64,6 +65,76 @@ func TestV1CreateJSBundle_Success(t *testing.T) {
 	}
 	if resp.Name != "hook" || resp.MainModule != jsbundle.DefaultMainModule {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestV1CreateJSBundleSelectsOneIsolateWorker(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
+	c := &createForwardCluster{
+		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		target: cluster.PlacementTarget{
+			NodeID: "isolate-a", InternalURL: "https://isolate-a:21443",
+		},
+	}
+	svc.AttachCluster(c)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+	body, _ := json.Marshal(models.CreateJSBundleRequest{Name: "hook", Source: jsHandlerBody})
+	rr := httptest.NewRecorder()
+	h.createJSBundle(rr, httptest.NewRequest(http.MethodPost, "/v1/js-bundles", bytes.NewReader(body)))
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want forwarded 202", rr.Code)
+	}
+	if c.forwardedPeer != "https://isolate-a:21443" || len(c.selectRequests) != 1 {
+		t.Fatalf("forwarded peer=%q select=%+v", c.forwardedPeer, c.selectRequests)
+	}
+	if c.selectRequests[0].Runtime != models.RuntimeIsolate {
+		t.Fatalf("placement runtime = %q, want isolate", c.selectRequests[0].Runtime)
+	}
+}
+
+func TestV1GetJSBundleRoutesNodeBoundRefInConstantTime(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
+	c := &createForwardCluster{
+		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		members: []cluster.Member{{
+			NodeID: "isolate-a", InternalURL: "https://isolate-a:21443", Alive: true,
+		}},
+	}
+	svc.AttachCluster(c)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+	ref := models.JSBundleRefForNode("sha256:abc", "isolate-a")
+	req := httptest.NewRequest(http.MethodGet, "/v1/js-bundles/ignored", nil)
+	req.SetPathValue("id", ref)
+	rr := httptest.NewRecorder()
+	h.getJSBundle(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want forwarded 202", rr.Code)
+	}
+	if c.forwardedPeer != "https://isolate-a:21443" {
+		t.Fatalf("forwarded peer = %q", c.forwardedPeer)
+	}
+}
+
+func TestValidateClusterIsolateBundleRef(t *testing.T) {
+	if err := service.ValidateClusterIsolateBundleRef(models.CreateSandboxRequest{
+		Runtime: models.RuntimeIsolate, ModuleRef: "hook",
+	}); err == nil {
+		t.Fatal("unbound cluster isolate ref was accepted")
+	}
+	if err := service.ValidateClusterIsolateBundleRef(models.CreateSandboxRequest{
+		Runtime:   models.RuntimeIsolate,
+		ModuleRef: models.JSBundleRefForNode("sha256:abc", "isolate-a"),
+	}); err != nil {
+		t.Fatalf("node-bound cluster isolate ref rejected: %v", err)
+	}
+	if err := service.ValidateClusterIsolateBundleRef(models.CreateSandboxRequest{
+		Runtime: models.RuntimeDocker, Image: "alpine",
+	}); err != nil {
+		t.Fatalf("non-isolate request rejected: %v", err)
 	}
 }
 

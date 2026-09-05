@@ -31,6 +31,14 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 	}
 	driver.SetBundleResolver(isolateruntime.NewBundleResolver(jsbundle.NewResolver(store)))
 	supervisor := isolateruntime.NewHostSupervisor(isoCfg)
+	// E3a: host-mediated egress destinations → audit JSONL (async, dial path).
+	if cfg.EgressAttributionEnabled {
+		if setter, ok := supervisor.(interface {
+			SetEgressObserver(pkgisolate.EgressObserver)
+		}); ok {
+			setter.SetEgressObserver(svc.EgressAuditObserver())
+		}
+	}
 	driver.SetHostSupervisor(supervisor)
 
 	if cfg.IsolatePoolEnabled {

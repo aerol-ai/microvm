@@ -992,6 +992,8 @@ func newServiceRuntimeHarness(t *testing.T, rt *recordingRuntime) (*Service, *st
 			t.Fatalf("store.Close: %v", err)
 		}
 	})
+	cipher := newTestCipher(t)
+	st.SetSecretCipher(cipher)
 
 	mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
 		RootDir:     filepath.Join(t.TempDir(), "mounts"),
@@ -1019,13 +1021,15 @@ func newServiceRuntimeHarness(t *testing.T, rt *recordingRuntime) (*Service, *st
 			// enqueues a pending_image_gc row.
 			ImageBuildGCEnabled: true,
 		},
-		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		docker:   rt,
-		caddy:    caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second}),
-		mounts:   mgr,
-		admitter: admitter,
-		images:   newDefaultImageDistributionProvider(""),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:          st,
+		docker:         rt,
+		caddy:          caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second}),
+		mounts:         mgr,
+		admitter:       admitter,
+		images:         newDefaultImageDistributionProvider(""),
+		cipher:         cipher,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
 	}
 	return svc, st, admitter
 }

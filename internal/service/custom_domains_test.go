@@ -116,7 +116,7 @@ func TestValidateCreateCustomDomains_DisabledRejects(t *testing.T) {
 	svc, _ := newCustomDomainsHarness(t, func(c *config.Config) {
 		c.EnableCustomDomains = false
 	})
-	req := models.CreateSandboxRequest{CustomDomains: []string{"api.acme.com"}}
+	req := models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true), CustomDomains: []string{"api.acme.com"}}
 	if err := svc.validateCreateCustomDomains(&req); !errors.Is(err, models.ErrCustomDomainNotSupported) {
 		t.Fatalf("disabled: got %v, want ErrCustomDomainNotSupported", err)
 	}
@@ -126,7 +126,7 @@ func TestValidateCreateCustomDomains_IPModeRejects(t *testing.T) {
 	svc, _ := newCustomDomainsHarness(t, func(c *config.Config) {
 		c.Domain = ""
 	})
-	req := models.CreateSandboxRequest{CustomDomains: []string{"api.acme.com"}}
+	req := models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true), CustomDomains: []string{"api.acme.com"}}
 	if err := svc.validateCreateCustomDomains(&req); !errors.Is(err, models.ErrCustomDomainNotSupported) {
 		t.Fatalf("ip mode: got %v, want ErrCustomDomainNotSupported", err)
 	}
@@ -148,7 +148,7 @@ func TestValidateCreateCustomDomains_EmptyIsFine(t *testing.T) {
 
 func TestValidateCreateCustomDomains_NormalizesAndDedupes(t *testing.T) {
 	svc, _ := newCustomDomainsHarness(t, nil)
-	req := models.CreateSandboxRequest{CustomDomains: []string{"API.Acme.com", "api.acme.com."}}
+	req := models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true), CustomDomains: []string{"API.Acme.com", "api.acme.com."}}
 	if err := svc.validateCreateCustomDomains(&req); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestValidateCreateCustomDomains_NormalizesAndDedupes(t *testing.T) {
 
 func TestValidateCreateCustomDomains_InvalidHostnameRejects(t *testing.T) {
 	svc, _ := newCustomDomainsHarness(t, nil)
-	req := models.CreateSandboxRequest{CustomDomains: []string{"single-label"}}
+	req := models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true), CustomDomains: []string{"single-label"}}
 	if err := svc.validateCreateCustomDomains(&req); !errors.Is(err, models.ErrCustomDomainInvalid) {
 		t.Fatalf("got %v, want ErrCustomDomainInvalid", err)
 	}
@@ -167,7 +167,7 @@ func TestValidateCreateCustomDomains_InvalidHostnameRejects(t *testing.T) {
 
 func TestValidateCreateCustomDomains_UnderBaseDomainRejects(t *testing.T) {
 	svc, _ := newCustomDomainsHarness(t, nil)
-	req := models.CreateSandboxRequest{CustomDomains: []string{"x.aerol.cloud"}}
+	req := models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true), CustomDomains: []string{"x.aerol.cloud"}}
 	if err := svc.validateCreateCustomDomains(&req); !errors.Is(err, models.ErrCustomDomainInvalid) {
 		t.Fatalf("got %v, want ErrCustomDomainInvalid", err)
 	}
