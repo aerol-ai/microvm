@@ -26,12 +26,12 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	fsm := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
 	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "n1"}
 	fsm.mu.Lock()
-	fsm.placements["sb"] = Placement{SandboxID: "sb", OwnerNodeID: "n", Spec: spec}
+	fsm.placements["sb"] = Placement{SandboxID: "sb", OwnerNodeID: "n", Spec: spec, IncarnationID: "inc-sb"}
 	fsm.ownerIndex = map[string]map[string]struct{}{"n": {"sb": {}}}
 	fsm.nameIndex = map[string]string{"n1": "sb"}
 	fsm.mu.Unlock()
 
-	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb", OwnerNodeID: "n2"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb", OwnerNodeID: "n2", ExpectedIncarnationID: "inc-sb"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("reassign store fail=%v", got)
 	}
 
@@ -47,17 +47,17 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	fsm.mu.Lock()
 	fsm.placements["sb-o"] = Placement{
 		SandboxID: "sb-o", OwnerState: PlacementOwnerStateOrphaned, OrphanedOwnerNodeID: "n",
-		Spec: &models.CreateSandboxRequest{Image: "x"},
+		IncarnationID: "inc-o", Spec: &models.CreateSandboxRequest{Image: "x"},
 	}
 	fsm.mu.Unlock()
-	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-o", OwnerNodeID: "n"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-o", OwnerNodeID: "n", IncarnationID: "inc-o"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("claim store fail=%v", got)
 	}
 
 	fsm2 := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
 	seed := newPlacementFSM()
-	applyOp(t, seed, command{Op: opPlace, SandboxID: "a", OwnerNodeID: "n", Spec: &models.CreateSandboxRequest{Name: "keep", Image: "i"}})
-	applyOp(t, seed, command{Op: opPlace, SandboxID: "b", OwnerNodeID: "n", Spec: &models.CreateSandboxRequest{Name: "old", Image: "i"}})
+	applyOp(t, seed, command{Op: opPlace, SandboxID: "a", OwnerNodeID: "n", IncarnationID: "inc-a", Spec: &models.CreateSandboxRequest{Name: "keep", Image: "i"}})
+	applyOp(t, seed, command{Op: opPlace, SandboxID: "b", OwnerNodeID: "n", IncarnationID: "inc-b", Spec: &models.CreateSandboxRequest{Name: "old", Image: "i"}})
 	fsm2.mu.Lock()
 	fsm2.placements = seed.placements
 	fsm2.nameIndex = seed.nameIndex
@@ -66,40 +66,40 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	fsm2.placementIDs = seed.placementIDs
 	fsm2.recovery = seed.recovery
 	fsm2.mu.Unlock()
-	if got := applyOp(t, fsm2, command{Op: opUpsertSpec, SandboxID: "b", Spec: &models.CreateSandboxRequest{Name: "keep", Image: "i2"}}); got == nil || !errors.Is(got.(error), ErrNameConflict) {
+	if got := applyOp(t, fsm2, command{Op: opUpsertSpec, SandboxID: "b", ExpectedIncarnationID: "inc-b", Spec: &models.CreateSandboxRequest{Name: "keep", Image: "i2"}}); got == nil || !errors.Is(got.(error), ErrNameConflict) {
 		t.Fatalf("upsert rename conflict=%v", got)
 	}
-	if got := applyOp(t, fsm2, command{Op: opUpsertSpec, SandboxID: "b", Spec: &models.CreateSandboxRequest{Name: "old2", Image: "i2"}}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	if got := applyOp(t, fsm2, command{Op: opUpsertSpec, SandboxID: "b", ExpectedIncarnationID: "inc-b", Spec: &models.CreateSandboxRequest{Name: "old2", Image: "i2"}}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("upsert store fail=%v", got)
 	}
 
 	fsm3 := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
 	fsm3.mu.Lock()
-	fsm3.placements["sb-p"] = Placement{SandboxID: "sb-p", OwnerNodeID: "n", Spec: &models.CreateSandboxRequest{Image: "i"}}
+	fsm3.placements["sb-p"] = Placement{SandboxID: "sb-p", OwnerNodeID: "n", IncarnationID: "inc-p", Spec: &models.CreateSandboxRequest{Image: "i"}}
 	fsm3.mu.Unlock()
-	if got := applyOp(t, fsm3, command{Op: opAddExposedPort, SandboxID: "sb-p", Port: 80, Protocol: "http"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	if got := applyOp(t, fsm3, command{Op: opAddExposedPort, SandboxID: "sb-p", ExpectedIncarnationID: "inc-p", Port: 80, Protocol: "http"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("add port store fail=%v", got)
 	}
 	fsm3.mu.Lock()
 	fsm3.placements["sb-p"] = Placement{
-		SandboxID: "sb-p", OwnerNodeID: "n", Spec: &models.CreateSandboxRequest{Image: "i"},
+		SandboxID: "sb-p", OwnerNodeID: "n", IncarnationID: "inc-p", Spec: &models.CreateSandboxRequest{Image: "i"},
 		ExposedPorts: map[int]string{80: "http"}, ExposedPortRoutes: map[int]ExposedPortRoute{80: {Protocol: "http"}},
 	}
 	fsm3.mu.Unlock()
-	if got := applyOp(t, fsm3, command{Op: opRemoveExposedPort, SandboxID: "sb-p", Port: 80}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	if got := applyOp(t, fsm3, command{Op: opRemoveExposedPort, SandboxID: "sb-p", ExpectedIncarnationID: "inc-p", Port: 80}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("remove port store fail=%v", got)
 	}
-	if got := applyOp(t, fsm3, command{Op: opAddCustomDomain, SandboxID: "sb-p", Hostname: "h.example"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	if got := applyOp(t, fsm3, command{Op: opAddCustomDomain, SandboxID: "sb-p", ExpectedIncarnationID: "inc-p", Hostname: "h.example"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("add domain store fail=%v", got)
 	}
 	fsm3.mu.Lock()
 	fsm3.placements["sb-p"] = Placement{
-		SandboxID: "sb-p", OwnerNodeID: "n", Spec: &models.CreateSandboxRequest{Image: "i"},
+		SandboxID: "sb-p", OwnerNodeID: "n", IncarnationID: "inc-p", Spec: &models.CreateSandboxRequest{Image: "i"},
 		CustomHostnames: []string{"h.example"},
 	}
 	fsm3.customHostnameIndex = map[string]string{"h.example": "sb-p"}
 	fsm3.mu.Unlock()
-	if got := applyOp(t, fsm3, command{Op: opRemoveCustomDomain, SandboxID: "sb-p", Hostname: "h.example"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	if got := applyOp(t, fsm3, command{Op: opRemoveCustomDomain, SandboxID: "sb-p", ExpectedIncarnationID: "inc-p", Hostname: "h.example"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("remove domain store fail=%v", got)
 	}
 }
@@ -123,12 +123,12 @@ func TestAssertOwnershipFirstErrorBranches(t *testing.T) {
 
 	place, _ := encodeCommand(command{
 		Op: opPlace, SandboxID: "holder", OwnerNodeID: "other",
-		Spec: &models.CreateSandboxRequest{Name: "holder", Image: "i"},
+		Spec: &models.CreateSandboxRequest{Name: "holder", Image: "i"}, IncarnationID: "inc-holder",
 	})
 	if err := c.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
 		t.Fatal(err)
 	}
-	addHN, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "holder", Hostname: "taken.example.test"})
+	addHN, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "holder", ExpectedIncarnationID: "inc-holder", Hostname: "taken.example.test"})
 	if err := c.raft.raft.Apply(addHN, 2*time.Second).Error(); err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +136,7 @@ func TestAssertOwnershipFirstErrorBranches(t *testing.T) {
 	err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-hn-conflict",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine", CPU: 1},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-hn-conflict"},
 		CustomHostnames: []string{"taken.example.test"},
 	}})
 	if err == nil || !errors.Is(err, ErrCustomHostnameConflict) {
@@ -143,27 +144,29 @@ func TestAssertOwnershipFirstErrorBranches(t *testing.T) {
 	}
 
 	err = c.AssertOwnership(ctx, []LocalSandboxState{{
-		ID:   "sb-big",
-		Spec: oversizedSpec("big"),
+		ID:      "sb-big",
+		Spec:    oversizedSpec("big"),
+		Secrets: PlacementSecrets{IncarnationID: "inc-big"},
 	}})
 	if err == nil || !errors.Is(err, ErrRecoveryPayloadTooLarge) {
 		t.Fatalf("oversized fresh=%v", err)
 	}
 
-	seed, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-nospec", OwnerNodeID: c.nodeID})
+	seed, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-nospec", OwnerNodeID: c.nodeID, IncarnationID: "inc-nospec"})
 	if err := c.raft.raft.Apply(seed, 2*time.Second).Error(); err != nil {
 		t.Fatal(err)
 	}
 	err = c.AssertOwnership(ctx, []LocalSandboxState{{
-		ID:   "sb-nospec",
-		Spec: oversizedSpec("owned-big"),
+		ID:      "sb-nospec",
+		Spec:    oversizedSpec("owned-big"),
+		Secrets: PlacementSecrets{IncarnationID: "inc-nospec"},
 	}})
 	if err == nil || !errors.Is(err, ErrRecoveryPayloadTooLarge) {
 		t.Fatalf("oversized upsert=%v", err)
 	}
 
 	res, _ := encodeCommand(command{
-		Op: opReserve, SandboxID: "sb-res-conflict", OwnerNodeID: c.nodeID,
+		Op: opReserve, SandboxID: "sb-res-conflict", OwnerNodeID: c.nodeID, IncarnationID: "inc-res-conflict",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
 	})
 	if err := c.raft.raft.Apply(res, 2*time.Second).Error(); err != nil {
@@ -172,6 +175,7 @@ func TestAssertOwnershipFirstErrorBranches(t *testing.T) {
 	err = c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-res-conflict",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine", CPU: 1},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-res-conflict"},
 		CustomHostnames: []string{"taken.example.test"},
 	}})
 	if err == nil || !errors.Is(err, ErrCustomHostnameConflict) {

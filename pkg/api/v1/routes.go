@@ -187,7 +187,6 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretHead)))
 	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretDelete)))
 	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", internalOp(http.HandlerFunc(h.clusterInternalSandboxAudit)))
-	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/meta", internalOp(http.HandlerFunc(h.clusterInternalSandboxMeta)))
 }
 
 const clusterPeerNodeIDHeader = cluster.PeerNodeIDHeader
@@ -209,15 +208,16 @@ func withInternalMTLS(d Deps, next http.Handler) http.Handler {
 	})
 }
 
-// peerMemberAlive reports whether peerID is an Alive gossip member when a
-// cluster client is available. Missing Cluster() skips the check (tests).
+// peerMemberAlive reports whether peerID is an Alive gossip member. A valid
+// CA-signed certificate is not sufficient after a node has been removed from
+// membership, and an unavailable membership source must fail closed.
 func peerMemberAlive(d Deps, peerID string) bool {
 	if d.Service == nil || peerID == "" {
-		return true
+		return false
 	}
 	c := d.Service.Cluster()
 	if c == nil {
-		return true
+		return false
 	}
 	return cluster.IsLivePeer(c, peerID)
 }

@@ -65,7 +65,7 @@ func TestFSMStorePlacementInlineRecoveryWithoutStore(t *testing.T) {
 	fsm.recovery = nil
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-inline", OwnerNodeID: "n",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"}, SecretRef: "sec", SecretVersion: 1,
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}, IncarnationID: "inc-inline", SecretRef: testSecretRef("sb-inline", "inc-inline"), SecretVersion: 1, SecretSealGeneration: 1,
 	}); got != nil {
 		t.Fatalf("place inline recovery: %v", got)
 	}
@@ -279,6 +279,7 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{ID: ""}, {
 		ID:              "sb-hn",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine", CPU: 1},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-hn"},
 		ExposedPorts:    map[int]ExposedPortRoute{80: {Protocol: "http"}},
 		CustomHostnames: []string{"hn.example.test"},
 	}}); err != nil {
@@ -292,6 +293,7 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-hn",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine", CPU: 1},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-hn"},
 		CustomHostnames: []string{"hn2.example.test"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership owned hostname: %v", err)
@@ -299,7 +301,7 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 
 	// Reserved promote with hostname.
 	applyPayload, _ := encodeCommand(command{
-		Op: opReserve, SandboxID: "sb-res-hn", OwnerNodeID: c.nodeID,
+		Op: opReserve, SandboxID: "sb-res-hn", OwnerNodeID: c.nodeID, IncarnationID: "inc-res-hn",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
 	})
 	if err := c.raft.raft.Apply(applyPayload, 2*time.Second).Error(); err != nil {
@@ -308,6 +310,7 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-res-hn",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine", CPU: 1},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-res-hn"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 		CustomHostnames: []string{"res.example.test"},
 	}}); err != nil {
@@ -316,14 +319,14 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 
 	// ClaimOrphan failure path: plant name conflict then try reclaim with conflicting name.
 	place, _ := encodeCommand(command{
-		Op: opPlace, SandboxID: "sb-name-holder", OwnerNodeID: "other",
+		Op: opPlace, SandboxID: "sb-name-holder", OwnerNodeID: "other", IncarnationID: "inc-name-holder",
 		Spec: &models.CreateSandboxRequest{Name: "taken-name", Image: "i"},
 	})
 	if err := c.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
 		t.Fatal(err)
 	}
 	place2, _ := encodeCommand(command{
-		Op: opPlace, SandboxID: "sb-orphan-claim", OwnerNodeID: c.nodeID,
+		Op: opPlace, SandboxID: "sb-orphan-claim", OwnerNodeID: c.nodeID, IncarnationID: "inc-orphan-claim",
 		Spec: &models.CreateSandboxRequest{Name: "orphan-old", Image: "i"},
 	})
 	if err := c.raft.raft.Apply(place2, 2*time.Second).Error(); err != nil {
@@ -334,8 +337,9 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := c.AssertOwnership(ctx, []LocalSandboxState{{
-		ID:   "sb-orphan-claim",
-		Spec: &models.CreateSandboxRequest{Name: "taken-name", Image: "i2"},
+		ID:      "sb-orphan-claim",
+		Spec:    &models.CreateSandboxRequest{Name: "taken-name", Image: "i2"},
+		Secrets: PlacementSecrets{IncarnationID: "inc-orphan-claim"},
 	}})
 	if err == nil || !errors.Is(err, ErrNameConflict) {
 		t.Fatalf("claim name conflict err=%v", err)
@@ -343,7 +347,7 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 
 	// Successful reclaim with ports+hostnames.
 	place3, _ := encodeCommand(command{
-		Op: opPlace, SandboxID: "sb-orphan-ok", OwnerNodeID: c.nodeID,
+		Op: opPlace, SandboxID: "sb-orphan-ok", OwnerNodeID: c.nodeID, IncarnationID: "inc-orphan-ok",
 		Spec: &models.CreateSandboxRequest{Name: "ok-old", Image: "i"},
 	})
 	if err := c.raft.raft.Apply(place3, 2*time.Second).Error(); err != nil {
@@ -355,6 +359,7 @@ func TestAssertOwnershipCustomHostnamesAndClaimError(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-orphan-ok",
 		Spec:            &models.CreateSandboxRequest{Name: "ok-new", Image: "i2"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-orphan-ok"},
 		ExposedPorts:    map[int]ExposedPortRoute{443: {Protocol: "https"}},
 		CustomHostnames: []string{"ok.example.test"},
 	}}); err != nil {
@@ -381,7 +386,7 @@ func TestClusterVolumeUpsertQuotaAndApplyErrors(t *testing.T) {
 		t.Fatalf("delete missing=%v", err)
 	}
 	if err := c.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "tq", VolumeID: "missing", SandboxID: "sb", Target: "/d", Source: "s",
+		Tenant: "tq", VolumeID: "missing", SandboxID: "sb", IncarnationID: "inc-sb", Target: "/d", Source: "s",
 	}}); !errors.Is(err, ErrUnknownVolume) {
 		t.Fatalf("attach unknown=%v", err)
 	}
@@ -484,7 +489,7 @@ func TestFSMOpDrainAndExposedPortEdges(t *testing.T) {
 	if !fsm.isNodeDrained("n1") {
 		t.Fatal("expected drained")
 	}
-	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb", OwnerNodeID: "a", Spec: &models.CreateSandboxRequest{Image: "i"}})
+	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb", OwnerNodeID: "a", Spec: &models.CreateSandboxRequest{Image: "i"}, IncarnationID: "inc-sb"})
 	// Add exposed port with empty protocol falls back to existing (empty).
 	if got := applyOp(t, fsm, command{Op: opAddExposedPort, SandboxID: "sb", Port: 80}); got != nil {
 		t.Fatal(got)
@@ -503,9 +508,10 @@ func TestEncodeCommandFailureDoesNotApply(t *testing.T) {
 	// Cover agent applyCommand validate size instead.
 	a := &Agent{}
 	err := a.applyCommand(context.Background(), command{
-		Op:        opPlace,
-		SandboxID: "sb",
-		Spec:      oversizedSpec("big"),
+		Op:            opPlace,
+		SandboxID:     "sb",
+		IncarnationID: "inc-size",
+		Spec:          oversizedSpec("big"),
 	})
 	if !errors.Is(err, ErrRecoveryPayloadTooLarge) {
 		t.Fatalf("applyCommand size=%v", err)
@@ -515,9 +521,10 @@ func TestEncodeCommandFailureDoesNotApply(t *testing.T) {
 func TestClusterApplyCommandSizeGuard(t *testing.T) {
 	c := &Cluster{}
 	err := c.applyCommand(context.Background(), command{
-		Op:        opPlace,
-		SandboxID: "sb",
-		Spec:      oversizedSpec("big"),
+		Op:            opPlace,
+		SandboxID:     "sb",
+		IncarnationID: "inc-size",
+		Spec:          oversizedSpec("big"),
 	})
 	if !errors.Is(err, ErrRecoveryPayloadTooLarge) {
 		t.Fatalf("applyCommand size=%v", err)

@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -170,12 +171,13 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 		return
 	}
 	cmd := command{
-		Op:                 opReassign,
-		SandboxID:          id,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
-		ReassignCause:      reassignCauseFailover,
+		Op:                    opReassign,
+		SandboxID:             id,
+		OwnerNodeID:           target.NodeID,
+		OwnerAPIURL:           target.APIURL,
+		OwnerDataPlaneHost:    target.DataPlaneHost,
+		ExpectedIncarnationID: strings.TrimSpace(p.IncarnationID),
+		ReassignCause:         reassignCauseFailover,
 	}
 	if err := c.applyCommand(ctx, cmd); err != nil {
 		c.logger.Warn("cluster: reassign stuck placement failed; will retry on next tick",

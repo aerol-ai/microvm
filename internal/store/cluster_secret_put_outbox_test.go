@@ -20,7 +20,7 @@ func TestSecretPutOutboxCRUD(t *testing.T) {
 	if err := st.UpsertSecretPutOutbox(ctx, "sb-put", "inc-1", 3, []string{"node-b", "node-c"}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	got, err := st.GetSecretPutOutbox(ctx, "sb-put")
+	got, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-put", "inc-1")
 	if err != nil || got == nil {
 		t.Fatalf("get: %v %#v", err, got)
 	}
@@ -33,7 +33,7 @@ func TestSecretPutOutboxCRUD(t *testing.T) {
 	if err := st.UpdateSecretPutOutboxRecipients(ctx, "sb-put", "inc-1", []string{"node-c"}, 3); err != nil {
 		t.Fatal(err)
 	}
-	got, err = st.GetSecretPutOutbox(ctx, "sb-put")
+	got, err = st.GetSecretPutOutboxForIncarnation(ctx, "sb-put", "inc-1")
 	if err != nil || got == nil || len(got.Recipients) != 1 || got.Recipients[0] != "node-c" || got.Attempts != 1 {
 		t.Fatalf("after shrink = %+v err=%v", got, err)
 	}
@@ -45,14 +45,80 @@ func TestSecretPutOutboxCRUD(t *testing.T) {
 	if err := st.DeleteSecretPutOutbox(ctx, "sb-put", "inc-1", 2); err != nil {
 		t.Fatal(err)
 	}
-	if got, err = st.GetSecretPutOutbox(ctx, "sb-put"); err != nil || got == nil {
+	if got, err = st.GetSecretPutOutboxForIncarnation(ctx, "sb-put", "inc-1"); err != nil || got == nil {
 		t.Fatalf("stale delete cleared outbox: %#v err=%v", got, err)
 	}
 	if err := st.UpdateSecretPutOutboxRecipients(ctx, "sb-put", "inc-1", nil, 3); err != nil {
 		t.Fatal(err)
 	}
-	if got, err = st.GetSecretPutOutbox(ctx, "sb-put"); err != nil || got != nil {
+	if got, err = st.GetSecretPutOutboxForIncarnation(ctx, "sb-put", "inc-1"); err != nil || got != nil {
 		t.Fatalf("expected cleared outbox, got %#v err=%v", got, err)
+	}
+}
+
+func TestSecretPutOutboxRejectsIncompleteIdentity(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	for name, call := range map[string]func() error{
+		"upsert missing sandbox": func() error {
+			return st.UpsertSecretPutOutbox(ctx, " ", "inc-a", 1, []string{"peer-a"})
+		},
+		"upsert missing incarnation": func() error {
+			return st.UpsertSecretPutOutbox(ctx, "sb-current-contract", " ", 1, []string{"peer-a"})
+		},
+		"upsert": func() error {
+			return st.UpsertSecretPutOutbox(ctx, "sb-current-contract", "inc-a", 0, []string{"peer-a"})
+		},
+		"shrink missing incarnation": func() error {
+			return st.UpdateSecretPutOutboxRecipients(ctx, "sb-current-contract", " ", nil, 1)
+		},
+		"shrink": func() error {
+			return st.UpdateSecretPutOutboxRecipients(ctx, "sb-current-contract", "inc-a", nil, 0)
+		},
+		"bump missing incarnation": func() error {
+			return st.BumpSecretPutOutboxAttempt(ctx, "sb-current-contract", " ", 1)
+		},
+		"bump": func() error {
+			return st.BumpSecretPutOutboxAttempt(ctx, "sb-current-contract", "inc-a", 0)
+		},
+		"delete missing incarnation": func() error {
+			return st.DeleteSecretPutOutbox(ctx, "sb-current-contract", " ", 1)
+		},
+		"delete": func() error {
+			return st.DeleteSecretPutOutbox(ctx, "sb-current-contract", "inc-a", 0)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); err == nil {
+				t.Fatal("incomplete outbox identity was accepted")
+			}
+		})
+	}
+}
+
+func TestPutClusterSecretRejectsPutOutboxWithoutIncarnation(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	peers := []string{"peer-a"}
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "cluster-secret://sandbox/sb-unfenced/i/inc-unfenced/v1", SandboxID: "sb-unfenced", Version: 1,
+		Recipients: []string{"node-a", "peer-a"}, SealedPayload: []byte("sealed"),
+		SealGeneration: 1, PutOutboxRecipients: &peers,
+	}); err == nil {
+		t.Fatal("atomic put outbox without incarnation was accepted")
+	}
+	if _, err := st.GetClusterSecret(ctx, "cluster-secret://sandbox/sb-unfenced/i/inc-unfenced/v1"); err == nil {
+		t.Fatal("secret row committed despite unfenced outbox")
 	}
 }
 
@@ -67,33 +133,33 @@ func TestPutClusterSecretJournalsPutOutboxAtomically(t *testing.T) {
 	now := time.Now().UTC()
 	peers := []string{"node-b", "node-c"}
 	gen, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
-		Ref: "cluster-secret://sandbox/sb-atomic/v1", SandboxID: "sb-atomic", Version: 1,
+		Ref: "cluster-secret://sandbox/sb-atomic/i/inc-atomic/v1", SandboxID: "sb-atomic", Version: 1,
 		Recipients: []string{"node-a", "node-b", "node-c"}, SealedPayload: []byte("sealed"),
 		SealGeneration: 1, CreatedAt: now, UpdatedAt: now,
-		PutOutboxIncarnationID: "inc-a",
+		PutOutboxIncarnationID: "inc-atomic",
 		PutOutboxRecipients:    &peers,
 	})
 	if err != nil || gen != 1 {
 		t.Fatalf("put: gen=%d err=%v", gen, err)
 	}
-	got, err := st.GetSecretPutOutbox(ctx, "sb-atomic")
+	got, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-atomic", "inc-atomic")
 	if err != nil || got == nil {
 		t.Fatalf("expected outbox with sealed row, got %#v err=%v", got, err)
 	}
-	if got.IncarnationID != "inc-a" || got.SealGeneration != 1 || len(got.Recipients) != 2 {
+	if got.IncarnationID != "inc-atomic" || got.SealGeneration != 1 || len(got.Recipients) != 2 {
 		t.Fatalf("outbox = %+v", got)
 	}
 
 	// A newer put clears its PUT journal but must preserve any independent
 	// delete obligations; peer deletion is generation-fenced.
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
-		Ref: "cluster-secret://sandbox/sb-atomic/v1", SandboxID: "sb-atomic", Version: 1,
+		Ref: "cluster-secret://sandbox/sb-atomic/i/inc-atomic/v1", SandboxID: "sb-atomic", Version: 1,
 		Recipients: []string{"node-a", "node-b", "node-c"}, SealedPayload: []byte("sealed-2"),
 		SealGeneration: 2, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got, err = st.GetSecretPutOutbox(ctx, "sb-atomic"); err != nil || got != nil {
+	if got, err = st.GetSecretPutOutboxForIncarnation(ctx, "sb-atomic", "inc-atomic"); err != nil || got != nil {
 		t.Fatalf("peer put should clear outbox, got %#v err=%v", got, err)
 	}
 }
@@ -106,19 +172,19 @@ func TestPutClusterSecretStagesAndMergesRetiredRecipients(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-retire", []string{"old-a"}, 1); err != nil {
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-retire", "inc-retire", []string{"old-a"}, 1); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
 	retired := []string{"old-b", "old-a"}
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
-		Ref: "cluster-secret://sandbox/sb-retire/v1", SandboxID: "sb-retire", Version: 1,
+		Ref: "cluster-secret://sandbox/sb-retire/i/inc-retire/v1", SandboxID: "sb-retire", Version: 1,
 		Recipients: []string{"new-a", "new-b"}, SealedPayload: []byte("generation-2"),
 		SealGeneration: 2, CreatedAt: now, UpdatedAt: now, RetireRecipients: &retired,
 	}); err != nil {
 		t.Fatalf("put resealed row: %v", err)
 	}
-	got, err := st.GetSecretDeleteOutbox(ctx, "sb-retire")
+	got, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-retire", "inc-retire")
 	if err != nil || got == nil {
 		t.Fatalf("get staged retirement: got=%#v err=%v", got, err)
 	}
@@ -131,10 +197,10 @@ func TestPutClusterSecretStagesAndMergesRetiredRecipients(t *testing.T) {
 
 	// Confirming the same generation makes the union eligible without losing
 	// either the older pending recipient or the newly retired recipient.
-	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-retire", []string{"old-b"}, 2); err != nil {
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-retire", "inc-retire", []string{"old-b"}, 2); err != nil {
 		t.Fatal(err)
 	}
-	got, err = st.GetSecretDeleteOutbox(ctx, "sb-retire")
+	got, err = st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-retire", "inc-retire")
 	if err != nil || got == nil || got.AwaitingPromotion || !slices.Equal(got.Recipients, []string{"old-a", "old-b"}) {
 		t.Fatalf("promoted retirement = %+v err=%v", got, err)
 	}
@@ -151,23 +217,64 @@ func TestPutClusterSecretDoesNotRetireReaddedCurrentRecipient(t *testing.T) {
 	// peer-a was pending deletion from an older generation, but generation 3
 	// selects it again while retiring peer-b. The merged journal must never
 	// delete peer-a's current generation.
-	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-readd", []string{"peer-a"}, 2); err != nil {
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-readd", "inc-readd", []string{"peer-a"}, 2); err != nil {
 		t.Fatal(err)
 	}
 	retired := []string{"peer-b"}
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
-		Ref: "cluster-secret://sandbox/sb-readd/v1", SandboxID: "sb-readd", Version: 1,
+		Ref: "cluster-secret://sandbox/sb-readd/i/inc-readd/v1", SandboxID: "sb-readd", Version: 1,
 		Recipients: []string{"node-a", "peer-a", "peer-c"}, SealedPayload: []byte("generation-3"),
 		SealGeneration: 3, RetireRecipients: &retired,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := st.GetSecretDeleteOutbox(ctx, "sb-readd")
+	got, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-readd", "inc-readd")
 	if err != nil || got == nil {
 		t.Fatalf("get staged retirement: got=%+v err=%v", got, err)
 	}
 	if !got.AwaitingPromotion || got.Generation != 3 || !slices.Equal(got.Recipients, []string{"peer-b"}) {
 		t.Fatalf("staged retirement = %+v, want only peer-b at generation 3", got)
+	}
+}
+
+func TestStaleRetirementMergeCannotDropNewerDeleteObligation(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-stale-retire", "inc-stale-retire", []string{"peer-newer"}, 5); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := upsertSecretDeleteOutboxTx(
+		ctx,
+		tx,
+		"sb-stale-retire",
+		"inc-stale-retire",
+		[]string{"peer-older"},
+		[]string{"peer-newer"},
+		4,
+		true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-stale-retire", "inc-stale-retire")
+	if err != nil || got == nil {
+		t.Fatalf("get merged retirement: got=%+v err=%v", got, err)
+	}
+	if got.Generation != 5 || got.AwaitingPromotion || !slices.Equal(got.Recipients, []string{"peer-newer", "peer-older"}) {
+		t.Fatalf("stale merge weakened newer job: %+v", got)
 	}
 }
 
@@ -179,18 +286,18 @@ func TestOrdinarySecretPutPreservesPendingDeleteObligation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-recreate", []string{"former-peer"}, 2); err != nil {
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-recreate", "inc-recreate", []string{"former-peer"}, 2); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
-		Ref: "cluster-secret://sandbox/sb-recreate/v1", SandboxID: "sb-recreate", Version: 1,
+		Ref: "cluster-secret://sandbox/sb-recreate/i/inc-recreate/v1", SandboxID: "sb-recreate", Version: 1,
 		Recipients: []string{"new-peer"}, SealedPayload: []byte("generation-3"),
 		SealGeneration: 3, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := st.GetSecretDeleteOutbox(ctx, "sb-recreate")
+	got, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-recreate", "inc-recreate")
 	if err != nil || got == nil || !slices.Equal(got.Recipients, []string{"former-peer"}) {
 		t.Fatalf("ordinary put lost prior cleanup obligation: got=%+v err=%v", got, err)
 	}
@@ -204,19 +311,19 @@ func TestSecretOutboxCorruptionFailsClosed(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-bad-delete", []string{"peer-a"}, 1); err != nil {
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-bad-delete", "inc-bad-delete", []string{"peer-a"}, 1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(ctx, `UPDATE cluster_secret_delete_outbox SET recipients_json = '{' WHERE sandbox_id = 'sb-bad-delete'`); err != nil {
 		t.Fatal(err)
 	}
-	if rec, err := st.GetSecretDeleteOutbox(ctx, "sb-bad-delete"); err == nil || rec != nil {
+	if rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-bad-delete", "inc-bad-delete"); err == nil || rec != nil {
 		t.Fatalf("corrupt delete outbox = rec=%+v err=%v, want fail closed", rec, err)
 	}
 	if rows, err := st.ListSecretDeleteOutboxBatch(ctx, 10); err == nil || rows != nil {
 		t.Fatalf("corrupt delete outbox list = rows=%+v err=%v, want fail closed", rows, err)
 	}
-	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-bad-delete", []string{"peer-b"}, 1); err == nil {
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-bad-delete", "inc-bad-delete", []string{"peer-b"}, 1); err == nil {
 		t.Fatal("corrupt delete outbox merge must not overwrite and lose peer-a")
 	}
 
@@ -226,7 +333,7 @@ func TestSecretOutboxCorruptionFailsClosed(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, `UPDATE cluster_secret_put_outbox SET recipients_json = '{' WHERE sandbox_id = 'sb-bad-put'`); err != nil {
 		t.Fatal(err)
 	}
-	if rec, err := st.GetSecretPutOutbox(ctx, "sb-bad-put"); err == nil || rec != nil {
+	if rec, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-bad-put", "inc-1"); err == nil || rec != nil {
 		t.Fatalf("corrupt put outbox = rec=%+v err=%v, want fail closed", rec, err)
 	}
 	if rows, err := st.ListSecretPutOutboxBatch(ctx, 10); err == nil || rows != nil {
@@ -246,22 +353,22 @@ func TestMarkSecretDeleteOutboxPromotedIsGenerationFenced(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	retired := []string{"peer-a"}
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
-		Ref: "cluster-secret://sandbox/sb-promote/v1", SandboxID: "sb-promote", Version: 1,
+		Ref: "cluster-secret://sandbox/sb-promote/i/inc-promote/v1", SandboxID: "sb-promote", Version: 1,
 		Recipients: []string{"node-a", "peer-b"}, SealedPayload: []byte("sealed"),
 		SealGeneration: 2, RetireRecipients: &retired,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if promoted, err := st.MarkSecretDeleteOutboxPromoted(ctx, "sb-promote", 1); err != nil || promoted {
+	if promoted, err := st.MarkSecretDeleteOutboxPromoted(ctx, "sb-promote", "inc-promote", 1); err != nil || promoted {
 		t.Fatalf("stale promotion = %v, %v; want false, nil", promoted, err)
 	}
-	if rec, err := st.GetSecretDeleteOutbox(ctx, "sb-promote"); err != nil || rec == nil || !rec.AwaitingPromotion {
+	if rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-promote", "inc-promote"); err != nil || rec == nil || !rec.AwaitingPromotion {
 		t.Fatalf("stale promotion released staged row: rec=%+v err=%v", rec, err)
 	}
-	if promoted, err := st.MarkSecretDeleteOutboxPromoted(ctx, "sb-promote", 2); err != nil || !promoted {
+	if promoted, err := st.MarkSecretDeleteOutboxPromoted(ctx, "sb-promote", "inc-promote", 2); err != nil || !promoted {
 		t.Fatalf("matching promotion = %v, %v; want true, nil", promoted, err)
 	}
-	if promoted, err := st.MarkSecretDeleteOutboxPromoted(ctx, "sb-promote", 2); err != nil || promoted {
+	if promoted, err := st.MarkSecretDeleteOutboxPromoted(ctx, "sb-promote", "inc-promote", 2); err != nil || promoted {
 		t.Fatalf("duplicate promotion = %v, %v; want false, nil", promoted, err)
 	}
 }
@@ -275,7 +382,7 @@ func TestPutClusterSecretStaleGeneration(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	now := time.Now().UTC()
-	ref := "cluster-secret://sandbox/sb-stale/v1"
+	ref := "cluster-secret://sandbox/sb-stale/i/inc-stale/v1"
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: ref, SandboxID: "sb-stale", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("gen2"),
@@ -300,7 +407,7 @@ func TestPutClusterSecretStaleGeneration(t *testing.T) {
 	}
 }
 
-func TestSecretPutOutboxRejectsDowngrade(t *testing.T) {
+func TestSecretPutOutboxKeepsIncarnationsIndependent(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -314,12 +421,16 @@ func TestSecretPutOutboxRejectsDowngrade(t *testing.T) {
 	if err := st.UpsertSecretPutOutbox(ctx, "sb-put", "inc-1", 4, []string{"node-c"}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := st.GetSecretPutOutbox(ctx, "sb-put")
-	if err != nil || got == nil {
-		t.Fatalf("get: %v %#v", err, got)
+	old, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-put", "inc-1")
+	if err != nil || old == nil {
+		t.Fatalf("get old lifecycle: %v %#v", err, old)
 	}
-	if got.SealGeneration != 5 || got.IncarnationID != "inc-2" || len(got.Recipients) != 1 || got.Recipients[0] != "node-b" {
-		t.Fatalf("downgrade clobbered outbox: %+v", got)
+	if old.SealGeneration != 4 || old.IncarnationID != "inc-1" || len(old.Recipients) != 1 || old.Recipients[0] != "node-c" {
+		t.Fatalf("old lifecycle outbox = %+v", old)
+	}
+	current, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-put", "inc-2")
+	if err != nil || current == nil || current.SealGeneration != 5 || len(current.Recipients) != 1 || current.Recipients[0] != "node-b" {
+		t.Fatalf("current lifecycle outbox = %+v, %v", current, err)
 	}
 }
 
@@ -344,7 +455,7 @@ func TestPutClusterSecretEqualGenerationPayload(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	now := time.Now().UTC()
-	ref := "cluster-secret://sandbox/sb-digest/v1"
+	ref := "cluster-secret://sandbox/sb-digest/i/inc-digest/v1"
 	rec := ClusterSecretRecord{
 		Ref: ref, SandboxID: "sb-digest", Version: 1,
 		Recipients: []string{"a"}, SealedPayload: []byte("same"),
@@ -360,7 +471,7 @@ func TestPutClusterSecretEqualGenerationPayload(t *testing.T) {
 	if _, err := st.PutClusterSecret(ctx, rec); !errors.Is(err, ErrClusterSecretPayloadConflict) {
 		t.Fatalf("conflict = %v, want ErrClusterSecretPayloadConflict", err)
 	}
-	got, err := st.GetClusterSecretForSandbox(ctx, "sb-digest")
+	got, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-digest", "inc-digest")
 	if err != nil || string(got.SealedPayload) != "same" {
 		t.Fatalf("row mutated on conflict: %+v err=%v", got, err)
 	}

@@ -82,7 +82,7 @@ func testCipher(t *testing.T) *Cipher {
 }
 
 func TestLocalProviderPutOpenRoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := ContextWithIncarnationID(context.Background(), "inc-test")
 	p := NewLocalProvider(testCipher(t), newMemBlobStore())
 	sec := Secrets{
 		Registry: &models.RegistryAuth{Server: "ghcr.io", Username: "u", Password: "supersecret"},
@@ -111,7 +111,7 @@ func TestLocalProviderPutOpenRoundTrip(t *testing.T) {
 }
 
 func TestLocalProviderWrongRecipientDenied(t *testing.T) {
-	ctx := context.Background()
+	ctx := ContextWithIncarnationID(context.Background(), "inc-test")
 	p := NewLocalProvider(testCipher(t), newMemBlobStore())
 	h, err := p.Put(ctx, "sb-1", Secrets{
 		Registry: &models.RegistryAuth{Password: "p"},
@@ -126,16 +126,16 @@ func TestLocalProviderWrongRecipientDenied(t *testing.T) {
 }
 
 func TestLocalProviderMissingNotFound(t *testing.T) {
-	ctx := context.Background()
+	ctx := ContextWithIncarnationID(context.Background(), "inc-test")
 	p := NewLocalProvider(testCipher(t), newMemBlobStore())
-	_, err := p.Open(ctx, "sb-1", Handle{Ref: "cluster-secret://sandbox/missing/v1", Version: 1}, "node-a")
+	_, err := p.Open(ctx, "sb-1", Handle{Ref: FormatRef("sb-1", "missing-incarnation", RefVersion), Version: RefVersion, SealGeneration: 1}, "node-a")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Open missing = %v, want ErrNotFound", err)
 	}
 }
 
 func TestLocalProviderEmptySecretsZeroHandle(t *testing.T) {
-	ctx := context.Background()
+	ctx := ContextWithIncarnationID(context.Background(), "inc-test")
 	store := newMemBlobStore()
 	p := NewLocalProvider(testCipher(t), store)
 	h, err := p.Put(ctx, "sb-1", Secrets{}, []string{"node-a"})
@@ -151,7 +151,7 @@ func TestLocalProviderEmptySecretsZeroHandle(t *testing.T) {
 }
 
 func TestLocalProviderDeleteAndErrorArms(t *testing.T) {
-	ctx := context.Background()
+	ctx := ContextWithIncarnationID(context.Background(), "inc-test")
 	store := newMemBlobStore()
 	c := testCipher(t)
 	p := NewLocalProvider(c, store)

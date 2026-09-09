@@ -73,6 +73,26 @@ func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID stri
 	return c.reserveErr
 }
 
+func (c *createForwardCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement)
+	for _, id := range ids {
+		for i := len(c.reserveCalls) - 1; i >= 0; i-- {
+			reservation := c.reserveCalls[i]
+			if reservation.sandboxID != id {
+				continue
+			}
+			out[id] = cluster.Placement{
+				SandboxID: id, OwnerNodeID: reservation.target.NodeID, IncarnationID: "inc-" + id,
+				SecretRecipients: append([]string(nil), reservation.secrets.Recipients...),
+				State:            cluster.PlacementStateReserved,
+				ExpiresUnix:      time.Now().Add(reservation.ttl).Unix(),
+			}
+			break
+		}
+	}
+	return out, nil
+}
+
 func (c *createForwardCluster) CancelReservation(_ context.Context, sandboxID string) error {
 	c.cancelCalls = append(c.cancelCalls, sandboxID)
 	return nil
@@ -1200,12 +1220,13 @@ func TestClusterRemoveMemberMapsLifecycleErrors(t *testing.T) {
 
 type orphanOpsStubCluster struct {
 	*cluster.Noop
-	placement   cluster.Placement
-	hasPlace    bool
-	claimCalls  []string
-	claimErr    error
-	deleteCalls []string
-	deleteErr   error
+	placement    cluster.Placement
+	hasPlace     bool
+	claimCalls   []string
+	claimErr     error
+	deleteCalls  []string
+	deleteFences []cluster.Placement
+	deleteErr    error
 }
 
 func (c *orphanOpsStubCluster) PlacementOf(string) (cluster.Placement, bool) {
@@ -1219,6 +1240,14 @@ func (c *orphanOpsStubCluster) ClaimOrphan(_ context.Context, sandboxID string, 
 
 func (c *orphanOpsStubCluster) DeletePlacement(_ context.Context, sandboxID string) error {
 	c.deleteCalls = append(c.deleteCalls, sandboxID)
+	return c.deleteErr
+}
+
+func (c *orphanOpsStubCluster) DeletePlacementExact(_ context.Context, sandboxID, ownerNodeID, incarnationID string) error {
+	c.deleteCalls = append(c.deleteCalls, sandboxID)
+	c.deleteFences = append(c.deleteFences, cluster.Placement{
+		SandboxID: sandboxID, OwnerNodeID: ownerNodeID, IncarnationID: incarnationID,
+	})
 	return c.deleteErr
 }
 
@@ -1289,6 +1318,7 @@ func TestClusterReclaimOrphanLocalRejectsOtherPreviousOwner(t *testing.T) {
 			SandboxID:           "sb-orphan",
 			OwnerState:          cluster.PlacementOwnerStateOrphaned,
 			OrphanedOwnerNodeID: "node-b",
+			IncarnationID:       "inc-orphan",
 			OrphanedUnix:        123,
 		},
 		hasPlace: true,
@@ -1316,6 +1346,7 @@ func TestClusterDeleteOrphanDeletesOnlyOrphanPlacement(t *testing.T) {
 			SandboxID:           "sb-orphan",
 			OwnerState:          cluster.PlacementOwnerStateOrphaned,
 			OrphanedOwnerNodeID: "node-b",
+			IncarnationID:       "inc-orphan",
 		},
 		hasPlace: true,
 	}
@@ -1332,6 +1363,9 @@ func TestClusterDeleteOrphanDeletesOnlyOrphanPlacement(t *testing.T) {
 	}
 	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-orphan" {
 		t.Fatalf("deleteCalls = %+v, want [sb-orphan]", stub.deleteCalls)
+	}
+	if len(stub.deleteFences) != 1 || stub.deleteFences[0].OwnerNodeID != "" || stub.deleteFences[0].IncarnationID != "inc-orphan" {
+		t.Fatalf("delete fences = %+v, want exact orphan incarnation", stub.deleteFences)
 	}
 }
 

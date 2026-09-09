@@ -25,8 +25,9 @@ func TestAssertOwnershipBackfillsFreshPlacement(t *testing.T) {
 
 	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512}
 	local := []LocalSandboxState{{
-		ID:   "sb-fresh",
-		Spec: spec,
+		ID:      "sb-fresh",
+		Spec:    spec,
+		Secrets: PlacementSecrets{IncarnationID: "inc-fresh"},
 		ExposedPorts: map[int]ExposedPortRoute{
 			80:   {Protocol: "http"},
 			5432: {Protocol: "tcp", HostPort: 22432},
@@ -65,7 +66,7 @@ func TestAssertOwnershipBackfillsMissingSpec(t *testing.T) {
 
 	// Plant a spec-less placement via raw raft Apply so we hit the
 	// "placement exists, spec missing" branch deterministically.
-	cmd := command{Op: opPlace, SandboxID: "sb-legacy", OwnerNodeID: "leader"}
+	cmd := command{Op: opPlace, SandboxID: "sb-legacy", OwnerNodeID: "leader", IncarnationID: "inc-legacy"}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("seed opPlace: %v", err)
@@ -77,6 +78,7 @@ func TestAssertOwnershipBackfillsMissingSpec(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-legacy",
 		Spec:         spec,
+		Secrets:      PlacementSecrets{IncarnationID: "inc-legacy"},
 		ExposedPorts: map[int]ExposedPortRoute{443: {Protocol: "tls"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
@@ -104,11 +106,12 @@ func TestAssertOwnershipPromotesSelfReservation(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 
 	cmd := command{
-		Op:          opReserve,
-		SandboxID:   "sb-reserved-local",
-		OwnerNodeID: "leader",
-		Spec:        &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
-		ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		Op:            opReserve,
+		SandboxID:     "sb-reserved-local",
+		OwnerNodeID:   "leader",
+		IncarnationID: "inc-reserved-local",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
+		ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
@@ -124,6 +127,7 @@ func TestAssertOwnershipPromotesSelfReservation(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-reserved-local",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-reserved-local"},
 		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
@@ -228,11 +232,12 @@ func TestAssertOwnershipClaimsOwnOrphanedPlacement(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 
 	place, _ := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-orphaned-self",
-		OwnerNodeID: "leader",
-		OwnerAPIURL: "http://old-leader",
-		Spec:        &models.CreateSandboxRequest{Image: "alpine:old", CPU: 1},
+		Op:            opPlace,
+		SandboxID:     "sb-orphaned-self",
+		OwnerNodeID:   "leader",
+		IncarnationID: "inc-orphaned-self",
+		OwnerAPIURL:   "http://old-leader",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:old", CPU: 1},
 	})
 	if err := c.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
 		t.Fatalf("seed opPlace: %v", err)
@@ -250,6 +255,7 @@ func TestAssertOwnershipClaimsOwnOrphanedPlacement(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-orphaned-self",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine:new", CPU: 2, MemoryMB: 512},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-orphaned-self"},
 		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
@@ -333,6 +339,7 @@ func TestAssertOwnershipIsIdempotent(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-twice",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-twice"},
 		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {

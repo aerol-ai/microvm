@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -73,8 +75,9 @@ func newSecretInternalTestMux(t *testing.T, nodeID string) (*http.ServeMux, *ser
 func mustSealBlob(t *testing.T, cipher *secrets.Cipher, sandboxID, nodeID string, recipients []string) secrets.SecretBlob {
 	t.Helper()
 	bag := secrets.Secrets{Registry: &models.RegistryAuth{Server: "ghcr.io", Username: "u", Password: "p"}}
-	ref := secrets.FormatRef(sandboxID, 1)
-	binding := secrets.SealBinding{SandboxID: sandboxID, Ref: ref, Version: 1, Generation: 1}
+	incarnationID := "inc-current"
+	ref := secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)
+	binding := secrets.SealBinding{SandboxID: sandboxID, IncarnationID: incarnationID, Ref: ref, Version: secrets.RefVersion, Generation: 1}
 	sealed, err := secrets.SealEnvelopeBound(cipher, bag, recipients, binding)
 	if err != nil {
 		t.Fatalf("SealEnvelopeBound: %v", err)
@@ -83,6 +86,7 @@ func mustSealBlob(t *testing.T, cipher *secrets.Cipher, sandboxID, nodeID string
 	return secrets.SecretBlob{
 		Ref:            ref,
 		SandboxID:      sandboxID,
+		IncarnationID:  incarnationID,
 		Version:        1,
 		Recipients:     recipients,
 		SealedPayload:  sealed,
@@ -139,6 +143,40 @@ func TestClusterInternalSecretPutOperatorOK(t *testing.T) {
 	mux.ServeHTTP(rr2, req2)
 	if rr2.Code != http.StatusNoContent {
 		t.Fatalf("idempotent upsert status = %d", rr2.Code)
+	}
+}
+
+func TestClusterInternalSecretPutAcceptsExpandedValidBlob(t *testing.T) {
+	mux, _, cipher := newSecretInternalTestMux(t, "node-a")
+	sandboxID := "sb-large"
+	incarnationID := "inc-current"
+	ref := secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)
+	binding := secrets.SealBinding{
+		SandboxID: sandboxID, IncarnationID: incarnationID, Ref: ref,
+		Version: secrets.RefVersion, Generation: 1,
+	}
+	sealed, err := secrets.SealEnvelopeBound(cipher, secrets.Secrets{
+		Registry: &models.RegistryAuth{Password: strings.Repeat("p", 700<<10)},
+	}, []string{"node-a"}, binding)
+	if err != nil {
+		t.Fatalf("SealEnvelopeBound: %v", err)
+	}
+	body, err := json.Marshal(secrets.SecretBlob{
+		Ref: ref, SandboxID: sandboxID, IncarnationID: incarnationID,
+		Version: secrets.RefVersion, Recipients: []string{"node-a"},
+		SealedPayload: sealed, SealGeneration: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal blob: %v", err)
+	}
+	if len(body) <= apihttp.MaxJSONBodyBytes || len(body) >= clusterSecretBlobMaxBodyBytes {
+		t.Fatalf("test body size = %d, want (%d, %d)", len(body), apihttp.MaxJSONBodyBytes, clusterSecretBlobMaxBodyBytes)
+	}
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodPost, cluster.PublicInternalSecretPath, bytes.NewReader(body)))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expanded valid blob status = %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -229,11 +267,13 @@ func TestClusterInternalSecretHeadAndDeleteLifecycle(t *testing.T) {
 		query string
 		want  int
 	}{
-		{want: http.StatusNoContent},
-		{query: "?min_generation=1", want: http.StatusNoContent},
-		{query: "?min_generation=2", want: http.StatusNotFound},
-		{query: "?min_generation=0", want: http.StatusBadRequest},
-		{query: "?min_generation=bad", want: http.StatusBadRequest},
+		{want: http.StatusBadRequest},
+		{query: "?min_generation=1", want: http.StatusBadRequest},
+		{query: "?min_generation=1&incarnation_id=inc-current", want: http.StatusNoContent},
+		{query: "?min_generation=1&incarnation_id=inc-stale", want: http.StatusNotFound},
+		{query: "?min_generation=2&incarnation_id=inc-current", want: http.StatusNotFound},
+		{query: "?min_generation=0&incarnation_id=inc-current", want: http.StatusBadRequest},
+		{query: "?min_generation=bad&incarnation_id=inc-current", want: http.StatusBadRequest},
 	} {
 		rr = httptest.NewRecorder()
 		mux.ServeHTTP(rr, internalOperatorRequest(http.MethodHead, headPath+tc.query, nil))
@@ -242,7 +282,7 @@ func TestClusterInternalSecretHeadAndDeleteLifecycle(t *testing.T) {
 		}
 	}
 
-	for _, query := range []string{"?generation=0", "?generation=bad"} {
+	for _, query := range []string{"", "?generation=0", "?generation=bad", "?generation=1"} {
 		rr = httptest.NewRecorder()
 		mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath+query, nil))
 		if rr.Code != http.StatusBadRequest {
@@ -250,18 +290,18 @@ func TestClusterInternalSecretHeadAndDeleteLifecycle(t *testing.T) {
 		}
 	}
 	rr = httptest.NewRecorder()
-	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath+"?generation=1", nil))
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath+"?generation=1&incarnation_id=inc-current", nil))
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	rr = httptest.NewRecorder()
-	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodHead, headPath, nil))
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodHead, headPath+"?min_generation=1&incarnation_id=inc-current", nil))
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("post-delete HEAD status = %d", rr.Code)
 	}
 	// Peer DELETE is idempotent and must ACK retries after the row is gone.
 	rr = httptest.NewRecorder()
-	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath, nil))
+	mux.ServeHTTP(rr, internalOperatorRequest(http.MethodDelete, headPath+"?generation=1&incarnation_id=inc-current", nil))
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("idempotent delete status = %d body=%s", rr.Code, rr.Body.String())
 	}

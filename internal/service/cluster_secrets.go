@@ -85,29 +85,38 @@ func secretsFromRequest(req models.CreateSandboxRequest) secrets.Secrets {
 	return bag
 }
 
-func (s *Service) secretsFromRequest(req models.CreateSandboxRequest) secrets.Secrets {
-	return secretsFromRequest(req)
-}
-
 // OpenClusterSecretsForNode resolves a replicated secret handle and merges the
 // decrypted credentials back into a redacted spec. The handle (Ref/Version)
 // is the only carrier — placements never embed sealed bytes.
 //
-// sandboxID is preferred for the audit event; when empty it is parsed from
-// placement.Ref (cluster-secret://sandbox/{id}/vN).
+// sandboxID is preferred for the audit event; when empty it is parsed from the
+// incarnation-scoped placement ref. Every open is fenced to that placement
+// lifetime before the provider can resolve retained ciphertext.
 func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID string, redacted models.CreateSandboxRequest, placement cluster.PlacementSecrets, nodeID string) (out models.CreateSandboxRequest, err error) {
 	if placement.Ref == "" {
 		return redacted, nil
 	}
-	if strings.TrimSpace(sandboxID) == "" {
-		sandboxID = sandboxIDFromSecretRef(placement.Ref)
+	sandboxID = strings.TrimSpace(sandboxID)
+	parsed, parseErr := secrets.ParseRef(placement.Ref)
+	if sandboxID == "" && parseErr == nil {
+		sandboxID = parsed.SandboxID
 	}
 	actor := nodeID
 	if actor == "" {
 		actor = s.auditActor()
 	}
-	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, placement.Ref, actor, correlationIDFromContext(ctx), s.secretIncarnationForSeal(sandboxID))
+	placementIncarnationID := strings.TrimSpace(placement.IncarnationID)
+	auditIncarnationID := placementIncarnationID
+	if auditIncarnationID == "" && parseErr == nil {
+		auditIncarnationID = parsed.IncarnationID
+	}
+	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, placement.Ref, actor, correlationIDFromContext(ctx), auditIncarnationID)
 	defer func() { done(err) }()
+	if parseErr != nil || placement.Version != secrets.RefVersion || placement.SealGeneration <= 0 || placementIncarnationID == "" ||
+		parsed.SandboxID != sandboxID || parsed.IncarnationID != placementIncarnationID || parsed.Version != placement.Version {
+		recordClusterSecretKeyMismatch()
+		return redacted, fmt.Errorf("%w: placement secret handle does not match the current sandbox lifecycle", secrets.ErrVersionMismatch)
+	}
 	p := s.provider()
 	if p == nil {
 		return redacted, errors.New("cluster secret store is not configured")
@@ -129,29 +138,131 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID strin
 	return mergeClusterSecrets(redacted, bag), nil
 }
 
-func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) error {
+func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID, incarnationID string) error {
 	if s == nil {
 		return nil
 	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return errors.New("cluster secret delete requires sandbox_id and incarnation_id")
+	}
 	unlock := lockSecretSandboxOps(sandboxID)
 	defer unlock()
-	// Capture recipients before local delete so durable outbox / fan-out knows
-	// which peers may hold a copy.
-	recipients := s.secretRecipientsForSandbox(ctx, sandboxID)
-	err := s.deleteClusterSecretsOriginator(ctx, sandboxID, recipients)
-	s.maybeAsyncDeleteFanout(sandboxID, recipients)
+	recipients, err := s.secretRecipientsForDelete(ctx, sandboxID, incarnationID)
+	if err != nil {
+		return fmt.Errorf("resolve cluster secret recipients before delete: %w", err)
+	}
+	err = s.deleteClusterSecretsOriginator(ctx, sandboxID, incarnationID, recipients)
+	if err == nil {
+		s.maybeAsyncDeleteFanout(sandboxID, incarnationID)
+	}
 	return err
+}
+
+// DeleteClusterSecretsForAuthoritativePlacement is the rollback finalizer for
+// a failed reserved/promote create that may not have persisted a sandbox row.
+// It retains the placement until this exact lifecycle has been tombed and its
+// remote cleanup journal is durable.
+func (s *Service) DeleteClusterSecretsForAuthoritativePlacement(ctx context.Context, sandboxID string) error {
+	if s == nil {
+		return nil
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	c := s.Cluster()
+	if sandboxID == "" || c == nil {
+		return errors.New("authoritative cluster placement is unavailable for secret cleanup")
+	}
+	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
+	if err != nil {
+		return fmt.Errorf("authoritative placement read before secret cleanup: %w", err)
+	}
+	placement, ok := placements[sandboxID]
+	if !ok || placement.SandboxID != sandboxID {
+		return errors.New("authoritative placement disappeared before secret cleanup")
+	}
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if incarnationID == "" {
+		return errors.New("authoritative placement incarnation_id is required for secret cleanup")
+	}
+	unlock := lockSecretSandboxOps(sandboxID)
+	defer unlock()
+	recipients := secrets.NormalizeRecipients(placement.SecretRecipients)
+	err = s.deleteClusterSecretsOriginator(ctx, sandboxID, incarnationID, recipients)
+	if err == nil {
+		s.maybeAsyncDeleteFanout(sandboxID, incarnationID)
+	}
+	return err
+}
+
+// secretRecipientsForDelete resolves the exact locally retained lifecycle,
+// falling back to its durable PUT outbox when the ciphertext row is already
+// gone. Destruction must not turn a failed local read into an empty set: doing
+// so can skip the remote cleanup journal and permanently strand ciphertext.
+func (s *Service) secretRecipientsForDelete(ctx context.Context, sandboxID, incarnationID string) ([]string, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if s.store == nil {
+		return nil, nil
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return nil, errors.New("local sandbox secret identity is required")
+	}
+	rec, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sandboxID, incarnationID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			if put, putErr := s.store.GetSecretPutOutboxForIncarnation(ctx, sandboxID, incarnationID); putErr != nil {
+				return nil, putErr
+			} else if put != nil {
+				return secrets.NormalizeRecipients(put.Recipients), nil
+			}
+			return s.secretRecipientsFromExactPlacement(ctx, sandboxID, incarnationID)
+		}
+		return nil, err
+	}
+	if rec == nil {
+		return s.secretRecipientsFromExactPlacement(ctx, sandboxID, incarnationID)
+	}
+	parsed, parseErr := secrets.ParseRef(rec.Ref)
+	if parseErr != nil || parsed.SandboxID != strings.TrimSpace(sandboxID) || parsed.IncarnationID == "" {
+		return nil, errors.New("stored cluster secret has an invalid current-format identity")
+	}
+	return secrets.NormalizeRecipients(rec.Recipients), nil
+}
+
+// secretRecipientsFromExactPlacement is the final no-vacuum source when a
+// local ciphertext/PUT row was already removed but the authoritative
+// lifecycle still exists. A different incarnation is never consulted: it may
+// be a replacement reusing the same sandbox ID. Placement lookup failure is
+// fail-closed, while a genuinely absent placement is compatible with retrying
+// after an earlier successful placement removal.
+func (s *Service) secretRecipientsFromExactPlacement(ctx context.Context, sandboxID, incarnationID string) ([]string, error) {
+	if s == nil || !s.cfg.EnableCluster {
+		return nil, nil
+	}
+	placements, err := s.authoritativeSecretPlacements(ctx, []string{sandboxID})
+	if err != nil {
+		return nil, err
+	}
+	placement, ok := placements[sandboxID]
+	if !ok || strings.TrimSpace(placement.IncarnationID) != incarnationID {
+		return nil, nil
+	}
+	return secrets.NormalizeRecipients(placement.SecretRecipients), nil
 }
 
 // deleteClusterSecretsOriginator tombs, deletes local rows, and enqueues the
 // peer-delete outbox in one SQLite transaction when fan-out is enabled and
 // there is at least one non-self recipient. Standalone destroys must not leave
 // forever-pending outbox rows or permanent tombs.
-func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID string, recipients []string) error {
+func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID, incarnationID string, recipients []string) error {
 	if s == nil {
 		return nil
 	}
-	clearSecretFanoutHolders(sandboxID)
+	clearSecretFanoutHoldersForIncarnation(sandboxID, incarnationID)
 	var peers []string
 	if len(recipients) > 0 {
 		// Avoid SelfNodeID() when there is nothing to filter — rollback/test
@@ -159,33 +270,37 @@ func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID 
 		peers = nonSelfRecipients(recipients, s.selfNodeID())
 	}
 	if s.store != nil && len(peers) > 0 {
-		_, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, sandboxID, peers)
+		_, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, sandboxID, incarnationID, peers)
 		return err
 	}
 	if p := s.provider(); p != nil {
-		return p.Delete(ctx, sandboxID)
+		return p.Delete(secrets.ContextWithIncarnationID(ctx, incarnationID), sandboxID)
 	}
 	if s.store != nil {
-		return s.store.DeleteClusterSecretsRowsOnly(ctx, sandboxID)
+		return s.store.DeleteClusterSecretRowsForIncarnation(ctx, sandboxID, incarnationID)
 	}
 	return nil
 }
 
 // DeleteClusterSecretsLocal applies a peer DELETE with generation gating and
 // a local tombstone so delayed PUTs cannot resurrect deleted credentials.
-func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID string, generation int64) error {
+func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
 	if s == nil {
 		return nil
 	}
 	unlock := lockSecretSandboxOps(sandboxID)
 	defer unlock()
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return errors.New("peer secret delete incarnation_id is required")
+	}
 	var err error
 	if s.store != nil {
-		err = s.store.ApplyPeerSecretDelete(ctx, sandboxID, generation)
+		err = s.store.ApplyPeerSecretDelete(ctx, sandboxID, incarnationID, generation)
 	} else if p := s.provider(); p != nil {
-		err = p.Delete(ctx, sandboxID)
+		err = p.Delete(secrets.ContextWithIncarnationID(ctx, incarnationID), sandboxID)
 	}
-	clearSecretFanoutHolders(sandboxID)
+	clearSecretFanoutHoldersForIncarnation(sandboxID, incarnationID)
 	return err
 }
 
@@ -216,7 +331,26 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 		if len(rows) == 0 {
 			return nil
 		}
-		jobs := make(chan string)
+		placementIDs := make([]string, 0, len(rows))
+		for _, rec := range rows {
+			if rec.AwaitingPromotion {
+				placementIDs = append(placementIDs, rec.SandboxID)
+			}
+		}
+		placements, err := s.authoritativeSecretPlacements(sweepCtx, placementIDs)
+		if err != nil {
+			for _, rec := range rows {
+				if rec.AwaitingPromotion {
+					_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), rec.SandboxID, rec.IncarnationID, rec.Generation)
+				}
+			}
+			return err
+		}
+		type deleteJob struct {
+			sandboxID     string
+			incarnationID string
+		}
+		jobs := make(chan deleteJob)
 		var wg sync.WaitGroup
 		var processed atomic.Int64
 		workers := min(deleteReconcileWorkers, len(rows))
@@ -224,18 +358,19 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for sandboxID := range jobs {
-					if _, loaded := deleteReconcileInflight.LoadOrStore(sandboxID, struct{}{}); loaded {
+				for job := range jobs {
+					key := secretDeleteReconcileKey(job.sandboxID, job.incarnationID)
+					if _, loaded := deleteReconcileInflight.LoadOrStore(key, struct{}{}); loaded {
 						continue
 					}
 					select {
 					case deleteReconcileSem <- struct{}{}:
-						s.reconcileSecretDeleteOutboxOnceContext(sweepCtx, sandboxID)
+						s.reconcileSecretDeleteOutboxIncarnationWithPlacements(sweepCtx, job.sandboxID, job.incarnationID, placements)
 						processed.Add(1)
 						<-deleteReconcileSem
-						deleteReconcileInflight.Delete(sandboxID)
+						deleteReconcileInflight.Delete(key)
 					case <-sweepCtx.Done():
-						deleteReconcileInflight.Delete(sandboxID)
+						deleteReconcileInflight.Delete(key)
 						return
 					}
 				}
@@ -243,7 +378,7 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 		}
 		for _, rec := range rows {
 			select {
-			case jobs <- rec.SandboxID:
+			case jobs <- deleteJob{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID}:
 			case <-sweepCtx.Done():
 				close(jobs)
 				wg.Wait()
@@ -382,6 +517,11 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 				if err := s.pruneClusterAuditACL(ctx); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: retained audit ACL prune failed", "err", err)
 				}
+				// Reconcile ciphertext whose lifecycle placement disappeared after
+				// an owner crashed mid-delete. This periodic pass retires only stale
+				// rows; active ciphertext is re-fanned out by boot/rejoin and holder
+				// repair, avoiding a full-fleet retransmit every ten minutes.
+				s.startSecretRetirementScan(ctx)
 			}
 		}
 	}()
@@ -408,10 +548,11 @@ func (s *Service) aliveMemberSet() map[string]struct{} {
 }
 
 const (
-	// secretHolderRefreshBatch caps fair-queue work per tick so a 100k fleet
-	// can still refresh within ACK TTL (90s) across ~3×30s ticks at 4096/tick.
-	// Raise further only with holder-refresh latency budgets in mind — each
-	// job may probe + re-push peers under secretHolderRefreshBudget.
+	// secretHolderRefreshBatch caps fair-queue work per node and tick. At the
+	// 100k/2k-node target, each worker owns only its local placement/replica
+	// partition; 4096 also leaves headroom for temporary skew without turning a
+	// tick into unbounded fan-out. Raise only with refresh latency budgets in
+	// mind — each job may probe + re-push peers under the budget below.
 	secretHolderRefreshBatch   = 4096
 	secretHolderRefreshWorkers = 64
 	secretHolderProbeTimeout   = 5 * time.Second
@@ -441,38 +582,108 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	selfID := s.selfNodeID()
 	alive := s.aliveMemberSet()
 	type job struct {
-		sandboxID string
-		gen       int64
-		peers     []string
-		lastProbe time.Time
+		sandboxID     string
+		incarnationID string
+		gen           int64
+		peers         []string
+		lastProbe     time.Time
+		lastExpand    time.Time
 	}
-	var expandIDs []string
+	var expandJobs []job
 	secretFanoutHolders.Range(func(key, val any) bool {
 		if refreshCtx.Err() != nil {
 			return false
 		}
-		sandboxID, _ := key.(string)
+		holderKey, _ := key.(secretHolderKey)
+		sandboxID := holderKey.sandboxID
 		hs, _ := val.(*holderNodeSet)
-		if sandboxID == "" || hs == nil {
+		if sandboxID == "" || holderKey.incarnationID == "" || hs == nil {
 			return true
 		}
+		var placementGeneration int64
+		if s.cfg.EnableCluster {
+			c := s.Cluster()
+			if c == nil {
+				return false
+			}
+			placement, ok := c.PlacementOf(sandboxID)
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != holderKey.incarnationID {
+				secretFanoutHolders.Delete(holderKey)
+				return true
+			}
+			placementGeneration = placement.SecretSealGeneration
+		}
 		hs.mu.Lock()
-		needs := s.anySecretTargetDead(mapKeys(hs.targets), alive, selfID)
+		holderGeneration := hs.gen
+		lastExpand := hs.lastExpand
+		needs := s.anySecretTargetDead(mapKeys(hs.targets), alive, selfID) ||
+			(placementGeneration > 0 && holderGeneration > placementGeneration)
 		hs.mu.Unlock()
 		if needs {
-			expandIDs = append(expandIDs, sandboxID)
+			expandJobs = append(expandJobs, job{
+				sandboxID: sandboxID, incarnationID: holderKey.incarnationID,
+				gen: holderGeneration, lastExpand: lastExpand,
+			})
 		}
 		return true
 	})
-	sort.Strings(expandIDs)
-	if len(expandIDs) > secretHolderRefreshBatch {
-		expandIDs = expandIDs[:secretHolderRefreshBatch]
+	sort.Slice(expandJobs, func(i, j int) bool {
+		if expandJobs[i].lastExpand.Equal(expandJobs[j].lastExpand) {
+			return expandJobs[i].sandboxID < expandJobs[j].sandboxID
+		}
+		if expandJobs[i].lastExpand.IsZero() {
+			return true
+		}
+		if expandJobs[j].lastExpand.IsZero() {
+			return false
+		}
+		return expandJobs[i].lastExpand.Before(expandJobs[j].lastExpand)
+	})
+	if len(expandJobs) > secretHolderRefreshBatch {
+		expandJobs = expandJobs[:secretHolderRefreshBatch]
+	}
+	expandIDs := make([]string, 0, len(expandJobs))
+	expandIncarnations := make(map[string]string, len(expandJobs))
+	expandAttemptedAt := time.Now()
+	for _, j := range expandJobs {
+		expandIDs = append(expandIDs, j.sandboxID)
+		expandIncarnations[j.sandboxID] = j.incarnationID
+		if val, ok := secretFanoutHolders.Load(secretHolderKey{sandboxID: j.sandboxID, incarnationID: j.incarnationID}); ok {
+			hs := val.(*holderNodeSet)
+			hs.mu.Lock()
+			if hs.gen == j.gen {
+				hs.lastExpand = expandAttemptedAt
+			}
+			hs.mu.Unlock()
+		}
+	}
+	var expandPlacements map[string]cluster.Placement
+	if s.cfg.EnableCluster && len(expandIDs) > 0 {
+		var err error
+		expandPlacements, err = s.authoritativeSecretPlacements(refreshCtx, expandIDs)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("cluster: authoritative placement read for secret reseal sweep failed", "err", err, "sandboxes", len(expandIDs))
+			}
+			expandIDs = nil
+		}
 	}
 	for _, sandboxID := range expandIDs {
 		if refreshCtx.Err() != nil {
 			break
 		}
-		if err := s.expandAndResealDeadSecretTargets(refreshCtx, sandboxID); err != nil && s.logger != nil {
+		var err error
+		if s.cfg.EnableCluster {
+			placement, ok := expandPlacements[sandboxID]
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != expandIncarnations[sandboxID] {
+				clearSecretFanoutHolders(sandboxID)
+				continue
+			}
+			err = s.expandAndResealDeadSecretTargetsForPlacement(refreshCtx, s.Cluster(), placement)
+		} else {
+			err = s.expandAndResealDeadSecretTargets(refreshCtx, sandboxID)
+		}
+		if err != nil && s.logger != nil {
 			s.logger.Warn("cluster: secret recipient expansion/reseal failed",
 				"sandbox_id", sandboxID, "err", err)
 		}
@@ -487,12 +698,25 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		if refreshCtx.Err() != nil {
 			return false
 		}
-		sandboxID, _ := key.(string)
+		holderKey, _ := key.(secretHolderKey)
+		sandboxID := holderKey.sandboxID
 		hs, _ := val.(*holderNodeSet)
-		if sandboxID == "" || hs == nil {
+		if sandboxID == "" || holderKey.incarnationID == "" || hs == nil {
 			return true
 		}
+		if s.cfg.EnableCluster {
+			c := s.Cluster()
+			if c == nil {
+				return false
+			}
+			placement, ok := c.PlacementOf(sandboxID)
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != holderKey.incarnationID {
+				secretFanoutHolders.Delete(holderKey)
+				return true
+			}
+		}
 		hs.mu.Lock()
+		incarnationID := holderKey.incarnationID
 		gen := hs.gen
 		peers := make([]string, 0, len(hs.targets))
 		needsProbe := false
@@ -508,11 +732,11 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		}
 		lastProbe := hs.lastProbe
 		hs.mu.Unlock()
-		if !needsProbe || len(peers) == 0 || gen <= 0 {
+		if !needsProbe || len(peers) == 0 || incarnationID == "" || gen <= 0 {
 			return true
 		}
 		sort.Strings(peers)
-		jobs = append(jobs, job{sandboxID: sandboxID, gen: gen, peers: peers, lastProbe: lastProbe})
+		jobs = append(jobs, job{sandboxID: sandboxID, incarnationID: incarnationID, gen: gen, peers: peers, lastProbe: lastProbe})
 		return true
 	})
 	sort.Slice(jobs, func(i, j int) bool {
@@ -530,8 +754,34 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	if len(jobs) > secretHolderRefreshBatch {
 		jobs = jobs[:secretHolderRefreshBatch]
 	}
+	if s.cfg.EnableCluster && len(jobs) > 0 {
+		ids := make([]string, 0, len(jobs))
+		for _, j := range jobs {
+			ids = append(ids, j.sandboxID)
+		}
+		placements, err := s.authoritativeSecretPlacements(refreshCtx, ids)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("cluster: authoritative placement read for secret holder refresh failed", "err", err, "sandboxes", len(jobs))
+			}
+			return
+		}
+		validated := jobs[:0]
+		for _, j := range jobs {
+			placement, ok := placements[j.sandboxID]
+			placementPeers := nonSelfRecipients(secrets.NormalizeRecipients(placement.SecretRecipients), selfID)
+			sort.Strings(placementPeers)
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != j.incarnationID ||
+				placement.SecretSealGeneration != j.gen || !sameStringSlice(placementPeers, j.peers) {
+				clearSecretFanoutHoldersForIncarnation(j.sandboxID, j.incarnationID)
+				continue
+			}
+			validated = append(validated, j)
+		}
+		jobs = validated
+	}
 	for _, j := range jobs {
-		if v, ok := secretFanoutHolders.Load(j.sandboxID); ok {
+		if v, ok := secretFanoutHolders.Load(secretHolderKey{sandboxID: j.sandboxID, incarnationID: j.incarnationID}); ok {
 			hs := v.(*holderNodeSet)
 			hs.mu.Lock()
 			if hs.gen == j.gen {
@@ -564,7 +814,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			probeCtx, probeCancel := context.WithTimeout(refreshCtx, secretHolderProbeTimeout)
-			holding, probeErr := pusher.ProbeSecretOnPeers(probeCtx, j.sandboxID, j.peers, j.gen)
+			holding, probeErr := pusher.ProbeSecretOnPeers(probeCtx, j.sandboxID, j.incarnationID, j.peers, j.gen)
 			probeCancel()
 			if probeErr != nil {
 				probeFailures.Lock()
@@ -575,7 +825,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 				probeFailures.Unlock()
 			}
 			missing := make([]string, 0)
-			hs := holderSetFor(j.sandboxID)
+			hs := holderSetFor(j.sandboxID, j.incarnationID)
 			hs.mu.Lock()
 			if hs.gen != j.gen && hs.gen != 0 {
 				hs.mu.Unlock()
@@ -610,26 +860,29 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			if len(missing) == 0 || probeErr != nil || s.store == nil {
 				return
 			}
-			rec, loadErr := s.store.GetClusterSecretForSandbox(refreshCtx, j.sandboxID)
+			rec, loadErr := s.store.GetClusterSecretForSandboxIncarnation(refreshCtx, j.sandboxID, j.incarnationID)
 			if loadErr != nil || rec == nil || rec.SealGeneration < j.gen {
+				return
+			}
+			parsed, parseErr := secrets.ParseRef(rec.Ref)
+			if parseErr != nil || parsed.SandboxID != rec.SandboxID || parsed.Version != rec.Version || parsed.IncarnationID != j.incarnationID {
+				recordSecretFanoutFailure()
 				return
 			}
 			blob := secrets.SecretBlob{
 				Ref:            rec.Ref,
 				SandboxID:      rec.SandboxID,
+				IncarnationID:  parsed.IncarnationID,
 				Version:        rec.Version,
 				Recipients:     append([]string(nil), rec.Recipients...),
 				SealedPayload:  rec.SealedPayload,
 				SealGeneration: rec.SealGeneration,
 			}
-			if parsed, parseErr := secrets.ParseRef(rec.Ref); parseErr == nil {
-				blob.IncarnationID = parsed.IncarnationID
-			}
 			pushCtx, pushCancel := context.WithTimeout(refreshCtx, secretHolderProbeTimeout)
 			acked, pushErr := pusher.PushSecretBlobToPeers(pushCtx, blob, missing)
 			pushCancel()
 			if len(acked) > 0 {
-				addSecretHolderNodes(j.sandboxID, j.gen, acked...)
+				addSecretHolderNodes(j.sandboxID, j.incarnationID, j.gen, acked...)
 			}
 			if pushErr != nil {
 				probeFailures.Lock()
@@ -677,18 +930,43 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if c == nil {
 		return nil
 	}
+	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
+	if err != nil {
+		return fmt.Errorf("authoritative placement read before secret reseal: %w", err)
+	}
+	placement, ok := placements[sandboxID]
+	if !ok {
+		if s.cfg.EnableCluster {
+			clearSecretFanoutHolders(sandboxID)
+		}
+		return nil
+	}
+	return s.expandAndResealDeadSecretTargetsForPlacement(ctx, c, placement)
+}
+
+func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Context, c cluster.Client, placement cluster.Placement) error {
+	sandboxID := strings.TrimSpace(placement.SandboxID)
+	if sandboxID == "" || strings.TrimSpace(placement.IncarnationID) == "" {
+		return errors.New("authoritative placement is missing its secret lifecycle identity")
+	}
+	if placement.IsDeleting() {
+		clearSecretFanoutHoldersForIncarnation(sandboxID, placement.IncarnationID)
+		return nil
+	}
 	selfID := s.selfNodeID()
-	placement, hasPlacement := c.PlacementOf(sandboxID)
-	if hasPlacement {
-		ownerID := strings.TrimSpace(placement.OwnerNodeID)
-		// Owner-only reseal. Control-plane / empty-owner secrets may be
-		// coordinated by the Raft leader instead.
-		if ownerID != "" && ownerID != selfID {
-			return nil
-		}
-		if ownerID == "" && c.Leader() != "" && c.Leader() != selfID {
-			return nil
-		}
+	secretsHandle := cluster.PlacementSecrets{
+		Ref: placement.SecretRef, Version: placement.SecretVersion,
+		Recipients:    append([]string(nil), placement.SecretRecipients...),
+		IncarnationID: placement.IncarnationID, SealGeneration: placement.SecretSealGeneration,
+	}
+	ownerID := strings.TrimSpace(placement.OwnerNodeID)
+	// Owner-only reseal. Control-plane / empty-owner secrets may be
+	// coordinated by the Raft leader instead.
+	if ownerID != "" && ownerID != selfID {
+		return nil
+	}
+	if ownerID == "" && c.Leader() != "" && c.Leader() != selfID {
+		return nil
 	}
 
 	// A reseal is a two-phase local/peer/Raft operation. If the process crashed after
@@ -698,8 +976,8 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	// would otherwise never repair this generation split.
 	unlock := lockSecretSandboxOps(sandboxID)
 	defer unlock()
-	if hasPlacement && s.store != nil && placement.SecretSealGeneration > 0 {
-		local, err := s.store.GetClusterSecretForSandbox(ctx, sandboxID)
+	if s.store != nil && placement.SecretSealGeneration > 0 {
+		local, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sandboxID, placement.IncarnationID)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return fmt.Errorf("load local secret generation: %w", err)
 		}
@@ -713,30 +991,32 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	}
 	alive := s.aliveMemberSet()
 
-	hs := holderSetFor(sandboxID)
+	holderIncarnationID := strings.TrimSpace(secretsHandle.IncarnationID)
+	if holderIncarnationID == "" {
+		holderIncarnationID = s.secretIncarnationForSeal(sandboxID)
+	}
+	if holderIncarnationID == "" {
+		return errors.New("current placement secret incarnation is required for reseal")
+	}
+	hs := holderSetFor(sandboxID, holderIncarnationID)
 	hs.mu.Lock()
 	frozen := mapKeys(hs.targets)
 	gen := hs.gen
 	hs.mu.Unlock()
-	if !s.anySecretTargetDead(frozen, alive, selfID) {
-		// Fall back to placement recipients when holder memory is empty but
-		// the FSM still lists dead backups.
-		if hasPlacement && len(placement.SecretRecipients) > 0 {
-			frozen = append([]string(nil), placement.SecretRecipients...)
-			if !s.anySecretTargetDead(frozen, alive, selfID) {
-				return nil
-			}
-		} else if p, ok := c.PlacementOf(sandboxID); ok && len(p.SecretRecipients) > 0 {
-			frozen = append([]string(nil), p.SecretRecipients...)
-			if !s.anySecretTargetDead(frozen, alive, selfID) {
-				return nil
-			}
-		} else {
-			return nil
+	// Raft is the durable source of truth for both retirement and the CAS
+	// generation. Holder memory is only an ACK cache and may be incomplete or
+	// stale after restart; using it here can forget a retired ciphertext copy.
+	if len(placement.SecretRecipients) > 0 {
+		frozen = secrets.NormalizeRecipients(placement.SecretRecipients)
+		if placement.SecretSealGeneration > 0 {
+			gen = placement.SecretSealGeneration
 		}
 	}
+	if !s.anySecretTargetDead(frozen, alive, selfID) {
+		return nil
+	}
 
-	replacements := s.SelectReplacementRecipients(sandboxID, s.SecretRecipientBackupCount())
+	replacements := s.selectReplacementRecipients(sandboxID, ownerID, s.SecretRecipientBackupCount())
 	if len(replacements) == 0 {
 		return fmt.Errorf("no live worker/mixed recipients for reseal")
 	}
@@ -751,9 +1031,15 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if p == nil || s.store == nil {
 		return fmt.Errorf("cluster secret store is not configured")
 	}
-	secretsHandle := c.SecretsOf(sandboxID)
 	if secretsHandle.Ref == "" {
-		rec, err := s.store.GetClusterSecretForSandbox(ctx, sandboxID)
+		loadIncarnationID := strings.TrimSpace(secretsHandle.IncarnationID)
+		if loadIncarnationID == "" {
+			loadIncarnationID = s.secretIncarnationForSeal(sandboxID)
+		}
+		if loadIncarnationID == "" {
+			return errors.New("current placement secret incarnation is required for reseal")
+		}
+		rec, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sandboxID, loadIncarnationID)
 		if err != nil || rec == nil {
 			return fmt.Errorf("no local sealed secret to reseal")
 		}
@@ -761,21 +1047,22 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 		secretsHandle.Version = rec.Version
 		secretsHandle.SealGeneration = rec.SealGeneration
 	}
-	if hasPlacement {
-		if gen <= 0 {
-			gen = placement.SecretSealGeneration
-		}
-		if secretsHandle.IncarnationID == "" {
-			secretsHandle.IncarnationID = placement.IncarnationID
-		}
+	if gen <= 0 {
+		gen = placement.SecretSealGeneration
+	}
+	if secretsHandle.IncarnationID == "" {
+		secretsHandle.IncarnationID = placement.IncarnationID
 	}
 	expectedInc := secretsHandle.IncarnationID
 	if expectedInc == "" {
 		expectedInc = s.secretIncarnationForSeal(sandboxID)
 	}
+	if expectedInc == "" {
+		return errors.New("current placement secret incarnation is required for reseal")
+	}
 	expectedGen := gen
 	if expectedGen <= 0 {
-		if maxGen, maxErr := s.store.MaxClusterSecretSealGeneration(ctx, sandboxID); maxErr == nil {
+		if maxGen, _, maxErr := s.store.ClusterSecretSealGeneration(ctx, sandboxID, expectedInc); maxErr == nil {
 			expectedGen = maxGen
 		}
 	}
@@ -811,6 +1098,9 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if err != nil {
 		return fmt.Errorf("reseal put: %w", err)
 	}
+	if handle.Ref == "" || handle.Version != secrets.RefVersion || handle.SealGeneration <= 0 {
+		return errors.New("reseal provider returned an incomplete current-format handle")
+	}
 	newHandle := cluster.PlacementSecrets{
 		Ref:            handle.Ref,
 		Version:        handle.Version,
@@ -818,18 +1108,21 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 		IncarnationID:  incarnationID,
 		SealGeneration: handle.SealGeneration,
 	}
-	if newHandle.SealGeneration <= 0 {
-		if blobRec, loadErr := s.store.GetClusterSecretForSandbox(ctx, sandboxID); loadErr == nil && blobRec != nil {
-			newHandle.SealGeneration = blobRec.SealGeneration
-		}
-	}
-	blobRec, err := s.store.GetClusterSecretForSandbox(ctx, sandboxID)
+	blobRec, err := s.store.GetClusterSecret(ctx, handle.Ref)
 	if err != nil || blobRec == nil {
 		return fmt.Errorf("load resealed blob: %v", err)
 	}
 	newGen := blobRec.SealGeneration
 	if newGen <= 0 {
-		newGen = expectedGen + 1
+		return errors.New("resealed blob is missing its seal generation")
+	}
+	if handle.Ref != blobRec.Ref || handle.Version != blobRec.Version || handle.SealGeneration != newGen {
+		return fmt.Errorf("reseal provider handle does not match persisted blob (handle ref=%q version=%d generation=%d; blob ref=%q version=%d generation=%d)",
+			handle.Ref, handle.Version, handle.SealGeneration, blobRec.Ref, blobRec.Version, newGen)
+	}
+	parsedBlobRef, parseErr := secrets.ParseRef(blobRec.Ref)
+	if parseErr != nil || parsedBlobRef.SandboxID != blobRec.SandboxID || parsedBlobRef.IncarnationID != incarnationID || parsedBlobRef.Version != blobRec.Version {
+		return errors.New("resealed blob ref does not match the current sandbox lifecycle")
 	}
 	blob := secrets.SecretBlob{
 		Ref:            blobRec.Ref,
@@ -840,13 +1133,11 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 		SealedPayload:  blobRec.SealedPayload,
 		SealGeneration: newGen,
 	}
-	if blob.IncarnationID == "" {
-		if parsed, parseErr := secrets.ParseRef(blobRec.Ref); parseErr == nil {
-			blob.IncarnationID = parsed.IncarnationID
-		}
-	}
 	pusher := s.secretPeerPusher()
 	remoteTargets := nonSelfRecipients(replacements, selfID)
+	if len(remoteTargets) == 0 {
+		return errors.New("no live replacement backup is available for reseal")
+	}
 	if pusher == nil && len(remoteTargets) > 0 {
 		return fmt.Errorf("secret peer transport unavailable; reseal remains staged locally")
 	}
@@ -869,10 +1160,10 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, newHandle, expectedInc, expectedGen); err != nil {
 		return fmt.Errorf("raft promote resealed secret: %w", err)
 	}
-	resetSecretHoldersForGeneration(sandboxID, newGen, selfID)
-	setSecretHolderTargets(sandboxID, newGen, replacements)
+	resetSecretHoldersForGeneration(sandboxID, blob.IncarnationID, newGen, selfID)
+	setSecretHolderTargets(sandboxID, blob.IncarnationID, newGen, replacements)
 	if len(acked) > 0 {
-		addSecretHolderNodes(sandboxID, newGen, acked...)
+		addSecretHolderNodes(sandboxID, blob.IncarnationID, newGen, acked...)
 	}
 	pending := pendingRecipientsAfterAck(replacements, acked, selfID)
 	if len(pending) > 0 {
@@ -890,10 +1181,10 @@ func (s *Service) expandAndResealDeadSecretTargets(ctx context.Context, sandboxI
 		recordSecretPutOutboxFailure()
 	}
 	if len(retired) > 0 {
-		if err := s.store.UpsertSecretDeleteOutbox(ctx, sandboxID, retired, newGen); err != nil {
+		if err := s.store.UpsertSecretDeleteOutbox(ctx, sandboxID, blob.IncarnationID, retired, newGen); err != nil {
 			return fmt.Errorf("journal retired secret recipients: %w", err)
 		}
-		go s.reconcileSecretDeleteOutboxOnce(sandboxID)
+		s.maybeAsyncDeleteFanout(sandboxID, blob.IncarnationID)
 	}
 	s.enqueueSecretFanout(sandboxID, blob, replacements, pusher)
 	return nil
@@ -907,9 +1198,17 @@ func (s *Service) finalizeResealedSecret(ctx context.Context, c cluster.Client, 
 	if local == nil {
 		return nil
 	}
+	parsed, parseErr := secrets.ParseRef(local.Ref)
+	if parseErr != nil || parsed.SandboxID != local.SandboxID || parsed.Version != local.Version || parsed.IncarnationID == "" ||
+		parsed.IncarnationID != strings.TrimSpace(placement.IncarnationID) || local.SealGeneration <= 0 {
+		return errors.New("interrupted reseal has an invalid current-format identity")
+	}
 	selfID := s.selfNodeID()
 	recipients := secrets.NormalizeRecipients(local.Recipients)
 	remoteTargets := nonSelfRecipients(recipients, selfID)
+	if len(nonSelfRecipients(placement.SecretRecipients, selfID)) > 0 && len(remoteTargets) == 0 {
+		return errors.New("interrupted reseal has no remote replacement backup")
+	}
 	pusher := s.secretPeerPusher()
 	var holding []string
 	if len(remoteTargets) > 0 {
@@ -917,7 +1216,7 @@ func (s *Service) finalizeResealedSecret(ctx context.Context, c cluster.Client, 
 			return errors.New("secret peer transport unavailable while finalizing reseal")
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, secretHolderProbeTimeout)
-		holding, _ = pusher.ProbeSecretOnPeers(probeCtx, local.SandboxID, remoteTargets, local.SealGeneration)
+		holding, _ = pusher.ProbeSecretOnPeers(probeCtx, local.SandboxID, placement.IncarnationID, remoteTargets, local.SealGeneration)
 		cancel()
 		if len(holding) == 0 {
 			blob := secrets.SecretBlob{
@@ -945,13 +1244,13 @@ func (s *Service) finalizeResealedSecret(ctx context.Context, c cluster.Client, 
 		return err
 	}
 	if retired := retiredSecretRecipients(placement.SecretRecipients, recipients, selfID); len(retired) > 0 {
-		if err := s.store.UpsertSecretDeleteOutbox(ctx, local.SandboxID, retired, local.SealGeneration); err != nil {
+		if err := s.store.UpsertSecretDeleteOutbox(ctx, local.SandboxID, placement.IncarnationID, retired, local.SealGeneration); err != nil {
 			return err
 		}
-		go s.reconcileSecretDeleteOutboxOnce(local.SandboxID)
+		s.maybeAsyncDeleteFanout(local.SandboxID, placement.IncarnationID)
 	}
-	resetSecretHoldersForGeneration(local.SandboxID, local.SealGeneration, selfID)
-	setSecretHolderTargets(local.SandboxID, local.SealGeneration, recipients)
+	resetSecretHoldersForGeneration(local.SandboxID, placement.IncarnationID, local.SealGeneration, selfID)
+	setSecretHolderTargets(local.SandboxID, placement.IncarnationID, local.SealGeneration, recipients)
 	return nil
 }
 
@@ -1013,7 +1312,22 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 		if len(rows) == 0 {
 			return nil
 		}
-		jobs := make(chan string)
+		placementIDs := make([]string, 0, len(rows))
+		for _, rec := range rows {
+			placementIDs = append(placementIDs, rec.SandboxID)
+		}
+		placements, err := s.authoritativeSecretPlacements(sweepCtx, placementIDs)
+		if err != nil {
+			for _, rec := range rows {
+				_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), rec.SandboxID, rec.IncarnationID, rec.SealGeneration)
+			}
+			return err
+		}
+		type putJob struct {
+			sandboxID     string
+			incarnationID string
+		}
+		jobs := make(chan putJob)
 		var wg sync.WaitGroup
 		var processed atomic.Int64
 		workers := min(deleteReconcileWorkers, len(rows))
@@ -1021,18 +1335,19 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for sandboxID := range jobs {
-					if _, loaded := putReconcileInflight.LoadOrStore(sandboxID, struct{}{}); loaded {
+				for job := range jobs {
+					key := secretDeleteReconcileKey(job.sandboxID, job.incarnationID)
+					if _, loaded := putReconcileInflight.LoadOrStore(key, struct{}{}); loaded {
 						continue
 					}
 					select {
 					case putReconcileSem <- struct{}{}:
-						s.reconcileSecretPutOutboxOnceContext(sweepCtx, sandboxID)
+						s.reconcileSecretPutOutboxIncarnationWithPlacements(sweepCtx, job.sandboxID, job.incarnationID, placements)
 						processed.Add(1)
 						<-putReconcileSem
-						putReconcileInflight.Delete(sandboxID)
+						putReconcileInflight.Delete(key)
 					case <-sweepCtx.Done():
-						putReconcileInflight.Delete(sandboxID)
+						putReconcileInflight.Delete(key)
 						return
 					}
 				}
@@ -1040,7 +1355,7 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 		}
 		for _, rec := range rows {
 			select {
-			case jobs <- rec.SandboxID:
+			case jobs <- putJob{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID}:
 			case <-sweepCtx.Done():
 				close(jobs)
 				wg.Wait()
@@ -1064,16 +1379,76 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 	}
 }
 
-func (s *Service) reconcileSecretPutOutboxOnceContext(parent context.Context, sandboxID string) {
+func (s *Service) reconcileSecretPutOutboxIncarnation(parent context.Context, sandboxID, incarnationID string) {
 	if s == nil || s.store == nil {
 		return
 	}
 	if parent == nil {
 		parent = context.Background()
 	}
-	rec, err := s.store.GetSecretPutOutbox(parent, sandboxID)
+	rec, err := s.store.GetSecretPutOutboxForIncarnation(parent, sandboxID, incarnationID)
 	if err != nil || rec == nil {
 		return
+	}
+	placements, err := s.authoritativeSecretPlacements(parent, []string{sandboxID})
+	if err != nil {
+		_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, incarnationID, rec.SealGeneration)
+		if s.logger != nil {
+			s.logger.Warn("cluster: authoritative placement read for secret put-outbox failed", "sandbox_id", sandboxID, "err", err)
+		}
+		return
+	}
+	s.reconcileSecretPutOutboxRecord(parent, rec, placements)
+}
+
+func (s *Service) reconcileSecretPutOutboxIncarnationWithPlacements(parent context.Context, sandboxID, incarnationID string, placements map[string]cluster.Placement) {
+	rec, err := s.store.GetSecretPutOutboxForIncarnation(parent, sandboxID, incarnationID)
+	if err != nil || rec == nil {
+		return
+	}
+	s.reconcileSecretPutOutboxRecord(parent, rec, placements)
+}
+
+func (s *Service) reconcileSecretPutOutboxRecord(parent context.Context, rec *store.SecretPutOutboxRecord, placements map[string]cluster.Placement) {
+	if s == nil || s.store == nil || rec == nil {
+		return
+	}
+	sandboxID := rec.SandboxID
+	if s.cfg.EnableCluster {
+		if placements == nil {
+			_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+			return
+		}
+		placement, ok := placements[sandboxID]
+		if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != strings.TrimSpace(rec.IncarnationID) {
+			// The put belongs to a lifecycle that is no longer authoritative.
+			// Atomically turn replication work into exact-incarnation deletion
+			// work so remote ciphertext cannot be stranded after ID reuse.
+			peers := nonSelfRecipients(rec.Recipients, s.selfNodeID())
+			if _, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(parent, sandboxID, rec.IncarnationID, peers); err != nil {
+				recordSecretPutOutboxFailure()
+				_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+				if s.logger != nil {
+					s.logger.Warn("cluster: stale secret put-outbox retirement failed", "sandbox_id", sandboxID, "err", err)
+				}
+				return
+			}
+			clearSecretFanoutHoldersForIncarnation(sandboxID, rec.IncarnationID)
+			return
+		}
+		ownerID := strings.TrimSpace(placement.OwnerNodeID)
+		if ownerID == "" {
+			if c := s.Cluster(); c != nil {
+				ownerID = strings.TrimSpace(c.Leader())
+			}
+		}
+		if ownerID == "" || ownerID != s.selfNodeID() {
+			// PUT outboxes are originator work. After reassignment the retained
+			// ciphertext may still be a valid backup, but this node must no longer
+			// push it as though it owned the lifecycle.
+			_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+			return
+		}
 	}
 	selfID := s.selfNodeID()
 	peers := nonSelfRecipients(rec.Recipients, selfID)
@@ -1085,15 +1460,50 @@ func (s *Service) reconcileSecretPutOutboxOnceContext(parent context.Context, sa
 	if pusher == nil {
 		return
 	}
-	blobRec, loadErr := s.store.GetClusterSecretForSandbox(parent, sandboxID)
-	if loadErr != nil || blobRec == nil {
-		// Local row gone (destroy/reseal race) — drop the durable job.
+	blobRec, loadErr := s.store.GetClusterSecretForSandboxIncarnation(parent, sandboxID, rec.IncarnationID)
+	if loadErr != nil && !errors.Is(loadErr, store.ErrNotFound) {
+		recordSecretPutOutboxFailure()
+		_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+		if s.logger != nil {
+			s.logger.Warn("cluster: secret put-outbox local blob load failed",
+				"sandbox_id", sandboxID, "err", loadErr)
+		}
+		return
+	}
+	if errors.Is(loadErr, store.ErrNotFound) || blobRec == nil {
+		// Atomic destroy/reseal removes or supersedes this row in the same TX.
+		// Missing ciphertext with a surviving outbox is therefore corruption or
+		// data loss. Keep the obligation visible instead of falsely ACKing it.
+		recordSecretPutOutboxFailure()
+		_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+		if s.logger != nil {
+			s.logger.Error("cluster: secret put-outbox ciphertext is missing; retaining recovery obligation",
+				"sandbox_id", sandboxID, "seal_generation", rec.SealGeneration)
+		}
+		return
+	}
+	if blobRec.SealGeneration > rec.SealGeneration && rec.SealGeneration > 0 {
+		// Stale outbox after reseal — drop; newer seal owns fan-out.
 		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
 		return
 	}
-	if blobRec.SealGeneration > 0 && rec.SealGeneration > 0 && blobRec.SealGeneration != rec.SealGeneration {
-		// Stale outbox after reseal — drop; newer seal owns fan-out.
-		_ = s.store.DeleteSecretPutOutbox(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+	if blobRec.SealGeneration > 0 && blobRec.SealGeneration < rec.SealGeneration {
+		recordSecretPutOutboxFailure()
+		_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+		if s.logger != nil {
+			s.logger.Error("cluster: secret put-outbox generation is newer than local ciphertext; retaining recovery obligation",
+				"sandbox_id", sandboxID, "outbox_generation", rec.SealGeneration, "local_generation", blobRec.SealGeneration)
+		}
+		return
+	}
+	parsed, parseErr := secrets.ParseRef(blobRec.Ref)
+	if parseErr != nil || parsed.SandboxID != blobRec.SandboxID || parsed.Version != blobRec.Version || parsed.IncarnationID == "" ||
+		parsed.IncarnationID != strings.TrimSpace(rec.IncarnationID) || blobRec.SealGeneration <= 0 || rec.SealGeneration <= 0 {
+		recordSecretPutOutboxFailure()
+		_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+		if s.logger != nil {
+			s.logger.Error("cluster: retained put-outbox with invalid current-format blob identity", "sandbox_id", sandboxID)
+		}
 		return
 	}
 	blob := secrets.SecretBlob{
@@ -1105,17 +1515,12 @@ func (s *Service) reconcileSecretPutOutboxOnceContext(parent context.Context, sa
 		SealedPayload:  blobRec.SealedPayload,
 		SealGeneration: blobRec.SealGeneration,
 	}
-	if blob.IncarnationID == "" {
-		if parsed, parseErr := secrets.ParseRef(blobRec.Ref); parseErr == nil {
-			blob.IncarnationID = parsed.IncarnationID
-		}
-	}
 	ctx, cancel := context.WithTimeout(parent, secretDeleteAttemptTimeout)
 	defer cancel()
 	acked, pushErr := pusher.PushSecretBlobToPeers(ctx, blob, peers)
 	_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
 	if len(acked) > 0 {
-		addSecretHolderNodes(sandboxID, blob.SealGeneration, acked...)
+		addSecretHolderNodes(sandboxID, blob.IncarnationID, blob.SealGeneration, acked...)
 	}
 	if pushErr != nil {
 		recordSecretFanoutFailure()
@@ -1135,43 +1540,67 @@ func (s *Service) reconcileSecretPutOutboxOnceContext(parent context.Context, sa
 	}
 }
 
-func (s *Service) reconcileSecretDeleteOutboxOnce(sandboxID string) {
-	s.reconcileSecretDeleteOutboxOnceContext(context.Background(), sandboxID)
-}
-
-func (s *Service) reconcileSecretDeleteOutboxOnceContext(parent context.Context, sandboxID string) {
+func (s *Service) reconcileSecretDeleteOutboxIncarnation(parent context.Context, sandboxID, incarnationID string) {
 	if s == nil || s.store == nil {
 		return
 	}
 	if parent == nil {
 		parent = context.Background()
 	}
-	rec, err := s.store.GetSecretDeleteOutbox(parent, sandboxID)
+	rec, err := s.store.GetSecretDeleteOutboxForIncarnation(parent, sandboxID, incarnationID)
 	if err != nil || rec == nil {
 		return
 	}
+	var placements map[string]cluster.Placement
+	if rec.AwaitingPromotion {
+		placements, err = s.authoritativeSecretPlacements(parent, []string{sandboxID})
+		if err != nil {
+			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, incarnationID, rec.Generation)
+			if s.logger != nil {
+				s.logger.Warn("cluster: authoritative placement read for staged secret retirement failed", "sandbox_id", sandboxID, "err", err)
+			}
+			return
+		}
+	}
+	s.reconcileSecretDeleteOutboxRecord(parent, rec, placements)
+}
+
+func (s *Service) reconcileSecretDeleteOutboxIncarnationWithPlacements(parent context.Context, sandboxID, incarnationID string, placements map[string]cluster.Placement) {
+	rec, err := s.store.GetSecretDeleteOutboxForIncarnation(parent, sandboxID, incarnationID)
+	if err != nil || rec == nil {
+		return
+	}
+	s.reconcileSecretDeleteOutboxRecord(parent, rec, placements)
+}
+
+func (s *Service) reconcileSecretDeleteOutboxRecord(parent context.Context, rec *store.SecretDeleteOutboxRecord, placements map[string]cluster.Placement) {
+	if s == nil || s.store == nil || rec == nil {
+		return
+	}
+	sandboxID := rec.SandboxID
 	if rec.AwaitingPromotion {
 		// A reseal stages this row before the Raft CAS so a post-CAS crash cannot
 		// forget retired holders. Never act on it while the old placement is still
 		// authoritative; the old replicas may be the only recoverable copies.
-		c := s.Cluster()
-		if c == nil {
-			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+		if placements == nil {
+			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
 			return
 		}
-		placement, ok := c.PlacementOf(sandboxID)
-		if !ok || placement.SecretSealGeneration < rec.Generation {
+		placement, ok := placements[sandboxID]
+		if ok && strings.TrimSpace(placement.IncarnationID) == rec.IncarnationID && placement.SecretSealGeneration < rec.Generation {
 			// Yield this deferred row to the back of the oldest-first queue so
 			// a full batch of unpromoted reseals cannot starve actionable deletes.
-			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+			// A missing placement or a different incarnation makes this old
+			// lifecycle safe to retire immediately.
+			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
 			return
 		}
-		promoted, err := s.store.MarkSecretDeleteOutboxPromoted(parent, sandboxID, rec.Generation)
+		promoted, err := s.store.MarkSecretDeleteOutboxPromoted(parent, sandboxID, rec.IncarnationID, rec.Generation)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Warn("cluster: mark staged secret retirement promoted", "sandbox_id", sandboxID, "err", err)
 			}
-			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
 			return
 		}
 		if !promoted {
@@ -1190,7 +1619,7 @@ func (s *Service) reconcileSecretDeleteOutboxOnceContext(parent context.Context,
 	// pending until an authenticated delete ACK is received.
 	peers := nonSelfRecipients(rec.Recipients, selfID)
 	if len(peers) == 0 {
-		_ = s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, nil, rec.Generation)
+		_ = s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, nil, rec.Generation)
 		return
 	}
 	pusher := s.secretPeerPusher()
@@ -1200,8 +1629,9 @@ func (s *Service) reconcileSecretDeleteOutboxOnceContext(parent context.Context,
 	}
 	ctx, cancel := context.WithTimeout(parent, secretDeleteAttemptTimeout)
 	defer cancel()
-	_, pending, delErr := pusher.DeleteSecretOnPeers(ctx, sandboxID, peers, rec.Generation)
-	_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID)
+	acked, delErr := pusher.DeleteSecretOnPeers(ctx, sandboxID, rec.IncarnationID, peers, rec.Generation)
+	_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
+	pending := pendingRecipientsAfterAck(peers, acked, selfID)
 	if delErr != nil {
 		recordSecretFanoutFailure()
 		if s.logger != nil {
@@ -1209,7 +1639,7 @@ func (s *Service) reconcileSecretDeleteOutboxOnceContext(parent context.Context,
 				"sandbox_id", sandboxID, "pending", len(pending), "err", delErr)
 		}
 	}
-	if err := s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, pending, rec.Generation); err != nil && s.logger != nil {
+	if err := s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, pending, rec.Generation); err != nil && s.logger != nil {
 		s.logger.Warn("cluster: secret delete-outbox recipient update failed",
 			"sandbox_id", sandboxID, "err", err)
 	}
@@ -1256,18 +1686,23 @@ const (
 
 var (
 	deleteReconcileSem      = make(chan struct{}, deleteReconcileWorkers)
-	deleteReconcileInflight sync.Map // sandboxID -> struct{}
+	deleteReconcileInflight sync.Map // sandboxID + incarnationID -> struct{}
 	putReconcileSem         = make(chan struct{}, deleteReconcileWorkers)
-	putReconcileInflight    sync.Map // sandboxID -> struct{}
+	putReconcileInflight    sync.Map // sandboxID + incarnationID -> struct{}
 )
 
-func (s *Service) maybeAsyncDeleteFanout(sandboxID string, recipients []string) {
-	_ = recipients
+func secretDeleteReconcileKey(sandboxID, incarnationID string) string {
+	return strings.TrimSpace(sandboxID) + "\x00" + strings.TrimSpace(incarnationID)
+}
+
+func (s *Service) maybeAsyncDeleteFanout(sandboxID, incarnationID string) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
 		return
 	}
-	if _, loaded := deleteReconcileInflight.LoadOrStore(sandboxID, struct{}{}); loaded {
+	key := secretDeleteReconcileKey(sandboxID, incarnationID)
+	if _, loaded := deleteReconcileInflight.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
 	select {
@@ -1275,12 +1710,12 @@ func (s *Service) maybeAsyncDeleteFanout(sandboxID string, recipients []string) 
 		go func() {
 			defer func() {
 				<-deleteReconcileSem
-				deleteReconcileInflight.Delete(sandboxID)
+				deleteReconcileInflight.Delete(key)
 			}()
-			s.reconcileSecretDeleteOutboxOnce(sandboxID)
+			s.reconcileSecretDeleteOutboxIncarnation(context.Background(), sandboxID, incarnationID)
 		}()
 	default:
-		deleteReconcileInflight.Delete(sandboxID)
+		deleteReconcileInflight.Delete(key)
 		// Saturated: durable outbox remains for the periodic reconciler.
 	}
 }

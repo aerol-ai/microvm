@@ -40,8 +40,8 @@ func MintEgressCapability(key, sandboxID, incarnationID string, expiry time.Time
 	key = strings.TrimSpace(key)
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if key == "" || sandboxID == "" {
-		return "", fmt.Errorf("auditlog: capability requires key and sandbox_id")
+	if key == "" || sandboxID == "" || incarnationID == "" {
+		return "", fmt.Errorf("auditlog: capability requires key, sandbox_id, and incarnation_id")
 	}
 	if expiry.IsZero() {
 		expiry = time.Now().UTC().Add(DefaultCapabilityTTL)
@@ -67,7 +67,7 @@ func ParseAndVerifyEgressCapability(key, capability string, now time.Time) (sand
 	sandboxID = strings.TrimSpace(parts[0])
 	incarnationID = strings.TrimSpace(parts[1])
 	expUnix, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil || sandboxID == "" {
+	if err != nil || sandboxID == "" || incarnationID == "" {
 		return "", "", fmt.Errorf("auditlog: malformed capability")
 	}
 	want := hmacEgressCapability(key, sandboxID, incarnationID, expUnix)

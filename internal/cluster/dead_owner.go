@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -180,12 +181,13 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 			continue
 		}
 		cmd := command{
-			Op:                 opReassign,
-			SandboxID:          id,
-			OwnerNodeID:        newOwnerID,
-			OwnerAPIURL:        newOwnerURL,
-			OwnerDataPlaneHost: newOwnerDataPlaneHost,
-			ReassignCause:      reassignCauseFailover,
+			Op:                    opReassign,
+			SandboxID:             id,
+			OwnerNodeID:           newOwnerID,
+			OwnerAPIURL:           newOwnerURL,
+			OwnerDataPlaneHost:    newOwnerDataPlaneHost,
+			ExpectedIncarnationID: strings.TrimSpace(p.IncarnationID),
+			ReassignCause:         reassignCauseFailover,
 		}
 		if err := c.applyCommand(ctx, cmd); err != nil {
 			c.logger.Warn("cluster: reassign placement failed; will retry next tick",
@@ -275,6 +277,34 @@ func (c *Cluster) reconcileReservations(ctx context.Context) {
 		c.logger.Info("cluster: cancelled expired reservation",
 			"sandbox_id", id, "owner", p.OwnerNodeID)
 	}
+	// A node can fail after committing the distributed delete fence but before
+	// its final opDelete. Expire only fences whose owner is unavailable; a live
+	// owner may still be retrying external artifact cleanup, and removing its
+	// fence would permit ID reuse to race that lifecycle-wide finalizer.
+	for _, p := range c.fsm.expiredDeletingPlacements(now) {
+		if !c.deleteFenceOwnerUnavailable(p.OwnerNodeID) {
+			continue
+		}
+		if err := c.DeletePlacementExact(ctx, p.SandboxID, p.OwnerNodeID, p.IncarnationID); err != nil {
+			c.logger.Warn("cluster: expire abandoned deleting placement failed; will retry next tick",
+				"sandbox_id", p.SandboxID, "owner", p.OwnerNodeID, "err", err)
+			continue
+		}
+		c.logger.Warn("cluster: expired abandoned deleting placement",
+			"sandbox_id", p.SandboxID, "owner", p.OwnerNodeID)
+	}
+}
+
+func (c *Cluster) deleteFenceOwnerUnavailable(ownerNodeID string) bool {
+	ownerNodeID = strings.TrimSpace(ownerNodeID)
+	if c == nil || ownerNodeID == "" {
+		return true
+	}
+	if ownerNodeID == strings.TrimSpace(c.nodeID) || c.gossip == nil {
+		return false
+	}
+	member, ok := c.gossip.lookupMember(ownerNodeID)
+	return !ok || !member.Alive
 }
 
 // pickRecreationTarget runs placement scoring against the replicated spec to

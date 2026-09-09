@@ -112,6 +112,30 @@ type promoteStubCluster struct {
 	deleteCalls   []string
 	deleteErr     error
 	selfNodePanic bool
+	placementInc  string
+}
+
+func (c *promoteStubCluster) PlacementOf(id string) (cluster.Placement, bool) {
+	if strings.TrimSpace(c.placementInc) == "" {
+		return cluster.Placement{}, false
+	}
+	return cluster.Placement{SandboxID: id, OwnerNodeID: c.SelfNodeID(), IncarnationID: c.placementInc}, true
+}
+
+func (c *promoteStubCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement, len(ids))
+	for _, id := range ids {
+		incarnationID := strings.TrimSpace(c.placementInc)
+		if incarnationID == "" {
+			incarnationID = "inc-" + id
+		}
+		out[id] = cluster.Placement{
+			SandboxID: id, OwnerNodeID: c.Noop.SelfNodeID(), IncarnationID: incarnationID,
+			SecretRecipients: []string{c.Noop.SelfNodeID()}, State: cluster.PlacementStateReserved,
+			ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		}
+	}
+	return out, nil
 }
 
 func (c *promoteStubCluster) SelfNodeID() string {
@@ -121,13 +145,16 @@ func (c *promoteStubCluster) SelfNodeID() string {
 	return c.Noop.SelfNodeID()
 }
 
-func (c *promoteStubCluster) RecordPlacement(_ context.Context, id string, _ *models.CreateSandboxRequest, _ cluster.PlacementSecrets) error {
+func (c *promoteStubCluster) RecordPlacement(_ context.Context, id string, _ *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
 	if c.recordDelay > 0 {
 		time.Sleep(c.recordDelay)
 	}
 	// Append before returning err so "errored but committed" (§7.2) is the
 	// default stub behavior — a client-side Raft error after FSM apply.
 	c.recordCalls = append(c.recordCalls, id)
+	if incarnationID := strings.TrimSpace(placementSecrets.IncarnationID); incarnationID != "" {
+		c.placementInc = incarnationID
+	}
 	return c.recordErr
 }
 
@@ -139,6 +166,10 @@ func (c *promoteStubCluster) CancelReservation(_ context.Context, id string) err
 func (c *promoteStubCluster) DeletePlacement(_ context.Context, id string) error {
 	c.deleteCalls = append(c.deleteCalls, id)
 	return c.deleteErr
+}
+
+func (c *promoteStubCluster) DeletePlacementExact(ctx context.Context, id, _, _ string) error {
+	return c.DeletePlacement(ctx, id)
 }
 
 func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster.Client) (*handlers, *storepkg.Store) {
@@ -159,10 +190,12 @@ func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster
 	t.Cleanup(mgr.Close)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, singleNode := stub.(*cluster.Noop)
 	cfg := config.Config{
 		Runtime:           models.RuntimeDocker,
 		ToolboxPort:       4321,
 		EnableCaddy:       false,
+		EnableCluster:     !singleNode,
 		HTTPClientTimeout: time.Second,
 	}
 	caddyClient := caddy.New(cfg)
@@ -372,7 +405,7 @@ func TestCreateSandboxOnSelectedNode_SelfLocalWithoutReservation(t *testing.T) {
 
 func TestCreateSandboxOnSelectedNode_PromoteWithRegistrySecrets(t *testing.T) {
 	rt := &apiRecordingRuntime{}
-	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", ""), placementInc: "inc-test"}
 	h, _ := newClusterCreateHarness(t, rt, stub)
 
 	req := models.CreateSandboxRequest{
@@ -574,8 +607,8 @@ func TestCreateSandboxOnSelectedNode_RecordPlacementDestroyAndDeleteErrors(t *te
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
-	if len(stub.deleteCalls) != 1 {
-		t.Fatalf("DeletePlacement calls = %+v, want one attempt despite errors", stub.deleteCalls)
+	if len(stub.deleteCalls) != 0 {
+		t.Fatalf("DeletePlacement calls = %+v, want none while runtime destruction failed", stub.deleteCalls)
 	}
 }
 
@@ -616,7 +649,7 @@ func TestNormalizeCreateRuntimeForPlacement_TemplateImpliesFirecracker(t *testin
 	}
 }
 
-func TestClusterDestroyWrap_SuccessAndDeletePlacementWarn(t *testing.T) {
+func TestClusterDestroyWrap_RetainsRowWhenPlacementDeleteFails(t *testing.T) {
 	rt := &apiRecordingRuntime{}
 	stub := &promoteStubCluster{
 		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
@@ -626,7 +659,8 @@ func TestClusterDestroyWrap_SuccessAndDeletePlacementWarn(t *testing.T) {
 	now := time.Now().UTC()
 	if err := st.Create(context.Background(), &models.Sandbox{
 		ID: "sb-destroy", Image: "alpine:3.20", Status: models.SandboxStatusStarted,
-		ContainerID: "ctr-sb-destroy", ContainerIP: "10.0.0.9",
+		AuditIncarnationID: "inc-sb-destroy",
+		ContainerID:        "ctr-sb-destroy", ContainerIP: "10.0.0.9",
 		CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root", ToolboxEnabled: true,
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
@@ -638,14 +672,17 @@ func TestClusterDestroyWrap_SuccessAndDeletePlacementWarn(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.clusterDestroyWrap(rr, req)
 
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204; body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
 	if len(rt.destroyIDs) != 1 || rt.destroyIDs[0] != "sb-destroy" {
 		t.Fatalf("destroy ids = %+v, want [sb-destroy]", rt.destroyIDs)
 	}
 	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-destroy" {
 		t.Fatalf("DeletePlacement calls = %+v, want [sb-destroy]", stub.deleteCalls)
+	}
+	if _, err := st.Get(context.Background(), "sb-destroy"); err != nil {
+		t.Fatalf("placement failure removed local reconciliation anchor: %v", err)
 	}
 }
 
@@ -718,7 +755,7 @@ func TestCreateSandboxOnSelectedNode_SelfWinsPromoteRollbackErrors(t *testing.T)
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
-	if len(stub.deleteCalls) != 1 {
-		t.Fatalf("DeletePlacement calls = %+v, want one attempt", stub.deleteCalls)
+	if len(stub.deleteCalls) != 0 {
+		t.Fatalf("DeletePlacement calls = %+v, want none while runtime destruction failed", stub.deleteCalls)
 	}
 }

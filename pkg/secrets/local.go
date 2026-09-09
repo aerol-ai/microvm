@@ -39,7 +39,10 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 	recipients = NormalizeRecipients(recipients)
 	version := RefVersion
 	incarnationID := IncarnationIDFromContext(ctx)
-	ref := FormatRefInc(sandboxID, incarnationID, version)
+	if incarnationID == "" {
+		return Handle{}, fmt.Errorf("cluster secret incarnation id is required")
+	}
+	ref := FormatRef(sandboxID, incarnationID, version)
 	gen, err := p.store.NextSealGeneration(ctx, sandboxID)
 	if err != nil {
 		return Handle{}, err
@@ -85,11 +88,12 @@ func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, no
 	if p == nil || p.store == nil {
 		return Secrets{}, fmt.Errorf("cluster secret store is not configured")
 	}
-	if h.Version != RefVersion {
-		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q version %d unsupported (want %d)", ErrVersionMismatch, h.Ref, h.Version, RefVersion)
-	}
 	if sandboxID == "" {
 		return Secrets{}, fmt.Errorf("%w: cluster secret sandbox id is required", ErrDecryptFailed)
+	}
+	parsed, handleErr := validateCurrentHandle(sandboxID, h)
+	if handleErr != nil {
+		return Secrets{}, handleErr
 	}
 	rec, err := p.store.Get(ctx, h.Ref)
 	if err != nil {
@@ -107,17 +111,15 @@ func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, no
 	if rec.SealGeneration <= 0 {
 		return Secrets{}, fmt.Errorf("%w: cluster secret seal generation is required", ErrDecryptFailed)
 	}
-	if h.SealGeneration <= 0 || h.SealGeneration != rec.SealGeneration {
+	if h.SealGeneration != rec.SealGeneration {
 		return Secrets{}, fmt.Errorf("%w: cluster secret ref %q generation mismatch: placement=%d store=%d", ErrVersionMismatch, h.Ref, h.SealGeneration, rec.SealGeneration)
 	}
 	if p.cipher == nil {
 		return Secrets{}, fmt.Errorf("cluster secrets cipher is not configured")
 	}
-	incarnationID := rec.IncarnationID
-	if incarnationID == "" {
-		if parsed, parseErr := ParseRef(rec.Ref); parseErr == nil {
-			incarnationID = parsed.IncarnationID
-		}
+	incarnationID := strings.TrimSpace(rec.IncarnationID)
+	if incarnationID == "" || parsed.IncarnationID != incarnationID || parsed.Version != rec.Version {
+		return Secrets{}, fmt.Errorf("%w: cluster secret ref/incarnation binding is invalid", ErrDecryptFailed)
 	}
 	binding := SealBinding{
 		SandboxID:     sandboxID,

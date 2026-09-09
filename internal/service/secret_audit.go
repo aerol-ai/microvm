@@ -98,20 +98,25 @@ func (unavailableSecretAuditSink) Emit(SecretAuditEvent) {
 }
 
 type auditWriteReq struct {
-	ev          SecretAuditEvent
-	durable     chan error // when non-nil, report the fsynced event result
-	sync        chan error // when non-nil, writer fsyncs after draining prior work
-	pruneCutoff time.Time  // when non-zero, rewrite file dropping older events
-	pruneDone   chan error
+	ev                    SecretAuditEvent
+	durable               chan error // when non-nil, report the fsynced event result
+	sync                  chan error // when non-nil, writer fsyncs after draining prior work
+	pruneCutoff           time.Time  // when non-zero, rewrite file dropping older events
+	pruneExportCursorPath string     // require cursor to cover the locked file generation/size
+	pruneWitnessedHead    string     // require the locked chain tip to equal this witnessed head
+	pruneDone             chan error
 }
+
+var errSecretAuditPruneGuardChanged = errors.New("secret audit advanced beyond the verified retention guard")
 
 // fileAuditSink appends JSON Lines under {DataDir}/audit/secrets.jsonl via a
 // single writer goroutine. Emit is always non-blocking: a full buffer either
 // drops (open-source) or enqueues onto spillCh (enterprise) for the writer to
 // durable-append — Emit never fsyncs. Gap markers are recorded only when
 // evidence cannot be persisted (drop path or failed spill accept). The writer
-// drains spill before channel work so spilled events land ahead of later
-// in-memory sends.
+// drains one spill segment before channel work so spilled events land ahead of
+// later in-memory sends without allowing a continuously replenished spill file
+// to starve durable requests indefinitely.
 //
 // sendMu serializes producers against Close so Emit/Sync/Prune never send on a
 // closed channel (check-then-send race under -race / daemon shutdown).
@@ -337,9 +342,9 @@ func (s *fileAuditSink) loop() {
 	}
 	for {
 		// Spill file first — durable overflow keeps chronological precedence.
-		if s.drainSpill() {
-			continue
-		}
+		// Then service at least one channel/ticker operation before another
+		// segment so a hot worker spill cannot starve EmitDurable or Sync.
+		_ = s.drainSpill()
 		select {
 		case ev, ok := <-s.spillCh:
 			if !ok {
@@ -372,7 +377,7 @@ func (s *fileAuditSink) loop() {
 			}
 			flushGap()
 			if next.pruneDone != nil {
-				next.pruneDone <- s.pruneLocked(next.pruneCutoff)
+				next.pruneDone <- s.pruneLocked(next.pruneCutoff, next.pruneExportCursorPath, next.pruneWitnessedHead)
 				continue
 			}
 			flushSpill := func() {
@@ -418,7 +423,7 @@ func (s *fileAuditSink) loop() {
 						flushGap()
 						control.sync <- s.syncFile()
 					} else {
-						control.pruneDone <- s.pruneLocked(control.pruneCutoff)
+						control.pruneDone <- s.pruneLocked(control.pruneCutoff, control.pruneExportCursorPath, control.pruneWitnessedHead)
 					}
 					continue
 				}
@@ -610,6 +615,15 @@ func (s *fileAuditSink) syncFile() error {
 // Prune drops events (and gap markers) older than cutoff. Serialized on the
 // writer goroutine so it cannot race appends.
 func (s *fileAuditSink) Prune(cutoff time.Time) error {
+	return s.pruneWithGuards(cutoff, "", "")
+}
+
+// pruneWithGuards atomically rechecks off-node export and witness watermarks
+// against the exact writer-serialized file that will be rewritten. The
+// service performs network I/O before enqueueing this request; these guards
+// close the append-between-check-and-prune window without blocking audit writes
+// on an external service.
+func (s *fileAuditSink) pruneWithGuards(cutoff time.Time, exportCursorPath, witnessedHead string) error {
 	if s == nil {
 		return nil
 	}
@@ -619,7 +633,12 @@ func (s *fileAuditSink) Prune(cutoff time.Time) error {
 		s.sendMu.Unlock()
 		return nil
 	}
-	s.ch <- auditWriteReq{pruneCutoff: cutoff, pruneDone: done}
+	s.ch <- auditWriteReq{
+		pruneCutoff:           cutoff,
+		pruneExportCursorPath: strings.TrimSpace(exportCursorPath),
+		pruneWitnessedHead:    strings.TrimSpace(witnessedHead),
+		pruneDone:             done,
+	}
 	s.sendMu.Unlock()
 	return <-done
 }
@@ -642,10 +661,11 @@ func (s *fileAuditSink) withAuditFileLock(fn func() error) error {
 	return fn()
 }
 
-func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
+func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnessedHead string) error {
 	if cutoff.IsZero() {
 		return nil
 	}
+	pruned := false
 	err := s.withAuditFileLock(func() error {
 		// Pass 1: discover whether anything expires and the last dropped hash.
 		// Retained event bytes are never rewritten (EventHash stays immutable).
@@ -655,6 +675,23 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 				return nil
 			}
 			return err
+		}
+		if exportCursorPath != "" {
+			generation, generationErr := auditFileGeneration(src)
+			if generationErr != nil {
+				_ = src.Close()
+				return generationErr
+			}
+			stat, statErr := src.Stat()
+			if statErr != nil {
+				_ = src.Close()
+				return statErr
+			}
+			cursor := loadAuditExportCursor(exportCursorPath)
+			if stat.Size() > 0 && (cursor.Generation != generation || cursor.Offset < stat.Size()) {
+				_ = src.Close()
+				return errSecretAuditPruneGuardChanged
+			}
 		}
 		scanner := bufio.NewScanner(src)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -666,8 +703,7 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		}
 		droppedLines := 0
 		droppingPrefix := true
-		chainPrev := auditlog.GenesisPrevHash
-		allowChainBreak := false
+		verifier := newSecretAuditChainVerifier()
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -678,24 +714,10 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 				_ = src.Close()
 				return fmt.Errorf("secret audit retention encountered malformed event: %w", err)
 			}
-			storedPrev := strings.TrimSpace(ev.PrevHash)
-			if storedPrev == "" {
-				storedPrev = chainPrev
-			}
-			if ev.EventHash == "" || ev.EventHash != auditlog.HashEvent(storedPrev, ev) {
+			if err := verifier.Add(ev); err != nil {
 				_ = src.Close()
-				return fmt.Errorf("secret audit retention encountered invalid event hash")
+				return fmt.Errorf("secret audit retention encountered invalid chain: %w", err)
 			}
-			if ev.Kind == secretAuditKindRetentionCheckpoint {
-				allowChainBreak = true
-			} else {
-				if storedPrev != chainPrev && !allowChainBreak {
-					_ = src.Close()
-					return fmt.Errorf("secret audit retention encountered broken hash chain")
-				}
-				allowChainBreak = false
-			}
-			chainPrev = ev.EventHash
 			if droppingPrefix && !ev.Time.IsZero() && ev.Time.Before(cutoff) {
 				droppedLines++
 				if ev.EventHash != "" {
@@ -711,6 +733,10 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		if err := scanner.Err(); err != nil {
 			_ = src.Close()
 			return err
+		}
+		if witnessedHead != "" && verifier.prev != witnessedHead {
+			_ = src.Close()
+			return errSecretAuditPruneGuardChanged
 		}
 		if droppedLines == 0 {
 			_ = src.Close()
@@ -839,13 +865,17 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time) error {
 		s.chainEvent = lastKeptEventID
 		s.chainMu.Unlock()
 		persistChainTip(s.tipPath, lastKeptHash, lastKeptEventID)
+		pruned = true
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if s.afterPrune != nil {
-		s.afterPrune()
+	if pruned && s.afterPrune != nil {
+		// Witness I/O is external and may consume its full timeout. Retention is
+		// serialized on the audit writer, so never perform that network call on
+		// the writer goroutine and starve event/spill draining.
+		go s.afterPrune()
 	}
 	return nil
 }
@@ -980,6 +1010,49 @@ func RecomputeChainHead(path string) (head, eventID string, err error) {
 	return head, eventID, err
 }
 
+type secretAuditChainVerifier struct {
+	prev       string
+	allowBreak bool
+	started    bool
+}
+
+func newSecretAuditChainVerifier() secretAuditChainVerifier {
+	return secretAuditChainVerifier{prev: auditlog.GenesisPrevHash}
+}
+
+// Add validates one immutable event in stream order. The only permitted link
+// discontinuity is the first retained event after a retention checkpoint,
+// whose predecessor was deliberately removed. Missing hash fields are never
+// interpreted as a legacy format: this audit format is intentionally one-way.
+func (v *secretAuditChainVerifier) Add(ev SecretAuditEvent) error {
+	if v == nil {
+		return errors.New("secret audit chain verifier unavailable")
+	}
+	storedPrev := strings.TrimSpace(ev.PrevHash)
+	if storedPrev == "" {
+		return errors.New("prev_hash is missing")
+	}
+	if ev.EventHash == "" || ev.EventHash != auditlog.HashEvent(storedPrev, ev) {
+		return errors.New("event_hash mismatch")
+	}
+	if ev.Kind == secretAuditKindRetentionCheckpoint {
+		if v.started {
+			return errors.New("retention checkpoint must be the first event")
+		}
+		v.prev = ev.EventHash
+		v.allowBreak = true
+		v.started = true
+		return nil
+	}
+	if storedPrev != v.prev && !v.allowBreak {
+		return fmt.Errorf("prev_hash mismatch (got %q want %q)", storedPrev, v.prev)
+	}
+	v.prev = ev.EventHash
+	v.allowBreak = false
+	v.started = true
+	return nil
+}
+
 // recomputeChain is the full verify path: returns ordered EventHashes so a
 // witnessed head can be checked for ancestry without trusting the tip sidecar.
 //
@@ -999,10 +1072,9 @@ func recomputeChain(path string) (head, eventID string, hashes []string, err err
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	prev := auditlog.GenesisPrevHash
+	verifier := newSecretAuditChainVerifier()
 	head = auditlog.GenesisPrevHash
 	lineNo := 0
-	allowBreak := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
@@ -1013,35 +1085,12 @@ func recomputeChain(path string) (head, eventID string, hashes []string, err err
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			return "", "", nil, fmt.Errorf("secret audit chain line %d: malformed json: %w", lineNo, err)
 		}
-		storedPrev := strings.TrimSpace(ev.PrevHash)
-		if storedPrev == "" {
-			storedPrev = prev
+		if err := verifier.Add(ev); err != nil {
+			return "", "", nil, fmt.Errorf("secret audit chain line %d: %w", lineNo, err)
 		}
-		wantHash := auditlog.HashEvent(storedPrev, ev)
-		if ev.EventHash == "" || ev.EventHash != wantHash {
-			return "", "", nil, fmt.Errorf("secret audit chain line %d: event_hash mismatch (got %q want %q)", lineNo, ev.EventHash, wantHash)
-		}
-		if strings.TrimSpace(ev.Kind) == secretAuditKindRetentionCheckpoint {
-			// Checkpoint bridges deleted prefix; do not require genesis continuity.
-			head = ev.EventHash
-			eventID = ev.EventID
-			hashes = append(hashes, ev.EventHash)
-			prev = ev.EventHash
-			allowBreak = true
-			continue
-		}
-		if storedPrev != prev {
-			if !allowBreak {
-				return "", "", nil, fmt.Errorf("secret audit chain line %d: prev_hash mismatch (got %q want %q)", lineNo, storedPrev, prev)
-			}
-			// First kept event after a retention_checkpoint may still point at
-			// a deleted predecessor — that discontinuity is expected.
-		}
-		allowBreak = false
 		head = ev.EventHash
 		eventID = ev.EventID
 		hashes = append(hashes, ev.EventHash)
-		prev = ev.EventHash
 	}
 	if err := sc.Err(); err != nil {
 		return "", "", nil, err
@@ -1238,7 +1287,7 @@ func (s *Service) startSecretAuditPruneTicker() {
 	s.secretAuditPruneDone.Add(1)
 	go func() {
 		defer s.secretAuditPruneDone.Done()
-		_ = s.PruneSecretAudit(nil)
+		_ = s.PruneSecretAudit(context.Background())
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
 		for {
@@ -1246,7 +1295,7 @@ func (s *Service) startSecretAuditPruneTicker() {
 			case <-stop:
 				return
 			case <-ticker.C:
-				_ = s.PruneSecretAudit(nil)
+				_ = s.PruneSecretAudit(context.Background())
 			}
 		}
 	}()

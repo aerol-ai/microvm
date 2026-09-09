@@ -399,7 +399,7 @@ func TestListHelpersQueryErrorsByDroppedTables(t *testing.T) {
 			seed: func(t *testing.T, st *Store) {},
 			call: func(st *Store) error {
 				_, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
-					Ref: "r", SandboxID: "sb", Version: 1, SealedPayload: []byte("x"),
+					Ref: "r", SandboxID: "sb", Version: 1, SealedPayload: []byte("x"), SealGeneration: 1,
 				})
 				return err
 			},

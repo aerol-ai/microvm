@@ -121,20 +121,14 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
-		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
-			h.deps.Logger.Warn("e2b metadata rollback failed", "sandbox_id", response.ID, "error", destroyErr)
-		}
-		clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
 	if err := h.deps.Service.CompleteIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint, response.ID, time.Now().UTC(), e2bCreateReplayWindow); err != nil {
-		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
-			h.deps.Logger.Warn("e2b create idempotency rollback failed", "sandbox_id", response.ID, "error", destroyErr)
-		}
-		clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -380,7 +374,6 @@ func (h *handlers) deleteSandbox(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, r.PathValue("id"))
 	w.WriteHeader(http.StatusNoContent)
 }
 

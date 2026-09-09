@@ -756,7 +756,9 @@ func TestServiceHelperErrorBranches(t *testing.T) {
 			owner: cluster.OwnerInfo{NodeID: "peer", APIURL: "http://peer", IsSelf: false},
 		}
 		svc.AttachCluster(stub)
-		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-peer", "reason")
+		svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{
+			SandboxID: "sb-peer", OwnerNodeID: "peer", IncarnationID: "inc-peer",
+		}, "reason")
 		if len(stub.deleteCalls) != 0 {
 			t.Fatalf("foreign placement should not be deleted, got %v", stub.deleteCalls)
 		}

@@ -75,7 +75,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}
 	}
-	auditIncarnationID, err := s.prepareAuditIncarnation(sandboxID, toolboxToken)
+	auditIncarnationID, err := s.prepareAuditIncarnation(ctx, sandboxID, toolboxToken)
 	if err != nil {
 		return nil, err
 	}
@@ -287,6 +287,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if err != nil {
 		return nil, err
 	}
+	stored.AuditIncarnationID = sandbox.AuditIncarnationID
 	return &models.CreateSandboxResponse{
 		Sandbox:       *stored,
 		SSHPrivateKey: privateKeyPEM,

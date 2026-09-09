@@ -30,6 +30,8 @@ const (
 type auditExportCursor struct {
 	Generation string `json:"generation"`
 	Offset     int64  `json:"offset"`
+	Head       string `json:"head"`
+	AllowBreak bool   `json:"allow_break,omitempty"`
 }
 
 var (
@@ -214,10 +216,12 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 	offsetPath := filepath.Join(filepath.Dir(s.secretAuditFile.path), secretAuditExportOffset)
 	cursor := loadAuditExportCursor(offsetPath)
 	var (
-		generation string
-		offset     int64
-		bytesRead  int64
-		events     []json.RawMessage
+		generation         string
+		offset             int64
+		bytesRead          int64
+		events             []json.RawMessage
+		verifiedHead       string
+		verifiedAllowBreak bool
 	)
 	// Snapshot a complete batch under the same flock used by append and prune.
 	// The network call happens after unlock, so slow receivers never stall the
@@ -247,6 +251,12 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 				return err
 			}
 		}
+		verifier := newSecretAuditChainVerifier()
+		if offset > 0 {
+			verifier.prev = cursor.Head
+			verifier.allowBreak = cursor.AllowBreak
+			verifier.started = true
+		}
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
 		for sc.Scan() {
@@ -256,15 +266,24 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 			if len(line) == 0 {
 				continue
 			}
-			if !json.Valid(line) {
-				return errors.New("audit export encountered malformed JSONL")
+			var ev SecretAuditEvent
+			if err := json.Unmarshal(line, &ev); err != nil {
+				return fmt.Errorf("audit export encountered malformed JSONL: %w", err)
+			}
+			if err := verifier.Add(ev); err != nil {
+				return fmt.Errorf("audit export encountered invalid hash chain: %w", err)
 			}
 			events = append(events, append(json.RawMessage(nil), line...))
 			if len(events) >= secretAuditExportBatchMax {
 				break
 			}
 		}
-		return sc.Err()
+		if err := sc.Err(); err != nil {
+			return err
+		}
+		verifiedHead = verifier.prev
+		verifiedAllowBreak = verifier.allowBreak
+		return nil
 	})
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -305,7 +324,9 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 	newOffset := offset + bytesRead
 	// The receiver acknowledges the batch but never controls our local byte
 	// cursor; trusting a remote offset could skip unexported evidence.
-	if err := persistAuditExportCursor(offsetPath, auditExportCursor{Generation: generation, Offset: newOffset}); err != nil {
+	if err := persistAuditExportCursor(offsetPath, auditExportCursor{
+		Generation: generation, Offset: newOffset, Head: verifiedHead, AllowBreak: verifiedAllowBreak,
+	}); err != nil {
 		secretAuditExportFailures.Add(1)
 		return 0, err
 	}
@@ -388,7 +409,8 @@ func loadAuditExportCursor(path string) auditExportCursor {
 	if err != nil {
 		return cursor
 	}
-	if json.Unmarshal(raw, &cursor) != nil || cursor.Offset < 0 || strings.TrimSpace(cursor.Generation) == "" {
+	if json.Unmarshal(raw, &cursor) != nil || cursor.Offset < 0 || strings.TrimSpace(cursor.Generation) == "" ||
+		(cursor.Offset > 0 && strings.TrimSpace(cursor.Head) == "") {
 		return auditExportCursor{}
 	}
 	return cursor

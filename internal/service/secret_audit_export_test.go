@@ -63,8 +63,67 @@ func TestSecretAuditExportIgnoresReceiverControlledCursor(t *testing.T) {
 	if cursor.Offset != st.Size() {
 		t.Fatalf("offset = %d, want locally computed file size %d", cursor.Offset, st.Size())
 	}
-	if cursor.Generation == "" {
-		t.Fatal("export cursor did not record the audit file generation")
+	if cursor.Generation == "" || cursor.Head == "" {
+		t.Fatalf("export cursor did not record verified generation/head: %+v", cursor)
+	}
+}
+
+func TestSecretAuditRetentionWaitsForProgrammaticExporter(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath:                   filepath.Join(t.TempDir(), "state.db"),
+		SecretAuditRetentionDays: 1,
+	}}
+	svc.auditExporter = &maliciousOffsetExporter{}
+	t.Cleanup(svc.CloseSecretAuditSink)
+	sink := svc.secretAuditSink().(*fileAuditSink)
+	if err := sink.EmitDurable(SecretAuditEvent{
+		Time: time.Now().UTC().Add(-48 * time.Hour), EventID: "unexported", SandboxID: "sb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PruneSecretAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "unexported") {
+		t.Fatal("retention removed evidence before the wired exporter advanced")
+	}
+}
+
+func TestSecretAuditPruneGuardsCloseAppendAfterVerificationWindow(t *testing.T) {
+	dir := t.TempDir()
+	svc := &Service{cfg: config.Config{DBPath: filepath.Join(dir, "state.db")}}
+	svc.auditExporter = &maliciousOffsetExporter{}
+	t.Cleanup(svc.CloseSecretAuditSink)
+	sink := svc.secretAuditSink().(*fileAuditSink)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	if err := sink.EmitDurable(SecretAuditEvent{Time: old, EventID: "verified", SandboxID: "sb"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.exportSecretAuditBatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	witnessedHead, _ := sink.chainTip()
+
+	// This append lands after both hypothetical external checks. The writer-side
+	// generation/size and chain-tip guards must preserve both records.
+	if err := sink.EmitDurable(SecretAuditEvent{Time: old, EventID: "after-check", SandboxID: "sb"}); err != nil {
+		t.Fatal(err)
+	}
+	offsetPath := filepath.Join(filepath.Dir(sink.path), secretAuditExportOffset)
+	err := sink.pruneWithGuards(time.Now().UTC().Add(-24*time.Hour), offsetPath, witnessedHead)
+	if !errors.Is(err, errSecretAuditPruneGuardChanged) {
+		t.Fatalf("prune guard error = %v, want changed guard", err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "verified") || !strings.Contains(string(raw), "after-check") {
+		t.Fatalf("guarded prune removed evidence: %s", raw)
 	}
 }
 
@@ -299,9 +358,10 @@ func TestSecretAuditExportCursorSafetyAndMalformedEvidence(t *testing.T) {
 
 	offsetPath := filepath.Join(filepath.Dir(svc.secretAuditFile.path), secretAuditExportOffset)
 	for name, raw := range map[string]string{
-		"malformed": `{`,
-		"negative":  `{"generation":"g","offset":-1}`,
-		"empty_gen": `{"generation":" ","offset":1}`,
+		"malformed":    `{`,
+		"negative":     `{"generation":"g","offset":-1}`,
+		"empty_gen":    `{"generation":" ","offset":1,"head":"h"}`,
+		"missing_head": `{"generation":"g","offset":1}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "cursor")
@@ -333,6 +393,19 @@ func TestSecretAuditExportCursorSafetyAndMalformedEvidence(t *testing.T) {
 	}
 	if _, err := svc.exportSecretAuditBatchOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "malformed JSONL") {
 		t.Fatalf("malformed evidence error = %v", err)
+	}
+	tampered, err := json.Marshal(SecretAuditEvent{
+		Time: time.Now().UTC(), EventID: "tampered", Result: secretAuditResultSuccess,
+		PrevHash: "0", EventHash: strings.Repeat("f", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(svc.secretAuditFile.path, append(tampered, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.exportSecretAuditBatchOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "invalid hash chain") {
+		t.Fatalf("hash-broken evidence error = %v", err)
 	}
 }
 

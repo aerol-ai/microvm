@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -415,13 +416,26 @@ func (c *Cluster) AttachInternalHandler(h http.Handler) {
 // handle the caller produces via service.SealAndDistribute.
 // Passing an empty handle preserves a previously-recorded handle.
 func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
 	expectedIncarnationID := strings.TrimSpace(secrets.IncarnationID)
 	incarnationID := expectedIncarnationID
 	if incarnationID == "" {
-		var err error
-		incarnationID, err = MintIncarnationID()
-		if err != nil {
-			return err
+		if placement, ok := c.fsm.get(sandboxID); ok {
+			incarnationID = strings.TrimSpace(placement.IncarnationID)
+			expectedIncarnationID = incarnationID
+			if incarnationID == "" {
+				return fmt.Errorf("%w: existing placement has no incarnation", ErrIncarnationConflict)
+			}
+		} else {
+			var err error
+			incarnationID, err = MintIncarnationID()
+			if err != nil {
+				return err
+			}
 		}
 	}
 	cmd := command{
@@ -447,6 +461,21 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 // node that was marked dead by gossip but never actually lost its local
 // sandbox.
 func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if strings.TrimSpace(secrets.IncarnationID) == "" {
+		placement, ok := c.fsm.get(sandboxID)
+		if !ok {
+			return ErrUnknownSandbox
+		}
+		secrets.IncarnationID = strings.TrimSpace(placement.IncarnationID)
+	}
+	if secrets.IncarnationID == "" {
+		return fmt.Errorf("%w: claim requires current incarnation", ErrIncarnationConflict)
+	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
 	cmd := command{
 		Op:                   opClaimOrphan,
 		SandboxID:            sandboxID,
@@ -457,6 +486,7 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
 		SecretSealGeneration: secrets.SealGeneration,
+		IncarnationID:        strings.TrimSpace(secrets.IncarnationID),
 		OwnerRef:             secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
@@ -473,13 +503,30 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
+	if strings.TrimSpace(secrets.IncarnationID) == "" {
+		placement, ok := c.fsm.get(sandboxID)
+		if !ok {
+			return ErrUnknownSandbox
+		}
+		secrets.IncarnationID = strings.TrimSpace(placement.IncarnationID)
+	}
+	if secrets.IncarnationID == "" {
+		return fmt.Errorf("%w: spec update requires current incarnation", ErrIncarnationConflict)
+	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
 	cmd := command{
-		Op:                   opUpsertSpec,
-		SandboxID:            sandboxID,
-		Spec:                 spec,
-		SecretRef:            secrets.Ref,
-		SecretVersion:        secrets.Version,
-		SecretSealGeneration: secrets.SealGeneration,
+		Op:                    opUpsertSpec,
+		SandboxID:             sandboxID,
+		Spec:                  spec,
+		SecretRef:             secrets.Ref,
+		SecretVersion:         secrets.Version,
+		SecretSealGeneration:  secrets.SealGeneration,
+		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -489,8 +536,8 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 // expectedIncarnationID / expectedSealGeneration CAS against the live placement.
 func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
 	recipients = normalizeSecretRecipientIDs(recipients)
-	if strings.TrimSpace(sandboxID) == "" || len(recipients) == 0 {
-		return nil
+	if err := validateSecretRecipientUpdate(sandboxID, recipients, secrets, expectedIncarnationID, expectedSealGeneration); err != nil {
+		return err
 	}
 	return c.applyCommand(ctx, command{
 		Op:                     opUpdateSecretRecipients,
@@ -499,6 +546,7 @@ func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID
 		SecretRef:              secrets.Ref,
 		SecretVersion:          secrets.Version,
 		SecretSealGeneration:   secrets.SealGeneration,
+		IncarnationID:          strings.TrimSpace(secrets.IncarnationID),
 		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
 		ExpectedSealGeneration: expectedSealGeneration,
 	})
@@ -560,13 +608,22 @@ func (c *Cluster) AddExposedPort(ctx context.Context, sandboxID string, port int
 	if port <= 0 {
 		return nil
 	}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return c.addExposedPortForIncarnation(ctx, sandboxID, incarnationID, port, route)
+}
+
+func (c *Cluster) addExposedPortForIncarnation(ctx context.Context, sandboxID, incarnationID string, port int, route ExposedPortRoute) error {
 	cmd := command{
-		Op:        opAddExposedPort,
-		SandboxID: sandboxID,
-		Port:      port,
-		Protocol:  route.Protocol,
-		HostPort:  route.HostPort,
-		PublicURL: route.PublicURL,
+		Op:                    opAddExposedPort,
+		SandboxID:             sandboxID,
+		ExpectedIncarnationID: incarnationID,
+		Port:                  port,
+		Protocol:              route.Protocol,
+		HostPort:              route.HostPort,
+		PublicURL:             route.PublicURL,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -576,7 +633,11 @@ func (c *Cluster) RemoveExposedPort(ctx context.Context, sandboxID string, port 
 	if port <= 0 {
 		return nil
 	}
-	cmd := command{Op: opRemoveExposedPort, SandboxID: sandboxID, Port: port}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	cmd := command{Op: opRemoveExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -601,7 +662,16 @@ func (c *Cluster) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	if sandboxID == "" || hostname == "" {
 		return nil
 	}
-	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return c.addCustomDomainForIncarnation(ctx, sandboxID, incarnationID, hostname)
+}
+
+func (c *Cluster) addCustomDomainForIncarnation(ctx context.Context, sandboxID, incarnationID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -612,8 +682,28 @@ func (c *Cluster) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	if sandboxID == "" || hostname == "" {
 		return nil
 	}
-	cmd := command{Op: opRemoveCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	cmd := command{Op: opRemoveCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname}
 	return c.applyCommand(ctx, cmd)
+}
+
+func (c *Cluster) currentPlacementIncarnation(sandboxID string) (string, bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if c == nil || c.fsm == nil || sandboxID == "" {
+		return "", false, nil
+	}
+	placement, ok := c.fsm.get(sandboxID)
+	if !ok {
+		return "", false, nil
+	}
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if incarnationID == "" {
+		return "", true, fmt.Errorf("%w: placement mutation requires current incarnation", ErrIncarnationConflict)
+	}
+	return incarnationID, true, nil
 }
 
 // CustomDomainsOf returns a sorted copy of the hostnames bound to sandboxID,
@@ -632,8 +722,59 @@ func (c *Cluster) ResolveCustomDomain(hostname string) (string, bool) {
 
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
-	cmd := command{Op: opDelete, SandboxID: sandboxID, ExpiresUnix: auditACLExpiryUnix(c.cfg.SecretAuditRetentionDays)}
+	if c == nil {
+		return nil
+	}
+	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
+	if err != nil {
+		return err
+	}
+	placement, ok := placements[strings.TrimSpace(sandboxID)]
+	if !ok {
+		return nil
+	}
+	return c.DeletePlacementExact(ctx, sandboxID, placement.OwnerNodeID, placement.IncarnationID)
+}
+
+func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	expectedOwnerNodeID = strings.TrimSpace(expectedOwnerNodeID)
+	expectedIncarnationID = strings.TrimSpace(expectedIncarnationID)
+	if c == nil || c.fsm == nil || sandboxID == "" {
+		return nil
+	}
+	if expectedIncarnationID == "" {
+		return fmt.Errorf("%w: exact placement delete requires current incarnation", ErrIncarnationConflict)
+	}
+	cmd := command{
+		Op: opDelete, SandboxID: sandboxID,
+		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
+		ExpiresUnix: auditACLExpiryUnix(c.cfg.SecretAuditRetentionDays),
+	}
 	return c.applyCommand(ctx, cmd)
+}
+
+func (c *Cluster) BeginDeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	expectedOwnerNodeID = strings.TrimSpace(expectedOwnerNodeID)
+	expectedIncarnationID = strings.TrimSpace(expectedIncarnationID)
+	if c == nil || c.fsm == nil || sandboxID == "" {
+		return nil
+	}
+	if expectedOwnerNodeID == "" || expectedIncarnationID == "" {
+		return fmt.Errorf("%w: begin placement delete requires owner and incarnation", ErrIncarnationConflict)
+	}
+	return c.applyCommand(ctx, command{
+		Op: opBeginDelete, SandboxID: sandboxID,
+		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true,
+		ExpectedIncarnationID: expectedIncarnationID, ExpiresUnix: placementDeleteExpiryUnix(),
+	})
+}
+
+const placementDeleteFinalizeTTL = 10 * time.Minute
+
+func placementDeleteExpiryUnix() int64 {
+	return time.Now().UTC().Add(placementDeleteFinalizeTTL).Unix()
 }
 
 func auditACLExpiryUnix(retentionDays int) int64 {
@@ -644,15 +785,15 @@ func auditACLExpiryUnix(retentionDays int) int64 {
 }
 
 func (c *Cluster) AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error) {
-	acl, ok, err := c.AuditACLForSandbox(ctx, sandboxID)
+	acl, ok, err := c.AuditACLForSandbox(ctx, sandboxID, "")
 	return acl.OwnerRef, ok, err
 }
 
-func (c *Cluster) AuditACLForSandbox(_ context.Context, sandboxID string) (AuditACL, bool, error) {
+func (c *Cluster) AuditACLForSandbox(_ context.Context, sandboxID, incarnationID string) (AuditACL, bool, error) {
 	if c == nil || c.fsm == nil {
 		return AuditACL{}, false, nil
 	}
-	acl, ok := c.fsm.auditACLForSandbox(sandboxID, time.Now().Unix())
+	acl, ok := c.fsm.auditACLForSandbox(sandboxID, incarnationID, time.Now().Unix())
 	return acl, ok, nil
 }
 
@@ -686,6 +827,11 @@ func (c *Cluster) PruneAuditACL(ctx context.Context, cutoff time.Time) error {
 func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
+	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
 	}
 	incarnationID := strings.TrimSpace(secrets.IncarnationID)
 	if incarnationID == "" {
@@ -728,6 +874,11 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 		if r.TTL <= 0 {
 			return fmt.Errorf("cluster: reservation ttl must be > 0")
 		}
+		if r.Secrets.hasUpdate() {
+			if err := validatePlacementSecretHandle(r.SandboxID, r.Secrets); err != nil {
+				return err
+			}
+		}
 		incarnationID := strings.TrimSpace(r.Secrets.IncarnationID)
 		if incarnationID == "" {
 			var mintErr error
@@ -759,7 +910,18 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 // State == Reserved, so a stale cancel after a successful promote is a
 // no-op. Idempotent; calling on a never-reserved id is also a no-op.
 func (c *Cluster) CancelReservation(ctx context.Context, sandboxID string) error {
-	cmd := command{Op: opCancelReserve, SandboxID: sandboxID}
+	if c == nil || c.fsm == nil {
+		return nil
+	}
+	placement, ok := c.fsm.get(strings.TrimSpace(sandboxID))
+	if !ok || !placement.IsReserved() {
+		return nil
+	}
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: cancel reservation requires current incarnation", ErrIncarnationConflict)
+	}
+	cmd := command{Op: opCancelReserve, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -782,18 +944,28 @@ func (c *Cluster) SetNodeDrainState(ctx context.Context, nodeID string, drained 
 
 // ReassignPlacement moves sandboxID to target via opReassign.
 func (c *Cluster) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
+	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return fmt.Errorf("cluster: ReassignPlacement requires sandbox id")
 	}
 	if target.NodeID == "" {
 		return fmt.Errorf("cluster: ReassignPlacement requires target node id")
 	}
+	placement, ok := c.fsm.get(sandboxID)
+	if !ok {
+		return ErrUnknownSandbox
+	}
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: reassign placement requires current incarnation", ErrIncarnationConflict)
+	}
 	cmd := command{
-		Op:                 opReassign,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
+		Op:                    opReassign,
+		SandboxID:             sandboxID,
+		OwnerNodeID:           target.NodeID,
+		OwnerAPIURL:           target.APIURL,
+		OwnerDataPlaneHost:    target.DataPlaneHost,
+		ExpectedIncarnationID: incarnationID,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -996,6 +1168,10 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			continue
 		}
 		existing, ok := c.fsm.get(st.ID)
+		incarnationID := strings.TrimSpace(st.Secrets.IncarnationID)
+		if ok {
+			incarnationID = strings.TrimSpace(existing.IncarnationID)
+		}
 
 		switch {
 		case !ok:
@@ -1006,12 +1182,12 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			// Replay port intents so the FSM matches local truth.
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1021,12 +1197,12 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				firstErr = err
 			}
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1043,12 +1219,12 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				}
 			}
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1061,7 +1237,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				continue
 			}
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1071,7 +1247,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			// stale row until that row is reaped; the next AssertOwnership
 			// pass after reap succeeds.
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1110,6 +1286,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 	if err := validateCommandRecoverySize(cmd); err != nil {
 		return err
 	}
+	if err := validateCommandLifecycle(cmd); err != nil {
+		return err
+	}
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
@@ -1136,6 +1315,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 		return ErrNotLeader
 	}
 	if err := validateCommandRecoverySize(cmd); err != nil {
+		return err
+	}
+	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
@@ -1379,10 +1561,69 @@ func (c *Cluster) PlacementOf(sandboxID string) (Placement, bool) {
 
 // PlacementsByIDs returns hot placement rows for the given IDs (point lookups).
 func (c *Cluster) PlacementsByIDs(ids []string) map[string]Placement {
-	if c.fsm == nil {
+	if c == nil || c.fsm == nil {
 		return map[string]Placement{}
 	}
 	return c.fsm.placementsByIDs(ids)
+}
+
+// AuthoritativePlacementsByIDs serves destructive reconciliation from the
+// current leader. Followers fetch the bounded result over the same node-pinned
+// mTLS channel used for forwarded Raft operations; they never substitute a
+// potentially stale local FSM read.
+func (c *Cluster) AuthoritativePlacementsByIDs(ctx context.Context, ids []string) (map[string]Placement, error) {
+	if c == nil || c.fsm == nil || c.raft == nil || c.raft.raft == nil {
+		return nil, errors.New("cluster: authoritative placement read unavailable")
+	}
+	if c.raft.raft.State() == raft.Leader {
+		return c.fsm.placementsByIDs(ids), nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, controlPlanePlacementRequestTimeout)
+	defer cancel()
+	leader := c.Leader()
+	if leader == "" {
+		return nil, ErrNotLeader
+	}
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return nil, ErrPeerInternalURLRequired
+	}
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return nil, ErrPeerInternalURLRequired
+	}
+	payload, err := json.Marshal(placementsByIDsRequest{IDs: ids})
+	if err != nil {
+		return nil, fmt.Errorf("cluster: encode authoritative placement read: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(peerInternal, "/")+PublicInternalPlacementsByIDsPath+"?authoritative=true", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("cluster: build authoritative placement read: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	SetPeerNodeIDHeader(req, c.nodeID)
+	if c.patToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	resp, err := c.ClientForPeer(leader).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: authoritative placement read: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return nil, ErrNotLeader
+		}
+		return nil, fmt.Errorf("cluster: authoritative placement read: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var out map[string]Placement
+	if err := decodeControlPlaneJSON(resp.Body, &out); err != nil {
+		return nil, fmt.Errorf("cluster: decode authoritative placement read: %w", err)
+	}
+	if out == nil {
+		out = map[string]Placement{}
+	}
+	return out, nil
 }
 
 // PlacementVersion returns the FSM's monotonic apply counter — bumps on

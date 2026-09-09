@@ -94,15 +94,30 @@ func (n *Noop) AddCustomDomain(ctx context.Context, sandboxID, hostname string) 
 func (n *Noop) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
 	return nil
 }
-func (n *Noop) CustomDomainsOf(sandboxID string) []string                   { return nil }
-func (n *Noop) ResolveCustomDomain(hostname string) (string, bool)          { return "", false }
-func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error { return nil }
+func (n *Noop) CustomDomainsOf(sandboxID string) []string          { return nil }
+func (n *Noop) ResolveCustomDomain(hostname string) (string, bool) { return "", false }
+
+func (n *Noop) DeletePlacement(_ context.Context, sandboxID string) error {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	n.releaseVolumeAttachmentsForSandboxLocked(strings.TrimSpace(sandboxID))
+	return nil
+}
+
+func (n *Noop) DeletePlacementExact(_ context.Context, sandboxID, _, incarnationID string) error {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	n.releaseVolumeAttachmentsForIncarnationLocked(strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID))
+	return nil
+}
+
+func (n *Noop) BeginDeletePlacementExact(context.Context, string, string, string) error { return nil }
 
 func (n *Noop) AuditOwnerRef(context.Context, string) (string, bool, error) {
 	return "", false, nil
 }
 
-func (n *Noop) AuditACLForSandbox(context.Context, string) (AuditACL, bool, error) {
+func (n *Noop) AuditACLForSandbox(context.Context, string, string) (AuditACL, bool, error) {
 	return AuditACL{}, false, nil
 }
 
@@ -232,15 +247,16 @@ func (n *Noop) PutVolumeAttachments(_ context.Context, attachments []models.Volu
 		tenant := strings.TrimSpace(a.Tenant)
 		volumeID := strings.TrimSpace(a.VolumeID)
 		sandboxID := strings.TrimSpace(a.SandboxID)
+		incarnationID := strings.TrimSpace(a.IncarnationID)
 		target := strings.TrimSpace(a.Target)
 		source := strings.TrimSpace(a.Source)
-		if tenant == "" || volumeID == "" || sandboxID == "" || target == "" || source == "" {
+		if tenant == "" || volumeID == "" || sandboxID == "" || incarnationID == "" || target == "" || source == "" {
 			return ErrUnknownVolume
 		}
 		if _, ok := n.volumes[volumeKey(tenant, volumeID)]; !ok {
 			return ErrUnknownVolume
 		}
-		a.Tenant, a.VolumeID, a.SandboxID, a.Target, a.Source = tenant, volumeID, sandboxID, target, source
+		a.Tenant, a.VolumeID, a.SandboxID, a.IncarnationID, a.Target, a.Source = tenant, volumeID, sandboxID, incarnationID, target, source
 		if a.CreatedAt.IsZero() {
 			a.CreatedAt = time.Now().UTC()
 		}
@@ -249,10 +265,10 @@ func (n *Noop) PutVolumeAttachments(_ context.Context, attachments []models.Volu
 	return nil
 }
 
-func (n *Noop) DeleteVolumeAttachmentsForSandbox(_ context.Context, sandboxID string) error {
+func (n *Noop) DeleteVolumeAttachmentsForSandbox(_ context.Context, sandboxID, incarnationID string) error {
 	n.volMu.Lock()
 	defer n.volMu.Unlock()
-	n.releaseVolumeAttachmentsForSandboxLocked(strings.TrimSpace(sandboxID))
+	n.releaseVolumeAttachmentsForIncarnationLocked(strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID))
 	return nil
 }
 
@@ -307,11 +323,25 @@ func (n *Noop) releaseVolumeAttachmentKeyLocked(key string, a models.VolumeAttac
 }
 
 func (n *Noop) releaseVolumeAttachmentsForSandboxLocked(sandboxID string) {
+	n.releaseVolumeAttachmentsLocked(sandboxID, "")
+}
+
+func (n *Noop) releaseVolumeAttachmentsForIncarnationLocked(sandboxID, incarnationID string) {
+	if incarnationID == "" {
+		return
+	}
+	n.releaseVolumeAttachmentsLocked(sandboxID, incarnationID)
+}
+
+func (n *Noop) releaseVolumeAttachmentsLocked(sandboxID, incarnationID string) {
 	if sandboxID == "" {
 		return
 	}
 	for key := range n.volAttachmentsBySandbox[sandboxID] {
 		if a, ok := n.volAttachments[key]; ok {
+			if incarnationID != "" && strings.TrimSpace(a.IncarnationID) != incarnationID {
+				continue
+			}
 			n.releaseVolumeAttachmentKeyLocked(key, a)
 		}
 	}
@@ -378,6 +408,10 @@ func (n *Noop) PlacementOf(sandboxID string) (Placement, bool) { return Placemen
 // PlacementsByIDs is empty in single-node mode (no FSM).
 func (n *Noop) PlacementsByIDs(ids []string) map[string]Placement {
 	return map[string]Placement{}
+}
+
+func (n *Noop) AuthoritativePlacementsByIDs(context.Context, []string) (map[string]Placement, error) {
+	return map[string]Placement{}, nil
 }
 
 // PlacementVersion always returns 0 in single-node mode — there's no FSM and

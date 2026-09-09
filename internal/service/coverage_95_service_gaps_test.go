@@ -114,8 +114,11 @@ func TestDeletePlatformVolumeInUseAndByNameMiss(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.store.UpsertSandboxAuditACL(ctx, "sb-vol", "", "inc-sb-vol"); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.volumeMeta().PutAttachments(ctx, []models.VolumeAttachment{{
-		VolumeID: v.ID, SandboxID: "sb-vol", Target: "/data", Tenant: v.Tenant, Source: v.Source,
+		VolumeID: v.ID, SandboxID: "sb-vol", IncarnationID: "inc-sb-vol", Target: "/data", Tenant: v.Tenant, Source: v.Source,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +147,7 @@ func TestApplyInFluxRouteHelpers(t *testing.T) {
 func TestSealClusterSecretEnvelopeRandFailure(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
 	setRandReader(t, &scriptedRandReader{errs: []error{errors.New("no entropy")}})
-	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", 1), Version: 1, Generation: 1}
 	if _, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{}`), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected rand failure")
 	}

@@ -8,7 +8,7 @@ import (
 
 func TestClusterAuditACLReadWrappersAndExpiry(t *testing.T) {
 	ctx := context.Background()
-	if acl, ok, err := (*Cluster)(nil).AuditACLForSandbox(ctx, "sb"); err != nil || ok || acl.SandboxID != "" || acl.OwnerRef != "" {
+	if acl, ok, err := (*Cluster)(nil).AuditACLForSandbox(ctx, "sb", ""); err != nil || ok || acl.SandboxID != "" || acl.OwnerRef != "" {
 		t.Fatalf("nil cluster ACL = %+v %v %v", acl, ok, err)
 	}
 	if owner, ok, err := (*Cluster)(nil).AuditOwnerRef(ctx, "sb"); err != nil || ok || owner != "" {
@@ -16,17 +16,18 @@ func TestClusterAuditACLReadWrappersAndExpiry(t *testing.T) {
 	}
 
 	fsm := newPlacementFSM()
-	fsm.auditACLs["sb"] = AuditACL{
+	fsm.auditACLs[auditACLKey("sb", "inc-a")] = AuditACL{
 		SandboxID: "sb", OwnerRef: "tenant-a", IncarnationID: "inc-a",
-		AuditNodeIDs: []string{"node-a", "node-b"}, ExpiresUnix: time.Now().Add(time.Hour).Unix(),
+		AuditNodeIDs: []string{"node-a", "node-b"}, ExpiresUnix: time.Now().Add(time.Hour).Unix(), RetainedVersion: 1,
 	}
+	fsm.rebuildAuditACLLatestLocked()
 	c := &Cluster{fsm: fsm}
-	acl, ok, err := c.AuditACLForSandbox(ctx, " sb ")
+	acl, ok, err := c.AuditACLForSandbox(ctx, " sb ", "")
 	if err != nil || !ok || acl.OwnerRef != "tenant-a" || acl.IncarnationID != "inc-a" {
 		t.Fatalf("cluster ACL = %+v %v %v", acl, ok, err)
 	}
 	acl.AuditNodeIDs[0] = "mutated"
-	again, ok, err := c.AuditACLForSandbox(ctx, "sb")
+	again, ok, err := c.AuditACLForSandbox(ctx, "sb", "inc-a")
 	if err != nil || !ok || again.AuditNodeIDs[0] != "node-a" {
 		t.Fatalf("cluster ACL was not cloned: %+v %v %v", again, ok, err)
 	}

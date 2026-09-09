@@ -183,20 +183,24 @@ func Open(path string) (*Store, error) {
 		// generation bumps on each originator delete; durable peer cleanup is
 		// tracked in cluster_secret_delete_outbox (boot reconciler).
 		`CREATE TABLE IF NOT EXISTS cluster_secret_tombs (
-			sandbox_id TEXT PRIMARY KEY,
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL,
 			deleted_at DATETIME NOT NULL,
-			generation INTEGER NOT NULL DEFAULT 1
+			generation INTEGER NOT NULL DEFAULT 1,
+			PRIMARY KEY (sandbox_id, incarnation_id)
 		);`,
 		// Durable delete outbox: survives daemon crash; boot reconciler retries
 		// peer DELETE until ACK'd, then drops the row (tomb remains until reseal).
 		`CREATE TABLE IF NOT EXISTS cluster_secret_delete_outbox (
-			sandbox_id TEXT PRIMARY KEY,
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL,
 			recipients_json TEXT NOT NULL DEFAULT '[]',
 			generation INTEGER NOT NULL DEFAULT 1,
 			awaiting_promotion INTEGER NOT NULL DEFAULT 0,
 			attempts INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id)
 		);`,
 		// Durable create fan-out outbox: when the in-memory create-path queue is
 		// saturated, remaining peer PUTs are persisted and retried by the same
@@ -216,6 +220,7 @@ func Open(path string) (*Store, error) {
 			sandbox_id TEXT NOT NULL,
 			incarnation_id TEXT NOT NULL DEFAULT '',
 			owner_ref TEXT NOT NULL DEFAULT '',
+			established_seq INTEGER NOT NULL,
 			updated_at DATETIME NOT NULL,
 			PRIMARY KEY (sandbox_id, incarnation_id)
 		);`,
@@ -312,8 +317,11 @@ func Open(path string) (*Store, error) {
 			ON cluster_secret_tombs(deleted_at, sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_audit_acl_updated
 			ON sandbox_audit_acl(updated_at, sandbox_id);`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_audit_acl_incarnation
-			ON sandbox_audit_acl(sandbox_id, incarnation_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_audit_acl_latest
+			ON sandbox_audit_acl(sandbox_id, established_seq DESC);`,
+		// The table primary key already indexes (sandbox_id, incarnation_id),
+		// so remove the redundant duplicate index from earlier hardening drafts.
+		`DROP INDEX IF EXISTS idx_sandbox_audit_acl_incarnation;`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
@@ -572,6 +580,7 @@ func Open(path string) (*Store, error) {
 				tenant TEXT NOT NULL,
 				volume_id TEXT NOT NULL,
 				sandbox_id TEXT NOT NULL,
+				incarnation_id TEXT NOT NULL,
 				target TEXT NOT NULL,
 				source TEXT NOT NULL,
 				created_at DATETIME NOT NULL,
@@ -760,6 +769,10 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN clone_generation TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_digest TEXT NOT NULL DEFAULT '';`,
+		// Exact live-lifecycle pointer. Retained audit ACLs intentionally allow
+		// many incarnations per sandbox ID, so timestamp ordering is not a safe
+		// substitute for this association (wall clocks can move backwards).
+		`ALTER TABLE sandboxes ADD COLUMN audit_incarnation_id TEXT NOT NULL DEFAULT '';`,
 		// Selective-egress CIDR policy (E2B network.allowOut / denyOut). JSON
 		// arrays so the start/reconcile paths can reinstall the host-firewall
 		// rules after a restart, the same way network_block_all is reapplied.
@@ -789,9 +802,6 @@ func Open(path string) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
-		// Reseal retirement is staged atomically with the local encrypted row,
-		// then made eligible only after the matching Raft generation commits.
-		`ALTER TABLE cluster_secret_delete_outbox ADD COLUMN awaiting_promotion INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -868,6 +878,7 @@ func validateCurrentSecretSchema(db *sql.DB) error {
 	}
 	defer rows.Close()
 	hasSealedToolbox := false
+	hasAuditIncarnation := false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
@@ -880,6 +891,8 @@ func validateCurrentSecretSchema(db *sql.DB) error {
 			return fmt.Errorf("unsupported plaintext secret schema: sandboxes.%s is present", name)
 		case "toolbox_token_sealed":
 			hasSealedToolbox = true
+		case "audit_incarnation_id":
+			hasAuditIncarnation = true
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -887,6 +900,9 @@ func validateCurrentSecretSchema(db *sql.DB) error {
 	}
 	if !hasSealedToolbox {
 		return errors.New("unsupported secret schema: sandboxes.toolbox_token_sealed is required")
+	}
+	if !hasAuditIncarnation {
+		return errors.New("unsupported secret schema: sandboxes.audit_incarnation_id is required")
 	}
 	// The hardening release is intentionally one-way. CREATE TABLE IF NOT
 	// EXISTS cannot repair older table shapes, so reject them here instead of
@@ -898,8 +914,15 @@ func validateCurrentSecretSchema(db *sql.DB) error {
 			"seal_generation": 0,
 		},
 		"cluster_secret_tombs": {
-			"sandbox_id": 1,
-			"generation": 0,
+			"sandbox_id":     1,
+			"incarnation_id": 2,
+			"generation":     0,
+		},
+		"cluster_secret_delete_outbox": {
+			"sandbox_id":         1,
+			"incarnation_id":     2,
+			"generation":         0,
+			"awaiting_promotion": 0,
 		},
 		"cluster_secret_put_outbox": {
 			"sandbox_id":      1,
@@ -908,9 +931,10 @@ func validateCurrentSecretSchema(db *sql.DB) error {
 			"recipients_json": 0,
 		},
 		"sandbox_audit_acl": {
-			"sandbox_id":     1,
-			"incarnation_id": 2,
-			"owner_ref":      0,
+			"sandbox_id":      1,
+			"incarnation_id":  2,
+			"owner_ref":       0,
+			"established_seq": 0,
 		},
 	} {
 		if err := validateRequiredTableShape(db, table, required); err != nil {
@@ -989,8 +1013,10 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
 		return err
 	}
-	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
-		return err
+	if strings.TrimSpace(sandbox.AuditIncarnationID) != "" {
+		if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit sandbox create: %w", err)
@@ -1026,8 +1052,10 @@ func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox
 	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
 		return err
 	}
-	if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
-		return err
+	if strings.TrimSpace(sandbox.AuditIncarnationID) != "" {
+		if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit create+env tx: %w", err)
@@ -1073,8 +1101,8 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			tenant_id, audit_incarnation_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -1131,6 +1159,7 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
+		strings.TrimSpace(sandbox.AuditIncarnationID),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -1237,7 +1266,34 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		return err
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	var exec dbExecer = s.db
+	var tx *sql.Tx
+	if incarnationID != "" {
+		tx, err = s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin sandbox upsert: %w", err)
+		}
+		defer tx.Rollback()
+		exec = tx
+
+		// Upsert may insert a row, but it must not silently replace the durable
+		// lifecycle identity of an existing sandbox.
+		var currentIncarnationID string
+		lookupErr := tx.QueryRowContext(ctx, `
+			SELECT audit_incarnation_id
+			FROM sandboxes
+			WHERE id = ?
+		`, sandbox.ID).Scan(&currentIncarnationID)
+		if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+			return fmt.Errorf("resolve live sandbox audit incarnation: %w", lookupErr)
+		}
+		if lookupErr == nil && strings.TrimSpace(currentIncarnationID) != "" && strings.TrimSpace(currentIncarnationID) != incarnationID {
+			return errors.New("upsert sandbox: sandbox incarnation conflict")
+		}
+	}
+
+	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
@@ -1257,8 +1313,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			tenant_id, audit_incarnation_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -1308,7 +1364,11 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			wasm_registry_digest = excluded.wasm_registry_digest,
 			owner_ref = excluded.owner_ref,
 			fleet_suspended = excluded.fleet_suspended,
-			tenant_id = excluded.tenant_id
+			tenant_id = excluded.tenant_id,
+			audit_incarnation_id = CASE
+				WHEN excluded.audit_incarnation_id <> '' THEN excluded.audit_incarnation_id
+				ELSE sandboxes.audit_incarnation_id
+			END
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -1365,12 +1425,21 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
+		incarnationID,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
 			return ErrSandboxNameConflict
 		}
 		return fmt.Errorf("upsert sandbox: %w", err)
+	}
+	if tx != nil {
+		if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, incarnationID, time.Now().UTC()); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit sandbox upsert: %w", err)
+		}
 	}
 	return nil
 }
@@ -1395,7 +1464,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -1443,7 +1512,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -1511,7 +1580,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -1563,7 +1632,7 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -3910,6 +3979,7 @@ func (s *Store) scanSandbox(scanner interface {
 		&sandbox.OwnerRef,
 		&fleetSuspended,
 		&sandbox.TenantID,
+		&sandbox.AuditIncarnationID,
 	)
 	if err != nil {
 		return nil, err
@@ -4282,7 +4352,9 @@ type ClusterSecretRecord struct {
 }
 
 // PutClusterSecret upserts a sealed row and returns the seal_generation that
-// landed (allocated when the caller left SealGeneration <= 0).
+// landed. The caller must allocate the generation before sealing because it is
+// authenticated inside the envelope; synthesizing one here would make the row
+// identity disagree with its ciphertext binding.
 func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (int64, error) {
 	rec.Ref = strings.TrimSpace(rec.Ref)
 	rec.SandboxID = strings.TrimSpace(rec.SandboxID)
@@ -4295,8 +4367,15 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 	if rec.Version <= 0 {
 		return 0, errors.New("cluster secret version must be positive")
 	}
+	if rec.SealGeneration <= 0 {
+		return 0, errors.New("cluster secret seal generation must be positive")
+	}
 	if len(rec.SealedPayload) == 0 {
 		return 0, errors.New("cluster secret sealed payload is required")
+	}
+	parsedRef, err := secrets.ParseRef(rec.Ref)
+	if err != nil || parsedRef.SandboxID != rec.SandboxID || parsedRef.Version != rec.Version || strings.TrimSpace(parsedRef.IncarnationID) == "" {
+		return 0, errors.New("cluster secret ref must match sandbox_id, version, and a non-empty incarnation_id")
 	}
 	recipientsJSON, err := json.Marshal(rec.Recipients)
 	if err != nil {
@@ -4316,22 +4395,21 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 	}
 	defer tx.Rollback()
 
-	if rec.SealGeneration <= 0 {
-		gen, genErr := nextClusterSecretSealGenerationTx(ctx, tx, rec.SandboxID)
-		if genErr != nil {
-			return 0, fmt.Errorf("next seal generation: %w", genErr)
-		}
-		rec.SealGeneration = gen
-	}
-
 	// Reject out-of-order peer fan-out that would downgrade a newer seal.
 	// Returning nil here used to look like an ACK to PushSecretBlobToPeers;
 	// peers must see a typed error → non-2xx so the originator keeps outbox.
 	var existingGen sql.NullInt64
+	var existingSandboxID string
 	var existingPayload []byte
-	_ = tx.QueryRowContext(ctx, `
-		SELECT seal_generation, sealed_payload FROM cluster_secrets WHERE ref = ?
-	`, rec.Ref).Scan(&existingGen, &existingPayload)
+	scanErr := tx.QueryRowContext(ctx, `
+		SELECT seal_generation, sandbox_id, sealed_payload FROM cluster_secrets WHERE ref = ?
+	`, rec.Ref).Scan(&existingGen, &existingSandboxID, &existingPayload)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read existing cluster secret generation: %w", scanErr)
+	}
+	if existingGen.Valid && existingSandboxID != rec.SandboxID {
+		return 0, fmt.Errorf("%w: ref %q already belongs to sandbox %q", ErrClusterSecretPayloadConflict, rec.Ref, existingSandboxID)
+	}
 	if existingGen.Valid && existingGen.Int64 > rec.SealGeneration {
 		return 0, fmt.Errorf("%w: existing seal_generation %d > %d for ref %q", ErrClusterSecretStaleGeneration, existingGen.Int64, rec.SealGeneration, rec.Ref)
 	}
@@ -4343,27 +4421,27 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 			return 0, fmt.Errorf("%w: seal_generation %d payload conflict for ref %q", ErrClusterSecretPayloadConflict, rec.SealGeneration, rec.Ref)
 		}
 	}
-	var maxOther sql.NullInt64
-	_ = tx.QueryRowContext(ctx, `
-		SELECT MAX(seal_generation) FROM cluster_secrets
-		WHERE sandbox_id = ? AND ref != ?
-	`, rec.SandboxID, rec.Ref).Scan(&maxOther)
-	if maxOther.Valid && maxOther.Int64 > rec.SealGeneration {
-		return 0, fmt.Errorf("%w: sandbox %q has seal_generation %d > %d", ErrClusterSecretStaleGeneration, rec.SandboxID, maxOther.Int64, rec.SealGeneration)
-	}
-
 	// Recheck tomb inside the write TX so a peer DELETE that committed after
 	// pre-validation cannot be erased by a stale/equal-generation PUT.
 	var tombGen sql.NullInt64
-	_ = tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID).Scan(&tombGen)
-	if tombGen.Valid && tombGen.Int64 > 0 && rec.SealGeneration <= tombGen.Int64 {
+	var tombIncarnationID string
+	tombErr := tx.QueryRowContext(ctx, `
+		SELECT incarnation_id, generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, rec.SandboxID, parsedRef.IncarnationID).Scan(&tombIncarnationID, &tombGen)
+	if tombErr != nil && !errors.Is(tombErr, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read cluster secret tomb before put: %w", tombErr)
+	}
+	if tombGen.Valid && tombIncarnationID == parsedRef.IncarnationID && tombGen.Int64 > 0 && rec.SealGeneration <= tombGen.Int64 {
 		return 0, fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrClusterSecretTombBlocksPut, rec.SandboxID, tombGen.Int64)
 	}
 
 	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
 		// Equal-generation identical payload: skip the row rewrite but still
 		// apply the generation's tomb and outbox transitions.
-		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?
+		`, rec.SandboxID, parsedRef.IncarnationID); err != nil {
 			return 0, fmt.Errorf("clear cluster secret tomb on put: %w", err)
 		}
 		if err := applySecretRetirementInTx(ctx, tx, rec); err != nil {
@@ -4394,7 +4472,9 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 		return 0, fmt.Errorf("put cluster secret: %w", err)
 	}
 	// Only a strictly newer seal may clear tomb/outbox (atomic with the row write).
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?
+	`, rec.SandboxID, parsedRef.IncarnationID); err != nil {
 		return 0, fmt.Errorf("clear cluster secret tomb on put: %w", err)
 	}
 	if err := applySecretRetirementInTx(ctx, tx, rec); err != nil {
@@ -4417,30 +4497,48 @@ func applySecretRetirementInTx(ctx context.Context, tx *sql.Tx, rec ClusterSecre
 	if rec.RetireRecipients == nil {
 		return nil
 	}
-	return upsertSecretDeleteOutboxTx(ctx, tx, rec.SandboxID, *rec.RetireRecipients, rec.Recipients, rec.SealGeneration, true)
+	parsed, err := secrets.ParseRef(rec.Ref)
+	if err != nil || parsed.IncarnationID == "" {
+		return errors.New("stage secret retirement: current incarnation_id is required")
+	}
+	return upsertSecretDeleteOutboxTx(ctx, tx, rec.SandboxID, parsed.IncarnationID, *rec.RetireRecipients, rec.Recipients, rec.SealGeneration, true)
 }
 
 // applyPutOutboxInTx journals or clears put-outbox inside an open Put TX.
 // When PutOutboxRecipients is nil, clear any prior job (peer PUT / local-only).
 // When non-nil, replace with the supplied peer list (may be empty → delete).
 func applyPutOutboxInTx(ctx context.Context, tx *sql.Tx, rec ClusterSecretRecord) error {
+	parsed, err := secrets.ParseRef(rec.Ref)
+	if err != nil || parsed.IncarnationID == "" {
+		return errors.New("secret put outbox requires a current-format sealed ref")
+	}
+	incarnationID := parsed.IncarnationID
 	if rec.PutOutboxRecipients == nil {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ? AND incarnation_id = ?`, rec.SandboxID, incarnationID); err != nil {
 			return fmt.Errorf("clear secret put outbox on put: %w", err)
 		}
 		return nil
 	}
 	peers := secrets.NormalizeRecipients(*rec.PutOutboxRecipients)
-	incarnationID := strings.TrimSpace(rec.PutOutboxIncarnationID)
+	requestedIncarnationID := strings.TrimSpace(rec.PutOutboxIncarnationID)
 	if len(peers) == 0 {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ?`, rec.SandboxID); err != nil {
+		if requestedIncarnationID != "" && requestedIncarnationID != incarnationID {
+			return errors.New("secret put outbox incarnation_id must match the sealed ref")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ? AND incarnation_id = ?`, rec.SandboxID, incarnationID); err != nil {
 			return fmt.Errorf("clear secret put outbox on put: %w", err)
 		}
 		return nil
 	}
+	if requestedIncarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
+	}
+	if requestedIncarnationID != incarnationID {
+		return errors.New("secret put outbox incarnation_id must match the sealed ref")
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM cluster_secret_put_outbox
-		WHERE sandbox_id = ? AND NOT (incarnation_id = ? AND seal_generation = ?)
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation != ?
 	`, rec.SandboxID, incarnationID, rec.SealGeneration); err != nil {
 		return fmt.Errorf("clear stale secret put outbox: %w", err)
 	}
@@ -4490,105 +4588,46 @@ func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecre
 	return &rec, nil
 }
 
-// GetClusterSecretForSandbox returns the highest-generation sealed row for
-// sandboxID, or ErrNotFound when none exist.
-func (s *Store) GetClusterSecretForSandbox(ctx context.Context, sandboxID string) (*ClusterSecretRecord, error) {
+// GetClusterSecretForSandboxIncarnation returns only the current-format row
+// for an exact sandbox lifecycle. Sandbox IDs can be reused, so reconciliation
+// and readiness code must not select a higher-generation row from an older
+// incarnation.
+func (s *Store) GetClusterSecretForSandboxIncarnation(ctx context.Context, sandboxID, incarnationID string) (*ClusterSecretRecord, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
 		return nil, ErrNotFound
 	}
-	row := s.db.QueryRowContext(ctx, `
-		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
-		FROM cluster_secrets
-		WHERE sandbox_id = ?
-		ORDER BY seal_generation DESC, updated_at DESC
-		LIMIT 1
-	`, sandboxID)
-	var rec ClusterSecretRecord
-	var recipientsJSON string
-	if err := row.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.SealGeneration, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("get cluster secret for sandbox: %w", err)
-	}
-	if recipientsJSON != "" {
-		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
-			return nil, fmt.Errorf("unmarshal cluster secret recipients: %w", err)
-		}
-	}
-	rec.SealedPayload = nullableBlob(rec.SealedPayload)
-	return &rec, nil
+	return s.GetClusterSecret(ctx, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion))
 }
 
-func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID string) error {
-	return s.deleteClusterSecretsForSandbox(ctx, sandboxID, true)
-}
-
-// DeleteClusterSecretsRowsOnly removes local sealed rows without writing a
-// tombstone. Used by peer delete-fanout receivers so a later reseal PUT is not
-// blocked on backups that never originated the delete.
-func (s *Store) DeleteClusterSecretsRowsOnly(ctx context.Context, sandboxID string) error {
-	return s.deleteClusterSecretsForSandbox(ctx, sandboxID, false)
-}
-
-func (s *Store) deleteClusterSecretsForSandbox(ctx context.Context, sandboxID string, tombstone bool) error {
+// DeleteClusterSecretRowsForIncarnation removes only one sandbox lifecycle.
+// This prevents a delayed teardown from erasing a replacement that reused the
+// same sandbox ID.
+func (s *Store) DeleteClusterSecretRowsForIncarnation(ctx context.Context, sandboxID, incarnationID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin delete cluster secrets: %w", err)
+	if incarnationID == "" {
+		return errors.New("delete cluster secret rows: incarnation_id is required")
 	}
-	defer tx.Rollback()
-	now := time.Now().UTC()
-	if tombstone {
-		gen, genErr := nextClusterSecretDeleteGenerationTx(ctx, tx, sandboxID)
-		if genErr != nil {
-			return genErr
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation) VALUES (?, ?, ?)
-			ON CONFLICT(sandbox_id) DO UPDATE SET deleted_at = excluded.deleted_at, generation = excluded.generation
-		`, sandboxID, now, gen); err != nil {
-			return fmt.Errorf("tombstone cluster secret: %w", err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
-		return fmt.Errorf("delete cluster secrets: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit delete cluster secrets: %w", err)
+	ref := secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, ref); err != nil {
+		return fmt.Errorf("delete cluster secret lifecycle rows: %w", err)
 	}
 	return nil
 }
 
-// HasClusterSecretTomb reports whether sandboxID was deleted and must not
-// accept peer PUT resurrection until the tomb is cleared (new seal).
-func (s *Store) HasClusterSecretTomb(ctx context.Context, sandboxID string) (bool, error) {
+// ClearClusterSecretTombForIncarnation removes one lifecycle's delete fence.
+func (s *Store) ClearClusterSecretTombForIncarnation(ctx context.Context, sandboxID, incarnationID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
-		return false, nil
-	}
-	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("has cluster secret tomb: %w", err)
-	}
-	return true, nil
-}
-
-// ClearClusterSecretTomb removes a delete tombstone when a sandbox is sealed again.
-func (s *Store) ClearClusterSecretTomb(ctx context.Context, sandboxID string) error {
-	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?`, sandboxID, incarnationID); err != nil {
 		return fmt.Errorf("clear cluster secret tomb: %w", err)
 	}
 	return nil
@@ -4600,23 +4639,68 @@ func (s *Store) UpsertSandboxAuditACL(ctx context.Context, sandboxID, ownerRef, 
 	sandboxID = strings.TrimSpace(sandboxID)
 	ownerRef = strings.TrimSpace(ownerRef)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if sandboxID == "" {
-		return nil
+	if sandboxID == "" || incarnationID == "" {
+		return errors.New("upsert sandbox audit acl: sandbox id and incarnation id are required")
 	}
-	return upsertSandboxAuditACLExec(ctx, s.db, sandboxID, ownerRef, incarnationID, time.Now().UTC())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sandbox audit acl upsert: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentIncarnationID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT audit_incarnation_id
+		FROM sandboxes
+		WHERE id = ?
+	`, sandboxID).Scan(&currentIncarnationID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("resolve live sandbox audit incarnation: %w", err)
+	}
+	if err == nil && strings.TrimSpace(currentIncarnationID) != "" && strings.TrimSpace(currentIncarnationID) != incarnationID {
+		return fmt.Errorf("upsert sandbox audit acl: sandbox incarnation conflict")
+	}
+	if err == nil && strings.TrimSpace(currentIncarnationID) == "" {
+		result, updateErr := tx.ExecContext(ctx, `
+			UPDATE sandboxes
+			SET audit_incarnation_id = ?
+			WHERE id = ? AND audit_incarnation_id = ''
+		`, incarnationID, sandboxID)
+		if updateErr != nil {
+			return fmt.Errorf("bind live sandbox audit incarnation: %w", updateErr)
+		}
+		if affected, rowsErr := result.RowsAffected(); rowsErr != nil || affected != 1 {
+			if rowsErr != nil {
+				return fmt.Errorf("bind live sandbox audit incarnation rows affected: %w", rowsErr)
+			}
+			return errors.New("bind live sandbox audit incarnation: concurrent lifecycle change")
+		}
+	}
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandboxID, ownerRef, incarnationID, time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox audit acl upsert: %w", err)
+	}
+	return nil
 }
 
 func upsertSandboxAuditACLExec(ctx context.Context, exec dbExecer, sandboxID, ownerRef, incarnationID string, now time.Time) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	ownerRef = strings.TrimSpace(ownerRef)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if sandboxID == "" {
-		return nil
+	if sandboxID == "" || incarnationID == "" {
+		return errors.New("upsert sandbox audit acl: sandbox id and incarnation id are required")
 	}
 	_, err := exec.ExecContext(ctx, `
-		INSERT INTO sandbox_audit_acl (sandbox_id, incarnation_id, owner_ref, updated_at) VALUES (?, ?, ?, ?)
+		INSERT INTO sandbox_audit_acl (sandbox_id, incarnation_id, owner_ref, established_seq, updated_at)
+		VALUES (?, ?, ?, COALESCE((
+			SELECT MAX(established_seq) + 1
+			FROM sandbox_audit_acl
+			WHERE sandbox_id = ?
+		), 1), ?)
 		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET owner_ref = excluded.owner_ref, updated_at = excluded.updated_at
-	`, sandboxID, incarnationID, ownerRef, now)
+	`, sandboxID, incarnationID, ownerRef, sandboxID, now)
 	if err != nil {
 		return fmt.Errorf("upsert sandbox audit acl: %w", err)
 	}
@@ -4624,8 +4708,9 @@ func upsertSandboxAuditACLExec(ctx context.Context, exec dbExecer, sandboxID, ow
 }
 
 // PruneSandboxAuditACL removes post-delete authorization metadata after its
-// audit retention window. ACLs for live sandboxes are never removed, even if
-// their creation timestamp is older than the cutoff.
+// audit retention window. For a reused live sandbox ID, only its newest ACL is
+// protected; older incarnations remain retention-bounded instead of surviving
+// forever merely because a different lifecycle currently owns the same ID.
 func (s *Store) PruneSandboxAuditACL(ctx context.Context, cutoff time.Time) (int64, error) {
 	if cutoff.IsZero() {
 		return 0, nil
@@ -4633,9 +4718,11 @@ func (s *Store) PruneSandboxAuditACL(ctx context.Context, cutoff time.Time) (int
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM sandbox_audit_acl
 		WHERE updated_at < ?
-		  AND NOT EXISTS (
-			SELECT 1 FROM sandboxes WHERE sandboxes.id = sandbox_audit_acl.sandbox_id
-		  )
+		  AND incarnation_id <> COALESCE((
+			SELECT sandbox.audit_incarnation_id
+			FROM sandboxes AS sandbox
+			WHERE sandbox.id = sandbox_audit_acl.sandbox_id
+		  ), '')
 	`, cutoff.UTC())
 	if err != nil {
 		return 0, fmt.Errorf("prune sandbox audit acl: %w", err)
@@ -4648,12 +4735,12 @@ func (s *Store) PruneSandboxAuditACL(ctx context.Context, cutoff time.Time) (int
 }
 
 // GetSandboxAuditACLOwnerRef returns the retained audit OwnerRef for the
-// exact (sandbox, incarnation) pair. Empty incarnationID looks up the empty-
-// incarnation row only — never falls back across incarnations (one-way format).
+// exact (sandbox, incarnation) pair. Empty lifecycle identifiers are rejected
+// rather than treated as wildcards or legacy rows.
 func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID, incarnationID string) (string, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if sandboxID == "" {
+	if sandboxID == "" || incarnationID == "" {
 		return "", nil
 	}
 	var ref string
@@ -4675,7 +4762,7 @@ func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID, incar
 func (s *Store) HasSandboxAuditACL(ctx context.Context, sandboxID, incarnationID string) (bool, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if sandboxID == "" {
+	if sandboxID == "" || incarnationID == "" {
 		return false, nil
 	}
 	var one int
@@ -4693,10 +4780,9 @@ func (s *Store) HasSandboxAuditACL(ctx context.Context, sandboxID, incarnationID
 	return true, nil
 }
 
-// CurrentSandboxAuditIncarnation returns the most recently established audit
-// lifecycle for sandboxID. Old incarnation rows intentionally coexist for
-// retention; updated_at identifies the live/latest lifecycle without adding a
-// second pointer table.
+// CurrentSandboxAuditIncarnation returns the exact lifecycle linked by the
+// live sandbox row. Retained ACLs are historical authorization records, not a
+// clock-ordered source of truth for the current lifecycle.
 func (s *Store) CurrentSandboxAuditIncarnation(ctx context.Context, sandboxID string) (string, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
@@ -4704,10 +4790,7 @@ func (s *Store) CurrentSandboxAuditIncarnation(ctx context.Context, sandboxID st
 	}
 	var incarnationID string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT incarnation_id FROM sandbox_audit_acl
-		WHERE sandbox_id = ?
-		ORDER BY updated_at DESC, incarnation_id DESC
-		LIMIT 1
+		SELECT audit_incarnation_id FROM sandboxes WHERE id = ?
 	`, sandboxID).Scan(&incarnationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -4718,11 +4801,37 @@ func (s *Store) CurrentSandboxAuditIncarnation(ctx context.Context, sandboxID st
 	return strings.TrimSpace(incarnationID), nil
 }
 
+// LatestRetainedSandboxAuditIncarnation resolves the most recently refreshed
+// retained ACL when no live sandbox row exists. It exists only for the audit
+// API's implicit-incarnation query; lifecycle mutation code must use
+// CurrentSandboxAuditIncarnation and therefore cannot bind to historical data.
+func (s *Store) LatestRetainedSandboxAuditIncarnation(ctx context.Context, sandboxID string) (string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return "", nil
+	}
+	var incarnationID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT incarnation_id FROM sandbox_audit_acl
+		WHERE sandbox_id = ? AND incarnation_id <> ''
+		ORDER BY established_seq DESC
+		LIMIT 1
+	`, sandboxID).Scan(&incarnationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get latest retained sandbox audit incarnation: %w", err)
+	}
+	return strings.TrimSpace(incarnationID), nil
+}
+
 // SecretDeleteOutboxRecord is one durable peer-delete job.
 type SecretDeleteOutboxRecord struct {
-	SandboxID  string
-	Recipients []string
-	Generation int64
+	SandboxID     string
+	IncarnationID string
+	Recipients    []string
+	Generation    int64
 	// AwaitingPromotion prevents a staged reseal retirement from deleting the
 	// only usable old replica before Raft publishes the new generation.
 	AwaitingPromotion bool
@@ -4733,11 +4842,15 @@ type SecretDeleteOutboxRecord struct {
 
 // UpsertSecretDeleteOutbox journals deletion from recipients retired by a
 // reseal without deleting or tombstoning the active local generation.
-func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, recipients []string, generation int64) error {
+func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	recipients = secrets.NormalizeRecipients(recipients)
 	if sandboxID == "" || len(recipients) == 0 {
 		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
 	}
 	if generation <= 0 {
 		return errors.New("secret delete outbox generation must be positive")
@@ -4747,7 +4860,7 @@ func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, 
 		return fmt.Errorf("begin secret delete outbox: %w", err)
 	}
 	defer tx.Rollback()
-	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, recipients, nil, generation, false); err != nil {
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -4756,11 +4869,15 @@ func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID string, 
 	return nil
 }
 
-func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID string, recipients, protectedRecipients []string, generation int64, awaitingPromotion bool) error {
+func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string, recipients, protectedRecipients []string, generation int64, awaitingPromotion bool) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	recipients = secrets.NormalizeRecipients(recipients)
 	if sandboxID == "" || len(recipients) == 0 {
 		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
 	}
 	if generation <= 0 {
 		return errors.New("secret delete outbox generation must be positive")
@@ -4770,11 +4887,15 @@ func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID strin
 		existingGen   int64
 		existingAwait int
 		createdAt     time.Time
+		// A stale merge may add a still-valid cleanup obligation, but it must
+		// never use its older view of the active recipient set to remove a peer
+		// from the newer generation's durable job.
+		applyProtectedRecipients = true
 	)
 	err := tx.QueryRowContext(ctx, `
 		SELECT recipients_json, generation, awaiting_promotion, created_at
-		FROM cluster_secret_delete_outbox WHERE sandbox_id = ?
-	`, sandboxID).Scan(&existingRaw, &existingGen, &existingAwait, &createdAt)
+		FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&existingRaw, &existingGen, &existingAwait, &createdAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("read secret delete outbox for merge: %w", err)
 	}
@@ -4788,12 +4909,13 @@ func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID strin
 		case generation < existingGen:
 			generation = existingGen
 			awaitingPromotion = existingAwait != 0
+			applyProtectedRecipients = false
 		case generation == existingGen:
 			// A confirmed promotion wins over another staged write.
 			awaitingPromotion = awaitingPromotion && existingAwait != 0
 		}
 	}
-	if len(protectedRecipients) > 0 {
+	if applyProtectedRecipients && len(protectedRecipients) > 0 {
 		protected := make(map[string]struct{}, len(protectedRecipients))
 		for _, id := range secrets.NormalizeRecipients(protectedRecipients) {
 			protected[id] = struct{}{}
@@ -4807,7 +4929,7 @@ func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID strin
 		recipients = kept
 	}
 	if len(recipients) == 0 {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, sandboxID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND incarnation_id = ?`, sandboxID, incarnationID); err != nil {
 			return fmt.Errorf("clear obsolete secret delete outbox: %w", err)
 		}
 		return nil
@@ -4826,15 +4948,15 @@ func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID strin
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO cluster_secret_delete_outbox
-			(sandbox_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET
+			(sandbox_id, incarnation_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET
 			recipients_json = excluded.recipients_json,
 			generation = excluded.generation,
 			awaiting_promotion = excluded.awaiting_promotion,
 			attempts = 0,
 			updated_at = excluded.updated_at
-	`, sandboxID, string(raw), generation, awaiting, createdAt, now)
+	`, sandboxID, incarnationID, string(raw), generation, awaiting, createdAt, now)
 	if err != nil {
 		return fmt.Errorf("upsert secret delete outbox: %w", err)
 	}
@@ -4845,15 +4967,21 @@ func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID strin
 // matching Raft generation is visible. The exact-generation fence prevents an
 // old completion from releasing a newer staged transition. promoted=false
 // means a concurrent writer replaced the row and the caller must reload it.
-func (s *Store) MarkSecretDeleteOutboxPromoted(ctx context.Context, sandboxID string, generation int64) (promoted bool, err error) {
-	if strings.TrimSpace(sandboxID) == "" || generation <= 0 {
+func (s *Store) MarkSecretDeleteOutboxPromoted(ctx context.Context, sandboxID, incarnationID string, generation int64) (promoted bool, err error) {
+	if strings.TrimSpace(sandboxID) == "" {
 		return false, nil
+	}
+	if strings.TrimSpace(incarnationID) == "" {
+		return false, errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return false, errors.New("secret delete outbox generation must be positive")
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_delete_outbox
 		SET awaiting_promotion = 0, updated_at = ?
-		WHERE sandbox_id = ? AND generation = ? AND awaiting_promotion = 1
-	`, time.Now().UTC(), strings.TrimSpace(sandboxID), generation)
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ? AND awaiting_promotion = 1
+	`, time.Now().UTC(), strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID), generation)
 	if err != nil {
 		return false, fmt.Errorf("mark secret delete outbox promoted: %w", err)
 	}
@@ -4867,10 +4995,14 @@ func (s *Store) MarkSecretDeleteOutboxPromoted(ctx context.Context, sandboxID st
 // DeleteClusterSecretsOriginatorWithOutbox tombs, deletes local rows, and
 // enqueues the peer-delete outbox in one transaction so a crash cannot leave
 // peer credentials without a cleanup job.
-func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sandboxID string, recipients []string) (generation int64, err error) {
+func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sandboxID, incarnationID string, recipients []string) (generation int64, err error) {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return 0, nil
+	}
+	if incarnationID == "" {
+		return 0, errors.New("delete cluster secrets originator: incarnation_id is required")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -4878,20 +5010,26 @@ func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sa
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
-	generation, err = nextClusterSecretDeleteGenerationTx(ctx, tx, sandboxID)
+	generation, err = nextClusterSecretDeleteGenerationTx(ctx, tx, sandboxID, incarnationID)
 	if err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation) VALUES (?, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET deleted_at = excluded.deleted_at, generation = excluded.generation
-	`, sandboxID, now, generation); err != nil {
+		INSERT INTO cluster_secret_tombs (sandbox_id, incarnation_id, deleted_at, generation) VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET deleted_at = excluded.deleted_at, generation = excluded.generation
+	`, sandboxID, incarnationID, now, generation); err != nil {
 		return 0, fmt.Errorf("tombstone cluster secret: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)); err != nil {
 		return 0, fmt.Errorf("delete cluster secrets: %w", err)
 	}
-	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, recipients, nil, generation, false); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID); err != nil {
+		return 0, fmt.Errorf("delete cluster secret put outbox: %w", err)
+	}
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -4902,17 +5040,23 @@ func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sa
 
 // nextClusterSecretDeleteGenerationTx returns a monotonic delete generation that
 // survives reseal (which clears the tomb but leaves a higher seal_generation).
-func nextClusterSecretDeleteGenerationTx(ctx context.Context, tx *sql.Tx, sandboxID string) (int64, error) {
+func nextClusterSecretDeleteGenerationTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string) (int64, error) {
 	var hwm int64
 	var prev sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `
+		SELECT generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&prev); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("read cluster secret tomb generation: %w", err)
 	}
 	if prev.Valid && prev.Int64 > hwm {
 		hwm = prev.Int64
 	}
 	var maxSeal sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal); err != nil {
+	if err := tx.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets
+		WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&maxSeal); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("read max seal generation: %w", err)
 	}
 	if maxSeal.Valid && maxSeal.Int64 > hwm {
@@ -4921,36 +5065,23 @@ func nextClusterSecretDeleteGenerationTx(ctx context.Context, tx *sql.Tx, sandbo
 	return hwm + 1, nil
 }
 
-func nextClusterSecretSealGenerationTx(ctx context.Context, tx *sql.Tx, sandboxID string) (int64, error) {
-	var prev sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, err
-	}
-	if prev.Valid {
-		return prev.Int64 + 1, nil
-	}
-	var maxSeal sql.NullInt64
-	_ = tx.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal)
-	if maxSeal.Valid && maxSeal.Int64 > 0 {
-		return maxSeal.Int64 + 1, nil
-	}
-	return 1, nil
-}
-
 // GetSecretDeleteOutbox returns one outbox row when present.
-func (s *Store) GetSecretDeleteOutbox(ctx context.Context, sandboxID string) (*SecretDeleteOutboxRecord, error) {
+// GetSecretDeleteOutboxForIncarnation returns the pending cleanup obligation
+// for one exact lifecycle.
+func (s *Store) GetSecretDeleteOutboxForIncarnation(ctx context.Context, sandboxID, incarnationID string) (*SecretDeleteOutboxRecord, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
 		return nil, nil
 	}
 	row := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
-		FROM cluster_secret_delete_outbox WHERE sandbox_id = ?
-	`, sandboxID)
+		SELECT sandbox_id, incarnation_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
+		FROM cluster_secret_delete_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID)
 	var rec SecretDeleteOutboxRecord
 	var recipientsJSON string
-	if err := row.Scan(&rec.SandboxID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	if err := row.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -4967,18 +5098,22 @@ func (s *Store) GetSecretDeleteOutbox(ctx context.Context, sandboxID string) (*S
 // UpdateSecretDeleteOutboxRecipients replaces the pending recipient list (ACK shrink).
 // Empty recipients deletes the outbox row. generation fences the update so a
 // concurrent reseal/delete cannot shrink a newer outbox job.
-func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxID string, recipients []string, generation int64) error {
+func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
 	if generation <= 0 {
-		generation = 1
+		return errors.New("secret delete outbox generation must be positive")
 	}
 	if len(recipients) == 0 {
 		_, err := s.db.ExecContext(ctx, `
-			DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND generation = ?
-		`, sandboxID, generation)
+			DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+		`, sandboxID, incarnationID, generation)
 		if err != nil {
 			return fmt.Errorf("delete secret delete outbox: %w", err)
 		}
@@ -4992,8 +5127,8 @@ func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxI
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_delete_outbox
 		SET recipients_json = ?, updated_at = ?
-		WHERE sandbox_id = ? AND generation = ?
-	`, string(raw), now, sandboxID, generation)
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+	`, string(raw), now, sandboxID, incarnationID, generation)
 	if err != nil {
 		return fmt.Errorf("update secret delete outbox recipients: %w", err)
 	}
@@ -5003,21 +5138,33 @@ func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxI
 // ApplyPeerSecretDelete tombs + deletes local sealed rows for a peer DELETE.
 // generation gates stale deletes after reseal: if any local row has
 // seal_generation >= generation, ACK without deleting (resealed newer data).
-func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID string, generation int64) error {
+func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
+	if incarnationID == "" {
+		return errors.New("peer secret delete incarnation_id is required")
+	}
 	if generation <= 0 {
-		generation = 1
+		return errors.New("peer secret delete generation must be positive")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin peer secret delete: %w", err)
 	}
 	defer tx.Rollback()
+	currentRef := secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)
 	var maxSeal sql.NullInt64
-	_ = tx.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal)
+	scanErr := tx.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets
+		WHERE sandbox_id = ? AND ref = ?
+		LIMIT 1
+	`, sandboxID, currentRef).Scan(&maxSeal)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return fmt.Errorf("read current cluster secret before peer delete: %w", scanErr)
+	}
 	if maxSeal.Valid && maxSeal.Int64 > generation {
 		// Strictly newer reseal after originator delete — stale DELETE must not
 		// wipe new bytes. Equal generation is the row being deleted.
@@ -5025,20 +5172,27 @@ func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID string, gen
 	}
 	now := time.Now().UTC()
 	var prev sql.NullInt64
-	_ = tx.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev)
+	var prevIncarnationID string
+	prevErr := tx.QueryRowContext(ctx, `
+		SELECT incarnation_id, generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&prevIncarnationID, &prev)
+	if prevErr != nil && !errors.Is(prevErr, sql.ErrNoRows) {
+		return fmt.Errorf("read cluster secret tomb before peer delete: %w", prevErr)
+	}
 	tombGen := generation
-	if prev.Valid && prev.Int64 > tombGen {
+	if prev.Valid && prevIncarnationID == incarnationID && prev.Int64 > tombGen {
 		tombGen = prev.Int64
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO cluster_secret_tombs (sandbox_id, deleted_at, generation) VALUES (?, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET
+		INSERT INTO cluster_secret_tombs (sandbox_id, incarnation_id, deleted_at, generation) VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET
 			deleted_at = excluded.deleted_at,
 			generation = excluded.generation
-	`, sandboxID, now, tombGen); err != nil {
+	`, sandboxID, incarnationID, now, tombGen); err != nil {
 		return fmt.Errorf("peer tombstone cluster secret: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, currentRef); err != nil {
 		return fmt.Errorf("peer delete cluster secrets: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -5047,61 +5201,72 @@ func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID string, gen
 	return nil
 }
 
-// NextClusterSecretSealGeneration returns tombGen+1 (or 1) for a new seal.
-func (s *Store) NextClusterSecretSealGeneration(ctx context.Context, sandboxID string) (int64, error) {
+// NextClusterSecretSealGenerationForIncarnation allocates within one sandbox
+// lifecycle. Generations are authenticated together with incarnation_id, so a
+// stale row or tomb from a reused sandbox ID must not force or block the new
+// lifecycle's sequence.
+func (s *Store) NextClusterSecretSealGenerationForIncarnation(ctx context.Context, sandboxID, incarnationID string) (int64, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
-		return 1, nil
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return 0, errors.New("next cluster secret generation: sandbox id and incarnation id are required")
 	}
-	var prev sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&prev)
+	var tombGeneration sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&tombGeneration)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, err
+		return 0, fmt.Errorf("read cluster secret lifecycle tomb generation: %w", err)
 	}
-	if prev.Valid {
-		return prev.Int64 + 1, nil
+	var sealGeneration sql.NullInt64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets
+		WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&sealGeneration)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read cluster secret lifecycle seal generation: %w", err)
 	}
-	var maxSeal sql.NullInt64
-	_ = s.db.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal)
-	if maxSeal.Valid && maxSeal.Int64 > 0 {
-		return maxSeal.Int64 + 1, nil
+	hwm := int64(0)
+	if tombGeneration.Valid && tombGeneration.Int64 > hwm {
+		hwm = tombGeneration.Int64
 	}
-	return 1, nil
+	if sealGeneration.Valid && sealGeneration.Int64 > hwm {
+		hwm = sealGeneration.Int64
+	}
+	return hwm + 1, nil
 }
 
-// MaxClusterSecretSealGeneration returns the highest seal_generation for
-// sandboxID, or 0 when no sealed row exists.
-func (s *Store) MaxClusterSecretSealGeneration(ctx context.Context, sandboxID string) (int64, error) {
+// ClusterSecretSealGeneration returns the highest locally stored generation
+// for the exact sandbox lifecycle without loading the encrypted payload.
+func (s *Store) ClusterSecretSealGeneration(ctx context.Context, sandboxID, incarnationID string) (int64, bool, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
-		return 0, nil
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return 0, false, nil
 	}
-	var maxSeal sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT MAX(seal_generation) FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID).Scan(&maxSeal)
+	var generation int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
 	if err != nil {
-		return 0, fmt.Errorf("max seal generation: %w", err)
+		return 0, false, fmt.Errorf("get cluster secret generation: %w", err)
 	}
-	if !maxSeal.Valid {
-		return 0, nil
-	}
-	return maxSeal.Int64, nil
-}
-
-// ListSecretDeleteOutbox returns every pending delete fan-out job. Retry order
-// uses updated_at so an attempted oldest job moves behind work that has not yet
-// received a turn.
-func (s *Store) ListSecretDeleteOutbox(ctx context.Context) ([]SecretDeleteOutboxRecord, error) {
-	return s.ListSecretDeleteOutboxBatch(ctx, 0)
+	return generation, true, nil
 }
 
 // ListSecretDeleteOutboxBatch returns at most limit pending jobs in fair retry
-// order. A non-positive limit preserves the all-rows behavior for diagnostics.
+// order. Requiring an explicit positive bound prevents diagnostics or future
+// callers from accidentally loading a 100k-sandbox backlog into memory.
 func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]SecretDeleteOutboxRecord, error) {
 	if limit <= 0 {
-		limit = int(^uint(0) >> 1)
+		return nil, errors.New("secret delete outbox batch limit must be positive")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
+		SELECT sandbox_id, incarnation_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
 		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
 		LIMIT ?
@@ -5114,7 +5279,7 @@ func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]S
 	for rows.Next() {
 		var rec SecretDeleteOutboxRecord
 		var recipientsJSON string
-		if err := rows.Scan(&rec.SandboxID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if err := rows.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if recipientsJSON != "" {
@@ -5128,26 +5293,43 @@ func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]S
 }
 
 // BumpSecretDeleteOutboxAttempt increments attempts after a retry round.
-func (s *Store) BumpSecretDeleteOutboxAttempt(ctx context.Context, sandboxID string) error {
+func (s *Store) BumpSecretDeleteOutboxAttempt(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
 	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_delete_outbox
 		SET attempts = attempts + 1, updated_at = ?
-		WHERE sandbox_id = ?
-	`, time.Now().UTC(), sandboxID)
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+	`, time.Now().UTC(), sandboxID, incarnationID, generation)
 	return err
 }
 
 // DeleteSecretDeleteOutbox drops a completed delete fan-out job.
-func (s *Store) DeleteSecretDeleteOutbox(ctx context.Context, sandboxID string) error {
+func (s *Store) DeleteSecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ?`, sandboxID)
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM cluster_secret_delete_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+	`, sandboxID, incarnationID, generation)
 	return err
 }
 
@@ -5168,12 +5350,18 @@ type SecretPutOutboxRecord struct {
 //
 // Identity is (sandbox_id, incarnation_id, seal_generation). A lower
 // seal_generation never overwrites a newer job; same gen+incarnation merges
-// recipients. Other rows for the sandbox are dropped so Get stays single-row.
+// recipients. Other incarnations are independent cleanup obligations.
 func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64, recipients []string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if sandboxID == "" || sealGeneration <= 0 {
-		return nil
+	if sandboxID == "" {
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
+	}
+	if sealGeneration <= 0 {
+		return errors.New("secret put outbox seal generation must be positive")
 	}
 	recipients = secrets.NormalizeRecipients(recipients)
 	if len(recipients) == 0 {
@@ -5187,15 +5375,14 @@ func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnatio
 	defer tx.Rollback()
 
 	var existingGen sql.NullInt64
-	var existingInc string
 	var existingRecipientsJSON string
 	scanErr := tx.QueryRowContext(ctx, `
-		SELECT seal_generation, incarnation_id, recipients_json
+		SELECT seal_generation, recipients_json
 		FROM cluster_secret_put_outbox
-		WHERE sandbox_id = ?
+		WHERE sandbox_id = ? AND incarnation_id = ?
 		ORDER BY seal_generation DESC, updated_at DESC
 		LIMIT 1
-	`, sandboxID).Scan(&existingGen, &existingInc, &existingRecipientsJSON)
+	`, sandboxID, incarnationID).Scan(&existingGen, &existingRecipientsJSON)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return fmt.Errorf("read secret put outbox: %w", scanErr)
 	}
@@ -5203,7 +5390,7 @@ func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnatio
 		// Newer job already pending — do not clobber with a stale fan-out.
 		return nil
 	}
-	if existingGen.Valid && existingGen.Int64 == sealGeneration && strings.TrimSpace(existingInc) == incarnationID {
+	if existingGen.Valid && existingGen.Int64 == sealGeneration {
 		var prior []string
 		if existingRecipientsJSON != "" {
 			if err := json.Unmarshal([]byte(existingRecipientsJSON), &prior); err != nil {
@@ -5213,10 +5400,10 @@ func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnatio
 		recipients = secrets.NormalizeRecipients(append(prior, recipients...))
 	}
 
-	// Keep one observable job per sandbox: drop other identities before upsert.
+	// Keep one active fan-out generation per exact lifecycle.
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM cluster_secret_put_outbox
-		WHERE sandbox_id = ? AND NOT (incarnation_id = ? AND seal_generation = ?)
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation != ?
 	`, sandboxID, incarnationID, sealGeneration); err != nil {
 		return fmt.Errorf("clear stale secret put outbox: %w", err)
 	}
@@ -5243,19 +5430,21 @@ func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnatio
 	return nil
 }
 
-// GetSecretPutOutbox returns the highest-generation put-outbox row for sandboxID.
-func (s *Store) GetSecretPutOutbox(ctx context.Context, sandboxID string) (*SecretPutOutboxRecord, error) {
+// GetSecretPutOutboxForIncarnation returns the active fan-out obligation for
+// one exact lifecycle.
+func (s *Store) GetSecretPutOutboxForIncarnation(ctx context.Context, sandboxID, incarnationID string) (*SecretPutOutboxRecord, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
 		return nil, nil
 	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
 		FROM cluster_secret_put_outbox
-		WHERE sandbox_id = ?
+		WHERE sandbox_id = ? AND incarnation_id = ?
 		ORDER BY seal_generation DESC, updated_at DESC
 		LIMIT 1
-	`, sandboxID)
+	`, sandboxID, incarnationID)
 	var rec SecretPutOutboxRecord
 	var recipientsJSON string
 	if err := row.Scan(&rec.SandboxID, &rec.IncarnationID, &rec.SealGeneration, &recipientsJSON, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
@@ -5275,7 +5464,7 @@ func (s *Store) GetSecretPutOutbox(ctx context.Context, sandboxID string) (*Secr
 // ListSecretPutOutboxBatch returns at most limit pending put fan-out jobs.
 func (s *Store) ListSecretPutOutboxBatch(ctx context.Context, limit int) ([]SecretPutOutboxRecord, error) {
 	if limit <= 0 {
-		limit = int(^uint(0) >> 1)
+		return nil, errors.New("secret put outbox batch limit must be positive")
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
@@ -5310,10 +5499,13 @@ func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID, 
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
-		return nil
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
 	}
 	if sealGeneration <= 0 {
-		sealGeneration = 1
+		return errors.New("secret put outbox seal generation must be positive")
 	}
 	if len(recipients) == 0 {
 		return s.DeleteSecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration)
@@ -5346,10 +5538,13 @@ func (s *Store) BumpSecretPutOutboxAttempt(ctx context.Context, sandboxID, incar
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
-		return nil
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
 	}
 	if sealGeneration <= 0 {
-		sealGeneration = 1
+		return errors.New("secret put outbox seal generation must be positive")
 	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_put_outbox
@@ -5366,10 +5561,13 @@ func (s *Store) DeleteSecretPutOutbox(ctx context.Context, sandboxID, incarnatio
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
-		return nil
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
 	}
 	if sealGeneration <= 0 {
-		return nil
+		return errors.New("secret put outbox seal generation must be positive")
 	}
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM cluster_secret_put_outbox
@@ -5449,23 +5647,27 @@ func (s *Store) PruneClusterSecretTombs(ctx context.Context, cutoff time.Time, l
 	}
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM cluster_secret_tombs
-		WHERE sandbox_id IN (
-			SELECT tomb.sandbox_id
+		WHERE rowid IN (
+			SELECT tomb.rowid
 			FROM cluster_secret_tombs AS tomb
 			WHERE tomb.deleted_at < ?
 			  AND NOT EXISTS (
 				SELECT 1 FROM cluster_secret_delete_outbox AS outbox
 				WHERE outbox.sandbox_id = tomb.sandbox_id
+				  AND outbox.incarnation_id = tomb.incarnation_id
 			  )
 			  AND NOT EXISTS (
 				SELECT 1 FROM cluster_secrets AS secret
 				WHERE secret.sandbox_id = tomb.sandbox_id
+				  AND secret.ref = 'cluster-secret://sandbox/' || tomb.sandbox_id || '/i/' || tomb.incarnation_id || '/v1'
 			  )
 			  AND NOT EXISTS (
-				SELECT 1 FROM sandboxes AS sandbox
+				SELECT 1
+				FROM sandboxes AS sandbox
 				WHERE sandbox.id = tomb.sandbox_id
+				  AND sandbox.audit_incarnation_id = tomb.incarnation_id
 			  )
-			ORDER BY tomb.deleted_at ASC, tomb.sandbox_id ASC
+			ORDER BY tomb.deleted_at ASC, tomb.sandbox_id ASC, tomb.incarnation_id ASC
 			LIMIT ?
 		)
 	`, cutoff.UTC(), limit)
@@ -5479,34 +5681,57 @@ func (s *Store) PruneClusterSecretTombs(ctx context.Context, cutoff time.Time, l
 	return n, nil
 }
 
-// ClusterSecretTombGeneration returns the tomb generation (0 if none).
-func (s *Store) ClusterSecretTombGeneration(ctx context.Context, sandboxID string) (int64, error) {
+// ClusterSecretTombGenerationForIncarnation returns the deletion fence for an
+// exact lifecycle. A tomb from an older use of the same sandbox ID is not a
+// fence for the replacement incarnation.
+func (s *Store) ClusterSecretTombGenerationForIncarnation(ctx context.Context, sandboxID, incarnationID string) (int64, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
 		return 0, nil
 	}
 	var gen int64
-	err := s.db.QueryRowContext(ctx, `SELECT generation FROM cluster_secret_tombs WHERE sandbox_id = ?`, sandboxID).Scan(&gen)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&gen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("get cluster secret lifecycle tomb generation: %w", err)
 	}
 	return gen, nil
 }
 
-// ListClusterSecrets returns every local sealed cluster-secret row. Used at
-// boot to re-fanout multi-recipient blobs and rebuild in-memory holder counts
-// after a restart (holders are not persisted).
-func (s *Store) ListClusterSecrets(ctx context.Context) ([]ClusterSecretRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+// ListClusterSecretsBatch returns the next ref-ordered page after afterRef.
+// Boot reconciliation must remain memory-bounded at the 100k-sandbox target,
+// so there is deliberately no all-rows convenience API.
+func (s *Store) ListClusterSecretsBatch(ctx context.Context, afterRef string, limit int) ([]ClusterSecretRecord, error) {
+	if limit <= 0 {
+		return nil, errors.New("cluster secret batch limit must be positive")
+	}
+	afterRef = strings.TrimSpace(afterRef)
+	query := `
 		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
 		FROM cluster_secrets
-		ORDER BY sandbox_id, ref
-	`)
+		ORDER BY ref
+		LIMIT ?
+	`
+	args := []any{limit}
+	if afterRef != "" {
+		query = `
+			SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
+			FROM cluster_secrets
+			WHERE ref > ?
+			ORDER BY ref
+			LIMIT ?
+		`
+		args = []any{afterRef, limit}
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list cluster secrets: %w", err)
+		return nil, fmt.Errorf("list cluster secret batch: %w", err)
 	}
 	defer rows.Close()
 	var out []ClusterSecretRecord
@@ -5514,7 +5739,7 @@ func (s *Store) ListClusterSecrets(ctx context.Context) ([]ClusterSecretRecord, 
 		var rec ClusterSecretRecord
 		var recipientsJSON string
 		if err := rows.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.SealGeneration, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("scan cluster secret: %w", err)
+			return nil, fmt.Errorf("scan cluster secret batch: %w", err)
 		}
 		if recipientsJSON != "" {
 			if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
@@ -5525,7 +5750,7 @@ func (s *Store) ListClusterSecrets(ctx context.Context) ([]ClusterSecretRecord, 
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list cluster secrets: %w", err)
+		return nil, fmt.Errorf("list cluster secret batch: %w", err)
 	}
 	return out, nil
 }

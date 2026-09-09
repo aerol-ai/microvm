@@ -142,12 +142,13 @@ func (a *Agent) PutVolumeAttachments(ctx context.Context, attachments []models.V
 	return err
 }
 
-func (a *Agent) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+func (a *Agent) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" && incarnationID == "" {
 		return nil
 	}
-	return a.applyCommand(ctx, command{Op: opDeleteVolumeAttach, VolumeSandboxID: sandboxID})
+	return a.applyCommand(ctx, command{Op: opDeleteVolumeAttach, VolumeSandboxID: sandboxID, ExpectedIncarnationID: incarnationID})
 }
 
 func (a *Agent) queryVolumes(ctx context.Context, q url.Values) (VolumeQueryResponse, error) {

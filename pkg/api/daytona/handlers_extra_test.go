@@ -200,15 +200,16 @@ func TestSandboxLifecycleHandlers(t *testing.T) {
 
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
-		ID:             "sb-123",
-		Name:           "test-sb",
-		Status:         models.SandboxStatusStopped,
-		ToolboxEnabled: true,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:                 "sb-123",
+		Name:               "test-sb",
+		Status:             models.SandboxStatusStopped,
+		AuditIncarnationID: "inc-sb-123",
+		ToolboxEnabled:     true,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
-	if err := st.Upsert(context.Background(), sb); err != nil {
-		t.Fatalf("Upsert: %v", err)
+	if err := st.Create(context.Background(), sb); err != nil {
+		t.Fatalf("Create: %v", err)
 	}
 
 	t.Run("get_sandbox", func(t *testing.T) {

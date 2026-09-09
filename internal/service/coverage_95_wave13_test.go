@@ -70,7 +70,8 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 	svc, st, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: "sb-del-fail", Image: "a", Status: models.SandboxStatusStarted,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-del-fail",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +84,8 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 	svc2, st2, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
 	if err := st2.Create(ctx, &models.Sandbox{
 		ID: "sb-post-del", Image: "a", Status: models.SandboxStatusStarted,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-post-del",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +103,8 @@ func TestDestroySandboxFailureArmsWave13(t *testing.T) {
 	svc3.SetWasmRuntime(&recordingRuntime{})
 	if err := st3.Create(ctx, &models.Sandbox{
 		ID: "sb-wasm-del", Image: "m", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-wasm-del",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +233,8 @@ func TestStaleOwnershipEmptySelfAndDestroyFailWave13(t *testing.T) {
 	now := time.Now().UTC()
 	_ = st.Create(ctx, &models.Sandbox{
 		ID: "sb-stale", Image: "a", Status: models.SandboxStatusStarted,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-stale",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	})
 
 	emptySelf := &stubStaleCluster{Noop: cluster.NewNoop("", "http://x", ""), otherNode: "other", otherURL: "http://other"}

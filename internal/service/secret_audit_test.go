@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -42,9 +43,6 @@ func TestClassifySecretAuditReason(t *testing.T) {
 }
 
 func TestSandboxIDFromSecretRef(t *testing.T) {
-	if got := sandboxIDFromSecretRef("cluster-secret://sandbox/sb-1/v1"); got != "sb-1" {
-		t.Fatalf("got %q, want sb-1", got)
-	}
 	if got := sandboxIDFromSecretRef("cluster-secret://sandbox/sb-1/i/abc/v1"); got != "sb-1" {
 		t.Fatalf("incarnation ref got %q, want sb-1", got)
 	}
@@ -98,7 +96,7 @@ func TestSecretAuditSuccessAndFailureClasses(t *testing.T) {
 		Image:    "private.example.com/app:latest",
 		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: password},
 	}
-	handle, err := s.SealAndDistribute(ctx, "sb-audit", req, []string{"node-a"}, SealStrict)
+	handle, err := s.SealAndDistribute(ctx, "sb-audit", req, []string{"node-a"})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -119,7 +117,7 @@ func TestSecretAuditSuccessAndFailureClasses(t *testing.T) {
 		t.Fatal("expected version mismatch")
 	}
 	// not found
-	missing := cluster.PlacementSecrets{Ref: "cluster-secret://sandbox/missing/v1", Version: 1}
+	missing := cluster.PlacementSecrets{Ref: secrets.FormatRef("missing", "inc-missing", secrets.RefVersion), Version: secrets.RefVersion, IncarnationID: "inc-missing", SealGeneration: 1}
 	if _, err := s.OpenClusterSecretsForNode(ctx, "missing", redacted, missing, "node-a"); err == nil {
 		t.Fatal("expected not found")
 	}
@@ -553,6 +551,60 @@ func TestFileAuditSinkPruneCarriesWitnessedDroppedAncestor(t *testing.T) {
 	}
 }
 
+func TestFileAuditSinkPruneWitnessTriggerIsChangedOnlyAndNonBlocking(t *testing.T) {
+	sink, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sink.Close)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	sink.afterPrune = func() {
+		started <- struct{}{}
+		<-release
+	}
+	now := time.Now().UTC()
+	if err := sink.EmitDurable(SecretAuditEvent{Time: now, EventID: "fresh", Result: secretAuditResultSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Prune(now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+		t.Fatal("witness triggered when retention changed no evidence")
+	default:
+	}
+	// Use a new sink whose first row is expired to exercise a real rotation.
+	other, err := newFileAuditSink(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(other.Close)
+	other.afterPrune = sink.afterPrune
+	if err := other.EmitDurable(SecretAuditEvent{Time: now.Add(-2 * time.Hour), EventID: "old", Result: secretAuditResultSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- other.Prune(now.Add(-time.Hour)) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("retention blocked on external witness callback")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("retention did not trigger witness after rotation")
+	}
+	close(release)
+}
+
 func TestFileAuditSinkEmitDurablePersistsBeforeReturn(t *testing.T) {
 	sink, err := newFileAuditSink(t.TempDir(), 1)
 	if err != nil {
@@ -568,6 +620,62 @@ func TestFileAuditSinkEmitDurablePersistsBeforeReturn(t *testing.T) {
 	}
 	if !bytes.Contains(raw, []byte("durable-1")) {
 		t.Fatalf("durable event absent after return: %s", raw)
+	}
+}
+
+func TestSecretAuditChainVerifierRejectsLegacyAndBrokenLinks(t *testing.T) {
+	var nilVerifier *secretAuditChainVerifier
+	if err := nilVerifier.Add(SecretAuditEvent{}); err == nil {
+		t.Fatal("nil verifier accepted an event")
+	}
+	v := newSecretAuditChainVerifier()
+	if err := v.Add(SecretAuditEvent{EventID: "legacy"}); err == nil || !strings.Contains(err.Error(), "prev_hash") {
+		t.Fatalf("missing hash fields error = %v", err)
+	}
+	first := SecretAuditEvent{EventID: "first", Result: secretAuditResultSuccess}
+	auditlog.LinkEvent(auditlog.GenesisPrevHash, &first)
+	if err := v.Add(first); err != nil {
+		t.Fatalf("first event: %v", err)
+	}
+	broken := SecretAuditEvent{EventID: "broken", Result: secretAuditResultSuccess}
+	auditlog.LinkEvent(strings.Repeat("a", 64), &broken)
+	if err := v.Add(broken); err == nil || !strings.Contains(err.Error(), "prev_hash mismatch") {
+		t.Fatalf("broken link error = %v", err)
+	}
+
+	checkpoint := SecretAuditEvent{EventID: "checkpoint", Kind: secretAuditKindRetentionCheckpoint, Result: secretAuditResultSuccess}
+	auditlog.LinkEvent(strings.Repeat("b", 64), &checkpoint)
+	if err := v.Add(checkpoint); err == nil || !strings.Contains(err.Error(), "first event") {
+		t.Fatalf("mid-stream retention checkpoint error = %v", err)
+	}
+
+	retentionVerifier := newSecretAuditChainVerifier()
+	if err := retentionVerifier.Add(checkpoint); err != nil {
+		t.Fatalf("leading retention checkpoint: %v", err)
+	}
+	retained := SecretAuditEvent{EventID: "retained", Result: secretAuditResultSuccess}
+	auditlog.LinkEvent(strings.Repeat("c", 64), &retained)
+	if err := retentionVerifier.Add(retained); err != nil {
+		t.Fatalf("first retained event may bridge deleted prefix: %v", err)
+	}
+	next := SecretAuditEvent{EventID: "next", Result: secretAuditResultSuccess}
+	auditlog.LinkEvent(retained.EventHash, &next)
+	if err := retentionVerifier.Add(next); err != nil {
+		t.Fatalf("post-retention chain: %v", err)
+	}
+}
+
+func TestRecomputeChainRejectsStructurallyLegacyJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), secretAuditFileName)
+	raw, err := json.Marshal(SecretAuditEvent{EventID: "legacy", Result: secretAuditResultSuccess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RecomputeChainHead(path); err == nil || !strings.Contains(err.Error(), "prev_hash") {
+		t.Fatalf("legacy audit file error = %v", err)
 	}
 }
 

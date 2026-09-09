@@ -117,6 +117,14 @@ func TestGetSandboxAuditReturnsEvents(t *testing.T) {
 	if page.Coverage.Partial {
 		t.Fatalf("unexpected partial: %+v", page.Coverage)
 	}
+	if len(page.Events) == 0 {
+		t.Fatal("expected the audited sandbox read")
+	}
+	for _, event := range page.Events {
+		if event.IncarnationID != "inc-audit-1" {
+			t.Fatalf("unscoped lifecycle event returned: %+v", event)
+		}
+	}
 }
 
 func TestClusterInternalSandboxAuditLocalOnly(t *testing.T) {
@@ -161,6 +169,7 @@ func newAuditTestHandler(t *testing.T, mut func(*models.Sandbox)) (*handlers, st
 		ID: "sb-audit-1", Image: "alpine", Status: models.SandboxStatusStarted,
 		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-audit-1",
 	}
 	if mut != nil {
 		mut(sb)

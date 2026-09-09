@@ -191,7 +191,8 @@ func TestDestroySandboxHappyPath(t *testing.T) {
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: "sb-des", Image: "alpine", Status: models.SandboxStatusStarted,
 		ContainerID: "ctr-des", CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
-		ExposedPorts: []models.ExposedPort{{Port: 8080, Protocol: models.ExposedPortProtocolHTTP}},
+		AuditIncarnationID: "inc-sb-des",
+		ExposedPorts:       []models.ExposedPort{{Port: 8080, Protocol: models.ExposedPortProtocolHTTP}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +203,7 @@ func TestDestroySandboxHappyPath(t *testing.T) {
 
 func TestSealClusterSecretEnvelopeNonceFailureAndBadDEK(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
-	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", 1), Version: 1, Generation: 1}
 	setRandReader(t, &scriptedRandReader{errs: []error{nil, errors.New("nonce entropy")}})
 	if _, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{"x":1}`), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected nonce failure")

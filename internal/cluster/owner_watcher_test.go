@@ -84,7 +84,7 @@ func TestOwnerWatcherSkipsWithoutSpec(t *testing.T) {
 	c.AttachRecreator(rec)
 
 	// Placement owned by self, but no Spec.
-	cmd := command{Op: opPlace, SandboxID: "sb-no-spec", OwnerNodeID: "leader"}
+	cmd := command{Op: opPlace, SandboxID: "sb-no-spec", OwnerNodeID: "leader", IncarnationID: "inc-no-spec"}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply: %v", err)
@@ -112,7 +112,7 @@ func TestOwnerWatcherRecreatesOwnedSandbox(t *testing.T) {
 	c.AttachRecreator(rec)
 
 	spec := failoverRecreateSpec()
-	cmd := command{Op: opPlace, SandboxID: "sb-failover", OwnerNodeID: "leader", Spec: spec}
+	cmd := command{Op: opPlace, SandboxID: "sb-failover", OwnerNodeID: "leader", Spec: spec, IncarnationID: "inc-failover"}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply: %v", err)
@@ -144,7 +144,7 @@ func TestOwnerWatcherRecreatesWasmDurableSandbox(t *testing.T) {
 	c.AttachRecreator(rec)
 
 	spec := failoverWasmRecreateSpec()
-	cmd := command{Op: opPlace, SandboxID: "sb-wasm-failover", OwnerNodeID: "leader", Spec: spec}
+	cmd := command{Op: opPlace, SandboxID: "sb-wasm-failover", OwnerNodeID: "leader", Spec: spec, IncarnationID: "inc-wasm-failover"}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply: %v", err)
@@ -172,7 +172,7 @@ func TestOwnerWatcherSkipsSandboxWithoutFailoverOptIn(t *testing.T) {
 	c.AttachRecreator(rec)
 
 	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512}
-	cmd := command{Op: opPlace, SandboxID: "sb-no-ha", OwnerNodeID: "leader", Spec: spec}
+	cmd := command{Op: opPlace, SandboxID: "sb-no-ha", OwnerNodeID: "leader", Spec: spec, IncarnationID: "inc-no-ha"}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply: %v", err)
@@ -200,13 +200,13 @@ func TestOwnerWatcherReplaysExposedPorts(t *testing.T) {
 	c.AttachRecreator(rec)
 
 	spec := failoverRecreateSpec()
-	place := command{Op: opPlace, SandboxID: "sb-with-ports", OwnerNodeID: "leader", Spec: spec}
+	place := command{Op: opPlace, SandboxID: "sb-with-ports", OwnerNodeID: "leader", Spec: spec, IncarnationID: "inc-with-ports"}
 	payload, _ := encodeCommand(place)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply opPlace: %v", err)
 	}
 	for port, route := range map[int]ExposedPortRoute{5432: {Protocol: "tcp", HostPort: 22432}, 8080: {Protocol: "http"}} {
-		add := command{Op: opAddExposedPort, SandboxID: "sb-with-ports", Port: port, Protocol: route.Protocol, HostPort: route.HostPort}
+		add := command{Op: opAddExposedPort, SandboxID: "sb-with-ports", ExpectedIncarnationID: "inc-with-ports", Port: port, Protocol: route.Protocol, HostPort: route.HostPort}
 		payload, _ = encodeCommand(add)
 		if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 			t.Fatalf("raft Apply opAddExposedPort: %v", err)
@@ -259,7 +259,7 @@ func TestEvictThenWatcherEndToEnd(t *testing.T) {
 	}
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-e2e", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
-		Spec: spec,
+		Spec: spec, IncarnationID: "inc-e2e",
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
@@ -366,7 +366,7 @@ func TestFailoverRecreateMetricsMoveOnOwnerDeath(t *testing.T) {
 
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-metrics", OwnerNodeID: "dead-node",
-		OwnerAPIURL: "http://gone", Spec: failoverRecreateSpec(),
+		OwnerAPIURL: "http://gone", Spec: failoverRecreateSpec(), IncarnationID: "inc-metrics",
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
@@ -422,7 +422,7 @@ func TestFailoverRecreateMetricsMoveOnOwnerDeath(t *testing.T) {
 func TestOwnerWatcherFallsBackToLegacyRecreator(t *testing.T) {
 	fsm := newPlacementFSM()
 	payload, _ := encodeCommand(command{
-		Op: opPlace, SandboxID: "sb-legacy-recreator", OwnerNodeID: "self",
+		Op: opPlace, SandboxID: "sb-legacy-recreator", OwnerNodeID: "self", IncarnationID: "inc-recreator",
 		Spec: failoverRecreateSpec(),
 	})
 	if got := fsm.Apply(&raft.Log{Index: 1, Data: payload}); got != nil {
@@ -463,7 +463,7 @@ func TestFailoverRecreateMetricsStayZeroWithoutOptIn(t *testing.T) {
 
 	// No Failover block — the default "leave it stopped" policy.
 	cmd := command{
-		Op: opPlace, SandboxID: "sb-no-optin", OwnerNodeID: "dead-node",
+		Op: opPlace, SandboxID: "sb-no-optin", OwnerNodeID: "dead-node", IncarnationID: "inc-no-optin",
 		OwnerAPIURL: "http://gone",
 		Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512},
 	}

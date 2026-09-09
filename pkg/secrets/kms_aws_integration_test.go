@@ -21,6 +21,7 @@ func TestAWSKMSLiveRoundTrip(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	ctx = ContextWithIncarnationID(ctx, "inc-live-kms")
 
 	w, err := NewAWSKMS(ctx, keyID)
 	if err != nil {

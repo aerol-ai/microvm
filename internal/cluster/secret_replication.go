@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,8 +16,8 @@ import (
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
-// secretFanoutMaxAttempts bounds async peer pushes / deletes. Create never
-// waits on these; failures increment aerolvm_secret_fanout_failures_total.
+// secretFanoutMaxAttempts bounds peer pushes and deletes. HA create may wait
+// for the first backup under its own deadline; remaining fan-out is async.
 const secretFanoutMaxAttempts = 4
 
 type peerMemberDialer func(Member) (*http.Client, string, error)
@@ -25,62 +26,128 @@ type peerMemberDialer func(Member) (*http.Client, string, error)
 // is alive and advertises a reachable internal mTLS URL. Best-effort with
 // bounded backoff; returns the
 // node IDs that ACK'd (callers intersect with live membership for
-// failover_ready). No-op when c is nil / has no gossip (Noop path never
-// reaches here).
+// failover_ready). Missing cluster transport is reported for any remote target;
+// self-only single-node calls remain a no-op.
 func (c *Cluster) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
-	if c == nil || c.gossip == nil {
+	if c == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	if c.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, c.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
 		return nil, nil
 	}
 	return pushSecretBlobToPeersLookupDial(ctx, c.gossip.lookupMember, c.currentInternalClient(), c.PeerDialMember, c.patToken, c.nodeID, blob, recipients)
 }
 
 // DeleteSecretOnPeers DELETEs the sandbox's cluster_secrets rows on peers that
-// may hold a fan-out copy. Returns acked vs still-pending recipients. Offline /
-// missing peers stay pending — never treated as success.
-func (c *Cluster) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
-	if c == nil || c.gossip == nil {
-		return nil, append([]string(nil), recipients...), nil
+// may hold a fan-out copy. It returns only authenticated acknowledgements;
+// callers derive pending recipients from requested minus acknowledged so an
+// incomplete transport response can never erase a durable delete obligation.
+func (c *Cluster) DeleteSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) (acked []string, err error) {
+	if c == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
 	}
-	return deleteSecretOnPeersLookupDial(ctx, c.gossip.lookupMember, c.currentInternalClient(), c.PeerDialMember, c.patToken, c.nodeID, sandboxID, recipients, generation)
+	if c.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, c.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	return deleteSecretOnPeersLookupDial(ctx, c.gossip.lookupMember, c.currentInternalClient(), c.PeerDialMember, c.patToken, c.nodeID, sandboxID, incarnationID, recipients, generation)
 }
 
 // ProbeSecretOnPeers HEADs peer secret rows and returns nodes that currently
 // hold seal_generation >= minGeneration (authoritative possession, not ACK memory).
-func (c *Cluster) ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error) {
-	if c == nil || c.gossip == nil {
+func (c *Cluster) ProbeSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, minGeneration int64) (holding []string, err error) {
+	if c == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
 		return nil, nil
 	}
-	return probeSecretOnPeersLookupDial(ctx, c.gossip.lookupMember, c.currentInternalClient(), c.PeerDialMember, c.patToken, c.nodeID, sandboxID, recipients, minGeneration)
+	if c.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, c.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	return probeSecretOnPeersLookupDial(ctx, c.gossip.lookupMember, c.currentInternalClient(), c.PeerDialMember, c.patToken, c.nodeID, sandboxID, incarnationID, recipients, minGeneration)
 }
 
 // Agent mirrors for worker nodes that seal locally and need to fan out.
 func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
-	if a == nil || a.gossip == nil {
+	if a == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	if a.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, a.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
 		return nil, nil
 	}
 	return pushSecretBlobToPeersLookupDial(ctx, a.gossip.lookupMember, a.internalClient, a.PeerDialMember, a.patToken, a.nodeID, blob, recipients)
 }
 
-func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
-	if a == nil || a.gossip == nil {
-		return nil, append([]string(nil), recipients...), nil
-	}
-	return deleteSecretOnPeersLookupDial(ctx, a.gossip.lookupMember, a.internalClient, a.PeerDialMember, a.patToken, a.nodeID, sandboxID, recipients, generation)
-}
-
-func (a *Agent) ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error) {
-	if a == nil || a.gossip == nil {
+func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) (acked []string, err error) {
+	if a == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
 		return nil, nil
 	}
-	return probeSecretOnPeersLookupDial(ctx, a.gossip.lookupMember, a.internalClient, a.PeerDialMember, a.patToken, a.nodeID, sandboxID, recipients, minGeneration)
+	if a.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, a.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	return deleteSecretOnPeersLookupDial(ctx, a.gossip.lookupMember, a.internalClient, a.PeerDialMember, a.patToken, a.nodeID, sandboxID, incarnationID, recipients, generation)
+}
+
+func (a *Agent) ProbeSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, minGeneration int64) (holding []string, err error) {
+	if a == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	if a.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, a.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	return probeSecretOnPeersLookupDial(ctx, a.gossip.lookupMember, a.internalClient, a.PeerDialMember, a.patToken, a.nodeID, sandboxID, incarnationID, recipients, minGeneration)
 }
 
 // SecretPeerPusher is the narrow seam Service uses for async fan-out so tests
 // can inject a fake without a full Cluster.
 type SecretPeerPusher interface {
 	PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error)
-	DeleteSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error)
-	ProbeSecretOnPeers(ctx context.Context, sandboxID string, recipients []string, minGeneration int64) (holding []string, err error)
+	DeleteSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) (acked []string, err error)
+	ProbeSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, minGeneration int64) (holding []string, err error)
+}
+
+func hasRemoteSecretRecipient(recipients []string, selfID string) bool {
+	selfID = strings.TrimSpace(selfID)
+	for _, id := range recipients {
+		id = strings.TrimSpace(id)
+		if id != "" && id != selfID {
+			return true
+		}
+	}
+	return false
 }
 
 func pushSecretBlobToPeers(ctx context.Context, members []Member, internalClient *http.Client, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
@@ -168,7 +235,7 @@ func pushSecretBlobToPeersLookupDial(ctx context.Context, lookup func(string) (M
 	return acked, firstErr
 }
 
-func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
+func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID, incarnationID string, recipients []string, generation int64) (acked []string, err error) {
 	byID := make(map[string]Member, len(members))
 	for _, m := range members {
 		if m.NodeID != "" {
@@ -178,33 +245,45 @@ func deleteSecretOnPeers(ctx context.Context, members []Member, client *http.Cli
 	return deleteSecretOnPeersLookup(ctx, func(id string) (Member, bool) {
 		m, ok := byID[id]
 		return m, ok
-	}, client, pat, selfID, sandboxID, recipients, generation)
+	}, client, pat, selfID, sandboxID, incarnationID, recipients, generation)
 }
 
-func deleteSecretOnPeersLookup(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, pat, selfID, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
-	return deleteSecretOnPeersLookupDial(ctx, lookup, internalClient, nil, pat, selfID, sandboxID, recipients, generation)
+func deleteSecretOnPeersLookup(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, pat, selfID, sandboxID, incarnationID string, recipients []string, generation int64) (acked []string, err error) {
+	return deleteSecretOnPeersLookupDial(ctx, lookup, internalClient, nil, pat, selfID, sandboxID, incarnationID, recipients, generation)
 }
 
-func deleteSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, dial peerMemberDialer, pat, selfID, sandboxID string, recipients []string, generation int64) (acked, pending []string, err error) {
+func deleteSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, dial peerMemberDialer, pat, selfID, sandboxID, incarnationID string, recipients []string, generation int64) (acked []string, err error) {
 	if strings.TrimSpace(sandboxID) == "" || lookup == nil {
-		return nil, append([]string(nil), recipients...), nil
+		return nil, nil
 	}
 	if internalClient == nil && dial == nil {
-		return nil, append([]string(nil), recipients...), ErrPeerInternalURLRequired
+		return nil, ErrPeerInternalURLRequired
 	}
 	if generation <= 0 {
-		generation = 1
+		return nil, errors.New("cluster: secret delete generation must be positive")
+	}
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return nil, errors.New("cluster: secret delete incarnation_id is required")
 	}
 	path := PublicInternalSecretPath + "/" + url.PathEscape(sandboxID)
 	var firstErr error
+	expected := 0
 	for _, id := range recipients {
 		id = strings.TrimSpace(id)
 		if id == "" || id == selfID {
 			continue
 		}
+		expected++
 		m, ok := lookup(id)
 		if !ok || !m.Alive {
-			pending = append(pending, id)
+			if firstErr == nil {
+				if !ok {
+					firstErr = fmt.Errorf("delete secret on %s: recipient unknown", id)
+				} else {
+					firstErr = fmt.Errorf("delete secret on %s: recipient not alive", id)
+				}
+			}
 			continue
 		}
 		var client *http.Client
@@ -217,17 +296,22 @@ func deleteSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Mem
 		}
 		endpoint := strings.TrimRight(base, "/") + path
 		if dialErr != nil || client == nil || endpoint == "" {
-			pending = append(pending, id)
-			if firstErr == nil && dialErr != nil {
-				firstErr = fmt.Errorf("delete secret on %s: %w", id, dialErr)
+			if firstErr == nil {
+				if dialErr != nil {
+					firstErr = fmt.Errorf("delete secret on %s: %w", id, dialErr)
+				} else {
+					firstErr = fmt.Errorf("delete secret on %s: no dial path", id)
+				}
 			}
 			continue
 		}
-		endpoint += "?generation=" + strconv.FormatInt(generation, 10)
+		query := url.Values{}
+		query.Set("generation", strconv.FormatInt(generation, 10))
+		query.Set("incarnation_id", incarnationID)
+		endpoint += "?" + query.Encode()
 		if delErr := withSecretFanoutBackoff(ctx, func() error {
 			return deleteSecretBlob(ctx, client, endpoint, pat, selfID)
 		}); delErr != nil {
-			pending = append(pending, id)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("delete secret on %s: %w", id, delErr)
 			}
@@ -235,10 +319,13 @@ func deleteSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Mem
 		}
 		acked = append(acked, id)
 	}
-	return acked, pending, firstErr
+	if len(acked) < expected && firstErr == nil {
+		firstErr = fmt.Errorf("cluster: secret delete incomplete: acked %d/%d", len(acked), expected)
+	}
+	return acked, firstErr
 }
 
-func probeSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID string, recipients []string, minGeneration int64) ([]string, error) {
+func probeSecretOnPeers(ctx context.Context, members []Member, client *http.Client, pat, selfID, sandboxID, incarnationID string, recipients []string, minGeneration int64) ([]string, error) {
 	byID := make(map[string]Member, len(members))
 	for _, m := range members {
 		if m.NodeID != "" {
@@ -248,14 +335,14 @@ func probeSecretOnPeers(ctx context.Context, members []Member, client *http.Clie
 	return probeSecretOnPeersLookup(ctx, func(id string) (Member, bool) {
 		m, ok := byID[id]
 		return m, ok
-	}, client, pat, selfID, sandboxID, recipients, minGeneration)
+	}, client, pat, selfID, sandboxID, incarnationID, recipients, minGeneration)
 }
 
-func probeSecretOnPeersLookup(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, pat, selfID, sandboxID string, recipients []string, minGeneration int64) ([]string, error) {
-	return probeSecretOnPeersLookupDial(ctx, lookup, internalClient, nil, pat, selfID, sandboxID, recipients, minGeneration)
+func probeSecretOnPeersLookup(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, pat, selfID, sandboxID, incarnationID string, recipients []string, minGeneration int64) ([]string, error) {
+	return probeSecretOnPeersLookupDial(ctx, lookup, internalClient, nil, pat, selfID, sandboxID, incarnationID, recipients, minGeneration)
 }
 
-func probeSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, dial peerMemberDialer, pat, selfID, sandboxID string, recipients []string, minGeneration int64) ([]string, error) {
+func probeSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, dial peerMemberDialer, pat, selfID, sandboxID, incarnationID string, recipients []string, minGeneration int64) ([]string, error) {
 	if strings.TrimSpace(sandboxID) == "" || lookup == nil {
 		return nil, nil
 	}
@@ -263,7 +350,11 @@ func probeSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Memb
 		return nil, ErrPeerInternalURLRequired
 	}
 	if minGeneration <= 0 {
-		minGeneration = 1
+		return nil, errors.New("cluster: secret probe generation must be positive")
+	}
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return nil, errors.New("cluster: secret probe incarnation id is required")
 	}
 	path := PublicInternalSecretPath + "/" + url.PathEscape(sandboxID)
 	var holding []string
@@ -292,7 +383,10 @@ func probeSecretOnPeersLookupDial(ctx context.Context, lookup func(string) (Memb
 			}
 			continue
 		}
-		endpoint += "?min_generation=" + strconv.FormatInt(minGeneration, 10)
+		query := url.Values{}
+		query.Set("incarnation_id", incarnationID)
+		query.Set("min_generation", strconv.FormatInt(minGeneration, 10))
+		endpoint += "?" + query.Encode()
 		okHold, err := headSecretBlob(ctx, client, endpoint, pat, selfID)
 		if err != nil {
 			if firstErr == nil {

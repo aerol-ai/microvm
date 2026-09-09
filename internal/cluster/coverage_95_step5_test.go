@@ -27,11 +27,11 @@ func TestNoopVolumeValidationAndAttachmentOverwrite(t *testing.T) {
 		t.Fatalf("existing name row=%+v created=%v err=%v", row, created, err)
 	}
 	if err := n.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "t", VolumeID: "v1", SandboxID: "", Target: "/d", Source: "s",
+		Tenant: "t", VolumeID: "v1", SandboxID: "", IncarnationID: "inc-sb", Target: "/d", Source: "s",
 	}}); !errors.Is(err, ErrUnknownVolume) {
 		t.Fatalf("incomplete attachment=%v", err)
 	}
-	a := models.VolumeAttachment{Tenant: "t", VolumeID: "v1", SandboxID: "sb", Target: "/d", Source: "s"}
+	a := models.VolumeAttachment{Tenant: "t", VolumeID: "v1", SandboxID: "sb", IncarnationID: "inc-sb", Target: "/d", Source: "s"}
 	if err := n.PutVolumeAttachments(ctx, []models.VolumeAttachment{a}); err != nil {
 		t.Fatal(err)
 	}

@@ -574,7 +574,7 @@ func TestNoopVolumeQuotaAndAttachmentHelpers(t *testing.T) {
 		n.volMu.Unlock()
 		t.Fatalf("volumeAttachmentCountLocked empty=%d", got)
 	}
-	a := models.VolumeAttachment{Tenant: "tq", VolumeID: "v1", SandboxID: "sb-1", Target: "/data", Source: "s3://x"}
+	a := models.VolumeAttachment{Tenant: "tq", VolumeID: "v1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s3://x"}
 	n.putVolumeAttachmentLocked(a)
 	if got := n.volumeAttachmentCountLocked("tq", "v1"); got != 1 {
 		n.volMu.Unlock()

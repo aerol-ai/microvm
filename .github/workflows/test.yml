@@ -76,11 +76,8 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          go test -count=1 -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
+          AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
           go tool cover -func=coverage.out | tail -n 1
-
-      - name: Scale gates
-        run: AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -run 'TestScaleGate|TestScaleHarness' ./internal/cluster ./internal/service
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

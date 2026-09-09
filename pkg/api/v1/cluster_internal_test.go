@@ -161,7 +161,7 @@ func TestClusterInternalHandlers_BasicCoverage(t *testing.T) {
 			t.Fatalf("seed volume: %v", err)
 		}
 		_ = c.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-			Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "bucket/t-a/data",
+			Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "bucket/t-a/data",
 		}})
 
 		cases := []struct {

@@ -75,7 +75,7 @@ func TestVolumeMetaPutAttachmentsClusterFailureWave3(t *testing.T) {
 		t.Fatalf("CreatePlatformVolume: %v", err)
 	}
 	err = s.volumeMeta().PutAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: v.Tenant, VolumeID: v.ID, SandboxID: "sb-x", Target: "/data", Source: v.Source,
+		Tenant: v.Tenant, VolumeID: v.ID, SandboxID: "sb-x", IncarnationID: "inc-sb-x", Target: "/data", Source: v.Source,
 	}})
 	if err == nil || !strings.Contains(err.Error(), "cluster put attachments failed") {
 		t.Fatalf("PutAttachments = %v, want cluster failure", err)

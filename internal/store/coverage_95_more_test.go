@@ -232,7 +232,7 @@ func TestVolumeListCountDeleteScanAndQueryErrors(t *testing.T) {
 		if _, err := st.CountVolumeAttachments(ctx, "t", "v"); err == nil {
 			t.Fatal("CountVolumeAttachments after drop")
 		}
-		if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb"); err == nil {
+		if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb", "inc-sb"); err == nil {
 			t.Fatal("DeleteVolumeAttachmentsForSandbox after drop")
 		}
 		st2 := newTestStore(t)

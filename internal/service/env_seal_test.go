@@ -174,14 +174,14 @@ func TestMergeClusterSecretsRestoresEnv(t *testing.T) {
 
 func TestSecretsFromRequestIncludesEnv(t *testing.T) {
 	req := models.CreateSandboxRequest{Env: map[string]string{"A": "1"}}
-	bag := (&Service{}).secretsFromRequest(req)
+	bag := secretsFromRequest(req)
 	if bag.IsEmpty() || bag.Env["A"] != "1" {
 		t.Fatalf("bag = %+v", bag)
 	}
 }
 
 func TestLocalProviderEnvUsesCanonicalRefVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := secrets.ContextWithIncarnationID(context.Background(), "inc-test")
 	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "k"))
 	if err != nil {
 		t.Fatalf("cipher: %v", err)
@@ -216,7 +216,7 @@ func TestOpenClusterSecretsMergesEnv(t *testing.T) {
 		Image: "alpine:3.19",
 		Env:   map[string]string{"RECREATE": "yes"},
 	}
-	handle, err := svc.SealAndDistribute(ctx, "sb-open", req, []string{"node-a"}, SealStrict)
+	handle, err := svc.SealAndDistribute(ctx, "sb-open", req, []string{"node-a"})
 	if err != nil {
 		t.Fatalf("SealAndDistribute: %v", err)
 	}

@@ -4,21 +4,20 @@ import (
 	"bufio"
 	"container/heap"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 const (
@@ -73,6 +72,13 @@ func (s *Service) PruneSecretAudit(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
+	// Normalize before any exporter/witness work. Enterprise witness validation
+	// uses the context before the SQLite ACL-prune phase below, so doing this only
+	// immediately before the store call leaves the periodic nil-context caller
+	// able to panic in context.WithTimeout.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	days := s.cfg.SecretAuditRetentionDays
 	if days <= 0 {
 		return nil
@@ -81,26 +87,33 @@ func (s *Service) PruneSecretAudit(ctx context.Context) error {
 	f := s.secretAuditFile
 	cutoff := time.Now().UTC().AddDate(0, 0, -days)
 	if f != nil {
-		if s.cfg.EnterpriseMode || strings.TrimSpace(s.cfg.SecretAuditExportURL) != "" {
-			exported, err := s.secretAuditFullyExported()
+		exporter := s.getAuditExporter()
+		hasExporter := exporter != nil && (controlplane.Provider{AuditExporter: exporter}).HasAuditExporter()
+		exportCursorPath := ""
+		if s.cfg.EnterpriseMode || strings.TrimSpace(s.cfg.SecretAuditExportURL) != "" || hasExporter {
+			exportCursorPath = filepath.Join(filepath.Dir(f.path), secretAuditExportOffset)
+		}
+		witnessedHead := ""
+		if s.cfg.SecretAuditExternalWitness {
+			var err error
+			witnessedHead, err = s.requireCurrentSecretAuditWitness(ctx)
 			if err != nil {
-				return fmt.Errorf("verify audit export watermark before prune: %w", err)
-			}
-			if !exported {
-				// The exporter loop will advance the watermark; retaining extra
-				// local history is safer than deleting unexported evidence.
-				return nil
+				// Never rotate evidence that has not been independently anchored.
+				// The daily ticker retries; manual callers receive the exact failure.
+				return fmt.Errorf("verify audit witness before prune: %w", err)
 			}
 		}
-		if err := f.Prune(cutoff); err != nil {
+		if err := f.pruneWithGuards(cutoff, exportCursorPath, witnessedHead); err != nil {
+			if errors.Is(err, errSecretAuditPruneGuardChanged) {
+				// An event landed after the external checks. Retain the file and let
+				// the export/witness loops advance before the next prune attempt.
+				return nil
+			}
 			return err
 		}
 	}
 	if s.store == nil {
 		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	_, err := s.store.PruneSandboxAuditACL(ctx, cutoff)
 	return err
@@ -149,7 +162,7 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 	if path == "" {
 		return nil, "", nil
 	}
-	f, err := os.Open(path)
+	f, snapshotSize, err := s.openSecretAuditSnapshot(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, "", nil
@@ -173,8 +186,8 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 			heap.Fix(&candidates, 0)
 		}
 	}
-	var malformed int
-	sc := bufio.NewScanner(f)
+	verifier := newSecretAuditChainVerifier()
+	sc := bufio.NewScanner(io.LimitReader(f, snapshotSize))
 	// Audit lines are small (metadata only); 1MiB is ample.
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	const cancelCheckEvery = 256
@@ -192,47 +205,18 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 		}
 		var ev SecretAuditEvent
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			malformed++
-			continue
+			return nil, "", fmt.Errorf("secret audit line %d is malformed: %w", linesSeen, err)
 		}
-		isGap := ev.Result == secretAuditResultGap || ev.Kind == secretAuditKindGap
-		if !isGap && ev.SandboxID != sandboxID {
-			continue
+		if err := verifier.Add(ev); err != nil {
+			return nil, "", fmt.Errorf("secret audit line %d failed integrity verification: %w", linesSeen, err)
 		}
-		if !isGap && incarnationID != "" && strings.TrimSpace(ev.IncarnationID) != incarnationID {
+		if !secretAuditEventMatches(ev, sandboxID, incarnationID, opts.Kind, after, afterKey) {
 			continue
-		}
-		if !isGap && !secretAuditKindMatches(ev.Kind, opts.Kind) {
-			continue
-		}
-		key := secretAuditEventCursorKey(ev)
-		if !after.IsZero() {
-			if ev.Time.Before(after) {
-				continue
-			}
-			if ev.Time.Equal(after) && (afterKey == "" || key <= afterKey) {
-				continue
-			}
 		}
 		keepCandidate(ev)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, "", err
-	}
-	if malformed > 0 {
-		// Stable time + event id so repeated queries do not invent a new gap
-		// row on every scan (hash of the malformed-line count is enough for
-		// local repeatability within one file generation).
-		stable := malformedGapTime(sandboxID, malformed)
-		keepCandidate(SecretAuditEvent{
-			Time:      stable,
-			EventID:   "ae-malformed-" + malformedGapID(sandboxID, malformed),
-			SandboxID: sandboxID,
-			Result:    secretAuditResultGap,
-			Reason:    "malformed_jsonl",
-			Kind:      secretAuditKindGap,
-			Dropped:   int64(malformed),
-		})
 	}
 	matched := append([]SecretAuditEvent(nil), candidates...)
 	sort.SliceStable(matched, func(i, j int) bool {
@@ -247,6 +231,42 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 		nextCursor = formatSecretAuditCursor(last)
 	}
 	return matched, nextCursor, nil
+}
+
+// openSecretAuditSnapshot captures a complete append boundary under the same
+// flock used by the writer and retention. The descriptor remains valid across
+// a later retention rename; limiting the reader prevents a concurrent append
+// from exposing a partial final JSON line to integrity verification.
+func (s *Service) openSecretAuditSnapshot(path string) (*os.File, int64, error) {
+	var (
+		f    *os.File
+		size int64
+	)
+	open := func() error {
+		var err error
+		f, err = os.Open(path)
+		if err != nil {
+			return err
+		}
+		st, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			f = nil
+			return err
+		}
+		size = st.Size()
+		return nil
+	}
+	if s != nil && s.secretAuditFile != nil {
+		if err := s.secretAuditFile.withAuditFileLock(open); err != nil {
+			return nil, 0, err
+		}
+		return f, size, nil
+	}
+	if err := open(); err != nil {
+		return nil, 0, err
+	}
+	return f, size, nil
 }
 
 // ListSecretAudit returns local events merged with a live fan-out to reachable
@@ -268,6 +288,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 	if err != nil {
 		return SecretAuditPage{}, err
 	}
+	after, afterKey, _ := parseSecretAuditCursor(opts.Cursor) // local validation succeeded
 
 	selfID := ""
 	var members []cluster.Member
@@ -285,7 +306,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 				}
 				preferKnown = len(prefer) > 0
 			}
-		} else if acl, exists, aclErr := c.AuditACLForSandbox(ctx, sandboxID); aclErr == nil && exists && !acl.AuditNodesTruncated {
+		} else if acl, exists, aclErr := c.AuditACLForSandbox(ctx, sandboxID, opts.IncarnationID); aclErr == nil && exists && !acl.AuditNodesTruncated {
 			for _, id := range acl.AuditNodeIDs {
 				addPreferredAuditNode(prefer, id)
 			}
@@ -408,7 +429,7 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 			coverage.Answered = append(coverage.Answered, r.nodeID)
 			for _, dto := range r.page.Events {
 				ev := secretAuditEventFromDTO(dto)
-				if !secretAuditKindMatches(ev.Kind, opts.Kind) {
+				if !secretAuditEventMatches(ev, sandboxID, opts.IncarnationID, opts.Kind, after, afterKey) {
 					continue
 				}
 				merged = append(merged, ev)
@@ -450,7 +471,10 @@ func addPreferredAuditNode(prefer map[string]struct{}, nodeID string) {
 }
 
 func (s *Service) secretAuditPath() string {
-	if s != nil && s.secretAuditFile != nil && s.secretAuditFile.path != "" {
+	if s == nil {
+		return ""
+	}
+	if s.secretAuditFile != nil && s.secretAuditFile.path != "" {
 		return s.secretAuditFile.path
 	}
 	dataDir := secretAuditDataDir(s.cfg.DBPath)
@@ -497,6 +521,30 @@ func secretAuditKindMatches(storedKind, filter string) bool {
 		return true
 	}
 	return storedKind == filter
+}
+
+// secretAuditEventMatches re-applies the complete query contract to both
+// local JSONL rows and peer responses. Peer mTLS authenticates the node, but a
+// stale or faulty peer must not be able to inject another sandbox lifetime into
+// the merged evidence page.
+func secretAuditEventMatches(ev SecretAuditEvent, sandboxID, incarnationID, kind string, after time.Time, afterKey string) bool {
+	isGap := ev.Result == secretAuditResultGap || ev.Kind == secretAuditKindGap
+	if !isGap && ev.SandboxID != sandboxID {
+		return false
+	}
+	if !isGap && incarnationID != "" && strings.TrimSpace(ev.IncarnationID) != strings.TrimSpace(incarnationID) {
+		return false
+	}
+	if !isGap && !secretAuditKindMatches(ev.Kind, kind) {
+		return false
+	}
+	if after.IsZero() {
+		return true
+	}
+	if ev.Time.Before(after) {
+		return false
+	}
+	return !ev.Time.Equal(after) || (afterKey != "" && secretAuditEventCursorKey(ev) > afterKey)
 }
 
 const secretAuditCursorSep = "\x1f"
@@ -580,18 +628,4 @@ func dedupeSecretAuditEvents(events []SecretAuditEvent) []SecretAuditEvent {
 		out = append(out, ev)
 	}
 	return out
-}
-
-func malformedGapID(sandboxID string, count int) string {
-	sum := sha256.Sum256([]byte(sandboxID + "|malformed|" + strconv.Itoa(count)))
-	return hex.EncodeToString(sum[:8])
-}
-
-// malformedGapTime is a stable synthetic timestamp so query pages do not churn
-// a fresh "now" gap on every scan of the same malformed content.
-func malformedGapTime(sandboxID string, count int) time.Time {
-	sum := sha256.Sum256([]byte(sandboxID + "|malformed-time|" + strconv.Itoa(count)))
-	// Fold into a fixed second within a far-past window (not wall-clock).
-	sec := int64(sum[0])<<24 | int64(sum[1])<<16 | int64(sum[2])<<8 | int64(sum[3])
-	return time.Unix(1_000_000_000+(sec%86_400), 0).UTC()
 }

@@ -47,23 +47,23 @@ func TestFSMApplyUncoveredBranchesStep2(t *testing.T) {
 	}
 
 	// Place, then orphan via reassign empty owner, then reject opPlace on orphan.
-	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-orph", OwnerNodeID: "a", Spec: &models.CreateSandboxRequest{Image: "x"}})
-	applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb-orph", OwnerNodeID: ""})
-	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-orph", OwnerNodeID: "b"}); got == nil || !errors.Is(got.(error), ErrReservationConflict) {
+	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-orph", OwnerNodeID: "a", Spec: &models.CreateSandboxRequest{Image: "x"}, IncarnationID: "inc-orph"})
+	applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb-orph", OwnerNodeID: "", ExpectedIncarnationID: "inc-orph"})
+	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-orph", OwnerNodeID: "b", IncarnationID: "inc-orph", ExpectedIncarnationID: "inc-orph"}); got == nil || !errors.Is(got.(error), ErrReservationConflict) {
 		t.Fatalf("place orphaned = %v", got)
 	}
 
 	// Reassign missing is a no-op.
-	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "missing", OwnerNodeID: "x"}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "missing", OwnerNodeID: "x", ExpectedIncarnationID: "inc-missing"}); got != nil {
 		t.Fatalf("reassign missing = %v", got)
 	}
 
 	// Reserve then reassign reserved row (pending reservation path).
 	applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb-res", OwnerNodeID: "a",
-		Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 64}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 64}, IncarnationID: "inc-res", ExpiresUnix: time.Now().Add(time.Minute).Unix(),
 	})
-	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb-res", OwnerNodeID: "b", OwnerAPIURL: "http://b"}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb-res", OwnerNodeID: "b", OwnerAPIURL: "http://b", ExpectedIncarnationID: "inc-res"}); got != nil {
 		t.Fatalf("reassign reserved = %v", got)
 	}
 
@@ -82,35 +82,35 @@ func TestFSMApplyUncoveredBranchesStep2(t *testing.T) {
 	}
 
 	// Place a live row and reject claim-orphan / reserved claim.
-	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-live", OwnerNodeID: "a", Spec: &models.CreateSandboxRequest{Name: "live", Image: "i"}})
-	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-live", OwnerNodeID: "a"}); got != nil {
+	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-live", OwnerNodeID: "a", IncarnationID: "inc-live", Spec: &models.CreateSandboxRequest{Name: "live", Image: "i"}})
+	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-live", OwnerNodeID: "a", IncarnationID: "inc-live"}); got != nil {
 		t.Fatalf("claim self-owned non-orphan should no-op: %v", got)
 	}
-	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-live", OwnerNodeID: "b"}); got == nil || !errors.Is(got.(error), ErrReservationConflict) {
+	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-live", OwnerNodeID: "b", IncarnationID: "inc-live"}); got == nil || !errors.Is(got.(error), ErrReservationConflict) {
 		t.Fatalf("claim foreign = %v", got)
 	}
 	applyOp(t, fsm, command{
-		Op: opReserve, SandboxID: "sb-res2", OwnerNodeID: "a",
+		Op: opReserve, SandboxID: "sb-res2", OwnerNodeID: "a", IncarnationID: "inc-res2",
 		Spec: &models.CreateSandboxRequest{Name: "r2", CPU: 1}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
 	})
-	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-res2", OwnerNodeID: "a"}); got == nil || !errors.Is(got.(error), ErrReservationConflict) {
+	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-res2", OwnerNodeID: "a", IncarnationID: "inc-res2"}); got == nil || !errors.Is(got.(error), ErrReservationConflict) {
 		t.Fatalf("claim reserved = %v", got)
 	}
 
 	// Orphan and claim (same previous owner) with renamed spec + secrets.
-	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-claim", OwnerNodeID: "old", Spec: &models.CreateSandboxRequest{Name: "oldn", Image: "i"}})
+	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-claim", OwnerNodeID: "old", IncarnationID: "inc-claim", Spec: &models.CreateSandboxRequest{Name: "oldn", Image: "i"}})
 	applyOp(t, fsm, command{Op: opOrphanOwner, NodeID: "old"})
 	if got := applyOp(t, fsm, command{
-		Op: opClaimOrphan, SandboxID: "sb-claim", OwnerNodeID: "old",
-		Spec: &models.CreateSandboxRequest{Name: "newn", Image: "i2"}, SecretRef: "s", SecretVersion: 3,
+		Op: opClaimOrphan, SandboxID: "sb-claim", OwnerNodeID: "old", IncarnationID: "inc-claim",
+		Spec: &models.CreateSandboxRequest{Name: "newn", Image: "i2"}, SecretRef: testSecretRef("sb-claim", "inc-claim"), SecretVersion: 1, SecretSealGeneration: 2,
 	}); got != nil {
 		t.Fatalf("claim orphan rename = %v", got)
 	}
 
 	// Foreign orphan claim conflict.
-	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-fo", OwnerNodeID: "x", Spec: &models.CreateSandboxRequest{Name: "fo", Image: "i"}})
+	applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-fo", OwnerNodeID: "x", IncarnationID: "inc-fo", Spec: &models.CreateSandboxRequest{Name: "fo", Image: "i"}})
 	applyOp(t, fsm, command{Op: opOrphanOwner, NodeID: "x"})
-	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-fo", OwnerNodeID: "y"}); got == nil || !errors.Is(got.(error), ErrOrphanClaimConflict) {
+	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-fo", OwnerNodeID: "y", IncarnationID: "inc-fo"}); got == nil || !errors.Is(got.(error), ErrOrphanClaimConflict) {
 		t.Fatalf("foreign orphan claim = %v", got)
 	}
 
@@ -263,6 +263,7 @@ func TestFSMRestoreRowsAndRecoveryMerge(t *testing.T) {
 		Version: 9,
 		Rows: []placementSnapshotRow{
 			{Placement: Placement{SandboxID: ""}}, // skipped
+			{Placement: Placement{SandboxID: "sb", OwnerNodeID: "n", IncarnationID: "inc-sb"}},
 			{
 				Placement: Placement{SandboxID: "sb-r", OwnerNodeID: "n", Version: 3},
 				Recovery:  placementRecovery{Spec: &models.CreateSandboxRequest{Image: "img"}, SecretRef: "r", SecretVersion: 2},
@@ -273,9 +274,9 @@ func TestFSMRestoreRowsAndRecoveryMerge(t *testing.T) {
 			{Tenant: "t", ID: "v1", Name: "n1", Backend: "s3"},
 		},
 		VolumeAttachments: []models.VolumeAttachment{
-			{Tenant: "t", VolumeID: "missing", SandboxID: "sb", Target: "/d", Source: "s"},
-			{Tenant: "t", VolumeID: "v1", SandboxID: "sb", Target: "/d", Source: "s"},
-			{Tenant: "", VolumeID: "v1", SandboxID: "sb", Target: "/d", Source: "s"},
+			{Tenant: "t", VolumeID: "missing", SandboxID: "sb", IncarnationID: "inc-sb", Target: "/d", Source: "s"},
+			{Tenant: "t", VolumeID: "v1", SandboxID: "sb", IncarnationID: "inc-sb", Target: "/d", Source: "s"},
+			{Tenant: "", VolumeID: "v1", SandboxID: "sb", IncarnationID: "inc-sb", Target: "/d", Source: "s"},
 		},
 	}
 	var buf bytes.Buffer
@@ -428,7 +429,7 @@ func TestAgentVolumeUpsertAndQueryErrorBranches(t *testing.T) {
 		t.Fatalf("VolumeDelete map=%v", err)
 	}
 	if err := a.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "t", VolumeID: "v", SandboxID: "s", Target: "/d", Source: "src",
+		Tenant: "t", VolumeID: "v", SandboxID: "s", IncarnationID: "inc-s", Target: "/d", Source: "src",
 	}}); err == nil || !strings.Contains(err.Error(), ErrUnknownVolume.Error()) {
 		t.Fatalf("PutVolumeAttachments map=%v", err)
 	}

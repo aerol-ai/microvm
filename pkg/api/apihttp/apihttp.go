@@ -38,8 +38,29 @@ const MaxJSONBodyBytes = 1 << 20 // 1 MiB
 // json.NewDecoder(r.Body) directly so the size cap is uniform across v1 and
 // the facades. The caller writes its own error envelope on failure.
 func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes)
-	return json.NewDecoder(r.Body).Decode(dst)
+	return DecodeJSONLimit(w, r, dst, MaxJSONBodyBytes)
+}
+
+// DecodeJSONLimit decodes a JSON request using an endpoint-specific maximum.
+// Keep exceptional limits at the handler so the shared public API default does
+// not grow merely because one internal wire format contains base64 expansion.
+func DecodeJSONLimit(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
+	if maxBytes <= 0 {
+		maxBytes = MaxJSONBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 // ReadJSONBody applies the same cap for cluster wrappers that must buffer and
@@ -108,6 +129,11 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	if errors.Is(err, service.ErrWakeCircuitOpen) {
 		w.Header().Set("Retry-After", "60")
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrClusterFinalizationUnavailable) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, service.ErrClusterFinalizationUnavailable.Error())
 		return
 	}
 	if errors.Is(err, service.ErrPublicTrafficDisabled) {

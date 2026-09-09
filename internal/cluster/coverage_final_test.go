@@ -110,11 +110,12 @@ func TestClusterApplyEncodedReservePath(t *testing.T) {
 	c.capacityLeases.set(c.nodeID, admitter.Snapshot(), time.Now())
 
 	payload, err := encodeCommand(command{
-		Op:          opReserve,
-		SandboxID:   "sb-encoded-reserve",
-		OwnerNodeID: c.nodeID,
-		Spec:        &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 1},
-		ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		Op:            opReserve,
+		SandboxID:     "sb-encoded-reserve",
+		OwnerNodeID:   c.nodeID,
+		IncarnationID: "inc-encoded-reserve",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 1},
+		ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -240,6 +241,7 @@ func TestAgentAssertOwnershipFreshPlacementReplaysPortsAndDomains(t *testing.T) 
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-fresh",
 		Spec:            spec,
+		Secrets:         PlacementSecrets{IncarnationID: "inc-fresh"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 		CustomHostnames: []string{"fresh.example.com"},
 	}}); err != nil {
@@ -265,10 +267,11 @@ func TestAgentAssertOwnershipPromotesSelfReservation(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-reserved",
 				Placement: Placement{
-					SandboxID:   "sb-reserved",
-					OwnerNodeID: "worker-self",
-					State:       PlacementStateReserved,
-					ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+					SandboxID:     "sb-reserved",
+					OwnerNodeID:   "worker-self",
+					IncarnationID: "inc-reserved",
+					State:         PlacementStateReserved,
+					ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -280,6 +283,7 @@ func TestAgentAssertOwnershipPromotesSelfReservation(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:           "sb-reserved",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine:3.20"},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-reserved"},
 		ExposedPorts: map[int]ExposedPortRoute{9000: {Protocol: "tcp", HostPort: 29000}},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership(reserved): %v", err)
@@ -297,9 +301,10 @@ func TestAgentAssertOwnershipBackfillsNilSpecOnSelfOwnedRow(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-nil-spec",
 				Placement: Placement{
-					SandboxID:   "sb-nil-spec",
-					OwnerNodeID: "worker-self",
-					OwnerState:  PlacementOwnerStateActive,
+					SandboxID:     "sb-nil-spec",
+					OwnerNodeID:   "worker-self",
+					OwnerState:    PlacementOwnerStateActive,
+					IncarnationID: "inc-nil-spec",
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -310,8 +315,9 @@ func TestAgentAssertOwnershipBackfillsNilSpecOnSelfOwnedRow(t *testing.T) {
 
 	spec := &models.CreateSandboxRequest{Image: "alpine:3.20"}
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
-		ID:   "sb-nil-spec",
-		Spec: spec,
+		ID:      "sb-nil-spec",
+		Spec:    spec,
+		Secrets: PlacementSecrets{IncarnationID: "inc-nil-spec"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership(nil spec): %v", err)
 	}
@@ -717,7 +723,7 @@ func TestClusterUpsertSpecOnLeader(t *testing.T) {
 		t.Fatalf("RecordPlacement: %v", err)
 	}
 	spec := &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 2}
-	if err := c.UpsertSpec(context.Background(), "sb-upsert", spec, PlacementSecrets{Ref: "secret-ref", Version: 1}); err != nil {
+	if err := c.UpsertSpec(context.Background(), "sb-upsert", spec, PlacementSecrets{}); err != nil {
 		t.Fatalf("UpsertSpec: %v", err)
 	}
 	got, ok := c.PlacementOf("sb-upsert")
@@ -753,9 +759,10 @@ func TestAgentAssertOwnershipSelfOwnedReplaysPortsAndDomains(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-owned",
 				Placement: Placement{
-					SandboxID:   "sb-owned",
-					OwnerNodeID: "worker-self",
-					Spec:        spec,
+					SandboxID:     "sb-owned",
+					OwnerNodeID:   "worker-self",
+					Spec:          spec,
+					IncarnationID: "inc-owned",
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -767,6 +774,7 @@ func TestAgentAssertOwnershipSelfOwnedReplaysPortsAndDomains(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-owned",
 		Spec:            spec,
+		Secrets:         PlacementSecrets{IncarnationID: "inc-owned"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 		CustomHostnames: []string{"owned.example.com"},
 	}}); err != nil {
@@ -788,10 +796,11 @@ func TestAgentAssertOwnershipReservedReplaysCustomDomains(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-res-domains",
 				Placement: Placement{
-					SandboxID:   "sb-res-domains",
-					OwnerNodeID: "worker-self",
-					State:       PlacementStateReserved,
-					ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+					SandboxID:     "sb-res-domains",
+					OwnerNodeID:   "worker-self",
+					IncarnationID: "inc-res-domains",
+					State:         PlacementStateReserved,
+					ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -803,6 +812,7 @@ func TestAgentAssertOwnershipReservedReplaysCustomDomains(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-res-domains",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine:3.20"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-res-domains"},
 		CustomHostnames: []string{"reserved.example.com"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership(reserved domains): %v", err)
@@ -926,9 +936,10 @@ func TestAgentApplyCommandNoControlPlaneMembers(t *testing.T) {
 	// control-plane members the command fails at the forward step, the only
 	// failure mode left on this path.
 	err := agent.applyCommand(context.Background(), command{
-		Op:        opPlace,
-		SandboxID: "sb-no-cp-members",
-		Spec:      &models.CreateSandboxRequest{Image: "alpine"},
+		Op:            opPlace,
+		SandboxID:     "sb-no-cp-members",
+		IncarnationID: "inc-no-cp-members",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "no live server-role control-plane members") {
 		t.Fatalf("applyCommand() = %v, want control-plane forward failure", err)

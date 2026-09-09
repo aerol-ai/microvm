@@ -42,27 +42,23 @@ func (f *failAfterRand) Read(p []byte) (int, error) {
 }
 
 func testBinding() SealBinding {
-	return SealBinding{SandboxID: "sb-1", Ref: FormatRef("sb-1", RefVersion), Version: RefVersion, Generation: 1}
+	return SealBinding{SandboxID: "sb-1", IncarnationID: "inc-1", Ref: FormatRef("sb-1", "inc-1", RefVersion), Version: RefVersion, Generation: 1}
 }
 
 func TestFormatRefAndParseRefIncarnation(t *testing.T) {
-	if got := FormatRef("sb", 1); got != "cluster-secret://sandbox/sb/v1" {
-		t.Fatalf("legacy FormatRef = %q", got)
+	if got := FormatRef("sb", "abc123", RefVersion); got != "cluster-secret://sandbox/sb/i/abc123/v1" {
+		t.Fatalf("FormatRef = %q", got)
 	}
-	if got := FormatRefInc("sb", "abc123", 2); got != "cluster-secret://sandbox/sb/i/abc123/v2" {
-		t.Fatalf("FormatRefInc = %q", got)
+	if _, err := ParseRef("cluster-secret://sandbox/sb-1/v1"); err == nil {
+		t.Fatal("incarnation-less ref was accepted")
 	}
-	legacy, err := ParseRef("cluster-secret://sandbox/sb-1/v1")
-	if err != nil || legacy.SandboxID != "sb-1" || legacy.IncarnationID != "" || legacy.Version != 1 {
-		t.Fatalf("ParseRef legacy = %+v err=%v", legacy, err)
-	}
-	inc, err := ParseRef("cluster-secret://sandbox/sb-1/i/deadbeef/v3")
-	if err != nil || inc.SandboxID != "sb-1" || inc.IncarnationID != "deadbeef" || inc.Version != 3 {
+	inc, err := ParseRef("cluster-secret://sandbox/sb-1/i/deadbeef/v1")
+	if err != nil || inc.SandboxID != "sb-1" || inc.IncarnationID != "deadbeef" || inc.Version != RefVersion {
 		t.Fatalf("ParseRef incarnation = %+v err=%v", inc, err)
 	}
 	binding := SealBinding{
 		SandboxID: "sb-1", IncarnationID: "deadbeef",
-		Ref: FormatRefInc("sb-1", "deadbeef", RefVersion), Version: RefVersion, Generation: 1,
+		Ref: FormatRef("sb-1", "deadbeef", RefVersion), Version: RefVersion, Generation: 1,
 	}
 	c := testCipher(t)
 	sealed, err := SealEnvelopeBound(c, Secrets{Env: map[string]string{"K": "V"}}, []string{"node-a"}, binding)

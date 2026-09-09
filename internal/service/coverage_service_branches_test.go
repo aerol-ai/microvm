@@ -122,6 +122,20 @@ func (s *serviceClusterStub) PlacementsByIDs(ids []string) map[string]cluster.Pl
 	return out
 }
 
+func (s *serviceClusterStub) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	if s.ownerErr != nil {
+		return nil, s.ownerErr
+	}
+	out := s.PlacementsByIDs(ids)
+	if len(out) > 0 || (s.owner.NodeID == "" && s.owner.APIURL == "" && !s.owner.IsSelf) {
+		return out, nil
+	}
+	for _, id := range ids {
+		out[id] = cluster.Placement{SandboxID: id, OwnerNodeID: s.owner.NodeID, OwnerAPIURL: s.owner.APIURL, IncarnationID: "inc-" + id}
+	}
+	return out, nil
+}
+
 func (s *serviceClusterStub) PlacementsForShards(cluster.PlacementShardFilter) []cluster.Placement {
 	return s.Placements()
 }
@@ -139,6 +153,11 @@ func (s *serviceClusterStub) SpecOf(id string) *models.CreateSandboxRequest {
 }
 
 func (s *serviceClusterStub) DeletePlacement(_ context.Context, sandboxID string) error {
+	s.deleteCalls = append(s.deleteCalls, sandboxID)
+	return nil
+}
+
+func (s *serviceClusterStub) DeletePlacementExact(_ context.Context, sandboxID, _, _ string) error {
 	s.deleteCalls = append(s.deleteCalls, sandboxID)
 	return nil
 }
@@ -515,7 +534,7 @@ func TestServiceOwnershipAndHealthBranches(t *testing.T) {
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 
 	// DeleteSelfOwnedClusterPlacement should be a no-op without cluster.
-	svc.deleteSelfOwnedClusterPlacement(ctx, "sb-none", "reason")
+	svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{SandboxID: "sb-none"}, "reason")
 
 	// And it should ignore non-self owners.
 	other := &serviceClusterStub{
@@ -524,7 +543,9 @@ func TestServiceOwnershipAndHealthBranches(t *testing.T) {
 	}
 	svc.cfg.EnableCluster = true
 	svc.AttachCluster(other)
-	svc.deleteSelfOwnedClusterPlacement(ctx, "sb-peer", "reason")
+	svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{
+		SandboxID: "sb-peer", OwnerNodeID: "peer", IncarnationID: "inc-peer",
+	}, "reason")
 	if len(other.deleteCalls) != 0 {
 		t.Fatalf("non-self placement should not be deleted, got %v", other.deleteCalls)
 	}
@@ -535,7 +556,9 @@ func TestServiceOwnershipAndHealthBranches(t *testing.T) {
 		owner: cluster.OwnerInfo{NodeID: "self", APIURL: "http://self", IsSelf: true},
 	}
 	svc.AttachCluster(selfOwned)
-	svc.deleteSelfOwnedClusterPlacement(ctx, "sb-self", "reason")
+	svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{
+		SandboxID: "sb-self", OwnerNodeID: "self", IncarnationID: "inc-self",
+	}, "reason")
 	if len(selfOwned.deleteCalls) != 1 || selfOwned.deleteCalls[0] != "sb-self" {
 		t.Fatalf("self-owned placement delete calls = %v", selfOwned.deleteCalls)
 	}
@@ -544,18 +567,19 @@ func TestServiceOwnershipAndHealthBranches(t *testing.T) {
 	// longer belong to this node.
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           "sb-stale",
-		Image:        "alpine",
-		Status:       models.SandboxStatusStarted,
-		Runtime:      models.RuntimeDocker,
-		ContainerID:  "ctr-stale",
-		ContainerIP:  "10.0.0.80",
-		CPU:          1,
-		MemoryMB:     256,
-		DiskGB:       5,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 "sb-stale",
+		Image:              "alpine",
+		Status:             models.SandboxStatusStarted,
+		Runtime:            models.RuntimeDocker,
+		ContainerID:        "ctr-stale",
+		ContainerIP:        "10.0.0.80",
+		CPU:                1,
+		MemoryMB:           256,
+		DiskGB:             5,
+		AuditIncarnationID: "inc-sb-stale",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
@@ -565,9 +589,6 @@ func TestServiceOwnershipAndHealthBranches(t *testing.T) {
 	}
 	svc.AttachCluster(stale)
 	svc.reconcileStaleOwnership(ctx)
-	if len(stale.ownerCalls) == 0 {
-		t.Fatal("reconcileStaleOwnership should consult owner mapping")
-	}
 	if _, err := st.Get(ctx, "sb-stale"); err == nil {
 		t.Fatal("stale sandbox should have been destroyed")
 	}
@@ -629,13 +650,14 @@ func TestServiceClusterAndHealthBranches(t *testing.T) {
 
 	t.Run("reconcile missing self-owned placements", func(t *testing.T) {
 		ctx := context.Background()
-		svc := &Service{cfg: config.Config{EnableCluster: true}}
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableCluster = true
 		stub := &serviceClusterStub{
 			Noop: cluster.NewNoop("self", "http://self", ""),
 			placements: []cluster.Placement{
-				{SandboxID: "sb-delete", OwnerNodeID: "self", OwnerState: cluster.PlacementOwnerStateActive, State: cluster.PlacementStatePlaced},
-				{SandboxID: "sb-skip", OwnerNodeID: "self", OwnerState: cluster.PlacementOwnerStateActive, State: cluster.PlacementStatePlaced},
-				{SandboxID: "sb-peer", OwnerNodeID: "peer", OwnerState: cluster.PlacementOwnerStateActive, State: cluster.PlacementStatePlaced},
+				{SandboxID: "sb-delete", OwnerNodeID: "self", IncarnationID: "inc-delete", OwnerState: cluster.PlacementOwnerStateActive, State: cluster.PlacementStatePlaced},
+				{SandboxID: "sb-skip", OwnerNodeID: "self", IncarnationID: "inc-skip", OwnerState: cluster.PlacementOwnerStateActive, State: cluster.PlacementStatePlaced},
+				{SandboxID: "sb-peer", OwnerNodeID: "peer", IncarnationID: "inc-peer", OwnerState: cluster.PlacementOwnerStateActive, State: cluster.PlacementStatePlaced},
 			},
 			specs: map[string]*models.CreateSandboxRequest{
 				"sb-skip": {Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}},
@@ -759,8 +781,8 @@ func TestServiceHelperBranchCoverageRoundTwo(t *testing.T) {
 		svc.cfg.ImageGCWhitelist = []string{"whitelisted:latest"}
 		svc.admitter = nil
 
-		svc.deleteSelfOwnedClusterPlacement(ctx, "", "empty")
-		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-none", "no-cluster")
+		svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{}, "empty")
+		svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{SandboxID: "sb-none"}, "no-cluster")
 
 		nonSelf := &serviceClusterStub{
 			Noop:     cluster.NewNoop("self", "http://self", ""),
@@ -768,14 +790,18 @@ func TestServiceHelperBranchCoverageRoundTwo(t *testing.T) {
 			ownerErr: errors.New("owner lookup failed"),
 		}
 		svc.AttachCluster(nonSelf)
-		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-peer", "peer")
+		svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{
+			SandboxID: "sb-peer", OwnerNodeID: "peer", IncarnationID: "inc-peer",
+		}, "peer")
 
 		selfOwned := &serviceClusterStub{
 			Noop:  cluster.NewNoop("self", "http://self", ""),
 			owner: cluster.OwnerInfo{NodeID: "self", APIURL: "http://self", IsSelf: true},
 		}
 		svc.AttachCluster(selfOwned)
-		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-self", "self")
+		svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{
+			SandboxID: "sb-self", OwnerNodeID: "self", IncarnationID: "inc-self",
+		}, "self")
 		if len(selfOwned.deleteCalls) != 1 || selfOwned.deleteCalls[0] != "sb-self" {
 			t.Fatalf("delete calls = %v, want [sb-self]", selfOwned.deleteCalls)
 		}
@@ -828,19 +854,20 @@ func TestFleetControllerOwnerActions(t *testing.T) {
 
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           "sb-owner",
-		Image:        "alpine",
-		Status:       models.SandboxStatusStarted,
-		Runtime:      models.RuntimeDocker,
-		ContainerID:  "ctr-owner",
-		ContainerIP:  "10.0.0.60",
-		CPU:          1,
-		MemoryMB:     256,
-		DiskGB:       5,
-		OwnerRef:     "acct-1",
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 "sb-owner",
+		Image:              "alpine",
+		Status:             models.SandboxStatusStarted,
+		Runtime:            models.RuntimeDocker,
+		ContainerID:        "ctr-owner",
+		ContainerIP:        "10.0.0.60",
+		CPU:                1,
+		MemoryMB:           256,
+		DiskGB:             5,
+		OwnerRef:           "acct-1",
+		AuditIncarnationID: "inc-sb-owner",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}

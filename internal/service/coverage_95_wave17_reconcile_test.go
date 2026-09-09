@@ -95,8 +95,9 @@ func TestReconcileGoneDockerRowWave17(t *testing.T) {
 	svc.caddy = caddy.New(config.Config{EnableCaddy: false, Domain: "sandbox.example.com", HTTPClientTimeout: time.Second})
 	_ = st.Create(ctx, &models.Sandbox{
 		ID: "sb-gone", Image: "alpine:3.20", Status: models.SandboxStatusStarted, ContainerID: "missing",
-		ExposedPorts: []models.ExposedPort{{Port: 80, Protocol: models.ExposedPortProtocolHTTP}},
-		CreatedAt:    now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-gone",
+		ExposedPorts:       []models.ExposedPort{{Port: 80, Protocol: models.ExposedPortProtocolHTTP}},
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	})
 	_ = st.UpsertPort(ctx, models.ExposedPort{
 		SandboxID: "sb-gone", Port: 80, Protocol: models.ExposedPortProtocolHTTP, PublicURL: "https://x",

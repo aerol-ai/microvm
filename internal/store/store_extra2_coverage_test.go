@@ -137,7 +137,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = sandboxFailoverPolicy(&models.Sandbox{})
 
 	_ = st.DeleteMounts(ctx, "sb-list")
-	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb-list")
+	_ = st.DeleteClusterSecretRowsForIncarnation(ctx, "sb-list", "inc-list")
 	_ = st.DeleteSnapshotAlias(ctx, "alias-list")
 	_ = st.DeleteSnapshot(ctx, "snap-list")
 	_ = st.DeleteTemplate(ctx, "tpl-list")
@@ -238,7 +238,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_ = st.SetNetworkLimits(ctx, "sb", 1, 1)
 	_ = st.ClearNetworkQuotaExceeded(ctx, "sb")
 	_, _ = st.GetClusterSecret(ctx, "sb")
-	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb")
+	_ = st.DeleteClusterSecretRowsForIncarnation(ctx, "sb", "inc")
 	_, _ = st.GetMounts(ctx, "sb")
 
 	_ = st.DeleteAllWasmStateKV(ctx, "sb")

@@ -211,14 +211,14 @@ func TestPersistedStandaloneAuditIncarnationRotatesAndRollbackPreservesHistory(t
 
 func TestPrepareAuditIncarnationRejectsConcurrentDifferentLifecycle(t *testing.T) {
 	svc := &Service{}
-	first, err := svc.prepareAuditIncarnation("sb-concurrent", "toolbox-a")
+	first, err := svc.prepareAuditIncarnation(context.Background(), "sb-concurrent", "toolbox-a")
 	if err != nil {
 		t.Fatalf("first prepare: %v", err)
 	}
-	if _, err := svc.prepareAuditIncarnation("sb-concurrent", "toolbox-b"); err == nil {
+	if _, err := svc.prepareAuditIncarnation(context.Background(), "sb-concurrent", "toolbox-b"); err == nil {
 		t.Fatal("different concurrent lifecycle reused pending audit incarnation")
 	}
-	if same, err := svc.prepareAuditIncarnation("sb-concurrent", "toolbox-a"); err != nil || same != first {
+	if same, err := svc.prepareAuditIncarnation(context.Background(), "sb-concurrent", "toolbox-a"); err != nil || same != first {
 		t.Fatalf("same lifecycle prepare = %q, %v; want %q", same, err, first)
 	}
 	svc.clearPendingAuditIncarnation("sb-concurrent", first)
@@ -410,6 +410,17 @@ func TestValidateEgressAuditBindingClusterAndStoreFailures(t *testing.T) {
 		Noop: cluster.NewNoop("self", "", ""),
 		placement: cluster.Placement{
 			SandboxID:     "sb",
+			OwnerState:    cluster.PlacementOwnerStateOrphaned,
+			IncarnationID: "inc",
+		},
+	}
+	if err := clustered.validateEgressAuditBinding(context.Background(), "sb", "inc"); !errors.Is(err, errAuditIngestBindingStale) {
+		t.Fatalf("orphaned-owner error = %v", err)
+	}
+	clustered.cluster = &placementOnlyCluster{
+		Noop: cluster.NewNoop("self", "", ""),
+		placement: cluster.Placement{
+			SandboxID:     "sb",
 			OwnerNodeID:   "self",
 			IncarnationID: "inc-current",
 		},
@@ -433,7 +444,7 @@ func TestValidateEgressAuditBindingClusterAndStoreFailures(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := local.validateEgressAuditBinding(context.Background(), "sb", ""); err == nil || errors.Is(err, errAuditIngestBindingStale) {
+	if err := local.validateEgressAuditBinding(context.Background(), "sb", "inc"); err == nil || errors.Is(err, errAuditIngestBindingStale) {
 		t.Fatalf("closed-store error = %v, want storage failure", err)
 	}
 }

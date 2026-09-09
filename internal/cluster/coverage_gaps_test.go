@@ -154,6 +154,7 @@ func TestAgentCustomDomainsAndIngressTargets(t *testing.T) {
 				SandboxID: "sb-domains",
 				Placement: Placement{
 					SandboxID:       "sb-domains",
+					IncarnationID:   "inc-domains",
 					CustomHostnames: []string{"api.acme.com", "shop.beta.io"},
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
@@ -207,6 +208,13 @@ func TestAgentReassignPlacementAndAssertOwnership(t *testing.T) {
 	capture := &agentControlPlaneCapture{}
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-reassign":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-reassign",
+				Placement: Placement{SandboxID: "sb-reassign", OwnerNodeID: "worker-self", IncarnationID: "inc-reassign"},
+			})
+			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-new":
 			http.Error(w, "not found", http.StatusNotFound)
 			return true
@@ -215,9 +223,10 @@ func TestAgentReassignPlacementAndAssertOwnership(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-reserved",
 				Placement: Placement{
-					SandboxID:   "sb-reserved",
-					OwnerNodeID: "worker-self",
-					State:       PlacementStateReserved,
+					SandboxID:     "sb-reserved",
+					OwnerNodeID:   "worker-self",
+					State:         PlacementStateReserved,
+					IncarnationID: "inc-reserved",
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -234,7 +243,7 @@ func TestAgentReassignPlacementAndAssertOwnership(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-owned",
-				Placement: Placement{SandboxID: "sb-owned", OwnerNodeID: "worker-self"},
+				Placement: Placement{SandboxID: "sb-owned", OwnerNodeID: "worker-self", IncarnationID: "inc-owned"},
 				Owner:     OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
 			return true
@@ -246,6 +255,7 @@ func TestAgentReassignPlacementAndAssertOwnership(t *testing.T) {
 					SandboxID:           "sb-orphan",
 					OwnerState:          PlacementOwnerStateOrphaned,
 					OrphanedOwnerNodeID: "worker-self",
+					IncarnationID:       "inc-orphan",
 				},
 			})
 			return true
@@ -272,14 +282,16 @@ func TestAgentReassignPlacementAndAssertOwnership(t *testing.T) {
 	if err := agent.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-new",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-new"},
 		CustomHostnames: []string{"new.acme.com"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http", PublicURL: "https://x"}},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership new: %v", err)
 	}
 	if err := agent.AssertOwnership(ctx, []LocalSandboxState{{
-		ID:   "sb-reserved",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+		ID:      "sb-reserved",
+		Spec:    &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets: PlacementSecrets{IncarnationID: "inc-reserved"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership reserved: %v", err)
 	}
@@ -290,14 +302,16 @@ func TestAgentReassignPlacementAndAssertOwnership(t *testing.T) {
 		t.Fatalf("AssertOwnership skip empty: %v", err)
 	}
 	if err := agent.AssertOwnership(ctx, []LocalSandboxState{{
-		ID:   "sb-owned",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+		ID:      "sb-owned",
+		Spec:    &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets: PlacementSecrets{IncarnationID: "inc-owned"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership owned upsert: %v", err)
 	}
 	if err := agent.AssertOwnership(ctx, []LocalSandboxState{{
-		ID:   "sb-orphan",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+		ID:      "sb-orphan",
+		Spec:    &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets: PlacementSecrets{IncarnationID: "inc-orphan"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership orphan claim: %v", err)
 	}
@@ -650,6 +664,7 @@ func TestClusterAssertOwnershipBranches(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-cluster-new",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-cluster-new"},
 		CustomHostnames: []string{"new.example.com"},
 		ExposedPorts:    map[int]ExposedPortRoute{9090: {Protocol: "http", PublicURL: "https://x"}},
 	}}); err != nil {
@@ -700,10 +715,11 @@ func TestReconcileReservationsCancelsExpired(t *testing.T) {
 
 	ctx := context.Background()
 	applyOp(t, c.fsm, command{
-		Op:          opReserve,
-		SandboxID:   "sb-expired-reconcile",
-		OwnerNodeID: c.nodeID,
-		ExpiresUnix: time.Now().Add(-time.Second).Unix(),
+		Op:            opReserve,
+		SandboxID:     "sb-expired-reconcile",
+		OwnerNodeID:   c.nodeID,
+		IncarnationID: "inc-expired-reconcile",
+		ExpiresUnix:   time.Now().Add(-time.Second).Unix(),
 	})
 	c.reconcileReservations(ctx)
 	if _, ok := c.PlacementOf("sb-expired-reconcile"); ok {
@@ -739,9 +755,10 @@ func TestAgentAssertOwnershipSelfOwnedAddsPorts(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-live",
 				Placement: Placement{
-					SandboxID:   "sb-live",
-					OwnerNodeID: "worker-self",
-					Spec:        &models.CreateSandboxRequest{Image: "alpine"},
+					SandboxID:     "sb-live",
+					OwnerNodeID:   "worker-self",
+					Spec:          &models.CreateSandboxRequest{Image: "alpine"},
+					IncarnationID: "inc-live",
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -752,6 +769,7 @@ func TestAgentAssertOwnershipSelfOwnedAddsPorts(t *testing.T) {
 
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:           "sb-live",
+		Secrets:      PlacementSecrets{IncarnationID: "inc-live"},
 		ExposedPorts: map[int]ExposedPortRoute{3000: {Protocol: "http", PublicURL: "https://live"}},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership live owner: %v", err)

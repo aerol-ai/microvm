@@ -351,7 +351,8 @@ func TestDestroySandboxUnmountWarnWithoutMountsWave14(t *testing.T) {
 	svc.testForceUnmountErr = errors.New("fuse phantom")
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: "sb-umount", Image: "a", Status: models.SandboxStatusStarted,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-umount",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}

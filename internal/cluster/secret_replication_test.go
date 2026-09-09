@@ -3,8 +3,10 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -73,18 +75,20 @@ func TestPushSecretBlobUnauthenticatedRejected(t *testing.T) {
 func TestDeleteSecretOnPeers(t *testing.T) {
 	var deletes atomic.Int32
 	var gotGen string
+	var gotIncarnation string
 	srv, internalClient := newNodeBoundForwardServer(t, "self", "peer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			t.Fatalf("method = %s", r.Method)
 		}
 		gotGen = r.URL.Query().Get("generation")
+		gotIncarnation = r.URL.Query().Get("incarnation_id")
 		deletes.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	members := []Member{{NodeID: "peer", Alive: true, InternalURL: srv.URL}}
-	acked, pending, err := deleteSecretOnPeers(context.Background(), members, internalClient, "pat", "self", "sb-del", []string{"peer", "offline"}, 7)
-	if err != nil {
-		t.Fatalf("delete: %v", err)
+	acked, err := deleteSecretOnPeers(context.Background(), members, internalClient, "pat", "self", "sb-del", "inc-del", []string{"peer", "offline"}, 7)
+	if err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("delete incomplete error: %v", err)
 	}
 	if deletes.Load() != 1 {
 		t.Fatalf("deletes = %d", deletes.Load())
@@ -92,11 +96,11 @@ func TestDeleteSecretOnPeers(t *testing.T) {
 	if gotGen != "7" {
 		t.Fatalf("generation query = %q, want 7", gotGen)
 	}
+	if gotIncarnation != "inc-del" {
+		t.Fatalf("incarnation query = %q, want inc-del", gotIncarnation)
+	}
 	if len(acked) != 1 || acked[0] != "peer" {
 		t.Fatalf("acked = %v", acked)
-	}
-	if len(pending) != 1 || pending[0] != "offline" {
-		t.Fatalf("pending = %v, want offline still pending", pending)
 	}
 }
 
@@ -198,17 +202,17 @@ func TestSecretReplicationFailClosedWithoutInternalURL(t *testing.T) {
 		t.Fatalf("public hits = %d, want 0 (no APIURL fallback)", publicHits.Load())
 	}
 
-	acked, pending, delErr := deleteSecretOnPeers(
-		context.Background(), members, public.Client(), "pat", "self", "sb", []string{"peer"}, 1,
+	acked, delErr := deleteSecretOnPeers(
+		context.Background(), members, public.Client(), "pat", "self", "sb", "inc-test", []string{"peer"}, 1,
 	)
 	if delErr == nil {
 		t.Fatal("expected delete fail-closed dial error")
 	}
-	if len(acked) != 0 || len(pending) != 1 || pending[0] != "peer" {
-		t.Fatalf("acked=%v pending=%v", acked, pending)
+	if len(acked) != 0 {
+		t.Fatalf("acked=%v", acked)
 	}
 	holding, probeErr := probeSecretOnPeers(
-		context.Background(), members, public.Client(), "pat", "self", "sb", []string{"peer"}, 1,
+		context.Background(), members, public.Client(), "pat", "self", "sb", "inc-test", []string{"peer"}, 1,
 	)
 	if probeErr == nil {
 		t.Fatal("expected probe fail-closed dial error")
@@ -265,6 +269,12 @@ func TestDeleteAndProbeSecretOnPeersLookup(t *testing.T) {
 			deletes.Add(1)
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodHead:
+			if got := r.URL.Query().Get("incarnation_id"); got != "inc-test" {
+				t.Fatalf("probe incarnation_id = %q", got)
+			}
+			if got := r.URL.Query().Get("min_generation"); got != "3" {
+				t.Fatalf("probe min_generation = %q", got)
+			}
 			heads.Add(1)
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -277,14 +287,14 @@ func TestDeleteAndProbeSecretOnPeersLookup(t *testing.T) {
 		}
 		return Member{NodeID: "peer", Alive: true, InternalURL: srv.URL}, true
 	}
-	acked, pending, err := deleteSecretOnPeersLookup(context.Background(), lookup, internalClient, "pat", "self", "sb", []string{"peer", "missing"}, 3)
-	if err != nil {
-		t.Fatalf("delete lookup: %v", err)
+	acked, err := deleteSecretOnPeersLookup(context.Background(), lookup, internalClient, "pat", "self", "sb", "inc-test", []string{"peer", "missing"}, 3)
+	if err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("delete lookup incomplete error: %v", err)
 	}
-	if deletes.Load() != 1 || len(acked) != 1 || acked[0] != "peer" || len(pending) != 1 || pending[0] != "missing" {
-		t.Fatalf("acked=%v pending=%v deletes=%d", acked, pending, deletes.Load())
+	if deletes.Load() != 1 || len(acked) != 1 || acked[0] != "peer" {
+		t.Fatalf("acked=%v deletes=%d", acked, deletes.Load())
 	}
-	holding, err := probeSecretOnPeersLookup(context.Background(), lookup, internalClient, "pat", "self", "sb", []string{"peer", "missing"}, 3)
+	holding, err := probeSecretOnPeersLookup(context.Background(), lookup, internalClient, "pat", "self", "sb", "inc-test", []string{"peer", "missing"}, 3)
 	if err != nil {
 		t.Fatalf("probe lookup: %v", err)
 	}
@@ -324,11 +334,11 @@ func TestClusterAndAgentSecretReplicationWrappers(t *testing.T) {
 			if err != nil || len(acked) != 1 || acked[0] != "peer" {
 				t.Fatalf("push acked=%v err=%v", acked, err)
 			}
-			acked, pending, err := pusher.DeleteSecretOnPeers(context.Background(), "sb", []string{"self", "peer"}, 0)
-			if err != nil || len(acked) != 1 || len(pending) != 0 {
-				t.Fatalf("delete acked=%v pending=%v err=%v", acked, pending, err)
+			acked, err = pusher.DeleteSecretOnPeers(context.Background(), "sb", "inc-test", []string{"self", "peer"}, 1)
+			if err != nil || len(acked) != 1 {
+				t.Fatalf("delete acked=%v err=%v", acked, err)
 			}
-			holding, err := pusher.ProbeSecretOnPeers(context.Background(), "sb", []string{"self", "peer"}, 0)
+			holding, err := pusher.ProbeSecretOnPeers(context.Background(), "sb", "inc-test", []string{"self", "peer"}, 1)
 			if err != nil || len(holding) != 1 || holding[0] != "peer" {
 				t.Fatalf("probe holding=%v err=%v", holding, err)
 			}
@@ -349,16 +359,120 @@ func TestNilClusterAndAgentSecretReplicationWrappers(t *testing.T) {
 		"agent":   (*Agent)(nil),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if acked, err := pusher.PushSecretBlobToPeers(ctx, blob, recipients); err != nil || len(acked) != 0 {
+			if acked, err := pusher.PushSecretBlobToPeers(ctx, blob, recipients); !errors.Is(err, ErrPeerInternalURLRequired) || len(acked) != 0 {
 				t.Fatalf("nil push acked=%v err=%v", acked, err)
 			}
-			acked, pending, err := pusher.DeleteSecretOnPeers(ctx, "sb", recipients, 1)
-			if err != nil || len(acked) != 0 || len(pending) != 1 || pending[0] != "peer" {
-				t.Fatalf("nil delete acked=%v pending=%v err=%v", acked, pending, err)
+			acked, err := pusher.DeleteSecretOnPeers(ctx, "sb", "inc-test", recipients, 1)
+			if !errors.Is(err, ErrPeerInternalURLRequired) || len(acked) != 0 {
+				t.Fatalf("nil delete acked=%v err=%v", acked, err)
 			}
-			if holding, err := pusher.ProbeSecretOnPeers(ctx, "sb", recipients, 1); err != nil || len(holding) != 0 {
+			if holding, err := pusher.ProbeSecretOnPeers(ctx, "sb", "inc-test", recipients, 1); !errors.Is(err, ErrPeerInternalURLRequired) || len(holding) != 0 {
 				t.Fatalf("nil probe holding=%v err=%v", holding, err)
 			}
 		})
+	}
+
+	for name, pusher := range map[string]SecretPeerPusher{
+		"cluster": &Cluster{nodeID: "self"},
+		"agent":   &Agent{nodeID: "self"},
+	} {
+		t.Run(name+" self-only", func(t *testing.T) {
+			if acked, err := pusher.PushSecretBlobToPeers(ctx, blob, []string{"self"}); err != nil || len(acked) != 0 {
+				t.Fatalf("self-only push acked=%v err=%v", acked, err)
+			}
+			if acked, err := pusher.DeleteSecretOnPeers(ctx, "sb", "inc-test", []string{"self"}, 1); err != nil || len(acked) != 0 {
+				t.Fatalf("self-only delete acked=%v err=%v", acked, err)
+			}
+			if holding, err := pusher.ProbeSecretOnPeers(ctx, "sb", "inc-test", []string{"self"}, 1); err != nil || len(holding) != 0 {
+				t.Fatalf("self-only probe holding=%v err=%v", holding, err)
+			}
+		})
+	}
+}
+
+func TestSecretReplicationInputAndDialFailuresStayPending(t *testing.T) {
+	ctx := context.Background()
+	blob := secrets.SecretBlob{Ref: "r", SandboxID: "sb", SealedPayload: []byte("sealed")}
+	lookup := func(string) (Member, bool) {
+		return Member{NodeID: "peer", Alive: true, InternalURL: "https://peer.internal"}, true
+	}
+	if acked, err := pushSecretBlobToPeersLookupDial(ctx, lookup, nil, nil, "", "self", blob, []string{"peer"}); !errors.Is(err, ErrPeerInternalURLRequired) || len(acked) != 0 {
+		t.Fatalf("transportless push acked=%v err=%v", acked, err)
+	}
+	if acked, err := pushSecretBlobToPeersLookupDial(ctx, nil, nil, nil, "", "self", blob, []string{"peer"}); err != nil || acked != nil {
+		t.Fatalf("nil-lookup push acked=%v err=%v", acked, err)
+	}
+	if acked, err := deleteSecretOnPeersLookupDial(ctx, lookup, nil, nil, "", "self", "sb", "inc-test", []string{"peer"}, 1); !errors.Is(err, ErrPeerInternalURLRequired) || len(acked) != 0 {
+		t.Fatalf("transportless delete acked=%v err=%v", acked, err)
+	}
+	if acked, err := deleteSecretOnPeersLookupDial(ctx, nil, nil, nil, "", "self", "", "inc-test", []string{"peer"}, 1); err != nil || acked != nil {
+		t.Fatalf("invalid delete input acked=%v err=%v", acked, err)
+	}
+	if holding, err := probeSecretOnPeersLookupDial(ctx, lookup, nil, nil, "", "self", "sb", "inc-test", []string{"peer"}, 1); !errors.Is(err, ErrPeerInternalURLRequired) || holding != nil {
+		t.Fatalf("transportless probe holding=%v err=%v", holding, err)
+	}
+	if holding, err := probeSecretOnPeersLookupDial(ctx, nil, nil, nil, "", "self", "", "", []string{"peer"}, 1); err != nil || holding != nil {
+		t.Fatalf("invalid probe input holding=%v err=%v", holding, err)
+	}
+
+	dialFailure := errors.New("certificate identity mismatch")
+	dial := func(Member) (*http.Client, string, error) { return nil, "", dialFailure }
+	if acked, err := pushSecretBlobToPeersLookupDial(ctx, lookup, nil, dial, "", "self", blob, []string{"", "self", "peer"}); !errors.Is(err, dialFailure) || len(acked) != 0 {
+		t.Fatalf("failed-dial push acked=%v err=%v", acked, err)
+	}
+	if acked, err := deleteSecretOnPeersLookupDial(ctx, lookup, nil, dial, "", "self", "sb", "inc-test", []string{"", "self", "peer"}, 1); !errors.Is(err, dialFailure) || len(acked) != 0 {
+		t.Fatalf("failed-dial delete acked=%v err=%v", acked, err)
+	}
+	if holding, err := probeSecretOnPeersLookupDial(ctx, lookup, nil, dial, "", "self", "sb", "inc-test", []string{"", "self", "peer"}, 1); !errors.Is(err, dialFailure) || len(holding) != 0 {
+		t.Fatalf("failed-dial probe holding=%v err=%v", holding, err)
+	}
+	if acked, err := deleteSecretOnPeersLookupDial(ctx, lookup, nil, dial, "", "self", "sb", "inc-test", []string{"peer"}, 0); err == nil || len(acked) != 0 {
+		t.Fatalf("invalid delete generation acked=%v err=%v", acked, err)
+	}
+	if holding, err := probeSecretOnPeersLookupDial(ctx, lookup, nil, dial, "", "self", "sb", "inc-test", []string{"peer"}, 0); err == nil || len(holding) != 0 {
+		t.Fatalf("invalid probe generation holding=%v err=%v", holding, err)
+	}
+}
+
+func TestSecretReplicationHTTPStatusAndCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			http.Error(w, "probe denied", http.StatusForbidden)
+		case http.MethodDelete:
+			http.Error(w, "delete denied", http.StatusForbidden)
+		case http.MethodPost:
+			http.Error(w, "push denied", http.StatusForbidden)
+		}
+	}))
+	defer server.Close()
+	if ok, err := headSecretBlob(context.Background(), server.Client(), server.URL, "pat", "self"); err == nil || ok {
+		t.Fatalf("forbidden HEAD = (%v, %v)", ok, err)
+	}
+	if err := deleteSecretBlob(context.Background(), server.Client(), server.URL, "pat", "self"); err == nil {
+		t.Fatal("forbidden DELETE succeeded")
+	}
+	if err := postSecretBlob(context.Background(), server.Client(), server.URL, "pat", "self", []byte(`{}`)); err == nil {
+		t.Fatal("forbidden POST succeeded")
+	}
+	if ok, err := headSecretBlob(context.Background(), server.Client(), ":", "", ""); err == nil || ok {
+		t.Fatalf("invalid HEAD endpoint = (%v, %v)", ok, err)
+	}
+	if err := deleteSecretBlob(context.Background(), server.Client(), ":", "", ""); err == nil {
+		t.Fatal("invalid DELETE endpoint succeeded")
+	}
+	if err := postSecretBlob(context.Background(), server.Client(), ":", "", "", nil); err == nil {
+		t.Fatal("invalid POST endpoint succeeded")
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	err := withSecretFanoutBackoff(cancelled, func() error {
+		called = true
+		return errors.New("should not run")
+	})
+	if !errors.Is(err, context.Canceled) || called {
+		t.Fatalf("pre-cancelled backoff err=%v called=%v", err, called)
 	}
 }

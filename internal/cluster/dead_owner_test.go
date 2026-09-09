@@ -132,6 +132,7 @@ func TestEvictDeadOwnerReassignsWhenSpecOptsIn(t *testing.T) {
 	// Placement with a non-nil spec belongs to a phantom dead node.
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-reassign", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
+		IncarnationID: "inc-reassign",
 		Spec: &models.CreateSandboxRequest{
 			Image:    "alpine",
 			CPU:      0.5,
@@ -167,7 +168,8 @@ func TestEvictDeadOwnerOrphansSpecWithoutFailoverOptIn(t *testing.T) {
 
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-no-ha", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256},
+		IncarnationID: "inc-no-ha",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256},
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {

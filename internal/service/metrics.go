@@ -62,7 +62,6 @@ var (
 	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.
 	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
 	// Best-effort local seal failures (ownership replay backfill).
-	clusterSecretSealBestEffortFailures = expvar.NewInt("aerolvm_secret_seal_best_effort_failures_total")
 	// Promote-retract counter for overlapped reserved-path create
 	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
 	// result so a DeletePlacement failure is visible without relying on logs.
@@ -202,10 +201,6 @@ func recordSecretProviderCanary(ok bool) {
 		return
 	}
 	secretProviderCanaryOK.Set(0)
-}
-
-func recordClusterSecretSealBestEffortFailure() {
-	clusterSecretSealBestEffortFailures.Add(1)
 }
 
 // reapplyNetworkBlockAll heals the per-IP isolation rule and reports whether

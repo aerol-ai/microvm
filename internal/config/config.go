@@ -2210,6 +2210,11 @@ func Load() (Config, error) {
 		}
 	}
 	if cfg.EnterpriseMode {
+		// Enterprise tamper-evidence requires both reconstructable event export
+		// and an independently retained chain-head witness. Force the daemon's
+		// provider validation even if an operator explicitly set the flag false;
+		// a no-op/open-source control plane then fails closed during startup.
+		cfg.SecretAuditExternalWitness = true
 		if len([]byte(cfg.PATToken)) < minEnterpriseCredentialBytes {
 			return Config{}, fmt.Errorf("SB_PAT_TOKEN must contain at least %d bytes when SB_ENTERPRISE_MODE=true", minEnterpriseCredentialBytes)
 		}
@@ -2233,9 +2238,6 @@ func Load() (Config, error) {
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
-		}
-		if strings.TrimSpace(cfg.SecretAuditExportURL) == "" {
-			return Config{}, errors.New("SB_ENTERPRISE_MODE=true requires SB_SECRET_AUDIT_EXPORT_URL so reconstructable audit events are durable off-node")
 		}
 		if cfg.EnableIsolate {
 			return Config{}, errors.New("SB_ENABLE_ISOLATE is experimental fleet-wide bundle replication and is forbidden when SB_ENTERPRISE_MODE=true")

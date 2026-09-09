@@ -66,6 +66,11 @@ var ErrPreferredHostPortUnavailable = errors.New("preferred host port unavailabl
 // and SSH gateway.
 var ErrPublicTrafficDisabled = errors.New("public traffic is disabled for this sandbox; pass allow_public_traffic=true at create or expose a port to opt in")
 
+// ErrClusterFinalizationUnavailable means local runtime teardown completed but
+// the owner+incarnation-fenced placement could not be durably removed. The
+// local sandbox row is intentionally retained as a retry/reconcile anchor.
+var ErrClusterFinalizationUnavailable = errors.New("cluster placement finalization temporarily unavailable")
+
 const clusterIngressReconcileInterval = 5 * time.Second
 
 type Service struct {
@@ -177,13 +182,13 @@ type Service struct {
 	secretAuditExportOnce   sync.Once
 	secretAuditExportStop   chan struct{}
 	secretAuditExportDone   sync.WaitGroup
+	secretRefanoutMu        sync.Mutex
+	secretRefanoutRunning   bool
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
-	// testSandboxMetaFetcher overrides owner-ref probes for ingress audit auth.
-	testSandboxMetaFetcher cluster.SandboxMetaFetcher
-	mounts                 *mounts.Manager
-	admitter               *capacity.Admitter
-	images                 ImageDistributionProvider
+	mounts           *mounts.Manager
+	admitter         *capacity.Admitter
+	images           ImageDistributionProvider
 	// volumeReclaimer deletes the backing bytes (S3 prefix / NFS dir) of deleted
 	// platform volumes. Non-nil only when the daemon wired a backend reclaimer;
 	// nil leaves the pending_volume_deletions ledger for an external reconciler.
@@ -718,6 +723,9 @@ func (s *Service) ociEngineForSandbox(sandbox *models.Sandbox) (runtime.Runtime,
 		}
 		return s.containerd, nil
 	}
+	if s.docker == nil {
+		return nil, fmt.Errorf("sandbox engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
+	}
 	return s.docker, nil
 }
 
@@ -959,10 +967,10 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 	return s.createSandbox(ctx, req, id)
 }
 
-// reconcileStaleOwnership destroys local sandboxes whose cluster placement
-// no longer points to self. Single-node mode (Noop client) reports IsSelf=true
-// for every id, so this is a no-op there. Errors are logged and swallowed —
-// the next reconcile tick retries.
+// reconcileStaleOwnership destroys local materializations whose authoritative
+// cluster placement no longer points to self. Reads are batched so a worker
+// with thousands of local rows makes O(pages), not O(sandboxes), control-plane
+// calls. Errors are logged and swallowed; the next reconcile tick retries.
 func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 	c := s.Cluster()
 	if c == nil {
@@ -977,28 +985,165 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 		s.logger.Warn("cluster: stale-ownership list failed", "err", err)
 		return
 	}
+	ids := make([]string, 0, len(known))
 	for _, sb := range known {
 		if sb == nil || sb.ID == "" {
 			continue
 		}
-		owner, err := c.OwnerOf(sb.ID)
+		ids = append(ids, sb.ID)
+	}
+	placements := make(map[string]cluster.Placement, len(ids))
+	for start := 0; start < len(ids); start += cluster.MaxPlacementPageLimit {
+		end := min(start+cluster.MaxPlacementPageLimit, len(ids))
+		batch, err := c.AuthoritativePlacementsByIDs(ctx, ids[start:end])
 		if err != nil {
-			// ErrUnknownSandbox: no FSM record yet (fresh boot before
-			// AssertOwnership replay completes); leave it alone.
-			// ErrOrphaned: the dead-owner reconciler is still mid-flight or
-			// the sandbox has no spec to recreate from; leave it alone.
+			s.logger.Warn("cluster: stale-ownership authoritative read failed", "err", err)
+			return
+		}
+		for id, placement := range batch {
+			placements[id] = placement
+		}
+	}
+	for _, sb := range known {
+		if sb == nil || sb.ID == "" {
 			continue
 		}
-		if owner.NodeID == "" || owner.NodeID == self {
+		placement, ok := placements[sb.ID]
+		// No placement can be a fresh local create awaiting ownership replay;
+		// an orphan has no replacement owner yet. Neither is proof that this
+		// node's runtime is stale.
+		if !ok || placement.IsOrphaned() || strings.TrimSpace(placement.OwnerNodeID) == self {
+			continue
+		}
+		if strings.TrimSpace(placement.IncarnationID) == "" {
+			s.logger.Warn("cluster: stale-ownership placement missing lifecycle; refusing local teardown",
+				"sandbox_id", sb.ID, "current_owner", placement.OwnerNodeID)
 			continue
 		}
 		s.logger.Warn("cluster: destroying stale local sandbox; ownership reassigned",
-			"sandbox_id", sb.ID, "current_owner", owner.NodeID)
-		if err := s.DestroySandbox(ctx, sb.ID); err != nil {
+			"sandbox_id", sb.ID, "current_owner", placement.OwnerNodeID)
+		if err := s.destroyStaleLocalSandbox(ctx, sb, placement); err != nil {
 			s.logger.Warn("cluster: stale-destroy failed; will retry next reconcile",
 				"sandbox_id", sb.ID, "err", err)
 		}
 	}
+}
+
+// destroyStaleLocalSandbox removes only this node's obsolete materialization.
+// The authoritative placement now belongs to another node, so the lifecycle's
+// replicated volume attachments, peer secrets, and external WASM checkpoints
+// must remain intact for that owner. The local row is removed before runtime
+// Destroy so the resulting Docker event cannot enter the normal lifecycle-wide
+// destroy finalizer and fan out credential deletion.
+func (s *Service) destroyStaleLocalSandbox(ctx context.Context, sandbox *models.Sandbox, placement cluster.Placement) error {
+	return s.finalizeStaleLocalSandbox(ctx, sandbox, placement, false)
+}
+
+func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models.Sandbox, placement cluster.Placement, runtimeAlreadyGone bool) error {
+	if s == nil || sandbox == nil || strings.TrimSpace(sandbox.ID) == "" {
+		return nil
+	}
+	self := ""
+	if c := s.Cluster(); c != nil {
+		self = strings.TrimSpace(c.SelfNodeID())
+	}
+	localIncarnation := strings.TrimSpace(sandbox.AuditIncarnationID)
+	placementIncarnation := strings.TrimSpace(placement.IncarnationID)
+	if placement.SandboxID != sandbox.ID || localIncarnation == "" || placementIncarnation == "" {
+		return errors.New("stale local sandbox lifecycle identity is missing")
+	}
+	if placementIncarnation == localIncarnation && strings.TrimSpace(placement.OwnerNodeID) == self && !placement.IsOrphaned() {
+		return nil
+	}
+	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+		return err
+	}
+	var rt runtime.Runtime
+	if !runtimeAlreadyGone {
+		var err error
+		rt, err = s.runtimeForSandbox(sandbox)
+		if err != nil {
+			return err
+		}
+	}
+	for _, port := range sandbox.ExposedPorts {
+		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+	}
+	_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
+	if s.mounts != nil {
+		if err := s.mounts.UnmountAll(sandbox.ID); err != nil && s.logger != nil {
+			s.logger.Warn("unmount stale local sandbox failed", "sandbox_id", sandbox.ID, "error", err)
+		}
+	}
+
+	if localIncarnation != placementIncarnation && s.store != nil {
+		// This is an ID-reused old local lifecycle, not merely the old owner of
+		// the current lifecycle. Tomb its local ciphertext without contacting
+		// any peer belonging to either lifecycle.
+		if _, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, sandbox.ID, localIncarnation, nil); err != nil {
+			return fmt.Errorf("delete stale-lifecycle local secrets: %w", err)
+		}
+	}
+	if s.isWasmSandbox(sandbox) && s.store != nil {
+		// Forget local tracking only. cleanupWasmSandboxArtifacts intentionally
+		// deletes external manifests and is therefore lifecycle-wide, not valid
+		// for an obsolete owner materialization.
+		if err := s.store.DeleteAllWasmStateKV(ctx, sandbox.ID); err != nil {
+			return err
+		}
+		if err := s.store.DeleteAllWasmCheckpointPushes(ctx, sandbox.ID); err != nil {
+			return err
+		}
+	}
+	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if !runtimeAlreadyGone {
+		if err := rt.Destroy(ctx, sandbox); err != nil {
+			// With the row gone, the ordinary orphan-runtime sweep owns retries and
+			// cannot mistake this for a lifecycle-wide delete.
+			return err
+		}
+	}
+	s.forgetWakeFlight(sandbox.ID)
+	s.invalidateWarm(sandbox.ID)
+	s.forgetNetstatsActivity(sandbox.ID)
+	if s.admitter != nil {
+		s.admitter.Release(sandbox.ID)
+	}
+	if !s.isWasmSandbox(sandbox) {
+		s.schedulePendingImageGC(ctx, sandbox.Image)
+	}
+	return nil
+}
+
+// obsoleteLocalPlacement returns an authoritative proof that sandbox is only
+// an obsolete local materialization. Missing placements are not proof: a
+// freshly-created local row may still be awaiting ownership replay.
+func (s *Service) obsoleteLocalPlacement(ctx context.Context, sandbox *models.Sandbox) (cluster.Placement, bool, error) {
+	if s == nil || sandbox == nil || !s.cfg.EnableCluster {
+		return cluster.Placement{}, false, nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return cluster.Placement{}, false, fmt.Errorf("%w: placement client unavailable", ErrClusterFinalizationUnavailable)
+	}
+	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandbox.ID})
+	if err != nil {
+		return cluster.Placement{}, false, fmt.Errorf("%w: resolve authoritative placement: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	placement, ok := placements[sandbox.ID]
+	if !ok {
+		return cluster.Placement{}, false, nil
+	}
+	localIncarnation := strings.TrimSpace(sandbox.AuditIncarnationID)
+	placementIncarnation := strings.TrimSpace(placement.IncarnationID)
+	if localIncarnation == "" || placementIncarnation == "" {
+		return cluster.Placement{}, false, fmt.Errorf("%w: sandbox or placement incarnation_id is missing", ErrClusterFinalizationUnavailable)
+	}
+	self := strings.TrimSpace(c.SelfNodeID())
+	obsolete := placementIncarnation != localIncarnation || placement.IsOrphaned() || strings.TrimSpace(placement.OwnerNodeID) != self
+	return placement, obsolete, nil
 }
 
 // RecreateSandbox satisfies cluster.SandboxRecreator. The cluster owner
@@ -1450,8 +1595,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 				incarnationID = p.IncarnationID
 			}
 		}
+		if incarnationID == "" {
+			// Size validation runs before an unreserved placement receives its
+			// real random incarnation. Use an equal-width placeholder so this
+			// preflight cannot undercount the canonical current-format handle.
+			incarnationID = strings.Repeat("0", 32)
+		}
 		handle := cluster.PlacementSecrets{
-			Ref:           secrets.FormatRefInc(sandboxID, incarnationID, secrets.RefVersion),
+			Ref:           secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion),
 			Version:       secrets.RefVersion,
 			IncarnationID: incarnationID,
 		}
@@ -1642,6 +1793,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if len(platformAttachments) > 0 {
 		for i := range platformAttachments {
 			platformAttachments[i].SandboxID = sandbox.ID
+			platformAttachments[i].IncarnationID = sandbox.AuditIncarnationID
 		}
 		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
 			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
@@ -1705,6 +1857,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, err
 	}
+	stored.AuditIncarnationID = sandbox.AuditIncarnationID
 	createtiming.From(ctx).RecordStage("svc_persist", time.Since(persistStart))
 	return &models.CreateSandboxResponse{
 		Sandbox:       *stored,
@@ -1933,6 +2086,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if err != nil {
 		return nil, err
 	}
+	stored.AuditIncarnationID = sandbox.AuditIncarnationID
 	return &models.CreateSandboxResponse{
 		Sandbox:       *stored,
 		SSHPrivateKey: privateKeyPEM,
@@ -2007,7 +2161,7 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 		return errors.New("store is not configured")
 	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
-		incarnationID, err := s.prepareAuditIncarnation(sandbox.ID, sandbox.ToolboxToken)
+		incarnationID, err := s.prepareAuditIncarnation(ctx, sandbox.ID, sandbox.ToolboxToken)
 		if err != nil {
 			return err
 		}
@@ -2445,6 +2599,16 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	// Establish retained authorization before any runtime or route teardown.
+	// Failure leaves both the sandbox row and its runtime intact for retry.
+	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+		return err
+	}
+	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
+		return err
+	} else if obsolete {
+		return s.destroyStaleLocalSandbox(ctx, sandbox, placement)
+	}
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
@@ -2474,20 +2638,34 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	} else if s.testForceUnmountErr != nil {
 		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", s.testForceUnmountErr)
 	}
-	// Refresh the retained audit authorization before deleting the authoritative
-	// sandbox row. If this fails, keep the sandbox so audit access cannot fall
-	// into an ownerless gap after a crash or later cleanup error.
-	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+	// Ownership can change while runtime destruction is in flight. Recheck
+	// before lifecycle-wide secret/checkpoint deletion; if failover won, finish
+	// only this obsolete materialization and preserve the active lifecycle.
+	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
+		return err
+	} else if obsolete {
+		return s.finalizeStaleLocalSandbox(ctx, sandbox, placement, true)
+	}
+	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
 		return err
 	}
 	// Tomb/outbox secret cleanup must succeed before the irreversible sandbox
 	// delete. cluster_secrets has no FK, so a post-delete failure leaves
 	// retries with ErrNotFound while ciphertext and peer copies remain.
 	// Shared with docker-destroy and reconcile-destroyed paths.
-	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
+	if err := s.DeleteClusterSecrets(ctx, id, sandbox.AuditIncarnationID); err != nil {
 		return err
 	}
 	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+		return err
+	}
+	// Placement deletion is part of the durable destroy boundary. Removing the
+	// local row first would leave no retry anchor if Raft were unavailable, and
+	// a recreate-enabled ghost placement could then resurrect a sandbox the
+	// client was told was deleted. Owner+incarnation CAS protects a concurrent
+	// failover or ID reuse. The FSM releases replicated volume attachments in
+	// the same apply, so there is no second Raft cleanup window.
+	if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
 		return err
 	}
 	if err := s.store.Delete(ctx, id); err != nil {
@@ -2495,11 +2673,6 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	}
 	if s.testAfterStoreDeleteOnDestroy != nil {
 		s.testAfterStoreDeleteOnDestroy()
-	}
-	if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, id); err != nil {
-		if s.logger != nil {
-			s.logger.Warn("platform volume attachment cleanup after destroy failed", "sandbox_id", id, "error", err)
-		}
 	}
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
@@ -2516,7 +2689,8 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, id, reason string) {
+func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, placement cluster.Placement, reason string) {
+	id := strings.TrimSpace(placement.SandboxID)
 	if !s.cfg.EnableCluster || id == "" {
 		return
 	}
@@ -2524,23 +2698,94 @@ func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, id, reaso
 	if c == nil {
 		return
 	}
-	owner, err := c.OwnerOf(id)
-	if err != nil {
-		if !errors.Is(err, cluster.ErrUnknownSandbox) && !errors.Is(err, cluster.ErrOrphaned) {
-			s.logger.Warn("cluster placement ownership check before delete failed",
-				"sandbox_id", id, "reason", reason, "error", err)
-		}
-		return
-	}
-	if !owner.IsSelf {
+	ownerID := strings.TrimSpace(placement.OwnerNodeID)
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if ownerID == "" || ownerID != strings.TrimSpace(c.SelfNodeID()) || incarnationID == "" {
 		return
 	}
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.DeletePlacement(commitCtx, id); err != nil {
+	if err := c.DeletePlacementExact(commitCtx, id, ownerID, incarnationID); err != nil {
 		s.logger.Warn("cluster placement delete after local destroy failed",
 			"sandbox_id", id, "reason", reason, "error", err)
 	}
+}
+
+func (s *Service) beginSelfOwnedClusterPlacementDeleteStrict(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || sandbox == nil || !s.cfg.EnableCluster || strings.TrimSpace(sandbox.ID) == "" {
+		return nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return fmt.Errorf("%w: placement client unavailable", ErrClusterFinalizationUnavailable)
+	}
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: sandbox incarnation_id is missing", ErrClusterFinalizationUnavailable)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	placements, err := c.AuthoritativePlacementsByIDs(lookupCtx, []string{sandbox.ID})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("%w: resolve authoritative placement before delete fence: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	placement, ok := placements[sandbox.ID]
+	if !ok {
+		// Retry after an earlier final opDelete: the local row remains the
+		// cleanup anchor and exact-incarnation secret cleanup is still safe.
+		return nil
+	}
+	selfID := strings.TrimSpace(c.SelfNodeID())
+	if strings.TrimSpace(placement.IncarnationID) != incarnationID || strings.TrimSpace(placement.OwnerNodeID) != selfID || placement.IsOrphaned() {
+		return fmt.Errorf("%w: authoritative ownership changed before delete fence", ErrClusterFinalizationUnavailable)
+	}
+	commitCtx, commitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer commitCancel()
+	if err := c.BeginDeletePlacementExact(commitCtx, sandbox.ID, selfID, incarnationID); err != nil {
+		return fmt.Errorf("%w: begin authoritative placement delete: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	return nil
+}
+
+func (s *Service) deleteSelfOwnedClusterPlacementStrict(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || sandbox == nil || !s.cfg.EnableCluster || strings.TrimSpace(sandbox.ID) == "" {
+		return nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return fmt.Errorf("%w: placement client unavailable", ErrClusterFinalizationUnavailable)
+	}
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: sandbox incarnation_id is missing", ErrClusterFinalizationUnavailable)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	placements, err := c.AuthoritativePlacementsByIDs(lookupCtx, []string{sandbox.ID})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("%w: resolve authoritative placement: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	placement, ok := placements[sandbox.ID]
+	if !ok {
+		return nil
+	}
+	if strings.TrimSpace(placement.IncarnationID) != incarnationID {
+		return fmt.Errorf("%w: local sandbox and authoritative placement lifecycles differ: %v",
+			ErrClusterFinalizationUnavailable, cluster.ErrIncarnationConflict)
+	}
+	selfID := strings.TrimSpace(c.SelfNodeID())
+	ownerID := strings.TrimSpace(placement.OwnerNodeID)
+	if ownerID == "" || ownerID != selfID {
+		// A stale-ownership reconcile destroys only local state. The current
+		// owner's placement must remain intact.
+		return nil
+	}
+	commitCtx, commitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer commitCancel()
+	if err := c.DeletePlacementExact(commitCtx, sandbox.ID, ownerID, incarnationID); err != nil {
+		return fmt.Errorf("%w: delete authoritative placement: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	return nil
 }
 
 // CreateSnapshot commits the sandbox container into a reusable local image.
@@ -4338,15 +4583,36 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			} else if s.testForceUnmountErr != nil {
 				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", s.testForceUnmountErr)
 			}
-			// Secret tomb/outbox before store/placement delete (no FK on
-			// cluster_secrets). Same finalizer as DestroySandbox / docker events.
+			// Runtime confirmation and teardown can overlap failover. An
+			// authoritative recheck prevents this former owner from deleting the
+			// active lifecycle's replicated secrets, volume attachments, or
+			// external WASM checkpoints after ownership moved elsewhere.
+			if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
+				return err
+			} else if obsolete {
+				if err := s.finalizeStaleLocalSandbox(ctx, sandbox, placement, true); err != nil {
+					return err
+				}
+				continue
+			}
+			// Persist retained authorization before the distributed delete lease.
+			// An owner crash after the fence can otherwise let leader expiry remove
+			// the last authoritative ownership record before audit ACL retention.
 			if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
 				return err
 			}
-			if err := s.DeleteClusterSecrets(ctx, sandbox.ID); err != nil {
+			if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
+				return err
+			}
+			// Secret tomb/outbox before store/placement delete (no FK on
+			// cluster_secrets). Same finalizer as DestroySandbox / docker events.
+			if err := s.DeleteClusterSecrets(ctx, sandbox.ID, sandbox.AuditIncarnationID); err != nil {
 				return err
 			}
 			if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+				return err
+			}
+			if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
 				return err
 			}
 			// store.Delete must happen BEFORE schedulePendingImageGC. The
@@ -4364,7 +4630,6 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
-			s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "reconcile-destroyed")
 			if !s.isWasmSandbox(sandbox) {
 				s.schedulePendingImageGC(ctx, sandbox.Image)
 			}
@@ -4589,10 +4854,28 @@ func (s *Service) reconcileMissingSelfOwnedPlacements(ctx context.Context, known
 		if _, ok := knownIDs[p.SandboxID]; ok {
 			continue
 		}
-		if spec := c.SpecOf(p.SandboxID); spec != nil && spec.ShouldRecreateOnFailover() {
+		// The initial knownIDs set is a sweep snapshot. A create may commit its
+		// local row after that snapshot but before its placement becomes visible.
+		// Recheck the point row before destructive cleanup so reconciliation can
+		// never erase a concurrently-created sandbox's placement.
+		if _, err := s.store.Get(ctx, p.SandboxID); err == nil {
+			continue
+		} else if !errors.Is(err, store.ErrNotFound) {
+			if s.logger != nil {
+				s.logger.Warn("cluster placement local-row recheck failed",
+					"sandbox_id", p.SandboxID, "error", err)
+			}
 			continue
 		}
-		s.deleteSelfOwnedClusterPlacement(ctx, p.SandboxID, "missing-local-row")
+		// A deleting placement is a durable cleanup anchor, never a candidate for
+		// recreation. Once its owner has removed the local row, exact deletion is
+		// the only remaining reconciliation step.
+		if !p.IsDeleting() {
+			if spec := c.SpecOf(p.SandboxID); spec != nil && spec.ShouldRecreateOnFailover() {
+				continue
+			}
+		}
+		s.deleteSelfOwnedClusterPlacement(ctx, p, "missing-local-row")
 	}
 }
 
@@ -4658,7 +4941,6 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
-				s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "lifecycle-auto-destroy")
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
 			}
 		case lifecycleStop:

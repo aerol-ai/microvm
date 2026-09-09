@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"os"
@@ -117,32 +118,44 @@ func (s *Service) shipSecretAuditHead(ctx context.Context) error {
 	if w == nil || !(controlplane.Provider{Witness: w}).HasExternalWitness() {
 		return nil
 	}
-	// Prefer recomputed tip for shipping so a stale secrets.tip cannot claim
-	// a head that is not in the verified chain.
-	head, eventID, err := RecomputeChainHead(s.secretAuditFile.path)
-	if err != nil {
+	// Sync drains accepted in-memory and spill events, fsyncs the JSONL, and
+	// leaves chainTip at the verified writer head. This is O(1) after the flush;
+	// rescanning the full retention file every witness interval does not scale.
+	if err := s.secretAuditFile.Sync(); err != nil {
 		secretAuditWitnessHealthy.Set(0)
 		secretAuditWitnessFailures.Add(1)
 		if s.logger != nil {
-			s.logger.Warn("secret audit witness ship: chain recompute failed", "err", err)
+			s.logger.Warn("secret audit witness ship: sync failed", "err", err)
 		}
 		return err
 	}
+	head, eventID := s.secretAuditFile.chainTip()
 	if head == "" || head == auditlog.GenesisPrevHash {
 		return nil
+	}
+	nodeID := ""
+	if c := s.Cluster(); c != nil {
+		nodeID = c.SelfNodeID()
 	}
 	lastLocal, _ := lastWitnessedHead(s.secretAuditWitnessPath())
 	if tip, _ := readWitnessTip(s.secretAuditWitnessTipPath()); tip.HeadHex != "" {
 		lastLocal = tip.HeadHex
 	}
 	if lastLocal == head {
-		// Unchanged tip — skip WitnessHeads and receipt growth.
-		secretAuditWitnessHealthy.Set(1)
-		return nil
-	}
-	nodeID := ""
-	if c := s.Cluster(); c != nil {
-		nodeID = c.SelfNodeID()
+		// A local receipt is not proof that the external store still has the
+		// acknowledgment. Confirm it; if missing/behind, re-submit the same
+		// idempotent head instead of suppressing witness repair forever.
+		verifyCtx := ctx
+		if verifyCtx == nil {
+			verifyCtx = context.Background()
+		}
+		checkCtx, cancel := context.WithTimeout(verifyCtx, secretAuditWitnessShipTimeout)
+		remoteHead, remoteOK, verifyErr := w.LastWitnessedHead(checkCtx, nodeID)
+		cancel()
+		if verifyErr == nil && remoteOK && strings.TrimSpace(remoteHead) == head {
+			secretAuditWitnessHealthy.Set(1)
+			return nil
+		}
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -204,7 +217,20 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 	if s == nil || s.secretAuditFile == nil {
 		return true, "", "", nil
 	}
-	localHead, _, hashes, err := recomputeChain(s.secretAuditFile.path)
+	var (
+		hashes            []string
+		retentionThrough  string
+		hasRetentionProof bool
+	)
+	err = s.secretAuditFile.withAuditFileLock(func() error {
+		var scanErr error
+		localHead, _, hashes, scanErr = recomputeChain(s.secretAuditFile.path)
+		if scanErr != nil {
+			return scanErr
+		}
+		retentionThrough, hasRetentionProof = retentionWitnessedThrough(s.secretAuditFile.path)
+		return nil
+	})
 	if err != nil {
 		secretAuditWitnessHealthy.Set(0)
 		return false, "", "", err
@@ -265,10 +291,8 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 			break
 		}
 	}
-	if !inChain {
-		if through, ok := retentionWitnessedThrough(s.secretAuditFile.path); ok && through == witnessedHead {
-			inChain = true
-		}
+	if !inChain && hasRetentionProof && retentionThrough == witnessedHead {
+		inChain = true
 	}
 	if !receiptOK && !inChain {
 		secretAuditWitnessHealthy.Set(0)
@@ -280,6 +304,44 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 	}
 	secretAuditWitnessHealthy.Set(1)
 	return true, localHead, witnessedHead, nil
+}
+
+// requireCurrentSecretAuditWitness gates retention on an exact current-head
+// acknowledgment. An older witnessed ancestor is sufficient for ordinary
+// integrity verification, but not for deleting a later prefix that was never
+// independently anchored.
+func (s *Service) requireCurrentSecretAuditWitness(ctx context.Context) (string, error) {
+	if s == nil || s.secretAuditFile == nil {
+		return "", errors.New("secret audit file is unavailable")
+	}
+	w := s.witness()
+	if w == nil || !(controlplane.Provider{Witness: w}).HasExternalWitness() {
+		return "", errors.New("external secret audit witness is unavailable")
+	}
+	if err := s.shipSecretAuditHead(ctx); err != nil {
+		return "", err
+	}
+	head, _ := s.secretAuditFile.chainTip()
+	if head == "" || head == auditlog.GenesisPrevHash {
+		return head, nil
+	}
+	nodeID := ""
+	if c := s.Cluster(); c != nil {
+		nodeID = c.SelfNodeID()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, secretAuditWitnessShipTimeout)
+	defer cancel()
+	remoteHead, ok, err := w.LastWitnessedHead(checkCtx, nodeID)
+	if err != nil {
+		return "", err
+	}
+	if !ok || strings.TrimSpace(remoteHead) != head {
+		return "", fmt.Errorf("current secret audit head is not witnessed (local=%q remote=%q)", head, strings.TrimSpace(remoteHead))
+	}
+	return head, nil
 }
 
 // retentionWitnessedThrough returns WitnessedThrough from the newest

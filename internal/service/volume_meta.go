@@ -28,7 +28,7 @@ type volumeMetaStore interface {
 	ExistsForSource(ctx context.Context, source string) (bool, error)
 	AttachmentCount(ctx context.Context, tenant, id string) (int, error)
 	PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
-	DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error
+	DeleteAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 }
 
 // volumeMeta returns the cluster-FSM-backed store when clustering is enabled and
@@ -74,8 +74,8 @@ func (m sqliteVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string
 func (m sqliteVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
 	return m.store.PutVolumeAttachments(ctx, attachments)
 }
-func (m sqliteVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
-	return m.store.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
+func (m sqliteVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error {
+	return m.store.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID, incarnationID)
 }
 
 // clusterVolumeMeta adapts the replicated cluster volume API to the service
@@ -125,8 +125,8 @@ func (m clusterVolumeMeta) PutAttachments(ctx context.Context, attachments []mod
 	}
 	return nil
 }
-func (m clusterVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
-	return m.c.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
+func (m clusterVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error {
+	return m.c.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID, incarnationID)
 }
 
 func mapVolumeNotFound(err error) error {

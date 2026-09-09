@@ -17,6 +17,7 @@ import (
 
 type stubWitness struct {
 	heads      []controlplane.AuditHead
+	shipCalls  int
 	receipt    controlplane.WitnessReceipt
 	shipErr    error
 	remoteHead string
@@ -25,6 +26,7 @@ type stubWitness struct {
 }
 
 func (w *stubWitness) WitnessHeads(_ context.Context, heads []controlplane.AuditHead) (controlplane.WitnessReceipt, error) {
+	w.shipCalls++
 	w.heads = append([]controlplane.AuditHead(nil), heads...)
 	if w.shipErr != nil {
 		return controlplane.WitnessReceipt{}, w.shipErr
@@ -38,6 +40,86 @@ func (w *stubWitness) WitnessHeads(_ context.Context, heads []controlplane.Audit
 	w.remoteHead = heads[len(heads)-1].HeadHex
 	w.remoteOK = true
 	return w.receipt, nil
+}
+
+func TestSecretAuditWitnessRepairsMissingRemoteAcknowledgment(t *testing.T) {
+	svc := &Service{cfg: config.Config{DBPath: filepath.Join(t.TempDir(), "state.db")}}
+	svc.ensureSecretAuditSink()
+	t.Cleanup(svc.CloseSecretAuditSink)
+	w := &stubWitness{}
+	svc.auditWitness = w
+
+	if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{EventID: "repair-head", SandboxID: "sb"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if w.shipCalls != 1 {
+		t.Fatalf("initial witness calls = %d, want 1", w.shipCalls)
+	}
+	w.remoteHead, w.remoteOK = "", false
+	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if w.shipCalls != 2 {
+		t.Fatalf("missing remote acknowledgment was not repaired: calls=%d", w.shipCalls)
+	}
+	if local, _ := svc.secretAuditFile.chainTip(); !w.remoteOK || w.remoteHead != local {
+		t.Fatalf("repaired remote head = %q/%v, want %q", w.remoteHead, w.remoteOK, local)
+	}
+}
+
+func TestSecretAuditRetentionRequiresCurrentExternalWitness(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath:                     filepath.Join(t.TempDir(), "state.db"),
+		SecretAuditExternalWitness: true,
+	}}
+	svc.ensureSecretAuditSink()
+	t.Cleanup(svc.CloseSecretAuditSink)
+	if stop := svc.secretAuditPruneStop; stop != nil {
+		close(stop)
+		svc.secretAuditPruneDone.Wait()
+		svc.secretAuditPruneStop = nil
+	}
+	svc.cfg.SecretAuditRetentionDays = 1
+	now := time.Now().UTC()
+	if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{
+		Time: now.Add(-48 * time.Hour), EventID: "must-not-prune", SandboxID: "sb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{
+		Time: now, EventID: "fresh", SandboxID: "sb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w := &stubWitness{shipErr: errors.New("witness offline")}
+	svc.auditWitness = w
+	// The periodic retention runner historically invoked this with nil. Keep
+	// that call safe even when witness validation performs network work first.
+	if err := svc.PruneSecretAudit(nil); err == nil {
+		t.Fatal("retention succeeded while current head was not witnessed")
+	}
+	raw, err := os.ReadFile(svc.secretAuditFile.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "must-not-prune") {
+		t.Fatal("retention removed unwitnessed evidence")
+	}
+
+	w.shipErr = nil
+	if err := svc.PruneSecretAudit(context.Background()); err != nil {
+		t.Fatalf("retention after witness recovery: %v", err)
+	}
+	raw, err = os.ReadFile(svc.secretAuditFile.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "must-not-prune") || !strings.Contains(string(raw), "fresh") {
+		t.Fatalf("retained audit contents = %s", raw)
+	}
 }
 
 func (w *stubWitness) LastWitnessedHead(_ context.Context, _ string) (string, bool, error) {

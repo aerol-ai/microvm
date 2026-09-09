@@ -162,7 +162,7 @@ func TestReconcileMissingSelfOwnedWave18(t *testing.T) {
 		Noop: cluster.NewNoop("self", "http://self", ""),
 		placements: map[string]cluster.Placement{
 			"sb-orphan-place": {
-				SandboxID: "sb-orphan-place", OwnerNodeID: "self",
+				SandboxID: "sb-orphan-place", OwnerNodeID: "self", IncarnationID: "inc-orphan-place",
 				Spec: &models.CreateSandboxRequest{Image: "alpine"},
 			},
 		},

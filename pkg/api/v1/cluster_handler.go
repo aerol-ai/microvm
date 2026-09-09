@@ -110,10 +110,9 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 //  2. if forwarded (X-Cluster-Create-Target == self): run locally against the
 //     reservation the router already wrote. The forwarded path never re-runs
 //     SelectPlacement (B1 fix preserved).
-//  3. otherwise: SelectPlacement → if a peer wins, mint a sandbox ID, seal +
-//     redact secrets, write opReserve to raft (so the cluster has *intent*
-//     before any side effect — B2 fix), then forward. If self wins, fall
-//     through to the existing single-commit flow with no reservation.
+//  3. otherwise: SelectPlacement, mint a sandbox ID, redact secrets, and write
+//     opReserve to raft (so the cluster has *intent* before any side effect —
+//     B2 fix), then create locally or forward using that same reservation.
 //
 // On forward we don't roll back the reservation when ForwardHTTP can't reach
 // the peer: ForwardHTTP doesn't return a transport error (it streams the proxy
@@ -386,31 +385,22 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Raft commit on the response path. Self-wins keeps sequential seal+
-	// promote (no pre-minted reservation ID to overlap against).
+	// Local-only images keep sequential seal+promote because this path has no
+	// pre-minted reservation ID.
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	secrets, sealErr := h.deps.Service.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, h.deps.Service.SecretRecipientsForSeal(resp.Sandbox.ID), service.SealStrict)
+	secrets, sealErr := h.deps.Service.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, h.deps.Service.SecretRecipientsForSeal(resp.Sandbox.ID))
 	if sealErr != nil {
 		h.deps.Logger.Error("cluster: store secret ref failed; rolling back create",
 			"sandbox_id", resp.Sandbox.ID, "err", sealErr)
-		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
-			h.deps.Logger.Error("cluster: rollback destroy failed",
-				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
-		}
-		// Self-wins has no reservation, but DeletePlacement still covers an
-		// ambiguous promote that somehow landed (and is a no-op if nothing
-		// was placed). Facades already do this via rollbackCreate.
-		if dErr := c.DeletePlacement(rbCtx, resp.Sandbox.ID); dErr != nil {
-			h.deps.Logger.Warn("cluster: DeletePlacement after secret-ref failure",
-				"sandbox_id", resp.Sandbox.ID, "err", dErr)
-		}
-		rbCancel()
+		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, resp.Sandbox.ID)
 		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteError(w, http.StatusInternalServerError, clustercreate.FormatSealError(sealErr))
 		return
+	}
+	if secrets.IncarnationID == "" {
+		secrets.IncarnationID = resp.Sandbox.AuditIncarnationID
 	}
 	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
@@ -419,18 +409,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	if promoteErr != nil {
 		h.deps.Logger.Error("cluster: RecordPlacement failed; rolling back create",
 			"sandbox_id", resp.Sandbox.ID, "err", promoteErr)
-		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
-			h.deps.Logger.Error("cluster: rollback destroy failed",
-				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
-		}
-		// DeletePlacement is mandatory on promote-fail: a client-side Raft
-		// error can still mean the FSM applied the place (§2.2 / TODOS.md).
-		if dErr := c.DeletePlacement(rbCtx, resp.Sandbox.ID); dErr != nil {
-			h.deps.Logger.Warn("cluster: DeletePlacement after promote failed",
-				"sandbox_id", resp.Sandbox.ID, "err", dErr)
-		}
-		rbCancel()
+		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, resp.Sandbox.ID)
 		if errors.Is(promoteErr, cluster.ErrNameConflict) {
 			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
@@ -698,17 +677,6 @@ func (h *handlers) clusterDestroyWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	c := h.deps.Service.Cluster()
-	if c != nil {
-		commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		if err := c.DeletePlacement(commitCtx, id); err != nil {
-			// Local destroy already succeeded; surface a warning but don't
-			// fail the response — reconcile catches ghost rows.
-			h.deps.Logger.Warn("cluster: DeletePlacement after destroy failed",
-				"sandbox_id", id, "err", err)
-		}
-	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -895,7 +863,9 @@ func (h *handlers) clusterDeleteOrphan(w http.ResponseWriter, r *http.Request) {
 	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	if err := c.DeletePlacement(commitCtx, id); err != nil {
+	// Compare-delete the exact orphan observed above. A concurrent claim or ID
+	// reuse must win instead of being erased by a second broad placement read.
+	if err := c.DeletePlacementExact(commitCtx, id, p.OwnerNodeID, p.IncarnationID); err != nil {
 		if errors.Is(err, cluster.ErrNotLeader) {
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
 			return
@@ -1160,6 +1130,15 @@ func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
+	if r.URL.Query().Get("authoritative") == "true" {
+		// Destructive lifecycle reconciliation asks the leader explicitly. A
+		// follower's locally valid but lagging FSM cannot prove absence. Normal
+		// failover-readiness batches remain distributable across server nodes.
+		if leader := c.Leader(); leader == "" || leader != c.SelfNodeID() {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+			return
+		}
+	}
 	var req struct {
 		IDs []string `json:"ids"`
 	}
@@ -1167,12 +1146,37 @@ func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	if len(req.IDs) > cluster.MaxPlacementPageLimit {
+		apihttp.WriteError(w, http.StatusBadRequest, "too many placement ids")
+		return
+	}
 	out := c.PlacementsByIDs(req.IDs)
 	for id, p := range out {
-		redactPlacementSecretFields(&p)
+		minimizePlacementBatchRecord(&p)
 		out[id] = p
 	}
 	apihttp.WriteJSON(w, http.StatusOK, out)
+}
+
+// minimizePlacementBatchRecord keeps the 5k-ID internal batch comfortably
+// bounded even when each placement carries a maximum-sized recovery spec and
+// many routes. Its only consumers are readiness and secret-lifecycle code.
+func minimizePlacementBatchRecord(p *cluster.Placement) {
+	if p == nil {
+		return
+	}
+	p.OwnerAPIURL = ""
+	p.OwnerDataPlaneHost = ""
+	p.RecoveryRef = ""
+	p.Spec = nil
+	p.SecretRef = ""
+	p.SecretVersion = 0
+	p.OwnerRef = ""
+	p.AuditNodeIDs = nil
+	p.AuditNodesTruncated = false
+	p.ExposedPorts = nil
+	p.ExposedPortRoutes = nil
+	p.CustomHostnames = nil
 }
 
 func (h *handlers) clusterInternalAuditACL(w http.ResponseWriter, r *http.Request) {
@@ -1181,7 +1185,7 @@ func (h *handlers) clusterInternalAuditACL(w http.ResponseWriter, r *http.Reques
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
-	acl, ok, err := c.AuditACLForSandbox(r.Context(), r.PathValue("id"))
+	acl, ok, err := c.AuditACLForSandbox(r.Context(), r.PathValue("id"), r.URL.Query().Get("incarnation_id"))
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1246,12 +1250,18 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})
 }
 
+// A public JSON create is capped at 1 MiB. Encrypting its credentials and then
+// embedding the envelope's bytes in SecretBlob applies base64 expansion twice,
+// so the peer wire representation can legitimately exceed that public cap.
+// Four MiB covers the worst-case expansion while retaining a hard memory bound.
+const clusterSecretBlobMaxBodyBytes = 4 << 20
+
 // clusterInternalSecretPut upserts a peer-fanout sealed secret blob into the
 // local store. Idempotent (store UPSERT). No-op semantics under Noop cluster
 // still accept the write so a misrouted POST doesn't 5xx — the row is local.
 func (h *handlers) clusterInternalSecretPut(w http.ResponseWriter, r *http.Request) {
 	var blob secrets.SecretBlob
-	if err := apihttp.DecodeJSON(w, r, &blob); err != nil {
+	if err := apihttp.DecodeJSONLimit(w, r, &blob, clusterSecretBlobMaxBodyBytes); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -1259,7 +1269,16 @@ func (h *handlers) clusterInternalSecretPut(w http.ResponseWriter, r *http.Reque
 		apihttp.WriteError(w, http.StatusBadRequest, "ref, sandbox_id, and sealed_payload are required")
 		return
 	}
-	if err := h.deps.Service.UpsertClusterSecretBlob(r.Context(), blob); err != nil {
+	originatorNodeID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	if err := h.deps.Service.UpsertClusterSecretBlob(r.Context(), blob, originatorNodeID); err != nil {
+		if errors.Is(err, service.ErrClusterSecretPlacementUnavailable) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		if errors.Is(err, service.ErrClusterSecretOriginatorDenied) {
+			apihttp.WriteError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		if errors.Is(err, service.ErrInvalidClusterSecretBlob) {
 			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 			return
@@ -1285,18 +1304,20 @@ func (h *handlers) clusterInternalSecretDelete(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
 		return
 	}
-	var generation int64 = 1
-	if raw := strings.TrimSpace(r.URL.Query().Get("generation")); raw != "" {
-		g, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || g <= 0 {
-			apihttp.WriteError(w, http.StatusBadRequest, "invalid generation")
-			return
-		}
-		generation = g
+	rawGeneration := strings.TrimSpace(r.URL.Query().Get("generation"))
+	generation, err := strconv.ParseInt(rawGeneration, 10, 64)
+	if rawGeneration == "" || err != nil || generation <= 0 {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid generation")
+		return
+	}
+	incarnationID := strings.TrimSpace(r.URL.Query().Get("incarnation_id"))
+	if incarnationID == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "incarnation_id required")
+		return
 	}
 	// Local delete only — this IS the peer delete-fanout receiver. Do not
 	// re-fanout from here (would loop).
-	if err := h.deps.Service.DeleteClusterSecretsLocal(r.Context(), sandboxID, generation); err != nil {
+	if err := h.deps.Service.DeleteClusterSecretsLocal(r.Context(), sandboxID, incarnationID, generation); err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1309,16 +1330,18 @@ func (h *handlers) clusterInternalSecretHead(w http.ResponseWriter, r *http.Requ
 		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
 		return
 	}
-	var minGen int64 = 1
-	if raw := strings.TrimSpace(r.URL.Query().Get("min_generation")); raw != "" {
-		g, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || g <= 0 {
-			apihttp.WriteError(w, http.StatusBadRequest, "invalid min_generation")
-			return
-		}
-		minGen = g
+	rawGeneration := strings.TrimSpace(r.URL.Query().Get("min_generation"))
+	minGen, err := strconv.ParseInt(rawGeneration, 10, 64)
+	if rawGeneration == "" || err != nil || minGen <= 0 {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid min_generation")
+		return
 	}
-	ok, err := h.deps.Service.HasLocalSealedSecretGeneration(r.Context(), sandboxID, minGen)
+	incarnationID := strings.TrimSpace(r.URL.Query().Get("incarnation_id"))
+	if incarnationID == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "incarnation id required")
+		return
+	}
+	ok, err := h.deps.Service.HasLocalSealedSecretGeneration(r.Context(), sandboxID, incarnationID, minGen)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -209,6 +209,17 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	capture := &agentControlPlaneCapture{}
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath:
+			if r.URL.Query().Get("authoritative") != "true" {
+				t.Fatalf("placement delete lookup was not authoritative: %s", r.URL.RequestURI())
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]Placement{
+				"sb-delete": {
+					SandboxID: "sb-delete", OwnerNodeID: "worker-self", IncarnationID: "inc-delete",
+				},
+			})
+			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-state":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
@@ -225,6 +236,27 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"missing":
 			http.Error(w, "not found", http.StatusNotFound)
+			return true
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-delete":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-delete",
+				Placement: Placement{SandboxID: "sb-delete", OwnerNodeID: "worker-self", IncarnationID: "inc-delete"},
+			})
+			return true
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-port":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-port",
+				Placement: Placement{SandboxID: "sb-port", OwnerNodeID: "worker-self", IncarnationID: "inc-port"},
+			})
+			return true
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-reserve":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-reserve",
+				Placement: Placement{SandboxID: "sb-reserve", OwnerNodeID: "node-a", State: PlacementStateReserved, IncarnationID: "inc-reserve"},
+			})
 			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalDrainStatePath+"node-a":
 			w.Header().Set("Content-Type", "application/json")
@@ -272,13 +304,13 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := agent.RecordPlacement(ctx, "sb-record", nil, PlacementSecrets{}); err != nil {
+	if err := agent.RecordPlacement(ctx, "sb-record", nil, PlacementSecrets{IncarnationID: "inc-record"}); err != nil {
 		t.Fatalf("RecordPlacement() error = %v", err)
 	}
-	if err := agent.ClaimOrphan(ctx, "sb-claim", nil, PlacementSecrets{}); err != nil {
+	if err := agent.ClaimOrphan(ctx, "sb-claim", nil, PlacementSecrets{IncarnationID: "inc-claim"}); err != nil {
 		t.Fatalf("ClaimOrphan() error = %v", err)
 	}
-	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{}); err != nil {
+	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{IncarnationID: "inc-upsert"}); err != nil {
 		t.Fatalf("UpsertSpec() error = %v", err)
 	}
 	if err := agent.AddExposedPort(ctx, "sb-port", 8080, ExposedPortRoute{Protocol: "http", PublicURL: "https://sandbox.example.com"}); err != nil {
@@ -290,7 +322,7 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	if err := agent.DeletePlacement(ctx, "sb-delete"); err != nil {
 		t.Fatalf("DeletePlacement() error = %v", err)
 	}
-	if err := agent.ReserveOnTarget(ctx, "sb-reserve", PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", DataPlaneHost: "dp-a"}, nil, PlacementSecrets{}, time.Minute); err != nil {
+	if err := agent.ReserveOnTarget(ctx, "sb-reserve", PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", DataPlaneHost: "dp-a"}, nil, PlacementSecrets{IncarnationID: "inc-reserve"}, time.Minute); err != nil {
 		t.Fatalf("ReserveOnTarget() error = %v", err)
 	}
 	if err := agent.CancelReservation(ctx, "sb-reserve"); err != nil {
@@ -329,12 +361,15 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	if len(cmds) != 10 {
 		t.Fatalf("captured commands = %d, want 10", len(cmds))
 	}
-	var upsert command
+	var upsert, deleteCmd command
 	seen := make(map[opCode]int)
 	for _, cmd := range cmds {
 		seen[cmd.Op]++
 		if cmd.Op == opUpsertSpec {
 			upsert = cmd
+		}
+		if cmd.Op == opDelete && cmd.SandboxID == "sb-delete" {
+			deleteCmd = cmd
 		}
 	}
 	for _, op := range []opCode{opPlace, opClaimOrphan, opUpsertSpec, opAddExposedPort, opRemoveExposedPort, opDelete, opReserve, opCancelReserve, opSetNodeDrainState} {
@@ -344,6 +379,9 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	}
 	if upsert.Spec == nil || upsert.Spec.Name != "named" {
 		t.Fatalf("upsert command = %+v, want inline spec (payloads ride the raft entry)", upsert)
+	}
+	if deleteCmd.ExpectedOwnerNodeID != "worker-self" || deleteCmd.ExpectedIncarnationID != "inc-delete" {
+		t.Fatalf("delete command = %+v, want exact owner and incarnation fence", deleteCmd)
 	}
 	paths := capture.removeMemberPathsSnapshot()
 	if len(paths) != 2 || paths[0] != "/v1/cluster/members/node-a?force=true" || paths[1] != "/v1/cluster/members/missing" {
@@ -444,7 +482,7 @@ func TestAgentAuditACLReadsAndPruneOwnership(t *testing.T) {
 			Exists: true,
 		})
 	}))
-	acl, ok, err := agent.AuditACLForSandbox(context.Background(), " sb-audit ")
+	acl, ok, err := agent.AuditACLForSandbox(context.Background(), " sb-audit ", "inc-a")
 	if err != nil || !ok || acl.OwnerRef != "tenant-a" || acl.IncarnationID != "inc-a" {
 		t.Fatalf("AuditACLForSandbox = %+v %v %v", acl, ok, err)
 	}
@@ -456,7 +494,7 @@ func TestAgentAuditACLReadsAndPruneOwnership(t *testing.T) {
 		t.Fatalf("agent prune must remain leader-owned: %v", err)
 	}
 	fail = true
-	if _, _, err := agent.AuditACLForSandbox(context.Background(), "sb-audit"); err == nil {
+	if _, _, err := agent.AuditACLForSandbox(context.Background(), "sb-audit", "inc-a"); err == nil {
 		t.Fatal("control-plane ACL failure must propagate")
 	}
 }

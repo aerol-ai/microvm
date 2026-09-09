@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -110,6 +111,23 @@ type Provider interface {
 	Put(ctx context.Context, sandboxID string, s Secrets, recipients []string) (Handle, error)
 	Open(ctx context.Context, sandboxID string, h Handle, nodeID string) (Secrets, error)
 	Delete(ctx context.Context, sandboxID string) error
+}
+
+func validateCurrentHandle(sandboxID string, h Handle) (ParsedRef, error) {
+	if h.Version != RefVersion {
+		return ParsedRef{}, fmt.Errorf("%w: cluster secret ref %q version %d unsupported (want %d)", ErrVersionMismatch, h.Ref, h.Version, RefVersion)
+	}
+	if h.SealGeneration <= 0 {
+		return ParsedRef{}, fmt.Errorf("%w: cluster secret ref %q seal generation is required", ErrVersionMismatch, h.Ref)
+	}
+	parsed, err := ParseRef(h.Ref)
+	if err != nil || parsed.Version != h.Version {
+		return ParsedRef{}, fmt.Errorf("%w: cluster secret ref %q is not current-format", ErrVersionMismatch, h.Ref)
+	}
+	if parsed.SandboxID != strings.TrimSpace(sandboxID) {
+		return ParsedRef{}, fmt.Errorf("%w: cluster secret sandbox_id mismatch", ErrDecryptFailed)
+	}
+	return parsed, nil
 }
 
 // BlobStore persists sealed secret rows. Defined here so pkg/secrets never

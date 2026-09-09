@@ -22,11 +22,12 @@ func TestDestroySandboxSuccessCoverage95(t *testing.T) {
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
 		ID: "sb-destroy", Name: "destroy-me", Status: models.SandboxStatusStarted,
-		ContainerID: "ctr-destroy", ContainerIP: "10.0.0.9",
+		AuditIncarnationID: "inc-sb-destroy",
+		ContainerID:        "ctr-destroy", ContainerIP: "10.0.0.9",
 		ToolboxEnabled: true, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := st.Upsert(ctx, sb); err != nil {
-		t.Fatalf("Upsert: %v", err)
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
 	}
 	stateJSON, err := sandboxMetaToState(sandboxMeta{Snapshot: stringPtr("snap-1"), Target: "dev"})
 	if err != nil {

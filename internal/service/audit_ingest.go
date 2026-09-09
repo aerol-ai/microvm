@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
@@ -46,7 +45,6 @@ type auditIngestServer struct {
 	spillDir string
 	server   *http.Server
 	ln       net.Listener
-	mu       sync.Mutex
 }
 
 type auditIngestRequest struct {
@@ -286,7 +284,7 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 // Cluster placement is authoritative when enabled; standalone mode uses the
 // local sandbox row. Incarnation and owner checks also fence failover races.
 func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, incarnationID string) error {
-	if s == nil || strings.TrimSpace(sandboxID) == "" {
+	if s == nil || strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(incarnationID) == "" {
 		return errAuditIngestBindingStale
 	}
 	if s.cfg.EnableCluster {
@@ -295,7 +293,10 @@ func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, inc
 			return errAuditIngestBindingStale
 		}
 		p, ok := c.PlacementOf(sandboxID)
-		if !ok || (strings.TrimSpace(p.OwnerNodeID) != "" && strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(c.SelfNodeID())) || strings.TrimSpace(p.IncarnationID) != strings.TrimSpace(incarnationID) {
+		// An orphan has no active owner and therefore no legitimate worker. Do
+		// not let a capability retained by the dead owner's process continue to
+		// append after Raft has fenced that owner.
+		if !ok || strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(c.SelfNodeID()) || strings.TrimSpace(p.IncarnationID) != strings.TrimSpace(incarnationID) {
 			return errAuditIngestBindingStale
 		}
 		return nil
@@ -310,13 +311,7 @@ func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, inc
 		}
 		return err
 	}
-	current := auditlog.LocalIncarnationID(sandbox.ID, sandbox.ToolboxToken)
-	if current == "" {
-		current, err = s.store.CurrentSandboxAuditIncarnation(ctx, sandboxID)
-		if err != nil {
-			return err
-		}
-	}
+	current := strings.TrimSpace(sandbox.AuditIncarnationID)
 	if strings.TrimSpace(current) == "" || strings.TrimSpace(current) != strings.TrimSpace(incarnationID) {
 		return errAuditIngestBindingStale
 	}

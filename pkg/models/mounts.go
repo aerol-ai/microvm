@@ -97,6 +97,7 @@ type VolumeAttachment struct {
 	Tenant        string    `json:"tenant"`
 	VolumeID      string    `json:"volume_id"`
 	SandboxID     string    `json:"sandbox_id"`
+	IncarnationID string    `json:"incarnation_id"`
 	Target        string    `json:"target"`
 	Source        string    `json:"source"`
 	CreatedAt     time.Time `json:"created_at"`

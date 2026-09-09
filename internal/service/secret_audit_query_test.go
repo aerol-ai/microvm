@@ -1,11 +1,14 @@
 package service
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -65,7 +68,7 @@ func (s *stubMembersCluster) LocalMembers() []cluster.Member { return s.Members(
 func (s *stubMembersCluster) PlacementOf(string) (cluster.Placement, bool) {
 	return s.placement, s.placement.SandboxID != ""
 }
-func (s *stubMembersCluster) AuditACLForSandbox(context.Context, string) (cluster.AuditACL, bool, error) {
+func (s *stubMembersCluster) AuditACLForSandbox(context.Context, string, string) (cluster.AuditACL, bool, error) {
 	return s.acl, s.aclExists, nil
 }
 
@@ -470,5 +473,107 @@ func TestListSecretAuditRequiresSandboxLocallyForOwnerScope(t *testing.T) {
 	}
 	if page.Coverage.Partial {
 		t.Fatalf("single-node should not be partial: %+v", page.Coverage)
+	}
+}
+
+func TestListSecretAuditRejectsCorruptLocalEvidence(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	auditDir := filepath.Join(dir, "audit")
+	if err := os.MkdirAll(auditDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"time":"2026-01-01T00:00:00Z","sandbox_id":"sb","event_id":"legacy","result":"success"}` + "\n"
+	if err := os.WriteFile(filepath.Join(auditDir, secretAuditFileName), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{cfg: config.Config{DBPath: dbPath}, secretAudit: unavailableSecretAuditSink{}}
+	if _, _, err := svc.ListSecretAuditLocal(context.Background(), "sb", SecretAuditQuery{}); err == nil || !strings.Contains(err.Error(), "integrity verification") {
+		t.Fatalf("corrupt evidence query error = %v", err)
+	}
+}
+
+func TestListSecretAuditRevalidatesPeerScopeAndCursor(t *testing.T) {
+	base := time.Unix(1_900_000_000, 0).UTC()
+	boundary := SecretAuditEvent{Time: base, EventID: "middle", SandboxID: "sb", IncarnationID: "inc-current", Kind: secretAuditKindEgress}
+	valid := SecretAuditEvent{Time: base.Add(time.Second), EventID: "valid", SandboxID: "sb", IncarnationID: "inc-current", Kind: secretAuditKindEgress}
+	gap := SecretAuditEvent{Time: base.Add(2 * time.Second), EventID: "gap", Kind: secretAuditKindGap, Result: secretAuditResultGap}
+	peerEvents := []cluster.AuditEventDTO{
+		{Time: base.Add(time.Second), EventID: "foreign-sandbox", SandboxID: "other", IncarnationID: "inc-current", Kind: secretAuditKindEgress},
+		{Time: base.Add(time.Second), EventID: "foreign-incarnation", SandboxID: "sb", IncarnationID: "inc-old", Kind: secretAuditKindEgress},
+		{Time: base.Add(time.Second), EventID: "wrong-kind", SandboxID: "sb", IncarnationID: "inc-current", Kind: secretAuditKindSecretOpen},
+		{Time: base.Add(-time.Second), EventID: "before", SandboxID: "sb", IncarnationID: "inc-current", Kind: secretAuditKindEgress},
+		{Time: base, EventID: "aardvark", SandboxID: "sb", IncarnationID: "inc-current", Kind: secretAuditKindEgress},
+		valid,
+		gap,
+	}
+	svc := &Service{
+		cfg: config.Config{DBPath: filepath.Join(t.TempDir(), "state.db")},
+		cluster: &stubMembersCluster{
+			Noop:      cluster.NewNoop("self", "http://self", ""),
+			members:   []cluster.Member{{NodeID: "self", Alive: true}, {NodeID: "peer", Alive: true, InternalURL: "https://peer"}},
+			placement: cluster.Placement{SandboxID: "sb", IncarnationID: "inc-current", AuditNodeIDs: []string{"self", "peer"}},
+		},
+		testAuditFetcher: &fakeAuditFetcher{pages: map[string]cluster.AuditPeerPage{"peer": {Events: peerEvents}}},
+	}
+	t.Cleanup(svc.CloseSecretAuditSink)
+	page, err := svc.ListSecretAudit(context.Background(), "sb", SecretAuditQuery{
+		Limit: 10, Cursor: formatSecretAuditCursor(boundary), Kind: secretAuditKindEgress, IncarnationID: "inc-current",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 2 || page.Events[0].EventID != valid.EventID || page.Events[1].EventID != gap.EventID {
+		t.Fatalf("peer scope revalidation returned %+v", page.Events)
+	}
+	if page.Coverage.Partial || len(page.Coverage.Answered) != 2 {
+		t.Fatalf("coverage = %+v", page.Coverage)
+	}
+}
+
+func TestSecretAuditQueryHelpersAndNilPath(t *testing.T) {
+	if got := (*Service)(nil).secretAuditPath(); got != "" {
+		t.Fatalf("nil audit path = %q", got)
+	}
+	if got := (*Service)(nil).auditPeerFetcher(); got != nil {
+		t.Fatalf("nil audit fetcher = %T", got)
+	}
+	if _, _, err := parseSecretAuditCursor("2026-01-01T00:00:00Z"); err == nil {
+		t.Fatal("cursor without compound event key was accepted")
+	}
+	if ts, key, err := parseSecretAuditCursor(""); err != nil || !ts.IsZero() || key != "" {
+		t.Fatalf("blank cursor = %v %q %v", ts, key, err)
+	}
+	h := secretAuditEventMaxHeap{{EventID: "a"}, {EventID: "b"}}
+	heap.Init(&h)
+	if got := heap.Pop(&h).(SecretAuditEvent); got.EventID == "" || len(h) != 1 {
+		t.Fatalf("heap pop = %+v remaining=%d", got, len(h))
+	}
+}
+
+func TestOpenSecretAuditSnapshotStopsAtCompleteAppendBoundary(t *testing.T) {
+	svc := &Service{cfg: config.Config{DBPath: filepath.Join(t.TempDir(), "state.db")}}
+	sink := svc.secretAuditSink().(*fileAuditSink)
+	t.Cleanup(svc.CloseSecretAuditSink)
+	if err := sink.EmitDurable(SecretAuditEvent{EventID: "before-snapshot", Result: secretAuditResultSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	f, size, err := svc.openSecretAuditSnapshot(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := sink.EmitDurable(SecretAuditEvent{EventID: "after-snapshot", Result: secretAuditResultSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "before-snapshot") || strings.Contains(string(raw), "after-snapshot") {
+		t.Fatalf("snapshot boundary leaked concurrent append: %s", raw)
+	}
+	if _, _, err := svc.openSecretAuditSnapshot(filepath.Join(t.TempDir(), "missing")); !os.IsNotExist(err) {
+		t.Fatalf("missing snapshot error = %v", err)
 	}
 }

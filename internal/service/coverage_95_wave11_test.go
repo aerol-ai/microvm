@@ -292,7 +292,8 @@ func TestDestroySandboxHappyWithPortsWave11(t *testing.T) {
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: "sb-des-ok", Image: "alpine", Status: models.SandboxStatusStarted, ContainerIP: "10.0.0.1",
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-des-ok",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -347,13 +348,13 @@ func TestOpenClusterSecretsBadPayloadWave11(t *testing.T) {
 	ctx := context.Background()
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cipher = newTestCipher(t)
-	ref := secrets.FormatRef("sb-bad", 1)
+	ref := secrets.FormatRef("sb-bad", "inc-test", 1)
 	if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
-		Ref: ref, SandboxID: "sb-bad", Version: 1, SealedPayload: []byte("not-json"),
+		Ref: ref, SandboxID: "sb-bad", Version: 1, SealGeneration: 1, SealedPayload: []byte("not-json"),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := svc.OpenClusterSecretsForNode(ctx, "sb-bad", models.CreateSandboxRequest{Image: "x"}, cluster.PlacementSecrets{Ref: ref, Version: 1}, "node-a")
+	_, err := svc.OpenClusterSecretsForNode(ctx, "sb-bad", models.CreateSandboxRequest{Image: "x"}, cluster.PlacementSecrets{Ref: ref, Version: 1, IncarnationID: "inc-test", SealGeneration: 1}, "node-a")
 	if err == nil {
 		t.Fatal("expected bad payload error")
 	}

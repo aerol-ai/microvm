@@ -1,8 +1,10 @@
 # Secrets hardening: cross-node failover, audit trail, env sealing, and the provider seam
 
-Status: **IMPLEMENTED 2026-08-08** (T1–T13 + E1a/E1b/E2a/E3a/E4) — ENG-REVIEWED 2026-08-06
-decisions below remain the build contract. Remaining gated/out-of-scope: E2b
-(auditor ask), E3b (own justification), E3c (deferred), E5 (out of scope).
+Status: **IMPLEMENTED 2026-08-08** (T1–T13 + E1a/E1b/E2a/E2b/E3a/E4) — ENG-REVIEWED 2026-08-06
+decisions below remain the build contract. E2b's repository mechanism is closed;
+the external witness/export receivers and their retention policy remain deployment
+requirements. Remaining gated/out-of-scope: E3b (own justification), E3c
+(deferred), E5 (out of scope).
 Supersedes the 2026-08-02 draft, whose Phase 0 premise is now proven and whose
 provider-seam and env-storage designs were both wrong (see §Corrections).
 
@@ -78,7 +80,7 @@ off the table. (The 2026-08-02 draft listed it as an option; deleted.)
 | D3 | Seal to a recipient **set** (owner + N failover candidates) and push the sealed row to those peers. Preserves recipient binding; keeps bytes out of Raft. |
 | D4 | **Bounded first-backup ACK, then asynchronous remainder** (see §3e), **only** for `failover.policy=recreate`. Every cluster mode fails and retracts a zero-ACK HA create. Default non-HA creates remain unchanged. **Plus** a KMS provider as a configurable alternative backend — both ship, operator picks. |
 | D5 | Recipient drift is repaired by an owner/leader-coordinated, generation-fenced reseal. The new sealed row and retired-recipient cleanup journal commit atomically before the Raft CAS; cleanup is released only after the promoted generation is visible. |
-| D6 | One seal+fanout helper with an explicit strict / best-effort policy argument. |
+| D6 | One fail-closed seal+fanout helper. Ownership replay must never publish an unredacted spec when sealing fails. |
 | D7 | One shared contract suite runs against **both** providers (offline fake for KMS); live KMS behind the `integration` tag. |
 | D8 | Sealed env lives in its **own row, read on demand**, mirroring `sealMounts`/`loadMounts`/`GetMounts`. The hot row scanner never carries env. |
 | D9 | `Get`/`List` **omit env by default**; an explicit opt-in returns it, and that read is audited. |
@@ -174,12 +176,9 @@ file is an operator reference for shipped flags, not a spec.
 
 `internal/service/cluster_secrets.go` stops touching `s.cipher` directly.
 
-**Open item (Codex #11): recipient-set selection is unspecified.** Reserve
-writes the redacted spec (`clustercreate.go:136`) *before* sealing happens on
-the target (`overlap.go:139`). Who picks the N candidates, from which
-membership view, and how does the choice survive reserve/promote races? Must be
-answered before coding — a non-deterministic set is a correctness bug, not a
-detail.
+**Resolved (Codex #11):** the router selects the recipient set once at reserve
+time and records it in the Raft reservation; the target obeys that recorded
+set. Section 3d-1 defines the source membership view and serialization rule.
 
 ---
 
@@ -187,38 +186,35 @@ detail.
 
 ### 3a. Recipient-set sealing + fan-out
 
-- `sealClusterSecrets` already takes `recipients []string` and the envelope is
-  already v3 with a `Recipients` field — no format invention needed.
+- `sealClusterSecrets` already takes `recipients []string`; the canonical,
+  identity-bound v4 envelope carries the authenticated recipient set and seal
+  generation.
 - Compute the set **only** when `failover.policy=recreate`. Otherwise seal to
   self exactly as today and skip the fan-out entirely.
-- Fan out **asynchronously** after create returns (§3e supersedes the earlier
-  sync choice). A 201 does **not** mean the HA guarantee is already true —
-  `failover_ready` starts false and flips true only when owner + ≥1 backup
-  hold the secret (E1a / 3d-2). Bounded backoff + metric on failure.
+- For an HA create, wait a configured bounded interval for the first backup
+  acknowledgement before success, then fan out to the remaining recipients
+  asynchronously. A zero-ACK create is retracted and fails; `failover_ready`
+  reflects authoritative possession of the promoted generation.
 - New peer-receive endpoint in `internal/cluster/`: idempotent on retry,
-  rejects **unauthenticated** pushes (PAT + `d.Auth`; per-peer identity is
-  separate work), no-op under `Noop`.
+  rejects **unauthenticated** pushes (node-ID-bound cluster mTLS plus PAT and
+  `d.Auth`), no-op under `Noop`.
 
-### 3b. One helper, explicit policy (D6)
+### 3b. One fail-closed helper (D6)
 
 Seal failure currently has three undocumented policies across four sites:
 
 | Call site | Today | After |
 |---|---|---|
-| `cluster_ownership.go:150` | warn + continue (silently drops the ref) | **best-effort**: metric + mark sandbox not-HA |
-| `cluster_handler.go:378` | error + rollback | **strict** |
-| `clustercreate.go:255` | rollback + return | **strict** |
-| `overlap.go:139` | error into channel | **strict** |
+| `cluster_ownership.go:150` | warn + continue (silently drops the ref) | **fail closed**: skip only the unsafe row, report the error, and continue safe rows |
+| `cluster_handler.go:378` | error + rollback | **fail closed** |
+| `clustercreate.go:255` | rollback + return | **fail closed** |
+| `overlap.go:139` | error into channel | **fail closed** |
 
-**Scope note after §3e:** the policy argument governs the **local seal only**,
-which is still synchronous. The fan-out is asynchronous and never fails a
-create, so "strict" now means *the local sealed row and its ref must exist
-before the create succeeds* — not *every peer must have acknowledged*.
-
-Partial fan-out is therefore no longer a create-time rollback question. Its rule
-is **3d-2**: owner + at least one backup constitutes success, the actual holder
-count is recorded, and `failover_ready` reports it. CLAUDE.md non-negotiable #4
-is satisfied by that rule plus the delete-fanout cleanup in **3d-3**.
+**Current scope after §3e:** strict HA create requires the local sealed row plus
+one authenticated backup acknowledgement within the bounded wait. It does not
+wait for every recipient. The actual holder count is recorded and
+`failover_ready` reports authoritative possession; delete-fanout cleanup is
+generation-fenced as specified in **3d-3**.
 
 ### 3c. Membership repair and no-vacuum retirement (D5)
 
@@ -263,9 +259,21 @@ Never plaintext, never PII.
 the Raft placement incarnation. Standalone WASM capabilities bind to a stable
 digest of the per-create toolbox token, which rotates when a deterministic
 sandbox ID is reused. The existing compound `sandbox_audit_acl` row stores that
-incarnation; create rollback removes only the aborted incarnation, while normal
-delete retains evidence until the audit-retention prune. There is no legacy
-any-incarnation authorization fallback and no second lifecycle/GC table.
+incarnation, while the live sandbox row keeps the exact current-lifecycle
+pointer. A monotonic establishment sequence selects post-delete history without
+trusting node clocks. Create rollback removes only the aborted incarnation,
+while normal delete retains evidence until the audit-retention prune. There is
+no legacy any-incarnation authorization fallback and no second lifecycle/GC
+table.
+
+All lifecycle-wide destroy paths first commit an exact owner/incarnation
+`deleting` fence in Raft. The FSM rejects reassignment, failover recreation,
+spec/route/volume mutation, and secret reseal while fenced; reserved rollback
+uses the same state. Runtime, exact-incarnation secret/outbox, and external
+artifact finalizers complete before the final placement delete. A failed step
+retains retry anchors, and leader cleanup expires abandoned fences only when the
+owner is unavailable. Peer secret scans are page-bounded and retire replicas
+whose exact authoritative lifecycle has disappeared.
 
 Worker delivery remains asynchronous, but an available loopback ingest socket
 does not disable the spill path. Every worker carries both destinations so a
@@ -275,14 +283,14 @@ gap.
 Also cover the two non-cluster decrypt sites currently outside the seam:
 `service.go:1883` (`UnsealRegistry`) and `service.go:1941` (`loadMounts`).
 
-**Open item (Codex #12):** structured logs are best-effort observability, not
-an audit trail. If #82's claim is compliance-grade, the plan needs retention,
-correlation IDs, and stated tamper/loss expectations. Decide the strength of
-the claim before building the sink.
+**Resolved (Codex #12):** the audit path uses a durable spill-aware JSONL sink,
+correlation IDs, explicit gap records and metrics, retention checkpoints,
+strict hash-chain verification, off-node witnessing, and an enterprise-required
+authenticated exporter. WORM retention remains an operator-owned external
+control and is not claimed by this repository.
 
-**Open item (Codex #9):** once env is a secret read, does every env
-materialization emit an event? D9 makes this tractable — env is opt-in, so the
-explicit read is the auditable event and `List` stays quiet.
+**Resolved (Codex #9):** every explicit env materialization is audited. Env is
+opt-in on read, while ordinary `List` remains quiet and omits it.
 
 ---
 
@@ -335,7 +343,7 @@ Shared contract suite (D7) runs every case below against **both** providers:
 | Area | Cases |
 |---|---|
 | Recipient set | policy unset → no set/no fanout; `=recreate` → owner+N; cluster < N; single-node Noop |
-| Fan-out | all peers ok; peer down (strict → rollback); partial 2/3; best-effort → metric + not-HA; 4xx vs timeout distinct |
+| Fan-out | all peers ok; peer down → rollback when no backup ACKs; partial 2/3; ownership-replay seal failure → no Raft write; 4xx vs timeout distinct |
 | Open | owner opens; **new owner in set opens (CRITICAL)**; not in set → distinct legible error; wrong recipient denied; version mismatch |
 | Audit | success → exactly one event; each failure class → one event + reason; no plaintext in payload; nil logger/sink no panic |
 | Peer endpoint | idempotent on retry; rejects foreign push; Noop no-op |
@@ -443,16 +451,18 @@ second token table, reconciliation loop, or garbage collector.
 | Failover node not in recipient set | yes (D5 case) | must be distinct error | clear error — **required**, not a decrypt failure |
 | Partial fan-out | yes | 3d-2 holder-count rule | create succeeds at owner + ≥1; holder count surfaced |
 | Peer unreachable during fan-out | yes | durable put-outbox + reconciler retry + metric (not silent in-memory drop) | nothing at create; `failover_ready` stays false |
-| Ownership replay seal failure | yes | best-effort + metric | sandbox marked not-HA |
+| Ownership replay seal failure | yes | fail closed for that row; redact unconditionally; continue reconciling safe rows | reconciliation error; no credential enters Raft |
 | Missing sealed env during recreate | yes | strict canonical ref and required sealed row | **fails loudly**, never boots with silently empty env |
 | KMS unreachable during fan-out | yes (fake) | durable put-outbox + reconciler retry | nothing at create; `failover_ready` stays false |
 | **Holder count lost on restart** | yes (ReFanout unit) | **fixed** — boot `ReFanoutClusterSecrets` rebuilds holders from local rows + async re-push | brief `failover_ready=false` until peers ACK again |
 
-### GAP-1 — the async fan-out window (MITIGATED)
+### GAP-1 — minimum HA contract CLOSED; configured redundancy converges asynchronously
 
-**There is a window between create returning and fan-out completion during which
-the sandbox may be running with fewer than HA holders.** If the owner dies in
-that window, failover fails and the sandbox cannot be recreated anywhere.
+**A successful HA create never returns with fewer than two holders.** It has the
+owner plus at least one peer ACK for the current lifecycle and seal generation.
+The asynchronous window only concerns additional configured recipients; losing
+more holders than the minimum one-node-failure contract before convergence can
+still exhaust redundancy.
 
 Distribution cannot be fully asynchronous because that leaves an unbounded
 owner-loss race. The contract is a **bounded sync
@@ -465,7 +475,9 @@ What bounds the remaining window:
   the race for healthy clusters before `201` returns.
 - If 0 peers ACK in the window, the sealed row is retracted, peer deletes are
   durably enqueued, and create fails.
-- `failover_ready` reads **false** for the entire unreplicated window (E1a).
+- `failover_ready` reads **false** until all configured recipients are verified
+  at the current generation (E1a); this reports convergence beyond the minimum
+  successful-create contract.
 - Fan-out retries with bounded backoff; failures emit
   `aerolvm_secret_fanout_failures_total` and feed the operator alert.
 - Live chaos: integration `UC-58c` (kill-owner-mid-fan-out, `integration` +
@@ -475,7 +487,8 @@ Who is affected: only `failover.policy=recreate` sandboxes. Non-HA sandboxes
 are explicitly orphaned on owner death regardless.
 
 There is no zero-ACK success mode. `failover_ready=false` after a successful
-create only means the remaining configured replicas are still converging.
+create only means the remaining configured replicas are still converging, not
+that the create returned with only the owner holding ciphertext.
 
 ### The other critical gap
 
@@ -510,10 +523,10 @@ but C touches `internal/cluster` + `pkg/api/clustercreate` while D touches
   - Surfaced by: §0 WALL 1 + WALL 2, both proven
   - Files: `cluster_secrets.go`, `internal/cluster/`, 4 seal call sites
   - Verify: CRITICAL cross-node failover regression test
-- [x] **T4 (P1, human: ~2d / CC: ~3h)** — internal/service — One seal+fanout helper with policy arg (D6)
+- [x] **T4 (P1, human: ~2d / CC: ~3h)** — internal/service — One fail-closed seal+fanout helper (D6)
   - Surfaced by: Code quality — 3 undocumented failure policies across 4 sites
   - Files: `cluster_ownership.go:149`, `cluster_handler.go:377`, `clustercreate.go:254`, `overlap.go:139`
-  - Verify: strict/best-effort/partial cases
+  - Verify: failure/partial cases and ownership replay never sends plaintext to Raft
 - [x] **T5 (P2, human: ~3h / CC: ~30m)** — internal/service — Typed sentinel errors
   - Surfaced by: Audit `Reason` has nothing to switch on
   - Files: `cluster_secrets.go:115,174,177,202,353,379`
@@ -623,7 +636,10 @@ reaches a peer **overwrites** the stale row rather than reading it. The real
 leak is only peers a retry does not reach, which delete-fanout fixes and
 attempt-unique refs would merely orphan under a new name.
 
-Keeping refs derivable from `(sandboxID, version)` is worth preserving.
+Keeping refs derivable from `(sandboxID, incarnationID, version)` is worth
+preserving. The incarnation component is mandatory: deterministic sandbox IDs
+may be reused, but an old worker, delayed delete, or stale peer row must never
+address the new lifecycle.
 
 ### 3d-4. `Provider.Open` takes the sandbox ID explicitly
 
@@ -658,12 +674,12 @@ This reverses D4's synchronous choice, which was made before E1a existed.
   carrying sandbox ID, target peer, and error class, and feeds the operator
   alert from the §8 decision.
 
-**The cost, stated plainly:** a sandbox that dies inside the fan-out window loses
-its credentials and cannot be recreated elsewhere. The mitigation is not that the
-window is small — it is that `failover_ready` reports false for its duration, so
-nothing and nobody is misled. If that field is not shipped, this decision is not
-safe. **E1a therefore moves from slice 3 into slice 1**, alongside the fan-out it
-now guards.
+**The cost, stated plainly:** a successful create is protected against one
+holder loss, but may not yet have reached every configured recipient. Losing
+multiple holders before the remainder converges can exhaust redundancy.
+`failover_ready` reports false until the full configured holder set is verified,
+so the reduced-redundancy interval is visible. **E1a therefore moves from slice
+3 into slice 1**, alongside the fan-out it guards.
 
 Boot-path consequence: HA creates perform one bounded first-backup ACK wait.
 Only the remaining recipients are fully asynchronous; default/non-HA creates
@@ -684,11 +700,14 @@ Four parts, all of them load-bearing:
    state fails explicitly (`503`) instead of launching an all-worker scan. The
    off-node exporter is mandatory in enterprise mode, so completeness does not
    depend on an unbounded discovery query. **Rate-limited** (see below).
-3. Authenticated HTTPS batch export advances a daemon-owned durable watermark;
+3. Authenticated HTTPS batch export, or a programmatically wired
+   `controlplane.AuditExporter`, advances a daemon-owned durable watermark;
    receiver-controlled cursors cannot skip local records.
 4. Open-source mode may omit the exporter and use bounded owner-history reads.
-   `SB_ENTERPRISE_MODE=true` fails boot unless an HTTPS export URL and strong
-   bearer credential are configured.
+   `SB_ENTERPRISE_MODE=true` fails boot unless either an authenticated HTTPS
+   exporter (with a strong bearer credential) or a non-noop programmatic
+   `controlplane.AuditExporter` is configured. Enterprise mode separately
+   requires a non-noop external `controlplane.Witness`.
 
 ### The claim is gated on the sink, and this is not optional wording
 
@@ -1026,8 +1045,9 @@ claim is withdrawn. New accepted gap
 recorded: **GAP-1** (closed for every cluster create via min-ACK wait,
 retraction, and failure when peers are unreachable — §10).
 
-**UNRESOLVED DECISIONS:**
-- SOC 2 observation window and auditor engagement status — E2a has no business date without it; E2b gated on an auditor ask
+**UNRESOLVED BUSINESS / OPERATIONAL REQUIREMENTS:**
+- SOC 2 observation window and auditor engagement status; the repository
+  mechanism does not itself constitute certification
 - Owners, dates, and per-slice rollback plans
 - Full off-node WORM/SIEM event store (Witness + HTTP export seam ship; reconstructable history still requires configuring export)
 - Automated certificate issuance/renewal and revocation distribution for the

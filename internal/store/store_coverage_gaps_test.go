@@ -302,18 +302,19 @@ func TestClusterSecretUpsertUpdate(t *testing.T) {
 	st := newTestStore(t)
 
 	rec := ClusterSecretRecord{
-		Ref:           "cluster-secret://sandbox/sb-upsert/v1",
-		SandboxID:     "sb-upsert",
-		Version:       1,
-		Recipients:    []string{"node-a"},
-		SealedPayload: []byte("v1"),
+		Ref:            "cluster-secret://sandbox/sb-upsert/i/inc-upsert/v1",
+		SandboxID:      "sb-upsert",
+		Version:        1,
+		Recipients:     []string{"node-a"},
+		SealedPayload:  []byte("v1"),
+		SealGeneration: 1,
 	}
 	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret insert: %v", err)
 	}
-	rec.Version = 2
 	rec.Recipients = []string{"node-b"}
 	rec.SealedPayload = []byte("v2")
+	rec.SealGeneration = 2
 	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret update: %v", err)
 	}
@@ -321,7 +322,7 @@ func TestClusterSecretUpsertUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetClusterSecret: %v", err)
 	}
-	if got.Version != 2 || got.Recipients[0] != "node-b" || string(got.SealedPayload) != "v2" {
+	if got.Version != 1 || got.Recipients[0] != "node-b" || string(got.SealedPayload) != "v2" {
 		t.Fatalf("updated secret = %+v", got)
 	}
 }
@@ -379,6 +380,11 @@ func TestPutClusterSecretValidation(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected validation error for empty sealed payload")
 	}
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: "ref", SandboxID: "sb", Version: 1, SealedPayload: []byte("x"),
+	}); err == nil {
+		t.Fatal("expected validation error for non-positive seal generation")
+	}
 }
 
 func TestGetClusterSecretInvalidRecipientsJSON(t *testing.T) {
@@ -398,8 +404,8 @@ func TestGetClusterSecretInvalidRecipientsJSON(t *testing.T) {
 	if _, err := st.GetClusterSecret(ctx, "  "); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("empty ref = %v, want ErrNotFound", err)
 	}
-	if err := st.DeleteClusterSecretsForSandbox(ctx, ""); err != nil {
-		t.Fatalf("DeleteClusterSecretsForSandbox empty id: %v", err)
+	if err := st.DeleteClusterSecretRowsForIncarnation(ctx, "", ""); err != nil {
+		t.Fatalf("DeleteClusterSecretRowsForIncarnation empty id: %v", err)
 	}
 }
 

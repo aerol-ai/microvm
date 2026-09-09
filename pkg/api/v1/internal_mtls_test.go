@@ -3,10 +3,23 @@ package v1
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
 )
+
+func internalMTLSTestDeps(nodeID string) Deps {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(cluster.NewNoop(nodeID, "http://"+nodeID, ""))
+	return Deps{Service: svc, Logger: logger}
+}
 
 func TestWithInternalMTLSBoundary(t *testing.T) {
 	calls := 0
@@ -14,7 +27,7 @@ func TestWithInternalMTLSBoundary(t *testing.T) {
 		calls++
 		w.WriteHeader(http.StatusNoContent)
 	})
-	guarded := withInternalMTLS(Deps{}, next)
+	guarded := withInternalMTLS(internalMTLSTestDeps("worker-boundary"), next)
 
 	publicReq := httptest.NewRequest(http.MethodPost, "http://public/v1/cluster/internal/secrets", nil)
 	publicRec := httptest.NewRecorder()
@@ -36,7 +49,7 @@ func TestWithInternalMTLSNodeIdentity(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	guarded := withInternalMTLS(Deps{}, next)
+	guarded := withInternalMTLS(internalMTLSTestDeps("worker-1"), next)
 
 	t.Run("matching_header_and_san", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "https://internal/v1/cluster/internal/secrets", nil)
@@ -71,6 +84,20 @@ func TestWithInternalMTLSNodeIdentity(t *testing.T) {
 			t.Fatalf("status=%d, want 403", rec.Code)
 		}
 	})
+}
+
+func TestWithInternalMTLSFailsClosedWithoutMembership(t *testing.T) {
+	nextCalled := false
+	guarded := withInternalMTLS(Deps{}, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		nextCalled = true
+	}))
+	req := httptest.NewRequest(http.MethodGet, "https://internal/v1/cluster/internal/secrets", nil)
+	addVerifiedClientCertificate(req, &x509.Certificate{DNSNames: []string{"node:worker-1"}})
+	rec := httptest.NewRecorder()
+	guarded.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || nextCalled {
+		t.Fatalf("missing membership status=%d called=%v, want fail-closed 403", rec.Code, nextCalled)
+	}
 }
 
 func addVerifiedClientCertificate(req *http.Request, peerCert *x509.Certificate) {

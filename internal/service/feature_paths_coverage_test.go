@@ -14,18 +14,19 @@ func seedStartedSandbox(t *testing.T, st interface {
 	t.Helper()
 	now := time.Now().UTC()
 	if err := st.Create(context.Background(), &models.Sandbox{
-		ID:           id,
-		Image:        "alpine:3.20",
-		Status:       models.SandboxStatusStarted,
-		Runtime:      models.RuntimeDocker,
-		ContainerID:  "ctr-" + id,
-		ContainerIP:  "10.0.0.77",
-		CPU:          2,
-		MemoryMB:     1024,
-		DiskGB:       10,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 id,
+		Image:              "alpine:3.20",
+		Status:             models.SandboxStatusStarted,
+		Runtime:            models.RuntimeDocker,
+		ContainerID:        "ctr-" + id,
+		ContainerIP:        "10.0.0.77",
+		CPU:                2,
+		MemoryMB:           1024,
+		DiskGB:             10,
+		AuditIncarnationID: "inc-" + id,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed %s: %v", id, err)
 	}

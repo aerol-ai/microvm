@@ -83,7 +83,7 @@ func (m *scriptedVolumeMeta) AttachmentCount(context.Context, string, string) (i
 func (m *scriptedVolumeMeta) PutAttachments(context.Context, []models.VolumeAttachment) error {
 	return m.putAttachmentsErr
 }
-func (m *scriptedVolumeMeta) DeleteAttachmentsForSandbox(context.Context, string) error {
+func (m *scriptedVolumeMeta) DeleteAttachmentsForSandbox(context.Context, string, string) error {
 	return m.deleteAttachErr
 }
 
@@ -423,8 +423,8 @@ func TestClusterOwnershipReplayGapsWave20(t *testing.T) {
 	_ = st3.Create(ctx, sb)
 	c3 := &fakeOwnershipCluster{Noop: cluster.NewNoop("self", "http://self", "")}
 	_ = st3.Close()
-	_ = svc3.localSandboxStateForCluster(ctx, c3, sb)
-	_ = svc3.specFromSandbox(nil, sb)
+	_, _ = svc3.localSandboxStateForCluster(ctx, c3, sb)
+	_, _ = svc3.specFromSandbox(nil, sb)
 }
 
 func clusterOwnershipNeedsReplayCall(svc *Service, c cluster.Client, sb *models.Sandbox) bool {

@@ -16,7 +16,27 @@ type providerContractOpts struct {
 
 func testProviderContract(t *testing.T, p Provider, opts providerContractOpts) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := ContextWithIncarnationID(context.Background(), "contract-incarnation")
+	contractSecrets := Secrets{Registry: &models.RegistryAuth{Password: "contract-secret"}}
+
+	t.Run("current_identity_required", func(t *testing.T) {
+		if _, err := p.Put(context.Background(), "sb-no-incarnation", contractSecrets, []string{"node-a"}); err == nil {
+			t.Fatal("Put accepted a secret without a lifecycle incarnation")
+		}
+		if _, err := p.Open(ctx, "sb-legacy", Handle{
+			Ref:            "cluster-secret://sandbox/sb-legacy/v1",
+			Version:        RefVersion,
+			SealGeneration: 1,
+		}, "node-a"); !errors.Is(err, ErrVersionMismatch) {
+			t.Fatalf("Open legacy ref = %v, want ErrVersionMismatch", err)
+		}
+		if _, err := p.Open(ctx, "sb-generation", Handle{
+			Ref:     FormatRef("sb-generation", "contract-incarnation", RefVersion),
+			Version: RefVersion,
+		}, "node-a"); !errors.Is(err, ErrVersionMismatch) {
+			t.Fatalf("Open generation-less ref = %v, want ErrVersionMismatch", err)
+		}
+	})
 
 	t.Run("put_open_round_trip", func(t *testing.T) {
 		sec := Secrets{
@@ -63,7 +83,7 @@ func testProviderContract(t *testing.T, p Provider, opts providerContractOpts) {
 	})
 
 	t.Run("not_found", func(t *testing.T) {
-		_, err := p.Open(ctx, "sb-missing", Handle{Ref: FormatRef("missing", RefVersion), Version: RefVersion}, "node-a")
+		_, err := p.Open(ctx, "sb-missing", Handle{Ref: FormatRef("sb-missing", "contract-incarnation", RefVersion), Version: RefVersion, SealGeneration: 1}, "node-a")
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("Open missing = %v, want ErrNotFound", err)
 		}
@@ -144,7 +164,7 @@ func TestFakeKMSProviderContract(t *testing.T) {
 }
 
 func TestFakeKMSInjectedErrors(t *testing.T) {
-	ctx := context.Background()
+	ctx := ContextWithIncarnationID(context.Background(), "inc-test")
 	fake, err := NewFakeKMS()
 	if err != nil {
 		t.Fatalf("NewFakeKMS: %v", err)

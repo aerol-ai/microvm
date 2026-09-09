@@ -247,11 +247,10 @@ func TestCreateOnSelectedNodeCoverage95Branches(t *testing.T) {
 	})
 }
 
-func TestBestEffortHelpersNilClusterOnService(t *testing.T) {
+func TestCancelReservationBestEffortNilClusterOnService(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc, _ := newCreateService(t, nil, true)
 
-	DeletePlacementBestEffort(context.Background(), svc, logger, "sb-1")
 	CancelReservationBestEffort(context.Background(), svc, logger, "sb-1")
 }
 
@@ -277,10 +276,11 @@ func TestRetractFailedPromoteDeletePlacementFailure(t *testing.T) {
 		deleteErr: errors.New("raft delete failed"),
 	}
 	svc, _ := newCreateService(t, stub, true)
+	seedReservedPlacement(stub, "sb-del-fail")
 	if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-del-fail"); err != nil {
 		t.Fatalf("CreateSandboxWithID: %v", err)
 	}
-	retractFailedPromote(context.Background(), svc, stub, logger, "sb-del-fail")
+	retractFailedPromote(context.Background(), svc, logger, "sb-del-fail")
 	if stub.deletes != 1 {
 		t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
 	}
@@ -295,20 +295,8 @@ func TestRetractReservedCreateDeleteSecretsFailure(t *testing.T) {
 	}
 	_ = st.Close()
 	retractReservedCreate(context.Background(), svc, stub, logger, "sb-secrets-del", nil)
-	if stub.cancels != 1 {
-		t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
-	}
-}
-
-func TestDeletePlacementBestEffortLogsDeleteError(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	stub := &clusterStub{
-		Noop:      cluster.NewNoop("node-a", "", ""),
-		deleteErr: errors.New("delete failed"),
-	}
-	DeletePlacementBestEffort(context.Background(), testServiceWithCluster(stub), logger, "sb-log-del")
-	if stub.deletes != 1 {
-		t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
+	if stub.cancels != 0 {
+		t.Fatalf("CancelReservation calls = %d, want 0 while exact secret cleanup is not durable", stub.cancels)
 	}
 }
 
@@ -332,17 +320,6 @@ func TestPrepareNilServiceAndDiskGBForCapacity(t *testing.T) {
 	}
 	if disk := diskGBForCapacity(10, models.RuntimeFirecracker, 5); disk != 15 {
 		t.Fatalf("diskGBForCapacity = %d, want 15", disk)
-	}
-}
-
-func TestDeletePlacementBestEffortDeleteErrorNilLogger(t *testing.T) {
-	stub := &clusterStub{
-		Noop:      cluster.NewNoop("node-a", "", ""),
-		deleteErr: errors.New("delete failed"),
-	}
-	DeletePlacementBestEffort(context.Background(), testServiceWithCluster(stub), nil, "sb-nil-logger")
-	if stub.deletes != 1 {
-		t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
 	}
 }
 
@@ -390,9 +367,9 @@ func TestRetractFailedPromoteDeleteSecretsFailure(t *testing.T) {
 		t.Fatalf("CreateSandboxWithID: %v", err)
 	}
 	_ = st.Close()
-	retractFailedPromote(context.Background(), svc, stub, logger, "sb-secrets-fail")
-	if stub.deletes != 1 {
-		t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
+	retractFailedPromote(context.Background(), svc, logger, "sb-secrets-fail")
+	if stub.deletes != 0 {
+		t.Fatalf("DeletePlacement calls = %d, want 0 while exact secret cleanup is not durable", stub.deletes)
 	}
 }
 

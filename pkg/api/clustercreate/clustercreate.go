@@ -257,39 +257,27 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		return nil, err
 	}
 	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
-		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, err
 	}
 
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	secrets, sealErr := svc.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, svc.SecretRecipientsForSeal(resp.Sandbox.ID), service.SealStrict)
+	secrets, sealErr := svc.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, svc.SecretRecipientsForSeal(resp.Sandbox.ID))
 	if sealErr != nil {
-		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, sealErr
+	}
+	if secrets.IncarnationID == "" {
+		secrets.IncarnationID = resp.Sandbox.AuditIncarnationID
 	}
 	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := service.RedactClusterSecrets(req)
 	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
-		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, promoteErr
 	}
 	return resp, nil
-}
-
-func DeletePlacementBestEffort(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
-	if svc == nil || sandboxID == "" {
-		return
-	}
-	c := svc.Cluster()
-	if c == nil {
-		return
-	}
-	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := c.DeletePlacement(commitCtx, sandboxID); err != nil && logger != nil {
-		logger.Warn("cluster: delete placement after facade rollback failed", "sandbox_id", sandboxID, "err", err)
-	}
 }
 
 func CancelReservationBestEffort(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
@@ -374,14 +362,23 @@ func clusterCreateSelfCanOwnSandbox(c cluster.Client) bool {
 	return true
 }
 
-func rollbackCreate(ctx context.Context, svc *service.Service, c cluster.Client, logger *slog.Logger, sandboxID, reservationID string) {
-	if err := svc.DestroySandbox(ctx, sandboxID); err != nil && logger != nil {
-		logger.Error("cluster: rollback destroy failed", "sandbox_id", sandboxID, "err", err)
+// RollbackLocalCreate retracts a non-reserved local create. Placement release
+// is conditional on complete local destruction: retaining the row and its
+// lifecycle identity is safer than creating an untracked live runtime when a
+// runtime, secret, or store finalizer fails.
+func RollbackLocalCreate(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
+	if svc == nil || strings.TrimSpace(sandboxID) == "" {
+		return
 	}
-	if reservationID != "" && c != nil {
-		cancelReservation(ctx, c, logger, reservationID)
+	rbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := svc.DestroySandbox(rbCtx, sandboxID); err != nil {
+		if logger != nil {
+			logger.Error("cluster: rollback destroy failed; retaining placement for reconciliation",
+				"sandbox_id", sandboxID, "err", err)
+		}
+		return
 	}
-	DeletePlacementBestEffort(ctx, svc, logger, sandboxID)
 }
 
 func cancelReservation(ctx context.Context, c cluster.Client, logger *slog.Logger, sandboxID string) {

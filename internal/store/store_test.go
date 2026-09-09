@@ -2143,11 +2143,12 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 	st := newTestStore(t)
 
 	rec := ClusterSecretRecord{
-		Ref:           "cluster-secret://sandbox/sb-store/v1",
-		SandboxID:     "sb-store",
-		Version:       1,
-		Recipients:    []string{"node-a"},
-		SealedPayload: []byte("opaque-ciphertext"),
+		Ref:            "cluster-secret://sandbox/sb-store/i/inc-store/v1",
+		SandboxID:      "sb-store",
+		Version:        1,
+		Recipients:     []string{"node-a"},
+		SealedPayload:  []byte("opaque-ciphertext"),
+		SealGeneration: 1,
 	}
 	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret: %v", err)
@@ -2166,30 +2167,30 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 		t.Fatalf("sealed payload = %q", string(got.SealedPayload))
 	}
 
-	if err := st.DeleteClusterSecretsForSandbox(ctx, rec.SandboxID); err != nil {
-		t.Fatalf("DeleteClusterSecretsForSandbox: %v", err)
+	if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, rec.SandboxID, "inc-store", []string{"node-a"}); err != nil {
+		t.Fatalf("DeleteClusterSecretsOriginatorWithOutbox: %v", err)
 	}
 	if _, err := st.GetClusterSecret(ctx, rec.Ref); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetClusterSecret after delete = %v, want ErrNotFound", err)
 	}
-	tomb, err := st.HasClusterSecretTomb(ctx, rec.SandboxID)
-	if err != nil || !tomb {
-		t.Fatalf("HasClusterSecretTomb = %v %v, want true", tomb, err)
+	tombGeneration, err := st.ClusterSecretTombGenerationForIncarnation(ctx, rec.SandboxID, "inc-store")
+	if err != nil || tombGeneration == 0 {
+		t.Fatalf("ClusterSecretTombGenerationForIncarnation = %d %v, want non-zero", tombGeneration, err)
 	}
-	if err := st.ClearClusterSecretTomb(ctx, rec.SandboxID); err != nil {
+	if err := st.ClearClusterSecretTombForIncarnation(ctx, rec.SandboxID, "inc-store"); err != nil {
 		t.Fatalf("ClearClusterSecretTomb: %v", err)
 	}
-	tomb, err = st.HasClusterSecretTomb(ctx, rec.SandboxID)
-	if err != nil || tomb {
-		t.Fatalf("HasClusterSecretTomb after clear = %v %v, want false", tomb, err)
+	tombGeneration, err = st.ClusterSecretTombGenerationForIncarnation(ctx, rec.SandboxID, "inc-store")
+	if err != nil || tombGeneration != 0 {
+		t.Fatalf("ClusterSecretTombGenerationForIncarnation after clear = %d %v, want zero", tombGeneration, err)
 	}
 }
 
-func TestListClusterSecrets(t *testing.T) {
+func TestListClusterSecretsBatch(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 
-	empty, err := st.ListClusterSecrets(ctx)
+	empty, err := st.ListClusterSecretsBatch(ctx, "", 1)
 	if err != nil {
 		t.Fatalf("ListClusterSecrets empty: %v", err)
 	}
@@ -2198,18 +2199,20 @@ func TestListClusterSecrets(t *testing.T) {
 	}
 
 	a := ClusterSecretRecord{
-		Ref:           "cluster-secret://sandbox/sb-a/v1",
-		SandboxID:     "sb-a",
-		Version:       1,
-		Recipients:    []string{"node-a", "node-b"},
-		SealedPayload: []byte("cipher-a"),
+		Ref:            "cluster-secret://sandbox/sb-a/i/inc-a/v1",
+		SandboxID:      "sb-a",
+		Version:        1,
+		Recipients:     []string{"node-a", "node-b"},
+		SealedPayload:  []byte("cipher-a"),
+		SealGeneration: 1,
 	}
 	b := ClusterSecretRecord{
-		Ref:           "cluster-secret://sandbox/sb-b/v1",
-		SandboxID:     "sb-b",
-		Version:       2,
-		Recipients:    []string{"node-a"},
-		SealedPayload: []byte("cipher-b"),
+		Ref:            "cluster-secret://sandbox/sb-b/i/inc-b/v1",
+		SandboxID:      "sb-b",
+		Version:        1,
+		Recipients:     []string{"node-a"},
+		SealedPayload:  []byte("cipher-b"),
+		SealGeneration: 1,
 	}
 	if _, err := st.PutClusterSecret(ctx, a); err != nil {
 		t.Fatalf("PutClusterSecret a: %v", err)
@@ -2218,22 +2221,28 @@ func TestListClusterSecrets(t *testing.T) {
 		t.Fatalf("PutClusterSecret b: %v", err)
 	}
 
-	got, err := st.ListClusterSecrets(ctx)
+	first, err := st.ListClusterSecretsBatch(ctx, "", 1)
 	if err != nil {
-		t.Fatalf("ListClusterSecrets: %v", err)
+		t.Fatalf("ListClusterSecretsBatch first: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("ListClusterSecrets len = %d, want 2", len(got))
+	if len(first) != 1 {
+		t.Fatalf("ListClusterSecretsBatch first len = %d, want 1", len(first))
 	}
-	// ORDER BY sandbox_id, ref
-	if got[0].SandboxID != "sb-a" || got[1].SandboxID != "sb-b" {
-		t.Fatalf("order = %q,%q want sb-a,sb-b", got[0].SandboxID, got[1].SandboxID)
+	second, err := st.ListClusterSecretsBatch(ctx, first[0].Ref, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("ListClusterSecretsBatch second = %+v, %v", second, err)
 	}
-	if len(got[0].Recipients) != 2 || string(got[0].SealedPayload) != "cipher-a" {
-		t.Fatalf("row a = %+v", got[0])
+	if first[0].SandboxID != "sb-a" || second[0].SandboxID != "sb-b" {
+		t.Fatalf("order = %q,%q want sb-a,sb-b", first[0].SandboxID, second[0].SandboxID)
 	}
-	if len(got[1].Recipients) != 1 || string(got[1].SealedPayload) != "cipher-b" {
-		t.Fatalf("row b = %+v", got[1])
+	if len(first[0].Recipients) != 2 || string(first[0].SealedPayload) != "cipher-a" {
+		t.Fatalf("row a = %+v", first[0])
+	}
+	if len(second[0].Recipients) != 1 || string(second[0].SealedPayload) != "cipher-b" {
+		t.Fatalf("row b = %+v", second[0])
+	}
+	if tail, err := st.ListClusterSecretsBatch(ctx, second[0].Ref, 1); err != nil || len(tail) != 0 {
+		t.Fatalf("ListClusterSecretsBatch tail = %+v, %v", tail, err)
 	}
 }
 

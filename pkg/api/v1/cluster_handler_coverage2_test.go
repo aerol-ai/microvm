@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -36,7 +37,7 @@ type auditACLStubCluster struct {
 	err error
 }
 
-func (c *auditACLStubCluster) AuditACLForSandbox(context.Context, string) (cluster.AuditACL, bool, error) {
+func (c *auditACLStubCluster) AuditACLForSandbox(context.Context, string, string) (cluster.AuditACL, bool, error) {
 	return c.acl, c.ok, c.err
 }
 
@@ -195,6 +196,8 @@ func TestClusterInternalPlacementsByIDsValidationAndRedaction(t *testing.T) {
 			{
 				SandboxID: "sb", SecretRef: "secret-ref", SecretVersion: 1,
 				SecretRecipients: []string{"node-a"}, SecretSealGeneration: 2,
+				Spec:              &models.CreateSandboxRequest{Image: strings.Repeat("x", 1024)},
+				ExposedPortRoutes: map[int]cluster.ExposedPortRoute{8080: {PublicURL: "https://example.test"}},
 			},
 		},
 	}
@@ -216,8 +219,33 @@ func TestClusterInternalPlacementsByIDsValidationAndRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out["sb"]
-	if got.SecretRef != "" || got.SecretVersion != 0 {
-		t.Fatalf("internal placement leaked secret handle: %+v", got)
+	if got.SecretRef != "" || got.SecretVersion != 0 || got.Spec != nil || len(got.ExposedPortRoutes) != 0 {
+		t.Fatalf("internal placement batch was not minimized: %+v", got)
+	}
+	if got.SecretSealGeneration != 2 || len(got.SecretRecipients) != 1 {
+		t.Fatalf("internal placement batch lost lifecycle fields: %+v", got)
+	}
+	tooMany := make([]string, cluster.MaxPlacementPageLimit+1)
+	body, err := json.Marshal(map[string]any{"ids": tooMany})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	h.clusterInternalPlacementsByIDs(rr, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("oversized id batch status = %d, want 400", rr.Code)
+	}
+
+	// Ordinary readiness reads may use any server replica, but a destructive
+	// reconciler's authoritative request must be rejected by a follower.
+	follower := &leaderStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", ""), leader: "node-b"}
+	svc = service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(follower)
+	h = &handlers{deps: Deps{Service: svc, Logger: logger}}
+	rr = httptest.NewRecorder()
+	h.clusterInternalPlacementsByIDs(rr, httptest.NewRequest(http.MethodPost, "/?authoritative=true", strings.NewReader(`{"ids":["sb"]}`)))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("follower authoritative status = %d, want 503", rr.Code)
 	}
 }
 

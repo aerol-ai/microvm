@@ -119,25 +119,6 @@ func TestV1GetJSBundleRoutesNodeBoundRefInConstantTime(t *testing.T) {
 	}
 }
 
-func TestValidateClusterIsolateBundleRef(t *testing.T) {
-	if err := service.ValidateClusterIsolateBundleRef(models.CreateSandboxRequest{
-		Runtime: models.RuntimeIsolate, ModuleRef: "hook",
-	}); err == nil {
-		t.Fatal("unbound cluster isolate ref was accepted")
-	}
-	if err := service.ValidateClusterIsolateBundleRef(models.CreateSandboxRequest{
-		Runtime:   models.RuntimeIsolate,
-		ModuleRef: models.JSBundleRefForNode("sha256:abc", "isolate-a"),
-	}); err != nil {
-		t.Fatalf("node-bound cluster isolate ref rejected: %v", err)
-	}
-	if err := service.ValidateClusterIsolateBundleRef(models.CreateSandboxRequest{
-		Runtime: models.RuntimeDocker, Image: "alpine",
-	}); err != nil {
-		t.Fatalf("non-isolate request rejected: %v", err)
-	}
-}
-
 func TestV1CreateJSBundle_InvalidJSON(t *testing.T) {
 	h := newJSBundleV1TestEnv(t)
 	req := httptest.NewRequest(http.MethodPost, "/v1/js-bundles", bytes.NewReader([]byte("{bad")))

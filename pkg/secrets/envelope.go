@@ -50,19 +50,20 @@ func (b SealBinding) normalized() SealBinding {
 	b.SandboxID = strings.TrimSpace(b.SandboxID)
 	b.IncarnationID = strings.TrimSpace(b.IncarnationID)
 	b.Ref = strings.TrimSpace(b.Ref)
-	if b.Version <= 0 {
-		b.Version = RefVersion
-	}
-	if b.Generation <= 0 {
-		b.Generation = 1
-	}
 	return b
 }
 
 func requireSealBinding(binding SealBinding) (SealBinding, error) {
 	binding = binding.normalized()
-	if binding.SandboxID == "" || binding.Ref == "" {
-		return SealBinding{}, fmt.Errorf("cluster secret sandbox binding is required")
+	if binding.SandboxID == "" || binding.IncarnationID == "" || binding.Ref == "" {
+		return SealBinding{}, fmt.Errorf("cluster secret sandbox and incarnation binding are required")
+	}
+	if binding.Version != RefVersion || binding.Generation <= 0 {
+		return SealBinding{}, fmt.Errorf("cluster secret binding version/generation is invalid")
+	}
+	parsed, err := ParseRef(binding.Ref)
+	if err != nil || parsed.SandboxID != binding.SandboxID || parsed.IncarnationID != binding.IncarnationID || parsed.Version != binding.Version {
+		return SealBinding{}, fmt.Errorf("cluster secret ref does not match its binding")
 	}
 	return binding, nil
 }
@@ -357,7 +358,8 @@ func EnvelopeBinding(sealed []byte) (EnvelopeBindingFields, error) {
 	if envelope.Version != EnvelopeVersion {
 		return EnvelopeBindingFields{}, fmt.Errorf("unsupported cluster secret envelope version %d", envelope.Version)
 	}
-	if strings.TrimSpace(envelope.SandboxID) == "" || strings.TrimSpace(envelope.Ref) == "" || envelope.RefVersion <= 0 || envelope.Generation <= 0 {
+	if strings.TrimSpace(envelope.SandboxID) == "" || strings.TrimSpace(envelope.IncarnationID) == "" || strings.TrimSpace(envelope.Ref) == "" ||
+		envelope.RefVersion != RefVersion || envelope.Generation <= 0 {
 		return EnvelopeBindingFields{}, fmt.Errorf("cluster secret envelope binding is incomplete")
 	}
 	return EnvelopeBindingFields{
@@ -370,21 +372,11 @@ func EnvelopeBinding(sealed []byte) (EnvelopeBindingFields, error) {
 	}, nil
 }
 
-// FormatRef builds the stable cluster-secret://sandbox/{id}/v{version} handle
-// (legacy shape with empty incarnation). Prefer FormatRefInc when an
-// incarnation ID is available.
-func FormatRef(sandboxID string, version int) string {
-	return FormatRefInc(sandboxID, "", version)
-}
-
-// FormatRefInc builds cluster-secret://sandbox/{id}/i/{inc}/v{version} when
-// incarnationID is non-empty; otherwise the legacy /v{version} shape.
-func FormatRefInc(sandboxID, incarnationID string, version int) string {
+// FormatRef builds the sole current handle shape. Callers must supply the
+// lifecycle incarnation; ParseRef rejects incarnation-less references.
+func FormatRef(sandboxID, incarnationID string, version int) string {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
-	if incarnationID == "" {
-		return fmt.Sprintf("cluster-secret://sandbox/%s/v%d", sandboxID, version)
-	}
 	return fmt.Sprintf("cluster-secret://sandbox/%s/i/%s/v%d", sandboxID, incarnationID, version)
 }
 
@@ -395,8 +387,7 @@ type ParsedRef struct {
 	Version       int
 }
 
-// ParseRef accepts both legacy cluster-secret://sandbox/{id}/v{N} and
-// incarnation-scoped cluster-secret://sandbox/{id}/i/{inc}/v{N} handles.
+// ParseRef accepts only cluster-secret://sandbox/{id}/i/{inc}/v{N} handles.
 func ParseRef(ref string) (ParsedRef, error) {
 	const prefix = "cluster-secret://sandbox/"
 	ref = strings.TrimSpace(ref)
@@ -404,42 +395,27 @@ func ParseRef(ref string) (ParsedRef, error) {
 		return ParsedRef{}, fmt.Errorf("invalid cluster secret ref %q", ref)
 	}
 	rest := ref[len(prefix):]
-	// incarnation form: {id}/i/{inc}/v{N}
-	if i := strings.Index(rest, "/i/"); i > 0 {
-		sandboxID := rest[:i]
-		tail := rest[i+len("/i/"):]
-		vIdx := strings.LastIndex(tail, "/v")
-		if vIdx <= 0 {
-			return ParsedRef{}, fmt.Errorf("invalid cluster secret ref %q", ref)
-		}
-		inc := tail[:vIdx]
-		verStr := tail[vIdx+len("/v"):]
-		ver, err := strconv.Atoi(verStr)
-		if err != nil || ver <= 0 || sandboxID == "" || strings.TrimSpace(inc) == "" {
-			return ParsedRef{}, fmt.Errorf("invalid cluster secret ref %q", ref)
-		}
-		return ParsedRef{SandboxID: sandboxID, IncarnationID: strings.TrimSpace(inc), Version: ver}, nil
+	i := strings.Index(rest, "/i/")
+	if i <= 0 {
+		return ParsedRef{}, fmt.Errorf("invalid cluster secret ref %q", ref)
 	}
-	// legacy: {id}/v{N}
-	vIdx := strings.LastIndex(rest, "/v")
+	sandboxID := rest[:i]
+	tail := rest[i+len("/i/"):]
+	vIdx := strings.LastIndex(tail, "/v")
 	if vIdx <= 0 {
 		return ParsedRef{}, fmt.Errorf("invalid cluster secret ref %q", ref)
 	}
-	sandboxID := rest[:vIdx]
-	ver, err := strconv.Atoi(rest[vIdx+len("/v"):])
-	if err != nil || ver <= 0 || sandboxID == "" {
+	inc := strings.TrimSpace(tail[:vIdx])
+	ver, err := strconv.Atoi(tail[vIdx+len("/v"):])
+	if err != nil || ver != RefVersion || sandboxID == "" || inc == "" {
 		return ParsedRef{}, fmt.Errorf("invalid cluster secret ref %q", ref)
 	}
-	return ParsedRef{SandboxID: sandboxID, Version: ver}, nil
+	return ParsedRef{SandboxID: sandboxID, IncarnationID: inc, Version: ver}, nil
 }
 
 // KeyAADBound authenticates the wrapped data-key for v4 envelopes.
 func KeyAADBound(recipients []string, b SealBinding) []byte {
 	b = b.normalized()
-	if b.IncarnationID == "" {
-		return []byte(fmt.Sprintf("aerolvm-cluster-secrets-v4-key\x00%s\x00%s\x00%d\x00%d\x00%s",
-			b.SandboxID, b.Ref, b.Version, b.Generation, strings.Join(NormalizeRecipients(recipients), "\x00")))
-	}
 	return []byte(fmt.Sprintf("aerolvm-cluster-secrets-v4-key\x00%s\x00%s\x00%s\x00%d\x00%d\x00%s",
 		b.SandboxID, b.IncarnationID, b.Ref, b.Version, b.Generation, strings.Join(NormalizeRecipients(recipients), "\x00")))
 }
@@ -447,10 +423,6 @@ func KeyAADBound(recipients []string, b SealBinding) []byte {
 // PayloadAADBound authenticates the ciphertext for v4 envelopes.
 func PayloadAADBound(recipients []string, b SealBinding) []byte {
 	b = b.normalized()
-	if b.IncarnationID == "" {
-		return []byte(fmt.Sprintf("aerolvm-cluster-secrets-v4-payload\x00%s\x00%s\x00%d\x00%d\x00%s",
-			b.SandboxID, b.Ref, b.Version, b.Generation, strings.Join(NormalizeRecipients(recipients), "\x00")))
-	}
 	return []byte(fmt.Sprintf("aerolvm-cluster-secrets-v4-payload\x00%s\x00%s\x00%s\x00%d\x00%d\x00%s",
 		b.SandboxID, b.IncarnationID, b.Ref, b.Version, b.Generation, strings.Join(NormalizeRecipients(recipients), "\x00")))
 }
@@ -459,13 +431,11 @@ func PayloadAADBound(recipients []string, b SealBinding) []byte {
 func EncryptionContextForBinding(b SealBinding) map[string]string {
 	b = b.normalized()
 	out := map[string]string{
-		"aerolvm.sandbox_id": b.SandboxID,
-		"aerolvm.ref":        b.Ref,
-		"aerolvm.version":    fmt.Sprintf("%d", b.Version),
-		"aerolvm.generation": fmt.Sprintf("%d", b.Generation),
-	}
-	if b.IncarnationID != "" {
-		out["aerolvm.incarnation_id"] = b.IncarnationID
+		"aerolvm.sandbox_id":     b.SandboxID,
+		"aerolvm.incarnation_id": b.IncarnationID,
+		"aerolvm.ref":            b.Ref,
+		"aerolvm.version":        fmt.Sprintf("%d", b.Version),
+		"aerolvm.generation":     fmt.Sprintf("%d", b.Generation),
 	}
 	return out
 }

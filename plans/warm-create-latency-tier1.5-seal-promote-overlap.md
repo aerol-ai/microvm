@@ -80,8 +80,9 @@ Shipped as `clustercreate.OverlapCreateAndPromote`, used by both
 (Daytona/E2B facades) so the paths cannot drift.
 
 ```
-createCh ← go CreateSandboxWithID(ctx, req, reservationID)      // leg 1
-sealCh   ← go PutClusterSecretsForRecipient(commitCtx, ...)     // leg 2
+binding  ← leader-authoritative ReservedSecretBinding(reservationID)
+createCh ← go CreateSandboxWithID(bindingContext, req, reservationID) // leg 1
+sealCh   ← go SealAndDistribute(bindingContext, ..., recipients)      // leg 2
 cr := <-createCh ; sr := <-sealCh                               // join
 if either failed → retractReservedCreate (§3) → error
 RecordPlacement(commitCtx, reservationID, redacted?, sr.secrets) // sequential
@@ -91,6 +92,10 @@ if promote failed → retractFailedPromote (§3) → error
 
 - **Scope gate:** only when `reservationID != ""`. Self-wins /
   `CreateSandbox` (no ID) stays sequential.
+- The binding read is leader-authoritative and supplies the reservation's
+  incarnation and recipient set to both legs. A follower cache that has not
+  observed a just-committed reservation therefore cannot split the runtime and
+  sealed secret into different lifecycle identities.
 - Both legs run in bare goroutines → each carries a `recover()` that
   converts a panic into a leg failure (net/http's per-request recover does
   not extend to handler-spawned goroutines; an unrecovered panic is a daemon
@@ -104,8 +109,10 @@ Unchanged from the original plan and still load-bearing for the sequential
 promote: a `RecordPlacement` error caused by timeout/cancel does not prove
 the command did not commit. Treat every promote error as "possibly Placed":
 
-- Retract with `DeletePlacement` (`opDelete` — effective on Placed **or**
-  Reserved, releases the pending reservation, idempotent). Never
+- Retract through `DestroySandbox`, whose finalization performs an
+  owner-and-incarnation-fenced `opDelete` after runtime and secret teardown
+  and before removing the local row. It is effective on Placed **or** Reserved.
+  Never
   `CancelReservation` alone: `opCancelReserve` is a documented no-op on
   Placed, and the ghost row would stick until reconcile (~5 min).
 - **Never use cancellation of the promote as cleanup.** Always classify the
@@ -126,18 +133,27 @@ retract metric says so loudly.
 **`retractReservedCreate`** — create- or seal-leg failure. Promote was never
 attempted, the row is still Reserved, no ambiguity exists:
 
-1. `DestroySandbox` best-effort (quiet not-found when the create leg already
-   rolled itself back; loud `destroy_failed` when create succeeded).
-2. `CancelReservation` — the correct, idempotent release for Reserved.
-3. `DeleteClusterSecrets`.
+1. `DestroySandbox` (quiet not-found only when the create leg already rolled
+   itself back; loud `destroy_failed` otherwise).
+2. If destroy succeeds, its exact placement delete already released a
+   successfully-created Reserved lifecycle; do not issue a second delete or
+   cancel.
+3. For the expected create-failed/not-found case, delete the exact secrets
+   against the still-live authoritative reservation, then cancel only if that
+   delete succeeds.
+4. For any other destroy/finalizer failure, retain runtime state, secrets, and
+   reservation together as a reconciliation anchor.
 
 **`retractFailedPromote`** — promote errored after create+seal OK
 (possibly committed, §2.2):
 
-1. `DestroySandbox` (loud on failure).
-2. `DeletePlacement` — mandatory; covers Placed and still-Reserved, so no
-   separate cancel.
-3. `DeleteClusterSecrets`.
+1. `DestroySandbox` (loud on failure; includes the exact-incarnation secret
+   finalizer).
+2. On success, the placement is already gone: `DestroySandbox` performs the
+   mandatory exact delete before removing the local retry anchor. No separate
+   delete or cancel is issued.
+3. On failure, retain placement and secrets with the live/partially finalized
+   runtime; reconciliation and alerting still have an authoritative anchor.
 
 Both run on a fresh background context (30s) and record
 `aerolvm_cluster_promote_retract_total{result}` where result reflects the
@@ -153,9 +169,10 @@ always gets the **original** leg error.
 | OK | OK | FAIL | `retractFailedPromote`; surface promote error (409 on name conflict / 503) |
 
 **Failure-path cost:** a failed create no longer pays a promote commit (the
-original overlap did — promote fired regardless). Failed reserved creates
-cost one `opCancelReserve`; failed promotes cost one `opDelete`. Cheaper
-than both the original overlap design and equal to today's sequential code.
+original overlap did — promote fired regardless). A create leg that never
+created local state costs one `opCancelReserve`; successful create legs that
+later fail sealing or promote cost the `opDelete` performed by
+`DestroySandbox`.
 
 ## 4. Owner-watcher, reconcile & backpressure analysis
 
@@ -164,7 +181,7 @@ than both the original overlap design and equal to today's sequential code.
 | Pending-reservation accounting | per opReserve/opPlace | **Preserved exactly**: row is Reserved for the full local create; `ClusterCreateMaxPendingPerWorker` and `SelectPlacement` headroom subtraction see every in-flight create. |
 | Owner watcher | 5s, failover-recreate specs only | Never sees the row mid-create (Reserved rows are not in the owner index). No duplicate-create race, regardless of create duration. |
 | `reconcileMissingSelfOwnedPlacements` | ~5 min | Backstop only for a failed `retractFailedPromote` (stuck Placed). |
-| `ReplayClusterOwnership` | boot + periodic | Retract destroys local state **first** so replay cannot re-assert a placement for a sandbox the client saw fail. Residual exposure: destroy itself fails (metric `destroy_failed`) — same exposure as the pre-Tier-1.5 sequential rollback. |
+| `ReplayClusterOwnership` | boot + periodic | Retract destroys local state **first** so replay cannot re-assert a placement for a sandbox the client saw fail. If destroy/finalization fails, the placement is deliberately retained and `destroy_failed` alerts rather than creating an untracked live-runtime vacuum. |
 | Reservation TTL GC (`reconcileReservations`) | periodic | Reaps a Reserved row if the node dies mid-create or a cancel is lost — unchanged. |
 
 **Node death mid-create:** the row is Reserved → TTL GC reaps it; the
@@ -190,13 +207,13 @@ been recreated elsewhere from a create the client never saw succeed.)
 1. **[REGRESSION] `TestOverlapCreateAndPromote_PromoteWaitsForCreate`** —
    `RecordPlacement` must not fire until the create leg completed (hook
    asserts `createFinished`); guards the §0 backpressure invariant.
-2. Create-FAIL → no promote call, `CancelReservation` (not DeletePlacement),
-   store row gone.
+2. Create-FAIL → no promote call, exact secret cleanup followed by
+   `CancelReservation`; no local row exists.
 3. Seal-FAIL (panic-injected via `SelfNodeID`) → seal phase surfaced, no
    promote, reserved retract.
 4. Both legs fail → create-phase precedence.
-5. Promote-FAIL after create-OK → `DeletePlacement` mandatory (errored-but-
-   committed §2.2), no cancel, store row gone.
+5. Promote-FAIL after create-OK → `DestroySandbox` performs the mandatory exact
+   placement delete (errored-but-committed §2.2), no cancel, store row gone.
 6. Retract error branches for both shapes (closed store + cluster errors);
    original error still surfaced.
 7. Create-leg panic → leg failure + retract, not a daemon crash.
@@ -242,8 +259,8 @@ samples at 15s gaps.
   destroy/cancel failures
 - [x] **T3** — Failure-matrix unit tests in both packages, incl. the
   promote-waits-for-create regression
-- [x] **T4** — Sequential self-wins promote-fail rollback fixed to
-  `DeletePlacement` (latent ghost-Placed bug)
+- [x] **T4** — Sequential self-wins promote-fail rollback fixed to use the
+  centralized destroy finalizer (latent ghost-Placed bug)
 - [x] **T5** — PR description call-outs: boot-path latency, failure-path
   consistency, cluster correctness (§0 analysis)
 - [x] **T6** — Bench run 2026-07-11: `cluster_seal` confirmed off the wall

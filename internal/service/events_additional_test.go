@@ -397,17 +397,18 @@ func TestHandleDockerEventRouteErrorBranches(t *testing.T) {
 
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           "sb-destroy-route",
-		Image:        "alpine",
-		Status:       models.SandboxStatusStarted,
-		ContainerID:  "ctr-destroy-route",
-		ContainerIP:  "10.0.0.99",
-		Runtime:      models.RuntimeDocker,
-		CPU:          1,
-		MemoryMB:     512,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 "sb-destroy-route",
+		Image:              "alpine",
+		Status:             models.SandboxStatusStarted,
+		ContainerID:        "ctr-destroy-route",
+		ContainerIP:        "10.0.0.99",
+		Runtime:            models.RuntimeDocker,
+		CPU:                1,
+		MemoryMB:           512,
+		AuditIncarnationID: "inc-sb-destroy-route",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed destroy sandbox: %v", err)
 	}
@@ -642,9 +643,10 @@ func TestHandleDestroyEventErrorBranches(t *testing.T) {
 		setMountRootDir(t, svc.mounts, "/dev/null")
 
 		sb := &models.Sandbox{
-			ID:          "sb-destroy-error",
-			ContainerIP: "10.0.0.12",
-			Runtime:     models.RuntimeDocker,
+			ID:                 "sb-destroy-error",
+			ContainerIP:        "10.0.0.12",
+			Runtime:            models.RuntimeDocker,
+			AuditIncarnationID: "inc-sb-destroy-error",
 			ExposedPorts: []models.ExposedPort{
 				{
 					Port:     5432,
@@ -667,9 +669,10 @@ func TestHandleDestroyEventErrorBranches(t *testing.T) {
 		svc.caddy = newAlwaysDeleteCaddy(t)
 
 		sb := &models.Sandbox{
-			ID:          "sb-destroy-delete-fail",
-			ContainerIP: "10.0.0.13",
-			Runtime:     models.RuntimeDocker,
+			ID:                 "sb-destroy-delete-fail",
+			ContainerIP:        "10.0.0.13",
+			Runtime:            models.RuntimeDocker,
+			AuditIncarnationID: "inc-sb-destroy-delete-fail",
 		}
 		if err := svc.handleDestroyEvent(ctx, sb); err == nil {
 			t.Fatal("handleDestroyEvent should fail when store.Delete fails")

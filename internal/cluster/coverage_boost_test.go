@@ -70,9 +70,10 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	})
 
 	payload, err := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-int-fwd",
-		OwnerNodeID: follower.nodeID,
+		Op:            opPlace,
+		SandboxID:     "sb-int-fwd",
+		OwnerNodeID:   follower.nodeID,
+		IncarnationID: "inc-int-fwd",
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -122,9 +123,10 @@ func TestLeaderApplyEncodedSuccess(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 
 	payload, err := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-apply-encoded",
-		OwnerNodeID: c.nodeID,
+		Op:            opPlace,
+		SandboxID:     "sb-apply-encoded",
+		OwnerNodeID:   c.nodeID,
+		IncarnationID: "inc-apply-encoded",
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -145,7 +147,7 @@ func TestApplyCommandReturnsPlacementConflict(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 
-	seed, err := encodeCommand(command{Op: opPlace, SandboxID: "sb-conflict", OwnerNodeID: "other-node"})
+	seed, err := encodeCommand(command{Op: opPlace, SandboxID: "sb-conflict", OwnerNodeID: "other-node", IncarnationID: "inc-conflict"})
 	if err != nil {
 		t.Fatalf("encode seed placement: %v", err)
 	}
@@ -317,6 +319,7 @@ func TestAgentAssertOwnershipClaimsOrphanWithPortsAndDomains(t *testing.T) {
 					OwnerNodeID:         "",
 					OwnerState:          PlacementOwnerStateOrphaned,
 					OrphanedOwnerNodeID: "worker-self",
+					IncarnationID:       "inc-orphan",
 				},
 				Orphaned: true,
 			})
@@ -329,6 +332,7 @@ func TestAgentAssertOwnershipClaimsOrphanWithPortsAndDomains(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-orphan",
 		Spec:            spec,
+		Secrets:         PlacementSecrets{IncarnationID: "inc-orphan"},
 		CustomHostnames: []string{"orphan.example.com"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http", PublicURL: "https://orphan"}},
 	}}); err != nil {
@@ -766,8 +770,8 @@ func TestClusterReadWrapperPaths(t *testing.T) {
 		SandboxID:     "sb-read",
 		OwnerNodeID:   "node-a",
 		Spec:          &models.CreateSandboxRequest{Image: "alpine"},
-		SecretRef:     "secret-ref",
-		SecretVersion: 2,
+		IncarnationID: "inc-read", SecretRef: testSecretRef("sb-read", "inc-read"),
+		SecretVersion: 1, SecretSealGeneration: 1,
 	})
 	applyOp(t, fsm, command{Op: opAddExposedPort, SandboxID: "sb-read", Port: 80, Protocol: "http"})
 	applyOp(t, fsm, command{Op: opAddCustomDomain, SandboxID: "sb-read", Hostname: "read.example.com"})
@@ -776,7 +780,7 @@ func TestClusterReadWrapperPaths(t *testing.T) {
 	if spec := c.SpecOf("sb-read"); spec == nil || spec.Image != "alpine" {
 		t.Fatalf("SpecOf = %+v", spec)
 	}
-	if got := c.SecretsOf("sb-read"); got.Ref != "secret-ref" {
+	if got := c.SecretsOf("sb-read"); got.Ref != testSecretRef("sb-read", "inc-read") {
 		t.Fatalf("SecretsOf = %+v", got)
 	}
 	ports := c.ExposedPortsOf("sb-read")
@@ -819,11 +823,13 @@ func TestAgentPlacementPageHarness(t *testing.T) {
 
 func TestAgentPlacementsByIDsBatch(t *testing.T) {
 	var gotIDs []string
+	var gotAuthoritative bool
 	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != PublicInternalPlacementsByIDsPath {
 			http.NotFound(w, r)
 			return
 		}
+		gotAuthoritative = r.URL.Query().Get("authoritative") == "true"
 		var req placementsByIDsRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode: %v", err)
@@ -842,6 +848,16 @@ func TestAgentPlacementsByIDsBatch(t *testing.T) {
 	}
 	if len(gotIDs) != 2 || gotIDs[0] != "sb-a" || gotIDs[1] != "sb-b" {
 		t.Fatalf("batch request ids = %v, want [sb-a sb-b]", gotIDs)
+	}
+	if gotAuthoritative {
+		t.Fatal("ordinary batch unexpectedly requested a leader-only read")
+	}
+	out, err := agent.AuthoritativePlacementsByIDs(context.Background(), []string{"sb-a"})
+	if err != nil || out["sb-a"].Version != 9 {
+		t.Fatalf("AuthoritativePlacementsByIDs = %+v, %v", out, err)
+	}
+	if !gotAuthoritative {
+		t.Fatal("authoritative batch did not request a leader-only read")
 	}
 }
 
@@ -922,9 +938,10 @@ func TestFollowerForwardApplyNodeBoundTLSInternalChannel(t *testing.T) {
 	})
 
 	payload, err := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-tls-fwd",
-		OwnerNodeID: follower.nodeID,
+		Op:            opPlace,
+		SandboxID:     "sb-tls-fwd",
+		OwnerNodeID:   follower.nodeID,
+		IncarnationID: "inc-tls-fwd",
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)

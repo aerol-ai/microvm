@@ -32,18 +32,6 @@ type AuditPeerFetcher interface {
 	FetchSandboxAuditFromPeer(ctx context.Context, nodeID, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error)
 }
 
-// SandboxMetaFetcher loads OwnerRef from a placement owner for ingress
-// authorization of GET /sandboxes/{id}/audit (no local SQLite row).
-type SandboxMetaFetcher interface {
-	FetchSandboxOwnerRef(ctx context.Context, nodeID, sandboxID string) (ownerRef string, ok bool, err error)
-}
-
-// SandboxOwnerMeta is the peer-local owner-ref probe response.
-type SandboxOwnerMeta struct {
-	OwnerRef string `json:"owner_ref"`
-	Exists   bool   `json:"exists"`
-}
-
 // FetchSandboxAuditFromPeer GETs a peer's local audit slice for sandboxID.
 func (c *Cluster) FetchSandboxAuditFromPeer(ctx context.Context, nodeID, sandboxID string, limit int, cursor, kind, incarnationID string) (AuditPeerPage, error) {
 	if c == nil || c.currentInternalClient() == nil || c.gossip == nil {
@@ -141,85 +129,4 @@ func fetchSandboxAuditFromPeer(ctx context.Context, client *http.Client, pat, se
 		return AuditPeerPage{}, fmt.Errorf("peer audit decode: %w", err)
 	}
 	return page, nil
-}
-
-// FetchSandboxOwnerRef GETs owner metadata from the placement owner.
-func (c *Cluster) FetchSandboxOwnerRef(ctx context.Context, nodeID, sandboxID string) (string, bool, error) {
-	if c == nil || c.currentInternalClient() == nil || c.gossip == nil {
-		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
-	}
-	m, ok := c.gossip.lookupMember(strings.TrimSpace(nodeID))
-	if !ok || !m.Alive {
-		return "", false, fmt.Errorf("cluster: sandbox meta peer %q is unavailable", nodeID)
-	}
-	client, endpoint, err := c.PeerDialMember(m)
-	if err != nil {
-		return "", false, err
-	}
-	return fetchSandboxOwnerRef(ctx, client, c.patToken, c.nodeID, endpoint, sandboxID)
-}
-
-func (a *Agent) FetchSandboxOwnerRef(ctx context.Context, nodeID, sandboxID string) (string, bool, error) {
-	if a == nil || a.internalClient == nil || a.gossip == nil {
-		return "", false, fmt.Errorf("cluster: sandbox meta fetch unavailable")
-	}
-	m, ok := a.gossip.lookupMember(strings.TrimSpace(nodeID))
-	if !ok || !m.Alive {
-		return "", false, fmt.Errorf("cluster: sandbox meta peer %q is unavailable", nodeID)
-	}
-	client, endpoint, err := a.PeerDialMember(m)
-	if err != nil {
-		return "", false, err
-	}
-	return fetchSandboxOwnerRef(ctx, client, a.patToken, a.nodeID, endpoint, sandboxID)
-}
-
-func (n *Noop) FetchSandboxOwnerRef(context.Context, string, string) (string, bool, error) {
-	return "", false, fmt.Errorf("cluster: no sandbox meta fetch in single-node mode")
-}
-
-func fetchSandboxOwnerRef(ctx context.Context, client *http.Client, pat, selfID, apiURL, sandboxID string) (string, bool, error) {
-	if client == nil {
-		return "", false, fmt.Errorf("cluster: nil http client")
-	}
-	sandboxID = strings.TrimSpace(sandboxID)
-	base := strings.TrimRight(strings.TrimSpace(apiURL), "/")
-	if sandboxID == "" || base == "" {
-		return "", false, fmt.Errorf("cluster: empty sandbox id or peer api url")
-	}
-	endpoint := base + PublicInternalSandboxAuditPath + url.PathEscape(sandboxID) + "/meta"
-	reqCtx := ctx
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		reqCtx, cancel = context.WithTimeout(ctx, auditPeerFetchTimeout)
-		defer cancel()
-	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return "", false, err
-	}
-	SetPeerNodeIDHeader(req, selfID)
-	if pat != "" {
-		req.Header.Set("Authorization", "Bearer "+pat)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", false, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode == http.StatusNotFound {
-		return "", false, nil
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", false, fmt.Errorf("peer %s returned %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var meta SandboxOwnerMeta
-	if err := json.Unmarshal(body, &meta); err != nil {
-		return "", false, fmt.Errorf("peer sandbox meta decode: %w", err)
-	}
-	if !meta.Exists {
-		return "", false, nil
-	}
-	return meta.OwnerRef, true, nil
 }

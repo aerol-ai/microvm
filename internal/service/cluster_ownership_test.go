@@ -128,11 +128,11 @@ func TestClusterOwnershipHelpers(t *testing.T) {
 	svc.cipher = newTestCipher(t)
 	badRegistry := *sandbox
 	badRegistry.RegistryAuthSealed = []byte("bad-seal")
-	if spec := svc.specFromSandbox(context.Background(), &badRegistry); spec == nil || spec.Registry != nil {
-		t.Fatalf("specFromSandbox should ignore invalid sealed registry, got %+v", spec)
+	if spec, err := svc.specFromSandbox(context.Background(), &badRegistry); err == nil || spec != nil {
+		t.Fatalf("specFromSandbox invalid registry = %+v, %v; want fail-closed error", spec, err)
 	}
-	if spec := svc.specFromSandbox(context.Background(), nil); spec != nil {
-		t.Fatalf("specFromSandbox(nil) = %+v, want nil", spec)
+	if spec, err := svc.specFromSandbox(context.Background(), nil); err != nil || spec != nil {
+		t.Fatalf("specFromSandbox(nil) = %+v, %v; want nil", spec, err)
 	}
 }
 
@@ -144,16 +144,17 @@ func TestLocalSandboxStateForClusterIncludesStoredMounts(t *testing.T) {
 
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
-		ID:           "sb-mounted",
-		Runtime:      models.RuntimeDocker,
-		Status:       models.SandboxStatusStarted,
-		Image:        "alpine:3.20",
-		CPU:          1,
-		MemoryMB:     256,
-		DiskGB:       2,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 "sb-mounted",
+		Runtime:            models.RuntimeDocker,
+		Status:             models.SandboxStatusStarted,
+		Image:              "alpine:3.20",
+		CPU:                1,
+		MemoryMB:           256,
+		DiskGB:             2,
+		AuditIncarnationID: "inc-sb-mounted",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
@@ -171,9 +172,62 @@ func TestLocalSandboxStateForClusterIncludesStoredMounts(t *testing.T) {
 		Noop:       cluster.NewNoop("self", "http://self", "self.example.com"),
 		placements: map[string]cluster.Placement{},
 	}
-	state := svc.localSandboxStateForCluster(ctx, c, sb)
+	state, err := svc.localSandboxStateForCluster(ctx, c, sb)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if state.Spec == nil || len(state.Spec.Mounts) != 1 || state.Spec.Mounts[0].Target != "/data" {
 		t.Fatalf("localSandboxStateForCluster mounts = %+v", state.Spec)
+	}
+}
+
+func TestLocalSandboxStateForClusterNeverReplicatesPlaintextWhenSealFails(t *testing.T) {
+	svc := &Service{cfg: config.Config{EnableCluster: true}}
+	c := &fakeOwnershipCluster{
+		Noop:       cluster.NewNoop("self", "http://self", "self.example.com"),
+		placements: map[string]cluster.Placement{},
+	}
+	sb := &models.Sandbox{
+		ID:                 "sb-seal-fail",
+		Image:              "alpine:3.20",
+		Env:                map[string]string{"TOKEN": "must-not-enter-raft"},
+		AuditIncarnationID: "inc-seal-fail",
+	}
+	state, err := svc.localSandboxStateForCluster(context.Background(), c, sb)
+	if err == nil {
+		t.Fatal("ownership replay accepted plaintext credentials without a secret provider")
+	}
+	if state.Spec != nil || state.Secrets.Ref != "" {
+		t.Fatalf("failed replay returned publishable state: %+v", state)
+	}
+}
+
+func TestAssertClusterOwnershipSkipsUnsafeRowWithoutStarvingSafeRows(t *testing.T) {
+	svc := &Service{cfg: config.Config{EnableCluster: true}}
+	c := &fakeOwnershipCluster{
+		Noop:       cluster.NewNoop("self", "http://self", "self.example.com"),
+		placements: map[string]cluster.Placement{},
+	}
+	svc.cluster = c
+	unsafe := &models.Sandbox{
+		ID:                 "sb-unsafe",
+		Image:              "alpine:3.20",
+		Status:             models.SandboxStatusStarted,
+		Env:                map[string]string{"TOKEN": "must-not-enter-raft"},
+		AuditIncarnationID: "inc-unsafe",
+	}
+	safe := &models.Sandbox{
+		ID:                 "sb-safe",
+		Image:              "alpine:3.20",
+		Status:             models.SandboxStatusStarted,
+		AuditIncarnationID: "inc-safe",
+	}
+	count, err := svc.assertClusterOwnership(context.Background(), []*models.Sandbox{unsafe, safe}, nil)
+	if err == nil {
+		t.Fatal("unsafe ownership row failure was not reported")
+	}
+	if count != 1 || len(c.asserted) != 1 || c.asserted[0].ID != safe.ID {
+		t.Fatalf("safe ownership rows were starved: count=%d asserted=%+v", count, c.asserted)
 	}
 }
 
@@ -184,6 +238,10 @@ func TestClusterOwnershipReplayAndReconcileErrors(t *testing.T) {
 	svc.cipher = newTestCipher(t)
 
 	now := time.Now().UTC()
+	sealedRegistry, err := svc.sealRegistry(&models.RegistryAuth{Server: "registry.example", Username: "u", Password: "p"})
+	if err != nil {
+		t.Fatalf("seal replay registry: %v", err)
+	}
 	replaySandbox := &models.Sandbox{
 		ID:                 "sb-replay",
 		Runtime:            models.RuntimeFirecracker,
@@ -193,7 +251,7 @@ func TestClusterOwnershipReplayAndReconcileErrors(t *testing.T) {
 		CPU:                1,
 		MemoryMB:           256,
 		DiskGB:             2,
-		RegistryAuthSealed: []byte("bad-seal"),
+		RegistryAuthSealed: sealedRegistry,
 		ExposedPorts: []models.ExposedPort{
 			{Port: 8080, Protocol: models.ExposedPortProtocolHTTP, HostPort: 18080, PublicURL: "http://example"},
 		},

@@ -61,7 +61,7 @@ func TestPutVolumeAttachmentsEmptyAndValidation(t *testing.T) {
 		t.Fatalf("empty attachments: %v", err)
 	}
 	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "t-a", VolumeID: "v1", SandboxID: "sb", Target: "", Source: "src",
+		Tenant: "t-a", VolumeID: "v1", SandboxID: "sb", IncarnationID: "inc-sb", Target: "", Source: "src",
 	}}); err == nil {
 		t.Fatal("expected validation error for empty target")
 	}
@@ -74,11 +74,11 @@ func TestPutVolumeAttachmentsUpsertUpdatesSource(t *testing.T) {
 	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3"}); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if err := st.Create(ctx, sampleSandbox("sb-upsert")); err != nil {
+	if err := st.Create(ctx, sampleVolumeSandbox("sb-upsert")); err != nil {
 		t.Fatalf("Create sandbox: %v", err)
 	}
 	base := models.VolumeAttachment{
-		Tenant: "t-a", VolumeID: "v1", SandboxID: "sb-upsert",
+		Tenant: "t-a", VolumeID: "v1", SandboxID: "sb-upsert", IncarnationID: "inc-sb-upsert",
 		Target: "/data", Source: "bucket/old",
 	}
 	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{base}); err != nil {
@@ -287,11 +287,11 @@ func TestDeleteVolumeIfUnattachedNotFound(t *testing.T) {
 func TestPutVolumeAttachmentsForeignKeyViolation(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
-	if err := st.Create(ctx, sampleSandbox("sb-fk")); err != nil {
+	if err := st.Create(ctx, sampleVolumeSandbox("sb-fk")); err != nil {
 		t.Fatalf("Create sandbox: %v", err)
 	}
 	err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "t-a", VolumeID: "no-such-volume", SandboxID: "sb-fk",
+		Tenant: "t-a", VolumeID: "no-such-volume", SandboxID: "sb-fk", IncarnationID: "inc-sb-fk",
 		Target: "/data", Source: "bucket/src",
 	}})
 	if err == nil {
@@ -308,12 +308,12 @@ func TestPutVolumeAttachmentsMultipleInOneTx(t *testing.T) {
 	if err := st.CreateVolume(ctx, &models.Volume{ID: "v2", Tenant: "t-a", Name: "b", Backend: "s3"}); err != nil {
 		t.Fatalf("CreateVolume v2: %v", err)
 	}
-	if err := st.Create(ctx, sampleSandbox("sb-multi")); err != nil {
+	if err := st.Create(ctx, sampleVolumeSandbox("sb-multi")); err != nil {
 		t.Fatalf("Create sandbox: %v", err)
 	}
 	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{
-		{Tenant: "t-a", VolumeID: "v1", SandboxID: "sb-multi", Target: "/a", Source: "bucket/a"},
-		{Tenant: "t-a", VolumeID: "v2", SandboxID: "sb-multi", Target: "/b", Source: "bucket/b"},
+		{Tenant: "t-a", VolumeID: "v1", SandboxID: "sb-multi", IncarnationID: "inc-sb-multi", Target: "/a", Source: "bucket/a"},
+		{Tenant: "t-a", VolumeID: "v2", SandboxID: "sb-multi", IncarnationID: "inc-sb-multi", Target: "/b", Source: "bucket/b"},
 	}); err != nil {
 		t.Fatalf("PutVolumeAttachments: %v", err)
 	}
@@ -361,10 +361,10 @@ func TestVolumeClosedDBErrors(t *testing.T) {
 	_, _ = st.CountVolumes(ctx, "t")
 	_ = st.DeleteVolume(ctx, "t", "v")
 	_ = st.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "t", VolumeID: "v", SandboxID: "sb", Target: "/d", Source: "s",
+		Tenant: "t", VolumeID: "v", SandboxID: "sb", IncarnationID: "inc-sb", Target: "/d", Source: "s",
 	}})
 	_, _ = st.CountVolumeAttachments(ctx, "t", "v")
-	_ = st.DeleteVolumeAttachmentsForSandbox(ctx, "sb")
+	_ = st.DeleteVolumeAttachmentsForSandbox(ctx, "sb", "inc-sb")
 	_ = st.DeleteVolumeIfUnattached(ctx, "t", "v", "src")
 	_, _ = st.ListPendingVolumeDeletions(ctx)
 	_ = st.SchedulePendingVolumeDeletion(ctx, models.Volume{ID: "v", Tenant: "t", Name: "n", Backend: "s3"}, "src")

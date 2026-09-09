@@ -295,7 +295,7 @@ func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 
 	// Mounts and Secrets missing paths
 	_ = st.DeleteMounts(ctx, "missing")
-	_ = st.DeleteClusterSecretsForSandbox(ctx, "missing")
+	_ = st.DeleteClusterSecretRowsForIncarnation(ctx, "missing", "inc-missing")
 	_, _ = st.GetClusterSecret(ctx, "missing")
 	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
 	_, _ = st.GetMounts(ctx, "missing")

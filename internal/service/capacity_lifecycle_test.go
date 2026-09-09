@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // fakeCapacityRuntime is a permissive runtime fake for the capacity-accounting
@@ -386,17 +388,18 @@ func seedSandbox(t *testing.T, st *store.Store, id string, status models.Sandbox
 	t.Helper()
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
-		ID:           id,
-		Image:        "ubuntu:22.04",
-		Status:       status,
-		ContainerID:  "ctr-" + id,
-		ContainerIP:  "10.0.0.1",
-		Runtime:      models.RuntimeDocker,
-		CPU:          cpu,
-		MemoryMB:     mem,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 id,
+		Image:              "ubuntu:22.04",
+		Status:             status,
+		ContainerID:        "ctr-" + id,
+		ContainerIP:        "10.0.0.1",
+		Runtime:            models.RuntimeDocker,
+		CPU:                cpu,
+		MemoryMB:           mem,
+		AuditIncarnationID: "inc-" + id,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}
 	if err := st.Create(context.Background(), sb); err != nil {
 		t.Fatalf("seed sandbox %s: %v", id, err)
@@ -410,14 +413,21 @@ type lifecyclePlacementCluster struct {
 	ownerErr    error
 	deleteCalls []string
 	deleteErr   error
+	beginCalls  []string
+	beginHook   func()
+	beginErr    error
 	placements  []cluster.Placement
 	specs       map[string]*models.CreateSandboxRequest
 }
 
 func newLifecyclePlacementCluster(self bool) *lifecyclePlacementCluster {
+	ownerID := "node-self"
+	if !self {
+		ownerID = "node-other"
+	}
 	return &lifecyclePlacementCluster{
 		Noop:  cluster.NewNoop("node-self", "http://self", ""),
-		owner: cluster.OwnerInfo{NodeID: "node-self", APIURL: "http://self", IsSelf: self},
+		owner: cluster.OwnerInfo{NodeID: ownerID, APIURL: "http://self", IsSelf: self},
 	}
 }
 
@@ -431,6 +441,19 @@ func (c *lifecyclePlacementCluster) OwnerOf(string) (cluster.OwnerInfo, error) {
 func (c *lifecyclePlacementCluster) DeletePlacement(_ context.Context, sandboxID string) error {
 	c.deleteCalls = append(c.deleteCalls, sandboxID)
 	return c.deleteErr
+}
+
+func (c *lifecyclePlacementCluster) DeletePlacementExact(_ context.Context, sandboxID, _, _ string) error {
+	c.deleteCalls = append(c.deleteCalls, sandboxID)
+	return c.deleteErr
+}
+
+func (c *lifecyclePlacementCluster) BeginDeletePlacementExact(_ context.Context, sandboxID, _, _ string) error {
+	c.beginCalls = append(c.beginCalls, sandboxID)
+	if c.beginHook != nil {
+		c.beginHook()
+	}
+	return c.beginErr
 }
 
 func (c *lifecyclePlacementCluster) Placements() []cluster.Placement {
@@ -451,6 +474,18 @@ func (c *lifecyclePlacementCluster) PlacementsByIDs(ids []string) map[string]clu
 		}
 	}
 	return out
+}
+
+func (c *lifecyclePlacementCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := c.PlacementsByIDs(ids)
+	for _, id := range ids {
+		if _, ok := out[id]; !ok {
+			out[id] = cluster.Placement{
+				SandboxID: id, OwnerNodeID: c.owner.NodeID, IncarnationID: "inc-" + id,
+			}
+		}
+	}
+	return out, nil
 }
 
 func (c *lifecyclePlacementCluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
@@ -502,14 +537,87 @@ func TestLifecycleAutoDestroyDoesNotDeleteForeignPlacement(t *testing.T) {
 	}
 }
 
+func TestDestroyRetainsLocalRowWhenPlacementDeleteFails(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	fc := newLifecyclePlacementCluster(true)
+	fc.deleteErr = errors.New("raft unavailable")
+	svc.AttachCluster(fc)
+
+	sb := seedSandbox(t, st, "sb-destroy-placement-fail", models.SandboxStatusStarted, 1, 1024)
+	if err := svc.DestroySandbox(ctx, sb.ID); err == nil || !strings.Contains(err.Error(), "delete authoritative placement") {
+		t.Fatalf("DestroySandbox error = %v, want placement finalization failure", err)
+	}
+	if _, err := st.Get(ctx, sb.ID); err != nil {
+		t.Fatalf("destroy removed retry anchor after placement failure: %v", err)
+	}
+	if len(fc.deleteCalls) != 1 || fc.deleteCalls[0] != sb.ID {
+		t.Fatalf("DeletePlacementExact calls = %v, want [%s]", fc.deleteCalls, sb.ID)
+	}
+}
+
+func TestDestroyDeleteFenceRejectsConcurrentReassignmentWithoutDeletingSecrets(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	cipher := newTestCipher(t)
+	st.SetSecretCipher(cipher)
+	svc.cipher = cipher
+	svc.secretProvider = secrets.NewLocalProvider(cipher, newSecretBlobStore(st))
+	fc := newLifecyclePlacementCluster(true)
+	svc.AttachCluster(fc)
+
+	sb := seedSandbox(t, st, "sb-destroy-fence-race", models.SandboxStatusStarted, 1, 1024)
+	fc.placements = []cluster.Placement{{
+		SandboxID: sb.ID, OwnerNodeID: "node-self", IncarnationID: sb.AuditIncarnationID,
+		SecretRecipients: []string{"node-self", "node-other"},
+	}}
+	handle, err := svc.putClusterSecretsForRecipientsAndIncarnation(ctx, sb.ID, models.CreateSandboxRequest{
+		Env: map[string]string{"TOKEN": "must-survive"},
+	}, []string{"node-self", "node-other"}, sb.AuditIncarnationID)
+	if err != nil {
+		t.Fatalf("put cluster secret: %v", err)
+	}
+	fc.beginHook = func() {
+		fc.placements[0].OwnerNodeID = "node-other"
+	}
+	fc.beginErr = cluster.ErrReservationConflict
+
+	err = svc.DestroySandbox(ctx, sb.ID)
+	if err == nil || !errors.Is(err, ErrClusterFinalizationUnavailable) {
+		t.Fatalf("DestroySandbox error = %v, want finalization unavailable", err)
+	}
+	if len(fc.beginCalls) != 1 || fc.beginCalls[0] != sb.ID {
+		t.Fatalf("BeginDeletePlacementExact calls = %v, want [%s]", fc.beginCalls, sb.ID)
+	}
+	if len(fc.deleteCalls) != 0 {
+		t.Fatalf("placement final delete ran after rejected fence: %v", fc.deleteCalls)
+	}
+	if _, err := st.Get(ctx, sb.ID); err != nil {
+		t.Fatalf("destroy removed retry anchor after rejected fence: %v", err)
+	}
+	rec, err := st.GetClusterSecret(ctx, handle.Ref)
+	if err != nil || rec == nil {
+		t.Fatalf("destroy removed secret after rejected fence: rec=%+v err=%v", rec, err)
+	}
+	if tomb, err := st.ClusterSecretTombGenerationForIncarnation(ctx, sb.ID, sb.AuditIncarnationID); err != nil || tomb != 0 {
+		t.Fatalf("destroy tombstoned secret after rejected fence: generation=%d err=%v", tomb, err)
+	}
+	if outbox, err := st.GetSecretDeleteOutboxForIncarnation(ctx, sb.ID, sb.AuditIncarnationID); err != nil || outbox != nil {
+		t.Fatalf("destroy journaled peer deletion after rejected fence: outbox=%+v err=%v", outbox, err)
+	}
+}
+
 func TestReconcileDeletesSelfOwnedPlacementMissingLocalRow(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newCapacityHarness(t, nil, nil)
 	svc.cfg.EnableCluster = true
 	fc := newLifecyclePlacementCluster(true)
 	fc.placements = []cluster.Placement{{
-		SandboxID:   "sb-stale-placement",
-		OwnerNodeID: "node-self",
+		SandboxID:     "sb-stale-placement",
+		OwnerNodeID:   "node-self",
+		IncarnationID: "inc-stale-placement",
 	}}
 	svc.AttachCluster(fc)
 
@@ -528,8 +636,9 @@ func TestReconcileKeepsMissingFailoverRecreatePlacement(t *testing.T) {
 	svc.cfg.EnableCluster = true
 	fc := newLifecyclePlacementCluster(true)
 	fc.placements = []cluster.Placement{{
-		SandboxID:   "sb-recreate-placement",
-		OwnerNodeID: "node-self",
+		SandboxID:     "sb-recreate-placement",
+		OwnerNodeID:   "node-self",
+		IncarnationID: "inc-recreate-placement",
 	}}
 	fc.specs = map[string]*models.CreateSandboxRequest{
 		"sb-recreate-placement": {
@@ -545,6 +654,29 @@ func TestReconcileKeepsMissingFailoverRecreatePlacement(t *testing.T) {
 
 	if len(fc.deleteCalls) != 0 {
 		t.Fatalf("DeletePlacement calls = %v, want none", fc.deleteCalls)
+	}
+}
+
+func TestReconcileDoesNotDeletePlacementCreatedAfterKnownSnapshot(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	fc := newLifecyclePlacementCluster(true)
+	fc.placements = []cluster.Placement{{
+		SandboxID:     "sb-concurrent-create",
+		OwnerNodeID:   "node-self",
+		IncarnationID: "inc-sb-concurrent-create",
+		State:         cluster.PlacementStatePlaced,
+	}}
+	svc.AttachCluster(fc)
+	seedSandbox(t, st, "sb-concurrent-create", models.SandboxStatusStarted, 1, 1024)
+
+	// Model a create that committed after Reconcile's initial store.List
+	// snapshot: the point row exists, but knownIDs does not contain it yet.
+	svc.reconcileMissingSelfOwnedPlacements(ctx, map[string]struct{}{})
+
+	if len(fc.deleteCalls) != 0 {
+		t.Fatalf("concurrently-created placement was deleted: %v", fc.deleteCalls)
 	}
 }
 
@@ -1114,19 +1246,20 @@ func TestReconcileMixedRuntimeStates(t *testing.T) {
 	seed := func(id, runtime string, cpu float64, mem int, ip string, networkBlockAll bool) {
 		t.Helper()
 		if err := st.Create(ctx, &models.Sandbox{
-			ID:              id,
-			Image:           "ubuntu:22.04",
-			Status:          models.SandboxStatusStarted,
-			ContainerID:     "ctr-" + id,
-			ContainerIP:     ip,
-			Runtime:         runtime,
-			CPU:             cpu,
-			MemoryMB:        mem,
-			DiskGB:          5,
-			NetworkBlockAll: networkBlockAll,
-			CreatedAt:       now,
-			UpdatedAt:       now,
-			LastActiveAt:    now,
+			ID:                 id,
+			Image:              "ubuntu:22.04",
+			Status:             models.SandboxStatusStarted,
+			ContainerID:        "ctr-" + id,
+			ContainerIP:        ip,
+			Runtime:            runtime,
+			CPU:                cpu,
+			MemoryMB:           mem,
+			DiskGB:             5,
+			NetworkBlockAll:    networkBlockAll,
+			AuditIncarnationID: "inc-" + id,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+			LastActiveAt:       now,
 		}); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}

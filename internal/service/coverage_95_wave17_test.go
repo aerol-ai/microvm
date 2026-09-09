@@ -93,7 +93,7 @@ func TestWasmCacheAndModuleGCWave17(t *testing.T) {
 
 func TestClusterSecretsOpenEnvelopeFailWave17(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
-	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", 1), Version: 1, Generation: 1}
 	sealed, err := secrets.SealEnvelopeBound(s.cipher, secrets.Secrets{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
 	}, []string{"node-a"}, binding)
@@ -144,7 +144,8 @@ func TestCreateWithNilMountsCleanupWave17(t *testing.T) {
 	now := time.Now().UTC()
 	_ = st.Create(ctx, &models.Sandbox{
 		ID: "sb-nil-mnt", Image: "a", Status: models.SandboxStatusStarted,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-nil-mnt",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	})
 	if err := svc.DestroySandbox(ctx, "sb-nil-mnt"); err != nil {
 		t.Fatalf("destroy: %v", err)

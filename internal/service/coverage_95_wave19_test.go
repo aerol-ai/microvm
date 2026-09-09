@@ -102,7 +102,8 @@ func TestReconcileFirecrackerGoneUnmountWave19(t *testing.T) {
 	_ = st.Create(ctx, &models.Sandbox{
 		ID: "sb-fc-um", Image: "alpine", Runtime: models.RuntimeFirecracker,
 		Status: models.SandboxStatusStarted, ContainerID: "vm-2",
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-fc-um",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	})
 	if err := svc.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)

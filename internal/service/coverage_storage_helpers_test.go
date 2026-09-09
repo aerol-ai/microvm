@@ -204,7 +204,10 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			ContainerCommand:   []string{"entry"},
 		}
 
-		spec := svc.specFromSandbox(context.Background(), sb)
+		spec, err := svc.specFromSandbox(context.Background(), sb)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if spec == nil || spec.Registry == nil || spec.Registry.Password != "secret" {
 			t.Fatalf("specFromSandbox registry = %+v", spec.Registry)
 		}
@@ -233,7 +236,10 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			t.Fatal("missing port route should force replay")
 		}
 
-		state := svc.localSandboxStateForCluster(ctx, c, sb)
+		state, err := svc.localSandboxStateForCluster(ctx, c, sb)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if state.Spec == nil || state.Spec.Registry == nil || state.Spec.Registry.Password != "" {
 			t.Fatalf("redacted cluster spec leaked secrets: %+v", state.Spec)
 		}
@@ -288,8 +294,8 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
 		}
 
-		binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
-		sealed, err := secrets.SealEnvelopeBound(svc.cipher, svc.secretsFromRequest(req), []string{"node-a"}, binding)
+		binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+		sealed, err := secrets.SealEnvelopeBound(svc.cipher, secretsFromRequest(req), []string{"node-a"}, binding)
 		if err != nil {
 			t.Fatalf("SealEnvelopeBound: %v", err)
 		}
@@ -331,14 +337,14 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		if secrets.RecipientAllowed([]string{"node-a"}, "node-b") {
 			t.Fatal("non-matching recipient should be rejected")
 		}
-		if got := secrets.FormatRef(" sb ", 2); got != "cluster-secret://sandbox/sb/v2" {
+		if got := secrets.FormatRef(" sb ", " inc ", secrets.RefVersion); got != "cluster-secret://sandbox/sb/i/inc/v1" {
 			t.Fatalf("FormatRef = %q", got)
 		}
 
-		if _, err := (&Service{cipher: newTestCipher(t)}).SealAndDistribute(ctx, " ", req, []string{"node-a"}, SealStrict); err == nil {
+		if _, err := (&Service{cipher: newTestCipher(t)}).SealAndDistribute(ctx, " ", req, []string{"node-a"}); err == nil {
 			t.Fatal("empty sandbox id accepted")
 		}
-		if _, err := (&Service{cipher: newTestCipher(t)}).SealAndDistribute(ctx, "sb", req, []string{"node-a"}, SealStrict); err == nil {
+		if _, err := (&Service{cipher: newTestCipher(t)}).SealAndDistribute(ctx, "sb", req, []string{"node-a"}); err == nil {
 			t.Fatal("storeless SealAndDistribute accepted")
 		}
 		if _, err := (&Service{cipher: newTestCipher(t)}).OpenClusterSecretsForNode(ctx, "sb", redacted, cluster.PlacementSecrets{Ref: "cluster-secret://sandbox/sb/v1", Version: 1}, "node-a"); err == nil {
@@ -678,7 +684,7 @@ func TestClusterSecretAndCustomDomainRollbackBranches(t *testing.T) {
 			Username: "alice",
 			Password: "secret",
 		},
-	}, []string{"node-a"}, SealStrict); err == nil || !strings.Contains(err.Error(), "cipher is not configured") {
+	}, []string{"node-a"}); err == nil || !strings.Contains(err.Error(), "cipher is not configured") {
 		t.Fatalf("SealAndDistribute without cipher = %v, want configured-cipher error", err)
 	}
 
@@ -697,8 +703,8 @@ func TestClusterSecretAndCustomDomainRollbackBranches(t *testing.T) {
 			Credentials: map[string]string{"token": "mount-secret"},
 		}},
 	}
-	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
-	sealed, err := secrets.SealEnvelopeBound(cryptoSvc.cipher, cryptoSvc.secretsFromRequest(req), []string{"node-a"}, binding)
+	binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", 1), Version: 1, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(cryptoSvc.cipher, secretsFromRequest(req), []string{"node-a"}, binding)
 	if err != nil {
 		t.Fatalf("SealEnvelopeBound: %v", err)
 	}

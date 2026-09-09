@@ -113,10 +113,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		AutoArchiveInterval: float32(int32Value(req.AutoArchiveInterval, 0)),
 	})
 	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
-		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
-			h.deps.Logger.Warn("daytona metadata persist cleanup failed", "sandbox_id", response.ID, "error", destroyErr)
-		}
-		clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -549,7 +546,6 @@ func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, sandboxID)
 	snapshot := *sandbox
 	snapshot.Status = models.SandboxStatusDestroyed
 	now := time.Now().UTC()

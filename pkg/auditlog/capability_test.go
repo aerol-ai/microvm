@@ -1,6 +1,7 @@
 package auditlog
 
 import (
+	"strconv"
 	"testing"
 	"time"
 )
@@ -24,6 +25,17 @@ func TestMintAndVerifyEgressCapability(t *testing.T) {
 	forged := joinCap(parts)
 	if _, _, err := ParseAndVerifyEgressCapability("secret-key", forged, time.Now().UTC()); err == nil {
 		t.Fatal("expected forged sandbox capability to fail")
+	}
+}
+
+func TestEgressCapabilityRequiresIncarnation(t *testing.T) {
+	if _, err := MintEgressCapability("secret-key", "sb-1", "", time.Now().UTC().Add(time.Hour)); err == nil {
+		t.Fatal("incarnation-less capability was minted")
+	}
+	exp := time.Now().UTC().Add(time.Hour).Unix()
+	removedFormat := "sb-1||" + strconv.FormatInt(exp, 10) + "|" + hmacEgressCapability("secret-key", "sb-1", "", exp)
+	if _, _, err := ParseAndVerifyEgressCapability("secret-key", removedFormat, time.Now().UTC()); err == nil {
+		t.Fatal("incarnation-less capability was accepted")
 	}
 }
 

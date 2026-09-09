@@ -189,9 +189,9 @@ func TestReassignNetnsAbortAndVolumeInUse(t *testing.T) {
 	}
 
 	_ = st.CreateVolume(ctx, &models.Volume{ID: "v-inuse", Tenant: "t", Name: "n", Backend: "s3", Source: "s"})
-	_ = st.Create(ctx, sampleSandbox("sb-vol"))
+	_ = st.Create(ctx, sampleVolumeSandbox("sb-vol"))
 	_ = st.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "t", VolumeID: "v-inuse", SandboxID: "sb-vol", Target: "/data", Source: "s",
+		Tenant: "t", VolumeID: "v-inuse", SandboxID: "sb-vol", IncarnationID: "inc-sb-vol", Target: "/data", Source: "s",
 	}})
 	if err := st.DeleteVolumeIfUnattached(ctx, "t", "v-inuse", "s"); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("in use = %v", err)

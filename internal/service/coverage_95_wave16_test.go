@@ -219,7 +219,7 @@ func TestClusterOwnershipNeedsReplayWave16(t *testing.T) {
 	_ = svc.clusterOwnershipNeedsReplay(cl, sb)
 	svc.AttachCluster(cl)
 	_, _ = svc.ReplayClusterOwnership(context.Background())
-	_ = svc.localSandboxStateForCluster(context.Background(), cl, sb)
+	_, _ = svc.localSandboxStateForCluster(context.Background(), cl, sb)
 }
 
 func TestPublicTrafficCleanupStoreFailsWave16(t *testing.T) {
@@ -252,7 +252,7 @@ func TestSealClusterSecretsMarshalEmptyCipherWave16(t *testing.T) {
 	s := &Service{}
 	_, err := s.SealAndDistribute(context.Background(), "sb", models.CreateSandboxRequest{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, []string{"node-a"}, SealStrict)
+	}, []string{"node-a"})
 	if err == nil {
 		t.Fatal("expected nil cipher")
 	}

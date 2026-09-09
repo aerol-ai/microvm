@@ -51,7 +51,7 @@ func TestSecretLifecyclePruneAndReconcileStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	if err := st.ApplyPeerSecretDelete(ctx, "sb-tomb", 1); err != nil {
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-tomb", "inc-tomb", 1); err != nil {
 		t.Fatal(err)
 	}
 	recorder := &pruneRecordingCluster{Noop: cluster.NewNoop("self", "", "")}
@@ -99,8 +99,8 @@ func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 	}
 
-	binding := secrets.SealBinding{SandboxID: "sb-roundtrip", Ref: secrets.FormatRef("sb-roundtrip", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
-	sealed, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding)
+	binding := secrets.SealBinding{SandboxID: "sb-roundtrip", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb-roundtrip", "inc-test", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(s.cipher, secretsFromRequest(req), []string{"node-a"}, binding)
 	if err != nil {
 		t.Fatalf("SealEnvelopeBound: %v", err)
 	}
@@ -168,8 +168,8 @@ func TestClusterSecretEnvelopeEmpty(t *testing.T) {
 		{Image: "alpine", Mounts: []models.MountSpec{{Type: models.MountTypeNFS, Target: "/srv", Source: "x:/y"}}},
 	}
 	for i, req := range cases {
-		binding := secrets.SealBinding{SandboxID: "sb-empty", Ref: secrets.FormatRef("sb-empty", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
-		sealed, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding)
+		binding := secrets.SealBinding{SandboxID: "sb-empty", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb-empty", "inc-test", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+		sealed, err := secrets.SealEnvelopeBound(s.cipher, secretsFromRequest(req), []string{"node-a"}, binding)
 		if err != nil {
 			t.Fatalf("case %d: SealEnvelopeBound: %v", i, err)
 		}
@@ -185,8 +185,8 @@ func TestSealClusterSecretsRecipientBound(t *testing.T) {
 		Image:    "private.example.com/app:latest",
 		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: "super-secret-password"},
 	}
-	binding := secrets.SealBinding{SandboxID: "sb-recipient", Ref: secrets.FormatRef("sb-recipient", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
-	sealed, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding)
+	binding := secrets.SealBinding{SandboxID: "sb-recipient", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb-recipient", "inc-test", secrets.RefVersion), Version: secrets.RefVersion, Generation: 1}
+	sealed, err := secrets.SealEnvelopeBound(s.cipher, secretsFromRequest(req), []string{"node-a"}, binding)
 	if err != nil {
 		t.Fatalf("SealEnvelopeBound: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 		}},
 	}
 
-	handle, err := s.SealAndDistribute(ctx, "sb-secret-ref", req, []string{"node-a"}, SealStrict)
+	handle, err := s.SealAndDistribute(ctx, "sb-secret-ref", req, []string{"node-a"})
 	if err != nil {
 		t.Fatalf("SealAndDistribute: %v", err)
 	}
@@ -292,20 +292,21 @@ func TestDeleteClusterSecretsStandaloneLeavesNoTomb(t *testing.T) {
 		secretProvider: secrets.NewLocalProvider(newTestCipher(t), newSecretBlobStore(st)),
 		cluster:        cluster.NewNoop("standalone", "http://localhost", ""),
 	}
-	if _, err := s.SealAndDistribute(ctx, "sb-solo", models.CreateSandboxRequest{
+	handle, err := s.SealAndDistribute(ctx, "sb-solo", models.CreateSandboxRequest{
 		Image:    "alpine",
 		Registry: &models.RegistryAuth{Server: "r", Username: "u", Password: "p"},
-	}, []string{"standalone"}, SealStrict); err != nil {
+	}, []string{"standalone"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteClusterSecrets(ctx, "sb-solo"); err != nil {
+	if err := s.DeleteClusterSecrets(ctx, "sb-solo", handle.IncarnationID); err != nil {
 		t.Fatal(err)
 	}
-	tomb, err := st.HasClusterSecretTomb(ctx, "sb-solo")
-	if err != nil || tomb {
-		t.Fatalf("standalone delete must not leave tomb: %v %v", tomb, err)
+	tombGeneration, err := st.ClusterSecretTombGenerationForIncarnation(ctx, "sb-solo", handle.IncarnationID)
+	if err != nil || tombGeneration != 0 {
+		t.Fatalf("standalone delete must not leave tomb: %d %v", tombGeneration, err)
 	}
-	outbox, err := st.GetSecretDeleteOutbox(ctx, "sb-solo")
+	outbox, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-solo", handle.IncarnationID)
 	if err != nil || outbox != nil {
 		t.Fatalf("standalone delete must not leave outbox: %+v %v", outbox, err)
 	}
@@ -324,11 +325,11 @@ func TestDeleteClusterSecretsRemovesProviderRecord(t *testing.T) {
 	handle, err := s.SealAndDistribute(ctx, "sb-delete-secrets", models.CreateSandboxRequest{
 		Image:    "private.example.com/app:latest",
 		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "alice", Password: "super-secret-password"},
-	}, []string{"node-a"}, SealStrict)
+	}, []string{"node-a"})
 	if err != nil {
 		t.Fatalf("SealAndDistribute: %v", err)
 	}
-	if err := s.DeleteClusterSecrets(ctx, "sb-delete-secrets"); err != nil {
+	if err := s.DeleteClusterSecrets(ctx, "sb-delete-secrets", handle.IncarnationID); err != nil {
 		t.Fatalf("DeleteClusterSecrets: %v", err)
 	}
 	if _, err := st.GetClusterSecret(ctx, handle.Ref); !errors.Is(err, storepkg.ErrNotFound) {
@@ -336,10 +337,10 @@ func TestDeleteClusterSecretsRemovesProviderRecord(t *testing.T) {
 	}
 
 	var nilService *Service
-	if err := nilService.DeleteClusterSecrets(ctx, "ignored"); err != nil {
+	if err := nilService.DeleteClusterSecrets(ctx, "ignored", "inc-ignored"); err != nil {
 		t.Fatalf("nil service DeleteClusterSecrets() error = %v", err)
 	}
-	if err := (&Service{}).DeleteClusterSecrets(ctx, "ignored"); err != nil {
+	if err := (&Service{}).DeleteClusterSecrets(ctx, "ignored", "inc-ignored"); err != nil {
 		t.Fatalf("storeless DeleteClusterSecrets() error = %v", err)
 	}
 }

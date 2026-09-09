@@ -9,7 +9,7 @@ import "github.com/aerol-ai/microvm/pkg/models"
 const reassignCauseFailover = "failover"
 
 func placementWantsFailoverRecreate(p Placement) bool {
-	return specWantsFailoverRecreate(p.Spec)
+	return !p.IsDeleting() && specWantsFailoverRecreate(p.Spec)
 }
 
 func specWantsFailoverRecreate(spec *models.CreateSandboxRequest) bool {

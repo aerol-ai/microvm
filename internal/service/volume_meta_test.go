@@ -92,11 +92,12 @@ func TestVolumeMetaClusterAttachmentsBlockDelete(t *testing.T) {
 		t.Fatalf("CreatePlatformVolume: %v", err)
 	}
 	if err := s.volumeMeta().PutAttachments(ctx, []models.VolumeAttachment{{
-		Tenant:    v.Tenant,
-		VolumeID:  v.ID,
-		SandboxID: "sb-remote",
-		Target:    "/data",
-		Source:    v.Source,
+		Tenant:        v.Tenant,
+		VolumeID:      v.ID,
+		SandboxID:     "sb-remote",
+		IncarnationID: "inc-sb-remote",
+		Target:        "/data",
+		Source:        v.Source,
 	}}); err != nil {
 		t.Fatalf("PutAttachments: %v", err)
 	}
@@ -104,7 +105,7 @@ func TestVolumeMetaClusterAttachmentsBlockDelete(t *testing.T) {
 	if err := s.DeletePlatformVolume(ctx, v.ID); !errors.Is(err, models.ErrPlatformVolumeInUse) {
 		t.Fatalf("DeletePlatformVolume attached = %v, want ErrPlatformVolumeInUse", err)
 	}
-	if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, "sb-remote"); err != nil {
+	if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, "sb-remote", "inc-sb-remote"); err != nil {
 		t.Fatalf("DeleteAttachmentsForSandbox: %v", err)
 	}
 	if err := s.DeletePlatformVolume(ctx, v.ID); err != nil {
@@ -145,7 +146,7 @@ func TestVolumeMetaClusterPutAttachmentsUnknownVolume(t *testing.T) {
 	s.cfg.EnableCluster = true
 	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
 	err := s.volumeMeta().PutAttachments(context.Background(), []models.VolumeAttachment{{
-		Tenant: "t-a", VolumeID: "missing", SandboxID: "sb-1", Target: "/data", Source: "s/x",
+		Tenant: "t-a", VolumeID: "missing", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/x",
 	}})
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("PutAttachments unknown volume = %v, want ErrNotFound", err)

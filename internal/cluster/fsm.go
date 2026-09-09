@@ -45,6 +45,7 @@ const (
 	opDeleteVolumeAttach     opCode = 18 // drop all platform-volume attachments for one sandbox
 	opPruneAuditACL          opCode = 19 // bounded-retention cleanup for post-delete owner ACLs
 	opUpdateSecretRecipients opCode = 20 // replace Placement.SecretRecipients (+ optional secret handle) without touching ownership/incarnation
+	opBeginDelete            opCode = 21 // freeze one exact owner/lifecycle before irreversible finalization
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -73,20 +74,24 @@ type command struct {
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
-	// SecretRecipients rides opReserve (and is preserved by opPlace). Additive
-	// omitempty — mixed-version clusters decode missing field as nil.
+	// SecretRecipients rides opReserve and is preserved by opPlace.
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
 	// IncarnationID rides opReserve and is preserved by opPlace/opReassign.
 	IncarnationID string `json:"incarnation_id,omitempty"`
 	// SecretSealGeneration accompanies the provider handle on initial place and
-	// later recipient reseals. Additive omitempty.
+	// later recipient reseals.
 	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
-	// ExpectedIncarnationID fences opPlace and opUpdateSecretRecipients from
-	// applying secret state to another sandbox lifetime. Empty skips it.
+	// ExpectedIncarnationID fences mutations of an existing placement from
+	// applying to another sandbox lifetime. ExpectedOwnerNodeID additionally
+	// fences destructive owner-side cleanup from a concurrent reassignment.
+	// ExpectedOwnerNodeIDSet distinguishes "expect orphaned owner" (the empty
+	// owner ID) from commands which do not request an owner comparison.
 	// ExpectedSealGeneration is the opUpdateSecretRecipients generation CAS.
 	ExpectedIncarnationID  string `json:"expected_incarnation_id,omitempty"`
+	ExpectedOwnerNodeID    string `json:"expected_owner_node_id,omitempty"`
+	ExpectedOwnerNodeIDSet bool   `json:"expected_owner_node_id_set,omitempty"`
 	ExpectedSealGeneration int64  `json:"expected_seal_generation,omitempty"`
-	// OwnerRef is the control-plane tenant account. Additive omitempty.
+	// OwnerRef is the control-plane tenant account.
 	OwnerRef  string `json:"owner_ref,omitempty"`
 	Port      int    `json:"port,omitempty"`
 	Protocol  string `json:"protocol,omitempty"`
@@ -176,6 +181,7 @@ func (c command) placementSecrets() PlacementSecrets {
 	return PlacementSecrets{
 		Ref:            c.SecretRef,
 		Version:        c.SecretVersion,
+		IncarnationID:  c.IncarnationID,
 		SealGeneration: c.SecretSealGeneration,
 	}
 }
@@ -226,15 +232,76 @@ func (c command) hasSecretUpdate() bool {
 	return c.placementSecrets().hasUpdate()
 }
 
+// validateCommandLifecycle rejects unfenced lifecycle and secret mutations
+// before they enter Raft. The FSM repeats secret-handle validation so direct
+// apply tests and future callers cannot bypass the one-way provider contract.
+func validateCommandLifecycle(c command) error {
+	requireIncarnation := func(sandboxID, incarnationID, operation string) error {
+		if strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(incarnationID) == "" {
+			return fmt.Errorf("%w: %s requires sandbox and incarnation", ErrIncarnationConflict, operation)
+		}
+		return nil
+	}
+	validateSecret := func(cmd command) error {
+		if !cmd.hasSecretUpdate() {
+			return nil
+		}
+		return validatePlacementSecretHandle(cmd.SandboxID, cmd.placementSecrets())
+	}
+
+	switch c.Op {
+	case opPlace, opReserve:
+		if err := requireIncarnation(c.SandboxID, c.IncarnationID, "placement write"); err != nil {
+			return err
+		}
+		return validateSecret(c)
+	case opReserveBatch:
+		for _, reservation := range c.Reservations {
+			cmd := commandFromReservation(reservation)
+			if err := requireIncarnation(cmd.SandboxID, cmd.IncarnationID, "reservation"); err != nil {
+				return err
+			}
+			if err := validateSecret(cmd); err != nil {
+				return err
+			}
+		}
+	case opClaimOrphan:
+		if err := requireIncarnation(c.SandboxID, c.IncarnationID, "orphan claim"); err != nil {
+			return err
+		}
+		return validateSecret(c)
+	case opDelete, opBeginDelete, opCancelReserve, opReassign, opAddExposedPort, opRemoveExposedPort, opAddCustomDomain, opRemoveCustomDomain:
+		return requireIncarnation(c.SandboxID, c.ExpectedIncarnationID, "placement mutation")
+	case opPutVolumeAttach:
+		for _, attachment := range c.VolumeAttachments {
+			if err := requireIncarnation(attachment.SandboxID, attachment.IncarnationID, "volume attachment write"); err != nil {
+				return err
+			}
+		}
+	case opDeleteVolumeAttach:
+		return requireIncarnation(c.VolumeSandboxID, c.ExpectedIncarnationID, "volume attachment delete")
+	case opUpsertSpec:
+		if c.Spec == nil && !c.hasSecretUpdate() {
+			return nil
+		}
+		if err := requireIncarnation(c.SandboxID, c.ExpectedIncarnationID, "spec update"); err != nil {
+			return err
+		}
+		if c.hasSecretUpdate() && strings.TrimSpace(c.IncarnationID) != strings.TrimSpace(c.ExpectedIncarnationID) {
+			return fmt.Errorf("%w: secret handle and spec fence differ", ErrIncarnationConflict)
+		}
+		return validateSecret(c)
+	case opUpdateSecretRecipients:
+		return validateSecretRecipientUpdate(c.SandboxID, c.SecretRecipients, c.placementSecrets(), c.ExpectedIncarnationID, c.ExpectedSealGeneration)
+	}
+	return nil
+}
+
 func applyCommandSecretUpdate(existing Placement, exists bool, cmd command) PlacementSecrets {
 	if !cmd.hasSecretUpdate() && exists {
 		return secretsFromPlacement(existing)
 	}
-	generation := cmd.SecretSealGeneration
-	if generation <= 0 && exists {
-		generation = existing.SecretSealGeneration
-	}
-	return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion, SealGeneration: generation}
+	return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion, IncarnationID: cmd.IncarnationID, SealGeneration: cmd.SecretSealGeneration}
 }
 
 // placementFSM is the raft.FSM implementation. It keeps hot routing/admission
@@ -299,6 +366,9 @@ type placementFSM struct {
 	// capacity claim has been pruned as expired. The leader GC uses it to find
 	// expired reservation rows without scanning every placed sandbox.
 	reservedIndex map[string]struct{}
+	// deletingIndex bounds leader cleanup of abandoned delete fences to the
+	// number of in-flight deletions rather than the full placement fleet.
+	deletingIndex map[string]struct{}
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -319,6 +389,9 @@ type placementFSM struct {
 	// operator or tenant query without probing 2,000 workers. Expiry is
 	// replicated and pruning is an explicit Raft command.
 	auditACLs map[string]AuditACL
+	// auditACLLatest indexes the newest retained lifecycle per sandbox for
+	// O(1) implicit audit lookups. It is derived from auditACLs on restore.
+	auditACLLatest map[string]string
 
 	// volumes holds replicated platform-volume metadata rows, keyed by
 	// volumeKey(tenant, id). volumeNameIndex maps volumeNameKey(tenant, name) →
@@ -403,9 +476,11 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationCapacity:   make(map[string]capacity.Request),
 		pendingReservationIDsByOwner: make(map[string]map[string]struct{}),
 		reservedIndex:                make(map[string]struct{}),
+		deletingIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
 		customHostnameIndex:          make(map[string]string),
 		auditACLs:                    make(map[string]AuditACL),
+		auditACLLatest:               make(map[string]string),
 		volumes:                      make(map[string]models.Volume),
 		volumeNameIndex:              make(map[string]string),
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
@@ -458,6 +533,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 
 	switch cmd.Op {
 	case opPlace:
+		if cmd.hasSecretUpdate() {
+			if err := validatePlacementSecretHandle(cmd.SandboxID, cmd.placementSecrets()); err != nil {
+				return err
+			}
+		}
 		// Idempotency: re-placing the same id with the same owner AND the same
 		// spec payload is a no-op when the existing row is already a placement.
 		// A reservation-state row with the same owner still needs the State
@@ -468,8 +548,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if exists {
 			expected := strings.TrimSpace(cmd.ExpectedIncarnationID)
 			current := strings.TrimSpace(existing.IncarnationID)
-			if expected != "" && current != "" && current != expected {
+			if expected == "" || current != expected {
 				return fmt.Errorf("%w: want %q have %q", ErrIncarnationConflict, expected, current)
+			}
+			if existing.IsDeleting() {
+				return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 			}
 		}
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && !cmd.hasSecretUpdate() && !existing.IsReserved() {
@@ -634,6 +717,15 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if !exists || !existing.IsReserved() {
 			return nil
 		}
+		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
+		if expectedIncarnationID == "" {
+			return fmt.Errorf("%w: cancel reservation requires current incarnation", ErrIncarnationConflict)
+		}
+		if strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
+			// A delayed rollback for an older reuse of this ID is already
+			// satisfied and must not cancel the current reservation.
+			return nil
+		}
 		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 		f.releaseShardLocked(cmd.SandboxID)
 		f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
@@ -641,23 +733,83 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
 		f.releasePendingReservationLocked(cmd.SandboxID)
 		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, expectedIncarnationID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
+		delete(f.deletingIndex, cmd.SandboxID)
 		return nil
+	case opBeginDelete:
+		existing, ok := f.fullPlacementLocked(cmd.SandboxID)
+		if !ok {
+			return ErrUnknownSandbox
+		}
+		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
+		if strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
+			return fmt.Errorf("%w: begin delete want %q have %q", ErrIncarnationConflict, expectedIncarnationID, existing.IncarnationID)
+		}
+		expectedOwnerNodeID := strings.TrimSpace(cmd.ExpectedOwnerNodeID)
+		if !cmd.ExpectedOwnerNodeIDSet || strings.TrimSpace(existing.OwnerNodeID) != expectedOwnerNodeID {
+			return fmt.Errorf("%w: begin delete owner want %q have %q", ErrReservationConflict, expectedOwnerNodeID, existing.OwnerNodeID)
+		}
+		if existing.IsOrphaned() {
+			return fmt.Errorf("%w: sandbox %s is not an active placement", ErrReservationConflict, cmd.SandboxID)
+		}
+		if existing.IsDeleting() {
+			return nil
+		}
+		// Reserved creates can already have a local runtime and sealed peer
+		// copies when create or promotion fails. Move the exact reservation into
+		// the same delete fence so rollback can finish immediately instead of
+		// waiting for reservation expiry and a later reconcile pass.
+		if existing.IsReserved() {
+			f.releasePendingReservationLocked(cmd.SandboxID)
+			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+		}
+		existing.State = PlacementStateDeleting
+		existing.ExpiresUnix = cmd.ExpiresUnix
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		return f.storePlacementLocked(cmd.SandboxID, existing)
 	case opDelete:
 		if existing, ok := f.fullPlacementLocked(cmd.SandboxID); ok {
+			expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
+			if expectedIncarnationID == "" {
+				return fmt.Errorf("%w: delete placement requires current incarnation", ErrIncarnationConflict)
+			}
+			if strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
+				// A stale destroy that arrives after ID reuse ACKs without deleting
+				// the replacement lifecycle or its routing/index state.
+				return nil
+			}
+			expectedOwnerNodeID := strings.TrimSpace(cmd.ExpectedOwnerNodeID)
+			if (cmd.ExpectedOwnerNodeIDSet || expectedOwnerNodeID != "") &&
+				strings.TrimSpace(existing.OwnerNodeID) != expectedOwnerNodeID {
+				// The lifecycle was reassigned while its previous owner was
+				// finalizing local state. That old owner must ACK the stale delete
+				// without removing the new owner's authoritative placement.
+				return nil
+			}
 			recordPlacementAuditNode(&existing, existing.OwnerNodeID)
 			recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
-			if f.auditACLs == nil {
-				f.auditACLs = make(map[string]AuditACL)
-			}
-			f.auditACLs[cmd.SandboxID] = AuditACL{
-				SandboxID:           cmd.SandboxID,
-				IncarnationID:       existing.IncarnationID,
-				OwnerRef:            strings.TrimSpace(existing.OwnerRef),
-				AuditNodeIDs:        append([]string(nil), existing.AuditNodeIDs...),
-				AuditNodesTruncated: existing.AuditNodesTruncated,
-				ExpiresUnix:         cmd.ExpiresUnix,
+			incarnationID := strings.TrimSpace(existing.IncarnationID)
+			if incarnationID != "" {
+				if f.auditACLs == nil {
+					f.auditACLs = make(map[string]AuditACL)
+				}
+				if f.auditACLLatest == nil {
+					f.auditACLLatest = make(map[string]string)
+				}
+				key := auditACLKey(cmd.SandboxID, incarnationID)
+				f.auditACLs[key] = AuditACL{
+					SandboxID:           cmd.SandboxID,
+					IncarnationID:       incarnationID,
+					OwnerRef:            strings.TrimSpace(existing.OwnerRef),
+					AuditNodeIDs:        append([]string(nil), existing.AuditNodeIDs...),
+					AuditNodesTruncated: existing.AuditNodesTruncated,
+					ExpiresUnix:         cmd.ExpiresUnix,
+					RetainedVersion:     log.Index,
+				}
+				f.auditACLLatest[cmd.SandboxID] = key
 			}
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
@@ -673,15 +825,25 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
+		delete(f.deletingIndex, cmd.SandboxID)
 		return nil
 	case opPruneAuditACL:
+		removed := false
 		for id, acl := range f.auditACLs {
 			if acl.ExpiresUnix > 0 && acl.ExpiresUnix <= cmd.ExpiresUnix {
 				delete(f.auditACLs, id)
+				removed = true
 			}
+		}
+		if removed {
+			f.rebuildAuditACLLatestLocked()
 		}
 		return nil
 	case opReassign:
+		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
+		if expectedIncarnationID == "" {
+			return fmt.Errorf("%w: reassign placement requires current incarnation", ErrIncarnationConflict)
+		}
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 		if !exists {
 			// Reassigning a non-existent placement is a no-op (could happen
@@ -690,6 +852,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				return reassignApplyResult{}
 			}
 			return nil
+		}
+		if strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
+			return fmt.Errorf("%w: reassign want %q have %q", ErrIncarnationConflict, expectedIncarnationID, existing.IncarnationID)
+		}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 		}
 		wasReserved := existing.IsReserved()
 		if wasReserved {
@@ -736,7 +904,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		for _, id := range f.ownedPlacementIDsLocked(cmd.NodeID) {
 			existing, ok := f.fullPlacementLocked(id)
-			if !ok || existing.IsReserved() || existing.OwnerNodeID != cmd.NodeID {
+			if !ok || existing.IsReserved() || existing.IsDeleting() || existing.OwnerNodeID != cmd.NodeID {
 				continue
 			}
 			f.releaseOwnerLocked(id, existing)
@@ -764,8 +932,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseAllCustomHostnamesLocked(id, existing)
 			f.releasePendingReservationLocked(id)
 			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
+			f.releaseVolumeAttachmentsForIncarnationLocked(id, existing.IncarnationID)
 			f.deletePlacementRecoveryLocked(id)
 			delete(f.placements, id)
+			delete(f.deletingIndex, id)
 		}
 		return nil
 	case opClaimOrphan:
@@ -776,8 +946,20 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if !exists {
 			return ErrUnknownSandbox
 		}
+		claimIncarnationID := strings.TrimSpace(cmd.IncarnationID)
+		if claimIncarnationID == "" || strings.TrimSpace(existing.IncarnationID) != claimIncarnationID {
+			return fmt.Errorf("%w: claim want %q have %q", ErrIncarnationConflict, claimIncarnationID, existing.IncarnationID)
+		}
+		if cmd.hasSecretUpdate() {
+			if err := validatePlacementSecretHandle(cmd.SandboxID, cmd.placementSecrets()); err != nil {
+				return err
+			}
+		}
 		if existing.IsReserved() {
 			return fmt.Errorf("%w: %s is a pending reservation", ErrReservationConflict, cmd.SandboxID)
+		}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 		}
 		if !existing.IsOrphaned() {
 			if existing.OwnerNodeID == cmd.OwnerNodeID {
@@ -829,8 +1011,20 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// failed locally if the sandbox truly doesn't exist.
 			return nil
 		}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
+		}
 		if cmd.Spec == nil && !cmd.hasSecretUpdate() {
 			return nil
+		}
+		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
+		if expectedIncarnationID == "" || strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
+			return fmt.Errorf("%w: spec update want %q have %q", ErrIncarnationConflict, expectedIncarnationID, existing.IncarnationID)
+		}
+		if cmd.hasSecretUpdate() {
+			if err := validatePlacementSecretHandle(cmd.SandboxID, cmd.placementSecrets()); err != nil {
+				return err
+			}
 		}
 		if cmd.Spec != nil {
 			oldName := placementName(existing)
@@ -870,32 +1064,36 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return nil
 	case opUpdateSecretRecipients:
 		// Dead-target expansion / reseal coordination: replace the frozen
-		// recipient set (and optionally the seal handle) while preserving
-		// ownership and IncarnationID. Empty recipients is a no-op so a
-		// partial forward can't wipe the set.
+		// recipient set and seal handle while preserving ownership and
+		// IncarnationID. The transition is always generation/incarnation fenced;
+		// there is no unfenced compatibility form.
+		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
+		if err := validateSecretRecipientUpdate(cmd.SandboxID, cmd.SecretRecipients, PlacementSecrets{
+			Ref:            cmd.SecretRef,
+			Version:        cmd.SecretVersion,
+			IncarnationID:  expectedIncarnationID,
+			SealGeneration: cmd.SecretSealGeneration,
+		}, expectedIncarnationID, cmd.ExpectedSealGeneration); err != nil {
+			return err
+		}
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
-		if !exists || len(cmd.SecretRecipients) == 0 {
-			return nil
+		if !exists {
+			return ErrUnknownSandbox
 		}
-		if exp := strings.TrimSpace(cmd.ExpectedIncarnationID); exp != "" {
-			if cur := strings.TrimSpace(existing.IncarnationID); cur != exp {
-				return fmt.Errorf("%w: incarnation want %q have %q", ErrSecretRecipientsCASMismatch, exp, cur)
-			}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 		}
-		if cmd.ExpectedSealGeneration > 0 {
-			if cur := existing.SecretSealGeneration; cur != cmd.ExpectedSealGeneration {
-				return fmt.Errorf("%w: seal_generation want %d have %d", ErrSecretRecipientsCASMismatch, cmd.ExpectedSealGeneration, cur)
-			}
+		if cur := strings.TrimSpace(existing.IncarnationID); cur != expectedIncarnationID {
+			return fmt.Errorf("%w: incarnation want %q have %q", ErrSecretRecipientsCASMismatch, expectedIncarnationID, cur)
+		}
+		if cur := existing.SecretSealGeneration; cur != cmd.ExpectedSealGeneration {
+			return fmt.Errorf("%w: seal_generation want %d have %d", ErrSecretRecipientsCASMismatch, cmd.ExpectedSealGeneration, cur)
 		}
 		existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
-		if cmd.hasSecretUpdate() {
-			secrets := applyCommandSecretUpdate(existing, true, cmd)
-			existing.SecretRef = secrets.Ref
-			existing.SecretVersion = secrets.Version
-		}
-		if cmd.SecretSealGeneration > 0 {
-			existing.SecretSealGeneration = cmd.SecretSealGeneration
-		}
+		secrets := applyCommandSecretUpdate(existing, true, cmd)
+		existing.SecretRef = secrets.Ref
+		existing.SecretVersion = secrets.Version
+		existing.SecretSealGeneration = cmd.SecretSealGeneration
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		return f.storePlacementLocked(cmd.SandboxID, existing)
@@ -903,6 +1101,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 		if !exists || cmd.Port <= 0 {
 			return nil
+		}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
+		}
+		if err := requireCurrentPlacementIncarnation(existing, cmd.ExpectedIncarnationID, "add exposed port"); err != nil {
+			return err
 		}
 		route := ExposedPortRoute{
 			Protocol:  cmd.Protocol,
@@ -941,6 +1145,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if !exists || cmd.Port <= 0 {
 			return nil
 		}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
+		}
+		if err := requireCurrentPlacementIncarnation(existing, cmd.ExpectedIncarnationID, "remove exposed port"); err != nil {
+			return err
+		}
 		if _, present := existing.ExposedPorts[cmd.Port]; !present {
 			return nil
 		}
@@ -978,6 +1188,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// surfaces it to a user).
 			return nil
 		}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
+		}
+		if err := requireCurrentPlacementIncarnation(existing, cmd.ExpectedIncarnationID, "add custom domain"); err != nil {
+			return err
+		}
 		if owner, claimed := f.customHostnameIndex[cmd.Hostname]; claimed && owner != cmd.SandboxID {
 			return fmt.Errorf("%w: %q held by %s", ErrCustomHostnameConflict, cmd.Hostname, owner)
 		}
@@ -1004,6 +1220,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// Make sure the index doesn't still point at the now-gone id.
 			f.releaseCustomHostnameLocked(cmd.SandboxID, cmd.Hostname)
 			return nil
+		}
+		if existing.IsDeleting() {
+			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
+		}
+		if err := requireCurrentPlacementIncarnation(existing, cmd.ExpectedIncarnationID, "remove custom domain"); err != nil {
+			return err
 		}
 		if !existingHasHostname(existing, cmd.Hostname) {
 			return nil
@@ -1099,15 +1321,26 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			tenant := strings.TrimSpace(a.Tenant)
 			volumeID := strings.TrimSpace(a.VolumeID)
 			sandboxID := strings.TrimSpace(a.SandboxID)
+			incarnationID := strings.TrimSpace(a.IncarnationID)
 			target := strings.TrimSpace(a.Target)
 			source := strings.TrimSpace(a.Source)
-			if tenant == "" || volumeID == "" || sandboxID == "" || target == "" || source == "" {
-				return fmt.Errorf("placementFSM: opPutVolumeAttach requires tenant, volume_id, sandbox_id, target, and source")
+			if tenant == "" || volumeID == "" || sandboxID == "" || incarnationID == "" || target == "" || source == "" {
+				return fmt.Errorf("placementFSM: opPutVolumeAttach requires tenant, volume_id, sandbox_id, incarnation_id, target, and source")
 			}
 			if _, ok := f.volumes[volumeKey(tenant, volumeID)]; !ok {
 				return ErrUnknownVolume
 			}
-			a.Tenant, a.VolumeID, a.SandboxID, a.Target, a.Source = tenant, volumeID, sandboxID, target, source
+			placement, ok := f.placements[sandboxID]
+			if !ok {
+				return fmt.Errorf("%w: volume attachment placement %q does not exist", ErrIncarnationConflict, sandboxID)
+			}
+			if placement.IsDeleting() {
+				return fmt.Errorf("%w: volume attachment placement %q is being deleted", ErrReservationConflict, sandboxID)
+			}
+			if err := requireCurrentPlacementIncarnation(placement, incarnationID, "put volume attachment"); err != nil {
+				return err
+			}
+			a.Tenant, a.VolumeID, a.SandboxID, a.IncarnationID, a.Target, a.Source = tenant, volumeID, sandboxID, incarnationID, target, source
 			if a.CreatedAt.IsZero() {
 				a.CreatedAt = time.Unix(now, 0).UTC()
 			}
@@ -1122,11 +1355,27 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if sandboxID == "" {
 			return fmt.Errorf("placementFSM: opDeleteVolumeAttach requires sandbox_id")
 		}
-		f.releaseVolumeAttachmentsForSandboxLocked(sandboxID)
+		existing, ok := f.placements[sandboxID]
+		if !ok {
+			return fmt.Errorf("%w: volume attachment placement %q does not exist", ErrIncarnationConflict, sandboxID)
+		}
+		if err := requireCurrentPlacementIncarnation(existing, cmd.ExpectedIncarnationID, "delete volume attachments"); err != nil {
+			return err
+		}
+		f.releaseVolumeAttachmentsForIncarnationLocked(sandboxID, cmd.ExpectedIncarnationID)
 		return nil
 	default:
 		return fmt.Errorf("placementFSM: unknown op %d", cmd.Op)
 	}
+}
+
+func requireCurrentPlacementIncarnation(existing Placement, expected, operation string) error {
+	expected = strings.TrimSpace(expected)
+	current := strings.TrimSpace(existing.IncarnationID)
+	if expected == "" || current == "" || expected != current {
+		return fmt.Errorf("%w: %s want %q have %q", ErrIncarnationConflict, operation, expected, current)
+	}
+	return nil
 }
 
 // specName returns the trimmed Name field, or "" if spec is nil. Centralized
@@ -1186,6 +1435,11 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 	if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
 		return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
 	}
+	if cmd.hasSecretUpdate() {
+		if err := validatePlacementSecretHandle(cmd.SandboxID, cmd.placementSecrets()); err != nil {
+			return err
+		}
+	}
 	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 	if exists {
 		// Reject when the slot is already materialized — a router racing a
@@ -1197,14 +1451,18 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		// refresh the TTL (and recipient set when supplied) and treat it as a
 		// no-op otherwise.
 		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
+			if strings.TrimSpace(existing.IncarnationID) != strings.TrimSpace(cmd.IncarnationID) {
+				return fmt.Errorf("%w: reservation retry changed its incarnation", ErrIncarnationConflict)
+			}
+			if cmd.hasSecretUpdate() && (existing.SecretRef != cmd.SecretRef || existing.SecretVersion != cmd.SecretVersion ||
+				existing.SecretSealGeneration != cmd.SecretSealGeneration) {
+				return fmt.Errorf("%w: reservation retry changed its secret handle", ErrInvalidSecretHandle)
+			}
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
 			existing.UpdatedUnix = now
 			if len(cmd.SecretRecipients) > 0 {
 				existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
-			}
-			if id := strings.TrimSpace(cmd.IncarnationID); id != "" && existing.IncarnationID == "" {
-				existing.IncarnationID = id
 			}
 			oldOwnerRef := existing.OwnerRef
 			if ref := strings.TrimSpace(cmd.OwnerRef); ref != "" {
@@ -1227,6 +1485,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
 			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
+			f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, existing.IncarnationID)
 		} else {
 			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
@@ -1816,6 +2075,7 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 			delete(f.recovery, id)
 		}
 		f.placements[id] = hot
+		f.indexDeletingStateLocked(id, hot)
 		return nil
 	}
 	if f.recoveryStore != nil {
@@ -1832,7 +2092,19 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 		f.recovery[id] = clonePlacementRecovery(rec)
 	}
 	f.placements[id] = hot
+	f.indexDeletingStateLocked(id, hot)
 	return nil
+}
+
+func (f *placementFSM) indexDeletingStateLocked(id string, p Placement) {
+	if f.deletingIndex == nil {
+		f.deletingIndex = make(map[string]struct{})
+	}
+	if p.IsDeleting() {
+		f.deletingIndex[id] = struct{}{}
+		return
+	}
+	delete(f.deletingIndex, id)
 }
 
 func (f *placementFSM) deletePlacementRecoveryLocked(id string) {
@@ -1991,6 +2263,24 @@ func (f *placementFSM) expiredReservationIDs(now int64) []string {
 		out = append(out, id)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func (f *placementFSM) expiredDeletingPlacements(now int64) []Placement {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if now <= 0 || len(f.deletingIndex) == 0 {
+		return nil
+	}
+	out := make([]Placement, 0, len(f.deletingIndex))
+	for id := range f.deletingIndex {
+		p, ok := f.placements[id]
+		if !ok || !p.IsDeleting() || p.ExpiresUnix == 0 || now <= p.ExpiresUnix {
+			continue
+		}
+		out = append(out, cloneHotPlacement(p))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SandboxID < out[j].SandboxID })
 	return out
 }
 
@@ -2212,14 +2502,52 @@ func (f *placementFSM) isNodeDrained(nodeID string) bool {
 	return f.drainedNodes[nodeID]
 }
 
-func (f *placementFSM) auditACLForSandbox(sandboxID string, nowUnix int64) (AuditACL, bool) {
+func auditACLKey(sandboxID, incarnationID string) string {
+	return strings.TrimSpace(sandboxID) + "\x00" + strings.TrimSpace(incarnationID)
+}
+
+func auditACLUsable(acl AuditACL, nowUnix int64) bool {
+	return strings.TrimSpace(acl.SandboxID) != "" && strings.TrimSpace(acl.IncarnationID) != "" &&
+		(acl.ExpiresUnix <= 0 || acl.ExpiresUnix > nowUnix)
+}
+
+func auditACLNewer(candidateKey string, candidate AuditACL, currentKey string, current AuditACL) bool {
+	return candidate.RetainedVersion > current.RetainedVersion ||
+		(candidate.RetainedVersion == current.RetainedVersion && candidateKey > currentKey)
+}
+
+func (f *placementFSM) rebuildAuditACLLatestLocked() {
+	f.auditACLLatest = make(map[string]string)
+	for key, acl := range f.auditACLs {
+		sandboxID := strings.TrimSpace(acl.SandboxID)
+		if sandboxID == "" || strings.TrimSpace(acl.IncarnationID) == "" {
+			continue
+		}
+		currentKey, ok := f.auditACLLatest[sandboxID]
+		if !ok || auditACLNewer(key, acl, currentKey, f.auditACLs[currentKey]) {
+			f.auditACLLatest[sandboxID] = key
+		}
+	}
+}
+
+func (f *placementFSM) auditACLForSandbox(sandboxID, incarnationID string, nowUnix int64) (AuditACL, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	acl, ok := f.auditACLs[strings.TrimSpace(sandboxID)]
-	if !ok {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
 		return AuditACL{}, false
 	}
-	if acl.ExpiresUnix > 0 && acl.ExpiresUnix <= nowUnix {
+	if incarnationID != "" {
+		acl, ok := f.auditACLs[auditACLKey(sandboxID, incarnationID)]
+		if !ok || !auditACLUsable(acl, nowUnix) {
+			return AuditACL{}, false
+		}
+		return cloneAuditACL(acl), true
+	}
+	key, ok := f.auditACLLatest[sandboxID]
+	acl := f.auditACLs[key]
+	if !ok || !auditACLUsable(acl, nowUnix) {
 		return AuditACL{}, false
 	}
 	return cloneAuditACL(acl), true
@@ -2367,13 +2695,17 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
+	f.deletingIndex = make(map[string]struct{})
 	f.customHostnameIndex = make(map[string]string)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
-	for id, acl := range payload.AuditACLs {
-		if id != "" {
-			f.auditACLs[id] = cloneAuditACL(acl)
+	for _, acl := range payload.AuditACLs {
+		sandboxID := strings.TrimSpace(acl.SandboxID)
+		incarnationID := strings.TrimSpace(acl.IncarnationID)
+		if sandboxID != "" && incarnationID != "" {
+			f.auditACLs[auditACLKey(sandboxID, incarnationID)] = cloneAuditACL(acl)
 		}
 	}
+	f.rebuildAuditACLLatestLocked()
 	// Rebuild the replicated volume table + name index from the snapshot.
 	f.volumes = make(map[string]models.Volume, len(payload.Volumes))
 	f.volumeNameIndex = make(map[string]string, len(payload.Volumes))
@@ -2395,12 +2727,17 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		a.Tenant = strings.TrimSpace(a.Tenant)
 		a.VolumeID = strings.TrimSpace(a.VolumeID)
 		a.SandboxID = strings.TrimSpace(a.SandboxID)
+		a.IncarnationID = strings.TrimSpace(a.IncarnationID)
 		a.Target = strings.TrimSpace(a.Target)
 		a.Source = strings.TrimSpace(a.Source)
-		if a.Tenant == "" || a.VolumeID == "" || a.SandboxID == "" || a.Target == "" || a.Source == "" {
+		if a.Tenant == "" || a.VolumeID == "" || a.SandboxID == "" || a.IncarnationID == "" || a.Target == "" || a.Source == "" {
 			continue
 		}
 		if _, ok := f.volumes[volumeKey(a.Tenant, a.VolumeID)]; !ok {
+			continue
+		}
+		placement, ok := payload.Placements[a.SandboxID]
+		if !ok || strings.TrimSpace(placement.IncarnationID) != a.IncarnationID {
 			continue
 		}
 		f.putVolumeAttachmentLocked(a)

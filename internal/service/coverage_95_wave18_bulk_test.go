@@ -84,7 +84,8 @@ func TestReconcileGoneUnmountWarnWave18(t *testing.T) {
 	svc.caddy = caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second})
 	_ = st.Create(ctx, &models.Sandbox{
 		ID: "sb-um18", Image: "alpine:3.20", Status: models.SandboxStatusStarted, ContainerID: "gone",
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-um18",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	})
 	if err := svc.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)

@@ -136,7 +136,7 @@ waits until the promoted generation is visible.
 | E1a | `failover_ready` + metric + secret ref in decrypt errors | 2 / 0.5 | ACCEPTED |
 | E1b | `/v1/sandboxes/{id}/audit` (paginated, tenant-scoped) | 3 / 0.5 | ACCEPTED, gated (see below) |
 | E2a | Audit retention + correlation IDs + auditor runbook | 5 / 1 | ACCEPTED |
-| E2b | Tamper-evident chain | 3 / 0.5 | **ACCEPTED, gated on an auditor actually asking** |
+| E2b | Tamper-evident chain | 3 / 0.5 | **IMPLEMENTED; claim requires an external witness** |
 | E3a | Attribution for host-mediated runtimes (wasm, isolate) + netstats totals | 8 / 1.5 | ACCEPTED |
 | E3b | Kernel-level capture (docker/containerd/firecracker): NFLOG/conntrack → IPs | 15 / 3 | ACCEPTED, own justification required |
 | E3c | Hostname resolution (DNS or TLS-SNI capture) for E3b | 10 / 2 | **DEFERRED** — separate deliverable, not an alternative |
@@ -153,9 +153,10 @@ not count until it ACKs the current generation.
 **E1b cluster-read model — IMPLEMENTED.** Every build keeps a hash-chained local
 JSONL operational copy. Reads target only the bounded Raft-retained owner
 history, merge by compound cursor, and include an explicit coverage block.
-Enterprise configuration fails boot without an authenticated HTTPS batch
-exporter; open-source mode may omit it and therefore does not claim dead-disk
-durability.
+Enterprise configuration fails boot without either an authenticated HTTPS batch
+exporter or a non-noop programmatic `controlplane.AuditExporter`; it also
+requires a distinct non-noop external witness. Open-source mode may omit these
+and therefore does not claim dead-disk durability or external tamper evidence.
 
 Owner-forwarding was eliminated because a current owner alone cannot cover
 pre-failover history. The implemented model retains a bounded owner-node list in
@@ -227,6 +228,26 @@ pruner; rollback deletes only the aborted incarnation. WASM workers always carry
 the spill directory alongside loopback IPC, so a transient ingest failure still
 leaves a durable record for reconciliation.
 
+Reserved cluster creates resolve one leader-authoritative binding before their
+parallel create and seal legs start. Both legs receive the same incarnation and
+the recipient set serialized in the Raft reservation; follower-cache lag cannot
+split runtime state and secret state across lifecycle identities. Rollback is
+destroy-first. Before lifecycle-wide cleanup, every destroy source commits an
+owner-and-incarnation-fenced `deleting` placement state. That state blocks
+reassignment, failover recreation, route/spec/volume mutation, and resealing;
+reserved create rollback uses the same transition. `DestroySandbox` performs
+runtime, exact-incarnation secret, and external-artifact finalization before the
+final compare-and-delete, then removes the local row. Failed finalizers retain
+the row and fenced placement as retry anchors. The leader expires an abandoned
+fence only after its owner is unavailable, while bounded peer reconciliation
+retires ciphertext after authoritative placement removal, so cleanup has no
+unowned state vacuum.
+
+The live sandbox row stores its exact audit incarnation pointer. Compound audit
+ACL rows retain lifecycle history, and a monotonic establishment sequence—not a
+wall-clock timestamp—selects the latest retained lifecycle after deletion. This
+prevents clock skew or a future-dated old ACL from rebinding current evidence.
+
 **Cluster facade hydration is page-bounded.** Ingress sends each placement
 owner the exact IDs for the current page, and Daytona/E2B apply that filter
 before metadata serialization. The response and memory cost therefore scale
@@ -272,12 +293,15 @@ path on a background ticker, **not** create.
 
 ## Known gaps
 
-**GAP-1 — the async fan-out window (mitigated).** Key distribution was fully
-async so create never blocked on peer I/O (§3e). Residual: between create
-return and HA holders≥2, an owner death can leave the sandbox unrecreateable.
+**GAP-1 — minimum HA contract closed; configured redundancy converges
+asynchronously.** A successful HA create has the owner plus at least one peer
+ACK for the exact lifecycle and seal generation. The residual window is only
+for additional configured recipients; multiple holder losses before convergence
+can still exhaust redundancy.
 
 Mitigation: bounded sync min-ACK wait (`SB_SECRET_FANOUT_MIN_ACK_WAIT`, default
-2s) for ≥1 peer ACK, then async remainder; `failover_ready=false` until ready;
+2s) for ≥1 peer ACK, then async remainder; `failover_ready=false` until every
+configured recipient is verified at the current generation;
 boot `ReFanoutClusterSecrets` after restart; chaos coverage via UC-58c
 (integration + disruptive). Every cluster mode fails and retracts an HA create
 when the window produces no backup ACK, and cluster configuration rejects a
@@ -423,7 +447,7 @@ rollback. Security storage and fan-out behavior are mandatory, not feature flags
 | 2 | **DONE 2026-08-08.** T5-T6, E2a (correlation + retention), E4 (canary + alerts + runbook) + audit drop counter/gap marker | One audit event per secret read, no plaintext; canary reports at boot; overflow produces counted gap marker + alert |
 | 3 | **DONE 2026-08-08.** T7-T9, T13, E1b + operator alerts/runbook | Env always sealed at rest; `Get`/`List` omit env; recipient repair documented; audit API has bounded owner-history coverage + rate limit |
 | 4 | **DONE 2026-08-08 (T10 + E3a).** T10 shipped; E3a wasm/isolate egress attribution into shared audit JSONL. Integration chaos case (kill-owner-mid-fan-out) still operator-run behind `integration` tag. | Both providers pass contract suite; attribution emits for wasm + isolate; netstats totals unchanged |
-| 5 | **PARTIAL.** Witness heads + authenticated HTTPS batch export ship; E3b (kernel IP) and auditor-gated E2b remain optional | Event exporter required on enterprise; receiver retention/WORM policy remains operator-owned |
+| 5 | **DONE in repository for E2b.** Witness heads + authenticated HTTPS/programmatic batch export ship; E3b (kernel IP) remains separately gated | Event exporter and external witness required on enterprise; receiver retention/WORM policy remains operator-owned |
 
 **Totals, slices 0-5:** ~81 eng-days ≈ **16 engineer-weeks**; ~17 CC-days of
 authoring. At 1.5 engineers that is ~11 calendar weeks of build, plus live-AWS
@@ -440,15 +464,17 @@ Owners and dates unassigned. Required before this is a commitment.
 
 Three adversarial spec-review iterations (4/10 → 6/10). Both earlier drafts were
 factually wrong about the attribution substrate in opposite directions; the table
-above is verified against source. Remaining open items, each needing a human
-decision before its slice starts:
+above is verified against source. The first implementation gates below are
+retained as decision history and are now closed. Business and operator-owned
+items remain explicit.
 
-- **Recipient-set selection** across the reserve/promote race (Codex #11) — gates
-  slice 1; the plan calls a non-deterministic set a correctness bug.
-- **Partial fan-out rollback rule** (CLAUDE.md #4) — plan §3b still says
-  "Recommend:", not "Decided". Gates slice 1.
-- **Cluster-mode audit reads** — node-local, owner-forwarded via
-  `internal/cluster/forward.go`, or fan-out? Gates E1b in slice 3.
+- ~~**Recipient-set selection** across the reserve/promote race~~ — **closed:**
+  router-selected once and serialized in the Raft reservation.
+- ~~**Partial fan-out rollback rule**~~ — **closed:** owner plus one backup is
+  required; zero-ACK HA creates are retracted and fail.
+- ~~**Cluster-mode audit reads**~~ — **closed:** bounded owner-history fan-out,
+  compound cursor merge, explicit missing-node coverage, and a mandatory
+  enterprise exporter.
 - ~~KMS wrapping-material cache TTL~~ **DECIDED 2026-08-07: no cache.** Every
   open calls KMS, so revocation is instant and CloudTrail is complete. Justified
   by volume: KMS unwraps occur only on failover recreate (the frequent
@@ -456,9 +482,11 @@ decision before its slice starts:
   node loss is ~100 calls, ~20 req/s worst case — about 0.1% of KMS quota.
   Caching would make CloudTrail incomplete, the same failure mode as silent audit
   drops and silent partial history. Revisit only with measured throttling.
-- **SOC 2 observation window** (3/6/12 months) and auditor engagement status —
-  E2a has no business date without it; E2b is gated on an auditor ask.
-- **E2b trust boundary / external witness** — or downgrade the claim.
+- **SOC 2 observation window** (3/6/12 months) and auditor engagement status;
+  repository controls do not themselves constitute certification.
+- ~~**E2b trust boundary / external witness**~~ — **closed in repository:**
+  witnessed hash heads plus authenticated event export ship. Receiver-side
+  WORM retention remains an operator-owned external control.
 - ~~E5's guest-credential fork~~ **CLOSED 2026-08-07 by putting E5 out of
   scope.** Customer secrets arrive at create time; AerolVM does not broker them.
   The "every use attributed" claim is withdrawn accordingly.

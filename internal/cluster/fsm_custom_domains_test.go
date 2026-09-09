@@ -15,6 +15,11 @@ import (
 // tests can assert on the wrapped error.
 func applyCustomDomainOp(t *testing.T, fsm *placementFSM, idx uint64, cmd command) interface{} {
 	t.Helper()
+	if (cmd.Op == opAddCustomDomain || cmd.Op == opRemoveCustomDomain) && cmd.ExpectedIncarnationID == "" {
+		if placement, ok := fsm.get(cmd.SandboxID); ok {
+			cmd.ExpectedIncarnationID = placement.IncarnationID
+		}
+	}
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		t.Fatalf("encode op %d: %v", cmd.Op, err)
@@ -25,10 +30,11 @@ func applyCustomDomainOp(t *testing.T, fsm *placementFSM, idx uint64, cmd comman
 func mustPlaceForCustomDomains(t *testing.T, fsm *placementFSM, idx uint64, sandboxID, owner string) {
 	t.Helper()
 	if res := applyCustomDomainOp(t, fsm, idx, command{
-		Op:          opPlace,
-		SandboxID:   sandboxID,
-		OwnerNodeID: owner,
-		OwnerAPIURL: "http://" + owner,
+		Op:            opPlace,
+		SandboxID:     sandboxID,
+		OwnerNodeID:   owner,
+		OwnerAPIURL:   "http://" + owner,
+		IncarnationID: "inc-" + sandboxID,
 	}); res != nil {
 		t.Fatalf("place %s on %s: %v", sandboxID, owner, res)
 	}
@@ -144,7 +150,7 @@ func TestFSMOpPlacePreservesCustomHostnames(t *testing.T) {
 	}
 	// Replay the original place (boot-time AssertOwnership shape) — the
 	// hostnames replicated separately MUST survive.
-	if res := applyCustomDomainOp(t, fsm, 3, command{Op: opPlace, SandboxID: "sb-1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://nodeA"}); res != nil {
+	if res := applyCustomDomainOp(t, fsm, 3, command{Op: opPlace, SandboxID: "sb-1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://nodeA", IncarnationID: "inc-sb-1", ExpectedIncarnationID: "inc-sb-1"}); res != nil {
 		t.Fatalf("re-place: %v", res)
 	}
 	p, _ := fsm.get("sb-1")
@@ -164,7 +170,7 @@ func TestFSMOpDeleteReleasesCustomHostnames(t *testing.T) {
 			t.Fatalf("add %s: %v", h, res)
 		}
 	}
-	if res := applyCustomDomainOp(t, fsm, 10, command{Op: opDelete, SandboxID: "sb-1"}); res != nil {
+	if res := applyCustomDomainOp(t, fsm, 10, command{Op: opDelete, SandboxID: "sb-1", ExpectedIncarnationID: "inc-sb-1"}); res != nil {
 		t.Fatalf("delete: %v", res)
 	}
 	for _, h := range []string{"a.example", "b.example"} {

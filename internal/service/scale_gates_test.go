@@ -123,7 +123,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				ref := secrets.FormatRef(j.id, 1)
+				ref := secrets.FormatRef(j.id, "inc-1", 1)
 				if _, err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
 					Ref: ref, SandboxID: j.id, Version: 1,
 					Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
@@ -132,7 +132,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 					errCh <- err
 					continue
 				}
-				if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, j.id, []string{"node-b"}); err != nil {
+				if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, j.id, "inc-1", []string{"node-b"}); err != nil {
 					errCh <- err
 				}
 			}
@@ -153,7 +153,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 	var raceWG sync.WaitGroup
 	for i := 0; i < raceN; i++ {
 		id := fmt.Sprintf("race-%03d", i)
-		handle, err := svc.SealAndDistribute(ctx, id, req, []string{"node-a", "node-b"}, SealStrict)
+		handle, err := svc.SealAndDistribute(ctx, id, req, []string{"node-a", "node-b"})
 		if err != nil {
 			t.Fatalf("race seed seal: %v", err)
 		}
@@ -166,13 +166,13 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 			raceWG.Add(2)
 			go func() {
 				defer raceWG.Done()
-				if err := svc.DeleteClusterSecretsLocal(ctx, id, gen); err != nil {
+				if err := svc.DeleteClusterSecretsLocal(ctx, id, blob.IncarnationID, gen); err != nil {
 					errCh <- err
 				}
 			}()
 			go func(b secrets.SecretBlob) {
 				defer raceWG.Done()
-				_ = svc.UpsertClusterSecretBlob(ctx, b)
+				_ = svc.UpsertClusterSecretBlob(ctx, b, "node-a")
 			}(*blob)
 		}
 	}
@@ -184,7 +184,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 		}
 	}
 
-	rows, err := st.ListClusterSecrets(ctx)
+	rows, err := st.ListClusterSecretsBatch(ctx, "", lifecycleN+raceN+1)
 	if err != nil {
 		t.Fatalf("list secrets after delete plane: %v", err)
 	}
@@ -192,15 +192,19 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 		if strings.HasPrefix(rec.SandboxID, "seal-del-") {
 			t.Fatalf("unique lifecycle left secret row for %s", rec.SandboxID)
 		}
-		tomb, terr := st.HasClusterSecretTomb(ctx, rec.SandboxID)
+		parsed, parseErr := secrets.ParseRef(rec.Ref)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		tombGeneration, terr := st.ClusterSecretTombGenerationForIncarnation(ctx, rec.SandboxID, parsed.IncarnationID)
 		if terr != nil {
 			t.Fatal(terr)
 		}
-		if !tomb && rec.SealGeneration <= 1 {
+		if tombGeneration == 0 && rec.SealGeneration <= 1 {
 			t.Fatalf("race resurrected stale generation for %s gen=%d without tomb", rec.SandboxID, rec.SealGeneration)
 		}
 	}
-	outbox, err := st.ListSecretDeleteOutbox(ctx)
+	outbox, err := st.ListSecretDeleteOutboxBatch(ctx, lifecycleN+raceN+1)
 	if err != nil {
 		t.Fatalf("list delete outbox after delete plane: %v", err)
 	}
@@ -213,7 +217,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 		t.Fatalf("first outbox batch len=%d err=%v", len(first), err)
 	}
 	for _, rec := range first {
-		if err := st.BumpSecretDeleteOutboxAttempt(ctx, rec.SandboxID); err != nil {
+		if err := st.BumpSecretDeleteOutboxAttempt(ctx, rec.SandboxID, rec.IncarnationID, rec.Generation); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -269,9 +273,10 @@ func TestScaleGateSecretPutOutboxDrainsWithoutSilentDrop(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("put-outbox-%03d", i)
+		t.Cleanup(func() { clearSecretFanoutHolders(id) })
 		pending := []string{"node-b"}
 		if _, err := st.PutClusterSecret(ctx, store.ClusterSecretRecord{
-			Ref: secrets.FormatRef(id, 1), SandboxID: id, Version: 1,
+			Ref: secrets.FormatRef(id, "inc-1", 1), SandboxID: id, Version: 1,
 			Recipients: []string{"node-a", "node-b"}, SealedPayload: []byte("sealed"),
 			SealGeneration:         1,
 			PutOutboxIncarnationID: "inc-1",

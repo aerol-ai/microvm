@@ -109,9 +109,9 @@ func TestReconcileMissingSelfOwnedWave23(t *testing.T) {
 	cl := &missingPlacementCluster{
 		Noop: cluster.NewNoop("self", "http://self", ""),
 		placements: []cluster.Placement{
-			{SandboxID: "missing-local", OwnerNodeID: "self", State: cluster.PlacementStatePlaced},
-			{SandboxID: "reserved", OwnerNodeID: "self", State: cluster.PlacementStateReserved},
-			{SandboxID: "other", OwnerNodeID: "peer", State: cluster.PlacementStatePlaced},
+			{SandboxID: "missing-local", OwnerNodeID: "self", IncarnationID: "inc-missing", State: cluster.PlacementStatePlaced},
+			{SandboxID: "reserved", OwnerNodeID: "self", IncarnationID: "inc-reserved", State: cluster.PlacementStateReserved},
+			{SandboxID: "other", OwnerNodeID: "peer", IncarnationID: "inc-other", State: cluster.PlacementStatePlaced},
 			{SandboxID: "", OwnerNodeID: "self", State: cluster.PlacementStatePlaced},
 		},
 	}

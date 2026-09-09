@@ -34,11 +34,14 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	secretspkg "github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // ErrNotLeader is returned by mutating Cluster operations when this node is not
@@ -103,6 +106,10 @@ var ErrReservationConflict = errors.New("cluster: sandbox already placed or rese
 // match the live placement (stale reseal loser).
 var ErrSecretRecipientsCASMismatch = errors.New("cluster: secret recipients CAS mismatch")
 
+// ErrInvalidSecretHandle rejects partial, generation-less, or cross-lifecycle
+// provider handles before they can enter replicated placement state.
+var ErrInvalidSecretHandle = errors.New("cluster: invalid secret handle")
+
 // ErrIncarnationConflict fences a placement update carrying secret state for
 // a different lifetime of the same sandbox ID.
 var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
@@ -162,10 +169,17 @@ type PlacementState string
 const (
 	PlacementStatePlaced   PlacementState = "" // empty = legacy/placed
 	PlacementStateReserved PlacementState = "reserved"
+	// PlacementStateDeleting is a distributed lifecycle fence. The current
+	// owner has committed delete intent, so failover/recreate and mutations
+	// must stop while durable secret/artifact cleanup completes.
+	PlacementStateDeleting PlacementState = "deleting"
 )
 
 // IsReserved reports whether p is a reservation awaiting promotion.
 func (p Placement) IsReserved() bool { return p.State == PlacementStateReserved }
+
+// IsDeleting reports whether lifecycle-wide finalization owns the placement.
+func (p Placement) IsDeleting() bool { return p.State == PlacementStateDeleting }
 
 // PlacementOwnerState records the ownership lifecycle independently from the
 // reservation lifecycle. Empty means the placement has an active owner.
@@ -192,24 +206,59 @@ type PlacementSecrets struct {
 	Version int    `json:"version,omitempty"`
 	// Recipients is the seal recipient set chosen at reserve time for
 	// failover.policy=recreate. It rides opReserve onto Placement.SecretRecipients
-	// (node IDs only — never ciphertext). Omitempty keeps mixed-version
-	// clusters wire-compatible. RecordPlacement leaves this empty so opPlace
-	// preserves the reservation's set.
+	// (node IDs only — never ciphertext). RecordPlacement leaves this empty so
+	// opPlace preserves the reservation's set.
 	Recipients []string `json:"recipients,omitempty"`
 	// OwnerRef is the control-plane tenant account for this sandbox. Not
 	// secret material — rides Place/Reserve so failover recreate preserves
 	// tenancy when the owner-watcher uses an unscoped internal context.
 	OwnerRef string `json:"owner_ref,omitempty"`
-	// IncarnationID tags this placement lifetime for secret binding. Minted
-	// at reserve; preserved across reassign. Additive omitempty.
+	// IncarnationID tags this placement lifetime for secret binding. Minted at
+	// reserve and preserved across reassign.
 	IncarnationID string `json:"incarnation_id,omitempty"`
 	// SealGeneration is the seal generation last coordinated via Raft
-	// (reseal / recipient expansion). Additive omitempty — 0 on pre-field rows.
+	// (reseal / recipient expansion).
 	SealGeneration int64 `json:"seal_generation,omitempty"`
 }
 
+func validatePlacementSecretHandle(sandboxID string, handle PlacementSecrets) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID := strings.TrimSpace(handle.IncarnationID)
+	if sandboxID == "" || strings.TrimSpace(handle.Ref) == "" || handle.Version != secretspkg.RefVersion ||
+		incarnationID == "" || handle.SealGeneration <= 0 {
+		return fmt.Errorf("%w: sandbox, current ref/version, incarnation, and positive generation are required", ErrInvalidSecretHandle)
+	}
+	parsed, err := secretspkg.ParseRef(handle.Ref)
+	if err != nil || parsed.SandboxID != sandboxID || parsed.IncarnationID != incarnationID || parsed.Version != handle.Version {
+		return fmt.Errorf("%w: ref does not match sandbox lifecycle", ErrInvalidSecretHandle)
+	}
+	return nil
+}
+
+// validateSecretRecipientUpdate enforces the one-way reseal contract before
+// a recipient transition can enter Raft. Both client wrappers and the FSM call
+// it so malformed or unfenced internal commands cannot publish a generation.
+func validateSecretRecipientUpdate(sandboxID string, recipients []string, next PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	expectedIncarnationID = strings.TrimSpace(expectedIncarnationID)
+	if sandboxID == "" || len(normalizeSecretRecipientIDs(recipients)) == 0 {
+		return fmt.Errorf("%w: sandbox id and recipients are required", ErrSecretRecipientsCASMismatch)
+	}
+	if expectedIncarnationID == "" || expectedSealGeneration <= 0 {
+		return fmt.Errorf("%w: positive expected generation and incarnation are required", ErrSecretRecipientsCASMismatch)
+	}
+	if strings.TrimSpace(next.IncarnationID) != expectedIncarnationID || next.Version != secretspkg.RefVersion || next.SealGeneration <= expectedSealGeneration {
+		return fmt.Errorf("%w: replacement handle must advance the current lifecycle generation", ErrSecretRecipientsCASMismatch)
+	}
+	parsed, err := secretspkg.ParseRef(next.Ref)
+	if err != nil || parsed.SandboxID != sandboxID || parsed.IncarnationID != expectedIncarnationID || parsed.Version != next.Version {
+		return fmt.Errorf("%w: replacement secret ref does not match the current lifecycle", ErrSecretRecipientsCASMismatch)
+	}
+	return nil
+}
+
 func (s PlacementSecrets) hasUpdate() bool {
-	return s.Ref != "" || s.Version != 0
+	return s.Ref != "" || s.Version != 0 || s.SealGeneration != 0
 }
 
 func secretsFromPlacement(p Placement) PlacementSecrets {
@@ -281,14 +330,14 @@ type Placement struct {
 	SecretVersion int                          `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
-	// recompute it. Additive omitempty — wire-compatible with older peers.
+	// recompute it. It is empty only when the placement has no replicated
+	// credential payload.
 	SecretRecipients []string `json:"secret_recipients,omitempty"`
 	// IncarnationID uniquely tags this placement lifetime for secret refs /
-	// seal bindings. Minted at reserve; preserved on reassign/promote.
-	// Additive omitempty — empty on pre-incarnation Raft rows.
+	// seal bindings. Minted at reserve and preserved on reassign/promote.
 	IncarnationID string `json:"incarnation_id,omitempty"`
 	// SecretSealGeneration is the last Raft-coordinated seal generation for
-	// this placement (reseal CAS). Additive omitempty — 0 until first coordinated update.
+	// this placement (reseal CAS). It is 0 only when no secret was sealed.
 	SecretSealGeneration int64 `json:"secret_seal_generation,omitempty"`
 	// OwnerRef is the control-plane tenant account (tenancy). Distinct from
 	// OwnerNodeID (which cluster node hosts the sandbox).
@@ -314,13 +363,14 @@ type Placement struct {
 	// the existing slice the same way ExposedPorts is preserved so a
 	// re-place/reassign cannot erase domains a prior raft entry installed.
 	CustomHostnames []string `json:"custom_hostnames,omitempty"`
-	// State is empty for materialized placements (the historical schema) and
-	// PlacementStateReserved for capacity-only intents that have not yet been
-	// promoted by a successful local create. Reservations are eligible for
-	// TTL-driven GC; opPlace transitions a reservation back to empty.
+	// State is empty for materialized placements, PlacementStateReserved for
+	// capacity-only intents, and PlacementStateDeleting while lifecycle-wide
+	// finalization owns the row. Reserved and deleting states are eligible for
+	// TTL-driven reconciliation; opPlace promotes a reservation to empty.
 	State PlacementState `json:"state,omitempty"`
-	// ExpiresUnix is meaningful only when State == PlacementStateReserved;
-	// the leader GC sweep cancels rows whose ExpiresUnix < now.
+	// ExpiresUnix bounds reserved and deleting states. The leader reconciler
+	// cancels expired reservations and completes abandoned exact-lifecycle
+	// deletes after their finalization lease expires.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
 }
 
@@ -334,6 +384,10 @@ type AuditACL struct {
 	AuditNodeIDs        []string `json:"audit_node_ids,omitempty"`
 	AuditNodesTruncated bool     `json:"audit_nodes_truncated,omitempty"`
 	ExpiresUnix         int64    `json:"expires_unix,omitempty"`
+	// RetainedVersion is the Raft log index of the delete that created this
+	// row. It provides a deterministic latest-lifecycle ordering without wall
+	// clocks or a second replicated table.
+	RetainedVersion uint64 `json:"retained_version"`
 }
 
 type AuditACLResponse struct {
@@ -585,11 +639,21 @@ type Client interface {
 
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error
+	// DeletePlacementExact removes only the placement lifecycle still owned by
+	// expectedOwnerNodeID. It is the destroy/finalizer primitive: a delayed
+	// cleanup must not erase an ID-reused or concurrently reassigned placement.
+	DeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error
+	// BeginDeletePlacementExact atomically freezes an exact owner/lifecycle
+	// before irreversible secret and external-artifact cleanup. It is
+	// idempotent for the same lifecycle and rejects reassignment races.
+	BeginDeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error
 	// AuditOwnerRef resolves the minimal Raft-retained owner ACL after placement
 	// deletion. PruneAuditACL removes expired rows through a deterministic Raft
 	// command so every ingress sees the same authorization state.
 	AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error)
-	AuditACLForSandbox(ctx context.Context, sandboxID string) (AuditACL, bool, error)
+	// AuditACLForSandbox resolves an exact retained lifecycle when
+	// incarnationID is non-empty, or the newest retained lifecycle otherwise.
+	AuditACLForSandbox(ctx context.Context, sandboxID, incarnationID string) (AuditACL, bool, error)
 	PruneAuditACL(ctx context.Context, cutoff time.Time) error
 
 	// ReserveOnTarget writes opReserve into the FSM holding capacity + name
@@ -643,7 +707,7 @@ type Client interface {
 	// so Daytona delete cannot miss a sandbox that lives on another worker.
 	VolumeAttachmentCount(ctx context.Context, tenant, id string) (int, error)
 	PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
-	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error
+	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 
 	// RemoveMember explicitly removes nodeID from the raft configuration after
 	// marking it drained and orphaning any placements it owned. Unknown raft
@@ -731,6 +795,13 @@ type Client interface {
 	// Used by list/get failover_ready batching so a page of N sandboxes does
 	// not pay for a full FSM scan.
 	PlacementsByIDs(ids []string) map[string]Placement
+
+	// AuthoritativePlacementsByIDs returns the same bounded point set from the
+	// current Raft leader. Unlike PlacementsByIDs, an unavailable or changing
+	// leader is an error rather than an empty result. Destructive reconcilers
+	// use this so a stale follower/control-plane outage cannot masquerade as
+	// placement absence and retire live lifecycle data.
+	AuthoritativePlacementsByIDs(ctx context.Context, ids []string) (map[string]Placement, error)
 
 	// PlacementVersion is the FSM's monotonic apply counter — bumps on every
 	// raft log entry the FSM applied. Exposed for metrics/observability and

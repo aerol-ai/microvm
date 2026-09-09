@@ -234,36 +234,36 @@ func TestClusterSecretsErrorArmsWave8(t *testing.T) {
 	}
 
 	s := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
-	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil || !strings.Contains(err.Error(), "cipher") {
+	binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", 1), Version: 1, Generation: 1}
+	if _, err := secrets.SealEnvelopeBound(s.cipher, secretsFromRequest(req), []string{"node-a"}, binding); err == nil || !strings.Contains(err.Error(), "cipher") {
 		t.Fatalf("nil cipher = %v", err)
 	}
 
 	s.cipher = newTestCipher(t)
 	setRandReader(t, &scriptedRandReader{errs: []error{errors.New("dek fail")}})
-	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
+	if _, err := secrets.SealEnvelopeBound(s.cipher, secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected dek entropy failure")
 	}
 
 	setRandReader(t, &scriptedRandReader{errs: []error{nil /*dek*/, errors.New("nonce fail")}})
-	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
+	if _, err := secrets.SealEnvelopeBound(s.cipher, secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected nonce entropy failure")
 	}
 
 	// Broken cipher (zero value) fails EncryptWithAAD on wrap.
 	s.cipher = &secrets.Cipher{}
-	if _, err := secrets.SealEnvelopeBound(s.cipher, s.secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
+	if _, err := secrets.SealEnvelopeBound(s.cipher, secretsFromRequest(req), []string{"node-a"}, binding); err == nil {
 		t.Fatal("expected wrap failure")
 	}
 
 	s2 := &Service{cipher: newTestCipher(t), store: nil, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	if _, err := s2.SealAndDistribute(ctx, "sb", req, []string{"n1"}, SealStrict); err == nil || !strings.Contains(err.Error(), "store") {
+	if _, err := s2.SealAndDistribute(ctx, "sb", req, []string{"n1"}); err == nil || !strings.Contains(err.Error(), "store") {
 		t.Fatalf("nil store put = %v", err)
 	}
-	if _, err := s2.SealAndDistribute(ctx, "", req, []string{"n1"}, SealStrict); err == nil {
+	if _, err := s2.SealAndDistribute(ctx, "", req, []string{"n1"}); err == nil {
 		t.Fatal("expected empty sandbox id")
 	}
-	empty, err := s2.SealAndDistribute(ctx, "sb", models.CreateSandboxRequest{Image: "x"}, []string{"n1"}, SealStrict)
+	empty, err := s2.SealAndDistribute(ctx, "sb", models.CreateSandboxRequest{Image: "x"}, []string{"n1"})
 	if err != nil || empty.Ref != "" {
 		t.Fatalf("no secrets = %+v %v", empty, err)
 	}
@@ -450,7 +450,8 @@ func TestDestroySandboxMountAndDestroyFailWave8(t *testing.T) {
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: "sb-dd", Image: "alpine", Status: models.SandboxStatusStarted,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-sb-dd",
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +639,7 @@ func TestGCZombieSnapshotFailWave8(t *testing.T) {
 
 func TestSealClusterSecretEnvelopeDirectWave8(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
-	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", 1), Version: 1, Generation: 1}
 	out, err := secrets.SealRawEnvelopeBound(s.cipher, []byte(`{"x":1}`), []string{"node-a"}, binding)
 	if err != nil || len(out) == 0 {
 		t.Fatalf("seal = %v %d", err, len(out))

@@ -79,7 +79,7 @@ func TestWriteTarHelpersErrorArmsWave15(t *testing.T) {
 func TestClusterSecretHelpersWave15(t *testing.T) {
 	_ = secrets.NormalizeRecipients([]string{"", " b ", "a", "a", "  "})
 	_ = secrets.NormalizeRecipients(nil)
-	binding := secrets.SealBinding{SandboxID: "sb", Ref: secrets.FormatRef("sb", 1), Version: 1, Generation: 1}
+	binding := secrets.SealBinding{SandboxID: "sb", IncarnationID: "inc-test", Ref: secrets.FormatRef("sb", "inc-test", 1), Version: 1, Generation: 1}
 
 	if _, err := secrets.OpenEnvelopePayloadBound([]byte("short"), []byte("x"), []string{"n1"}, binding); err == nil {
 		t.Fatal("expected bad dek")
@@ -104,12 +104,12 @@ func TestClusterSecretHelpersWave15(t *testing.T) {
 
 	if _, err := s.SealAndDistribute(context.Background(), "", models.CreateSandboxRequest{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, []string{"n1"}, SealStrict); err == nil {
+	}, []string{"n1"}); err == nil {
 		t.Fatal("expected empty sandbox id")
 	}
 	if _, err := (&Service{}).SealAndDistribute(context.Background(), "sb", models.CreateSandboxRequest{
 		Registry: &models.RegistryAuth{Username: "u", Password: "p"},
-	}, []string{"n1"}, SealStrict); err == nil {
+	}, []string{"n1"}); err == nil {
 		t.Fatal("expected nil cipher/store")
 	}
 }
