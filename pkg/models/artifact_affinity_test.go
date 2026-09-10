@@ -2,6 +2,18 @@ package models
 
 import "testing"
 
+func TestModuleRefForCreatePrefersModuleRef(t *testing.T) {
+	if got := ModuleRefForCreate(CreateSandboxRequest{ModuleRef: " sha256:abc ", Image: "img"}); got != "sha256:abc" {
+		t.Fatalf("module ref = %q", got)
+	}
+	if got := ModuleRefForCreate(CreateSandboxRequest{Image: " img "}); got != "img" {
+		t.Fatalf("image fallback = %q", got)
+	}
+	if got := ModuleRefForCreate(CreateSandboxRequest{}); got != "" {
+		t.Fatalf("empty = %q", got)
+	}
+}
+
 func TestJSBundleNodeRefRoundTrip(t *testing.T) {
 	ref := JSBundleRefForNode("sha256:abcdef", "worker-a")
 	nodeID, local, ok := ParseJSBundleNodeRef(ref)
