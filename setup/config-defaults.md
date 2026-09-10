@@ -59,7 +59,7 @@ feature is still mid-rollout.
 | `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
 | `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create. Cluster mode requires `>0`; zero ACKs retract the secret and fail the create. |
 | `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` retention. Appends are fsynced at least once per second and at shutdown; pruned daily (and on sink start). `0` disables prune. |
-| `SB_SECRET_AUDIT_STRICT_BOOT` | `true` | Refuse daemon startup when the local secret-audit writer cannot be opened. |
+| `SB_SECRET_AUDIT_STRICT_BOOT` | `true` | Refuse daemon startup when the local secret-audit writer cannot be opened or its hash chain fails verification. A torn final record from an unclean shutdown is not a failure: it is cut at open and recorded as a `reason=torn_tail` gap marker. |
 | `SB_SECRET_TOMB_RETENTION_DAYS` | `30` | Retain delete fences after all peer ACKs; `0` disables tombstone GC. Live/pending rows are never pruned. |
 | `SB_EGRESS_ATTRIBUTION_ENABLED` | `true` | Wasm/isolate egress destination records in the same audit JSONL (`kind=egress`). Observational; off create path. |
 

@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -36,6 +37,9 @@ const (
 	secretAuditReasonDecryptFailed   = "decrypt_failed"
 	secretAuditReasonError           = "error"
 	secretAuditReasonOverflow        = "overflow"
+	// secretAuditReasonTornTail marks a gap the sink chained at boot after
+	// cutting an unterminated, unparseable tail that a crash left mid-append.
+	secretAuditReasonTornTail = "torn_tail"
 
 	// secretAuditKindSecretOpen is an explicit stored kind. Missing Kind is not
 	// reinterpreted. secretAuditKindEgress is host-mediated destination
@@ -60,6 +64,14 @@ const (
 	// wasm workers lock this path *before* opening secrets.jsonl so a rename
 	// during prune cannot leave writers appending to an unlinked inode.
 	secretAuditLockName = "secrets.jsonl.lock"
+	// secretAuditTornName is the durable intent record for a boot-time tail
+	// repair. Written before the truncate and removed after the gap marker is
+	// chained, so a crash between the two cannot lose the record that evidence
+	// was lost.
+	secretAuditTornName = "secrets.torn"
+	// secretAuditMaxLineBytes bounds one JSONL record during chain scans; audit
+	// lines are metadata-only, so anything larger is corruption, not evidence.
+	secretAuditMaxLineBytes = 1024 * 1024
 )
 
 var (
@@ -67,6 +79,10 @@ var (
 	auditSpillMalformedTotal = expvar.NewInt("aerolvm_audit_spill_malformed_total")
 	auditTipWriteFailTotal   = expvar.NewInt("aerolvm_audit_tip_write_fail_total")
 	secretAuditSinkHealthy   = expvar.NewInt("aerolvm_secret_audit_sink_healthy")
+	// Boot-time torn-tail repairs. Each one is also a gap marker in the chain
+	// and a log line; the counters exist so the alert fires without log access.
+	auditTornTailRepairsTotal = expvar.NewInt("aerolvm_audit_torn_tail_repairs_total")
+	auditTornTailBytesTotal   = expvar.NewInt("aerolvm_audit_torn_tail_bytes_total")
 )
 
 // SecretAuditEvent is one audit record (secret-open by default, or host-mediated
@@ -140,12 +156,16 @@ type fileAuditSink struct {
 	tipPath          string
 	spillPath        string
 	spillWorkingPath string
+	tornPath         string
 	witnessTipPath   string // optional; prune reads WitnessedThrough from here
 	file             *os.File
-	chainMu          sync.Mutex
-	chainHead        string
-	chainEvent       string
-	writePoison      error // append outcome became ambiguous; refuse later writes
+	// bootRepair is set when this open truncated a torn tail and chained the
+	// corresponding gap marker; the Service logs it once at sink init.
+	bootRepair  *secretAuditTornTailRepair
+	chainMu     sync.Mutex
+	chainHead   string
+	chainEvent  string
+	writePoison error // append outcome became ambiguous; refuse later writes
 	// writeHook, when set (tests), runs before each file write and may block.
 	writeHook func()
 	// afterPrune, when set (Service), ships a new witness tip after prune
@@ -164,62 +184,180 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 	if err := os.MkdirAll(auditDir, 0o700); err != nil {
 		return nil, fmt.Errorf("secret audit mkdir: %w", err)
 	}
-	path := filepath.Join(auditDir, secretAuditFileName)
-	lockPath := filepath.Join(auditDir, secretAuditLockName)
-	gapPath := filepath.Join(auditDir, "secrets.gap")
-	tipPath := filepath.Join(auditDir, "secrets.tip")
-	spillPath := filepath.Join(auditDir, secretAuditSpillName)
-	spillWorkingPath := filepath.Join(auditDir, secretAuditSpillWorking)
-	// Acquire the stable sidecar lock before opening the data file so retention
-	// rename cannot race a concurrent open+append onto an unlinked inode.
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("secret audit lock open: %w", err)
-	}
-	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
-		_ = lockFile.Close()
-		return nil, fmt.Errorf("secret audit lock: %w", err)
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-		_ = lockFile.Close()
-		return nil, fmt.Errorf("secret audit open: %w", err)
-	}
-	// Refuse to append after malformed or tampered evidence. Continuing from a
-	// stale sidecar tip would fork the chain and make every later event
-	// unverifiable, so startup derives the tip from the authoritative JSONL.
-	head, tipEvent, err := RecomputeChainHead(path)
-	if err != nil {
-		_ = f.Close()
-		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-		_ = lockFile.Close()
-		return nil, fmt.Errorf("verify secret audit chain: %w", err)
-	}
-	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-	_ = lockFile.Close()
-	pending := loadGapCount(gapPath)
 	s := &fileAuditSink{
 		ch:               make(chan auditWriteReq, buffer),
 		spillCh:          make(chan SecretAuditEvent, buffer),
 		done:             make(chan struct{}),
-		path:             path,
-		lockPath:         lockPath,
-		gapPath:          gapPath,
-		tipPath:          tipPath,
-		spillPath:        spillPath,
-		spillWorkingPath: spillWorkingPath,
+		path:             filepath.Join(auditDir, secretAuditFileName),
+		lockPath:         filepath.Join(auditDir, secretAuditLockName),
+		gapPath:          filepath.Join(auditDir, "secrets.gap"),
+		tipPath:          filepath.Join(auditDir, "secrets.tip"),
+		spillPath:        filepath.Join(auditDir, secretAuditSpillName),
+		spillWorkingPath: filepath.Join(auditDir, secretAuditSpillWorking),
+		tornPath:         filepath.Join(auditDir, secretAuditTornName),
 		witnessTipPath:   filepath.Join(auditDir, secretAuditWitnessTipFile),
-		file:             f,
 		spillEnabled:     spillEnabled,
-		chainHead:        head,
-		chainEvent:       tipEvent,
 	}
-	if pending > 0 {
-		s.pendingGap.Store(pending)
+	// Probe the sidecar lock read-write once: withAuditFileLock opens it
+	// read-only (a directory or unwritable path would pass), and a lock the
+	// daemon cannot own must fail here, not on the first append.
+	lockProbe, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("secret audit lock open: %w", err)
+	}
+	_ = lockProbe.Close()
+	// Hold the stable sidecar lock across verify, repair, and open so retention
+	// rename cannot race a concurrent open+append onto an unlinked inode, and so
+	// no reader can snapshot a tail this open is about to cut.
+	if err := s.withAuditFileLock(s.openLocked); err != nil {
+		return nil, err
 	}
 	go s.loop()
 	return s, nil
+}
+
+// openLocked verifies the chain, repairs what a crash mid-append can leave,
+// opens the append handle, and chains the repair marker before any new event.
+//
+// Appends are one write per batch and fsynced on a ticker, so an unclean
+// shutdown can leave a strict byte-prefix of the last batch on disk. Refusing
+// to open on that tail would turn every OOM-kill or power loss into a node
+// that cannot boot under strict mode, while the tail itself proves nothing was
+// tampered with: every complete line before it still verifies. Cut it, keep
+// the verified prefix as the chain head, and record the loss in-stream.
+//
+// Anything else — malformed JSON that *was* fully written, or a valid record
+// whose hash does not link — is corruption or tampering and still fails closed.
+func (s *fileAuditSink) openLocked() error {
+	scan, err := scanSecretAuditChain(s.path, false)
+	if err != nil {
+		return fmt.Errorf("verify secret audit chain: %w", err)
+	}
+	pendingRepair := loadTornTailRepair(s.tornPath)
+	if scan.tornBytes > 0 {
+		rec := secretAuditTornTailRepair{Offset: scan.validEnd, Bytes: scan.tornBytes, Dropped: 1}
+		switch {
+		case pendingRepair == nil:
+		case pendingRepair.Offset == scan.validEnd:
+			// The same tear: an earlier open recorded it but did not finish
+			// (the truncate failed, or it crashed while writing the marker).
+			// Keep the first accounting so one loss is never reported twice.
+			rec.Dropped = pendingRepair.Dropped
+			rec.Bytes = max(rec.Bytes, pendingRepair.Bytes)
+		default:
+			// A marker was still owed at another offset and a new tear
+			// appeared after it: both losses are real.
+			rec.Bytes += pendingRepair.Bytes
+			rec.Dropped += pendingRepair.Dropped
+		}
+		// Durable intent before the destructive write: if the marker append
+		// below fails, the next open still owes the stream this gap.
+		if err := persistTornTailRepair(s.tornPath, rec); err != nil {
+			return fmt.Errorf("record secret audit torn-tail repair: %w", err)
+		}
+		pendingRepair = &rec
+	}
+	if scan.tornBytes > 0 || scan.missingNewline {
+		if err := repairSecretAuditTail(s.path, scan); err != nil {
+			return fmt.Errorf("repair secret audit tail: %w", err)
+		}
+	}
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("secret audit open: %w", err)
+	}
+	s.file = f
+	// Never continue from the sidecar tip: it can lag or lead the file after a
+	// crash, and either forks the chain. The verified scan is authoritative.
+	s.chainHead = scan.head
+	s.chainEvent = scan.eventID
+	if pending := loadGapCount(s.gapPath); pending > 0 {
+		s.pendingGap.Store(pending)
+	}
+	if pendingRepair == nil {
+		return nil
+	}
+	// Dropped is a floor: exactly one partial record was visible on disk, but
+	// events still in the page cache at the crash left no trace at all.
+	marker := SecretAuditEvent{
+		Time:    time.Now().UTC(),
+		Result:  secretAuditResultGap,
+		Reason:  secretAuditReasonTornTail,
+		Kind:    secretAuditKindGap,
+		Dropped: pendingRepair.Dropped,
+	}
+	if err := s.appendBatchLocked([]SecretAuditEvent{marker}, true); err != nil {
+		_ = f.Close()
+		s.file = nil
+		return fmt.Errorf("record secret audit torn-tail gap marker: %w", err)
+	}
+	_ = os.Remove(s.tornPath)
+	s.bootRepair = pendingRepair
+	auditTornTailRepairsTotal.Add(1)
+	auditTornTailBytesTotal.Add(pendingRepair.Bytes)
+	return nil
+}
+
+// repairSecretAuditTail makes the file end exactly on a newline-terminated,
+// verified line. Caller holds the audit flock. The two cases are exclusive: a
+// torn tail is cut back to validEnd; a complete final record that only lost
+// its terminator gets one, or the next append would be glued onto it.
+func repairSecretAuditTail(path string, scan secretAuditChainScan) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if scan.tornBytes > 0 {
+		if err := f.Truncate(scan.validEnd); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	if scan.missingNewline {
+		if _, err := f.Seek(0, io.SeekEnd); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if _, err := f.Write([]byte{'\n'}); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// secretAuditTornTailRepair is the durable intent record behind secrets.torn.
+type secretAuditTornTailRepair struct {
+	Offset  int64 `json:"offset"`
+	Bytes   int64 `json:"bytes"`
+	Dropped int64 `json:"dropped"`
+}
+
+// loadTornTailRepair returns the pending repair, or nil when none is owed. A
+// sidecar that exists but cannot be parsed still owes at least one marker —
+// only this process writes it, so garbage there is not a reason to forget.
+func loadTornTailRepair(path string) *secretAuditTornTailRepair {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var rec secretAuditTornTailRepair
+	if json.Unmarshal(raw, &rec) != nil || rec.Dropped <= 0 {
+		return &secretAuditTornTailRepair{Dropped: 1}
+	}
+	return &rec
+}
+
+func persistTornTailRepair(path string, rec secretAuditTornTailRepair) error {
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomicDurable(path, append(raw, '\n'), 0o600)
 }
 
 func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
@@ -905,80 +1043,7 @@ func (s *fileAuditSink) writeEventBatch(events []SecretAuditEvent, durable, acco
 		}
 	}
 	lineErr := s.withAuditFileLock(func() error {
-		s.chainMu.Lock()
-		poisoned := s.writePoison
-		s.chainMu.Unlock()
-		if poisoned != nil {
-			return fmt.Errorf("secret audit writer poisoned: %w", poisoned)
-		}
-		// Prefer the verified in-memory tip under flock. If it is ever absent,
-		// recompute from authoritative evidence and propagate corruption instead
-		// of silently restarting from genesis.
-		prev := s.chainHead
-		if prev == "" {
-			var err error
-			prev, _, err = RecomputeChainHead(s.path)
-			if err != nil {
-				return fmt.Errorf("recompute secret audit chain head: %w", err)
-			}
-		}
-		if prev == "" {
-			prev = auditlog.GenesisPrevHash
-		}
-		var encoded []byte
-		for i := range events {
-			ev := &events[i]
-			if ev.Time.IsZero() {
-				ev.Time = time.Now().UTC()
-			}
-			ensureSecretAuditEventID(ev)
-			auditlog.LinkEvent(prev, ev)
-			line, err := json.Marshal(ev)
-			if err != nil {
-				return err
-			}
-			encoded = append(encoded, line...)
-			encoded = append(encoded, '\n')
-			prev = ev.EventHash
-		}
-		before, err := s.file.Stat()
-		if err != nil {
-			return err
-		}
-		rollback := func(writeErr error) error {
-			if truncateErr := s.file.Truncate(before.Size()); truncateErr != nil {
-				s.chainMu.Lock()
-				s.writePoison = fmt.Errorf("rollback append after %v: %w", writeErr, truncateErr)
-				s.chainMu.Unlock()
-				return s.writePoison
-			}
-			if syncErr := s.file.Sync(); syncErr != nil {
-				s.chainMu.Lock()
-				s.writePoison = fmt.Errorf("sync rollback after %v: %w", writeErr, syncErr)
-				s.chainMu.Unlock()
-				return s.writePoison
-			}
-			return writeErr
-		}
-		if _, err := s.file.Write(encoded); err != nil {
-			return rollback(err)
-		}
-		if durable {
-			if err := s.file.Sync(); err != nil {
-				return rollback(err)
-			}
-		}
-		last := events[len(events)-1]
-		s.chainMu.Lock()
-		s.chainHead = last.EventHash
-		s.chainEvent = last.EventID
-		s.chainMu.Unlock()
-		if durable {
-			if tipErr := persistChainTipErr(s.tipPath, last.EventHash, last.EventID); tipErr != nil {
-				auditTipWriteFailTotal.Add(1)
-			}
-		}
-		return nil
+		return s.appendBatchLocked(events, durable)
 	})
 	if lineErr != nil {
 		secretAuditSinkHealthy.Set(0)
@@ -990,6 +1055,86 @@ func (s *fileAuditSink) writeEventBatch(events []SecretAuditEvent, durable, acco
 		return lineErr
 	}
 	secretAuditSinkHealthy.Set(1)
+	return nil
+}
+
+// appendBatchLocked links, appends, and (when durable) fsyncs one batch.
+// Caller holds the audit flock. Shared by the writer goroutine and the boot
+// repair path, which already holds the lock and must not re-acquire it.
+func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable bool) error {
+	s.chainMu.Lock()
+	poisoned := s.writePoison
+	s.chainMu.Unlock()
+	if poisoned != nil {
+		return fmt.Errorf("secret audit writer poisoned: %w", poisoned)
+	}
+	// Prefer the verified in-memory tip under flock. If it is ever absent,
+	// recompute from authoritative evidence and propagate corruption instead
+	// of silently restarting from genesis.
+	prev := s.chainHead
+	if prev == "" {
+		var err error
+		prev, _, err = RecomputeChainHead(s.path)
+		if err != nil {
+			return fmt.Errorf("recompute secret audit chain head: %w", err)
+		}
+	}
+	if prev == "" {
+		prev = auditlog.GenesisPrevHash
+	}
+	var encoded []byte
+	for i := range events {
+		ev := &events[i]
+		if ev.Time.IsZero() {
+			ev.Time = time.Now().UTC()
+		}
+		ensureSecretAuditEventID(ev)
+		auditlog.LinkEvent(prev, ev)
+		line, err := json.Marshal(ev)
+		if err != nil {
+			return err
+		}
+		encoded = append(encoded, line...)
+		encoded = append(encoded, '\n')
+		prev = ev.EventHash
+	}
+	before, err := s.file.Stat()
+	if err != nil {
+		return err
+	}
+	rollback := func(writeErr error) error {
+		if truncateErr := s.file.Truncate(before.Size()); truncateErr != nil {
+			s.chainMu.Lock()
+			s.writePoison = fmt.Errorf("rollback append after %v: %w", writeErr, truncateErr)
+			s.chainMu.Unlock()
+			return s.writePoison
+		}
+		if syncErr := s.file.Sync(); syncErr != nil {
+			s.chainMu.Lock()
+			s.writePoison = fmt.Errorf("sync rollback after %v: %w", writeErr, syncErr)
+			s.chainMu.Unlock()
+			return s.writePoison
+		}
+		return writeErr
+	}
+	if _, err := s.file.Write(encoded); err != nil {
+		return rollback(err)
+	}
+	if durable {
+		if err := s.file.Sync(); err != nil {
+			return rollback(err)
+		}
+	}
+	last := events[len(events)-1]
+	s.chainMu.Lock()
+	s.chainHead = last.EventHash
+	s.chainEvent = last.EventID
+	s.chainMu.Unlock()
+	if durable {
+		if tipErr := persistChainTipErr(s.tipPath, last.EventHash, last.EventID); tipErr != nil {
+			auditTipWriteFailTotal.Add(1)
+		}
+	}
 	return nil
 }
 
@@ -1006,8 +1151,11 @@ func (s *fileAuditSink) chainTip() (head, eventID string) {
 // HashEvent(PrevHash, ev) with PrevHash linkage. Does not trust secrets.tip.
 // Returns the verified tip head and its event ID (genesis/"0" when empty).
 func RecomputeChainHead(path string) (head, eventID string, err error) {
-	head, eventID, _, err = recomputeChain(path)
-	return head, eventID, err
+	scan, err := strictSecretAuditChainScan(path, false)
+	if err != nil {
+		return "", "", err
+	}
+	return scan.head, scan.eventID, nil
 }
 
 type secretAuditChainVerifier struct {
@@ -1062,40 +1210,141 @@ func (v *secretAuditChainVerifier) Add(ev SecretAuditEvent) error {
 // bytes are verified as stored (no rewrite); a single discontinuity is allowed
 // immediately after a retention_checkpoint.
 func recomputeChain(path string) (head, eventID string, hashes []string, err error) {
+	scan, err := strictSecretAuditChainScan(path, true)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return scan.head, scan.eventID, scan.hashes, nil
+}
+
+// strictSecretAuditChainScan is the read-side contract: a torn tail is an
+// error here. Only the sink constructor may repair one — every other caller
+// (writer tip fallback, witness verify, tests) must refuse a tail it cannot
+// verify rather than quietly trim evidence.
+func strictSecretAuditChainScan(path string, collectHashes bool) (secretAuditChainScan, error) {
+	scan, err := scanSecretAuditChain(path, collectHashes)
+	if err != nil {
+		return scan, err
+	}
+	if scan.tornBytes > 0 {
+		return scan, fmt.Errorf("secret audit chain has an unterminated %d-byte tail at offset %d that is not valid json", scan.tornBytes, scan.validEnd)
+	}
+	return scan, nil
+}
+
+// secretAuditChainScan is one verified pass over secrets.jsonl.
+type secretAuditChainScan struct {
+	head    string
+	eventID string
+	hashes  []string
+	// validEnd is the byte offset just past the last complete, verified line.
+	validEnd int64
+	// tornBytes is the length of an unterminated, unparseable tail after
+	// validEnd — what a crash leaves when it interrupts one append write. The
+	// writer emits line+'\n' in a single write, so a crash leaves a strict
+	// byte-prefix, and no proper prefix of a JSON object is itself valid JSON;
+	// that is what makes this the only defect safe to classify as a tear.
+	tornBytes int64
+	// missingNewline reports a complete, verified final record without its
+	// terminator (the write stopped exactly between '}' and '\n').
+	missingNewline bool
+}
+
+// scanSecretAuditChain walks the file once, verifying every record against
+// its predecessor. Blank lines are tolerated but never alter the chain.
+func scanSecretAuditChain(path string, collectHashes bool) (secretAuditChainScan, error) {
+	scan := secretAuditChainScan{head: auditlog.GenesisPrevHash}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return auditlog.GenesisPrevHash, "", nil, nil
+			return scan, nil
 		}
-		return "", "", nil, err
+		return scan, err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	br := bufio.NewReaderSize(f, 64*1024)
 	verifier := newSecretAuditChainVerifier()
-	head = auditlog.GenesisPrevHash
+	var offset int64
 	lineNo := 0
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+	for {
+		line, consumed, terminated, tooLong, err := readSecretAuditLine(br)
+		if err != nil {
+			return scan, err
+		}
+		if consumed == 0 {
+			return scan, nil
+		}
+		offset += consumed
+		if tooLong {
+			if !terminated {
+				scan.tornBytes = offset - scan.validEnd
+				return scan, nil
+			}
+			return scan, fmt.Errorf("secret audit chain line %d exceeds %d bytes", lineNo+1, secretAuditMaxLineBytes)
+		}
+		text := bytes.TrimSpace(line)
+		if len(text) == 0 {
+			// Whitespace is harmless in either position: a terminated blank line
+			// is kept, and unterminated trailing whitespace is left for the
+			// next append to follow (TrimSpace on read absorbs it).
+			if terminated {
+				scan.validEnd = offset
+			}
 			continue
 		}
 		lineNo++
 		var ev SecretAuditEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			return "", "", nil, fmt.Errorf("secret audit chain line %d: malformed json: %w", lineNo, err)
+		if err := json.Unmarshal(text, &ev); err != nil {
+			if !terminated {
+				scan.tornBytes = offset - scan.validEnd
+				return scan, nil
+			}
+			return scan, fmt.Errorf("secret audit chain line %d: malformed json: %w", lineNo, err)
 		}
+		// A parseable record that does not link is never a tear (see
+		// tornBytes) — fail regardless of whether its terminator is present.
 		if err := verifier.Add(ev); err != nil {
-			return "", "", nil, fmt.Errorf("secret audit chain line %d: %w", lineNo, err)
+			return scan, fmt.Errorf("secret audit chain line %d: %w", lineNo, err)
 		}
-		head = ev.EventHash
-		eventID = ev.EventID
-		hashes = append(hashes, ev.EventHash)
+		scan.head = ev.EventHash
+		scan.eventID = ev.EventID
+		if collectHashes {
+			scan.hashes = append(scan.hashes, ev.EventHash)
+		}
+		scan.validEnd = offset
+		if !terminated {
+			scan.missingNewline = true
+			return scan, nil
+		}
 	}
-	if err := sc.Err(); err != nil {
-		return "", "", nil, err
+}
+
+// readSecretAuditLine returns one line (terminator included when present)
+// and the bytes consumed. A line past secretAuditMaxLineBytes is counted but
+// not retained so a NUL-filled or runaway tail cannot balloon the scan.
+func readSecretAuditLine(br *bufio.Reader) (line []byte, consumed int64, terminated, tooLong bool, err error) {
+	for {
+		chunk, readErr := br.ReadSlice('\n')
+		consumed += int64(len(chunk))
+		if !tooLong {
+			if int64(len(line))+int64(len(chunk)) > secretAuditMaxLineBytes {
+				tooLong = true
+				line = nil
+			} else {
+				line = append(line, chunk...)
+			}
+		}
+		switch {
+		case readErr == nil:
+			return line, consumed, true, tooLong, nil
+		case errors.Is(readErr, bufio.ErrBufferFull):
+			continue
+		case errors.Is(readErr, io.EOF):
+			return line, consumed, false, tooLong, nil
+		default:
+			return nil, consumed, false, tooLong, readErr
+		}
 	}
-	return head, eventID, hashes, nil
 }
 
 func persistChainTip(path, head, eventID string) {
@@ -1239,6 +1488,10 @@ func (s *Service) ensureSecretAuditSink() {
 		secretAuditSinkHealthy.Set(1)
 		s.secretAudit = sink
 		s.secretAuditFile = sink
+		if r := sink.bootRepair; r != nil && s.logger != nil {
+			s.logger.Warn("secret audit torn tail repaired at boot; gap marker chained",
+				"offset", r.Offset, "bytes_cut", r.Bytes, "dropped_at_least", r.Dropped, "path", sink.path)
+		}
 		// Prune rotates the hash chain — ship the new tip to the external
 		// witness immediately so LastWitnessedHead tracks the re-linked head.
 		sink.afterPrune = func() {

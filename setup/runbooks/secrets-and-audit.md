@@ -99,6 +99,33 @@ only `ca.crt`, `node.crt`, and `node.key`.
 4. Mitigate: free disk, reduce decrypt storms, restart only after capturing the
    current JSONL for evidence.
 
+### Torn tail at boot (`"reason":"torn_tail"`)
+
+Appends are one write per batch and fsynced at least once per second, so an
+unclean shutdown (OOM kill, power loss, `kill -9`, spot reclaim) can leave a
+partial final record on disk. At the next open the sink cuts that
+unterminated, unparseable tail back to the last verified record, chains a gap
+marker (`"result":"gap","reason":"torn_tail"`), logs
+`secret audit torn tail repaired at boot`, and increments
+`aerolvm_audit_torn_tail_repairs_total` / `aerolvm_audit_torn_tail_bytes_total`
+(alert `SandboxdAuditTornTailRepaired`). The node boots normally under strict
+mode; no operator action is needed for the audit sink itself.
+
+What this does and does not mean:
+
+- Every record before the marker still verifies; nothing was rewritten.
+- `dropped` on the marker is a floor. Exactly one partial record was visible on
+  disk; events still in the page cache at the crash left no trace at all.
+- Only an *unterminated* tail that is not valid JSON is treated as a tear. A
+  fully written malformed line, or a parseable record whose hash does not link,
+  still refuses to open — that is corruption or tampering, not a crash, and the
+  `SandboxdSecretAuditSinkUnavailable` path applies.
+- `secrets.torn` in the audit directory means a repair was recorded but its
+  marker has not been chained yet (the daemon went down again in between). The
+  next open writes it. Do not delete the file.
+
+Repeated firing means the node itself is crashing. Find that cause first.
+
 Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) prunes old lines daily.
 Prune drops a prefix and inserts an immutable `retention_checkpoint` (kept
 event bytes / EventHash are unchanged). Witness verification uses

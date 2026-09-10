@@ -399,6 +399,20 @@ groups:
           description: "aerolvm_audit_events_dropped_total increased in the last 5 minutes. The local audit stream has gap markers; history on this node is incomplete."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # A crash mid-append left an unterminated partial record; the sink cut it
+      # at boot and chained a torn_tail gap marker. Evidence before the tear is
+      # intact, but whatever was still in the page cache at the crash is gone.
+      - alert: SandboxdAuditTornTailRepaired
+        expr: increase(aerolvm_audit_torn_tail_repairs_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd repaired a torn secret audit tail at boot"
+          description: "aerolvm_audit_torn_tail_repairs_total increased: the node restarted after an unclean shutdown and cut an unterminated partial record from secrets.jsonl. A gap marker (reason=torn_tail) is in the chain; its dropped count is a floor. Repeated firing means the node is crashing — find that cause, the audit sink is behaving as designed."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Async sealed-blob peer push/delete failures. Creates do not wait on
       # fan-out; failover_ready stays false until copies land.
       - alert: SandboxdSecretFanoutFailures
