@@ -749,7 +749,7 @@ func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedO
 	cmd := command{
 		Op: opDelete, SandboxID: sandboxID,
 		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
-		ExpiresUnix: auditACLExpiryUnix(c.cfg.SecretAuditRetentionDays),
+		ExpiresUnix: auditACLExpiryUnix(c.cfg.AuditDeletedGrace), AuditIndexMax: int64(c.cfg.AuditDeletedIndexMax),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -777,11 +777,13 @@ func placementDeleteExpiryUnix() int64 {
 	return time.Now().UTC().Add(placementDeleteFinalizeTTL).Unix()
 }
 
-func auditACLExpiryUnix(retentionDays int) int64 {
-	if retentionDays <= 0 {
+// auditACLExpiryUnix bounds the post-delete routing stub by the configured
+// grace. Zero disables retention outright — it never means forever.
+func auditACLExpiryUnix(grace time.Duration) int64 {
+	if grace <= 0 {
 		return 0
 	}
-	return time.Now().UTC().Add(time.Duration(retentionDays) * 24 * time.Hour).Unix()
+	return time.Now().UTC().Add(grace).Unix()
 }
 
 func (c *Cluster) AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error) {

@@ -4,18 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 type maliciousOffsetExporter struct {
@@ -129,7 +125,10 @@ func TestSecretAuditPruneGuardsCloseAppendAfterVerificationWindow(t *testing.T) 
 
 func TestSecretAuditPruneChangesGenerationAndExportsFromStart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
-	svc := &Service{cfg: config.Config{DBPath: dbPath}}
+	// Retention 0 now means a one-day crash buffer, and the sink prunes once at
+	// open; an explicit 30-day window keeps the 48h-old event for the prune
+	// this test performs itself.
+	svc := &Service{cfg: config.Config{DBPath: dbPath, SecretAuditRetentionDays: 30}}
 	t.Cleanup(svc.CloseSecretAuditSink)
 	sink := svc.secretAuditSink().(*fileAuditSink)
 	now := time.Now().UTC()
@@ -179,31 +178,6 @@ func TestSecretAuditPruneChangesGenerationAndExportsFromStart(t *testing.T) {
 	}
 }
 
-func TestHTTPAuditExporterSendsBearerAndIdempotencyKey(t *testing.T) {
-	var auth, idem string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth = r.Header.Get("Authorization")
-		idem = r.Header.Get("Idempotency-Key")
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.Header().Set("X-Aerol-Audit-Next-Offset", "999999")
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer srv.Close()
-	exporter := newHTTPAuditBatchExporter(srv.URL, "receiver-token")
-	next, err := exporter.ExportEvents(context.Background(), controlplane.AuditEventBatch{
-		NodeID: "node-a", Offset: "42", Events: []json.RawMessage{json.RawMessage(`{"event_id":"e1"}`)},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != "42" {
-		t.Fatalf("exporter accepted receiver cursor %q, want submitted offset 42", next)
-	}
-	if auth != "Bearer receiver-token" || idem == "" || idem == "node-a:42" || !strings.HasPrefix(idem, "node-a:42:") {
-		t.Fatalf("headers authorization=%q idempotency=%q", auth, idem)
-	}
-}
-
 func TestAuditExportBatchIDDoesNotCollideAfterPruneOffsetReset(t *testing.T) {
 	oldID := auditExportBatchID("node-a", "0", []json.RawMessage{json.RawMessage(`{"event_id":"old"}`)})
 	newID := auditExportBatchID("node-a", "0", []json.RawMessage{json.RawMessage(`{"event_id":"retention-checkpoint"}`)})
@@ -212,71 +186,6 @@ func TestAuditExportBatchIDDoesNotCollideAfterPruneOffsetReset(t *testing.T) {
 	}
 	if retry := auditExportBatchID("node-a", "0", []json.RawMessage{json.RawMessage(`{"event_id":"old"}`)}); retry != oldID {
 		t.Fatalf("retry id = %q, want stable %q", retry, oldID)
-	}
-}
-
-func TestHTTPAuditExporterRejectsRedirect(t *testing.T) {
-	receiverCalls := 0
-	receiver := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		receiverCalls++
-	}))
-	defer receiver.Close()
-	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, receiver.URL, http.StatusTemporaryRedirect)
-	}))
-	defer redirector.Close()
-
-	exporter := newHTTPAuditBatchExporter(redirector.URL, "receiver-token")
-	_, err := exporter.ExportEvents(context.Background(), controlplane.AuditEventBatch{
-		NodeID: "node-a", Offset: "0", Events: []json.RawMessage{json.RawMessage(`{"event_id":"e1"}`)},
-	})
-	if err == nil {
-		t.Fatal("redirected audit export must fail closed")
-	}
-	if receiverCalls != 0 {
-		t.Fatalf("redirect target calls = %d, want 0", receiverCalls)
-	}
-}
-
-func TestHTTPAuditExporterDisabledAndFailurePaths(t *testing.T) {
-	if got := newHTTPAuditBatchExporter("  ", "token"); got != nil {
-		t.Fatalf("blank URL exporter = %#v, want nil", got)
-	}
-	batch := controlplane.AuditEventBatch{Offset: "7"}
-	var nilExporter *httpAuditBatchExporter
-	if got, err := nilExporter.ExportEvents(context.Background(), batch); err != nil || got != "7" {
-		t.Fatalf("nil exporter offset=%q err=%v", got, err)
-	}
-	badURL := &httpAuditBatchExporter{url: "://bad", client: http.DefaultClient}
-	if _, err := badURL.ExportEvents(context.Background(), batch); err == nil {
-		t.Fatal("invalid exporter URL must fail")
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Idempotency-Key"); got != "supplied-batch" {
-			t.Errorf("idempotency key = %q", got)
-		}
-		body, _ := io.ReadAll(r.Body)
-		if got, want := string(body), "\n{\"event_id\":\"e1\"}\n"; got != want {
-			t.Errorf("body = %q, want %q", got, want)
-		}
-		http.Error(w, "receiver unavailable", http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-	exporter := newHTTPAuditBatchExporter(srv.URL, "")
-	_, err := exporter.ExportEvents(context.Background(), controlplane.AuditEventBatch{
-		Offset:  "8",
-		BatchID: "supplied-batch",
-		Events:  []json.RawMessage{nil, json.RawMessage(`{"event_id":"e1"}` + "\n")},
-	})
-	if err == nil || !strings.Contains(err.Error(), "status 503") {
-		t.Fatalf("status error = %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := exporter.ExportEvents(ctx, batch); err == nil {
-		t.Fatal("cancelled export must fail")
 	}
 }
 
@@ -315,7 +224,7 @@ func TestSecretAuditExportLoopLifecycleAndDrain(t *testing.T) {
 	}}
 	configured.ConfigureHTTPAuditExporter()
 	configured.stopSecretAuditExportLoop()
-	if got, ok := configured.getAuditExporter().(*httpAuditBatchExporter); !ok || got.url != "https://audit.example/export" || got.bearerToken != "token" {
+	if got, ok := configured.getAuditExporter().(backendExporter); !ok || got.backend == nil || got.backend.Name() != "webhook" {
 		t.Fatalf("configured exporter = %#v", configured.getAuditExporter())
 	}
 	configured.CloseSecretAuditSink()

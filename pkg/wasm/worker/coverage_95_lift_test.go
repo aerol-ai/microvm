@@ -18,15 +18,39 @@ func TestWorkerEgressAuditGapAndErrorHelpers(t *testing.T) {
 	}
 
 	before := workerEgressDropped.Load()
-	appendWorkerEgressGap("", "n1", "sb-1", "inc-1")
+	empty, node := "", "n1"
+	workerEgressGapDir.Store(&empty)
+	workerEgressGapNode.Store(&node)
+	workerEgressPendingGap.Store(0)
+	noteWorkerEgressOverflow()
 	if workerEgressDropped.Load() <= before {
-		t.Fatal("empty spill dir must count a drop")
+		t.Fatal("overflow must count a drop even with no spill dir")
+	}
+	select {
+	case <-workerEgressGapKick:
+	default:
+	}
+	if flushWorkerEgressGap() {
+		t.Fatal("no spill dir: flush must not claim a write")
 	}
 	appendWorkerEgressSpill("", workerEgressAuditEvent{SandboxID: "sb-1"})
 
 	dir := t.TempDir()
-	appendWorkerEgressGap(dir, "n1", "sb-1", "inc-1")
+	workerEgressGapDir.Store(&dir)
+	noteWorkerEgressOverflow()
+	select {
+	case <-workerEgressGapKick:
+	default:
+	}
+	flushWorkerEgressGap() // the pool goroutine may have flushed first
 	spill := filepath.Join(dir, workerEgressSpillFile)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(spill); err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, err := os.Stat(spill); err != nil {
 		t.Fatalf("gap spill missing: %v", err)
 	}

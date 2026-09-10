@@ -59,6 +59,9 @@ func TestSecretLifecyclePruneAndReconcileStartup(t *testing.T) {
 		cfg: config.Config{
 			SecretTombRetentionDays:  1,
 			SecretAuditRetentionDays: 30,
+			// The Raft stub sweep is gated on the deleted-sandbox grace, not on
+			// local retention (plans/audit-export-connectors.md).
+			AuditDeletedGrace: time.Hour,
 		},
 		store:   st,
 		cluster: recorder,

@@ -110,7 +110,8 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID strin
 	if auditIncarnationID == "" && parseErr == nil {
 		auditIncarnationID = parsed.IncarnationID
 	}
-	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, placement.Ref, actor, correlationIDFromContext(ctx), auditIncarnationID)
+	_, auditOwnerRef := s.auditIdentityFor(sandboxID)
+	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, placement.Ref, actor, correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if parseErr != nil || placement.Version != secrets.RefVersion || placement.SealGeneration <= 0 || placementIncarnationID == "" ||
 		parsed.SandboxID != sandboxID || parsed.IncarnationID != placementIncarnationID || parsed.Version != placement.Version {
@@ -453,7 +454,9 @@ func (s *Service) pruneClusterSecretTombs(ctx context.Context) error {
 }
 
 func (s *Service) pruneClusterAuditACL(ctx context.Context) error {
-	if s == nil || s.cfg.SecretAuditRetentionDays <= 0 {
+	// The Raft stub is bounded by the deleted-sandbox grace, not by local
+	// retention; with grace disabled nothing is ever written, so nothing to sweep.
+	if s == nil || s.cfg.AuditDeletedGrace <= 0 {
 		return nil
 	}
 	c := s.Cluster()

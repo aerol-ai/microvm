@@ -10,13 +10,13 @@ import (
 	"expvar"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
@@ -37,71 +37,29 @@ type auditExportCursor struct {
 var (
 	secretAuditExportOK       = expvar.NewInt("aerolvm_secret_audit_export_ok")
 	secretAuditExportFailures = expvar.NewInt("aerolvm_secret_audit_export_failures_total")
+	// secretAuditExportLagBytes is how far the durable cursor trails the file.
+	// A failing backend never drops evidence — it lags — and this is the gauge
+	// the alert watches. Retention refuses to rotate unexported bytes.
+	secretAuditExportLagBytes = expvar.NewInt("aerolvm_audit_export_lag_bytes")
 )
 
-// httpAuditBatchExporter POSTs JSONL segments to SB_SECRET_AUDIT_EXPORT_URL.
-type httpAuditBatchExporter struct {
-	url         string
-	bearerToken string
-	client      *http.Client
+// backendExporter adapts an auditexport.Backend to the control-plane seam so
+// an env-configured connector and a managed build's injected exporter share
+// one tailer. The receiver never controls the local cursor: the submitted
+// offset is returned deterministically.
+type backendExporter struct {
+	backend auditexport.Backend
 }
 
-func newHTTPAuditBatchExporter(url, bearerToken string) *httpAuditBatchExporter {
-	url = strings.TrimSpace(url)
-	if url == "" {
-		return nil
-	}
-	return &httpAuditBatchExporter{
-		url:         url,
-		bearerToken: strings.TrimSpace(bearerToken),
-		client: &http.Client{
-			Timeout: 15 * time.Second,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-	}
-}
-
-func (e *httpAuditBatchExporter) ExportEvents(ctx context.Context, batch controlplane.AuditEventBatch) (string, error) {
-	if e == nil || e.url == "" {
+func (e backendExporter) ExportEvents(ctx context.Context, batch controlplane.AuditEventBatch) (string, error) {
+	if e.backend == nil {
 		return batch.Offset, nil
 	}
-	var buf bytes.Buffer
-	for _, raw := range batch.Events {
-		buf.Write(raw)
-		if len(raw) == 0 || raw[len(raw)-1] != '\n' {
-			buf.WriteByte('\n')
-		}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.url, &buf)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-ndjson")
-	req.Header.Set("X-Aerol-Audit-Offset", batch.Offset)
-	req.Header.Set("X-Aerol-Node-ID", batch.NodeID)
-	batchID := strings.TrimSpace(batch.BatchID)
-	if batchID == "" {
-		batchID = auditExportBatchID(batch.NodeID, batch.Offset, batch.Events)
-	}
-	req.Header.Set("Idempotency-Key", batchID)
-	req.Header.Set("X-Aerol-Audit-Batch-ID", batchID)
-	if e.bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+e.bearerToken)
-	}
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("audit export status %d", resp.StatusCode)
-	}
-	// The receiver acknowledges only success or failure. It never controls the
-	// local evidence cursor, so return the submitted offset deterministically.
-	return batch.Offset, nil
+	err := e.backend.Export(ctx, auditexport.Batch{
+		NodeID: batch.NodeID, BatchID: batch.BatchID, Offset: batch.Offset,
+		Events: batch.Events, ShippedAt: batch.ShippedAt,
+	})
+	return batch.Offset, err
 }
 
 func auditExportBatchID(nodeID, offset string, events []json.RawMessage) string {
@@ -152,9 +110,13 @@ func (s *Service) startSecretAuditExportLoop() {
 		stop := make(chan struct{})
 		s.secretAuditExportStop = stop
 		s.secretAuditExportDone.Add(1)
+		interval := s.cfg.AuditExportFlushInterval
+		if interval <= 0 {
+			interval = secretAuditExportInterval
+		}
 		go func() {
 			defer s.secretAuditExportDone.Done()
-			ticker := time.NewTicker(secretAuditExportInterval)
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			_ = s.drainSecretAuditExport(context.Background())
 			for {
@@ -196,11 +158,18 @@ func (s *Service) drainSecretAuditExport(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if n < secretAuditExportBatchMax {
+		if n < s.auditExportBatchMax() {
 			return nil
 		}
 	}
 	return nil
+}
+
+func (s *Service) auditExportBatchMax() int {
+	if s != nil && s.cfg.AuditExportBatchMax > 0 {
+		return s.cfg.AuditExportBatchMax
+	}
+	return secretAuditExportBatchMax
 }
 
 func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
@@ -213,11 +182,18 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 	}
 	s.auditExportRunMu.Lock()
 	defer s.auditExportRunMu.Unlock()
+	// Backoff after a failure: skip ticks until the delay elapses so 2,000
+	// nodes that lost the same receiver do not hammer it every second.
+	if !s.auditExportNotBefore.IsZero() && time.Now().Before(s.auditExportNotBefore) {
+		return 0, nil
+	}
 	offsetPath := filepath.Join(filepath.Dir(s.secretAuditFile.path), secretAuditExportOffset)
 	cursor := loadAuditExportCursor(offsetPath)
+	batchMax := s.auditExportBatchMax()
 	var (
 		generation         string
 		offset             int64
+		fileSize           int64
 		bytesRead          int64
 		events             []json.RawMessage
 		verifiedHead       string
@@ -243,7 +219,7 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 		}
 		if st, statErr := f.Stat(); statErr != nil {
 			return statErr
-		} else if offset > st.Size() {
+		} else if fileSize = st.Size(); offset > fileSize {
 			offset = 0
 		}
 		if offset > 0 {
@@ -274,7 +250,7 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 				return fmt.Errorf("audit export encountered invalid hash chain: %w", err)
 			}
 			events = append(events, append(json.RawMessage(nil), line...))
-			if len(events) >= secretAuditExportBatchMax {
+			if len(events) >= batchMax {
 				break
 			}
 		}
@@ -294,6 +270,7 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 	}
 	if len(events) == 0 {
 		secretAuditExportOK.Set(1)
+		secretAuditExportLagBytes.Set(0)
 		return 0, nil
 	}
 	nodeID := ""
@@ -316,11 +293,18 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		secretAuditExportOK.Set(0)
 		secretAuditExportFailures.Add(1)
+		secretAuditExportLagBytes.Set(fileSize - offset)
+		s.auditExportBackoff.Base = s.cfg.AuditExportFlushInterval
+		s.auditExportBackoff.Max = s.cfg.AuditExportMaxBackoff
+		delay := s.auditExportBackoff.Next()
+		s.auditExportNotBefore = time.Now().Add(delay)
 		if s.logger != nil {
-			s.logger.Warn("secret audit export failed", "err", err)
+			s.logger.Warn("secret audit export failed; backing off", "err", err, "retry_in", delay, "attempt", s.auditExportBackoff.Attempts())
 		}
 		return 0, err
 	}
+	s.auditExportBackoff.Reset()
+	s.auditExportNotBefore = time.Time{}
 	newOffset := offset + bytesRead
 	// The receiver acknowledges the batch but never controls our local byte
 	// cursor; trusting a remote offset could skip unexported evidence.
@@ -331,6 +315,7 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	secretAuditExportOK.Set(1)
+	secretAuditExportLagBytes.Set(fileSize - newOffset)
 	return len(events), nil
 }
 
@@ -424,14 +409,59 @@ func persistAuditExportCursor(path string, cursor auditExportCursor) error {
 	return writeFileAtomicDurable(path, append(raw, '\n'), 0o600)
 }
 
-// ConfigureHTTPAuditExporter wires SB_SECRET_AUDIT_EXPORT_URL when set.
+// ConfigureAuditExporter builds the connector named by SB_AUDIT_EXPORT_BACKEND
+// (plans/audit-export-connectors.md) and installs it behind the shared tailer.
+// A noop backend installs nothing: the open-source default keeps evidence on
+// local disk and says so. Configuration errors fail boot; a backend that
+// cannot reach its receiver does not — it lags, visibly.
+func (s *Service) ConfigureAuditExporter() error {
+	if s == nil {
+		return nil
+	}
+	cfg := s.cfg.AuditExportConfig()
+	if !s.cfg.AuditExportEnabled() {
+		return nil
+	}
+	backend, err := auditexport.Open(cfg)
+	if err != nil {
+		return err
+	}
+	if auditexport.IsNoop(backend) {
+		return nil
+	}
+	s.auditExportMu.Lock()
+	s.auditBackend = backend
+	s.auditExportMu.Unlock()
+	if s.logger != nil {
+		s.logger.Info("audit export connector configured", "backend", backend.Name())
+	}
+	s.SetAuditExporter(backendExporter{backend: backend})
+	return nil
+}
+
+// ConfigureHTTPAuditExporter is the pre-connector entry point; it now resolves
+// SB_SECRET_AUDIT_EXPORT_URL to the webhook backend. Kept for callers that
+// predate ConfigureAuditExporter; configuration errors are logged, not fatal.
 func (s *Service) ConfigureHTTPAuditExporter() {
 	if s == nil {
 		return
 	}
-	url := strings.TrimSpace(s.cfg.SecretAuditExportURL)
-	if url == "" {
-		return
+	if err := s.ConfigureAuditExporter(); err != nil && s.logger != nil {
+		s.logger.Error("audit export connector configuration failed", "err", err)
 	}
-	s.SetAuditExporter(newHTTPAuditBatchExporter(url, s.cfg.SecretAuditExportBearerToken))
+}
+
+// AuditExportHealthy reports the configured connector's last observed
+// outcome; nil when none is configured.
+func (s *Service) AuditExportHealthy(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.auditExportMu.Lock()
+	b := s.auditBackend
+	s.auditExportMu.Unlock()
+	if b == nil {
+		return nil
+	}
+	return b.Healthy(ctx)
 }

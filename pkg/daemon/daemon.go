@@ -306,13 +306,16 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// emits nothing and pays no cost.
 	svc.SetUsageReporter(cp.Reporter)
 	svc.SetWitness(cp.Witness)
+	// Audit export connectors (plans/audit-export-connectors.md): a managed
+	// build's injected exporter wins; otherwise SB_AUDIT_EXPORT_BACKEND selects
+	// a connector behind the same tailer. Raft never carries this history.
 	if cp.HasAuditExporter() {
 		svc.SetAuditExporter(cp.AuditExporter)
-	} else {
-		svc.ConfigureHTTPAuditExporter()
+	} else if err := svc.ConfigureAuditExporter(); err != nil {
+		return fmt.Errorf("configure audit export connector: %w", err)
 	}
-	if cfg.EnterpriseMode && strings.TrimSpace(cfg.SecretAuditExportURL) == "" && !cp.HasAuditExporter() {
-		return errors.New("enterprise mode requires an off-node audit exporter: set SB_SECRET_AUDIT_EXPORT_URL or wire controlplane.AuditExporter")
+	if cfg.EnterpriseMode && !cfg.AuditExportEnabled() && !cp.HasAuditExporter() {
+		return errors.New("enterprise mode requires an off-node audit exporter: set SB_AUDIT_EXPORT_BACKEND=webhook|s3|bus (or SB_SECRET_AUDIT_EXPORT_URL) or wire controlplane.AuditExporter")
 	}
 	// Witness is installed after the sink opens; re-validate so enterprise +
 	// external witness fail closed at boot when the chain/receipts disagree.

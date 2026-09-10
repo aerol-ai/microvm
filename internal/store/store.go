@@ -7239,3 +7239,23 @@ func (s *Store) CompareCloneGeneration(ctx context.Context, sandboxID, snapshotG
 	}
 	return fmt.Errorf("clone generation mismatch (row=%s snapshot=%s): %w", current, snapshotGen, models.ErrSnapshotFenced)
 }
+
+// CurrentSandboxAuditIdentity returns the live lifecycle id and tenant owner
+// in one read. The audit emit path resolves both on every sandbox start, so
+// they must not cost two round-trips on the single-writer connection.
+func (s *Store) CurrentSandboxAuditIdentity(ctx context.Context, sandboxID string) (incarnationID, ownerRef string, err error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return "", "", nil
+	}
+	err = s.db.QueryRowContext(ctx, `
+		SELECT audit_incarnation_id, owner_ref FROM sandboxes WHERE id = ?
+	`, sandboxID).Scan(&incarnationID, &ownerRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("get current sandbox audit identity: %w", err)
+	}
+	return strings.TrimSpace(incarnationID), strings.TrimSpace(ownerRef), nil
+}

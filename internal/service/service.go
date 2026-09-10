@@ -27,6 +27,7 @@ import (
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -179,11 +180,18 @@ type Service struct {
 	auditExportMu           sync.Mutex
 	auditExportRunMu        sync.Mutex // serializes cursor/read/export/prune reset
 	auditExporter           controlplane.AuditExporter
-	secretAuditExportOnce   sync.Once
-	secretAuditExportStop   chan struct{}
-	secretAuditExportDone   sync.WaitGroup
-	secretRefanoutMu        sync.Mutex
-	secretRefanoutRunning   bool
+	// auditBackend is the env-configured connector behind auditExporter (nil
+	// when a managed build injected its own exporter or none is configured).
+	auditBackend auditexport.Backend
+	// auditExportBackoff / auditExportNotBefore pace retries after a failed
+	// export; guarded by auditExportRunMu.
+	auditExportBackoff    auditexport.Backoff
+	auditExportNotBefore  time.Time
+	secretAuditExportOnce sync.Once
+	secretAuditExportStop chan struct{}
+	secretAuditExportDone sync.WaitGroup
+	secretRefanoutMu      sync.Mutex
+	secretRefanoutRunning bool
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
 	mounts           *mounts.Manager
@@ -2120,7 +2128,8 @@ func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.
 	if len(sealed) == 0 {
 		return nil, nil
 	}
-	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "", s.secretIncarnationForSeal(sandboxID))
+	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
+	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "", auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if s == nil || s.cipher == nil {
 		return nil, fmt.Errorf("%w: registry auth cipher is not configured", secrets.ErrDecryptFailed)
@@ -2197,7 +2206,8 @@ func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
 
 // loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
 func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string]string, err error) {
-	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), s.secretIncarnationForSeal(sandboxID))
+	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
+	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 
 	sealed, getErr := s.store.GetEnv(ctx, sandboxID)
@@ -2255,7 +2265,8 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []mod
 	if len(sealed) == 0 {
 		return nil, nil
 	}
-	done := beginSecretAuditInc(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), s.secretIncarnationForSeal(sandboxID))
+	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
+	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if s.cipher == nil {
 		return nil, fmt.Errorf("%w: mounts cipher is not configured", secrets.ErrDecryptFailed)

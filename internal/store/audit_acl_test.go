@@ -347,3 +347,24 @@ func TestClusterSecretTombPruneIsBoundedAndPreservesLiveState(t *testing.T) {
 		t.Fatalf("stats = %+v, want pending=1 tombstones=4 with oldest", stats)
 	}
 }
+
+func TestCurrentSandboxAuditIdentityOneRead(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-identity")
+	sb.OwnerRef = "tenant-z"
+	sb.AuditIncarnationID = "inc-z"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	inc, owner, err := st.CurrentSandboxAuditIdentity(ctx, sb.ID)
+	if err != nil || inc != "inc-z" || owner != "tenant-z" {
+		t.Fatalf("identity = (%q, %q, %v)", inc, owner, err)
+	}
+	if inc, owner, err := st.CurrentSandboxAuditIdentity(ctx, "absent"); err != nil || inc != "" || owner != "" {
+		t.Fatalf("absent identity = (%q, %q, %v)", inc, owner, err)
+	}
+	if inc, owner, err := st.CurrentSandboxAuditIdentity(ctx, "  "); err != nil || inc != "" || owner != "" {
+		t.Fatalf("blank identity = (%q, %q, %v)", inc, owner, err)
+	}
+}

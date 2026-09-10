@@ -102,6 +102,10 @@ type command struct {
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
 	// transitioning State back to Placed.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+	// AuditIndexMax caps the retained post-delete audit index. Carried in the
+	// command (not read from node config) so every replica evicts identically;
+	// zero means the compiled-in default.
+	AuditIndexMax int64 `json:"audit_index_max,omitempty"`
 	// NodeID + Drained are populated by opSetNodeDrainState. NodeID is the
 	// target of the drain mark; Drained is the desired state (true = exclude
 	// from SelectPlacement, false = uncordon). All other ops leave them zero.
@@ -392,6 +396,15 @@ type placementFSM struct {
 	// auditACLLatest indexes the newest retained lifecycle per sandbox for
 	// O(1) implicit audit lookups. It is derived from auditACLs on restore.
 	auditACLLatest map[string]string
+	// auditACLBySandbox groups retained lifecycles per sandbox so the latest
+	// pointer is repaired in O(k) when one is pruned or evicted.
+	auditACLBySandbox map[string]map[string]struct{}
+	// auditACLByVersion / auditACLByExpiry are derived orderings that make cap
+	// eviction (oldest log index first) and TTL prune (earliest expiry first)
+	// O(log N) instead of a full-map scan under the write lock. The snapshot
+	// carries only the map; both trees are rebuilt on Restore.
+	auditACLByVersion *btree.BTreeG[auditACLOrder]
+	auditACLByExpiry  *btree.BTreeG[auditACLOrder]
 
 	// volumes holds replicated platform-volume metadata rows, keyed by
 	// volumeKey(tenant, id). volumeNameIndex maps volumeNameKey(tenant, name) →
@@ -481,6 +494,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		customHostnameIndex:          make(map[string]string),
 		auditACLs:                    make(map[string]AuditACL),
 		auditACLLatest:               make(map[string]string),
+		auditACLBySandbox:            make(map[string]map[string]struct{}),
 		volumes:                      make(map[string]models.Volume),
 		volumeNameIndex:              make(map[string]string),
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
@@ -500,6 +514,189 @@ func volumeAttachmentKey(tenant, volumeID, sandboxID, target string) string {
 
 func newPlacementIDIndex() *btree.BTreeG[string] {
 	return btree.NewG[string](32, func(a, b string) bool { return a < b })
+}
+
+// maxRetainedAuditACLs is the post-delete audit index cap applied when a
+// command carries none (log entries written before the connector split) and
+// on Restore. It bounds FSM memory and snapshot size whatever the delete
+// rate. A var only so tests can lower it; production never changes it.
+var maxRetainedAuditACLs int64 = 100_000
+
+// auditACLOrder is the key shared by the two derived orderings.
+type auditACLOrder struct {
+	Version uint64
+	Expires int64
+	Key     string
+}
+
+func auditACLByVersionLess(a, b auditACLOrder) bool {
+	if a.Version != b.Version {
+		return a.Version < b.Version
+	}
+	return a.Key < b.Key
+}
+
+func auditACLByExpiryLess(a, b auditACLOrder) bool {
+	if a.Expires != b.Expires {
+		return a.Expires < b.Expires
+	}
+	return auditACLByVersionLess(a, b)
+}
+
+func newAuditACLIndexes() (byVersion, byExpiry *btree.BTreeG[auditACLOrder]) {
+	return btree.NewG[auditACLOrder](32, auditACLByVersionLess), btree.NewG[auditACLOrder](32, auditACLByExpiryLess)
+}
+
+func auditACLOrderOf(key string, acl AuditACL) auditACLOrder {
+	return auditACLOrder{Version: acl.RetainedVersion, Expires: acl.ExpiresUnix, Key: key}
+}
+
+func (f *placementFSM) ensureAuditACLIndexesLocked() {
+	if f.auditACLs == nil {
+		f.auditACLs = make(map[string]AuditACL)
+	}
+	if f.auditACLLatest == nil {
+		f.auditACLLatest = make(map[string]string)
+	}
+	if f.auditACLBySandbox == nil {
+		f.auditACLBySandbox = make(map[string]map[string]struct{})
+	}
+	if f.auditACLByVersion == nil || f.auditACLByExpiry == nil {
+		// Derive every index from the map in one pass so a map populated
+		// without going through retainAuditACLLocked (older snapshots, tests)
+		// still gets correct eviction, prune, and latest-pointer behaviour.
+		f.auditACLByVersion, f.auditACLByExpiry = newAuditACLIndexes()
+		f.auditACLBySandbox = make(map[string]map[string]struct{})
+		for key, acl := range f.auditACLs {
+			ord := auditACLOrderOf(key, acl)
+			f.auditACLByVersion.ReplaceOrInsert(ord)
+			f.auditACLByExpiry.ReplaceOrInsert(ord)
+			set := f.auditACLBySandbox[acl.SandboxID]
+			if set == nil {
+				set = make(map[string]struct{}, 1)
+				f.auditACLBySandbox[acl.SandboxID] = set
+			}
+			set[key] = struct{}{}
+		}
+		for sandboxID := range f.auditACLBySandbox {
+			f.refreshAuditACLLatestLocked(sandboxID)
+		}
+	}
+}
+
+// retainAuditACLLocked stores one post-delete routing stub and enforces the
+// cap by evicting the oldest log index first. This is a grace-window index
+// for routing an audit read to the nodes that hold evidence — never history:
+// ExpiresUnix <= 0 means "do not retain", which is what
+// SB_AUDIT_DELETED_GRACE=0 (and the old retention=0) now mean instead of
+// "forever". The result is order-independent (a streaming top-k by version),
+// so Restore can feed it from a map.
+func (f *placementFSM) retainAuditACLLocked(acl AuditACL, cap int64) {
+	acl.SandboxID = strings.TrimSpace(acl.SandboxID)
+	acl.IncarnationID = strings.TrimSpace(acl.IncarnationID)
+	if acl.SandboxID == "" || acl.IncarnationID == "" {
+		return
+	}
+	key := auditACLKey(acl.SandboxID, acl.IncarnationID)
+	if acl.ExpiresUnix <= 0 {
+		f.removeAuditACLLocked(key)
+		return
+	}
+	f.ensureAuditACLIndexesLocked()
+	if old, ok := f.auditACLs[key]; ok {
+		f.auditACLByVersion.Delete(auditACLOrderOf(key, old))
+		f.auditACLByExpiry.Delete(auditACLOrderOf(key, old))
+	}
+	f.auditACLs[key] = acl
+	ord := auditACLOrderOf(key, acl)
+	f.auditACLByVersion.ReplaceOrInsert(ord)
+	f.auditACLByExpiry.ReplaceOrInsert(ord)
+	set := f.auditACLBySandbox[acl.SandboxID]
+	if set == nil {
+		set = make(map[string]struct{}, 1)
+		f.auditACLBySandbox[acl.SandboxID] = set
+	}
+	set[key] = struct{}{}
+	f.refreshAuditACLLatestLocked(acl.SandboxID)
+	if cap <= 0 {
+		cap = maxRetainedAuditACLs
+	}
+	for int64(len(f.auditACLs)) > cap {
+		oldest, ok := f.auditACLByVersion.Min()
+		if !ok {
+			break
+		}
+		before := len(f.auditACLs)
+		f.removeAuditACLLocked(oldest.Key)
+		if len(f.auditACLs) == before {
+			// An ordering entry with no map row cannot happen by construction;
+			// if it ever did, dropping it is the only way this apply terminates.
+			f.auditACLByVersion.Delete(oldest)
+			f.auditACLByExpiry.Delete(oldest)
+		}
+	}
+}
+
+func (f *placementFSM) removeAuditACLLocked(key string) {
+	acl, ok := f.auditACLs[key]
+	if !ok {
+		return
+	}
+	delete(f.auditACLs, key)
+	if f.auditACLByVersion != nil {
+		f.auditACLByVersion.Delete(auditACLOrderOf(key, acl))
+		f.auditACLByExpiry.Delete(auditACLOrderOf(key, acl))
+	}
+	if set := f.auditACLBySandbox[acl.SandboxID]; set != nil {
+		delete(set, key)
+		if len(set) == 0 {
+			delete(f.auditACLBySandbox, acl.SandboxID)
+		}
+	}
+	f.refreshAuditACLLatestLocked(acl.SandboxID)
+}
+
+// refreshAuditACLLatestLocked repairs the per-sandbox latest pointer from the
+// few lifecycles a sandbox ID ever had, so a prune never rescans the map.
+func (f *placementFSM) refreshAuditACLLatestLocked(sandboxID string) {
+	if f.auditACLLatest == nil {
+		f.auditACLLatest = make(map[string]string)
+	}
+	set := f.auditACLBySandbox[sandboxID]
+	if len(set) == 0 {
+		delete(f.auditACLLatest, sandboxID)
+		return
+	}
+	bestKey := ""
+	var best AuditACL
+	for key := range set {
+		acl := f.auditACLs[key]
+		if bestKey == "" || auditACLNewer(key, acl, bestKey, best) {
+			bestKey, best = key, acl
+		}
+	}
+	f.auditACLLatest[sandboxID] = bestKey
+}
+
+// pruneAuditACLLocked removes every stub expiring at or before cutoff, in
+// O(expired · log N) from the expiry ordering — never a scan of the live set.
+func (f *placementFSM) pruneAuditACLLocked(cutoff int64) int {
+	f.ensureAuditACLIndexesLocked()
+	removed := 0
+	for {
+		first, ok := f.auditACLByExpiry.Min()
+		if !ok || first.Expires <= 0 || first.Expires > cutoff {
+			return removed
+		}
+		before := len(f.auditACLs)
+		f.removeAuditACLLocked(first.Key)
+		if len(f.auditACLs) == before {
+			f.auditACLByVersion.Delete(first)
+			f.auditACLByExpiry.Delete(first)
+			continue
+		}
+		removed++
+	}
 }
 
 // Apply is invoked by raft for every committed log entry on every node.
@@ -791,16 +988,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			recordPlacementAuditNode(&existing, existing.OwnerNodeID)
 			recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
-			incarnationID := strings.TrimSpace(existing.IncarnationID)
-			if incarnationID != "" {
-				if f.auditACLs == nil {
-					f.auditACLs = make(map[string]AuditACL)
-				}
-				if f.auditACLLatest == nil {
-					f.auditACLLatest = make(map[string]string)
-				}
-				key := auditACLKey(cmd.SandboxID, incarnationID)
-				f.auditACLs[key] = AuditACL{
+			if incarnationID := strings.TrimSpace(existing.IncarnationID); incarnationID != "" {
+				f.retainAuditACLLocked(AuditACL{
 					SandboxID:           cmd.SandboxID,
 					IncarnationID:       incarnationID,
 					OwnerRef:            strings.TrimSpace(existing.OwnerRef),
@@ -808,8 +997,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 					AuditNodesTruncated: existing.AuditNodesTruncated,
 					ExpiresUnix:         cmd.ExpiresUnix,
 					RetainedVersion:     log.Index,
-				}
-				f.auditACLLatest[cmd.SandboxID] = key
+				}, cmd.AuditIndexMax)
 			}
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
@@ -828,16 +1016,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		delete(f.deletingIndex, cmd.SandboxID)
 		return nil
 	case opPruneAuditACL:
-		removed := false
-		for id, acl := range f.auditACLs {
-			if acl.ExpiresUnix > 0 && acl.ExpiresUnix <= cmd.ExpiresUnix {
-				delete(f.auditACLs, id)
-				removed = true
-			}
-		}
-		if removed {
-			f.rebuildAuditACLLatestLocked()
-		}
+		f.pruneAuditACLLocked(cmd.ExpiresUnix)
 		return nil
 	case opReassign:
 		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
@@ -2516,20 +2695,6 @@ func auditACLNewer(candidateKey string, candidate AuditACL, currentKey string, c
 		(candidate.RetainedVersion == current.RetainedVersion && candidateKey > currentKey)
 }
 
-func (f *placementFSM) rebuildAuditACLLatestLocked() {
-	f.auditACLLatest = make(map[string]string)
-	for key, acl := range f.auditACLs {
-		sandboxID := strings.TrimSpace(acl.SandboxID)
-		if sandboxID == "" || strings.TrimSpace(acl.IncarnationID) == "" {
-			continue
-		}
-		currentKey, ok := f.auditACLLatest[sandboxID]
-		if !ok || auditACLNewer(key, acl, currentKey, f.auditACLs[currentKey]) {
-			f.auditACLLatest[sandboxID] = key
-		}
-	}
-}
-
 func (f *placementFSM) auditACLForSandbox(sandboxID, incarnationID string, nowUnix int64) (AuditACL, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -2698,14 +2863,15 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.deletingIndex = make(map[string]struct{})
 	f.customHostnameIndex = make(map[string]string)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
+	f.auditACLLatest = make(map[string]string)
+	f.auditACLBySandbox = make(map[string]map[string]struct{})
+	f.auditACLByVersion, f.auditACLByExpiry = newAuditACLIndexes()
+	// A snapshot written before the connector split can carry far more than
+	// the cap and "forever" (0) expiries. Feeding it through the same retain
+	// path bounds both, so a rejoining node never inherits unbounded history.
 	for _, acl := range payload.AuditACLs {
-		sandboxID := strings.TrimSpace(acl.SandboxID)
-		incarnationID := strings.TrimSpace(acl.IncarnationID)
-		if sandboxID != "" && incarnationID != "" {
-			f.auditACLs[auditACLKey(sandboxID, incarnationID)] = cloneAuditACL(acl)
-		}
+		f.retainAuditACLLocked(cloneAuditACL(acl), maxRetainedAuditACLs)
 	}
-	f.rebuildAuditACLLatestLocked()
 	// Rebuild the replicated volume table + name index from the snapshot.
 	f.volumes = make(map[string]models.Volume, len(payload.Volumes))
 	f.volumeNameIndex = make(map[string]string, len(payload.Volumes))

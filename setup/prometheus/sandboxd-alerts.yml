@@ -413,6 +413,34 @@ groups:
           description: "aerolvm_audit_torn_tail_repairs_total increased: the node restarted after an unclean shutdown and cut an unterminated partial record from secrets.jsonl. A gap marker (reason=torn_tail) is in the chain; its dropped count is a floor. Repeated firing means the node is crashing — find that cause, the audit sink is behaving as designed."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # The export tailer is falling behind its backend. Evidence is not lost
+      # (retention refuses to rotate unexported bytes) but disk grows and the
+      # off-node copy is stale. Usually the receiver, not the daemon.
+      - alert: SandboxdAuditExportLagging
+        expr: aerolvm_audit_export_lag_bytes > 67108864
+        for: 15m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd audit export is lagging its backend"
+          description: "aerolvm_audit_export_lag_bytes has exceeded 64 MiB for 15 minutes. The local JSONL is retaining evidence the backend has not acknowledged; check the receiver and aerolvm_audit_export_backend_healthy. Do not shrink retention to reclaim disk."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # The configured connector's last export failed and has kept failing.
+      # Evidence is retained locally; this names the backend so the receiver
+      # (webhook / bucket / broker) is the first place to look.
+      - alert: SandboxdAuditExportBackendUnhealthy
+        expr: aerolvm_audit_export_backend_healthy{key!="noop"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd audit export backend {{ $labels.key }} is unhealthy"
+          description: "aerolvm_audit_export_backend_healthy{key={{ $labels.key }}} has been 0 for 10 minutes: the last export to this backend failed and the tailer is backing off (aerolvm_audit_export_failures_total{key={{ $labels.key }}}). Local evidence is retained and export lag is growing."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Async sealed-blob peer push/delete failures. Creates do not wait on
       # fan-out; failover_ready stays false until copies land.
       - alert: SandboxdSecretFanoutFailures

@@ -31,6 +31,12 @@ type Event struct {
 	// IncarnationID scopes the event to a placement incarnation so post-delete
 	// ACL and recreate history do not cross tenant ownership boundaries.
 	IncarnationID string `json:"incarnation_id,omitempty"`
+	// OwnerRef is the tenant account the sandbox belonged to when the event
+	// was recorded. It makes an exported record self-describing downstream
+	// and lets a node authorize a post-delete read from the evidence itself,
+	// without consulting Raft. Empty for operator-owned sandboxes. Being
+	// omitempty, records written before the field existed hash identically.
+	OwnerRef string `json:"owner_ref,omitempty"`
 	// Dropped is set on gap markers to record how many events were coalesced
 	// into this single overflow marker (lossy buffer evidence).
 	Dropped int64 `json:"dropped,omitempty"`

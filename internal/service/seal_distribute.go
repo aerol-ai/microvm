@@ -1229,14 +1229,22 @@ func (s *Service) anySecretTargetDead(targets []string, alive map[string]struct{
 // so a destroyed-and-recreated deterministic sandbox ID cannot inherit an old
 // worker capability or mix two tenants' evidence.
 func (s *Service) secretIncarnationForSeal(sandboxID string) string {
+	incarnationID, _ := s.auditIdentityFor(sandboxID)
+	return incarnationID
+}
+
+// auditIdentityFor resolves the lifecycle id and tenant owner an audit event
+// is stamped with. Placement (in-memory) first; then the pre-persist nonce;
+// then one SQLite read that returns both — the same single round-trip the
+// start path already paid for the incarnation alone.
+func (s *Service) auditIdentityFor(sandboxID string) (incarnationID, ownerRef string) {
 	if s == nil {
-		return ""
+		return "", ""
 	}
-	c := s.Cluster()
-	if c != nil {
+	if c := s.Cluster(); c != nil {
 		if p, ok := c.PlacementOf(sandboxID); ok {
-			if incarnationID := strings.TrimSpace(p.IncarnationID); incarnationID != "" {
-				return incarnationID
+			if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
+				return inc, strings.TrimSpace(p.OwnerRef)
 			}
 		}
 	}
@@ -1244,15 +1252,15 @@ func (s *Service) secretIncarnationForSeal(sandboxID string) string {
 	pending := strings.TrimSpace(s.pendingAuditIncarnation[sandboxID])
 	s.auditIncarnationMu.RUnlock()
 	if pending != "" {
-		return pending
+		return pending, ""
 	}
 	if s.store != nil {
-		incarnationID, err := s.store.CurrentSandboxAuditIncarnation(context.Background(), sandboxID)
+		inc, owner, err := s.store.CurrentSandboxAuditIdentity(context.Background(), sandboxID)
 		if err == nil {
-			return strings.TrimSpace(incarnationID)
+			return strings.TrimSpace(inc), strings.TrimSpace(owner)
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // prepareAuditIncarnation makes a lifecycle nonce available before the WASM

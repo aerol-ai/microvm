@@ -31,3 +31,20 @@ func TestLinkEventBuildsStableTamperEvidentChain(t *testing.T) {
 	}
 	LinkEvent("ignored", nil)
 }
+
+// Adding owner_ref must not change the hash of records that never carried it
+// (omitempty), while a record that does carry it is bound to it.
+func TestOwnerRefIsOmittedWhenEmptyAndBoundWhenSet(t *testing.T) {
+	base := Event{EventID: "ae-1", SandboxID: "sb-1", Result: "success"}
+	without := HashEvent(GenesisPrevHash, base)
+	withEmpty := base
+	withEmpty.OwnerRef = ""
+	if HashEvent(GenesisPrevHash, withEmpty) != without {
+		t.Fatal("empty owner_ref changed the hash of a legacy record")
+	}
+	withOwner := base
+	withOwner.OwnerRef = "acct-1"
+	if HashEvent(GenesisPrevHash, withOwner) == without {
+		t.Fatal("owner_ref is not covered by the hash")
+	}
+}

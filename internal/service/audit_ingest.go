@@ -262,6 +262,7 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		Network:       strings.TrimSpace(req.Network),
 		IncarnationID: incarnationID,
 	}
+	_, event.OwnerRef = ing.svc.auditIdentityFor(sandboxID)
 	if durable, ok := sink.(DurableSecretAuditSink); ok {
 		if err := durable.EmitDurable(event); err != nil {
 			auditIngestRejectedTotal.Add(1)

@@ -16,11 +16,10 @@ func TestClusterAuditACLReadWrappersAndExpiry(t *testing.T) {
 	}
 
 	fsm := newPlacementFSM()
-	fsm.auditACLs[auditACLKey("sb", "inc-a")] = AuditACL{
+	fsm.retainAuditACLLocked(AuditACL{
 		SandboxID: "sb", OwnerRef: "tenant-a", IncarnationID: "inc-a",
 		AuditNodeIDs: []string{"node-a", "node-b"}, ExpiresUnix: time.Now().Add(time.Hour).Unix(), RetainedVersion: 1,
-	}
-	fsm.rebuildAuditACLLatestLocked()
+	}, 0)
 	c := &Cluster{fsm: fsm}
 	acl, ok, err := c.AuditACLForSandbox(ctx, " sb ", "")
 	if err != nil || !ok || acl.OwnerRef != "tenant-a" || acl.IncarnationID != "inc-a" {
@@ -45,9 +44,9 @@ func TestClusterAuditACLReadWrappersAndExpiry(t *testing.T) {
 	if got := auditACLExpiryUnix(0); got != 0 {
 		t.Fatalf("disabled expiry = %d", got)
 	}
-	before := time.Now().Add(23*time.Hour + 59*time.Minute).Unix()
-	after := time.Now().Add(24*time.Hour + time.Minute).Unix()
-	if got := auditACLExpiryUnix(1); got < before || got > after {
-		t.Fatalf("one-day expiry = %d, want [%d,%d]", got, before, after)
+	before := time.Now().Add(59 * time.Minute).Unix()
+	after := time.Now().Add(61 * time.Minute).Unix()
+	if got := auditACLExpiryUnix(time.Hour); got < before || got > after {
+		t.Fatalf("one-hour grace expiry = %d, want [%d,%d]", got, before, after)
 	}
 }

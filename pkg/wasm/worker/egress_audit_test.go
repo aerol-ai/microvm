@@ -161,3 +161,74 @@ func TestInstalledObserverSpillsWhenConfiguredIngestFails(t *testing.T) {
 func bytesTrimLine(raw []byte) []byte {
 	return []byte(strings.TrimSpace(string(raw)))
 }
+
+// The dial-path overflow branch must do no I/O: no directory, file, lock, or
+// fsync — only counters. The writer later turns the count into ONE marker.
+func TestObserverOverflowDoesNoIOOnDialPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "spill-not-created")
+	node := "n-ovf"
+	workerEgressGapDir.Store(&dir)
+	workerEgressGapNode.Store(&node)
+	workerEgressPendingGap.Store(0)
+	before := workerEgressDropped.Load()
+
+	// Overflow itself is two atomics: the counters move, the filesystem does
+	// not. (The pool's flush goroutine may already be running from another
+	// test and race us for the kick, so the marker may land before or after
+	// our explicit flush; only the total is asserted.)
+	stat := func() error { _, err := os.Stat(dir); return err }
+	for range 37 {
+		if err := stat(); !os.IsNotExist(err) {
+			t.Fatalf("overflow touched the filesystem on the dial path (stat err=%v)", err)
+		}
+		noteWorkerEgressOverflow()
+	}
+	if got := workerEgressDropped.Load() - before; got != 37 {
+		t.Fatalf("dropped counter delta = %d, want 37", got)
+	}
+	select {
+	case <-workerEgressGapKick:
+	default:
+	}
+	flushWorkerEgressGap()
+	var total float64
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		total = 0
+		raw, err := os.ReadFile(filepath.Join(dir, workerEgressSpillFile))
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+				var ev map[string]any
+				if err := json.Unmarshal([]byte(line), &ev); err != nil {
+					t.Fatal(err)
+				}
+				if ev["kind"] != "gap" || ev["reason"] != "overflow" || ev["node_id"] != "n-ovf" {
+					t.Fatalf("marker = %v", ev)
+				}
+				total += ev["dropped"].(float64)
+			}
+		}
+		if total == 37 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if total != 37 {
+		t.Fatalf("coalesced markers account for %v drops, want 37", total)
+	}
+	if flushWorkerEgressGap() {
+		t.Fatal("nothing pending: flush must not write")
+	}
+	// Without a spill directory the counter is the only evidence; no panic,
+	// no write.
+	empty := ""
+	workerEgressGapDir.Store(&empty)
+	noteWorkerEgressOverflow()
+	select {
+	case <-workerEgressGapKick:
+	default:
+	}
+	if flushWorkerEgressGap() {
+		t.Fatal("flush without a spill dir must not claim to have written")
+	}
+}

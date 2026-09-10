@@ -57,9 +57,13 @@ const (
 	// Bound the power-loss window for the local audit fallback. Enterprise
 	// deployments must also configure an external durable/WORM witness.
 	secretAuditSyncInterval = time.Second
-	secretAuditFileName     = "secrets.jsonl"
-	secretAuditSpillName    = "secrets.spill.jsonl"
-	secretAuditSpillWorking = "secrets.spill.jsonl.working"
+	// secretAuditCrashBufferDays is what the local JSONL keeps when
+	// SB_SECRET_AUDIT_RETENTION_DAYS=0: enough to survive a crash before the
+	// export tailer catches up, and nothing that could be read as "forever".
+	secretAuditCrashBufferDays = 1
+	secretAuditFileName        = "secrets.jsonl"
+	secretAuditSpillName       = "secrets.spill.jsonl"
+	secretAuditSpillWorking    = "secrets.spill.jsonl.working"
 	// secretAuditLockName is a stable sidecar flock target. Retention and
 	// wasm workers lock this path *before* opening secrets.jsonl so a rename
 	// during prune cannot leave writers appending to an unlinked inode.
@@ -1475,6 +1479,17 @@ func (s *Service) ensureSecretAuditSink() {
 			// to secrets.spill.jsonl under flock; gap only if spill write fails.
 			spill = true
 		}
+		// Operator overrides (SB_AUDIT_QUEUE_MAX / SB_AUDIT_OVERFLOW_POLICY):
+		// the buffered-backend knobs, same as kube-apiserver's audit buffer.
+		if s.cfg.AuditQueueMax > 0 {
+			buf = s.cfg.AuditQueueMax
+		}
+		switch s.cfg.AuditOverflowPolicy {
+		case "gap":
+			spill = false
+		case "spill":
+			spill = true
+		}
 		sink, err := newFileAuditSinkOpts(filepath.Join(dataDir, "audit"), buf, spill)
 		if err != nil {
 			s.secretAuditInitErr = err
@@ -1610,14 +1625,24 @@ func beginSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID
 }
 
 func beginSecretAuditInc(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID string) func(error) {
+	return beginSecretAuditOwned(sink, sandboxID, ref, actor, correlationID, incarnationID, "")
+}
+
+// beginSecretAuditOwned stamps the tenant owner so the record authorizes and
+// describes itself without a Raft lookup (plans/audit-export-connectors.md).
+func beginSecretAuditOwned(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID, ownerRef string) func(error) {
 	metricDone := beginClusterSecretOpen()
 	return func(err error) {
 		metricDone(err)
-		emitSecretAudit(sink, sandboxID, ref, actor, correlationID, incarnationID, err)
+		emitSecretAuditOwned(sink, sandboxID, ref, actor, correlationID, incarnationID, ownerRef, err)
 	}
 }
 
 func emitSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID string, err error) {
+	emitSecretAuditOwned(sink, sandboxID, ref, actor, correlationID, incarnationID, "", err)
+}
+
+func emitSecretAuditOwned(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID, ownerRef string, err error) {
 	if sink == nil {
 		return
 	}
@@ -1634,6 +1659,7 @@ func emitSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID,
 		CorrelationID: correlationID,
 		NodeID:        actor,
 		IncarnationID: strings.TrimSpace(incarnationID),
+		OwnerRef:      strings.TrimSpace(ownerRef),
 		Kind:          secretAuditKindSecretOpen,
 	}
 	if err != nil {
@@ -1660,6 +1686,7 @@ func (s *Service) emitEgressAudit(sandboxID, network, destination string) {
 		return
 	}
 	actor := s.auditActor()
+	incarnationID, ownerRef := s.auditIdentityFor(sandboxID)
 	sink.Emit(SecretAuditEvent{
 		Time:          time.Now().UTC(),
 		Actor:         actor,
@@ -1670,7 +1697,8 @@ func (s *Service) emitEgressAudit(sandboxID, network, destination string) {
 		Kind:          secretAuditKindEgress,
 		Destination:   destination,
 		Network:       strings.TrimSpace(network),
-		IncarnationID: s.secretIncarnationForSeal(sandboxID),
+		IncarnationID: incarnationID,
+		OwnerRef:      ownerRef,
 	})
 }
 

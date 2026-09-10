@@ -28,8 +28,9 @@ On the open-source build:
   records chain heads / receipts so retroactive local-file tampering is
   detectable. It does **not** store full audit batches today and cannot rebuild
   the JSONL after disk loss.
-- **Batch export.** Set an `https://` `SB_SECRET_AUDIT_EXPORT_URL` and
-  `SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN` to enable authenticated periodic POST
+- **Batch export.** Set `SB_AUDIT_EXPORT_BACKEND=webhook` with an `https://`
+  `SB_SECRET_AUDIT_EXPORT_URL` and `SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN` (or
+  HMAC / mTLS), or `s3` / `bus`, to enable authenticated periodic export
   of new JSONL segments (`Content-Type: application/x-ndjson`). A custom
   `controlplane.AuditExporter` is also supported. In enterprise mode the bearer
   token must contain at least 32 bytes. A configured
@@ -77,6 +78,39 @@ only `ca.crt`, `node.crt`, and `node.key`.
 | `SandboxdSecretAuditExportFailing` | Off-node event batches are not being accepted | Restore receiver connectivity/auth before local disk loss exceeds the recovery objective |
 | `SandboxdClusterCertExpiring` | Node (<14 days) or CA (<30 days) certificate approaches expiry | Sign a fresh node pair and atomically replace `node.crt`/`node.key`; prefer ≤90-day leaf certs |
 | `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down | For `awskms`, check IAM/KMS; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
+
+## Audit export connectors
+
+`SB_AUDIT_EXPORT_BACKEND` selects `noop` | `stdout` | `file` | `webhook` | `s3`
+| `bus` (design: `plans/audit-export-connectors.md`; defaults:
+`setup/config-defaults.md`). The split copies kube-apiserver: Raft holds only
+live placement and a short-grace deleted-sandbox routing stub; the local JSONL
+is the buffer; the backend carries history. Nothing here runs on a sandbox
+request path.
+
+What to expect and check:
+
+1. **At-least-once.** A crash between the receiver's ack and the local cursor
+   write re-sends a batch with the **same** `Idempotency-Key` /
+   `X-Aerol-Audit-Batch-ID`; the S3 key is that id. Receivers dedupe on it or
+   on `event_id`. Duplicates are normal after a restart, never a corruption sign.
+2. **Lag, never loss.** A failing backend makes
+   `aerolvm_audit_export_lag_bytes` grow and `aerolvm_audit_export_backend_healthy`
+   read 0 (alerts `SandboxdAuditExportLagging` / `SandboxdAuditExportFailures`).
+   Retention refuses to rotate unexported bytes, so disk grows until the
+   receiver recovers. Fix the receiver; do not shrink retention to "free" disk —
+   that discards evidence the backend never got.
+3. **Backoff.** After a failure the tailer waits (exponential, jittered, capped
+   by `SB_AUDIT_EXPORT_MAX_BACKOFF`) before retrying; the log line says
+   `retry_in`. This is expected during a receiver outage.
+4. **Every record carries `owner_ref` and `incarnation_id`**, so a downstream
+   store can authorize and partition without asking the cluster.
+5. **Post-delete reads.** For `SB_AUDIT_DELETED_GRACE` after a delete, any
+   ingress can still route `GET /v1/sandboxes/{id}/audit` to the evidence
+   nodes. After that (or when the stub index hit `SB_AUDIT_DELETED_INDEX_MAX`),
+   the cluster answers 404/503 and the export backend is the source of record.
+   The evidence node itself keeps serving from its own `sandbox_audit_acl`
+   row for `SB_SECRET_AUDIT_RETENTION_DAYS`.
 
 ## Audit drops / gap markers
 

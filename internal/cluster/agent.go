@@ -590,7 +590,7 @@ func (a *Agent) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwn
 	return a.applyCommand(ctx, command{
 		Op: opDelete, SandboxID: sandboxID,
 		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
-		ExpiresUnix: auditACLExpiryUnix(a.cfg.SecretAuditRetentionDays),
+		ExpiresUnix: auditACLExpiryUnix(a.cfg.AuditDeletedGrace), AuditIndexMax: int64(a.cfg.AuditDeletedIndexMax),
 	})
 }
 

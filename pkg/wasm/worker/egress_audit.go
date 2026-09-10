@@ -54,6 +54,16 @@ var (
 	workerEgressDropped atomic.Int64
 	workerEgressIPCFail = expvar.NewInt("aerolvm_wasm_egress_audit_ipc_fail_total")
 	workerEgressHTTP    = &http.Client{Timeout: 2 * time.Second}
+	// Overflow accounting mirrors the daemon sink's reserved-slot design: the
+	// dial path only bumps a counter and kicks the writer; one goroutine turns
+	// the count into a single coalesced gap marker. No flock, fsync, or log
+	// line ever runs on a sandbox's dial.
+	workerEgressPendingGap atomic.Int64
+	workerEgressGapKick    = make(chan struct{}, 1)
+	workerEgressGapDir     atomic.Pointer[string]
+	workerEgressGapNode    atomic.Pointer[string]
+	// workerEgressGapMarkers counts coalesced markers written (not drops).
+	workerEgressGapMarkers = expvar.NewInt("aerolvm_wasm_egress_audit_gap_markers_total")
 )
 
 // installDefaultEgressObserver wires destination attribution when
@@ -74,6 +84,8 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 		return
 	}
 	node := strings.TrimSpace(os.Getenv("SB_NODE_ID"))
+	workerEgressGapDir.Store(&spillDir)
+	workerEgressGapNode.Store(&node)
 	ensureWorkerEgressPool()
 	m.SetEgressObserver(func(sandboxID, network, address string) {
 		binding := egressAuditBinding{}
@@ -88,12 +100,53 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 		select {
 		case workerEgressCh <- job:
 		default:
-			workerEgressDropped.Add(1)
-			slog.Warn("wasm egress audit queue full; writing gap marker",
-				"sandbox_id", sandboxID, "destination", address, "dropped_total", workerEgressDropped.Load())
-			appendWorkerEgressGap(spillDir, node, sandboxID, binding.incarnationID)
+			noteWorkerEgressOverflow()
 		}
 	})
+}
+
+// noteWorkerEgressOverflow is the entire dial-path cost of a full queue: two
+// atomics. The pending count is flushed as one gap marker by the writer.
+func noteWorkerEgressOverflow() {
+	workerEgressDropped.Add(1)
+	workerEgressPendingGap.Add(1)
+	select {
+	case workerEgressGapKick <- struct{}{}:
+	default:
+	}
+}
+
+// flushWorkerEgressGap writes one marker for every drop counted since the
+// last flush. Runs only on the writer goroutine (or a test), never on a dial.
+func flushWorkerEgressGap() bool {
+	n := workerEgressPendingGap.Swap(0)
+	if n <= 0 {
+		return false
+	}
+	dir, node := "", ""
+	if p := workerEgressGapDir.Load(); p != nil {
+		dir = *p
+	}
+	if p := workerEgressGapNode.Load(); p != nil {
+		node = *p
+	}
+	if dir == "" {
+		// Nowhere durable to record the gap; the counter is the only evidence.
+		return false
+	}
+	appendWorkerEgressSpill(dir, workerEgressAuditEvent{
+		Time:    time.Now().UTC(),
+		Actor:   node,
+		Result:  "gap",
+		Reason:  "overflow",
+		NodeID:  node,
+		Kind:    "gap",
+		Dropped: n,
+	})
+	workerEgressGapMarkers.Add(1)
+	slog.Warn("wasm egress audit queue overflowed; coalesced gap marker written",
+		"dropped", n, "dropped_total", workerEgressDropped.Load())
+	return true
 }
 
 func ensureWorkerEgressPool() {
@@ -106,6 +159,11 @@ func ensureWorkerEgressPool() {
 				}
 			}()
 		}
+		go func() {
+			for range workerEgressGapKick {
+				flushWorkerEgressGap()
+			}
+		}()
 	})
 }
 
@@ -180,23 +238,6 @@ type statusError int
 func (e statusError) Error() string { return "audit ingest status " + strconv.Itoa(int(e)) }
 
 func errStatus(code int) error { return statusError(code) }
-
-func appendWorkerEgressGap(spillDir, node, sandboxID, incarnationID string) {
-	if spillDir == "" {
-		workerEgressDropped.Add(1)
-		return
-	}
-	appendWorkerEgressSpill(spillDir, workerEgressAuditEvent{
-		Time:          time.Now().UTC(),
-		Actor:         node,
-		SandboxID:     strings.TrimSpace(sandboxID),
-		Result:        "gap",
-		Reason:        "overflow",
-		NodeID:        node,
-		Kind:          "gap",
-		IncarnationID: strings.TrimSpace(incarnationID),
-	})
-}
 
 // appendWorkerEgressSpill durable-appends under flock + fsync to the parent
 // spill file. Does not update secrets.tip or secrets.jsonl.

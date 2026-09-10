@@ -647,9 +647,12 @@ type Client interface {
 	// before irreversible secret and external-artifact cleanup. It is
 	// idempotent for the same lifecycle and rejects reassignment races.
 	BeginDeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error
-	// AuditOwnerRef resolves the minimal Raft-retained owner ACL after placement
-	// deletion. PruneAuditACL removes expired rows through a deterministic Raft
-	// command so every ingress sees the same authorization state.
+	// AuditOwnerRef resolves the bounded, short-grace routing stub Raft keeps
+	// for a deleted sandbox (owner_ref + evidence nodes). The stub exists only
+	// for SB_AUDIT_DELETED_GRACE and under SB_AUDIT_DELETED_INDEX_MAX; the
+	// durable authorization record is the evidence node's sandbox_audit_acl
+	// row, and long-term history is the export backend's. PruneAuditACL
+	// removes expired stubs through a deterministic Raft command.
 	AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error)
 	// AuditACLForSandbox resolves an exact retained lifecycle when
 	// incarnationID is non-empty, or the newest retained lifecycle otherwise.

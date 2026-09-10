@@ -68,6 +68,10 @@ type SecretAuditPage struct {
 // PruneSecretAudit drops audit state older than
 // SB_SECRET_AUDIT_RETENTION_DAYS. The JSONL rewrite is skipped when the file
 // sink is unavailable, but retained post-delete ACL metadata is still pruned.
+//
+// Zero retention means "retain nothing beyond the crash buffer": post-delete
+// ACL rows go at the next sweep and the JSONL keeps one day for the export
+// tailer to catch up. It never means forever.
 func (s *Service) PruneSecretAudit(ctx context.Context) error {
 	if s == nil {
 		return nil
@@ -80,12 +84,18 @@ func (s *Service) PruneSecretAudit(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	days := s.cfg.SecretAuditRetentionDays
-	if days <= 0 {
+	if days < 0 {
 		return nil
 	}
 	s.ensureSecretAuditSink()
 	f := s.secretAuditFile
-	cutoff := time.Now().UTC().AddDate(0, 0, -days)
+	now := time.Now().UTC()
+	cutoff := now.AddDate(0, 0, -days)
+	aclCutoff := cutoff
+	if days == 0 {
+		cutoff = now.AddDate(0, 0, -secretAuditCrashBufferDays)
+		aclCutoff = now
+	}
 	if f != nil {
 		exporter := s.getAuditExporter()
 		hasExporter := exporter != nil && (controlplane.Provider{AuditExporter: exporter}).HasAuditExporter()
@@ -115,7 +125,7 @@ func (s *Service) PruneSecretAudit(ctx context.Context) error {
 	if s.store == nil {
 		return nil
 	}
-	_, err := s.store.PruneSandboxAuditACL(ctx, cutoff)
+	_, err := s.store.PruneSandboxAuditACL(ctx, aclCutoff)
 	return err
 }
 

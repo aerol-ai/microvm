@@ -58,7 +58,7 @@ feature is still mid-rollout.
 | `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start on awskms boot-canary failure. Default fail-open with a warning. |
 | `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
 | `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create. Cluster mode requires `>0`; zero ACKs retract the secret and fail the create. |
-| `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` retention. Appends are fsynced at least once per second and at shutdown; pruned daily (and on sink start). `0` disables prune. |
+| `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` and `sandbox_audit_acl` retention. Appends are fsynced at least once per second and at shutdown; pruned daily (and on sink start). **`0` means retain nothing beyond the crash buffer** — post-delete ACL rows go at the next sweep and the JSONL keeps one day for the export tailer. It never means forever. |
 | `SB_SECRET_AUDIT_STRICT_BOOT` | `true` | Refuse daemon startup when the local secret-audit writer cannot be opened or its hash chain fails verification. A torn final record from an unclean shutdown is not a failure: it is cut at open and recorded as a `reason=torn_tail` gap marker. |
 | `SB_SECRET_TOMB_RETENTION_DAYS` | `30` | Retain delete fences after all peer ACKs; `0` disables tombstone GC. Live/pending rows are never pruned. |
 | `SB_EGRESS_ATTRIBUTION_ENABLED` | `true` | Wasm/isolate egress destination records in the same audit JSONL (`kind=egress`). Observational; off create path. |
@@ -74,6 +74,33 @@ These bound amplification on `GET /v1/sandboxes/{id}/audit` (one client call →
 | `SB_AUDIT_RATE_LIMIT_NODE` | `50` | Global per-node ceiling (req/s). Burst 100. The only effective bound on OSS (single operator identity). |
 
 `vault` is accepted as a known name but **fails boot** with a not-implemented error (no silent fallback to local).
+
+## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
+
+Modeled on kube-apiserver's audit backends (`plans/audit-export-connectors.md`):
+the local hash-chained JSONL is the buffer, one cursor-tailer ships batches,
+and the backend is pluggable. Raft never carries audit history. Delivery is
+at-least-once — receivers dedupe on `Idempotency-Key` / `X-Aerol-Audit-Batch-ID`
+(the S3 object key *is* the batch id, so a re-send overwrites, not duplicates).
+A failing backend never drops evidence: the cursor lags, retention refuses to
+rotate unexported bytes, and `aerolvm_audit_export_lag_bytes` grows visibly.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_EXPORT_BACKEND` | `noop` (`webhook` when `SB_SECRET_AUDIT_EXPORT_URL` is set) | `noop` \| `stdout` \| `file` \| `webhook` \| `s3` \| `bus`. `noop` keeps evidence on local disk only and claims nothing more. Enterprise mode requires a non-noop backend or an injected `controlplane.AuditExporter`. |
+| `SB_AUDIT_EXPORT_BATCH_MAX` | `4096` | Events per shipped batch (≤ 65536). |
+| `SB_AUDIT_EXPORT_FLUSH_INTERVAL` | `1s` | Tailer tick (≥ 100ms). |
+| `SB_AUDIT_EXPORT_MAX_BACKOFF` | `5m` | Retry cap after a failed export; exponential with full jitter from the flush interval. |
+| `SB_AUDIT_QUEUE_MAX` | `1024` (`8192` enterprise) | Bounded in-memory emit queue in front of the JSONL. Emit never blocks a request. |
+| `SB_AUDIT_OVERFLOW_POLICY` | `gap` (`spill` enterprise) | Full queue: `gap` drops and writes a counted `gap` marker; `spill` durable-appends to `secrets.spill.jsonl` (gap only if that fails). |
+| `SB_AUDIT_EXPORT_FILE_PATH` | (empty) | `file` backend target; `-` = stdout. A log backend for shippers, not durable storage. |
+| `SB_AUDIT_EXPORT_WEBHOOK_URL` / `SB_AUDIT_EXPORT_WEBHOOK_BEARER_TOKEN` | (empty) | Aliases of `SB_SECRET_AUDIT_EXPORT_URL` / `..._BEARER_TOKEN`. Batched NDJSON POST; redirects are refused. |
+| `SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY` | (empty) | Signs each body: `X-Aerol-Signature: sha256=<hex hmac>`. |
+| `SB_AUDIT_EXPORT_WEBHOOK_CA_FILE` / `_CERT_FILE` / `_KEY_FILE` | (empty) | Receiver pinning and client-certificate (mTLS) auth. Enterprise webhooks must be `https` with at least one of bearer, HMAC, or client cert. |
+| `SB_AUDIT_EXPORT_S3_BUCKET` / `_PREFIX` / `_ENDPOINT` / `_REGION` / `_PATH_STYLE` | (empty) | Any S3-compatible store; one object per batch at `<prefix>/node=<id>/<yyyy>/<mm>/<dd>/<batch>.jsonl`. Credentials come from the default AWS chain. Enterprise requires an `https` endpoint. |
+| `SB_AUDIT_EXPORT_BUS_BROKERS` / `_TOPIC` | (empty) | Consumed by a registered `auditexport.BusPublisher` (Kafka/NATS client linked into the build). Without one, boot fails with `not implemented`. |
+| `SB_AUDIT_DELETED_GRACE` | `1h` | How long the Raft FSM keeps a **routing stub** (owner_ref + evidence nodes) for a deleted sandbox so any ingress can still route a post-delete audit read. A grace window, never history: hard cap 24h; `0` disables it (pure Kubernetes mode — post-delete history is the backend's). |
+| `SB_AUDIT_DELETED_INDEX_MAX` | `100000` | Hard cap on that stub index, oldest log index evicted first. Bounds FSM memory and snapshot size regardless of delete rate. Carried in each delete command so every replica evicts identically. |
 
 Sandbox environment values are always encrypted in `sandbox_env`, and toolbox
 bearer tokens are always encrypted in `sandboxes.toolbox_token_sealed`. There

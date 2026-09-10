@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"net"
 	"net/url"
 	"os"
@@ -1129,6 +1130,64 @@ type Config struct {
 	// receiver. Required with SecretAuditExportURL in enterprise mode.
 	// SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN.
 	SecretAuditExportBearerToken string
+
+	// Audit export connectors (plans/audit-export-connectors.md). Modeled on
+	// kube-apiserver audit backends: the local JSONL is the buffer, a cursor
+	// tailer ships batches, and the backend is pluggable. Raft never holds
+	// history.
+	//
+	// AuditExportBackend selects noop|stdout|file|webhook|s3|bus. Empty
+	// resolves to webhook when SecretAuditExportURL is set, else noop.
+	// SB_AUDIT_EXPORT_BACKEND.
+	AuditExportBackend string
+	// AuditExportBatchMax bounds events per shipped batch. SB_AUDIT_EXPORT_BATCH_MAX.
+	AuditExportBatchMax int
+	// AuditExportFlushInterval is the tailer tick. SB_AUDIT_EXPORT_FLUSH_INTERVAL.
+	AuditExportFlushInterval time.Duration
+	// AuditExportMaxBackoff caps retry delay after a failed export.
+	// SB_AUDIT_EXPORT_MAX_BACKOFF.
+	AuditExportMaxBackoff time.Duration
+	// AuditQueueMax is the bounded in-memory emit queue. 0 keeps the built-in
+	// default (1024, 8192 in enterprise mode). SB_AUDIT_QUEUE_MAX.
+	AuditQueueMax int
+	// AuditOverflowPolicy is what a full queue does: "gap" drops and writes a
+	// counted gap marker; "spill" durable-appends to a spill file. Empty
+	// keeps the built-in default (gap; spill in enterprise mode).
+	// SB_AUDIT_OVERFLOW_POLICY.
+	AuditOverflowPolicy string
+	// AuditExportFilePath is the file backend target ("-" = stdout).
+	// SB_AUDIT_EXPORT_FILE_PATH.
+	AuditExportFilePath string
+	// AuditExportWebhookHMACKey signs webhook bodies (X-Aerol-Signature).
+	// SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY.
+	AuditExportWebhookHMACKey string
+	// AuditExportWebhookCAFile / CertFile / KeyFile configure receiver
+	// pinning and client-certificate (mTLS) authentication.
+	// SB_AUDIT_EXPORT_WEBHOOK_{CA,CERT,KEY}_FILE.
+	AuditExportWebhookCAFile   string
+	AuditExportWebhookCertFile string
+	AuditExportWebhookKeyFile  string
+	// AuditExportS3* target any S3-compatible object store; credentials come
+	// from the default AWS chain. SB_AUDIT_EXPORT_S3_{BUCKET,PREFIX,ENDPOINT,REGION,PATH_STYLE}.
+	AuditExportS3Bucket    string
+	AuditExportS3Prefix    string
+	AuditExportS3Endpoint  string
+	AuditExportS3Region    string
+	AuditExportS3PathStyle bool
+	// AuditExportBusBrokers / Topic feed a registered bus publisher.
+	// SB_AUDIT_EXPORT_BUS_{BROKERS,TOPIC}.
+	AuditExportBusBrokers string
+	AuditExportBusTopic   string
+	// AuditDeletedGrace bounds how long the Raft FSM keeps a routing stub
+	// (owner_ref + evidence nodes) for a deleted sandbox so ingress can still
+	// route a post-delete audit read. It is a short grace, never history: 0
+	// disables the stub entirely and post-delete history is the export
+	// backend's job. Default 1h, hard cap 24h. SB_AUDIT_DELETED_GRACE.
+	AuditDeletedGrace time.Duration
+	// AuditDeletedIndexMax hard-caps that stub index; the oldest entries are
+	// evicted first. Bounds FSM memory and snapshot size regardless of delete
+	// rate. Default 100000. SB_AUDIT_DELETED_INDEX_MAX.
+	AuditDeletedIndexMax int
 	// AuditRateLimitIdentity is the per-OwnerRef token rate (req/s) for
 	// GET /v1/sandboxes/{id}/audit. Security parameter (amplification bound).
 	// SB_AUDIT_RATE_LIMIT_IDENTITY. Default 10.
@@ -1650,6 +1709,26 @@ func Load() (Config, error) {
 		AuditIngestToken:              strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN")),
 		SecretAuditExportURL:          strings.TrimSpace(os.Getenv("SB_SECRET_AUDIT_EXPORT_URL")),
 		SecretAuditExportBearerToken:  strings.TrimSpace(os.Getenv("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN")),
+		AuditExportBackend:            strings.ToLower(strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_BACKEND"))),
+		AuditExportBatchMax:           getEnvInt("SB_AUDIT_EXPORT_BATCH_MAX", 4096),
+		AuditExportFlushInterval:      getEnvDuration("SB_AUDIT_EXPORT_FLUSH_INTERVAL", time.Second),
+		AuditExportMaxBackoff:         getEnvDuration("SB_AUDIT_EXPORT_MAX_BACKOFF", 5*time.Minute),
+		AuditQueueMax:                 getEnvInt("SB_AUDIT_QUEUE_MAX", 0),
+		AuditOverflowPolicy:           strings.ToLower(strings.TrimSpace(os.Getenv("SB_AUDIT_OVERFLOW_POLICY"))),
+		AuditExportFilePath:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_FILE_PATH")),
+		AuditExportWebhookHMACKey:     strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY")),
+		AuditExportWebhookCAFile:      strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_CA_FILE")),
+		AuditExportWebhookCertFile:    strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_CERT_FILE")),
+		AuditExportWebhookKeyFile:     strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_KEY_FILE")),
+		AuditExportS3Bucket:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_BUCKET")),
+		AuditExportS3Prefix:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_PREFIX")),
+		AuditExportS3Endpoint:         strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_ENDPOINT")),
+		AuditExportS3Region:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_REGION")),
+		AuditExportS3PathStyle:        getEnvBool("SB_AUDIT_EXPORT_S3_PATH_STYLE", false),
+		AuditExportBusBrokers:         strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_BUS_BROKERS")),
+		AuditExportBusTopic:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_BUS_TOPIC")),
+		AuditDeletedGrace:             getEnvDuration("SB_AUDIT_DELETED_GRACE", time.Hour),
+		AuditDeletedIndexMax:          getEnvInt("SB_AUDIT_DELETED_INDEX_MAX", 100000),
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
@@ -2197,17 +2276,33 @@ func Load() (Config, error) {
 	if cfg.AuditRateLimitNode <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_NODE must be > 0")
 	}
-	if raw := strings.TrimSpace(cfg.SecretAuditExportURL); raw != "" {
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" || u.User != nil {
-			return Config{}, errors.New("SB_SECRET_AUDIT_EXPORT_URL must be an absolute URL without userinfo")
-		}
-		if cfg.EnterpriseMode && !strings.EqualFold(u.Scheme, "https") {
-			return Config{}, errors.New("SB_SECRET_AUDIT_EXPORT_URL must use https when SB_ENTERPRISE_MODE=true")
-		}
-		if cfg.EnterpriseMode && strings.TrimSpace(cfg.SecretAuditExportBearerToken) == "" {
-			return Config{}, errors.New("SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN is required with SB_SECRET_AUDIT_EXPORT_URL when SB_ENTERPRISE_MODE=true")
-		}
+	// Aliases: the connector-era names win, the pre-connector names still work.
+	if v := strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_URL")); v != "" {
+		cfg.SecretAuditExportURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_BEARER_TOKEN")); v != "" {
+		cfg.SecretAuditExportBearerToken = v
+	}
+	cfg.AuditExportBackend = cfg.ResolvedAuditExportBackend()
+	if err := cfg.AuditExportConfig().Validate(); err != nil {
+		return Config{}, err
+	}
+	if cfg.AuditQueueMax < 0 {
+		return Config{}, errors.New("SB_AUDIT_QUEUE_MAX must be >= 0")
+	}
+	switch cfg.AuditOverflowPolicy {
+	case "", "gap", "spill":
+	default:
+		return Config{}, errors.New("SB_AUDIT_OVERFLOW_POLICY must be gap or spill")
+	}
+	if cfg.AuditDeletedGrace < 0 {
+		return Config{}, errors.New("SB_AUDIT_DELETED_GRACE must be >= 0")
+	}
+	if cfg.AuditDeletedGrace > 24*time.Hour {
+		return Config{}, errors.New("SB_AUDIT_DELETED_GRACE must be <= 24h: the Raft routing stub is a grace window, not audit history — use the export backend for longer retention")
+	}
+	if cfg.AuditDeletedIndexMax < 0 {
+		return Config{}, errors.New("SB_AUDIT_DELETED_INDEX_MAX must be >= 0")
 	}
 	if cfg.EnterpriseMode {
 		// Enterprise tamper-evidence requires both reconstructable event export
@@ -2676,4 +2771,52 @@ func normalizeAdvertiseHost(value string) string {
 		return strings.Trim(value[:i], "[]")
 	}
 	return trimmed
+}
+
+// AuditExportConfig projects the audit connector settings into the
+// backend-neutral shape pkg/auditexport validates and builds from.
+func (c Config) AuditExportConfig() auditexport.Config {
+	return auditexport.Config{
+		Backend:       c.ResolvedAuditExportBackend(),
+		BatchMax:      c.AuditExportBatchMax,
+		FlushInterval: c.AuditExportFlushInterval,
+		MaxBackoff:    c.AuditExportMaxBackoff,
+		Enterprise:    c.EnterpriseMode,
+		File:          auditexport.FileConfig{Path: c.AuditExportFilePath},
+		Webhook: auditexport.WebhookConfig{
+			URL:         c.SecretAuditExportURL,
+			BearerToken: c.SecretAuditExportBearerToken,
+			HMACKey:     c.AuditExportWebhookHMACKey,
+			CAFile:      c.AuditExportWebhookCAFile,
+			CertFile:    c.AuditExportWebhookCertFile,
+			KeyFile:     c.AuditExportWebhookKeyFile,
+		},
+		S3: auditexport.S3Config{
+			Bucket:    c.AuditExportS3Bucket,
+			Prefix:    c.AuditExportS3Prefix,
+			Endpoint:  c.AuditExportS3Endpoint,
+			Region:    c.AuditExportS3Region,
+			PathStyle: c.AuditExportS3PathStyle,
+		},
+		Bus: auditexport.BusConfig{Brokers: c.AuditExportBusBrokers, Topic: c.AuditExportBusTopic},
+	}
+}
+
+// ResolvedAuditExportBackend applies the legacy alias: an unset backend with
+// SB_SECRET_AUDIT_EXPORT_URL present means webhook, otherwise noop. Load
+// stores the resolved value, but embedders that build Config directly get
+// the same answer.
+func (c Config) ResolvedAuditExportBackend() string {
+	if b := strings.ToLower(strings.TrimSpace(c.AuditExportBackend)); b != "" {
+		return b
+	}
+	if strings.TrimSpace(c.SecretAuditExportURL) != "" {
+		return auditexport.BackendWebhook
+	}
+	return auditexport.BackendNoop
+}
+
+// AuditExportEnabled reports whether a non-noop connector is configured.
+func (c Config) AuditExportEnabled() bool {
+	return c.ResolvedAuditExportBackend() != auditexport.BackendNoop
 }
