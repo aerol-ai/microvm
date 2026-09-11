@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -28,6 +27,10 @@ const (
 var (
 	secretAuditWitnessHealthy  = expvar.NewInt("aerolvm_secret_audit_witness_healthy")
 	secretAuditWitnessFailures = expvar.NewInt("aerolvm_secret_audit_witness_failures_total")
+	// secretAuditBootWitnessProvisional counts boots that accepted a
+	// witnessed head on the local receipt because it lay in the checkpoint's
+	// trusted prefix; the background pass settles it.
+	secretAuditBootWitnessProvisional = expvar.NewInt("aerolvm_secret_audit_boot_witness_provisional_total")
 )
 
 type witnessReceiptRecord struct {
@@ -213,32 +216,23 @@ func (s *Service) secretAuditWitnessTipPath() string {
 // VerifySecretAuditWitness recomputes the local hash chain (never trusting
 // secrets.tip) and checks that an external witness head is an ancestor of the
 // verified tip. Local tip may be ahead of the last ship — that is success.
+//
+// One pass, O(1) memory: the witnessed head is fetched first and the scan
+// probes for it (and records the newest retention checkpoint's
+// WitnessedThrough) instead of materializing every hash in the file.
 func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead string, err error) {
 	if s == nil || s.secretAuditFile == nil {
 		return true, "", "", nil
 	}
-	var (
-		hashes            []string
-		retentionThrough  string
-		hasRetentionProof bool
-	)
-	err = s.secretAuditFile.withAuditFileLock(func() error {
-		var scanErr error
-		localHead, _, hashes, scanErr = recomputeChain(s.secretAuditFile.path)
-		if scanErr != nil {
-			return scanErr
-		}
-		retentionThrough, hasRetentionProof = retentionWitnessedThrough(s.secretAuditFile.path)
-		return nil
-	})
-	if err != nil {
-		secretAuditWitnessHealthy.Set(0)
-		return false, "", "", err
-	}
 	w := s.witness()
 	hasExternal := w != nil && (controlplane.Provider{Witness: w}).HasExternalWitness()
 	if !hasExternal {
-		return true, localHead, "", nil
+		scan, scanErr := s.verifiedSecretAuditScan()
+		if scanErr != nil {
+			secretAuditWitnessHealthy.Set(0)
+			return false, "", "", scanErr
+		}
+		return true, scan.head, "", nil
 	}
 
 	nodeID := ""
@@ -251,59 +245,116 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 	if err != nil {
 		secretAuditWitnessHealthy.Set(0)
 		secretAuditWitnessFailures.Add(1)
-		return false, localHead, "", err
+		return false, "", "", err
 	}
-
+	remoteHead = strings.TrimSpace(remoteHead)
+	scan, err := s.verifiedSecretAuditScan(remoteHead)
+	if err != nil {
+		secretAuditWitnessHealthy.Set(0)
+		return false, "", "", err
+	}
+	localHead = scan.head
 	// Empty chain has nothing to witness yet.
-	if localHead == "" || localHead == auditlog.GenesisPrevHash || len(hashes) == 0 {
+	if localHead == "" || localHead == auditlog.GenesisPrevHash || scan.records == 0 {
 		return true, localHead, "", nil
 	}
-
-	localReceipt, err := lastWitnessedHead(s.secretAuditWitnessPath())
+	localReceipt, err := s.localWitnessReceiptHead()
 	if err != nil {
 		return false, localHead, "", err
+	}
+	return s.judgeWitnessAncestry(localHead, localReceipt, remoteHead, remoteOK, scan.found[remoteHead], scan.witnessedThrough)
+}
+
+// verifiedSecretAuditScan is one strict pass under the audit flock, probing
+// for the given hashes.
+func (s *Service) verifiedSecretAuditScan(probe ...string) (secretAuditChainScan, error) {
+	var scan secretAuditChainScan
+	err := s.secretAuditFile.withAuditFileLock(func() error {
+		var scanErr error
+		scan, scanErr = recomputeChain(s.secretAuditFile.path, probe...)
+		return scanErr
+	})
+	return scan, err
+}
+
+// localWitnessReceiptHead is the head this node last recorded as shipped:
+// the tip sidecar when present, else the newest receipt line.
+func (s *Service) localWitnessReceiptHead() (string, error) {
+	localReceipt, err := lastWitnessedHead(s.secretAuditWitnessPath())
+	if err != nil {
+		return "", err
 	}
 	if tip, tipErr := readWitnessTip(s.secretAuditWitnessTipPath()); tipErr == nil && tip.HeadHex != "" {
 		localReceipt = tip.HeadHex
 	}
-	// Missing local receipts is failure when an external witness is required —
-	// never treat "no receipt file" as success.
-	if localReceipt == "" {
-		secretAuditWitnessHealthy.Set(0)
-		return false, localHead, "", nil
-	}
-	if !remoteOK || remoteHead == "" {
-		secretAuditWitnessHealthy.Set(0)
-		return false, localHead, "", nil
-	}
-	witnessedHead = remoteHead
+	return strings.TrimSpace(localReceipt), nil
+}
 
-	// Witnessed head must match a local receipt OR appear as some EventHash in
-	// the verified chain OR equal a retention_checkpoint.WitnessedThrough.
-	// Ancestry (not tip equality) is the success criterion: local tip may be
-	// ahead of the last ship; prune may drop the witnessed prefix while
-	// recording WitnessedThrough on the checkpoint.
-	receiptOK := localReceipt == witnessedHead
-	inChain := false
-	for _, h := range hashes {
-		if h == witnessedHead {
-			inChain = true
-			break
-		}
-	}
-	if !inChain && hasRetentionProof && retentionThrough == witnessedHead {
-		inChain = true
-	}
-	if !receiptOK && !inChain {
+// judgeWitnessAncestry applies the witness contract once the facts are in
+// hand. Missing local receipts is failure when an external witness is
+// required — never treat "no receipt file" as success. The witnessed head
+// must be in the verified chain (or be the WitnessedThrough a retention
+// checkpoint carried forward): ancestry, not tip equality, is the success
+// criterion, since the local tip may be ahead of the last ship.
+func (s *Service) judgeWitnessAncestry(localHead, localReceipt, remoteHead string, remoteOK, inChain bool, retentionThrough string) (bool, string, string, error) {
+	if localReceipt == "" || !remoteOK || remoteHead == "" {
 		secretAuditWitnessHealthy.Set(0)
-		return false, localHead, witnessedHead, nil
+		return false, localHead, "", nil
+	}
+	if !inChain && retentionThrough != "" && retentionThrough == remoteHead {
+		inChain = true
 	}
 	if !inChain {
 		secretAuditWitnessHealthy.Set(0)
-		return false, localHead, witnessedHead, nil
+		return false, localHead, remoteHead, nil
 	}
 	secretAuditWitnessHealthy.Set(1)
-	return true, localHead, witnessedHead, nil
+	return true, localHead, remoteHead, nil
+}
+
+// verifySecretAuditWitnessAtBoot answers the boot-time check from the pass
+// the sink already made when it opened. That pass probed for the locally
+// recorded witness tip, so when the external witness agrees with that tip
+// (the normal case) nothing is read again. In checkpoint mode a tip that
+// lies in the trusted prefix is accepted on the strength of the local
+// receipt; the background full pass proves the chain behind it. Anything
+// else falls back to one full probing pass.
+func (s *Service) verifySecretAuditWitnessAtBoot(w controlplane.Witness) (ok bool, localHead, witnessedHead string, err error) {
+	f := s.secretAuditFile
+	nodeID := ""
+	if c := s.Cluster(); c != nil {
+		nodeID = c.SelfNodeID()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), secretAuditWitnessShipTimeout)
+	defer cancel()
+	remoteHead, remoteOK, err := w.LastWitnessedHead(ctx, nodeID)
+	if err != nil {
+		secretAuditWitnessHealthy.Set(0)
+		secretAuditWitnessFailures.Add(1)
+		return false, "", "", err
+	}
+	remoteHead = strings.TrimSpace(remoteHead)
+	localHead, _ = f.chainTip()
+	if localHead == "" || localHead == auditlog.GenesisPrevHash || (f.bootScan.records == 0 && f.bootTrusted == 0) {
+		return true, localHead, "", nil
+	}
+	localReceipt, err := s.localWitnessReceiptHead()
+	if err != nil {
+		return false, localHead, "", err
+	}
+	if remoteHead != "" && remoteHead == localReceipt {
+		inChain := f.bootScan.found[remoteHead] || remoteHead == localHead
+		if !inChain && f.bootTrusted > 0 {
+			// The head was shipped by this node from a chain it had
+			// verified; it precedes the checkpoint this boot trusted.
+			inChain = true
+			secretAuditBootWitnessProvisional.Add(1)
+		}
+		return s.judgeWitnessAncestry(localHead, localReceipt, remoteHead, remoteOK, inChain, f.bootScan.witnessedThrough)
+	}
+	// The witness holds a head this node did not record as its latest ship
+	// (a receipt write lost to a crash, or an older ack): locate it.
+	return s.VerifySecretAuditWitness()
 }
 
 // requireCurrentSecretAuditWitness gates retention on an exact current-head
@@ -344,36 +395,6 @@ func (s *Service) requireCurrentSecretAuditWitness(ctx context.Context) (string,
 	return head, nil
 }
 
-// retentionWitnessedThrough returns WitnessedThrough from the newest
-// retention_checkpoint in the JSONL (empty/false when none).
-func retentionWitnessedThrough(path string) (string, bool) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", false
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	var through string
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		var ev SecretAuditEvent
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue
-		}
-		if strings.TrimSpace(ev.Kind) == secretAuditKindRetentionCheckpoint && strings.TrimSpace(ev.WitnessedThrough) != "" {
-			through = strings.TrimSpace(ev.WitnessedThrough)
-		}
-	}
-	if through == "" {
-		return "", false
-	}
-	return through, true
-}
-
 // ValidateSecretAuditWitness fails closed when a real external witness is
 // installed and the local chain does not contain a witnessed ancestor head.
 // No-op when only the noop witness is present (daemon enforces
@@ -390,7 +411,16 @@ func (s *Service) ValidateSecretAuditWitness() error {
 	if s.secretAuditFile == nil {
 		s.ensureSecretAuditSink()
 	}
-	ok, local, witnessed, err := s.VerifySecretAuditWitness()
+	var (
+		ok               bool
+		local, witnessed string
+		err              error
+	)
+	if f := s.secretAuditFile; f != nil && f.bootScanCurrent() {
+		ok, local, witnessed, err = s.verifySecretAuditWitnessAtBoot(w)
+	} else {
+		ok, local, witnessed, err = s.VerifySecretAuditWitness()
+	}
 	if err != nil {
 		return fmt.Errorf("verify secret audit witness: %w", err)
 	}

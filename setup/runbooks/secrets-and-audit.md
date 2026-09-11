@@ -112,6 +112,36 @@ What to expect and check:
    The evidence node itself keeps serving from its own `sandbox_audit_acl`
    row for `SB_SECRET_AUDIT_RETENTION_DAYS`.
 
+## Boot verification and `secrets.verified`
+
+Every boot verifies the local chain before the writer opens. With
+`SB_SECRET_AUDIT_BOOT_VERIFY=full` (default) that is one pass over the whole
+file — O(retained volume) in time, O(1) in memory; the boot-time witness
+check reuses that pass (it probes for the locally recorded witness tip), so a
+node with an external witness does not read the file a second time.
+
+With `checkpoint`, the writer keeps `secrets.verified` next to the log: the
+offset, record, and head of the last fsync. Boot re-reads only that record
+and what follows it, opens the writer, and then runs the same full pass an
+operator can request with `POST /v1/audit/verify` in the background:
+
+- `secret audit chain verified from checkpoint; full verification continues in
+  background` at boot, then `secret audit chain fully verified after checkpoint
+  boot` — normal.
+- `secret audit chain failed full verification after checkpoint boot` (alert
+  `SandboxdAuditChainBroken`, critical): the prefix boot trusted does not
+  verify. Local audit reads answer `503`, the read index is off, appends
+  continue (they link from the checkpoint). Capture the file; the log line
+  and `POST /v1/audit/verify` name the offset.
+- A stale sidecar (retention rewrote the file, the record is gone, or it
+  points past EOF) is ignored: boot reads everything, then re-pins it.
+  `aerolvm_secret_audit_boot_witness_provisional_total` counts boots that
+  accepted a witnessed head on the local receipt because it lay in the
+  trusted prefix; the background pass proves it.
+
+Do not delete `secrets.verified` to "force" a full check — set the mode to
+`full` for one boot, or call `POST /v1/audit/verify`.
+
 ## Audit read index and on-demand verification
 
 `GET /v1/sandboxes/{id}/audit` is served from a per-sandbox index over the

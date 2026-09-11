@@ -1007,6 +1007,15 @@ list) per page; the per-row step is in-memory only. A failed batch read
 reports not-ready for the page (the per-row reader used to report *ready*
 on a store error, because "no recipients" read as single-node).
 
+Fourth stacked PR: boot read the whole log up to three times (sink open;
+`recomputeChain` for the witness with an all-hashes slice; a separate pass
+for the retention checkpoint's `WitnessedThrough`). Now one pass, O(1)
+memory: the scan probes for the hashes it is asked about and carries the
+checkpoint's `WitnessedThrough`; boot-time witness validation reuses the
+open pass. `SB_SECRET_AUDIT_BOOT_VERIFY=checkpoint` (opt-in) makes boot
+O(bytes since the last sync) via `secrets.verified` and proves the prefix in
+the background, withholding reads on failure instead of refusing to start.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

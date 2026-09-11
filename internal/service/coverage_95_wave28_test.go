@@ -694,9 +694,9 @@ func TestSecretAuditWitnessAndExportRemaining(t *testing.T) {
 		t.Fatalf("exporterless batch = %d %v", n, err)
 	}
 
-	headHex, eventID, hashes, err := recomputeChain(filepath.Join(t.TempDir(), "missing.jsonl"))
-	if err != nil || headHex == "" || eventID != "" || hashes != nil {
-		t.Fatalf("missing chain = %q %q %v %v", headHex, eventID, hashes, err)
+	scan, err := recomputeChain(filepath.Join(t.TempDir(), "missing.jsonl"))
+	if err != nil || scan.head == "" || scan.eventID != "" || scan.records != 0 || scan.found != nil {
+		t.Fatalf("missing chain = %+v %v", scan, err)
 	}
 }
 

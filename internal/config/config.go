@@ -1093,6 +1093,15 @@ type Config struct {
 	// evidence stream is not a safe production state. Tests and embedders with
 	// no DBPath remain unaffected. SB_SECRET_AUDIT_STRICT_BOOT.
 	SecretAuditStrictBoot bool
+	// SecretAuditBootVerify selects how much of secrets.jsonl boot re-reads
+	// before the writer opens. "full" (default) verifies every record, one
+	// pass, O(1) memory: boot is O(retained volume). "checkpoint" verifies
+	// from the writer's last fsynced checkpoint (secrets.verified) — O(bytes
+	// since the last sync) — and re-verifies the whole chain in the
+	// background right after boot; a failure there withholds local audit
+	// reads (503) and fires the critical alert instead of refusing to start.
+	// SB_SECRET_AUDIT_BOOT_VERIFY.
+	SecretAuditBootVerify string
 	// SecretAuditExternalWitness requires a non-noop control-plane Witness so
 	// audit chain heads leave the node. Required when SB_ENTERPRISE_MODE=true
 	// — local JSONL alone must not claim tamper-evidence. Managed builds wire
@@ -1707,6 +1716,7 @@ func Load() (Config, error) {
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
+		SecretAuditBootVerify:         strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_AUDIT_BOOT_VERIFY", "full"))),
 		SecretAuditExternalWitness:    getEnvBool("SB_SECRET_AUDIT_EXTERNAL_WITNESS", false),
 		SecretAuditWitnessInterval:    getEnvDuration("SB_SECRET_AUDIT_WITNESS_INTERVAL", 30*time.Second),
 		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
@@ -2270,6 +2280,9 @@ func Load() (Config, error) {
 	}
 	if cfg.SecretAuditRetentionDays < 0 {
 		return Config{}, errors.New("SB_SECRET_AUDIT_RETENTION_DAYS must be >= 0")
+	}
+	if cfg.SecretAuditBootVerify != "full" && cfg.SecretAuditBootVerify != "checkpoint" {
+		return Config{}, fmt.Errorf("SB_SECRET_AUDIT_BOOT_VERIFY must be full or checkpoint (got %q)", cfg.SecretAuditBootVerify)
 	}
 	if cfg.SecretTombRetentionDays < 0 {
 		return Config{}, errors.New("SB_SECRET_TOMB_RETENTION_DAYS must be >= 0")

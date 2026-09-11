@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
@@ -288,25 +289,39 @@ func TestSecretAuditWitnessAcceptsAncestorAndRejectsForgedReceipt(t *testing.T) 
 	}
 }
 
-func TestRetentionWitnessParserUsesNewestValidCheckpoint(t *testing.T) {
+// The scan carries the retention checkpoint's WitnessedThrough and probes
+// for named hashes in the same pass, so witness verification never needs a
+// second read or an all-hashes slice.
+func TestChainScanCarriesRetentionWitnessAndProbes(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
-	if got, ok := retentionWitnessedThrough(missing); ok || got != "" {
-		t.Fatalf("missing retention witness = %q %v", got, ok)
+	if scan, err := scanSecretAuditChainWith(missing, secretAuditScanOptions{probe: []string{"x"}}); err != nil || scan.witnessedThrough != "" || scan.found != nil || scan.records != 0 {
+		t.Fatalf("missing file scan = %+v err=%v", scan, err)
 	}
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	events := []string{
-		"",
-		"not-json",
-		`{"kind":"open","witnessed_through":"ignored"}`,
-		`{"kind":"retention_checkpoint"}`,
-		`{"kind":"retention_checkpoint","witnessed_through":" old "}`,
-		`{"kind":"retention_checkpoint","witnessed_through":"new"}`,
+	cp := SecretAuditEvent{Time: time.Now().UTC(), EventID: "cp", Result: secretAuditResultSuccess, Reason: "prune",
+		Kind: secretAuditKindRetentionCheckpoint, WitnessedThrough: " new "}
+	auditlog.LinkEvent(strings.Repeat("d", 64), &cp) // predecessor was pruned away
+	mid := SecretAuditEvent{Time: time.Now().UTC(), EventID: "mid", SandboxID: "sb", Result: secretAuditResultSuccess}
+	auditlog.LinkEvent(cp.EventHash, &mid)
+	last := SecretAuditEvent{Time: time.Now().UTC(), EventID: "last", SandboxID: "sb", Result: secretAuditResultSuccess}
+	auditlog.LinkEvent(mid.EventHash, &last)
+	var raw []byte
+	for _, ev := range []SecretAuditEvent{cp, mid, last} {
+		line, _ := json.Marshal(ev)
+		raw = append(append(raw, line...), '\n')
 	}
-	if err := os.WriteFile(path, []byte(strings.Join(events, "\n")), 0o600); err != nil {
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := retentionWitnessedThrough(path); !ok || got != "new" {
-		t.Fatalf("retention witness = %q %v", got, ok)
+	scan, err := scanSecretAuditChainWith(path, secretAuditScanOptions{probe: []string{mid.EventHash, strings.Repeat("0", 64)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scan.witnessedThrough != "new" || !scan.found[mid.EventHash] || scan.found[strings.Repeat("0", 64)] || scan.records != 3 || scan.head != last.EventHash {
+		t.Fatalf("scan = %+v", scan)
+	}
+	if scan.lastLineStart != int64(len(raw))-int64(len(raw)-strings.LastIndex(strings.TrimRight(string(raw), "\n"), "\n")-1) {
+		t.Fatalf("lastLineStart = %d for a %d-byte file", scan.lastLineStart, len(raw))
 	}
 }
 

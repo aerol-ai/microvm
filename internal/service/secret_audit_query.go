@@ -191,11 +191,11 @@ func (s *Service) ListSecretAuditLocal(ctx context.Context, sandboxID string, op
 	if path == "" {
 		return nil, "", nil
 	}
-	if idx := s.secretAuditIndex; idx != nil && idx.broken.Load() {
+	if s.secretAuditChainBroken.Load() || (s.secretAuditIndex != nil && s.secretAuditIndex.broken.Load()) {
 		// Per-record checks cannot tell a forged-but-self-consistent record
-		// from a genuine one; the chain can, and the indexer saw it break.
-		// Refuse to serve evidence from a log that no longer verifies, as
-		// strict boot would.
+		// from a genuine one; the chain can, and either the indexer or the
+		// boot-time background pass saw it break. Refuse to serve evidence
+		// from a log that no longer verifies, as strict boot would.
 		return nil, "", ErrSecretAuditChainBroken
 	}
 	for attempt := 0; ; attempt++ {
@@ -679,7 +679,7 @@ func (s *Service) VerifySecretAuditChain(ctx context.Context) (SecretAuditVerifi
 	defer f.Close()
 	report.Generation = snap.generation
 	report.Bytes = snap.size
-	scan, err := scanSecretAuditChainReader(io.LimitReader(f, snap.size), false)
+	scan, err := scanSecretAuditChainReader(io.LimitReader(f, snap.size), secretAuditScanOptions{})
 	if err == nil && scan.tornBytes > 0 {
 		err = fmt.Errorf("unterminated %d-byte tail at offset %d is not valid json", scan.tornBytes, scan.validEnd)
 	}

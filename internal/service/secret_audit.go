@@ -72,6 +72,15 @@ const (
 	// chained, so a crash between the two cannot lose the record that evidence
 	// was lost.
 	secretAuditTornName = "secrets.torn"
+	// secretAuditVerifiedName records how far the writer has verified and
+	// fsynced the chain (offset, last record, head). In checkpoint boot mode
+	// the next open verifies only what follows it, synchronously, and proves
+	// the prefix again in the background.
+	secretAuditVerifiedName = "secrets.verified"
+
+	// Boot verification modes (SB_SECRET_AUDIT_BOOT_VERIFY).
+	secretAuditBootVerifyFull       = "full"
+	secretAuditBootVerifyCheckpoint = "checkpoint"
 	// secretAuditMaxLineBytes bounds one JSONL record during chain scans; audit
 	// lines are metadata-only, so anything larger is corruption, not evidence.
 	secretAuditMaxLineBytes = 1024 * 1024
@@ -160,15 +169,26 @@ type fileAuditSink struct {
 	spillPath        string
 	spillWorkingPath string
 	tornPath         string
+	verifiedPath     string
 	witnessTipPath   string // optional; prune reads WitnessedThrough from here
 	file             *os.File
+	// bootVerify is the boot mode; bootScan is what open verified (with the
+	// witness tip probed) so boot-time witness validation needs no second
+	// pass; bootTrusted is how many prefix bytes open accepted from the
+	// verified checkpoint instead of re-reading (0 = the whole file was read).
+	bootVerify  string
+	bootScan    secretAuditChainScan
+	bootTrusted int64
 	// bootRepair is set when this open truncated a torn tail and chained the
 	// corresponding gap marker; the Service logs it once at sink init.
-	bootRepair  *secretAuditTornTailRepair
-	chainMu     sync.Mutex
-	chainHead   string
-	chainEvent  string
-	writePoison error // append outcome became ambiguous; refuse later writes
+	bootRepair *secretAuditTornTailRepair
+	chainMu    sync.Mutex
+	chainHead  string
+	chainEvent string
+	// lastLineOffset is where the record carrying chainHead starts; the
+	// verified checkpoint pins it so boot can re-read that one record.
+	lastLineOffset int64
+	writePoison    error // append outcome became ambiguous; refuse later writes
 	// writeHook, when set (tests), runs before each file write and may block.
 	writeHook func()
 	// afterPrune, when set (Service), ships a new witness tip after prune
@@ -189,8 +209,19 @@ func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
 }
 
 func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*fileAuditSink, error) {
+	return newFileAuditSinkWith(auditDir, buffer, spillEnabled, secretAuditBootVerifyFull)
+}
+
+// newFileAuditSinkWith opens the sink with an explicit boot verification
+// mode: "full" re-verifies every record before the writer opens; "checkpoint"
+// verifies from the last fsynced checkpoint and leaves the prefix to the
+// Service's background pass.
+func newFileAuditSinkWith(auditDir string, buffer int, spillEnabled bool, bootVerify string) (*fileAuditSink, error) {
 	if buffer <= 0 {
 		buffer = defaultSecretAuditBuffer
+	}
+	if bootVerify != secretAuditBootVerifyCheckpoint {
+		bootVerify = secretAuditBootVerifyFull
 	}
 	if err := os.MkdirAll(auditDir, 0o700); err != nil {
 		return nil, fmt.Errorf("secret audit mkdir: %w", err)
@@ -206,8 +237,10 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 		spillPath:        filepath.Join(auditDir, auditlog.SpillFileName),
 		spillWorkingPath: filepath.Join(auditDir, secretAuditSpillWorking),
 		tornPath:         filepath.Join(auditDir, secretAuditTornName),
+		verifiedPath:     filepath.Join(auditDir, secretAuditVerifiedName),
 		witnessTipPath:   filepath.Join(auditDir, secretAuditWitnessTipFile),
 		spillEnabled:     spillEnabled,
+		bootVerify:       bootVerify,
 	}
 	// Probe the sidecar lock read-write once: withAuditFileLock opens it
 	// read-only (a directory or unwritable path would pass), and a lock the
@@ -240,10 +273,18 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 // Anything else — malformed JSON that *was* fully written, or a valid record
 // whose hash does not link — is corruption or tampering and still fails closed.
 func (s *fileAuditSink) openLocked() error {
-	scan, err := scanSecretAuditChain(s.path, false)
+	// Probe for the last witnessed head in the same pass so boot-time witness
+	// validation does not read the file a second time.
+	var probe []string
+	if tip, err := readWitnessTip(s.witnessTipPath); err == nil && strings.TrimSpace(tip.HeadHex) != "" {
+		probe = []string{strings.TrimSpace(tip.HeadHex)}
+	}
+	scan, trusted, err := s.bootScanLocked(probe)
 	if err != nil {
 		return fmt.Errorf("verify secret audit chain: %w", err)
 	}
+	s.bootScan = scan
+	s.bootTrusted = trusted
 	pendingRepair := loadTornTailRepair(s.tornPath)
 	if scan.tornBytes > 0 {
 		rec := secretAuditTornTailRepair{Offset: scan.validEnd, Bytes: scan.tornBytes, Dropped: 1}
@@ -282,10 +323,13 @@ func (s *fileAuditSink) openLocked() error {
 	// crash, and either forks the chain. The verified scan is authoritative.
 	s.chainHead = scan.head
 	s.chainEvent = scan.eventID
+	s.lastLineOffset = scan.lastLineStart
 	if pending := loadGapCount(s.gapPath); pending > 0 {
 		s.pendingGap.Store(pending)
 	}
 	if pendingRepair == nil {
+		// Whatever open verified is what the next boot may start from.
+		s.persistVerifiedLocked()
 		return nil
 	}
 	// Dropped is a floor: exactly one partial record was visible on disk, but
@@ -303,10 +347,143 @@ func (s *fileAuditSink) openLocked() error {
 		return fmt.Errorf("record secret audit torn-tail gap marker: %w", err)
 	}
 	_ = os.Remove(s.tornPath)
+	s.bootScan.head, s.bootScan.eventID = s.chainHead, s.chainEvent
+	s.persistVerifiedLocked()
 	s.bootRepair = pendingRepair
 	auditTornTailRepairsTotal.Add(1)
 	auditTornTailBytesTotal.Add(pendingRepair.Bytes)
 	return nil
+}
+
+// bootScanLocked verifies the file for open. In checkpoint mode a valid
+// secrets.verified sidecar lets it start from the last fsynced record and
+// read only what came after — O(bytes since the last sync) instead of
+// O(retained volume) — returning how many prefix bytes it trusted. Anything
+// wrong with the sidecar (missing, stale, pointing past EOF, or naming a
+// record the file no longer holds) falls back to reading everything.
+func (s *fileAuditSink) bootScanLocked(probe []string) (secretAuditChainScan, int64, error) {
+	if s.bootVerify == secretAuditBootVerifyCheckpoint {
+		if cp := loadVerifiedCheckpoint(s.verifiedPath); cp != nil {
+			scan, ok, err := scanSecretAuditChainFromCheckpoint(s.path, cp, probe)
+			if err != nil {
+				return scan, 0, err
+			}
+			if ok {
+				return scan, cp.Offset, nil
+			}
+		}
+	}
+	scan, err := scanSecretAuditChainWith(s.path, secretAuditScanOptions{probe: probe})
+	return scan, 0, err
+}
+
+// secretAuditVerifiedCheckpoint is the secrets.verified sidecar: the writer
+// records it after every fsync, so it always names a record that is durable
+// and was appended by a chain the writer had verified.
+type secretAuditVerifiedCheckpoint struct {
+	Offset     int64  `json:"offset"`      // bytes verified and fsynced
+	LineOffset int64  `json:"line_offset"` // start of the record carrying Head
+	Head       string `json:"head"`
+	EventID    string `json:"event_id"`
+}
+
+func loadVerifiedCheckpoint(path string) *secretAuditVerifiedCheckpoint {
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cp secretAuditVerifiedCheckpoint
+	if json.Unmarshal(raw, &cp) != nil || cp.Offset <= 0 || cp.LineOffset < 0 || cp.LineOffset >= cp.Offset ||
+		cp.Offset-cp.LineOffset > secretAuditMaxLineBytes || strings.TrimSpace(cp.Head) == "" {
+		return nil
+	}
+	return &cp
+}
+
+// persistVerifiedLocked records the writer's current durable head. Called
+// under the audit flock right after a successful fsync, and after retention
+// rewrote the file. Best effort: a missing sidecar only costs the next boot
+// a full read.
+func (s *fileAuditSink) persistVerifiedLocked() {
+	if s == nil || s.verifiedPath == "" || s.file == nil {
+		return
+	}
+	st, err := s.file.Stat()
+	if err != nil {
+		return
+	}
+	s.chainMu.Lock()
+	cp := secretAuditVerifiedCheckpoint{Offset: st.Size(), LineOffset: s.lastLineOffset, Head: s.chainHead, EventID: s.chainEvent}
+	s.chainMu.Unlock()
+	if cp.Offset <= 0 || cp.Head == "" || cp.Head == auditlog.GenesisPrevHash || cp.LineOffset >= cp.Offset {
+		_ = os.Remove(s.verifiedPath)
+		return
+	}
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomicDurable(s.verifiedPath, append(raw, '\n'), 0o600)
+}
+
+// scanSecretAuditChainFromCheckpoint re-reads only the checkpoint's own
+// record (it must still be there, byte-for-byte hashing to Head, and end on
+// a newline) and then verifies everything after it, continuing the chain
+// from that head. ok=false means the checkpoint does not describe this file
+// and the caller must read it all.
+func scanSecretAuditChainFromCheckpoint(path string, cp *secretAuditVerifiedCheckpoint, probe []string) (secretAuditChainScan, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return secretAuditChainScan{head: auditlog.GenesisPrevHash}, false, nil
+		}
+		return secretAuditChainScan{}, false, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return secretAuditChainScan{}, false, err
+	}
+	if st.Size() < cp.Offset {
+		return secretAuditChainScan{}, false, nil
+	}
+	buf := make([]byte, cp.Offset-cp.LineOffset)
+	if _, err := f.ReadAt(buf, cp.LineOffset); err != nil {
+		return secretAuditChainScan{}, false, nil
+	}
+	if buf[len(buf)-1] != '\n' {
+		return secretAuditChainScan{}, false, nil
+	}
+	var ev SecretAuditEvent
+	if err := json.Unmarshal(bytes.TrimSpace(buf), &ev); err != nil || ev.EventHash != cp.Head || verifySecretAuditRecord(ev) != nil {
+		return secretAuditChainScan{}, false, nil
+	}
+	verifier := newSecretAuditChainVerifier()
+	verifier.prev = cp.Head
+	verifier.started = true
+	verifier.allowBreak = ev.Kind == secretAuditKindRetentionCheckpoint
+	scan, err := scanSecretAuditChainReader(io.NewSectionReader(f, cp.Offset, st.Size()-cp.Offset), secretAuditScanOptions{
+		base:            cp.Offset,
+		verifier:        &verifier,
+		startEventID:    cp.EventID,
+		startLineOffset: cp.LineOffset,
+		probe:           probe,
+	})
+	if err != nil {
+		return scan, true, err
+	}
+	for _, h := range probe {
+		if h == cp.Head {
+			scan.markFound(h)
+		}
+	}
+	if ev.Kind == secretAuditKindRetentionCheckpoint && strings.TrimSpace(ev.WitnessedThrough) != "" && scan.witnessedThrough == "" {
+		scan.witnessedThrough = strings.TrimSpace(ev.WitnessedThrough)
+	}
+	return scan, true, nil
 }
 
 // repairSecretAuditTail makes the file end exactly on a newline-terminated,
@@ -753,7 +930,11 @@ func (s *fileAuditSink) syncFile() error {
 			return err
 		}
 		head, eventID := s.chainTip()
-		return persistChainTipErr(s.tipPath, head, eventID)
+		if err := persistChainTipErr(s.tipPath, head, eventID); err != nil {
+			return err
+		}
+		s.persistVerifiedLocked()
+		return nil
 	})
 	if err != nil {
 		secretAuditSinkHealthy.Set(0)
@@ -947,6 +1128,8 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		br := bufio.NewReaderSize(src, 64*1024)
 		remainingDrops := droppedLines
 		var srcPos int64
+		dstPos := shift.checkpointLen
+		lastKeptLineOffset := int64(0) // the checkpoint line, until a record is kept
 		floorSet := false
 		for {
 			rawLine, consumed, _, tooLong, err := readSecretAuditLine(br)
@@ -1002,7 +1185,9 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 			if ev.EventHash != "" {
 				lastKeptHash = ev.EventHash
 				lastKeptEventID = ev.EventID
+				lastKeptLineOffset = dstPos
 			}
+			dstPos += int64(len(raw)) + 1
 		}
 		if !floorSet {
 			shift.floor = srcPos // nothing kept: every indexed offset is below the floor
@@ -1038,8 +1223,13 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		s.chainMu.Lock()
 		s.chainHead = lastKeptHash
 		s.chainEvent = lastKeptEventID
+		s.lastLineOffset = lastKeptLineOffset
 		s.chainMu.Unlock()
 		persistChainTip(s.tipPath, lastKeptHash, lastKeptEventID)
+		// The rewritten file is fsynced; its offsets are new, so re-pin the
+		// verified checkpoint now rather than leave a stale one for boot to
+		// reject.
+		s.persistVerifiedLocked()
 		if s.onPruneShift != nil {
 			s.onPruneShift(shift)
 		}
@@ -1183,6 +1373,7 @@ func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable boo
 	s.chainMu.Lock()
 	s.chainHead = last.EventHash
 	s.chainEvent = last.EventID
+	s.lastLineOffset = lines[len(lines)-1].offset
 	s.chainMu.Unlock()
 	if durable {
 		if tipErr := persistChainTipErr(s.tipPath, last.EventHash, last.EventID); tipErr != nil {
@@ -1190,6 +1381,17 @@ func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable boo
 		}
 	}
 	return lines, nil
+}
+
+// bootScanCurrent reports whether the open-time pass still describes the
+// chain: nothing has been appended and retention has not rewritten it. The
+// boot witness check may then reuse it instead of reading the file again.
+func (s *fileAuditSink) bootScanCurrent() bool {
+	if s == nil {
+		return false
+	}
+	head, _ := s.chainTip()
+	return head == s.bootScan.head
 }
 
 func (s *fileAuditSink) chainTip() (head, eventID string) {
@@ -1205,7 +1407,7 @@ func (s *fileAuditSink) chainTip() (head, eventID string) {
 // HashEvent(PrevHash, ev) with PrevHash linkage. Does not trust secrets.tip.
 // Returns the verified tip head and its event ID (genesis/"0" when empty).
 func RecomputeChainHead(path string) (head, eventID string, err error) {
-	scan, err := strictSecretAuditChainScan(path, false)
+	scan, err := strictSecretAuditChainScan(path, secretAuditScanOptions{})
 	if err != nil {
 		return "", "", err
 	}
@@ -1255,28 +1457,26 @@ func (v *secretAuditChainVerifier) Add(ev SecretAuditEvent) error {
 	return nil
 }
 
-// recomputeChain is the full verify path: returns ordered EventHashes so a
-// witnessed head can be checked for ancestry without trusting the tip sidecar.
+// recomputeChain is the full verify path with an ancestry probe: instead of
+// materializing every EventHash (a multi-GB slice on a busy node), the
+// caller names the hashes it needs to locate and the scan reports which of
+// them it passed, plus the newest retention checkpoint's WitnessedThrough.
 //
 // Retention: prune drops a prefix and inserts an immutable retention_checkpoint
 // whose PrevHash is the last dropped EventHash. Witness verification uses
 // checkpoint.WitnessedThrough (when set) plus the remaining chain. Kept event
 // bytes are verified as stored (no rewrite); a single discontinuity is allowed
 // immediately after a retention_checkpoint.
-func recomputeChain(path string) (head, eventID string, hashes []string, err error) {
-	scan, err := strictSecretAuditChainScan(path, true)
-	if err != nil {
-		return "", "", nil, err
-	}
-	return scan.head, scan.eventID, scan.hashes, nil
+func recomputeChain(path string, probe ...string) (secretAuditChainScan, error) {
+	return strictSecretAuditChainScan(path, secretAuditScanOptions{probe: probe})
 }
 
 // strictSecretAuditChainScan is the read-side contract: a torn tail is an
 // error here. Only the sink constructor may repair one — every other caller
 // (writer tip fallback, witness verify, tests) must refuse a tail it cannot
 // verify rather than quietly trim evidence.
-func strictSecretAuditChainScan(path string, collectHashes bool) (secretAuditChainScan, error) {
-	scan, err := scanSecretAuditChain(path, collectHashes)
+func strictSecretAuditChainScan(path string, opts secretAuditScanOptions) (secretAuditChainScan, error) {
+	scan, err := scanSecretAuditChainWith(path, opts)
 	if err != nil {
 		return scan, err
 	}
@@ -1286,11 +1486,33 @@ func strictSecretAuditChainScan(path string, collectHashes bool) (secretAuditCha
 	return scan, nil
 }
 
+// secretAuditScanOptions parameterize one pass. A nil verifier starts at
+// genesis; a primed one continues a chain from base (checkpoint boot).
+type secretAuditScanOptions struct {
+	base            int64
+	verifier        *secretAuditChainVerifier
+	startEventID    string
+	startLineOffset int64
+	// probe lists hashes whose presence the scan should report (witness
+	// ancestry) — O(len(probe)) memory instead of O(records).
+	probe []string
+}
+
+// secretAuditFullScans counts passes that start at byte zero. Boot must add
+// exactly one in full mode and none in checkpoint mode (the background pass
+// adds its own); tests assert that.
+var secretAuditFullScans atomic.Int64
+
 // secretAuditChainScan is one verified pass over secrets.jsonl.
 type secretAuditChainScan struct {
 	head    string
 	eventID string
-	hashes  []string
+	// lastLineStart is the offset of the record carrying head.
+	lastLineStart int64
+	// found reports which probed hashes the pass saw.
+	found map[string]bool
+	// witnessedThrough is the newest retention checkpoint's WitnessedThrough.
+	witnessedThrough string
 	// validEnd is the byte offset just past the last complete, verified line.
 	validEnd int64
 	// tornBytes is the length of an unterminated, unparseable tail after
@@ -1308,7 +1530,11 @@ type secretAuditChainScan struct {
 
 // scanSecretAuditChain walks the file once, verifying every record against
 // its predecessor. Blank lines are tolerated but never alter the chain.
-func scanSecretAuditChain(path string, collectHashes bool) (secretAuditChainScan, error) {
+func scanSecretAuditChain(path string) (secretAuditChainScan, error) {
+	return scanSecretAuditChainWith(path, secretAuditScanOptions{})
+}
+
+func scanSecretAuditChainWith(path string, opts secretAuditScanOptions) (secretAuditChainScan, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1317,17 +1543,38 @@ func scanSecretAuditChain(path string, collectHashes bool) (secretAuditChainScan
 		return secretAuditChainScan{head: auditlog.GenesisPrevHash}, err
 	}
 	defer f.Close()
-	return scanSecretAuditChainReader(f, collectHashes)
+	return scanSecretAuditChainReader(f, opts)
+}
+
+func (scan *secretAuditChainScan) markFound(hash string) {
+	if scan.found == nil {
+		scan.found = map[string]bool{}
+	}
+	scan.found[hash] = true
 }
 
 // scanSecretAuditChainReader is scanSecretAuditChain over an already-bounded
 // reader (a size snapshot taken under the flock) so a verification can run
-// while the writer keeps appending.
-func scanSecretAuditChainReader(r io.Reader, collectHashes bool) (secretAuditChainScan, error) {
-	scan := secretAuditChainScan{head: auditlog.GenesisPrevHash}
+// while the writer keeps appending. Memory is O(1) in the number of records.
+func scanSecretAuditChainReader(r io.Reader, opts secretAuditScanOptions) (secretAuditChainScan, error) {
+	scan := secretAuditChainScan{head: auditlog.GenesisPrevHash, validEnd: opts.base, lastLineStart: opts.startLineOffset}
 	br := bufio.NewReaderSize(r, 64*1024)
 	verifier := newSecretAuditChainVerifier()
-	var offset int64
+	if opts.verifier != nil {
+		verifier = *opts.verifier
+		scan.head = verifier.prev
+		scan.eventID = opts.startEventID
+	}
+	if opts.base == 0 {
+		secretAuditFullScans.Add(1)
+	}
+	probe := make(map[string]struct{}, len(opts.probe))
+	for _, h := range opts.probe {
+		if h != "" {
+			probe[h] = struct{}{}
+		}
+	}
+	offset := opts.base
 	lineNo := 0
 	for {
 		line, consumed, terminated, tooLong, err := readSecretAuditLine(br)
@@ -1372,8 +1619,12 @@ func scanSecretAuditChainReader(r io.Reader, collectHashes bool) (secretAuditCha
 		scan.head = ev.EventHash
 		scan.eventID = ev.EventID
 		scan.records++
-		if collectHashes {
-			scan.hashes = append(scan.hashes, ev.EventHash)
+		scan.lastLineStart = offset - consumed
+		if _, want := probe[ev.EventHash]; want {
+			scan.markFound(ev.EventHash)
+		}
+		if ev.Kind == secretAuditKindRetentionCheckpoint && strings.TrimSpace(ev.WitnessedThrough) != "" {
+			scan.witnessedThrough = strings.TrimSpace(ev.WitnessedThrough)
 		}
 		scan.validEnd = offset
 		if !terminated {
@@ -1550,7 +1801,7 @@ func (s *Service) ensureSecretAuditSink() {
 		case "spill":
 			spill = true
 		}
-		sink, err := newFileAuditSinkOpts(filepath.Join(dataDir, "audit"), buf, spill)
+		sink, err := newFileAuditSinkWith(filepath.Join(dataDir, "audit"), buf, spill, s.cfg.SecretAuditBootVerify)
 		if err != nil {
 			s.secretAuditInitErr = err
 			secretAuditSinkHealthy.Set(0)
@@ -1566,6 +1817,15 @@ func (s *Service) ensureSecretAuditSink() {
 		if r := sink.bootRepair; r != nil && s.logger != nil {
 			s.logger.Warn("secret audit torn tail repaired at boot; gap marker chained",
 				"offset", r.Offset, "bytes_cut", r.Bytes, "dropped_at_least", r.Dropped, "path", sink.path)
+		}
+		if sink.bootTrusted > 0 {
+			// Checkpoint boot: the prefix was accepted on the writer's own
+			// checkpoint. Prove it now, off the boot path.
+			if s.logger != nil {
+				s.logger.Info("secret audit chain verified from checkpoint; full verification continues in background",
+					"trusted_bytes", sink.bootTrusted, "path", sink.path)
+			}
+			s.startSecretAuditBootVerify()
 		}
 		// Prune rotates the hash chain — ship the new tip to the external
 		// witness immediately so LastWitnessedHead tracks the re-linked head.
@@ -1644,6 +1904,48 @@ func secretAuditDataDir(dbPath string) string {
 	return filepath.Dir(dbPath)
 }
 
+// startSecretAuditBootVerify proves, off the boot path, the prefix a
+// checkpoint boot accepted on the writer's word. It is the same full pass
+// an operator can request (VerifySecretAuditChain); the difference is what
+// a failure means here: the node is already running, so instead of refusing
+// to start it withholds local audit reads, disables the index, and raises
+// the critical alert. Evidence keeps being appended — the break is at a
+// known offset and everything after it still links.
+func (s *Service) startSecretAuditBootVerify() {
+	if s == nil || s.secretAuditFile == nil {
+		return
+	}
+	s.secretAuditBootVerify.Add(1)
+	go func() {
+		defer s.secretAuditBootVerify.Done()
+		report, err := s.VerifySecretAuditChain(context.Background())
+		switch {
+		case err != nil:
+			// Could not run (busy, sink gone): leave it to the operator
+			// endpoint and the daily retention pass; do not claim either way.
+			if s.logger != nil {
+				s.logger.Warn("secret audit background verification did not run", "err", err)
+			}
+		case report.OK:
+			if s.logger != nil {
+				s.logger.Info("secret audit chain fully verified after checkpoint boot",
+					"records", report.Records, "bytes", report.Bytes, "duration_ms", report.DurationMS)
+			}
+		default:
+			s.secretAuditChainBroken.Store(true)
+			if s.secretAuditIndex != nil {
+				s.secretAuditIndex.markBroken(errors.New(report.Error))
+			} else {
+				secretAuditIndexChainBreaks.Add(1)
+			}
+			if s.logger != nil {
+				s.logger.Error("secret audit chain failed full verification after checkpoint boot; local audit reads withheld until repaired",
+					"error", report.Error, "records", report.Records, "bytes", report.Bytes)
+			}
+		}
+	}()
+}
+
 func (s *Service) secretAuditSink() SecretAuditSink {
 	if s == nil {
 		return nil
@@ -1684,6 +1986,7 @@ func (s *Service) CloseSecretAuditSink() {
 	}
 	// After the writer: its final drain may still hand batches to the index.
 	s.secretAuditIndex.Close()
+	s.secretAuditBootVerify.Wait()
 }
 
 // beginSecretAudit records decrypt latency/error metrics and emits one audit

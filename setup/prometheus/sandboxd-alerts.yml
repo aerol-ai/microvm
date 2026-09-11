@@ -466,7 +466,7 @@ groups:
           component: secrets-audit
         annotations:
           summary: "sandboxd detected a break in its local audit hash chain"
-          description: "aerolvm_audit_index_chain_breaks_total increased: a record in secrets.jsonl does not link to the one before it. This is corruption or tampering, not a crash (torn tails are repaired at boot). Local audit reads answer 503 and the index stays off until restart. Capture the file before touching it; POST /v1/audit/verify names the offset."
+          description: "aerolvm_audit_index_chain_breaks_total increased: a record in secrets.jsonl does not link to the one before it — seen while indexing, or by the background full verification after a checkpoint boot (SB_SECRET_AUDIT_BOOT_VERIFY=checkpoint). This is corruption or tampering, not a crash (torn tails are repaired at boot). Local audit reads answer 503 and the index stays off until restart. Capture the file before touching it; POST /v1/audit/verify names the offset."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
       # An operator-triggered full verification (POST /v1/audit/verify)
