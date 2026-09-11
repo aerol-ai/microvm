@@ -115,7 +115,7 @@ func (h *handlers) forwardBoundJSBundle(w http.ResponseWriter, r *http.Request) 
 	}
 	member, found := lookup.LookupMember(nodeID)
 	if !found || !member.Alive || strings.TrimSpace(member.InternalURL) == "" {
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: bundle owner is unavailable")
+		writeJSBundleOwnerUnavailable(w, nodeID)
 		return true
 	}
 	c.ForwardHTTP(cluster.Endpoint{

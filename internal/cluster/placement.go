@@ -123,6 +123,11 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// to roll a node out of rotation without restarting it.
 	drained := c.fsm.drainedNodesSnapshot()
 	candidates := make([]Member, 0, len(all))
+	// requiredReachable records whether the artifact-bound node, if any, was
+	// seen as a live capacity-reporting member. If it was and still produced
+	// no candidate, the failure is ordinary (capacity, drain); if it was not,
+	// the artifact itself is out of reach and the client must re-create it.
+	requiredReachable := false
 	for _, m := range all {
 		if !m.Alive {
 			rejects["dead"]++
@@ -146,6 +151,9 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			rejects["capacity_heartbeat"]++
 			continue
 		}
+		if req.RequiredNodeID != "" && m.NodeID == req.RequiredNodeID {
+			requiredReachable = true
+		}
 		if drained[m.NodeID] {
 			rejects["drained"]++
 			continue
@@ -160,7 +168,7 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, nil, ErrNoPlacementTarget
+		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable)
 	}
 
 	// Power-of-two-choices.
@@ -522,3 +530,14 @@ var _ = func() error {
 	var _ Client = (*Noop)(nil)
 	return errors.New("type assertion only, never returned")
 }()
+
+// noPlacementTargetError picks the sentinel for an empty candidate set. A
+// request bound to one node by an artifact fails as ErrArtifactNodeUnavailable
+// when that node was not a live capacity-reporting member — the artifact is
+// gone with it, and waiting will not bring it back.
+func noPlacementTargetError(req capacity.Request, requiredReachable bool) error {
+	if req.RequiredNodeID != "" && !requiredReachable {
+		return fmt.Errorf("%w (node %q)", ErrArtifactNodeUnavailable, req.RequiredNodeID)
+	}
+	return ErrNoPlacementTarget
+}

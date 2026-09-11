@@ -113,3 +113,59 @@ func TestSelectPlacementEdgeCases(t *testing.T) {
 		t.Errorf("expected topology error, got nil")
 	}
 }
+
+// A request pinned to one node by an artifact it holds (node-bound js-bundle,
+// built image) fails as ErrArtifactNodeUnavailable when that node is not a
+// live capacity-reporting member — the artifact is gone with it — and as the
+// plain ErrNoPlacementTarget when the node is present but merely full or
+// drained. Both still satisfy errors.Is(err, ErrNoPlacementTarget).
+func TestSelectPlacementRequiredNodeUnavailableIsArtifactError(t *testing.T) {
+	c := &Cluster{
+		nodeID: "self-node",
+		apiURL: "http://self-node",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: newGossipMemberIndex()},
+	}
+	full := capacity.Snapshot{HostCPUCores: 4, HostMemoryTotalMB: 4096, CPUBudget: 4, MemoryBudgetMB: 4096}
+	other := Member{NodeID: "other", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://other", Capacity: full}
+	req := capacity.Request{CPU: 1, MemoryMB: 128, RequiredNodeID: "holder"}
+
+	// Not a member at all.
+	c.gossip.memberIndex.replace([]Member{other})
+	_, err := c.SelectPlacement(req)
+	if !errors.Is(err, ErrArtifactNodeUnavailable) || !errors.Is(err, ErrNoPlacementTarget) {
+		t.Fatalf("missing holder: err = %v, want ErrArtifactNodeUnavailable", err)
+	}
+	// Dead.
+	c.gossip.memberIndex.replace([]Member{other, {NodeID: "holder", Alive: false, Role: config.NodeRoleWorker, APIURL: "http://holder", Capacity: full}})
+	if _, err := c.SelectPlacement(req); !errors.Is(err, ErrArtifactNodeUnavailable) {
+		t.Fatalf("dead holder: err = %v", err)
+	}
+	// Alive but not reporting capacity: still unreachable for placement.
+	c.gossip.memberIndex.replace([]Member{other, {NodeID: "holder", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://holder", CapacityStale: true, Capacity: full}})
+	if _, err := c.SelectPlacement(req); !errors.Is(err, ErrArtifactNodeUnavailable) {
+		t.Fatalf("stale holder: err = %v", err)
+	}
+	// Present and healthy but drained: an ordinary no-target, not an artifact loss.
+	c.gossip.memberIndex.replace([]Member{other, {NodeID: "holder", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://holder", Capacity: full}})
+	applyOp(t, c.fsm, command{Op: opSetNodeDrainState, NodeID: "holder", Drained: true})
+	_, err = c.SelectPlacement(req)
+	if !errors.Is(err, ErrNoPlacementTarget) || errors.Is(err, ErrArtifactNodeUnavailable) {
+		t.Fatalf("drained holder: err = %v, want plain ErrNoPlacementTarget", err)
+	}
+	// Present and healthy but too small for the request: ordinary no-target.
+	applyOp(t, c.fsm, command{Op: opSetNodeDrainState, NodeID: "holder", Drained: false})
+	if _, err := c.SelectPlacement(capacity.Request{CPU: 64, MemoryMB: 1 << 20, RequiredNodeID: "holder"}); !errors.Is(err, ErrNoPlacementTarget) || errors.Is(err, ErrArtifactNodeUnavailable) {
+		t.Fatalf("undersized holder: err = %v, want plain ErrNoPlacementTarget", err)
+	}
+	// Present and fitting: placed there and nowhere else.
+	target, err := c.SelectPlacement(req)
+	if err != nil || target.NodeID != "holder" {
+		t.Fatalf("healthy holder: target = %+v err = %v", target, err)
+	}
+	// No affinity at all never yields the artifact error.
+	c.gossip.memberIndex.replace(nil)
+	if _, err := c.SelectPlacement(capacity.Request{CPU: 1, MemoryMB: 128}); errors.Is(err, ErrArtifactNodeUnavailable) {
+		t.Fatalf("unpinned request produced the artifact error: %v", err)
+	}
+}

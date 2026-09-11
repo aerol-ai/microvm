@@ -1078,7 +1078,18 @@ type ExecResult struct {
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+	// Code is an optional stable identifier for errors a client is expected
+	// to act on programmatically (retry, re-upload, ...). Absent for errors
+	// that are only ever shown to a person.
+	Code string `json:"code,omitempty"`
 }
+
+// ErrorCodeArtifactNodeUnavailable is returned (503) when an operation needs
+// a node-bound artifact — a js-bundle or a node-built image — and the one
+// worker holding it is not available. Such artifacts are single-copy; the
+// recovery is to re-create the artifact (re-upload the bundle, rebuild the
+// image), which yields a new node-bound ref.
+const ErrorCodeArtifactNodeUnavailable = "artifact_node_unavailable"
 
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming
