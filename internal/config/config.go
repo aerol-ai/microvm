@@ -659,6 +659,16 @@ type Config struct {
 	// drops to inside the jail. SB_ISOLATE_JAIL_UID / SB_ISOLATE_JAIL_GID.
 	IsolateJailUID int
 	IsolateJailGID int
+	// IsolateJailCgroupRoot is the parent cgroup (v2) for per-group cgroups
+	// (cpu.max / memory.max from the group's caps). SB_ISOLATE_JAIL_CGROUP_ROOT.
+	IsolateJailCgroupRoot string
+	// IsolateSeccompMode selects how the jail's syscall filter behaves:
+	// "enforce" kills the group process on an unlisted syscall (default);
+	// "audit" logs it (kernel audit log) and allows it — for the first
+	// real-host run against a new workerd build; "off" installs no filter
+	// (only to isolate a suspected filter fault). Enterprise mode requires
+	// enforce. SB_ISOLATE_SECCOMP_MODE.
+	IsolateSeccompMode string
 	// IsolateJitless launches workerd's V8 with --jitless: no writable+
 	// executable pages, so the seccomp allowlist can drop the W^X/JIT
 	// syscall surface at a large throughput cost. The honest alternative
@@ -1833,6 +1843,8 @@ func Load() (Config, error) {
 		IsolateJailUID:               getEnvInt("SB_ISOLATE_JAIL_UID", 1000),
 		IsolateJailGID:               getEnvInt("SB_ISOLATE_JAIL_GID", 1000),
 		IsolateJitless:               getEnvBool("SB_ISOLATE_JITLESS", false),
+		IsolateJailCgroupRoot:        getEnv("SB_ISOLATE_JAIL_CGROUP_ROOT", "/sys/fs/cgroup/aerolvm-isolate"),
+		IsolateSeccompMode:           strings.ToLower(strings.TrimSpace(getEnv("SB_ISOLATE_SECCOMP_MODE", "enforce"))),
 		IsolateGroupIdleTTL:          getEnvDuration("SB_ISOLATE_GROUP_IDLE_TTL", 5*time.Minute),
 		IsolatePoolEnabled:           getEnvBool("SB_ISOLATE_POOL_ENABLED", true),
 		IsolatePoolDepthDefault:      getEnvInt("SB_ISOLATE_POOL_DEPTH_DEFAULT", 2),
@@ -2147,6 +2159,14 @@ func Load() (Config, error) {
 			if cfg.IsolateJailUID == 0 || cfg.IsolateJailGID == 0 {
 				return Config{}, errors.New("SB_ISOLATE_JAIL_UID/SB_ISOLATE_JAIL_GID must be non-root (> 0) when SB_ISOLATE_USE_JAIL=true")
 			}
+			if cfg.IsolateJailCgroupRoot == "" || !filepath.IsAbs(cfg.IsolateJailCgroupRoot) {
+				return Config{}, fmt.Errorf("SB_ISOLATE_JAIL_CGROUP_ROOT must be an absolute path when SB_ISOLATE_USE_JAIL=true (got %q)", cfg.IsolateJailCgroupRoot)
+			}
+		}
+		switch cfg.IsolateSeccompMode {
+		case "enforce", "audit", "off":
+		default:
+			return Config{}, fmt.Errorf("SB_ISOLATE_SECCOMP_MODE must be enforce, audit, or off (got %q)", cfg.IsolateSeccompMode)
 		}
 		if cfg.IsolatePoolEnabled && cfg.IsolatePoolDepthDefault <= 0 {
 			return Config{}, errors.New("SB_ISOLATE_POOL_DEPTH_DEFAULT must be > 0 when SB_ISOLATE_POOL_ENABLED=true")
@@ -2354,8 +2374,16 @@ func Load() (Config, error) {
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
 		}
-		if cfg.EnableIsolate {
-			return Config{}, errors.New("SB_ENABLE_ISOLATE is experimental fleet-wide bundle replication and is forbidden when SB_ENTERPRISE_MODE=true")
+		// Isolate's cross-tenant boundary is one workerd process per tenant
+		// group; enterprise mode may run it only with that process fully
+		// jailed (chroot + cgroup + privilege drop + enforcing seccomp). The
+		// jail-off and audit/off filter modes exist for bring-up and
+		// diagnosis, not for the hardened posture.
+		if cfg.EnableIsolate && !cfg.IsolateUseJail {
+			return Config{}, errors.New("SB_ISOLATE_USE_JAIL must be true when SB_ENTERPRISE_MODE=true and SB_ENABLE_ISOLATE=true (the workerd jail is the cross-tenant boundary)")
+		}
+		if cfg.EnableIsolate && cfg.IsolateSeccompMode != "enforce" {
+			return Config{}, fmt.Errorf("SB_ISOLATE_SECCOMP_MODE must be enforce when SB_ENTERPRISE_MODE=true and SB_ENABLE_ISOLATE=true (got %q)", cfg.IsolateSeccompMode)
 		}
 		if cfg.EnableCluster {
 			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {

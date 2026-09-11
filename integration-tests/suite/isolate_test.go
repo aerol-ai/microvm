@@ -223,3 +223,91 @@ func TestIsolateJSBundleCatalogue(t *testing.T) {
 		t.Fatalf("get after delete succeeded; want not-found for %s", created.Digest)
 	}
 }
+
+// UC-109 — the workerd jail on a real host. Creates an isolate sandbox (so a
+// group process exists and is serving), then inspects that process over SSH:
+// it must run as the jail uid, with no_new_privs, under an enforcing seccomp
+// filter, rooted in its group chroot, in its own cgroup — and still answer a
+// fetch. This is the only place all five properties are proven together.
+func TestIsolateJailRealizedOnHost(t *testing.T) {
+	harness.Require(t, sc, "UC-109")
+	targets := harness.LoadIntegrationTargets()
+	node, ok := harness.PickSSHNode(targets)
+	if !ok {
+		t.Skip("UC-109 needs an SSH-reachable node")
+	}
+	target, _ := harness.SSHTarget(node)
+	c := client(t)
+
+	ref := uploadBundle(t, c, "itest-isolate-jailed",
+		`export default { async fetch() { return new Response("jailed-ok"); } };`)
+	sb := newIsolateSandbox(t, c, ref, "itest-jail", sdktypes.CreateSandboxOptions{})
+	waitRunning(t, sb)
+	if got := execFetch(t, sb, "/"); got != "jailed-ok" {
+		t.Fatalf("fetch through the jailed group = %q, want %q", got, "jailed-ok")
+	}
+
+	// Every workerd on the node must be confined; there is at least one.
+	script := `set -e
+pids=$(pgrep -x workerd || true)
+if [ -z "$pids" ]; then echo "NO_WORKERD"; exit 0; fi
+for pid in $pids; do
+  echo "PID $pid"
+  sudo grep -E '^(Uid|Gid|NoNewPrivs|Seccomp):' /proc/$pid/status
+  echo "ROOT $(sudo readlink /proc/$pid/root)"
+  echo "CGROUP $(sudo cat /proc/$pid/cgroup)"
+  echo "CWD $(sudo readlink /proc/$pid/cwd)"
+done
+grep -E '^SB_ISOLATE_(JAIL_UID|JAIL_CHROOT_BASE|JAIL_CGROUP_ROOT|SECCOMP_MODE|USE_JAIL)=' /etc/sandboxd/sandboxd.env || true`
+	out, err := harness.SSHRun(t, target, script)
+	if err != nil {
+		t.Fatalf("inspect workerd on %s: %v\n%s", target, err, out)
+	}
+	if strings.Contains(out, "NO_WORKERD") {
+		t.Fatalf("no workerd process on the node after a successful isolate create:\n%s", out)
+	}
+	env := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok && strings.HasPrefix(k, "SB_ISOLATE_") {
+			env[k] = strings.TrimSpace(v)
+		}
+	}
+	jailUID := env["SB_ISOLATE_JAIL_UID"]
+	chrootBase := env["SB_ISOLATE_JAIL_CHROOT_BASE"]
+	if chrootBase == "" {
+		chrootBase = "/srv/isolate-jail"
+	}
+	cgroupRoot := strings.TrimPrefix(env["SB_ISOLATE_JAIL_CGROUP_ROOT"], "/sys/fs/cgroup")
+	if cgroupRoot == "" {
+		cgroupRoot = "/aerolvm-isolate"
+	}
+	if jailUID == "" || jailUID == "0" {
+		t.Fatalf("node has no non-root SB_ISOLATE_JAIL_UID:\n%s", out)
+	}
+	seen := 0
+	for _, block := range strings.Split(out, "PID ")[1:] {
+		seen++
+		lines := strings.Split(block, "\n")
+		pid := strings.TrimSpace(lines[0])
+		want := func(prefix, contains, what string) {
+			for _, l := range lines {
+				if strings.HasPrefix(l, prefix) {
+					if !strings.Contains(l, contains) {
+						t.Errorf("workerd %s: %s = %q, want %q", pid, what, l, contains)
+					}
+					return
+				}
+			}
+			t.Errorf("workerd %s: %s line missing:\n%s", pid, what, block)
+		}
+		want("Uid:", "\t"+jailUID+"\t"+jailUID+"\t"+jailUID, "real/effective/saved uid = jail uid")
+		want("NoNewPrivs:", "1", "no_new_privs")
+		want("Seccomp:", "2", "seccomp filter mode")
+		want("ROOT ", chrootBase+"/", "chroot under the jail base")
+		want("CGROUP ", cgroupRoot+"/aerolvm-isolate-", "own cgroup under the isolate root")
+		want("CWD ", "/run", "cwd is the in-jail run dir")
+	}
+	if seen == 0 {
+		t.Fatalf("no workerd process inspected:\n%s", out)
+	}
+}

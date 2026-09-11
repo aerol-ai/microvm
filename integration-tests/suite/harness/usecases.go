@@ -28,9 +28,15 @@ const (
 	// hard-fail. Unlike CapWasm it needs no node-side module staging — the UCs
 	// upload JS bundles over POST /v1/js-bundles at runtime.
 	CapIsolate Capability = "isolate" // V8-isolate (workerd) runtime available
-	CapGPU     Capability = "gpu"     // a GPU worker
-	CapDomain  Capability = "domain"  // public domain + TLS (not local-mode)
-	CapCluster Capability = "cluster" // multi-node cluster (raft/forwarding)
+	// CapIsolateJail gates UC-109: the node runs isolate with
+	// SB_ISOLATE_USE_JAIL=true (the default) and the suite may SSH in to
+	// inspect the workerd process. Only single-node-isolate-jail advertises it;
+	// the other isolate scenarios still run jail-off, so their UC-103..105
+	// coverage is unaffected by a jail regression and vice versa.
+	CapIsolateJail Capability = "isolate-jail"
+	CapGPU         Capability = "gpu"     // a GPU worker
+	CapDomain      Capability = "domain"  // public domain + TLS (not local-mode)
+	CapCluster     Capability = "cluster" // multi-node cluster (raft/forwarding)
 	// CapMixedArchNegative gates UC-79: inject a foreign-arch snapshot ref and
 	// assert the arm64 cluster refuses to resume it.
 	CapMixedArchNegative Capability = "mixed-arch-negative"
@@ -345,6 +351,16 @@ var Registry = []UseCase{
 	// surface it, delete removes it. The owner-scoping + in-use-refusal edges are
 	// covered offline; this is the live round-trip.
 	{ID: "UC-105", Title: "Isolate js-bundle catalogue CRUD (upload/list/get/delete)", Requires: []Capability{CapIsolate}, Implemented: true},
+	// UC-109 is the real-host proof of the workerd jail (plans/isolate-runtime.md
+	// §2.1): with SB_ISOLATE_USE_JAIL=true an isolate sandbox still serves, and
+	// the workerd process behind it runs as the jail uid (not root), with
+	// NoNewPrivs and an enforcing seccomp filter (/proc/<pid>/status Seccomp: 2),
+	// inside a chroot whose root is the group directory under
+	// SB_ISOLATE_JAIL_CHROOT_BASE, in its own cgroup under
+	// SB_ISOLATE_JAIL_CGROUP_ROOT. Offline tests prove each piece; only a Linux
+	// root can prove them together, which is why this is the gate for trusting
+	// the jail with untrusted tenant code (and for enterprise mode).
+	{ID: "UC-109", Title: "Isolate jail realized on a real host (non-root uid, chroot, seccomp, cgroup) while serving", Requires: []Capability{CapIsolate, CapIsolateJail}, Implemented: true},
 
 	// Investor-benchmark observability (plans/investor-benchmark-observability.md).
 	// UC-106/107 prove the obs stack is actually up; UC-108 asserts each

@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/aerol-ai/microvm/pkg/daemon"
+	"github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -15,6 +16,7 @@ var (
 	runDaemon              = daemon.Run
 	runWasmWorkerCLI       = worker.RunCLI
 	runWasmResidentHostCLI = worker.RunCLIResident
+	runIsolateJailShim     = isolate.RunJailShim
 	osExit                 = os.Exit
 )
 
@@ -32,6 +34,19 @@ func main() {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")
 			osExit(1)
+		}
+		return
+	}
+
+	// Isolate jail shim: the daemon re-exec'd between fork and exec of a
+	// workerd group process to chroot, drop privileges, set no_new_privs and
+	// install seccomp — what os/exec cannot express (pkg/isolate/shim_linux.go).
+	// Spawned only by a jailed isolate group; exits 125 on any failure so the
+	// parent's "workerd exited during startup" has a cause beside it.
+	if len(os.Args) >= 2 && os.Args[1] == isolate.JailShimFlag {
+		if err := runIsolateJailShim(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(125)
 		}
 		return
 	}

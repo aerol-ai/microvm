@@ -1016,6 +1016,32 @@ open pass. `SB_SECRET_AUDIT_BOOT_VERIFY=checkpoint` (opt-in) makes boot
 O(bytes since the last sync) via `secrets.verified` and proves the prefix in
 the background, withholding reads on failure instead of refusing to start.
 
+Fifth stacked PR (review finding #7, js-bundle replication removal): the
+node-bound `module_ref` was the right scale call, but `GET /v1/js-bundles`
+became local-only (empty from ingress) and a bundle became single-copy with a
+generic 503 on node loss. Closed by making the list the shared per-worker
+catalogue shape (leader-coalesced, cached, bounded fan-out to isolate
+workers only, digest-deduped, partial coverage in headers — one generic
+implementation now serves templates and bundles), and by a machine-readable
+`503` + `code: artifact_node_unavailable` (no `Retry-After`) from the create,
+get and delete paths so SDKs re-upload. Placement's no-target error is now
+classified: a request pinned to an artifact's node fails as
+`cluster.ErrArtifactNodeUnavailable` (still `errors.Is` `ErrNoPlacementTarget`)
+when that node is not a live capacity-reporting member. Registry-backed
+durable bundles are recorded in `plans/isolate-runtime.md` as the Phase 5
+prerequisite.
+
+The same PR replaces the enterprise isolate gate. The old text ("experimental
+fleet-wide bundle replication") named machinery that no longer existed; the
+real reason isolate could not run in enterprise mode was that its jail was a
+uid drop with an unpopulated chroot, and every live run disabled it. The jail
+is now realized end to end (`pkg/isolate`: boot-time chroot base, per-group
+hard-linked roots, cgroup v2 caps, a re-exec shim that chroots, drops
+privileges, sets `no_new_privs` and installs a classic-BPF seccomp allowlist
+before `execve`), and enterprise mode requires it with an enforcing filter
+rather than forbidding the runtime. Real-host proof is a new scenario
+(`make integration-single-isolate-jail`, UC-109) that has not yet been run.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

@@ -92,6 +92,14 @@ var timeNow = func() time.Time { return time.Now() }
 func (d *Driver) spawnGroup(ctx context.Context, groupKey string, cpu float64, memMB int) (GroupHost, error) {
 	if d.warmPool != nil {
 		if host, ok := d.warmPool.Acquire(ctx); ok && host != nil {
+			// A blank host was jailed with unlimited caps; it now belongs to
+			// this tenant and takes theirs (cgroup v2 applies them live).
+			if capped, ok := host.(capsApplier); ok {
+				if err := capped.ApplyCaps(cpu, memMB); err != nil {
+					_ = host.Stop()
+					return nil, fmt.Errorf("isolate: apply caps to warm host for group %q: %w", groupKey, err)
+				}
+			}
 			return host, nil
 		}
 	}

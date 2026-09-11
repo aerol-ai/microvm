@@ -9,7 +9,7 @@
 #   integration-tests/run.sh all       [flags]
 #
 # Scenarios: single-node | single-node-containerd | single-node-wasm |
-#            single-node-isolate | local-mode | cluster-3-mixed |
+#            single-node-isolate | single-node-isolate-jail | local-mode | cluster-3-mixed |
 #            cluster-3-mixed-docker | cluster-3-mixed-containerd | cluster-3-mixed-fc |
 #            cluster-3-mixed-gvisor | cluster-3-mixed-gvisor-docker |
 #            cluster-3-mixed-wasm | cluster-hetero |
@@ -1183,7 +1183,7 @@ elif [[ "$BENCH_ONLY" == "1" ]]; then
     run_one "$SCENARIO"
   fi
 elif [[ "$SCENARIO" == "all" ]]; then
-  for s in local-mode single-node single-node-wasm single-node-isolate cluster-3-mixed cluster-3-mixed-docker cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64 cluster-mixed-benchmark-with-obs; do
+  for s in local-mode single-node single-node-wasm single-node-isolate single-node-isolate-jail cluster-3-mixed cluster-3-mixed-docker cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64 cluster-mixed-benchmark-with-obs; do
     ( run_one "$s" )
   done
 else

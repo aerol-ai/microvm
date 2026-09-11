@@ -153,6 +153,7 @@ func TestCoverage95LiftRunErrorBranches(t *testing.T) {
 		t.Setenv("SB_WASM_RUN_DIR", filepath.Join(paths.rootDir, "wasm-run"))
 		t.Setenv("SB_WASM_MODULES_DIR", filepath.Join(paths.rootDir, "wasm-mod"))
 		t.Setenv("SB_ENABLE_ISOLATE", "true")
+		t.Setenv("SB_ISOLATE_USE_JAIL", "false") // jail is a boot contract this host cannot honor
 		t.Setenv("SB_ISOLATE_WORKERD_PATH", "/bin/true")
 		t.Setenv("SB_ISOLATE_RUN_DIR", filepath.Join(paths.rootDir, "isolate"))
 		if err := runWithAutoCancel(t, 800*time.Millisecond, nil); err != nil {

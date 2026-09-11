@@ -450,6 +450,34 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			name: "isolate_seccomp_mode_and_cgroup_root",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_ISOLATE", "true")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.IsolateSeccompMode != "enforce" || cfg.IsolateJailCgroupRoot != "/sys/fs/cgroup/aerolvm-isolate" {
+					t.Fatalf("defaults = seccomp %q cgroup root %q", cfg.IsolateSeccompMode, cfg.IsolateJailCgroupRoot)
+				}
+				t.Setenv("SB_ISOLATE_SECCOMP_MODE", " Audit ")
+				if cfg, err := Load(); err != nil || cfg.IsolateSeccompMode != "audit" {
+					t.Fatalf("audit mode = %q err=%v", cfg.IsolateSeccompMode, err)
+				}
+				t.Setenv("SB_ISOLATE_SECCOMP_MODE", "maybe")
+				if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ISOLATE_SECCOMP_MODE") {
+					t.Fatalf("invalid seccomp mode err = %v", err)
+				}
+				t.Setenv("SB_ISOLATE_SECCOMP_MODE", "enforce")
+				t.Setenv("SB_ISOLATE_JAIL_CGROUP_ROOT", "relative/cg")
+				if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ISOLATE_JAIL_CGROUP_ROOT") {
+					t.Fatalf("relative cgroup root err = %v", err)
+				}
+			},
+		},
+		{
 			name: "isolate_jail_disabled_skips_jail_validation",
 			run: func(t *testing.T) {
 				clearEnv(t)
@@ -1514,11 +1542,24 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 		t.Fatalf("enterprise mode not retained: %+v", cfg)
 	}
 
+	// Enterprise may run isolate only fully jailed with an enforcing filter:
+	// the jail is the cross-tenant boundary.
 	t.Setenv("SB_ENABLE_ISOLATE", "true")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ENABLE_ISOLATE") {
-		t.Fatalf("Load error = %v, want isolate-forbidden-in-enterprise", err)
+	t.Setenv("SB_ISOLATE_USE_JAIL", "false")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ISOLATE_USE_JAIL must be true") {
+		t.Fatalf("Load error = %v, want jail-required-in-enterprise", err)
+	}
+	t.Setenv("SB_ISOLATE_USE_JAIL", "true")
+	t.Setenv("SB_ISOLATE_SECCOMP_MODE", "audit")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ISOLATE_SECCOMP_MODE must be enforce") {
+		t.Fatalf("Load error = %v, want enforce-required-in-enterprise", err)
+	}
+	t.Setenv("SB_ISOLATE_SECCOMP_MODE", "enforce")
+	if cfg, err := Load(); err != nil || !cfg.EnableIsolate || !cfg.IsolateUseJail {
+		t.Fatalf("jailed isolate in enterprise: cfg=%+v err=%v", cfg, err)
 	}
 	t.Setenv("SB_ENABLE_ISOLATE", "false")
+	t.Setenv("SB_ISOLATE_SECCOMP_MODE", "")
 
 	t.Setenv("SB_PAT_TOKEN", "weak-token")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {

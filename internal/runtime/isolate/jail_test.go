@@ -3,6 +3,8 @@ package isolate
 import (
 	"strings"
 	"testing"
+
+	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 )
 
 // Jail-profile regression tests (plans/isolate-runtime.md §2.1, Phase-1
@@ -101,10 +103,28 @@ func TestBuildJailSpec(t *testing.T) {
 	if !spec.Jitless {
 		t.Fatal("Jitless not propagated")
 	}
-	for _, name := range spec.SeccompAllowlistFor() {
-		if name == "mprotect" {
-			t.Fatal("jitless spec's profile still allows mprotect")
-		}
+	// Jitless keeps mprotect by name (the loader's RELRO and pthread's guard
+	// pages need it) but refuses PROT_EXEC by argument, and refuses anonymous
+	// executable mappings; the JIT profile has no argument rules at all.
+	rules := spec.SeccompArgRulesFor()
+	if len(rules) != 2 || rules[0].Syscall != "mprotect" || rules[1].Syscall != "mmap" {
+		t.Fatalf("jitless arg rules = %+v", rules)
+	}
+	if rules[0].DenyIfAll[0] != (pkgisolate.SeccompArgMask{Arg: 2, Mask: protExec}) {
+		t.Fatalf("mprotect rule = %+v", rules[0])
+	}
+	if len(rules[1].DenyIfAll) != 2 || rules[1].DenyIfAll[1] != (pkgisolate.SeccompArgMask{Arg: 3, Mask: mapAnonymous}) {
+		t.Fatalf("mmap rule = %+v", rules[1])
+	}
+	if got := SeccompArgRules(false); got != nil {
+		t.Fatalf("JIT profile has arg rules: %+v", got)
+	}
+	// The realized fields travel with the spec.
+	full := cfg
+	full.JailCgroupRoot, full.SeccompMode, full.ShimPath = "/sys/fs/cgroup/x", "audit", "/usr/local/bin/sandboxd"
+	spec, err = BuildJailSpec(full, "acme", 1, 64)
+	if err != nil || spec.CgroupRoot != "/sys/fs/cgroup/x" || spec.SeccompMode != "audit" || spec.ShimPath != "/usr/local/bin/sandboxd" || spec.CPUQuota != 1 || spec.MemoryLimitMB != 64 {
+		t.Fatalf("realized fields = %+v err=%v", spec, err)
 	}
 
 	// A hostile group key must fail spec construction, never reach a path.
@@ -191,9 +211,10 @@ func TestSeccompProfileInvariants(t *testing.T) {
 		}
 	}
 
-	// The JIT group is exactly what jitless removes: present by default,
-	// absent under --jitless.
-	for _, jit := range []string{"mprotect", "memfd_create", "pkey_alloc", "pkey_mprotect", "pkey_free"} {
+	// The JIT group is exactly what jitless removes by name: present by
+	// default, absent under --jitless. (mprotect stays in both — the loader
+	// needs it — and is narrowed by argument instead; see TestBuildJailSpec.)
+	for _, jit := range []string{"memfd_create", "pkey_alloc", "pkey_mprotect", "pkey_free", "process_madvise"} {
 		if _, ok := defaultSet[jit]; !ok {
 			t.Fatalf("JIT syscall %q missing from default profile (V8 with a JIT cannot run)", jit)
 		}
@@ -202,16 +223,20 @@ func TestSeccompProfileInvariants(t *testing.T) {
 		}
 	}
 
-	// Floor of the base profile: without these, no V8 host runs at all.
-	for _, base := range []string{"mmap", "futex", "clone", "epoll_pwait", "read", "write", "accept4"} {
+	// Floor of the base profile: without these, no glibc-linked V8 host runs
+	// at all — the filter is installed before execve, so the dynamic loader
+	// (mprotect for RELRO, set_tid_address) and glibc 2.34+ pthreads (clone3)
+	// run under it, and the shim's one execve into workerd must pass.
+	for _, base := range []string{"mmap", "mprotect", "futex", "clone", "clone3", "set_tid_address", "epoll_pwait", "read", "write", "accept4", "execve", "getrandom", "rseq"} {
 		if _, ok := jitlessSet[base]; !ok {
 			t.Fatalf("base syscall %q missing from jitless profile", base)
 		}
 	}
 
-	// Escape primitives stay pinned on the never list.
+	// Escape primitives stay pinned on the never list — including the ways
+	// a filtered process could change its own filter or identity.
 	neverSet := toSet(SeccompNeverAllow())
-	for _, escape := range []string{"ptrace", "mount", "setns", "unshare", "bpf", "execve"} {
+	for _, escape := range []string{"ptrace", "mount", "setns", "unshare", "bpf", "execveat", "seccomp", "setuid", "setresuid", "capset"} {
 		if _, ok := neverSet[escape]; !ok {
 			t.Fatalf("escape primitive %q missing from never-allow list", escape)
 		}
