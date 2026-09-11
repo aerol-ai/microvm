@@ -3,8 +3,6 @@ package worker
 import (
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,52 +15,13 @@ func TestWorkerEgressAuditGapAndErrorHelpers(t *testing.T) {
 		t.Fatalf("errStatus = %v", err)
 	}
 
+	// A nil spill writer counts every loss and never touches a disk.
+	var none *workerEgressSpiller
 	before := workerEgressDropped.Load()
-	empty, node := "", "n1"
-	workerEgressGapDir.Store(&empty)
-	workerEgressGapNode.Store(&node)
-	workerEgressPendingGap.Store(0)
-	noteWorkerEgressOverflow()
-	if workerEgressDropped.Load() <= before {
-		t.Fatal("overflow must count a drop even with no spill dir")
-	}
-	select {
-	case <-workerEgressGapKick:
-	default:
-	}
-	if flushWorkerEgressGap() {
-		t.Fatal("no spill dir: flush must not claim a write")
-	}
-	appendWorkerEgressSpill("", workerEgressAuditEvent{SandboxID: "sb-1"})
-
-	dir := t.TempDir()
-	workerEgressGapDir.Store(&dir)
-	noteWorkerEgressOverflow()
-	select {
-	case <-workerEgressGapKick:
-	default:
-	}
-	flushWorkerEgressGap() // the pool goroutine may have flushed first
-	spill := filepath.Join(dir, workerEgressSpillFile)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := os.Stat(spill); err == nil || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if _, err := os.Stat(spill); err != nil {
-		t.Fatalf("gap spill missing: %v", err)
-	}
-
-	blocker := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	before = workerEgressDropped.Load()
-	appendWorkerEgressSpill(filepath.Join(blocker, "nested"), workerEgressAuditEvent{SandboxID: "sb-2"})
-	if workerEgressDropped.Load() <= before {
-		t.Fatal("mkdir failure must count a drop")
+	none.enqueue(workerEgressAuditEvent{SandboxID: "sb-1"})
+	none.noteDrop(2)
+	if workerEgressDropped.Load() != before+3 {
+		t.Fatalf("nil writer dropped delta = %d, want 3", workerEgressDropped.Load()-before)
 	}
 
 	postOrSpillWorkerEgress(egressAuditJob{})
@@ -85,17 +44,6 @@ func TestWorkerEgressAuditGapAndErrorHelpers(t *testing.T) {
 	installDefaultEgressObserver(&NetMediator{})
 
 	(*NetMediator)(nil).SetEgressObserver(nil)
-
-	// Spill file is a directory so the append open fails.
-	badSpill := t.TempDir()
-	if err := os.Mkdir(filepath.Join(badSpill, workerEgressSpillFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	before = workerEgressDropped.Load()
-	appendWorkerEgressSpill(badSpill, workerEgressAuditEvent{SandboxID: "sb-dir"})
-	if workerEgressDropped.Load() <= before {
-		t.Fatal("spill-as-directory must count a drop")
-	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no", http.StatusInternalServerError)

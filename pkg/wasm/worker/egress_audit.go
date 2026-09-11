@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,28 +14,45 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/auditlog"
-	"golang.org/x/sys/unix"
 )
 
 // Worker subprocesses cannot call internal/service.emitEgressAudit. They POST
 // egress events to the daemon's loopback audit ingest
 // (SB_AUDIT_INGEST_PORT + per-sandbox capability). Workers never write
-// secrets.jsonl tip. When IPC is unavailable they durable-append to
-// secrets.spill.jsonl for the parent drain path (or count a gap drop).
+// secrets.jsonl or its tip. When IPC is unavailable they append to the audit
+// directory's shared spill file (auditlog.SpillFile — the same writer, lock
+// and format the daemon's own sink uses) for the daemon's drain path.
+//
+// Nothing here runs on a sandbox's dial path except a non-blocking channel
+// send. A full queue costs two atomics and a kick; a full spill queue costs
+// the same. The spill file is written by exactly one goroutine, in batches,
+// one flock and one fsync per batch, with backoff when the disk misbehaves —
+// so audit backpressure can slow evidence down, but it can never stall a
+// tenant's egress, and one tenant's burst can never hold the audit lock
+// against another's.
 
 const (
-	workerEgressLockFile   = "secrets.jsonl.lock"
-	workerEgressSpillFile  = "secrets.spill.jsonl"
+	workerEgressSpillFile  = auditlog.SpillFileName
 	workerEgressWorkers    = 8
 	workerEgressQueue      = 1024
 	workerEgressIngestPath = "/internal/audit/egress"
 	workerEgressCapHdr     = "X-Aerol-Audit-Capability"
+	// workerEgressSpillQueue is how many IPC-failed events may wait for the
+	// spill writer before they are counted as dropped (and reported by one
+	// coalesced gap marker). Sized for a daemon restart, not an outage: an
+	// outage is what the marker is for.
+	workerEgressSpillQueue = 4096
+	// workerEgressSpillBatch bounds one group-committed append.
+	workerEgressSpillBatch      = 256
+	workerEgressSpillBackoffMin = time.Second
+	workerEgressSpillBackoffMax = 30 * time.Second
 )
 
 type workerEgressAuditEvent = auditlog.Event
 
 type egressAuditJob struct {
-	port, capability, spillDir, node           string
+	port, capability, node                     string
+	spill                                      *workerEgressSpiller
 	sandboxID, incarnationID, network, address string
 	eventTime                                  time.Time
 }
@@ -54,21 +70,18 @@ var (
 	workerEgressDropped atomic.Int64
 	workerEgressIPCFail = expvar.NewInt("aerolvm_wasm_egress_audit_ipc_fail_total")
 	workerEgressHTTP    = &http.Client{Timeout: 2 * time.Second}
-	// Overflow accounting mirrors the daemon sink's reserved-slot design: the
-	// dial path only bumps a counter and kicks the writer; one goroutine turns
-	// the count into a single coalesced gap marker. No flock, fsync, or log
-	// line ever runs on a sandbox's dial.
-	workerEgressPendingGap atomic.Int64
-	workerEgressGapKick    = make(chan struct{}, 1)
-	workerEgressGapDir     atomic.Pointer[string]
-	workerEgressGapNode    atomic.Pointer[string]
+	// workerEgressSpill is the installed spill writer; the dial-path overflow
+	// branch only needs it to count.
+	workerEgressSpill atomic.Pointer[workerEgressSpiller]
 	// workerEgressGapMarkers counts coalesced markers written (not drops).
-	workerEgressGapMarkers = expvar.NewInt("aerolvm_wasm_egress_audit_gap_markers_total")
+	workerEgressGapMarkers   = expvar.NewInt("aerolvm_wasm_egress_audit_gap_markers_total")
+	workerEgressSpillBatches = expvar.NewInt("aerolvm_wasm_egress_audit_spill_batches_total")
+	workerEgressSpillFail    = expvar.NewInt("aerolvm_wasm_egress_audit_spill_fail_total")
 )
 
 // installDefaultEgressObserver wires destination attribution when
 // SB_EGRESS_ATTRIBUTION_ENABLED is unset/true. Prefers SB_AUDIT_INGEST_PORT
-// and always carries the spill directory as the durable fallback when IPC is
+// and always carries the spill writer as the durable fallback when IPC is
 // unavailable or temporarily fails.
 func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindingResolver) {
 	if m == nil || !envBoolDefaultTrue("SB_EGRESS_ATTRIBUTION_ENABLED") {
@@ -84,8 +97,11 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 		return
 	}
 	node := strings.TrimSpace(os.Getenv("SB_NODE_ID"))
-	workerEgressGapDir.Store(&spillDir)
-	workerEgressGapNode.Store(&node)
+	spill := newWorkerEgressSpiller(spillDir, node)
+	if spill != nil {
+		spill.start()
+	}
+	workerEgressSpill.Store(spill)
 	ensureWorkerEgressPool()
 	m.SetEgressObserver(func(sandboxID, network, address string) {
 		binding := egressAuditBinding{}
@@ -93,7 +109,7 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 			binding, _ = resolve(sandboxID)
 		}
 		job := egressAuditJob{
-			port: port, capability: binding.capability, spillDir: spillDir, node: node,
+			port: port, capability: binding.capability, spill: spill, node: node,
 			sandboxID: sandboxID, incarnationID: binding.incarnationID, network: network, address: address,
 			eventTime: time.Now().UTC(),
 		}
@@ -106,47 +122,10 @@ func installDefaultEgressObserver(m *NetMediator, resolvers ...egressAuditBindin
 }
 
 // noteWorkerEgressOverflow is the entire dial-path cost of a full queue: two
-// atomics. The pending count is flushed as one gap marker by the writer.
+// atomics and a non-blocking kick. The spill writer turns the count into one
+// gap marker.
 func noteWorkerEgressOverflow() {
-	workerEgressDropped.Add(1)
-	workerEgressPendingGap.Add(1)
-	select {
-	case workerEgressGapKick <- struct{}{}:
-	default:
-	}
-}
-
-// flushWorkerEgressGap writes one marker for every drop counted since the
-// last flush. Runs only on the writer goroutine (or a test), never on a dial.
-func flushWorkerEgressGap() bool {
-	n := workerEgressPendingGap.Swap(0)
-	if n <= 0 {
-		return false
-	}
-	dir, node := "", ""
-	if p := workerEgressGapDir.Load(); p != nil {
-		dir = *p
-	}
-	if p := workerEgressGapNode.Load(); p != nil {
-		node = *p
-	}
-	if dir == "" {
-		// Nowhere durable to record the gap; the counter is the only evidence.
-		return false
-	}
-	appendWorkerEgressSpill(dir, workerEgressAuditEvent{
-		Time:    time.Now().UTC(),
-		Actor:   node,
-		Result:  "gap",
-		Reason:  "overflow",
-		NodeID:  node,
-		Kind:    "gap",
-		Dropped: n,
-	})
-	workerEgressGapMarkers.Add(1)
-	slog.Warn("wasm egress audit queue overflowed; coalesced gap marker written",
-		"dropped", n, "dropped_total", workerEgressDropped.Load())
-	return true
+	workerEgressSpill.Load().noteDrop(1)
 }
 
 func ensureWorkerEgressPool() {
@@ -159,11 +138,6 @@ func ensureWorkerEgressPool() {
 				}
 			}()
 		}
-		go func() {
-			for range workerEgressGapKick {
-				flushWorkerEgressGap()
-			}
-		}()
 	})
 }
 
@@ -186,23 +160,20 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 		}
 		workerEgressIPCFail.Add(1)
 	}
-	// IPC unavailable — durable spill for parent import; never touch secrets.jsonl tip.
-	if job.spillDir != "" {
-		appendWorkerEgressSpill(job.spillDir, workerEgressAuditEvent{
-			Time:          job.eventTime,
-			Actor:         job.node,
-			SandboxID:     sandboxID,
-			Result:        "success",
-			Reason:        "ok",
-			NodeID:        job.node,
-			Kind:          "egress",
-			Destination:   address,
-			Network:       strings.TrimSpace(job.network),
-			IncarnationID: strings.TrimSpace(job.incarnationID),
-		})
-		return
-	}
-	workerEgressDropped.Add(1)
+	// IPC unavailable — hand the record to the spill writer; never touch
+	// secrets.jsonl. A nil writer (no spill dir) counts a drop.
+	job.spill.enqueue(workerEgressAuditEvent{
+		Time:          job.eventTime,
+		Actor:         job.node,
+		SandboxID:     sandboxID,
+		Result:        "success",
+		Reason:        "ok",
+		NodeID:        job.node,
+		Kind:          "egress",
+		Destination:   address,
+		Network:       strings.TrimSpace(job.network),
+		IncarnationID: strings.TrimSpace(job.incarnationID),
+	})
 }
 
 func postWorkerEgressAudit(job egressAuditJob) error {
@@ -239,64 +210,138 @@ func (e statusError) Error() string { return "audit ingest status " + strconv.It
 
 func errStatus(code int) error { return statusError(code) }
 
-// appendWorkerEgressSpill durable-appends under flock + fsync to the parent
-// spill file. Does not update secrets.tip or secrets.jsonl.
-func appendWorkerEgressSpill(spillDir string, ev workerEgressAuditEvent) {
-	if spillDir == "" {
-		return
-	}
-	auditlog.EnsureEventID(&ev)
-	if err := os.MkdirAll(spillDir, 0o700); err != nil {
-		slog.Warn("wasm egress spill mkdir failed", "dir", spillDir, "err", err)
-		workerEgressDropped.Add(1)
-		return
-	}
-	lockPath := filepath.Join(spillDir, workerEgressLockFile)
-	spillPath := filepath.Join(spillDir, workerEgressSpillFile)
-	// The lock sidecar carries no data. Open it read-only so close cannot hide
-	// a buffered-write failure; flock only needs a stable file descriptor.
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDONLY, 0o600)
-	if err != nil {
-		slog.Warn("wasm egress spill lock open failed", "path", lockPath, "err", err)
-		workerEgressDropped.Add(1)
-		return
-	}
-	defer lf.Close()
-	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
-		slog.Warn("wasm egress spill flock failed", "path", lockPath, "err", err)
-		workerEgressDropped.Add(1)
-		return
-	}
-	defer func() { _ = unix.Flock(int(lf.Fd()), unix.LOCK_UN) }()
+// workerEgressSpiller is the single writer of this process's spill records.
+// Producers (the IPC pool on failure, the dial path on overflow) only touch
+// its channel and counters; the goroutine behind run does every byte of I/O.
+type workerEgressSpiller struct {
+	file auditlog.SpillFile
+	node string
+	ch   chan workerEgressAuditEvent
+	kick chan struct{}
+	// pending is the coalesced drop count the next batch reports as one gap
+	// marker. It is never reset by a failed write: the loss stays owed until
+	// the disk takes it.
+	pending atomic.Int64
+	once    sync.Once
+	// sleep is the retry pause after a failed append (tests replace it).
+	sleep func(time.Duration)
+}
 
-	line, err := json.Marshal(ev)
-	if err != nil {
-		slog.Warn("wasm egress spill marshal failed", "err", err)
+func newWorkerEgressSpiller(dir, node string) *workerEgressSpiller {
+	if strings.TrimSpace(dir) == "" {
+		return nil
+	}
+	return &workerEgressSpiller{
+		file:  auditlog.SpillFileIn(dir),
+		node:  node,
+		ch:    make(chan workerEgressAuditEvent, workerEgressSpillQueue),
+		kick:  make(chan struct{}, 1),
+		sleep: time.Sleep,
+	}
+}
+
+func (s *workerEgressSpiller) start() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() { go s.run() })
+}
+
+// noteDrop accounts n lost events. Safe on a nil spiller (no spill dir):
+// the counter is then the only evidence.
+func (s *workerEgressSpiller) noteDrop(n int64) {
+	workerEgressDropped.Add(n)
+	if s == nil {
+		return
+	}
+	s.pending.Add(n)
+	select {
+	case s.kick <- struct{}{}:
+	default:
+	}
+}
+
+// enqueue hands one record to the writer without blocking. A full spill
+// queue is a drop, reported by the next gap marker.
+func (s *workerEgressSpiller) enqueue(ev workerEgressAuditEvent) {
+	if s == nil {
 		workerEgressDropped.Add(1)
 		return
 	}
-	line = append(line, '\n')
-	f, err := os.OpenFile(spillPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		slog.Warn("wasm egress spill open failed", "path", spillPath, "err", err)
-		workerEgressDropped.Add(1)
-		return
+	select {
+	case s.ch <- ev:
+	default:
+		s.noteDrop(1)
 	}
-	if _, err := f.Write(line); err != nil {
-		_ = f.Close()
-		slog.Warn("wasm egress spill write failed", "path", spillPath, "err", err)
-		workerEgressDropped.Add(1)
-		return
+}
+
+// drainOnce group-commits one batch: a gap marker for every drop owed, then
+// first (if any) and whatever else is queued, up to workerEgressSpillBatch.
+// One lock, one write, one fsync. On failure every record in the batch is
+// a drop and the owed count grows by the batch, so nothing is lost silently.
+func (s *workerEgressSpiller) drainOnce(first *workerEgressAuditEvent) (written int, err error) {
+	batch := make([]workerEgressAuditEvent, 0, workerEgressSpillBatch+1)
+	gap := s.pending.Swap(0)
+	if gap > 0 {
+		batch = append(batch, auditlog.GapMarker(s.node, gap, time.Now().UTC()))
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		slog.Warn("wasm egress spill sync failed", "path", spillPath, "err", err)
-		workerEgressDropped.Add(1)
-		return
+	if first != nil {
+		batch = append(batch, *first)
 	}
-	if err := f.Close(); err != nil {
-		slog.Warn("wasm egress spill close failed", "path", spillPath, "err", err)
-		workerEgressDropped.Add(1)
+	for len(batch) < cap(batch) {
+		select {
+		case ev := <-s.ch:
+			batch = append(batch, ev)
+			continue
+		default:
+		}
+		break
+	}
+	if len(batch) == 0 {
+		return 0, nil
+	}
+	if err := s.file.Append(batch); err != nil {
+		workerEgressSpillFail.Add(1)
+		lost := int64(len(batch))
+		if gap > 0 {
+			lost-- // the marker itself is not an event
+		}
+		workerEgressDropped.Add(lost)
+		s.pending.Add(gap + lost)
+		return 0, err
+	}
+	workerEgressSpillBatches.Add(1)
+	if gap > 0 {
+		workerEgressGapMarkers.Add(1)
+	}
+	return len(batch), nil
+}
+
+// run is the writer loop. After a failed append it backs off (1s doubling
+// to 30s) rather than retrying per event: a dead disk must cost the node
+// one warning per backoff, not one per dial. Records that arrive meanwhile
+// queue up to the spill queue's capacity and are counted beyond it.
+func (s *workerEgressSpiller) run() {
+	var backoff time.Duration
+	for {
+		var first *workerEgressAuditEvent
+		select {
+		case ev := <-s.ch:
+			first = &ev
+		case <-s.kick:
+		}
+		if _, err := s.drainOnce(first); err != nil {
+			if backoff == 0 {
+				backoff = workerEgressSpillBackoffMin
+			} else {
+				backoff = min(backoff*2, workerEgressSpillBackoffMax)
+			}
+			slog.Warn("wasm egress audit spill append failed; backing off",
+				"err", err, "retry_in", backoff, "dropped_total", workerEgressDropped.Load())
+			s.sleep(backoff)
+			continue
+		}
+		backoff = 0
 	}
 }
 

@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -49,28 +51,57 @@ func TestPostOrSpillWorkerEgressUsesIngest(t *testing.T) {
 	}
 }
 
-func TestPostOrSpillWorkerEgressFallsBackToSpill(t *testing.T) {
-	dir := t.TempDir()
-	postOrSpillWorkerEgress(egressAuditJob{
-		port: "1", capability: "cap", spillDir: dir, node: "n1",
-		sandboxID: "sb-1", network: "tcp", address: "host:9",
-	})
-	raw, err := os.ReadFile(filepath.Join(dir, workerEgressSpillFile))
+func readWorkerSpill(t *testing.T, dir string) []workerEgressAuditEvent {
+	t.Helper()
+	f, err := os.Open(filepath.Join(dir, workerEgressSpillFile))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		t.Fatal(err)
 	}
-	var ev workerEgressAuditEvent
-	if err := json.Unmarshal(bytesTrimLine(raw), &ev); err != nil {
-		t.Fatalf("unmarshal: %v raw=%s", err, raw)
+	defer f.Close()
+	var out []workerEgressAuditEvent
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var ev workerEgressAuditEvent
+		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
+			t.Fatalf("spill line does not parse: %v", err)
+		}
+		out = append(out, ev)
 	}
-	if ev.Kind != "egress" || ev.SandboxID != "sb-1" || ev.Destination != "host:9" {
-		t.Fatalf("spill event = %+v", ev)
+	return out
+}
+
+func TestPostOrSpillWorkerEgressFallsBackToSpill(t *testing.T) {
+	dir := t.TempDir()
+	spill := newWorkerEgressSpiller(dir, "n1") // not started: drained by hand
+	postOrSpillWorkerEgress(egressAuditJob{
+		port: "1", capability: "cap", spill: spill, node: "n1",
+		sandboxID: "sb-1", network: "tcp", address: "host:9",
+	})
+	if got := readWorkerSpill(t, dir); len(got) != 0 {
+		t.Fatalf("IPC failure wrote synchronously: %+v", got)
+	}
+	if n, err := spill.drainOnce(nil); err != nil || n != 1 {
+		t.Fatalf("drain = %d, %v", n, err)
+	}
+	got := readWorkerSpill(t, dir)
+	if len(got) != 1 || got[0].Kind != "egress" || got[0].SandboxID != "sb-1" || got[0].Destination != "host:9" || got[0].EventID == "" {
+		t.Fatalf("spill event = %+v", got)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "secrets.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("worker must not write secrets.jsonl, err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "secrets.tip")); !os.IsNotExist(err) {
 		t.Fatalf("worker must not write secrets.tip, err=%v", err)
+	}
+	// No spill writer at all: the drop is counted, nothing panics.
+	before := workerEgressDropped.Load()
+	postOrSpillWorkerEgress(egressAuditJob{port: "1", capability: "cap", sandboxID: "sb-1", address: "host:9"})
+	if workerEgressDropped.Load() != before+1 {
+		t.Fatal("IPC failure without a spill writer must count a drop")
 	}
 }
 
@@ -134,22 +165,14 @@ func TestInstalledObserverSpillsWhenConfiguredIngestFails(t *testing.T) {
 	}
 	observer("sb-fallback", "tcp", "example.com:443")
 
-	path := filepath.Join(dir, workerEgressSpillFile)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		raw, err := os.ReadFile(path)
-		if err == nil {
-			var ev workerEgressAuditEvent
-			if err := json.Unmarshal(bytesTrimLine(raw), &ev); err != nil {
-				t.Fatalf("unmarshal spill: %v", err)
-			}
-			if ev.SandboxID != "sb-fallback" || ev.IncarnationID != "inc-1" || ev.Destination != "example.com:443" {
+		if got := readWorkerSpill(t, dir); len(got) > 0 {
+			ev := got[0]
+			if ev.SandboxID != "sb-fallback" || ev.IncarnationID != "inc-1" || ev.Destination != "example.com:443" || ev.NodeID != "node-a" {
 				t.Fatalf("spill event = %+v", ev)
 			}
 			break
-		}
-		if !os.IsNotExist(err) {
-			t.Fatalf("read spill: %v", err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("spill file not written after ingest failure")
@@ -158,27 +181,17 @@ func TestInstalledObserverSpillsWhenConfiguredIngestFails(t *testing.T) {
 	}
 }
 
-func bytesTrimLine(raw []byte) []byte {
-	return []byte(strings.TrimSpace(string(raw)))
-}
-
 // The dial-path overflow branch must do no I/O: no directory, file, lock, or
-// fsync — only counters. The writer later turns the count into ONE marker.
+// fsync — only counters and a kick. The writer later turns the count into
+// ONE marker.
 func TestObserverOverflowDoesNoIOOnDialPath(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "spill-not-created")
-	node := "n-ovf"
-	workerEgressGapDir.Store(&dir)
-	workerEgressGapNode.Store(&node)
-	workerEgressPendingGap.Store(0)
+	spill := newWorkerEgressSpiller(dir, "n-ovf") // not started
+	prev := workerEgressSpill.Swap(spill)
+	t.Cleanup(func() { workerEgressSpill.Store(prev) })
 	before := workerEgressDropped.Load()
-
-	// Overflow itself is two atomics: the counters move, the filesystem does
-	// not. (The pool's flush goroutine may already be running from another
-	// test and race us for the kick, so the marker may land before or after
-	// our explicit flush; only the total is asserted.)
-	stat := func() error { _, err := os.Stat(dir); return err }
 	for range 37 {
-		if err := stat(); !os.IsNotExist(err) {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
 			t.Fatalf("overflow touched the filesystem on the dial path (stat err=%v)", err)
 		}
 		noteWorkerEgressOverflow()
@@ -186,49 +199,167 @@ func TestObserverOverflowDoesNoIOOnDialPath(t *testing.T) {
 	if got := workerEgressDropped.Load() - before; got != 37 {
 		t.Fatalf("dropped counter delta = %d, want 37", got)
 	}
+	if spill.pending.Load() != 37 {
+		t.Fatalf("pending gap = %d, want 37", spill.pending.Load())
+	}
 	select {
-	case <-workerEgressGapKick:
+	case <-spill.kick:
 	default:
+		t.Fatal("overflow must kick the writer")
 	}
-	flushWorkerEgressGap()
-	var total float64
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		total = 0
-		raw, err := os.ReadFile(filepath.Join(dir, workerEgressSpillFile))
-		if err == nil {
-			for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-				var ev map[string]any
-				if err := json.Unmarshal([]byte(line), &ev); err != nil {
-					t.Fatal(err)
-				}
-				if ev["kind"] != "gap" || ev["reason"] != "overflow" || ev["node_id"] != "n-ovf" {
-					t.Fatalf("marker = %v", ev)
-				}
-				total += ev["dropped"].(float64)
-			}
-		}
-		if total == 37 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	markers := workerEgressGapMarkers.Value()
+	if n, err := spill.drainOnce(nil); err != nil || n != 1 {
+		t.Fatalf("drain = %d, %v (want exactly one marker)", n, err)
 	}
-	if total != 37 {
-		t.Fatalf("coalesced markers account for %v drops, want 37", total)
+	got := readWorkerSpill(t, dir)
+	if len(got) != 1 || got[0].Kind != "gap" || got[0].Reason != "overflow" || got[0].Dropped != 37 || got[0].NodeID != "n-ovf" {
+		t.Fatalf("marker = %+v", got)
 	}
-	if flushWorkerEgressGap() {
-		t.Fatal("nothing pending: flush must not write")
+	if workerEgressGapMarkers.Value() != markers+1 {
+		t.Fatal("marker not counted")
 	}
-	// Without a spill directory the counter is the only evidence; no panic,
-	// no write.
-	empty := ""
-	workerEgressGapDir.Store(&empty)
+	if n, err := spill.drainOnce(nil); err != nil || n != 0 {
+		t.Fatalf("nothing pending: drain = %d, %v", n, err)
+	}
+	// Without a spill writer the counter is the only evidence; no panic.
+	workerEgressSpill.Store(nil)
+	before = workerEgressDropped.Load()
 	noteWorkerEgressOverflow()
-	select {
-	case <-workerEgressGapKick:
-	default:
+	if workerEgressDropped.Load() != before+1 {
+		t.Fatal("overflow without a spill writer must still count")
 	}
-	if flushWorkerEgressGap() {
-		t.Fatal("flush without a spill dir must not claim to have written")
+	if newWorkerEgressSpiller("  ", "n") != nil {
+		t.Fatal("blank spill dir must yield no writer")
+	}
+	var none *workerEgressSpiller
+	none.start()
+	none.noteDrop(1)
+}
+
+func TestWorkerEgressSpillerBatchesAndCoalesces(t *testing.T) {
+	dir := t.TempDir()
+	spill := newWorkerEgressSpiller(dir, "n-batch")
+	for i := range 300 {
+		spill.enqueue(workerEgressAuditEvent{SandboxID: fmt.Sprintf("sb-%d", i%7), Kind: "egress", Destination: fmt.Sprintf("d:%d", i), Result: "success"})
+	}
+	spill.noteDrop(5)
+	batches := workerEgressSpillBatches.Value()
+	// One marker plus one full batch; the remainder next time. Two lock
+	// acquisitions and two fsyncs for 301 records.
+	if n, err := spill.drainOnce(nil); err != nil || n != workerEgressSpillBatch+1 {
+		t.Fatalf("first drain = %d, %v", n, err)
+	}
+	if n, err := spill.drainOnce(nil); err != nil || n != 300-workerEgressSpillBatch {
+		t.Fatalf("second drain = %d, %v", n, err)
+	}
+	if workerEgressSpillBatches.Value() != batches+2 {
+		t.Fatalf("batches counted = %d, want +2", workerEgressSpillBatches.Value()-batches)
+	}
+	got := readWorkerSpill(t, dir)
+	if len(got) != 301 || got[0].Kind != "gap" || got[0].Dropped != 5 {
+		t.Fatalf("spill = %d records, first %+v", len(got), got[0])
+	}
+	for i, ev := range got[1:] {
+		if ev.Destination != fmt.Sprintf("d:%d", i) {
+			t.Fatalf("record %d out of order: %+v", i, ev)
+		}
+	}
+	// first is written ahead of the queue.
+	head := workerEgressAuditEvent{SandboxID: "sb-head", Kind: "egress", Destination: "head", Result: "success"}
+	spill.enqueue(workerEgressAuditEvent{SandboxID: "sb-tail", Kind: "egress", Destination: "tail", Result: "success"})
+	if n, err := spill.drainOnce(&head); err != nil || n != 2 {
+		t.Fatalf("drain with first = %d, %v", n, err)
+	}
+	got = readWorkerSpill(t, dir)
+	if got[301].Destination != "head" || got[302].Destination != "tail" {
+		t.Fatalf("first not written ahead: %+v %+v", got[301], got[302])
+	}
+}
+
+func TestWorkerEgressSpillerOverflowAndFailureKeepTheLossOwed(t *testing.T) {
+	// A tiny queue: the third record overflows and is owed as a gap.
+	small := &workerEgressSpiller{file: newWorkerEgressSpiller(t.TempDir(), "n").file, node: "n", ch: make(chan workerEgressAuditEvent, 2), kick: make(chan struct{}, 1), sleep: time.Sleep}
+	before := workerEgressDropped.Load()
+	for i := range 3 {
+		small.enqueue(workerEgressAuditEvent{SandboxID: "sb", Destination: fmt.Sprint(i)})
+	}
+	if workerEgressDropped.Load() != before+1 || small.pending.Load() != 1 {
+		t.Fatalf("overflow: dropped delta %d pending %d", workerEgressDropped.Load()-before, small.pending.Load())
+	}
+	if n, err := small.drainOnce(nil); err != nil || n != 3 {
+		t.Fatalf("drain = %d, %v (marker + 2)", n, err)
+	}
+
+	// The spill path is a directory: the append fails, every record in the
+	// batch is a drop, and the owed count grows by the batch so the next
+	// successful marker reports it.
+	bad := t.TempDir()
+	if err := os.Mkdir(filepath.Join(bad, workerEgressSpillFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	broken := newWorkerEgressSpiller(bad, "n")
+	broken.enqueue(workerEgressAuditEvent{SandboxID: "a"})
+	broken.enqueue(workerEgressAuditEvent{SandboxID: "b"})
+	broken.noteDrop(4)
+	before = workerEgressDropped.Load()
+	fails := workerEgressSpillFail.Value()
+	n, err := broken.drainOnce(nil)
+	if err == nil || n != 0 {
+		t.Fatalf("drain on a broken spill = %d, %v", n, err)
+	}
+	if workerEgressDropped.Load() != before+2 {
+		t.Fatalf("failed batch dropped delta = %d, want 2 (the marker is not an event)", workerEgressDropped.Load()-before)
+	}
+	if broken.pending.Load() != 6 {
+		t.Fatalf("owed after failure = %d, want 4 + 2", broken.pending.Load())
+	}
+	if workerEgressSpillFail.Value() != fails+1 {
+		t.Fatal("spill failure not counted")
+	}
+	// Once the disk is back, one marker reports the whole loss.
+	broken.file = newWorkerEgressSpiller(t.TempDir(), "n").file
+	if n, err := broken.drainOnce(nil); err != nil || n != 1 {
+		t.Fatalf("drain after recovery = %d, %v", n, err)
+	}
+	got := readWorkerSpill(t, filepath.Dir(broken.file.Path))
+	if len(got) != 1 || got[0].Dropped != 6 {
+		t.Fatalf("recovery marker = %+v", got)
+	}
+}
+
+func TestWorkerEgressSpillerRunBacksOffInsteadOfRetryingPerEvent(t *testing.T) {
+	bad := t.TempDir()
+	if err := os.Mkdir(filepath.Join(bad, workerEgressSpillFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spill := newWorkerEgressSpiller(bad, "n")
+	slept := make(chan time.Duration, 8)
+	spill.sleep = func(d time.Duration) { slept <- d }
+	spill.start()
+	spill.start() // idempotent
+	wait := func(want time.Duration) {
+		t.Helper()
+		select {
+		case d := <-slept:
+			if d != want {
+				t.Fatalf("backoff = %v, want %v", d, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("writer did not back off")
+		}
+	}
+	spill.enqueue(workerEgressAuditEvent{SandboxID: "a"})
+	wait(workerEgressSpillBackoffMin)
+	spill.enqueue(workerEgressAuditEvent{SandboxID: "b"})
+	wait(2 * workerEgressSpillBackoffMin)
+	spill.noteDrop(1) // a kick alone also drives a (failing) flush
+	wait(4 * workerEgressSpillBackoffMin)
+	// Sleeping never blocks producers: the queue and counters keep working.
+	before := workerEgressDropped.Load()
+	for range 10 {
+		spill.enqueue(workerEgressAuditEvent{SandboxID: "c"})
+	}
+	if workerEgressDropped.Load() < before {
+		t.Fatal("unreachable")
 	}
 }
