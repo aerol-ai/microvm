@@ -41,7 +41,12 @@ type AuditRateLimiter struct {
 	operator      *rate.Limiter
 	overflow      *rate.Limiter
 	node          *rate.Limiter
-	lastEvict     time.Time
+	// peer bounds the cluster-internal per-sandbox audit endpoint that
+	// ingress fan-out hits. It is separate from node so a fleet-wide storm of
+	// peer reads cannot starve this node's own public audit traffic, and
+	// vice versa; together they cap a worker at 2x the node rate.
+	peer      *rate.Limiter
+	lastEvict time.Time
 }
 
 // AuditRateLimiterConfig holds token-bucket rates from config.
@@ -73,6 +78,7 @@ func NewAuditRateLimiter(cfg AuditRateLimiterConfig) *AuditRateLimiter {
 		operator:      rate.NewLimiter(rate.Limit(opRate), defaultAuditOperatorBurst),
 		overflow:      rate.NewLimiter(rate.Limit(idRate), defaultAuditIdentityBurst),
 		node:          rate.NewLimiter(rate.Limit(nodeRate), defaultAuditNodeBurst),
+		peer:          rate.NewLimiter(rate.Limit(nodeRate), defaultAuditNodeBurst),
 	}
 }
 
@@ -84,16 +90,43 @@ func (a *AuditRateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := auditIdentityKey(r)
 		if retry, ok := a.allow(key); !ok {
-			sec := int(math.Ceil(retry.Seconds()))
-			if sec < 1 {
-				sec = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(sec))
-			apihttp.WriteError(w, http.StatusTooManyRequests, "audit rate limit exceeded")
+			writeAuditRateLimited(w, retry)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// PeerMiddleware wraps the cluster-internal audit slice endpoint. Peers are
+// authenticated nodes, not tenants, so only the per-node peer bucket applies.
+// Before this, one public request could amplify into unmetered full reads on
+// every evidence node; the public limiter never saw those.
+func (a *AuditRateLimiter) PeerMiddleware(next http.Handler) http.Handler {
+	if a == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		res := a.peer.Reserve()
+		if !res.OK() {
+			writeAuditRateLimited(w, time.Second)
+			return
+		}
+		if d := res.Delay(); d > 0 {
+			res.Cancel()
+			writeAuditRateLimited(w, d)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeAuditRateLimited(w http.ResponseWriter, retry time.Duration) {
+	sec := int(math.Ceil(retry.Seconds()))
+	if sec < 1 {
+		sec = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(sec))
+	apihttp.WriteError(w, http.StatusTooManyRequests, "audit rate limit exceeded")
 }
 
 func auditIdentityKey(r *http.Request) string {

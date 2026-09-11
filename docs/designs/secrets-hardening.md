@@ -491,3 +491,10 @@ items remain explicit.
   scope.** Customer secrets arrive at create time; AerolVM does not broker them.
   The "every use attributed" claim is withdrawn accordingly.
 - **Owners, dates, per-slice rollback plans.**
+- ~~**Audit reads O(retained fleet events) per page**~~ — **closed** (stacked
+  PR on #374): per-sandbox posting-list index over `secrets.jsonl`
+  (`secret_audit_index`, O(page) reads, re-based on retention, rebuilt from
+  the file on any disagreement), per-record verification on read with
+  whole-chain verification at boot / retention / `POST /v1/audit/verify`,
+  fail-fast `429` on read-slot saturation, and a separate per-node rate
+  bucket on the peer fan-out endpoint. Design: `plans/audit-read-index.md`.

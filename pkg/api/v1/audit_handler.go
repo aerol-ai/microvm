@@ -77,6 +77,19 @@ func (h *handlers) clusterInternalSandboxAudit(w http.ResponseWriter, r *http.Re
 	})
 }
 
+// verifySandboxAudit serves POST /v1/audit/verify: a full hash-chain
+// verification of this node's local audit log. A failed verification is a
+// 200 with ok=false and the reason — the call succeeded, the evidence did
+// not; a concurrent verification in flight is a 429.
+func (h *handlers) verifySandboxAudit(w http.ResponseWriter, r *http.Request) {
+	report, err := h.deps.Service.VerifySecretAuditChain(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, report)
+}
+
 func parseSecretAuditQuery(r *http.Request) service.SecretAuditQuery {
 	q := service.SecretAuditQuery{
 		Cursor:        strings.TrimSpace(r.URL.Query().Get("cursor")),

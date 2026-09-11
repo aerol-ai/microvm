@@ -131,6 +131,20 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	// Audit read slots on this node are all busy: 429 + Retry-After so the
+	// caller backs off instead of queueing until its deadline turns into a
+	// 504 (the audit rate limiter uses the same status for the same reason).
+	if errors.Is(err, service.ErrSecretAuditBusy) {
+		w.Header().Set("Retry-After", "1")
+		WriteError(w, http.StatusTooManyRequests, service.ErrSecretAuditBusy.Error())
+		return
+	}
+	// The node's audit chain no longer verifies: evidence is withheld, not
+	// served unverified. Not retryable until an operator repairs the log.
+	if errors.Is(err, service.ErrSecretAuditChainBroken) {
+		WriteError(w, http.StatusServiceUnavailable, service.ErrSecretAuditChainBroken.Error())
+		return
+	}
 	if errors.Is(err, service.ErrClusterFinalizationUnavailable) {
 		w.Header().Set("Retry-After", "5")
 		WriteError(w, http.StatusServiceUnavailable, service.ErrClusterFinalizationUnavailable.Error())

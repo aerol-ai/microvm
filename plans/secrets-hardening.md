@@ -976,6 +976,18 @@ which already has a "rule for flipping a default on" section). `config.go:562`
 shows `SB_WASM_RESIDENT_HOST_ENABLED` was flipped default-on in v0.7.12 with a
 documented escape hatch — precedent for D15's defect-fixes-default-on posture.
 
+## Follow-up — audit read index (2026-09-11)
+
+Review of PR #374 found the audit read path O(retained fleet events) per
+page (full scan + full chain re-hash per request, 8 slots queueing to 504
+under the 50 req/s limiter, unmetered peer fan-out). Closed in a stacked PR:
+per-sandbox posting-list index over `secrets.jsonl` (`secret_audit_index`,
+O(page) reads, re-based on retention, rebuilt from the file on any
+disagreement), per-record verification on read with whole-chain verification
+at boot / retention / `POST /v1/audit/verify`, fail-fast `429` on read-slot
+saturation, and a separate per-node rate bucket on the peer fan-out
+endpoint. Design and scale table: `plans/audit-read-index.md`.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

@@ -161,9 +161,12 @@ type Service struct {
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
 	// StartSandbox / create hot path.
-	secretAudit             SecretAuditSink
-	secretAuditFile         *fileAuditSink // non-nil when the sink is the file writer
-	secretAuditInitErr      error          // retained so daemon boot can fail closed
+	secretAudit     SecretAuditSink
+	secretAuditFile *fileAuditSink // non-nil when the sink is the file writer
+	// secretAuditIndex is the per-sandbox read index over secretAuditFile
+	// (nil when disabled or storeless); reads fall back to a scan without it.
+	secretAuditIndex        *secretAuditIndexer
+	secretAuditInitErr      error // retained so daemon boot can fail closed
 	secretAuditOnce         sync.Once
 	secretAuditPruneStop    chan struct{}
 	secretAuditPruneDone    sync.WaitGroup

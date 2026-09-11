@@ -558,7 +558,7 @@ func TestOpenSecretAuditSnapshotStopsAtCompleteAppendBoundary(t *testing.T) {
 	if err := sink.EmitDurable(SecretAuditEvent{EventID: "before-snapshot", Result: secretAuditResultSuccess}); err != nil {
 		t.Fatal(err)
 	}
-	f, size, err := svc.openSecretAuditSnapshot(sink.path)
+	f, snap, err := svc.openSecretAuditSnapshot(sink.path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +566,7 @@ func TestOpenSecretAuditSnapshotStopsAtCompleteAppendBoundary(t *testing.T) {
 	if err := sink.EmitDurable(SecretAuditEvent{EventID: "after-snapshot", Result: secretAuditResultSuccess}); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := io.ReadAll(io.LimitReader(f, size))
+	raw, err := io.ReadAll(io.LimitReader(f, snap.size))
 	if err != nil {
 		t.Fatal(err)
 	}

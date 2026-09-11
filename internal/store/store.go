@@ -224,6 +224,34 @@ func Open(path string) (*Store, error) {
 			updated_at DATETIME NOT NULL,
 			PRIMARY KEY (sandbox_id, incarnation_id)
 		);`,
+		// Per-sandbox posting lists over the local secret-audit JSONL so one
+		// sandbox's page is O(page), not a scan of every retained fleet event.
+		// Derived from the file (secret_audit_index_meta.generation pins which
+		// file); a disagreement rebuilds it. Chunked so a hot sandbox costs one
+		// row rewrite per append batch, not one row per event. WITHOUT ROWID:
+		// the composite key is the only access path and the payload is small.
+		`CREATE TABLE IF NOT EXISTS secret_audit_index (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			chunk_seq INTEGER NOT NULL,
+			first_offset INTEGER NOT NULL,
+			last_offset INTEGER NOT NULL,
+			min_time INTEGER NOT NULL,
+			max_time INTEGER NOT NULL,
+			last_time INTEGER NOT NULL,
+			n INTEGER NOT NULL,
+			entries BLOB NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id, chunk_seq)
+		) WITHOUT ROWID;`,
+		`CREATE TABLE IF NOT EXISTS secret_audit_index_meta (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			generation TEXT NOT NULL,
+			indexed_through INTEGER NOT NULL DEFAULT 0,
+			last_line_offset INTEGER NOT NULL DEFAULT 0,
+			last_event_hash TEXT NOT NULL DEFAULT '',
+			allow_break INTEGER NOT NULL DEFAULT 0,
+			updated_at DATETIME NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -322,6 +350,10 @@ func Open(path string) (*Store, error) {
 		// The table primary key already indexes (sandbox_id, incarnation_id),
 		// so remove the redundant duplicate index from earlier hardening drafts.
 		`DROP INDEX IF EXISTS idx_sandbox_audit_acl_incarnation;`,
+		// Retention shifts the audit index by byte offset: whole chunks below
+		// the pruned prefix are deleted and the straddling ones trimmed.
+		`CREATE INDEX IF NOT EXISTS idx_secret_audit_index_last_offset
+			ON secret_audit_index(last_offset);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,

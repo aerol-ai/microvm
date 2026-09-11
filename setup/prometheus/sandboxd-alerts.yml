@@ -441,6 +441,61 @@ groups:
           description: "aerolvm_audit_export_backend_healthy{key={{ $labels.key }}} has been 0 for 10 minutes: the last export to this backend failed and the tailer is backing off (aerolvm_audit_export_failures_total{key={{ $labels.key }}}). Local evidence is retained and export lag is growing."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # The per-sandbox audit read index is not serving: pages scan the whole
+      # local log instead (correct, O(retained events) per page). Expected for
+      # minutes after a first boot on a large log or a rebuild; persistent
+      # means the store is refusing the index's writes.
+      - alert: SandboxdAuditIndexNotReady
+        expr: aerolvm_audit_index_ready == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd audit read index has been down for 30 minutes"
+          description: "aerolvm_audit_index_ready is 0: GET /v1/sandboxes/{id}/audit is served by scanning secrets.jsonl. Check aerolvm_audit_index_write_failures_total and the daemon log for 'building secret audit index'. If the log is large a rebuild takes minutes; if writes are failing, fix the store (disk, locks)."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # While indexing, a record did not link to its predecessor: the local
+      # chain is broken. The node withholds audit reads until restart.
+      - alert: SandboxdAuditChainBroken
+        expr: increase(aerolvm_audit_index_chain_breaks_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd detected a break in its local audit hash chain"
+          description: "aerolvm_audit_index_chain_breaks_total increased: a record in secrets.jsonl does not link to the one before it. This is corruption or tampering, not a crash (torn tails are repaired at boot). Local audit reads answer 503 and the index stays off until restart. Capture the file before touching it; POST /v1/audit/verify names the offset."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # An operator-triggered full verification (POST /v1/audit/verify)
+      # failed most recently.
+      - alert: SandboxdAuditChainVerifyFailed
+        expr: aerolvm_audit_chain_verify_ok == 0 and aerolvm_audit_chain_verified_unix > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd's last on-demand audit chain verification failed"
+          description: "The last POST /v1/audit/verify on this node reported ok=false. The response body carries the failing offset and reason. Treat the local log as untrusted evidence until reconciled with the export backend or witness."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # Audit reads are being refused for lack of read slots. With the index
+      # ready a slot is held for milliseconds; sustained busy rejections mean
+      # the node is saturated or the index is off.
+      - alert: SandboxdAuditReadsBusy
+        expr: increase(aerolvm_audit_query_busy_total[10m]) > 50
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd is rejecting audit reads as busy (429)"
+          description: "aerolvm_audit_query_busy_total is rising: audit reads on this node could not get one of its 8 read slots within 50ms and were answered 429 + Retry-After. Check aerolvm_audit_index_ready (scanning pages hold slots far longer) and aerolvm_audit_query_scan_fallback_total."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Async sealed-blob peer push/delete failures. Creates do not wait on
       # fan-out; failover_ready stays false until copies land.
       - alert: SandboxdSecretFanoutFailures

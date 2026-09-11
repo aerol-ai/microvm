@@ -112,6 +112,54 @@ What to expect and check:
    The evidence node itself keeps serving from its own `sandbox_audit_acl`
    row for `SB_SECRET_AUDIT_RETENTION_DAYS`.
 
+## Audit read index and on-demand verification
+
+`GET /v1/sandboxes/{id}/audit` is served from a per-sandbox index over the
+local `secrets.jsonl` (`secret_audit_index` in the store; design:
+`plans/audit-read-index.md`). A page costs O(page): the index names the
+records, only those are read, and each is checked against its own hash. The
+index is derived data — the JSONL and its chain stay the evidence — so any
+disagreement between the two throws the index away and rebuilds it from the
+file in the background while pages are served by a scan of the file.
+
+What to expect and check:
+
+1. **`aerolvm_audit_index_ready` = 0** (alert `SandboxdAuditIndexNotReady`)
+   means pages are being served by the scan. Normal for the minutes after a
+   first boot on an existing log, after retention rewrote lines it could not
+   re-base, or after a read proved an index entry wrong; the log line
+   `building secret audit index from the local log` says why and
+   `aerolvm_audit_index_rebuilds_total` counts it. Persistently 0 with
+   `aerolvm_audit_index_write_failures_total` rising means the store is
+   refusing the index's transactions (disk full, locked DB) — fix that, the
+   maintainer retries with backoff.
+2. **`aerolvm_audit_index_lag_bytes`** is how much of the file the index does
+   not yet cover; pages scan that tail themselves, so lag never hides an
+   event, it only costs time. It is normally 0 or one batch.
+3. **`aerolvm_audit_index_chain_breaks_total` > 0** (alert
+   `SandboxdAuditChainBroken`, critical): while indexing, a record did not link
+   to its predecessor. That is corruption or tampering, not a crash — a torn
+   tail is cut at boot and never reaches the indexer. The node withholds all
+   local audit reads (`503`) and the index stays off until restart, which
+   re-verifies the whole file and refuses to boot on it under strict mode.
+   Capture the JSONL for evidence before touching it; `POST /v1/audit/verify`
+   names the offset.
+4. **`POST /v1/audit/verify`** (operator PAT) re-verifies every record against
+   the chain on demand: `{"ok":true,"head":…,"records":N,"writer_tip_matches":true}`.
+   It is O(file) and runs one at a time per node (`429` while one is in
+   flight). `aerolvm_audit_chain_verify_ok` / `_verified_unix` record the last
+   result (alert `SandboxdAuditChainVerifyFailed`). Boot and every retention
+   sweep also verify the whole chain; page reads do not.
+5. **`aerolvm_audit_query_busy_total` rising** with `429 Retry-After: 1` on
+   audit reads: the node's 8 read slots stayed busy for 50 ms. With the index
+   ready a slot is held for milliseconds, so this means the node is genuinely
+   saturated (or the index is off and pages are scanning). Peer fan-out reads
+   have their own per-node rate bucket, so a fleet-wide storm cannot starve
+   public reads here.
+6. **`SB_AUDIT_INDEX_ENABLED=false`** returns to scanning every retained record
+   per page. Use only to isolate a suspected index fault; nothing else depends
+   on the index.
+
 ## Audit drops / gap markers
 
 1. Confirm the counter:

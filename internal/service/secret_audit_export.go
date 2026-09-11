@@ -382,10 +382,17 @@ func auditFileGeneration(f *os.File) (string, error) {
 		return "", err
 	}
 	if len(first) == 0 {
-		return "empty", nil
+		return secretAuditEmptyGeneration, nil
 	}
-	sum := sha256.Sum256(first)
-	return fmt.Sprintf("%x", sum[:16]), nil
+	return auditGenerationOfLine(first), nil
+}
+
+// auditGenerationOfLine is the generation a file whose first record is line
+// would report: the identity that export cursors and the read index pin
+// their offsets to, and that retention's checkpoint line changes.
+func auditGenerationOfLine(line []byte) string {
+	sum := sha256.Sum256(bytes.TrimSpace(line))
+	return fmt.Sprintf("%x", sum[:16])
 }
 
 func loadAuditExportCursor(path string) auditExportCursor {
