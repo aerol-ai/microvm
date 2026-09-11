@@ -203,11 +203,24 @@ func TestFailoverReadyRemainingBranches(t *testing.T) {
 		t.Fatalf("local+peer ready = %v", sb.FailoverReady)
 	}
 	svc.attachFailoverReadyAll(ctx, []*models.Sandbox{nil, sb})
-	if svc.computeFailoverReadyCached(ctx, sb, nil, nil) == nil {
-		t.Fatal("nil placement snapshot must fail closed")
+	if ready := svc.computeFailoverReadyRow(sb, &failoverReadyInputs{placements: nil, seals: map[string]storepkg.ClusterSecretSealSummary{}}); ready == nil || *ready {
+		t.Fatalf("nil placement snapshot must fail closed, got %v", ready)
+	}
+	if ready := svc.computeFailoverReadyRow(sb, &failoverReadyInputs{placements: map[string]cluster.Placement{}, seals: nil}); ready == nil || *ready {
+		t.Fatalf("failed sealed-row read must fail closed, got %v", ready)
+	}
+	if svc.computeFailoverReadyRow(&models.Sandbox{ID: "plain"}, &failoverReadyInputs{}) != nil {
+		t.Fatal("non-recreate row must be omitted")
 	}
 	single := &models.Sandbox{ID: "solo", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
-	if ready := svc.computeFailoverReadyCached(ctx, single, cl.members, map[string]cluster.Placement{}); ready == nil || !*ready {
+	in := &failoverReadyInputs{
+		selfID:      "node-a",
+		alive:       map[string]struct{}{"node-a": {}, "node-b": {}},
+		placements:  map[string]cluster.Placement{},
+		incarnation: map[string]string{"solo": ""},
+		seals:       map[string]storepkg.ClusterSecretSealSummary{},
+	}
+	if ready := svc.computeFailoverReadyRow(single, in); ready == nil || !*ready {
 		t.Fatalf("single-recipient ready = %v", ready)
 	}
 }

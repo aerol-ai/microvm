@@ -1399,16 +1399,110 @@ func (s *Service) RedactClusterSecretsConfigured(req models.CreateSandboxRequest
 // until it ACKs again, (3) generation-scoped holder resets on reseal, and
 // (4) ACK TTL so a peer that loses SQLite without an Alive=false flap stops
 // counting until a fresh ACK / background possession refresh.
+//
+// A single row is a page of one: there is exactly one implementation.
 func (s *Service) computeFailoverReady(ctx context.Context, sb *models.Sandbox) *bool {
 	if sb == nil {
 		return nil
 	}
-	ids := []string{}
-	if sb.ID != "" {
-		ids = []string{sb.ID}
+	s.failoverReadyBatch(ctx, []*models.Sandbox{sb})
+	return sb.FailoverReady
+}
+
+// failoverReadyInputs is everything a page shares: built once per page, read
+// per row. Nothing in the per-row step touches the store or the member list.
+type failoverReadyInputs struct {
+	selfID string
+	// alive is the live member set including self. Built once: at 2,000
+	// members a 100-row page used to rebuild it 100 times.
+	alive map[string]struct{}
+	// placements is the control-plane batch for the page's ids; nil means
+	// the batch was unavailable and readiness fails closed.
+	placements map[string]cluster.Placement
+	// incarnation resolves each row's lifecycle (placement first, then the
+	// row's own column).
+	incarnation map[string]string
+	// seals holds this node's sealed-row summaries by ref from one batched
+	// read; nil means that read failed and readiness fails closed.
+	seals map[string]store.ClusterSecretSealSummary
+}
+
+// failoverReadyBatch attaches failover_ready to a page with one membership
+// snapshot, one PlacementsByIDs call, and one batched store read for the
+// rows that need it (recreate policy). Per-row work is in-memory only, so a
+// 100-row page costs one SQLite round trip on the single connection instead
+// of a hundred competing with creates.
+func (s *Service) failoverReadyBatch(ctx context.Context, sandboxes []*models.Sandbox) {
+	if s == nil || len(sandboxes) == 0 {
+		return
 	}
-	members, placements := s.failoverReadySnapshots(ids)
-	return s.computeFailoverReadyCached(ctx, sb, members, placements)
+	var rows []*models.Sandbox
+	ids := make([]string, 0, len(sandboxes))
+	for _, sb := range sandboxes {
+		if sb == nil {
+			continue
+		}
+		if sb.Failover == nil || !sb.Failover.ShouldRecreate() {
+			sb.FailoverReady = nil
+			continue
+		}
+		rows = append(rows, sb)
+		if sb.ID != "" {
+			ids = append(ids, sb.ID)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	in := failoverReadyInputs{incarnation: make(map[string]string, len(rows))}
+	var members []cluster.Member
+	members, in.placements = s.failoverReadySnapshots(ids)
+	if c := s.Cluster(); c != nil {
+		in.selfID = c.SelfNodeID()
+	}
+	in.alive = make(map[string]struct{}, len(members)+1)
+	for _, m := range members {
+		if m.Alive && m.NodeID != "" {
+			in.alive[m.NodeID] = struct{}{}
+		}
+	}
+	if in.selfID != "" {
+		in.alive[in.selfID] = struct{}{}
+	}
+	refs := make([]string, 0, len(rows))
+	for _, sb := range rows {
+		incarnationID := strings.TrimSpace(sb.AuditIncarnationID)
+		if p, ok := in.placements[sb.ID]; ok && strings.TrimSpace(p.IncarnationID) != "" {
+			incarnationID = strings.TrimSpace(p.IncarnationID)
+		}
+		if incarnationID == "" {
+			// Rare: a row without its own lifecycle column and no placement.
+			incarnationID = s.secretIncarnationForSeal(sb.ID)
+		}
+		in.incarnation[sb.ID] = incarnationID
+		if sb.ID != "" && incarnationID != "" {
+			refs = append(refs, secrets.FormatRef(sb.ID, incarnationID, secrets.RefVersion))
+		}
+	}
+	if s.store != nil && len(refs) > 0 {
+		failoverReadyStoreReads.Add(1)
+		seals, err := s.store.ClusterSecretSealSummaries(ctx, refs)
+		if err != nil {
+			// Fail closed, and say so: the old per-row reader treated a store
+			// error as "no local row, no recipients" and reported ready=true.
+			if s.logger != nil {
+				s.logger.Warn("failover readiness: sealed-row batch read failed; reporting not ready", "rows", len(refs), "err", err)
+			}
+			in.seals = nil
+		} else {
+			in.seals = seals
+		}
+	} else {
+		in.seals = map[string]store.ClusterSecretSealSummary{}
+	}
+	for _, sb := range rows {
+		sb.FailoverReady = s.computeFailoverReadyRow(sb, &in)
+	}
 }
 
 // failoverReadySnapshots loads membership once and placement rows only for the
@@ -1432,39 +1526,36 @@ func (s *Service) failoverReadySnapshots(ids []string) (members []cluster.Member
 	return members, placements
 }
 
-func (s *Service) computeFailoverReadyCached(ctx context.Context, sb *models.Sandbox, members []cluster.Member, placements map[string]cluster.Placement) *bool {
+// computeFailoverReadyRow is the per-row step over prebuilt page inputs. It
+// reads maps and the in-memory ACK state only.
+func (s *Service) computeFailoverReadyRow(sb *models.Sandbox, in *failoverReadyInputs) *bool {
 	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
 		return nil
 	}
-	if placements == nil && s.Cluster() != nil {
-		// The control-plane batch was unavailable. Fail readiness closed without
-		// issuing an O(page-size) point-read fallback.
-		ready := false
+	ready := false
+	if (in.placements == nil && s.Cluster() != nil) || in.seals == nil {
+		// The control-plane batch or the local sealed-row read was
+		// unavailable. Fail readiness closed without a per-row fallback.
 		return &ready
 	}
-	selfID := ""
-	alive := map[string]struct{}{}
-	if c := s.Cluster(); c != nil {
-		selfID = c.SelfNodeID()
+	incarnationID := in.incarnation[sb.ID]
+	ref := ""
+	if sb.ID != "" && incarnationID != "" {
+		ref = secrets.FormatRef(sb.ID, incarnationID, secrets.RefVersion)
 	}
-	for _, m := range members {
-		if m.Alive && m.NodeID != "" {
-			alive[m.NodeID] = struct{}{}
-		}
+	seal, sealed := in.seals[ref]
+	var recipients []string
+	if p, ok := in.placements[sb.ID]; ok && len(p.SecretRecipients) > 0 {
+		recipients = p.SecretRecipients
+	} else if sealed {
+		recipients = seal.Recipients
 	}
-	if selfID != "" {
-		alive[selfID] = struct{}{}
+	pruneDeadSecretHolders(sb.ID, incarnationID, in.alive)
+	localGen, localHolds := int64(0), false
+	if sealed && seal.SealGeneration > 0 {
+		localGen, localHolds = seal.SealGeneration, true
 	}
-	incarnationID := strings.TrimSpace(sb.AuditIncarnationID)
-	if placement, ok := placements[sb.ID]; ok && strings.TrimSpace(placement.IncarnationID) != "" {
-		incarnationID = strings.TrimSpace(placement.IncarnationID)
-	}
-	if incarnationID == "" {
-		incarnationID = s.secretIncarnationForSeal(sb.ID)
-	}
-	recipients := s.secretRecipientsForSandboxCached(ctx, sb.ID, incarnationID, placements)
-	pruneDeadSecretHolders(sb.ID, incarnationID, alive)
-	localGen, localHolds := s.localSealedSecretGeneration(ctx, sb.ID, incarnationID)
+	selfID := in.selfID
 	if localGen > 0 && secretHolderGeneration(sb.ID, incarnationID) != localGen {
 		seed := []string{}
 		if localHolds && selfID != "" {
@@ -1483,7 +1574,7 @@ func (s *Service) computeFailoverReadyCached(ctx context.Context, sb *models.San
 
 	liveHolders := 0
 	for _, id := range holders {
-		if _, ok := alive[id]; !ok {
+		if _, ok := in.alive[id]; !ok {
 			continue
 		}
 		if id == selfID && !localHolds {
@@ -1491,17 +1582,18 @@ func (s *Service) computeFailoverReadyCached(ctx context.Context, sb *models.San
 		}
 		liveHolders++
 	}
-	ready := false
 	switch {
 	case len(recipients) <= 1:
 		ready = true
 	case liveHolders >= 2:
 		ready = true
-	default:
-		ready = false
 	}
 	return &ready
 }
+
+// failoverReadyStoreReads counts store round trips made for failover
+// readiness (tests assert one per page).
+var failoverReadyStoreReads atomic.Int64
 
 func (s *Service) localSealedSecretGeneration(ctx context.Context, sandboxID, incarnationID string) (gen int64, holds bool) {
 	if s == nil || s.store == nil || strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(incarnationID) == "" {
@@ -1560,28 +1652,6 @@ func (s *Service) attachFailoverReady(ctx context.Context, sb *models.Sandbox) {
 		return
 	}
 	sb.FailoverReady = s.computeFailoverReady(ctx, sb)
-}
-
-// failoverReadyBatch attaches failover_ready using one Members()/LocalMembers
-// snapshot and PlacementsByIDs for the page — not a full Placements() dump.
-func (s *Service) failoverReadyBatch(ctx context.Context, sandboxes []*models.Sandbox) {
-	if len(sandboxes) == 0 {
-		return
-	}
-	ids := make([]string, 0, len(sandboxes))
-	for _, sb := range sandboxes {
-		if sb == nil || sb.ID == "" {
-			continue
-		}
-		ids = append(ids, sb.ID)
-	}
-	members, placements := s.failoverReadySnapshots(ids)
-	for _, sb := range sandboxes {
-		if sb == nil {
-			continue
-		}
-		sb.FailoverReady = s.computeFailoverReadyCached(ctx, sb, members, placements)
-	}
 }
 
 func (s *Service) attachFailoverReadyAll(ctx context.Context, sandboxes []*models.Sandbox) {

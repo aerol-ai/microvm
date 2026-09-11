@@ -5290,6 +5290,85 @@ func (s *Store) ClusterSecretSealGeneration(ctx context.Context, sandboxID, inca
 	return generation, true, nil
 }
 
+// ClusterSecretSealSummary is what failover readiness needs from a sealed
+// row: which generation this node holds and who the recipients are. The
+// encrypted payload is never loaded for it.
+type ClusterSecretSealSummary struct {
+	SealGeneration int64
+	Recipients     []string
+}
+
+// clusterSecretSummaryChunk bounds one IN (...) list well under SQLite's
+// bound-parameter limit.
+const clusterSecretSummaryChunk = 500
+
+// ClusterSecretSealSummaries reads the summaries for many sealed refs in a
+// handful of round trips instead of one per row. A ref this node does not
+// hold is simply absent from the result. This is the List page's only
+// store work for failover_ready: one query per 500 rows on the single
+// SQLite connection rather than one per row competing with creates.
+func (s *Store) ClusterSecretSealSummaries(ctx context.Context, refs []string) (map[string]ClusterSecretSealSummary, error) {
+	out := make(map[string]ClusterSecretSealSummary, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	pending := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		if _, dup := seen[ref]; dup {
+			continue
+		}
+		seen[ref] = struct{}{}
+		pending = append(pending, ref)
+	}
+	for len(pending) > 0 {
+		chunk := pending
+		if len(chunk) > clusterSecretSummaryChunk {
+			chunk = pending[:clusterSecretSummaryChunk]
+		}
+		pending = pending[len(chunk):]
+		args := make([]any, len(chunk))
+		marks := make([]string, len(chunk))
+		for i, ref := range chunk {
+			args[i] = ref
+			marks[i] = "?"
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT ref, seal_generation, recipients_json
+			FROM cluster_secrets
+			WHERE ref IN (`+strings.Join(marks, ",")+`)
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("read cluster secret seal summaries: %w", err)
+		}
+		for rows.Next() {
+			var (
+				ref            string
+				summary        ClusterSecretSealSummary
+				recipientsJSON string
+			)
+			if err := rows.Scan(&ref, &summary.SealGeneration, &recipientsJSON); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan cluster secret seal summary: %w", err)
+			}
+			if recipientsJSON != "" {
+				if err := json.Unmarshal([]byte(recipientsJSON), &summary.Recipients); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("unmarshal cluster secret recipients for %s: %w", ref, err)
+				}
+			}
+			out[ref] = summary
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate cluster secret seal summaries: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
 // ListSecretDeleteOutboxBatch returns at most limit pending jobs in fair retry
 // order. Requiring an explicit positive bound prevents diagnostics or future
 // callers from accidentally loading a 100k-sandbox backlog into memory.
