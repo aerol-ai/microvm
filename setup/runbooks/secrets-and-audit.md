@@ -181,6 +181,20 @@ What to expect and check:
 4. Mitigate: free disk, reduce decrypt storms, restart only after capturing the
    current JSONL for evidence.
 
+5. WASM worker subprocesses never write `secrets.jsonl`. When the loopback
+   ingest is down they append to the same `secrets.spill.jsonl` under the same
+   lock, through the same writer the daemon uses (`auditlog.SpillFile`): one
+   goroutine per worker, one flock and one fsync per batch, and the daemon's
+   drain folds the file into the chain. A sandbox's dial only ever does a
+   non-blocking queue send; a full queue costs two atomics and is reported by
+   one coalesced `reason=overflow` marker. If the spill disk fails the worker
+   backs off (1s doubling to 30s, one log line per backoff) and keeps the loss
+   owed until the next marker lands. Counters (worker expvar):
+   `aerolvm_wasm_egress_audit_ipc_fail_total`,
+   `aerolvm_wasm_egress_audit_spill_batches_total`,
+   `aerolvm_wasm_egress_audit_spill_fail_total`,
+   `aerolvm_wasm_egress_audit_gap_markers_total`.
+
 ### Torn tail at boot (`"reason":"torn_tail"`)
 
 Appends are one write per batch and fsynced at least once per second, so an

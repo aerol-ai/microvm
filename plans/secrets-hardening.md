@@ -988,6 +988,15 @@ at boot / retention / `POST /v1/audit/verify`, fail-fast `429` on read-slot
 saturation, and a separate per-node rate bucket on the peer fan-out
 endpoint. Design and scale table: `plans/audit-read-index.md`.
 
+The same review found the WASM worker's egress-audit spill re-implementing
+the daemon's writer with a flock + fsync per event on the pool goroutines
+(and, before the connectors PR, on the dial path itself). Closed in a
+second stacked PR: one shared writer (`pkg/auditlog/spill.go`,
+`auditlog.SpillFile`) used by the daemon's sink and every worker; workers
+spill through a single goroutine in batches (one lock, one fsync per
+batch) with backoff on disk failure and a coalesced gap marker for every
+drop, so audit backpressure can never stall a tenant's egress.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

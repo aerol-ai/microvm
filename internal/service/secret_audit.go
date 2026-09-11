@@ -22,7 +22,6 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/secrets"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -62,12 +61,12 @@ const (
 	// export tailer catches up, and nothing that could be read as "forever".
 	secretAuditCrashBufferDays = 1
 	secretAuditFileName        = "secrets.jsonl"
-	secretAuditSpillName       = "secrets.spill.jsonl"
+	secretAuditSpillName       = auditlog.SpillFileName
 	secretAuditSpillWorking    = "secrets.spill.jsonl.working"
 	// secretAuditLockName is a stable sidecar flock target. Retention and
 	// wasm workers lock this path *before* opening secrets.jsonl so a rename
 	// during prune cannot leave writers appending to an unlinked inode.
-	secretAuditLockName = "secrets.jsonl.lock"
+	secretAuditLockName = auditlog.LockFileName
 	// secretAuditTornName is the durable intent record for a boot-time tail
 	// repair. Written before the truncate and removed after the gap marker is
 	// chained, so a crash between the two cannot lose the record that evidence
@@ -201,10 +200,10 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 		spillCh:          make(chan SecretAuditEvent, buffer),
 		done:             make(chan struct{}),
 		path:             filepath.Join(auditDir, secretAuditFileName),
-		lockPath:         filepath.Join(auditDir, secretAuditLockName),
+		lockPath:         filepath.Join(auditDir, auditlog.LockFileName),
 		gapPath:          filepath.Join(auditDir, "secrets.gap"),
 		tipPath:          filepath.Join(auditDir, "secrets.tip"),
-		spillPath:        filepath.Join(auditDir, secretAuditSpillName),
+		spillPath:        filepath.Join(auditDir, auditlog.SpillFileName),
 		spillWorkingPath: filepath.Join(auditDir, secretAuditSpillWorking),
 		tornPath:         filepath.Join(auditDir, secretAuditTornName),
 		witnessTipPath:   filepath.Join(auditDir, secretAuditWitnessTipFile),
@@ -501,23 +500,17 @@ func (s *fileAuditSink) loop() {
 				s.spillCh = nil
 				continue
 			}
-			if err := s.appendSpill(ev); err != nil {
-				auditEventsDroppedTotal.Add(1)
-				n := s.pendingGap.Add(1)
-				s.persistGapState(n)
-			}
+			s.spillQueued(ev)
 		case next, ok := <-s.ch:
 			if !ok {
 				// Drain remaining spill queue then spill file on shutdown.
-				if s.spillCh != nil {
-					for ev := range s.spillCh {
-						if err := s.appendSpill(ev); err != nil {
-							auditEventsDroppedTotal.Add(1)
-							n := s.pendingGap.Add(1)
-							s.persistGapState(n)
-						}
+				for s.spillCh != nil {
+					ev, ok := <-s.spillCh
+					if !ok {
+						s.spillCh = nil
+						break
 					}
-					s.spillCh = nil
+					s.spillQueued(ev)
 				}
 				for s.drainSpill() {
 				}
@@ -531,22 +524,18 @@ func (s *fileAuditSink) loop() {
 				continue
 			}
 			flushSpill := func() {
-				if s.spillCh != nil {
-					for {
-						select {
-						case ev, ok := <-s.spillCh:
-							if !ok {
-								s.spillCh = nil
-							} else if err := s.appendSpill(ev); err != nil {
-								auditEventsDroppedTotal.Add(1)
-								n := s.pendingGap.Add(1)
-								s.persistGapState(n)
-							}
-							continue
-						default:
+				for s.spillCh != nil {
+					select {
+					case ev, ok := <-s.spillCh:
+						if !ok {
+							s.spillCh = nil
+						} else {
+							s.spillQueued(ev)
 						}
-						break
+						continue
+					default:
 					}
+					break
 				}
 				for s.drainSpill() {
 				}
@@ -602,39 +591,49 @@ func (s *fileAuditSink) loop() {
 	}
 }
 
-// appendSpill durable-appends one event under the audit flock when the
+// appendSpill durable-appends a batch under the audit flock when the
 // in-memory channel is full. Used by enterprise Emit so request paths never
-// block and evidence is not silently discarded. fsync bounds the loss window.
-func (s *fileAuditSink) appendSpill(ev SecretAuditEvent) error {
+// block and evidence is not silently discarded. One fsync per batch bounds
+// the loss window without paying a disk barrier per event. The writer is
+// auditlog.SpillFile, shared with the WASM worker subprocesses that spill
+// into the same file.
+func (s *fileAuditSink) appendSpill(events ...SecretAuditEvent) error {
 	if s == nil || s.spillPath == "" {
 		return errors.New("secret audit spill path unset")
 	}
-	if ev.Time.IsZero() {
-		ev.Time = time.Now().UTC()
-	}
-	ensureSecretAuditEventID(&ev)
-	line, err := json.Marshal(ev)
-	if err != nil {
-		return err
-	}
-	line = append(line, '\n')
 	s.spillMu.Lock()
 	defer s.spillMu.Unlock()
-	return s.withAuditFileLock(func() error {
-		f, err := os.OpenFile(s.spillPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-		if err != nil {
-			return err
+	return auditlog.SpillFile{Path: s.spillPath, LockPath: s.lockPath}.Append(events)
+}
+
+// spillBatchMax bounds one group-committed spill append so a saturated
+// overflow queue cannot starve the writer's other work (durable requests,
+// sync, prune) behind one huge write.
+const spillBatchMax = 256
+
+// spillQueued group-commits first plus whatever else is already queued on
+// spillCh (up to spillBatchMax). Drops are accounted per event, as one
+// coalesced gap.
+func (s *fileAuditSink) spillQueued(first SecretAuditEvent) {
+	batch := append(make([]SecretAuditEvent, 0, spillBatchMax), first)
+	for len(batch) < spillBatchMax {
+		select {
+		case ev, ok := <-s.spillCh:
+			if !ok {
+				s.spillCh = nil
+			} else {
+				batch = append(batch, ev)
+				continue
+			}
+		default:
 		}
-		if _, err := f.Write(line); err != nil {
-			_ = f.Close()
-			return err
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			return err
-		}
-		return f.Close()
-	})
+		break
+	}
+	if err := s.appendSpill(batch...); err != nil {
+		auditEventsDroppedTotal.Add(int64(len(batch)))
+		n := s.pendingGap.Add(int64(len(batch)))
+		s.persistGapState(n)
+	}
 }
 
 // drainSpill moves one immutable spill segment into the authoritative JSONL.
@@ -799,16 +798,7 @@ func (s *fileAuditSink) withAuditFileLock(fn func() error) error {
 		lockPath = s.path + ".lock"
 	}
 	// The sidecar is only a flock target and never stores data.
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer lf.Close()
-	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer func() { _ = unix.Flock(int(lf.Fd()), unix.LOCK_UN) }()
-	return fn()
+	return auditlog.WithFileLock(lockPath, fn)
 }
 
 func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnessedHead string) error {
