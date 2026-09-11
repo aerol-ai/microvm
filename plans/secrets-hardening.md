@@ -375,7 +375,7 @@ need a regression test next to the file they change plus a PR call-out.
 | T9 | ~0 | Map copy plus a version check. |
 | T10 KMS | 0 | The wrap rides the async fan-out. No cache means no warm-up either. |
 | T11-T13 | 0 | Messages, a deletion, docs. |
-| E1a | 0 | Computed on read from live memberlist, never persisted, never in the row scanner. |
+| E1a | 0 create; **List: 1 store read per page** | Computed on read from the live memberlist, never persisted, never in the row scanner. Per-page, not per-row: one membership snapshot, one `PlacementsByIDs`, one batched `cluster_secrets` summary read for the page's recreate-policy rows (the first cut ran one SQLite query and one O(members) alive-set rebuild per row — the same shape as #70, relocated; closed in a stacked PR after #403). |
 | E1b | 0 | New read endpoint. |
 | E2a / E2b | **0 *if* async** | Chain append is serialized, but off the request path behind the bounded channel. |
 | E3a | **0 *if* async** | Event emission must not be synchronous on create. |
@@ -996,6 +996,16 @@ second stacked PR: one shared writer (`pkg/auditlog/spill.go`,
 spill through a single goroutine in batches (one lock, one fsync per
 batch) with backoff on disk failure and a coalesced gap marker for every
 drop, so audit backpressure can never stall a tenant's egress.
+
+Third stacked PR: `List` paid one SQLite query (`ClusterSecretSealGeneration`,
+plus a sealed-row read for recipients when placement lacked them) and one
+O(members) alive-set rebuild per row for `failover_ready` — 100 serialized
+round trips on the single connection and ~200k map inserts per page at
+2,000 nodes. Now one membership snapshot, one placement batch, and one
+batched summary read (`ClusterSecretSealSummaries`, ≤500 refs per `IN`
+list) per page; the per-row step is in-memory only. A failed batch read
+reports not-ready for the page (the per-row reader used to report *ready*
+on a store error, because "no recipients" read as single-node).
 
 ## GSTACK REVIEW REPORT
 
