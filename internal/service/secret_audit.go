@@ -175,6 +175,14 @@ type fileAuditSink struct {
 	// afterPrune, when set (Service), ships a new witness tip after prune
 	// inserts a retention_checkpoint (retained event bytes are unchanged).
 	afterPrune func()
+	// afterAppend, when set (Service), receives every appended batch with
+	// its file offsets, after the flock is released, on the writer goroutine.
+	// The per-sandbox read index is built from it.
+	afterAppend func([]secretAuditIndexedLine)
+	// onPruneShift, when set (Service), runs inside the retention flock right
+	// after the rewritten file is in place, so the read index can re-base
+	// before anyone can open the new file.
+	onPruneShift func(secretAuditPruneShift)
 }
 
 func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
@@ -290,7 +298,7 @@ func (s *fileAuditSink) openLocked() error {
 		Kind:    secretAuditKindGap,
 		Dropped: pendingRepair.Dropped,
 	}
-	if err := s.appendBatchLocked([]SecretAuditEvent{marker}, true); err != nil {
+	if _, err := s.appendBatchLocked([]SecretAuditEvent{marker}, true); err != nil {
 		_ = f.Close()
 		s.file = nil
 		return fmt.Errorf("record secret audit torn-tail gap marker: %w", err)
@@ -936,26 +944,62 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		lastKeptHash := cp.EventHash
 		lastKeptEventID := cp.EventID
 
-		// Pass 2: stream kept lines through unchanged (no rehash).
-		scanner = bufio.NewScanner(src)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		// Pass 2: stream kept lines through unchanged (no rehash), tracking
+		// exact byte positions so the read index can be re-based by one
+		// constant instead of rebuilt: every kept line moves by
+		// checkpointLen - floor as long as it is copied byte-for-byte.
+		shift := secretAuditPruneShift{
+			generation:     auditGenerationOfLine(line),
+			checkpointLen:  int64(len(line)) + 1,
+			checkpointHash: cp.EventHash,
+			exact:          true,
+		}
+		br := bufio.NewReaderSize(src, 64*1024)
 		remainingDrops := droppedLines
-		for scanner.Scan() {
-			raw := strings.TrimSpace(scanner.Text())
-			if raw == "" {
+		var srcPos int64
+		floorSet := false
+		for {
+			rawLine, consumed, _, tooLong, err := readSecretAuditLine(br)
+			if err != nil {
+				_ = f.Close()
+				_ = src.Close()
+				return err
+			}
+			if consumed == 0 {
+				break
+			}
+			lineStart := srcPos
+			srcPos += consumed
+			if tooLong {
+				_ = f.Close()
+				_ = src.Close()
+				return fmt.Errorf("secret audit retention encountered a record over %d bytes", secretAuditMaxLineBytes)
+			}
+			raw := bytes.TrimSpace(rawLine)
+			if len(raw) == 0 {
+				if floorSet {
+					shift.exact = false // a dropped blank line moves what follows
+				}
 				continue
 			}
 			if remainingDrops > 0 {
 				remainingDrops--
 				continue
 			}
+			if !floorSet {
+				shift.floor = lineStart
+				floorSet = true
+			}
+			if int64(len(raw))+1 != consumed {
+				shift.exact = false // re-normalized whitespace changes the line's length
+			}
 			var ev SecretAuditEvent
-			if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			if err := json.Unmarshal(raw, &ev); err != nil {
 				_ = f.Close()
 				_ = src.Close()
 				return fmt.Errorf("secret audit retention event changed between passes: %w", err)
 			}
-			if _, err := writer.WriteString(raw); err != nil {
+			if _, err := writer.Write(raw); err != nil {
 				_ = f.Close()
 				_ = src.Close()
 				return err
@@ -970,11 +1014,10 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 				lastKeptEventID = ev.EventID
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			_ = f.Close()
-			_ = src.Close()
-			return err
+		if !floorSet {
+			shift.floor = srcPos // nothing kept: every indexed offset is below the floor
 		}
+		shift.delta = shift.checkpointLen - shift.floor
 		_ = src.Close()
 
 		if err := writer.Flush(); err != nil {
@@ -1007,6 +1050,9 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		s.chainEvent = lastKeptEventID
 		s.chainMu.Unlock()
 		persistChainTip(s.tipPath, lastKeptHash, lastKeptEventID)
+		if s.onPruneShift != nil {
+			s.onPruneShift(shift)
+		}
 		pruned = true
 		return nil
 	})
@@ -1046,8 +1092,11 @@ func (s *fileAuditSink) writeEventBatch(events []SecretAuditEvent, durable, acco
 			s.writeHook()
 		}
 	}
+	var lines []secretAuditIndexedLine
 	lineErr := s.withAuditFileLock(func() error {
-		return s.appendBatchLocked(events, durable)
+		var err error
+		lines, err = s.appendBatchLocked(events, durable)
+		return err
 	})
 	if lineErr != nil {
 		secretAuditSinkHealthy.Set(0)
@@ -1059,18 +1108,22 @@ func (s *fileAuditSink) writeEventBatch(events []SecretAuditEvent, durable, acco
 		return lineErr
 	}
 	secretAuditSinkHealthy.Set(1)
+	if s.afterAppend != nil && len(lines) > 0 {
+		s.afterAppend(lines)
+	}
 	return nil
 }
 
-// appendBatchLocked links, appends, and (when durable) fsyncs one batch.
-// Caller holds the audit flock. Shared by the writer goroutine and the boot
-// repair path, which already holds the lock and must not re-acquire it.
-func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable bool) error {
+// appendBatchLocked links, appends, and (when durable) fsyncs one batch,
+// returning where each record landed. Caller holds the audit flock. Shared by
+// the writer goroutine and the boot repair path, which already holds the lock
+// and must not re-acquire it.
+func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable bool) ([]secretAuditIndexedLine, error) {
 	s.chainMu.Lock()
 	poisoned := s.writePoison
 	s.chainMu.Unlock()
 	if poisoned != nil {
-		return fmt.Errorf("secret audit writer poisoned: %w", poisoned)
+		return nil, fmt.Errorf("secret audit writer poisoned: %w", poisoned)
 	}
 	// Prefer the verified in-memory tip under flock. If it is ever absent,
 	// recompute from authoritative evidence and propagate corruption instead
@@ -1080,13 +1133,14 @@ func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable boo
 		var err error
 		prev, _, err = RecomputeChainHead(s.path)
 		if err != nil {
-			return fmt.Errorf("recompute secret audit chain head: %w", err)
+			return nil, fmt.Errorf("recompute secret audit chain head: %w", err)
 		}
 	}
 	if prev == "" {
 		prev = auditlog.GenesisPrevHash
 	}
 	var encoded []byte
+	lines := make([]secretAuditIndexedLine, 0, len(events))
 	for i := range events {
 		ev := &events[i]
 		if ev.Time.IsZero() {
@@ -1096,15 +1150,16 @@ func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable boo
 		auditlog.LinkEvent(prev, ev)
 		line, err := json.Marshal(ev)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		encoded = append(encoded, line...)
 		encoded = append(encoded, '\n')
+		lines = append(lines, secretAuditIndexedLine{length: int64(len(line)) + 1, raw: line, ev: *ev})
 		prev = ev.EventHash
 	}
 	before, err := s.file.Stat()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rollback := func(writeErr error) error {
 		if truncateErr := s.file.Truncate(before.Size()); truncateErr != nil {
@@ -1122,12 +1177,17 @@ func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable boo
 		return writeErr
 	}
 	if _, err := s.file.Write(encoded); err != nil {
-		return rollback(err)
+		return nil, rollback(err)
 	}
 	if durable {
 		if err := s.file.Sync(); err != nil {
-			return rollback(err)
+			return nil, rollback(err)
 		}
+	}
+	offset := before.Size()
+	for i := range lines {
+		lines[i].offset = offset
+		offset += lines[i].length
 	}
 	last := events[len(events)-1]
 	s.chainMu.Lock()
@@ -1139,7 +1199,7 @@ func (s *fileAuditSink) appendBatchLocked(events []SecretAuditEvent, durable boo
 			auditTipWriteFailTotal.Add(1)
 		}
 	}
-	return nil
+	return lines, nil
 }
 
 func (s *fileAuditSink) chainTip() (head, eventID string) {
@@ -1252,21 +1312,30 @@ type secretAuditChainScan struct {
 	// missingNewline reports a complete, verified final record without its
 	// terminator (the write stopped exactly between '}' and '\n').
 	missingNewline bool
+	// records counts verified records (blank lines excluded).
+	records int64
 }
 
 // scanSecretAuditChain walks the file once, verifying every record against
 // its predecessor. Blank lines are tolerated but never alter the chain.
 func scanSecretAuditChain(path string, collectHashes bool) (secretAuditChainScan, error) {
-	scan := secretAuditChainScan{head: auditlog.GenesisPrevHash}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return scan, nil
+			return secretAuditChainScan{head: auditlog.GenesisPrevHash}, nil
 		}
-		return scan, err
+		return secretAuditChainScan{head: auditlog.GenesisPrevHash}, err
 	}
 	defer f.Close()
-	br := bufio.NewReaderSize(f, 64*1024)
+	return scanSecretAuditChainReader(f, collectHashes)
+}
+
+// scanSecretAuditChainReader is scanSecretAuditChain over an already-bounded
+// reader (a size snapshot taken under the flock) so a verification can run
+// while the writer keeps appending.
+func scanSecretAuditChainReader(r io.Reader, collectHashes bool) (secretAuditChainScan, error) {
+	scan := secretAuditChainScan{head: auditlog.GenesisPrevHash}
+	br := bufio.NewReaderSize(r, 64*1024)
 	verifier := newSecretAuditChainVerifier()
 	var offset int64
 	lineNo := 0
@@ -1312,6 +1381,7 @@ func scanSecretAuditChain(path string, collectHashes bool) (secretAuditChainScan
 		}
 		scan.head = ev.EventHash
 		scan.eventID = ev.EventID
+		scan.records++
 		if collectHashes {
 			scan.hashes = append(scan.hashes, ev.EventHash)
 		}
@@ -1512,6 +1582,13 @@ func (s *Service) ensureSecretAuditSink() {
 		sink.afterPrune = func() {
 			_ = s.shipSecretAuditHead(context.Background())
 		}
+		if s.store != nil && s.cfg.AuditIndexEnabled {
+			idx := newSecretAuditIndexer(s.store, sink, s.logger)
+			sink.afterAppend = idx.onAppended
+			sink.onPruneShift = idx.onPruned
+			s.secretAuditIndex = idx
+			idx.start()
+		}
 		s.startSecretAuditPruneTicker()
 	})
 }
@@ -1615,6 +1692,8 @@ func (s *Service) CloseSecretAuditSink() {
 	if f := s.secretAuditFile; f != nil {
 		f.Close()
 	}
+	// After the writer: its final drain may still hand batches to the index.
+	s.secretAuditIndex.Close()
 }
 
 // beginSecretAudit records decrypt latency/error metrics and emits one audit

@@ -114,6 +114,10 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Auth(withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
+	// On-demand full-chain verification of this node's audit log. O(file),
+	// one at a time per node, operator-only: page reads verify only the
+	// records they return, this is where the whole chain is proven.
+	mux.Handle("POST "+PathPrefix+"/audit/verify", withAuthOperator(d, http.HandlerFunc(h.verifySandboxAudit)))
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
@@ -186,7 +190,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalSecretPath, internalOp(http.HandlerFunc(h.clusterInternalSecretPut)))
 	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretHead)))
 	mux.Handle("DELETE "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretDelete)))
-	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", internalOp(http.HandlerFunc(h.clusterInternalSandboxAudit)))
+	mux.Handle("GET "+cluster.PublicInternalSandboxAuditPath+"{id}/audit", internalOp(withAuditPeerLimit(d, http.HandlerFunc(h.clusterInternalSandboxAudit))))
 }
 
 const clusterPeerNodeIDHeader = cluster.PeerNodeIDHeader
@@ -229,4 +233,11 @@ func withAuditLimit(d Deps, next http.Handler) http.Handler {
 		return next
 	}
 	return d.AuditLimiter.Middleware(next)
+}
+
+func withAuditPeerLimit(d Deps, next http.Handler) http.Handler {
+	if d.AuditLimiter == nil {
+		return next
+	}
+	return d.AuditLimiter.PeerMiddleware(next)
 }

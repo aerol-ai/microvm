@@ -1199,6 +1199,12 @@ type Config struct {
 	// AuditRateLimitNode is the global per-node ceiling (req/s) on audit
 	// fan-out requests. Default 50. SB_AUDIT_RATE_LIMIT_NODE.
 	AuditRateLimitNode float64
+	// AuditIndexEnabled keeps a per-sandbox read index (secret_audit_index)
+	// over the local audit JSONL so GET /v1/sandboxes/{id}/audit is O(page)
+	// instead of a scan of every retained event. Derived data, rebuilt from
+	// the file whenever they disagree. Off means every page scans the file.
+	// SB_AUDIT_INDEX_ENABLED. Default true.
+	AuditIndexEnabled bool
 
 	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
 	// any other future cluster-internal RPC) ride over a separate HTTPS listener
@@ -1732,6 +1738,7 @@ func Load() (Config, error) {
 		AuditRateLimitIdentity:        getEnvFloat("SB_AUDIT_RATE_LIMIT_IDENTITY", 10),
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
+		AuditIndexEnabled:             getEnvBool("SB_AUDIT_INDEX_ENABLED", true),
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),

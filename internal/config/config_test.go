@@ -889,6 +889,24 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		if cfg.AuditRateLimitIdentity != 10 || cfg.AuditRateLimitOperator != 50 || cfg.AuditRateLimitNode != 50 {
 			t.Fatalf("audit rate defaults = %v/%v/%v", cfg.AuditRateLimitIdentity, cfg.AuditRateLimitOperator, cfg.AuditRateLimitNode)
 		}
+		if !cfg.AuditIndexEnabled {
+			t.Fatal("AuditIndexEnabled default = false, want true")
+		}
+	})
+
+	t.Run("audit_index_can_be_disabled", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "")
+		t.Setenv("SB_AUDIT_INDEX_ENABLED", "false")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.AuditIndexEnabled {
+			t.Fatal("SB_AUDIT_INDEX_ENABLED=false ignored")
+		}
 	})
 
 	t.Run("secret_provider_awskms_requires_key", func(t *testing.T) {

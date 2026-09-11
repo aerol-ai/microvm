@@ -73,6 +73,16 @@ These bound amplification on `GET /v1/sandboxes/{id}/audit` (one client call →
 | `SB_AUDIT_RATE_LIMIT_OPERATOR` | `50` | Operator PAT bucket (req/s). Burst 100 — generous for incident response. |
 | `SB_AUDIT_RATE_LIMIT_NODE` | `50` | Global per-node ceiling (req/s). Burst 100. The only effective bound on OSS (single operator identity). |
 
+The cluster-internal per-sandbox audit endpoint that ingress fan-out hits has its own per-node bucket at the same rate (`SB_AUDIT_RATE_LIMIT_NODE`), so a fleet-wide storm of peer reads cannot starve a node's own public audit traffic or the other way round. A node whose 8 local read slots stay busy for 50 ms answers `429` + `Retry-After: 1` (`aerolvm_audit_query_busy_total`) instead of queueing the request until its deadline turns into a 504.
+
+### Audit read index
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_INDEX_ENABLED` | `true` | Keep a per-sandbox posting-list index (`secret_audit_index` in the SQLite store) over the local `secrets.jsonl` so a page of one sandbox's history is O(page) — the index names the records the page needs and only those are read and hash-checked. Derived data: rebuilt in the background from the file whenever they disagree, and reads scan the file meanwhile (`aerolvm_audit_index_ready`, `aerolvm_audit_query_scan_fallback_total`). Off means every page scans every retained record on the node, the pre-index behaviour; only useful to isolate a suspected index fault. Design: `plans/audit-read-index.md`. |
+
+Whole-chain verification no longer runs on every page read. It runs at boot, before every retention sweep, incrementally as records are indexed (a break disables the index and withholds reads with `503` until an operator repairs the log), and on demand via `POST /v1/audit/verify` (operator PAT; O(file); one at a time per node; `aerolvm_audit_chain_verify_ok`).
+
 `vault` is accepted as a known name but **fails boot** with a not-implemented error (no silent fallback to local).
 
 ## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)

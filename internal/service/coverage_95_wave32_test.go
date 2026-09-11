@@ -363,7 +363,9 @@ func TestSecretAuditQueryFiltersWave32(t *testing.T) {
 	bad := &Service{cfg: config.Config{DBPath: filepath.Join(t.TempDir(), "state.db")}}
 	t.Cleanup(bad.CloseSecretAuditSink)
 	_ = bad.secretAuditSink()
-	if err := os.WriteFile(bad.secretAuditFile.path, []byte("not-json\n"), 0o600); err != nil {
+	// A page read parses only records that can belong to it; a malformed
+	// record claiming the queried sandbox must still fail the read.
+	if err := os.WriteFile(bad.secretAuditFile.path, []byte(`{"sandbox_id":"sb",not-json`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := bad.ListSecretAuditLocal(context.Background(), "sb", SecretAuditQuery{}); err == nil {
