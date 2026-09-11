@@ -209,6 +209,19 @@ func (i *secretAuditIndexer) onAppended(lines []secretAuditIndexedLine) {
 	i.setReady(next, 0)
 }
 
+// markBroken latches the chain-break state from outside the indexer (the
+// boot-time background verification).
+func (i *secretAuditIndexer) markBroken(err error) {
+	if i == nil {
+		return
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if !i.broken.Load() {
+		i.markBrokenLocked(err)
+	}
+}
+
 func (i *secretAuditIndexer) markBrokenLocked(err error) {
 	secretAuditIndexChainBreaks.Add(1)
 	i.broken.Store(true)

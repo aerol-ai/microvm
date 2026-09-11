@@ -165,7 +165,11 @@ type Service struct {
 	secretAuditFile *fileAuditSink // non-nil when the sink is the file writer
 	// secretAuditIndex is the per-sandbox read index over secretAuditFile
 	// (nil when disabled or storeless); reads fall back to a scan without it.
-	secretAuditIndex        *secretAuditIndexer
+	secretAuditIndex *secretAuditIndexer
+	// secretAuditChainBroken latches a failed full verification (the boot
+	// background pass); local audit reads refuse until restart.
+	secretAuditChainBroken  atomic.Bool
+	secretAuditBootVerify   sync.WaitGroup
 	secretAuditInitErr      error // retained so daemon boot can fail closed
 	secretAuditOnce         sync.Once
 	secretAuditPruneStop    chan struct{}

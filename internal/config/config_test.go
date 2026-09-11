@@ -892,6 +892,28 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		if !cfg.AuditIndexEnabled {
 			t.Fatal("AuditIndexEnabled default = false, want true")
 		}
+		if cfg.SecretAuditBootVerify != "full" {
+			t.Fatalf("SecretAuditBootVerify default = %q, want full", cfg.SecretAuditBootVerify)
+		}
+	})
+
+	t.Run("audit_boot_verify_modes", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "")
+		t.Setenv("SB_SECRET_AUDIT_BOOT_VERIFY", " Checkpoint ")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.SecretAuditBootVerify != "checkpoint" {
+			t.Fatalf("SecretAuditBootVerify = %q, want checkpoint", cfg.SecretAuditBootVerify)
+		}
+		t.Setenv("SB_SECRET_AUDIT_BOOT_VERIFY", "sometimes")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_AUDIT_BOOT_VERIFY") {
+			t.Fatalf("invalid mode err = %v", err)
+		}
 	})
 
 	t.Run("audit_index_can_be_disabled", func(t *testing.T) {

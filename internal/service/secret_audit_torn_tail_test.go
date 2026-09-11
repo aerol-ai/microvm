@@ -181,7 +181,7 @@ func TestScanSecretAuditChainClassifiesTails(t *testing.T) {
 			if tc.raw != nil {
 				mustWriteRaw(t, p, tc.raw)
 			}
-			scan, err := scanSecretAuditChain(p, true)
+			scan, err := scanSecretAuditChain(p)
 			if tc.wantErrContain != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErrContain) {
 					t.Fatalf("err = %v, want containing %q", err, tc.wantErrContain)
@@ -316,7 +316,7 @@ func TestFileAuditSinkTornTailEveryCutOffset(t *testing.T) {
 		path := filepath.Join(dir, secretAuditFileName)
 		mustWriteRaw(t, path, clean[:cut])
 
-		scan, err := scanSecretAuditChain(path, false)
+		scan, err := scanSecretAuditChain(path)
 		if err != nil {
 			t.Fatalf("cut@%d: classifier errored: %v", cut, err)
 		}
@@ -547,7 +547,7 @@ func TestRecomputeChainStaysStrictOnTornTail(t *testing.T) {
 	if _, _, err := RecomputeChainHead(path); err == nil || !strings.Contains(err.Error(), "unterminated") {
 		t.Fatalf("RecomputeChainHead must refuse a torn tail (writer fallback / witness): %v", err)
 	}
-	if _, _, _, err := recomputeChain(path); err == nil {
+	if _, err := recomputeChain(path); err == nil {
 		t.Fatal("recomputeChain must refuse a torn tail")
 	}
 	after, _ := os.ReadFile(path)
@@ -920,7 +920,7 @@ func TestFileAuditSinkTornTailRepairErrorPaths(t *testing.T) {
 	t.Run("unreadable path surfaces the read error", func(t *testing.T) {
 		// A directory opens but cannot be read: the scan must return the I/O
 		// error rather than classify it as empty or torn.
-		if _, err := scanSecretAuditChain(t.TempDir(), false); err == nil {
+		if _, err := scanSecretAuditChain(t.TempDir()); err == nil {
 			t.Fatal("scan of a directory succeeded")
 		}
 		if _, _, err := RecomputeChainHead(t.TempDir()); err == nil {
