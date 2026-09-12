@@ -48,6 +48,10 @@ const (
 	secretAuditKindEgress              = "egress"
 	secretAuditKindGap                 = "gap"
 	secretAuditKindRetentionCheckpoint = "retention_checkpoint"
+	// secretAuditKindRetentionRedacted is what retention leaves of an expired
+	// record it cannot cut out of the chain: its two link hashes and nothing
+	// that says who opened what. See redactSecretAuditEvent.
+	secretAuditKindRetentionRedacted = "retention_redacted"
 
 	defaultSecretAuditBuffer = 1024
 	// enterpriseSecretAuditBuffer reduces spill likelihood under burst open
@@ -95,6 +99,12 @@ var (
 	// and a log line; the counters exist so the alert fires without log access.
 	auditTornTailRepairsTotal = expvar.NewInt("aerolvm_audit_torn_tail_repairs_total")
 	auditTornTailBytesTotal   = expvar.NewInt("aerolvm_audit_torn_tail_bytes_total")
+	// Retention: records dropped with the prefix, and records behind a newer
+	// one that were reduced to hash-only stubs instead (out-of-order arrival
+	// via the spill drain or worker ingest). Both are expired records leaving
+	// the log; the split says how much of the file is stubs.
+	auditRetentionDroppedTotal  = expvar.NewInt("aerolvm_audit_retention_dropped_total")
+	auditRetentionRedactedTotal = expvar.NewInt("aerolvm_audit_retention_redacted_total")
 )
 
 // SecretAuditEvent is one audit record (secret-open by default, or host-mediated
@@ -942,7 +952,9 @@ func (s *fileAuditSink) syncFile() error {
 	return err
 }
 
-// Prune drops events (and gap markers) older than cutoff. Serialized on the
+// Prune removes events (and gap markers) older than cutoff wherever they sit
+// in the file: the expired prefix is dropped, expired records behind a fresh
+// one become hash-only stubs (see pruneLocked). Serialized on the
 // writer goroutine so it cannot race appends.
 func (s *fileAuditSink) Prune(cutoff time.Time) error {
 	return s.pruneWithGuards(cutoff, "", "")
@@ -1022,8 +1034,19 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		if tip, tipErr := readWitnessTip(s.witnessTipPath); tipErr == nil {
 			witnessCandidate = strings.TrimSpace(tip.HeadHex)
 		}
-		droppedLines := 0
+		// Pass 1 decides what the rewrite will do. Retention is by time, not
+		// by position: the expired head of the file is dropped (the chain can
+		// lose a prefix and keep verifying from a checkpoint), and expired
+		// records that sit behind a newer one — the spill drain and worker
+		// ingest land older events after newer ones — cannot be cut out of
+		// the chain, so pass 2 reduces them to hash-only stubs: the payload
+		// goes, the link stays. Stopping at the first fresh record would keep
+		// those for as long as the record in front of them lives.
+		droppedLines := 0   // lines pass 2 skips, the leading checkpoint included
+		droppedRecords := 0 // expired records among them
+		redactRecords := 0  // expired records behind a fresh one
 		droppingPrefix := true
+		var priorCheckpoint *SecretAuditEvent
 		verifier := newSecretAuditChainVerifier()
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
@@ -1039,8 +1062,21 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 				_ = src.Close()
 				return fmt.Errorf("secret audit retention encountered invalid chain: %w", err)
 			}
-			if droppingPrefix && !ev.Time.IsZero() && ev.Time.Before(cutoff) {
+			if ev.Kind == secretAuditKindRetentionCheckpoint {
+				// The leading checkpoint (the verifier guarantees it is first)
+				// is re-minted by every rewrite — it is the file's generation
+				// marker and the new one carries its ancestry — but it never
+				// causes a rewrite by itself: a daily rewrite of an unchanged
+				// file would restart the exporter for nothing.
+				cp := ev
+				priorCheckpoint = &cp
 				droppedLines++
+				continue
+			}
+			expired := secretAuditExpired(ev, cutoff)
+			if droppingPrefix && expired {
+				droppedLines++
+				droppedRecords++
 				if ev.EventHash != "" {
 					lastDroppedHash = ev.EventHash
 					if ev.EventHash == witnessCandidate {
@@ -1050,6 +1086,9 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 				continue
 			}
 			droppingPrefix = false
+			if expired && ev.Kind != secretAuditKindRetentionRedacted {
+				redactRecords++
+			}
 		}
 		if err := scanner.Err(); err != nil {
 			_ = src.Close()
@@ -1059,9 +1098,22 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 			_ = src.Close()
 			return errSecretAuditPruneGuardChanged
 		}
-		if droppedLines == 0 {
+		if droppedRecords == 0 && redactRecords == 0 {
 			_ = src.Close()
 			return nil
+		}
+		if priorCheckpoint != nil {
+			// Nothing dropped this time: the new checkpoint stands where the
+			// old one did, naming the same dropped ancestor. And a witness that
+			// is still parked on a head the first prune dropped must stay
+			// verifiable through the second: carry WitnessedThrough forward
+			// unless this prune dropped the witnessed head itself.
+			if lastDroppedHash == "" {
+				lastDroppedHash = strings.TrimSpace(priorCheckpoint.PrevHash)
+			}
+			if witnessedThrough == "" {
+				witnessedThrough = strings.TrimSpace(priorCheckpoint.WitnessedThrough)
+			}
 		}
 		if _, err := src.Seek(0, io.SeekStart); err != nil {
 			_ = src.Close()
@@ -1072,9 +1124,9 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		// dropped prefix. Requiring it to equal the last dropped event would make
 		// a legitimately lagging witness unverifiable after retention.
 		cp := SecretAuditEvent{
-			// Anchor the checkpoint at the retained boundary. Using prune wall
-			// time here would pin it at the head for an entire retention window
-			// and prevent daily prefix reclamation.
+			// Anchor the checkpoint at the retained boundary: it records where
+			// retention stands. Its time never decides anything — the leading
+			// checkpoint is re-minted by every rewrite and triggers none.
 			Time:             cutoff.UTC(),
 			Result:           secretAuditResultSuccess,
 			Reason:           "prune",
@@ -1118,7 +1170,10 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		// Pass 2: stream kept lines through unchanged (no rehash), tracking
 		// exact byte positions so the read index can be re-based by one
 		// constant instead of rebuilt: every kept line moves by
-		// checkpointLen - floor as long as it is copied byte-for-byte.
+		// checkpointLen - floor as long as it is copied byte-for-byte. An
+		// expired record behind a fresh one is written as its stub instead;
+		// the stub is shorter, so what follows moves by a different delta and
+		// the index rebuilds (once, on a day retention actually redacted).
 		shift := secretAuditPruneShift{
 			generation:     auditGenerationOfLine(line),
 			checkpointLen:  int64(len(line)) + 1,
@@ -1127,6 +1182,7 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		}
 		br := bufio.NewReaderSize(src, 64*1024)
 		remainingDrops := droppedLines
+		redacted := 0
 		var srcPos int64
 		dstPos := shift.checkpointLen
 		lastKeptLineOffset := int64(0) // the checkpoint line, until a record is kept
@@ -1171,6 +1227,17 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 				_ = f.Close()
 				_ = src.Close()
 				return fmt.Errorf("secret audit retention event changed between passes: %w", err)
+			}
+			if secretAuditExpired(ev, cutoff) && ev.Kind != secretAuditKindRetentionRedacted {
+				stub, err := json.Marshal(redactSecretAuditEvent(ev))
+				if err != nil {
+					_ = f.Close()
+					_ = src.Close()
+					return err
+				}
+				raw = stub
+				redacted++
+				shift.exact = false
 			}
 			if _, err := writer.Write(raw); err != nil {
 				_ = f.Close()
@@ -1233,6 +1300,8 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		if s.onPruneShift != nil {
 			s.onPruneShift(shift)
 		}
+		auditRetentionDroppedTotal.Add(int64(droppedRecords))
+		auditRetentionRedactedTotal.Add(int64(redacted))
 		pruned = true
 		return nil
 	})
@@ -1246,6 +1315,33 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		go s.afterPrune()
 	}
 	return nil
+}
+
+// secretAuditExpired reports whether retention has passed a record. A record
+// without a time is kept: nothing proves it is old, and since the write path
+// stamps every record one can only come from a file edited by hand.
+func secretAuditExpired(ev SecretAuditEvent, cutoff time.Time) bool {
+	return !ev.Time.IsZero() && ev.Time.Before(cutoff)
+}
+
+// redactSecretAuditEvent is what retention leaves of an expired record that
+// sits behind a newer one and so cannot be cut out of the chain: the two link
+// hashes, the time and id (so a later prune reclaims it with the prefix and
+// an operator can place it), and nothing that says who opened what.
+// EventHash is the original — it is what the successor's prev_hash names —
+// so the chain still verifies through the stub; the verifier links a stub by
+// its stored hashes because the payload that produced them is gone, and
+// refuses one that still carries any other field.
+func redactSecretAuditEvent(ev SecretAuditEvent) SecretAuditEvent {
+	return SecretAuditEvent{
+		Time:      ev.Time,
+		EventID:   ev.EventID,
+		Result:    secretAuditResultSuccess,
+		Reason:    "prune",
+		Kind:      secretAuditKindRetentionRedacted,
+		PrevHash:  ev.PrevHash,
+		EventHash: ev.EventHash,
+	}
 }
 
 func ensureSecretAuditEventID(ev *SecretAuditEvent) {
@@ -1436,7 +1532,29 @@ func (v *secretAuditChainVerifier) Add(ev SecretAuditEvent) error {
 	if storedPrev == "" {
 		return errors.New("prev_hash is missing")
 	}
-	if ev.EventHash == "" || ev.EventHash != auditlog.HashEvent(storedPrev, ev) {
+	if ev.EventHash == "" {
+		return errors.New("event_hash is missing")
+	}
+	if ev.Kind == secretAuditKindRetentionRedacted {
+		// Retention kept only this record's links. Its payload is gone, so
+		// event_hash cannot be recomputed; the stub is verified by position
+		// instead: prev_hash must be the chain so far and event_hash is what
+		// the next record must name. A stub can therefore stand only where a
+		// record stood — none can be inserted or removed — but its content is
+		// no longer provable, which is why one that still carries a payload
+		// is rejected rather than trusted.
+		if redactSecretAuditEvent(ev) != ev {
+			return errors.New("retention stub carries payload")
+		}
+		if storedPrev != v.prev && !v.allowBreak {
+			return fmt.Errorf("prev_hash mismatch (got %q want %q)", storedPrev, v.prev)
+		}
+		v.prev = ev.EventHash
+		v.allowBreak = false
+		v.started = true
+		return nil
+	}
+	if ev.EventHash != auditlog.HashEvent(storedPrev, ev) {
 		return errors.New("event_hash mismatch")
 	}
 	if ev.Kind == secretAuditKindRetentionCheckpoint {
@@ -1463,10 +1581,12 @@ func (v *secretAuditChainVerifier) Add(ev SecretAuditEvent) error {
 // them it passed, plus the newest retention checkpoint's WitnessedThrough.
 //
 // Retention: prune drops a prefix and inserts an immutable retention_checkpoint
-// whose PrevHash is the last dropped EventHash. Witness verification uses
-// checkpoint.WitnessedThrough (when set) plus the remaining chain. Kept event
-// bytes are verified as stored (no rewrite); a single discontinuity is allowed
-// immediately after a retention_checkpoint.
+// whose PrevHash is the last dropped EventHash, and reduces expired records
+// that sit behind a fresh one to retention_redacted stubs that keep only their
+// link hashes. Witness verification uses checkpoint.WitnessedThrough (when
+// set) plus the remaining chain. Kept event bytes are verified as stored (no
+// rewrite); a single discontinuity is allowed immediately after a
+// retention_checkpoint, and a stub is linked by its stored hashes.
 func recomputeChain(path string, probe ...string) (secretAuditChainScan, error) {
 	return strictSecretAuditChainScan(path, secretAuditScanOptions{probe: probe})
 }
@@ -1526,6 +1646,10 @@ type secretAuditChainScan struct {
 	missingNewline bool
 	// records counts verified records (blank lines excluded).
 	records int64
+	// redacted counts retention stubs among them: records whose payload
+	// retention removed in place. The node never produces one inside the
+	// retention window.
+	redacted int64
 }
 
 // scanSecretAuditChain walks the file once, verifying every record against
@@ -1619,6 +1743,9 @@ func scanSecretAuditChainReader(r io.Reader, opts secretAuditScanOptions) (secre
 		scan.head = ev.EventHash
 		scan.eventID = ev.EventID
 		scan.records++
+		if ev.Kind == secretAuditKindRetentionRedacted {
+			scan.redacted++
+		}
 		scan.lastLineStart = offset - consumed
 		if _, want := probe[ev.EventHash]; want {
 			scan.markFound(ev.EventHash)

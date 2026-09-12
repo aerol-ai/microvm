@@ -378,7 +378,18 @@ func verifySecretAuditRecord(ev SecretAuditEvent) error {
 	if prev == "" {
 		return errors.New("prev_hash is missing")
 	}
-	if ev.EventHash == "" || ev.EventHash != auditlog.HashEvent(prev, ev) {
+	if ev.EventHash == "" {
+		return errors.New("event_hash is missing")
+	}
+	if ev.Kind == secretAuditKindRetentionRedacted {
+		// A retention stub has no payload to hash; it is sound when it
+		// carries nothing but its links (the chain scan checks the linking).
+		if redactSecretAuditEvent(ev) != ev {
+			return errors.New("retention stub carries payload")
+		}
+		return nil
+	}
+	if ev.EventHash != auditlog.HashEvent(prev, ev) {
 		return errors.New("event_hash mismatch")
 	}
 	return nil
@@ -626,7 +637,13 @@ type SecretAuditVerification struct {
 	Head       string `json:"head"`
 	EventID    string `json:"event_id,omitempty"`
 	Records    int64  `json:"records"`
-	Bytes      int64  `json:"bytes"`
+	// Redacted counts retention stubs among the records: expired records
+	// whose payload retention removed in place because a newer record stood
+	// in front of them. The node never produces one inside the retention
+	// window, so a stub younger than SB_SECRET_AUDIT_RETENTION_DAYS is
+	// evidence of a hand-edited file.
+	Redacted int64 `json:"redacted"`
+	Bytes    int64 `json:"bytes"`
 	// WriterTipMatches reports whether the verified head equals the tip the
 	// writer held at the snapshot, i.e. the file and the process agree.
 	WriterTipMatches bool   `json:"writer_tip_matches"`
@@ -686,6 +703,7 @@ func (s *Service) VerifySecretAuditChain(ctx context.Context) (SecretAuditVerifi
 	report.Head = scan.head
 	report.EventID = scan.eventID
 	report.Records = scan.records
+	report.Redacted = scan.redacted
 	report.DurationMS = time.Since(started).Milliseconds()
 	if err != nil {
 		report.Error = err.Error()
@@ -966,6 +984,9 @@ func secretAuditKindMatches(storedKind, filter string) bool {
 // stale or faulty peer must not be able to inject another sandbox lifetime into
 // the merged evidence page.
 func secretAuditEventMatches(ev SecretAuditEvent, sandboxID, incarnationID, kind string, after time.Time, afterKey string) bool {
+	if ev.Kind == secretAuditKindRetentionCheckpoint || ev.Kind == secretAuditKindRetentionRedacted {
+		return false // chain structure left by retention, never evidence
+	}
 	isGap := ev.Result == secretAuditResultGap || ev.Kind == secretAuditKindGap
 	if !isGap && ev.SandboxID != sandboxID {
 		return false

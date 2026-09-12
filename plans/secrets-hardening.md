@@ -1055,6 +1055,22 @@ scan uses), and lets tombstone retention finish the job. Cluster mode with the
 transport not yet attached still keeps every row. Counted and logged with the
 peers named; documented in the runbook ("Leaving a cluster").
 
+Seventh stacked PR (review finding #11, prefix-only retention): `pruneLocked`
+stopped dropping at the first record inside the window and never resumed, so an
+expired record that the spill drain or worker ingest had landed behind a newer
+one stayed for as long as that record lived — over-retention with no bound the
+retention claim could state. Retention is now by record time anywhere in the
+file: the expired prefix is dropped as before, and an expired record behind a
+fresh one is reduced in place to a `retention_redacted` stub (`time`,
+`event_id`, `prev_hash`, `event_hash`, nothing else) so the immutable chain
+still verifies through it; the verifier links a stub by its stored hashes and
+rejects one that carries payload, and a later prune reclaims stubs with the
+prefix. The leading checkpoint is re-minted by every rewrite (carrying its
+ancestor and `WitnessedThrough` forward, which a second prune used to drop)
+but never causes one. A redacting prune rebuilds the read index once; a pure
+prefix drop still shifts it. `POST /v1/audit/verify` reports `redacted`;
+`aerolvm_audit_retention_{dropped,redacted}_total` count both.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

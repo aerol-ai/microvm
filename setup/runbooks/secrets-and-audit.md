@@ -252,11 +252,31 @@ What this does and does not mean:
 
 Repeated firing means the node itself is crashing. Find that cause first.
 
-Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) prunes old lines daily.
-Prune drops a prefix and inserts an immutable `retention_checkpoint` (kept
-event bytes / EventHash are unchanged). Witness verification uses
-`checkpoint.WitnessedThrough` (when that head was actually shipped) plus the
-remaining chain.
+Retention: `SB_SECRET_AUDIT_RETENTION_DAYS` (default 30) removes records older
+than the window daily, by record time, wherever they sit in the file:
+
+- The expired head of the file is dropped and replaced by one immutable
+  `retention_checkpoint` whose `prev_hash` is the last dropped `event_hash`
+  (kept event bytes / `event_hash` are never rewritten). Witness verification
+  uses `checkpoint.WitnessedThrough` (when that head was actually shipped) plus
+  the remaining chain; the value is carried from prune to prune while the
+  witness stays parked on it.
+- An expired record that sits *behind* a newer one (the spill drain and worker
+  ingest land older events after newer ones) cannot be cut out of the chain,
+  so it is reduced in place to a `retention_redacted` stub: `time`,
+  `event_id`, `prev_hash`, `event_hash`, and nothing else. The chain verifies
+  through the stub (its `event_hash` is what the next record's `prev_hash`
+  names), and a later prune reclaims the stub with the prefix once the record
+  in front of it expires. A downstream verifier must treat
+  `kind=retention_redacted` as a link-only record: accept it when its
+  `prev_hash` is the chain so far, continue from its `event_hash`, and reject
+  one that carries any other field. The node never writes a stub inside the
+  retention window, so `redacted` in the `POST /v1/audit/verify` report counts
+  what retention did; a stub younger than the window means a hand-edited file.
+- `aerolvm_audit_retention_dropped_total` and
+  `aerolvm_audit_retention_redacted_total` count both outcomes. A prune that
+  redacted anything rebuilds the read index once (offsets after a stub move
+  unevenly); a pure prefix drop shifts it in place.
 
 ## Fan-out failures / `failover_ready` false
 

@@ -575,8 +575,9 @@ func (i *secretAuditIndexer) buildLocked(ctx context.Context, meta store.SecretA
 
 // secretAuditIndexKeyFor decides which posting list a record belongs to.
 // Gap markers go under the empty sandbox id because every page must surface
-// them; records that no query can return (a checkpoint, an event with no
-// sandbox) are not indexed at all, though the index still advances past them.
+// them; records that no query can return (a checkpoint, a retention stub, an
+// event with no sandbox) are not indexed at all, though the index still
+// advances past them.
 func secretAuditIndexKeyFor(ev SecretAuditEvent) (store.SecretAuditIndexKey, bool) {
 	if ev.Result == secretAuditResultGap || ev.Kind == secretAuditKindGap {
 		return store.SecretAuditIndexKey{}, true
