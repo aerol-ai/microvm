@@ -269,8 +269,9 @@ func TestReconcileSecretPutOutboxRemainingBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.reconcileSecretPutOutboxIncarnation(nil, "sb-auth-fail", "inc-a")
-	if rec, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-auth-fail", "inc-a"); err != nil || rec == nil || rec.Attempts < 1 {
-		t.Fatalf("auth-fail bump: rec=%+v err=%v", rec, err)
+	// A placement read failure defers (touch) rather than counts an attempt.
+	if rec, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-auth-fail", "inc-a"); err != nil || rec == nil || rec.Attempts != 0 {
+		t.Fatalf("auth-fail deferral: rec=%+v err=%v", rec, err)
 	}
 
 	putSecretRow(t, st, "sb-nil-place", "inc-a", 1, []string{"node-a", "node-b"})

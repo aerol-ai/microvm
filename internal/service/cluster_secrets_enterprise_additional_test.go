@@ -414,7 +414,9 @@ func TestPutOutboxPlacementReadFailureCannotRetireLiveCiphertext(t *testing.T) {
 	if rec, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-put-placement-down", "inc-live"); err != nil || rec == nil {
 		t.Fatalf("live ciphertext was retired on ambiguous placement read: rec=%+v err=%v", rec, err)
 	}
-	if rec, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-put-placement-down", "inc-live"); err != nil || rec == nil || rec.Attempts != 1 {
+	// Deferred, not attempted: nothing was tried, so the row is touched to the
+	// back of the queue with attempts unchanged and stays due next tick.
+	if rec, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-put-placement-down", "inc-live"); err != nil || rec == nil || rec.Attempts != 0 {
 		t.Fatalf("put obligation was not retained and deferred: rec=%+v err=%v", rec, err)
 	}
 	if rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-put-placement-down", "inc-live"); err != nil || rec != nil {
@@ -498,8 +500,8 @@ func TestStagedRetirementPlacementReadFailureCannotCreateRecoveryVacuum(t *testi
 		t.Fatal("authoritative placement failure was not reported")
 	}
 	rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-retire-placement-down", "inc-live")
-	if err != nil || rec == nil || !rec.AwaitingPromotion || rec.Attempts != 1 {
-		t.Fatalf("staged retirement was promoted on ambiguous placement read: rec=%+v err=%v", rec, err)
+	if err != nil || rec == nil || !rec.AwaitingPromotion || rec.Attempts != 0 {
+		t.Fatalf("staged retirement was promoted on ambiguous placement read (or counted as an attempt): rec=%+v err=%v", rec, err)
 	}
 	pusher.mu.Lock()
 	deletes := len(pusher.deletes)

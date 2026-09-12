@@ -1146,6 +1146,28 @@ refusal, the handler maps it to `429`, and the worker treats `429` as final
 instead of spilling. Metrics, a warning alert, and a runbook section ship with
 it. Cardinality control for egress evidence is therefore built, not deferred.
 
+Twelfth stacked PR (DRY / YAGNI review of the secrets surface): three items
+verified. (1) `attempts` was written and bumped in seventeen places and read by
+no decision: no cap, no backoff, a permanently unreachable recipient retried
+every 30 s forever. Kept and made load-bearing rather than dropped: attempt *n*
+is due `min(30s·2^(n−1), 15m)` after its last attempt, the schedule is applied
+in the query (`ListSecret{Delete,Put}OutboxDue`) so a backlog of backed-off
+rows — every obligation to a decommissioned node — cannot fill the oldest-first
+batch and starve fresh work, yields that tried nothing (placement unreadable,
+staged reseal not yet promoted) *touch* the row instead of bumping it, and a
+member rejoining gives every obligation one immediate try. (2) The two sweep
+loops were structurally identical; they are now one `sweepSecretOutbox` with
+the table-specific list, defer and per-row action plugged in. The other three
+deferred-cleanup queues the review counted are deliberately not folded in:
+`pending_image_gc` is serial by design with conditional deletes keyed on
+`scheduled_at`, `pending_volume_deletions` has no paging and its own
+concurrency knob, and `wasm_checkpoint_pushes` is a keep-last-N per sandbox
+run on push, not a sweep — a sweeper generic enough for all six would carry
+more knobs than the loops it replaced. (3) The 112 `coverage_95_*` test files
+are session-named and mix subjects; they are reorganised into subject-named
+files in the following PR so `seal_distribute_coverage_test.go` sits next to
+`seal_distribute.go`.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
