@@ -1106,6 +1106,25 @@ a warning and proceeds, since refusing it would lose the sandbox. Docs, the revi
 rulebook (§5) and the cluster-secrets checklist now state that `source` and
 `options` are replicated in the clear and only `credentials` is sealed.
 
+Tenth stacked PR (review finding #8, the 100-ingress target's opt-in):
+investigated and judged worth fixing, not as a code defect — the gate is right
+and loud (enterprise boot refuses with the fix in the message; open-source logs,
+skips ingress reconcile, reports `degraded`) — but as an operability gap with a
+specific hazard: every place an operator designs a large ingress tier (the
+cluster-ingress docs page, `setup/cluster.md`, the Terraform module, and the
+plans that set the 100-ingress scale bar) recommended plain load balancers and
+never named the 10-node cap, so the first sign is a refused boot at scale-out
+time, and the tempting wrong fix — flipping `SB_CLUSTER_SHARD_AWARE_INGRESS`
+to silence it while keeping the plain LB — black-holes most public traffic with
+nothing daemon-side able to notice. Fixed by stating the prerequisite where the
+target is set and where LBs are recommended (this plan, the export plan, the
+LB plan's failure table corrected: the ingress-count rule never refuses
+creates), a runbook, a Terraform `shard_aware_ingress` variable that threads
+the env flag and a plan-time precondition refusing more than 10 ingress-capable
+nodes without it (mirrored in `Terraform/validate`), and a gauge
+`aerolvm_cluster_topology_ok` with a critical alert so the open-source
+not-ready state is visible in monitoring, not only in logs and `/health`.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
@@ -1184,4 +1203,12 @@ retraction, and failure when peers are unreachable — §10).
   existing node-ID-bound cluster certificates remains an operational follow-up.
   Atomically replaced leaf pairs hot-reload on the next handshake and expiry
   metrics/alerts are shipped; CA rotation remains a coordinated operation.
-- Live 2,000-process / 100-ingress soak remains operator-run (`plans/data-plane-load-balancer.md`)
+- Live 2,000-process / 100-ingress soak remains operator-run (`plans/data-plane-load-balancer.md`).
+  **Prerequisite for any ingress tier above 10 nodes:** a shard-aware router
+  that resolves owners through `GET /v1/cluster/ingress-route/{id}`, and
+  `SB_CLUSTER_SHARD_AWARE_INGRESS=true` on every node once it does. Above
+  `cluster.MaxReplicatedIngressRouteNodes` (10) each ingress node holds only its
+  rendezvous-hashed share of the route table, so a plain LB is not an option;
+  without the flag enterprise boots refuse and open-source never marks ingress
+  ready (`aerolvm_cluster_topology_ok = 0`). Nothing in this plan removes that
+  requirement; the 100-ingress figure assumes it is met.

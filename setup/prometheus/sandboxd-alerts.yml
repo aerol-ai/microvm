@@ -586,3 +586,25 @@ groups:
           summary: "sandboxd secret provider canary is failing"
           description: "aerolvm_secret_provider_canary_ok has been 0 for 10 minutes. New wraps/opens may fail; for awskms check IAM/KMS reachability."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+  - name: sandboxd.cluster-topology
+    interval: 30s
+    rules:
+      # The live membership violates the production topology contract. The
+      # common case is an ingress tier past 10 nodes without
+      # SB_CLUSTER_SHARD_AWARE_INGRESS: enterprise boots refuse outright, an
+      # open-source node boots but never starts its ingress reconciler and
+      # reports degraded on /health. Do NOT clear this by setting the flag
+      # unless a shard-aware router (GET /v1/cluster/ingress-route/{id}) is
+      # actually in front of the tier — with a plain LB that silences the
+      # check and black-holes most public sandbox traffic.
+      - alert: SandboxdClusterTopologyViolation
+        expr: aerolvm_cluster_topology_ok == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: cluster-ingress
+        annotations:
+          summary: "sandboxd cluster topology violation; ingress may not be serving"
+          description: "aerolvm_cluster_topology_ok has been 0 for 5 minutes on {{ $labels.instance }}. Either more than 10 live ingress nodes without a declared shard-aware router, or mixed/hybrid roles above 10 live nodes. See /health cluster_topology for the exact reason."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md"

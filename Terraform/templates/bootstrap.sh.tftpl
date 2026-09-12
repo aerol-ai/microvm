@@ -440,6 +440,10 @@ SB_IMAGE_BUILD_GC_ENABLED=${image_build_gc_enabled}
 SB_IMAGE_BUILD_GC_INTERVAL=${image_build_gc_interval}
 SB_IMAGE_BUILD_GC_TTL=${image_build_gc_ttl}
 SB_ENABLE_CUSTOM_DOMAINS=${enable_custom_domains}
+# More than 10 ingress-capable nodes need a shard-aware router in front of the
+# tier (GET /v1/cluster/ingress-route/{id}); the daemon fails closed without
+# this declaration. See setup/runbooks/cluster-ingress-topology.md.
+SB_CLUSTER_SHARD_AWARE_INGRESS=${shard_aware_ingress}
 SB_CUSTOM_DOMAIN_VERIFY_PREFIX=${custom_domain_txt_prefix}
 SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX=${custom_domain_txt_value_prefix}
 SB_PLATFORM_VOLUMES_ENABLED=${platform_volumes_cfg.enabled}

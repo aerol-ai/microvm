@@ -165,7 +165,11 @@ least one of bearer, HMAC, or mTLS.
 ## Scale bar
 
 - 2000 nodes / 100k sandboxes / 100 ingress: export cost is per-node and
-  per-batch; nothing here scales with the fleet.
+  per-batch; nothing here scales with the fleet. The 100-ingress figure
+  presumes the fleet's own prerequisite for an ingress tier above 10 nodes: a
+  shard-aware router on `GET /v1/cluster/ingress-route/{id}` and
+  `SB_CLUSTER_SHARD_AWARE_INGRESS=true` (`plans/data-plane-load-balancer.md`);
+  the daemon fails closed at that size without it.
 - Raft: live placements only, plus ≤`SB_AUDIT_DELETED_INDEX_MAX` routing stubs
   pruned from a heap. Snapshot growth is bounded by that cap.
 - No per-request full-file scan is introduced here; the audit read path's own

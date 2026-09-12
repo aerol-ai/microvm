@@ -358,3 +358,14 @@ func idempotencyState(record *models.IdempotentRequestRecord) string {
 		return "unknown"
 	}
 }
+
+// clusterTopologyOK is 1 while the live membership satisfies the production
+// topology contract and 0 while it does not — in practice an ingress tier past
+// cluster.MaxReplicatedIngressRouteNodes without SB_CLUSTER_SHARD_AWARE_INGRESS,
+// the state in which open-source boots never mark ingress ready. /health and a
+// reconcile log line already say so; this makes it alertable without scraping
+// either. Standalone nodes never evaluate the contract, so the gauge starts at
+// 1 and stays there for them.
+var clusterTopologyOK = expvar.NewInt("aerolvm_cluster_topology_ok")
+
+func init() { clusterTopologyOK.Set(1) }
