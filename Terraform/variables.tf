@@ -200,6 +200,22 @@ variable "default_volume_throughput" {
 # Exactly one node must set seed = true.
 ###############################################################################
 
+variable "shard_aware_ingress" {
+  description = <<-EOT
+    Declares that the router in front of the ingress tier resolves each
+    sandbox's owners through GET /v1/cluster/ingress-route/{id} before
+    forwarding. Required, and only correct, for more than 10 ingress-capable
+    nodes: above that size each ingress node holds only its share of the
+    public route table, so DNS round-robin, an NLB, or a BGP VIP would
+    black-hole most sandbox traffic, and the daemon fails closed without this
+    flag (SB_CLUSTER_SHARD_AWARE_INGRESS). Setting it true with a plain LB in
+    front silences that check and breaks traffic silently. Runbook:
+    setup/runbooks/cluster-ingress-topology.md.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "nodes" {
   description = <<-EOT
     Map of node-name => node config. Each entry supports:

@@ -568,6 +568,23 @@ retry another A record. Use only for testing or tiny private deployments.
 | Small private test cluster | Topology C is acceptable if client retries tolerate dead DNS answers. |
 | Environment that forbids node-to-node ingress forwarding | Topology B, with the operational cost of per-sandbox DNS updates. |
 
+### Ingress tier size limit
+
+Every topology on this page picks *any* live ingress-capable node for *any*
+sandbox, which is only correct while each of them holds the full public route
+table - guaranteed through **10 live ingress-capable nodes**. Above 10, each
+ingress node holds only its rendezvous-hashed share (primary plus one failover
+replica per shard) and a plain LB sends most connections to a node without the
+route. The daemon fails closed there: enterprise boots refuse, open-source
+never marks ingress ready and reports `degraded` on `/health`
+(`aerolvm_cluster_topology_ok = 0`, alert `SandboxdClusterTopologyViolation`).
+Running more than 10 ingress nodes needs a router that resolves owners through
+`GET /v1/cluster/ingress-route/{id}` before forwarding, and then
+`SB_CLUSTER_SHARD_AWARE_INGRESS=true` on every node (Terraform:
+`shard_aware_ingress = true`). Setting the flag with a plain LB in front
+silences the check and breaks traffic silently. Runbook:
+`setup/runbooks/cluster-ingress-topology.md`.
+
 ---
 
 ## Concrete deployment: AWS + Cloudflare (3 nodes)

@@ -902,6 +902,16 @@ func (s *Service) ClusterTopologyError() error {
 // loop can run the same shard-aware-ingress check without re-fetching members
 // or duplicating the threshold logic.
 func (s *Service) clusterTopologyErrorFor(members []cluster.Member) error {
+	err := s.evaluateClusterTopology(members)
+	if err != nil {
+		clusterTopologyOK.Set(0)
+	} else {
+		clusterTopologyOK.Set(1)
+	}
+	return err
+}
+
+func (s *Service) evaluateClusterTopology(members []cluster.Member) error {
 	if err := cluster.LargeClusterTopologyError(members); err != nil {
 		return err
 	}

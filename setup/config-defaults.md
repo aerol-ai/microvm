@@ -144,7 +144,7 @@ this schema as a coordinated, one-way change.
 | `SB_CONTAINERD_POOL_REFILL_INTERVAL` | containerd warm-pool refill ticker; default `5s`. |
 | `SB_ENABLE_CLUSTER` | Opt-in; cluster code must be a no-op when false. |
 | `SB_CLUSTER_BOOTSTRAP` | Single-seed cluster bring-up only. |
-| `SB_CLUSTER_SHARD_AWARE_INGRESS` | Cluster ingress topology. |
+| `SB_CLUSTER_SHARD_AWARE_INGRESS` | Declares that the router in front of the ingress tier resolves each sandbox's owners through `GET /v1/cluster/ingress-route/{id}`. Above 10 live ingress-capable nodes each ingress node holds only its share of the public route table (primary plus one replica per shard), so DNS round-robin, a cloud TCP LB, or a BGP VIP would black-hole most sandbox traffic. Without this flag the daemon fails closed at that size: enterprise boots refuse, open-source never marks ingress ready, `/health` reports `degraded`, `aerolvm_cluster_topology_ok` is 0. Flipping it with a plain LB in front silences the check and breaks traffic silently — the daemon cannot see what fronts it. Runbook: `setup/runbooks/cluster-ingress-topology.md`. |
 | `SB_OTEL_METRICS_ENABLED` | Needs a collector; auto-enables when `SB_OTEL_METRICS_ENDPOINT` is set. |
 | `SB_OTEL_TRACES_ENABLED` | Needs a collector; auto-enables when `SB_OTEL_TRACES_ENDPOINT` is set. |
 | `SB_PLATFORM_VOLUMES_ENABLED` | Needs an S3/NFS backend config. |
