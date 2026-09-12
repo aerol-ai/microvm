@@ -156,8 +156,14 @@ var errSecretAuditPruneGuardChanged = errors.New("secret audit advanced beyond t
 // later in-memory sends without allowing a continuously replenished spill file
 // to starve durable requests indefinitely.
 //
-// sendMu serializes producers against Close so Emit/Sync/Prune never send on a
-// closed channel (check-then-send race under -race / daemon shutdown).
+// sendMu guards the channels against Close so Emit/Sync/Prune never send on a
+// closed channel (check-then-send race under -race / daemon shutdown). It is
+// an RWMutex held on the read side by every sender, so senders never exclude
+// one another: Sync, EmitDurable and Prune legitimately wait for a slot while
+// the writer is busy (retention on a large file holds it for a long time), and
+// that wait must not stall Emit — a StartSandbox secret open would otherwise
+// sit behind a blocked witness ship or worker ingest for the whole prune.
+// Close takes the write side, which waits for in-flight sends and then closes.
 type fileAuditSink struct {
 	ch         chan auditWriteReq
 	spillCh    chan SecretAuditEvent // enterprise overflow; drained by writer
@@ -166,9 +172,10 @@ type fileAuditSink struct {
 	// spillEnabled (enterprise): buffer-full Emit enqueues to spillCh instead
 	// of dropping. Gap only if spillCh cannot accept quickly.
 	spillEnabled bool
-	// sendMu serializes channel send vs Close. Spill file I/O runs on the
-	// writer goroutine so Emit never holds sendMu across disk waits.
-	sendMu           sync.Mutex
+	// sendMu: read side for senders, write side for Close (see the type
+	// comment). Spill file I/O runs on the writer goroutine so Emit never
+	// holds it across disk waits either.
+	sendMu           sync.RWMutex
 	spillMu          sync.Mutex
 	gapMu            sync.Mutex
 	done             chan struct{}
@@ -559,43 +566,36 @@ func persistTornTailRepair(path string, rec secretAuditTornTailRepair) error {
 }
 
 func (s *fileAuditSink) Emit(ev SecretAuditEvent) {
-	if s == nil {
+	if s == nil || s.closed.Load() {
+		// Checked before the lock: once Close has begun it holds or awaits
+		// the write side, and a request-path Emit must not queue behind it.
 		return
 	}
-	s.sendMu.Lock()
+	s.sendMu.RLock()
 	if s.closed.Load() {
-		s.sendMu.Unlock()
+		s.sendMu.RUnlock()
 		return
 	}
 	req := auditWriteReq{ev: ev}
 	select {
 	case s.ch <- req:
-		s.sendMu.Unlock()
+		s.sendMu.RUnlock()
+		return
 	default:
-		spill := s.spillEnabled
-		s.sendMu.Unlock()
-		// Never fsync on the Emit path. Prefer a non-blocking spillCh handoff;
-		// the writer durable-appends. If spillCh is also full, record a gap.
-		if spill {
-			s.sendMu.Lock()
-			if s.closed.Load() {
-				s.sendMu.Unlock()
-				return
-			}
-			select {
-			case s.spillCh <- ev:
-				s.sendMu.Unlock()
-				return
-			default:
-				s.sendMu.Unlock()
-			}
-			auditEventsDroppedTotal.Add(1)
-			s.pendingGap.Add(1)
-			return
-		}
-		auditEventsDroppedTotal.Add(1)
-		s.pendingGap.Add(1)
 	}
+	// Never fsync on the Emit path. Prefer a non-blocking spillCh handoff;
+	// the writer durable-appends. If spillCh is also full, record a gap.
+	if s.spillEnabled {
+		select {
+		case s.spillCh <- ev:
+			s.sendMu.RUnlock()
+			return
+		default:
+		}
+	}
+	s.sendMu.RUnlock()
+	auditEventsDroppedTotal.Add(1)
+	s.pendingGap.Add(1)
 }
 
 func (s *fileAuditSink) EmitDurable(ev SecretAuditEvent) error {
@@ -603,13 +603,15 @@ func (s *fileAuditSink) EmitDurable(ev SecretAuditEvent) error {
 		return errors.New("secret audit sink unavailable")
 	}
 	done := make(chan error, 1)
-	s.sendMu.Lock()
+	s.sendMu.RLock()
 	if s.closed.Load() {
-		s.sendMu.Unlock()
+		s.sendMu.RUnlock()
 		return errors.New("secret audit sink closed")
 	}
+	// Durable means waiting for a slot when the writer is busy. The read side
+	// keeps Close from closing the channel mid-send without excluding Emit.
 	s.ch <- auditWriteReq{ev: ev, durable: done}
-	s.sendMu.Unlock()
+	s.sendMu.RUnlock()
 	return <-done
 }
 
@@ -620,20 +622,25 @@ func (s *fileAuditSink) Sync() error {
 		return nil
 	}
 	done := make(chan error, 1)
-	s.sendMu.Lock()
+	s.sendMu.RLock()
 	if s.closed.Load() {
-		s.sendMu.Unlock()
+		s.sendMu.RUnlock()
 		return nil
 	}
-	// Sync must not drop — wait for buffer space while still holding sendMu so
-	// Close cannot close(ch) mid-send.
+	// Sync must not drop — wait for buffer space on the read side so Close
+	// cannot close(ch) mid-send and Emit is not held up meanwhile.
 	s.ch <- auditWriteReq{sync: done}
-	s.sendMu.Unlock()
+	s.sendMu.RUnlock()
 	return <-done
 }
 
 // Close stops the writer and closes the file. Safe to call once.
 // Callers must stop retention (and await it) before Close so Prune cannot race.
+//
+// closed flips first so new Emits return without touching the lock; the write
+// side then waits for senders already inside (a Sync or EmitDurable waiting
+// for a slot completes once the writer drains, which it keeps doing until the
+// channel is closed here) and only then closes the channels.
 func (s *fileAuditSink) Close() {
 	if s == nil || !s.closed.CompareAndSwap(false, true) {
 		return
@@ -970,9 +977,9 @@ func (s *fileAuditSink) pruneWithGuards(cutoff time.Time, exportCursorPath, witn
 		return nil
 	}
 	done := make(chan error, 1)
-	s.sendMu.Lock()
+	s.sendMu.RLock()
 	if s.closed.Load() {
-		s.sendMu.Unlock()
+		s.sendMu.RUnlock()
 		return nil
 	}
 	s.ch <- auditWriteReq{
@@ -981,7 +988,7 @@ func (s *fileAuditSink) pruneWithGuards(cutoff time.Time, exportCursorPath, witn
 		pruneWitnessedHead:    strings.TrimSpace(witnessedHead),
 		pruneDone:             done,
 	}
-	s.sendMu.Unlock()
+	s.sendMu.RUnlock()
 	return <-done
 }
 

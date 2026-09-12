@@ -1071,6 +1071,21 @@ but never causes one. A redacting prune rebuilds the read index once; a pure
 prefix drop still shifts it. `POST /v1/audit/verify` reports `redacted`;
 `aerolvm_audit_retention_{dropped,redacted}_total` count both.
 
+Eighth stacked PR (review finding #12, `Sync()` can block `Emit`): confirmed
+real. `Sync`, `EmitDurable` and `Prune` did a blocking channel send while
+holding the sink's `sendMu` exclusively, and `Emit` took the same mutex before
+its non-blocking send. With the writer parked in a long retention rewrite (or
+an fsync stall) the buffer fills; the next witness ship (`Sync`), worker
+ingest (`EmitDurable`) or retention tick then waited for a slot under the
+mutex and every `Emit` — `loadEnv` / `loadMounts` on StartSandbox, egress
+audit — queued behind it for the rest of the outage, undoing "audit I/O stays
+off the request path" exactly when the writer was slowest. Reproduced by a test
+that parks the writer behind the audit flock. Fix: `sendMu` is an RWMutex held
+on the read side by every sender (senders never exclude one another; a waiting
+`Sync` cannot stall `Emit`, which takes the overflow path as designed) and on
+the write side by `Close`, which flips `closed` first so request-path Emits
+never queue behind a shutdown either.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
