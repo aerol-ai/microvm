@@ -58,7 +58,9 @@ If you change who holds a PAT (sub-accounts, hosted offering, external CI), this
 - Isolate mount helpers (dedicated low-priv user, network namespace scoped to the declared endpoint, seccomp/AppArmor, or a helper VM).
 - Re-validate `source` schemes and reject control characters.
 
-**Reviewer asks:** does this PR widen what a PAT holder can pass into a host-side mount command? If yes, is it still safe under the "PAT == operator" assumption, and is the assumption still accurate?
+`source` and `options` are also **replicated in the clear** inside a cluster (Raft placement spec and recovery store, via `RedactClusterSecrets`); only `credentials` is sealed. `models.MountSpec.Validate` refuses credential-shaped names in `options` keys, `extra_args` flags, NFS `opts` entries, and rclone connection-string parameters in `source`, so a secret cannot ride a replicated field by accident.
+
+**Reviewer asks:** does this PR widen what a PAT holder can pass into a host-side mount command? If yes, is it still safe under the "PAT == operator" assumption, and is the assumption still accurate? Does it add a mount option or source form that can carry a credential? If so, it must go through `credentials`.
 
 
 ## 6. TCP host-port pool & L4 bootstrap

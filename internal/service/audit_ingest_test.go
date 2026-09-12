@@ -363,6 +363,11 @@ func TestAuditIngestRejectsMalformedAndNonLoopbackRequests(t *testing.T) {
 		want       int
 	}{
 		{name: "non_loopback", remoteAddr: "192.0.2.10:1234", body: `{"destination":"host:9"}`, capability: "x", want: http.StatusForbidden},
+		// A peer address that does not parse must fail closed, not skip the check.
+		{name: "unparsable_remote", remoteAddr: "not-an-address", body: `{"destination":"host:9"}`, capability: "x", want: http.StatusForbidden},
+		{name: "empty_remote", remoteAddr: "", body: `{"destination":"host:9"}`, capability: "x", want: http.StatusForbidden},
+		// IPv6 loopback passes the gate and reaches body parsing.
+		{name: "ipv6_loopback_reaches_body", remoteAddr: "[::1]:1234", body: `{`, capability: "x", want: http.StatusBadRequest},
 		{name: "bad_json", remoteAddr: "127.0.0.1:1234", body: `{`, capability: "x", want: http.StatusBadRequest},
 		{name: "trailing_json", remoteAddr: "127.0.0.1:1234", body: `{"destination":"host:9"}{}`, capability: "x", want: http.StatusBadRequest},
 		{name: "bad_capability", remoteAddr: "127.0.0.1:1234", body: `{"destination":"host:9"}`, capability: "invalid", want: http.StatusUnauthorized},

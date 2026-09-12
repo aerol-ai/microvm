@@ -1240,7 +1240,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	if err != nil {
 		return true, fmt.Errorf("recreate %s: %w", id, err)
 	}
-	if _, err := s.CreateSandboxWithID(ctx, merged, id); err != nil {
+	if _, err := s.CreateSandboxWithID(contextWithStoredSpecReplay(ctx), merged, id); err != nil {
 		return true, err
 	}
 	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
@@ -1309,6 +1309,53 @@ func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
 		return base + overlaySizeGB
 	}
 	return base
+}
+
+// storedSpecReplayKey marks a context in which createSandbox is replaying a
+// spec the cluster already holds (failover recreate) rather than admitting a
+// new request. Intake-only rules — ones whose purpose is to keep something out
+// of the replicated spec — are downgraded to a warning there: the spec is
+// already replicated, and refusing the recreate would only lose the sandbox.
+type storedSpecReplayKey struct{}
+
+func contextWithStoredSpecReplay(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, storedSpecReplayKey{}, true)
+}
+
+func isStoredSpecReplay(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	replay, _ := ctx.Value(storedSpecReplayKey{}).(bool)
+	return replay
+}
+
+// validateCreateMounts applies the mount policy to a create request. The
+// placement rule (credentials must be in Credentials, never in Source or
+// Options, which are replicated in the clear) is enforced on new requests and
+// only logged on a stored-spec replay — see storedSpecReplayKey.
+func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.MountSpec, sandboxID string) error {
+	if len(mounts) > models.MaxMountsPerSandbox {
+		return fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
+	}
+	for i := range mounts {
+		if err := mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
+			return fmt.Errorf("mount %d: %w", i, err)
+		}
+		if err := mounts[i].ValidateSecretsPlacement(); err != nil {
+			if !isStoredSpecReplay(ctx) {
+				return fmt.Errorf("mount %d: %w", i, err)
+			}
+			if s.logger != nil {
+				s.logger.Warn("cluster: recreating a sandbox whose stored mount spec carries a credential outside credentials; it is replicated in the clear — recreate the sandbox with the credential in credentials",
+					"sandbox_id", sandboxID, "mount", i, "target", mounts[i].Target, "err", err)
+			}
+		}
+	}
+	return validateUniqueMountTargets(mounts)
 }
 
 func validateUniqueMountTargets(mounts []models.MountSpec) error {
@@ -1529,15 +1576,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 	req.Runtime = chosenRuntime
 
-	if len(req.Mounts) > models.MaxMountsPerSandbox {
-		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
-	}
-	for i := range req.Mounts {
-		if err := req.Mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
-			return nil, fmt.Errorf("mount %d: %w", i, err)
-		}
-	}
-	if err := validateUniqueMountTargets(req.Mounts); err != nil {
+	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride); err != nil {
 		return nil, err
 	}
 

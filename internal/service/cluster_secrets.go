@@ -1846,6 +1846,15 @@ func (s *Service) maybeAsyncDeleteFanout(sandboxID, incarnationID string) {
 // Env is always cleared from the Raft spec and rides in the provider bag
 // instead (§5c / T9).
 //
+// Mount Source and Options are kept on purpose. They are not secrets by
+// contract — the read API returns them, and models.MountSpec.Validate refuses
+// credential-shaped names in them at intake (an rclone connection-string
+// parameter, an extra_args flag, an NFS option, an invented options key) —
+// and the replicated spec must carry them to re-run the mount on the new
+// owner. Everything the adapters treat as a credential rides in Credentials,
+// which is sealed. Do not scrub Options here: a value removed from the spec
+// but absent from the sealed bag would break the recreate it exists for.
+//
 // Lives next to Put/Open because the two are always called as a pair: put
 // returns the provider handle, redact returns the safe-to-replicate spec, and
 // writing one without the other would either leak secrets (no redact) or lose
