@@ -1,6 +1,8 @@
 package v1
 
 import (
+	"bytes"
+
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -20,6 +22,8 @@ import (
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 type applyStubCluster struct {
@@ -645,4 +649,320 @@ func TestCapacityRequestFromCreate_OverlayDisk(t *testing.T) {
 		t.Fatalf("DiskGB = %d, want 12", got.DiskGB)
 	}
 	_ = capacity.Request{}
+}
+
+func TestClusterInternalSecretHandlerGaps(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "key"))
+	if err != nil {
+		t.Fatalf("cipher: %v", err)
+	}
+	svc := service.New(config.Config{EnableCluster: true}, logger, st, nil, nil, nil, cipher, nil, nil)
+	svc.AttachCluster(cluster.NewNoop("node-a", "http://node-a", ""))
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	delRR := httptest.NewRecorder()
+	h.clusterInternalSecretDelete(delRR, httptest.NewRequest(http.MethodDelete, "/v1/cluster/internal/secrets/", nil))
+	if delRR.Code != http.StatusBadRequest {
+		t.Fatalf("delete missing id = %d", delRR.Code)
+	}
+
+	headRR := httptest.NewRecorder()
+	h.clusterInternalSecretHead(headRR, httptest.NewRequest(http.MethodHead, "/v1/cluster/internal/secrets/", nil))
+	if headRR.Code != http.StatusBadRequest {
+		t.Fatalf("head missing id = %d", headRR.Code)
+	}
+
+	_ = st.Close()
+	delReq := httptest.NewRequest(http.MethodDelete, "/v1/cluster/internal/secrets/sb-x?generation=1&incarnation_id=inc", nil)
+	delReq.SetPathValue("sandboxID", "sb-x")
+	closedDel := httptest.NewRecorder()
+	h.clusterInternalSecretDelete(closedDel, delReq)
+	if closedDel.Code != http.StatusInternalServerError {
+		t.Fatalf("delete closed store = %d", closedDel.Code)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/v1/cluster/internal/secrets/sb-x?min_generation=1&incarnation_id=inc", nil)
+	headReq.SetPathValue("sandboxID", "sb-x")
+	closedHead := httptest.NewRecorder()
+	h.clusterInternalSecretHead(closedHead, headReq)
+	if closedHead.Code != http.StatusInternalServerError {
+		t.Fatalf("head closed store = %d", closedHead.Code)
+	}
+
+	// Placement-unavailable PUT: EnableCluster but no cluster client.
+	svc.ClearClusterForTest()
+	putRR := httptest.NewRecorder()
+	h.clusterInternalSecretPut(putRR, httptest.NewRequest(http.MethodPost, "/v1/cluster/internal/secrets", strings.NewReader(
+		`{"ref":"cluster-secret://sandbox/sb/v1","sandbox_id":"sb","sealed_payload":"YQ=="}`)))
+	if putRR.Code == http.StatusNoContent {
+		t.Fatal("expected put failure without live placement")
+	}
+}
+
+func TestClusterPlacementLookupErrorAndNilReplicate(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&ownerOfStubCluster{
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		err:  errors.New("raft timeout"),
+	})
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/sandboxes/sb-1/placement", nil)
+	req.SetPathValue("id", "sb-1")
+	rr := httptest.NewRecorder()
+	h.clusterPlacement(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("placement status = %d", rr.Code)
+	}
+
+	svc.ClearClusterForTest()
+	h.replicateAddExposedPort(context.Background(), "sb-1", 8080, cluster.ExposedPortRoute{})
+	h.replicateRemoveExposedPort(context.Background(), "sb-1", 8080)
+
+	got := capacityRequestFromCreate(models.CreateSandboxRequest{
+		Runtime:   models.RuntimeIsolate,
+		ModuleRef: models.JSBundleRefForNode("sha256:abc", "worker-b"),
+	})
+	if got.RequiredNodeID == "" {
+		t.Fatalf("expected isolate node-bound required node, got %+v", got)
+	}
+	encoded, ok := models.EncodeNodeAffinity("worker-b")
+	if !ok {
+		t.Fatal("EncodeNodeAffinity")
+	}
+	built := capacityRequestFromCreate(models.CreateSandboxRequest{
+		Image: "aerolvm-build/node-" + encoded + "/abc:latest",
+	})
+	if built.RequiredNodeID != "worker-b" {
+		t.Fatalf("built-image required node = %q", built.RequiredNodeID)
+	}
+	if err := normalizeCreateRuntimeForPlacement(&models.CreateSandboxRequest{Runtime: "nope"}); err == nil {
+		t.Fatal("expected invalid runtime")
+	}
+	minimizePlacementBatchRecord(nil)
+}
+
+func TestClusterForwardWrapUnknownSandboxFallsThrough(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&ownerOfStubCluster{
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		err:  cluster.ErrUnknownSandbox,
+	})
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+	local := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-x", nil)
+	req.SetPathValue("id", "sb-x")
+	rr := httptest.NewRecorder()
+	h.clusterForwardWrap(local).ServeHTTP(rr, req)
+	if rr.Code != http.StatusTeapot {
+		t.Fatalf("unknown sandbox should fall through, status=%d", rr.Code)
+	}
+}
+
+type v1WasmMigrateCluster struct {
+	*cluster.Noop
+	selfID       string
+	targetID     string
+	targetURL    string
+	importClient *http.Client
+	spec         *models.CreateSandboxRequest
+}
+
+func (c *v1WasmMigrateCluster) OwnerOf(string) (cluster.OwnerInfo, error) {
+	return cluster.OwnerInfo{NodeID: c.selfID, IsSelf: true}, nil
+}
+
+func (c *v1WasmMigrateCluster) Members() []cluster.Member {
+	targetURL := c.targetURL
+	if targetURL == "" {
+		targetURL = "http://target"
+	}
+	return []cluster.Member{
+		{NodeID: c.selfID, APIURL: "http://self", Alive: true, Role: config.NodeRoleWorker},
+		{NodeID: c.targetID, APIURL: targetURL, InternalURL: targetURL, Alive: true, Role: config.NodeRoleWorker},
+	}
+}
+
+func (c *v1WasmMigrateCluster) SpecOf(string) *models.CreateSandboxRequest {
+	return c.spec
+}
+
+func (c *v1WasmMigrateCluster) PeerDialMember(m cluster.Member) (*http.Client, string, error) {
+	if c.targetURL == "" || m.NodeID != c.targetID {
+		return nil, "", cluster.ErrPeerInternalURLRequired
+	}
+	return c.importClient, c.targetURL, nil
+}
+
+func seedV1WasmSandbox(t *testing.T, st *storepkg.Store, id string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := st.Create(context.Background(), &models.Sandbox{
+		ID: id, Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm",
+		Image: "file:///tmp/demo.wasm", Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create sandbox %s: %v", id, err)
+	}
+}
+
+func newV1WasmMigrateHarness(t *testing.T, importServer *httptest.Server) (*handlers, *storepkg.Store) {
+	t.Helper()
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	src := filepath.Join(t.TempDir(), "mem.snap")
+	cap := wasmengine.SnapshotCapture{
+		Config: wasmengine.SnapshotConfig{
+			SchemaVersion:   1,
+			Engine:          wasmengine.EngineNameWazero(),
+			BaseModule:      wasmengine.SnapshotBaseModule{Digest: "sha256:abc", Size: 1},
+			Durability:      models.DurabilityPassivatable,
+			CloneGeneration: "gen-handoff",
+		},
+		Memory:    []byte("mem"),
+		Globals:   []byte("[]"),
+		WASIState: []byte("{}"),
+	}
+	if err := wasmengine.WriteSnapshotDir(src, cap); err != nil {
+		t.Fatalf("WriteSnapshotDir: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableWasm: true, WasmModulesDir: t.TempDir()}, logger, st, nil, nil, nil, nil, nil, nil)
+	svc.SetWasmRuntime(v1WasmMigrateHost{snapDir: src, cloneGen: "gen-handoff"})
+	targetURL := ""
+	var importClient *http.Client
+	if importServer != nil {
+		targetURL = importServer.URL
+		importClient = importServer.Client()
+	}
+	svc.AttachCluster(&v1WasmMigrateCluster{
+		Noop:         cluster.NewNoop("node-a", "http://self", ""),
+		selfID:       "node-a",
+		targetID:     "node-b",
+		targetURL:    targetURL,
+		importClient: importClient,
+		spec: &models.CreateSandboxRequest{
+			Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm",
+		},
+	})
+	seedV1WasmSandbox(t, st, "sb-handoff")
+	return &handlers{deps: Deps{Service: svc, Logger: logger}}, st
+}
+
+func TestClusterWasmMigrateSuccess(t *testing.T) {
+	var imported bool
+	importSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/import") {
+			imported = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(importSrv.Close)
+
+	h, _ := newV1WasmMigrateHarness(t, importSrv)
+	body := `{"sandbox_id":"sb-handoff","target_node_id":"node-b"}`
+	rr := httptest.NewRecorder()
+	h.clusterWasmMigrate(rr, httptest.NewRequest(http.MethodPost, cluster.PublicWasmMigratePath, strings.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+	if !imported {
+		t.Fatal("expected target import call")
+	}
+}
+
+func TestClusterInternalWasmMigrateExportSuccess(t *testing.T) {
+	h, _ := newV1WasmMigrateHarness(t, nil)
+	req := httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"sb-handoff/export", nil)
+	req.SetPathValue("id", "sb-handoff")
+	rr := httptest.NewRecorder()
+	h.clusterInternalWasmMigrateExport(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get(cluster.WasmMigrateCloneGenHeader); got != "gen-handoff" {
+		t.Fatalf("clone gen = %q", got)
+	}
+}
+
+func TestClusterInternalWasmMigrateExportOrphaned(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableWasm: true, WasmModulesDir: t.TempDir()}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(&orphanedOwnerCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")})
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"sb-1/export", nil)
+	req.SetPathValue("id", "sb-1")
+	rr := httptest.NewRecorder()
+	h.clusterInternalWasmMigrateExport(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rr.Code)
+	}
+}
+
+type orphanedOwnerCluster struct {
+	*cluster.Noop
+}
+
+func (orphanedOwnerCluster) OwnerOf(string) (cluster.OwnerInfo, error) {
+	return cluster.OwnerInfo{}, cluster.ErrOrphaned
+}
+
+func TestClusterInternalWasmMigrateImportSuccess(t *testing.T) {
+	h, st := newV1WasmMigrateHarness(t, nil)
+
+	exportRR := httptest.NewRecorder()
+	exportReq := httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"sb-handoff/export", nil)
+	exportReq.SetPathValue("id", "sb-handoff")
+	h.clusterInternalWasmMigrateExport(exportRR, exportReq)
+	if exportRR.Code != http.StatusOK {
+		t.Fatalf("export status = %d, body=%s", exportRR.Code, exportRR.Body.String())
+	}
+
+	importReq := httptest.NewRequest(http.MethodPut, cluster.PublicInternalWasmMigratePath+"sb-import/import", bytes.NewReader(exportRR.Body.Bytes()))
+	importReq.SetPathValue("id", "sb-import")
+	importReq.Header.Set(cluster.WasmMigrateCloneGenHeader, exportRR.Header().Get(cluster.WasmMigrateCloneGenHeader))
+	importRR := httptest.NewRecorder()
+	h.clusterInternalWasmMigrateImport(importRR, importReq)
+	if importRR.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body=%s", importRR.Code, importRR.Body.String())
+	}
+	if _, err := st.Get(context.Background(), "sb-import"); err != nil {
+		t.Fatalf("imported sandbox missing: %v", err)
+	}
+}
+
+func TestClusterWasmMigrateServiceNil(t *testing.T) {
+	h := &handlers{deps: Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	rr := httptest.NewRecorder()
+	h.clusterWasmMigrate(rr, httptest.NewRequest(http.MethodPost, cluster.PublicWasmMigratePath, strings.NewReader(`{"sandbox_id":"sb","target_node_id":"node-b"}`)))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+}
+
+func TestClusterInternalWasmMigrateExportMissingID(t *testing.T) {
+	h, _ := newV1WasmMigrateHarness(t, nil)
+	req := httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"/export", nil)
+	req.SetPathValue("id", "")
+	rr := httptest.NewRecorder()
+	h.clusterInternalWasmMigrateExport(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
 }
