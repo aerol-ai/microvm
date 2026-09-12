@@ -369,7 +369,9 @@ func TestSecretAuditIndexFollowsRetentionShiftWithoutRebuild(t *testing.T) {
 	}
 
 	// A rewrite that is not a pure prefix drop (a blank line inside the kept
-	// region) cannot be shifted; it must rebuild, and stay correct.
+	// region) cannot be shifted; it must rebuild, and stay correct. The prune
+	// must drop real records to rewrite at all: the leading checkpoint alone
+	// never triggers one.
 	fh, err := os.OpenFile(f.sink.path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -383,15 +385,17 @@ func TestSecretAuditIndexFollowsRetentionShiftWithoutRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.waitReady(t) // the offset gap degraded the index; the maintainer caught up
-	if err := f.sink.Prune(now.Add(-time.Hour)); err != nil {
+	// Drops sb-span 10..19 and sb-new 0..19 (times now+10s..now+19s and
+	// now..now+19s); sb-new 20..24, 99 and 100 stay behind the blank line.
+	if err := f.sink.Prune(now.Add(20 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	f.waitReady(t)
 	if secretAuditIndexRebuildsTotal.Value() == rebuilds {
 		t.Fatal("inexact rewrite did not rebuild the index")
 	}
-	if ids := f.assertSamePages(t, "sb-new", SecretAuditQuery{Limit: 9}); len(ids) != 27 {
-		t.Fatalf("after rebuild = %d ids", len(ids))
+	if ids := f.assertSamePages(t, "sb-new", SecretAuditQuery{Limit: 9}); len(ids) != 7 {
+		t.Fatalf("after rebuild = %d ids, want 7", len(ids))
 	}
 	f.assertSamePages(t, "sb-span", SecretAuditQuery{Limit: 3})
 }
@@ -956,4 +960,77 @@ func TestSecretAuditIndexHelperErrorPaths(t *testing.T) {
 	// Shift / append hooks after Close are no-ops.
 	f2.idx.onPruned(secretAuditPruneShift{exact: true})
 	f2.idx.onAppended([]secretAuditIndexedLine{{length: 1}})
+}
+
+// Expired records that arrived behind fresh ones are redacted in place; the
+// stubs are shorter, so offsets after them move unevenly and the index must
+// rebuild rather than shift — once, and end up correct.
+func TestSecretAuditIndexRebuildsAfterRedactingPrune(t *testing.T) {
+	f := newIndexedAuditFixture(t)
+	f.waitReady(t)
+	now := time.Now().UTC()
+	old := now.Add(-40 * 24 * time.Hour)
+	for i := range 30 {
+		f.sink.Emit(indexedFixtureEvent("sb-old", "inc", secretAuditKindSecretOpen, i, old.Add(time.Duration(i)*time.Second)))
+	}
+	for i := range 25 {
+		f.sink.Emit(indexedFixtureEvent("sb-new", "inc", secretAuditKindSecretOpen, i, now.Add(time.Duration(i)*time.Second)))
+	}
+	// Late arrivals: expired by time, behind the fresh records in the file.
+	for i := range 10 {
+		f.sink.Emit(indexedFixtureEvent("sb-late", "inc", secretAuditKindEgress, i, old.Add(time.Duration(i)*time.Second)))
+	}
+	if err := f.sink.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	f.waitReady(t)
+	if ids := f.assertSamePages(t, "sb-late", SecretAuditQuery{Limit: 4}); len(ids) != 10 {
+		t.Fatalf("late records before prune = %d", len(ids))
+	}
+	rebuilds := secretAuditIndexRebuildsTotal.Value()
+
+	if err := f.sink.Prune(now.Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	f.waitReady(t)
+	if secretAuditIndexRebuildsTotal.Value() == rebuilds {
+		t.Fatal("a redacting rewrite must rebuild the index; a shift would point at stubs")
+	}
+	f.assertCaughtUp(t)
+	if ids := f.assertSamePages(t, "sb-old", SecretAuditQuery{}); len(ids) != 0 {
+		t.Fatalf("dropped sandbox still has %v", ids)
+	}
+	if ids := f.assertSamePages(t, "sb-late", SecretAuditQuery{}); len(ids) != 0 {
+		t.Fatalf("redacted sandbox still has %v", ids)
+	}
+	if ids := f.assertSamePages(t, "sb-new", SecretAuditQuery{Limit: 6}); len(ids) != 25 {
+		t.Fatalf("kept sandbox after prune = %d ids", len(ids))
+	}
+	raw, err := os.ReadFile(f.sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stubs keep event_id (which this fixture derives from the sandbox name),
+	// so look for the payload fields themselves.
+	if bytes.Contains(raw, []byte(`"sandbox_id":"sb-late"`)) || bytes.Contains(raw, []byte(`"kind":"egress"`)) {
+		t.Fatalf("redacted payload survived: %s", raw)
+	}
+	if n := bytes.Count(raw, []byte(secretAuditKindRetentionRedacted)); n != 10 {
+		t.Fatalf("stubs in file = %d, want 10", n)
+	}
+	report, err := f.svc.VerifySecretAuditChain(context.Background())
+	if err != nil || !report.OK {
+		t.Fatalf("verify after redaction: %+v err=%v", report, err)
+	}
+	if report.Records != 1+25+10 || report.Redacted != 10 {
+		t.Fatalf("verify records=%d redacted=%d, want 36/10", report.Records, report.Redacted)
+	}
+	// Appends after the rebuild continue from the new coverage.
+	f.sink.Emit(indexedFixtureEvent("sb-new", "inc", secretAuditKindSecretOpen, 99, now.Add(time.Hour)))
+	if err := f.sink.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if ids := f.assertSamePages(t, "sb-new", SecretAuditQuery{Limit: 100}); len(ids) != 26 || ids[25] != "sb-new-secret_open-099" {
+		t.Fatalf("append after rebuild = %v", ids)
+	}
 }

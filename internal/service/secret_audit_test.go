@@ -440,37 +440,6 @@ func TestFileAuditSinkFailedGapFlushKeepsPendingCount(t *testing.T) {
 	}
 }
 
-func TestFileAuditSinkPruneOnlyDropsContiguousPrefix(t *testing.T) {
-	sink, err := newFileAuditSink(t.TempDir(), 8)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(sink.Close)
-	now := time.Now().UTC()
-	for _, ev := range []SecretAuditEvent{
-		{Time: now, EventID: "fresh-1", SandboxID: "sb", Result: secretAuditResultSuccess},
-		{Time: now.Add(-48 * time.Hour), EventID: "old-middle", SandboxID: "sb", Result: secretAuditResultSuccess},
-		{Time: now.Add(time.Second), EventID: "fresh-2", SandboxID: "sb", Result: secretAuditResultSuccess},
-	} {
-		if err := sink.EmitDurable(ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := sink.Prune(now.Add(-24 * time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(sink.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := len(nonEmptyLines(string(raw))); got != 3 {
-		t.Fatalf("retained lines = %d, want 3; middle old event is not a droppable prefix", got)
-	}
-	if _, _, err := RecomputeChainHead(sink.path); err != nil {
-		t.Fatalf("chain after prefix-safe prune: %v", err)
-	}
-}
-
 func TestFileAuditSinkRetentionCheckpointDoesNotBlockNextPrune(t *testing.T) {
 	sink, err := newFileAuditSink(t.TempDir(), 8)
 	if err != nil {
