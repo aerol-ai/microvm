@@ -218,6 +218,12 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		}
 		target, err := c.SelectPlacement(capacityRequestFromCreate(req))
 		if err != nil {
+			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
+				// The artifact went with its node; no Retry-After, the client
+				// must re-create it (re-upload the bundle / rebuild the image).
+				apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+				return
+			}
 			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 				if errors.Is(err, cluster.ErrInvalidTopology) {
 					w.Header().Set("Retry-After", "300")
@@ -250,6 +256,12 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 
 	target, candidates, err := c.SelectPlacementWithCandidates(capacityRequestFromCreate(req))
 	if err != nil {
+		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
+			// A node-bound js-bundle whose worker is gone: the client must
+			// re-upload, so no Retry-After — waiting changes nothing.
+			apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+			return
+		}
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
 				w.Header().Set("Retry-After", "300")

@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -89,6 +90,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
 		if err != nil {
+			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
+				// The artifact went with its node; no Retry-After, the client
+				// must re-create it (re-upload the bundle / rebuild the image).
+				apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+				return Decision{}, false
+			}
 			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 				if errors.Is(err, cluster.ErrInvalidTopology) {
 					w.Header().Set("Retry-After", "300")
@@ -120,6 +127,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 
 	target, candidates, err := c.SelectPlacementWithCandidates(CapacityRequestFromCreate(req))
 	if err != nil {
+		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
+			// A node-bound js-bundle whose worker is gone: the client must
+			// re-upload, so no Retry-After — waiting changes nothing.
+			apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+			return Decision{}, false
+		}
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
 				w.Header().Set("Retry-After", "300")

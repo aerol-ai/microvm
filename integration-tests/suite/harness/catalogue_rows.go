@@ -58,6 +58,7 @@ func rtRows() []CatalogueRow {
 		row("RT-09", "Does Firecracker cold-boot from a plain OCI image?", catRT(), "", "boots", scnHetero(), RTFirecracker, "UC-88"),
 		row("RT-10", "Do Firecracker template clones have distinct kernel entropy?", catRT(), "", "unique entropy", scnHetero(), RTFirecracker, "UC-80"),
 		row("RT-11", "Does isolate serve a fetch handler from an uploaded bundle?", catRT(), "", "body matches", scnBoth(), RTIsolate, "UC-103"),
+		row("RT-12", "Is the workerd group process jailed (non-root, chroot, seccomp, cgroup) while serving?", catRT(), "", "confined + serves", scnBoth(), RTIsolate, "UC-109"),
 	}
 }
 

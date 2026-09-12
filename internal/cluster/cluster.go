@@ -119,6 +119,13 @@ var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
 // ingress node must not silently fall back to local Docker ownership.
 var ErrNoPlacementTarget = errors.New("cluster: no worker placement target available")
 
+// ErrArtifactNodeUnavailable is ErrNoPlacementTarget's specific form for a
+// request pinned to one node by an artifact it holds (a node-bound js-bundle
+// or built image) when that node is not a live, capacity-reporting member.
+// errors.Is(err, ErrNoPlacementTarget) stays true; the API adds a code so a
+// client can tell "re-create the artifact" from "wait for capacity".
+var ErrArtifactNodeUnavailable = fmt.Errorf("cluster: the node holding this artifact is unavailable: %w", ErrNoPlacementTarget)
+
 // ErrInvalidTopology is returned when the live cluster shape violates a
 // production topology invariant. API layers translate this to 503 so clients
 // retry after the operator fixes membership instead of treating it as a

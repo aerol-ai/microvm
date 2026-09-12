@@ -3,21 +3,16 @@ package v1
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -26,13 +21,7 @@ const (
 	clusterTemplateItemLeaderHeader = "X-Cluster-Template-Item-Leader"
 )
 
-const (
-	clusterTemplateListConcurrency  = 64
-	clusterTemplateListMaxBytes     = 16 << 20
-	clusterTemplatePeerTimeout      = 5 * time.Second
-	clusterTemplateAggregateTimeout = 10 * time.Second
-	clusterTemplateListCacheTTL     = 2 * time.Second
-)
+const clusterTemplatePeerTimeout = clusterListPeerTimeout
 
 // Template handlers — POST/GET/LIST/DELETE for the Firecracker template
 // pipeline (plans/snapshot-clone-fast-boot.md Phase 2). Template artifacts
@@ -40,34 +29,6 @@ const (
 // them. Cluster mode routes creates to a Firecracker-capable worker, routes
 // item operations from advertised inventory, and coalesces cluster-wide lists
 // on the Raft leader.
-
-type templateListAggregate struct {
-	rows        []*models.Template
-	failedPeers int
-}
-
-type templateListCache struct {
-	mu      sync.RWMutex
-	expires time.Time
-	value   templateListAggregate
-	group   singleflight.Group
-}
-
-func (c *templateListCache) get(now time.Time) (templateListAggregate, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.expires.IsZero() || !now.Before(c.expires) {
-		return templateListAggregate{}, false
-	}
-	return c.value, true
-}
-
-func (c *templateListCache) put(now time.Time, value templateListAggregate) {
-	c.mu.Lock()
-	c.value = value
-	c.expires = now.Add(clusterTemplateListCacheTTL)
-	c.mu.Unlock()
-}
 
 func (h *handlers) clusterCreateTemplateWrap(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get(clusterTemplateForwardedHeader) == "1" {
@@ -132,16 +93,24 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	aggregate, err := h.cachedTemplateList(r, c)
+	aggregate, err := h.templateLists.cached(r, func(req *http.Request) (clusterListAggregate[*models.Template], error) {
+		local, localErr := h.deps.Service.ListTemplates(req.Context())
+		return clusterListSweep(req, c, models.RuntimeFirecracker, clusterTemplateForwardedHeader,
+			local, localErr, templateListKey, h.deps.Logger, "templates")
+	})
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	if aggregate.failedPeers > 0 {
-		w.Header().Set("X-Aerol-Partial", "true")
-		w.Header().Set("X-Aerol-Missing-Template-Peers", fmt.Sprint(aggregate.failedPeers))
-	}
+	writeClusterListCoverage(w, aggregate.failedPeers, "X-Aerol-Missing-Template-Peers")
 	apihttp.WriteJSON(w, http.StatusOK, aggregate.rows)
+}
+
+func templateListKey(tpl *models.Template) string {
+	if tpl == nil {
+		return ""
+	}
+	return tpl.ID
 }
 
 func (h *handlers) forwardTemplateToLeader(w http.ResponseWriter, r *http.Request, c cluster.Client, routedHeader string) bool {
@@ -186,159 +155,6 @@ func templateMemberByID(c cluster.Client, nodeID string) (cluster.Member, bool) 
 		}
 	}
 	return cluster.Member{}, false
-}
-
-func (h *handlers) cachedTemplateList(r *http.Request, c cluster.Client) (templateListAggregate, error) {
-	if cached, ok := h.templateLists.get(time.Now()); ok {
-		return cached, nil
-	}
-	value, err, _ := h.templateLists.group.Do("all", func() (any, error) {
-		if cached, ok := h.templateLists.get(time.Now()); ok {
-			return cached, nil
-		}
-		// Finish the bounded aggregate even if the first ingress caller leaves;
-		// other concurrent callers share this work through singleflight.
-		ctx, cancel := context.WithTimeout(context.Background(), clusterTemplateAggregateTimeout)
-		defer cancel()
-		request := r.Clone(ctx)
-		request.Header = r.Header.Clone()
-		aggregate, err := h.aggregateTemplateList(request, c)
-		if err != nil {
-			return templateListAggregate{}, err
-		}
-		h.templateLists.put(time.Now(), aggregate)
-		return aggregate, nil
-	})
-	if err != nil {
-		return templateListAggregate{}, err
-	}
-	return value.(templateListAggregate), nil
-}
-
-func (h *handlers) aggregateTemplateList(r *http.Request, c cluster.Client) (templateListAggregate, error) {
-	peers := clusterTemplatePeers(c)
-	unavailablePeers := clusterTemplateUnavailablePeerCount(c)
-
-	local, localErr := h.deps.Service.ListTemplates(r.Context())
-	if localErr != nil && h.deps.Logger != nil {
-		h.deps.Logger.Warn("cluster templates: local list failed", "err", localErr)
-	}
-	merged := make([]*models.Template, 0, len(local))
-	seen := map[string]struct{}{}
-	for _, tpl := range local {
-		if tpl == nil {
-			continue
-		}
-		seen[tpl.ID] = struct{}{}
-		merged = append(merged, tpl)
-	}
-
-	successfulPeers := 0
-	for result := range listTemplatesFromPeers(r, c, peers) {
-		if result.err != nil {
-			if h.deps.Logger != nil {
-				h.deps.Logger.Warn("cluster templates: peer list failed", "peer", result.peerID, "err", result.err)
-			}
-			continue
-		}
-		successfulPeers++
-		for _, tpl := range result.rows {
-			if tpl == nil {
-				continue
-			}
-			if _, ok := seen[tpl.ID]; ok {
-				continue
-			}
-			seen[tpl.ID] = struct{}{}
-			merged = append(merged, tpl)
-		}
-	}
-	if localErr != nil && len(merged) == 0 {
-		return templateListAggregate{}, localErr
-	}
-	// The aggregate context may expire before every peer is dispatched. Count
-	// every peer without a successful response as missing so a partial response
-	// can never under-report its coverage gap.
-	failedPeers := unavailablePeers + len(peers) - successfulPeers
-	if localErr != nil {
-		failedPeers++
-	}
-	return templateListAggregate{rows: merged, failedPeers: failedPeers}, nil
-}
-
-type templateListPeerResult struct {
-	peerID string
-	rows   []*models.Template
-	err    error
-}
-
-func listTemplatesFromPeers(parent *http.Request, c cluster.Client, peers []cluster.Member) <-chan templateListPeerResult {
-	results := make(chan templateListPeerResult, len(peers))
-	if len(peers) == 0 {
-		close(results)
-		return results
-	}
-	workers := min(clusterTemplateListConcurrency, len(peers))
-	jobs := make(chan cluster.Member)
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	for range workers {
-		go func() {
-			defer wg.Done()
-			for peer := range jobs {
-				rows, err := listTemplatesFromPeer(parent, c, peer)
-				results <- templateListPeerResult{peerID: peer.NodeID, rows: rows, err: err}
-			}
-		}()
-	}
-	go func() {
-		defer close(jobs)
-		for _, peer := range peers {
-			select {
-			case jobs <- peer:
-			case <-parent.Context().Done():
-				return
-			}
-		}
-	}()
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-	return results
-}
-
-func listTemplatesFromPeer(parent *http.Request, c cluster.Client, peer cluster.Member) ([]*models.Template, error) {
-	client, base, err := dialClusterPeer(c, peer)
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithTimeout(parent.Context(), clusterTemplatePeerTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+parent.URL.RequestURI(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set(clusterTemplateForwardedHeader, "1")
-	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
-	if auth := parent.Header.Get("Authorization"); auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var rows []*models.Template
-	dec := json.NewDecoder(io.LimitReader(resp.Body, clusterTemplateListMaxBytes+1))
-	if err := dec.Decode(&rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
 }
 
 func (h *handlers) clusterTemplateItemWrap(local http.Handler) http.HandlerFunc {
@@ -432,44 +248,10 @@ func templateOwnerFromInventory(c cluster.Client, templateID string) (cluster.Me
 	return owner, unknown, owner.NodeID != ""
 }
 
-func clusterTemplatePeers(c cluster.Client) []cluster.Member {
-	if c == nil {
-		return nil
-	}
-	out := make([]cluster.Member, 0)
-	for _, m := range c.Members() {
-		if !clusterTemplateMemberEligible(c, m) || !m.Alive || strings.TrimSpace(m.InternalURL) == "" {
-			continue
-		}
-		out = append(out, m)
-	}
-	return out
-}
-
-func clusterTemplateUnavailablePeerCount(c cluster.Client) int {
-	if c == nil {
-		return 0
-	}
-	count := 0
-	for _, member := range c.Members() {
-		if !clusterTemplateMemberEligible(c, member) {
-			continue
-		}
-		if !member.Alive || strings.TrimSpace(member.InternalURL) == "" {
-			count++
-		}
-	}
-	return count
-}
-
 // clusterTemplateMemberEligible identifies workers whose template inventory
-// belongs in the cluster control-plane view. Drain state intentionally does not
-// apply: draining prevents new sandbox placement, not administration of
-// artifacts already owned by that worker.
+// belongs in the cluster control-plane view (cluster_list.go for the rule).
 func clusterTemplateMemberEligible(c cluster.Client, member cluster.Member) bool {
-	return c != nil && member.NodeID != "" && member.NodeID != c.SelfNodeID() &&
-		clusterMemberCanOwnSandbox(member.Role) &&
-		clusterMemberSupportsRuntime(member, models.RuntimeFirecracker)
+	return clusterRuntimeMemberEligible(c, member, models.RuntimeFirecracker)
 }
 
 func templatePeerRequest(c cluster.Client, parent *http.Request, raw []byte, peer cluster.Member) (int, http.Header, []byte, error) {

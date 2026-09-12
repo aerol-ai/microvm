@@ -76,7 +76,7 @@ func TestClusterHelpersCoverage(t *testing.T) {
 }
 
 func TestClusterTemplatePeersFiltersMembers(t *testing.T) {
-	if clusterTemplatePeers(nil) != nil {
+	if clusterRuntimePeers(nil, models.RuntimeFirecracker) != nil {
 		t.Fatal("nil cluster should return nil peers")
 	}
 	c := &drainableMembersCluster{
@@ -92,12 +92,16 @@ func TestClusterTemplatePeersFiltersMembers(t *testing.T) {
 		},
 		drained: map[string]bool{"drained": true},
 	}
-	peers := clusterTemplatePeers(c)
+	peers := clusterRuntimePeers(c, models.RuntimeFirecracker)
 	if len(peers) != 2 || peers[0].NodeID != "drained" || peers[1].NodeID != "fc-peer" {
 		t.Fatalf("peers = %+v, want drained and fc-peer", peers)
 	}
-	if got := clusterTemplateUnavailablePeerCount(c); got != 1 {
+	if got := clusterRuntimeUnavailablePeerCount(c, models.RuntimeFirecracker); got != 1 {
 		t.Fatalf("unavailable template peers = %d, want dead worker", got)
+	}
+	// The same rule, keyed by runtime: an isolate list asks isolate workers.
+	if peers := clusterRuntimePeers(c, models.RuntimeIsolate); len(peers) != 0 {
+		t.Fatalf("isolate peers = %+v, want none (no member advertises isolate)", peers)
 	}
 }
 

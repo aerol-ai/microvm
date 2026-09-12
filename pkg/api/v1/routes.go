@@ -144,7 +144,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// runtime's "no image, no registry" upload path. Owner-scoped; per-host.
 	// EXPERIMENTAL until the §10.1 demand checkpoint.
 	mux.Handle("POST "+PathPrefix+"/js-bundles", d.Auth(http.HandlerFunc(h.createJSBundle)))
-	mux.Handle("GET "+PathPrefix+"/js-bundles", d.Auth(http.HandlerFunc(h.listJSBundles)))
+	mux.Handle("GET "+PathPrefix+"/js-bundles", d.Auth(http.HandlerFunc(h.clusterListJSBundlesWrap)))
 	mux.Handle("GET "+PathPrefix+"/js-bundles/{id}", d.Auth(http.HandlerFunc(h.getJSBundle)))
 	mux.Handle("DELETE "+PathPrefix+"/js-bundles/{id}", d.Auth(http.HandlerFunc(h.deleteJSBundle)))
 

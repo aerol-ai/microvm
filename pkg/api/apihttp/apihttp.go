@@ -83,6 +83,12 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 	WriteJSON(w, status, models.ErrorResponse{Error: message})
 }
 
+// WriteErrorCode is WriteError with a stable machine-readable code for
+// errors a client is expected to act on (see models.ErrorCode*).
+func WriteErrorCode(w http.ResponseWriter, status int, code, message string) {
+	WriteJSON(w, status, models.ErrorResponse{Error: message, Code: code})
+}
+
 // WriteStoreAwareError maps the small set of well-known service-layer error
 // kinds to HTTP responses. The mapping (404 for missing sandboxes, 503 for
 // capacity/topology admission failures, 400 for everything else) is a contract

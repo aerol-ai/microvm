@@ -87,6 +87,10 @@ func (h *Host) startSlotServerLocked(slot int) error {
 	if err != nil {
 		return fmt.Errorf("isolate: listen egress slot %d socket: %w", slot, err)
 	}
+	if err := h.grantJailAccess(sock); err != nil {
+		_ = ln.Close()
+		return err
+	}
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			h.serveEgressSlot(slot, w, r)

@@ -202,8 +202,11 @@ nodes = {
 
 Or set `default_with_isolate = true` for every node. After deploy, create with
 `runtime: "isolate"` and a `module_ref` pointing at an uploaded JS bundle
-(`POST /v1/js-bundles`). See [Isolate Sandbox](/isolate-sandbox) for egress
-attribution, residual limits, and the ~4ms warm create path.
+(`POST /v1/js-bundles`). Bundles live on the one worker that received the
+upload; `GET /v1/js-bundles` from any node lists the whole cluster's catalogue,
+and a bundle whose worker is gone must be re-uploaded (the API says so with
+`code: artifact_node_unavailable`). See [Isolate Sandbox](/isolate-sandbox) for
+egress attribution, cluster mode, residual limits, and the ~4ms warm create path.
 
 ## Step 8 - Enable GPU support (optional)
 

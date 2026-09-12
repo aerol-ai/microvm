@@ -2,6 +2,7 @@ package clustercreate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
@@ -647,10 +648,15 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 			err            error
 			wantStatus     int
 			wantRetryAfter string
+			wantCode       string
 		}{
 			{name: "no_target", err: cluster.ErrNoPlacementTarget, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
 			{name: "invalid_topology", err: cluster.ErrInvalidTopology, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "300"},
 			{name: "generic", err: errors.New("boom"), wantStatus: http.StatusInternalServerError},
+			// A node-bound artifact whose worker is gone is written directly
+			// with a machine-readable code and no Retry-After (re-create, do
+			// not wait); it bypasses the caller's writeError.
+			{name: "artifact_node_unavailable", err: cluster.ErrArtifactNodeUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: models.ErrorCodeArtifactNodeUnavailable},
 		}
 
 		for _, tc := range tests {
@@ -658,14 +664,20 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 				stub := &clusterStub{Noop: cluster.NewNoop("node-a", "", ""), selectErr: tc.err}
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
-				var status int
+				status := 0
 				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
 					status = code
 				}, PrepareOptions{})
 				if ok {
 					t.Fatal("Prepare returned ok=true, want false")
 				}
-				if status != tc.wantStatus {
+				if tc.wantCode != "" {
+					var body models.ErrorResponse
+					_ = json.Unmarshal(w.Body.Bytes(), &body)
+					if w.Code != tc.wantStatus || body.Code != tc.wantCode {
+						t.Fatalf("direct write = %d %+v, want %d code %q", w.Code, body, tc.wantStatus, tc.wantCode)
+					}
+				} else if status != tc.wantStatus {
 					t.Fatalf("status = %d, want %d", status, tc.wantStatus)
 				}
 				if got := w.Header().Get("Retry-After"); got != tc.wantRetryAfter {

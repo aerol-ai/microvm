@@ -34,6 +34,14 @@ type Config struct {
 	// Jitless runs V8 with --jitless so the seccomp allowlist can drop the
 	// W^X/JIT syscall surface (per-sandbox paranoid tier, §2.1).
 	Jitless bool
+	// JailCgroupRoot is the parent cgroup (v2) under which each group gets
+	// its own cgroup with the group's caps.
+	JailCgroupRoot string
+	// SeccompMode is enforce | audit | off (pkg/isolate.Seccomp*).
+	SeccompMode string
+	// ShimPath is the daemon binary the jail re-execs to drop privileges and
+	// install seccomp before workerd starts (os.Executable at boot).
+	ShimPath string
 	// IdleTTL is how long a group may sit without Create/Invoke before the
 	// idle reaper tears it down. Zero disables the reaper.
 	IdleTTL time.Duration
@@ -53,6 +61,8 @@ func FromDaemonConfig(cfg config.Config) Config {
 		JailUID:          cfg.IsolateJailUID,
 		JailGID:          cfg.IsolateJailGID,
 		Jitless:          cfg.IsolateJitless,
+		JailCgroupRoot:   cfg.IsolateJailCgroupRoot,
+		SeccompMode:      cfg.IsolateSeccompMode,
 		IdleTTL:          cfg.IsolateGroupIdleTTL,
 		EgressPoolSize:   cfg.IsolateEgressPoolSize,
 	}

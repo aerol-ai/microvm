@@ -407,7 +407,7 @@ func TestForwardTemplateToLeaderBranches(t *testing.T) {
 	if _, ok := templateMemberByID(&membersStubCluster{Noop: cluster.NewNoop("self", "http://self", "")}, "nope"); ok {
 		t.Fatal("expected miss")
 	}
-	if n := clusterTemplateUnavailablePeerCount(nil); n != 0 {
+	if n := clusterRuntimeUnavailablePeerCount(nil, models.RuntimeFirecracker); n != 0 {
 		t.Fatalf("nil cluster count = %d", n)
 	}
 }
@@ -626,7 +626,7 @@ func TestClusterForwardWrapUnknownSandboxFallsThrough(t *testing.T) {
 
 func TestTemplateListCacheHit(t *testing.T) {
 	h := &handlers{deps: Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
-	h.templateLists.put(time.Now(), templateListAggregate{rows: []*models.Template{{ID: "cached"}}})
+	h.templateLists.put(time.Now(), clusterListAggregate[*models.Template]{rows: []*models.Template{{ID: "cached"}}})
 	got, ok := h.templateLists.get(time.Now())
 	if !ok || len(got.rows) != 1 {
 		t.Fatalf("cache hit = %+v ok=%v", got, ok)

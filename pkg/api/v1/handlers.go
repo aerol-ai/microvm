@@ -22,7 +22,8 @@ import (
 // wire encode — so the version boundary stays at this layer.
 type handlers struct {
 	deps          Deps
-	templateLists templateListCache
+	templateLists clusterListCache[*models.Template]
+	jsBundleLists clusterListCache[*models.JSBundle]
 }
 
 func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {

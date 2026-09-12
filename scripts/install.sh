@@ -856,6 +856,22 @@ EOF
 		if [[ -n "${WORKERD_BIN_RESOLVED:-}" && "$WORKERD_BIN_RESOLVED" != "/usr/local/bin/workerd" ]]; then
 			echo "SB_ISOLATE_WORKERD_PATH=$WORKERD_BIN_RESOLVED" >> /etc/sandboxd/sandboxd.env
 		fi
+		# The jail drops each workerd group process to a dedicated system
+		# user. The daemon's default (uid/gid 1000) is the first login user on
+		# most images — on AWS Ubuntu that is `ubuntu`, with sudo — so give the
+		# jail an identity that owns nothing and can log in nowhere.
+		if ! getent passwd sandboxd-isolate >/dev/null 2>&1; then
+			useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-isolate
+		fi
+		ISOLATE_JAIL_UID="$(id -u sandboxd-isolate)"
+		ISOLATE_JAIL_GID="$(id -g sandboxd-isolate)"
+		{
+			echo "SB_ISOLATE_JAIL_UID=${ISOLATE_JAIL_UID}"
+			echo "SB_ISOLATE_JAIL_GID=${ISOLATE_JAIL_GID}"
+			echo "SB_ISOLATE_JAIL_CHROOT_BASE=/srv/isolate-jail"
+			echo "SB_ISOLATE_JAIL_CGROUP_ROOT=/sys/fs/cgroup/aerolvm-isolate"
+		} >> /etc/sandboxd/sandboxd.env
+		install -d -m 0755 /srv/isolate-jail
 	fi
 	# Containerd engine is opt-in and dark by default (plans/containerd-engine.md).
 	# Flipping SB_CONTAINER_ENGINE here does not remove dockerd; coexistence is
