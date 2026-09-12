@@ -1086,6 +1086,26 @@ on the read side by every sender (senders never exclude one another; a waiting
 the write side by `Close`, which flips `closed` first so request-path Emits
 never queue behind a shutdown either.
 
+Ninth stacked PR (review finding #13, two minor security notes): both
+validated. (a) The audit-ingest loopback check skipped itself when the peer
+address did not parse; the listener is TCP loopback so it was unreachable, but
+the logic was inverted — it now fails closed. (b) `RedactClusterSecrets` keeps
+mount `Options` (and `Source`) in the replicated spec. One correction to the
+note's premise: the S3 adapter drives `mount-s3`, which takes credentials only
+through the AWS chain (fed from the sealed `Credentials` profile), so no
+`extra_args` flag carries a secret today; the live exposure was the rclone
+adapter's `source`, whose connection-string syntax (`:s3,secret_access_key=…:b`)
+needs no rclone.conf. Scrubbing the replicated copy alone was rejected: a value
+removed from the spec but absent from the sealed bag silently breaks the
+failover recreate it exists for. Instead `models.MountSpec.ValidateSecretsPlacement` refuses
+credential-shaped names (secret / password / token / access_key / …) in
+`options` keys, `extra_args` flags, NFS `opts` entries and rclone
+connection-string parameters, pointing at `credentials` — on new requests
+only; a stored spec replayed for a failover recreate (already replicated) logs
+a warning and proceeds, since refusing it would lose the sandbox. Docs, the review
+rulebook (§5) and the cluster-secrets checklist now state that `source` and
+`options` are replicated in the clear and only `credentials` is sealed.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

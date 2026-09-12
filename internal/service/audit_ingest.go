@@ -188,13 +188,19 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
-			auditIngestRejectedTotal.Add(1)
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
+	// Loopback-only, failing closed: the listener is bound to 127.0.0.1, so a
+	// peer address that does not parse is not a connection this server
+	// accepted, and it is refused rather than waved past the check.
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
 	}
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, auditIngestMaxBody+1))
