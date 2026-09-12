@@ -308,6 +308,9 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, inca
 // ReconcileSecretDeleteOutbox retries durable peer DELETEs after boot / crash
 // and on the periodic ticker. Work is dispatched through the bounded delete
 // fan-out pool so a large outbox cannot serialize the reconciler for minutes.
+//
+// Without cluster mode there is no transport to the peers these rows name and
+// never will be; see retireStandaloneSecretOutbox for what happens to them.
 func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
@@ -317,7 +320,10 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 	}
 	defer s.refreshSecretLifecycleMetrics(ctx)
 	if s.secretPeerPusher() == nil {
-		return nil
+		if !s.cfg.EnableCluster {
+			return s.retireStandaloneSecretOutbox(ctx)
+		}
+		return nil // cluster mode, transport not attached yet: keep the durable jobs
 	}
 	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
 	defer cancel()
@@ -466,10 +472,114 @@ func (s *Service) pruneClusterAuditACL(ctx context.Context) error {
 	return c.PruneAuditACL(ctx, time.Now().UTC())
 }
 
-// StartSecretDeleteOutboxReconcile runs periodic peer-delete retries so offline
-// recipients are not permanently abandoned after the boot pass. When membership
-// gains a newly-alive node, reconcile runs immediately and secrets are re-fanout
-// so holders re-ACK after rejoin.
+// secretLifecycleNow is the clock the standalone retirement reads; tests
+// advance it instead of aging rows.
+var secretLifecycleNow = time.Now
+
+// retireStandaloneSecretOutbox is what a node without cluster mode does with
+// peer obligations. The rows were written when it was a cluster member (or by
+// destroying a cluster-created sandbox after the downgrade): "push this
+// ciphertext to peers X", "tell peers X to delete theirs". Standalone, neither
+// can ever be sent — there is no transport and no membership — so keeping the
+// rows is not durability, it is a leak that also pins tombstones forever.
+//
+// The rows are retired after SB_SECRET_OUTBOX_STANDALONE_GRACE (measured from
+// their last attempt), so a short cluster-off restart keeps them and a node
+// that rejoins within the grace still owes and retries them. What is given up
+// is bounded: peers retire ciphertext themselves when its placement is gone,
+// and a rejoining node's boot re-fanout re-pushes anything still live. Every
+// retirement is counted and the peers named in the log, so the operator knows
+// which nodes may still hold ciphertext for which lifecycles.
+func (s *Service) retireStandaloneSecretOutbox(ctx context.Context) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	cutoff := secretLifecycleNow().UTC().Add(-s.cfg.SecretOutboxStandaloneGrace)
+	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
+	defer cancel()
+	var (
+		deletesRetired, putsRetired int
+		samplePeers                 = map[string]struct{}{}
+		sample                      []string
+	)
+	notePeers := func(recipients []string) {
+		for _, id := range nonSelfRecipients(recipients, s.selfNodeID()) {
+			if _, seen := samplePeers[id]; seen || len(sample) >= 8 {
+				continue
+			}
+			samplePeers[id] = struct{}{}
+			sample = append(sample, id)
+		}
+	}
+	// Oldest first: the first batch that contains nothing past the cutoff
+	// ends the sweep, so a large young backlog costs one page per tick.
+	for {
+		rows, err := s.store.ListSecretDeleteOutboxBatch(sweepCtx, secretDeleteReconcileBatch)
+		if err != nil {
+			return err
+		}
+		retired := 0
+		for _, rec := range rows {
+			if rec.UpdatedAt.After(cutoff) {
+				break
+			}
+			if err := s.store.DeleteSecretDeleteOutbox(sweepCtx, rec.SandboxID, rec.IncarnationID, rec.Generation); err != nil {
+				return err
+			}
+			clearSecretFanoutHoldersForIncarnation(rec.SandboxID, rec.IncarnationID)
+			notePeers(rec.Recipients)
+			retired++
+		}
+		deletesRetired += retired
+		if retired == 0 || retired < len(rows) {
+			break
+		}
+	}
+	for {
+		rows, err := s.store.ListSecretPutOutboxBatch(sweepCtx, secretDeleteReconcileBatch)
+		if err != nil {
+			return err
+		}
+		retired := 0
+		for _, rec := range rows {
+			if rec.UpdatedAt.After(cutoff) {
+				break
+			}
+			if err := s.store.DeleteSecretPutOutbox(sweepCtx, rec.SandboxID, rec.IncarnationID, rec.SealGeneration); err != nil {
+				return err
+			}
+			notePeers(rec.Recipients)
+			retired++
+		}
+		putsRetired += retired
+		if retired == 0 || retired < len(rows) {
+			break
+		}
+	}
+	if deletesRetired == 0 && putsRetired == 0 {
+		return nil
+	}
+	secretDeleteOutboxRetiredStandalone.Add(int64(deletesRetired))
+	secretPutOutboxRetiredStandalone.Add(int64(putsRetired))
+	if s.logger != nil {
+		s.logger.Warn("standalone: retired peer secret obligations this node can never discharge (cluster mode is off); the named peers may still hold ciphertext until their own retirement scan removes it",
+			"delete_obligations", deletesRetired, "put_obligations", putsRetired,
+			"grace", s.cfg.SecretOutboxStandaloneGrace, "peers_sample", sample)
+	}
+	return nil
+}
+
+// StartSecretDeleteOutboxReconcile runs the secret-lifecycle maintenance loop:
+// periodic peer-delete and peer-put retries so offline recipients are not
+// permanently abandoned after the boot pass, tombstone and audit-ACL pruning,
+// holder possession refresh, and the stale-ciphertext retirement scan. When
+// membership gains a newly-alive node, reconcile runs immediately and secrets
+// are re-fanout so holders re-ACK after rejoin.
+//
+// It runs in every mode. Standalone, the cluster-only steps are no-ops and the
+// outbox/ciphertext steps retire what a node without peers can never finish
+// (retireStandaloneSecretOutbox, runSecretRetirementScan) — the four lifecycle
+// tables must never depend on cluster mode being on to be garbage collected.
 func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 	if s == nil || s.store == nil {
 		return
@@ -1300,6 +1410,10 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 	}
 	defer s.refreshSecretLifecycleMetrics(ctx)
 	if s.secretPeerPusher() == nil {
+		// Cluster mode with the transport not attached yet keeps the rows.
+		// Standalone, both outboxes are retired by one sweep owned by the
+		// delete reconciler (retireStandaloneSecretOutbox) so a tick never
+		// retires twice.
 		return nil
 	}
 	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)

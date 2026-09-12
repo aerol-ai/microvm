@@ -66,3 +66,38 @@ func TestClusterSecretSealSummariesBatchesAcrossChunks(t *testing.T) {
 		t.Fatal("closed store succeeded")
 	}
 }
+
+func TestSandboxAuditIncarnationsBatchesAndSkipsMissing(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	const n = clusterSecretSummaryChunk + 3
+	ids := make([]string, 0, n+2)
+	for i := range n {
+		sb := sampleSandbox(fmt.Sprintf("sb-%d", i))
+		sb.AuditIncarnationID = fmt.Sprintf("inc-%d", i)
+		if err := st.Create(ctx, sb); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		ids = append(ids, sb.ID)
+	}
+	ids = append(ids, "sb-missing", " ", ids[0])
+	got, err := st.SandboxAuditIncarnations(ctx, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != n || got["sb-0"] != "inc-0" || got[fmt.Sprintf("sb-%d", n-1)] != fmt.Sprintf("inc-%d", n-1) {
+		t.Fatalf("incarnations = %d entries, sb-0=%q", len(got), got["sb-0"])
+	}
+	if _, ok := got["sb-missing"]; ok {
+		t.Fatal("missing sandbox reported")
+	}
+	if empty, err := st.SandboxAuditIncarnations(ctx, nil); err != nil || len(empty) != 0 {
+		t.Fatalf("empty = %v err=%v", empty, err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SandboxAuditIncarnations(ctx, ids[:1]); err == nil {
+		t.Fatal("closed store succeeded")
+	}
+}

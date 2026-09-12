@@ -691,7 +691,7 @@ func TestRefanoutReconcileAndAuthorizeWave32(t *testing.T) {
 		cluster:        cl, logger: logger, testSecretPeerPusher: &fakePeerPusher{},
 	}
 
-	if _, err := svc.prepareSecretRefanoutRecord(ctx, storepkg.ClusterSecretRecord{Ref: "not-a-ref"}, false, nil); err == nil {
+	if _, err := svc.prepareSecretRefanoutRecord(ctx, storepkg.ClusterSecretRecord{Ref: "not-a-ref"}, false, nil, nil); err == nil {
 		t.Fatal("invalid refanout ref")
 	}
 	unbound := storepkg.ClusterSecretRecord{
@@ -699,7 +699,7 @@ func TestRefanoutReconcileAndAuthorizeWave32(t *testing.T) {
 		SandboxID: "sb-unbound32", Version: secrets.RefVersion,
 		SealedPayload: []byte("not-sealed"), SealGeneration: 1, Recipients: []string{"node-a", "node-b"},
 	}
-	if _, err := svc.prepareSecretRefanoutRecord(ctx, unbound, false, nil); err == nil {
+	if _, err := svc.prepareSecretRefanoutRecord(ctx, unbound, false, nil, nil); err == nil {
 		t.Fatal("unbound refanout row")
 	}
 
@@ -712,7 +712,7 @@ func TestRefanoutReconcileAndAuthorizeWave32(t *testing.T) {
 		Version: blob.Version, Recipients: blob.Recipients, SealedPayload: blob.SealedPayload,
 		SealGeneration: blob.SealGeneration,
 	}
-	if got, err := svc.prepareSecretRefanoutRecord(ctx, rec, true, nil); err != nil || got != nil {
+	if got, err := svc.prepareSecretRefanoutRecord(ctx, rec, true, nil, nil); err != nil || got != nil {
 		t.Fatalf("missing placement should retire: %v %v", got, err)
 	}
 	cl.placements = map[string]cluster.Placement{
@@ -732,23 +732,23 @@ func TestRefanoutReconcileAndAuthorizeWave32(t *testing.T) {
 		SealGeneration: live.SealGeneration,
 	}
 	cl.placements["sb-live32"] = cluster.Placement{SandboxID: "sb-live32", IncarnationID: "inc-a", OwnerNodeID: "node-a"}
-	got, err := svc.prepareSecretRefanoutRecord(ctx, liveRec, true, cl.placements)
+	got, err := svc.prepareSecretRefanoutRecord(ctx, liveRec, true, cl.placements, nil)
 	if err != nil || got == nil || got.SandboxID != "sb-live32" {
 		t.Fatalf("live refanout blob = %+v err=%v", got, err)
 	}
 	svc.cfg.EnableCluster = false
 	solo := liveRec
 	solo.Recipients = []string{"node-a"}
-	if got, err := svc.prepareSecretRefanoutRecord(ctx, solo, false, cl.placements); err != nil || got != nil {
+	if got, err := svc.prepareSecretRefanoutRecord(ctx, solo, false, cl.placements, nil); err != nil || got != nil {
 		t.Fatalf("single recipient = %v %v", got, err)
 	}
 	solo.Recipients = nil
-	if got, err := svc.prepareSecretRefanoutRecord(ctx, solo, false, cl.placements); err != nil || got != nil {
+	if got, err := svc.prepareSecretRefanoutRecord(ctx, solo, false, cl.placements, nil); err != nil || got != nil {
 		t.Fatalf("empty recipients = %v %v", got, err)
 	}
 	solo.Recipients = []string{"node-a", "node-b"}
 	solo.SealGeneration = 0
-	if _, err := svc.prepareSecretRefanoutRecord(ctx, solo, false, cl.placements); err == nil {
+	if _, err := svc.prepareSecretRefanoutRecord(ctx, solo, false, cl.placements, nil); err == nil {
 		t.Fatal("zero generation refanout")
 	}
 	svc.cfg.EnableCluster = true

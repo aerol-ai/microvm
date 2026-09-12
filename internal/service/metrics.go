@@ -59,6 +59,13 @@ var (
 	secretPutOutboxOldestAgeSeconds    = expvar.NewInt("aerolvm_secret_put_outbox_oldest_age_seconds")
 	secretPutOutboxFailuresTotal       = expvar.NewInt("aerolvm_secret_put_outbox_failures_total")
 	secretTombstones                   = expvar.NewInt("aerolvm_secret_tombstones")
+	// Retirement counters. Standalone retirement is a node without cluster
+	// mode giving up peer obligations it can never discharge (after
+	// SB_SECRET_OUTBOX_STANDALONE_GRACE); ciphertext retirement is either
+	// mode tombing a sealed row whose lifecycle no longer exists.
+	secretDeleteOutboxRetiredStandalone = expvar.NewInt("aerolvm_secret_delete_outbox_retired_standalone_total")
+	secretPutOutboxRetiredStandalone    = expvar.NewInt("aerolvm_secret_put_outbox_retired_standalone_total")
+	secretCiphertextRetiredTotal        = expvar.NewInt("aerolvm_secret_ciphertext_retired_total")
 	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.
 	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
 	// Best-effort local seal failures (ownership replay backfill).

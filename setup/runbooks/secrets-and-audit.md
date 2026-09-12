@@ -289,6 +289,36 @@ After an eligible tomb is pruned, peer PUT still requires a matching live Raft
 placement and exact recorded recipient set; deleted IDs cannot be resurrected
 through the retention boundary.
 
+### Leaving a cluster (cluster→single-node downgrade)
+
+A node that ran in cluster mode keeps four lifecycle tables that only cluster
+traffic could ever settle: sealed rows it holds as a backup for other owners'
+sandboxes, tombstones, and the two peer outboxes (PUTs it still owed, DELETEs
+it still owed). With `SB_ENABLE_CLUSTER=false` the same maintenance loop runs
+and, having no peers, retires what cannot be finished:
+
+1. **Peer obligations** older than `SB_SECRET_OUTBOX_STANDALONE_GRACE`
+   (default 1h since their last attempt) are dropped, counted in
+   `aerolvm_secret_delete_outbox_retired_standalone_total` /
+   `aerolvm_secret_put_outbox_retired_standalone_total`, and logged once per
+   sweep with a sample of the peers involved (`standalone: retired peer secret
+   obligations ...`). Those peers may still hold ciphertext for the named
+   lifecycles until their own retirement scan sees the placement is gone.
+2. **Orphaned ciphertext** — a sealed row whose `(sandbox, incarnation)` has no
+   live local sandbox row — is tombed after the same grace
+   (`aerolvm_secret_ciphertext_retired_total`), exactly as the cluster
+   retirement scan does when a placement disappears. Rows for sandboxes that
+   still run here are never touched.
+3. **Tombstones** are then pruned on `SB_SECRET_TOMB_RETENTION_DAYS` as usual,
+   because nothing pins them any more.
+
+Expect `SandboxdSecretDeleteOutboxStalled` to fire for up to the grace after
+the downgrade (the obligations are visibly stranded, which is the point); it
+clears when they are retired. If the node is going back into the cluster,
+restart it in cluster mode within the grace and it still owes and retries them.
+A node that was a cluster **server or ingress** never held secrets and has
+nothing to retire.
+
 ## Provider canary failure
 
 1. Read `aerolvm_secret_provider_canary_ok` (1 = ok, 0 = failing).
