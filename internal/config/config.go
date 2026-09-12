@@ -1127,6 +1127,15 @@ type Config struct {
 	// secret, or pending outbox are never eligible. Default 30.
 	// SB_SECRET_TOMB_RETENTION_DAYS.
 	SecretTombRetentionDays int
+	// SecretOutboxStandaloneGrace is how long a node running WITHOUT cluster
+	// mode keeps peer secret obligations (pending peer PUTs and DELETEs, and
+	// sealed rows for sandboxes it no longer has) before retiring them. A
+	// standalone node can never reach those peers, so the rows would otherwise
+	// leak forever after a cluster→single-node downgrade; the grace covers a
+	// brief cluster-off restart so a node that rejoins within it still holds
+	// its obligations. Zero retires them on the first sweep. Default 1h.
+	// SB_SECRET_OUTBOX_STANDALONE_GRACE.
+	SecretOutboxStandaloneGrace time.Duration
 	// EgressAttributionEnabled records host-mediated egress destinations
 	// (wasm NetMediator + isolate proxy) into the secret-audit JSONL. Default
 	// ON — observational, dial-path only, never on create. Escape hatch:
@@ -1730,6 +1739,7 @@ func Load() (Config, error) {
 		SecretAuditExternalWitness:    getEnvBool("SB_SECRET_AUDIT_EXTERNAL_WITNESS", false),
 		SecretAuditWitnessInterval:    getEnvDuration("SB_SECRET_AUDIT_WITNESS_INTERVAL", 30*time.Second),
 		SecretTombRetentionDays:       getEnvInt("SB_SECRET_TOMB_RETENTION_DAYS", 30),
+		SecretOutboxStandaloneGrace:   getEnvDuration("SB_SECRET_OUTBOX_STANDALONE_GRACE", time.Hour),
 		EgressAttributionEnabled:      getEnvBool("SB_EGRESS_ATTRIBUTION_ENABLED", true),
 		AuditIngestPort:               getEnvInt("SB_AUDIT_INGEST_PORT", 0),
 		AuditIngestToken:              strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_TOKEN")),
@@ -2306,6 +2316,9 @@ func Load() (Config, error) {
 	}
 	if cfg.SecretTombRetentionDays < 0 {
 		return Config{}, errors.New("SB_SECRET_TOMB_RETENTION_DAYS must be >= 0")
+	}
+	if cfg.SecretOutboxStandaloneGrace < 0 {
+		return Config{}, errors.New("SB_SECRET_OUTBOX_STANDALONE_GRACE must be >= 0")
 	}
 	if cfg.AuditRateLimitIdentity <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_IDENTITY must be > 0")

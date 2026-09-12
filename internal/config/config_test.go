@@ -450,6 +450,22 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			name: "secret_outbox_standalone_grace",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_SECRET_OUTBOX_STANDALONE_GRACE", "0s")
+				cfg, err := Load()
+				if err != nil || cfg.SecretOutboxStandaloneGrace != 0 {
+					t.Fatalf("zero grace: %v err=%v", cfg.SecretOutboxStandaloneGrace, err)
+				}
+				t.Setenv("SB_SECRET_OUTBOX_STANDALONE_GRACE", "-1s")
+				if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_OUTBOX_STANDALONE_GRACE") {
+					t.Fatalf("negative grace err = %v", err)
+				}
+			},
+		},
+		{
 			name: "isolate_seccomp_mode_and_cgroup_root",
 			run: func(t *testing.T) {
 				clearEnv(t)
@@ -910,6 +926,9 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 		if cfg.SecretTombRetentionDays != 30 {
 			t.Fatalf("SecretTombRetentionDays = %d, want 30", cfg.SecretTombRetentionDays)
+		}
+		if cfg.SecretOutboxStandaloneGrace != time.Hour {
+			t.Fatalf("SecretOutboxStandaloneGrace = %v, want 1h", cfg.SecretOutboxStandaloneGrace)
 		}
 		if !cfg.EgressAttributionEnabled {
 			t.Fatal("EgressAttributionEnabled default = false, want true")

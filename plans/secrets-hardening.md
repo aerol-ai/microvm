@@ -1042,6 +1042,19 @@ before `execve`), and enterprise mode requires it with an enforcing filter
 rather than forbidding the runtime. Real-host proof is a new scenario
 (`make integration-single-isolate-jail`, UC-109) that has not yet been run.
 
+Sixth stacked PR (review finding #10, cluster→single-node downgrade): the
+secret-lifecycle reconciler was wired only inside the cluster branch, and both
+per-row reconcilers returned untouched when there was no peer transport, so a
+node that left the cluster kept its `cluster_secrets` / tombstone / put-outbox
+/ delete-outbox rows forever. The same loop now runs standalone; without peers
+it retires obligations it can never send after `SB_SECRET_OUTBOX_STANDALONE_GRACE`
+(default 1h, so a brief cluster-off restart keeps them), tombs sealed rows
+whose `(sandbox, incarnation)` has no live local sandbox (the local table is
+the standalone authority, through the same retirement transaction the cluster
+scan uses), and lets tombstone retention finish the job. Cluster mode with the
+transport not yet attached still keeps every row. Counted and logged with the
+peers named; documented in the runbook ("Leaving a cluster").
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

@@ -665,6 +665,18 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				svc.StartClusterIngressReconcile(ctx)
 			}
 		}
+	} else {
+		// Standalone. The secret-lifecycle tables (sealed rows, tombstones,
+		// both peer outboxes) exist regardless of mode, and a node that left a
+		// cluster still holds rows it can never act on — peer PUTs and DELETEs
+		// with no transport, ciphertext for sandboxes that are not here. The
+		// same reconciler runs here; with no peers it retires those after
+		// SB_SECRET_OUTBOX_STANDALONE_GRACE and prunes tombstones on retention,
+		// so a cluster→single-node downgrade does not leak them forever.
+		if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+			logger.Warn("standalone: secret lifecycle reconcile at boot failed", "error", err)
+		}
+		svc.StartSecretDeleteOutboxReconcile(ctx)
 	}
 
 	// Bypass-flip rollback marker (D5 of plans/warm-direct-route-bypass.md).

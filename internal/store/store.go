@@ -4812,6 +4812,60 @@ func (s *Store) HasSandboxAuditACL(ctx context.Context, sandboxID, incarnationID
 	return true, nil
 }
 
+// SandboxAuditIncarnations returns the live lifecycle of every listed sandbox
+// that has a row, in a handful of round trips. A standalone node has no Raft
+// placement to say which sealed rows are still someone's; this is its
+// authority: a sealed row whose (sandbox, incarnation) is not here is orphaned.
+func (s *Store) SandboxAuditIncarnations(ctx context.Context, ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	pending := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		pending = append(pending, id)
+	}
+	for len(pending) > 0 {
+		chunk := pending
+		if len(chunk) > clusterSecretSummaryChunk {
+			chunk = pending[:clusterSecretSummaryChunk]
+		}
+		pending = pending[len(chunk):]
+		args := make([]any, len(chunk))
+		marks := make([]string, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+			marks[i] = "?"
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT id, audit_incarnation_id FROM sandboxes WHERE id IN (`+strings.Join(marks, ",")+`)
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("read sandbox audit incarnations: %w", err)
+		}
+		for rows.Next() {
+			var id, inc string
+			if err := rows.Scan(&id, &inc); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan sandbox audit incarnation: %w", err)
+			}
+			out[id] = strings.TrimSpace(inc)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate sandbox audit incarnations: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
 // CurrentSandboxAuditIncarnation returns the exact lifecycle linked by the
 // live sandbox row. Retained ACLs are historical authorization records, not a
 // clock-ordered source of truth for the current lifecycle.

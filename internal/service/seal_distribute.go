@@ -686,7 +686,7 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 			return errors.Join(validationErr, err)
 		}
 		for _, rec := range rows {
-			if _, err := s.prepareSecretRefanoutRecord(ctx, rec, true, placements); err != nil {
+			if _, err := s.prepareSecretRefanoutRecord(ctx, rec, true, placements, nil); err != nil {
 				validationErr = errors.Join(validationErr, err)
 			}
 		}
@@ -759,10 +759,51 @@ func (s *Service) authoritativeSecretPlacements(ctx context.Context, ids []strin
 	return placements, nil
 }
 
-func (s *Service) prepareSecretRefanoutRecord(ctx context.Context, rec store.ClusterSecretRecord, seedHolders bool, placements map[string]cluster.Placement) (*secrets.SecretBlob, error) {
+// standaloneLiveIncarnations is the standalone authority for a page of sealed
+// rows: which of their sandboxes still exist here, and under which lifecycle.
+func (s *Service) standaloneLiveIncarnations(ctx context.Context, rows []store.ClusterSecretRecord) (map[string]string, error) {
+	ids := make([]string, 0, len(rows))
+	for _, rec := range rows {
+		if id := strings.TrimSpace(rec.SandboxID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	live, err := s.store.SandboxAuditIncarnations(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("local sandbox lifecycles during standalone secret retirement: %w", err)
+	}
+	return live, nil
+}
+
+// retireStaleSecretRow tombs a sealed row whose lifecycle is gone and journals
+// the peer deletes it implies. The same transaction serves both modes; only
+// the authority that declared the row stale differs.
+func (s *Service) retireStaleSecretRow(ctx context.Context, rec store.ClusterSecretRecord, incarnationID string) error {
+	peers := nonSelfRecipients(rec.Recipients, s.selfNodeID())
+	if _, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, rec.SandboxID, incarnationID, peers); err != nil {
+		return fmt.Errorf("retire stale cluster secret %q: %w", rec.Ref, err)
+	}
+	clearSecretFanoutHoldersForIncarnation(rec.SandboxID, incarnationID)
+	secretCiphertextRetiredTotal.Add(1)
+	return nil
+}
+
+func (s *Service) prepareSecretRefanoutRecord(ctx context.Context, rec store.ClusterSecretRecord, seedHolders bool, placements map[string]cluster.Placement, live map[string]string) (*secrets.SecretBlob, error) {
 	parsed, parseErr := secrets.ParseRef(rec.Ref)
 	if parseErr != nil || strings.TrimSpace(parsed.IncarnationID) == "" {
 		return nil, fmt.Errorf("cluster secret %q lacks required incarnation binding", rec.Ref)
+	}
+	if !s.cfg.EnableCluster && live != nil {
+		// Standalone: the row is someone's only if a local sandbox row carries
+		// exactly this lifecycle. Rows younger than the standalone grace are
+		// left alone so a node that rejoins a cluster within it keeps them.
+		if inc, ok := live[rec.SandboxID]; !ok || inc != parsed.IncarnationID {
+			if rec.UpdatedAt.After(secretLifecycleNow().UTC().Add(-s.cfg.SecretOutboxStandaloneGrace)) {
+				return nil, nil
+			}
+			return nil, s.retireStaleSecretRow(ctx, rec, parsed.IncarnationID)
+		}
+		return nil, nil
 	}
 	if s.cfg.EnableCluster {
 		binding, bindErr := secrets.EnvelopeBinding(rec.SealedPayload)
@@ -776,12 +817,7 @@ func (s *Service) prepareSecretRefanoutRecord(ctx context.Context, rec store.Clu
 		}
 		placement, placementOK := placements[rec.SandboxID]
 		if !placementOK || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != parsed.IncarnationID {
-			peers := nonSelfRecipients(rec.Recipients, s.selfNodeID())
-			if _, cleanupErr := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, rec.SandboxID, parsed.IncarnationID, peers); cleanupErr != nil {
-				return nil, fmt.Errorf("retire stale cluster secret %q: %w", rec.Ref, cleanupErr)
-			}
-			clearSecretFanoutHoldersForIncarnation(rec.SandboxID, parsed.IncarnationID)
-			return nil, nil
+			return nil, s.retireStaleSecretRow(ctx, rec, parsed.IncarnationID)
 		}
 	}
 	if len(rec.Recipients) == 0 {
@@ -815,7 +851,7 @@ func (s *Service) startSecretRefanoutScan(ctx context.Context, pusher cluster.Se
 }
 
 func (s *Service) startSecretRetirementScan(ctx context.Context) {
-	if s == nil || !s.cfg.EnableCluster || s.store == nil {
+	if s == nil || s.store == nil {
 		return
 	}
 	s.startSecretMaintenanceScan(ctx, "cluster: paged stale-secret retirement failed", s.runSecretRetirementScan)
@@ -848,8 +884,12 @@ func (s *Service) startSecretMaintenanceScan(ctx context.Context, failureMessage
 }
 
 // runSecretRetirementScan validates exact lifecycle bindings and tombs rows
-// whose authoritative placement is absent/deleting/reused. It deliberately
+// whose authoritative lifecycle is absent/deleting/reused. It deliberately
 // discards active blobs: periodic GC must not resend the entire active fleet.
+//
+// The authority is the Raft placement in cluster mode and the local sandboxes
+// table standalone (a node without cluster mode has nothing else to ask, and
+// a sealed row whose sandbox is not here belongs to no one it can serve).
 func (s *Service) runSecretRetirementScan(ctx context.Context) error {
 	afterRef := ""
 	var validationErr error
@@ -865,8 +905,15 @@ func (s *Service) runSecretRetirementScan(ctx context.Context) error {
 		if err != nil {
 			return errors.Join(validationErr, err)
 		}
+		var live map[string]string
+		if !s.cfg.EnableCluster {
+			live, err = s.standaloneLiveIncarnations(ctx, rows)
+			if err != nil {
+				return errors.Join(validationErr, err)
+			}
+		}
 		for _, rec := range rows {
-			if _, err := s.prepareSecretRefanoutRecord(ctx, rec, false, placements); err != nil {
+			if _, err := s.prepareSecretRefanoutRecord(ctx, rec, false, placements, live); err != nil {
 				validationErr = errors.Join(validationErr, err)
 			}
 		}
@@ -910,7 +957,7 @@ func (s *Service) runSecretRefanoutScan(ctx context.Context, pusher cluster.Secr
 			return errors.Join(validationErr, err)
 		}
 		for _, rec := range rows {
-			blob, err := s.prepareSecretRefanoutRecord(ctx, rec, false, placements)
+			blob, err := s.prepareSecretRefanoutRecord(ctx, rec, false, placements, nil)
 			if err != nil {
 				validationErr = errors.Join(validationErr, err)
 				continue
