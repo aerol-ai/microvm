@@ -312,6 +312,13 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, inca
 // Without cluster mode there is no transport to the peers these rows name and
 // never will be; see retireStandaloneSecretOutbox for what happens to them.
 func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
+	return s.reconcileSecretDeleteOutboxAt(ctx, secretLifecycleNow())
+}
+
+// reconcileSecretDeleteOutboxAt is ReconcileSecretDeleteOutbox with an explicit
+// "now" for the retry schedule: the ticker passes the clock, the rejoin path
+// passes a time past every backoff so each obligation gets one immediate try.
+func (s *Service) reconcileSecretDeleteOutboxAt(ctx context.Context, now time.Time) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
@@ -325,10 +332,64 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 		}
 		return nil // cluster mode, transport not attached yet: keep the durable jobs
 	}
+	return s.sweepSecretOutbox(ctx, now, secretOutboxSweep{
+		sem:      deleteReconcileSem,
+		inflight: &deleteReconcileInflight,
+		listDue: func(ctx context.Context, now time.Time, limit int) ([]secretOutboxRow, error) {
+			recs, err := s.store.ListSecretDeleteOutboxDue(ctx, now, limit)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]secretOutboxRow, 0, len(recs))
+			for _, rec := range recs {
+				// Only a staged reseal reads the placement; a plain delete
+				// is actionable without one.
+				rows = append(rows, secretOutboxRow{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID, generation: rec.Generation, needsPlacement: rec.AwaitingPromotion})
+			}
+			return rows, nil
+		},
+		deferRow: func(ctx context.Context, row secretOutboxRow) error {
+			return s.store.TouchSecretDeleteOutbox(ctx, row.sandboxID, row.incarnationID, row.generation)
+		},
+		process: func(ctx context.Context, row secretOutboxRow, placements map[string]cluster.Placement) {
+			s.reconcileSecretDeleteOutboxIncarnationWithPlacements(ctx, row.sandboxID, row.incarnationID, placements)
+		},
+	})
+}
+
+// secretOutboxRow is what the shared sweep needs to know about one durable
+// peer obligation, whichever table it came from.
+type secretOutboxRow struct {
+	sandboxID, incarnationID string
+	generation               int64
+	// needsPlacement marks rows whose handling reads the authoritative
+	// placement (every PUT; a staged DELETE awaiting promotion).
+	needsPlacement bool
+}
+
+// secretOutboxSweep is the shape both durable peer-obligation queues share.
+// The tables and the per-row decisions differ; the sweep does not: page the
+// due rows oldest-first, resolve authoritative placements once per page, hand
+// each row to a bounded worker pool behind an in-flight set so the boot pass
+// and the ticker never double-process one lifecycle, and stop when a page
+// yields nothing or the time budget is spent.
+type secretOutboxSweep struct {
+	sem      chan struct{}
+	inflight *sync.Map
+	// listDue returns one page of rows whose retry backoff has elapsed.
+	listDue func(ctx context.Context, now time.Time, limit int) ([]secretOutboxRow, error)
+	// deferRow moves a row to the back of the fair queue without counting an
+	// attempt: the page's placements could not be read, so nothing was tried.
+	deferRow func(ctx context.Context, row secretOutboxRow) error
+	// process handles one row with the page's placements.
+	process func(ctx context.Context, row secretOutboxRow, placements map[string]cluster.Placement)
+}
+
+func (s *Service) sweepSecretOutbox(ctx context.Context, now time.Time, sw secretOutboxSweep) error {
 	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
 	defer cancel()
 	for {
-		rows, err := s.store.ListSecretDeleteOutboxBatch(sweepCtx, secretDeleteReconcileBatch)
+		rows, err := sw.listDue(sweepCtx, now.UTC(), secretDeleteReconcileBatch)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 				return nil
@@ -339,25 +400,21 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 			return nil
 		}
 		placementIDs := make([]string, 0, len(rows))
-		for _, rec := range rows {
-			if rec.AwaitingPromotion {
-				placementIDs = append(placementIDs, rec.SandboxID)
+		for _, row := range rows {
+			if row.needsPlacement {
+				placementIDs = append(placementIDs, row.sandboxID)
 			}
 		}
 		placements, err := s.authoritativeSecretPlacements(sweepCtx, placementIDs)
 		if err != nil {
-			for _, rec := range rows {
-				if rec.AwaitingPromotion {
-					_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), rec.SandboxID, rec.IncarnationID, rec.Generation)
+			for _, row := range rows {
+				if row.needsPlacement {
+					_ = sw.deferRow(context.Background(), row)
 				}
 			}
 			return err
 		}
-		type deleteJob struct {
-			sandboxID     string
-			incarnationID string
-		}
-		jobs := make(chan deleteJob)
+		jobs := make(chan secretOutboxRow)
 		var wg sync.WaitGroup
 		var processed atomic.Int64
 		workers := min(deleteReconcileWorkers, len(rows))
@@ -365,27 +422,27 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for job := range jobs {
-					key := secretDeleteReconcileKey(job.sandboxID, job.incarnationID)
-					if _, loaded := deleteReconcileInflight.LoadOrStore(key, struct{}{}); loaded {
+				for row := range jobs {
+					key := secretDeleteReconcileKey(row.sandboxID, row.incarnationID)
+					if _, loaded := sw.inflight.LoadOrStore(key, struct{}{}); loaded {
 						continue
 					}
 					select {
-					case deleteReconcileSem <- struct{}{}:
-						s.reconcileSecretDeleteOutboxIncarnationWithPlacements(sweepCtx, job.sandboxID, job.incarnationID, placements)
+					case sw.sem <- struct{}{}:
+						sw.process(sweepCtx, row, placements)
 						processed.Add(1)
-						<-deleteReconcileSem
-						deleteReconcileInflight.Delete(key)
+						<-sw.sem
+						sw.inflight.Delete(key)
 					case <-sweepCtx.Done():
-						deleteReconcileInflight.Delete(key)
+						sw.inflight.Delete(key)
 						return
 					}
 				}
 			}()
 		}
-		for _, rec := range rows {
+		for _, row := range rows {
 			select {
-			case jobs <- deleteJob{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID}:
+			case jobs <- row:
 			case <-sweepCtx.Done():
 				close(jobs)
 				wg.Wait()
@@ -611,10 +668,17 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 					}
 				}
 				prevAlive = alive
-				if err := s.ReconcileSecretDeleteOutbox(ctx); err != nil && s.logger != nil {
+				// A member came back: every obligation to it is worth one
+				// immediate try regardless of how far it had backed off, so
+				// "now" is placed past every retry delay for this pass.
+				now := secretLifecycleNow()
+				if rejoined {
+					now = now.Add(store.SecretOutboxBackoffCap)
+				}
+				if err := s.reconcileSecretDeleteOutboxAt(ctx, now); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret delete-outbox reconcile failed", "err", err)
 				}
-				if err := s.ReconcileSecretPutOutbox(ctx); err != nil && s.logger != nil {
+				if err := s.reconcileSecretPutOutboxAt(ctx, now); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret put-outbox reconcile failed", "err", err)
 				}
 				s.refreshSecretHolderPossession(ctx)
@@ -1402,6 +1466,10 @@ func (s *Service) persistSecretPutOutboxRecipients(ctx context.Context, sandboxI
 // Work is dispatched through a bounded worker pool mirroring delete reconcile
 // so a large outbox cannot serialize the reconciler for minutes.
 func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
+	return s.reconcileSecretPutOutboxAt(ctx, secretLifecycleNow())
+}
+
+func (s *Service) reconcileSecretPutOutboxAt(ctx context.Context, now time.Time) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
@@ -1416,84 +1484,27 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 		// retires twice.
 		return nil
 	}
-	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
-	defer cancel()
-	for {
-		rows, err := s.store.ListSecretPutOutboxBatch(sweepCtx, secretDeleteReconcileBatch)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-				return nil
+	return s.sweepSecretOutbox(ctx, now, secretOutboxSweep{
+		sem:      putReconcileSem,
+		inflight: &putReconcileInflight,
+		listDue: func(ctx context.Context, now time.Time, limit int) ([]secretOutboxRow, error) {
+			recs, err := s.store.ListSecretPutOutboxDue(ctx, now, limit)
+			if err != nil {
+				return nil, err
 			}
-			return err
-		}
-		if len(rows) == 0 {
-			return nil
-		}
-		placementIDs := make([]string, 0, len(rows))
-		for _, rec := range rows {
-			placementIDs = append(placementIDs, rec.SandboxID)
-		}
-		placements, err := s.authoritativeSecretPlacements(sweepCtx, placementIDs)
-		if err != nil {
-			for _, rec := range rows {
-				_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), rec.SandboxID, rec.IncarnationID, rec.SealGeneration)
+			rows := make([]secretOutboxRow, 0, len(recs))
+			for _, rec := range recs {
+				rows = append(rows, secretOutboxRow{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID, generation: rec.SealGeneration, needsPlacement: true})
 			}
-			return err
-		}
-		type putJob struct {
-			sandboxID     string
-			incarnationID string
-		}
-		jobs := make(chan putJob)
-		var wg sync.WaitGroup
-		var processed atomic.Int64
-		workers := min(deleteReconcileWorkers, len(rows))
-		for range workers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for job := range jobs {
-					key := secretDeleteReconcileKey(job.sandboxID, job.incarnationID)
-					if _, loaded := putReconcileInflight.LoadOrStore(key, struct{}{}); loaded {
-						continue
-					}
-					select {
-					case putReconcileSem <- struct{}{}:
-						s.reconcileSecretPutOutboxIncarnationWithPlacements(sweepCtx, job.sandboxID, job.incarnationID, placements)
-						processed.Add(1)
-						<-putReconcileSem
-						putReconcileInflight.Delete(key)
-					case <-sweepCtx.Done():
-						putReconcileInflight.Delete(key)
-						return
-					}
-				}
-			}()
-		}
-		for _, rec := range rows {
-			select {
-			case jobs <- putJob{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID}:
-			case <-sweepCtx.Done():
-				close(jobs)
-				wg.Wait()
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				return nil
-			}
-		}
-		close(jobs)
-		wg.Wait()
-		if sweepCtx.Err() != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return nil
-		}
-		if processed.Load() == 0 || len(rows) < secretDeleteReconcileBatch {
-			return nil
-		}
-	}
+			return rows, nil
+		},
+		deferRow: func(ctx context.Context, row secretOutboxRow) error {
+			return s.store.TouchSecretPutOutbox(ctx, row.sandboxID, row.incarnationID, row.generation)
+		},
+		process: func(ctx context.Context, row secretOutboxRow, placements map[string]cluster.Placement) {
+			s.reconcileSecretPutOutboxIncarnationWithPlacements(ctx, row.sandboxID, row.incarnationID, placements)
+		},
+	})
 }
 
 func (s *Service) reconcileSecretPutOutboxIncarnation(parent context.Context, sandboxID, incarnationID string) {
@@ -1509,7 +1520,7 @@ func (s *Service) reconcileSecretPutOutboxIncarnation(parent context.Context, sa
 	}
 	placements, err := s.authoritativeSecretPlacements(parent, []string{sandboxID})
 	if err != nil {
-		_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, incarnationID, rec.SealGeneration)
+		_ = s.store.TouchSecretPutOutbox(context.Background(), sandboxID, incarnationID, rec.SealGeneration)
 		if s.logger != nil {
 			s.logger.Warn("cluster: authoritative placement read for secret put-outbox failed", "sandbox_id", sandboxID, "err", err)
 		}
@@ -1533,7 +1544,7 @@ func (s *Service) reconcileSecretPutOutboxRecord(parent context.Context, rec *st
 	sandboxID := rec.SandboxID
 	if s.cfg.EnableCluster {
 		if placements == nil {
-			_ = s.store.BumpSecretPutOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
+			_ = s.store.TouchSecretPutOutbox(context.Background(), sandboxID, rec.IncarnationID, rec.SealGeneration)
 			return
 		}
 		placement, ok := placements[sandboxID]
@@ -1672,7 +1683,7 @@ func (s *Service) reconcileSecretDeleteOutboxIncarnation(parent context.Context,
 	if rec.AwaitingPromotion {
 		placements, err = s.authoritativeSecretPlacements(parent, []string{sandboxID})
 		if err != nil {
-			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, incarnationID, rec.Generation)
+			_ = s.store.TouchSecretDeleteOutbox(context.Background(), sandboxID, incarnationID, rec.Generation)
 			if s.logger != nil {
 				s.logger.Warn("cluster: authoritative placement read for staged secret retirement failed", "sandbox_id", sandboxID, "err", err)
 			}
@@ -1700,16 +1711,18 @@ func (s *Service) reconcileSecretDeleteOutboxRecord(parent context.Context, rec 
 		// forget retired holders. Never act on it while the old placement is still
 		// authoritative; the old replicas may be the only recoverable copies.
 		if placements == nil {
-			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
+			_ = s.store.TouchSecretDeleteOutbox(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
 			return
 		}
 		placement, ok := placements[sandboxID]
 		if ok && strings.TrimSpace(placement.IncarnationID) == rec.IncarnationID && placement.SecretSealGeneration < rec.Generation {
 			// Yield this deferred row to the back of the oldest-first queue so
 			// a full batch of unpromoted reseals cannot starve actionable deletes.
-			// A missing placement or a different incarnation makes this old
-			// lifecycle safe to retire immediately.
-			_ = s.store.BumpSecretDeleteOutboxAttempt(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
+			// A touch, not an attempt: nothing was tried, so the row must stay
+			// due on the next tick rather than back off. A missing placement
+			// or a different incarnation makes this old lifecycle safe to
+			// retire immediately.
+			_ = s.store.TouchSecretDeleteOutbox(context.Background(), sandboxID, rec.IncarnationID, rec.Generation)
 			return
 		}
 		promoted, err := s.store.MarkSecretDeleteOutboxPromoted(parent, sandboxID, rec.IncarnationID, rec.Generation)
@@ -1794,8 +1807,9 @@ const deleteReconcileWorkers = 64
 const secretDeleteAttemptTimeout = 15 * time.Second
 
 // A sweep keeps filling the bounded worker pool until this batch is drained or
-// its time budget expires. Attempted rows move to the back via updated_at, so
-// persistent failures cannot starve fresh work.
+// its time budget expires. Attempted rows move to the back via updated_at and
+// back off per store.SecretOutboxRetryDelay, so persistent failures neither
+// starve fresh work nor cost a delivery attempt every tick forever.
 const (
 	secretDeleteReconcileBatch  = 1024
 	secretDeleteReconcileBudget = 25 * time.Second

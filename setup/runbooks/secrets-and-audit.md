@@ -317,6 +317,17 @@ and enterprise mode refuses it.
 
 ## Fan-out failures / `failover_ready` false
 
+Peer obligations (the put and delete outboxes) retry on a schedule, not every
+tick: attempt *n* is due `min(30s × 2^(n−1), 15m)` after the last attempt, a
+never-attempted row is due at once, and a member rejoining gives every
+obligation one immediate try regardless of its backoff. Rows whose placement
+could not be read, or whose staged reseal is not yet promoted, are moved to
+the back of the fair queue without counting an attempt, so they stay on the
+30-second cadence. A permanently unreachable recipient therefore costs one
+delivery attempt per 15 minutes per row, and the obligation stays until the
+peer ACKs or retirement removes it; `aerolvm_secret_delete_outbox_pending`
+and the stalled-outbox alert still show it.
+
 1. Check `aerolvm_secret_fanout_failures_total` and recent create logs for
    `secret fanout` warnings.
 2. Confirm recipients are alive (`GET /v1/cluster/members`) and share the

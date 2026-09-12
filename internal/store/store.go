@@ -5427,15 +5427,27 @@ func (s *Store) ClusterSecretSealSummaries(ctx context.Context, refs []string) (
 // order. Requiring an explicit positive bound prevents diagnostics or future
 // callers from accidentally loading a 100k-sandbox backlog into memory.
 func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]SecretDeleteOutboxRecord, error) {
+	return s.listSecretDeleteOutbox(ctx, "", nil, limit)
+}
+
+// ListSecretDeleteOutboxDue is ListSecretDeleteOutboxBatch restricted to rows
+// whose retry backoff has elapsed at now (see SecretOutboxRetryDelay).
+func (s *Store) ListSecretDeleteOutboxDue(ctx context.Context, now time.Time, limit int) ([]SecretDeleteOutboxRecord, error) {
+	where, args := secretOutboxDueClause(now)
+	return s.listSecretDeleteOutbox(ctx, "WHERE "+where, args, limit)
+}
+
+func (s *Store) listSecretDeleteOutbox(ctx context.Context, where string, args []any, limit int) ([]SecretDeleteOutboxRecord, error) {
 	if limit <= 0 {
 		return nil, errors.New("secret delete outbox batch limit must be positive")
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT sandbox_id, incarnation_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
+		`+where+`
 		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
 		LIMIT ?
-	`, limit)
+	`, append(args, limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("list secret delete outbox: %w", err)
 	}
@@ -5457,8 +5469,68 @@ func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]S
 	return out, rows.Err()
 }
 
-// BumpSecretDeleteOutboxAttempt increments attempts after a retry round.
+// Retry schedule for durable peer obligations (both outboxes). Attempt n is
+// due min(SecretOutboxBackoffBase·2^(n-1), SecretOutboxBackoffCap) after the
+// last attempt (updated_at); a row never attempted is due at once. Before
+// this, attempts was counted and never read: a permanently unreachable
+// recipient was retried every tick forever. The schedule lives in the query,
+// not in a Go-side skip, because a backlog of backed-off rows — every
+// obligation to a decommissioned node — would otherwise occupy the whole
+// oldest-first batch and starve fresh work until its backoff expired.
+const (
+	SecretOutboxBackoffBase = 30 * time.Second
+	SecretOutboxBackoffCap  = 15 * time.Minute
+)
+
+// SecretOutboxRetryDelay is how long a row with the given attempt count waits
+// after its last attempt before it is due again.
+func SecretOutboxRetryDelay(attempts int) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+	d := SecretOutboxBackoffBase
+	for i := 1; i < attempts && d < SecretOutboxBackoffCap; i++ {
+		d *= 2
+	}
+	return min(d, SecretOutboxBackoffCap)
+}
+
+// secretOutboxDueClause renders the schedule as a WHERE fragment over
+// (attempts, updated_at): one bound cutoff per distinct delay, the last one
+// covering every attempt count at the cap.
+func secretOutboxDueClause(now time.Time) (string, []any) {
+	now = now.UTC()
+	parts := []string{"attempts <= 0"}
+	var args []any
+	for n := 1; ; n++ {
+		d := SecretOutboxRetryDelay(n)
+		if d >= SecretOutboxBackoffCap {
+			parts = append(parts, "(attempts >= ? AND updated_at <= ?)")
+			args = append(args, n, now.Add(-d))
+			break
+		}
+		parts = append(parts, "(attempts = ? AND updated_at <= ?)")
+		args = append(args, n, now.Add(-d))
+	}
+	return "(" + strings.Join(parts, " OR ") + ")", args
+}
+
+// BumpSecretDeleteOutboxAttempt records a delivery attempt (or a local failure
+// worth backing off): attempts grows and the row moves to the back of the
+// fair queue, due again after SecretOutboxRetryDelay.
 func (s *Store) BumpSecretDeleteOutboxAttempt(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.retrySecretDeleteOutbox(ctx, sandboxID, incarnationID, generation, true)
+}
+
+// TouchSecretDeleteOutbox moves a row to the back of the fair queue without
+// counting an attempt: nothing was tried because the world was not ready (the
+// placement could not be read, or a staged reseal is not yet promoted). The
+// row stays due on the next tick.
+func (s *Store) TouchSecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.retrySecretDeleteOutbox(ctx, sandboxID, incarnationID, generation, false)
+}
+
+func (s *Store) retrySecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, generation int64, countAttempt bool) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
@@ -5470,9 +5542,13 @@ func (s *Store) BumpSecretDeleteOutboxAttempt(ctx context.Context, sandboxID, in
 	if generation <= 0 {
 		return errors.New("secret delete outbox generation must be positive")
 	}
+	set := "updated_at = ?"
+	if countAttempt {
+		set = "attempts = attempts + 1, " + set
+	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_delete_outbox
-		SET attempts = attempts + 1, updated_at = ?
+		SET `+set+`
 		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
 	`, time.Now().UTC(), sandboxID, incarnationID, generation)
 	return err
@@ -5628,15 +5704,27 @@ func (s *Store) GetSecretPutOutboxForIncarnation(ctx context.Context, sandboxID,
 
 // ListSecretPutOutboxBatch returns at most limit pending put fan-out jobs.
 func (s *Store) ListSecretPutOutboxBatch(ctx context.Context, limit int) ([]SecretPutOutboxRecord, error) {
+	return s.listSecretPutOutbox(ctx, "", nil, limit)
+}
+
+// ListSecretPutOutboxDue is ListSecretPutOutboxBatch restricted to rows whose
+// retry backoff has elapsed at now (see SecretOutboxRetryDelay).
+func (s *Store) ListSecretPutOutboxDue(ctx context.Context, now time.Time, limit int) ([]SecretPutOutboxRecord, error) {
+	where, args := secretOutboxDueClause(now)
+	return s.listSecretPutOutbox(ctx, "WHERE "+where, args, limit)
+}
+
+func (s *Store) listSecretPutOutbox(ctx context.Context, where string, args []any, limit int) ([]SecretPutOutboxRecord, error) {
 	if limit <= 0 {
 		return nil, errors.New("secret put outbox batch limit must be positive")
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
 		FROM cluster_secret_put_outbox
+		`+where+`
 		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC, seal_generation ASC
 		LIMIT ?
-	`, limit)
+	`, append(args, limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("list secret put outbox: %w", err)
 	}
@@ -5698,8 +5786,19 @@ func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID, 
 	return nil
 }
 
-// BumpSecretPutOutboxAttempt increments attempts after a retry round.
+// BumpSecretPutOutboxAttempt records a delivery attempt (or a local failure
+// worth backing off); see BumpSecretDeleteOutboxAttempt.
 func (s *Store) BumpSecretPutOutboxAttempt(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64) error {
+	return s.retrySecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration, true)
+}
+
+// TouchSecretPutOutbox moves a row to the back of the fair queue without
+// counting an attempt; see TouchSecretDeleteOutbox.
+func (s *Store) TouchSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64) error {
+	return s.retrySecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration, false)
+}
+
+func (s *Store) retrySecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64, countAttempt bool) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
@@ -5711,9 +5810,13 @@ func (s *Store) BumpSecretPutOutboxAttempt(ctx context.Context, sandboxID, incar
 	if sealGeneration <= 0 {
 		return errors.New("secret put outbox seal generation must be positive")
 	}
+	set := "updated_at = ?"
+	if countAttempt {
+		set = "attempts = attempts + 1, " + set
+	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_secret_put_outbox
-		SET attempts = attempts + 1, updated_at = ?
+		SET `+set+`
 		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
 	`, time.Now().UTC(), sandboxID, incarnationID, sealGeneration)
 	return err
