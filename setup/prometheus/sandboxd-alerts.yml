@@ -399,6 +399,21 @@ groups:
           description: "aerolvm_audit_events_dropped_total increased in the last 5 minutes. The local audit stream has gap markers; history on this node is incomplete."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # One sandbox is over its per-sandbox egress evidence budget. Not data
+      # loss in the gap sense — the refusals are recorded as that sandbox's own
+      # rate_limited record — but sustained firing means a tenant is flooding
+      # (or the budget is too small for a legitimate workload).
+      - alert: SandboxdAuditEgressBudgetExceeded
+        expr: increase(aerolvm_audit_egress_rate_limited_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "a sandbox on this node is over its egress audit budget"
+          description: "aerolvm_audit_egress_rate_limited_total has kept increasing for 10 minutes. Find the sandbox by the rate_limited records in its audit history; raise SB_AUDIT_EGRESS_SANDBOX_RATE/BURST only for a legitimate workload."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # A crash mid-append left an unterminated partial record; the sink cut it
       # at boot and chained a torn_tail gap marker. Evidence before the tear is
       # intact, but whatever was still in the page cache at the crash is gone.

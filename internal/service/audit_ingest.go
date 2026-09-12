@@ -31,6 +31,10 @@ const (
 var (
 	auditIngestAcceptedTotal = expvar.NewInt("aerolvm_audit_ingest_accepted_total")
 	auditIngestRejectedTotal = expvar.NewInt("aerolvm_audit_ingest_rejected_total")
+	// auditIngestThrottledTotal counts events the sandbox's egress evidence
+	// budget refused (429). Not a rejection: the loss is recorded in the
+	// sandbox's own coalesced rate_limited record.
+	auditIngestThrottledTotal = expvar.NewInt("aerolvm_audit_ingest_throttled_total")
 )
 
 var errAuditIngestBindingStale = errors.New("audit ingest capability no longer belongs to an active local sandbox")
@@ -271,6 +275,17 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 	_, event.OwnerRef = ing.svc.auditIdentityFor(sandboxID)
 	if durable, ok := sink.(DurableSecretAuditSink); ok {
 		if err := durable.EmitDurable(event); err != nil {
+			if errors.Is(err, errAuditRateLimited) {
+				// Over the per-sandbox budget. Terminal for the worker: the
+				// daemon has already counted this record toward the
+				// sandbox's coalesced rate_limited entry, so spilling or
+				// retrying it would re-submit the very load the budget
+				// refused.
+				auditIngestThrottledTotal.Add(1)
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "sandbox egress audit budget exhausted", http.StatusTooManyRequests)
+				return
+			}
 			auditIngestRejectedTotal.Add(1)
 			http.Error(w, "audit persistence unavailable", http.StatusServiceUnavailable)
 			return
