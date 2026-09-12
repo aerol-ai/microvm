@@ -1183,6 +1183,17 @@ type Config struct {
 	// keeps the built-in default (gap; spill in enterprise mode).
 	// SB_AUDIT_OVERFLOW_POLICY.
 	AuditOverflowPolicy string
+	// AuditEgressSandboxRate / AuditEgressSandboxBurst are the per-sandbox
+	// egress evidence budget: a token bucket of egress records per second
+	// with the given burst, applied at the audit writer on every path (worker
+	// ingest, worker spill, in-process mediators). Records over budget are
+	// coalesced into one rate_limited record per sandbox instead of written,
+	// so a busy or compromised sandbox cannot grow the node-global evidence
+	// file or starve other tenants' records. Rate 0 disables the budget
+	// (refused in enterprise mode). SB_AUDIT_EGRESS_SANDBOX_RATE,
+	// SB_AUDIT_EGRESS_SANDBOX_BURST.
+	AuditEgressSandboxRate  float64
+	AuditEgressSandboxBurst int
 	// AuditExportFilePath is the file backend target ("-" = stdout).
 	// SB_AUDIT_EXPORT_FILE_PATH.
 	AuditExportFilePath string
@@ -1750,6 +1761,8 @@ func Load() (Config, error) {
 		AuditExportFlushInterval:      getEnvDuration("SB_AUDIT_EXPORT_FLUSH_INTERVAL", time.Second),
 		AuditExportMaxBackoff:         getEnvDuration("SB_AUDIT_EXPORT_MAX_BACKOFF", 5*time.Minute),
 		AuditQueueMax:                 getEnvInt("SB_AUDIT_QUEUE_MAX", 0),
+		AuditEgressSandboxRate:        getEnvFloat("SB_AUDIT_EGRESS_SANDBOX_RATE", 25),
+		AuditEgressSandboxBurst:       getEnvInt("SB_AUDIT_EGRESS_SANDBOX_BURST", 250),
 		AuditOverflowPolicy:           strings.ToLower(strings.TrimSpace(os.Getenv("SB_AUDIT_OVERFLOW_POLICY"))),
 		AuditExportFilePath:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_FILE_PATH")),
 		AuditExportWebhookHMACKey:     strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY")),
@@ -2340,6 +2353,12 @@ func Load() (Config, error) {
 	if err := cfg.AuditExportConfig().Validate(); err != nil {
 		return Config{}, err
 	}
+	if cfg.AuditEgressSandboxRate < 0 {
+		return Config{}, errors.New("SB_AUDIT_EGRESS_SANDBOX_RATE must be >= 0 (0 disables the per-sandbox egress evidence budget)")
+	}
+	if cfg.AuditEgressSandboxBurst < 1 {
+		return Config{}, errors.New("SB_AUDIT_EGRESS_SANDBOX_BURST must be >= 1")
+	}
 	if cfg.AuditQueueMax < 0 {
 		return Config{}, errors.New("SB_AUDIT_QUEUE_MAX must be >= 0")
 	}
@@ -2386,6 +2405,9 @@ func Load() (Config, error) {
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.AuditEgressSandboxRate <= 0 {
+			return Config{}, errors.New("SB_AUDIT_EGRESS_SANDBOX_RATE must be > 0 when SB_ENTERPRISE_MODE=true (one tenant must not be able to grow the shared evidence file without bound)")
 		}
 		// Isolate's cross-tenant boundary is one workerd process per tenant
 		// group; enterprise mode may run it only with that process fully

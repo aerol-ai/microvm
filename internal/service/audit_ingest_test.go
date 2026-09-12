@@ -453,3 +453,50 @@ func TestValidateEgressAuditBindingClusterAndStoreFailures(t *testing.T) {
 		t.Fatalf("closed-store error = %v, want storage failure", err)
 	}
 }
+
+// A sandbox over its egress evidence budget gets 429 per refused record and the
+// refusal is recorded once, as that sandbox's own rate_limited entry, so a
+// flood cannot grow the shared log or hide the fact that it was throttled.
+func TestAuditIngestThrottlesASandboxOverItsEgressBudget(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Create(t.Context(), &models.Sandbox{ID: "sb-flood", Image: "wasm", Status: models.SandboxStatusStarted, AuditIncarnationID: "inc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{cfg: config.Config{DBPath: dbPath, EnterpriseMode: true, AuditEgressSandboxRate: 1, AuditEgressSandboxBurst: 2}, store: st}
+	ing := &auditIngestServer{svc: svc, token: "master-key"}
+	capability := scopedAuditCapability(t, "master-key", "sb-flood", "inc-1")
+	throttled := auditIngestThrottledTotal.Value()
+
+	var codes []int
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodPost, auditIngestPath, strings.NewReader(`{"destination":"example.com:443","network":"tcp"}`))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set(auditIngestHeaderCap, capability)
+		rec := httptest.NewRecorder()
+		ing.handleEgress(rec, req)
+		codes = append(codes, rec.Code)
+		if rec.Code == http.StatusTooManyRequests && rec.Header().Get("Retry-After") != "1" {
+			t.Fatalf("429 without Retry-After: %v", rec.Header())
+		}
+	}
+	want := []int{http.StatusAccepted, http.StatusAccepted, http.StatusTooManyRequests, http.StatusTooManyRequests, http.StatusTooManyRequests}
+	for i := range want {
+		if codes[i] != want[i] {
+			t.Fatalf("status codes = %v, want %v", codes, want)
+		}
+	}
+	if auditIngestThrottledTotal.Value()-throttled != 3 {
+		t.Fatalf("throttled counter +%d, want 3", auditIngestThrottledTotal.Value()-throttled)
+	}
+	// Close flushes what is owed regardless of the marker delay.
+	svc.CloseSecretAuditSink()
+	egress, markers, _ := quotaTestRecords(t, filepath.Join(secretAuditDataDir(dbPath), "audit", secretAuditFileName))
+	if egress["sb-flood"] != 2 || len(markers) != 1 || markers[0].Dropped != 3 || markers[0].SandboxID != "sb-flood" || markers[0].IncarnationID != "inc-1" {
+		t.Fatalf("file egress=%d markers=%+v, want 2 records and one marker owing 3", egress["sb-flood"], markers)
+	}
+}

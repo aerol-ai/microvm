@@ -1125,6 +1125,27 @@ nodes without it (mirrored in `Terraform/validate`), and a gauge
 `aerolvm_cluster_topology_ok` with a critical alert so the open-source
 not-ready state is visible in monitoring, not only in logs and `/health`.
 
+Eleventh stacked PR (review finding #9, no per-sandbox quota on audit
+ingest): confirmed real. The worker posts one egress record per dial, the
+ingest handler and the in-process mediator path emitted every one, and the only
+bound was the node-global writer queue — so a busy or compromised sandbox grew
+the shared evidence file without limit, pushed other tenants' secret-open
+records into the overflow path (spill or gap), and slowed every O(file) pass on
+the node. One detail shaped the fix: the worker spills any record the ingest
+endpoint rejects, and the daemon drains that spill into the same log, so a
+limiter that only answered 429 at the handler would have been bypassed by the
+worker's own fallback. The budget therefore lives at the writer — the one
+funnel every egress record passes through (channel batch and spill drain) — as
+a per-sandbox token bucket (`SB_AUDIT_EGRESS_SANDBOX_RATE` 25/s, burst 250;
+`0` = unbounded, refused in enterprise). Refused records are counted and
+written as one coalesced `egress` record per sandbox (`reason=rate_limited`,
+`dropped=n`) indexed under that sandbox only, so the loss is honest and visible
+to its reader without leaking the flooding sandbox onto other tenants' pages;
+secret-open records and gap markers are exempt. A durable emit learns the
+refusal, the handler maps it to `429`, and the worker treats `429` as final
+instead of spilling. Metrics, a warning alert, and a runbook section ship with
+it. Cardinality control for egress evidence is therefore built, not deferred.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

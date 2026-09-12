@@ -77,6 +77,11 @@ var (
 	workerEgressGapMarkers   = expvar.NewInt("aerolvm_wasm_egress_audit_gap_markers_total")
 	workerEgressSpillBatches = expvar.NewInt("aerolvm_wasm_egress_audit_spill_batches_total")
 	workerEgressSpillFail    = expvar.NewInt("aerolvm_wasm_egress_audit_spill_fail_total")
+	// workerEgressThrottled counts records the daemon refused under the
+	// sandbox's egress evidence budget (429). They are not spilled: the daemon
+	// already owes them to the sandbox's coalesced rate_limited record, and
+	// the spill file is a path into the log, not around the budget.
+	workerEgressThrottled = expvar.NewInt("aerolvm_wasm_egress_audit_throttled_total")
 )
 
 // installDefaultEgressObserver wires destination attribution when
@@ -198,6 +203,13 @@ func postWorkerEgressAudit(job egressAuditJob) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// Terminal: the daemon counted this record toward the sandbox's
+		// coalesced rate_limited entry. Spilling it would re-submit the load
+		// the budget refused.
+		workerEgressThrottled.Add(1)
+		return nil
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return errStatus(resp.StatusCode)
 	}

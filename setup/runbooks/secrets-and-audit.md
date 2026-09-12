@@ -278,6 +278,43 @@ than the window daily, by record time, wherever they sit in the file:
   redacted anything rebuilds the read index once (offsets after a stub move
   unevenly); a pure prefix drop shifts it in place.
 
+## Per-sandbox egress evidence budget
+
+Egress attribution writes one record per outbound connection. Without a
+budget, one busy or compromised sandbox can grow the node-global
+`secrets.jsonl` without bound, fill the bounded writer queue so other tenants'
+secret-open records take the overflow path, and slow every O(file) pass
+(boot verification, retention, index rebuild) for everyone on the node.
+
+Each sandbox therefore has a token bucket of egress records
+(`SB_AUDIT_EGRESS_SANDBOX_RATE` per second, burst
+`SB_AUDIT_EGRESS_SANDBOX_BURST`; defaults 25 / 250). It is applied on the audit
+writer itself, at the one funnel every record passes through, so the worker
+ingest endpoint, the worker spill file, and the in-process mediators are all
+covered and none can route around it. Secret-open records and gap markers are
+never budgeted.
+
+What you see when a sandbox is over budget:
+
+- Its refused records are not written. They are counted and, within about five
+  seconds (immediately at shutdown), written as **one** `egress` record for
+  that sandbox with `reason: rate_limited` and `dropped: n` — indexed under the
+  sandbox, so `GET /v1/sandboxes/{id}/audit` shows the loss to whoever reads
+  that sandbox's history and to nobody else. The chain stays valid.
+- `aerolvm_audit_egress_rate_limited_total` counts refused records;
+  `aerolvm_audit_egress_rate_limit_markers_total` counts the coalesced
+  records; `aerolvm_audit_ingest_throttled_total` counts worker posts answered
+  `429`. Alert `SandboxdAuditEgressBudgetExceeded` fires while refusals
+  continue.
+- Workers treat `429` as final (`aerolvm_wasm_egress_audit_throttled_total`)
+  and do not spill the record; the spill file is a path into the log, not
+  around the budget.
+
+If a legitimate workload needs more per-connection evidence, raise the rate and
+burst — the cost is file growth on that node and export volume. Do not set the
+rate to `0` on a shared node: that is the unbounded state the budget replaces,
+and enterprise mode refuses it.
+
 ## Fan-out failures / `failover_ready` false
 
 1. Check `aerolvm_secret_fanout_failures_total` and recent create logs for

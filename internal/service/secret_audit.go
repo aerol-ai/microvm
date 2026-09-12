@@ -36,6 +36,10 @@ const (
 	secretAuditReasonDecryptFailed   = "decrypt_failed"
 	secretAuditReasonError           = "error"
 	secretAuditReasonOverflow        = "overflow"
+	// secretAuditReasonRateLimited marks the coalesced egress record that
+	// stands for Dropped connections the sandbox's evidence budget refused
+	// (see secret_audit_quota.go).
+	secretAuditReasonRateLimited = "rate_limited"
 	// secretAuditReasonTornTail marks a gap the sink chained at boot after
 	// cutting an unterminated, unparseable tail that a crash left mid-append.
 	secretAuditReasonTornTail = "torn_tail"
@@ -219,6 +223,23 @@ type fileAuditSink struct {
 	// after the rewritten file is in place, so the read index can re-base
 	// before anyone can open the new file.
 	onPruneShift func(secretAuditPruneShift)
+	// egressQuota is the per-sandbox egress evidence budget, applied on the
+	// writer goroutine at every funnel a record can take. nil = unbounded.
+	egressQuota *egressAuditQuota
+}
+
+// fileAuditSinkOptions configures newFileAuditSinkFrom. Zero values keep the
+// built-in defaults; EgressRate 0 leaves egress evidence unbudgeted.
+type fileAuditSinkOptions struct {
+	buffer       int
+	spillEnabled bool
+	bootVerify   string
+	// EgressRate / EgressBurst are the per-sandbox egress token bucket
+	// (records per second, burst). EgressMarkerDelay is how long a refused
+	// count accumulates before its coalesced record is written.
+	egressRate        float64
+	egressBurst       int
+	egressMarkerDelay time.Duration
 }
 
 func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
@@ -234,6 +255,11 @@ func newFileAuditSinkOpts(auditDir string, buffer int, spillEnabled bool) (*file
 // verifies from the last fsynced checkpoint and leaves the prefix to the
 // Service's background pass.
 func newFileAuditSinkWith(auditDir string, buffer int, spillEnabled bool, bootVerify string) (*fileAuditSink, error) {
+	return newFileAuditSinkFrom(auditDir, fileAuditSinkOptions{buffer: buffer, spillEnabled: spillEnabled, bootVerify: bootVerify})
+}
+
+func newFileAuditSinkFrom(auditDir string, opts fileAuditSinkOptions) (*fileAuditSink, error) {
+	buffer, spillEnabled, bootVerify := opts.buffer, opts.spillEnabled, opts.bootVerify
 	if buffer <= 0 {
 		buffer = defaultSecretAuditBuffer
 	}
@@ -258,6 +284,7 @@ func newFileAuditSinkWith(auditDir string, buffer int, spillEnabled bool, bootVe
 		witnessTipPath:   filepath.Join(auditDir, secretAuditWitnessTipFile),
 		spillEnabled:     spillEnabled,
 		bootVerify:       bootVerify,
+		egressQuota:      newEgressAuditQuota(opts.egressRate, opts.egressBurst, opts.egressMarkerDelay),
 	}
 	// Probe the sidecar lock read-write once: withAuditFileLock opens it
 	// read-only (a directory or unwritable path would pass), and a lock the
@@ -708,6 +735,7 @@ func (s *fileAuditSink) loop() {
 				}
 				for s.drainSpill() {
 				}
+				s.flushEgressQuotaMarkers(true)
 				flushGap()
 				_ = s.syncFile()
 				return
@@ -737,6 +765,7 @@ func (s *fileAuditSink) loop() {
 			if next.sync != nil {
 				// Sync must observe spilled events: flush spillCh → spill file → JSONL.
 				flushSpill()
+				s.flushEgressQuotaMarkers(false)
 				flushGap()
 				next.sync <- s.syncFile()
 				continue
@@ -753,6 +782,7 @@ func (s *fileAuditSink) loop() {
 					queued = queued[1:]
 					if control.sync != nil {
 						flushSpill()
+						s.flushEgressQuotaMarkers(false)
 						flushGap()
 						control.sync <- s.syncFile()
 					} else {
@@ -770,19 +800,43 @@ func (s *fileAuditSink) loop() {
 				for i := range end {
 					events[i] = queued[i].ev
 				}
-				err := s.writeEventBatch(events, durable, true)
+				// The budget decides here, at the funnel, so a record refused
+				// on one path cannot re-enter on another; a durable caller
+				// learns the refusal instead of a write result.
+				kept, suppressed := s.egressQuota.admit(events)
+				var err error
+				if len(kept) > 0 {
+					err = s.writeEventBatch(kept, durable, true)
+				}
 				for i := range end {
-					if queued[i].durable != nil {
+					if queued[i].durable == nil {
+						continue
+					}
+					if suppressed != nil && suppressed[i] {
+						queued[i].durable <- errAuditRateLimited
+					} else {
 						queued[i].durable <- err
 					}
 				}
 				queued = queued[end:]
 			}
 		case <-ticker.C:
+			s.flushEgressQuotaMarkers(false)
 			flushGap()
 			_ = s.syncFile()
 		}
 	}
+}
+
+// flushEgressQuotaMarkers writes the coalesced records owed by sandboxes the
+// budget refused (all of them when force is set, for shutdown). Writer
+// goroutine only.
+func (s *fileAuditSink) flushEgressQuotaMarkers(force bool) {
+	markers := s.egressQuota.owedMarkers(force)
+	if len(markers) == 0 {
+		return
+	}
+	_ = s.writeEventBatch(markers, false, true)
 }
 
 // appendSpill durable-appends a batch under the audit flock when the
@@ -892,8 +946,13 @@ func (s *fileAuditSink) drainSpill() bool {
 		if len(batch) == 0 {
 			return true
 		}
-		if err := s.writeEventBatch(batch, true, false); err != nil {
-			return false
+		// Worker-spilled records take the same budget as everything else:
+		// the spill file is a path into the log, not around the quota.
+		kept, _ := s.egressQuota.admit(batch)
+		if len(kept) > 0 {
+			if err := s.writeEventBatch(kept, true, false); err != nil {
+				return false
+			}
 		}
 		if err := persistSpillOffset(offsetPath, start+consumed); err != nil {
 			return false
@@ -1935,7 +1994,10 @@ func (s *Service) ensureSecretAuditSink() {
 		case "spill":
 			spill = true
 		}
-		sink, err := newFileAuditSinkWith(filepath.Join(dataDir, "audit"), buf, spill, s.cfg.SecretAuditBootVerify)
+		sink, err := newFileAuditSinkFrom(filepath.Join(dataDir, "audit"), fileAuditSinkOptions{
+			buffer: buf, spillEnabled: spill, bootVerify: s.cfg.SecretAuditBootVerify,
+			egressRate: s.cfg.AuditEgressSandboxRate, egressBurst: s.cfg.AuditEgressSandboxBurst,
+		})
 		if err != nil {
 			s.secretAuditInitErr = err
 			secretAuditSinkHealthy.Set(0)

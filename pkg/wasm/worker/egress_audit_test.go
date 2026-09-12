@@ -363,3 +363,34 @@ func TestWorkerEgressSpillerRunBacksOffInsteadOfRetryingPerEvent(t *testing.T) {
 		t.Fatal("unreachable")
 	}
 }
+
+// 429 is the daemon saying "over budget, already counted": the record must not
+// be spilled — the spill file is a path into the log, not around the budget —
+// and it is not an IPC failure.
+func TestPostOrSpillWorkerEgressTreatsThrottleAsFinal(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := strings.TrimPrefix(ln.Addr().String(), "127.0.0.1:")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/audit/egress", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "sandbox egress audit budget exhausted", http.StatusTooManyRequests)
+	})
+	go http.Serve(ln, mux)
+
+	spill := newWorkerEgressSpiller(t.TempDir(), "n1") // not started: anything enqueued stays visible
+	throttled, ipcFail := workerEgressThrottled.Value(), workerEgressIPCFail.Value()
+	postOrSpillWorkerEgress(egressAuditJob{
+		port: port, capability: "cap", node: "n1", spill: spill,
+		sandboxID: "sb-1", network: "tcp", address: "example.com:443",
+	})
+	if len(spill.ch) != 0 {
+		t.Fatalf("throttled record was spilled (%d queued)", len(spill.ch))
+	}
+	if workerEgressThrottled.Value()-throttled != 1 || workerEgressIPCFail.Value() != ipcFail {
+		t.Fatalf("throttled +%d ipc_fail +%d, want 1/0", workerEgressThrottled.Value()-throttled, workerEgressIPCFail.Value()-ipcFail)
+	}
+}

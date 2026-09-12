@@ -450,6 +450,27 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			name: "audit_egress_sandbox_budget",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_AUDIT_EGRESS_SANDBOX_RATE", "0")
+				cfg, err := Load()
+				if err != nil || cfg.AuditEgressSandboxRate != 0 {
+					t.Fatalf("rate 0 (no budget) must load outside enterprise: %v err=%v", cfg.AuditEgressSandboxRate, err)
+				}
+				t.Setenv("SB_AUDIT_EGRESS_SANDBOX_RATE", "-1")
+				if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_AUDIT_EGRESS_SANDBOX_RATE") {
+					t.Fatalf("negative rate err = %v", err)
+				}
+				t.Setenv("SB_AUDIT_EGRESS_SANDBOX_RATE", "5")
+				t.Setenv("SB_AUDIT_EGRESS_SANDBOX_BURST", "0")
+				if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_AUDIT_EGRESS_SANDBOX_BURST") {
+					t.Fatalf("zero burst err = %v", err)
+				}
+			},
+		},
+		{
 			name: "secret_outbox_standalone_grace",
 			run: func(t *testing.T) {
 				clearEnv(t)
@@ -935,6 +956,9 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 		if cfg.AuditRateLimitIdentity != 10 || cfg.AuditRateLimitOperator != 50 || cfg.AuditRateLimitNode != 50 {
 			t.Fatalf("audit rate defaults = %v/%v/%v", cfg.AuditRateLimitIdentity, cfg.AuditRateLimitOperator, cfg.AuditRateLimitNode)
+		}
+		if cfg.AuditEgressSandboxRate != 25 || cfg.AuditEgressSandboxBurst != 250 {
+			t.Fatalf("egress budget defaults = %v/%d, want 25/250", cfg.AuditEgressSandboxRate, cfg.AuditEgressSandboxBurst)
 		}
 		if !cfg.AuditIndexEnabled {
 			t.Fatal("AuditIndexEnabled default = false, want true")
