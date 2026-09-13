@@ -351,8 +351,10 @@ to deferred:
   surviving node possesses.
 - **`toolbox_token` plaintext at rest** — closed. The token is always encrypted
   in the existing sandbox row (`toolbox_token_sealed`) with sandbox-bound AAD.
-  There is no plaintext token column or rollout flag. Keeping it in the existing
-  table avoids a second lifecycle/GC implementation.
+  Warm upgrades seal and scrub the legacy plaintext column in the same
+  transaction that drops it. There is no plaintext token column or rollout
+  flag after migration. Keeping it in the existing table avoids a second
+  lifecycle/GC implementation.
 - Issue #70 (full-table scan per tick) — D8 and E1a avoid worsening it.
 
 Added here:
@@ -381,7 +383,7 @@ operator API, not an interface.
 | §2 | **KMS error taxonomy doesn't exist.** T5's sentinels were designed against the local provider; KMS fails as unreachable / throttled / IAM-denied, none of which map. Throttle needs backoff, not failure. | **Provider-agnostic classes**: `ErrProviderUnavailable`, `ErrProviderThrottled`, `ErrProviderDenied`; throttle retries with backoff. Both providers raise the same set, so D7's contract suite tests one contract. | 1 |
 | §2 | **Audit drops are silent** — a gap appears exactly under load, invisible in the record. Invalidates the evidence stream. | **Drop, but never silently**: `aerolvm_audit_events_dropped_total`, a gap marker written into the stream, and an alert. Audit I/O stays off the request path. | 1 |
 | §3 | **Peer-push endpoint has no auth model.** A new HTTP endpoint on every node accepting sealed credential blobs. Anything on the cluster network could write credential rows. **Most serious finding in the plan.** | **Reuse `SB_GOSSIP_SECRET_KEY`** — the trust boundary operators already configure and that cluster mode already requires. Reject unsigned pushes; fail closed. | 2 |
-| §1/§9 | **Format changes are one-way.** | **Final decision:** do not carry mixed-version compatibility. Recipient-set sealing, fan-out, env storage, and toolbox-token sealing are mandatory; only provider selection remains configurable. | 3 |
+| §1/§9 | **Format changes are one-way.** | **Final decision:** do not carry mixed-version runtime compatibility. Recipient-set sealing, fan-out, env storage, and toolbox-token sealing are mandatory; only provider selection remains configurable. The startup schema migration upgrades legacy plaintext env/toolbox rows transactionally before serving traffic. | 3 |
 | §1 | **Fan-out is O(N recipients) per HA create with no batching or concurrency bound.** Fine at 10x, 300x peer traffic at 100x. | **Measure first**: ship the simple fan-out, add an HA-create latency benchmark case so the real curve is visible. No speculative batching — the Firecracker investigation is the precedent for not guessing at the lever. | 0.5 |
 | §6 | **No chaos test for owner death mid-fan-out** — the exact interleaving the feature exists to survive. UC-20's reconcile race is the precedent for what unit tests miss. | **Integration chaos case** in the existing AWS harness: kill the owner mid-fan-out, assert the sandbox is fully recoverable or cleanly failed, never half-sealed. | 3 |
 | §8 | **Zero operator signal.** 12 Grafana dashboards, 8 runbooks, and none would show provider health, fan-out success, audit drops, or failover-readiness. | **Dashboard + alerts + runbook**: one panel set, matching Prometheus rules, and a "secrets and audit" runbook. Wires up metrics D5/D6/D8/E1a already produce. | 2 |

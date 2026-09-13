@@ -91,9 +91,9 @@ func TestRun_ConfigLoadFailureReturnsError(t *testing.T) {
 }
 
 // TestRun_StoreOpenFailureReturnsError: with a loadable config but an
-// unopenable DB path (parent is a regular file, so store.Open's MkdirAll
-// fails), Run must return the wrapped error. This exercises the store.Open
-// boot-failure branch that previously called os.Exit(1).
+// unopenable DB path (parent is a regular file, so store startup's MkdirAll
+// fails), Run must return the wrapped error. This exercises the store boot-
+// failure branch that previously called os.Exit(1).
 func TestRun_StoreOpenFailureReturnsError(t *testing.T) {
 	// A regular file standing where store.Open expects the DB's parent dir.
 	parentAsFile := filepath.Join(t.TempDir(), "not-a-dir")
@@ -103,6 +103,7 @@ func TestRun_StoreOpenFailureReturnsError(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", "test-token")
 	t.Setenv("SB_PUBLIC_HOST", "localhost") // required when SB_DOMAIN is empty
 	t.Setenv("SB_DB_PATH", filepath.Join(parentAsFile, "state.db"))
+	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", filepath.Join(t.TempDir(), "credential.key"))
 
 	err := Run(context.Background(), testLogger(), nil)
 	if err == nil {

@@ -36,6 +36,19 @@ func (s *Store) SetSecretCipher(cipher *secrets.Cipher) {
 const sqliteBusyTimeoutMS = 5000
 
 func Open(path string) (*Store, error) {
+	return open(path, nil)
+}
+
+// OpenWithSecretCipher opens the store with the cipher needed to migrate
+// plaintext secret columns created by releases before secrets hardening. New
+// databases can still use Open and configure the cipher later with
+// SetSecretCipher, but production startup must use this entry point so warm
+// upgrades can seal legacy values before the plaintext columns are removed.
+func OpenWithSecretCipher(path string, secretCipher *secrets.Cipher) (*Store, error) {
+	return open(path, secretCipher)
+}
+
+func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 	// The DB stores encrypted secrets and sandbox metadata.
 	// Lock the directory and file to owner-only so a custom DBPath, a dev
 	// run on a shared host, or any setup that doesn't go through the
@@ -671,6 +684,13 @@ func Open(path string) (*Store, error) {
 		// table. Required for cluster failover to re-pull private images on a
 		// new owner — the runtime layer drops creds after the initial pull.
 		`ALTER TABLE sandboxes ADD COLUMN registry_auth_sealed BLOB NOT NULL DEFAULT X'';`,
+		// AES-GCM-sealed toolbox token. This migration is required for warm
+		// upgrades because CREATE TABLE IF NOT EXISTS does not add the column to
+		// a pre-hardening sandboxes table.
+		`ALTER TABLE sandboxes ADD COLUMN toolbox_token_sealed BLOB NOT NULL DEFAULT X'';`,
+		// Pre-hardening databases already have cluster_secrets, so its new fence
+		// must also be additive rather than relying on CREATE TABLE IF NOT EXISTS.
+		`ALTER TABLE cluster_secrets ADD COLUMN seal_generation INTEGER NOT NULL DEFAULT 0;`,
 		// Protocol of an exposed port: "http" (Caddy HTTP reverse proxy,
 		// historical behavior), "tcp" (caddy-l4 listener at host_port), or
 		// "tls" (caddy-l4 SNI route on the shared TLS listener).
@@ -879,6 +899,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
 	}
+	if err := migrateLegacyPlaintextSecrets(db, secretCipher); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := validateCurrentSecretSchema(db); err != nil {
 		db.Close()
 		return nil, err
@@ -896,13 +920,248 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, secretCipher: secretCipher}, nil
 }
 
-// validateCurrentSecretSchema makes the intentional one-way storage contract
-// explicit at boot. A database with plaintext secret columns or without the
-// sealed toolbox column is rejected instead of starting and failing later on
-// the first create/read.
+const legacySecretMigrationBatchSize = 256
+
+type legacySecretColumns struct {
+	envJSON      bool
+	toolboxToken bool
+}
+
+// migrateLegacyPlaintextSecrets upgrades the two secret columns that existed
+// before secrets hardening. All sealing, side-row writes, plaintext scrubbing,
+// and column drops share one transaction: a malformed row, encryption error,
+// or DDL failure leaves the original schema and every plaintext value intact
+// for a corrected retry. Rows are paged by the sandbox primary key so a large
+// node does not hold every sandbox's secrets in memory during startup.
+func migrateLegacyPlaintextSecrets(db *sql.DB, secretCipher *secrets.Cipher) (retErr error) {
+	columns, err := inspectLegacySecretColumns(db)
+	if err != nil {
+		return err
+	}
+	if !columns.envJSON && !columns.toolboxToken {
+		return nil
+	}
+	if secretCipher == nil {
+		return errors.New("migrate legacy plaintext secrets: secret cipher is required")
+	}
+
+	// Scrub deleted/shortened record content before the transaction is
+	// checkpointed into the main database. Reset this connection afterward so
+	// the one-time upgrade does not add secure-delete overhead to normal GC.
+	if _, err := db.Exec(`PRAGMA secure_delete = ON`); err != nil {
+		return fmt.Errorf("enable secure delete for legacy secret migration: %w", err)
+	}
+	defer func() {
+		if _, err := db.Exec(`PRAGMA secure_delete = OFF`); retErr == nil && err != nil {
+			retErr = fmt.Errorf("disable secure delete after legacy secret migration: %w", err)
+		}
+	}()
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin legacy secret migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	migratedAt := time.Now().UTC()
+	if columns.envJSON {
+		if err := migrateLegacyEnvRows(ctx, tx, secretCipher, migratedAt); err != nil {
+			return err
+		}
+	}
+	if columns.toolboxToken {
+		if err := migrateLegacyToolboxTokenRows(ctx, tx, secretCipher); err != nil {
+			return err
+		}
+	}
+
+	// Overwrite before DROP COLUMN so secure_delete clears both live cells and
+	// discarded record content. The outer transaction still makes this atomic
+	// with every sealed write.
+	if columns.envJSON {
+		if _, err := tx.ExecContext(ctx, `UPDATE sandboxes SET env_json = '{}'`); err != nil {
+			return fmt.Errorf("scrub legacy sandbox env: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE sandboxes DROP COLUMN env_json`); err != nil {
+			return fmt.Errorf("drop legacy sandbox env column: %w", err)
+		}
+	}
+	if columns.toolboxToken {
+		if _, err := tx.ExecContext(ctx, `UPDATE sandboxes SET toolbox_token = ''`); err != nil {
+			return fmt.Errorf("scrub legacy toolbox tokens: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE sandboxes DROP COLUMN toolbox_token`); err != nil {
+			return fmt.Errorf("drop legacy toolbox token column: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit legacy secret migration: %w", err)
+	}
+
+	// WAL mode may leave the pre-migration database pages in the main file
+	// until a checkpoint. Startup owns the only connection here, so force and
+	// truncate the checkpoint before accepting requests.
+	var busy, logFrames, checkpointedFrames int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames); err != nil {
+		return fmt.Errorf("checkpoint legacy secret migration: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("checkpoint legacy secret migration: database remained busy (%d WAL frames, %d checkpointed)", logFrames, checkpointedFrames)
+	}
+	return nil
+}
+
+func inspectLegacySecretColumns(db *sql.DB) (legacySecretColumns, error) {
+	rows, err := db.Query(`PRAGMA table_info(sandboxes)`)
+	if err != nil {
+		return legacySecretColumns{}, fmt.Errorf("inspect legacy sandbox secret schema: %w", err)
+	}
+	defer rows.Close()
+
+	var columns legacySecretColumns
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return legacySecretColumns{}, fmt.Errorf("scan legacy sandbox secret schema: %w", err)
+		}
+		switch name {
+		case "env_json":
+			columns.envJSON = true
+		case "toolbox_token":
+			columns.toolboxToken = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return legacySecretColumns{}, fmt.Errorf("iterate legacy sandbox secret schema: %w", err)
+	}
+	return columns, nil
+}
+
+func migrateLegacyEnvRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets.Cipher, migratedAt time.Time) error {
+	afterID := ""
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, env_json
+			FROM sandboxes
+			WHERE id > ?
+			ORDER BY id
+			LIMIT ?
+		`, afterID, legacySecretMigrationBatchSize)
+		if err != nil {
+			return fmt.Errorf("read legacy sandbox env batch: %w", err)
+		}
+		type legacyEnvRow struct {
+			id  string
+			raw string
+		}
+		batch := make([]legacyEnvRow, 0, legacySecretMigrationBatchSize)
+		for rows.Next() {
+			var row legacyEnvRow
+			if err := rows.Scan(&row.id, &row.raw); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan legacy sandbox env: %w", err)
+			}
+			batch = append(batch, row)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate legacy sandbox env: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close legacy sandbox env rows: %w", err)
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+
+		for _, row := range batch {
+			var env map[string]string
+			if err := json.Unmarshal([]byte(row.raw), &env); err != nil {
+				return fmt.Errorf("decode legacy sandbox env for %q: %w", row.id, err)
+			}
+			if len(env) == 0 {
+				continue
+			}
+			sealed, err := secretCipher.Encrypt([]byte(row.raw))
+			if err != nil {
+				return fmt.Errorf("seal legacy sandbox env for %q: %w", row.id, err)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+				VALUES (?, ?, ?)
+			`, row.id, sealed, migratedAt); err != nil {
+				return fmt.Errorf("store migrated sandbox env for %q: %w", row.id, err)
+			}
+		}
+		afterID = batch[len(batch)-1].id
+	}
+}
+
+func migrateLegacyToolboxTokenRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets.Cipher) error {
+	afterID := ""
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, toolbox_token, toolbox_token_sealed
+			FROM sandboxes
+			WHERE id > ?
+			ORDER BY id
+			LIMIT ?
+		`, afterID, legacySecretMigrationBatchSize)
+		if err != nil {
+			return fmt.Errorf("read legacy toolbox token batch: %w", err)
+		}
+		type legacyToolboxRow struct {
+			id     string
+			token  string
+			sealed []byte
+		}
+		batch := make([]legacyToolboxRow, 0, legacySecretMigrationBatchSize)
+		for rows.Next() {
+			var row legacyToolboxRow
+			if err := rows.Scan(&row.id, &row.token, &row.sealed); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan legacy toolbox token: %w", err)
+			}
+			batch = append(batch, row)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate legacy toolbox tokens: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close legacy toolbox token rows: %w", err)
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+
+		for _, row := range batch {
+			if row.token == "" {
+				continue
+			}
+			if len(row.sealed) != 0 {
+				return fmt.Errorf("migrate legacy toolbox token for %q: sealed value already exists", row.id)
+			}
+			sealed, err := secretCipher.EncryptWithAAD([]byte(row.token), toolboxTokenAAD(row.id))
+			if err != nil {
+				return fmt.Errorf("seal legacy toolbox token for %q: %w", row.id, err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE sandboxes SET toolbox_token_sealed = ? WHERE id = ?`, sealed, row.id); err != nil {
+				return fmt.Errorf("store migrated toolbox token for %q: %w", row.id, err)
+			}
+		}
+		afterID = batch[len(batch)-1].id
+	}
+}
+
+// validateCurrentSecretSchema checks the post-migration storage contract at
+// boot so a malformed database fails before the first create/read.
 func validateCurrentSecretSchema(db *sql.DB) error {
 	rows, err := db.Query(`PRAGMA table_info(sandboxes)`)
 	if err != nil {
