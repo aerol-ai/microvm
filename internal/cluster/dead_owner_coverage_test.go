@@ -41,7 +41,7 @@ func TestDeleteFenceOwnerUnavailableAndReconcileGuards(t *testing.T) {
 	c.reconcileReservations(context.Background())
 }
 
-func TestPickRecreationTargetSelectError(t *testing.T) {
+func TestSelectRecreationTargetNoCapacity(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "self", Alive: true, Role: config.NodeRoleServer, APIURL: "http://self", CapacityStale: true})
 	c := &Cluster{
@@ -51,8 +51,8 @@ func TestPickRecreationTargetSelectError(t *testing.T) {
 		gossip: &gossipNode{memberIndex: index},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	if id, _, _ := c.pickRecreationTarget(&models.CreateSandboxRequest{CPU: 4, MemoryMB: 4096, Image: "x"}); id != "" {
-		t.Fatalf("expected no target, got %q", id)
+	if target, ok := c.selectRecreationTarget(Placement{Spec: &models.CreateSandboxRequest{CPU: 4, MemoryMB: 4096, Image: "x"}}); ok {
+		t.Fatalf("expected no target, got %+v", target)
 	}
 }
 
@@ -121,7 +121,7 @@ func TestFSMOrphanOwnerStaleIndexAndReserveBatchStoreFail(t *testing.T) {
 	}
 }
 
-func TestPickRecreationTargetIsSelf(t *testing.T) {
+func TestSelectRecreationTargetIsSelf(t *testing.T) {
 	fat := step3FatCapacity()
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "self", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://self", Capacity: fat})
@@ -133,9 +133,9 @@ func TestPickRecreationTargetIsSelf(t *testing.T) {
 		gossip:        &gossipNode{memberIndex: index},
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	id, url, host := c.pickRecreationTarget(&models.CreateSandboxRequest{CPU: 1, MemoryMB: 64, Image: "x"})
-	if id != "self" || url != "http://self" || host != "dp" {
-		t.Fatalf("IsSelf target id=%q url=%q host=%q", id, url, host)
+	target, ok := c.selectRecreationTarget(Placement{Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 64, Image: "x"}})
+	if !ok || target.NodeID != "self" || target.APIURL != "http://self" || target.DataPlaneHost != "dp" || !target.IsSelf {
+		t.Fatalf("IsSelf target=%+v ok=%v", target, ok)
 	}
 }
 

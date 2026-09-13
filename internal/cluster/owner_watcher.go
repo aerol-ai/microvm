@@ -164,7 +164,7 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 	if !placementWantsFailoverRecreate(p) {
 		return
 	}
-	target, ok := c.selectRecreationTargetExcluding(p.Spec, c.nodeID)
+	target, ok := c.selectRecreationTarget(p, c.nodeID)
 	if !ok {
 		c.logger.Warn("cluster: no alternate node available for stuck placement; will keep retrying locally",
 			"sandbox_id", id)
@@ -192,11 +192,13 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 		"sandbox_id", id, "from", c.nodeID, "to", target.NodeID)
 }
 
-// selectRecreationTargetExcluding picks a placement target for spec, skipping
-// any node ID listed in exclude. Returns ok=false if no candidate fits — the
-// caller should NOT clear or orphan the placement in that case; better to keep
-// trying locally than abandon a sandbox the operator can fix by adding capacity.
-func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequest, exclude ...string) (PlacementTarget, bool) {
+// selectRecreationTarget picks a placement target for a failover recreate,
+// skipping any node ID listed in exclude. A placement with sealed secrets is
+// restricted to its replicated recipient set: those are the only nodes that
+// can both hold and decrypt the local-provider row. Placements without a
+// secret handle retain ordinary fleet-wide placement behavior.
+func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (PlacementTarget, bool) {
+	spec := p.Spec
 	if spec == nil {
 		return PlacementTarget{}, false
 	}
@@ -208,13 +210,20 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		excluded[id] = struct{}{}
 	}
 	req := capacityRequestFromSpec(spec)
+	// Preserve the existing O(1) power-of-two placement path for the initial
+	// failover of a sandbox that has no secret row. The full deterministic scan
+	// is needed only when exclusions apply or a small recipient set constrains
+	// the candidates.
+	if !placementHasSecretHandle(p) && len(exclude) == 0 {
+		target, err := c.SelectPlacement(req)
+		return target, err == nil
+	}
 	drained := c.fsm.drainedNodesSnapshot()
-	// Score every alive candidate that isn't excluded; pick the one with the
-	// highest headroom. We don't use power-of-two here because the candidate
-	// set is already filtered (and likely small after excludes) — full scan
-	// gives a deterministic best-fit, which matters more for recovery than
-	// for steady-state placement spread.
-	all := c.gossip.members()
+	// Score every eligible candidate that isn't excluded and pick the one with
+	// the highest headroom. Secret-bearing placements normally have only the
+	// owner plus two backups, so the recipient lookup remains O(recipients)
+	// rather than scanning a 2,000-node fleet for every failed sandbox.
+	all := c.recreationCandidates(p)
 	pending := c.fsm.pendingReservationsByNode(time.Now().Unix())
 	var best Member
 	bestScore := -1.0
@@ -255,4 +264,35 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, true
 	}
 	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, DataPlaneHost: best.DataPlaneHost, IsSelf: false}, true
+}
+
+// recreationCandidates returns the existing fleet gossip view for a stuck
+// sandbox without sealed secrets. When a handle is present it resolves only
+// the recorded recipient IDs through the gossip index, because a non-recipient
+// cannot open (and normally does not even store) the local secret row.
+func (c *Cluster) recreationCandidates(p Placement) []Member {
+	if !placementHasSecretHandle(p) {
+		// This path is used only for stuck-owner reassignment (initial
+		// secretless failover returned through SelectPlacement above). Preserve
+		// its existing gossip-view behavior.
+		return c.gossip.members()
+	}
+	if c == nil || c.gossip == nil {
+		return nil
+	}
+	recipientIDs := normalizeSecretRecipientIDs(p.SecretRecipients)
+	members := make([]Member, 0, len(recipientIDs))
+	for _, id := range recipientIDs {
+		if member, ok := c.gossip.lookupMember(id); ok {
+			members = append(members, member)
+		}
+	}
+	if c.capacityLeases != nil {
+		members = c.capacityLeases.apply(members, time.Now())
+	}
+	return members
+}
+
+func placementHasSecretHandle(p Placement) bool {
+	return strings.TrimSpace(p.SecretRef) != "" || p.SecretVersion != 0 || p.SecretSealGeneration != 0
 }

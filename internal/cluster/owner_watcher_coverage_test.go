@@ -29,7 +29,7 @@ func TestSelectRecreationTargetExcludingFilters(t *testing.T) {
 		gossip: &gossipNode{memberIndex: index},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	target, ok := c.selectRecreationTargetExcluding(&models.CreateSandboxRequest{CPU: 1, MemoryMB: 64}, "self")
+	target, ok := c.selectRecreationTarget(Placement{Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 64}}, "self")
 	if !ok || target.NodeID != "peer" {
 		t.Fatalf("target=%+v ok=%v", target, ok)
 	}
@@ -38,7 +38,7 @@ func TestSelectRecreationTargetExcludingFilters(t *testing.T) {
 		{NodeID: "self", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://self", Capacity: fat},
 		{NodeID: "tiny", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://t", Capacity: capacity.Snapshot{HostCPUCores: 1, CanAdmit: false, Reasons: []string{"full"}}},
 	})
-	target, ok = c.selectRecreationTargetExcluding(&models.CreateSandboxRequest{CPU: 1, MemoryMB: 64})
+	target, ok = c.selectRecreationTarget(Placement{Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 64}})
 	if !ok || !target.IsSelf {
 		t.Fatalf("self target=%+v ok=%v", target, ok)
 	}
