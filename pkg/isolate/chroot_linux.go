@@ -25,13 +25,25 @@ var jailDevNodes = []struct {
 	{"urandom", 1, 9, 0o666},
 }
 
-// makeDevNodes creates the device nodes in dir (root only).
+// makeDevNodes creates the device nodes in dir. Root + CAP_MKNOD produces
+// real character devices; unprivileged hosts (CI, unit tests) get empty
+// regular placeholders so PrepareJailBase can still build the tree.
+// applyJail refuses to realize without root, so a production jail never
+// starts on these stand-ins.
 func makeDevNodes(dir string) error {
 	for _, n := range jailDevNodes {
 		path := filepath.Join(dir, n.name)
 		_ = os.Remove(path)
 		dev := unix.Mkdev(n.major, n.minor)
 		if err := unix.Mknod(path, unix.S_IFCHR|n.mode, int(dev)); err != nil {
+			if err == unix.EPERM || err == unix.EACCES {
+				f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, os.FileMode(n.mode))
+				if ferr != nil {
+					return fmt.Errorf("isolate jail: mknod %s: %w (placeholder: %v)", path, err, ferr)
+				}
+				_ = f.Close()
+				continue
+			}
 			return fmt.Errorf("isolate jail: mknod %s: %w", path, err)
 		}
 		if err := os.Chmod(path, os.FileMode(n.mode)); err != nil {

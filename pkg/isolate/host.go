@@ -246,6 +246,12 @@ func (h *Host) Start(ctx context.Context) error {
 		realized, err = applyJail(cmd, h.cfg.Jail, workerdArgs)
 		if err != nil {
 			_ = h.stopServers()
+			// MkdirAll(RunDir) may have created <chroot>/run before applyJail
+			// refused (non-root, missing shim, …). Drop the group tree so a
+			// failed required-jail start never leaves a half-built chroot.
+			if dir := h.cfg.Jail.ChrootDir; dir != "" {
+				_ = os.RemoveAll(dir)
+			}
 			return fmt.Errorf("isolate: jail required but not realized here — refusing to spawn workerd unconfined (set SB_ISOLATE_USE_JAIL=false to run without a jail, accepting the risk): %w", err)
 		}
 		if len(realized.unknownSyscalls) > 0 {

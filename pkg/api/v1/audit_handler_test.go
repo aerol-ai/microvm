@@ -102,23 +102,32 @@ func TestGetSandboxAuditReturnsEvents(t *testing.T) {
 		t.Fatalf("GetSandboxWithOptions: %v", err)
 	}
 
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/"+sbID+"/audit", nil)
-	req.SetPathValue("id", sbID)
-	req = req.WithContext(controlplane.ContextWithAccess(req.Context(), controlplane.Access{Operator: true}))
-	h.getSandboxAudit(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
-	}
+	// loadEnv emits asynchronously; wait for the writer (and per-sandbox
+	// index) before asserting the page — -race makes the lag visible.
+	deadline := time.Now().Add(2 * time.Second)
 	var page service.SecretAuditPage
-	if err := json.Unmarshal(rr.Body.Bytes(), &page); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if page.Coverage.Partial {
-		t.Fatalf("unexpected partial: %+v", page.Coverage)
-	}
-	if len(page.Events) == 0 {
-		t.Fatal("expected the audited sandbox read")
+	for {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/"+sbID+"/audit", nil)
+		req.SetPathValue("id", sbID)
+		req = req.WithContext(controlplane.ContextWithAccess(req.Context(), controlplane.Access{Operator: true}))
+		h.getSandboxAudit(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &page); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if page.Coverage.Partial {
+			t.Fatalf("unexpected partial: %+v", page.Coverage)
+		}
+		if len(page.Events) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected the audited sandbox read")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	for _, event := range page.Events {
 		if event.IncarnationID != "inc-audit-1" {

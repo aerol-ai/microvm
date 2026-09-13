@@ -543,12 +543,12 @@ func TestDeleteClusterSecretsAndRecipientsWave31(t *testing.T) {
 	}
 
 	svc.cfg.EnableCluster = true
-	svc.cluster = &wave30AuthCluster{
+	svc.AttachCluster(&wave30AuthCluster{
 		Noop: cluster.NewNoop("node-a", "http://a", ""),
 		placements: map[string]cluster.Placement{
 			"sb-place-del31": {SandboxID: "sb-place-del31", IncarnationID: "inc-a", SecretRecipients: []string{"node-a", "node-d"}},
 		},
-	}
+	})
 	recips, err = svc.secretRecipientsForDelete(ctx, "sb-place-del31", "inc-a")
 	if err != nil || !sameStringSlice(recips, []string{"node-a", "node-d"}) {
 		t.Fatalf("placement recipients = %v %v", recips, err)
