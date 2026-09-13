@@ -15,6 +15,10 @@ func TestWorkerEgressAuditGapAndErrorHelpers(t *testing.T) {
 
 	// A nil spill writer counts every loss and never touches a disk.
 	var none *workerEgressSpiller
+	none.Close()
+	none.start()
+	idle := newWorkerEgressSpiller(t.TempDir(), "n")
+	idle.Close() // never started
 	before := workerEgressDropped.Load()
 	none.enqueue(workerEgressAuditEvent{SandboxID: "sb-1"})
 	none.noteDrop(2)

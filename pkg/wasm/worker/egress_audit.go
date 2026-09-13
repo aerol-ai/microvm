@@ -237,6 +237,11 @@ type workerEgressSpiller struct {
 	once    sync.Once
 	// sleep is the retry pause after a failed append (tests replace it).
 	sleep func(time.Duration)
+	// stop/done let Close park the writer so tests can release t.TempDir
+	// without racing a flock or a recreate-after-unlink. Workers just exit.
+	stop     chan struct{}
+	stopOnce sync.Once
+	done     chan struct{}
 }
 
 func newWorkerEgressSpiller(dir, node string) *workerEgressSpiller {
@@ -249,6 +254,7 @@ func newWorkerEgressSpiller(dir, node string) *workerEgressSpiller {
 		ch:    make(chan workerEgressAuditEvent, workerEgressSpillQueue),
 		kick:  make(chan struct{}, 1),
 		sleep: time.Sleep,
+		stop:  make(chan struct{}),
 	}
 }
 
@@ -256,7 +262,23 @@ func (s *workerEgressSpiller) start() {
 	if s == nil {
 		return
 	}
-	s.once.Do(func() { go s.run() })
+	s.once.Do(func() {
+		s.done = make(chan struct{})
+		go s.run()
+	})
+}
+
+// Close stops the writer and waits for it. Safe on a nil or never-started
+// spiller. Tests must call this before t.TempDir cleanup: a live writer
+// holds the audit flock and recreates files under the temp dir.
+func (s *workerEgressSpiller) Close() {
+	if s == nil || s.stop == nil {
+		return
+	}
+	s.stopOnce.Do(func() { close(s.stop) })
+	if s.done != nil {
+		<-s.done
+	}
 }
 
 // noteDrop accounts n lost events. Safe on a nil spiller (no spill dir):
@@ -334,10 +356,15 @@ func (s *workerEgressSpiller) drainOnce(first *workerEgressAuditEvent) (written 
 // one warning per backoff, not one per dial. Records that arrive meanwhile
 // queue up to the spill queue's capacity and are counted beyond it.
 func (s *workerEgressSpiller) run() {
+	if s.done != nil {
+		defer close(s.done)
+	}
 	var backoff time.Duration
 	for {
 		var first *workerEgressAuditEvent
 		select {
+		case <-s.stop:
+			return
 		case ev := <-s.ch:
 			first = &ev
 		case <-s.kick:

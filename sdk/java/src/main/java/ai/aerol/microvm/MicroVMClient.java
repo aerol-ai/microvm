@@ -285,15 +285,11 @@ public class MicroVMClient {
         return path + sep + encodeQueryValue(key) + "=" + encodeQueryValue(value);
     }
 
-    // Renders the tag filter as the server's ?tag.<key>=<value> wire format.
-    // The "tag." prefix is literal — parseTagFilter on the server checks the
-    // *decoded* query key — so only the user-supplied key and value get
-    // percent-encoded. Returns "" for null/empty so the URL stays
+    // Renders tag filters and optional include_env as the server's wire
+    // format. The "tag." prefix is literal — parseTagFilter on the server
+    // checks the *decoded* query key — so only the user-supplied key and
+    // value get percent-encoded. Returns "" for null/empty so the URL stays
     // byte-identical to the pre-filter call (no stray trailing "?").
-    private static String buildTagQuery(java.util.Map<String, String> tags) {
-        return buildSandboxQuery(tags, false);
-    }
-
     private static String buildSandboxQuery(java.util.Map<String, String> tags, boolean includeEnv) {
         boolean hasTags = tags != null && !tags.isEmpty();
         if (!hasTags && !includeEnv) {
