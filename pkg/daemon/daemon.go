@@ -143,7 +143,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}()
 	}
 
-	db, err := store.Open(cfg.DBPath)
+	// Initialize the cipher before opening the database. Store startup may need
+	// it to transactionally seal plaintext env/toolbox values left by a
+	// pre-hardening release before any service begins reading the database.
+	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
+	if err != nil {
+		return fmt.Errorf("initialize credential cipher: %w", err)
+	}
+
+	db, err := store.OpenWithSecretCipher(cfg.DBPath, cipher)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -180,11 +188,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	configureAOCRPullAuth(logger, cfg, dockerClient)
 
 	caddyClient := caddy.New(cfg)
-
-	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
-	if err != nil {
-		return fmt.Errorf("initialize credential cipher: %w", err)
-	}
 
 	mountManager, err := mounts.New(logger, mounts.Config{
 		RootDir:     cfg.MountsRootPath,

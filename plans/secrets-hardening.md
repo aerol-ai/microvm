@@ -306,8 +306,12 @@ Why not in place: that column is projected by the scanner used by `Get`,
 `netstats.go:219` calls `store.List(ctx)` **every poll tick** (open issue #70).
 Sealing in place adds an AES-GCM open per sandbox per tick, forever.
 
-There is no plaintext migration path. The schema has no `env_json` column;
-writes require the cipher and reads accept only the sealed `sandbox_env` row.
+Warm upgrades transactionally seal every legacy `env_json` value into
+`sandbox_env`, scrub the plaintext cells, and drop the old column before the
+daemon accepts requests. Any malformed row, encryption failure, or DDL failure
+rolls the whole migration back for a safe retry. The current schema has no
+`env_json` column; writes require the cipher and reads accept only the sealed
+`sandbox_env` row.
 
 ### 5b. API contract change (D9)
 
@@ -427,8 +431,10 @@ gives the regression signal.
 The token remains a platform-minted, sandbox-scoped control-plane credential
 and remains `json:"-"`, so it cannot enter the Raft-replicated spec. Writes
 always encrypt it with the existing secret cipher and sandbox-bound AAD into
-`toolbox_token_sealed`; there is no plaintext token column. Reads authenticate
-and decrypt it through the shared sandbox scanner.
+`toolbox_token_sealed`. Warm upgrades seal and scrub the legacy plaintext value
+transactionally before dropping that column; the current schema has no
+plaintext token column. Reads authenticate and decrypt it through the shared
+sandbox scanner.
 
 This deliberately reuses the sandbox row and lifecycle rather than adding a
 second token table, reconciliation loop, or garbage collector.
