@@ -534,17 +534,13 @@ func TestExpandResealStopsWithoutPeerTransport(t *testing.T) {
 		t.Fatalf("transportless reseal = %v", err)
 	}
 
-	sink, err := newFileAuditSinkOpts(t.TempDir(), 4, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(sink.Close)
 	block := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sink.spillPath = filepath.Join(block, "secrets.spill.jsonl")
-	if err := sink.appendSpill(SecretAuditEvent{EventID: "spill-dir", Result: secretAuditResultSuccess}); err == nil {
+	// appendSpill's parent-dir check does not need a live writer loop.
+	blocked := &fileAuditSink{spillPath: filepath.Join(block, "secrets.spill.jsonl")}
+	if err := blocked.appendSpill(SecretAuditEvent{EventID: "spill-dir", Result: secretAuditResultSuccess}); err == nil {
 		t.Fatal("spill under a file succeeded")
 	}
 	if err := (&fileAuditSink{}).appendSpill(SecretAuditEvent{}); err == nil {
@@ -693,12 +689,12 @@ func TestWriteEventBatchAndPruneLockedIOWave32(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(ro.Close)
+	ro.Close()
 	readonly, err := os.Open(ro.path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = readonly.Close() })
-	_ = ro.file.Close()
 	ro.file = readonly
 	// A read-only descriptor makes append fail and Truncate fail, which is the
 	// only portable way to poison the writer without filling the disk.
@@ -748,12 +744,7 @@ func TestWriteEventBatchAndPruneLockedIOWave32(t *testing.T) {
 		t.Fatalf("nothing-to-drop prune: %v", err)
 	}
 
-	spill, err := newFileAuditSinkOpts(t.TempDir(), 4, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(spill.Close)
-	// Point spill at a file the writer loop is not draining so chmod cannot
+	// Point spill at a file no writer loop is draining so chmod cannot
 	// race a rename/remove of secrets.spill.jsonl.
 	manualSpill := filepath.Join(t.TempDir(), "manual.spill")
 	if err := os.WriteFile(manualSpill, []byte("x"), 0o600); err != nil {
@@ -763,8 +754,8 @@ func TestWriteEventBatchAndPruneLockedIOWave32(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(manualSpill, 0o600) })
-	spill.spillPath = manualSpill
-	if err := spill.appendSpill(SecretAuditEvent{EventID: "spill-chmod32"}); err == nil {
+	detached := &fileAuditSink{spillPath: manualSpill}
+	if err := detached.appendSpill(SecretAuditEvent{EventID: "spill-chmod32"}); err == nil {
 		t.Fatal("chmod-000 spill succeeded")
 	}
 

@@ -35,6 +35,14 @@ func (e *channelAuditExporter) ExportEvents(_ context.Context, batch controlplan
 	return batch.Offset, e.err
 }
 
+// setAuditExporter installs ex without starting the export loop (unlike
+// SetAuditExporter). The prune ticker already reads under auditExportMu.
+func setAuditExporter(s *Service, ex controlplane.AuditExporter) {
+	s.auditExportMu.Lock()
+	s.auditExporter = ex
+	s.auditExportMu.Unlock()
+}
+
 func TestSecretAuditExportIgnoresReceiverControlledCursor(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	svc := &Service{cfg: config.Config{DBPath: dbPath}}
@@ -44,7 +52,7 @@ func TestSecretAuditExportIgnoresReceiverControlledCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	exporter := &maliciousOffsetExporter{}
-	svc.auditExporter = exporter
+	setAuditExporter(svc, exporter)
 	if err := svc.exportSecretAuditBatch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +77,7 @@ func TestSecretAuditRetentionWaitsForProgrammaticExporter(t *testing.T) {
 		DBPath:                   filepath.Join(t.TempDir(), "state.db"),
 		SecretAuditRetentionDays: 1,
 	}}
-	svc.auditExporter = &maliciousOffsetExporter{}
+	setAuditExporter(svc, &maliciousOffsetExporter{})
 	t.Cleanup(svc.CloseSecretAuditSink)
 	sink := svc.secretAuditSink().(*fileAuditSink)
 	if err := sink.EmitDurable(SecretAuditEvent{
@@ -92,7 +100,7 @@ func TestSecretAuditRetentionWaitsForProgrammaticExporter(t *testing.T) {
 func TestSecretAuditPruneGuardsCloseAppendAfterVerificationWindow(t *testing.T) {
 	dir := t.TempDir()
 	svc := &Service{cfg: config.Config{DBPath: filepath.Join(dir, "state.db")}}
-	svc.auditExporter = &maliciousOffsetExporter{}
+	setAuditExporter(svc, &maliciousOffsetExporter{})
 	t.Cleanup(svc.CloseSecretAuditSink)
 	sink := svc.secretAuditSink().(*fileAuditSink)
 	old := time.Now().UTC().Add(-48 * time.Hour)
@@ -155,7 +163,7 @@ func TestSecretAuditPruneChangesGenerationAndExportsFromStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	exporter := &maliciousOffsetExporter{}
-	svc.auditExporter = exporter
+	setAuditExporter(svc, exporter)
 	if err := svc.exportSecretAuditBatch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +265,7 @@ func TestSecretAuditExportCursorSafetyAndMalformedEvidence(t *testing.T) {
 	if ok, err := svc.secretAuditFullyExported(); ok || err != nil {
 		t.Fatalf("unexported evidence = %v, %v", ok, err)
 	}
-	svc.auditExporter = &maliciousOffsetExporter{}
+	setAuditExporter(svc, &maliciousOffsetExporter{})
 	if n, err := svc.exportSecretAuditBatchOnce(nil); n != 1 || err != nil {
 		t.Fatalf("export n=%d err=%v", n, err)
 	}
@@ -340,7 +348,7 @@ func TestAuditFileGenerationAndLargeBatchDrain(t *testing.T) {
 		}
 	}
 	exporter := &maliciousOffsetExporter{}
-	svc.auditExporter = exporter
+	setAuditExporter(svc, exporter)
 	if err := svc.drainSecretAuditExport(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +357,7 @@ func TestAuditFileGenerationAndLargeBatchDrain(t *testing.T) {
 	}
 
 	failing := &channelAuditExporter{err: errors.New("offline")}
-	svc.auditExporter = failing
+	setAuditExporter(svc, failing)
 	if err := svc.drainSecretAuditExport(context.Background()); err != nil {
 		t.Fatalf("fully drained exporter should be idle: %v", err)
 	}
