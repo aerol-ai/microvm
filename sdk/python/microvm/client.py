@@ -1110,10 +1110,6 @@ def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
-def _build_tag_query(tags: Optional[Dict[str, str]]) -> str:
-    return _build_sandbox_query(tags, False)
-
-
 def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = False) -> str:
     # Renders tag filters and optional include_env as the server's wire format.
     # The `tag.` prefix is literal — the server's parseTagFilter inspects the

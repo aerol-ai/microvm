@@ -131,6 +131,11 @@ func TestInstallDefaultEgressObserverRespectsFlag(t *testing.T) {
 	t.Setenv("SB_NODE_ID", "n1")
 	m3 := newNetMediator()
 	installDefaultEgressObserver(m3)
+	t.Cleanup(func() {
+		if s := workerEgressSpill.Swap(nil); s != nil {
+			s.Close()
+		}
+	})
 	if m3.egressObserver() == nil {
 		t.Fatal("expected observer when enabled + DB path (spill fallback)")
 	}
@@ -158,6 +163,11 @@ func TestInstalledObserverSpillsWhenConfiguredIngestFails(t *testing.T) {
 	m := newNetMediator()
 	installDefaultEgressObserver(m, func(sandboxID string) (egressAuditBinding, bool) {
 		return egressAuditBinding{capability: "cap", incarnationID: "inc-1"}, sandboxID == "sb-fallback"
+	})
+	t.Cleanup(func() {
+		if s := workerEgressSpill.Swap(nil); s != nil {
+			s.Close()
+		}
 	})
 	observer := m.egressObserver()
 	if observer == nil {
@@ -334,9 +344,17 @@ func TestWorkerEgressSpillerRunBacksOffInsteadOfRetryingPerEvent(t *testing.T) {
 	}
 	spill := newWorkerEgressSpiller(bad, "n")
 	slept := make(chan time.Duration, 8)
-	spill.sleep = func(d time.Duration) { slept <- d }
+	// Sleep must not block Close: the writer retries immediately after
+	// recording the backoff, so the next send can fill the buffer.
+	spill.sleep = func(d time.Duration) {
+		select {
+		case slept <- d:
+		case <-spill.stop:
+		}
+	}
 	spill.start()
 	spill.start() // idempotent
+	t.Cleanup(spill.Close)
 	wait := func(want time.Duration) {
 		t.Helper()
 		select {
