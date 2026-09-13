@@ -300,7 +300,7 @@ func TestSelectRecreationTargetExcludingSkipsNonOwnersAndDrainedNodes(t *testing
 	}
 	c.fsm.drainedNodes["drained-worker"] = true
 
-	target, ok := c.selectRecreationTargetExcluding(failoverRecreateSpec(), "self")
+	target, ok := c.selectRecreationTarget(Placement{Spec: failoverRecreateSpec()}, "self")
 	if !ok {
 		t.Fatal("expected a recreation target")
 	}

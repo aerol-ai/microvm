@@ -43,17 +43,11 @@ func TestVoterAutoJoinAndDeadOwnerUnitBranches(t *testing.T) {
 
 	c.reconcileDeadOwners(context.Background()) // raft nil
 	c.reconcileReservations(context.Background())
-	if id, url, host := c.pickRecreationTarget(nil); id != "" || url != "" || host != "" {
+	if _, ok := c.selectRecreationTarget(Placement{}); ok {
 		t.Fatal("nil spec")
 	}
-	if id, _, _ := c.pickRecreationTarget(&models.CreateSandboxRequest{ImageDistributionMode: models.ImageDistributionLocalOnly}); id != "" {
+	if _, ok := c.selectRecreationTarget(Placement{Spec: &models.CreateSandboxRequest{ImageDistributionMode: models.ImageDistributionLocalOnly}}); ok {
 		t.Fatal("local-only")
-	}
-	if _, ok := c.selectRecreationTargetExcluding(nil); ok {
-		t.Fatal("nil spec exclude")
-	}
-	if _, ok := c.selectRecreationTargetExcluding(&models.CreateSandboxRequest{ImageDistributionMode: models.ImageDistributionLocalOnly}); ok {
-		t.Fatal("local-only exclude")
 	}
 
 }

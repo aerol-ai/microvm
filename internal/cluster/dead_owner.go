@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
 
@@ -174,8 +173,8 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		if !placementWantsFailoverRecreate(p) {
 			continue
 		}
-		newOwnerID, newOwnerURL, newOwnerDataPlaneHost := c.pickRecreationTarget(p.Spec)
-		if newOwnerID == "" {
+		target, ok := c.selectRecreationTarget(p)
+		if !ok {
 			c.logger.Warn("cluster: no failover recreation target; placement will be orphaned",
 				"sandbox_id", id, "dead_node", nodeID)
 			continue
@@ -183,15 +182,15 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		cmd := command{
 			Op:                    opReassign,
 			SandboxID:             id,
-			OwnerNodeID:           newOwnerID,
-			OwnerAPIURL:           newOwnerURL,
-			OwnerDataPlaneHost:    newOwnerDataPlaneHost,
+			OwnerNodeID:           target.NodeID,
+			OwnerAPIURL:           target.APIURL,
+			OwnerDataPlaneHost:    target.DataPlaneHost,
 			ExpectedIncarnationID: strings.TrimSpace(p.IncarnationID),
 			ReassignCause:         reassignCauseFailover,
 		}
 		if err := c.applyCommand(ctx, cmd); err != nil {
 			c.logger.Warn("cluster: reassign placement failed; will retry next tick",
-				"sandbox_id", id, "dead_node", nodeID, "new_owner", newOwnerID, "err", err)
+				"sandbox_id", id, "dead_node", nodeID, "new_owner", target.NodeID, "err", err)
 			return
 		}
 		// The leader apply wrapper increments the metric only when the FSM
@@ -305,26 +304,4 @@ func (c *Cluster) deleteFenceOwnerUnavailable(ownerNodeID string) bool {
 	}
 	member, ok := c.gossip.lookupMember(ownerNodeID)
 	return !ok || !member.Alive
-}
-
-// pickRecreationTarget runs placement scoring against the replicated spec to
-// pick a live node for the recreated sandbox. Returns empty strings if spec is
-// nil (caller treats that as the orphan path) or if SelectPlacement errors out.
-// Self is a perfectly valid choice — the leader is a normal recreation target.
-func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeID, apiURL, dataPlaneHost string) {
-	if spec == nil {
-		return "", "", ""
-	}
-	if spec.ImageDistributionMode == models.ImageDistributionLocalOnly {
-		return "", "", ""
-	}
-	req := capacityRequestFromSpec(spec)
-	target, err := c.SelectPlacement(req)
-	if err != nil {
-		return "", "", ""
-	}
-	if target.IsSelf {
-		return c.nodeID, c.apiURL, c.dataPlaneHost
-	}
-	return target.NodeID, target.APIURL, target.DataPlaneHost
 }
