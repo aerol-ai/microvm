@@ -75,6 +75,25 @@ func (*panicAuthPlacementsCluster) AuthoritativePlacementsByIDs(context.Context,
 	panic("identity lookup exploded")
 }
 
+type localOnlyPlacementCluster struct {
+	*cluster.Noop
+	placement cluster.Placement
+}
+
+func (*localOnlyPlacementCluster) AuthoritativePlacementsByIDs(context.Context, []string) (map[string]cluster.Placement, error) {
+	panic("peer PUT must not read the Raft leader")
+}
+
+func (c *localOnlyPlacementCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	out := make(map[string]cluster.Placement)
+	for _, id := range ids {
+		if id == c.placement.SandboxID && id != "" {
+			out[id] = c.placement
+		}
+	}
+	return out
+}
+
 type nilSnapshotCluster struct {
 	*cluster.Noop
 }
@@ -758,6 +777,24 @@ func TestUpsertClusterSecretBlobRejectsMissingAndStalePlacement(t *testing.T) {
 	cl.placement.SecretSealGeneration = 3
 	if err := svc.UpsertClusterSecretBlob(ctx, blob, "node-a"); err == nil || !strings.Contains(err.Error(), "next placement generation") {
 		t.Fatalf("stale staged reseal = %v", err)
+	}
+}
+
+func TestUpsertClusterSecretBlobDoesNotReadLeader(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	cl := &localOnlyPlacementCluster{
+		Noop: cluster.NewNoop("node-b", "http://b", ""),
+		placement: cluster.Placement{
+			SandboxID: "sb-local-put", OwnerNodeID: "node-a", IncarnationID: "inc-cur",
+			SecretRecipients: []string{"node-a", "node-b"}, SecretSealGeneration: 1,
+		},
+	}
+	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cipher: cipher, cluster: cl}
+	blob := wave30BoundBlob(t, cipher, "sb-local-put", "inc-cur", []string{"node-a", "node-b"}, 1)
+	if err := svc.UpsertClusterSecretBlob(ctx, blob, "node-a"); err != nil {
+		t.Fatalf("local FSM snapshot put: %v", err)
 	}
 }
 

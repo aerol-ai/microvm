@@ -1059,6 +1059,70 @@ func TestSecretRefanoutPoolBoundsRestartConcurrency(t *testing.T) {
 	}
 }
 
+func TestReFanoutClusterSecretsSkipsNonOwnerReplicas(t *testing.T) {
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	st := openSealTestStore(t)
+	const sandboxID = "sb-refan-replica"
+	const incarnationID = "inc-1"
+	recipients := []string{"node-a", "node-b"}
+	ref := secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)
+	payload, err := secrets.SealEnvelopeBound(cipher, secrets.Secrets{
+		Registry: &models.RegistryAuth{Server: "registry", Username: "u", Password: "p"},
+	}, recipients, secrets.SealBinding{
+		SandboxID: sandboxID, IncarnationID: incarnationID, Ref: ref,
+		Version: secrets.RefVersion, Generation: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PutClusterSecret(ctx, storepkg.ClusterSecretRecord{
+		Ref: ref, SandboxID: sandboxID, Version: secrets.RefVersion, Recipients: recipients,
+		SealedPayload: payload, SealGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placement := cluster.Placement{
+		SandboxID: sandboxID, OwnerNodeID: "node-a", IncarnationID: incarnationID,
+		SecretRecipients: recipients, SecretSealGeneration: 1,
+	}
+	backupPusher := &fakePeerPusher{acked: []string{"node-a"}}
+	backup := &Service{
+		cfg: config.Config{EnableCluster: true}, store: st, cipher: cipher,
+		cluster: &placementOnlyCluster{
+			Noop: cluster.NewNoop("node-b", "http://b", ""), placement: placement,
+		},
+		testSecretPeerPusher: backupPusher,
+	}
+	if err := backup.runSecretRefanoutScan(ctx, backupPusher); err != nil {
+		t.Fatalf("backup re-fanout: %v", err)
+	}
+	backupPusher.mu.Lock()
+	backupCalls := backupPusher.pushCalls
+	backupPusher.mu.Unlock()
+	if backupCalls != 0 {
+		t.Fatalf("backup replica re-fanout pushes = %d, want 0", backupCalls)
+	}
+
+	ownerPusher := &fakePeerPusher{acked: []string{"node-b"}}
+	owner := &Service{
+		cfg: config.Config{EnableCluster: true}, store: st, cipher: cipher,
+		cluster: &placementOnlyCluster{
+			Noop: cluster.NewNoop("node-a", "http://a", ""), placement: placement,
+		},
+		testSecretPeerPusher: ownerPusher,
+	}
+	if err := owner.runSecretRefanoutScan(ctx, ownerPusher); err != nil {
+		t.Fatalf("owner re-fanout: %v", err)
+	}
+	ownerPusher.mu.Lock()
+	ownerCalls := ownerPusher.pushCalls
+	ownerPusher.mu.Unlock()
+	if ownerCalls != 1 {
+		t.Fatalf("owner re-fanout pushes = %d, want 1", ownerCalls)
+	}
+}
+
 func TestComputeFailoverReady(t *testing.T) {
 	svc := &Service{cfg: config.Config{}}
 	sb := &models.Sandbox{ID: "sb1", AuditIncarnationID: "inc-sb1", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}

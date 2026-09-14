@@ -724,15 +724,20 @@ func (c *Cluster) ResolveCustomDomain(hostname string) (string, bool) {
 }
 
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
+// The expected owner/incarnation come from the local FSM — the same source
+// RemoveCustomDomain uses — so a follower destroy does not POST to the Raft
+// leader before the write. applyCommand still commits on the leader; a stale
+// local row fails the exact CAS instead of 503ing every delete during an
+// election.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	if c == nil {
 		return nil
 	}
-	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
-	if err != nil {
-		return err
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
 	}
-	placement, ok := placements[strings.TrimSpace(sandboxID)]
+	placement, ok := c.PlacementOf(sandboxID)
 	if !ok {
 		return nil
 	}

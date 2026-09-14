@@ -210,15 +210,7 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath:
-			if r.URL.Query().Get("authoritative") != "true" {
-				t.Fatalf("placement delete lookup was not authoritative: %s", r.URL.RequestURI())
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]Placement{
-				"sb-delete": {
-					SandboxID: "sb-delete", OwnerNodeID: "worker-self", IncarnationID: "inc-delete",
-				},
-			})
+			t.Fatalf("placement delete must not POST placements-by-ids (leader path): %s", r.URL.RequestURI())
 			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-state":
 			w.Header().Set("Content-Type", "application/json")

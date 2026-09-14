@@ -19,13 +19,20 @@ func (c *wave30AuthCluster) AuthoritativePlacementsByIDs(_ context.Context, ids 
 	if c.err != nil {
 		return nil, c.err
 	}
+	return c.PlacementsByIDs(ids), nil
+}
+
+func (c *wave30AuthCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	if c.err != nil {
+		return nil
+	}
 	out := make(map[string]cluster.Placement, len(ids))
 	for _, id := range ids {
 		if p, ok := c.placements[id]; ok {
 			out[id] = p
 		}
 	}
-	return out, nil
+	return out
 }
 
 func (c *wave30AuthCluster) DeletePlacementExact(_ context.Context, sandboxID, _, _ string) error {

@@ -825,6 +825,12 @@ func (s *Service) prepareSecretRefanoutRecord(ctx context.Context, rec store.Clu
 		if !placementOK || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != parsed.IncarnationID {
 			return nil, s.retireStaleSecretRow(ctx, rec, parsed.IncarnationID)
 		}
+		// Only the owner originates a retransmit. Every replica used to
+		// re-push on boot/rejoin, so a membership flap stampeded the fleet
+		// (and, via PUT validation, the leader) with one copy per holder.
+		if ownerID := strings.TrimSpace(placement.OwnerNodeID); ownerID == "" || ownerID != s.selfNodeID() {
+			return nil, nil
+		}
 	}
 	if len(rec.Recipients) == 0 {
 		return nil, nil
@@ -1123,16 +1129,17 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 	// anti-resurrection fence: deleted sandboxes have no placement, and a peer
 	// may only store the exact recipient set committed before sealing. This
 	// keeps tomb GC bounded without opening a stale-PUT vacuum after retention.
+	//
+	// The read is the local/distributable FSM snapshot, not a leader HTTP
+	// round-trip. Create fans out one PUT per backup; asking the Raft leader
+	// on each ACK serialized the fleet onto one node and turned a leader
+	// election into 503s for every in-flight fan-out. A lagging local FSM
+	// fail-closes (no placement ⇒ reject); the originator retries via outbox.
 	if s.cfg.EnableCluster {
-		c := s.Cluster()
-		if c == nil {
-			return ErrClusterSecretPlacementUnavailable
-		}
-		placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
+		placement, ok, err := s.liveSecretPlacement(sandboxID)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrClusterSecretPlacementUnavailable, err)
 		}
-		placement, ok := placements[sandboxID]
 		if !ok || placement.IsOrphaned() {
 			return fmt.Errorf("%w: sandbox %q has no live placement", ErrInvalidClusterSecretBlob, sandboxID)
 		}
@@ -1187,6 +1194,23 @@ func validatePeerSecretBlob(ctx context.Context, s *Service, blob secrets.Secret
 		}
 	}
 	return nil
+}
+
+// liveSecretPlacement is the peer-PUT fence: a local/distributable FSM
+// snapshot. Nil (Agent read failure) is unavailable, not absence; a missing
+// ID is absence. AuthoritativePlacementsByIDs is reserved for destructive
+// reconcilers that must not treat a lagging follower as "deleted".
+func (s *Service) liveSecretPlacement(sandboxID string) (cluster.Placement, bool, error) {
+	c := s.Cluster()
+	if c == nil {
+		return cluster.Placement{}, false, ErrClusterSecretPlacementUnavailable
+	}
+	placements := c.PlacementsByIDs([]string{sandboxID})
+	if placements == nil {
+		return cluster.Placement{}, false, ErrClusterSecretPlacementUnavailable
+	}
+	placement, ok := placements[sandboxID]
+	return placement, ok, nil
 }
 
 func sameStringSlice(a, b []string) bool {
