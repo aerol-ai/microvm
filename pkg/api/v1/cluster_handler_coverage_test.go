@@ -677,8 +677,25 @@ func TestClusterInternalSecretHandlerGaps(t *testing.T) {
 		t.Fatalf("head missing id = %d", headRR.Code)
 	}
 
+	if _, err := st.PutClusterSecret(context.Background(), storepkg.ClusterSecretRecord{
+		Ref:       secrets.FormatRef("sb-peer-delete", "inc-peer-delete", secrets.RefVersion),
+		SandboxID: "sb-peer-delete", Version: secrets.RefVersion, Recipients: []string{"node-a"},
+		SealedPayload: []byte("sealed"), SealGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	authorizedReq := httptest.NewRequest(http.MethodDelete, "/v1/cluster/internal/secrets/sb-peer-delete?generation=1&incarnation_id=inc-peer-delete", nil)
+	authorizedReq = authorizedReq.WithContext(context.WithValue(authorizedReq.Context(), clusterPeerNodeIDContextKey{}, "node-a"))
+	authorizedReq.SetPathValue("sandboxID", "sb-peer-delete")
+	authorizedRR := httptest.NewRecorder()
+	h.clusterInternalSecretDelete(authorizedRR, authorizedReq)
+	if authorizedRR.Code != http.StatusNoContent {
+		t.Fatalf("authorized peer delete = %d", authorizedRR.Code)
+	}
+
 	_ = st.Close()
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/cluster/internal/secrets/sb-x?generation=1&incarnation_id=inc", nil)
+	delReq = delReq.WithContext(context.WithValue(delReq.Context(), clusterPeerNodeIDContextKey{}, "node-a"))
 	delReq.SetPathValue("sandboxID", "sb-x")
 	closedDel := httptest.NewRecorder()
 	h.clusterInternalSecretDelete(closedDel, delReq)

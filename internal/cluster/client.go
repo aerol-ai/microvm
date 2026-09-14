@@ -447,6 +447,7 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		Spec:                  spec,
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
 		SecretSealGeneration:  secrets.SealGeneration,
 		IncarnationID:         incarnationID,
 		ExpectedIncarnationID: expectedIncarnationID,
@@ -485,6 +486,7 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 		Spec:                 spec,
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
+		SecretRecipients:     normalizeSecretRecipientIDs(secrets.Recipients),
 		SecretSealGeneration: secrets.SealGeneration,
 		IncarnationID:        strings.TrimSpace(secrets.IncarnationID),
 		OwnerRef:             secrets.OwnerRef,
@@ -524,6 +526,7 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 		Spec:                  spec,
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
 		SecretSealGeneration:  secrets.SealGeneration,
 		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
 		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
@@ -1215,8 +1218,23 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			// pre-cluster-sandbox limitation), then replay port + hostname
 			// intents. The FSM treats already-bound (sandbox, hostname) pairs
 			// as idempotent no-ops, so re-replaying every boot is cheap.
-			if existing.Spec == nil && st.Spec != nil {
-				if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
+			needsSecretBackfill := existing.SecretSealGeneration <= 0 && st.Secrets.hasUpdate()
+			if (existing.Spec == nil && st.Spec != nil) || needsSecretBackfill {
+				var spec *models.CreateSandboxRequest
+				if existing.Spec == nil {
+					spec = st.Spec
+				}
+				replaySecrets := PlacementSecrets{IncarnationID: incarnationID}
+				if needsSecretBackfill {
+					replaySecrets = st.Secrets
+				}
+				if err := c.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if existing.SecretSealGeneration > 0 && st.Secrets.hasUpdate() &&
+				st.Secrets.SealGeneration > existing.SecretSealGeneration && len(st.Secrets.Recipients) > 0 {
+				if err := c.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, existing.SecretSealGeneration); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

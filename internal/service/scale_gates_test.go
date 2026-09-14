@@ -166,7 +166,7 @@ func TestScaleGateConcurrentSealDeletePlane(t *testing.T) {
 			raceWG.Add(2)
 			go func() {
 				defer raceWG.Done()
-				if err := svc.DeleteClusterSecretsLocal(ctx, id, blob.IncarnationID, gen); err != nil {
+				if err := svc.DeleteClusterSecretsLocal(ctx, id, blob.IncarnationID, gen, "node-a"); err != nil {
 					errCh <- err
 				}
 			}()

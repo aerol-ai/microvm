@@ -398,8 +398,8 @@ func TestSelectReplacementAndFailoverReadyBatch(t *testing.T) {
 	if !svc.anySecretTargetDead([]string{"node-a", "dead-a"}, map[string]struct{}{"node-a": {}}, "node-a") {
 		t.Fatal("dead backup was not detected")
 	}
-	if svc.anySecretTargetDead([]string{"node-a"}, map[string]struct{}{"node-a": {}}, "node-a") {
-		t.Fatal("self-only set is not a dead-target trigger")
+	if !svc.anySecretTargetDead([]string{"node-a"}, map[string]struct{}{"node-a": {}}, "node-a") {
+		t.Fatal("self-only HA set was not selected for width repair")
 	}
 }
 
@@ -845,6 +845,9 @@ func TestUpsertClusterSecretBlobRemainingFences(t *testing.T) {
 		t.Fatal("stale generation was accepted")
 	}
 
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-tomb30", "inc-cur", 1); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.ApplyPeerSecretDelete(ctx, "sb-tomb30", "inc-cur", 2); err != nil {
 		t.Fatal(err)
 	}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,27 @@ func (c *Cluster) PushSecretBlobToPeers(ctx context.Context, blob secrets.Secret
 		return nil, nil
 	}
 	return pushSecretBlobToPeersLookupDial(ctx, c.gossip.lookupMember, c.currentInternalClient(), c.PeerDialMember, c.patToken, c.nodeID, blob, recipients)
+}
+
+// PushSecretBlobToAnyPeer races all eligible recipients and returns as soon as
+// one authenticated peer ACKs. The create path uses this narrow minimum-ACK
+// operation so an unreachable recipient cannot spend the entire ACK window
+// before a healthy backup is attempted. Full convergence continues through
+// PushSecretBlobToPeers and the durable put outbox.
+func (c *Cluster) PushSecretBlobToAnyPeer(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
+	if c == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	if c.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, c.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	return pushSecretBlobToPeersLookupDialUntil(ctx, c.gossip.lookupMember, c.currentInternalClient(), c.PeerDialMember, c.patToken, c.nodeID, blob, recipients, true)
 }
 
 // DeleteSecretOnPeers DELETEs the sandbox's cluster_secrets rows on peers that
@@ -99,6 +121,22 @@ func (a *Agent) PushSecretBlobToPeers(ctx context.Context, blob secrets.SecretBl
 	return pushSecretBlobToPeersLookupDial(ctx, a.gossip.lookupMember, a.internalClient, a.PeerDialMember, a.patToken, a.nodeID, blob, recipients)
 }
 
+func (a *Agent) PushSecretBlobToAnyPeer(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error) {
+	if a == nil {
+		if hasRemoteSecretRecipient(recipients, "") {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	if a.gossip == nil {
+		if hasRemoteSecretRecipient(recipients, a.nodeID) {
+			return nil, ErrPeerInternalURLRequired
+		}
+		return nil, nil
+	}
+	return pushSecretBlobToPeersLookupDialUntil(ctx, a.gossip.lookupMember, a.internalClient, a.PeerDialMember, a.patToken, a.nodeID, blob, recipients, true)
+}
+
 func (a *Agent) DeleteSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) (acked []string, err error) {
 	if a == nil {
 		if hasRemoteSecretRecipient(recipients, "") {
@@ -139,6 +177,13 @@ type SecretPeerPusher interface {
 	ProbeSecretOnPeers(ctx context.Context, sandboxID, incarnationID string, recipients []string, minGeneration int64) (holding []string, err error)
 }
 
+// SecretPeerMinACKPusher is implemented by the production cluster clients.
+// Keeping it separate preserves the small full-fanout test seam while letting
+// the synchronous HA-create path stop immediately after its first backup ACK.
+type SecretPeerMinACKPusher interface {
+	PushSecretBlobToAnyPeer(ctx context.Context, blob secrets.SecretBlob, recipients []string) (ackedNodes []string, err error)
+}
+
 func hasRemoteSecretRecipient(recipients []string, selfID string) bool {
 	selfID = strings.TrimSpace(selfID)
 	for _, id := range recipients {
@@ -168,6 +213,21 @@ func pushSecretBlobToPeersLookup(ctx context.Context, lookup func(string) (Membe
 }
 
 func pushSecretBlobToPeersLookupDial(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, dial peerMemberDialer, pat, selfID string, blob secrets.SecretBlob, recipients []string) ([]string, error) {
+	return pushSecretBlobToPeersLookupDialUntil(ctx, lookup, internalClient, dial, pat, selfID, blob, recipients, false)
+}
+
+type secretPushTarget struct {
+	nodeID   string
+	client   *http.Client
+	endpoint string
+}
+
+type secretPushResult struct {
+	nodeID string
+	err    error
+}
+
+func pushSecretBlobToPeersLookupDialUntil(ctx context.Context, lookup func(string) (Member, bool), internalClient *http.Client, dial peerMemberDialer, pat, selfID string, blob secrets.SecretBlob, recipients []string, firstACK bool) ([]string, error) {
 	if len(recipients) == 0 || lookup == nil {
 		return nil, nil
 	}
@@ -178,14 +238,19 @@ func pushSecretBlobToPeersLookupDial(ctx context.Context, lookup func(string) (M
 	if err != nil {
 		return nil, fmt.Errorf("cluster: marshal secret blob: %w", err)
 	}
-	var acked []string
 	var firstErr error
 	expected := 0
+	seen := make(map[string]struct{}, len(recipients))
+	targets := make([]secretPushTarget, 0, len(recipients))
 	for _, id := range recipients {
 		id = strings.TrimSpace(id)
 		if id == "" || id == selfID {
 			continue
 		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
 		expected++
 		m, ok := lookup(id)
 		if !ok || !m.Alive {
@@ -197,6 +262,15 @@ func pushSecretBlobToPeersLookupDial(ctx context.Context, lookup func(string) (M
 				} else {
 					firstErr = fmt.Errorf("fanout secret to %s: recipient not alive", id)
 				}
+			}
+			continue
+		}
+		// A member without an internal URL is not an ACK candidate. In
+		// particular, do not let it occupy the first serial retry window before
+		// a healthy mTLS recipient is attempted.
+		if strings.TrimSpace(m.InternalURL) == "" {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("fanout secret to %s: %w", id, ErrPeerInternalURLRequired)
 			}
 			continue
 		}
@@ -219,16 +293,51 @@ func pushSecretBlobToPeersLookupDial(ctx context.Context, lookup func(string) (M
 			}
 			continue
 		}
-		if err := withSecretFanoutBackoff(ctx, func() error {
-			return postSecretBlob(ctx, client, endpoint, pat, selfID, body)
-		}); err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("fanout secret to %s: %w", m.NodeID, err)
-			}
-			continue
-		}
-		acked = append(acked, m.NodeID)
+		targets = append(targets, secretPushTarget{nodeID: m.NodeID, client: client, endpoint: endpoint})
 	}
+	if len(targets) == 0 {
+		if expected > 0 && firstErr == nil {
+			firstErr = fmt.Errorf("cluster: secret fan-out has no eligible peer")
+		}
+		return nil, firstErr
+	}
+
+	pushCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan secretPushResult, len(targets))
+	for _, target := range targets {
+		target := target
+		go func() {
+			err := withSecretFanoutBackoff(pushCtx, func() error {
+				return postSecretBlob(pushCtx, target.client, target.endpoint, pat, selfID, body)
+			})
+			results <- secretPushResult{nodeID: target.nodeID, err: err}
+		}()
+	}
+
+	acked := make([]string, 0, len(targets))
+	for completed := 0; completed < len(targets); completed++ {
+		select {
+		case result := <-results:
+			if result.err == nil {
+				acked = append(acked, result.nodeID)
+				if firstACK {
+					cancel()
+					return acked, nil
+				}
+				continue
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("fanout secret to %s: %w", result.nodeID, result.err)
+			}
+		case <-ctx.Done():
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			completed = len(targets)
+		}
+	}
+	sort.Strings(acked)
 	if len(acked) < expected && firstErr == nil {
 		firstErr = fmt.Errorf("cluster: secret fan-out incomplete: acked %d/%d", len(acked), expected)
 	}

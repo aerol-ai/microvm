@@ -212,6 +212,24 @@ func normalizeSecretRecipientIDs(ids []string) []string {
 	return out
 }
 
+func sameSecretRecipientSet(a, b []string) bool {
+	a = normalizeSecretRecipientIDs(a)
+	b = normalizeSecretRecipientIDs(b)
+	if len(a) != len(b) {
+		return false
+	}
+	want := make(map[string]struct{}, len(a))
+	for _, id := range a {
+		want[id] = struct{}{}
+	}
+	for _, id := range b {
+		if _, ok := want[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // SelectSecretRecipients builds the seal recipient set: owner first, then up
 // to maxBackups other candidates chosen by deterministic rendezvous hashing
 // over (sandboxID, nodeID). Sorting by NodeID alone hotspot-loads the

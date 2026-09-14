@@ -213,8 +213,9 @@ type PlacementSecrets struct {
 	Version int    `json:"version,omitempty"`
 	// Recipients is the seal recipient set chosen at reserve time for
 	// failover.policy=recreate. It rides opReserve onto Placement.SecretRecipients
-	// (node IDs only — never ciphertext). RecordPlacement leaves this empty so
-	// opPlace preserves the reservation's set.
+	// (node IDs only — never ciphertext). Reserved promotes normally repeat the
+	// same set; boot ownership replay carries the durable local set so rebuilding
+	// a missing placement cannot silently downgrade HA to one holder.
 	Recipients []string `json:"recipients,omitempty"`
 	// OwnerRef is the control-plane tenant account for this sandbox. Not
 	// secret material — rides Place/Reserve so failover recreate preserves

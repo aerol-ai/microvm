@@ -414,10 +414,10 @@ func TestClusterSecretsEasyGuardsWave30(t *testing.T) {
 	if err := (&Service{store: st}).DeleteClusterSecrets(ctx, " ", "inc"); err == nil {
 		t.Fatal("blank delete id was accepted")
 	}
-	if err := (*Service)(nil).DeleteClusterSecretsLocal(ctx, "sb", "inc", 1); err != nil {
+	if err := (*Service)(nil).DeleteClusterSecretsLocal(ctx, "sb", "inc", 1, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := (&Service{store: st}).DeleteClusterSecretsLocal(ctx, "sb", " ", 1); err == nil {
+	if err := (&Service{store: st}).DeleteClusterSecretsLocal(ctx, "sb", " ", 1, ""); err == nil {
 		t.Fatal("blank local incarnation was accepted")
 	}
 
@@ -530,7 +530,7 @@ func TestDeleteClusterSecretsAndRecipientsWave31(t *testing.T) {
 	if err := svc.DeleteClusterSecrets(ctx, "sb-del31", "inc-a"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-del31", "inc-a", 2); err != nil {
+	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-del31", "inc-a", 2, ""); err != nil {
 		t.Fatal(err)
 	}
 

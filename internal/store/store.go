@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -4586,6 +4587,16 @@ var ErrClusterSecretPayloadConflict = errors.New("cluster secret payload conflic
 // or sandbox. Peers must map this to a non-2xx response so Push does not ACK.
 var ErrClusterSecretStaleGeneration = errors.New("cluster secret stale generation")
 
+// ErrClusterSecretDeleteGenerationTooNew rejects a peer DELETE that attempts
+// to jump beyond the local lifecycle high-water mark by more than one. This
+// prevents a wire-supplied generation from permanently fencing legitimate
+// reseals (and avoids poisoning the next-generation counter).
+var ErrClusterSecretDeleteGenerationTooNew = errors.New("cluster secret delete generation exceeds local high-water mark")
+
+// ErrClusterSecretGenerationExhausted is returned instead of overflowing the
+// signed generation counter after an imported/corrupt max-int high-water mark.
+var ErrClusterSecretGenerationExhausted = errors.New("cluster secret generation exhausted")
+
 // afterTransferTapReads is set only by tests to inject a concurrent ownership
 // move between TransferFirecrackerTapSlot's reads and its UPDATE.
 var afterTransferTapReads func()
@@ -5510,12 +5521,6 @@ func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID, incarnatio
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return fmt.Errorf("read current cluster secret before peer delete: %w", scanErr)
 	}
-	if maxSeal.Valid && maxSeal.Int64 > generation {
-		// Strictly newer reseal after originator delete — stale DELETE must not
-		// wipe new bytes. Equal generation is the row being deleted.
-		return tx.Commit()
-	}
-	now := time.Now().UTC()
 	var prev sql.NullInt64
 	var prevIncarnationID string
 	prevErr := tx.QueryRowContext(ctx, `
@@ -5525,6 +5530,22 @@ func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID, incarnatio
 	if prevErr != nil && !errors.Is(prevErr, sql.ErrNoRows) {
 		return fmt.Errorf("read cluster secret tomb before peer delete: %w", prevErr)
 	}
+	highWater := int64(0)
+	if maxSeal.Valid && maxSeal.Int64 > highWater {
+		highWater = maxSeal.Int64
+	}
+	if prev.Valid && prev.Int64 > highWater {
+		highWater = prev.Int64
+	}
+	if highWater < math.MaxInt64 && generation > highWater+1 {
+		return fmt.Errorf("%w: got %d, local high-water mark %d", ErrClusterSecretDeleteGenerationTooNew, generation, highWater)
+	}
+	if maxSeal.Valid && maxSeal.Int64 > generation {
+		// Strictly newer reseal after originator delete — stale DELETE must not
+		// wipe new bytes. Equal generation is the row being deleted.
+		return tx.Commit()
+	}
+	now := time.Now().UTC()
 	tombGen := generation
 	if prev.Valid && prevIncarnationID == incarnationID && prev.Int64 > tombGen {
 		tombGen = prev.Int64
@@ -5578,6 +5599,9 @@ func (s *Store) NextClusterSecretSealGenerationForIncarnation(ctx context.Contex
 	}
 	if sealGeneration.Valid && sealGeneration.Int64 > hwm {
 		hwm = sealGeneration.Int64
+	}
+	if hwm == math.MaxInt64 {
+		return 0, ErrClusterSecretGenerationExhausted
 	}
 	return hwm + 1, nil
 }

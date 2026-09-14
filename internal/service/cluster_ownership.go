@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	secretspkg "github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // ReplayClusterOwnership pushes local sandbox truth into the cluster placement
@@ -162,10 +165,12 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 	}
 	var secrets cluster.PlacementSecrets
 	if spec != nil {
-		// Boot replay has no reservation, so seal for self only. Never put the
-		// unredacted recovery spec into Raft: a sealing failure leaves this row
-		// pending for the next reconciliation pass instead of leaking credentials.
-		handle, sealErr := s.SealAndDistribute(ctx, sb.ID, *spec, []string{c.SelfNodeID()})
+		// Reuse the exact durable seal when possible and otherwise preserve (or
+		// restore) the HA recipient width. Boot replay has no reservation from
+		// which RecordPlacement could recover that set. Never put the unredacted
+		// recovery spec into Raft: a sealing failure leaves this row pending for
+		// the next reconciliation pass instead of leaking credentials.
+		handle, sealErr := s.secretHandleForOwnershipReplay(ctx, c, sb, *spec)
 		if sealErr != nil {
 			return cluster.LocalSandboxState{}, fmt.Errorf("seal sandbox %s for ownership replay: %w", sb.ID, sealErr)
 		}
@@ -193,6 +198,54 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 		ExposedPorts:    clusterPortsFromSandbox(sb),
 		CustomHostnames: sandboxCustomHostnamesList(sb),
 	}, nil
+}
+
+func (s *Service) secretHandleForOwnershipReplay(ctx context.Context, c cluster.Client, sb *models.Sandbox, spec models.CreateSandboxRequest) (cluster.PlacementSecrets, error) {
+	if secretsFromRequest(spec).IsEmpty() {
+		return cluster.PlacementSecrets{}, nil
+	}
+	selfID := strings.TrimSpace(c.SelfNodeID())
+	placement, placed := c.PlacementOf(sb.ID)
+	incarnationID := strings.TrimSpace(sb.AuditIncarnationID)
+	if placed && strings.TrimSpace(placement.IncarnationID) != "" {
+		incarnationID = strings.TrimSpace(placement.IncarnationID)
+	}
+
+	var local *store.ClusterSecretRecord
+	if s.store != nil && incarnationID != "" {
+		rec, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sb.ID, incarnationID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return cluster.PlacementSecrets{}, fmt.Errorf("load durable secret for ownership replay: %w", err)
+		}
+		local = rec
+	}
+
+	recipients := secretspkg.NormalizeRecipients(placement.SecretRecipients)
+	if local != nil && (len(recipients) == 0 || local.SealGeneration > placement.SecretSealGeneration) {
+		recipients = secretspkg.NormalizeRecipients(local.Recipients)
+	}
+	if len(recipients) == 0 {
+		recipients = []string{selfID}
+	}
+
+	// A previously buggy replay may have published only self. Widen active or
+	// missing placements immediately; an orphan is first reclaimed with its
+	// existing valid seal and the periodic recipient reconciler widens it once
+	// peers will accept owner-authorized PUTs again.
+	if spec.ShouldRecreateOnFailover() && (!placed || !placement.IsOrphaned()) &&
+		len(nonSelfRecipients(recipients, selfID)) < s.SecretRecipientBackupCount() {
+		if replacements := s.selectReplacementRecipients(sb.ID, selfID, s.SecretRecipientBackupCount()); len(nonSelfRecipients(replacements, selfID)) > len(nonSelfRecipients(recipients, selfID)) {
+			recipients = replacements
+		}
+	}
+
+	if local != nil && sameStringSlice(secretspkg.NormalizeRecipients(local.Recipients), secretspkg.NormalizeRecipients(recipients)) {
+		return cluster.PlacementSecrets{
+			Ref: local.Ref, Version: local.Version, Recipients: append([]string(nil), local.Recipients...),
+			IncarnationID: incarnationID, SealGeneration: local.SealGeneration,
+		}, nil
+	}
+	return s.sealAndDistributeForIncarnation(ctx, sb.ID, spec, recipients, incarnationID)
 }
 
 func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*models.CreateSandboxRequest, error) {
