@@ -11,11 +11,13 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 type fakeOwnershipCluster struct {
 	*cluster.Noop
 	placements map[string]cluster.Placement
+	members    []cluster.Member
 	asserted   []cluster.LocalSandboxState
 	assertErr  error
 }
@@ -28,6 +30,14 @@ func (c *fakeOwnershipCluster) PlacementOf(sandboxID string) (cluster.Placement,
 func (c *fakeOwnershipCluster) AssertOwnership(_ context.Context, local []cluster.LocalSandboxState) error {
 	c.asserted = append(c.asserted, local...)
 	return c.assertErr
+}
+
+func (c *fakeOwnershipCluster) LocalMembers() []cluster.Member {
+	return append([]cluster.Member(nil), c.members...)
+}
+
+func (c *fakeOwnershipCluster) Members() []cluster.Member {
+	return append([]cluster.Member(nil), c.members...)
 }
 
 func TestClusterOwnershipHelpers(t *testing.T) {
@@ -199,6 +209,37 @@ func TestLocalSandboxStateForClusterNeverReplicatesPlaintextWhenSealFails(t *tes
 	}
 	if state.Spec != nil || state.Secrets.Ref != "" {
 		t.Fatalf("failed replay returned publishable state: %+v", state)
+	}
+}
+
+func TestLocalSandboxStateForClusterKeepsHAFanoutOnOwnershipReplay(t *testing.T) {
+	ctx := context.Background()
+	st := openSealTestStore(t)
+	cipher := newTestCipher(t)
+	c := &fakeOwnershipCluster{
+		Noop:       cluster.NewNoop("self", "http://self", "self.example.com"),
+		placements: map[string]cluster.Placement{},
+		members: []cluster.Member{
+			{NodeID: "self", Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-b", Alive: true, Role: config.NodeRoleWorker},
+			{NodeID: "node-c", Alive: true, Role: config.NodeRoleWorker},
+		},
+	}
+	svc := &Service{
+		cfg: config.Config{EnableCluster: true, SecretRecipientBackupCount: 2}, store: st, cipher: cipher,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)), cluster: c,
+		testSecretPeerPusher: &fakePeerPusher{acked: []string{"node-b"}},
+	}
+	sb := &models.Sandbox{
+		ID: "sb-ha-replay", Image: "alpine", Env: map[string]string{"TOKEN": "secret"},
+		AuditIncarnationID: "inc-ha-replay", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+	state, err := svc.localSandboxStateForCluster(ctx, c, sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := secrets.NormalizeRecipients(state.Secrets.Recipients); len(got) != 3 || !sameStringSlice(got, []string{"node-b", "node-c", "self"}) {
+		t.Fatalf("ownership replay recipients = %v, want owner plus two backups", state.Secrets.Recipients)
 	}
 }
 

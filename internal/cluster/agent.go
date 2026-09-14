@@ -339,6 +339,7 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		Spec:                  spec,
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
 		SecretSealGeneration:  secrets.SealGeneration,
 		IncarnationID:         incarnationID,
 		ExpectedIncarnationID: expectedIncarnationID,
@@ -375,6 +376,7 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 		Spec:                 spec,
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
+		SecretRecipients:     normalizeSecretRecipientIDs(secrets.Recipients),
 		SecretSealGeneration: secrets.SealGeneration,
 		IncarnationID:        strings.TrimSpace(secrets.IncarnationID),
 		OwnerRef:             secrets.OwnerRef,
@@ -410,6 +412,7 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 		Spec:                  spec,
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
 		SecretSealGeneration:  secrets.SealGeneration,
 		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
 		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
@@ -800,8 +803,23 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 				}
 			}
 		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned():
-			if existing.Placement.Spec == nil && st.Spec != nil {
-				if err := a.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
+			needsSecretBackfill := existing.Placement.SecretSealGeneration <= 0 && st.Secrets.hasUpdate()
+			if (existing.Placement.Spec == nil && st.Spec != nil) || needsSecretBackfill {
+				var spec *models.CreateSandboxRequest
+				if existing.Placement.Spec == nil {
+					spec = st.Spec
+				}
+				replaySecrets := PlacementSecrets{IncarnationID: incarnationID}
+				if needsSecretBackfill {
+					replaySecrets = st.Secrets
+				}
+				if err := a.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if existing.Placement.SecretSealGeneration > 0 && st.Secrets.hasUpdate() &&
+				st.Secrets.SealGeneration > existing.Placement.SecretSealGeneration && len(st.Secrets.Recipients) > 0 {
+				if err := a.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, existing.Placement.SecretSealGeneration); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

@@ -699,7 +699,7 @@ func TestPeerSecretPutRequiresLivePlacementAfterTombGC(t *testing.T) {
 	if err := svc.UpsertClusterSecretBlob(ctx, blob, "node-a"); err != nil {
 		t.Fatalf("live placement put: %v", err)
 	}
-	if err := svc.DeleteClusterSecretsLocal(ctx, blob.SandboxID, blob.IncarnationID, blob.SealGeneration); err != nil {
+	if err := svc.DeleteClusterSecretsLocal(ctx, blob.SandboxID, blob.IncarnationID, blob.SealGeneration, "node-a"); err != nil {
 		t.Fatalf("peer delete: %v", err)
 	}
 	if n, err := st.PruneClusterSecretTombs(ctx, time.Now().UTC().Add(time.Hour), 1); err != nil || n != 1 {
@@ -1137,6 +1137,25 @@ type placementRecipientsCluster struct {
 	incarnationID string
 }
 
+func TestFailoverReadyRejectsSingleRecipientForClusterHASecret(t *testing.T) {
+	ctx := context.Background()
+	st := openSealTestStore(t)
+	putSecretRow(t, st, "sb-single-copy", "inc-single", 1, []string{"self"})
+	c := &placementRecipientsCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""), recipients: []string{"self"}, incarnationID: "inc-single",
+		members: []cluster.Member{{NodeID: "self", Alive: true, Role: config.NodeRoleWorker}},
+	}
+	svc := &Service{cfg: config.Config{EnableCluster: true, SecretRecipientBackupCount: 2}, store: st, cluster: c}
+	clearSecretFanoutHolders("sb-single-copy")
+	t.Cleanup(func() { clearSecretFanoutHolders("sb-single-copy") })
+	addSecretHolderNodes("sb-single-copy", "inc-single", 1, "self")
+	sb := &models.Sandbox{ID: "sb-single-copy", AuditIncarnationID: "inc-single", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
+	ready := svc.computeFailoverReady(ctx, sb)
+	if ready == nil || *ready {
+		t.Fatalf("single-copy cluster HA readiness = %v, want false", ready)
+	}
+}
+
 func (c *placementRecipientsCluster) PlacementOf(sandboxID string) (cluster.Placement, bool) {
 	owner := c.SelfNodeID()
 	return cluster.Placement{
@@ -1321,7 +1340,7 @@ func TestPeerPutDeleteRaceDoesNotResurrect(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_ = svc.DeleteClusterSecretsLocal(ctx, "sb-race", blob.IncarnationID, gen)
+			_ = svc.DeleteClusterSecretsLocal(ctx, "sb-race", blob.IncarnationID, gen, "node-a")
 		}()
 		go func() {
 			defer wg.Done()

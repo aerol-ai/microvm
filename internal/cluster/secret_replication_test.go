@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -53,6 +54,56 @@ func TestPushSecretBlobToPeersIdempotentAndAuth(t *testing.T) {
 	acked, err = pushSecretBlobToPeers(context.Background(), members, internalClient, "test-pat", "self", blob, []string{"self", "peer-a"})
 	if err != nil || len(acked) != 1 {
 		t.Fatalf("retry acked=%v err=%v", acked, err)
+	}
+}
+
+func TestPushSecretBlobToAnyPeerRacesRecipientsAndSkipsMissingInternalURL(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(750 * time.Millisecond):
+			http.Error(w, "unreachable", http.StatusServiceUnavailable)
+		}
+	}))
+	defer slow.Close()
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fast.Close()
+
+	members := map[string]Member{
+		"no-url": {NodeID: "no-url", Alive: true},
+		"slow":   {NodeID: "slow", Alive: true, InternalURL: "https://slow.internal"},
+		"fast":   {NodeID: "fast", Alive: true, InternalURL: "https://fast.internal"},
+	}
+	var missingURLDialed atomic.Bool
+	dial := func(m Member) (*http.Client, string, error) {
+		switch m.NodeID {
+		case "no-url":
+			missingURLDialed.Store(true)
+			return nil, "", errors.New("missing URL should have been filtered")
+		case "slow":
+			return slow.Client(), slow.URL, nil
+		default:
+			return fast.Client(), fast.URL, nil
+		}
+	}
+	lookup := func(id string) (Member, bool) {
+		m, ok := members[id]
+		return m, ok
+	}
+	blob := secrets.SecretBlob{Ref: "r", SandboxID: "sb", SealedPayload: []byte("sealed")}
+	started := time.Now()
+	acked, err := pushSecretBlobToPeersLookupDialUntil(context.Background(), lookup, nil, dial, "pat", "self", blob, []string{"no-url", "slow", "fast"}, true)
+	if err != nil || len(acked) != 1 || acked[0] != "fast" {
+		t.Fatalf("first ACK = %v, %v", acked, err)
+	}
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("first ACK waited behind unreachable peer: %s", elapsed)
+	}
+	if missingURLDialed.Load() {
+		t.Fatal("member without InternalURL entered the dial/ACK race")
 	}
 }
 

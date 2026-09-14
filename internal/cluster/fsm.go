@@ -758,6 +758,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if exists && existing.IsOrphaned() {
 			return fmt.Errorf("%w: %s is orphaned; use ClaimOrphan", ErrReservationConflict, cmd.SandboxID)
 		}
+		if exists && existing.IsReserved() && len(existing.SecretRecipients) > 0 && len(cmd.SecretRecipients) > 0 &&
+			!sameSecretRecipientSet(existing.SecretRecipients, cmd.SecretRecipients) {
+			return fmt.Errorf("%w: reservation recipient set changed during promotion", ErrInvalidSecretHandle)
+		}
 		if exists && !existing.IsReserved() && existing.OwnerNodeID != "" && existing.OwnerNodeID != cmd.OwnerNodeID {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
@@ -1167,6 +1171,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
 			existing.SecretSealGeneration = secrets.SealGeneration
+			if len(cmd.SecretRecipients) > 0 {
+				existing.SecretRecipients = normalizeSecretRecipientIDs(cmd.SecretRecipients)
+			}
 		}
 		recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
 		existing.OwnerNodeID = cmd.OwnerNodeID
@@ -1227,6 +1234,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			existing.SecretRef = secrets.Ref
 			existing.SecretVersion = secrets.Version
 			existing.SecretSealGeneration = secrets.SealGeneration
+			if len(cmd.SecretRecipients) > 0 {
+				existing.SecretRecipients = normalizeSecretRecipientIDs(cmd.SecretRecipients)
+			}
 		}
 		wasReserved := existing.IsReserved()
 		if wasReserved {

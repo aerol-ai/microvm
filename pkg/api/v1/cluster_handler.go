@@ -1329,7 +1329,20 @@ func (h *handlers) clusterInternalSecretDelete(w http.ResponseWriter, r *http.Re
 	}
 	// Local delete only — this IS the peer delete-fanout receiver. Do not
 	// re-fanout from here (would loop).
-	if err := h.deps.Service.DeleteClusterSecretsLocal(r.Context(), sandboxID, incarnationID, generation); err != nil {
+	originatorNodeID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	if err := h.deps.Service.DeleteClusterSecretsLocal(r.Context(), sandboxID, incarnationID, generation, originatorNodeID); err != nil {
+		if errors.Is(err, service.ErrClusterSecretOriginatorDenied) {
+			apihttp.WriteError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		if errors.Is(err, service.ErrClusterSecretPlacementUnavailable) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		if errors.Is(err, store.ErrClusterSecretDeleteGenerationTooNew) {
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

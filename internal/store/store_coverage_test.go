@@ -2313,7 +2313,7 @@ func TestApplyPeerSecretDeleteRemainingBranches(t *testing.T) {
 	if err := st.ApplyPeerSecretDelete(ctx, "sb", "", 1); err == nil {
 		t.Fatal("empty incarnation accepted")
 	}
-	if err := st.ApplyPeerSecretDelete(ctx, "sb-none", "inc-none", 2); err != nil {
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-none", "inc-none", 1); err != nil {
 		t.Fatalf("missing row delete: %v", err)
 	}
 

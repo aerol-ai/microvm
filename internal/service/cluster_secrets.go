@@ -283,9 +283,12 @@ func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID,
 	return nil
 }
 
-// DeleteClusterSecretsLocal applies a peer DELETE with generation gating and
-// a local tombstone so delayed PUTs cannot resurrect deleted credentials.
-func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+// DeleteClusterSecretsLocal applies an authenticated peer DELETE with
+// generation gating and a local tombstone so delayed PUTs cannot resurrect
+// deleted credentials. In cluster mode the mTLS peer must be either the
+// authoritative owner or a recipient recorded on this exact local ciphertext
+// lifecycle. Standalone callers retain the local-only behavior.
+func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, incarnationID string, generation int64, peerNodeID string) error {
 	if s == nil {
 		return nil
 	}
@@ -295,6 +298,9 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, inca
 	if incarnationID == "" {
 		return errors.New("peer secret delete incarnation_id is required")
 	}
+	if err := s.authorizePeerSecretDelete(ctx, sandboxID, incarnationID, peerNodeID); err != nil {
+		return err
+	}
 	var err error
 	if s.store != nil {
 		err = s.store.ApplyPeerSecretDelete(ctx, sandboxID, incarnationID, generation)
@@ -303,6 +309,42 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, inca
 	}
 	clearSecretFanoutHoldersForIncarnation(sandboxID, incarnationID)
 	return err
+}
+
+func (s *Service) authorizePeerSecretDelete(ctx context.Context, sandboxID, incarnationID, peerNodeID string) error {
+	if s == nil || !s.cfg.EnableCluster {
+		return nil
+	}
+	peerNodeID = strings.TrimSpace(peerNodeID)
+	if peerNodeID == "" {
+		return fmt.Errorf("%w: peer identity is required for secret delete", ErrClusterSecretOriginatorDenied)
+	}
+	// Prefer the exact local lifecycle record. It remains authoritative for a
+	// delayed cleanup after a sandbox ID has been reused by a new placement.
+	if s.store != nil {
+		rec, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sandboxID, incarnationID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("authorize peer secret delete from local record: %w", err)
+		}
+		if rec != nil && secrets.RecipientAllowed(rec.Recipients, peerNodeID) {
+			return nil
+		}
+	}
+	c := s.Cluster()
+	if c == nil {
+		return ErrClusterSecretPlacementUnavailable
+	}
+	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrClusterSecretPlacementUnavailable, err)
+	}
+	placement, ok := placements[sandboxID]
+	if ok {
+		if strings.TrimSpace(placement.OwnerNodeID) == peerNodeID || secrets.RecipientAllowed(placement.SecretRecipients, peerNodeID) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: node %q cannot delete sandbox %q secrets", ErrClusterSecretOriginatorDenied, peerNodeID, sandboxID)
 }
 
 // ReconcileSecretDeleteOutbox retries durable peer DELETEs after boot / crash

@@ -484,13 +484,19 @@ func (s *Service) fanoutSecretAfterSeal(parent context.Context, sandboxID string
 	if wait > 0 {
 		waitCtx, cancel := context.WithTimeout(parent, wait)
 		var waitErr error
-		acked, waitErr = pusher.PushSecretBlobToPeers(waitCtx, *blob, recipients)
+		if minACKPusher, ok := pusher.(cluster.SecretPeerMinACKPusher); ok {
+			acked, waitErr = minACKPusher.PushSecretBlobToAnyPeer(waitCtx, *blob, recipients)
+		} else {
+			// Compatibility path for narrow test/custom pushers. Production
+			// Cluster and Agent clients implement the first-ACK operation above.
+			acked, waitErr = pusher.PushSecretBlobToPeers(waitCtx, *blob, recipients)
+		}
 		cancel()
 		if len(acked) > 0 {
 			addSecretHolderNodes(sandboxID, blob.IncarnationID, blob.SealGeneration, acked...)
 		}
 		if waitErr != nil && s.logger != nil && len(acked) == 0 {
-			s.logger.Warn("cluster: secret fan-out min-ACK wait got no peer; continuing async",
+			s.logger.Warn("cluster: secret fan-out min-ACK wait got no peer; retracting HA create",
 				"sandbox_id", sandboxID, "wait", wait, "err", waitErr)
 		}
 	}
@@ -1268,7 +1274,10 @@ func (s *Service) anySecretTargetDead(targets []string, alive map[string]struct{
 	// Restore the configured replication factor as soon as any intended backup
 	// is lost. Waiting for a strict majority means one dead node in the default
 	// two-backup set is never replaced and its put-outbox retries forever.
-	return frozenPeers > 0 && deadPeers > 0
+	// Also repair recipient sets narrowed by an older ownership replay. There
+	// may be no dead target in [self], so dead-only detection would leave an HA
+	// sandbox permanently at one ciphertext copy.
+	return (frozenPeers > 0 && deadPeers > 0) || frozenPeers < s.SecretRecipientBackupCount()
 }
 
 // secretIncarnationForSeal returns the current cluster placement or local
@@ -1592,8 +1601,9 @@ func (s *Service) computeFailoverReadyRow(sb *models.Sandbox, in *failoverReadyI
 	}
 	seal, sealed := in.seals[ref]
 	var recipients []string
-	if p, ok := in.placements[sb.ID]; ok && len(p.SecretRecipients) > 0 {
-		recipients = p.SecretRecipients
+	placement, placed := in.placements[sb.ID]
+	if placed && len(placement.SecretRecipients) > 0 {
+		recipients = placement.SecretRecipients
 	} else if sealed {
 		recipients = seal.Recipients
 	}
@@ -1629,10 +1639,13 @@ func (s *Service) computeFailoverReadyRow(sb *models.Sandbox, in *failoverReadyI
 		}
 		liveHolders++
 	}
+	hasSecret := sealed || (placed && (strings.TrimSpace(placement.SecretRef) != "" || len(recipients) > 0))
 	switch {
-	case len(recipients) <= 1:
+	case !hasSecret:
 		ready = true
-	case liveHolders >= 2:
+	case !s.cfg.EnableCluster && len(recipients) <= 1 && liveHolders >= 1:
+		ready = true
+	case len(recipients) > 1 && liveHolders >= 2:
 		ready = true
 	}
 	return &ready

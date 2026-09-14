@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -132,7 +133,7 @@ func TestPeerDeleteCleansExactOldLifecycleDespiteReusedPlacement(t *testing.T) {
 			},
 		},
 	}
-	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-delete-reuse", "inc-old", 4); err != nil {
+	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-delete-reuse", "inc-old", 4, "node-a"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-delete-reuse", "inc-old"); !errors.Is(err, storepkg.ErrNotFound) {
@@ -140,6 +141,41 @@ func TestPeerDeleteCleansExactOldLifecycleDespiteReusedPlacement(t *testing.T) {
 	}
 	if rec, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-delete-reuse", "inc-new"); err != nil || rec == nil {
 		t.Fatalf("current lifecycle was affected: rec=%+v err=%v", rec, err)
+	}
+}
+
+func TestPeerDeleteRequiresOwnerOrRecordedRecipientAndCapsGeneration(t *testing.T) {
+	ctx := context.Background()
+	st := openSealTestStore(t)
+	putSecretRow(t, st, "sb-peer-auth", "inc-auth", 3, []string{"node-b", "node-c"})
+	svc := &Service{
+		cfg: config.Config{EnableCluster: true}, store: st,
+		cluster: &placementOnlyCluster{
+			Noop: cluster.NewNoop("node-b", "http://b", ""),
+			placement: cluster.Placement{
+				SandboxID: "sb-peer-auth", OwnerNodeID: "node-a", IncarnationID: "inc-auth",
+				SecretRecipients: []string{"node-b", "node-c"}, SecretSealGeneration: 3,
+			},
+		},
+	}
+
+	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-auth", "inc-auth", 3, "node-compromised"); !errors.Is(err, ErrClusterSecretOriginatorDenied) {
+		t.Fatalf("unauthorized peer error = %v", err)
+	}
+	if _, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-auth", "inc-auth"); err != nil {
+		t.Fatalf("unauthorized peer deleted ciphertext: %v", err)
+	}
+	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-auth", "inc-auth", math.MaxInt64, "node-a"); !errors.Is(err, storepkg.ErrClusterSecretDeleteGenerationTooNew) {
+		t.Fatalf("owner huge-generation error = %v", err)
+	}
+	if _, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-auth", "inc-auth"); err != nil {
+		t.Fatalf("huge generation deleted ciphertext: %v", err)
+	}
+	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-auth", "inc-auth", 3, "node-b"); err != nil {
+		t.Fatalf("recorded recipient delete: %v", err)
+	}
+	if _, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-auth", "inc-auth"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("authorized delete left ciphertext: %v", err)
 	}
 }
 
@@ -185,7 +221,7 @@ func TestClusterSecretLifecycleGuardsAndProviderFallback(t *testing.T) {
 	if err := nilService.deleteClusterSecretsOriginator(ctx, "sb", "inc-test", nil); err != nil {
 		t.Fatalf("nil originator delete = %v", err)
 	}
-	if err := nilService.DeleteClusterSecretsLocal(ctx, "sb", "inc-test", 1); err != nil {
+	if err := nilService.DeleteClusterSecretsLocal(ctx, "sb", "inc-test", 1, ""); err != nil {
 		t.Fatalf("nil local delete = %v", err)
 	}
 	if err := nilService.ReconcileSecretDeleteOutbox(ctx); err != nil {
@@ -233,7 +269,7 @@ func TestClusterSecretLifecycleGuardsAndProviderFallback(t *testing.T) {
 
 	provider := &secretProviderStub{deleteErr: errors.New("delete failed")}
 	svc := &Service{secretProvider: provider}
-	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-local", "inc-local", 1); !errors.Is(err, provider.deleteErr) || provider.deleteCalls != 1 {
+	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-local", "inc-local", 1, ""); !errors.Is(err, provider.deleteErr) || provider.deleteCalls != 1 {
 		t.Fatalf("provider local delete calls=%d err=%v", provider.deleteCalls, err)
 	}
 	provider.deleteErr = nil

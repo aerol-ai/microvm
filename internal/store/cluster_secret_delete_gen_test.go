@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -79,6 +80,53 @@ func TestApplyPeerSecretDeleteEqualGenerationDeletes(t *testing.T) {
 	}
 }
 
+func TestApplyPeerSecretDeleteCapsWireGenerationAtLocalHighWaterPlusOne(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ref := "cluster-secret://sandbox/sb-cap/i/inc-cap/v1"
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: ref, SandboxID: "sb-cap", Version: 1, Recipients: []string{"node-a", "node-b"},
+		SealedPayload: []byte("sealed"), SealGeneration: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-cap", "inc-cap", math.MaxInt64); !errors.Is(err, ErrClusterSecretDeleteGenerationTooNew) {
+		t.Fatalf("huge generation error = %v", err)
+	}
+	if _, err := st.GetClusterSecret(ctx, ref); err != nil {
+		t.Fatalf("rejected generation deleted local row: %v", err)
+	}
+	if generation, err := st.ClusterSecretTombGenerationForIncarnation(ctx, "sb-cap", "inc-cap"); err != nil || generation != 0 {
+		t.Fatalf("rejected generation wrote tomb=%d err=%v", generation, err)
+	}
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-cap", "inc-cap", 8); err != nil {
+		t.Fatalf("high-water+1 delete: %v", err)
+	}
+}
+
+func TestNextClusterSecretGenerationRejectsOverflow(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO cluster_secret_tombs (sandbox_id, incarnation_id, deleted_at, generation)
+		VALUES (?, ?, ?, ?)
+	`, "sb-overflow", "inc-overflow", time.Now().UTC(), int64(math.MaxInt64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.NextClusterSecretSealGenerationForIncarnation(ctx, "sb-overflow", "inc-overflow"); !errors.Is(err, ErrClusterSecretGenerationExhausted) {
+		t.Fatalf("next generation error = %v", err)
+	}
+}
+
 func TestPeerDeleteIsIncarnationFencedAcrossSandboxIDReuse(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
@@ -94,21 +142,21 @@ func TestPeerDeleteIsIncarnationFencedAcrossSandboxIDReuse(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// A delayed request from the destroyed lifecycle may carry a much larger
-	// generation. Incarnation identity, not generation ordering, must win.
-	if err := st.ApplyPeerSecretDelete(ctx, "sb-reused", "inc-old", 99); err != nil {
+	// The prior lifecycle still cannot affect the current row. With no local
+	// high-water mark for inc-old, only generation 1 is accepted.
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-reused", "inc-old", 1); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.GetClusterSecret(ctx, ref)
 	if err != nil || string(got.SealedPayload) != "new-lifecycle" {
 		t.Fatalf("prior-incarnation delete erased reused ID: got=%+v err=%v", got, err)
 	}
-	if generation, err := st.ClusterSecretTombGenerationForIncarnation(ctx, "sb-reused", "inc-old"); err != nil || generation != 99 {
-		t.Fatalf("prior-incarnation delete tomb: generation=%d err=%v, want 99", generation, err)
+	if generation, err := st.ClusterSecretTombGenerationForIncarnation(ctx, "sb-reused", "inc-old"); err != nil || generation != 1 {
+		t.Fatalf("prior-incarnation delete tomb: generation=%d err=%v, want 1", generation, err)
 	}
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-reused/i/inc-old/v1", SandboxID: "sb-reused", Version: 1,
-		Recipients: []string{"node-old"}, SealedPayload: []byte("delayed-old-put"), SealGeneration: 99,
+		Recipients: []string{"node-old"}, SealedPayload: []byte("delayed-old-put"), SealGeneration: 1,
 	}); !errors.Is(err, ErrClusterSecretTombBlocksPut) {
 		t.Fatalf("delayed prior-incarnation put error = %v, want tomb rejection", err)
 	}
@@ -122,7 +170,7 @@ func TestNewLifecyclePutPreservesPriorIncarnationTomb(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	if err := st.ApplyPeerSecretDelete(ctx, "sb-reused", "inc-old", 99); err != nil {
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-reused", "inc-old", 1); err != nil {
 		t.Fatal(err)
 	}
 	ref := "cluster-secret://sandbox/sb-reused/i/inc-new/v1"
@@ -132,12 +180,12 @@ func TestNewLifecyclePutPreservesPriorIncarnationTomb(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("old lifecycle tomb blocked current put: %v", err)
 	}
-	if generation, err := st.ClusterSecretTombGenerationForIncarnation(ctx, "sb-reused", "inc-old"); err != nil || generation != 99 {
+	if generation, err := st.ClusterSecretTombGenerationForIncarnation(ctx, "sb-reused", "inc-old"); err != nil || generation != 1 {
 		t.Fatalf("current put cleared prior-incarnation tomb: generation=%d err=%v", generation, err)
 	}
 	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
 		Ref: "cluster-secret://sandbox/sb-reused/i/inc-old/v1", SandboxID: "sb-reused", Version: 1,
-		Recipients: []string{"node-old"}, SealedPayload: []byte("delayed-old-put"), SealGeneration: 99,
+		Recipients: []string{"node-old"}, SealedPayload: []byte("delayed-old-put"), SealGeneration: 1,
 	}); !errors.Is(err, ErrClusterSecretTombBlocksPut) {
 		t.Fatalf("delayed prior-incarnation put error = %v, want tomb rejection", err)
 	}
@@ -281,7 +329,7 @@ func TestSecretLifecycleStatsTracksBothDurableQueues(t *testing.T) {
 	if err := st.UpsertSecretPutOutbox(ctx, "sb-put", "inc-a", 2, []string{"peer"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ApplyPeerSecretDelete(ctx, "sb-tomb", "inc-tomb", 4); err != nil {
+	if err := st.ApplyPeerSecretDelete(ctx, "sb-tomb", "inc-tomb", 1); err != nil {
 		t.Fatal(err)
 	}
 	stats, err := st.SecretLifecycleStats(ctx)
