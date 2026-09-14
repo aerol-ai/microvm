@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -221,6 +222,86 @@ func TestClusterListJSBundlesRoutesIngressToLeaderAndCoalesces(t *testing.T) {
 	wg.Wait()
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("peer asked %d times for 16 concurrent lists, want 1 coalesced sweep", got)
+	}
+}
+
+func withOwnerAccess(r *http.Request, owner string) *http.Request {
+	return r.WithContext(controlplane.ContextWithAccess(r.Context(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: owner},
+	}))
+}
+
+func createJSBundleAs(t *testing.T, h http.Handler, owner, name string) models.JSBundle {
+	t.Helper()
+	body, _ := json.Marshal(models.CreateJSBundleRequest{Name: name, Source: jsHandlerBody})
+	req := httptest.NewRequest(http.MethodPost, "/v1/js-bundles", bytes.NewReader(body))
+	req.Header.Set("X-Cluster-Forwarded", "1")
+	req = withOwnerAccess(req, owner)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("upload %s/%s: %d %s", owner, name, rr.Code, rr.Body.String())
+	}
+	var created models.JSBundle
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode upload: %v", err)
+	}
+	return created
+}
+
+func listJSBundlesAs(t *testing.T, h http.Handler, owner string) (*httptest.ResponseRecorder, []*models.JSBundle) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/js-bundles", nil)
+	req.Header.Set("Authorization", "Bearer "+owner)
+	req = withOwnerAccess(req, owner)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	var rows []*models.JSBundle
+	if rr.Code == http.StatusOK {
+		if err := json.NewDecoder(rr.Body).Decode(&rows); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+	}
+	return rr, rows
+}
+
+// The leader cache used to key singleflight and TTL on the literal "all", so
+// tenant B listing within 2s received tenant A's catalogue. Bundles are
+// owner-scoped; the cache and sweep Access must be too.
+func TestClusterListJSBundlesDoesNotLeakAcrossTenants(t *testing.T) {
+	env := newJSBundleClusterEnv(t, config.NodeRoleServer)
+	created := createJSBundleAs(t, env.handler, "tenant-a", "private")
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		rows := []*models.JSBundle{}
+		if auth == "Bearer tenant-a" {
+			rows = []*models.JSBundle{{Digest: "peer-a", ModuleRef: models.JSBundleRefForNode("sha256:peer-a", "iso-a"), Name: "peer-a"}}
+		}
+		_ = json.NewEncoder(w).Encode(rows)
+	}))
+	defer peer.Close()
+	env.svc.AttachCluster(jsBundleMembersCluster("server-a", isolateMember("iso-a", peer.URL)))
+
+	rrA, rowsA := listJSBundlesAs(t, env.handler, "tenant-a")
+	if rrA.Code != http.StatusOK {
+		t.Fatalf("tenant-a list: %d %s", rrA.Code, rrA.Body.String())
+	}
+	seenA := map[string]bool{}
+	for _, row := range rowsA {
+		seenA[row.Digest] = true
+	}
+	if !seenA[created.Digest] {
+		t.Fatalf("tenant-a missing its upload: %+v", rowsA)
+	}
+
+	rrB, rowsB := listJSBundlesAs(t, env.handler, "tenant-b")
+	if rrB.Code != http.StatusOK {
+		t.Fatalf("tenant-b list: %d %s", rrB.Code, rrB.Body.String())
+	}
+	for _, row := range rowsB {
+		if row != nil && (row.Digest == created.Digest || row.Digest == "peer-a") {
+			t.Fatalf("tenant-b received tenant-a's catalogue: %+v", rowsB)
+		}
 	}
 }
 

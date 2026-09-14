@@ -569,15 +569,18 @@ func (a *Agent) ResolveCustomDomain(hostname string) (string, bool) {
 }
 
 func (a *Agent) DeletePlacement(ctx context.Context, sandboxID string) error {
-	placements, err := a.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
-	if err != nil {
-		return err
-	}
-	placement, ok := placements[strings.TrimSpace(sandboxID)]
-	if !ok {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
 		return nil
 	}
-	return a.DeletePlacementExact(ctx, sandboxID, placement.OwnerNodeID, placement.IncarnationID)
+	// Same distributable GET any control-plane member uses for port/domain
+	// mutations. An authoritative leader POST here serialized every destroy
+	// onto the Raft leader and 503'd ACKs across elections.
+	lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
+	if err != nil || !ok {
+		return err
+	}
+	return a.DeletePlacementExact(ctx, sandboxID, lookup.Placement.OwnerNodeID, lookup.Placement.IncarnationID)
 }
 
 func (a *Agent) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {

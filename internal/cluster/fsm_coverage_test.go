@@ -378,8 +378,8 @@ func TestClusterEasyClientAgentFSMBranches(t *testing.T) {
 		t.Fatalf("agent wrapper probe: %v", err)
 	}
 
-	if err := empty.DeletePlacement(ctx, "sb"); err == nil {
-		t.Fatal("delete without raft should fail the authoritative read")
+	if err := empty.DeletePlacement(ctx, "sb"); err != nil {
+		t.Fatalf("delete of a locally unknown placement = %v", err)
 	}
 }
 

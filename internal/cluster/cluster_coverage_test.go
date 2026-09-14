@@ -144,6 +144,9 @@ func TestClusterAgentClientAndDialCoverage(t *testing.T) {
 	if err := (*Cluster)(nil).DeletePlacement(ctx, "sb"); err != nil {
 		t.Fatalf("nil delete: %v", err)
 	}
+	if err := c.DeletePlacement(ctx, "missing-local"); err != nil {
+		t.Fatalf("local FSM miss must not consult the leader: %v", err)
+	}
 	if err := c.PruneAuditACL(ctx, time.Time{}); err != nil {
 		t.Fatalf("zero prune: %v", err)
 	}

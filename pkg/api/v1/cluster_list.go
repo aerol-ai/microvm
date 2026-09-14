@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -21,8 +22,8 @@ import (
 // shares one shape, and this file is that shape:
 //
 //   - ingress forwards to the Raft leader so there is one aggregator;
-//   - the leader answers from a short cache, and concurrent callers share one
-//     sweep through singleflight;
+//   - the leader answers from a short per-caller cache, and concurrent
+//     callers of the same owner share one sweep through singleflight;
 //   - the sweep asks only workers that advertise the artifact's runtime, with
 //     bounded parallelism and a per-peer deadline, and counts every peer that
 //     did not answer so a partial result is never silently short.
@@ -45,43 +46,87 @@ type clusterListAggregate[T any] struct {
 	failedPeers int
 }
 
-// clusterListCache holds the last sweep for clusterListCacheTTL and coalesces
-// concurrent misses.
+// clusterListCache holds the last sweep per caller for clusterListCacheTTL
+// and coalesces concurrent misses for that same caller. Bundles (and any
+// other owner-scoped catalogue) must never share one slot: a 2s TTL keyed on
+// a literal "all" would hand tenant B tenant A's rows.
 type clusterListCache[T any] struct {
 	mu      sync.RWMutex
-	expires time.Time
-	value   clusterListAggregate[T]
+	entries map[string]clusterListCacheEntry[T]
 	group   singleflight.Group
 }
 
-func (c *clusterListCache[T]) get(now time.Time) (clusterListAggregate[T], bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.expires.IsZero() || !now.Before(c.expires) {
-		return clusterListAggregate[T]{}, false
-	}
-	return c.value, true
+type clusterListCacheEntry[T any] struct {
+	expires time.Time
+	value   clusterListAggregate[T]
 }
 
-func (c *clusterListCache[T]) put(now time.Time, value clusterListAggregate[T]) {
+func (c *clusterListCache[T]) get(key string, now time.Time) (clusterListAggregate[T], bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.entries[key]
+	if !ok || e.expires.IsZero() || !now.Before(e.expires) {
+		return clusterListAggregate[T]{}, false
+	}
+	return e.value, true
+}
+
+func (c *clusterListCache[T]) put(key string, now time.Time, value clusterListAggregate[T]) {
 	c.mu.Lock()
-	c.value = value
-	c.expires = now.Add(clusterListCacheTTL)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]clusterListCacheEntry[T])
+	}
+	for k, e := range c.entries {
+		if e.expires.IsZero() || !now.Before(e.expires) {
+			delete(c.entries, k)
+		}
+	}
+	c.entries[key] = clusterListCacheEntry[T]{expires: now.Add(clusterListCacheTTL), value: value}
+}
+
+// clusterListCallerKey isolates cached catalogues by tenant. Operator and
+// unscoped callers share one fleet-wide slot; a user token never reads it.
+func clusterListCallerKey(r *http.Request) string {
+	if r == nil {
+		return "operator"
+	}
+	access, ok := controlplane.AccessFromContext(r.Context())
+	if !ok || access.Operator {
+		return "operator"
+	}
+	owner := strings.TrimSpace(access.Identity.OwnerRef)
+	if owner == "" {
+		return "operator"
+	}
+	return "owner:" + owner
+}
+
+func clusterListSweepContext(parent *http.Request) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), clusterListSweepTimeout)
+	if parent != nil {
+		if access, ok := controlplane.AccessFromContext(parent.Context()); ok {
+			ctx = controlplane.ContextWithAccess(ctx, access)
+		}
+	}
+	return ctx, cancel
 }
 
 // cached returns the cached sweep or runs one, sharing it with every caller
-// that arrives while it is in flight. The sweep runs on its own context so
-// the first ingress caller leaving does not abort work others are waiting on.
+// of the same owner that arrives while it is in flight. The sweep runs on
+// its own context so the first ingress caller leaving does not abort work
+// others are waiting on, but Access is copied so local owner scoping still
+// applies.
 func (c *clusterListCache[T]) cached(r *http.Request, sweep func(*http.Request) (clusterListAggregate[T], error)) (clusterListAggregate[T], error) {
-	if v, ok := c.get(time.Now()); ok {
+	key := clusterListCallerKey(r)
+	if v, ok := c.get(key, time.Now()); ok {
 		return v, nil
 	}
-	value, err, _ := c.group.Do("all", func() (any, error) {
-		if v, ok := c.get(time.Now()); ok {
+	value, err, _ := c.group.Do(key, func() (any, error) {
+		if v, ok := c.get(key, time.Now()); ok {
 			return v, nil
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), clusterListSweepTimeout)
+		ctx, cancel := clusterListSweepContext(r)
 		defer cancel()
 		request := r.Clone(ctx)
 		request.Header = r.Header.Clone()
@@ -89,7 +134,7 @@ func (c *clusterListCache[T]) cached(r *http.Request, sweep func(*http.Request) 
 		if err != nil {
 			return clusterListAggregate[T]{}, err
 		}
-		c.put(time.Now(), aggregate)
+		c.put(key, time.Now(), aggregate)
 		return aggregate, nil
 	})
 	if err != nil {
