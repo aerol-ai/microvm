@@ -124,8 +124,9 @@ func (s *Service) PruneSecretAudit(ctx context.Context) error {
 		}
 		if err := f.pruneWithGuards(cutoff, exportCursorPath, witnessedHead); err != nil {
 			if errors.Is(err, errSecretAuditPruneGuardChanged) {
-				// An event landed after the external checks. Retain the file and let
-				// the export/witness loops advance before the next prune attempt.
+				// Export is still on a previous generation, or the witness head
+				// we just shipped is not in the file. Keep the file; the 1s
+				// export tick and the next prune retry pick this up.
 				return nil
 			}
 			return err

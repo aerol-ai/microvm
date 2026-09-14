@@ -201,8 +201,9 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 	)
 	// Snapshot a complete batch under the same flock used by append and prune.
 	// The network call happens after unlock, so slow receivers never stall the
-	// writer. A concurrent prune can then cause only a safe duplicate: its new
-	// generation will force the following export back to byte zero.
+	// writer. Retention rewrites re-pin this cursor onto the new generation at
+	// the first unexported byte (or EOF), so a successful prune does not force
+	// the tailer back to offset 0.
 	err := s.secretAuditFile.withAuditFileLock(func() error {
 		f, err := os.Open(s.secretAuditFile.path)
 		if err != nil {

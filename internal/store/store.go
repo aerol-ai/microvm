@@ -144,6 +144,8 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// sandbox_env mirrors sandbox_mounts: sealed env lives off the hot
 		// row so List/netstats scanners never AES-GCM-open every sandbox
 		// (plans/secrets-hardening D8). FK CASCADE on destroy.
+		// toolbox_token_sealed stays on the row but scanSandbox does not
+		// decrypt it; only Get calls openToolboxToken.
 		`CREATE TABLE IF NOT EXISTS sandbox_env (
 			sandbox_id TEXT PRIMARY KEY,
 			sealed_blob BLOB NOT NULL,
@@ -1502,6 +1504,29 @@ func toolboxTokenAAD(sandboxID string) []byte {
 	return []byte("aerolvm/toolbox-token/" + strings.TrimSpace(sandboxID))
 }
 
+// openToolboxToken AES-GCM-opens toolbox_token_sealed onto ToolboxToken.
+// Get is the only caller: List/ListByOwner/ListByRuntime leave the blob
+// sealed so a fleet scan never decrypts every row (the same reason env
+// lives in sandbox_env) and so one undecryptable token cannot fail the
+// whole List and stall every reconcile loop on the node.
+func (s *Store) openToolboxToken(sandbox *models.Sandbox) error {
+	if sandbox == nil || len(sandbox.ToolboxTokenSealed) == 0 {
+		return nil
+	}
+	if sandbox.ToolboxToken != "" {
+		return nil
+	}
+	if s.secretCipher == nil {
+		return errors.New("sealed toolbox token cannot be opened: store cipher is not configured")
+	}
+	plain, err := s.secretCipher.DecryptWithAAD(sandbox.ToolboxTokenSealed, toolboxTokenAAD(sandbox.ID))
+	if err != nil {
+		return fmt.Errorf("open toolbox token for sandbox %q: %w", sandbox.ID, err)
+	}
+	sandbox.ToolboxToken = string(plain)
+	return nil
+}
+
 func (s *Store) toolboxTokenStorage(sandbox *models.Sandbox) ([]byte, error) {
 	if sandbox == nil {
 		return []byte{}, nil
@@ -1768,6 +1793,9 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 		}
 		return nil, err
 	}
+	if err := s.openToolboxToken(sandbox); err != nil {
+		return nil, err
+	}
 
 	ports, err := s.loadPorts(ctx, id)
 	if err != nil {
@@ -1901,9 +1929,10 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 // per-runtime background sweeps (wasm periodic checkpoint, wasm durable-push
 // retry) use it instead of List so they scan only their own rows rather than
 // the whole fleet on every tick — at a node packing thousands of mixed-runtime
-// sandboxes, List would load (and scanSandbox-decode) every docker/firecracker
-// row just to filter them back out. Like ListByOwner, ports and custom domains
-// are not attached: the sweep callers only need identity + lifecycle fields.
+// sandboxes, List would load every docker/firecracker row just to filter them
+// back out. Like ListByOwner, ports and custom domains are not attached: the
+// sweep callers only need identity + lifecycle fields. Toolbox tokens stay
+// sealed; those sweeps never need the bearer.
 func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -4284,16 +4313,6 @@ func (s *Store) scanSandbox(scanner interface {
 	}
 	sandbox.RegistryAuthSealed = nullableBlob(registryAuthSealed)
 	sandbox.ToolboxTokenSealed = nullableBlob(toolboxTokenSealed)
-	if len(toolboxTokenSealed) > 0 {
-		if s.secretCipher == nil {
-			return nil, errors.New("sealed toolbox token cannot be opened: store cipher is not configured")
-		}
-		plain, err := s.secretCipher.DecryptWithAAD(toolboxTokenSealed, toolboxTokenAAD(sandbox.ID))
-		if err != nil {
-			return nil, fmt.Errorf("open toolbox token for sandbox %q: %w", sandbox.ID, err)
-		}
-		sandbox.ToolboxToken = string(plain)
-	}
 	sandbox.AutoImportPending = autoImportPending == 1
 	sandbox.WakeArmed = wakeArmed == 1
 
