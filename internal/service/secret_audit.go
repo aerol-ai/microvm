@@ -860,8 +860,9 @@ func (s *fileAuditSink) appendSpill(events ...SecretAuditEvent) error {
 const spillBatchMax = 256
 
 // spillQueued group-commits first plus whatever else is already queued on
-// spillCh (up to spillBatchMax). Drops are accounted per event, as one
-// coalesced gap.
+// spillCh (up to spillBatchMax) into the authoritative JSONL. In-process
+// overflow is trusted — the writer already holds these events — so it must
+// not land in the spill file, which WASM workers can also write.
 func (s *fileAuditSink) spillQueued(first SecretAuditEvent) {
 	batch := append(make([]SecretAuditEvent, 0, spillBatchMax), first)
 	for len(batch) < spillBatchMax {
@@ -877,17 +878,19 @@ func (s *fileAuditSink) spillQueued(first SecretAuditEvent) {
 		}
 		break
 	}
-	if err := s.appendSpill(batch...); err != nil {
-		auditEventsDroppedTotal.Add(int64(len(batch)))
-		n := s.pendingGap.Add(int64(len(batch)))
-		s.persistGapState(n)
+	if err := s.writeEventBatch(batch, true, true); err != nil {
+		// writeEventBatch already accounts the drop when accountFailure is set.
+		return
 	}
 }
 
 // drainSpill moves one immutable spill segment into the authoritative JSONL.
-// It streams and group-commits the segment in bounded batches, then removes the
-// segment only after every batch is durable. A crash may replay a batch (event
-// IDs make that detectable/idempotent downstream), but cannot lose evidence.
+// The spill file is an unauthenticated write path (WASM workers share the
+// daemon uid and the audit directory); drain sanitizes every line before it
+// is chained. It streams and group-commits the segment in bounded batches,
+// then removes the segment only after every batch is durable. A crash may
+// replay a batch (event IDs make that detectable/idempotent downstream), but
+// cannot lose evidence.
 func (s *fileAuditSink) drainSpill() bool {
 	if s == nil || s.spillPath == "" {
 		return false
@@ -960,28 +963,35 @@ func (s *fileAuditSink) drainSpill() bool {
 		batch = batch[:0]
 		return true
 	}
+	now := time.Now().UTC()
 	for {
-		line, readErr := br.ReadBytes('\n')
-		if len(line) > 0 {
-			consumed += int64(len(line))
-			text := strings.TrimSpace(string(line))
-			if text != "" {
-				var ev SecretAuditEvent
-				if json.Unmarshal([]byte(text), &ev) != nil {
-					auditSpillMalformedTotal.Add(1)
-					sum := sha256.Sum256([]byte(text))
-					ev = SecretAuditEvent{
-						Time: time.Unix(1_000_000_000+int64(sum[0]), 0).UTC(), EventID: "ae-spill-malformed-" + hex.EncodeToString(sum[:8]),
-						Result: secretAuditResultGap, Reason: secretAuditReasonOverflow, Kind: secretAuditKindGap, Dropped: 1,
-					}
-				}
-				batch = append(batch, ev)
+		line, readConsumed, _, tooLong, readErr := readSecretAuditLineMax(br, auditIngestMaxBody)
+		if readConsumed > 0 {
+			consumed += readConsumed
+			if tooLong {
+				auditSpillMalformedTotal.Add(1)
+				batch = append(batch, spillMalformedGap([]byte("too-long")))
 				if len(batch) == cap(batch) && !flush() {
 					return false
 				}
+			} else {
+				text := strings.TrimSpace(string(line))
+				if text != "" {
+					var ev SecretAuditEvent
+					if json.Unmarshal([]byte(text), &ev) != nil {
+						auditSpillMalformedTotal.Add(1)
+						ev = spillMalformedGap([]byte(text))
+					} else {
+						ev = sanitizeSpillEvent(ev, now)
+					}
+					batch = append(batch, ev)
+					if len(batch) == cap(batch) && !flush() {
+						return false
+					}
+				}
 			}
 		}
-		if readErr == io.EOF {
+		if readErr == io.EOF || (readErr == nil && readConsumed == 0) {
 			break
 		}
 		if readErr != nil {
@@ -998,6 +1008,70 @@ func (s *fileAuditSink) drainSpill() bool {
 		return false
 	}
 	return true
+}
+
+const secretAuditSpillDestMax = 512
+
+// spillMalformedGap is the record that stands in for a spill line the drain
+// refused to chain: oversized, not JSON, or a kind workers are not allowed
+// to mint. Time is now so a planted far-future timestamp cannot stall prefix
+// retention. Hashes are left empty; appendBatchLocked re-links them.
+func spillMalformedGap(seed []byte) SecretAuditEvent {
+	if len(seed) == 0 {
+		seed = []byte("spill")
+	}
+	sum := sha256.Sum256(seed)
+	return SecretAuditEvent{
+		Time:    time.Now().UTC(),
+		EventID: "ae-spill-malformed-" + hex.EncodeToString(sum[:8]),
+		Result:  secretAuditResultGap,
+		Reason:  secretAuditReasonOverflow,
+		Kind:    secretAuditKindGap,
+		Dropped: 1,
+	}
+}
+
+// sanitizeSpillEvent treats a decoded spill line as unauthenticated worker
+// input. Only egress and gap kinds are chained; secret-open (and anything
+// else) becomes a gap. Hashes are stripped so the writer re-links against
+// the live tip. Future timestamps are clamped so they cannot block retention.
+func sanitizeSpillEvent(ev SecretAuditEvent, now time.Time) SecretAuditEvent {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if ev.Time.IsZero() || ev.Time.After(now) {
+		ev.Time = now
+	}
+	kind := strings.TrimSpace(ev.Kind)
+	result := strings.TrimSpace(ev.Result)
+	switch {
+	case kind == secretAuditKindGap || result == secretAuditResultGap:
+		dropped := ev.Dropped
+		if dropped < 1 {
+			dropped = 1
+		}
+		return SecretAuditEvent{
+			Time:    ev.Time,
+			EventID: ev.EventID,
+			Result:  secretAuditResultGap,
+			Reason:  secretAuditReasonOverflow,
+			Kind:    secretAuditKindGap,
+			Dropped: dropped,
+		}
+	case kind == secretAuditKindEgress:
+		if len(ev.Destination) > secretAuditSpillDestMax {
+			ev.Destination = ev.Destination[:secretAuditSpillDestMax]
+		}
+		ev.Kind = secretAuditKindEgress
+		ev.Ref = ""
+		ev.PrevHash = ""
+		ev.EventHash = ""
+		ev.WitnessedThrough = ""
+		return ev
+	default:
+		auditSpillMalformedTotal.Add(1)
+		return spillMalformedGap([]byte(ev.EventID + kind + ev.SandboxID))
+	}
 }
 
 func (s *fileAuditSink) syncFile() error {
@@ -1075,25 +1149,32 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 			}
 			return err
 		}
+		// exportedThrough is the byte watermark the exporter has acknowledged
+		// in this generation. -1 means no exporter is wired (open-source
+		// prune): every expired prefix record is eligible. 0 means nothing
+		// has been shipped, so retention must not drop a byte. A live node
+		// always has cursor.Offset < size because events keep appending;
+		// aborting the whole prune on that inequality is what filled disks.
+		exportedThrough := int64(-1)
 		if exportCursorPath != "" {
 			generation, generationErr := auditFileGeneration(src)
 			if generationErr != nil {
 				_ = src.Close()
 				return generationErr
 			}
-			stat, statErr := src.Stat()
-			if statErr != nil {
-				_ = src.Close()
-				return statErr
-			}
 			cursor := loadAuditExportCursor(exportCursorPath)
-			if stat.Size() > 0 && (cursor.Generation != generation || cursor.Offset < stat.Size()) {
+			if cursor.Generation != "" && cursor.Generation != generation {
+				// Export is still pinned to a previous rewrite. Wait; dropping
+				// now would make that generation unrecoverable.
 				_ = src.Close()
 				return errSecretAuditPruneGuardChanged
 			}
+			if cursor.Generation == generation {
+				exportedThrough = cursor.Offset
+			} else {
+				exportedThrough = 0
+			}
 		}
-		scanner := bufio.NewScanner(src)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		var lastDroppedHash string
 		witnessedThrough := ""
 		witnessCandidate := ""
@@ -1108,14 +1189,36 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		// the chain, so pass 2 reduces them to hash-only stubs: the payload
 		// goes, the link stays. Stopping at the first fresh record would keep
 		// those for as long as the record in front of them lives.
+		//
+		// A record is only prefix-dropped or redacted once export (and, when
+		// configured, the external witness) has acknowledged it. Unexported
+		// expired events stay intact until the tailer catches up; a far-future
+		// or freshly appended record cannot stall the exported prefix forever.
 		droppedLines := 0   // lines pass 2 skips, the leading checkpoint included
 		droppedRecords := 0 // expired records among them
 		redactRecords := 0  // expired records behind a fresh one
 		droppingPrefix := true
+		afterWitness := false
+		witnessedHeadFound := witnessedHead == ""
 		var priorCheckpoint *SecretAuditEvent
 		verifier := newSecretAuditChainVerifier()
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
+		pass1 := bufio.NewReaderSize(src, 64*1024)
+		var pass1Pos int64
+		for {
+			rawLine, consumed, _, tooLong, readErr := readSecretAuditLine(pass1)
+			if readErr != nil {
+				_ = src.Close()
+				return readErr
+			}
+			if consumed == 0 {
+				break
+			}
+			pass1Pos += consumed
+			if tooLong {
+				_ = src.Close()
+				return fmt.Errorf("secret audit retention encountered a record over %d bytes", secretAuditMaxLineBytes)
+			}
+			line := strings.TrimSpace(string(rawLine))
 			if line == "" {
 				continue
 			}
@@ -1137,10 +1240,21 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 				cp := ev
 				priorCheckpoint = &cp
 				droppedLines++
+				if witnessedHead != "" && ev.EventHash == witnessedHead {
+					witnessedHeadFound = true
+					afterWitness = true
+				}
 				continue
 			}
+			exported := exportedThrough < 0 || pass1Pos <= exportedThrough
+			if witnessedHead != "" && ev.EventHash == witnessedHead {
+				witnessedHeadFound = true
+			}
 			expired := secretAuditExpired(ev, cutoff)
-			if droppingPrefix && expired {
+			if witnessedHead != "" && afterWitness {
+				droppingPrefix = false
+			}
+			if droppingPrefix && expired && exported {
 				droppedLines++
 				droppedRecords++
 				if ev.EventHash != "" {
@@ -1149,18 +1263,20 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 						witnessedThrough = witnessCandidate
 					}
 				}
+				if witnessedHead != "" && ev.EventHash == witnessedHead {
+					afterWitness = true
+				}
 				continue
 			}
 			droppingPrefix = false
-			if expired && ev.Kind != secretAuditKindRetentionRedacted {
+			if witnessedHead != "" && ev.EventHash == witnessedHead {
+				afterWitness = true
+			}
+			if expired && exported && ev.Kind != secretAuditKindRetentionRedacted {
 				redactRecords++
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			_ = src.Close()
-			return err
-		}
-		if witnessedHead != "" && verifier.prev != witnessedHead {
+		if witnessedHead != "" && !witnessedHeadFound {
 			_ = src.Close()
 			return errSecretAuditPruneGuardChanged
 		}
@@ -1253,6 +1369,8 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		dstPos := shift.checkpointLen
 		lastKeptLineOffset := int64(0) // the checkpoint line, until a record is kept
 		floorSet := false
+		firstUnexportedDst := int64(-1)
+		exportResumeHead := cp.EventHash
 		for {
 			rawLine, consumed, _, tooLong, err := readSecretAuditLine(br)
 			if err != nil {
@@ -1294,7 +1412,12 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 				_ = src.Close()
 				return fmt.Errorf("secret audit retention event changed between passes: %w", err)
 			}
-			if secretAuditExpired(ev, cutoff) && ev.Kind != secretAuditKindRetentionRedacted {
+			exported := exportedThrough < 0 || srcPos <= exportedThrough
+			if exportedThrough >= 0 && srcPos > exportedThrough && firstUnexportedDst < 0 {
+				firstUnexportedDst = dstPos
+				exportResumeHead = lastKeptHash
+			}
+			if exported && secretAuditExpired(ev, cutoff) && ev.Kind != secretAuditKindRetentionRedacted {
 				stub, err := json.Marshal(redactSecretAuditEvent(ev))
 				if err != nil {
 					_ = f.Close()
@@ -1363,6 +1486,26 @@ func (s *fileAuditSink) pruneLocked(cutoff time.Time, exportCursorPath, witnesse
 		// verified checkpoint now rather than leave a stale one for boot to
 		// reject.
 		s.persistVerifiedLocked()
+		if exportCursorPath != "" {
+			// Re-pin the exporter onto the rewritten file so the next tick
+			// does not treat the new generation as "start over from byte 0"
+			// and re-ship the retained window. Unexported tail keeps its
+			// place; a fully-exported file is marked caught up at EOF.
+			newCursor := auditExportCursor{Generation: shift.generation}
+			switch {
+			case exportedThrough == 0:
+				newCursor.Offset = 0
+			case firstUnexportedDst < 0:
+				newCursor.Offset = dstPos
+				newCursor.Head = lastKeptHash
+			default:
+				newCursor.Offset = firstUnexportedDst
+				newCursor.Head = exportResumeHead
+			}
+			if err := persistAuditExportCursor(exportCursorPath, newCursor); err != nil {
+				return err
+			}
+		}
 		if s.onPruneShift != nil {
 			s.onPruneShift(shift)
 		}
@@ -1831,11 +1974,20 @@ func scanSecretAuditChainReader(r io.Reader, opts secretAuditScanOptions) (secre
 // and the bytes consumed. A line past secretAuditMaxLineBytes is counted but
 // not retained so a NUL-filled or runaway tail cannot balloon the scan.
 func readSecretAuditLine(br *bufio.Reader) (line []byte, consumed int64, terminated, tooLong bool, err error) {
+	return readSecretAuditLineMax(br, secretAuditMaxLineBytes)
+}
+
+// readSecretAuditLineMax is the bounded reader drainSpill uses with the ingest
+// body cap, so a worker cannot plant a line that fails strict boot.
+func readSecretAuditLineMax(br *bufio.Reader, max int64) (line []byte, consumed int64, terminated, tooLong bool, err error) {
+	if max <= 0 {
+		max = secretAuditMaxLineBytes
+	}
 	for {
 		chunk, readErr := br.ReadSlice('\n')
 		consumed += int64(len(chunk))
 		if !tooLong {
-			if int64(len(line))+int64(len(chunk)) > secretAuditMaxLineBytes {
+			if int64(len(line))+int64(len(chunk)) > max {
 				tooLong = true
 				line = nil
 			} else {

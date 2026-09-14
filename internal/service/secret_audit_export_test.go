@@ -97,6 +97,89 @@ func TestSecretAuditRetentionWaitsForProgrammaticExporter(t *testing.T) {
 	}
 }
 
+func TestSecretAuditPruneDropsExportedPrefixWhileLiveTailExists(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath:                   filepath.Join(t.TempDir(), "state.db"),
+		SecretAuditRetentionDays: 1,
+	}}
+	setAuditExporter(svc, &maliciousOffsetExporter{})
+	t.Cleanup(svc.CloseSecretAuditSink)
+	sink := svc.secretAuditSink().(*fileAuditSink)
+	now := time.Now().UTC()
+	if err := sink.EmitDurable(SecretAuditEvent{
+		Time: now.Add(-48 * time.Hour), EventID: "exported-old", SandboxID: "sb", Result: secretAuditResultSuccess,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.exportSecretAuditBatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.EmitDurable(SecretAuditEvent{
+		Time: now, EventID: "live-tail", SandboxID: "sb", Result: secretAuditResultSuccess,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PruneSecretAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "exported-old") {
+		t.Fatalf("exported expired prefix survived a live tail: %s", raw)
+	}
+	if !strings.Contains(string(raw), "live-tail") {
+		t.Fatalf("live tail was dropped: %s", raw)
+	}
+}
+
+func TestSecretAuditPruneDoesNotReshipExportedWindow(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath:                   filepath.Join(t.TempDir(), "state.db"),
+		SecretAuditRetentionDays: 1,
+	}}
+	exporter := &maliciousOffsetExporter{}
+	setAuditExporter(svc, exporter)
+	t.Cleanup(svc.CloseSecretAuditSink)
+	sink := svc.secretAuditSink().(*fileAuditSink)
+	now := time.Now().UTC()
+	if err := sink.EmitDurable(SecretAuditEvent{
+		Time: now.Add(-48 * time.Hour), EventID: "old", SandboxID: "sb", Result: secretAuditResultSuccess,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.EmitDurable(SecretAuditEvent{
+		Time: now, EventID: "fresh", SandboxID: "sb", Result: secretAuditResultSuccess,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.exportSecretAuditBatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(exporter.batches) == 0 {
+		t.Fatal("pre-prune export shipped nothing")
+	}
+	if err := svc.PruneSecretAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	exporter.batches = nil
+	if err := svc.exportSecretAuditBatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, batch := range exporter.batches {
+		for _, raw := range batch.Events {
+			var ev SecretAuditEvent
+			if err := json.Unmarshal(raw, &ev); err != nil {
+				t.Fatal(err)
+			}
+			if ev.EventID == "fresh" {
+				t.Fatalf("post-prune export re-shipped retained event: %+v", ev)
+			}
+		}
+	}
+}
+
 func TestSecretAuditPruneGuardsCloseAppendAfterVerificationWindow(t *testing.T) {
 	dir := t.TempDir()
 	svc := &Service{cfg: config.Config{DBPath: filepath.Join(dir, "state.db")}}
@@ -112,22 +195,21 @@ func TestSecretAuditPruneGuardsCloseAppendAfterVerificationWindow(t *testing.T) 
 	}
 	witnessedHead, _ := sink.chainTip()
 
-	// This append lands after both hypothetical external checks. The writer-side
-	// generation/size and chain-tip guards must preserve both records.
+	// This append lands after both hypothetical external checks. The unexported
+	// record must stay; the already-exported expired prefix may be dropped.
 	if err := sink.EmitDurable(SecretAuditEvent{Time: old, EventID: "after-check", SandboxID: "sb"}); err != nil {
 		t.Fatal(err)
 	}
 	offsetPath := filepath.Join(filepath.Dir(sink.path), secretAuditExportOffset)
-	err := sink.pruneWithGuards(time.Now().UTC().Add(-24*time.Hour), offsetPath, witnessedHead)
-	if !errors.Is(err, errSecretAuditPruneGuardChanged) {
-		t.Fatalf("prune guard error = %v, want changed guard", err)
+	if err := sink.pruneWithGuards(time.Now().UTC().Add(-24*time.Hour), offsetPath, witnessedHead); err != nil {
+		t.Fatalf("prune after live append: %v", err)
 	}
 	raw, err := os.ReadFile(sink.path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "verified") || !strings.Contains(string(raw), "after-check") {
-		t.Fatalf("guarded prune removed evidence: %s", raw)
+	if !strings.Contains(string(raw), "after-check") {
+		t.Fatalf("unexported post-check evidence was dropped: %s", raw)
 	}
 }
 

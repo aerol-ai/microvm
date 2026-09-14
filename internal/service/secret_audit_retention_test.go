@@ -291,9 +291,9 @@ func TestSecretAuditChainVerifierLinksStubsByStoredHashesOnly(t *testing.T) {
 	}
 }
 
-// End to end through the real reordering path: an event that reached the
-// spill file (worker or overflow) drains behind a newer in-memory event and
-// still leaves the log when it expires.
+// End to end through the real reordering path: an old worker-spilled egress
+// event drains behind a newer in-memory event and still leaves the log when
+// it expires.
 func TestFileAuditSinkSpilledOldEventStillExpires(t *testing.T) {
 	sink, err := newFileAuditSinkOpts(t.TempDir(), 8, true)
 	if err != nil {
@@ -304,7 +304,10 @@ func TestFileAuditSinkSpilledOldEventStillExpires(t *testing.T) {
 	if err := sink.EmitDurable(SecretAuditEvent{Time: now, EventID: "fresh", SandboxID: "sb-fresh", Result: secretAuditResultSuccess}); err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.appendSpill(SecretAuditEvent{Time: now.Add(-48 * time.Hour), EventID: "spilled-old", SandboxID: "sb-old", Result: secretAuditResultSuccess}); err != nil {
+	if err := sink.appendSpill(SecretAuditEvent{
+		Time: now.Add(-48 * time.Hour), EventID: "spilled-old", SandboxID: "sb-old",
+		Kind: secretAuditKindEgress, Destination: "old.example:443", Result: secretAuditResultSuccess,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := sink.Sync(); err != nil {
