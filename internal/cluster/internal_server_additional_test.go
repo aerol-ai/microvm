@@ -233,3 +233,28 @@ func TestInternalServerEnterpriseApplyRequiresLiveCertIdentity(t *testing.T) {
 		t.Fatalf("apply calls=%d, want only the authorized bounded request", calls)
 	}
 }
+
+func TestInternalServerDoesNotBoundStreamingBodies(t *testing.T) {
+	// Forwarded exec/log/upload/websocket hitch a ride on this listener.
+	// ReadTimeout/WriteTimeout would cut those the way the public API
+	// deliberately does not (pkg/daemon/daemon.go).
+	pool, cert, err := generateTestCertForNode("worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := &ClusterTLS{caPool: pool, nodeCert: cert}
+	srv, err := startInternalServer("127.0.0.1:0", ct, func(context.Context, []byte) error { return nil }, slog.Default(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	if srv.srv.ReadTimeout != 0 {
+		t.Fatalf("ReadTimeout = %s, want 0 (streaming)", srv.srv.ReadTimeout)
+	}
+	if srv.srv.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %s, want 0 (streaming)", srv.srv.WriteTimeout)
+	}
+	if srv.srv.ReadHeaderTimeout != 10*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %s, want 10s", srv.srv.ReadHeaderTimeout)
+	}
+}

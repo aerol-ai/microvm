@@ -12,3 +12,9 @@ func makeDevNodes(string) error { return nil }
 func cloneDevNode(string, string) error { return nil }
 
 func runningAsRoot() bool { return os.Geteuid() == 0 }
+
+func mountNoexecTmpfs(string, int, int) error {
+	return errNotRoot
+}
+
+func unmountNoexecMounts([]string) {}

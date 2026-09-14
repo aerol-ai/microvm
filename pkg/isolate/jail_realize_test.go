@@ -288,8 +288,8 @@ func TestResolveSharedLibsAndPrepareJailBase(t *testing.T) {
 			t.Fatalf("base lacks %s: %v", p, err)
 		}
 	}
-	if st, _ := os.Stat(filepath.Join(base, jailBaseName, "tmp")); st.Mode().Perm()&0o002 == 0 {
-		t.Fatalf("tmp not world-writable: %v", st.Mode())
+	if st, _ := os.Stat(filepath.Join(base, jailBaseName, "tmp")); st.Mode().Perm()&0o002 != 0 {
+		t.Fatalf("tmp still world-writable (execve + 1777 /tmp is the plant-a-binary path): %v", st.Mode())
 	}
 	// Rebuild in place is idempotent and atomic (no .next / .old left behind).
 	if err := PrepareJailBase(base, static); err != nil {
@@ -533,4 +533,10 @@ func TestHostStartFailsClosedWithFullJailConfigWhenUnrealizable(t *testing.T) {
 		}
 	}
 	_ = errors.Is(err, errNotRoot)
+}
+
+func TestMountNoexecTmpfsRejectsRelative(t *testing.T) {
+	if err := mountNoexecTmpfs("tmp", 1, 1); err == nil {
+		t.Fatal("relative dir accepted")
+	}
 }

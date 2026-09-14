@@ -178,7 +178,7 @@ var seccompBaseAllow = []string{
 	"clone", "clone3", "futex", "set_robust_list", "set_tid_address", "rseq", "sched_yield",
 	"sched_getaffinity", "sched_setaffinity", "sched_getparam", "sched_getscheduler",
 	"sched_get_priority_max", "sched_get_priority_min", "getcpu",
-	"getpid", "gettid", "getppid", "getpgrp", "tgkill", "tkill", "kill", "wait4",
+	"getpid", "gettid", "getppid", "getpgrp", "tgkill", "wait4",
 	"getuid", "geteuid", "getgid", "getegid", "getgroups", "capget", "umask",
 	// Signals.
 	"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "rt_sigtimedwait", "rt_sigsuspend", "rt_sigpending",
@@ -196,7 +196,8 @@ var seccompBaseAllow = []string{
 	"prctl", "arch_prctl", "exit", "exit_group", "uname", "sysinfo",
 	"setpriority", "getpriority", "prlimit64", "getrlimit",
 	// Bootstrap: the shim's exec into workerd. no_new_privs is already set,
-	// the chroot holds one binary, and execveat stays denied.
+	// the chroot holds one binary, writable dirs are noexec tmpfs, and
+	// execveat stays denied.
 	"execve",
 }
 
@@ -227,6 +228,11 @@ var seccompNeverAllow = []string{
 	"iopl", "ioperm", "quotactl",
 	"fsopen", "fsconfig", "fsmount", "move_mount",
 	"execveat", "seccomp", "setuid", "setgid", "setresuid", "setresgid", "setreuid", "setregid", "capset",
+	// Shared jail uid + host PID namespace would make these cross-tenant
+	// kills. They stay off the allowlist even with a per-group PID
+	// namespace (CLONE_NEWPID): pthread uses tgkill, and kill(-1)/tkill
+	// are how one group would harvest every other group on the node.
+	"kill", "tkill",
 }
 
 // Argument masks the jitless rules test (Linux ABI values, identical on

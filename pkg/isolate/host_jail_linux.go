@@ -95,9 +95,26 @@ func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized
 	attr.Setpgid = true
 	attr.UseCgroupFD = true
 	attr.CgroupFD = cgFD
+	attr.Cloneflags = jailCloneflags()
 	cmd.SysProcAttr = attr
+	for _, dir := range []string{filepath.Join(j.ChrootDir, "tmp"), filepath.Join(j.ChrootDir, JailRunDirName)} {
+		if err := mountNoexecTmpfs(dir, j.UID, j.GID); err != nil {
+			realized.teardown()
+			return nil, err
+		}
+		realized.noexecMounts = append(realized.noexecMounts, dir)
+	}
 	return realized, nil
 }
 
-// jailRealizable reports whether this platform can realize the jail at all.
-func jailRealizable() bool { return true }
+// jailCloneflags gives each group its own PID namespace. Isolate groups
+// share the jail uid; without this, kill/tkill/tgkill (or kill -1) from one
+// tenant's workerd can signal every other tenant's. Inside the namespace
+// those calls can only address this process.
+func jailCloneflags() uintptr { return syscall.CLONE_NEWPID }
+
+// jailRealizable reports whether this host can realize the jail. Linux is
+// not enough: applyJail needs root (chroot, cgroup, mknod, setuid). A
+// non-root daemon that reported realizable=true would boot green and then
+// fail every isolate create.
+func jailRealizable() bool { return runningAsRoot() }
