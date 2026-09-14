@@ -67,3 +67,26 @@ func cloneDevNode(src, dst string) error {
 }
 
 func runningAsRoot() bool { return os.Geteuid() == 0 }
+
+// mountNoexecTmpfs covers a jail-writable directory so a process that still
+// has execve (the shim's one exec into workerd) cannot write a binary there
+// and run it. nosuid/nodev are the usual extra bits.
+func mountNoexecTmpfs(dir string, uid, gid int) error {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return fmt.Errorf("isolate jail: noexec tmpfs dir %q must be absolute", dir)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	opts := fmt.Sprintf("size=64M,mode=0700,uid=%d,gid=%d", uid, gid)
+	if err := unix.Mount("tmpfs", dir, "tmpfs", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, opts); err != nil {
+		return fmt.Errorf("isolate jail: noexec tmpfs on %s: %w", dir, err)
+	}
+	return nil
+}
+
+func unmountNoexecMounts(dirs []string) {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = unix.Unmount(dirs[i], unix.MNT_DETACH)
+	}
+}

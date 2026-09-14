@@ -16,6 +16,9 @@ type jailRealized struct {
 	// unknownSyscalls are allowlist names this architecture lacks; logged
 	// once at spawn so a typo is visible.
 	unknownSyscalls []string
+	// noexecMounts are tmpfs mounts on the group's writable dirs (tmp, run).
+	// Unmount before removing the chroot.
+	noexecMounts []string
 }
 
 // closeFD releases the cgroup descriptor the child was cloned into. Call
@@ -36,6 +39,8 @@ func (r *jailRealized) teardown() error {
 	}
 	r.closeFD()
 	var errs []error
+	unmountNoexecMounts(r.noexecMounts)
+	r.noexecMounts = nil
 	if r.cgroupDir != "" {
 		if err := r.cgroup.remove(r.cgroupDir); err != nil {
 			errs = append(errs, err)

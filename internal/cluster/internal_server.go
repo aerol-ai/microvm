@@ -120,10 +120,13 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 	}
 
 	srv := &http.Server{
-		Handler:           mux,
+		Handler: mux,
+		// Match the public API listener (pkg/daemon/daemon.go): ReadHeaderTimeout
+		// bounds slowloris, IdleTimeout reaps keep-alives between requests.
+		// Do not set ReadTimeout/WriteTimeout — every forwarded exec, log
+		// stream, upload, and websocket attach shares this listener, and those
+		// run longer than 15s/30s by design.
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 	}

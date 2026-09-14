@@ -236,10 +236,24 @@ func TestSeccompProfileInvariants(t *testing.T) {
 	// Escape primitives stay pinned on the never list — including the ways
 	// a filtered process could change its own filter or identity.
 	neverSet := toSet(SeccompNeverAllow())
-	for _, escape := range []string{"ptrace", "mount", "setns", "unshare", "bpf", "execveat", "seccomp", "setuid", "setresuid", "capset"} {
+	for _, escape := range []string{"ptrace", "mount", "setns", "unshare", "bpf", "execveat", "seccomp", "setuid", "setresuid", "capset", "kill", "tkill"} {
 		if _, ok := neverSet[escape]; !ok {
 			t.Fatalf("escape primitive %q missing from never-allow list", escape)
 		}
+	}
+
+	// Shared jail uid: kill/tkill must not be on the allowlist even though
+	// tgkill stays (pthread). One group must not be able to signal another.
+	for _, cross := range []string{"kill", "tkill"} {
+		if _, ok := defaultSet[cross]; ok {
+			t.Fatalf("%s is on the default allowlist (cross-tenant signal)", cross)
+		}
+		if _, ok := jitlessSet[cross]; ok {
+			t.Fatalf("%s is on the jitless allowlist (cross-tenant signal)", cross)
+		}
+	}
+	if _, ok := defaultSet["tgkill"]; !ok {
+		t.Fatal("tgkill missing from default profile (pthread_kill)")
 	}
 
 	// SeccompNeverAllow must hand out a copy — a caller mutating the result

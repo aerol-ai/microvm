@@ -78,11 +78,12 @@ func PrepareJailBase(chrootBase, workerdPath string) error {
 		_ = os.RemoveAll(staging)
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(staging, "tmp"), 0o1777); err != nil {
+	// 0755, not 1777: the group's /tmp is a noexec tmpfs at spawn (applyJail),
+	// so a writable sticky tmp plus execve cannot plant a second binary.
+	if err := os.MkdirAll(filepath.Join(staging, "tmp"), 0o755); err != nil {
 		_ = os.RemoveAll(staging)
 		return err
 	}
-	_ = os.Chmod(filepath.Join(staging, "tmp"), 0o1777)
 	if err := makeDevNodes(filepath.Join(staging, "dev")); err != nil {
 		_ = os.RemoveAll(staging)
 		return err

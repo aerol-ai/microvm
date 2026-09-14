@@ -97,9 +97,15 @@ func wazeroCompileCacheDir() string {
 // MultiInstanceEngine (engine_multi.go) so both get identical runtime config —
 // notably the same compilation cache, which is what makes a warm compile cheap.
 func newBaseRuntime(ctx context.Context, pages uint32) (wazero.Runtime, error) {
-	// Guests are untrusted. This enables wazero's supported concurrent
-	// Module.Close path and ensures cancellation/deadlines can preempt CPU-bound
-	// guest code rather than pinning an OS thread indefinitely.
+	// Guests are untrusted. WithCloseOnContextDone is wazero's supported
+	// concurrent Module.Close path: cancellation/deadlines can preempt
+	// CPU-bound guest code rather than pinning an OS thread indefinitely.
+	//
+	// Cost: wazero hashes this flag into the module ID (AssignModuleID),
+	// so enabling it misses every on-disk compile-cache entry compiled
+	// without it. First create of each module on each node after the flip
+	// pays the 2–3s cold compile once, then the new key is cached. Do not
+	// turn the flag off to "fix" that miss — Stop would no longer be safe.
 	cfg := wazero.NewRuntimeConfig().WithCloseOnContextDone(true)
 	if pages > 0 {
 		cfg = cfg.WithMemoryLimitPages(pages)
