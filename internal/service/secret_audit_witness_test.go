@@ -78,11 +78,7 @@ func TestSecretAuditRetentionRequiresCurrentExternalWitness(t *testing.T) {
 	}}
 	svc.ensureSecretAuditSink()
 	t.Cleanup(svc.CloseSecretAuditSink)
-	if stop := svc.secretAuditPruneStop; stop != nil {
-		close(stop)
-		svc.secretAuditPruneDone.Wait()
-		svc.secretAuditPruneStop = nil
-	}
+	stopSecretAuditPruneTickerForTest(svc)
 	svc.cfg.SecretAuditRetentionDays = 1
 	now := time.Now().UTC()
 	if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{

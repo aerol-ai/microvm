@@ -35,9 +35,37 @@ func templateOperatorAuth(next http.Handler) http.Handler {
 // service.TemplateBuilder. Touches the requested OutPath so the
 // success path's os.Stat round-trip produces a non-zero size.
 type fakeTemplateBuilderV1 struct {
-	mu    sync.Mutex
-	calls int
-	done  chan struct{}
+	mu        sync.Mutex
+	calls     int
+	completed int
+	done      chan struct{}
+}
+
+func (f *fakeTemplateBuilderV1) waitForBuilds(n int) {
+	if f == nil {
+		return
+	}
+	if n < 1 {
+		f.mu.Lock()
+		n = f.calls
+		f.mu.Unlock()
+	}
+	if n < 1 {
+		return
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		finished := f.completed
+		f.mu.Unlock()
+		if finished >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (f *fakeTemplateBuilderV1) Build(_ context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
@@ -45,6 +73,9 @@ func (f *fakeTemplateBuilderV1) Build(_ context.Context, req service.TemplateBui
 	f.calls++
 	f.mu.Unlock()
 	defer func() {
+		f.mu.Lock()
+		f.completed++
+		f.mu.Unlock()
 		if f.done != nil {
 			f.done <- struct{}{}
 		}
@@ -87,6 +118,16 @@ func newTemplateV1TestEnv(t *testing.T) *templateV1Env {
 	svc := service.New(cfg, logger, st, &noopRuntime{}, nil, nil, nil, nil, nil)
 	builder := &fakeTemplateBuilderV1{done: make(chan struct{}, 1)}
 	svc.SetTemplateBuilder(builder)
+	// CreateTemplate returns Accepted before kickTemplateBuild finishes
+	// writing into t.TempDir. Drain in-flight builds so RemoveAll does not
+	// race MkdirAll/WriteFile (ENOTEMPTY under -race).
+	t.Cleanup(func() {
+		n := 0
+		if rows, err := st.ListTemplates(context.Background()); err == nil {
+			n = len(rows)
+		}
+		builder.waitForBuilds(n)
+	})
 
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
