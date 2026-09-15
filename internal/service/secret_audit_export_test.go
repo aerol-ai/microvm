@@ -43,6 +43,20 @@ func setAuditExporter(s *Service, ex controlplane.AuditExporter) {
 	s.auditExportMu.Unlock()
 }
 
+// stopSecretAuditPruneTickerForTest awaits the startup prune and prevents
+// the daily ticker from racing a test that captures a witness/export
+// watermark and then calls pruneWithGuards itself.
+func stopSecretAuditPruneTickerForTest(s *Service) {
+	if s == nil {
+		return
+	}
+	if stop := s.secretAuditPruneStop; stop != nil {
+		close(stop)
+		s.secretAuditPruneDone.Wait()
+		s.secretAuditPruneStop = nil
+	}
+}
+
 func TestSecretAuditExportIgnoresReceiverControlledCursor(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	svc := &Service{cfg: config.Config{DBPath: dbPath}}
@@ -186,6 +200,11 @@ func TestSecretAuditPruneGuardsCloseAppendAfterVerificationWindow(t *testing.T) 
 	setAuditExporter(svc, &maliciousOffsetExporter{})
 	t.Cleanup(svc.CloseSecretAuditSink)
 	sink := svc.secretAuditSink().(*fileAuditSink)
+	// Opening the sink starts a daily prune that runs once immediately. Under
+	// -race that first pass can rewrite the file after export and invalidate
+	// the witnessed head this test captures. Stop it so the sequence below is
+	// the only prune that fires.
+	stopSecretAuditPruneTickerForTest(svc)
 	old := time.Now().UTC().Add(-48 * time.Hour)
 	if err := sink.EmitDurable(SecretAuditEvent{Time: old, EventID: "verified", SandboxID: "sb"}); err != nil {
 		t.Fatal(err)
