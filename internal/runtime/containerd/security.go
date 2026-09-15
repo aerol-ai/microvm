@@ -1,8 +1,8 @@
 package containerd
 
 import (
-	"github.com/containerd/containerd/contrib/seccomp"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/contrib/seccomp"
+	"github.com/containerd/containerd/v2/pkg/oci"
 )
 
 // securitySpecOpts assembles the default non-privileged security envelope

@@ -30,6 +30,10 @@ func (c *daytonaForwardCluster) SelectPlacement(capacity.Request) (cluster.Place
 	return c.target, nil
 }
 
+func (c *daytonaForwardCluster) SelectPlacementWithCandidates(capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
+	return c.target, []cluster.Member{{NodeID: c.target.NodeID, APIURL: c.target.APIURL, Alive: true}}, nil
+}
+
 func (c *daytonaForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, _ cluster.PlacementTarget, redacted *models.CreateSandboxRequest, _ cluster.PlacementSecrets, _ time.Duration) error {
 	c.reservedID = sandboxID
 	c.reservedReq = redacted

@@ -5,7 +5,7 @@ its default, and **why** it defaults the way it does. Use this when deciding
 whether a flag is safe to flip on for a deployment, or when reviewing a proposal
 to change a shipped default.
 
-Snapshot as of 2026-07-12. When you change a default in `config.go`, update the
+Snapshot as of 2026-08-11. When you change a default in `config.go`, update the
 matching row here.
 
 ## The rule for flipping a default on
@@ -37,18 +37,95 @@ feature is still mid-rollout.
 | `SB_FIRECRACKER_SNAPSHOT_ENABLED` | true |
 | `SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD` | true |
 | `SB_FIRECRACKER_OVERLAY_ENABLED` | true |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` — sync wait on HA create for ≥1 peer ACK before return. Cluster mode requires a positive value; remaining peers stay async. |
+| `SB_EGRESS_ATTRIBUTION_ENABLED` | true — host-mediated egress destinations (wasm + isolate) into audit JSONL; dial-path only, never create. Set false to disable. |
 
 ## 🔴 Must stay off — security / safety
 | Env var | Why off is correct |
 |---|---|
+| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes. |
 | `SB_CONTAINER_PRIVILEGED` | Privileged containers = sandbox escape. |
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
 | `SB_RESOURCE_LIMITS_DISABLED` | *Disables* cgroup limits; `false` already = limits ON. |
 
+## Secret provider (SB_SECRET_PROVIDER)
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault`. Off-state is `local` — never contacts AWS/Vault unless explicitly set. See `docs/.../cluster-secrets.mdx`. |
+| `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. |
+| `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start on awskms boot-canary failure. Default fail-open with a warning. |
+| `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create. Cluster mode requires `>0`; zero ACKs retract the secret and fail the create. |
+| `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` and `sandbox_audit_acl` retention. Appends are fsynced at least once per second and at shutdown; pruned daily (and on sink start). **`0` means retain nothing beyond the crash buffer** — post-delete ACL rows go at the next sweep and the JSONL keeps one day for the export tailer. It never means forever. Removal is by record time anywhere in the file: the expired prefix is dropped; an expired record that landed behind a newer one (spill drain, worker ingest) becomes a hash-only `retention_redacted` stub so the chain still verifies (runbook: secrets-and-audit). |
+| `SB_SECRET_AUDIT_STRICT_BOOT` | `true` | Refuse daemon startup when the local secret-audit writer cannot be opened or its hash chain fails verification. A torn final record from an unclean shutdown is not a failure: it is cut at open and recorded as a `reason=torn_tail` gap marker. |
+| `SB_SECRET_AUDIT_BOOT_VERIFY` | `full` | How much of `secrets.jsonl` boot re-reads before the writer opens. `full`: every record, in **one** pass with O(1) memory (the witness check rides on the same pass, probing for the witnessed head instead of holding every hash in memory) — boot is O(retained volume). `checkpoint`: verify from the writer's last fsynced checkpoint (`secrets.verified`, written every sync) — O(bytes since the last sync) — then re-verify the whole chain in the background right after boot. A background failure withholds local audit reads (`503`), disables the read index, and fires `SandboxdAuditChainBroken`, instead of refusing to start. Trade-off: for the minutes the background pass takes, an in-place edit of the already-verified prefix is not yet detected; the tail, the checkpoint record, and everything appended after boot are verified synchronously. Recommended for large logs (multi-GB) where a full read at every restart is minutes of downtime; the default keeps the strict contract exactly as before. |
+| `SB_SECRET_TOMB_RETENTION_DAYS` | `30` | Retain delete fences after all peer ACKs; `0` disables tombstone GC. Live/pending rows are never pruned. |
+| `SB_SECRET_OUTBOX_STANDALONE_GRACE` | `1h` | Only matters with cluster mode **off** on a node that was a cluster member. Peer obligations it can never send (pending peer PUTs/DELETEs) and sealed rows for sandboxes it no longer has are retired once older than this; the grace keeps them across a brief cluster-off restart so a node that rejoins still owes them. `0` retires on the first sweep. Without this, a cluster→single-node downgrade leaked those rows forever. |
+| `SB_EGRESS_ATTRIBUTION_ENABLED` | `true` | Wasm/isolate egress destination records in the same audit JSONL (`kind=egress`). Observational; off create path. |
+
+### Audit rate limits (security parameters)
+
+These bound amplification on `GET /v1/sandboxes/{id}/audit` (one client call → N peer reads). They are **security parameters**, not throughput knobs. On reject the API returns `429` with `Retry-After` — never silent truncation.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_RATE_LIMIT_IDENTITY` | `10` | Per-`OwnerRef` token rate (req/s). Burst 20. |
+| `SB_AUDIT_RATE_LIMIT_OPERATOR` | `50` | Operator PAT bucket (req/s). Burst 100 — generous for incident response. |
+| `SB_AUDIT_RATE_LIMIT_NODE` | `50` | Global per-node ceiling (req/s). Burst 100. The only effective bound on OSS (single operator identity). |
+
+The cluster-internal per-sandbox audit endpoint that ingress fan-out hits has its own per-node bucket at the same rate (`SB_AUDIT_RATE_LIMIT_NODE`), so a fleet-wide storm of peer reads cannot starve a node's own public audit traffic or the other way round. A node whose 8 local read slots stay busy for 50 ms answers `429` + `Retry-After: 1` (`aerolvm_audit_query_busy_total`) instead of queueing the request until its deadline turns into a 504.
+
+### Audit read index
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_INDEX_ENABLED` | `true` | Keep a per-sandbox posting-list index (`secret_audit_index` in the SQLite store) over the local `secrets.jsonl` so a page of one sandbox's history is O(page) — the index names the records the page needs and only those are read and hash-checked. Derived data: rebuilt in the background from the file whenever they disagree, and reads scan the file meanwhile (`aerolvm_audit_index_ready`, `aerolvm_audit_query_scan_fallback_total`). Off means every page scans every retained record on the node, the pre-index behaviour; only useful to isolate a suspected index fault. Design: `plans/audit-read-index.md`. |
+
+Whole-chain verification no longer runs on every page read. It runs at boot, before every retention sweep, incrementally as records are indexed (a break disables the index and withholds reads with `503` until an operator repairs the log), and on demand via `POST /v1/audit/verify` (operator PAT; O(file); one at a time per node; `aerolvm_audit_chain_verify_ok`).
+
+`vault` is accepted as a known name but **fails boot** with a not-implemented error (no silent fallback to local).
+
+## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
+
+Modeled on kube-apiserver's audit backends (`plans/audit-export-connectors.md`):
+the local hash-chained JSONL is the buffer, one cursor-tailer ships batches,
+and the backend is pluggable. Raft never carries audit history. Delivery is
+at-least-once — receivers dedupe on `Idempotency-Key` / `X-Aerol-Audit-Batch-ID`
+(the S3 object key *is* the batch id, so a re-send overwrites, not duplicates).
+A failing backend never drops evidence: the cursor lags, retention refuses to
+rotate unexported bytes, and `aerolvm_audit_export_lag_bytes` grows visibly.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_EXPORT_BACKEND` | `noop` (`webhook` when `SB_SECRET_AUDIT_EXPORT_URL` is set) | `noop` \| `stdout` \| `file` \| `webhook` \| `s3` \| `bus`. `noop` keeps evidence on local disk only and claims nothing more. Enterprise mode requires a non-noop backend or an injected `controlplane.AuditExporter`. |
+| `SB_AUDIT_EXPORT_BATCH_MAX` | `4096` | Events per shipped batch (≤ 65536). |
+| `SB_AUDIT_EXPORT_FLUSH_INTERVAL` | `1s` | Tailer tick (≥ 100ms). |
+| `SB_AUDIT_EXPORT_MAX_BACKOFF` | `5m` | Retry cap after a failed export; exponential with full jitter from the flush interval. |
+| `SB_AUDIT_QUEUE_MAX` | `1024` (`8192` enterprise) | Bounded in-memory emit queue in front of the JSONL. Emit never blocks a request. |
+| `SB_AUDIT_OVERFLOW_POLICY` | `gap` (`spill` enterprise) | Full queue: `gap` drops and writes a counted `gap` marker; `spill` durable-appends to `secrets.spill.jsonl` (gap only if that fails). |
+| `SB_AUDIT_EGRESS_SANDBOX_RATE` | `25` | Per-sandbox egress evidence budget, records per second, applied at the audit writer on every path (worker ingest, worker spill, in-process mediators) so a busy or compromised sandbox cannot grow the node-global evidence file or push other tenants' secret-open records into the overflow path. Records over budget are not written; they are counted and reported as one `egress` record per sandbox with `reason=rate_limited` and `dropped=n`, indexed under that sandbox only. `0` disables the budget (refused in enterprise mode). Workers get `429` for a refused record and do not spill it. |
+| `SB_AUDIT_EGRESS_SANDBOX_BURST` | `250` | Burst for the budget above: a sandbox keeps full per-connection evidence for bursts up to this size, then `SB_AUDIT_EGRESS_SANDBOX_RATE` per second. |
+| `SB_AUDIT_EXPORT_FILE_PATH` | (empty) | `file` backend target; `-` = stdout. A log backend for shippers, not durable storage. |
+| `SB_AUDIT_EXPORT_WEBHOOK_URL` / `SB_AUDIT_EXPORT_WEBHOOK_BEARER_TOKEN` | (empty) | Aliases of `SB_SECRET_AUDIT_EXPORT_URL` / `..._BEARER_TOKEN`. Batched NDJSON POST; redirects are refused. |
+| `SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY` | (empty) | Signs each body: `X-Aerol-Signature: sha256=<hex hmac>`. |
+| `SB_AUDIT_EXPORT_WEBHOOK_CA_FILE` / `_CERT_FILE` / `_KEY_FILE` | (empty) | Receiver pinning and client-certificate (mTLS) auth. Enterprise webhooks must be `https` with at least one of bearer, HMAC, or client cert. |
+| `SB_AUDIT_EXPORT_S3_BUCKET` / `_PREFIX` / `_ENDPOINT` / `_REGION` / `_PATH_STYLE` | (empty) | Any S3-compatible store; one object per batch at `<prefix>/node=<id>/<yyyy>/<mm>/<dd>/<batch>.jsonl`. Credentials come from the default AWS chain. Enterprise requires an `https` endpoint. |
+| `SB_AUDIT_EXPORT_BUS_BROKERS` / `_TOPIC` | (empty) | Consumed by a registered `auditexport.BusPublisher` (Kafka/NATS client linked into the build). Without one, boot fails with `not implemented`. |
+| `SB_AUDIT_DELETED_GRACE` | `1h` | How long the Raft FSM keeps a **routing stub** (owner_ref + evidence nodes) for a deleted sandbox so any ingress can still route a post-delete audit read. A grace window, never history: hard cap 24h; `0` disables it (pure Kubernetes mode — post-delete history is the backend's). |
+| `SB_AUDIT_DELETED_INDEX_MAX` | `100000` | Hard cap on that stub index, oldest log index evicted first. Bounds FSM memory and snapshot size regardless of delete rate. Carried in each delete command so every replica evicts identically. |
+
+Sandbox environment values are always encrypted in `sandbox_env`, and toolbox
+bearer tokens are always encrypted in `sandboxes.toolbox_token_sealed`. There
+are no plaintext storage columns or compatibility flags for either path. A
+database containing the removed plaintext columns is rejected at boot; deploy
+this schema as a coordinated, one-way change.
+
 ## 🟡 Opt-in — needs external config/hardware, would break or no-op if forced on
 | Env var | Blocker |
 |---|---|
+| `SB_SECRET_PROVIDER=awskms` | Needs `SB_SECRET_AWS_KMS_KEY_ID` + AWS credentials / IAM. Default remains `local`. |
 | `SB_ENABLE_FIRECRACKER` | Needs KVM/metal host; rejects create otherwise. |
 | `SB_ENABLE_WASM` | Needs a provisioned wasm modules dir. |
 | `SB_CONTAINER_ENGINE` | Code fallback is `docker` (empty/unknown → docker, so a bare host or the local `install.sh` stays dockerd). **Server deployments now default to `containerd`**: the shipped `config/cluster.yml`, Terraform, and Ansible all set `containerd` — set `container_engine: docker` there to keep a legacy dockerd host. This is the docker→containerd migration target; per-sandbox rows record their owning engine so a flip never strands existing sandboxes. containerd is live-validated on the t3 cluster topology (`cluster-3-mixed-containerd`); metal/arm64 provisioning is not yet live-proven (`plans/containerd-engine.md`). |
@@ -69,7 +146,7 @@ feature is still mid-rollout.
 | `SB_CONTAINERD_POOL_REFILL_INTERVAL` | containerd warm-pool refill ticker; default `5s`. |
 | `SB_ENABLE_CLUSTER` | Opt-in; cluster code must be a no-op when false. |
 | `SB_CLUSTER_BOOTSTRAP` | Single-seed cluster bring-up only. |
-| `SB_CLUSTER_SHARD_AWARE_INGRESS` | Cluster ingress topology. |
+| `SB_CLUSTER_SHARD_AWARE_INGRESS` | Declares that the router in front of the ingress tier resolves each sandbox's owners through `GET /v1/cluster/ingress-route/{id}`. Above 10 live ingress-capable nodes each ingress node holds only its share of the public route table (primary plus one replica per shard), so DNS round-robin, a cloud TCP LB, or a BGP VIP would black-hole most sandbox traffic. Without this flag the daemon fails closed at that size: enterprise boots refuse, open-source never marks ingress ready, `/health` reports `degraded`, `aerolvm_cluster_topology_ok` is 0. Flipping it with a plain LB in front silences the check and breaks traffic silently — the daemon cannot see what fronts it. Runbook: `setup/runbooks/cluster-ingress-topology.md`. |
 | `SB_OTEL_METRICS_ENABLED` | Needs a collector; auto-enables when `SB_OTEL_METRICS_ENDPOINT` is set. |
 | `SB_OTEL_TRACES_ENABLED` | Needs a collector; auto-enables when `SB_OTEL_TRACES_ENDPOINT` is set. |
 | `SB_PLATFORM_VOLUMES_ENABLED` | Needs an S3/NFS backend config. |

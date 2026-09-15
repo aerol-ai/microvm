@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/runtime"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
 
 	"github.com/aerol-ai/microvm/pkg/docker"

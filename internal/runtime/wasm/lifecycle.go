@@ -125,6 +125,9 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		Args:           append([]string(nil), inst.baseArgs...),
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, inst.memoryMB, d.cfg.DefaultWallTimeout)
+	if err := d.bindAuditCapability(sandboxID, &caps); err != nil {
+		return nil, err
+	}
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}

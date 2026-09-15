@@ -163,7 +163,10 @@ Either way the registry is the source of truth and the daemon only pulls to run.
 
 ## Catalogue API
 
-Register modules on the host before create, or let create resolve inline. Catalogue rows are per-node (not cluster-forwarded), like Firecracker templates.
+Register modules on the host before create, or let create resolve inline. WASM
+catalogue rows are per-node and are not cluster-forwarded. Firecracker template
+administration is different: it is an operator-only cluster control plane with
+worker-routed create/item operations and a leader-coalesced list.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

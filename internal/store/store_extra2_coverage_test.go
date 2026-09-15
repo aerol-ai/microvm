@@ -24,7 +24,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = st.UpsertCompatState(ctx, "sb-list", "key1", "val1")
 	_ = st.AddCustomDomain(ctx, "sb-list", "domain.com", 80)
 	_ = st.PutMounts(ctx, "sb-list", []byte("a"))
-	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{SandboxID: "sb-list"})
+	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{SandboxID: "sb-list"})
 
 	// Run List to hit Scan rows
 	_, _ = st.List(ctx)
@@ -137,7 +137,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = sandboxFailoverPolicy(&models.Sandbox{})
 
 	_ = st.DeleteMounts(ctx, "sb-list")
-	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb-list")
+	_ = st.DeleteClusterSecretRowsForIncarnation(ctx, "sb-list", "inc-list")
 	_ = st.DeleteSnapshotAlias(ctx, "alias-list")
 	_ = st.DeleteSnapshot(ctx, "snap-list")
 	_ = st.DeleteTemplate(ctx, "tpl-list")
@@ -172,7 +172,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.ListCustomDomains(ctx, "sb")
 	_, _ = st.ListAllCustomDomains(ctx)
 	_ = st.SetCustomDomainStatus(ctx, "sb", models.CustomDomainStatus("active"), "err")
-	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
+	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
 	_, _ = st.AllocateFirecrackerTapSlot(ctx, "sb", time.Now())
 	_ = st.ReleaseFirecrackerTapSlot(ctx, "sb")
 	_ = st.MarkFirecrackerVMMSlotLoaded(ctx, "id", "sb", "tap", 1, time.Now())
@@ -238,7 +238,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_ = st.SetNetworkLimits(ctx, "sb", 1, 1)
 	_ = st.ClearNetworkQuotaExceeded(ctx, "sb")
 	_, _ = st.GetClusterSecret(ctx, "sb")
-	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb")
+	_ = st.DeleteClusterSecretRowsForIncarnation(ctx, "sb", "inc")
 	_, _ = st.GetMounts(ctx, "sb")
 
 	_ = st.DeleteAllWasmStateKV(ctx, "sb")

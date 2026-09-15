@@ -156,6 +156,30 @@ func TestWasmCheckpointPushHistory(t *testing.T) {
 	}
 }
 
+func TestEnsureWasmCheckpointCleanupRefIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	first, err := st.EnsureWasmCheckpointCleanupRef(ctx, "sb-cleanup", "aocr://sb-cleanup:latest")
+	if err != nil || first <= 0 {
+		t.Fatalf("first ensure = id %d err %v", first, err)
+	}
+	second, err := st.EnsureWasmCheckpointCleanupRef(ctx, "sb-cleanup", "aocr://sb-cleanup:latest")
+	if err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second ensure id = %d, want existing id %d", second, first)
+	}
+	pushes, err := st.ListWasmCheckpointPushes(ctx, "sb-cleanup")
+	if err != nil {
+		t.Fatalf("list pushes: %v", err)
+	}
+	if len(pushes) != 1 || pushes[0].Digest != "cleanup-only" {
+		t.Fatalf("cleanup rows = %+v, want one cleanup-only row", pushes)
+	}
+}
+
 func TestWasmStateKVDeleteAll(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

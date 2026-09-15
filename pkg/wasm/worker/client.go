@@ -26,7 +26,9 @@ func NewClient(socketPath string) *Client {
 }
 
 func (c *Client) roundTrip(env Envelope) (Envelope, error) {
-	conn, err := c.dial(c.socketPath)
+	dial := c.dial
+	socketPath := c.socketPath
+	conn, err := dial(socketPath)
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -45,15 +47,26 @@ func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Avoid launching a dial goroutine for an already-cancelled request. Apart
+	// from unnecessary work, a custom/test dialer could otherwise outlive the
+	// call and retain resources after the caller has moved on.
+	if err := ctx.Err(); err != nil {
+		return Envelope{}, err
+	}
 	type dialResult struct {
 		conn net.Conn
 		err  error
 	}
 	ch := make(chan dialResult, 1)
 	done := make(chan struct{})
+	// Capture immutable request dependencies before the goroutine starts. A
+	// cancelled dial may outlive this call, and must not dereference Client
+	// fields after the caller has returned.
+	dial := c.dial
+	socketPath := c.socketPath
 	defer close(done)
 	go func() {
-		conn, err := c.dial(c.socketPath)
+		conn, err := dial(socketPath)
 		select {
 		case ch <- dialResult{conn: conn, err: err}:
 		case <-done:

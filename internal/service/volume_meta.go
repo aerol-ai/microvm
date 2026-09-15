@@ -15,9 +15,10 @@ import (
 // raft so a volume's id/name/source survive the tenant's API ownership moving
 // between nodes. The service selects between them with volumeMeta().
 //
-// Only the metadata row is abstracted here. The pending-deletion ledger and
-// attachment index remain in local SQLite (cluster-wide attachment visibility is
-// a tracked follow-up); the backing bytes are deterministic in S3/NFS.
+// Metadata and attachment ownership use the same abstraction: SQLite in
+// single-node mode and the cluster FSM in cluster mode. The pending-deletion
+// ledger remains local because each node deletes only its deterministic S3/NFS
+// backing path.
 type volumeMetaStore interface {
 	GetOrCreate(ctx context.Context, v *models.Volume, maxPerTenant int) (*models.Volume, bool, error)
 	ByID(ctx context.Context, tenant, id string) (*models.Volume, error)
@@ -27,7 +28,7 @@ type volumeMetaStore interface {
 	ExistsForSource(ctx context.Context, source string) (bool, error)
 	AttachmentCount(ctx context.Context, tenant, id string) (int, error)
 	PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
-	DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error
+	DeleteAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 }
 
 // volumeMeta returns the cluster-FSM-backed store when clustering is enabled and
@@ -73,8 +74,8 @@ func (m sqliteVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string
 func (m sqliteVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
 	return m.store.PutVolumeAttachments(ctx, attachments)
 }
-func (m sqliteVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
-	return m.store.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
+func (m sqliteVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error {
+	return m.store.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID, incarnationID)
 }
 
 // clusterVolumeMeta adapts the replicated cluster volume API to the service
@@ -124,8 +125,8 @@ func (m clusterVolumeMeta) PutAttachments(ctx context.Context, attachments []mod
 	}
 	return nil
 }
-func (m clusterVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
-	return m.c.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
+func (m clusterVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error {
+	return m.c.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID, incarnationID)
 }
 
 func mapVolumeNotFound(err error) error {

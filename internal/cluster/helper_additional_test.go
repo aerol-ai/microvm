@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"sort"
 	"testing"
 
@@ -16,20 +15,19 @@ import (
 
 func newAgentControlPlaneHarness(t *testing.T, handler http.Handler, gossipMembers ...Member) *Agent {
 	t.Helper()
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, internalClient := newNodeBoundForwardServer(t, "worker-self", "server-1", handler)
 
 	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "server-1", APIURL: server.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "server-1", APIURL: server.URL, InternalURL: server.URL, Alive: true, Role: config.NodeRoleServer})
 	for _, member := range gossipMembers {
 		index.upsert(member)
 	}
 
 	return &Agent{
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		nodeID:     "worker-self",
-		httpClient: server.Client(),
-		gossip:     &gossipNode{memberIndex: index},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID:         "worker-self",
+		internalClient: internalClient,
+		gossip:         &gossipNode{memberIndex: index},
 	}
 }
 

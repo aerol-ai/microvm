@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 type failingExposeCluster struct {
@@ -73,6 +74,8 @@ func newServiceRuntimeHarnessAllowStoreClose(t *testing.T, rt *recordingRuntime)
 	t.Cleanup(func() {
 		_ = st.Close()
 	})
+	cipher := newTestCipher(t)
+	st.SetSecretCipher(cipher)
 
 	mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
 		RootDir:     filepath.Join(t.TempDir(), "mounts"),
@@ -97,13 +100,15 @@ func newServiceRuntimeHarnessAllowStoreClose(t *testing.T, rt *recordingRuntime)
 			EnableCaddy:       false,
 			HTTPClientTimeout: time.Second,
 		},
-		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		docker:   rt,
-		caddy:    caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second}),
-		mounts:   mgr,
-		admitter: admitter,
-		images:   newDefaultImageDistributionProvider(""),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:          st,
+		docker:         rt,
+		caddy:          caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second}),
+		mounts:         mgr,
+		admitter:       admitter,
+		images:         newDefaultImageDistributionProvider(""),
+		cipher:         cipher,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
 	}
 	return svc, st, admitter
 }
@@ -751,7 +756,9 @@ func TestServiceHelperErrorBranches(t *testing.T) {
 			owner: cluster.OwnerInfo{NodeID: "peer", APIURL: "http://peer", IsSelf: false},
 		}
 		svc.AttachCluster(stub)
-		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-peer", "reason")
+		svc.deleteSelfOwnedClusterPlacement(ctx, cluster.Placement{
+			SandboxID: "sb-peer", OwnerNodeID: "peer", IncarnationID: "inc-peer",
+		}, "reason")
 		if len(stub.deleteCalls) != 0 {
 			t.Fatalf("foreign placement should not be deleted, got %v", stub.deleteCalls)
 		}

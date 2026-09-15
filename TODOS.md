@@ -222,3 +222,82 @@ passed, zero-deployments premise re-verified in-tree). Branch
 - **Depends on / blocked by:** rides naturally on the §9 create-stage instrumentation
   (`plans/investor-benchmark-observability.md` §9) once that lands.
 - **Start:** `internal/service/metrics.go` (create), `internal/pool/{wasm,isolate,vmm,dockerpool}/metrics.go`.
+
+## Flaky `internal/cluster` memberlist tests (testing, `internal/cluster`) — mitigated 2026-08-08
+
+- **What:** Loopback port-binding flakiness in the `internal/cluster`
+  memberlist/SWIM harnesses (`use of closed network connection` after
+  push/pull sync).
+- **Why it mattered:** The cluster suite is the only guard on the highest-risk
+  package; intermittent red trained people to re-run rather than read failures.
+- **Mitigation:** Serialize construct/Close of real raft/memberlist harnesses
+  via `testClusterMu` + 50ms settle after Close in
+  `newTestClusterWithAPI`, `newTestClusterWithRole`,
+  `newTestClusterWithRoleAndGrace`, `newTestClusterWithTLSDir`,
+  `newTestAgentWithRole`, and `newTestAgentWithTLS`. Lock is **not** held for
+  cluster lifetime (multi-node tests still create two clusters concurrently).
+- **Verify:** `go test -count=1 ./internal/cluster/` (and `-count=3` if chasing).
+- **Residual:** Local machine contention can still surface; if flakes return,
+  widen settle or serialize the whole short-lived gossip pair.
+- **Depends on / blocked by:** nothing. Independent of secrets-hardening product
+  code; fixed alongside the GAP follow-ups so cluster signal stays trustworthy.
+
+## Per-node identity for cluster-internal HTTP (security, `pkg/api` + `internal/cluster`) — landed 2026-09-02
+
+- **Landed:** Every cluster role exposes a dedicated TLS 1.3 internal listener;
+  clients pin the peer to a required `node:<SB_NODE_ID>` SAN, servers bind that
+  identity to live membership, and every delegated internal/public-shaped route
+  is authorized before dispatch. The fleet PAT remains defense in depth.
+- **Rotation:** atomically replaced leaf/key files hot-reload for new
+  handshakes; expiry metrics and alerts are present. Automated issuance,
+  revocation distribution, and coordinated CA rotation remain operator work.
+- **Where documented:** `docs/src/content/docs/cluster-secrets.mdx` (known
+  limitation), `setup/runbooks/secrets-and-audit.md`,
+  `docs/designs/secrets-hardening.md` Deferred,
+  `plans/secrets-hardening.md` re-review row #6.
+- **Where:** `internal/cluster/{tls,internal_server,peer_dial}.go`, the global
+  `pkg/api` cluster-control-header guard, config validation, docs, and runbook.
+
+## Durable secret-delete outbox / ACK ledger (cluster secrets) — landed 2026-08-09
+
+- **What:** Generation-scoped tombstones + persistent cleanup outbox so peer
+  DELETE fan-out survives daemon crash, retries until every recipient ACKs,
+  and rejects stale PUTs until a newer seal generation clears the tomb.
+- **Landed:** originator tomb+row-delete+outbox in one SQLite TX; per-recipient
+  pending shrink (offline peers stay pending, never treated as success);
+  DELETE carries `generation`; peer tombs with seal_generation gating so stale
+  DELETEs cannot wipe a reseal; boot + 30s periodic reconcile (O(1) per job);
+  reseal stages retired-recipient cleanup atomically with the new sealed row,
+  gates deletion on Raft promotion, and preserves older pending recipients.
+- **Residual:** long partitions require operator action based on the shipped
+  outbox age/backlog metrics; KMS CMK policy is separate. `failover_ready` now HEAD-probes
+  remote holders for the current `seal_generation` (not ACK memory alone);
+  member rejoin triggers outbox reconcile + re-fanout.
+- **Where:** `internal/store` outbox/tombs, `internal/service/cluster_secrets.go`,
+  `internal/cluster/secret_replication.go`, daemon boot + ticker.
+
+## Indexed / central secret-audit store (scale) — parked residual 2026-08-09
+
+- **What:** Replace full JSONL scan + sequential all-member fan-out with an
+  indexed durable store or central sink; E2b witness.
+- **Interim landed:** sidecar flock; Close/Prune `sendMu`; verified startup chain;
+  authenticated, idempotent HTTPS batch export with durable watermark; gap markers with
+  `kind=gap` (included in kind-filtered pages); compound cursor; malformed
+  JSONL → gap event; wasm queue-full writes a durable gap marker; post-delete
+  ACL via `sandbox_audit_acl` + Placement.OwnerRef.
+- **Residual:** local fallback queries and startup verification still scan the
+  JSONL file. Enterprise mode requires the external exporter/receiver; receiver
+  indexing, WORM retention, and operational verification remain deployment gates.
+- **Start:** `internal/service/secret_audit_query.go`; E2b witness sink may
+  double as the central store.
+
+## WASM egress audit via bounded IPC (not shared JSONL) — landed 2026-09-02
+
+- **Landed:** Worker subprocesses enqueue through the daemon's
+  authoritative audit writer (bounded channel, drop counter, gap markers)
+  instead of opening `secrets.jsonl` themselves.
+- **Mechanism:** authenticated Unix-socket ingest, bounded worker pool, durable
+  acknowledgement through the authoritative writer, and explicit gap accounting
+  under overload. Workers no longer open the audit JSONL directly.
+- **Where:** `pkg/wasm/worker/egress_audit.go`, daemon spawn environment, and
+  `internal/service/wasm_audit_ingest.go`.

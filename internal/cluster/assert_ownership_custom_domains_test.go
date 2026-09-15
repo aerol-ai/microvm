@@ -29,6 +29,7 @@ func TestAssertOwnershipBackfillsCustomHostnames(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:              "sb-domains",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-domains"},
 		CustomHostnames: []string{"api.acme.com", "shop.beta.io"},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
@@ -71,6 +72,7 @@ func TestAssertOwnershipReReplaysMissingCustomHostnames(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-catchup",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-catchup"},
 		CustomHostnames: []string{"first.acme.com"},
 	}}); err != nil {
 		t.Fatalf("first AssertOwnership: %v", err)
@@ -82,6 +84,7 @@ func TestAssertOwnershipReReplaysMissingCustomHostnames(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-catchup",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-catchup"},
 		CustomHostnames: []string{"first.acme.com", "second.acme.com"},
 	}}); err != nil {
 		t.Fatalf("second AssertOwnership: %v", err)

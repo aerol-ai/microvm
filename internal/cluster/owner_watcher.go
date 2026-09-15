@@ -2,10 +2,13 @@ package cluster
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // ownerWatcherInterval is the polling cadence for the owner watcher loop. The
@@ -31,7 +34,7 @@ const maxRecreateFailuresBeforeReassign = 5
 // opts into failover.policy=recreate are materialized; all others remain
 // ordinary non-HA sandboxes and are orphaned when their owner dies.
 func (c *Cluster) startOwnerWatcher() {
-	c.recreateFailures = &recreateFailureTracker{counts: make(map[string]int)}
+	c.recreateFailures = &recreateFailureTracker{counts: make(map[string]int), permanent: make(map[string]struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ownerWatcherStop = cancel
 	go func() {
@@ -50,10 +53,12 @@ func (c *Cluster) startOwnerWatcher() {
 
 // recreateFailureTracker counts consecutive recreate failures per sandbox so
 // the watcher can escalate from "retry locally" to "ask for reassignment"
-// instead of looping forever on a permanent failure.
+// instead of looping forever on a permanent failure. permanent holds ids that
+// must not be reassigned (e.g. recipient-denied — walking the fleet cannot help).
 type recreateFailureTracker struct {
-	mu     sync.Mutex
-	counts map[string]int
+	mu        sync.Mutex
+	counts    map[string]int
+	permanent map[string]struct{}
 }
 
 func (t *recreateFailureTracker) record(id string) int {
@@ -67,6 +72,23 @@ func (t *recreateFailureTracker) clear(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.counts, id)
+}
+
+func (t *recreateFailureTracker) markPermanent(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.permanent == nil {
+		t.permanent = make(map[string]struct{})
+	}
+	t.permanent[id] = struct{}{}
+	delete(t.counts, id)
+}
+
+func (t *recreateFailureTracker) isPermanent(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.permanent[id]
+	return ok
 }
 
 // recreateOwnedSandboxes scans the FSM for placements where this node is the
@@ -83,6 +105,9 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 	placements := c.fsm.fullPlacementsForOwner(c.nodeID)
 	for id, p := range placements {
 		if !placementWantsFailoverRecreate(p) {
+			continue
+		}
+		if c.recreateFailures != nil && c.recreateFailures.isPermanent(id) {
 			continue
 		}
 		if p.Spec == nil {
@@ -107,6 +132,16 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 			recordFailoverRecreate(err)
 		}
 		if err != nil {
+			// Recipient-denied cannot be fixed by reassigning to another
+			// arbitrary node (D5 / outside-voice #7) — stop churn permanently.
+			if errors.Is(err, secrets.ErrRecipientDenied) {
+				if c.recreateFailures != nil {
+					c.recreateFailures.markPermanent(id)
+				}
+				c.logger.Error("cluster: recreate permanently failed: recipient denied; not reassigning",
+					"sandbox_id", id, "err", err)
+				continue
+			}
 			fails := c.recreateFailures.record(id)
 			c.logger.Warn("cluster: recreate owned sandbox failed",
 				"sandbox_id", id, "consecutive_failures", fails, "err", err)
@@ -129,19 +164,20 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 	if !placementWantsFailoverRecreate(p) {
 		return
 	}
-	target, ok := c.selectRecreationTargetExcluding(p.Spec, c.nodeID)
+	target, ok := c.selectRecreationTarget(p, c.nodeID)
 	if !ok {
 		c.logger.Warn("cluster: no alternate node available for stuck placement; will keep retrying locally",
 			"sandbox_id", id)
 		return
 	}
 	cmd := command{
-		Op:                 opReassign,
-		SandboxID:          id,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
-		ReassignCause:      reassignCauseFailover,
+		Op:                    opReassign,
+		SandboxID:             id,
+		OwnerNodeID:           target.NodeID,
+		OwnerAPIURL:           target.APIURL,
+		OwnerDataPlaneHost:    target.DataPlaneHost,
+		ExpectedIncarnationID: strings.TrimSpace(p.IncarnationID),
+		ReassignCause:         reassignCauseFailover,
 	}
 	if err := c.applyCommand(ctx, cmd); err != nil {
 		c.logger.Warn("cluster: reassign stuck placement failed; will retry on next tick",
@@ -156,11 +192,13 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 		"sandbox_id", id, "from", c.nodeID, "to", target.NodeID)
 }
 
-// selectRecreationTargetExcluding picks a placement target for spec, skipping
-// any node ID listed in exclude. Returns ok=false if no candidate fits — the
-// caller should NOT clear or orphan the placement in that case; better to keep
-// trying locally than abandon a sandbox the operator can fix by adding capacity.
-func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequest, exclude ...string) (PlacementTarget, bool) {
+// selectRecreationTarget picks a placement target for a failover recreate,
+// skipping any node ID listed in exclude. A placement with sealed secrets is
+// restricted to its replicated recipient set: those are the only nodes that
+// can both hold and decrypt the local-provider row. Placements without a
+// secret handle retain ordinary fleet-wide placement behavior.
+func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (PlacementTarget, bool) {
+	spec := p.Spec
 	if spec == nil {
 		return PlacementTarget{}, false
 	}
@@ -172,13 +210,20 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		excluded[id] = struct{}{}
 	}
 	req := capacityRequestFromSpec(spec)
+	// Preserve the existing O(1) power-of-two placement path for the initial
+	// failover of a sandbox that has no secret row. The full deterministic scan
+	// is needed only when exclusions apply or a small recipient set constrains
+	// the candidates.
+	if !placementHasSecretHandle(p) && len(exclude) == 0 {
+		target, err := c.SelectPlacement(req)
+		return target, err == nil
+	}
 	drained := c.fsm.drainedNodesSnapshot()
-	// Score every alive candidate that isn't excluded; pick the one with the
-	// highest headroom. We don't use power-of-two here because the candidate
-	// set is already filtered (and likely small after excludes) — full scan
-	// gives a deterministic best-fit, which matters more for recovery than
-	// for steady-state placement spread.
-	all := c.gossip.members()
+	// Score every eligible candidate that isn't excluded and pick the one with
+	// the highest headroom. Secret-bearing placements normally have only the
+	// owner plus two backups, so the recipient lookup remains O(recipients)
+	// rather than scanning a 2,000-node fleet for every failed sandbox.
+	all := c.recreationCandidates(p)
 	pending := c.fsm.pendingReservationsByNode(time.Now().Unix())
 	var best Member
 	bestScore := -1.0
@@ -191,6 +236,9 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 			continue
 		}
 		if !CanOwnSandboxRole(m.Role) {
+			continue
+		}
+		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
 			continue
 		}
 		if drained[m.NodeID] {
@@ -216,4 +264,35 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, true
 	}
 	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, DataPlaneHost: best.DataPlaneHost, IsSelf: false}, true
+}
+
+// recreationCandidates returns the existing fleet gossip view for a stuck
+// sandbox without sealed secrets. When a handle is present it resolves only
+// the recorded recipient IDs through the gossip index, because a non-recipient
+// cannot open (and normally does not even store) the local secret row.
+func (c *Cluster) recreationCandidates(p Placement) []Member {
+	if !placementHasSecretHandle(p) {
+		// This path is used only for stuck-owner reassignment (initial
+		// secretless failover returned through SelectPlacement above). Preserve
+		// its existing gossip-view behavior.
+		return c.gossip.members()
+	}
+	if c == nil || c.gossip == nil {
+		return nil
+	}
+	recipientIDs := normalizeSecretRecipientIDs(p.SecretRecipients)
+	members := make([]Member, 0, len(recipientIDs))
+	for _, id := range recipientIDs {
+		if member, ok := c.gossip.lookupMember(id); ok {
+			members = append(members, member)
+		}
+	}
+	if c.capacityLeases != nil {
+		members = c.capacityLeases.apply(members, time.Now())
+	}
+	return members
+}
+
+func placementHasSecretHandle(p Placement) bool {
+	return strings.TrimSpace(p.SecretRef) != "" || p.SecretVersion != 0 || p.SecretSealGeneration != 0
 }

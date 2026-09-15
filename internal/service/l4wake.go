@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -170,8 +171,20 @@ func (s *Service) WakeAwareL4PortTarget(ctx context.Context, id string, port int
 // ECONNREFUSED — narrowing the retry to only ECONNREFUSED would
 // surface those races to the client. Initial backoff carries 0-50ms
 // jitter so a convoy of waiters released by one wake doesn't all
-// dial in lockstep. Overridable in tests.
-var dialL4Upstream = func(ctx context.Context, addr string, budget time.Duration) (net.Conn, error) {
+// dial in lockstep. Overridable in tests via setDialL4UpstreamForTest.
+func dialL4Upstream(ctx context.Context, addr string, budget time.Duration) (net.Conn, error) {
+	dialL4UpstreamMu.RLock()
+	fn := dialL4UpstreamFn
+	dialL4UpstreamMu.RUnlock()
+	return fn(ctx, addr, budget)
+}
+
+var (
+	dialL4UpstreamMu sync.RWMutex
+	dialL4UpstreamFn = defaultDialL4Upstream
+)
+
+func defaultDialL4Upstream(ctx context.Context, addr string, budget time.Duration) (net.Conn, error) {
 	deadline := time.Now().Add(budget)
 	dialCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()

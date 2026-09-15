@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func newProxyTestHandler(t *testing.T, cfg config.Config) (*handlers, *store.Store) {
@@ -26,8 +27,12 @@ func newProxyTestHandler(t *testing.T, cfg config.Config) (*handlers, *store.Sto
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "secrets.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(cfg, logger, db, nil, nil, nil, nil, nil, nil)
+	svc := service.New(cfg, logger, db, nil, nil, nil, cipher, nil, nil)
 	return &handlers{deps: Deps{Service: svc, Logger: logger}}, db
 }
 

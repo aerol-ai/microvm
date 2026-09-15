@@ -3,12 +3,15 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -50,6 +53,14 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 		TemplateID: templateID,
 		ModuleRef:  models.ModuleRefForCreate(*spec),
 	}
+	if nodeID, ok := docker.BuiltImagePlacementNode(spec.Image); ok {
+		out.RequiredNodeID = nodeID
+	}
+	if runtimeName == models.RuntimeIsolate {
+		if nodeID, _, ok := models.ParseJSBundleNodeRef(out.ModuleRef); ok {
+			out.RequiredNodeID = nodeID
+		}
+	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
 	}
@@ -83,12 +94,20 @@ func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
 // "place locally" is the existing single-node behavior; we only forward when
 // a peer is genuinely better.
 func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
+	target, _, err := c.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+// SelectPlacementWithCandidates is SelectPlacement plus the filtered candidate
+// slice the router uses to record the secret recipient set at reserve time
+// (plans/secrets-hardening §3d-1). The target is always one of candidates.
+func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
 	all := c.membersWithCapacity()
 	rejects := make(map[string]int64)
 	if err := LargeClusterTopologyError(all); err != nil {
 		rejects["topology"] = 1
 		recordSchedulerDecision("invalid_topology", 0, rejects)
-		return PlacementTarget{}, err
+		return PlacementTarget{}, nil, err
 	}
 	// Subtract still-in-flight reservations (router wrote opReserve but the
 	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
@@ -104,6 +123,11 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 	// to roll a node out of rotation without restarting it.
 	drained := c.fsm.drainedNodesSnapshot()
 	candidates := make([]Member, 0, len(all))
+	// requiredReachable records whether the artifact-bound node, if any, was
+	// seen as a live capacity-reporting member. If it was and still produced
+	// no candidate, the failure is ordinary (capacity, drain); if it was not,
+	// the artifact itself is out of reach and the client must re-create it.
+	requiredReachable := false
 	for _, m := range all {
 		if !m.Alive {
 			rejects["dead"]++
@@ -111,6 +135,10 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		}
 		if !CanOwnSandboxRole(m.Role) {
 			rejects["role"]++
+			continue
+		}
+		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
+			rejects["artifact_affinity"]++
 			continue
 		}
 		// Only consider members that have advertised an APIURL — others may
@@ -122,6 +150,9 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
 			rejects["capacity_heartbeat"]++
 			continue
+		}
+		if req.RequiredNodeID != "" && m.NodeID == req.RequiredNodeID {
+			requiredReachable = true
 		}
 		if drained[m.NodeID] {
 			rejects["drained"]++
@@ -137,7 +168,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, ErrNoPlacementTarget
+		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable)
 	}
 
 	// Power-of-two-choices.
@@ -149,7 +180,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 
 	if winner.NodeID == c.nodeID {
 		recordSchedulerDecision("self", len(candidates), rejects)
-		return self, nil
+		return self, candidates, nil
 	}
 	recordSchedulerDecision("remote", len(candidates), rejects)
 	return PlacementTarget{
@@ -158,7 +189,110 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		DataPlaneHost: winner.DataPlaneHost,
 		InternalURL:   winner.InternalURL,
 		IsSelf:        false,
-	}, nil
+	}, candidates, nil
+}
+
+func normalizeSecretRecipientIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func sameSecretRecipientSet(a, b []string) bool {
+	a = normalizeSecretRecipientIDs(a)
+	b = normalizeSecretRecipientIDs(b)
+	if len(a) != len(b) {
+		return false
+	}
+	want := make(map[string]struct{}, len(a))
+	for _, id := range a {
+		want[id] = struct{}{}
+	}
+	for _, id := range b {
+		if _, ok := want[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// SelectSecretRecipients builds the seal recipient set: owner first, then up
+// to maxBackups other candidates chosen by deterministic rendezvous hashing
+// over (sandboxID, nodeID). Sorting by NodeID alone hotspot-loads the
+// lexicographically first workers; HRW spreads backup rows evenly while
+// remaining stable for a given sandbox.
+// When the cluster is smaller than owner+maxBackups, every eligible candidate
+// is included. Empty ownerID or candidates yields nil.
+func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID string, maxBackups int) []string {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" || len(candidates) == 0 {
+		return nil
+	}
+	if maxBackups < 0 {
+		maxBackups = 0
+	}
+	seen := map[string]struct{}{ownerID: {}}
+	out := []string{ownerID}
+	type scored struct {
+		id    string
+		score uint64
+	}
+	rest := make([]scored, 0, len(candidates))
+	for _, m := range candidates {
+		id := strings.TrimSpace(m.NodeID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		rest = append(rest, scored{id: id, score: secretRecipientScore(sandboxID, id)})
+	}
+	sort.SliceStable(rest, func(i, j int) bool {
+		if rest[i].score != rest[j].score {
+			return rest[i].score > rest[j].score
+		}
+		return rest[i].id < rest[j].id
+	})
+	if maxBackups > len(rest) {
+		maxBackups = len(rest)
+	}
+	for i := 0; i < maxBackups; i++ {
+		out = append(out, rest[i].id)
+	}
+	return out
+}
+
+// secretRecipientScore is highest-random-weight (rendezvous) hashing so each
+// sandbox picks a stable, evenly distributed backup set. FNV alone can
+// correlate on sequential IDs; a splitmix-style finalizer removes that skew.
+func secretRecipientScore(sandboxID, nodeID string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strings.TrimSpace(sandboxID)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strings.TrimSpace(nodeID)))
+	x := h.Sum64()
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }
 
 // nodeFits returns true if the member could plausibly accept req based on its
@@ -414,3 +548,14 @@ var _ = func() error {
 	var _ Client = (*Noop)(nil)
 	return errors.New("type assertion only, never returned")
 }()
+
+// noPlacementTargetError picks the sentinel for an empty candidate set. A
+// request bound to one node by an artifact fails as ErrArtifactNodeUnavailable
+// when that node was not a live capacity-reporting member — the artifact is
+// gone with it, and waiting will not bring it back.
+func noPlacementTargetError(req capacity.Request, requiredReachable bool) error {
+	if req.RequiredNodeID != "" && !requiredReachable {
+		return fmt.Errorf("%w (node %q)", ErrArtifactNodeUnavailable, req.RequiredNodeID)
+	}
+	return ErrNoPlacementTarget
+}

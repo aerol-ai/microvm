@@ -171,6 +171,9 @@ func (s *Service) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 		}
 		id = generated
 	}
+	if !models.ValidTemplateID(id) {
+		return nil, errors.New("template id must start with an alphanumeric character and contain only alphanumerics, dot, underscore, or hyphen (maximum 128 characters)")
+	}
 
 	now := time.Now().UTC()
 	template := &models.Template{

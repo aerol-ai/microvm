@@ -111,19 +111,19 @@ func TestBuildImageReturnsContentAddressedTag(t *testing.T) {
 	}
 }
 
-func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
+func TestClusterBuildImageWrapRoutesToOneDockerWorker(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo hi"
 	var remoteSeen bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remoteSeen = true
-		if got := r.Header.Get(clusterImageBuildFanoutHeader); got != "1" {
-			t.Fatalf("%s = %q, want 1", clusterImageBuildFanoutHeader, got)
+		if got := r.Header.Get(clusterImageBuildRoutedHeader); got != "1" {
+			t.Fatalf("%s = %q, want 1", clusterImageBuildRoutedHeader, got)
 		}
 		var req buildImageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode remote request: %v", err)
 		}
-		apiResp := buildImageResponse{Image: docker.BuildTagFor(req.DockerfileContent, nil)}
+		apiResp := buildImageResponse{Image: docker.BuildTagForNode(req.DockerfileContent, nil, "worker-docker")}
 		_ = json.NewEncoder(w).Encode(apiResp)
 	}))
 	defer remote.Close()
@@ -131,11 +131,15 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		Noop:           cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		internalClient: remote.Client(),
+		placement: cluster.PlacementTarget{
+			NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL,
+		},
 		members: []cluster.Member{
 			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 			{
@@ -159,18 +163,18 @@ func TestClusterBuildImageWrapFansOutToDockerWorkers(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
 	}
 	if !remoteSeen {
-		t.Fatal("remote docker worker did not receive build fanout")
+		t.Fatal("remote docker worker did not receive routed build")
 	}
 	var resp buildImageResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if want := docker.BuildTagFor(dockerfile, nil); resp.Image != want {
+	if want := docker.BuildTagForNode(dockerfile, nil, "worker-docker"); resp.Image != want {
 		t.Fatalf("Image = %q, want %q", resp.Image, want)
 	}
 }
 
-func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
+func TestClusterBuildImageWrapBuildsLocallyWhenPlacementSelectsSelf(t *testing.T) {
 	dockerfile := "FROM alpine\nRUN echo local"
 	var remoteSeen bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -182,11 +186,15 @@ func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleMixed}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("mixed-a", "http://mixed-a", ""),
+		Noop:           cluster.NewNoop("mixed-a", "http://mixed-a", ""),
+		internalClient: remote.Client(),
+		placement: cluster.PlacementTarget{
+			NodeID: "mixed-a", APIURL: "http://mixed-a", IsSelf: true,
+		},
 		members: []cluster.Member{
 			{NodeID: "mixed-a", APIURL: "http://mixed-a", Alive: true, Role: config.NodeRoleMixed},
 			{
-				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 		},
@@ -208,7 +216,7 @@ func TestClusterBuildImageWrapSkipsFanoutWhenSelfCanOwn(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
 	}
 	if remoteSeen {
-		t.Fatal("remote worker received build fanout even though this node can own the follow-up create")
+		t.Fatal("remote worker received build even though placement selected self")
 	}
 	if len(builder.builds) != 1 {
 		t.Fatalf("local build calls = %d, want 1", len(builder.builds))
@@ -224,11 +232,15 @@ func TestClusterBuildImageWrapReturnsBadGatewayWhenPeerBuildFails(t *testing.T) 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&membersStubCluster{
-		Noop: cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		Noop:           cluster.NewNoop("ingress-a", "http://ingress-a", ""),
+		internalClient: remote.Client(),
+		placement: cluster.PlacementTarget{
+			NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL,
+		},
 		members: []cluster.Member{
 			{NodeID: "ingress-a", APIURL: "http://ingress-a", Alive: true, Role: config.NodeRoleServer},
 			{
-				NodeID: "worker-docker", APIURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
+				NodeID: "worker-docker", APIURL: remote.URL, InternalURL: remote.URL, Alive: true, Role: config.NodeRoleWorker,
 				Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeDocker}},
 			},
 		},

@@ -54,7 +54,7 @@ type existsFailBackend struct {
 	memBackend
 }
 
-func (existsFailBackend) Exists(string, string, ...string) (bool, error) {
+func (*existsFailBackend) Exists(string, string, ...string) (bool, error) {
 	return false, errors.New("exists boom")
 }
 

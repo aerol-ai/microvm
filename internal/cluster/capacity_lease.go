@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -38,6 +37,7 @@ type capacityLeaseCache struct {
 	// Firecracker disabled, and the placement path naturally degrades
 	// to "no template gate" via the unknown-allow rule.
 	localTemplateInventory   func() ([]string, bool)
+	localTemplateCatalog     func() ([]string, bool)
 	localWasmModuleInventory func() ([]string, bool)
 }
 
@@ -63,18 +63,29 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 		return
 	}
 	snap := c.admitter.Snapshot()
+	c.mu.RLock()
+	templateInventory := c.localTemplateInventory
+	templateCatalog := c.localTemplateCatalog
+	wasmModuleInventory := c.localWasmModuleInventory
+	c.mu.RUnlock()
 	// Overlay PR-D template inventory before storing — placement reads
 	// straight off this lease, so without the overlay our own snapshot
 	// would advertise no templates and the unknown-allow rule would
 	// let creates land on peers that lack them.
-	if c.localTemplateInventory != nil {
-		if ids, known := c.localTemplateInventory(); known {
+	if templateInventory != nil {
+		if ids, known := templateInventory(); known {
 			snap.LocalTemplateInventoryKnown = true
 			snap.LocalTemplateIDs = ids
 		}
 	}
-	if c.localWasmModuleInventory != nil {
-		if refs, known := c.localWasmModuleInventory(); known {
+	if templateCatalog != nil {
+		if ids, known := templateCatalog(); known {
+			snap.LocalTemplateCatalogInventoryKnown = true
+			snap.LocalTemplateCatalogIDs = ids
+		}
+	}
+	if wasmModuleInventory != nil {
+		if refs, known := wasmModuleInventory(); known {
 			snap.LocalWasmModuleInventoryKnown = true
 			snap.LocalWasmModuleIDs = refs
 		}
@@ -93,6 +104,18 @@ func (c *capacityLeaseCache) SetLocalTemplateIDsProvider(fn func() ([]string, bo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.localTemplateInventory = fn
+}
+
+// SetLocalTemplateCatalogProvider installs the all-lifecycle template
+// catalogue used for direct administrative item routing. It is deliberately
+// separate from the ready-only placement inventory.
+func (c *capacityLeaseCache) SetLocalTemplateCatalogProvider(fn func() ([]string, bool)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localTemplateCatalog = fn
 }
 
 // SetLocalWasmModuleIDsProvider installs the WASM module inventory callback.
@@ -204,7 +227,7 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 		if m.NodeID == "" || m.NodeID == c.nodeID || !m.Alive || !CanOwnSandboxRole(m.Role) {
 			continue
 		}
-		if m.APIURL == "" && m.InternalURL == "" {
+		if m.InternalURL == "" {
 			continue
 		}
 		jobs <- m
@@ -216,19 +239,11 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 func (c *Cluster) fetchMemberCapacity(ctx context.Context, m Member) (capacity.Snapshot, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if c.internalClient != nil && m.InternalURL != "" {
-		snap, err := fetchCapacitySnapshot(reqCtx, c.internalClient, strings.TrimRight(m.InternalURL, "/")+"/v1/capacity", c.patToken)
-		if err == nil {
-			return snap, nil
-		}
-		if !isStatus(err, http.StatusServiceUnavailable) || m.APIURL == "" {
-			return capacity.Snapshot{}, err
-		}
+	client, base, err := c.PeerDialMember(m)
+	if err != nil {
+		return capacity.Snapshot{}, err
 	}
-	if m.APIURL == "" {
-		return capacity.Snapshot{}, fmt.Errorf("node %s has no API URL for capacity heartbeat", m.NodeID)
-	}
-	return fetchCapacitySnapshot(reqCtx, c.httpClient, strings.TrimRight(m.APIURL, "/")+"/v1/capacity", c.patToken)
+	return fetchCapacitySnapshot(reqCtx, client, strings.TrimRight(base, "/")+"/v1/capacity", c.patToken)
 }
 
 func fetchCapacitySnapshot(ctx context.Context, client *http.Client, endpoint, patToken string) (capacity.Snapshot, error) {

@@ -143,6 +143,9 @@ func (s *Service) runWasmCheckpointPool(ctx context.Context, sandboxes []*models
 	if len(sandboxes) == 0 {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	parallelism := s.wasmCheckpointParallelism()
 	if parallelism > len(sandboxes) {
 		parallelism = len(sandboxes)
@@ -173,6 +176,9 @@ func (s *Service) runWasmCheckpointPool(ctx context.Context, sandboxes []*models
 	close(jobs)
 	wg.Wait()
 	close(errCh)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for err := range errCh {
 		if err != nil {
 			return err
@@ -285,7 +291,9 @@ func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.San
 	}
 	// Unseal per-tenant registry creds so a failover peer re-pulls a private
 	// oci:// base module under the tenant's identity (codex C4).
-	s.attachWasmRegistryAuth(sandbox)
+	if err := s.attachWasmRegistryAuth(sandbox); err != nil {
+		return nil, err
+	}
 	state, err := host.RehydrateSandbox(ctx, sandbox, hostMounts)
 	if err != nil {
 		if errors.Is(err, models.ErrSnapshotCorrupt) || errors.Is(err, models.ErrSnapshotFenced) {

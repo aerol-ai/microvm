@@ -36,6 +36,7 @@ func makeScalePlacements(n int) []cluster.Placement {
 			OwnerAPIURL:        fmt.Sprintf("http://10.0.%d.%d:21212", (i/256)%256, i%256),
 			OwnerDataPlaneHost: fmt.Sprintf("10.0.%d.%d", (i/256)%256, i%256),
 			Version:            uint64(i + 1),
+			Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				3000: {Protocol: models.ExposedPortProtocolHTTP},
 				5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 22000 + i},
@@ -302,6 +303,7 @@ func TestReconcileClusterIngressFailoverStormBoundedBurst(t *testing.T) {
 			OwnerAPIURL:        "http://10.0.0.1:21212",
 			OwnerDataPlaneHost: "10.0.0.1",
 			Version:            uint64(i + 1),
+			Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				3000: {Protocol: models.ExposedPortProtocolHTTP},
 				5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 22000 + i},

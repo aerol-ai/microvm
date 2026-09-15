@@ -15,10 +15,12 @@ import (
 
 // Server holds one wazero engine per worker process (D11: one module per worker).
 type Server struct {
-	mu       sync.Mutex
-	eng      wasmengine.Engine
-	lastCaps wasmengine.Capabilities
-	net      *NetMediator
+	mu            sync.Mutex
+	eng           wasmengine.Engine
+	lastCaps      wasmengine.Capabilities
+	net           *NetMediator
+	auditMu       sync.RWMutex
+	auditBindings map[string]egressAuditBinding
 	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick drains them.
 	workerNet map[string]*workerNetUsage
 }
@@ -41,8 +43,33 @@ func (s *Server) netUsageFor(sandboxID string) *workerNetUsage {
 func (s *Server) mediator() *NetMediator {
 	if s.net == nil {
 		s.net = newNetMediator()
+		// Worker process: append egress destinations to the daemon's audit JSONL
+		// (cannot import internal/service). Dial-path only; never create.
+		installDefaultEgressObserver(s.net, s.auditBinding)
 	}
 	return s.net
+}
+
+func (s *Server) setAuditBinding(sandboxID string, caps wasmengine.Capabilities) {
+	s.auditMu.Lock()
+	defer s.auditMu.Unlock()
+	if s.auditBindings == nil {
+		s.auditBindings = make(map[string]egressAuditBinding)
+	}
+	s.auditBindings[sandboxID] = egressAuditBinding{capability: caps.AuditCapability, incarnationID: caps.AuditIncarnation}
+}
+
+func (s *Server) auditBinding(sandboxID string) (egressAuditBinding, bool) {
+	s.auditMu.RLock()
+	defer s.auditMu.RUnlock()
+	b, ok := s.auditBindings[sandboxID]
+	return b, ok
+}
+
+func (s *Server) clearAuditBinding(sandboxID string) {
+	s.auditMu.Lock()
+	delete(s.auditBindings, sandboxID)
+	s.auditMu.Unlock()
 }
 
 // syncResolvedListenPort copies the host port for an ephemeral wasip1 listener into caps.
@@ -206,9 +233,11 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.setAuditBinding(env.SandboxID, p.Caps)
 			s.mu.Lock()
 			if s.eng == nil {
 				s.mu.Unlock()
+				s.clearAuditBinding(env.SandboxID)
 				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
 					return err
 				}
@@ -222,6 +251,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			}
 			s.mu.Unlock()
 			if err != nil {
+				s.clearAuditBinding(env.SandboxID)
 				if replyErr(env.SandboxID, err) != nil {
 					return err
 				}
@@ -319,6 +349,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				s.clearNetworkHook()
 			}
 			s.mu.Unlock()
+			s.clearAuditBinding(env.SandboxID)
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
 					return err
@@ -383,9 +414,11 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.setAuditBinding(env.SandboxID, p.Caps)
 			s.mu.Lock()
 			if s.eng == nil {
 				s.mu.Unlock()
+				s.clearAuditBinding(env.SandboxID)
 				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
 					return err
 				}
@@ -399,6 +432,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			}
 			s.mu.Unlock()
 			if err != nil {
+				s.clearAuditBinding(env.SandboxID)
 				if replyErr(env.SandboxID, err) != nil {
 					return err
 				}

@@ -250,6 +250,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 	peer := cluster.Placement{
 		SandboxID: "sb-peer", OwnerNodeID: "peer-1", OwnerAPIURL: "http://10.0.0.2:8080",
 		Version: 1,
+		Spec:    &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 			5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 25432},
 			8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -300,6 +301,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 		OwnerNodeID: "peer-2",
 		OwnerAPIURL: "http://10.0.0.3:8080",
 		Version:     2,
+		Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 			9090: {},
 		},
@@ -373,6 +375,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 			OwnerAPIURL:        "http://10.0.0.7:21212",
 			OwnerDataPlaneHost: "10.0.0.7",
 			Version:            1,
+			Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			CustomHostnames:    []string{"api.acme.com"},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -385,6 +388,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 			SandboxID:   "sb-flux",
 			OwnerNodeID: "peer-2",
 			Version:     2,
+			Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				9000: {Protocol: models.ExposedPortProtocolHTTP},
 			},
@@ -653,10 +657,10 @@ func TestHandleL4WakeTCPConnBranches(t *testing.T) {
 		svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 		server, client := net.Pipe()
-		go func() {
-			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
-			_ = client.Close()
-		}()
+		go func(conn net.Conn) {
+			_, _ = conn.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = conn.Close()
+		}(client)
 		svc.handleL4WakeTCPConn(server)
 
 		now := time.Now().UTC()
@@ -684,10 +688,10 @@ func TestHandleL4WakeTCPConnBranches(t *testing.T) {
 			t.Fatalf("UpsertPort: %v", err)
 		}
 		server, client = net.Pipe()
-		go func() {
-			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
-			_ = client.Close()
-		}()
+		go func(conn net.Conn) {
+			_, _ = conn.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = conn.Close()
+		}(client)
 		svc.handleL4WakeTCPConn(server)
 	})
 }
@@ -722,11 +726,9 @@ func TestProxyL4WakeConnDialError(t *testing.T) {
 		t.Fatalf("UpsertPort: %v", err)
 	}
 
-	oldDial := dialL4Upstream
-	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+	setDialL4UpstreamForTest(t, func(context.Context, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
-	}
-	defer func() { dialL4Upstream = oldDial }()
+	})
 
 	server, client := net.Pipe()
 	go func() {
@@ -767,11 +769,9 @@ func TestTLSWakeListenerAcceptBranches(t *testing.T) {
 		t.Fatalf("UpsertPort: %v", err)
 	}
 
-	oldDial := dialL4Upstream
-	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+	setDialL4UpstreamForTest(t, func(context.Context, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
-	}
-	defer func() { dialL4Upstream = oldDial }()
+	})
 
 	socketPath, err := svc.ensureTLSWakeListener("sb-tls-accept", 8443)
 	if err != nil {

@@ -75,12 +75,42 @@ type Host struct {
 	slotByID map[string]int // sandbox id → assigned slot
 	idBySlot []string       // slot → sandbox id ("" == free)
 	slotSrv  []*http.Server // slot → lazily-started listener (nil == unbound)
+	// jail is what applyJail realized for this process (nil when unjailed);
+	// Stop tears it down after the process is gone. Set in Start under mu.
+	jail *jailRealized
 	// cmd/ctrlClient/servers are set once in Start and cleared in Stop; guarded
 	// by mu because Invoke reads ctrlClient while Stop nils cmd concurrently.
 	cmd           *exec.Cmd
 	bundleSrv     *http.Server
 	egressDenySrv *http.Server
 	ctrlClient    *http.Client
+
+	// egressObserver records host-mediated destinations (E3a). Guarded by mu.
+	egressObserver EgressObserver
+}
+
+// SetEgressObserver installs (or clears) the async egress attribution callback.
+func (h *Host) SetEgressObserver(obs EgressObserver) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.egressObserver = obs
+	h.mu.Unlock()
+}
+
+func (h *Host) observeEgress(sandboxID, network, destination string) {
+	if h == nil {
+		return
+	}
+	h.mu.RLock()
+	obs := h.egressObserver
+	h.mu.RUnlock()
+	if obs == nil {
+		return
+	}
+	sid, netw, dest := sandboxID, network, destination
+	go obs(sid, netw, dest)
 }
 
 // NewHost prepares (does not start) a group host.
@@ -93,6 +123,15 @@ func NewHost(cfg HostConfig) (*Host, error) {
 	}
 	if strings.TrimSpace(cfg.RunDir) == "" {
 		return nil, fmt.Errorf("isolate: run dir is required")
+	}
+	if cfg.Jail.Require && cfg.Jail.ChrootDir != "" {
+		// Both sides must name the same inodes: workerd binds sockets at
+		// /run/... inside its root, the Go side dials <chroot>/run/... on the
+		// host. Anywhere else the jailed process could not reach them.
+		want := filepath.Join(cfg.Jail.ChrootDir, JailRunDirName)
+		if filepath.Clean(cfg.RunDir) != want {
+			return nil, fmt.Errorf("isolate: jailed run dir must be %s (got %s)", want, cfg.RunDir)
+		}
 	}
 	if cfg.StartTimeout == 0 {
 		cfg.StartTimeout = 10 * time.Second
@@ -193,26 +232,50 @@ func (h *Host) Start(ctx context.Context) error {
 	}
 
 	configPath := filepath.Join(h.cfg.RunDir, "config.capnp")
-	cmd := exec.Command(h.cfg.WorkerdPath, "serve", "--experimental", configPath)
+	workerdArgs := []string{"serve", "--experimental", h.inJail(configPath)}
+	cmd := exec.Command(h.cfg.WorkerdPath, workerdArgs...)
 	cmd.Dir = h.cfg.RunDir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	// Fail-closed jail gate: if confinement is REQUIRED but this platform can't
 	// realize it (or the spec is incomplete), refuse to spawn rather than run
 	// untrusted tenant JS unconfined while the operator believes it is jailed.
+	var realized *jailRealized
 	if h.cfg.Jail.Require {
-		if err := applyJail(cmd, h.cfg.Jail); err != nil {
+		var err error
+		realized, err = applyJail(cmd, h.cfg.Jail, workerdArgs)
+		if err != nil {
 			_ = h.stopServers()
+			// MkdirAll(RunDir) may have created <chroot>/run before applyJail
+			// refused (non-root, missing shim, …). Drop the group tree so a
+			// failed required-jail start never leaves a half-built chroot.
+			if dir := h.cfg.Jail.ChrootDir; dir != "" {
+				_ = os.RemoveAll(dir)
+			}
 			return fmt.Errorf("isolate: jail required but not realized here — refusing to spawn workerd unconfined (set SB_ISOLATE_USE_JAIL=false to run without a jail, accepting the risk): %w", err)
+		}
+		if len(realized.unknownSyscalls) > 0 {
+			h.logger.Info("isolate jail: allowlist names absent on this architecture (skipped)", "group", h.cfg.GroupKey, "syscalls", realized.unknownSyscalls)
+		}
+		// Everything workerd must read or bind was created by root; hand it
+		// to the jail identity now that the run dir exists.
+		if err := h.grantJailAccess(h.cfg.RunDir, configPath, filepath.Join(h.cfg.RunDir, controllerModuleName), h.hostSock, h.egressDenySock); err != nil {
+			_ = realized.teardown()
+			_ = h.stopServers()
+			return err
 		}
 	}
 	if err := cmd.Start(); err != nil {
+		realized.closeFD()
+		_ = realized.teardown()
 		_ = h.stopServers()
 		return fmt.Errorf("isolate: start workerd: %w", err)
 	}
+	realized.closeFD()
 	client := unixHTTPClient(h.controlSock)
 	h.mu.Lock()
 	h.cmd = cmd
+	h.jail = realized
 	h.ctrlClient = client
 	h.mu.Unlock()
 
@@ -228,7 +291,11 @@ func (h *Host) writeConfig() error {
 	if err := os.WriteFile(filepath.Join(h.cfg.RunDir, controllerModuleName), []byte(controllerJS), 0o600); err != nil {
 		return fmt.Errorf("isolate: write controller: %w", err)
 	}
-	cfg := capnpConfig(h.controlSock, h.hostSock, h.egressSocks, h.egressDenySock, h.cfg.GroupKey)
+	egress := make([]string, len(h.egressSocks))
+	for i, s := range h.egressSocks {
+		egress[i] = h.inJail(s)
+	}
+	cfg := capnpConfig(h.inJail(h.controlSock), h.inJail(h.hostSock), egress, h.inJail(h.egressDenySock), h.cfg.GroupKey)
 	if err := os.WriteFile(filepath.Join(h.cfg.RunDir, "config.capnp"), []byte(cfg), 0o600); err != nil {
 		return fmt.Errorf("isolate: write config: %w", err)
 	}
@@ -268,7 +335,12 @@ func (h *Host) startBundleServer() error {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(wire)
 	})
-	h.bundleSrv = &http.Server{Handler: mux}
+	h.bundleSrv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() { _ = h.bundleSrv.Serve(ln) }()
 	return nil
 }
@@ -351,13 +423,72 @@ func (h *Host) Stop() error {
 	h.started.Store(false)
 	h.mu.Lock()
 	cmd := h.cmd
+	jail := h.jail
 	h.cmd = nil
+	h.jail = nil
 	h.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
 	}
-	return h.stopServers()
+	err := h.stopServers()
+	if jail != nil {
+		// After the process: the kernel refuses to remove a populated cgroup,
+		// and the run dir inside the chroot holds the sockets we just closed.
+		if terr := jail.teardown(); terr != nil && h.logger != nil {
+			h.logger.Warn("isolate jail teardown incomplete", "group", h.cfg.GroupKey, "err", terr)
+		}
+	}
+	return err
+}
+
+// ApplyCaps changes the group's cgroup caps while it runs: a warm blank host
+// starts unlimited and takes the claiming tenant's caps here. No-op when the
+// host is not jailed (there is no cgroup to write).
+func (h *Host) ApplyCaps(cpu float64, memMB int) error {
+	h.mu.RLock()
+	jail := h.jail
+	h.mu.RUnlock()
+	return jail.applyCaps(cpu, memMB)
+}
+
+// inJail maps a host path under the chroot onto the path the jailed process
+// sees. Unjailed hosts see the same paths on both sides.
+func (h *Host) inJail(hostPath string) string {
+	root := h.cfg.Jail.ChrootDir
+	if !h.cfg.Jail.Require || root == "" {
+		return hostPath
+	}
+	rel, err := filepath.Rel(root, hostPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return hostPath
+	}
+	return "/" + rel
+}
+
+// grantJailAccess hands root-created files to the jail identity. workerd
+// must read its config and controller, and connect to (write) the sockets
+// the Go side listens on; the run dir itself must be traversable and
+// writable for the sockets workerd binds.
+func (h *Host) grantJailAccess(paths ...string) error {
+	if !h.cfg.Jail.Require {
+		return nil
+	}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("isolate: jail access %s: %w", p, err)
+		}
+		if err := os.Chown(p, h.cfg.Jail.UID, h.cfg.Jail.GID); err != nil {
+			return fmt.Errorf("isolate: chown %s to jail uid: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // unixHTTPClient returns an http.Client whose transport dials the given unix

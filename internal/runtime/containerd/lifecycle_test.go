@@ -7,7 +7,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
-	cntr "github.com/containerd/containerd"
+	cntr "github.com/containerd/containerd/v2/client"
 )
 
 func TestBuildEnvIncludesToolboxContractAndUserEnv(t *testing.T) {

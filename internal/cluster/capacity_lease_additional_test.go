@@ -65,37 +65,38 @@ func TestFetchCapacitySnapshot(t *testing.T) {
 func TestFetchMemberCapacityNoUrl(t *testing.T) {
 	c := &Cluster{}
 	_, err := c.fetchMemberCapacity(context.Background(), Member{NodeID: "m1", APIURL: ""})
-	if err == nil || err.Error() != "node m1 has no API URL for capacity heartbeat" {
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
 		t.Errorf("expected missing url error, got %v", err)
 	}
 }
 
-func TestFetchMemberCapacityFallsBackToPublicAPI(t *testing.T) {
+func TestFetchMemberCapacityFailClosedOnInternal503(t *testing.T) {
 	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("try public"))
 	}))
 	defer internal.Close()
 
+	publicHits := 0
 	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		publicHits++
 		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16384})
 	}))
 	defer public.Close()
 
 	c := &Cluster{
-		httpClient:     public.Client(),
 		internalClient: internal.Client(),
 	}
-	snap, err := c.fetchMemberCapacity(context.Background(), Member{
+	_, err := c.fetchMemberCapacity(context.Background(), Member{
 		NodeID:      "m1",
 		APIURL:      public.URL,
 		InternalURL: internal.URL,
 	})
-	if err != nil {
-		t.Fatalf("fetchMemberCapacity() error = %v", err)
+	if err == nil {
+		t.Fatal("expected internal 503 to fail closed (no public downgrade)")
 	}
-	if snap.HostCPUCores != 8 || snap.HostMemoryTotalMB != 16384 {
-		t.Fatalf("fetchMemberCapacity() snapshot = %+v", snap)
+	if publicHits != 0 {
+		t.Fatalf("public hits = %d, want 0", publicHits)
 	}
 }
 
@@ -106,11 +107,11 @@ func TestRefreshCapacityLeasesHandlesErrorsAndFallbacks(t *testing.T) {
 	}))
 	defer internalError.Close()
 
-	internalFallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	internalUnavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("retry public"))
+		_, _ = w.Write([]byte("unavailable"))
 	}))
-	defer internalFallback.Close()
+	defer internalUnavailable.Close()
 
 	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 6, HostMemoryTotalMB: 12288})
@@ -119,8 +120,7 @@ func TestRefreshCapacityLeasesHandlesErrorsAndFallbacks(t *testing.T) {
 
 	c := &Cluster{
 		nodeID:         "self",
-		httpClient:     public.Client(),
-		internalClient: internalError.Client(),
+		internalClient: &http.Client{}, // shared dialer; PeerDial selects each peer's InternalURL
 		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),
 		gossip: &gossipNode{
@@ -130,12 +130,14 @@ func TestRefreshCapacityLeasesHandlesErrorsAndFallbacks(t *testing.T) {
 	c.gossip.memberIndex.upsert(Member{NodeID: "skip-empty", Alive: true, Role: config.NodeRoleWorker})
 	c.gossip.memberIndex.upsert(Member{NodeID: "dead-node", Alive: false, Role: config.NodeRoleWorker, APIURL: public.URL})
 	c.gossip.memberIndex.upsert(Member{NodeID: "error-node", Alive: true, Role: config.NodeRoleWorker, APIURL: public.URL, InternalURL: internalError.URL})
-	c.gossip.memberIndex.upsert(Member{NodeID: "fallback-node", Alive: true, Role: config.NodeRoleWorker, APIURL: public.URL, InternalURL: internalFallback.URL})
+	c.gossip.memberIndex.upsert(Member{NodeID: "no-public-downgrade", Alive: true, Role: config.NodeRoleWorker, APIURL: public.URL, InternalURL: internalUnavailable.URL})
 
 	c.refreshCapacityLeases(context.Background())
 
-	if lease, ok := c.capacityLeases.leases["fallback-node"]; !ok || lease.snapshot.HostCPUCores != 6 || lease.snapshot.HostMemoryTotalMB != 12288 {
-		t.Fatalf("refreshCapacityLeases() fallback lease = %+v ok=%v", lease, ok)
+	// With TLS loaded, a 503 on the internal channel must not silently
+	// downgrade to the public capacity endpoint.
+	if _, ok := c.capacityLeases.leases["no-public-downgrade"]; ok {
+		t.Fatal("refreshCapacityLeases() downgraded 503 internal to public capacity")
 	}
 	if _, ok := c.capacityLeases.leases["skip-empty"]; ok {
 		t.Fatal("refreshCapacityLeases() created a lease for skip-empty member")

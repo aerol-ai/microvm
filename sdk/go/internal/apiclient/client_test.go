@@ -497,3 +497,74 @@ func TestListWithoutTagsOmitsQueryString(t *testing.T) {
 		}
 	}
 }
+
+func TestListDrainsClusterPages(t *testing.T) {
+	ctx := context.Background()
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.String())
+		w.Header().Set("X-Cluster-List-Partial", "false")
+		w.Header().Set("X-Cluster-List-Placement-Ready", "true")
+		switch r.URL.Query().Get("page_token") {
+		case "":
+			w.Header().Set("X-Cluster-List-Next-Page-Token", "tok-1")
+			_, _ = w.Write([]byte(`[{"id":"sb-1","image":"alpine","status":"started","cpu":1,"memory_mb":256,"disk_gb":1,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}]`))
+		case "tok-1":
+			_, _ = w.Write([]byte(`[{"id":"sb-2","image":"alpine","status":"started","cpu":1,"memory_mb":256,"disk_gb":1,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}]`))
+		default:
+			t.Fatalf("unexpected page_token %q", r.URL.Query().Get("page_token"))
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	items, err := client.List(ctx, nil)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(items) != 2 || items[0].ID != "sb-1" || items[1].ID != "sb-2" {
+		t.Fatalf("items = %+v, want sb-1 then sb-2", items)
+	}
+	if len(paths) != 2 || paths[1] != "/v1/sandboxes?page_token=tok-1" {
+		t.Fatalf("paths = %v", paths)
+	}
+}
+
+func TestListPageWithOptionsReturnsOnePage(t *testing.T) {
+	ctx := context.Background()
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if got := r.URL.Query().Get("page_token"); got != "tok-0" {
+			t.Fatalf("page_token = %q, want tok-0", got)
+		}
+		w.Header().Set("X-Cluster-List-Placement-Ready", "true")
+		w.Header().Set("X-Cluster-List-Next-Page-Token", "tok-1")
+		_, _ = w.Write([]byte(`[{"id":"sb-page","image":"alpine","status":"started"}]`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	items, next, err := client.ListPageWithOptions(ctx, nil, false, "tok-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || len(items) != 1 || items[0].ID != "sb-page" || next != "tok-1" {
+		t.Fatalf("calls=%d items=%+v next=%q", calls, items, next)
+	}
+}
+
+func TestListErrorsOnPartialClusterCoverage(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Cluster-List-Partial", "true")
+		w.Header().Set("X-Cluster-List-Placement-Ready", "true")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	if _, err := client.List(ctx, nil); err == nil || !strings.Contains(err.Error(), "incomplete cluster list") {
+		t.Fatalf("List() error = %v, want incomplete cluster list", err)
+	}
+}

@@ -56,8 +56,11 @@ func TestAgentDelegatesVolumeReadWriteToServerControlPlane(t *testing.T) {
 	if err != nil || !exists {
 		t.Fatalf("agent VolumeExistsForSource = %v, %v", exists, err)
 	}
+	if err := agent.RecordPlacement(ctx, "sb-1", nil, PlacementSecrets{IncarnationID: "inc-sb-1"}); err != nil {
+		t.Fatalf("agent RecordPlacement: %v", err)
+	}
 	attach := models.VolumeAttachment{
-		Tenant: "t-a", VolumeID: "vol-agent", SandboxID: "sb-1", Target: "/data", Source: "bucket/t-a/data",
+		Tenant: "t-a", VolumeID: "vol-agent", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "bucket/t-a/data",
 	}
 	if err := agent.PutVolumeAttachments(ctx, []models.VolumeAttachment{attach}); err != nil {
 		t.Fatalf("agent PutVolumeAttachments: %v", err)
@@ -66,7 +69,7 @@ func TestAgentDelegatesVolumeReadWriteToServerControlPlane(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("agent VolumeAttachmentCount = %d, %v", count, err)
 	}
-	if err := agent.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil {
+	if err := agent.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1", "inc-sb-1"); err != nil {
 		t.Fatalf("agent DeleteVolumeAttachmentsForSandbox: %v", err)
 	}
 	if err := agent.VolumeDelete(ctx, "t-a", "vol-agent"); err != nil {
@@ -87,7 +90,7 @@ func TestAgentVolumeValidation(t *testing.T) {
 	if err := a.PutVolumeAttachments(ctx, nil); err != nil {
 		t.Fatalf("PutVolumeAttachments empty: %v", err)
 	}
-	if err := a.DeleteVolumeAttachmentsForSandbox(ctx, " "); err != nil {
+	if err := a.DeleteVolumeAttachmentsForSandbox(ctx, " ", ""); err != nil {
 		t.Fatalf("DeleteVolumeAttachmentsForSandbox whitespace: %v", err)
 	}
 }
@@ -175,6 +178,7 @@ func startAgentControlPlaneServerWithVolumes(t *testing.T, c *Cluster, ln net.Li
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
 	})
+	c.AttachInternalHandler(mux)
 	srv := &httptest.Server{Listener: ln, Config: &http.Server{Handler: mux}}
 	srv.Start()
 	return srv

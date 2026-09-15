@@ -9,6 +9,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // stubStaleCluster is a Noop wrapper that returns a fixed non-self owner for
@@ -22,6 +23,16 @@ type stubStaleCluster struct {
 
 func (s *stubStaleCluster) OwnerOf(_ string) (cluster.OwnerInfo, error) {
 	return cluster.OwnerInfo{NodeID: s.otherNode, APIURL: s.otherURL, IsSelf: false}, nil
+}
+
+func (s *stubStaleCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement, len(ids))
+	for _, id := range ids {
+		out[id] = cluster.Placement{
+			SandboxID: id, OwnerNodeID: s.otherNode, OwnerAPIURL: s.otherURL, IncarnationID: "inc-" + id,
+		}
+	}
+	return out, nil
 }
 
 type recordingOwnershipCluster struct {
@@ -67,7 +78,7 @@ func legacyPortProtocols(routes map[int]cluster.ExposedPortRoute) map[int]string
 
 func TestSpecFromSandboxPreservesFirecrackerTemplateFields(t *testing.T) {
 	svc := &Service{}
-	spec := svc.specFromSandbox(context.Background(), &models.Sandbox{
+	spec, err := svc.specFromSandbox(context.Background(), &models.Sandbox{
 		ID:            "sb-fc-spec",
 		Image:         "alpine:3.20",
 		Runtime:       models.RuntimeFirecracker,
@@ -78,6 +89,9 @@ func TestSpecFromSandboxPreservesFirecrackerTemplateFields(t *testing.T) {
 		DiskGB:        10,
 		Env:           map[string]string{"A": "B"},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if spec == nil {
 		t.Fatal("specFromSandbox returned nil")
 	}
@@ -158,17 +172,18 @@ func TestReplayReservationsThenStaleOwnershipReleasesCapacity(t *testing.T) {
 	const sandboxID = "sb-reassigned"
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           sandboxID,
-		Image:        "ubuntu:22.04",
-		Status:       models.SandboxStatusStarted,
-		ContainerID:  "ctr-reassigned",
-		ContainerIP:  "10.0.0.20",
-		CPU:          2,
-		MemoryMB:     2048,
-		Runtime:      models.RuntimeDocker,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 sandboxID,
+		Image:              "ubuntu:22.04",
+		Status:             models.SandboxStatusStarted,
+		ContainerID:        "ctr-reassigned",
+		ContainerIP:        "10.0.0.20",
+		CPU:                2,
+		MemoryMB:           2048,
+		Runtime:            models.RuntimeDocker,
+		AuditIncarnationID: "inc-" + sandboxID,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -201,6 +216,58 @@ func TestReplayReservationsThenStaleOwnershipReleasesCapacity(t *testing.T) {
 	}
 	if _, err := st.Get(ctx, sandboxID); err == nil {
 		t.Fatal("local row should be deleted after stale-ownership destroy")
+	}
+}
+
+func TestReconcileStaleOwnershipPreservesCurrentLifecycleSecrets(t *testing.T) {
+	ctx := context.Background()
+	runtime := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, runtime)
+	svc.cfg.EnableCluster = true
+	const sandboxID = "sb-reassigned-secrets"
+	incarnationID := "inc-" + sandboxID
+	peer := &stubStaleCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""), otherNode: "node-b", otherURL: "http://node-b",
+	}
+	svc.AttachCluster(peer)
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		Runtime: models.RuntimeDocker, ContainerID: "ctr-" + sandboxID,
+		AuditIncarnationID: incarnationID, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := svc.putClusterSecretsForRecipientsAndIncarnation(ctx, sandboxID, models.CreateSandboxRequest{
+		Env: map[string]string{"TOKEN": "must-survive"},
+	}, []string{"self", "node-b"}, incarnationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc.reconcileStaleOwnership(ctx)
+	if _, err := st.Get(ctx, sandboxID); err == nil {
+		t.Fatal("stale local sandbox row was not removed")
+	}
+	if len(runtime.destroyIDs) != 1 || runtime.destroyIDs[0] != sandboxID {
+		t.Fatalf("runtime destroys = %v", runtime.destroyIDs)
+	}
+	rec, err := st.GetClusterSecret(ctx, handle.Ref)
+	if err != nil || rec == nil || rec.SealGeneration != handle.SealGeneration {
+		t.Fatalf("active lifecycle secret was deleted: rec=%+v err=%v", rec, err)
+	}
+	if tomb, err := st.ClusterSecretTombGenerationForIncarnation(ctx, sandboxID, incarnationID); err != nil || tomb != 0 {
+		t.Fatalf("active lifecycle was tombstoned: generation=%d err=%v", tomb, err)
+	}
+	if outbox, err := st.GetSecretDeleteOutboxForIncarnation(ctx, sandboxID, incarnationID); err != nil || outbox != nil {
+		t.Fatalf("stale owner enqueued peer deletion: outbox=%+v err=%v", outbox, err)
+	}
+	opened, err := svc.provider().Open(secrets.ContextWithIncarnationID(ctx, incarnationID), sandboxID, secrets.Handle{
+		Ref: handle.Ref, Version: handle.Version, SealGeneration: handle.SealGeneration,
+	}, "self")
+	if err != nil || opened.Env["TOKEN"] != "must-survive" {
+		t.Fatalf("preserved secret cannot open: %+v err=%v", opened, err)
 	}
 }
 

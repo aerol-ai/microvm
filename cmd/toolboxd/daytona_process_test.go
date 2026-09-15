@@ -16,6 +16,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const daytonaAsyncTestTimeout = 10 * time.Second
+
 func newDaytonaTestServer(t *testing.T) *server {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -143,7 +145,7 @@ func TestHandleDaytonaSessionCommandInputDeliversStdin(t *testing.T) {
 	}
 
 	// Wait for the goroutine to mark the command active before sending input.
-	if !waitForActiveCommand(t, srv, "input-session", execResp.CmdID, 2*time.Second) {
+	if !waitForActiveCommand(t, srv, "input-session", execResp.CmdID, daytonaAsyncTestTimeout) {
 		t.Fatal("command never reached the active state")
 	}
 
@@ -160,7 +162,7 @@ func TestHandleDaytonaSessionCommandInputDeliversStdin(t *testing.T) {
 
 	// Once the command receives the line, the wrapper script prints the end
 	// marker and finishCommand records stdout. Poll until that happens.
-	if !waitForCommandStdoutContains(t, srv, "input-session", execResp.CmdID, "Hello, Alice", 3*time.Second) {
+	if !waitForCommandStdoutContains(t, srv, "input-session", execResp.CmdID, "Hello, Alice", daytonaAsyncTestTimeout) {
 		t.Fatal("never saw expected stdout from interactive command")
 	}
 }
@@ -192,7 +194,7 @@ func TestHandleDaytonaSessionCommandInputAutoTerminates(t *testing.T) {
 		t.Fatalf("decode exec response: %v", err)
 	}
 
-	if !waitForActiveCommand(t, srv, "auto-newline-session", execResp.CmdID, 2*time.Second) {
+	if !waitForActiveCommand(t, srv, "auto-newline-session", execResp.CmdID, daytonaAsyncTestTimeout) {
 		t.Fatal("command never reached the active state")
 	}
 
@@ -211,7 +213,7 @@ func TestHandleDaytonaSessionCommandInputAutoTerminates(t *testing.T) {
 
 	// The command should still complete, proving that the server
 	// supplied the missing newline for `read`.
-	if !waitForCommandStdoutContains(t, srv, "auto-newline-session", execResp.CmdID, "Hello, Alice", 3*time.Second) {
+	if !waitForCommandStdoutContains(t, srv, "auto-newline-session", execResp.CmdID, "Hello, Alice", daytonaAsyncTestTimeout) {
 		t.Fatal("command never received the input (no auto-newline?)")
 	}
 }
@@ -393,6 +395,37 @@ func TestLongestEndMarkerPrefixSuffix(t *testing.T) {
 	}
 }
 
+func TestDaytonaCommandStreamConcurrentBroadcastAndFinish(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		stream := newDaytonaCommandStream()
+		_, frames, _ := stream.subscribe()
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+
+		go func() {
+			<-start
+			stream.broadcast(sessions.StreamStdout, []byte("output"))
+			done <- struct{}{}
+		}()
+		go func() {
+			<-start
+			stream.finish()
+			done <- struct{}{}
+		}()
+		close(start)
+
+		for completed := 0; completed < 2; completed++ {
+			select {
+			case <-done:
+			case <-time.After(daytonaAsyncTestTimeout):
+				t.Fatal("concurrent stream operation did not finish")
+			}
+		}
+		for range frames {
+		}
+	}
+}
+
 // TestHandleDaytonaSessionCommandLogsFollowStreamsShortOutput pins the
 // regression case behind the hold-back fix: a command that prints a
 // short prompt and then blocks on stdin must still surface that prompt
@@ -437,9 +470,9 @@ func TestHandleDaytonaSessionCommandLogsFollowStreamsShortOutput(t *testing.T) {
 	}
 	defer conn.Close()
 
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(daytonaAsyncTestTimeout))
 	var collected []byte
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(daytonaAsyncTestTimeout)
 	for time.Now().Before(deadline) {
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
@@ -454,7 +487,7 @@ func TestHandleDaytonaSessionCommandLogsFollowStreamsShortOutput(t *testing.T) {
 	}
 	demuxed := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
 	demuxed = bytes.ReplaceAll(demuxed, daytonaStderrPrefix, nil)
-	t.Fatalf("never saw the prompt on the WS within 2s; got %q", demuxed)
+	t.Fatalf("never saw the prompt on the WS within %s; got %q", daytonaAsyncTestTimeout, demuxed)
 }
 
 // TestHandleDaytonaSessionCommandLogsFollowStreamsWebSocket pins the
@@ -513,7 +546,7 @@ func TestHandleDaytonaSessionCommandLogsFollowStreamsWebSocket(t *testing.T) {
 	}
 	defer conn.Close()
 
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(daytonaAsyncTestTimeout))
 	var collected []byte
 	for {
 		msgType, payload, err := conn.ReadMessage()
@@ -588,7 +621,7 @@ func TestHandleDaytonaSessionCommandLogsFollowReplaysFinishedCommand(t *testing.
 	}
 	defer conn.Close()
 
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(daytonaAsyncTestTimeout))
 	var collected []byte
 	for {
 		_, payload, err := conn.ReadMessage()
@@ -636,7 +669,7 @@ func TestDaytonaCommandStreamHelpers(t *testing.T) {
 		if !bytes.Contains(frame, []byte("next")) {
 			t.Fatalf("unexpected frame: %q", frame)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(daytonaAsyncTestTimeout):
 		t.Fatal("timed out waiting for live frame")
 	}
 

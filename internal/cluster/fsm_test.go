@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	secretspkg "github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/hashicorp/raft"
 )
 
@@ -31,14 +34,40 @@ func TestFSMApplyPlace(t *testing.T) {
 	}
 }
 
+func TestFSMInitialPlacementPreservesSecretSealGeneration(t *testing.T) {
+	fsm := newPlacementFSM()
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-secret-gen", OwnerNodeID: "node-a",
+		IncarnationID: "inc-secret-gen", SecretRef: testSecretRef("sb-secret-gen", "inc-secret-gen"), SecretVersion: secretspkg.RefVersion,
+		SecretSealGeneration: 7,
+	}
+	payload, err := encodeCommand(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: payload}); got != nil {
+		t.Fatalf("apply returned %v", got)
+	}
+	placement, ok := fsm.get("sb-secret-gen")
+	if !ok || placement.SecretSealGeneration != 7 {
+		t.Fatalf("placement = %+v, want seal generation 7", placement)
+	}
+	handle := secretsFromPlacement(placement)
+	if handle.SealGeneration != 7 {
+		t.Fatalf("handle = %+v, want seal generation 7", handle)
+	}
+}
+
 func TestFSMPlaceIdempotent(t *testing.T) {
 	fsm := newPlacementFSM()
-	cmd := command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a:8080"}
+	cmd := command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a:8080", IncarnationID: "inc-1"}
 	payload, _ := encodeCommand(cmd)
 	fsm.Apply(&raft.Log{Data: payload})
 	first, _ := fsm.get("sb1")
 	// Re-apply same command — version should not bump for the placement,
 	// even though the FSM-wide version counter does.
+	cmd.ExpectedIncarnationID = "inc-1"
+	payload, _ = encodeCommand(cmd)
 	fsm.Apply(&raft.Log{Data: payload})
 	second, _ := fsm.get("sb1")
 	if first.Version != second.Version {
@@ -51,8 +80,8 @@ func TestFSMPlaceIdempotent(t *testing.T) {
 
 func TestFSMReassignOwner(t *testing.T) {
 	fsm := newPlacementFSM()
-	c1, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", OwnerAPIURL: "http://a"})
-	c2, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b"})
+	c1, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", OwnerAPIURL: "http://a", IncarnationID: "inc-1"})
+	c2, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b", ExpectedIncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Data: c1})
 	createdFirst, _ := fsm.get("sb1")
 	time.Sleep(time.Second) // allow CreatedUnix preservation to be observable
@@ -68,11 +97,11 @@ func TestFSMReassignOwner(t *testing.T) {
 
 func TestFSMPlaceCannotOverwriteActiveOwner(t *testing.T) {
 	fsm := newPlacementFSM()
-	first, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", OwnerAPIURL: "http://a"})
+	first, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", OwnerAPIURL: "http://a", IncarnationID: "inc-1"})
 	if got := fsm.Apply(&raft.Log{Data: first}); got != nil {
 		t.Fatalf("first place: %v", got)
 	}
-	overwrite, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b"})
+	overwrite, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b", IncarnationID: "inc-1", ExpectedIncarnationID: "inc-1"})
 	got := fsm.Apply(&raft.Log{Data: overwrite})
 	err, _ := got.(error)
 	if err == nil || !errors.Is(err, ErrReservationConflict) {
@@ -130,18 +159,18 @@ func TestFSMClaimOrphanRequiresPreviousOwner(t *testing.T) {
 		payload, _ := encodeCommand(cmd)
 		return fsm.Apply(&raft.Log{Index: idx, Data: payload})
 	}
-	if got := apply(1, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "dead", Spec: &models.CreateSandboxRequest{Name: "original", Image: "alpine"}}); got != nil {
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "dead", IncarnationID: "inc-claim", Spec: &models.CreateSandboxRequest{Name: "original", Image: "alpine"}}); got != nil {
 		t.Fatalf("place: %v", got)
 	}
 	if got := apply(2, command{Op: opOrphanOwner, NodeID: "dead"}); got != nil {
 		t.Fatalf("orphan: %v", got)
 	}
-	got := apply(3, command{Op: opClaimOrphan, SandboxID: "sb1", OwnerNodeID: "other", OwnerAPIURL: "http://other"})
+	got := apply(3, command{Op: opClaimOrphan, SandboxID: "sb1", OwnerNodeID: "other", OwnerAPIURL: "http://other", IncarnationID: "inc-claim"})
 	err, _ := got.(error)
 	if err == nil || !errors.Is(err, ErrOrphanClaimConflict) {
 		t.Fatalf("wrong-owner claim = %v, want ErrOrphanClaimConflict", got)
 	}
-	if got := apply(4, command{Op: opClaimOrphan, SandboxID: "sb1", OwnerNodeID: "dead", OwnerAPIURL: "http://dead-new", Spec: &models.CreateSandboxRequest{Name: "original", Image: "alpine:new"}}); got != nil {
+	if got := apply(4, command{Op: opClaimOrphan, SandboxID: "sb1", OwnerNodeID: "dead", OwnerAPIURL: "http://dead-new", IncarnationID: "inc-claim", Spec: &models.CreateSandboxRequest{Name: "original", Image: "alpine:new"}}); got != nil {
 		t.Fatalf("previous-owner claim: %v", got)
 	}
 	p, _ := fsm.get("sb1")
@@ -155,15 +184,313 @@ func TestFSMClaimOrphanRequiresPreviousOwner(t *testing.T) {
 
 func TestFSMDelete(t *testing.T) {
 	fsm := newPlacementFSM()
-	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A"})
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", IncarnationID: "inc-delete"})
 	fsm.Apply(&raft.Log{Data: c})
-	d, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb1"})
+	d, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb1", ExpectedIncarnationID: "inc-delete"})
 	fsm.Apply(&raft.Log{Data: d})
 	if _, ok := fsm.get("sb1"); ok {
 		t.Fatal("placement should be gone after delete")
 	}
 	// Idempotent.
 	fsm.Apply(&raft.Log{Data: d})
+}
+
+func TestFSMDeleteIsIncarnationFencedAcrossIDReuse(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(index uint64, cmd command) interface{} {
+		payload, err := encodeCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fsm.Apply(&raft.Log{Index: index, Data: payload})
+	}
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb-reused", OwnerNodeID: "node-new", IncarnationID: "inc-new"}); got != nil {
+		t.Fatal(got)
+	}
+	if got := apply(2, command{Op: opDelete, SandboxID: "sb-reused", ExpectedIncarnationID: "inc-old"}); got != nil {
+		t.Fatalf("stale delete = %v, want acknowledged no-op", got)
+	}
+	if p, ok := fsm.get("sb-reused"); !ok || p.IncarnationID != "inc-new" {
+		t.Fatalf("stale delete removed replacement placement: %+v ok=%v", p, ok)
+	}
+	if got := apply(3, command{Op: opDelete, SandboxID: "sb-reused"}); !errors.Is(got.(error), ErrIncarnationConflict) {
+		t.Fatalf("unfenced delete = %v, want ErrIncarnationConflict", got)
+	}
+	if _, ok := fsm.get("sb-reused"); !ok {
+		t.Fatal("unfenced delete removed placement")
+	}
+}
+
+func TestFSMDeleteIsOwnerFencedAcrossConcurrentReassignment(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(index uint64, cmd command) interface{} {
+		payload, err := encodeCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fsm.Apply(&raft.Log{Index: index, Data: payload})
+	}
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb-reassigned", OwnerNodeID: "node-new", IncarnationID: "inc-same"}); got != nil {
+		t.Fatal(got)
+	}
+	if got := apply(2, command{
+		Op: opDelete, SandboxID: "sb-reassigned", ExpectedIncarnationID: "inc-same", ExpectedOwnerNodeID: "node-old",
+	}); got != nil {
+		t.Fatalf("stale-owner delete = %v, want acknowledged no-op", got)
+	}
+	if p, ok := fsm.get("sb-reassigned"); !ok || p.OwnerNodeID != "node-new" {
+		t.Fatalf("stale owner removed reassigned placement: %+v ok=%v", p, ok)
+	}
+	if got := apply(3, command{
+		Op: opDelete, SandboxID: "sb-reassigned", ExpectedIncarnationID: "inc-same", ExpectedOwnerNodeID: "node-new",
+	}); got != nil {
+		t.Fatalf("current-owner delete: %v", got)
+	}
+	if _, ok := fsm.get("sb-reassigned"); ok {
+		t.Fatal("current owner could not delete placement")
+	}
+}
+
+func TestFSMBeginDeleteFencesLifecycleWideCleanup(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(index uint64, cmd command) interface{} {
+		payload, err := encodeCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fsm.Apply(&raft.Log{Index: index, Data: payload})
+	}
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb-delete-fence", OwnerNodeID: "node-a", IncarnationID: "inc-a"}); got != nil {
+		t.Fatal(got)
+	}
+	if got := apply(2, command{
+		Op: opBeginDelete, SandboxID: "sb-delete-fence", ExpectedOwnerNodeID: "node-b", ExpectedOwnerNodeIDSet: true,
+		ExpectedIncarnationID: "inc-a", ExpiresUnix: 100,
+	}); !errors.Is(got.(error), ErrReservationConflict) {
+		t.Fatalf("wrong-owner begin delete = %v", got)
+	}
+	if got := apply(3, command{
+		Op: opBeginDelete, SandboxID: "sb-delete-fence", ExpectedOwnerNodeID: "node-a", ExpectedOwnerNodeIDSet: true,
+		ExpectedIncarnationID: "inc-a", ExpiresUnix: 100,
+	}); got != nil {
+		t.Fatalf("begin delete: %v", got)
+	}
+	p, ok := fsm.get("sb-delete-fence")
+	if !ok || !p.IsDeleting() || p.ExpiresUnix != 100 {
+		t.Fatalf("deleting placement = %+v, ok=%v", p, ok)
+	}
+	if got := apply(4, command{
+		Op: opReassign, SandboxID: "sb-delete-fence", OwnerNodeID: "node-b", ExpectedIncarnationID: "inc-a",
+	}); !errors.Is(got.(error), ErrReservationConflict) {
+		t.Fatalf("reassign deleting placement = %v", got)
+	}
+	if got := apply(5, command{
+		Op: opUpsertSpec, SandboxID: "sb-delete-fence", ExpectedIncarnationID: "inc-a", Spec: &models.CreateSandboxRequest{Image: "replacement"},
+	}); !errors.Is(got.(error), ErrReservationConflict) {
+		t.Fatalf("mutate deleting placement = %v", got)
+	}
+	expired := fsm.expiredDeletingPlacements(101)
+	if len(expired) != 1 || expired[0].SandboxID != "sb-delete-fence" {
+		t.Fatalf("expired deleting placements = %+v", expired)
+	}
+	if got := apply(6, command{
+		Op: opDelete, SandboxID: "sb-delete-fence", ExpectedOwnerNodeID: "node-a", ExpectedOwnerNodeIDSet: true,
+		ExpectedIncarnationID: "inc-a",
+	}); got != nil {
+		t.Fatalf("final delete: %v", got)
+	}
+	if _, ok := fsm.get("sb-delete-fence"); ok || len(fsm.expiredDeletingPlacements(101)) != 0 {
+		t.Fatal("final delete left placement or deleting index")
+	}
+}
+
+func TestFSMBeginDeletePromotesReservationIntoCleanupFence(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(index uint64, cmd command) interface{} {
+		payload, err := encodeCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fsm.Apply(&raft.Log{Index: index, Data: payload})
+	}
+	if got := apply(1, command{
+		Op: opReserve, SandboxID: "sb-reserved-delete", OwnerNodeID: "node-a",
+		IncarnationID: "inc-a", ExpiresUnix: 50,
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2, MemoryMB: 1024},
+	}); got != nil {
+		t.Fatal(got)
+	}
+	if len(fsm.pendingReservationsByNode(1)) != 1 {
+		t.Fatal("reservation did not acquire pending capacity")
+	}
+	if got := apply(2, command{
+		Op: opBeginDelete, SandboxID: "sb-reserved-delete", ExpectedOwnerNodeID: "node-a", ExpectedOwnerNodeIDSet: true,
+		ExpectedIncarnationID: "inc-a", ExpiresUnix: 100,
+	}); got != nil {
+		t.Fatalf("begin reserved delete: %v", got)
+	}
+	p, ok := fsm.get("sb-reserved-delete")
+	if !ok || !p.IsDeleting() || p.ExpiresUnix != 100 {
+		t.Fatalf("reserved delete fence = %+v, ok=%v", p, ok)
+	}
+	if len(fsm.pendingReservationsByNode(1)) != 0 || len(fsm.reservedIndex) != 0 {
+		t.Fatal("reserved delete fence retained pending capacity")
+	}
+}
+
+func TestFSMOrphanDeleteIsOwnerFencedAcrossConcurrentClaim(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(index uint64, cmd command) interface{} {
+		payload, err := encodeCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fsm.Apply(&raft.Log{Index: index, Data: payload})
+	}
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb-claimed", OwnerNodeID: "node-new", IncarnationID: "inc-same"}); got != nil {
+		t.Fatal(got)
+	}
+	if got := apply(2, command{
+		Op: opDelete, SandboxID: "sb-claimed", ExpectedIncarnationID: "inc-same", ExpectedOwnerNodeIDSet: true,
+	}); got != nil {
+		t.Fatalf("stale orphan delete = %v, want acknowledged no-op", got)
+	}
+	if p, ok := fsm.get("sb-claimed"); !ok || p.OwnerNodeID != "node-new" {
+		t.Fatalf("stale orphan delete removed claimed placement: %+v ok=%v", p, ok)
+	}
+}
+
+func TestFSMDeleteRetainsAndPrunesAuditACL(t *testing.T) {
+	fsm := newPlacementFSM()
+	expires := time.Now().UTC().Add(time.Hour).Unix()
+	place, _ := encodeCommand(command{
+		Op:            opPlace,
+		SandboxID:     "sb-audit",
+		OwnerNodeID:   "node-a",
+		OwnerRef:      "tenant-a",
+		IncarnationID: "inc-a",
+	})
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: place}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+	reassign, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb-audit", OwnerNodeID: "node-b", ExpectedIncarnationID: "inc-a"})
+	if got := fsm.Apply(&raft.Log{Index: 2, Data: reassign}); got != nil {
+		t.Fatalf("reassign: %v", got)
+	}
+	del, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb-audit", ExpectedIncarnationID: "inc-a", ExpiresUnix: expires})
+	if got := fsm.Apply(&raft.Log{Index: 3, Data: del}); got != nil {
+		t.Fatalf("delete: %v", got)
+	}
+	if _, ok := fsm.get("sb-audit"); ok {
+		t.Fatal("placement should be gone after delete")
+	}
+	acl, ok := fsm.auditACLForSandbox("sb-audit", "inc-a", expires-1)
+	if !ok || acl.OwnerRef != "tenant-a" || acl.ExpiresUnix != expires {
+		t.Fatalf("retained ACL = %+v, %v", acl, ok)
+	}
+	if got, want := acl.AuditNodeIDs, []string{"node-a", "node-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("retained audit nodes = %v, want %v", got, want)
+	}
+	if _, ok := fsm.auditACLForSandbox("sb-audit", "inc-a", expires); ok {
+		t.Fatal("expired ACL must not authorize access before its prune sweep")
+	}
+
+	snap, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	restored := newPlacementFSM()
+	if err := restored.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if acl, ok := restored.auditACLForSandbox("sb-audit", "inc-a", expires-1); !ok || acl.OwnerRef != "tenant-a" {
+		t.Fatalf("restored ACL = %+v, %v", acl, ok)
+	}
+
+	if acl, ok := restored.auditACLForSandbox("sb-audit", "inc-a", expires-1); !ok || !reflect.DeepEqual(acl.AuditNodeIDs, []string{"node-a", "node-b"}) {
+		t.Fatalf("restored audit nodes = %+v, %v", acl, ok)
+	}
+
+	prune, _ := encodeCommand(command{Op: opPruneAuditACL, ExpiresUnix: expires})
+	if got := restored.Apply(&raft.Log{Index: 4, Data: prune}); got != nil {
+		t.Fatalf("prune: %v", got)
+	}
+	if _, ok := restored.auditACLForSandbox("sb-audit", "inc-a", expires-1); ok {
+		t.Fatal("prune should remove the expired retained ACL")
+	}
+}
+
+func TestFSMDeleteRetainsOwnerlessAuditNodeIndex(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, err := encodeCommand(command{
+		Op:            opPlace,
+		SandboxID:     "sb-operator-audit",
+		OwnerNodeID:   "node-a",
+		IncarnationID: "inc-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: place}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+	del, err := encodeCommand(command{Op: opDelete, SandboxID: "sb-operator-audit", ExpectedIncarnationID: "inc-a", ExpiresUnix: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 2, Data: del}); got != nil {
+		t.Fatalf("delete: %v", got)
+	}
+	acl, ok := fsm.auditACLForSandbox("sb-operator-audit", "inc-a", time.Now().Unix())
+	if !ok || acl.OwnerRef != "" || acl.IncarnationID != "inc-a" || !reflect.DeepEqual(acl.AuditNodeIDs, []string{"node-a"}) {
+		t.Fatalf("ownerless audit ACL = %+v ok=%v", acl, ok)
+	}
+}
+
+func TestFSMDeleteRetainsEverySandboxIncarnation(t *testing.T) {
+	fsm := newPlacementFSM()
+	expires := time.Now().Add(time.Hour).Unix()
+	apply := func(index uint64, cmd command) {
+		t.Helper()
+		payload, err := encodeCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fsm.Apply(&raft.Log{Index: index, Data: payload}); got != nil {
+			t.Fatalf("apply index %d: %v", index, got)
+		}
+	}
+	apply(1, command{Op: opPlace, SandboxID: "sb-reused", OwnerNodeID: "node-a", OwnerRef: "tenant-old", IncarnationID: "inc-old"})
+	apply(2, command{Op: opDelete, SandboxID: "sb-reused", ExpectedIncarnationID: "inc-old", ExpiresUnix: expires})
+	apply(3, command{Op: opPlace, SandboxID: "sb-reused", OwnerNodeID: "node-b", OwnerRef: "tenant-new", IncarnationID: "inc-new"})
+	apply(4, command{Op: opDelete, SandboxID: "sb-reused", ExpectedIncarnationID: "inc-new", ExpiresUnix: expires})
+
+	oldACL, oldOK := fsm.auditACLForSandbox("sb-reused", "inc-old", expires-1)
+	newACL, newOK := fsm.auditACLForSandbox("sb-reused", "inc-new", expires-1)
+	latest, latestOK := fsm.auditACLForSandbox("sb-reused", "", expires-1)
+	if !oldOK || oldACL.OwnerRef != "tenant-old" || !newOK || newACL.OwnerRef != "tenant-new" {
+		t.Fatalf("retained lifecycle ACLs old=%+v/%v new=%+v/%v", oldACL, oldOK, newACL, newOK)
+	}
+	if !latestOK || latest.IncarnationID != "inc-new" || latest.RetainedVersion != 4 {
+		t.Fatalf("latest retained lifecycle = %+v/%v", latest, latestOK)
+	}
+}
+
+func TestPlacementAuditNodeHistoryBoundIsFailOpenForCoverage(t *testing.T) {
+	p := Placement{}
+	for i := 0; i <= maxPlacementAuditNodes; i++ {
+		recordPlacementAuditNode(&p, fmt.Sprintf("node-%03d", i))
+	}
+	if len(p.AuditNodeIDs) != maxPlacementAuditNodes {
+		t.Fatalf("history len = %d, want %d", len(p.AuditNodeIDs), maxPlacementAuditNodes)
+	}
+	if !p.AuditNodesTruncated {
+		t.Fatal("overflow must mark history truncated so readers use full fan-out")
+	}
 }
 
 // TestFSMPlaceCarriesSpec verifies the spec payload survives an opPlace round
@@ -190,12 +517,12 @@ func TestFSMPlaceCarriesSpec(t *testing.T) {
 // without touching the owner pointer.
 func TestFSMUpsertSpec(t *testing.T) {
 	fsm := newPlacementFSM()
-	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", IncarnationID: "inc-upsert",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1}})
 	fsm.Apply(&raft.Log{Data: c})
 
 	// Resize: bump CPU via opUpsertSpec.
-	u, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1",
+	u, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1", ExpectedIncarnationID: "inc-upsert",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2}})
 	fsm.Apply(&raft.Log{Data: u})
 
@@ -209,7 +536,7 @@ func TestFSMUpsertSpec(t *testing.T) {
 
 	// Upsert against unknown sandbox: silent no-op.
 	u2, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "ghost",
-		Spec: &models.CreateSandboxRequest{Image: "x"}})
+		ExpectedIncarnationID: "inc-ghost", Spec: &models.CreateSandboxRequest{Image: "x"}})
 	if got := fsm.Apply(&raft.Log{Data: u2}); got != nil {
 		t.Fatalf("upsert against unknown id returned %v, want nil", got)
 	}
@@ -223,13 +550,13 @@ func TestFSMHotPlacementReadsOmitRecoveryPayload(t *testing.T) {
 		OwnerNodeID:   "node-a",
 		OwnerAPIURL:   "http://node-a",
 		Spec:          &models.CreateSandboxRequest{Image: "alpine", Name: "demo", Env: map[string]string{"K": "V"}},
-		SecretRef:     "cluster-secret://sandbox/sb-hot/v1",
-		SecretVersion: 1,
+		IncarnationID: "inc-hot", SecretRef: testSecretRef("sb-hot", "inc-hot"),
+		SecretVersion: secretspkg.RefVersion, SecretSealGeneration: 1,
 	})
 	if got := fsm.Apply(&raft.Log{Index: 1, Data: place}); got != nil {
 		t.Fatalf("opPlace: %v", got)
 	}
-	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb-hot", Port: 8080, Protocol: "http"})
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb-hot", ExpectedIncarnationID: "inc-hot", Port: 8080, Protocol: "http"})
 	if got := fsm.Apply(&raft.Log{Index: 2, Data: add}); got != nil {
 		t.Fatalf("opAddExposedPort: %v", got)
 	}
@@ -254,14 +581,267 @@ func TestFSMHotPlacementReadsOmitRecoveryPayload(t *testing.T) {
 	if len(page.Placements) != 1 {
 		t.Fatalf("placementPage len=%d, want 1", len(page.Placements))
 	}
+	if page.NextPageToken != "" {
+		t.Fatalf("exact-full page NextPageToken=%q, want empty (no further IDs)", page.NextPageToken)
+	}
 	if page.Placements[0].Spec != nil || page.Placements[0].SecretRef != "" {
 		t.Fatalf("hot page read included recovery payload: %+v", page.Placements[0])
 	}
 }
 
+func TestPlacementPageExactLimitBoundaryClearsNextToken(t *testing.T) {
+	fsm := newPlacementFSM()
+	for i := 0; i < 3; i++ {
+		place, _ := encodeCommand(command{
+			Op:          opPlace,
+			SandboxID:   fmt.Sprintf("sb-%d", i),
+			OwnerNodeID: "node-a",
+			Spec:        &models.CreateSandboxRequest{Image: "alpine"},
+		})
+		if got := fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: place}); got != nil {
+			t.Fatalf("place %d: %v", i, got)
+		}
+	}
+	page := fsm.placementPage(PlacementPageRequest{Limit: 3})
+	if len(page.Placements) != 3 {
+		t.Fatalf("len=%d, want 3", len(page.Placements))
+	}
+	if page.NextPageToken != "" {
+		t.Fatalf("NextPageToken=%q, want empty when total==limit", page.NextPageToken)
+	}
+	mid := fsm.placementPage(PlacementPageRequest{Limit: 2})
+	if len(mid.Placements) != 2 || mid.NextPageToken == "" {
+		t.Fatalf("mid page = %+v, want 2 rows and next token", mid)
+	}
+	last := fsm.placementPage(PlacementPageRequest{Limit: 2, PageToken: mid.NextPageToken})
+	if len(last.Placements) != 1 || last.NextPageToken != "" {
+		t.Fatalf("last page = %+v, want 1 row and empty next", last)
+	}
+}
+
+func TestPlacementsByIDsPointLookup(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "n1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}, SecretRecipients: []string{"n1", "n2"},
+	})
+	fsm.Apply(&raft.Log{Index: 1, Data: place})
+	got := fsm.placementsByIDs([]string{"sb-a", "missing", ""})
+	if len(got) != 1 || got["sb-a"].OwnerNodeID != "n1" {
+		t.Fatalf("placementsByIDs = %+v", got)
+	}
+	if len(got["sb-a"].SecretRecipients) != 2 {
+		t.Fatalf("SecretRecipients = %v", got["sb-a"].SecretRecipients)
+	}
+}
+
+func TestFSMUpdateSecretRecipientsPreservesIncarnation(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-exp", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
+		Spec:                 &models.CreateSandboxRequest{Image: "alpine"},
+		SecretRecipients:     []string{"n1", "dead-a", "dead-b"},
+		IncarnationID:        "inc-keep",
+		SecretRef:            secretspkg.FormatRef("sb-exp", "inc-keep", secretspkg.RefVersion),
+		SecretVersion:        secretspkg.RefVersion,
+		SecretSealGeneration: 3,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 1, Data: place}); res != nil {
+		t.Fatalf("opPlace: %v", res)
+	}
+	upd, _ := encodeCommand(command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              "sb-exp",
+		SecretRecipients:       []string{"n1", "live-b", "live-c"},
+		SecretRef:              secretspkg.FormatRef("sb-exp", "inc-keep", secretspkg.RefVersion),
+		SecretVersion:          secretspkg.RefVersion,
+		SecretSealGeneration:   4,
+		ExpectedIncarnationID:  "inc-keep",
+		ExpectedSealGeneration: 3,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 2, Data: upd}); res != nil {
+		t.Fatalf("opUpdateSecretRecipients: %v", res)
+	}
+	got, ok := fsm.get("sb-exp")
+	if !ok {
+		t.Fatal("placement missing")
+	}
+	if got.IncarnationID != "inc-keep" {
+		t.Fatalf("IncarnationID=%q, want preserved", got.IncarnationID)
+	}
+	if got.OwnerNodeID != "n1" {
+		t.Fatalf("OwnerNodeID=%q, want n1", got.OwnerNodeID)
+	}
+	if len(got.SecretRecipients) != 3 || got.SecretRecipients[1] != "live-b" {
+		t.Fatalf("SecretRecipients=%v", got.SecretRecipients)
+	}
+}
+
+func TestFSMPlacePreservesAndFencesIncarnation(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-inc-place", OwnerNodeID: "n1",
+		IncarnationID: "inc-a", SecretRef: testSecretRef("sb-inc-place", "inc-a"), SecretVersion: secretspkg.RefVersion, SecretSealGeneration: 1,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 1, Data: place}); res != nil {
+		t.Fatalf("initial opPlace: %v", res)
+	}
+
+	// A mutation of an existing placement must carry the authoritative fence.
+	replay, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-inc-place", OwnerNodeID: "n1",
+		IncarnationID: "inc-a", ExpectedIncarnationID: "inc-a",
+	})
+	if res := fsm.Apply(&raft.Log{Index: 2, Data: replay}); res != nil {
+		t.Fatalf("replay opPlace: %v", res)
+	}
+	if got, _ := fsm.get("sb-inc-place"); got.IncarnationID != "inc-a" {
+		t.Fatalf("replay changed incarnation to %q", got.IncarnationID)
+	}
+	unfenced, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-inc-place", OwnerNodeID: "n1",
+		IncarnationID: "candidate-only",
+	})
+	if res := fsm.Apply(&raft.Log{Index: 3, Data: unfenced}); !errors.Is(res.(error), ErrIncarnationConflict) {
+		t.Fatalf("unfenced opPlace = %v, want ErrIncarnationConflict", res)
+	}
+
+	stale, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-inc-place", OwnerNodeID: "n1",
+		IncarnationID: "inc-b", ExpectedIncarnationID: "inc-b",
+		SecretRef: testSecretRef("sb-inc-place", "inc-b"), SecretVersion: secretspkg.RefVersion, SecretSealGeneration: 2,
+	})
+	res := fsm.Apply(&raft.Log{Index: 4, Data: stale})
+	if err, ok := res.(error); !ok || !errors.Is(err, ErrIncarnationConflict) {
+		t.Fatalf("stale opPlace result = %v, want ErrIncarnationConflict", res)
+	}
+	got, _ := fsm.get("sb-inc-place")
+	if got.IncarnationID != "inc-a" || got.SecretRef != testSecretRef("sb-inc-place", "inc-a") || got.SecretVersion != secretspkg.RefVersion {
+		t.Fatalf("stale opPlace mutated placement: %+v", got)
+	}
+}
+
+func TestFSMReassignIsIncarnationFencedAcrossIDReuse(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-reassign-reused", OwnerNodeID: "node-new", IncarnationID: "inc-new",
+	})
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: place}); got != nil {
+		t.Fatal(got)
+	}
+	stale, _ := encodeCommand(command{
+		Op: opReassign, SandboxID: "sb-reassign-reused", OwnerNodeID: "stale-target", ExpectedIncarnationID: "inc-old",
+	})
+	if got := fsm.Apply(&raft.Log{Index: 2, Data: stale}); !errors.Is(got.(error), ErrIncarnationConflict) {
+		t.Fatalf("stale reassign = %v, want ErrIncarnationConflict", got)
+	}
+	if p, ok := fsm.get("sb-reassign-reused"); !ok || p.OwnerNodeID != "node-new" || p.IncarnationID != "inc-new" {
+		t.Fatalf("stale reassign mutated replacement: %+v ok=%v", p, ok)
+	}
+}
+
+func TestFSMRoutingMutationsAreIncarnationFencedAcrossIDReuse(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(index uint64, cmd command) interface{} {
+		payload, err := encodeCommand(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fsm.Apply(&raft.Log{Index: index, Data: payload})
+	}
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb-routing-reused", OwnerNodeID: "node-new", IncarnationID: "inc-new"}); got != nil {
+		t.Fatal(got)
+	}
+	if got := apply(2, command{Op: opAddExposedPort, SandboxID: "sb-routing-reused", ExpectedIncarnationID: "inc-new", Port: 8080, Protocol: "http"}); got != nil {
+		t.Fatal(got)
+	}
+	for index, cmd := range []command{
+		{Op: opRemoveExposedPort, SandboxID: "sb-routing-reused", ExpectedIncarnationID: "inc-old", Port: 8080},
+		{Op: opAddExposedPort, SandboxID: "sb-routing-reused", ExpectedIncarnationID: "inc-old", Port: 9090, Protocol: "http"},
+		{Op: opAddCustomDomain, SandboxID: "sb-routing-reused", ExpectedIncarnationID: "inc-old", Hostname: "stale.example.com"},
+	} {
+		got := apply(uint64(index+3), cmd)
+		if err, ok := got.(error); !ok || !errors.Is(err, ErrIncarnationConflict) {
+			t.Fatalf("stale routing op %d = %v, want ErrIncarnationConflict", cmd.Op, got)
+		}
+	}
+	p, ok := fsm.get("sb-routing-reused")
+	if !ok || p.ExposedPorts[8080] != "http" {
+		t.Fatalf("stale remove changed replacement ports: %+v ok=%v", p.ExposedPorts, ok)
+	}
+	if _, exists := p.ExposedPorts[9090]; exists || len(p.CustomHostnames) != 0 {
+		t.Fatalf("stale add changed replacement routing: ports=%+v domains=%v", p.ExposedPorts, p.CustomHostnames)
+	}
+}
+
+func TestFSMUpdateSecretRecipientsCASRejectsStaleGeneration(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb-cas", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
+		Spec:                 &models.CreateSandboxRequest{Image: "alpine"},
+		SecretRecipients:     []string{"n1", "dead-a", "dead-b"},
+		IncarnationID:        "inc-a",
+		SecretRef:            secretspkg.FormatRef("sb-cas", "inc-a", secretspkg.RefVersion),
+		SecretVersion:        secretspkg.RefVersion,
+		SecretSealGeneration: 5,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 1, Data: place}); res != nil {
+		t.Fatalf("opPlace: %v", res)
+	}
+	unfenced, _ := encodeCommand(command{
+		Op:                   opUpdateSecretRecipients,
+		SandboxID:            "sb-cas",
+		SecretRecipients:     []string{"n1", "live-b", "live-c"},
+		SecretRef:            secretspkg.FormatRef("sb-cas", "inc-a", secretspkg.RefVersion),
+		SecretVersion:        secretspkg.RefVersion,
+		SecretSealGeneration: 6,
+	})
+	unfencedRes := fsm.Apply(&raft.Log{Index: 2, Data: unfenced})
+	if err, ok := unfencedRes.(error); !ok || !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+		t.Fatalf("unfenced recipient update = %v, want ErrSecretRecipientsCASMismatch", unfencedRes)
+	}
+	stale, _ := encodeCommand(command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              "sb-cas",
+		SecretRecipients:       []string{"n1", "live-b", "live-c"},
+		ExpectedIncarnationID:  "inc-a",
+		ExpectedSealGeneration: 4,
+		SecretSealGeneration:   6,
+		SecretRef:              secretspkg.FormatRef("sb-cas", "inc-a", secretspkg.RefVersion),
+		SecretVersion:          secretspkg.RefVersion,
+	})
+	res := fsm.Apply(&raft.Log{Index: 3, Data: stale})
+	err, ok := res.(error)
+	if !ok || !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+		t.Fatalf("stale CAS = %v (%T), want ErrSecretRecipientsCASMismatch", res, res)
+	}
+	got, _ := fsm.get("sb-cas")
+	if got.SecretSealGeneration != 5 || got.SecretRecipients[1] != "dead-a" {
+		t.Fatalf("stale CAS mutated placement: gen=%d recipients=%v", got.SecretSealGeneration, got.SecretRecipients)
+	}
+
+	okCmd, _ := encodeCommand(command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              "sb-cas",
+		SecretRecipients:       []string{"n1", "live-b", "live-c"},
+		ExpectedIncarnationID:  "inc-a",
+		ExpectedSealGeneration: 5,
+		SecretSealGeneration:   6,
+		SecretRef:              secretspkg.FormatRef("sb-cas", "inc-a", secretspkg.RefVersion),
+		SecretVersion:          secretspkg.RefVersion,
+	})
+	if res := fsm.Apply(&raft.Log{Index: 4, Data: okCmd}); res != nil {
+		t.Fatalf("matching CAS: %v", res)
+	}
+	got, _ = fsm.get("sb-cas")
+	if got.SecretSealGeneration != 6 || got.SecretRecipients[1] != "live-b" {
+		t.Fatalf("after CAS gen=%d recipients=%v", got.SecretSealGeneration, got.SecretRecipients)
+	}
+}
+
 func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
 	fsm := newPlacementFSM()
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", IncarnationID: "inc-name",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "alpha"}})
 	fsm.Apply(&raft.Log{Data: place})
 
@@ -269,7 +849,7 @@ func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
 		t.Fatalf("lookup alpha = (%q, %v), want (sb1, true)", got, ok)
 	}
 
-	rename, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1",
+	rename, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1", ExpectedIncarnationID: "inc-name",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "beta"}})
 	fsm.Apply(&raft.Log{Data: rename})
 
@@ -280,7 +860,7 @@ func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
 		t.Fatalf("lookup beta = (%q, %v), want (sb1, true)", got, ok)
 	}
 
-	deleteCmd, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb1"})
+	deleteCmd, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb1", ExpectedIncarnationID: "inc-name"})
 	fsm.Apply(&raft.Log{Data: deleteCmd})
 	if got, ok := fsm.sandboxIDByName("beta"); ok {
 		t.Fatalf("deleted name beta still resolves to %q", got)
@@ -292,9 +872,9 @@ func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
 func TestFSMReassignPreservesSpec(t *testing.T) {
 	fsm := newPlacementFSM()
 	spec := &models.CreateSandboxRequest{Image: "alpine"}
-	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", Spec: spec})
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", Spec: spec, IncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Data: c})
-	r, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b"})
+	r, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b", ExpectedIncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Data: r})
 	got, _ := fsm.get("sb1")
 	if got.OwnerNodeID != "B" {
@@ -310,11 +890,11 @@ func TestFSMReassignPreservesSpec(t *testing.T) {
 // the empty map collapses to nil so JSON snapshots stay clean.
 func TestFSMAddRemoveExposedPort(t *testing.T) {
 	fsm := newPlacementFSM()
-	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A"})
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", IncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Data: c})
 
-	add1, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 80, Protocol: "http"})
-	add2, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 5432, Protocol: "tcp"})
+	add1, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-1", Port: 80, Protocol: "http"})
+	add2, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-1", Port: 5432, Protocol: "tcp"})
 	fsm.Apply(&raft.Log{Data: add1})
 	fsm.Apply(&raft.Log{Data: add2})
 
@@ -332,7 +912,7 @@ func TestFSMAddRemoveExposedPort(t *testing.T) {
 	}
 
 	// Remove one and verify the other survives.
-	rem, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", Port: 80})
+	rem, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-1", Port: 80})
 	fsm.Apply(&raft.Log{Data: rem})
 	got, _ = fsm.get("sb1")
 	if _, present := got.ExposedPorts[80]; present {
@@ -344,7 +924,7 @@ func TestFSMAddRemoveExposedPort(t *testing.T) {
 
 	// Remove the last entry — the map should collapse to nil so snapshots don't
 	// carry an empty container indefinitely.
-	rem2, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", Port: 5432})
+	rem2, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-1", Port: 5432})
 	fsm.Apply(&raft.Log{Data: rem2})
 	got, _ = fsm.get("sb1")
 	if got.ExposedPorts != nil {
@@ -365,9 +945,9 @@ func TestFSMAddRemoveExposedPort(t *testing.T) {
 // intents that had been added by opAddExposedPort calls in between.
 func TestFSMPlaceCarriesPortsThroughRetry(t *testing.T) {
 	fsm := newPlacementFSM()
-	p, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A"})
+	p, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", IncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Data: p})
-	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 8080, Protocol: "http"})
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-1", Port: 8080, Protocol: "http"})
 	fsm.Apply(&raft.Log{Data: add})
 	// Retry place with same owner, no spec — must not erase ports.
 	fsm.Apply(&raft.Log{Data: p})
@@ -383,11 +963,11 @@ func TestFSMPlaceCarriesPortsThroughRetry(t *testing.T) {
 func TestFSMReassignPreservesPorts(t *testing.T) {
 	fsm := newPlacementFSM()
 	p, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"}})
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}, IncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Data: p})
-	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 5432, Protocol: "tcp"})
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-1", Port: 5432, Protocol: "tcp"})
 	fsm.Apply(&raft.Log{Data: add})
-	r, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B"})
+	r, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B", ExpectedIncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Data: r})
 	got, _ := fsm.get("sb1")
 	if got.OwnerNodeID != "B" {
@@ -401,19 +981,19 @@ func TestFSMReassignPreservesPorts(t *testing.T) {
 func TestFSMRejectsDuplicateTCPHostPortWithSentinel(t *testing.T) {
 	fsm := newPlacementFSM()
 	for _, id := range []string{"sb1", "sb2"} {
-		place, _ := encodeCommand(command{Op: opPlace, SandboxID: id, OwnerNodeID: "node-" + id})
+		place, _ := encodeCommand(command{Op: opPlace, SandboxID: id, OwnerNodeID: "node-" + id, IncarnationID: "inc-" + id})
 		fsm.Apply(&raft.Log{Data: place})
 	}
 	add1, _ := encodeCommand(command{
 		Op: opAddExposedPort, SandboxID: "sb1", Port: 5432,
-		Protocol: models.ExposedPortProtocolTCP, HostPort: 22432,
+		Protocol: models.ExposedPortProtocolTCP, HostPort: 22432, ExpectedIncarnationID: "inc-sb1",
 	})
 	if got := fsm.Apply(&raft.Log{Data: add1}); got != nil {
 		t.Fatalf("first add returned %v, want nil", got)
 	}
 	add2, _ := encodeCommand(command{
 		Op: opAddExposedPort, SandboxID: "sb2", Port: 5432,
-		Protocol: models.ExposedPortProtocolTCP, HostPort: 22432,
+		Protocol: models.ExposedPortProtocolTCP, HostPort: 22432, ExpectedIncarnationID: "inc-sb2",
 	})
 	got := fsm.Apply(&raft.Log{Data: add2})
 	err, ok := got.(error)
@@ -506,39 +1086,38 @@ func TestFSMStoresSecretRefWithoutReplicatedPayload(t *testing.T) {
 	place, _ := encodeCommand(command{
 		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a",
 		Spec:          &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
-		SecretRef:     "cluster-secret://sandbox/sb1/v1",
-		SecretVersion: 1,
+		IncarnationID: "inc-secret", SecretRef: testSecretRef("sb1", "inc-secret"),
+		SecretVersion: secretspkg.RefVersion, SecretSealGeneration: 1,
 	})
 	if got := fsm.Apply(&raft.Log{Data: place}); got != nil {
 		t.Fatalf("opPlace: %v", got)
 	}
 	p, _ := fsm.get("sb1")
-	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+	if p.SecretRef != testSecretRef("sb1", "inc-secret") || p.SecretVersion != secretspkg.RefVersion {
 		t.Fatalf("secret handle = (%q,%d), want ref v1", p.SecretRef, p.SecretVersion)
 	}
 
 	upsert, _ := encodeCommand(command{
-		Op: opUpsertSpec, SandboxID: "sb1",
+		Op: opUpsertSpec, SandboxID: "sb1", ExpectedIncarnationID: "inc-secret",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2, MemoryMB: 512},
 	})
 	if got := fsm.Apply(&raft.Log{Data: upsert}); got != nil {
 		t.Fatalf("opUpsertSpec: %v", got)
 	}
 	p, _ = fsm.get("sb1")
-	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+	if p.SecretRef != testSecretRef("sb1", "inc-secret") || p.SecretVersion != secretspkg.RefVersion {
 		t.Fatalf("secret ref was not preserved through spec-only upsert: %+v", p)
 	}
 
 	rotated, _ := encodeCommand(command{
-		Op: opUpsertSpec, SandboxID: "sb1",
-		SecretRef:     "cluster-secret://sandbox/sb1/v2",
-		SecretVersion: 2,
+		Op: opUpsertSpec, SandboxID: "sb1", ExpectedIncarnationID: "inc-secret", IncarnationID: "inc-secret",
+		SecretRef: testSecretRef("sb1", "inc-secret"), SecretVersion: secretspkg.RefVersion, SecretSealGeneration: 2,
 	})
 	if got := fsm.Apply(&raft.Log{Data: rotated}); got != nil {
 		t.Fatalf("opUpsertSpec ref-only: %v", got)
 	}
 	p, _ = fsm.get("sb1")
-	if p.SecretRef != "cluster-secret://sandbox/sb1/v2" || p.SecretVersion != 2 {
+	if p.SecretRef != testSecretRef("sb1", "inc-secret") || p.SecretVersion != secretspkg.RefVersion || p.SecretSealGeneration != 2 {
 		t.Fatalf("secret ref did not rotate: (%q,%d)", p.SecretRef, p.SecretVersion)
 	}
 }
@@ -546,9 +1125,10 @@ func TestFSMStoresSecretRefWithoutReplicatedPayload(t *testing.T) {
 func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
 	fsm := newPlacementFSM()
 	place, _ := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb1",
-		OwnerNodeID: "nodeA",
+		Op:            opPlace,
+		SandboxID:     "sb1",
+		OwnerNodeID:   "nodeA",
+		IncarnationID: "inc-1",
 		Spec: &models.CreateSandboxRequest{
 			Image: "alpine",
 			Env:   map[string]string{"A": "1"},
@@ -565,7 +1145,7 @@ func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
 		},
 	})
 	fsm.Apply(&raft.Log{Data: place})
-	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 8080, Protocol: "http"})
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-1", Port: 8080, Protocol: "http"})
 	fsm.Apply(&raft.Log{Data: add})
 
 	got, ok := fsm.get("sb1")
@@ -639,11 +1219,11 @@ func TestFSMRejectsDuplicateName(t *testing.T) {
 func TestFSMNameReleasedOnDelete(t *testing.T) {
 	fsm := newPlacementFSM()
 	spec := &models.CreateSandboxRequest{Name: "freed"}
-	payload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: spec})
+	payload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", IncarnationID: "inc-a", Spec: spec})
 	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
 		t.Fatalf("place: %v", got)
 	}
-	delPayload, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb-a"})
+	delPayload, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb-a", ExpectedIncarnationID: "inc-a"})
 	if got := fsm.Apply(&raft.Log{Data: delPayload}); got != nil {
 		t.Fatalf("delete: %v", got)
 	}
@@ -661,11 +1241,12 @@ func TestFSMNameReleasedOnDelete(t *testing.T) {
 func TestFSMSamePlacementSameNameIdempotent(t *testing.T) {
 	fsm := newPlacementFSM()
 	spec := &models.CreateSandboxRequest{Name: "stable"}
-	payload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: spec})
+	payload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: spec, IncarnationID: "inc-a"})
+	retry, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: spec, IncarnationID: "inc-a", ExpectedIncarnationID: "inc-a"})
 	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
 		t.Fatalf("first place: %v", got)
 	}
-	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
+	if got := fsm.Apply(&raft.Log{Data: retry}); got != nil {
 		t.Fatalf("idempotent re-place rejected: %v", got)
 	}
 }
@@ -781,9 +1362,13 @@ func TestFSMSubscribeCancel(t *testing.T) {
 func TestFSMVersionTracksLogIndex(t *testing.T) {
 	fsm := newPlacementFSM()
 	for _, idx := range []uint64{10, 11, 17, 42} {
+		expected := ""
+		if idx != 10 {
+			expected = "inc-1"
+		}
 		cmd, _ := encodeCommand(command{
 			Op: opPlace, SandboxID: "sb1", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
-			Spec: &models.CreateSandboxRequest{Image: "img", CPU: 1, MemoryMB: 64},
+			Spec: &models.CreateSandboxRequest{Image: "img", CPU: 1, MemoryMB: 64}, IncarnationID: "inc-1", ExpectedIncarnationID: expected,
 		})
 		fsm.Apply(&raft.Log{Index: idx, Data: cmd})
 		if got := fsm.currentVersion(); got != idx {
@@ -870,7 +1455,7 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 			Image: "alpine:before",
 			Env:   map[string]string{"K": "before"},
 		},
-		SecretRef: "cluster-secret://sandbox/sb1/v1",
+		IncarnationID: "inc-snapshot", SecretRef: testSecretRef("sb1", "inc-snapshot"), SecretVersion: secretspkg.RefVersion, SecretSealGeneration: 1,
 	})
 	src.Apply(&raft.Log{Data: place})
 
@@ -884,14 +1469,14 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 	// fresh opPlace (new owner / version) must not leak into the persisted
 	// bytes.
 	upsert, _ := encodeCommand(command{
-		Op:        opUpsertSpec,
-		SandboxID: "sb1",
+		Op:                    opUpsertSpec,
+		SandboxID:             "sb1",
+		ExpectedIncarnationID: "inc-snapshot",
 		Spec: &models.CreateSandboxRequest{
 			Image: "alpine:after",
 			Env:   map[string]string{"K": "after"},
 		},
-		SecretRef:     "cluster-secret://sandbox/sb1/v2",
-		SecretVersion: 2,
+		IncarnationID: "inc-snapshot", SecretRef: testSecretRef("sb1", "inc-snapshot"), SecretVersion: secretspkg.RefVersion, SecretSealGeneration: 2,
 	})
 	src.Apply(&raft.Log{Data: upsert})
 
@@ -914,7 +1499,7 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 	if got.Spec.Env["K"] != "before" {
 		t.Fatalf("snapshot leaked post-snapshot Env mutation: K=%q", got.Spec.Env["K"])
 	}
-	if got.SecretRef != "cluster-secret://sandbox/sb1/v1" {
+	if got.SecretRef != testSecretRef("sb1", "inc-snapshot") {
 		t.Fatalf("snapshot leaked post-snapshot secret-handle mutation: %q", got.SecretRef)
 	}
 }
@@ -931,10 +1516,10 @@ func TestFSMSnapshotIsolatedFromExposedPortMutations(t *testing.T) {
 	src := newPlacementFSM()
 	place, _ := encodeCommand(command{
 		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}, IncarnationID: "inc-snapshot",
 	})
 	src.Apply(&raft.Log{Data: place})
-	add80, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 80, Protocol: "http"})
+	add80, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-snapshot", Port: 80, Protocol: "http"})
 	src.Apply(&raft.Log{Data: add80})
 
 	snap, err := src.Snapshot()
@@ -946,9 +1531,9 @@ func TestFSMSnapshotIsolatedFromExposedPortMutations(t *testing.T) {
 	// snapshot aliased the live ExposedPorts map, both mutations would
 	// leak — the persisted state would show port 443 (added later) and
 	// miss port 80 (removed later).
-	add443, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 443, Protocol: "tls"})
+	add443, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-snapshot", Port: 443, Protocol: "tls"})
 	src.Apply(&raft.Log{Data: add443})
-	rm80, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", Port: 80})
+	rm80, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", ExpectedIncarnationID: "inc-snapshot", Port: 80})
 	src.Apply(&raft.Log{Data: rm80})
 
 	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
@@ -999,7 +1584,7 @@ func TestFSMReassignFailoverReportsOnlyRealTransitions(t *testing.T) {
 	// ("delete wins") and must not count it.
 	missing, _ := encodeCommand(command{
 		Op: opReassign, SandboxID: "sb-gone", OwnerNodeID: "nodeB",
-		ReassignCause: reassignCauseFailover,
+		ExpectedIncarnationID: "inc-gone", ReassignCause: reassignCauseFailover,
 	})
 	before := clusterFailoverReassignTotal.Value()
 	got, ok := fsm.Apply(&raft.Log{Index: 1, Data: missing}).(reassignApplyResult)
@@ -1012,12 +1597,12 @@ func TestFSMReassignFailoverReportsOnlyRealTransitions(t *testing.T) {
 
 	// Real transition: place, then reassign. The FSM reports changed, while
 	// the leader wrapper remains responsible for the one process-local count.
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA"})
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", IncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Index: 2, Data: place})
 
 	real, _ := encodeCommand(command{
 		Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB",
-		ReassignCause: reassignCauseFailover,
+		ExpectedIncarnationID: "inc-1", ReassignCause: reassignCauseFailover,
 	})
 	before = clusterFailoverReassignTotal.Value()
 	got, ok = fsm.Apply(&raft.Log{Index: 3, Data: real}).(reassignApplyResult)
@@ -1035,7 +1620,7 @@ func TestFSMReassignFailoverReportsOnlyRealTransitions(t *testing.T) {
 	// an idempotent state refresh, not another failover reassignment.
 	redundant, _ := encodeCommand(command{
 		Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB",
-		ReassignCause: reassignCauseFailover,
+		ExpectedIncarnationID: "inc-1", ReassignCause: reassignCauseFailover,
 	})
 	got, ok = fsm.Apply(&raft.Log{Index: 4, Data: redundant}).(reassignApplyResult)
 	if !ok || got.Changed {
@@ -1050,11 +1635,11 @@ func TestFSMReassignFailoverReportsOnlyRealTransitions(t *testing.T) {
 // aerolvm_cluster_failover_reassign_total.
 func TestFSMReassignMetricIgnoresOperatorReassign(t *testing.T) {
 	fsm := newPlacementFSM()
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA"})
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", IncarnationID: "inc-1"})
 	fsm.Apply(&raft.Log{Index: 1, Data: place})
 
 	// No ReassignCause — what ReassignPlacement emits.
-	operator, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB"})
+	operator, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB", ExpectedIncarnationID: "inc-1"})
 	before := clusterFailoverReassignTotal.Value()
 	fsm.Apply(&raft.Log{Index: 2, Data: operator})
 
@@ -1066,21 +1651,21 @@ func TestFSMReassignMetricIgnoresOperatorReassign(t *testing.T) {
 	}
 }
 
-// TestFSMReassignCauseIsReplaySafe pins the mixed-version / replay contract:
-// ReassignCause is observability-only, so a log entry written by a node that
-// predates the field (or any entry that simply omits it) must produce exactly
-// the same placement state as a tagged one. Only the metric differs.
-func TestFSMReassignCauseIsReplaySafe(t *testing.T) {
+// TestFSMReassignCauseDoesNotAffectState pins that ReassignCause is
+// observability-only. Tagged and untagged current-format commands produce the
+// same placement state; only the metric differs.
+func TestFSMReassignCauseDoesNotAffectState(t *testing.T) {
 	apply := func(cause string) Placement {
 		t.Helper()
 		fsm := newPlacementFSM()
 		place, _ := encodeCommand(command{
 			Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a:8080",
+			IncarnationID: "inc-1",
 		})
 		fsm.Apply(&raft.Log{Index: 1, Data: place})
 		reassign, _ := encodeCommand(command{
 			Op: opReassign, SandboxID: "sb1", OwnerNodeID: "nodeB",
-			OwnerAPIURL: "http://b:8080", ReassignCause: cause,
+			OwnerAPIURL: "http://b:8080", ExpectedIncarnationID: "inc-1", ReassignCause: cause,
 		})
 		fsm.Apply(&raft.Log{Index: 2, Data: reassign})
 		p, ok := fsm.get("sb1")
@@ -1090,8 +1675,8 @@ func TestFSMReassignCauseIsReplaySafe(t *testing.T) {
 		return p
 	}
 
-	untagged := apply("")                  // pre-upgrade entry
-	tagged := apply(reassignCauseFailover) // post-upgrade entry
+	untagged := apply("")
+	tagged := apply(reassignCauseFailover)
 
 	if untagged.OwnerNodeID != tagged.OwnerNodeID ||
 		untagged.OwnerAPIURL != tagged.OwnerAPIURL ||

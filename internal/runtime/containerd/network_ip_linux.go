@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 
-	cntr "github.com/containerd/containerd"
+	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )

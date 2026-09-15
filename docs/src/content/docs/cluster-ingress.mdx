@@ -86,10 +86,27 @@ AerolVM does not build, run, or manage any of the three. The ingress nodes thems
 | Cluster size | Suggested layout |
 |---|---|
 | &lt;= 10 nodes | `mixed` or a small split. Hybrid roles are allowed here for constrained deployments. |
-| 11+ nodes | Mandatory split: 3 or 5 `server` + N `worker` + 2+ dedicated `ingress`. Mixed and hybrid roles are rejected for placement/create. |
-| 1000-worker target | 3 or 5 `server`, 1000 `worker`, and a separately scaled `ingress` tier behind your LB. |
+| 11+ nodes | Mandatory split: 3 or 5 `server` + N `worker` + 2 to 10 dedicated `ingress` behind a plain LB. Mixed and hybrid roles are rejected for placement/create. |
+| 1000-worker target | 3 or 5 `server`, 1000 `worker`, and a separately scaled `ingress` tier. Up to 10 ingress nodes work behind any of the three LB options above; more than 10 requires a shard-aware router and `SB_CLUSTER_SHARD_AWARE_INGRESS=true` - see the next section. |
 
 The voter-cap setting (`SB_CLUSTER_MAX_AUTO_VOTERS`, default 5) is still in effect, but the role split is the real control: any node whose role-set lacks `server` (single `worker`, single `ingress`, or any hybrid like `worker,ingress`) never becomes a Raft voter regardless of the cap.
+
+## Ingress tiers above 10 nodes
+
+The three LB options above all pick *any* ingress node for *any* sandbox. That works only while every ingress node holds the full public route table, which AerolVM guarantees through **10 live ingress-capable nodes**. Above that, each ingress node subscribes only to its rendezvous-hashed share of the route table (the primary owner plus one failover replica per shard), so a plain LB would send most connections to a node without the route.
+
+The daemon cannot see what is in front of it, so it fails closed at that size until you declare the router shard-aware:
+
+| Mode | More than 10 ingress nodes, flag unset |
+|---|---|
+| Enterprise | Boot refuses; the error names `SB_CLUSTER_SHARD_AWARE_INGRESS` and the route endpoint. |
+| Open-source | Boot logs the violation and never starts the ingress reconciler; `GET /health` reports `degraded` with the reason; `aerolvm_cluster_topology_ok` is 0 and the `SandboxdClusterTopologyViolation` alert fires. |
+
+Creates keep working; public traffic through the ingress tier is what is at stake.
+
+To run more than 10 ingress nodes, the router in front of the tier must resolve ownership before forwarding: call `GET /v1/cluster/ingress-route/{id}` (operator PAT) for the sandbox id or the hostname derived from it, forward to one of the returned `owners[]` (`data_plane_host` for sandbox traffic; the first owner is the shard's primary, the second its failover replica), cache with a short TTL, and fail closed on a miss rather than spraying every ingress node. Only once that path is live, set `SB_CLUSTER_SHARD_AWARE_INGRESS=true` on every node (Terraform: `shard_aware_ingress = true`, which also refuses to plan more than 10 ingress-capable nodes without it).
+
+Never set the flag to silence the check while a plain LB fronts the tier: the check goes quiet and most public sandbox traffic black-holes with nothing left to notice. The operator procedure is in `setup/runbooks/cluster-ingress-topology.md`; the router contract is `plans/data-plane-load-balancer.md`.
 
 ## Bootstrap example
 

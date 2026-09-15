@@ -236,6 +236,15 @@ func TestCreateTemplateValidationAndIdentifierErrors(t *testing.T) {
 			t.Fatalf("CreateTemplate() error = %v, want min_size_mib rejection", err)
 		}
 	})
+
+	t.Run("path traversal id", func(t *testing.T) {
+		svc, _, _ := newTemplateHarness(t)
+		svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+		_, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "../outside", Image: "docker://alpine"})
+		if err == nil || !contains(err.Error(), "template id must") {
+			t.Fatalf("CreateTemplate() error = %v, want unsafe id rejection", err)
+		}
+	})
 }
 
 // TestDeleteTemplate_InUseRejected pins the IRON RULE: an active

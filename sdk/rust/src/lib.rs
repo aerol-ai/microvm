@@ -176,6 +176,13 @@ pub struct Sandbox {
     pub ssh_private_key: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SandboxPage {
+    pub sandboxes: Vec<Sandbox>,
+    /// Opaque token to pass to the next call; `None` marks the final page.
+    pub next_page_token: Option<String>,
+}
+
 pub struct ExecStreamHandle {
     control_tx: UnboundedSender<ControlMessage>,
     done_rx: mpsc::Receiver<Result<ExecExitInfo, Error>>,
@@ -662,21 +669,84 @@ impl Client {
         &self,
         tags: &std::collections::HashMap<String, String>,
     ) -> Result<Vec<Sandbox>, Error> {
-        let mut path = format!("{}/sandboxes", self.version_prefix());
-        path.push_str(&build_tag_query(tags));
-        let raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
-        Ok(raw
-            .into_iter()
-            .map(|item| Sandbox::new(self.clone(), item))
-            .collect())
+        self.list_with_options(tags, false)
+    }
+
+    /// Lists sandboxes with optional `include_env=true` (env omitted by default).
+    /// Drains cluster pages via `X-Cluster-List-Next-Page-Token` and errors on
+    /// partial / unready placement coverage instead of returning a silent subset.
+    pub fn list_with_options(
+        &self,
+        tags: &std::collections::HashMap<String, String>,
+        include_env: bool,
+    ) -> Result<Vec<Sandbox>, Error> {
+        let mut items = Vec::new();
+        let mut page_token = String::new();
+        // Safety cap: enough for 100k sandboxes at page size 1 (default page
+        // size is 100). Stop earlier when the next-page token is empty.
+        for _ in 0..100_000 {
+            let page = self.list_page_with_options(tags, include_env, &page_token)?;
+            items.extend(page.sandboxes);
+            match page.next_page_token {
+                Some(next) => page_token = next,
+                None => return Ok(items),
+            }
+        }
+        Err(Error::Api(
+            "incomplete cluster list: exceeded max pages".into(),
+        ))
+    }
+
+    /// Fetches exactly one cluster-list page for bounded-memory fleet scans.
+    pub fn list_page_with_options(
+        &self,
+        tags: &std::collections::HashMap<String, String>,
+        include_env: bool,
+        page_token: &str,
+    ) -> Result<SandboxPage, Error> {
+        let mut base_path = format!("{}/sandboxes", self.version_prefix());
+        base_path.push_str(&build_sandbox_query(tags, include_env));
+        let path = append_query_param(&base_path, "page_token", page_token);
+        let (raw, headers) =
+            self.do_json_headers::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
+        let partial = headers
+            .get("X-Cluster-List-Partial")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let ready = headers
+            .get("X-Cluster-List-Placement-Ready")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if partial == "true" || ready == "false" {
+            return Err(Error::Api("incomplete cluster list".into()));
+        }
+        let next = headers
+            .get("X-Cluster-List-Next-Page-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Ok(SandboxPage {
+            sandboxes: raw
+                .into_iter()
+                .map(|item| Sandbox::new(self.clone(), item))
+                .collect(),
+            next_page_token: if next.is_empty() { None } else { Some(next) },
+        })
     }
 
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(
-            Method::GET,
-            &format!("{}/sandboxes/{}", self.version_prefix(), id),
-            None,
-        )?;
+        self.get_with_options(id, false)
+    }
+
+    /// Fetches a sandbox; when `include_env` is true, appends `?include_env=true`.
+    pub fn get_with_options(&self, id: &str, include_env: bool) -> Result<Sandbox, Error> {
+        let mut path = format!("{}/sandboxes/{}", self.version_prefix(), id);
+        path.push_str(&build_sandbox_query(
+            &std::collections::HashMap::new(),
+            include_env,
+        ));
+        let raw = self.do_json::<(), SandboxData>(Method::GET, &path, None)?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
@@ -1412,6 +1482,16 @@ impl Client {
         path: &str,
         payload: Option<&T>,
     ) -> Result<U, Error> {
+        let (body, _) = self.do_json_headers(method, path, payload)?;
+        Ok(body)
+    }
+
+    fn do_json_headers<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
         let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
         let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
@@ -1439,10 +1519,13 @@ impl Client {
                         // Fall through to retry logic
                     } else {
                         let response = self.handle_response(response)?;
+                        let headers = response.headers().clone();
                         if response.status() == reqwest::StatusCode::NO_CONTENT {
-                            return serde_json::from_str("null").map_err(Error::SerdeJson);
+                            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
+                            return Ok((body, headers));
                         }
-                        return response.json().map_err(Error::Reqwest);
+                        let body = response.json().map_err(Error::Reqwest)?;
+                        return Ok((body, headers));
                     }
                 }
                 Err(err) => {
@@ -1698,8 +1781,8 @@ async fn run_session_attach(
 // the pre-filter call (no stray trailing "?"). Map iteration order is
 // unspecified; the server treats every `tag.*` pair as an AND clause so the
 // emitted order does not affect the response.
-fn build_tag_query(tags: &std::collections::HashMap<String, String>) -> String {
-    if tags.is_empty() {
+fn build_sandbox_query(tags: &std::collections::HashMap<String, String>, include_env: bool) -> String {
+    if tags.is_empty() && !include_env {
         return String::new();
     }
     let mut out = String::from("?");
@@ -1714,7 +1797,27 @@ fn build_tag_query(tags: &std::collections::HashMap<String, String>) -> String {
         out.push('=');
         out.push_str(&urlencoding::encode(value));
     }
+    if include_env {
+        if !first {
+            out.push('&');
+        }
+        out.push_str("include_env=true");
+    }
     out
+}
+
+fn append_query_param(path: &str, key: &str, value: &str) -> String {
+    if value.trim().is_empty() {
+        return path.to_string();
+    }
+    let sep = if path.contains('?') { '&' } else { '?' };
+    format!(
+        "{}{}{}={}",
+        path,
+        sep,
+        urlencoding::encode(key),
+        urlencoding::encode(value)
+    )
 }
 
 fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
@@ -3116,9 +3219,60 @@ mod tests {
         );
     }
 
-    // Backward-compat: list() and list_with_tags(&empty) must produce the
-    // pre-filter URL byte-for-byte — no stray trailing "?" — so fixtures and
-    // request matchers in downstream code keep working.
+    #[test]
+    fn get_and_list_include_env() {
+        // Only assert wire query for include_env; list returns [] so we avoid
+        // needing a full Sandbox decode fixture for get.
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("team".to_string(), "a".to_string());
+        client
+            .list_with_options(&tags, true)
+            .expect("list_with_options should succeed");
+        let list_req = request_rx.recv().expect("list request");
+        assert!(
+            list_req.contains("include_env=true") && list_req.contains("tag.team=a"),
+            "unexpected list request: {}",
+            list_req
+        );
+
+        // get_with_options shares build_sandbox_query; assert path via a raw
+        // request capture with a minimal valid Sandbox payload.
+        let body = serde_json::json!({
+            "id": "sb-1",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-1.example.com",
+            "container_id": "c1",
+            "container_ip": "10.0.0.1",
+            "cpu": 1,
+            "memory_mb": 512,
+            "disk_gb": 5,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "last_active_at": "2024-01-01T00:00:00Z",
+            "lifecycle": {}
+        })
+        .to_string();
+        let (url2, request_rx2) = spawn_json_server(body);
+        let client2 = Client::new(Some(&url2), Some("pat-token")).expect("client should build");
+        client2
+            .get_with_options("sb-1", true)
+            .expect("get_with_options should succeed");
+        let get_req = request_rx2.recv().expect("get request");
+        assert!(
+            get_req.starts_with("GET /v1/sandboxes/sb-1?include_env=true HTTP/1.1\r\n"),
+            "unexpected get request: {}",
+            get_req
+        );
+    }
+
+    // Empty filters should produce the canonical collection URL without a
+    // stray query delimiter.
     #[test]
     fn list_without_tags_omits_query_string() {
         let (url, request_rx) = spawn_json_server("[]".to_string());
@@ -3142,6 +3296,66 @@ mod tests {
             "unexpected request: {}",
             request2
         );
+    }
+
+    #[test]
+    fn list_page_fetches_only_one_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read_http_request(&mut stream);
+            request_tx.send(request).expect("send request");
+            let body = serde_json::json!([{
+                "id": "sb-page", "image": "alpine", "status": "started",
+                "public_url": "", "container_id": null, "container_ip": null,
+                "cpu": 1, "memory_mb": 256, "disk_gb": 1, "os_user": "root",
+                "network_block_all": false, "toolbox_enabled": true,
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "last_active_at": "2024-01-01T00:00:00Z", "lifecycle": {}
+            }]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Cluster-List-Placement-Ready: true\r\nX-Cluster-List-Next-Page-Token: tok-next\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).expect("write response");
+        });
+        let client = Client::new(Some(&format!("http://{}", addr)), Some("pat-token"))
+            .expect("client");
+        let page = client
+            .list_page_with_options(&std::collections::HashMap::new(), false, "tok-current")
+            .expect("list page");
+        assert_eq!(page.sandboxes.len(), 1);
+        assert_eq!(page.sandboxes[0].data.id, "sb-page");
+        assert_eq!(page.next_page_token.as_deref(), Some("tok-next"));
+        let request = request_rx.recv().expect("request");
+        assert!(request.starts_with("GET /v1/sandboxes?page_token=tok-current HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn list_errors_on_partial_cluster_coverage() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = read_http_request(&mut stream);
+            let body = b"[]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Cluster-List-Partial: true\r\nX-Cluster-List-Placement-Ready: true\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write headers");
+            stream.write_all(body).expect("write body");
+        });
+        let client =
+            Client::new(Some(&format!("http://{}", addr)), Some("pat-token")).expect("client");
+        let err = client.list().expect_err("partial list must fail");
+        match err {
+            Error::Api(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     // Custom-domains: POST returns 201 with the post-add list envelope, body

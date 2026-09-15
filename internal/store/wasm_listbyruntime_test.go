@@ -87,6 +87,39 @@ func TestListByRuntime_QueryErrorOnClosedDB(t *testing.T) {
 	}
 }
 
+func TestDeleteOrphanedWasmStateKV(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	live := sampleSandbox("sb-live-kv")
+	live.Runtime = models.RuntimeWasm
+	if err := st.Create(ctx, live); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := st.PutWasmStateKV(ctx, "sb-live-kv", "counter", []byte("1")); err != nil {
+		t.Fatalf("PutWasmStateKV(live): %v", err)
+	}
+	if err := st.PutWasmStateKV(ctx, "sb-gone-kv", "counter", []byte("2")); err != nil {
+		t.Fatalf("PutWasmStateKV(gone): %v", err)
+	}
+
+	n, err := st.DeleteOrphanedWasmStateKV(ctx, 0)
+	if err != nil {
+		t.Fatalf("DeleteOrphanedWasmStateKV: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deleted = %d, want 1", n)
+	}
+	keys, err := st.ListWasmStateKVKeys(ctx, "sb-live-kv")
+	if err != nil || len(keys) != 1 || keys[0] != "counter" {
+		t.Fatalf("live keys = %v err=%v, want [counter]", keys, err)
+	}
+	gone, err := st.ListWasmStateKVKeys(ctx, "sb-gone-kv")
+	if err != nil || len(gone) != 0 {
+		t.Fatalf("gone keys = %v err=%v, want empty", gone, err)
+	}
+}
+
 // TestListOrphanedWasmCheckpointPushes_QueryErrorOnClosedDB covers the
 // query-error branch.
 func TestListOrphanedWasmCheckpointPushes_QueryErrorOnClosedDB(t *testing.T) {

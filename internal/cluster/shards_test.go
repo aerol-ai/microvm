@@ -73,8 +73,39 @@ func TestIngressRouteForSandboxReturnsShardOwnerForLargeIngressTier(t *testing.T
 
 	route := IngressRouteForSandbox(members, "sb-route")
 	wantShard := PlacementShardForSandbox("sb-route", DefaultPlacementShardCount)
-	wantOwner := fmt.Sprintf("ing-%02d", wantShard%len(members))
-	if len(route.Owners) != 1 || route.Owners[0].NodeID != wantOwner {
-		t.Fatalf("owners = %+v, want single shard owner %q", route.Owners, wantOwner)
+	ids := ingressShardNodeIDs(members)
+	wantIdxs := rendezvousIngressOwnerIndexes(wantShard, ids, 2)
+	if len(route.Owners) != len(wantIdxs) {
+		t.Fatalf("owners = %+v, want %d shard owners", route.Owners, len(wantIdxs))
+	}
+	for i, idx := range wantIdxs {
+		if route.Owners[i].NodeID != ids[idx] {
+			t.Fatalf("owners[%d] = %q, want %q", i, route.Owners[i].NodeID, ids[idx])
+		}
+	}
+}
+
+func TestIngressShardRendezvousStableUnderMembershipChurn(t *testing.T) {
+	n := MaxReplicatedIngressRouteNodes + 5
+	full := make([]Member, 0, n)
+	for i := 0; i < n; i++ {
+		full = append(full, Member{
+			NodeID: fmt.Sprintf("ing-%02d", i),
+			Alive:  true,
+			Role:   config.NodeRoleIngress,
+		})
+	}
+	shrunk := full[:n-1]
+	moved := 0
+	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
+		a := rendezvousIngressOwnerIndex(shard, ingressShardNodeIDs(full))
+		b := rendezvousIngressOwnerIndex(shard, ingressShardNodeIDs(shrunk))
+		if ingressShardNodeIDs(full)[a] != ingressShardNodeIDs(shrunk)[b] {
+			moved++
+		}
+	}
+	// Modulo assignment remaps ~99%; rendezvous should remap roughly 1/N.
+	if moved > DefaultPlacementShardCount/2 {
+		t.Fatalf("membership N→N-1 remapped %d/%d shards (want well under half)", moved, DefaultPlacementShardCount)
 	}
 }

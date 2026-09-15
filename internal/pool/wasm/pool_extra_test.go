@@ -257,6 +257,54 @@ func TestCloseWithNoSpawner(t *testing.T) {
 	}
 }
 
+func TestClosedPoolRejectsAndCleansLateSlots(t *testing.T) {
+	spawner := &errSpawner{}
+	p := New(t.TempDir(), nil)
+	p.SetSpawner(spawner)
+	p.MarkSpawning("digest")
+	if drained := p.Close(); drained != 0 {
+		t.Fatalf("initial Close drained = %d", drained)
+	}
+	if drained := p.Close(); drained != 0 {
+		t.Fatalf("idempotent Close drained = %d", drained)
+	}
+	p.SetSpawner(&errSpawner{warmErr: errors.New("must not replace closed spawner")})
+	p.NoteModule("late", "/late.wasm")
+	if len(p.ListTargets()) != 0 {
+		t.Fatal("closed pool admitted a module target")
+	}
+	if _, err := p.Acquire(context.Background(), "digest", "/mod.wasm", 0); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("closed Acquire error = %v", err)
+	}
+	if _, ok, err := AcquireOrMiss(context.Background(), p, "digest", "/mod.wasm", 0); ok || !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("closed AcquireOrMiss = (ok=%v, err=%v)", ok, err)
+	}
+	if _, err := p.WarmOne(context.Background(), "digest", "/mod.wasm"); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("closed WarmOne error = %v", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "late-slot")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p.RecordLoaded(&Slot{
+		ID: "late", ModuleDigest: "digest", WorkerKey: "late-worker",
+		SocketPath: filepath.Join(dir, "worker.sock"),
+	})
+	if len(spawner.shutdownCalled) != 1 || spawner.shutdownCalled[0] != "late-worker" {
+		t.Fatalf("late slot shutdowns = %v", spawner.shutdownCalled)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("late slot directory still exists: %v", err)
+	}
+	p.mu.Lock()
+	spawning := p.spawning["digest"]
+	p.mu.Unlock()
+	if spawning != 0 {
+		t.Fatalf("late slot left %d in-flight spawn(s)", spawning)
+	}
+}
+
 func TestAcquireOrMiss(t *testing.T) {
 	ctx := context.Background()
 

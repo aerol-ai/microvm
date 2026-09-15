@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // PortGateway is the host-mediated HTTP ingress surface for WASM sandboxes.
@@ -103,6 +104,9 @@ func (g *networkGateway) EnsureHTTPListener(_ context.Context, sandboxID string,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			g.serveHTTP(sandboxID, guestPort, w, r)
 		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	go func() {
 		_ = srv.Serve(ln)

@@ -145,6 +145,7 @@ resource "aws_instance" "seed" {
     image_build_gc_interval                  = local.cluster_ops.image_build_gc.interval
     image_build_gc_ttl                       = local.cluster_ops.image_build_gc.ttl
     extra_user_data                          = local.seed_node.extra_user_data
+    shard_aware_ingress                      = var.shard_aware_ingress
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
     caddy_storage_s3_bucket         = local.caddy_storage_s3.bucket
@@ -198,6 +199,18 @@ resource "aws_instance" "seed" {
 
   lifecycle {
     ignore_changes = [ami] # don't recycle a running cluster member on AMI refresh
+
+    # Mirror the daemon's topology gate (cluster.MaxReplicatedIngressRouteNodes)
+    # at plan time: above 10 ingress-capable nodes each ingress node holds only
+    # its share of the public route table, and sandboxd refuses to boot (or,
+    # open-source, to mark ingress ready) unless the operator declares a
+    # shard-aware router with shard_aware_ingress. Failing here is cheaper
+    # than provisioning 100 nodes the daemon rejects. Mirrored in
+    # Terraform/validate/ingress.go.
+    precondition {
+      condition     = length(local.ingress_node_names) <= 10 || var.shard_aware_ingress
+      error_message = "More than 10 ingress-capable nodes (ingress, a hybrid containing it, or mixed) need a shard-aware router in front of the tier (GET /v1/cluster/ingress-route/{id}); set shard_aware_ingress = true only once that router is in place. See setup/runbooks/cluster-ingress-topology.md."
+    }
   }
 }
 
@@ -329,6 +342,7 @@ resource "aws_instance" "joiner" {
     image_build_gc_interval                  = local.cluster_ops.image_build_gc.interval
     image_build_gc_ttl                       = local.cluster_ops.image_build_gc.ttl
     extra_user_data                          = each.value.extra_user_data
+    shard_aware_ingress                      = var.shard_aware_ingress
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
     caddy_storage_s3_bucket         = local.caddy_storage_s3.bucket

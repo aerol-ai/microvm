@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/oci"
-	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
-	"github.com/containerd/containerd/runtime"
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/typeurl/v2"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"

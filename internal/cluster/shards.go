@@ -1,8 +1,12 @@
 package cluster
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"sort"
+	"strings"
 )
 
 // DefaultPlacementShardCount is the stable shard space for placement-index
@@ -33,11 +37,17 @@ type PlacementPageRequest struct {
 	Limit       int                  `json:"limit,omitempty"`
 	PageToken   string               `json:"page_token,omitempty"`
 	ShardFilter PlacementShardFilter `json:"shard_filter,omitempty"`
+	// OwnerRef, when set, returns only placements for that tenant account.
+	OwnerRef string `json:"owner_ref,omitempty"`
 }
 
 type PlacementPageResponse struct {
 	Placements    []Placement `json:"placements"`
 	NextPageToken string      `json:"next_page_token,omitempty"`
+	// Authoritative is true when the page was produced by a ready FSM / control
+	// plane. Empty Authoritative pages mean "tenant (or fleet) has zero rows"
+	// — not "placement view unavailable". Agents set this false on CP errors.
+	Authoritative bool `json:"authoritative,omitempty"`
 }
 
 type IngressRouteOwner struct {
@@ -66,6 +76,7 @@ func (r PlacementPageRequest) Normalize() PlacementPageRequest {
 		Limit:       limit,
 		PageToken:   r.PageToken,
 		ShardFilter: r.ShardFilter.Normalize(),
+		OwnerRef:    strings.TrimSpace(r.OwnerRef),
 	}
 }
 
@@ -146,8 +157,11 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 
 	shards := make([]int, 0, DefaultPlacementShardCount/len(ids)+1)
 	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
-		if shard%len(ids) == selfIndex {
-			shards = append(shards, shard)
+		for _, idx := range rendezvousIngressOwnerIndexes(shard, ids, 2) {
+			if idx == selfIndex {
+				shards = append(shards, shard)
+				break
+			}
 		}
 	}
 	return PlacementShardFilter{
@@ -158,7 +172,8 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 
 // IngressRouteForSandbox returns the ingress owner set an upstream router
 // should target for sandboxID. Small ingress tiers all own every sandbox route;
-// very large ingress tiers return the stable shard owner.
+// very large ingress tiers return the primary shard owner plus one failover
+// replica so a single ingress death does not create a traffic vacuum.
 func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRoute {
 	shardCount := DefaultPlacementShardCount
 	shard := PlacementShardForSandbox(sandboxID, shardCount)
@@ -176,8 +191,60 @@ func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRout
 		route.Owners = owners
 		return route
 	}
-	route.Owners = append(route.Owners, owners[shard%len(owners)])
+	ids := ingressShardNodeIDs(members)
+	for _, idx := range rendezvousIngressOwnerIndexes(shard, ids, 2) {
+		if idx >= 0 && idx < len(owners) {
+			route.Owners = append(route.Owners, owners[idx])
+		}
+	}
 	return route
+}
+
+// rendezvousIngressOwnerIndex picks a stable shard owner via highest-random-weight
+// hashing so membership N→N-1 remaps ~1/N shards instead of ~99%.
+func rendezvousIngressOwnerIndex(shard int, nodeIDs []string) int {
+	idxs := rendezvousIngressOwnerIndexes(shard, nodeIDs, 1)
+	if len(idxs) == 0 {
+		return -1
+	}
+	return idxs[0]
+}
+
+// rendezvousIngressOwnerIndexes returns up to n distinct HRW owners for shard.
+func rendezvousIngressOwnerIndexes(shard int, nodeIDs []string, n int) []int {
+	if len(nodeIDs) == 0 || n <= 0 {
+		return nil
+	}
+	type scored struct {
+		idx   int
+		score uint64
+		id    string
+	}
+	all := make([]scored, 0, len(nodeIDs))
+	for i, id := range nodeIDs {
+		all = append(all, scored{idx: i, score: rendezvousScore(shard, id), id: id})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].score == all[j].score {
+			return all[i].id < all[j].id
+		}
+		return all[i].score > all[j].score
+	})
+	if n > len(all) {
+		n = len(all)
+	}
+	out := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, all[i].idx)
+	}
+	return out
+}
+
+func rendezvousScore(shard int, nodeID string) uint64 {
+	// SHA-256 avoids FNV clustering on sequential node IDs (ing-00..ing-N)
+	// which left some owners with zero shards under naive FNV-HRW.
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%s", shard, nodeID)))
+	return binary.BigEndian.Uint64(sum[:8])
 }
 
 func ingressShardNodeIDs(members []Member) []string {

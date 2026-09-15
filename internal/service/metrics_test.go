@@ -3,10 +3,12 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestBeginSandboxCreateMetricTracksSuccessAndTimeouts(t *testing.T) {
@@ -121,6 +123,27 @@ func TestClassifyMetricErrorsAndHelpers(t *testing.T) {
 
 	if got := classifySecretMetricError(errors.New("version mismatch for cluster secret ref")); got != "key_version_mismatch" {
 		t.Fatalf("secret key mismatch classification = %q, want key_version_mismatch", got)
+	}
+	if got := classifySecretMetricError(fmt.Errorf("%w: placement", secrets.ErrVersionMismatch)); got != "key_version_mismatch" {
+		t.Fatalf("sentinel version mismatch = %q, want key_version_mismatch", got)
+	}
+	if got := classifySecretMetricError(fmt.Errorf("%w: node-b", secrets.ErrRecipientDenied)); got != "recipient_denied" {
+		t.Fatalf("sentinel recipient denied = %q, want recipient_denied", got)
+	}
+	if got := classifySecretMetricError(fmt.Errorf("%w: ref", secrets.ErrNotFound)); got != "ref_not_found" {
+		t.Fatalf("sentinel not found = %q, want ref_not_found", got)
+	}
+	if got := classifySecretMetricError(fmt.Errorf("%w: unwrap", secrets.ErrDecryptFailed)); got != "decrypt_failed" {
+		t.Fatalf("sentinel decrypt failed = %q, want decrypt_failed", got)
+	}
+	if got := classifySecretMetricError(fmt.Errorf("%w: down", secrets.ErrProviderUnavailable)); got != "provider_unavailable" {
+		t.Fatalf("sentinel provider unavailable = %q, want provider_unavailable", got)
+	}
+	if got := classifySecretMetricError(fmt.Errorf("%w: rate", secrets.ErrProviderThrottled)); got != "provider_throttled" {
+		t.Fatalf("sentinel provider throttled = %q, want provider_throttled", got)
+	}
+	if got := classifySecretMetricError(fmt.Errorf("%w: iam", secrets.ErrProviderDenied)); got != "provider_denied" {
+		t.Fatalf("sentinel provider denied = %q, want provider_denied", got)
 	}
 	if got := classifySecretMetricError(errors.New("decrypt failed")); got != "decrypt_failed" {
 		t.Fatalf("secret decrypt classification = %q, want decrypt_failed", got)

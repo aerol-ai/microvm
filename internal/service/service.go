@@ -27,6 +27,7 @@ import (
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -65,6 +66,11 @@ var ErrPreferredHostPortUnavailable = errors.New("preferred host port unavailabl
 // caller kept private. The sandbox stays reachable through the toolbox proxy
 // and SSH gateway.
 var ErrPublicTrafficDisabled = errors.New("public traffic is disabled for this sandbox; pass allow_public_traffic=true at create or expose a port to opt in")
+
+// ErrClusterFinalizationUnavailable means local runtime teardown completed but
+// the owner+incarnation-fenced placement could not be durably removed. The
+// local sandbox row is intentionally retained as a retry/reconcile anchor.
+var ErrClusterFinalizationUnavailable = errors.New("cluster placement finalization temporarily unavailable")
 
 const clusterIngressReconcileInterval = 5 * time.Second
 
@@ -106,11 +112,6 @@ type Service struct {
 	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
 	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
 	isolateBundles *jsbundle.Store
-	// jsBundleReplicator fans a newly-uploaded bundle out to cluster peers so an
-	// isolate create placed on any node resolves it locally (isolate's bundle
-	// store is per-node). Nil in single-node mode (no-op) and set by pkg/daemon
-	// to (*cluster).ReplicateJSBundle only when EnableCluster && EnableIsolate.
-	jsBundleReplicator func(ctx context.Context, owner string, req models.CreateJSBundleRequest) error
 	// isolateStaging refcounts content digests staged by an in-flight isolate
 	// create but not yet pinned by a persisted store row, so the bundle GC does
 	// not reap them mid-create (pinStagingDigest / stagingDigests).
@@ -152,9 +153,57 @@ type Service struct {
 	dockerAux *docker.Client
 	caddy     *caddy.Client
 	cipher    *secrets.Cipher
-	mounts    *mounts.Manager
-	admitter  *capacity.Admitter
-	images    ImageDistributionProvider
+	// secretProvider owns cluster-secret Put/Open/Delete (ref → plaintext).
+	// Lazily built from cipher+store when tests construct &Service{...}
+	// without New; mount/registry seal paths still use cipher directly.
+	secretProvider secrets.Provider
+	// secretAudit records every secret decrypt/open (cluster provider,
+	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
+	// unless tests inject a sink. Writes are async/buffered — never on the
+	// StartSandbox / create hot path.
+	secretAudit     SecretAuditSink
+	secretAuditFile *fileAuditSink // non-nil when the sink is the file writer
+	// secretAuditIndex is the per-sandbox read index over secretAuditFile
+	// (nil when disabled or storeless); reads fall back to a scan without it.
+	secretAuditIndex *secretAuditIndexer
+	// secretAuditChainBroken latches a failed full verification (the boot
+	// background pass); local audit reads refuse until restart.
+	secretAuditChainBroken  atomic.Bool
+	secretAuditBootVerify   sync.WaitGroup
+	secretAuditInitErr      error // retained so daemon boot can fail closed
+	secretAuditOnce         sync.Once
+	secretAuditPruneStop    chan struct{}
+	secretAuditPruneDone    sync.WaitGroup
+	auditWitnessMu          sync.Mutex
+	auditWitness            controlplane.Witness
+	auditWitnessShipMu      sync.Mutex // serializes ship + receipt rewrite
+	secretAuditWitnessOnce  sync.Once
+	secretAuditWitnessStop  chan struct{}
+	secretAuditWitnessDone  sync.WaitGroup
+	auditIngestMu           sync.Mutex
+	auditIngest             *auditIngestServer
+	auditIncarnationMu      sync.RWMutex
+	pendingAuditIncarnation map[string]string
+	auditExportMu           sync.Mutex
+	auditExportRunMu        sync.Mutex // serializes cursor/read/export/prune reset
+	auditExporter           controlplane.AuditExporter
+	// auditBackend is the env-configured connector behind auditExporter (nil
+	// when a managed build injected its own exporter or none is configured).
+	auditBackend auditexport.Backend
+	// auditExportBackoff / auditExportNotBefore pace retries after a failed
+	// export; guarded by auditExportRunMu.
+	auditExportBackoff    auditexport.Backoff
+	auditExportNotBefore  time.Time
+	secretAuditExportOnce sync.Once
+	secretAuditExportStop chan struct{}
+	secretAuditExportDone sync.WaitGroup
+	secretRefanoutMu      sync.Mutex
+	secretRefanoutRunning bool
+	// testAuditFetcher overrides peer audit fan-out in tests.
+	testAuditFetcher cluster.AuditPeerFetcher
+	mounts           *mounts.Manager
+	admitter         *capacity.Admitter
+	images           ImageDistributionProvider
 	// volumeReclaimer deletes the backing bytes (S3 prefix / NFS dir) of deleted
 	// platform volumes. Non-nil only when the daemon wired a backend reclaimer;
 	// nil leaves the pending_volume_deletions ledger for an external reconciler.
@@ -197,6 +246,7 @@ type Service struct {
 	// worst case. Lazily populated on first Capacity() call.
 	localReadyTemplateIDsMu        sync.Mutex
 	localReadyTemplateIDsCache     []string
+	localTemplateCatalogIDsCache   []string
 	localReadyTemplateIDsKnown     bool
 	localReadyTemplateIDsExpires   time.Time
 	localReadyWasmModuleIDsMu      sync.Mutex
@@ -458,6 +508,9 @@ type Service struct {
 	// testForceUnmountErr, when non-nil, replaces the UnmountAll result in
 	// DestroySandbox so the warn arm is reachable offline. Nil in production.
 	testForceUnmountErr error
+	// testSecretPeerPusher overrides cluster secret fan-out in tests. Nil in
+	// production (SealAndDistribute type-asserts the live Cluster/Agent).
+	testSecretPeerPusher cluster.SecretPeerPusher
 	// testBeforeStoreCreateSnapshot runs after normalize/initial push state and
 	// before store.CreateSnapshot so conflict / GetSnapshot arms can be forced
 	// under the snapshotMu lock. Nil in production.
@@ -480,6 +533,9 @@ type Service struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
+	if db != nil {
+		db.SetSecretCipher(cipher)
+	}
 	s := &Service{
 		cfg:      cfg,
 		logger:   logger,
@@ -499,9 +555,58 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		cluster:     cluster.NewNoop("standalone", "", cfg.EffectivePublicHost()),
 		dnsResolver: &DefaultDNSResolver{},
 	}
+	// Default to local provider when cipher+store are present. Non-local
+	// backends (awskms) are wired by ConfigureSecretProvider at daemon boot
+	// so AWS client construction / boot canary stay off the New() path used
+	// by unit tests.
+	if cipher != nil && db != nil && secrets.NormalizeProviderName(cfg.SecretProvider) == secrets.ProviderLocal {
+		s.secretProvider = secrets.NewLocalProvider(cipher, newSecretBlobStore(db))
+	}
+	s.ensureSecretAuditSink()
 	s.ensureTouchCoalescer()
 	s.ensureCaddyCoalescer()
 	return s
+}
+
+// ConfigureSecretProvider selects the secrets.Provider from cfg.SecretProvider.
+// For awskms it builds the AWS client, runs an optional wrap/unwrap canary
+// (E4 lite), and fails open unless cfg.SecretProviderStrictBoot. Safe to call
+// when the provider is already local — it is a no-op refresh for that case.
+func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
+	opts := secrets.ProviderOptions{
+		Name:        name,
+		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
+		Cipher:      s.cipher,
+		Store:       newSecretBlobStore(s.store),
+	}
+	p, wrapper, err := secrets.NewProvider(ctx, opts)
+	if err != nil {
+		return err
+	}
+	s.secretProvider = p
+	if name != secrets.ProviderAWSKMS || wrapper == nil {
+		return nil
+	}
+	if err := secrets.CanaryWrapUnwrap(ctx, wrapper); err != nil {
+		recordSecretProviderCanary(false)
+		if s.cfg.SecretProviderStrictBoot {
+			return fmt.Errorf("secret provider boot canary failed (SB_SECRET_PROVIDER_STRICT_BOOT=true): %w", err)
+		}
+		if s.logger != nil {
+			s.logger.Warn("secret provider boot canary failed; continuing (set SB_SECRET_PROVIDER_STRICT_BOOT=true to fail closed)",
+				"provider", name, "err", err)
+		}
+		return nil
+	}
+	recordSecretProviderCanary(true)
+	if s.logger != nil {
+		s.logger.Info("secret provider boot canary ok", "provider", name)
+	}
+	return nil
 }
 
 // ensureTouchCoalescer is the lazy init path TouchSandbox uses. Direct
@@ -632,6 +737,9 @@ func (s *Service) ociEngineForSandbox(sandbox *models.Sandbox) (runtime.Runtime,
 			return nil, fmt.Errorf("sandbox engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
 		}
 		return s.containerd, nil
+	}
+	if s.docker == nil {
+		return nil, fmt.Errorf("sandbox engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
 	}
 	return s.docker, nil
 }
@@ -768,6 +876,12 @@ func (s *Service) Cluster() cluster.Client {
 	return s.cluster
 }
 
+// ClusterEnabled distinguishes a configured cluster from the single-node Noop
+// client, which intentionally implements the same interface.
+func (s *Service) ClusterEnabled() bool {
+	return s != nil && s.cfg.EnableCluster
+}
+
 // ClusterTopologyError returns a production-topology violation for the current
 // live member set. It is intentionally a runtime check so rolling membership,
 // old nodes that still gossip empty roles, and explicit hybrid roles are all
@@ -788,6 +902,16 @@ func (s *Service) ClusterTopologyError() error {
 // loop can run the same shard-aware-ingress check without re-fetching members
 // or duplicating the threshold logic.
 func (s *Service) clusterTopologyErrorFor(members []cluster.Member) error {
+	err := s.evaluateClusterTopology(members)
+	if err != nil {
+		clusterTopologyOK.Set(0)
+	} else {
+		clusterTopologyOK.Set(1)
+	}
+	return err
+}
+
+func (s *Service) evaluateClusterTopology(members []cluster.Member) error {
 	if err := cluster.LargeClusterTopologyError(members); err != nil {
 		return err
 	}
@@ -868,10 +992,10 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 	return s.createSandbox(ctx, req, id)
 }
 
-// reconcileStaleOwnership destroys local sandboxes whose cluster placement
-// no longer points to self. Single-node mode (Noop client) reports IsSelf=true
-// for every id, so this is a no-op there. Errors are logged and swallowed —
-// the next reconcile tick retries.
+// reconcileStaleOwnership destroys local materializations whose authoritative
+// cluster placement no longer points to self. Reads are batched so a worker
+// with thousands of local rows makes O(pages), not O(sandboxes), control-plane
+// calls. Errors are logged and swallowed; the next reconcile tick retries.
 func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 	c := s.Cluster()
 	if c == nil {
@@ -886,28 +1010,165 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 		s.logger.Warn("cluster: stale-ownership list failed", "err", err)
 		return
 	}
+	ids := make([]string, 0, len(known))
 	for _, sb := range known {
 		if sb == nil || sb.ID == "" {
 			continue
 		}
-		owner, err := c.OwnerOf(sb.ID)
+		ids = append(ids, sb.ID)
+	}
+	placements := make(map[string]cluster.Placement, len(ids))
+	for start := 0; start < len(ids); start += cluster.MaxPlacementPageLimit {
+		end := min(start+cluster.MaxPlacementPageLimit, len(ids))
+		batch, err := c.AuthoritativePlacementsByIDs(ctx, ids[start:end])
 		if err != nil {
-			// ErrUnknownSandbox: no FSM record yet (fresh boot before
-			// AssertOwnership replay completes); leave it alone.
-			// ErrOrphaned: the dead-owner reconciler is still mid-flight or
-			// the sandbox has no spec to recreate from; leave it alone.
+			s.logger.Warn("cluster: stale-ownership authoritative read failed", "err", err)
+			return
+		}
+		for id, placement := range batch {
+			placements[id] = placement
+		}
+	}
+	for _, sb := range known {
+		if sb == nil || sb.ID == "" {
 			continue
 		}
-		if owner.NodeID == "" || owner.NodeID == self {
+		placement, ok := placements[sb.ID]
+		// No placement can be a fresh local create awaiting ownership replay;
+		// an orphan has no replacement owner yet. Neither is proof that this
+		// node's runtime is stale.
+		if !ok || placement.IsOrphaned() || strings.TrimSpace(placement.OwnerNodeID) == self {
+			continue
+		}
+		if strings.TrimSpace(placement.IncarnationID) == "" {
+			s.logger.Warn("cluster: stale-ownership placement missing lifecycle; refusing local teardown",
+				"sandbox_id", sb.ID, "current_owner", placement.OwnerNodeID)
 			continue
 		}
 		s.logger.Warn("cluster: destroying stale local sandbox; ownership reassigned",
-			"sandbox_id", sb.ID, "current_owner", owner.NodeID)
-		if err := s.DestroySandbox(ctx, sb.ID); err != nil {
+			"sandbox_id", sb.ID, "current_owner", placement.OwnerNodeID)
+		if err := s.destroyStaleLocalSandbox(ctx, sb, placement); err != nil {
 			s.logger.Warn("cluster: stale-destroy failed; will retry next reconcile",
 				"sandbox_id", sb.ID, "err", err)
 		}
 	}
+}
+
+// destroyStaleLocalSandbox removes only this node's obsolete materialization.
+// The authoritative placement now belongs to another node, so the lifecycle's
+// replicated volume attachments, peer secrets, and external WASM checkpoints
+// must remain intact for that owner. The local row is removed before runtime
+// Destroy so the resulting Docker event cannot enter the normal lifecycle-wide
+// destroy finalizer and fan out credential deletion.
+func (s *Service) destroyStaleLocalSandbox(ctx context.Context, sandbox *models.Sandbox, placement cluster.Placement) error {
+	return s.finalizeStaleLocalSandbox(ctx, sandbox, placement, false)
+}
+
+func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models.Sandbox, placement cluster.Placement, runtimeAlreadyGone bool) error {
+	if s == nil || sandbox == nil || strings.TrimSpace(sandbox.ID) == "" {
+		return nil
+	}
+	self := ""
+	if c := s.Cluster(); c != nil {
+		self = strings.TrimSpace(c.SelfNodeID())
+	}
+	localIncarnation := strings.TrimSpace(sandbox.AuditIncarnationID)
+	placementIncarnation := strings.TrimSpace(placement.IncarnationID)
+	if placement.SandboxID != sandbox.ID || localIncarnation == "" || placementIncarnation == "" {
+		return errors.New("stale local sandbox lifecycle identity is missing")
+	}
+	if placementIncarnation == localIncarnation && strings.TrimSpace(placement.OwnerNodeID) == self && !placement.IsOrphaned() {
+		return nil
+	}
+	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+		return err
+	}
+	var rt runtime.Runtime
+	if !runtimeAlreadyGone {
+		var err error
+		rt, err = s.runtimeForSandbox(sandbox)
+		if err != nil {
+			return err
+		}
+	}
+	for _, port := range sandbox.ExposedPorts {
+		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+	}
+	_ = s.deleteSandboxPublicRoutes(ctx, sandbox)
+	if s.mounts != nil {
+		if err := s.mounts.UnmountAll(sandbox.ID); err != nil && s.logger != nil {
+			s.logger.Warn("unmount stale local sandbox failed", "sandbox_id", sandbox.ID, "error", err)
+		}
+	}
+
+	if localIncarnation != placementIncarnation && s.store != nil {
+		// This is an ID-reused old local lifecycle, not merely the old owner of
+		// the current lifecycle. Tomb its local ciphertext without contacting
+		// any peer belonging to either lifecycle.
+		if _, err := s.store.DeleteClusterSecretsOriginatorWithOutbox(ctx, sandbox.ID, localIncarnation, nil); err != nil {
+			return fmt.Errorf("delete stale-lifecycle local secrets: %w", err)
+		}
+	}
+	if s.isWasmSandbox(sandbox) && s.store != nil {
+		// Forget local tracking only. cleanupWasmSandboxArtifacts intentionally
+		// deletes external manifests and is therefore lifecycle-wide, not valid
+		// for an obsolete owner materialization.
+		if err := s.store.DeleteAllWasmStateKV(ctx, sandbox.ID); err != nil {
+			return err
+		}
+		if err := s.store.DeleteAllWasmCheckpointPushes(ctx, sandbox.ID); err != nil {
+			return err
+		}
+	}
+	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if !runtimeAlreadyGone {
+		if err := rt.Destroy(ctx, sandbox); err != nil {
+			// With the row gone, the ordinary orphan-runtime sweep owns retries and
+			// cannot mistake this for a lifecycle-wide delete.
+			return err
+		}
+	}
+	s.forgetWakeFlight(sandbox.ID)
+	s.invalidateWarm(sandbox.ID)
+	s.forgetNetstatsActivity(sandbox.ID)
+	if s.admitter != nil {
+		s.admitter.Release(sandbox.ID)
+	}
+	if !s.isWasmSandbox(sandbox) {
+		s.schedulePendingImageGC(ctx, sandbox.Image)
+	}
+	return nil
+}
+
+// obsoleteLocalPlacement returns an authoritative proof that sandbox is only
+// an obsolete local materialization. Missing placements are not proof: a
+// freshly-created local row may still be awaiting ownership replay.
+func (s *Service) obsoleteLocalPlacement(ctx context.Context, sandbox *models.Sandbox) (cluster.Placement, bool, error) {
+	if s == nil || sandbox == nil || !s.cfg.EnableCluster {
+		return cluster.Placement{}, false, nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return cluster.Placement{}, false, fmt.Errorf("%w: placement client unavailable", ErrClusterFinalizationUnavailable)
+	}
+	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandbox.ID})
+	if err != nil {
+		return cluster.Placement{}, false, fmt.Errorf("%w: resolve authoritative placement: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	placement, ok := placements[sandbox.ID]
+	if !ok {
+		return cluster.Placement{}, false, nil
+	}
+	localIncarnation := strings.TrimSpace(sandbox.AuditIncarnationID)
+	placementIncarnation := strings.TrimSpace(placement.IncarnationID)
+	if localIncarnation == "" || placementIncarnation == "" {
+		return cluster.Placement{}, false, fmt.Errorf("%w: sandbox or placement incarnation_id is missing", ErrClusterFinalizationUnavailable)
+	}
+	self := strings.TrimSpace(c.SelfNodeID())
+	obsolete := placementIncarnation != localIncarnation || placement.IsOrphaned() || strings.TrimSpace(placement.OwnerNodeID) != self
+	return placement, obsolete, nil
 }
 
 // RecreateSandbox satisfies cluster.SandboxRecreator. The cluster owner
@@ -919,10 +1180,12 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // secrets is the provider handle that can rehydrate the redacted spec; we
 // resolve and re-merge it here via OpenClusterSecretsForNode so the recreated
 // container can pull from the same private registry / mount the same external
-// storage. A decrypt failure is
-// fatal to this attempt but non-fatal globally — the watcher's retry loop
-// (now with reassign-after-K-failures) will eventually move the placement
-// to a node whose key matches.
+// storage. Two walls historically blocked cross-node open: the sealed
+// cluster_secrets row lived only on the sealing node, and the envelope was
+// recipient-bound to that node alone. Recipient-set sealing plus mandatory
+// peer fan-out fix both. A decrypt failure is
+// fatal to this attempt; ErrRecipientDenied is permanent for this node (the
+// owner watcher must not reassign-churn the fleet).
 //
 // Port replay tries every port but returns an error when any replay failed so
 // the owner watcher keeps retrying and can eventually reassign the placement.
@@ -945,7 +1208,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		if c := s.Cluster(); c != nil {
 			nodeID = c.SelfNodeID()
 		}
-		merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
+		merged, err := s.OpenClusterSecretsForNode(ctx, id, spec, secrets, nodeID)
 		if err != nil {
 			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
@@ -983,20 +1246,11 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	if c := s.Cluster(); c != nil {
 		nodeID = c.SelfNodeID()
 	}
-	merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
+	merged, err := s.OpenClusterSecretsForNode(ctx, id, spec, secrets, nodeID)
 	if err != nil {
 		return true, fmt.Errorf("recreate %s: %w", id, err)
 	}
-	// A replicated spec written before the private-by-default flip carries a
-	// nil flag, and store-backed rows always materialize the tri-state — so a
-	// nil here can only be a legacy replica from when public WAS the default.
-	// Pin it to true so failover never silently changes a sandbox's
-	// reachability; createSandbox would otherwise normalize nil to private.
-	if merged.AllowPublicTraffic == nil {
-		public := true
-		merged.AllowPublicTraffic = &public
-	}
-	if _, err := s.CreateSandboxWithID(ctx, merged, id); err != nil {
+	if _, err := s.CreateSandboxWithID(contextWithStoredSpecReplay(ctx), merged, id); err != nil {
 		return true, err
 	}
 	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
@@ -1067,6 +1321,53 @@ func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
 	return base
 }
 
+// storedSpecReplayKey marks a context in which createSandbox is replaying a
+// spec the cluster already holds (failover recreate) rather than admitting a
+// new request. Intake-only rules — ones whose purpose is to keep something out
+// of the replicated spec — are downgraded to a warning there: the spec is
+// already replicated, and refusing the recreate would only lose the sandbox.
+type storedSpecReplayKey struct{}
+
+func contextWithStoredSpecReplay(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, storedSpecReplayKey{}, true)
+}
+
+func isStoredSpecReplay(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	replay, _ := ctx.Value(storedSpecReplayKey{}).(bool)
+	return replay
+}
+
+// validateCreateMounts applies the mount policy to a create request. The
+// placement rule (credentials must be in Credentials, never in Source or
+// Options, which are replicated in the clear) is enforced on new requests and
+// only logged on a stored-spec replay — see storedSpecReplayKey.
+func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.MountSpec, sandboxID string) error {
+	if len(mounts) > models.MaxMountsPerSandbox {
+		return fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
+	}
+	for i := range mounts {
+		if err := mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
+			return fmt.Errorf("mount %d: %w", i, err)
+		}
+		if err := mounts[i].ValidateSecretsPlacement(); err != nil {
+			if !isStoredSpecReplay(ctx) {
+				return fmt.Errorf("mount %d: %w", i, err)
+			}
+			if s.logger != nil {
+				s.logger.Warn("cluster: recreating a sandbox whose stored mount spec carries a credential outside credentials; it is replicated in the clear — recreate the sandbox with the credential in credentials",
+					"sandbox_id", sandboxID, "mount", i, "target", mounts[i].Target, "err", err)
+			}
+		}
+	}
+	return validateUniqueMountTargets(mounts)
+}
+
 func validateUniqueMountTargets(mounts []models.MountSpec) error {
 	seen := make(map[string]int, len(mounts))
 	for i, m := range mounts {
@@ -1134,14 +1435,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 	// Private-by-default: a create that doesn't opt in with
 	// allow_public_traffic=true gets no public ingress route (and ExposePort
-	// refuses). The default is pinned to an explicit false HERE, not inside
-	// allowPublicTrafficEnabled, because nil must keep meaning "public" for
-	// store rows written before the default flipped. Unconditional on purpose:
-	// cluster-mode creates arrive via CreateSandboxWithID (reserved ID), so an
-	// idOverride guard would silently exempt every cluster create. The one
-	// caller that must NOT re-interpret a legacy nil — the failover recreate
-	// replaying a pre-flag replicated spec — pins it to true in
-	// RecreateSandbox before calling in.
+	// refuses). Normalize to explicit false so persisted and replicated state
+	// remains unambiguous. This applies equally to failover recreation.
 	if req.AllowPublicTraffic == nil {
 		private := false
 		req.AllowPublicTraffic = &private
@@ -1157,7 +1452,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// create, not per request) so the auth hot path stays write-free; it is
 	// best-effort because attribution on the sandbox row is the source of
 	// truth, and a noop store/owner-less create has nothing to record.
-	ownerRef := ownerRefForCreate(ctx)
+	ownerRef := s.ownerRefForCreateOrRecreate(ctx, idOverride)
 	if ownerRef != "" {
 		access, _ := controlplane.AccessFromContext(ctx)
 		if err := s.store.UpsertAccountMapping(ctx, ownerRef, access.Identity.ExternalID); err != nil {
@@ -1291,15 +1586,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 	req.Runtime = chosenRuntime
 
-	if len(req.Mounts) > models.MaxMountsPerSandbox {
-		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
-	}
-	for i := range req.Mounts {
-		if err := req.Mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
-			return nil, fmt.Errorf("mount %d: %w", i, err)
-		}
-	}
-	if err := validateUniqueMountTargets(req.Mounts); err != nil {
+	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride); err != nil {
 		return nil, err
 	}
 
@@ -1366,7 +1653,23 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// SHA-256 of ≤4KiB (~µs), cluster mode only.
 	if s.cfg.EnableCluster {
 		redacted := RedactClusterSecrets(req)
-		handle := cluster.PlacementSecrets{Ref: clusterSecretRef(sandboxID, clusterSecretVersion), Version: clusterSecretVersion}
+		incarnationID := ""
+		if c := s.Cluster(); c != nil {
+			if p, ok := c.PlacementOf(sandboxID); ok {
+				incarnationID = p.IncarnationID
+			}
+		}
+		if incarnationID == "" {
+			// Size validation runs before an unreserved placement receives its
+			// real random incarnation. Use an equal-width placeholder so this
+			// preflight cannot undercount the canonical current-format handle.
+			incarnationID = strings.Repeat("0", 32)
+		}
+		handle := cluster.PlacementSecrets{
+			Ref:           secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion),
+			Version:       secrets.RefVersion,
+			IncarnationID: incarnationID,
+		}
 		if err := cluster.ValidateRecoveryPayloadSize(sandboxID, &redacted, handle); err != nil {
 			return nil, fmt.Errorf("sandbox spec too large to replicate across the cluster (image, env, labels, and mount definitions all count): %w", err)
 		}
@@ -1531,7 +1834,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
-	if err := s.store.Create(ctx, sandbox); err != nil {
+	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		rollbackDestroy(sandbox)
 		cleanupMounts()
@@ -1554,9 +1857,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if len(platformAttachments) > 0 {
 		for i := range platformAttachments {
 			platformAttachments[i].SandboxID = sandbox.ID
+			platformAttachments[i].IncarnationID = sandbox.AuditIncarnationID
 		}
 		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
-			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
@@ -1583,7 +1887,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
-			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
@@ -1595,7 +1899,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		// Same rollback chain as a mount-persist failure. ErrCustomDomainConflict
 		// flows through unchanged so the API layer can map it to 409.
-		_ = s.store.Delete(ctx, sandbox.ID)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		rollbackDestroy(sandbox)
 		cleanupMounts()
@@ -1617,6 +1921,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, err
 	}
+	stored.AuditIncarnationID = sandbox.AuditIncarnationID
 	createtiming.From(ctx).RecordStage("svc_persist", time.Since(persistStart))
 	return &models.CreateSandboxResponse{
 		Sandbox:       *stored,
@@ -1817,10 +2122,8 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 	}
 
-	// Same owner attribution as the docker path; createSandbox already
-	// refreshed the account mapping before dispatching here.
-	sandbox.OwnerRef = ownerRefForCreate(ctx)
-	if err := s.store.Create(ctx, sandbox); err != nil {
+	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, idOverride)
+	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
@@ -1828,7 +2131,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	}
 
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
-		_ = s.store.Delete(ctx, sandbox.ID)
+		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
 		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
@@ -1847,6 +2150,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if err != nil {
 		return nil, err
 	}
+	stored.AuditIncarnationID = sandbox.AuditIncarnationID
 	return &models.CreateSandboxResponse{
 		Sandbox:       *stored,
 		SSHPrivateKey: privateKeyPEM,
@@ -1875,40 +2179,115 @@ func (s *Service) sealRegistry(auth *models.RegistryAuth) ([]byte, error) {
 // UnsealRegistry decrypts a previously sealed RegistryAuth. Returns nil/nil
 // when the input is empty (no credentials persisted). Exported for the
 // boot-time backfill in cmd/sandboxd that rebuilds CreateSandboxRequest from
-// the persisted Sandbox row.
-func (s *Service) UnsealRegistry(sealed []byte) (*models.RegistryAuth, error) {
+// the persisted Sandbox row. sandboxID is audit-only (ref registry:{id}).
+func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.RegistryAuth, err error) {
 	if len(sealed) == 0 {
 		return nil, nil
 	}
-	plain, err := s.cipher.Decrypt(sealed)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt registry auth: %w", err)
+	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
+	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "", auditIncarnationID, auditOwnerRef)
+	defer func() { done(err) }()
+	if s == nil || s.cipher == nil {
+		return nil, fmt.Errorf("%w: registry auth cipher is not configured", secrets.ErrDecryptFailed)
 	}
-	var auth models.RegistryAuth
-	if err := json.Unmarshal(plain, &auth); err != nil {
-		return nil, fmt.Errorf("unmarshal registry auth: %w", err)
+	plain, decErr := s.cipher.Decrypt(sealed)
+	if decErr != nil {
+		return nil, fmt.Errorf("%w: decrypt registry auth: %v", secrets.ErrDecryptFailed, decErr)
 	}
-	return &auth, nil
+	var out models.RegistryAuth
+	if err := json.Unmarshal(plain, &out); err != nil {
+		return nil, fmt.Errorf("%w: unmarshal registry auth: %v", secrets.ErrDecryptFailed, err)
+	}
+	return &out, nil
 }
 
 // attachWasmRegistryAuth unseals the sandbox's persisted registry creds into
 // its transient RegistryAuth field, so the WASM runtime can re-pull a private
 // oci:// module under the tenant's identity on a node that lacks it (codex C4).
-// Best-effort: an unseal failure is logged and leaves RegistryAuth nil, which
-// degrades to a public/system-identity pull rather than blocking start.
-func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) {
+// Fail closed when persisted credentials cannot be opened. Falling through to
+// the node's ambient registry identity would cross the tenant authorization
+// boundary and make credential revocation ineffective.
+func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) error {
 	if sandbox == nil || len(sandbox.RegistryAuthSealed) == 0 {
-		return
+		return nil
 	}
-	auth, err := s.UnsealRegistry(sandbox.RegistryAuthSealed)
+	auth, err := s.UnsealRegistry(sandbox.ID, sandbox.RegistryAuthSealed)
 	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("wasm: unseal registry auth failed; private module pull may fail on this node",
-				"sandbox_id", sandbox.ID, "err", err)
-		}
-		return
+		return fmt.Errorf("wasm: unseal registry auth for %s: %w", sandbox.ID, err)
 	}
 	sandbox.RegistryAuth = auth
+	return nil
+}
+
+// persistSandboxCreate writes the sandbox row and its sealed environment in
+// the same transaction.
+func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || s.store == nil {
+		return errors.New("store is not configured")
+	}
+	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
+		incarnationID, err := s.prepareAuditIncarnation(ctx, sandbox.ID, sandbox.ToolboxToken)
+		if err != nil {
+			return err
+		}
+		defer s.clearPendingAuditIncarnation(sandbox.ID, incarnationID)
+		sandbox.AuditIncarnationID = incarnationID
+	}
+	sealed, err := s.sealEnv(sandbox.Env)
+	if err != nil {
+		return err
+	}
+	return s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
+}
+
+// sealEnv marshals env and encrypts it for at-rest storage. Returns nil when
+// env is empty (no sandbox_env row).
+func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
+	if len(env) == 0 {
+		return nil, nil
+	}
+	plain, err := json.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("marshal env: %w", err)
+	}
+	if s.cipher == nil {
+		return nil, fmt.Errorf("env cipher is not configured")
+	}
+	sealed, err := s.cipher.Encrypt(plain)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt env: %w", err)
+	}
+	return sealed, nil
+}
+
+// loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
+func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string]string, err error) {
+	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
+	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
+	defer func() { done(err) }()
+
+	sealed, getErr := s.store.GetEnv(ctx, sandboxID)
+	if getErr == nil && len(sealed) > 0 {
+		if s.cipher == nil {
+			return nil, fmt.Errorf("%w: env cipher is not configured", secrets.ErrDecryptFailed)
+		}
+		plain, decErr := s.cipher.Decrypt(sealed)
+		if decErr != nil {
+			return nil, fmt.Errorf("%w: decrypt env: %v", secrets.ErrDecryptFailed, decErr)
+		}
+		var out map[string]string
+		if umErr := json.Unmarshal(plain, &out); umErr != nil {
+			return nil, fmt.Errorf("%w: unmarshal env: %v", secrets.ErrDecryptFailed, umErr)
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		return out, nil
+	}
+	if errors.Is(getErr, store.ErrNotFound) {
+		return map[string]string{}, nil
+	}
+	return nil, getErr
 }
 
 // sealMounts marshals the user's mount specs and encrypts the JSON for
@@ -1929,22 +2308,32 @@ func (s *Service) sealMounts(specs []models.MountSpec) ([]byte, error) {
 }
 
 // loadMounts reads, decrypts, and unmarshals a sandbox's stored mount specs.
-// Returns nil, nil when the sandbox has no mounts.
-func (s *Service) loadMounts(ctx context.Context, sandboxID string) ([]models.MountSpec, error) {
-	sealed, err := s.store.GetMounts(ctx, sandboxID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+// Returns nil, nil when the sandbox has no mounts. Decrypt attempts are
+// audited under ref mounts:{sandboxID}.
+func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []models.MountSpec, err error) {
+	sealed, getErr := s.store.GetMounts(ctx, sandboxID)
+	if getErr != nil {
+		if errors.Is(getErr, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, getErr
 	}
-	plain, err := s.cipher.Decrypt(sealed)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt mounts: %w", err)
+	if len(sealed) == 0 {
+		return nil, nil
+	}
+	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
+	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
+	defer func() { done(err) }()
+	if s.cipher == nil {
+		return nil, fmt.Errorf("%w: mounts cipher is not configured", secrets.ErrDecryptFailed)
+	}
+	plain, decErr := s.cipher.Decrypt(sealed)
+	if decErr != nil {
+		return nil, fmt.Errorf("%w: decrypt mounts: %v", secrets.ErrDecryptFailed, decErr)
 	}
 	var file models.MountSpecFile
-	if err := json.Unmarshal(plain, &file); err != nil {
-		return nil, fmt.Errorf("unmarshal mounts: %w", err)
+	if umErr := json.Unmarshal(plain, &file); umErr != nil {
+		return nil, fmt.Errorf("%w: unmarshal mounts: %v", secrets.ErrDecryptFailed, umErr)
 	}
 	return file.Mounts, nil
 }
@@ -1984,8 +2373,36 @@ func generateSandboxSSHKeys() (authorizedKey, privateKeyPEM string, err error) {
 	return authorizedKey, privateKeyPEM, nil
 }
 
+// GetSandboxOptions controls public Get/List env materialization (D9).
+type GetSandboxOptions struct {
+	IncludeEnv bool
+	// CorrelationID is attached to the audited include_env load when set
+	// (typically from X-Correlation-ID / X-Request-ID).
+	CorrelationID string
+}
+
 func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	return s.scopedGet(ctx, id)
+	return s.GetSandboxWithOptions(ctx, id, GetSandboxOptions{})
+}
+
+// GetSandboxWithOptions returns a sandbox. Env is omitted unless IncludeEnv
+// is set; that opt-in path loads via loadEnv and is audited.
+func (s *Service) GetSandboxWithOptions(ctx context.Context, id string, opts GetSandboxOptions) (*models.Sandbox, error) {
+	sb, err := s.scopedGet(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	s.attachFailoverReady(ctx, sb)
+	if opts.IncludeEnv {
+		env, loadErr := s.loadEnv(ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID), id)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		sb.Env = env
+	} else {
+		sb.Env = nil
+	}
+	return sb, nil
 }
 
 // ListSandboxes returns sandboxes whose Tags match every entry in tagFilter.
@@ -1995,7 +2412,13 @@ func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, e
 // extra hop worth it. The filter exists so an external control plane can ask
 // "give me the sandboxes belonging to user X" without round-tripping every
 // sandbox in the cluster (see plans/multi-tenancy-via-control-plane.md).
+// Env is always omitted (D9); use ListSandboxesWithOptions to opt in.
 func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string) ([]*models.Sandbox, error) {
+	return s.ListSandboxesWithOptions(ctx, tagFilter, GetSandboxOptions{})
+}
+
+// ListSandboxesWithOptions is ListSandboxes with optional IncludeEnv (audited).
+func (s *Service) ListSandboxesWithOptions(ctx context.Context, tagFilter map[string]string, opts GetSandboxOptions) ([]*models.Sandbox, error) {
 	sandboxes, err := s.store.List(ctx)
 	if err != nil {
 		return nil, err
@@ -2005,6 +2428,10 @@ func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string
 	// can't tag-probe across owners.
 	sandboxes = filterByOwnerScope(ctx, sandboxes)
 	if len(tagFilter) == 0 {
+		s.attachFailoverReadyAll(ctx, sandboxes)
+		if err := s.applyListEnvOptions(ctx, sandboxes, opts); err != nil {
+			return nil, err
+		}
 		return sandboxes, nil
 	}
 	filtered := sandboxes[:0]
@@ -2013,7 +2440,34 @@ func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string
 			filtered = append(filtered, sb)
 		}
 	}
+	s.attachFailoverReadyAll(ctx, filtered)
+	if err := s.applyListEnvOptions(ctx, filtered, opts); err != nil {
+		return nil, err
+	}
 	return filtered, nil
+}
+
+func (s *Service) applyListEnvOptions(ctx context.Context, sandboxes []*models.Sandbox, opts GetSandboxOptions) error {
+	if opts.IncludeEnv {
+		loadCtx := ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID)
+		for _, sb := range sandboxes {
+			if sb == nil {
+				continue
+			}
+			env, err := s.loadEnv(loadCtx, sb.ID)
+			if err != nil {
+				return err
+			}
+			sb.Env = env
+		}
+		return nil
+	}
+	for _, sb := range sandboxes {
+		if sb != nil {
+			sb.Env = nil
+		}
+	}
+	return nil
 }
 
 // sandboxMatchesTags returns true iff every key in want is present on sb.Tags
@@ -2031,6 +2485,14 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	// Sealed-env mode omits Env from store scans. Runtime paths (especially
+	// WASM reconstruct / passivate rehydrate) need the materialised map —
+	// public Get/List redaction must not starve internal start.
+	if env, loadErr := s.loadEnv(ctx, id); loadErr != nil {
+		return nil, loadErr
+	} else if len(env) > 0 {
+		sandbox.Env = env
 	}
 	wasmPassivated := s.isWasmSandbox(sandbox) && sandbox.Status == models.SandboxStatusPassivated
 	var wasmRehydrateBinds []mounts.ContainerBind
@@ -2091,7 +2553,12 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			// Unseal per-tenant registry creds so a private oci:// module
 			// re-pulls under the tenant's identity if this node lacks it
 			// (codex C4). Transient: never persisted or serialized.
-			s.attachWasmRegistryAuth(sandbox)
+			if err := s.attachWasmRegistryAuth(sandbox); err != nil {
+				_ = s.mounts.UnmountAll(id)
+				releaseAdmission()
+				_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+				return nil, err
+			}
 			state, err = host.StartSandbox(ctx, sandbox, hostBinds)
 			if err != nil {
 				_ = s.mounts.UnmountAll(id)
@@ -2199,6 +2666,16 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	// Establish retained authorization before any runtime or route teardown.
+	// Failure leaves both the sandbox row and its runtime intact for retry.
+	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+		return err
+	}
+	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
+		return err
+	} else if obsolete {
+		return s.destroyStaleLocalSandbox(ctx, sandbox, placement)
+	}
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
@@ -2228,26 +2705,45 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	} else if s.testForceUnmountErr != nil {
 		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", s.testForceUnmountErr)
 	}
+	// Ownership can change while runtime destruction is in flight. Recheck
+	// before lifecycle-wide secret/checkpoint deletion; if failover won, finish
+	// only this obsolete materialization and preserve the active lifecycle.
+	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
+		return err
+	} else if obsolete {
+		return s.finalizeStaleLocalSandbox(ctx, sandbox, placement, true)
+	}
+	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
+		return err
+	}
+	// Tomb/outbox secret cleanup must succeed before the irreversible sandbox
+	// delete. cluster_secrets has no FK, so a post-delete failure leaves
+	// retries with ErrNotFound while ciphertext and peer copies remain.
+	// Shared with docker-destroy and reconcile-destroyed paths.
+	if err := s.DeleteClusterSecrets(ctx, id, sandbox.AuditIncarnationID); err != nil {
+		return err
+	}
+	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+		return err
+	}
+	// Placement deletion is part of the durable destroy boundary. Removing the
+	// local row first would leave no retry anchor if Raft were unavailable, and
+	// a recreate-enabled ghost placement could then resurrect a sandbox the
+	// client was told was deleted. Owner+incarnation CAS protects a concurrent
+	// failover or ID reuse. The FSM releases replicated volume attachments in
+	// the same apply, so there is no second Raft cleanup window.
+	if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
+		return err
+	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
 	if s.testAfterStoreDeleteOnDestroy != nil {
 		s.testAfterStoreDeleteOnDestroy()
 	}
-	if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, id); err != nil {
-		if s.logger != nil {
-			s.logger.Warn("platform volume attachment cleanup after destroy failed", "sandbox_id", id, "error", err)
-		}
-	}
-	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
-		return err
-	}
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
 	s.forgetNetstatsActivity(id)
-	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
-		return err
-	}
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
@@ -2260,7 +2756,8 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, id, reason string) {
+func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, placement cluster.Placement, reason string) {
+	id := strings.TrimSpace(placement.SandboxID)
 	if !s.cfg.EnableCluster || id == "" {
 		return
 	}
@@ -2268,23 +2765,94 @@ func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, id, reaso
 	if c == nil {
 		return
 	}
-	owner, err := c.OwnerOf(id)
-	if err != nil {
-		if !errors.Is(err, cluster.ErrUnknownSandbox) && !errors.Is(err, cluster.ErrOrphaned) {
-			s.logger.Warn("cluster placement ownership check before delete failed",
-				"sandbox_id", id, "reason", reason, "error", err)
-		}
-		return
-	}
-	if !owner.IsSelf {
+	ownerID := strings.TrimSpace(placement.OwnerNodeID)
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if ownerID == "" || ownerID != strings.TrimSpace(c.SelfNodeID()) || incarnationID == "" {
 		return
 	}
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.DeletePlacement(commitCtx, id); err != nil {
+	if err := c.DeletePlacementExact(commitCtx, id, ownerID, incarnationID); err != nil {
 		s.logger.Warn("cluster placement delete after local destroy failed",
 			"sandbox_id", id, "reason", reason, "error", err)
 	}
+}
+
+func (s *Service) beginSelfOwnedClusterPlacementDeleteStrict(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || sandbox == nil || !s.cfg.EnableCluster || strings.TrimSpace(sandbox.ID) == "" {
+		return nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return fmt.Errorf("%w: placement client unavailable", ErrClusterFinalizationUnavailable)
+	}
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: sandbox incarnation_id is missing", ErrClusterFinalizationUnavailable)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	placements, err := c.AuthoritativePlacementsByIDs(lookupCtx, []string{sandbox.ID})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("%w: resolve authoritative placement before delete fence: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	placement, ok := placements[sandbox.ID]
+	if !ok {
+		// Retry after an earlier final opDelete: the local row remains the
+		// cleanup anchor and exact-incarnation secret cleanup is still safe.
+		return nil
+	}
+	selfID := strings.TrimSpace(c.SelfNodeID())
+	if strings.TrimSpace(placement.IncarnationID) != incarnationID || strings.TrimSpace(placement.OwnerNodeID) != selfID || placement.IsOrphaned() {
+		return fmt.Errorf("%w: authoritative ownership changed before delete fence", ErrClusterFinalizationUnavailable)
+	}
+	commitCtx, commitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer commitCancel()
+	if err := c.BeginDeletePlacementExact(commitCtx, sandbox.ID, selfID, incarnationID); err != nil {
+		return fmt.Errorf("%w: begin authoritative placement delete: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	return nil
+}
+
+func (s *Service) deleteSelfOwnedClusterPlacementStrict(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || sandbox == nil || !s.cfg.EnableCluster || strings.TrimSpace(sandbox.ID) == "" {
+		return nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return fmt.Errorf("%w: placement client unavailable", ErrClusterFinalizationUnavailable)
+	}
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: sandbox incarnation_id is missing", ErrClusterFinalizationUnavailable)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	placements, err := c.AuthoritativePlacementsByIDs(lookupCtx, []string{sandbox.ID})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("%w: resolve authoritative placement: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	placement, ok := placements[sandbox.ID]
+	if !ok {
+		return nil
+	}
+	if strings.TrimSpace(placement.IncarnationID) != incarnationID {
+		return fmt.Errorf("%w: local sandbox and authoritative placement lifecycles differ: %v",
+			ErrClusterFinalizationUnavailable, cluster.ErrIncarnationConflict)
+	}
+	selfID := strings.TrimSpace(c.SelfNodeID())
+	ownerID := strings.TrimSpace(placement.OwnerNodeID)
+	if ownerID == "" || ownerID != selfID {
+		// A stale-ownership reconcile destroys only local state. The current
+		// owner's placement must remain intact.
+		return nil
+	}
+	commitCtx, commitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer commitCancel()
+	if err := c.DeletePlacementExact(commitCtx, sandbox.ID, ownerID, incarnationID); err != nil {
+		return fmt.Errorf("%w: delete authoritative placement: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	return nil
 }
 
 // CreateSnapshot commits the sandbox container into a reusable local image.
@@ -3679,6 +4247,10 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalTemplateInventoryKnown = true
 		snap.LocalTemplateIDs = ids
 	}
+	if ids, known := s.LocalTemplateCatalogInventory(context.Background()); known {
+		snap.LocalTemplateCatalogInventoryKnown = true
+		snap.LocalTemplateCatalogIDs = ids
+	}
 	if refs, known := s.LocalReadyWasmModuleInventory(context.Background()); known {
 		snap.LocalWasmModuleInventoryKnown = true
 		snap.LocalWasmModuleIDs = refs
@@ -3714,7 +4286,7 @@ func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bo
 	}
 	s.localReadyTemplateIDsMu.Unlock()
 
-	ids, err := s.store.ListReadyTemplateIDs(ctx)
+	ids, catalogIDs, err := s.store.ListTemplateInventoryIDs(ctx)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Warn("local ready template ids: list failed",
@@ -3731,11 +4303,27 @@ func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bo
 	}
 	s.localReadyTemplateIDsMu.Lock()
 	s.localReadyTemplateIDsCache = ids
+	s.localTemplateCatalogIDsCache = catalogIDs
 	s.localReadyTemplateIDsKnown = true
 	s.localReadyTemplateIDsExpires = now.Add(5 * time.Second)
 	out := append([]string(nil), ids...)
 	s.localReadyTemplateIDsMu.Unlock()
 	return out, true
+}
+
+// LocalTemplateCatalogInventory returns every template row on this worker,
+// including pending and failed rows. It shares the ready-inventory refresh so
+// capacity heartbeats still perform only one small SQLite query per TTL.
+func (s *Service) LocalTemplateCatalogInventory(ctx context.Context) ([]string, bool) {
+	if s == nil || s.store == nil {
+		return nil, false
+	}
+	// Refreshes both cache slices when expired.
+	_, known := s.LocalReadyTemplateInventory(ctx)
+	s.localReadyTemplateIDsMu.Lock()
+	out := append([]string(nil), s.localTemplateCatalogIDsCache...)
+	s.localReadyTemplateIDsMu.Unlock()
+	return out, known
 }
 
 // LocalReadyTemplateIDs returns only the template IDs from
@@ -4062,6 +4650,38 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			} else if s.testForceUnmountErr != nil {
 				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", s.testForceUnmountErr)
 			}
+			// Runtime confirmation and teardown can overlap failover. An
+			// authoritative recheck prevents this former owner from deleting the
+			// active lifecycle's replicated secrets, volume attachments, or
+			// external WASM checkpoints after ownership moved elsewhere.
+			if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
+				return err
+			} else if obsolete {
+				if err := s.finalizeStaleLocalSandbox(ctx, sandbox, placement, true); err != nil {
+					return err
+				}
+				continue
+			}
+			// Persist retained authorization before the distributed delete lease.
+			// An owner crash after the fence can otherwise let leader expiry remove
+			// the last authoritative ownership record before audit ACL retention.
+			if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+				return err
+			}
+			if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
+				return err
+			}
+			// Secret tomb/outbox before store/placement delete (no FK on
+			// cluster_secrets). Same finalizer as DestroySandbox / docker events.
+			if err := s.DeleteClusterSecrets(ctx, sandbox.ID, sandbox.AuditIncarnationID); err != nil {
+				return err
+			}
+			if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+				return err
+			}
+			if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
+				return err
+			}
 			// store.Delete must happen BEFORE schedulePendingImageGC. The
 			// pending-image janitor uses HasActiveImageRef to decide whether
 			// to actually call docker.RemoveImage at sweep time; a stale row
@@ -4076,10 +4696,6 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.forgetNetstatsActivity(sandbox.ID)
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
-			}
-			s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "reconcile-destroyed")
-			if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
-				return err
 			}
 			if !s.isWasmSandbox(sandbox) {
 				s.schedulePendingImageGC(ctx, sandbox.Image)
@@ -4305,10 +4921,28 @@ func (s *Service) reconcileMissingSelfOwnedPlacements(ctx context.Context, known
 		if _, ok := knownIDs[p.SandboxID]; ok {
 			continue
 		}
-		if spec := c.SpecOf(p.SandboxID); spec != nil && spec.ShouldRecreateOnFailover() {
+		// The initial knownIDs set is a sweep snapshot. A create may commit its
+		// local row after that snapshot but before its placement becomes visible.
+		// Recheck the point row before destructive cleanup so reconciliation can
+		// never erase a concurrently-created sandbox's placement.
+		if _, err := s.store.Get(ctx, p.SandboxID); err == nil {
+			continue
+		} else if !errors.Is(err, store.ErrNotFound) {
+			if s.logger != nil {
+				s.logger.Warn("cluster placement local-row recheck failed",
+					"sandbox_id", p.SandboxID, "error", err)
+			}
 			continue
 		}
-		s.deleteSelfOwnedClusterPlacement(ctx, p.SandboxID, "missing-local-row")
+		// A deleting placement is a durable cleanup anchor, never a candidate for
+		// recreation. Once its owner has removed the local row, exact deletion is
+		// the only remaining reconciliation step.
+		if !p.IsDeleting() {
+			if spec := c.SpecOf(p.SandboxID); spec != nil && spec.ShouldRecreateOnFailover() {
+				continue
+			}
+		}
+		s.deleteSelfOwnedClusterPlacement(ctx, p, "missing-local-row")
 	}
 }
 
@@ -4374,7 +5008,6 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
-				s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "lifecycle-auto-destroy")
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
 			}
 		case lifecycleStop:

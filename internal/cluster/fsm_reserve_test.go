@@ -17,6 +17,11 @@ import (
 // reservation tests stay focused on state transitions.
 func applyOp(t *testing.T, fsm *placementFSM, cmd command) any {
 	t.Helper()
+	if cmd.ExpectedIncarnationID == "" && (cmd.Op == opAddExposedPort || cmd.Op == opRemoveExposedPort || cmd.Op == opAddCustomDomain || cmd.Op == opRemoveCustomDomain) {
+		if placement, ok := fsm.get(cmd.SandboxID); ok {
+			cmd.ExpectedIncarnationID = placement.IncarnationID
+		}
+	}
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -36,7 +41,7 @@ func TestFSMReserveWritesReservedState(t *testing.T) {
 
 	if got := applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b",
-		Spec: spec, SecretRef: "cluster-secret://sandbox/sb1/v1", SecretVersion: 1, ExpiresUnix: expiry,
+		Spec: spec, IncarnationID: "inc-reserve", SecretRef: testSecretRef("sb1", "inc-reserve"), SecretVersion: 1, SecretSealGeneration: 1, ExpiresUnix: expiry,
 	}); got != nil {
 		t.Fatalf("opReserve returned %v, want nil", got)
 	}
@@ -57,7 +62,7 @@ func TestFSMReserveWritesReservedState(t *testing.T) {
 	if p.Spec == nil || p.Spec.Image != "alpine" {
 		t.Fatalf("Spec = %+v, want preserved alpine spec", p.Spec)
 	}
-	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+	if p.SecretRef != testSecretRef("sb1", "inc-reserve") || p.SecretVersion != 1 {
 		t.Fatalf("secret handle = (%q,%d), want preserved", p.SecretRef, p.SecretVersion)
 	}
 	pending := fsm.pendingReservationsByNode(time.Now().Unix())
@@ -218,11 +223,11 @@ func TestFSMPlacePromotesReservationInheritsSpec(t *testing.T) {
 	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "demo"}
 	applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B",
-		Spec: spec, SecretRef: "cluster-secret://sandbox/sb1/v1", SecretVersion: 1,
+		Spec: spec, IncarnationID: "inc-reserve", SecretRef: testSecretRef("sb1", "inc-reserve"), SecretVersion: 1, SecretSealGeneration: 1,
 		ExpiresUnix: time.Now().Add(60 * time.Second).Unix(),
 	})
 
-	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B"}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B", IncarnationID: "inc-reserve", ExpectedIncarnationID: "inc-reserve"}); got != nil {
 		t.Fatalf("opPlace promote = %v, want nil", got)
 	}
 
@@ -236,7 +241,7 @@ func TestFSMPlacePromotesReservationInheritsSpec(t *testing.T) {
 	if p.Spec == nil || p.Spec.Image != "alpine" {
 		t.Fatalf("Spec = %+v, want inherited from reservation", p.Spec)
 	}
-	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+	if p.SecretRef != testSecretRef("sb1", "inc-reserve") || p.SecretVersion != 1 {
 		t.Fatalf("secret handle lost during promote: (%q,%d)", p.SecretRef, p.SecretVersion)
 	}
 }
@@ -247,9 +252,9 @@ func TestFSMPlacePromotesReservationInheritsSpec(t *testing.T) {
 func TestFSMCancelReserveRemovesReservedRow(t *testing.T) {
 	fsm := newPlacementFSM()
 	spec := &models.CreateSandboxRequest{Name: "demo"}
-	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", Spec: spec, ExpiresUnix: time.Now().Add(60 * time.Second).Unix()})
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", IncarnationID: "inc-sb1", Spec: spec, ExpiresUnix: time.Now().Add(60 * time.Second).Unix()})
 
-	if got := applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb1"}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb1", ExpectedIncarnationID: "inc-sb1"}); got != nil {
 		t.Fatalf("opCancelReserve = %v, want nil", got)
 	}
 
@@ -260,6 +265,23 @@ func TestFSMCancelReserveRemovesReservedRow(t *testing.T) {
 	// different sandbox ID must succeed.
 	if got := applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb2", OwnerNodeID: "C", Spec: &models.CreateSandboxRequest{Name: "demo"}, ExpiresUnix: time.Now().Add(60 * time.Second).Unix()}); got != nil {
 		t.Fatalf("re-reserve under same Name after cancel = %v, want nil (name should be released)", got)
+	}
+}
+
+func TestFSMCancelReserveIsIncarnationFencedAcrossIDReuse(t *testing.T) {
+	fsm := newPlacementFSM()
+	applyOp(t, fsm, command{
+		Op: opReserve, SandboxID: "sb-reused", OwnerNodeID: "node-new", IncarnationID: "inc-new",
+		ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+	})
+	if got := applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb-reused", ExpectedIncarnationID: "inc-old"}); got != nil {
+		t.Fatalf("stale cancel = %v, want acknowledged no-op", got)
+	}
+	if p, ok := fsm.get("sb-reused"); !ok || !p.IsReserved() || p.IncarnationID != "inc-new" {
+		t.Fatalf("stale cancel removed replacement reservation: %+v ok=%v", p, ok)
+	}
+	if got := applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb-reused"}); !errors.Is(got.(error), ErrIncarnationConflict) {
+		t.Fatalf("unfenced cancel = %v, want ErrIncarnationConflict", got)
 	}
 }
 
@@ -304,8 +326,8 @@ func TestFSMSnapshotRoundTripPreservesReservedState(t *testing.T) {
 	expiry := time.Now().Add(120 * time.Second).Unix()
 	applyOp(t, src, command{
 		Op: opReserve, SandboxID: "sb-r", OwnerNodeID: "B",
-		Spec:        &models.CreateSandboxRequest{Image: "alpine", Name: "named-reservation"},
-		SecretRef:   "cluster-secret://sandbox/sb-r/v1",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine", Name: "named-reservation"},
+		IncarnationID: "inc-r", SecretRef: testSecretRef("sb-r", "inc-r"), SecretVersion: 1, SecretSealGeneration: 1,
 		ExpiresUnix: expiry,
 	})
 	applyOp(t, src, command{Op: opPlace, SandboxID: "sb-p", OwnerNodeID: "A"})
@@ -340,7 +362,7 @@ func TestFSMSnapshotRoundTripPreservesReservedState(t *testing.T) {
 	if got.Spec == nil || got.Spec.Name != "named-reservation" {
 		t.Fatalf("Spec lost during restore: %+v", got.Spec)
 	}
-	if got.SecretRef != "cluster-secret://sandbox/sb-r/v1" {
+	if got.SecretRef != testSecretRef("sb-r", "inc-r") {
 		t.Fatalf("secret handle lost during restore: %q", got.SecretRef)
 	}
 	// Placed row alongside it must restore as Placed (zero-value State), not
@@ -392,11 +414,12 @@ func TestFSMExpiredReservationIDsSurviveCapacityPrune(t *testing.T) {
 	fsm := newPlacementFSM()
 	now := time.Now()
 	applyOp(t, fsm, command{
-		Op:          opReserve,
-		SandboxID:   "sb-expired",
-		OwnerNodeID: "B",
-		Spec:        &models.CreateSandboxRequest{CPU: 2},
-		ExpiresUnix: now.Add(-time.Second).Unix(),
+		Op:            opReserve,
+		SandboxID:     "sb-expired",
+		OwnerNodeID:   "B",
+		IncarnationID: "inc-expired",
+		Spec:          &models.CreateSandboxRequest{CPU: 2},
+		ExpiresUnix:   now.Add(-time.Second).Unix(),
 	})
 
 	if got := fsm.pendingReservationsByNode(now.Unix()); len(got) != 0 {
@@ -407,7 +430,7 @@ func TestFSMExpiredReservationIDsSurviveCapacityPrune(t *testing.T) {
 		t.Fatalf("expiredReservationIDs = %+v, want [sb-expired]", ids)
 	}
 
-	applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb-expired"})
+	applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb-expired", ExpectedIncarnationID: "inc-expired"})
 	if ids := fsm.expiredReservationIDs(now.Unix()); len(ids) != 0 {
 		t.Fatalf("expired reservation remained after cancel: %+v", ids)
 	}
@@ -417,13 +440,13 @@ func TestFSMPendingReservationIndexReleasesOnStateTransitions(t *testing.T) {
 	fsm := newPlacementFSM()
 	expiry := time.Now().Add(60 * time.Second).Unix()
 
-	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 2}, ExpiresUnix: expiry})
-	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb2", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 1}, ExpiresUnix: expiry})
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", IncarnationID: "inc-sb1", Spec: &models.CreateSandboxRequest{CPU: 2}, ExpiresUnix: expiry})
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb2", OwnerNodeID: "B", IncarnationID: "inc-sb2", Spec: &models.CreateSandboxRequest{CPU: 1}, ExpiresUnix: expiry})
 	if got := fsm.pendingReservationsByNode(time.Now().Unix())["B"].CPU; got != 3 {
 		t.Fatalf("pending CPU after two reservations = %v, want 3", got)
 	}
 
-	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B"}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B", IncarnationID: "inc-sb1", ExpectedIncarnationID: "inc-sb1"}); got != nil {
 		t.Fatalf("promote sb1: %v", got)
 	}
 	if got := fsm.pendingReservationsByNode(time.Now().Unix())["B"].CPU; got != 1 {
@@ -433,15 +456,15 @@ func TestFSMPendingReservationIndexReleasesOnStateTransitions(t *testing.T) {
 		t.Fatalf("promoted reservation sb1 still has a pending claim")
 	}
 
-	if got := applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb2"}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb2", ExpectedIncarnationID: "inc-sb2"}); got != nil {
 		t.Fatalf("cancel sb2: %v", got)
 	}
 	if _, ok := fsm.pendingReservationsByNode(time.Now().Unix())["B"]; ok {
 		t.Fatalf("owner B still has pending capacity after cancel")
 	}
 
-	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb3", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 4}, ExpiresUnix: expiry})
-	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb3", OwnerNodeID: "C"}); got != nil {
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb3", OwnerNodeID: "B", IncarnationID: "inc-sb3", Spec: &models.CreateSandboxRequest{CPU: 4}, ExpiresUnix: expiry})
+	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb3", OwnerNodeID: "C", ExpectedIncarnationID: "inc-sb3"}); got != nil {
 		t.Fatalf("reassign sb3: %v", got)
 	}
 	pending := fsm.pendingReservationsByNode(time.Now().Unix())
@@ -451,7 +474,7 @@ func TestFSMPendingReservationIndexReleasesOnStateTransitions(t *testing.T) {
 	if got := pending["C"].CPU; got != 4 {
 		t.Fatalf("new owner C pending CPU = %v, want 4", got)
 	}
-	if got := applyOp(t, fsm, command{Op: opDelete, SandboxID: "sb3"}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opDelete, SandboxID: "sb3", ExpectedIncarnationID: "inc-sb3"}); got != nil {
 		t.Fatalf("delete sb3: %v", got)
 	}
 	if len(fsm.pendingReservationsByNode(time.Now().Unix())) != 0 {
@@ -482,8 +505,8 @@ func TestFSMPendingReservationIndexRefreshesExpiryWithoutDoubleCounting(t *testi
 func TestFSMPendingReservationIndexUpdatesOnReservedSpecUpsert(t *testing.T) {
 	fsm := newPlacementFSM()
 	expiry := time.Now().Add(60 * time.Second).Unix()
-	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 512}, ExpiresUnix: expiry})
-	if got := applyOp(t, fsm, command{Op: opUpsertSpec, SandboxID: "sb1", Spec: &models.CreateSandboxRequest{CPU: 3, MemoryMB: 2048}}); got != nil {
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", IncarnationID: "inc-reserve-index", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 512}, ExpiresUnix: expiry})
+	if got := applyOp(t, fsm, command{Op: opUpsertSpec, SandboxID: "sb1", ExpectedIncarnationID: "inc-reserve-index", Spec: &models.CreateSandboxRequest{CPU: 3, MemoryMB: 2048}}); got != nil {
 		t.Fatalf("upsert reserved spec: %v", got)
 	}
 	got := fsm.pendingReservationsByNode(time.Now().Unix())["B"]

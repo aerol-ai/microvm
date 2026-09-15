@@ -79,6 +79,7 @@ func (s *Service) runWasmDurablePushSweep(ctx context.Context) {
 	// clean up without leaving a permanent registry leak. Reuses this sweep's
 	// ticker + pusher precondition rather than standing up a fourth janitor.
 	s.runWasmOrphanRefSweep(ctx)
+	s.runWasmOrphanStateKVSweep(ctx)
 
 	known, err := s.store.ListByRuntime(ctx, models.RuntimeWasm)
 	if err != nil {
@@ -135,5 +136,17 @@ func (s *Service) runWasmOrphanRefSweep(ctx context.Context) {
 			s.logger.Warn("wasm orphan-ref sweep: row delete failed",
 				"push_id", p.ID, "sandbox_id", p.SandboxID, "error", err)
 		}
+	}
+}
+
+// runWasmOrphanStateKVSweep removes host-KV rows whose sandbox is already gone.
+// Destroy deletes these first, but a crash after parent-row removal (or a
+// historical vacuum) must still be recoverable without an FK.
+func (s *Service) runWasmOrphanStateKVSweep(ctx context.Context) {
+	if s == nil || s.store == nil {
+		return
+	}
+	if _, err := s.store.DeleteOrphanedWasmStateKV(ctx, 1024); err != nil && s.logger != nil {
+		s.logger.Warn("wasm orphan state-kv sweep: delete failed", "error", err)
 	}
 }

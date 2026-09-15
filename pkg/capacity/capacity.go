@@ -98,6 +98,9 @@ type Request struct {
 	// ModuleRef, when set alongside Runtime="wasm", lets cluster placement
 	// prefer peers that already have the module cached locally.
 	ModuleRef string
+	// RequiredNodeID pins non-portable local artifacts (for example an image
+	// built on one worker) to the only node that can satisfy the request.
+	RequiredNodeID string
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -185,6 +188,15 @@ type Snapshot struct {
 	// pre-feature behaviour, while known=true plus an empty list means
 	// "definitely no local templates here."
 	LocalTemplateIDs []string `json:"local_template_ids,omitempty"`
+	// LocalTemplateCatalogInventoryKnown distinguishes an authoritative empty
+	// administrative catalogue from a peer that has not published one yet.
+	// Unlike LocalTemplateIDs, the catalogue includes pending and failed rows:
+	// item GET/DELETE/rebuild must still route to their owning worker.
+	LocalTemplateCatalogInventoryKnown bool `json:"local_template_catalog_inventory_known,omitempty"`
+	// LocalTemplateCatalogIDs lists every locally-owned template row regardless
+	// of lifecycle status. It is used only for O(1) control-plane routing and
+	// must never be used to decide whether a node can boot a template.
+	LocalTemplateCatalogIDs []string `json:"local_template_catalog_ids,omitempty"`
 	// LocalWasmModuleInventoryKnown mirrors LocalTemplateInventoryKnown for
 	// runtime=wasm module_ref placement (plans/wasm-runtime.md Phase 7).
 	LocalWasmModuleInventoryKnown bool `json:"local_wasm_module_inventory_known,omitempty"`

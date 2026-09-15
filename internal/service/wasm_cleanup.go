@@ -41,14 +41,20 @@ func (s *Service) cleanupWasmSandboxArtifacts(ctx context.Context, sandbox *mode
 				"error", err,
 			)
 		}
-		// The :latest rolling tag and any WasmRegistryRef not yet tracked by a
-		// push row have no tracking row to strand, so they are pure best-effort —
-		// a failure here is retried only via the per-row refs below or a manual
-		// cleanup, never leaving an untracked row behind.
+		// Record every otherwise-untracked ref before attempting deletion. Once
+		// the sandbox row is removed, the existing orphan-ref sweep owns retries.
 		for _, ref := range s.untrackedWasmRefs(sandbox, pushes) {
+			cleanupID, trackErr := s.store.EnsureWasmCheckpointCleanupRef(ctx, sandbox.ID, ref)
+			if trackErr != nil {
+				return trackErr
+			}
 			if err := s.wasmCheckpointPusher.DeleteRef(ctx, ref); err != nil {
 				s.logger.Warn("delete wasm checkpoint AOCR ref failed",
 					"sandbox_id", sandbox.ID, "registry_ref", ref, "error", err)
+				continue
+			}
+			if err := s.store.DeleteWasmCheckpointPush(ctx, cleanupID); err != nil {
+				return err
 			}
 		}
 		// Per-row refs: drop the row only when its manifest is confirmed gone.
@@ -88,11 +94,11 @@ func (s *Service) cleanupWasmSandboxArtifacts(ctx context.Context, sandbox *mode
 
 // untrackedWasmRefs returns the registry refs that have no push-history row to
 // strand — the rolling :latest tag and a WasmRegistryRef that is not already
-// covered by one of the supplied push rows. Deleting these is pure best-effort
-// (no row is dropped on success), so a transient failure here cannot leave an
-// orphaned tracking row.
+// covered by one of the supplied push rows. Callers durably create cleanup-only
+// rows for these refs before deletion so a transient registry failure remains
+// visible to the orphan sweep after the sandbox row is removed.
 func (s *Service) untrackedWasmRefs(sandbox *models.Sandbox, pushes []store.WasmCheckpointPushRecord) []string {
-	tracked := make(map[string]struct{}, len(pushes))
+	tracked := make(map[string]struct{}, len(pushes)+2)
 	for _, p := range pushes {
 		if ref := strings.TrimSpace(p.RegistryRef); ref != "" {
 			tracked[ref] = struct{}{}
@@ -102,11 +108,13 @@ func (s *Service) untrackedWasmRefs(sandbox *models.Sandbox, pushes []store.Wasm
 	if latest := strings.TrimSpace(s.wasmCheckpointPusher.DestRefTagged(sandbox.ID, "latest")); latest != "" {
 		if _, ok := tracked[latest]; !ok {
 			out = append(out, latest)
+			tracked[latest] = struct{}{}
 		}
 	}
 	if ref := strings.TrimSpace(sandbox.WasmRegistryRef); ref != "" {
 		if _, ok := tracked[ref]; !ok {
 			out = append(out, ref)
+			tracked[ref] = struct{}{}
 		}
 	}
 	return out

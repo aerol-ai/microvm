@@ -117,6 +117,13 @@ integration-single-wasm:
 integration-single-isolate:
 	integration-tests/run.sh single-node-isolate $(RUN_FLAGS)
 
+# Same box with the workerd jail ON (the daemon default): chroot + cgroup +
+# privilege drop + enforcing seccomp. Runs UC-103..105 against jailed groups
+# and UC-109, which inspects the workerd process over SSH. This is the gate for
+# trusting the jail with untrusted tenant code (setup/runbooks/isolate-jail.md).
+integration-single-isolate-jail:
+	integration-tests/run.sh single-node-isolate-jail $(RUN_FLAGS)
+
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)
 
