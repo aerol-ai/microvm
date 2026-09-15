@@ -130,3 +130,74 @@ func TestEnvBindingMigrationEmptyOldSchemaNeedsNoCipher(t *testing.T) {
 	}
 	st.Close()
 }
+
+// An env row whose sandbox is gone is unreadable by construction (every read
+// selects FROM sandboxes) and has no lifecycle to bind to. FK CASCADE should
+// have removed it, but a database that ever ran with foreign keys off can
+// carry one. The upgrade must drop it, not refuse to boot forever on it.
+func TestEnvBindingMigrationDropsOrphanedRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "orphan.db")
+	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := OpenWithSecretCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := cipher.Encrypt([]byte(`{"TOKEN":"kept"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateWithSealedEnv(ctx, testSandbox("live", nil), legacy); err != nil {
+		t.Fatal(err)
+	}
+	// Forge the orphan the way a foreign-keys-off database would carry it.
+	if _, err := st.db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO sandbox_env (sandbox_id, sealed_blob, created_at) VALUES ('ghost', ?, CURRENT_TIMESTAMP)`, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`ALTER TABLE sandbox_env DROP COLUMN binding_version`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	st, err = OpenWithSecretCipher(path, cipher)
+	if err != nil {
+		t.Fatalf("orphaned env row blocked startup: %v", err)
+	}
+	defer st.Close()
+
+	var ghosts int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sandbox_env WHERE sandbox_id = 'ghost'`).Scan(&ghosts); err != nil {
+		t.Fatal(err)
+	}
+	if ghosts != 0 {
+		t.Fatalf("orphaned env row survived the upgrade: %d", ghosts)
+	}
+	// The live row is still bound and readable, and the marker committed.
+	blob, inc, _, err := st.GetEnvWithIdentity(ctx, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := cipher.DecryptWithAAD(blob, secrets.EnvAAD("live", inc))
+	if err != nil {
+		t.Fatalf("live row lost its binding: %v", err)
+	}
+	if !bytes.Equal(plain, []byte(`{"TOKEN":"kept"}`)) {
+		t.Fatalf("live env = %s", plain)
+	}
+	var marker int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('sandbox_env') WHERE name = 'binding_version'`).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if marker != 1 {
+		t.Fatal("binding marker did not commit alongside the orphan drop")
+	}
+}

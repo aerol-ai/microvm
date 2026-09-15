@@ -69,6 +69,7 @@ func TestFileAuditSinkSpillQueuedGroupCommits(t *testing.T) {
 	// A batch the writer refuses is one coalesced gap the size of the batch.
 	broken := &fileAuditSink{
 		gapPath:     filepath.Join(dir, "broken.gap"),
+		lockPath:    filepath.Join(dir, "broken.lock"),
 		spillCh:     make(chan SecretAuditEvent, 8),
 		writePoison: fmt.Errorf("injected poison"),
 	}
@@ -85,5 +86,39 @@ func TestFileAuditSinkSpillQueuedGroupCommits(t *testing.T) {
 	}
 	if err := (&fileAuditSink{}).appendSpill(SecretAuditEvent{}); err == nil {
 		t.Fatal("append without a spill path succeeded")
+	}
+}
+
+// A sink with neither a lock path nor a log path must fail closed. The old
+// fallback concatenated an empty path into a bare relative ".lock", which
+// flocked a file in the process working directory: two audit directories
+// would have serialized against one unrelated file, and a unit test dropped
+// the sidecar into the source tree.
+func TestWithAuditFileLockRefusesUnsetPath(t *testing.T) {
+	ran := false
+	if err := (&fileAuditSink{}).withAuditFileLock(func() error { ran = true; return nil }); err == nil {
+		t.Fatal("unset audit lock path was accepted")
+	}
+	if ran {
+		t.Fatal("entered the critical section without holding a lock")
+	}
+	// The regression signal: the bare sidecar lands in whatever directory the
+	// process happens to be in, which under `go test` is the package source.
+	if _, err := os.Stat(".lock"); !os.IsNotExist(err) {
+		t.Fatalf("bare .lock created in the working directory: %v", err)
+	}
+
+	// A sink carrying only its log path still derives the sidecar beside it.
+	dir := t.TempDir()
+	path := filepath.Join(dir, secretAuditFileName)
+	locked := false
+	if err := (&fileAuditSink{path: path}).withAuditFileLock(func() error { locked = true; return nil }); err != nil {
+		t.Fatalf("derived sidecar rejected: %v", err)
+	}
+	if !locked {
+		t.Fatal("critical section did not run under the derived sidecar")
+	}
+	if _, err := os.Stat(path + ".lock"); err != nil {
+		t.Fatalf("derived sidecar missing: %v", err)
 	}
 }

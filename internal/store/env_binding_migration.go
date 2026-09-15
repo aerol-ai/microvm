@@ -59,6 +59,17 @@ func migrateEnvBinding(db *sql.DB, cipher *secrets.Cipher) error {
 		}
 		for _, r := range batch {
 			inc, err := envIncarnationForMigration(ctx, tx, r.id)
+			if errors.Is(err, sql.ErrNoRows) {
+				// FK CASCADE should have taken this row with its sandbox. An
+				// env row with no sandbox is already unreadable — every read
+				// selects FROM sandboxes — and there is no lifecycle left to
+				// bind it to. Drop the dead ciphertext rather than fail every
+				// future startup on a row nothing can ever open.
+				if _, delErr := tx.ExecContext(ctx, `DELETE FROM sandbox_env WHERE sandbox_id = ?`, r.id); delErr != nil {
+					return fmt.Errorf("drop orphaned env %q: %w", r.id, delErr)
+				}
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -88,10 +99,15 @@ func migrateEnvBinding(db *sql.DB, cipher *secrets.Cipher) error {
 	return tx.Commit()
 }
 
+// Returns sql.ErrNoRows when the sandbox is gone; callers decide whether that
+// is an orphan to drop or an impossible state for their source table.
 func envIncarnationForMigration(ctx context.Context, tx *sql.Tx, sandboxID string) (string, error) {
 	var inc string
 	if err := tx.QueryRowContext(ctx, `SELECT audit_incarnation_id FROM sandboxes WHERE id = ?`, sandboxID).Scan(&inc); err != nil {
-		return "", err
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		return "", fmt.Errorf("read lifecycle for env migration %q: %w", sandboxID, err)
 	}
 	if inc != "" {
 		return inc, nil
