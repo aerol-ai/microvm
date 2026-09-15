@@ -3,10 +3,12 @@ package cluster
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"fmt"
 	"hash/fnv"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 // DefaultPlacementShardCount is the stable shard space for placement-index
@@ -126,10 +128,36 @@ func PlacementShardForSandbox(sandboxID string, count int) int {
 // load balancers work for every sandbox. Very large ingress tiers shard the
 // table and require a shard-aware upstream router.
 func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFilter {
+	return ingressShardFilterForIDs(ingressShardNodeIDs(members), nodeID)
+}
+
+// IngressShardFilterCache retains only the last topology for one reconciler.
+// Capacity heartbeats and endpoint changes do not change HRW ownership. Compare
+// the sorted live ingress IDs, not the entire membership (or a lossy hash).
+type IngressShardFilterCache struct {
+	mu     sync.Mutex
+	nodeID string
+	ids    []string
+	filter PlacementShardFilter
+}
+
+func (c *IngressShardFilterCache) ForNode(members []Member, nodeID string) PlacementShardFilter {
+	ids := ingressShardNodeIDs(members)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.nodeID != nodeID || !slices.Equal(c.ids, ids) {
+		c.nodeID, c.ids = nodeID, slices.Clone(ids)
+		c.filter = ingressShardFilterForIDs(ids, nodeID)
+	}
+	filter := c.filter
+	filter.Shards = slices.Clone(filter.Shards)
+	return filter
+}
+
+func ingressShardFilterForIDs(ids []string, nodeID string) PlacementShardFilter {
 	if nodeID == "" {
 		return PlacementShardFilter{}
 	}
-	ids := ingressShardNodeIDs(members)
 	found := false
 	for _, id := range ids {
 		if id == nodeID {
@@ -155,13 +183,11 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 		return PlacementShardFilter{}
 	}
 
-	shards := make([]int, 0, DefaultPlacementShardCount/len(ids)+1)
+	shards := make([]int, 0, 2*DefaultPlacementShardCount/len(ids)+1)
 	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
-		for _, idx := range rendezvousIngressOwnerIndexes(shard, ids, 2) {
-			if idx == selfIndex {
-				shards = append(shards, shard)
-				break
-			}
+		primary, backup := rendezvousIngressTopTwo(shard, ids)
+		if primary == selfIndex || backup == selfIndex {
+			shards = append(shards, shard)
 		}
 	}
 	return PlacementShardFilter{
@@ -215,6 +241,13 @@ func rendezvousIngressOwnerIndexes(shard int, nodeIDs []string, n int) []int {
 	if len(nodeIDs) == 0 || n <= 0 {
 		return nil
 	}
+	if n <= 2 {
+		first, second := rendezvousIngressTopTwo(shard, nodeIDs)
+		if n == 1 || second < 0 {
+			return []int{first}
+		}
+		return []int{first, second}
+	}
 	type scored struct {
 		idx   int
 		score uint64
@@ -240,16 +273,45 @@ func rendezvousIngressOwnerIndexes(shard int, nodeIDs []string, n int) []int {
 	return out
 }
 
+// The routing contract uses at most two winners. Keep the same hash and lexical
+// tie-break as the full ordering, without allocating/sorting N scored entries.
+func rendezvousIngressTopTwo(shard int, ids []string) (first, second int) {
+	first, second = -1, -1
+	var firstScore, secondScore uint64
+	for i, id := range ids {
+		score := rendezvousScore(shard, id)
+		if first < 0 || score > firstScore || (score == firstScore && id < ids[first]) {
+			second, secondScore = first, firstScore
+			first, firstScore = i, score
+		} else if second < 0 || score > secondScore || (score == secondScore && id < ids[second]) {
+			second, secondScore = i, score
+		}
+	}
+	return first, second
+}
+
 func rendezvousScore(shard int, nodeID string) uint64 {
 	// SHA-256 avoids FNV clustering on sequential node IDs (ing-00..ing-N)
 	// which left some owners with zero shards under naive FNV-HRW.
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%s", shard, nodeID)))
+	// Preserve the wire-compatible decimal-shard/NUL/node input. A stack
+	// buffer eliminates fmt's per-candidate allocations for normal node IDs.
+	var buf [256]byte
+	input := strconv.AppendInt(buf[:0], int64(shard), 10)
+	input = append(input, 0)
+	input = append(input, nodeID...)
+	sum := sha256.Sum256(input)
 	return binary.BigEndian.Uint64(sum[:8])
 }
 
 func ingressShardNodeIDs(members []Member) []string {
-	seen := make(map[string]struct{}, len(members))
-	ids := make([]string, 0, len(members))
+	count := 0
+	for _, m := range members {
+		if m.NodeID != "" && m.Alive && CanServeIngressRole(m.Role) {
+			count++
+		}
+	}
+	seen := make(map[string]struct{}, count)
+	ids := make([]string, 0, count)
 	for _, m := range members {
 		if m.NodeID == "" || !m.Alive || !CanServeIngressRole(m.Role) {
 			continue

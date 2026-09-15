@@ -162,6 +162,9 @@ func TestPeerDeleteRequiresOwnerOrRecordedRecipientAndCapsGeneration(t *testing.
 	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-auth", "inc-auth", 3, "node-compromised"); !errors.Is(err, ErrClusterSecretOriginatorDenied) {
 		t.Fatalf("unauthorized peer error = %v", err)
 	}
+	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-auth", "different-incarnation", 1, "node-a"); !errors.Is(err, ErrClusterSecretOriginatorDenied) {
+		t.Fatalf("owner authorized to delete unrelated lifecycle: %v", err)
+	}
 	if _, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-auth", "inc-auth"); err != nil {
 		t.Fatalf("unauthorized peer deleted ciphertext: %v", err)
 	}

@@ -825,6 +825,18 @@ func (s *Service) prepareSecretRefanoutRecord(ctx context.Context, rec store.Clu
 		if !placementOK || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != parsed.IncarnationID {
 			return nil, s.retireStaleSecretRow(ctx, rec, parsed.IncarnationID)
 		}
+		// Raft promotion survives loss of the resealing owner's disk/outbox.
+		// A returning holder can therefore retire its superseded generation
+		// itself. Never retire a staged generation ahead of Raft: its ACK/CAS
+		// may still be in flight. Do not guess from an unbound/legacy placement.
+		if placement.SecretRef == rec.Ref && placement.SecretSealGeneration > 0 && len(placement.SecretRecipients) > 0 &&
+			(rec.SealGeneration < placement.SecretSealGeneration ||
+				(rec.SealGeneration == placement.SecretSealGeneration && !secrets.RecipientAllowed(placement.SecretRecipients, s.selfNodeID()))) {
+			if err := s.store.RetireClusterSecretGeneration(ctx, rec.SandboxID, parsed.IncarnationID, rec.SealGeneration); err != nil {
+				return nil, fmt.Errorf("retire superseded cluster secret %q: %w", rec.Ref, err)
+			}
+			return nil, nil
+		}
 		// Only the owner originates a retransmit. Every replica used to
 		// re-push on boot/rejoin, so a membership flap stampeded the fleet
 		// (and, via PUT validation, the leader) with one copy per holder.
@@ -896,7 +908,8 @@ func (s *Service) startSecretMaintenanceScan(ctx context.Context, failureMessage
 }
 
 // runSecretRetirementScan validates exact lifecycle bindings and tombs rows
-// whose authoritative lifecycle is absent/deleting/reused. It deliberately
+// whose authoritative lifecycle is absent/deleting/reused or whose generation
+// or recipient membership is superseded. It deliberately
 // discards active blobs: periodic GC must not resend the entire active fleet.
 //
 // The authority is the Raft placement in cluster mode and the local sandboxes

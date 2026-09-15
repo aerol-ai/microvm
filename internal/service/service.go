@@ -445,10 +445,11 @@ type Service struct {
 	// ingressRouteCache is the last route-intent set successfully applied to
 	// local Caddy by ReconcileClusterIngress. The reconciler diffs against it
 	// so a one-sandbox placement mutation does not rewrite the full shard.
-	ingressRouteMu        sync.Mutex
-	ingressRouteCache     map[string]ingressRouteIntent
-	ingressLastFullGCUnix atomic.Int64
-	dnsResolver           DNSResolver
+	ingressRouteMu          sync.Mutex
+	ingressShardFilterCache cluster.IngressShardFilterCache
+	ingressRouteCache       map[string]ingressRouteIntent
+	ingressLastFullGCUnix   atomic.Int64
+	dnsResolver             DNSResolver
 
 	// probeContainerPortFn is the function used by exposePort to verify a
 	// container port is accepting connections before installing the Caddy route.
@@ -2233,7 +2234,7 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 		defer s.clearPendingAuditIncarnation(sandbox.ID, incarnationID)
 		sandbox.AuditIncarnationID = incarnationID
 	}
-	sealed, err := s.sealEnv(sandbox.Env)
+	sealed, err := s.sealEnv(sandbox.ID, sandbox.AuditIncarnationID, sandbox.Env)
 	if err != nil {
 		return err
 	}
@@ -2242,9 +2243,12 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 
 // sealEnv marshals env and encrypts it for at-rest storage. Returns nil when
 // env is empty (no sandbox_env row).
-func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
+func (s *Service) sealEnv(sandboxID, incarnationID string, env map[string]string) ([]byte, error) {
 	if len(env) == 0 {
 		return nil, nil
+	}
+	if sandboxID == "" || incarnationID == "" {
+		return nil, errors.New("seal env: sandbox id and incarnation id are required")
 	}
 	plain, err := json.Marshal(env)
 	if err != nil {
@@ -2253,7 +2257,7 @@ func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
 	if s.cipher == nil {
 		return nil, fmt.Errorf("env cipher is not configured")
 	}
-	sealed, err := s.cipher.Encrypt(plain)
+	sealed, err := s.cipher.EncryptWithAAD(plain, secrets.EnvAAD(sandboxID, incarnationID))
 	if err != nil {
 		return nil, fmt.Errorf("encrypt env: %w", err)
 	}
@@ -2261,17 +2265,24 @@ func (s *Service) sealEnv(env map[string]string) ([]byte, error) {
 }
 
 // loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
-func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string]string, err error) {
-	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
+func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) (env map[string]string, err error) {
+	sealed, auditIncarnationID, auditOwnerRef, getErr := s.store.GetEnvWithIdentity(ctx, sandboxID)
 	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 
-	sealed, getErr := s.store.GetEnv(ctx, sandboxID)
+	if getErr == nil {
+		if auditIncarnationID != incarnationID {
+			return nil, fmt.Errorf("%w: sandbox lifecycle changed before env read", secrets.ErrDecryptFailed)
+		}
+		if owner, scoped := ownerScope(ctx); scoped && owner != auditOwnerRef {
+			return nil, store.ErrNotFound
+		}
+	}
 	if getErr == nil && len(sealed) > 0 {
 		if s.cipher == nil {
 			return nil, fmt.Errorf("%w: env cipher is not configured", secrets.ErrDecryptFailed)
 		}
-		plain, decErr := s.cipher.Decrypt(sealed)
+		plain, decErr := s.cipher.DecryptWithAAD(sealed, secrets.EnvAAD(sandboxID, auditIncarnationID))
 		if decErr != nil {
 			return nil, fmt.Errorf("%w: decrypt env: %v", secrets.ErrDecryptFailed, decErr)
 		}
@@ -2284,7 +2295,7 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID string) (env map[string
 		}
 		return out, nil
 	}
-	if errors.Is(getErr, store.ErrNotFound) {
+	if errors.Is(getErr, store.ErrNotFound) || (getErr == nil && len(sealed) == 0) {
 		return map[string]string{}, nil
 	}
 	return nil, getErr
@@ -2394,7 +2405,7 @@ func (s *Service) GetSandboxWithOptions(ctx context.Context, id string, opts Get
 	}
 	s.attachFailoverReady(ctx, sb)
 	if opts.IncludeEnv {
-		env, loadErr := s.loadEnv(ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID), id)
+		env, loadErr := s.loadEnv(ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID), id, sb.AuditIncarnationID)
 		if loadErr != nil {
 			return nil, loadErr
 		}
@@ -2454,7 +2465,7 @@ func (s *Service) applyListEnvOptions(ctx context.Context, sandboxes []*models.S
 			if sb == nil {
 				continue
 			}
-			env, err := s.loadEnv(loadCtx, sb.ID)
+			env, err := s.loadEnv(loadCtx, sb.ID, sb.AuditIncarnationID)
 			if err != nil {
 				return err
 			}
@@ -2489,7 +2500,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	// Sealed-env mode omits Env from store scans. Runtime paths (especially
 	// WASM reconstruct / passivate rehydrate) need the materialised map —
 	// public Get/List redaction must not starve internal start.
-	if env, loadErr := s.loadEnv(ctx, id); loadErr != nil {
+	if env, loadErr := s.loadEnv(ctx, id, sandbox.AuditIncarnationID); loadErr != nil {
 		return nil, loadErr
 	} else if len(env) > 0 {
 		sandbox.Env = env
@@ -5306,7 +5317,7 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 		return
 	}
 	self := c.SelfNodeID()
-	for _, p := range c.PlacementsForShards(clusterIngressShardFilter(c, self)) {
+	for _, p := range c.PlacementsForShards(s.clusterIngressShardFilter(c, self)) {
 		if p.SandboxID == "" || p.OwnerNodeID == self {
 			continue
 		}
@@ -5597,7 +5608,7 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	if self == "" {
 		return nil
 	}
-	shardFilter := clusterIngressShardFilter(c, self)
+	shardFilter := s.clusterIngressShardFilter(c, self)
 	placements := c.PlacementsForShards(shardFilter)
 
 	// Idle-skip: hash the relevant slice of the placement view. If nothing

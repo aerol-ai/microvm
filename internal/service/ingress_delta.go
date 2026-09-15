@@ -32,11 +32,15 @@ type ingressRouteIntent struct {
 	delete      func(context.Context) error
 }
 
-func clusterIngressShardFilter(c cluster.Client, self string) cluster.PlacementShardFilter {
+func (s *Service) clusterIngressShardFilter(c cluster.Client, self string) cluster.PlacementShardFilter {
 	if c == nil || self == "" {
 		return cluster.PlacementShardFilter{}
 	}
-	return cluster.IngressShardFilterForNode(c.Members(), self)
+	members := c.LocalMembers()
+	if len(members) == 0 {
+		members = c.Members()
+	}
+	return s.ingressShardFilterCache.ForNode(members, self)
 }
 
 func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, self string) (map[string]ingressRouteIntent, bool) {
