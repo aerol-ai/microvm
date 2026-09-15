@@ -339,7 +339,7 @@ func (s *Service) authorizePeerSecretDelete(ctx context.Context, sandboxID, inca
 		return fmt.Errorf("%w: %v", ErrClusterSecretPlacementUnavailable, err)
 	}
 	placement, ok := placements[sandboxID]
-	if ok {
+	if ok && strings.TrimSpace(placement.IncarnationID) == incarnationID {
 		if strings.TrimSpace(placement.OwnerNodeID) == peerNodeID || secrets.RecipientAllowed(placement.SecretRecipients, peerNodeID) {
 			return nil
 		}

@@ -150,6 +150,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			sandbox_id TEXT PRIMARY KEY,
 			sealed_blob BLOB NOT NULL,
 			created_at DATETIME NOT NULL,
+			binding_version INTEGER NOT NULL DEFAULT 1 CHECK (binding_version = 1),
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
 		// sandbox_custom_domains attaches operator-provided public hostnames
@@ -906,6 +907,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateEnvBinding(db, secretCipher); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := validateCurrentSecretSchema(db); err != nil {
 		db.Close()
 		return nil, err
@@ -1091,7 +1096,11 @@ func migrateLegacyEnvRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets
 			if len(env) == 0 {
 				continue
 			}
-			sealed, err := secretCipher.Encrypt([]byte(row.raw))
+			incarnationID, err := envIncarnationForMigration(ctx, tx, row.id)
+			if err != nil {
+				return err
+			}
+			sealed, err := secretCipher.EncryptWithAAD([]byte(row.raw), secrets.EnvAAD(row.id, incarnationID))
 			if err != nil {
 				return fmt.Errorf("seal legacy sandbox env for %q: %w", row.id, err)
 			}
@@ -5437,6 +5446,9 @@ func nextClusterSecretDeleteGenerationTx(ctx context.Context, tx *sql.Tx, sandbo
 	if maxSeal.Valid && maxSeal.Int64 > hwm {
 		hwm = maxSeal.Int64
 	}
+	if hwm == math.MaxInt64 {
+		return 0, ErrClusterSecretGenerationExhausted
+	}
 	return hwm + 1, nil
 }
 
@@ -5512,8 +5524,19 @@ func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxI
 
 // ApplyPeerSecretDelete tombs + deletes local sealed rows for a peer DELETE.
 // generation gates stale deletes after reseal: if any local row has
-// seal_generation >= generation, ACK without deleting (resealed newer data).
+// seal_generation > generation, ACK without deleting (resealed newer data).
 func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.applySecretDelete(ctx, sandboxID, incarnationID, generation, false)
+}
+
+// RetireClusterSecretGeneration removes only the generation observed by an
+// authoritative GC scan. It creates no peer-delete obligation: supersession
+// of this replica is not authority to delete the promoted recovery copies.
+func (s *Store) RetireClusterSecretGeneration(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.applySecretDelete(ctx, sandboxID, incarnationID, generation, true)
+}
+
+func (s *Store) applySecretDelete(ctx context.Context, sandboxID, incarnationID string, generation int64, onlyIfCurrent bool) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
@@ -5539,6 +5562,9 @@ func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID, incarnatio
 	`, sandboxID, currentRef).Scan(&maxSeal)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return fmt.Errorf("read current cluster secret before peer delete: %w", scanErr)
+	}
+	if onlyIfCurrent && (!maxSeal.Valid || maxSeal.Int64 != generation) {
+		return tx.Commit()
 	}
 	var prev sql.NullInt64
 	var prevIncarnationID string
@@ -5579,6 +5605,10 @@ func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID, incarnatio
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, currentRef); err != nil {
 		return fmt.Errorf("peer delete cluster secrets: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation <= ?`, sandboxID, incarnationID, generation); err != nil {
+		return fmt.Errorf("retire secret put outbox: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit peer secret delete: %w", err)
@@ -6371,6 +6401,19 @@ func (s *Store) GetEnv(ctx context.Context, sandboxID string) ([]byte, error) {
 		return nil, fmt.Errorf("get sandbox env: %w", err)
 	}
 	return blob, nil
+}
+
+// GetEnvWithIdentity reads ciphertext and its local lifecycle in one snapshot.
+// A cached Raft incarnation or two separate queries could bind an env read to
+// a replacement sandbox while the local row is being destroyed/recreated.
+func (s *Store) GetEnvWithIdentity(ctx context.Context, sandboxID string) (blob []byte, incarnationID, ownerRef string, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT env.sealed_blob, sandbox.audit_incarnation_id, sandbox.owner_ref
+		FROM sandboxes AS sandbox LEFT JOIN sandbox_env AS env ON env.sandbox_id = sandbox.id
+		WHERE sandbox.id = ?`, sandboxID).Scan(&blob, &incarnationID, &ownerRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", "", ErrNotFound
+	}
+	return
 }
 
 // DeleteEnv removes sealed env for a sandbox. Cascade on sandboxes covers

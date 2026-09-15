@@ -125,6 +125,53 @@ func TestNextClusterSecretGenerationRejectsOverflow(t *testing.T) {
 	if _, err := st.NextClusterSecretSealGenerationForIncarnation(ctx, "sb-overflow", "inc-overflow"); !errors.Is(err, ErrClusterSecretGenerationExhausted) {
 		t.Fatalf("next generation error = %v", err)
 	}
+	if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, "sb-overflow", "inc-overflow", nil); !errors.Is(err, ErrClusterSecretGenerationExhausted) {
+		t.Fatalf("next delete generation error = %v", err)
+	}
+}
+
+func TestRetireClusterSecretGenerationCannotRaceNewerPUT(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ref := "cluster-secret://sandbox/sb-race/i/inc-race/v1"
+	for _, gen := range []int64{1, 2} {
+		if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{Ref: ref, SandboxID: "sb-race", Version: 1, Recipients: []string{"a", "b"}, SealedPayload: []byte{byte(gen)}, SealGeneration: gen}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertSecretPutOutbox(ctx, "sb-race", "inc-race", 2, []string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+	// The scan observed generation 1, but a promoted replacement arrived
+	// before its destructive transaction. Both the new row and its job survive.
+	if err := st.RetireClusterSecretGeneration(ctx, "sb-race", "inc-race", 1); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := st.GetClusterSecret(ctx, ref); err != nil || rec.SealGeneration != 2 {
+		t.Fatalf("newer row lost: %+v %v", rec, err)
+	}
+	if outbox, err := st.GetSecretPutOutboxForIncarnation(ctx, "sb-race", "inc-race"); err != nil || outbox == nil {
+		t.Fatalf("newer job lost: %+v %v", outbox, err)
+	}
+	if gen, err := st.ClusterSecretTombGenerationForIncarnation(ctx, "sb-race", "inc-race"); err != nil || gen != 0 {
+		t.Fatalf("stale scan wrote tomb: %d %v", gen, err)
+	}
+	if err := st.RetireClusterSecretGeneration(ctx, "sb-race", "inc-race", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RetireClusterSecretGeneration(ctx, "sb-race", "inc-race", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetClusterSecret(ctx, ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("observed generation survived: %v", err)
+	}
+	if gen, err := st.NextClusterSecretSealGenerationForIncarnation(ctx, "sb-race", "inc-race"); err != nil || gen != 3 {
+		t.Fatalf("retirement fenced future reseal: %d %v", gen, err)
+	}
 }
 
 func TestPeerDeleteIsIncarnationFencedAcrossSandboxIDReuse(t *testing.T) {

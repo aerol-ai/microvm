@@ -1,11 +1,119 @@
 package cluster
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"os"
+	"os/exec"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/config"
 )
+
+func TestIngressTopTwoPreservesFullSortRouting(t *testing.T) {
+	ids := []string{"ing-c", "ing-a", "ing-b", "ing-a", strings.Repeat("long-id", 60)}
+	for shard := 0; shard < 100; shard++ {
+		order := make([]int, len(ids))
+		for i, id := range ids {
+			order[i] = i
+			old := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%s", shard, id)))
+			if rendezvousScore(shard, id) != binary.BigEndian.Uint64(old[:8]) {
+				t.Fatal("changed HRW hash remaps existing routes")
+			}
+		}
+		sort.SliceStable(order, func(i, j int) bool {
+			a, b := rendezvousScore(shard, ids[order[i]]), rendezvousScore(shard, ids[order[j]])
+			return a > b || (a == b && ids[order[i]] < ids[order[j]])
+		})
+		for n := 1; n <= len(ids)+1; n++ {
+			if got := rendezvousIngressOwnerIndexes(shard, ids, n); !slices.Equal(got, order[:min(n, len(ids))]) {
+				t.Fatalf("shard %d n %d: got %v want %v", shard, n, got, order)
+			}
+		}
+	}
+}
+
+func ingressBenchmarkMembers() []Member {
+	members := make([]Member, 2000)
+	for i := range members {
+		members[i] = Member{NodeID: fmt.Sprintf("node-%04d", i), Alive: true, Role: config.NodeRoleWorker}
+		if i < 100 {
+			members[i].Role = config.NodeRoleIngress
+		}
+	}
+	return members
+}
+
+func TestIngressShardCacheTracksTopologyAndOwnsResult(t *testing.T) {
+	members := ingressBenchmarkMembers()
+	var cache IngressShardFilterCache
+	want := IngressShardFilterForNode(members, "node-0000")
+	got := cache.ForNode(members, "node-0000")
+	if !slices.Equal(got.Shards, want.Shards) {
+		t.Fatal("cached result differs")
+	}
+	got.Shards[0] = -1
+	cacheStorage := &cache.filter.Shards[0]
+	slices.Reverse(members)
+	if got := cache.ForNode(members, "node-0000"); !slices.Equal(got.Shards, want.Shards) {
+		t.Fatal("caller mutated cache or membership order remapped it")
+	}
+	if &cache.filter.Shards[0] != cacheStorage {
+		t.Fatal("unchanged topology rebuilt the filter")
+	}
+	members[len(members)-1].Alive = false
+	want = IngressShardFilterForNode(members, "node-0001")
+	if got := cache.ForNode(members, "node-0001"); !slices.Equal(got.Shards, want.Shards) {
+		t.Fatal("membership change did not invalidate cache")
+	}
+}
+
+func TestIngressShardAllocationBudget(t *testing.T) {
+	// AllocsPerRun counts process-wide allocations. Other cluster tests leave
+	// gossip/raft shutdown work in flight, so measure in a clean subprocess.
+	const isolated = "AEROLVM_INGRESS_ALLOCATION_TEST"
+	if os.Getenv(isolated) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestIngressShardAllocationBudget$", "-test.count=1")
+		cmd.Env = append(os.Environ(), isolated+"=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("isolated allocation check: %v\n%s", err, out)
+		}
+		return
+	}
+	members := ingressBenchmarkMembers()
+	var cache IngressShardFilterCache
+	// A fixed allocation budget catches the original millions-of-allocations
+	// per-tick regression without a hardware-sensitive wall-clock assertion.
+	if allocs := testing.AllocsPerRun(10, func() { cache.ForNode(members, "node-0001") }); allocs > 30 {
+		t.Fatalf("cached filter allocated %.0f objects, budget 30", allocs)
+	}
+	if allocs := testing.AllocsPerRun(1, func() { IngressShardFilterForNode(members, "node-0001") }); allocs > 30 {
+		t.Fatalf("cold filter allocated %.0f objects, budget 30", allocs)
+	}
+}
+
+func BenchmarkIngressShardFilter100Ingress2000Nodes(b *testing.B) {
+	members := ingressBenchmarkMembers()
+	b.Run("cold", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			IngressShardFilterForNode(members, "node-0000")
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		var cache IngressShardFilterCache
+		cache.ForNode(members, "node-0000")
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			cache.ForNode(members, "node-0000")
+		}
+	})
+}
 
 func TestIngressShardFilterReplicatesSmallIngressTier(t *testing.T) {
 	members := []Member{

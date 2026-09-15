@@ -129,6 +129,14 @@ repaired from a live holder: the new generation and retired-recipient journal
 commit atomically, a replacement ACK precedes the Raft CAS, and peer deletion
 waits until the promoted generation is visible.
 
+Returning replicas also self-retire superseded local generations from the
+authoritative placement, without sending DELETEs to the promoted recipient
+set. This survives permanent loss of the coordinator's disk. A local staged
+generation ahead of Raft is retained until promotion or rollback resolves it.
+Offline/decommissioned holders still pin pending deletion metadata: there is
+no authoritative storage-destruction terminal state yet. Do not equate gossip
+absence or a retry timeout with verified erasure.
+
 ## Scope decisions
 
 | # | Proposal | eng-days / CC-days | Decision |

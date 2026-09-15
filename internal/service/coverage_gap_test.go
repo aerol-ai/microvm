@@ -238,9 +238,9 @@ func TestClusterOwnershipNeedsReplayVariants(t *testing.T) {
 // --- ingress_delta.go ---
 
 func TestIngressDeltaHelpersAndGC(t *testing.T) {
-	_ = clusterIngressShardFilter(nil, "self")
+	_ = (&Service{}).clusterIngressShardFilter(nil, "self")
 	c := cluster.NewNoop("self", "http://self", "")
-	f := clusterIngressShardFilter(c, "self")
+	f := (&Service{}).clusterIngressShardFilter(c, "self")
 	_ = f
 
 	svc := &Service{
