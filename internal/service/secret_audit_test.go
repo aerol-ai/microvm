@@ -68,8 +68,8 @@ func TestSecretAuditStrictBootAndUnavailableSink(t *testing.T) {
 	if got := auditEventsDroppedTotal.Value() - before; got != 1 {
 		t.Fatalf("dropped delta = %d, want 1", got)
 	}
-	if got := secretAuditSinkHealthy.Value(); got != 0 {
-		t.Fatalf("sink health = %d, want 0", got)
+	if _, ok := s.secretAudit.(unavailableSecretAuditSink); !ok {
+		t.Fatalf("sink type = %T, want unavailable", s.secretAudit)
 	}
 }
 
