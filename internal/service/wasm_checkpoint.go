@@ -268,6 +268,12 @@ func (s *Service) pruneWasmCheckpointPushes(ctx context.Context, sandboxID strin
 	}
 }
 
+// rehydrateWasmIfNeeded restores a passivated WASM sandbox from its checkpoint.
+//
+// Callers must hand it a sandbox whose Env is already materialised — the
+// driver bakes the restored instance's baseEnv from that field and a store row
+// never carries it. hydrateSandboxEnvForRestore is what does that; StartSandbox
+// loads env inline for the same reason.
 func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.Sandbox, hostMounts []mounts.ContainerBind) (*models.Sandbox, error) {
 	if sandbox == nil || !s.isWasmSandbox(sandbox) {
 		return sandbox, nil

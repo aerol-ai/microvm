@@ -26,8 +26,12 @@ var _ wasmruntime.CheckpointHost = (*fakeWasmRecreateRuntime)(nil)
 type fakeWasmRecreateRuntime struct {
 	wasmModuleAPINoopRuntime
 	noopWasmPortGateway
-	rehydrated   []string
-	rehydrateErr error
+	rehydrated []string
+	// rehydratedEnv records the environment each restore was handed. The real
+	// driver builds the instance's baseEnv from exactly this field, so an
+	// empty map here is an empty environment for every later exec.
+	rehydratedEnv []map[string]string
+	rehydrateErr  error
 }
 
 type noopWasmPortGateway struct{}
@@ -50,6 +54,11 @@ func (f *fakeWasmRecreateRuntime) RehydrateSandbox(_ context.Context, sandbox *m
 	}
 	if sandbox != nil {
 		f.rehydrated = append(f.rehydrated, sandbox.ID)
+		env := make(map[string]string, len(sandbox.Env))
+		for k, v := range sandbox.Env {
+			env[k] = v
+		}
+		f.rehydratedEnv = append(f.rehydratedEnv, env)
 	}
 	return &models.SandboxRuntimeState{
 		ContainerID: "wasm:" + sandbox.ID,

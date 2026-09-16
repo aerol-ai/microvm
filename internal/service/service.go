@@ -1231,6 +1231,11 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		if s.isWasmSandbox(existing) && existing.Durability == models.DurabilityDurable &&
 			existing.Status == models.SandboxStatusPassivated {
 			attempted = true
+			// Sealed env only: this branch never opened the cluster secret bag,
+			// and the replicated spec it was given is the redacted one.
+			if err := s.hydrateSandboxEnvForRestore(ctx, existing, nil); err != nil {
+				return true, fmt.Errorf("recreate %s: %w", id, err)
+			}
 			if _, err := s.rehydrateWasmIfNeeded(ctx, existing, nil); err != nil {
 				return true, fmt.Errorf("recreate %s: rehydrate wasm: %w", id, err)
 			}
@@ -2302,6 +2307,72 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) 
 		return map[string]string{}, nil
 	}
 	return nil, getErr
+}
+
+// hydrateSandboxEnvForRestore materialises a sandbox's environment before a
+// runtime restore hands the row to a driver.
+//
+// The hardened schema has no env_json column — sealed sandbox_env is the only
+// source — so a row read back with store.Get always has Env nil. The WASM
+// driver builds an instance's baseEnv from exactly that field, so restoring
+// from an unhydrated row brings the sandbox back with an empty environment and
+// every later exec silently loses its credentials. StartSandbox loads env for
+// this reason; the failover-recreate paths must too, and a retry after a
+// failed restore is precisely where the row is read back instead of built.
+//
+// specEnv is the decrypted create spec's environment when the caller has one
+// (failover recreate opens the cluster secret bag). It is the fallback for a
+// row whose sealed env is missing, and the seal is repaired from it so the
+// next restore on this node does not depend on the spec being available again.
+func (s *Service) hydrateSandboxEnvForRestore(ctx context.Context, sandbox *models.Sandbox, specEnv map[string]string) error {
+	if s == nil || sandbox == nil || len(sandbox.Env) > 0 {
+		return nil
+	}
+	env, err := s.loadEnv(ctx, sandbox.ID, sandbox.AuditIncarnationID)
+	if err != nil {
+		if len(specEnv) == 0 {
+			return fmt.Errorf("load sealed env for %s: %w", sandbox.ID, err)
+		}
+		// The authenticated cluster-secret bag carries the same credentials the
+		// local seal was written from, so an unreadable seal is worth a warning
+		// and a repair, not a sandbox that never comes back.
+		if s.logger != nil {
+			s.logger.Warn("sealed env unreadable on restore; falling back to the placement spec",
+				"sandbox_id", sandbox.ID, "error", err)
+		}
+		env = nil
+	}
+	if len(env) > 0 {
+		sandbox.Env = env
+		return nil
+	}
+	if len(specEnv) == 0 {
+		return nil
+	}
+	sandbox.Env = specEnv
+	return s.repairSealedEnv(ctx, sandbox)
+}
+
+// repairSealedEnv writes the sealed row for an environment recovered from the
+// placement spec. Failure is returned rather than logged: the restore has not
+// started yet, so the caller can retry a whole attempt instead of running a
+// sandbox whose next wake would lose its environment again.
+func (s *Service) repairSealedEnv(ctx context.Context, sandbox *models.Sandbox) error {
+	if s == nil || s.store == nil || sandbox == nil {
+		return nil
+	}
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	if incarnationID == "" {
+		return nil
+	}
+	sealed, err := s.sealEnv(sandbox.ID, incarnationID, sandbox.Env)
+	if err != nil {
+		return fmt.Errorf("seal recovered env for %s: %w", sandbox.ID, err)
+	}
+	if len(sealed) == 0 {
+		return nil
+	}
+	return s.store.PutEnv(ctx, sandbox.ID, sealed)
 }
 
 // sealMounts marshals the user's mount specs and encrypts the JSON for
