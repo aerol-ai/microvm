@@ -89,6 +89,19 @@ func TestRegistryAndOpen(t *testing.T) {
 	}
 }
 
+func TestIsOffNodeBackend(t *testing.T) {
+	for _, name := range []string{BackendWebhook, BackendS3, BackendBus, " S3 "} {
+		if !IsOffNodeBackend(name) {
+			t.Errorf("IsOffNodeBackend(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{BackendNoop, BackendStdout, BackendFile, "", "kinesis"} {
+		if IsOffNodeBackend(name) {
+			t.Errorf("IsOffNodeBackend(%q) = true, want false", name)
+		}
+	}
+}
+
 func TestConfigValidate(t *testing.T) {
 	cases := map[string]struct {
 		cfg     Config
@@ -113,6 +126,12 @@ func TestConfigValidate(t *testing.T) {
 		"flush too small":           {cfg: Config{FlushInterval: time.Millisecond}, wantErr: "flush interval"},
 		"batch too big":             {cfg: Config{BatchMax: 1 << 20}, wantErr: "batch max"},
 		"unknown":                   {cfg: Config{Backend: "kinesis"}, wantErr: "unknown backend"},
+		// Enterprise tamper-evidence needs history this node cannot silently
+		// rewrite; noop/stdout/file all die with the disk.
+		"noop enterprise":   {cfg: Config{Enterprise: true}, wantErr: "off-node backend"},
+		"stdout enterprise": {cfg: Config{Backend: BackendStdout, Enterprise: true}, wantErr: "off-node backend"},
+		"file enterprise":   {cfg: Config{Backend: BackendFile, Enterprise: true, File: FileConfig{Path: "/tmp/x"}}, wantErr: "off-node backend"},
+		"bus enterprise ok": {cfg: Config{Backend: BackendBus, Enterprise: true, Bus: BusConfig{Topic: "audit"}}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

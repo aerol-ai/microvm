@@ -78,6 +78,21 @@ type BusConfig struct {
 	Topic   string
 }
 
+// IsOffNodeBackend reports whether name ships evidence to a system this node
+// cannot silently rewrite. stdout, file and noop do not: losing the disk (or
+// the operator with root on it) takes the reconstructable history with it,
+// which is the single property the enterprise posture buys. Enterprise
+// therefore accepts only these, or a programmatic exporter wired through
+// controlplane.AuditExporter.
+func IsOffNodeBackend(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case BackendWebhook, BackendS3, BackendBus:
+		return true
+	default:
+		return false
+	}
+}
+
 // WithDefaults fills zero values.
 func (c Config) WithDefaults() Config {
 	c.Backend = strings.ToLower(strings.TrimSpace(c.Backend))
@@ -124,10 +139,16 @@ func (c Config) Validate() error {
 	}
 	switch c.Backend {
 	case BackendNoop, BackendStdout:
+		if c.Enterprise {
+			return fmt.Errorf("%w: %q keeps audit evidence on this node", ErrOnNodeBackend, c.Backend)
+		}
 		return nil
 	case BackendFile:
 		if c.File.Path == "" {
 			return errors.New("SB_AUDIT_EXPORT_FILE_PATH is required for the file backend")
+		}
+		if c.Enterprise {
+			return fmt.Errorf("%w: %q keeps audit evidence on this node", ErrOnNodeBackend, c.Backend)
 		}
 		return nil
 	case BackendWebhook:

@@ -53,7 +53,7 @@ type HostSupervisor interface {
 // they run (pkg/isolate.Host via its cgroup). The group router uses it when a
 // warm blank host is claimed by a tenant.
 type capsApplier interface {
-	ApplyCaps(cpu float64, memMB int) error
+	ApplyCaps(cpu float64, memMB int, pidsMax int) error
 }
 
 // WarmPool hands out blank workerd group hosts. Production implementation:

@@ -203,7 +203,7 @@ type fakeGroupHost struct {
 
 func newFakeGroupHost() *fakeGroupHost { return &fakeGroupHost{loaded: map[string]bool{}} }
 
-func (h *fakeGroupHost) ApplyCaps(cpu float64, memMB int) error {
+func (h *fakeGroupHost) ApplyCaps(cpu float64, memMB int, pidsMax int) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.capsHits++

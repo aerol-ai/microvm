@@ -351,16 +351,16 @@ func TestResolveSharedLibsAndPrepareJailBase(t *testing.T) {
 func TestCgroupFSLayout(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cg")
 	cg := cgroupFS{root: root}
-	if _, err := cg.ensure("", 1, 1); err == nil {
+	if _, err := cg.ensure("", 1, 1, 0); err == nil {
 		t.Fatal("empty name accepted")
 	}
-	if _, err := cg.ensure("a/b", 1, 1); err == nil {
+	if _, err := cg.ensure("a/b", 1, 1, 0); err == nil {
 		t.Fatal("nested name accepted")
 	}
-	if _, err := (cgroupFS{root: "cg"}).ensure("x", 1, 1); err == nil {
+	if _, err := (cgroupFS{root: "cg"}).ensure("x", 1, 1, 0); err == nil {
 		t.Fatal("relative root accepted")
 	}
-	dir, err := cg.ensure("aerolvm-isolate-acme", 1.5, 512)
+	dir, err := cg.ensure("aerolvm-isolate-acme", 1.5, 512, 128)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,21 +377,30 @@ func TestCgroupFSLayout(t *testing.T) {
 	if got := read("memory.max"); got != "536870912" {
 		t.Fatalf("memory.max = %q", got)
 	}
+	// pids.max bounds the group's thread/process count: clone/clone3 are in
+	// the seccomp allowlist, so an unbounded cgroup lets one tenant exhaust
+	// the host PID space.
+	if got := read("pids.max"); got != "128" {
+		t.Fatalf("pids.max = %q, want 128", got)
+	}
 	// Zero caps mean unlimited; a warm blank host starts this way.
-	if err := cg.applyCaps(dir, 0, 0); err != nil {
+	if err := cg.applyCaps(dir, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if read("cpu.max") != "max 100000" || read("memory.max") != "max" {
-		t.Fatalf("unlimited = %q / %q", read("cpu.max"), read("memory.max"))
+	if read("cpu.max") != "max 100000" || read("memory.max") != "max" || read("pids.max") != "max" {
+		t.Fatalf("unlimited = %q / %q / %q", read("cpu.max"), read("memory.max"), read("pids.max"))
 	}
-	if err := cg.applyCaps(dir, -1, 0); err == nil {
+	if err := cg.applyCaps(dir, -1, 0, 0); err == nil {
 		t.Fatal("negative cap accepted")
+	}
+	if err := cg.applyCaps(dir, 0, 0, -1); err == nil {
+		t.Fatal("negative pids cap accepted")
 	}
 	// With a subtree_control file present (a real cgroupfs), controllers are enabled.
 	if err := os.WriteFile(filepath.Join(root, "cgroup.subtree_control"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cg.ensure("aerolvm-isolate-b", 0, 0); err != nil {
+	if _, err := cg.ensure("aerolvm-isolate-b", 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if raw, _ := os.ReadFile(filepath.Join(root, "cgroup.subtree_control")); !strings.Contains(string(raw), "+memory") {
@@ -412,7 +421,7 @@ func TestCgroupFSLayout(t *testing.T) {
 	if err := none.teardown(); err != nil {
 		t.Fatal(err)
 	}
-	if err := none.applyCaps(1, 1); err != nil {
+	if err := none.applyCaps(1, 1, 16); err != nil {
 		t.Fatal(err)
 	}
 	base := filepath.Join(t.TempDir(), "jail")
@@ -425,9 +434,9 @@ func TestCgroupFSLayout(t *testing.T) {
 	if err := linkGroupJail(base, group, os.Getuid(), os.Getgid()); err != nil {
 		t.Fatal(err)
 	}
-	cgDir, _ := cg.ensure("aerolvm-isolate-g", 2, 64)
+	cgDir, _ := cg.ensure("aerolvm-isolate-g", 2, 64, 64)
 	r := &jailRealized{chrootBase: base, chrootDir: group, cgroup: cg, cgroupDir: cgDir}
-	if err := r.applyCaps(1, 32); err != nil {
+	if err := r.applyCaps(1, 32, 16); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.teardown(); err != nil {
@@ -491,7 +500,7 @@ func TestHostJailPathMappingAndRunDirContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	// ApplyCaps on an unjailed host is a no-op.
-	if err := plain.ApplyCaps(1, 1); err != nil {
+	if err := plain.ApplyCaps(1, 1, 8); err != nil {
 		t.Fatal(err)
 	}
 }

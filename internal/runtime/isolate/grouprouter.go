@@ -94,8 +94,11 @@ func (d *Driver) spawnGroup(ctx context.Context, groupKey string, cpu float64, m
 		if host, ok := d.warmPool.Acquire(ctx); ok && host != nil {
 			// A blank host was jailed with unlimited caps; it now belongs to
 			// this tenant and takes theirs (cgroup v2 applies them live).
+			// pids.max moves with the other caps: a blank host is spawned
+			// unlimited, and leaving it that way would hand the claiming
+			// tenant an unbounded PID budget on a shared host.
 			if capped, ok := host.(capsApplier); ok {
-				if err := capped.ApplyCaps(cpu, memMB); err != nil {
+				if err := capped.ApplyCaps(cpu, memMB, d.cfg.JailPidsMax); err != nil {
 					_ = host.Stop()
 					return nil, fmt.Errorf("isolate: apply caps to warm host for group %q: %w", groupKey, err)
 				}

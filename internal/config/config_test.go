@@ -1598,8 +1598,17 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 		t.Fatalf("Load error = %v, want enforce-required-in-enterprise", err)
 	}
 	t.Setenv("SB_ISOLATE_SECCOMP_MODE", "enforce")
+	// An unbounded pids.max leaves one tenant group able to exhaust the host
+	// PID space through clone/clone3, which the seccomp profile must allow.
+	t.Setenv("SB_ISOLATE_JAIL_PIDS_MAX", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_ISOLATE_JAIL_PIDS_MAX must be > 0") {
+		t.Fatalf("Load error = %v, want bounded-pids-required-in-enterprise", err)
+	}
+	t.Setenv("SB_ISOLATE_JAIL_PIDS_MAX", "")
 	if cfg, err := Load(); err != nil || !cfg.EnableIsolate || !cfg.IsolateUseJail {
 		t.Fatalf("jailed isolate in enterprise: cfg=%+v err=%v", cfg, err)
+	} else if cfg.IsolateJailPidsMax != 512 {
+		t.Fatalf("IsolateJailPidsMax = %d, want the bounded 512 default", cfg.IsolateJailPidsMax)
 	}
 	t.Setenv("SB_ENABLE_ISOLATE", "false")
 	t.Setenv("SB_ISOLATE_SECCOMP_MODE", "")
