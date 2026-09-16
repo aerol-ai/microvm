@@ -61,7 +61,7 @@ func TestSandboxMetaFromNativeDestroyAtAgeBranch(t *testing.T) {
 }
 
 func TestCreateRequestFingerprintAndMetadataHelpers(t *testing.T) {
-	fp, err := createRequestFingerprint("base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
+	fp, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
 		TemplateID: "base", TimeoutSeconds: 120, OnTimeout: "kill",
 	})
 	if err != nil || fp == "" {

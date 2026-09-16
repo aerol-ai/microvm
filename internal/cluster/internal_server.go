@@ -37,11 +37,19 @@ type internalServer struct {
 	srv      *http.Server
 	listener net.Listener
 	logger   *slog.Logger
-	// strictPeers is the enterprise revocation boundary for HTTP control-plane
-	// RPCs. The authorizer is installed after gossip is constructed; requests
-	// arriving in that boot window fail closed.
-	strictPeers bool
-	peerAuth    atomic.Pointer[internalPeerAuthorizer]
+	// peerAuth is the live-membership revocation boundary for every HTTP
+	// control-plane RPC, in every cluster mode. A cluster-CA leaf stays valid
+	// until it expires, so certificate possession alone cannot decide whether
+	// a node is still part of the cluster: without this check a decommissioned
+	// node keeps raft-apply and delegated-owner-API authority for the whole
+	// remaining lifetime of its certificate. Enterprise mode used to be the
+	// only mode that enforced it; revocation is not an enterprise feature.
+	//
+	// The authorizer is installed once gossip exists. Requests that arrive in
+	// that boot window are refused as *not ready* (503), not as revoked (403),
+	// so a forwarding peer retries instead of surfacing a permanent failure —
+	// that is the boot-safe half of the revocation path.
+	peerAuth atomic.Pointer[internalPeerAuthorizer]
 	// extra is loaded atomically so AttachInternalHandler is lock-free for
 	// the hot path (every incoming forward reads it once per request).
 	extra atomic.Pointer[http.Handler]
@@ -52,11 +60,11 @@ type internalPeerAuthorizer func(nodeID string) bool
 // startInternalServer binds bindAddr with the cluster mTLS config and spawns
 // the serve goroutine. Returns the constructed server (caller owns Close) and
 // the actual bound address (useful when bindAddr used :0).
-func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(context.Context, []byte) error, logger *slog.Logger, strictPeers bool) (*internalServer, error) {
+func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(context.Context, []byte) error, logger *slog.Logger) (*internalServer, error) {
 	if ct == nil {
 		return nil, errors.New("cluster internal server: TLS material required")
 	}
-	is := &internalServer{logger: logger, strictPeers: strictPeers}
+	is := &internalServer{logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+InternalAPIPath, func(w http.ResponseWriter, r *http.Request) {
 		if !is.authorizePeerRequest(w, r) {
@@ -151,13 +159,19 @@ func (s *internalServer) authorizePeerRequest(w http.ResponseWriter, r *http.Req
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return false
 	}
-	if s.strictPeers {
-		authorizer := s.peerAuth.Load()
-		if authorizer == nil || !(*authorizer)(peerID) {
-			RecordMTLSUnknownPeer()
-			http.Error(w, "cluster peer not in membership", http.StatusForbidden)
-			return false
-		}
+	authorizer := s.peerAuth.Load()
+	if authorizer == nil {
+		// Boot window: the listener is bound but gossip has not been
+		// constructed yet, so there is no membership to check against. Fail
+		// closed, but as a retryable "not ready" — the same shape the
+		// delegated path already returns before AttachInternalHandler fires.
+		http.Error(w, "cluster: peer membership not yet available", http.StatusServiceUnavailable)
+		return false
+	}
+	if !(*authorizer)(peerID) {
+		RecordMTLSUnknownPeer()
+		http.Error(w, "cluster peer not in membership", http.StatusForbidden)
+		return false
 	}
 	return true
 }

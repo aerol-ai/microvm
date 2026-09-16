@@ -151,7 +151,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
 		a.mtlsProxies = newProxyCache()
-		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, a.ApplyEncoded, logger, cfg.EnterpriseMode)
+		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, a.ApplyEncoded, logger)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
 		}

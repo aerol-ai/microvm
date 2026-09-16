@@ -989,6 +989,15 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		return nil, errors.New("CreateSandboxWithID: id required")
 	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		// The fast path returns a fully-hydrated row — toolbox token included
+		// — so it must never answer a caller that does not own it. A facade
+		// deriving the ID from request content (E2B) would otherwise let any
+		// tenant reclaim another tenant's ID and be handed its credentials.
+		// enforceOwner passes for the owner-watcher / internal recreate path,
+		// which carries no Access and legitimately re-materializes any row.
+		if err := enforceOwner(ctx, existing); err != nil {
+			return nil, fmt.Errorf("%w: sandbox id is already in use", models.ErrSandboxExists)
+		}
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
 		return &models.CreateSandboxResponse{Sandbox: *existing}, nil

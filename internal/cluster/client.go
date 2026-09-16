@@ -184,7 +184,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
 		c.mtlsProxies = newProxyCache()
-		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger, cfg.EnterpriseMode)
+		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger)
 		if err != nil {
 			_ = rn.Close()
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)

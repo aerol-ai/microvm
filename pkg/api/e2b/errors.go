@@ -85,6 +85,14 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, "Snapshot name already in use")
 		return
 	}
+	// A create that resolved to an id another caller already holds. The
+	// owner-bound fingerprint makes this unreachable for distinct tenants;
+	// it stays mapped so the CreateSandboxWithID ownership guard surfaces as
+	// a conflict rather than the 400 default.
+	if errors.Is(err, models.ErrSandboxExists) {
+		WriteError(w, http.StatusConflict, "Sandbox already exists")
+		return
+	}
 	if errors.Is(err, capacity.ErrCapacityExceeded) || errors.Is(err, cluster.ErrCapacityExceeded) {
 		if logger != nil {
 			logger.Info("capacity rejected", "error", err)
