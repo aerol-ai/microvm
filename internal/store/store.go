@@ -858,6 +858,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
+		// Backfill an empty env row for every sandbox that predates the
+		// "always write a row" rule above. Without it a warm upgrade cannot
+		// tell an env-less sandbox from one whose sealed env was lost, and
+		// the fail-loud read in loadEnv would refuse to start healthy
+		// sandboxes. INSERT OR IGNORE keeps it idempotent across restarts.
+		`INSERT OR IGNORE INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+			SELECT id, X'', CURRENT_TIMESTAMP FROM sandboxes;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -1104,9 +1111,15 @@ func migrateLegacyEnvRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets
 			if err != nil {
 				return fmt.Errorf("seal legacy sandbox env for %q: %w", row.id, err)
 			}
+			// Upsert, not insert: the schema backfill has already placed an
+			// empty-seal row for every sandbox (so a missing row can mean
+			// "lost"), and this migration fills in the real ciphertext.
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO sandbox_env (sandbox_id, sealed_blob, created_at)
 				VALUES (?, ?, ?)
+				ON CONFLICT(sandbox_id) DO UPDATE SET
+					sealed_blob = excluded.sealed_blob,
+					created_at = excluded.created_at
 			`, row.id, sealed, migratedAt); err != nil {
 				return fmt.Errorf("store migrated sandbox env for %q: %w", row.id, err)
 			}
@@ -1314,6 +1327,14 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	}
 	defer tx.Rollback()
 	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
+		return err
+	}
+	// An empty env is recorded as an empty row, never as an absent one. That
+	// is what lets a later read tell "this sandbox has no environment" from
+	// "this sandbox's sealed environment is gone" and fail loud on the second
+	// (plans/secrets-hardening: a start must never silently boot without the
+	// credentials it was created with).
+	if err := putEnvExec(ctx, tx, sandbox.ID, []byte{}); err != nil {
 		return err
 	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) != "" {
@@ -1758,6 +1779,19 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			return ErrSandboxNameConflict
 		}
 		return fmt.Errorf("upsert sandbox: %w", err)
+	}
+	// Upsert can insert a row (a sandbox that never went through Create), and
+	// the "a missing env row means the seal was lost" rule only holds if every
+	// path that can create a sandbox also creates its env row. OR IGNORE so an
+	// existing sealed environment is never clobbered by an ordinary update.
+	// Selected from sandboxes rather than inserted blind: the row can be gone
+	// again by now (a concurrent destroy), and an env row for a sandbox that
+	// no longer exists is an FK violation, not an error worth failing on.
+	if _, err := exec.ExecContext(ctx, `
+		INSERT OR IGNORE INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+		SELECT id, X'', ? FROM sandboxes WHERE id = ?
+	`, time.Now().UTC(), sandbox.ID); err != nil {
+		return fmt.Errorf("ensure sandbox env row: %w", err)
 	}
 	if tx != nil {
 		if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, incarnationID, time.Now().UTC()); err != nil {
@@ -6406,12 +6440,18 @@ func (s *Store) GetEnv(ctx context.Context, sandboxID string) ([]byte, error) {
 // GetEnvWithIdentity reads ciphertext and its local lifecycle in one snapshot.
 // A cached Raft incarnation or two separate queries could bind an env read to
 // a replacement sandbox while the local row is being destroyed/recreated.
-func (s *Store) GetEnvWithIdentity(ctx context.Context, sandboxID string) (blob []byte, incarnationID, ownerRef string, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT env.sealed_blob, sandbox.audit_incarnation_id, sandbox.owner_ref
+//
+// present distinguishes an env row holding an empty seal (the sandbox has no
+// environment — the normal case, written at create) from no env row at all
+// (the row was lost). Both scan to a zero-length blob, so callers that must
+// fail loud on loss cannot use the blob length alone. ErrNotFound still means
+// the SANDBOX row is missing, not the env row.
+func (s *Store) GetEnvWithIdentity(ctx context.Context, sandboxID string) (blob []byte, present bool, incarnationID, ownerRef string, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT env.sealed_blob, env.sandbox_id IS NOT NULL, sandbox.audit_incarnation_id, sandbox.owner_ref
 		FROM sandboxes AS sandbox LEFT JOIN sandbox_env AS env ON env.sandbox_id = sandbox.id
-		WHERE sandbox.id = ?`, sandboxID).Scan(&blob, &incarnationID, &ownerRef)
+		WHERE sandbox.id = ?`, sandboxID).Scan(&blob, &present, &incarnationID, &ownerRef)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, "", "", ErrNotFound
+		return nil, false, "", "", ErrNotFound
 	}
 	return
 }

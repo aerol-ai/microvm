@@ -2283,7 +2283,7 @@ func (s *Service) sealEnv(sandboxID, incarnationID string, env map[string]string
 
 // loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
 func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) (env map[string]string, err error) {
-	sealed, auditIncarnationID, auditOwnerRef, getErr := s.store.GetEnvWithIdentity(ctx, sandboxID)
+	sealed, envPresent, auditIncarnationID, auditOwnerRef, getErr := s.store.GetEnvWithIdentity(ctx, sandboxID)
 	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 
@@ -2311,6 +2311,15 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) 
 			out = map[string]string{}
 		}
 		return out, nil
+	}
+	if getErr == nil && !envPresent {
+		// The sandbox row exists but its sealed env row does not. Every create
+		// writes one (empty when the sandbox has no environment) and warm
+		// upgrades are backfilled, so absence is loss — not "no env". Mapping
+		// it to an empty map is how a start/wake without a replicated spec
+		// used to boot a sandbox stripped of its credentials; fail loud
+		// instead so the operator sees it.
+		return nil, fmt.Errorf("%w: sealed env row is missing for sandbox %s", secrets.ErrDecryptFailed, sandboxID)
 	}
 	if errors.Is(getErr, store.ErrNotFound) || (getErr == nil && len(sealed) == 0) {
 		return map[string]string{}, nil

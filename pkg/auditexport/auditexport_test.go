@@ -128,7 +128,9 @@ func TestConfigValidate(t *testing.T) {
 		"unknown":                   {cfg: Config{Backend: "kinesis"}, wantErr: "unknown backend"},
 		// Enterprise tamper-evidence needs history this node cannot silently
 		// rewrite; noop/stdout/file all die with the disk.
-		"noop enterprise":   {cfg: Config{Enterprise: true}, wantErr: "off-node backend"},
+		// noop is enforced by the daemon (it alone can see a programmatic
+		// controlplane.AuditExporter), not here. See TestIsOffNodeBackend.
+		"noop enterprise":   {cfg: Config{Enterprise: true}},
 		"stdout enterprise": {cfg: Config{Backend: BackendStdout, Enterprise: true}, wantErr: "off-node backend"},
 		"file enterprise":   {cfg: Config{Backend: BackendFile, Enterprise: true, File: FileConfig{Path: "/tmp/x"}}, wantErr: "off-node backend"},
 		"bus enterprise ok": {cfg: Config{Backend: BackendBus, Enterprise: true, Bus: BusConfig{Topic: "audit"}}},

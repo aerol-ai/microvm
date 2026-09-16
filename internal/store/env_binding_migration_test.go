@@ -77,7 +77,7 @@ func TestEnvBindingMigrationIsAtomicAndOneTime(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, id := range []string{"a", "z"} {
-				blob, inc, _, err := st.GetEnvWithIdentity(ctx, id)
+				blob, _, inc, _, err := st.GetEnvWithIdentity(ctx, id)
 				if err != nil || inc == "" {
 					t.Fatalf("identity: %q %v", inc, err)
 				}
@@ -103,7 +103,7 @@ func TestEnvBindingMigrationIsAtomicAndOneTime(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer st.Close()
-			blob, inc, _, err := st.GetEnvWithIdentity(ctx, "a")
+			blob, _, inc, _, err := st.GetEnvWithIdentity(ctx, "a")
 			if err != nil || !bytes.Equal(blob, legacy) {
 				t.Fatal("restart ran legacy fallback again")
 			}
@@ -182,7 +182,7 @@ func TestEnvBindingMigrationDropsOrphanedRows(t *testing.T) {
 		t.Fatalf("orphaned env row survived the upgrade: %d", ghosts)
 	}
 	// The live row is still bound and readable, and the marker committed.
-	blob, inc, _, err := st.GetEnvWithIdentity(ctx, "live")
+	blob, _, inc, _, err := st.GetEnvWithIdentity(ctx, "live")
 	if err != nil {
 		t.Fatal(err)
 	}

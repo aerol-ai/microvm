@@ -138,7 +138,14 @@ func (c Config) Validate() error {
 		return errors.New("audit export batch max must be <= 65536")
 	}
 	switch c.Backend {
-	case BackendNoop, BackendStdout:
+	case BackendNoop:
+		// "Nothing selected" is not necessarily "nothing exports": a managed
+		// build wires controlplane.AuditExporter programmatically and never
+		// sets SB_AUDIT_EXPORT_BACKEND. Only the daemon can see both, so the
+		// enterprise requirement is enforced there (IsOffNodeBackend), not at
+		// config load where it would reject that legitimate wiring.
+		return nil
+	case BackendStdout:
 		if c.Enterprise {
 			return fmt.Errorf("%w: %q keeps audit evidence on this node", ErrOnNodeBackend, c.Backend)
 		}

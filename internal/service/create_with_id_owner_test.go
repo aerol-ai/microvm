@@ -60,3 +60,50 @@ func TestCreateSandboxWithIDRejectsForeignOwner(t *testing.T) {
 		t.Fatalf("operator recreate id = %q, want %q", operatorReplay.Sandbox.ID, id)
 	}
 }
+
+// TestLoadEnvFailsLoudWhenSealedRowIsMissing pins the fail-loud contract for
+// sealed environments. A sandbox created WITH an environment whose sandbox_env
+// row then disappears must not read back as "this sandbox has no environment":
+// that is how a start or wake without a replicated spec silently boots a
+// sandbox stripped of the credentials it was created with.
+func TestLoadEnvFailsLoudWhenSealedRowIsMissing(t *testing.T) {
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	svc.admitter = nil
+	ctx := t.Context()
+
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
+		Image: "alpine:3.20",
+		Env:   map[string]string{"TOKEN": "s3cret"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	id := resp.Sandbox.ID
+
+	env, err := svc.loadEnv(ctx, id, resp.Sandbox.AuditIncarnationID)
+	if err != nil || env["TOKEN"] != "s3cret" {
+		t.Fatalf("loadEnv = %v, %v; want the sealed environment", env, err)
+	}
+
+	if err := st.DeleteEnv(ctx, id); err != nil {
+		t.Fatalf("DeleteEnv: %v", err)
+	}
+	if _, err := svc.loadEnv(ctx, id, resp.Sandbox.AuditIncarnationID); err == nil {
+		t.Fatal("loadEnv returned an environment after its sealed row was deleted")
+	}
+
+	// A sandbox genuinely created without an environment still reads as empty,
+	// because create writes an empty row rather than no row at all.
+	bare, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"})
+	if err != nil {
+		t.Fatalf("CreateSandbox without env: %v", err)
+	}
+	env, err = svc.loadEnv(ctx, bare.Sandbox.ID, bare.Sandbox.AuditIncarnationID)
+	if err != nil {
+		t.Fatalf("loadEnv for an env-less sandbox = %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("loadEnv for an env-less sandbox = %v, want empty", env)
+	}
+}
