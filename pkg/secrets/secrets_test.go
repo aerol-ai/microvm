@@ -11,6 +11,42 @@ import (
 
 type errReader struct{}
 
+func TestEnvAADHasUnambiguousSandboxAndLifecycleBinding(t *testing.T) {
+	for _, pair := range [][2][2]string{
+		{{"a", "b"}, {"b", "a"}},
+		{{"sandbox", "old"}, {"sandbox", "new"}},
+		{{"a\x00b", "c"}, {"a", "b\x00c"}},
+	} {
+		if bytes.Equal(EnvAAD(pair[0][0], pair[0][1]), EnvAAD(pair[1][0], pair[1][1])) {
+			t.Fatalf("ambiguous env binding: %q", pair)
+		}
+	}
+}
+
+func BenchmarkEnvBindingOverhead(b *testing.B) {
+	cipher, err := NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)), "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	plain := []byte(`{"TOKEN":"example-value","MODE":"production"}`)
+	b.Run("unbound", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := cipher.Encrypt(plain); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("bound", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := cipher.EncryptWithAAD(plain, EnvAAD("sandbox-id", "incarnation-id")); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func (errReader) Read(p []byte) (int, error) {
 	return 0, io.ErrUnexpectedEOF
 }

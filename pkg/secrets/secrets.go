@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,13 @@ import (
 )
 
 var randReader io.Reader = rand.Reader
+
+// EnvAAD binds an environment to both its sandbox and lifecycle. JSON string
+// framing prevents ambiguous boundaries even if an ID contains a delimiter.
+func EnvAAD(sandboxID, incarnationID string) []byte {
+	aad, _ := json.Marshal([3]string{"sandbox-env/v1", sandboxID, incarnationID})
+	return aad
+}
 
 // Cipher seals and opens user-supplied secrets (cloud credentials for sandbox
 // mounts) using AES-256-GCM. The seal format is `nonce(12) || ciphertext+tag`.

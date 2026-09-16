@@ -264,7 +264,11 @@ func TestOpenWithSecretCipherMigratesPlaintextSecrets(t *testing.T) {
 		_ = migrated.Close()
 		t.Fatalf("GetEnv: %v", err)
 	}
-	plainEnv, err := cipher.Decrypt(sealedEnv)
+	inc, _, err := migrated.CurrentSandboxAuditIdentity(ctx, fullID)
+	if err != nil || inc == "" {
+		t.Fatalf("migrated lifecycle: %q %v", inc, err)
+	}
+	plainEnv, err := cipher.DecryptWithAAD(sealedEnv, secrets.EnvAAD(fullID, inc))
 	if err != nil {
 		_ = migrated.Close()
 		t.Fatalf("decrypt migrated env: %v", err)

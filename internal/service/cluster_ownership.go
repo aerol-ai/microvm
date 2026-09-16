@@ -291,7 +291,7 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 		} else if len(mounts) > 0 {
 			spec.Mounts = mounts
 		}
-		if env, envErr := s.loadEnv(ctx, sb.ID); envErr != nil {
+		if env, envErr := s.loadEnv(ctx, sb.ID, sb.AuditIncarnationID); envErr != nil {
 			return nil, fmt.Errorf("load environment for ownership replay %s: %w", sb.ID, envErr)
 		} else if len(env) > 0 {
 			spec.Env = env

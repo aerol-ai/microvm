@@ -9,10 +9,39 @@ Environment variables set at create time are secrets. `get` and `list` **omit `e
 Create, get, and list responses are redacted unless the read API explicitly
 opts in to env materialization.
 
-At rest, env values exist only as an authenticated, sandbox-bound encrypted
-blob in `sandbox_env`. There is no plaintext `env_json` column, fallback read,
-or rollout flag. A missing cipher or sealed row fails closed, and a database
-that still contains a plaintext secret column is rejected at boot.
+At rest, env values exist only as an authenticated encrypted blob in
+`sandbox_env`, bound to the sandbox ID **and its lifecycle incarnation**.
+Copying ciphertext to another sandbox, or to a replacement that reuses its ID,
+does not make it decryptable there. Missing keys or invalid ciphertext fail
+closed. A sandbox created without environment variables has no env row.
+
+Startup transactionally migrates legacy plaintext columns and upgrades older
+unbound encrypted env rows using the existing encryption key. The binding
+upgrade is recorded in the schema; normal reads and subsequent restarts never
+fall back to unbound decryption. Back up the database **and its matching key**
+before upgrading, and retain them together for rollback to an older binary.
+Do not run an older binary against an upgraded database.
+
+## Migrating existing clients
+
+Hiding env is an intentional breaking response-contract change, including
+single-node and local deployments. An absent `env` in a default response does
+**not** mean that the sandbox lost its environment. There is no server flag
+that restores plaintext disclosure to old clients.
+
+1. Identify code that reads `sandbox.env` after get/list (including code that
+   copies those values into a new create request). Do not interpret a redacted
+   response as an empty environment to propagate elsewhere.
+2. Upgrade the SDK to a release with the opt-in methods below, then request env
+   only where the application actually needs secret values. Routine inventory,
+   status polling, and dashboards should continue using the redacted defaults.
+3. Test both the explicit read and the redacted default in a staging deployment
+   before upgrading production. Confirm the explicit read produces an audit
+   event and that the application does not log the returned secrets.
+
+The next two sections show the replacement calls for all five SDKs. Clients
+that cannot yet be upgraded need an application migration before this server
+upgrade; they are not silently made compatible by the database migration.
 
 ## Get a sandbox with env
 

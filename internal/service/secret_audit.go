@@ -1128,6 +1128,13 @@ func (s *fileAuditSink) pruneWithGuards(cutoff time.Time, exportCursorPath, witn
 func (s *fileAuditSink) withAuditFileLock(fn func() error) error {
 	lockPath := s.lockPath
 	if lockPath == "" {
+		// Derive the sidecar from the log path. Never let both be empty fall
+		// through to a bare relative ".lock": that silently takes the lock in
+		// the process working directory, so two audit directories would
+		// serialize against one unrelated file instead of their own.
+		if strings.TrimSpace(s.path) == "" {
+			return errors.New("audit lock path is unset")
+		}
 		lockPath = s.path + ".lock"
 	}
 	// The sidecar is only a flock target and never stores data.

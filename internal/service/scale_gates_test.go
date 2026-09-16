@@ -36,7 +36,7 @@ func TestScaleGateIngressShardAssignmentAt10KMembers(t *testing.T) {
 		})
 	}
 	stub := &stubIngressCluster{Noop: cluster.NewNoop("ing-05000", "http://self", ""), members: known}
-	filter := clusterIngressShardFilter(stub, "ing-05000")
+	filter := (&Service{}).clusterIngressShardFilter(stub, "ing-05000")
 	if filter.ShardCount != cluster.DefaultPlacementShardCount {
 		t.Fatalf("shard count=%d, want %d", filter.ShardCount, cluster.DefaultPlacementShardCount)
 	}

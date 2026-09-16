@@ -223,10 +223,19 @@ recipient dies, the owner (or leader for ownerless records) opens the current
 generation, seals to live replacements, and requires a replacement ACK before
 the Raft CAS. The sealed row and an `awaiting_promotion` retired-recipient
 journal are one SQLite transaction. Peer deletion starts only after Raft shows
-the new generation, so a crash cannot create either a recovery vacuum or a
-forgotten ciphertext copy. Removed/decommissioned node IDs remain pending in
+the new generation. Returning holders independently compare their exact ref,
+incarnation, seal generation and recipient membership with authoritative Raft
+state; superseded local generations are tombed without peer fan-out. This
+closes the forgotten-copy case when the resealing coordinator permanently
+loses its disk before draining its outbox. A staged generation ahead of Raft
+is retained, and generation-conditional deletion protects a concurrent PUT.
+
+Removed/decommissioned node IDs remain pending in
 the delete outbox until their authenticated generation-scoped DELETE ACKs;
 membership disappearance is never treated as cleanup success.
+An authoritative storage-destruction/terminal-retirement protocol is still
+not implemented. Permanent loss can therefore retain outbox/tomb metadata
+indefinitely; bounded per-tick retries are not a bound on retained rows.
 
 ### 3d. Corrections that ride along
 
@@ -313,12 +322,23 @@ rolls the whole migration back for a safe retry. The current schema has no
 `env_json` column; writes require the cipher and reads accept only the sealed
 `sandbox_env` row.
 
+Env AEAD authenticates both sandbox ID and incarnation. A one-time,
+transactional schema migration binds existing unbound encrypted rows with the
+same key; after the binding-version marker commits, runtime reads and later
+restarts cannot fall back to nil-AAD decryption. The local row identity and
+ciphertext are loaded in a single SQLite snapshot, not from cached placement.
+
 ### 5b. API contract change (D9)
 
 `Get`/`List` omit env by default; an explicit opt-in returns it and audits the
 read. This is a **breaking change** for callers reading `sandbox.Env` today —
 needs SDK work across all five languages and a docs page per CLAUDE.md
 (five-tab `syncKey="lang"`, no curl).
+
+Review decision: retain this secure default, with the explicit migration
+procedure in `docs/src/content/docs/sandbox-env.mdx`. Database compatibility
+does not imply compatibility for deployed clients that depend on default env
+disclosure. There is no legacy disclosure flag.
 
 ### 5c. Redact `Env` from the replicated spec
 

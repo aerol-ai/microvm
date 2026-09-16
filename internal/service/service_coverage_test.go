@@ -3324,15 +3324,15 @@ func TestConfigureSecretProviderAWSKMSCanaryOffline(t *testing.T) {
 
 func TestSealLoadEnvAndApplyListEnvError(t *testing.T) {
 	ctx := context.Background()
-	if sealed, err := (&Service{}).sealEnv(nil); sealed != nil || err != nil {
+	if sealed, err := (&Service{}).sealEnv("", "", nil); sealed != nil || err != nil {
 		t.Fatalf("empty env = %v %v", sealed, err)
 	}
-	if _, err := (&Service{}).sealEnv(map[string]string{"K": "v"}); err == nil {
+	if _, err := (&Service{}).sealEnv("sb", "inc", map[string]string{"K": "v"}); err == nil {
 		t.Fatal("seal without cipher succeeded")
 	}
 
 	svc, st, _ := testEnvService(t)
-	if _, err := svc.loadEnv(ctx, "missing"); err != nil {
+	if _, err := svc.loadEnv(ctx, "missing", ""); err != nil {
 		t.Fatalf("missing env: %v", err)
 	}
 	for _, id := range []string{"sb-garbage", "sb-null", "sb-badjson", "sb-sealed"} {
@@ -3341,32 +3341,32 @@ func TestSealLoadEnvAndApplyListEnvError(t *testing.T) {
 	if err := st.PutEnv(ctx, "sb-garbage", []byte("not-an-envelope")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.loadEnv(ctx, "sb-garbage"); err == nil || !errors.Is(err, secrets.ErrDecryptFailed) {
+	if _, err := svc.loadEnv(ctx, "sb-garbage", "inc-sb-garbage"); err == nil || !errors.Is(err, secrets.ErrDecryptFailed) {
 		t.Fatalf("garbage decrypt = %v", err)
 	}
-	plainNull, err := svc.cipher.Encrypt([]byte("null"))
+	plainNull, err := svc.cipher.EncryptWithAAD([]byte("null"), secrets.EnvAAD("sb-null", "inc-sb-null"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := st.PutEnv(ctx, "sb-null", plainNull); err != nil {
 		t.Fatal(err)
 	}
-	got, err := svc.loadEnv(ctx, "sb-null")
+	got, err := svc.loadEnv(ctx, "sb-null", "inc-sb-null")
 	if err != nil || got == nil {
 		t.Fatalf("null env = %+v err=%v", got, err)
 	}
-	plainBad, err := svc.cipher.Encrypt([]byte("{not-json"))
+	plainBad, err := svc.cipher.EncryptWithAAD([]byte("{not-json"), secrets.EnvAAD("sb-badjson", "inc-sb-badjson"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := st.PutEnv(ctx, "sb-badjson", plainBad); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.loadEnv(ctx, "sb-badjson"); err == nil || !errors.Is(err, secrets.ErrDecryptFailed) {
+	if _, err := svc.loadEnv(ctx, "sb-badjson", "inc-sb-badjson"); err == nil || !errors.Is(err, secrets.ErrDecryptFailed) {
 		t.Fatalf("bad json = %v", err)
 	}
 
-	sealed, err := svc.sealEnv(map[string]string{"A": "1"})
+	sealed, err := svc.sealEnv("sb-sealed", "inc-sb-sealed", map[string]string{"A": "1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3374,7 +3374,7 @@ func TestSealLoadEnvAndApplyListEnvError(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.cipher = nil
-	if _, err := svc.loadEnv(ctx, "sb-sealed"); err == nil {
+	if _, err := svc.loadEnv(ctx, "sb-sealed", "inc-sb-sealed"); err == nil {
 		t.Fatal("load without cipher succeeded")
 	}
 	if err := svc.applyListEnvOptions(ctx, []*models.Sandbox{{ID: "sb-sealed"}}, GetSandboxOptions{IncludeEnv: true}); err == nil {
@@ -3387,7 +3387,7 @@ func TestSealLoadEnvAndApplyListEnvError(t *testing.T) {
 	}
 	closedSvc := &Service{store: closed, cipher: newTestCipher(t)}
 	_ = closed.Close()
-	if _, err := closedSvc.loadEnv(ctx, "sb"); err == nil {
+	if _, err := closedSvc.loadEnv(ctx, "sb", "inc"); err == nil {
 		t.Fatal("closed-store loadEnv succeeded")
 	}
 }
@@ -3561,11 +3561,12 @@ func TestListSandboxesWithOptionsEnvAndTags(t *testing.T) {
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
 		ID: "sb-list31", Image: "alpine", Status: models.SandboxStatusStarted,
-		Tags: map[string]string{"env": "prod"}, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-list31",
+		Tags:               map[string]string{"env": "prod"}, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := svc.sealEnv(map[string]string{"K": "v"})
+	sealed, err := svc.sealEnv("sb-list31", "inc-list31", map[string]string{"K": "v"})
 	if err != nil {
 		t.Fatal(err)
 	}

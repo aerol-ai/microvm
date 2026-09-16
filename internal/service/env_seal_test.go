@@ -43,6 +43,7 @@ func seedEnvSandbox(t *testing.T, st *store.Store, id string, env map[string]str
 		PublicURL: "http://x/" + id, ContainerID: "c", ContainerIP: "10.0.0.1",
 		CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root", Env: env,
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		AuditIncarnationID: "inc-" + id,
 	}
 	if err := st.Create(context.Background(), sb); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -54,14 +55,14 @@ func TestSealLoadEnvRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	seedEnvSandbox(t, st, "sb-rt", map[string]string{"TOKEN": "secret"})
 
-	sealed, err := svc.sealEnv(map[string]string{"TOKEN": "secret"})
+	sealed, err := svc.sealEnv("sb-rt", "inc-sb-rt", map[string]string{"TOKEN": "secret"})
 	if err != nil {
 		t.Fatalf("sealEnv: %v", err)
 	}
 	if err := st.PutEnv(ctx, "sb-rt", sealed); err != nil {
 		t.Fatalf("PutEnv: %v", err)
 	}
-	got, err := svc.loadEnv(ctx, "sb-rt")
+	got, err := svc.loadEnv(ctx, "sb-rt", "inc-sb-rt")
 	if err != nil {
 		t.Fatalf("loadEnv: %v", err)
 	}
@@ -71,6 +72,89 @@ func TestSealLoadEnvRoundTrip(t *testing.T) {
 	evs := audit.Events()
 	if len(evs) != 1 || evs[0].Result != secretAuditResultSuccess {
 		t.Fatalf("audit = %+v", evs)
+	}
+}
+
+func TestEnvCannotBeTransplantedAcrossSandboxOrIncarnation(t *testing.T) {
+	svc, st, audit := testEnvService(t)
+	ctx := context.Background()
+	seedEnvSandbox(t, st, "source", nil)
+	seedEnvSandbox(t, st, "target", nil)
+	sealed, err := svc.sealEnv("source", "inc-source", map[string]string{"TOKEN": "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"source", "target"} {
+		if err := st.PutEnv(ctx, target, sealed); err != nil {
+			t.Fatal(err)
+		}
+		_, err := svc.loadEnv(ctx, target, "inc-"+target)
+		if (target == "source" && err != nil) || (target == "target" && !errors.Is(err, secrets.ErrDecryptFailed)) {
+			t.Fatalf("load %s: %v", target, err)
+		}
+	}
+	sb, err := st.Get(ctx, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Delete(ctx, "source"); err != nil {
+		t.Fatal(err)
+	}
+	sb.AuditIncarnationID = "inc-replacement"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutEnv(ctx, "source", sealed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.loadEnv(ctx, "source", "inc-replacement"); !errors.Is(err, secrets.ErrDecryptFailed) {
+		t.Fatalf("old lifetime env accepted: %v", err)
+	}
+	legacy, err := svc.cipher.Encrypt([]byte(`{"TOKEN":"legacy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutEnv(ctx, "source", legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.loadEnv(ctx, "source", "inc-replacement"); !errors.Is(err, secrets.ErrDecryptFailed) {
+		t.Fatalf("runtime accepted nil-AAD env: %v", err)
+	}
+	if len(audit.Events()) != 4 {
+		t.Fatal("explicit success/failure reads were not audited")
+	}
+}
+
+func TestLoadEnvRejectsLifecycleAndOwnerChangesBeforeRead(t *testing.T) {
+	svc, st, _ := testEnvService(t)
+	ctx := context.Background()
+	seedEnvSandbox(t, st, "owned", nil)
+	sb, err := st.Get(ctx, "owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb.OwnerRef = "new-owner"
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := svc.sealEnv(sb.ID, sb.AuditIncarnationID, map[string]string{"K": "V"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutEnv(ctx, sb.ID, blob); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.loadEnv(ctx, sb.ID, "old-incarnation"); !errors.Is(err, secrets.ErrDecryptFailed) {
+		t.Fatalf("stale authorized lifecycle opened replacement: %v", err)
+	}
+	if _, err := svc.loadEnv(userCtx("old-owner"), sb.ID, sb.AuditIncarnationID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stale authorized owner opened replacement: %v", err)
+	}
+	if env, err := svc.loadEnv(userCtx("new-owner"), sb.ID, sb.AuditIncarnationID); err != nil || env["K"] != "V" {
+		t.Fatalf("current owner read: %v %v", env, err)
+	}
+	if _, err := svc.sealEnv("", "inc", map[string]string{"K": "V"}); err == nil {
+		t.Fatal("unbound env seal accepted")
 	}
 }
 
@@ -95,7 +179,7 @@ func TestUpsertPreservesSealedEnv(t *testing.T) {
 	if err := st.Upsert(ctx, sb); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	got, err := svc.loadEnv(ctx, "sb-up")
+	got, err := svc.loadEnv(ctx, "sb-up", sb.AuditIncarnationID)
 	if err != nil {
 		t.Fatalf("loadEnv: %v", err)
 	}
