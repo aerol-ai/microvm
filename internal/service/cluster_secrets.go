@@ -125,6 +125,15 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID strin
 	bag, openErr := p.Open(ctx, sandboxID, secrets.Handle{
 		Ref: placement.Ref, Version: placement.Version, SealGeneration: placement.SealGeneration,
 	}, nodeID)
+	if openErr != nil && errors.Is(openErr, secrets.ErrVersionMismatch) {
+		if staged, ok := s.stagedResealTakeoverHandle(ctx, sandboxID, placement, nodeID); ok {
+			if s.logger != nil {
+				s.logger.Warn("cluster: opening staged reseal generation for takeover; Raft still publishes the older generation",
+					"sandbox_id", sandboxID, "placement_generation", placement.SealGeneration, "local_generation", staged.SealGeneration)
+			}
+			bag, openErr = p.Open(ctx, sandboxID, staged, nodeID)
+		}
+	}
 	if openErr != nil {
 		if errors.Is(openErr, secrets.ErrVersionMismatch) {
 			recordClusterSecretKeyMismatch()
@@ -137,6 +146,32 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID strin
 		return redacted, openErr
 	}
 	return mergeClusterSecrets(redacted, bag), nil
+}
+
+// stagedResealTakeoverHandle returns the handle for a strictly newer local
+// generation of the exact lifecycle the placement names, when this node is a
+// recipient of it. A reseal stages G+1 on its replacement recipients before
+// the Raft CAS; a replacement that was already a backup holds one row per
+// ref, so the staged PUT overwrites its committed G copy. If the owner dies
+// before the CAS, Raft keeps handing out G and the only surviving copies are
+// the staged ones — refusing them strands failover while the plaintext (the
+// same bag, resealed to a new recipient set) sits on disk. Once this node is
+// the owner, expandAndResealDeadSecretTargets finalizes the interrupted
+// promotion so Raft catches up with the store.
+func (s *Service) stagedResealTakeoverHandle(ctx context.Context, sandboxID string, placement cluster.PlacementSecrets, nodeID string) (secrets.Handle, bool) {
+	if s == nil || !s.cfg.EnableCluster || s.store == nil || placement.SealGeneration <= 0 {
+		return secrets.Handle{}, false
+	}
+	rec, err := s.store.GetClusterSecret(ctx, placement.Ref)
+	if err != nil || rec == nil || rec.SandboxID != sandboxID || rec.Version != placement.Version ||
+		rec.SealGeneration <= placement.SealGeneration || !secrets.RecipientAllowed(rec.Recipients, nodeID) {
+		return secrets.Handle{}, false
+	}
+	parsed, parseErr := secrets.ParseRef(rec.Ref)
+	if parseErr != nil || parsed.IncarnationID != strings.TrimSpace(placement.IncarnationID) {
+		return secrets.Handle{}, false
+	}
+	return secrets.Handle{Ref: rec.Ref, Version: rec.Version, SealGeneration: rec.SealGeneration}, true
 }
 
 func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID, incarnationID string) error {
@@ -298,10 +333,16 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, inca
 	if incarnationID == "" {
 		return errors.New("peer secret delete incarnation_id is required")
 	}
-	if err := s.authorizePeerSecretDelete(ctx, sandboxID, incarnationID, peerNodeID); err != nil {
+	alreadyApplied, err := s.authorizePeerSecretDelete(ctx, sandboxID, incarnationID, generation, peerNodeID)
+	if err != nil {
 		return err
 	}
-	var err error
+	if alreadyApplied {
+		// Acknowledge without touching state: the originator's durable outbox
+		// only needs the ACK it lost, and re-applying would change nothing.
+		clearSecretFanoutHoldersForIncarnation(sandboxID, incarnationID)
+		return nil
+	}
 	if s.store != nil {
 		err = s.store.ApplyPeerSecretDelete(ctx, sandboxID, incarnationID, generation)
 	} else if p := s.provider(); p != nil {
@@ -311,40 +352,93 @@ func (s *Service) DeleteClusterSecretsLocal(ctx context.Context, sandboxID, inca
 	return err
 }
 
-func (s *Service) authorizePeerSecretDelete(ctx context.Context, sandboxID, incarnationID, peerNodeID string) error {
+// authorizePeerSecretDelete decides whether a peer DELETE may be applied.
+// alreadyApplied reports that this node holds nothing at or below generation
+// for the exact lifecycle and nothing can land later, so the caller must
+// acknowledge without applying.
+//
+// Authorization evidence is transient: the ciphertext row disappears on the
+// first successful apply and the authoritative placement disappears when the
+// sandbox is destroyed. A retry after a lost ACK — the normal case for a
+// durable outbox — therefore has to be recognized from the local tomb, not
+// re-authorized from evidence that no longer exists, or the originator's
+// outbox row and tomb never retire.
+func (s *Service) authorizePeerSecretDelete(ctx context.Context, sandboxID, incarnationID string, generation int64, peerNodeID string) (alreadyApplied bool, err error) {
 	if s == nil || !s.cfg.EnableCluster {
-		return nil
+		return false, nil
 	}
 	peerNodeID = strings.TrimSpace(peerNodeID)
 	if peerNodeID == "" {
-		return fmt.Errorf("%w: peer identity is required for secret delete", ErrClusterSecretOriginatorDenied)
+		return false, fmt.Errorf("%w: peer identity is required for secret delete", ErrClusterSecretOriginatorDenied)
 	}
+	denied := fmt.Errorf("%w: node %q cannot delete sandbox %q secrets", ErrClusterSecretOriginatorDenied, peerNodeID, sandboxID)
 	// Prefer the exact local lifecycle record. It remains authoritative for a
 	// delayed cleanup after a sandbox ID has been reused by a new placement.
+	var rec *store.ClusterSecretRecord
 	if s.store != nil {
-		rec, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sandboxID, incarnationID)
+		rec, err = s.store.GetClusterSecretForSandboxIncarnation(ctx, sandboxID, incarnationID)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("authorize peer secret delete from local record: %w", err)
+			return false, fmt.Errorf("authorize peer secret delete from local record: %w", err)
 		}
 		if rec != nil && secrets.RecipientAllowed(rec.Recipients, peerNodeID) {
-			return nil
+			return false, nil
+		}
+		if rec == nil {
+			// Tombs are only ever written by an authorized delete (this node as
+			// originator, or a peer that passed this check), so a tomb at or
+			// above the requested generation is proof the work is already done.
+			tombGen, tombErr := s.store.ClusterSecretTombGenerationForIncarnation(ctx, sandboxID, incarnationID)
+			if tombErr != nil {
+				return false, fmt.Errorf("authorize peer secret delete from local tomb: %w", tombErr)
+			}
+			if tombGen >= generation {
+				return true, nil
+			}
 		}
 	}
 	c := s.Cluster()
 	if c == nil {
-		return ErrClusterSecretPlacementUnavailable
+		return false, ErrClusterSecretPlacementUnavailable
 	}
 	placements, err := c.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrClusterSecretPlacementUnavailable, err)
+		return false, fmt.Errorf("%w: %v", ErrClusterSecretPlacementUnavailable, err)
 	}
-	placement, ok := placements[sandboxID]
-	if ok && strings.TrimSpace(placement.IncarnationID) == incarnationID {
-		if strings.TrimSpace(placement.OwnerNodeID) == peerNodeID || secrets.RecipientAllowed(placement.SecretRecipients, peerNodeID) {
-			return nil
+	if placement, ok := placements[sandboxID]; ok && strings.TrimSpace(placement.IncarnationID) == incarnationID {
+		if peerSecretDeleteAuthorizedByPlacement(placement, peerNodeID) {
+			return false, nil
 		}
+		return false, denied
 	}
-	return fmt.Errorf("%w: node %q cannot delete sandbox %q secrets", ErrClusterSecretOriginatorDenied, peerNodeID, sandboxID)
+	if rec != nil {
+		// Ciphertext is present but neither the row nor the authoritative
+		// lifecycle names the peer: only the retirement scan may remove it.
+		return false, denied
+	}
+	// No local ciphertext, no covering tomb, and the authoritative lifecycle
+	// is gone (destroyed, or the ID was reused by a new incarnation) — the
+	// first fan-out attempt can land here when the peer never received the
+	// PUT and the placement removal won the race. A PUT for this incarnation
+	// can only pass validatePeerSecretBlob while the local FSM snapshot still
+	// shows the lifecycle live, and both checks run under lockSecretSandboxOps,
+	// so that snapshot is the last evidence that can authorize a tomb.
+	live, ok, liveErr := s.liveSecretPlacement(sandboxID)
+	if liveErr != nil {
+		return false, fmt.Errorf("%w: %v", ErrClusterSecretPlacementUnavailable, liveErr)
+	}
+	if ok && strings.TrimSpace(live.IncarnationID) == incarnationID {
+		if peerSecretDeleteAuthorizedByPlacement(live, peerNodeID) {
+			return false, nil
+		}
+		return false, denied
+	}
+	// Nothing to delete and nothing can arrive: acknowledge so the originator's
+	// outbox retires. No tomb is minted on an unauthenticated say-so.
+	return true, nil
+}
+
+func peerSecretDeleteAuthorizedByPlacement(placement cluster.Placement, peerNodeID string) bool {
+	return strings.TrimSpace(placement.OwnerNodeID) == peerNodeID || secrets.RecipientAllowed(placement.SecretRecipients, peerNodeID)
 }
 
 // ReconcileSecretDeleteOutbox retries durable peer DELETEs after boot / crash

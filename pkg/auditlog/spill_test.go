@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +34,68 @@ func readSpillLines(t *testing.T, path string) []Event {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// A record's capability rides on the line as a top-level field so the
+// daemon's drain can authenticate it; Append (no capability) must not emit
+// the field at all, and the caller's records are never mutated.
+func TestSpillFileAppendRecordsCarriesCapability(t *testing.T) {
+	dir := t.TempDir()
+	s := SpillFileIn(dir)
+	records := []SpillRecord{
+		{Event: Event{SandboxID: "sb-1", Kind: "egress", Destination: "a:1", Result: "success"}, Capability: "sb-1|inc-1|9999999999|mac"},
+		{Event: GapMarker("node-x", 2, time.Now().UTC())},
+	}
+	if err := s.AppendRecords(records); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append([]Event{{SandboxID: "sb-2", Kind: "egress", Destination: "b:2", Result: "success"}}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3", len(lines))
+	}
+	var first SpillRecord
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Capability != "sb-1|inc-1|9999999999|mac" || first.SandboxID != "sb-1" || first.EventID == "" || first.Time.IsZero() {
+		t.Fatalf("record round trip = %+v", first)
+	}
+	for i, line := range lines[1:] {
+		var rec SpillRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Capability != "" {
+			t.Fatalf("line %d carries a capability it was not given: %s", i+1, line)
+		}
+		if strings.Contains(line, `"capability"`) {
+			t.Fatalf("line %d emits an empty capability field: %s", i+1, line)
+		}
+	}
+	if records[0].EventID != "" {
+		t.Fatal("AppendRecords mutated the caller's records")
+	}
+	if err := (SpillFile{}).AppendRecords(records); !errors.Is(err, ErrNoSpillPath) {
+		t.Fatalf("unset paths err = %v", err)
+	}
+	if err := s.AppendRecords(nil); err != nil {
+		t.Fatalf("empty AppendRecords: %v", err)
+	}
 }
 
 func TestSpillFileAppendIsOneBatchWithIDsAndTimes(t *testing.T) {

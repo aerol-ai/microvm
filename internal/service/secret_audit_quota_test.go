@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
 
 func quotaTestEgress(sandboxID, dest string) SecretAuditEvent {
@@ -203,16 +205,22 @@ func TestFileAuditSinkAppliesEgressBudgetAtTheWriter(t *testing.T) {
 // overflow) take the same budget: the spill is a path into the log, not
 // around the quota.
 func TestFileAuditSinkAppliesEgressBudgetToSpilledRecords(t *testing.T) {
-	sink, err := newFileAuditSinkFrom(t.TempDir(), fileAuditSinkOptions{buffer: 64, spillEnabled: true, egressRate: 1, egressBurst: 3, egressMarkerDelay: time.Millisecond})
+	sink, err := newFileAuditSinkFrom(t.TempDir(), fileAuditSinkOptions{
+		buffer: 64, spillEnabled: true, egressRate: 1, egressBurst: 3, egressMarkerDelay: time.Millisecond,
+		spillVerify: func(capability string, now time.Time) (string, string, error) {
+			return auditlog.ParseAndVerifyEgressCapability(drainTestSpillKey, capability, now)
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(sink.Close)
-	spilled := make([]SecretAuditEvent, 0, 6)
+	capability := mintDrainTestCapability(t, "sb-c", "inc-sb-c", time.Now().Add(time.Hour))
+	spilled := make([]auditlog.SpillRecord, 0, 6)
 	for i := 0; i < 6; i++ {
-		spilled = append(spilled, quotaTestEgress("sb-c", "c"))
+		spilled = append(spilled, auditlog.SpillRecord{Event: quotaTestEgress("sb-c", "c"), Capability: capability})
 	}
-	if err := sink.appendSpill(spilled...); err != nil {
+	if err := sink.appendSpillRecords(spilled...); err != nil {
 		t.Fatal(err)
 	}
 	if err := sink.Sync(); err != nil {

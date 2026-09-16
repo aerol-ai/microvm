@@ -64,16 +64,38 @@ func SpillFileIn(dir string) SpillFile {
 	return SpillFile{Path: filepath.Join(dir, SpillFileName), LockPath: filepath.Join(dir, LockFileName)}
 }
 
-// Append durable-appends events as one write and one fsync under the audit
-// lock. Events get an id and a time if they lack one. Either every line
+// SpillRecord is one spill line: the event plus the sandbox-scoped
+// capability the worker would have sent on the ingest header. The spill file
+// is written by worker subprocesses and drained by the daemon, so every
+// identity field on the line is unauthenticated until the drain verifies the
+// capability and rebinds them from it — exactly what the HTTP ingest does.
+// The capability is a bearer credential and never reaches secrets.jsonl.
+type SpillRecord struct {
+	Event
+	Capability string `json:"capability,omitempty"`
+}
+
+// Append durable-appends events with no capability (gap markers, daemon-side
+// tests). Egress records need AppendRecords: an unauthenticated egress line
+// is drained as a gap.
+func (s SpillFile) Append(events []Event) error {
+	records := make([]SpillRecord, len(events))
+	for i := range events {
+		records[i] = SpillRecord{Event: events[i]}
+	}
+	return s.AppendRecords(records)
+}
+
+// AppendRecords durable-appends records as one write and one fsync under the
+// audit lock. Events get an id and a time if they lack one. Either every line
 // lands or the error covers the whole batch: a torn spill line is repaired
 // by the daemon's drain (which counts it as a gap), so a crash mid-write
 // loses at most this batch and never corrupts what came before.
-func (s SpillFile) Append(events []Event) error {
+func (s SpillFile) AppendRecords(records []SpillRecord) error {
 	if s.Path == "" || s.LockPath == "" {
 		return ErrNoSpillPath
 	}
-	if len(events) == 0 {
+	if len(records) == 0 {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
@@ -81,12 +103,12 @@ func (s SpillFile) Append(events []Event) error {
 	}
 	var buf []byte
 	now := time.Now().UTC()
-	for i := range events {
-		ev := events[i]
+	for i := range records {
+		ev := records[i]
 		if ev.Time.IsZero() {
 			ev.Time = now
 		}
-		EnsureEventID(&ev)
+		EnsureEventID(&ev.Event)
 		line, err := json.Marshal(ev)
 		if err != nil {
 			return fmt.Errorf("audit spill marshal: %w", err)

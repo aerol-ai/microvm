@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"log/slog"
 	"net/http"
@@ -50,6 +51,12 @@ const (
 
 type workerEgressAuditEvent = auditlog.Event
 
+// workerEgressSpillRecord is what actually hits the spill file: the event
+// plus the capability the daemon would have verified on the ingest header.
+// Without it the daemon's drain has no way to tell this worker's record from
+// a forged one and chains it as a gap.
+type workerEgressSpillRecord = auditlog.SpillRecord
+
 type egressAuditJob struct {
 	port, capability, node                     string
 	spill                                      *workerEgressSpiller
@@ -82,6 +89,11 @@ var (
 	// already owes them to the sandbox's coalesced rate_limited record, and
 	// the spill file is a path into the log, not around the budget.
 	workerEgressThrottled = expvar.NewInt("aerolvm_wasm_egress_audit_throttled_total")
+	// workerEgressRejected counts records the daemon refused on identity or
+	// shape (4xx other than 429: a stale or forged capability, a bad body).
+	// They are not spilled either: the spill file exists for a daemon that is
+	// unreachable, not for a daemon that already said no.
+	workerEgressRejected = expvar.NewInt("aerolvm_wasm_egress_audit_rejected_total")
 )
 
 // installDefaultEgressObserver wires destination attribution when
@@ -160,24 +172,39 @@ func postOrSpillWorkerEgress(job egressAuditJob) {
 		job.eventTime = time.Now().UTC()
 	}
 	if job.port != "" && job.capability != "" {
-		if err := postWorkerEgressAudit(job); err == nil {
+		err := postWorkerEgressAudit(job)
+		if err == nil {
+			return
+		}
+		var status statusError
+		if errors.As(err, &status) && status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+			// The daemon was reachable and refused this record's identity or
+			// shape. Spilling it would only re-present the same rejected
+			// capability to the same daemon's drain.
+			workerEgressRejected.Add(1)
 			return
 		}
 		workerEgressIPCFail.Add(1)
 	}
 	// IPC unavailable — hand the record to the spill writer; never touch
-	// secrets.jsonl. A nil writer (no spill dir) counts a drop.
-	job.spill.enqueue(workerEgressAuditEvent{
-		Time:          job.eventTime,
-		Actor:         job.node,
-		SandboxID:     sandboxID,
-		Result:        "success",
-		Reason:        "ok",
-		NodeID:        job.node,
-		Kind:          "egress",
-		Destination:   address,
-		Network:       strings.TrimSpace(job.network),
-		IncarnationID: strings.TrimSpace(job.incarnationID),
+	// secrets.jsonl. A nil writer (no spill dir) counts a drop. The identity
+	// fields ride along for operators reading the raw spill, but the drain
+	// rebinds sandbox/incarnation from the capability and stamps actor/owner
+	// itself, so a worker cannot spill under another sandbox's name.
+	job.spill.enqueueRecord(workerEgressSpillRecord{
+		Event: workerEgressAuditEvent{
+			Time:          job.eventTime,
+			Actor:         job.node,
+			SandboxID:     sandboxID,
+			Result:        "success",
+			Reason:        "ok",
+			NodeID:        job.node,
+			Kind:          "egress",
+			Destination:   address,
+			Network:       strings.TrimSpace(job.network),
+			IncarnationID: strings.TrimSpace(job.incarnationID),
+		},
+		Capability: strings.TrimSpace(job.capability),
 	})
 }
 
@@ -228,7 +255,7 @@ func errStatus(code int) error { return statusError(code) }
 type workerEgressSpiller struct {
 	file auditlog.SpillFile
 	node string
-	ch   chan workerEgressAuditEvent
+	ch   chan workerEgressSpillRecord
 	kick chan struct{}
 	// pending is the coalesced drop count the next batch reports as one gap
 	// marker. It is never reset by a failed write: the loss stays owed until
@@ -251,7 +278,7 @@ func newWorkerEgressSpiller(dir, node string) *workerEgressSpiller {
 	return &workerEgressSpiller{
 		file:  auditlog.SpillFileIn(dir),
 		node:  node,
-		ch:    make(chan workerEgressAuditEvent, workerEgressSpillQueue),
+		ch:    make(chan workerEgressSpillRecord, workerEgressSpillQueue),
 		kick:  make(chan struct{}, 1),
 		sleep: time.Sleep,
 		stop:  make(chan struct{}),
@@ -295,15 +322,21 @@ func (s *workerEgressSpiller) noteDrop(n int64) {
 	}
 }
 
-// enqueue hands one record to the writer without blocking. A full spill
-// queue is a drop, reported by the next gap marker.
+// enqueue hands one capability-less record (a marker, a test event) to the
+// writer without blocking. A full spill queue is a drop, reported by the next
+// gap marker.
 func (s *workerEgressSpiller) enqueue(ev workerEgressAuditEvent) {
+	s.enqueueRecord(workerEgressSpillRecord{Event: ev})
+}
+
+// enqueueRecord is enqueue for a record that carries its capability.
+func (s *workerEgressSpiller) enqueueRecord(rec workerEgressSpillRecord) {
 	if s == nil {
 		workerEgressDropped.Add(1)
 		return
 	}
 	select {
-	case s.ch <- ev:
+	case s.ch <- rec:
 	default:
 		s.noteDrop(1)
 	}
@@ -313,11 +346,11 @@ func (s *workerEgressSpiller) enqueue(ev workerEgressAuditEvent) {
 // first (if any) and whatever else is queued, up to workerEgressSpillBatch.
 // One lock, one write, one fsync. On failure every record in the batch is
 // a drop and the owed count grows by the batch, so nothing is lost silently.
-func (s *workerEgressSpiller) drainOnce(first *workerEgressAuditEvent) (written int, err error) {
-	batch := make([]workerEgressAuditEvent, 0, workerEgressSpillBatch+1)
+func (s *workerEgressSpiller) drainOnce(first *workerEgressSpillRecord) (written int, err error) {
+	batch := make([]workerEgressSpillRecord, 0, workerEgressSpillBatch+1)
 	gap := s.pending.Swap(0)
 	if gap > 0 {
-		batch = append(batch, auditlog.GapMarker(s.node, gap, time.Now().UTC()))
+		batch = append(batch, workerEgressSpillRecord{Event: auditlog.GapMarker(s.node, gap, time.Now().UTC())})
 	}
 	if first != nil {
 		batch = append(batch, *first)
@@ -334,7 +367,7 @@ func (s *workerEgressSpiller) drainOnce(first *workerEgressAuditEvent) (written 
 	if len(batch) == 0 {
 		return 0, nil
 	}
-	if err := s.file.Append(batch); err != nil {
+	if err := s.file.AppendRecords(batch); err != nil {
 		workerEgressSpillFail.Add(1)
 		lost := int64(len(batch))
 		if gap > 0 {
@@ -361,7 +394,7 @@ func (s *workerEgressSpiller) run() {
 	}
 	var backoff time.Duration
 	for {
-		var first *workerEgressAuditEvent
+		var first *workerEgressSpillRecord
 		select {
 		case <-s.stop:
 			return
