@@ -451,10 +451,28 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 	return s.reconcileSecretDeleteOutboxAt(ctx, secretLifecycleNow())
 }
 
+// secretOutboxPass describes one sweep of a durable peer-obligation queue.
+//
+// ignoreBackoff is the rejoin override: a member that just came back is worth
+// one immediate try for every obligation to it, however far those rows had
+// backed off. It is an explicit flag rather than a clock placed past the
+// backoff cap because the clock is also what decides whether a row this pass
+// has already attempted still looks due — with a shifted clock every page
+// re-listed the rows the previous page had just tried, and one rejoin cost a
+// 1024-row backlog six rounds of peer calls before the schedule caught up.
+type secretOutboxPass struct {
+	now           time.Time
+	ignoreBackoff bool
+}
+
 // reconcileSecretDeleteOutboxAt is ReconcileSecretDeleteOutbox with an explicit
-// "now" for the retry schedule: the ticker passes the clock, the rejoin path
-// passes a time past every backoff so each obligation gets one immediate try.
+// "now" for the retry schedule. The rejoin path does not use it: it overrides
+// the schedule outright with secretOutboxPass.ignoreBackoff.
 func (s *Service) reconcileSecretDeleteOutboxAt(ctx context.Context, now time.Time) error {
+	return s.reconcileSecretDeleteOutboxPass(ctx, secretOutboxPass{now: now})
+}
+
+func (s *Service) reconcileSecretDeleteOutboxPass(ctx context.Context, pass secretOutboxPass) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
@@ -468,11 +486,17 @@ func (s *Service) reconcileSecretDeleteOutboxAt(ctx context.Context, now time.Ti
 		}
 		return nil // cluster mode, transport not attached yet: keep the durable jobs
 	}
-	return s.sweepSecretOutbox(ctx, now, secretOutboxSweep{
+	return s.sweepSecretOutbox(ctx, pass, secretOutboxSweep{
 		sem:      deleteReconcileSem,
 		inflight: &deleteReconcileInflight,
-		listDue: func(ctx context.Context, now time.Time, limit int) ([]secretOutboxRow, error) {
-			recs, err := s.store.ListSecretDeleteOutboxDue(ctx, now, limit)
+		listDue: func(ctx context.Context, pass secretOutboxPass, limit int) ([]secretOutboxRow, error) {
+			var recs []store.SecretDeleteOutboxRecord
+			var err error
+			if pass.ignoreBackoff {
+				recs, err = s.store.ListSecretDeleteOutboxBatch(ctx, limit)
+			} else {
+				recs, err = s.store.ListSecretDeleteOutboxDue(ctx, pass.now.UTC(), limit)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -512,8 +536,9 @@ type secretOutboxRow struct {
 type secretOutboxSweep struct {
 	sem      chan struct{}
 	inflight *sync.Map
-	// listDue returns one page of rows whose retry backoff has elapsed.
-	listDue func(ctx context.Context, now time.Time, limit int) ([]secretOutboxRow, error)
+	// listDue returns one page of rows whose retry backoff has elapsed, or of
+	// every pending row when the pass overrides the schedule.
+	listDue func(ctx context.Context, pass secretOutboxPass, limit int) ([]secretOutboxRow, error)
 	// deferRow moves a row to the back of the fair queue without counting an
 	// attempt: the page's placements could not be read, so nothing was tried.
 	deferRow func(ctx context.Context, row secretOutboxRow) error
@@ -521,17 +546,41 @@ type secretOutboxSweep struct {
 	process func(ctx context.Context, row secretOutboxRow, placements map[string]cluster.Placement)
 }
 
-func (s *Service) sweepSecretOutbox(ctx context.Context, now time.Time, sw secretOutboxSweep) error {
+func (s *Service) sweepSecretOutbox(ctx context.Context, pass secretOutboxPass, sw secretOutboxSweep) error {
 	sweepCtx, cancel := context.WithTimeout(ctx, secretDeleteReconcileBudget)
 	defer cancel()
+	// One attempt per obligation per pass. Every page is a fresh read of the
+	// queue, and a row can still match the listing right after this pass
+	// handled it: a rejoin pass ignores the schedule outright, and the paths
+	// that defer a row (an unpromoted reseal, an unreadable placement) move it
+	// without counting an attempt, which leaves it due. Without this set those
+	// rows come straight back on the next page and the same backlog is worked
+	// over and over until the time budget runs out.
+	//
+	// Keyed by lifecycle, like the in-flight guard: process resolves the row
+	// from (sandbox, incarnation), so a second page listing another generation
+	// of the same lifecycle would only redo the work this one just did.
+	attempted := make(map[string]struct{})
 	for {
-		rows, err := sw.listDue(sweepCtx, now.UTC(), secretDeleteReconcileBatch)
+		page, err := sw.listDue(sweepCtx, pass, secretDeleteReconcileBatch)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 				return nil
 			}
 			return err
 		}
+		if len(page) == 0 {
+			return nil
+		}
+		rows := make([]secretOutboxRow, 0, len(page))
+		for _, row := range page {
+			if _, done := attempted[secretDeleteReconcileKey(row.sandboxID, row.incarnationID)]; done {
+				continue
+			}
+			rows = append(rows, row)
+		}
+		// A page of nothing but rows this pass already handled means the queue
+		// has no further work for it, however the listing is filtered.
 		if len(rows) == 0 {
 			return nil
 		}
@@ -577,6 +626,10 @@ func (s *Service) sweepSecretOutbox(ctx context.Context, now time.Time, sw secre
 			}()
 		}
 		for _, row := range rows {
+			// Marked on dispatch, not on completion: a row another goroutine is
+			// already handling, or one this pass ran out of time for, has had
+			// its turn either way and must not re-enter the next page.
+			attempted[secretDeleteReconcileKey(row.sandboxID, row.incarnationID)] = struct{}{}
 			select {
 			case jobs <- row:
 			case <-sweepCtx.Done():
@@ -597,6 +650,12 @@ func (s *Service) sweepSecretOutbox(ctx context.Context, now time.Time, sw secre
 			return nil
 		}
 		if processed.Load() == 0 || len(rows) < secretDeleteReconcileBatch {
+			return nil
+		}
+		// The time budget is the usual end of a long pass; this bounds the
+		// per-pass set itself so a fleet-sized backlog cannot grow it without
+		// limit. What is left stays durable and is picked up next tick.
+		if len(attempted) >= secretOutboxSweepMaxRows {
 			return nil
 		}
 	}
@@ -805,16 +864,15 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 				}
 				prevAlive = alive
 				// A member came back: every obligation to it is worth one
-				// immediate try regardless of how far it had backed off, so
-				// "now" is placed past every retry delay for this pass.
-				now := secretLifecycleNow()
-				if rejoined {
-					now = now.Add(store.SecretOutboxBackoffCap)
-				}
-				if err := s.reconcileSecretDeleteOutboxAt(ctx, now); err != nil && s.logger != nil {
+				// immediate try regardless of how far it had backed off. The
+				// pass says so outright instead of moving its clock past the
+				// backoff cap, which also made rows this pass had just tried
+				// look due to the next page (see secretOutboxPass).
+				pass := secretOutboxPass{now: secretLifecycleNow(), ignoreBackoff: rejoined}
+				if err := s.reconcileSecretDeleteOutboxPass(ctx, pass); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret delete-outbox reconcile failed", "err", err)
 				}
-				if err := s.reconcileSecretPutOutboxAt(ctx, now); err != nil && s.logger != nil {
+				if err := s.reconcileSecretPutOutboxPass(ctx, pass); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret put-outbox reconcile failed", "err", err)
 				}
 				s.refreshSecretHolderPossession(ctx)
@@ -1606,6 +1664,10 @@ func (s *Service) ReconcileSecretPutOutbox(ctx context.Context) error {
 }
 
 func (s *Service) reconcileSecretPutOutboxAt(ctx context.Context, now time.Time) error {
+	return s.reconcileSecretPutOutboxPass(ctx, secretOutboxPass{now: now})
+}
+
+func (s *Service) reconcileSecretPutOutboxPass(ctx context.Context, pass secretOutboxPass) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
@@ -1620,11 +1682,17 @@ func (s *Service) reconcileSecretPutOutboxAt(ctx context.Context, now time.Time)
 		// retires twice.
 		return nil
 	}
-	return s.sweepSecretOutbox(ctx, now, secretOutboxSweep{
+	return s.sweepSecretOutbox(ctx, pass, secretOutboxSweep{
 		sem:      putReconcileSem,
 		inflight: &putReconcileInflight,
-		listDue: func(ctx context.Context, now time.Time, limit int) ([]secretOutboxRow, error) {
-			recs, err := s.store.ListSecretPutOutboxDue(ctx, now, limit)
+		listDue: func(ctx context.Context, pass secretOutboxPass, limit int) ([]secretOutboxRow, error) {
+			var recs []store.SecretPutOutboxRecord
+			var err error
+			if pass.ignoreBackoff {
+				recs, err = s.store.ListSecretPutOutboxBatch(ctx, limit)
+			} else {
+				recs, err = s.store.ListSecretPutOutboxDue(ctx, pass.now.UTC(), limit)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -1949,6 +2017,11 @@ const secretDeleteAttemptTimeout = 15 * time.Second
 const (
 	secretDeleteReconcileBatch  = 1024
 	secretDeleteReconcileBudget = 25 * time.Second
+	// secretOutboxSweepMaxRows caps how many distinct obligations one pass
+	// tracks (and therefore handles). Sixty-four pages is far more than the
+	// time budget allows in practice — every row is a peer round-trip — so it
+	// is a memory bound on the per-pass set, not a throughput limit.
+	secretOutboxSweepMaxRows = 64 * secretDeleteReconcileBatch
 )
 
 var (

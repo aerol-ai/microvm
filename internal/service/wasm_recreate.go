@@ -25,6 +25,12 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spe
 		if _, err := s.ensureWasmCheckpointLocal(ctx, existing); err != nil {
 			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
+		// This branch is the retry after a restore that failed once the row was
+		// already persisted: the row comes from the store and therefore carries
+		// no env, while the seed branch below builds it from the spec.
+		if err := s.hydrateSandboxEnvForRestore(ctx, existing, spec.Env); err != nil {
+			return true, fmt.Errorf("recreate %s: %w", id, err)
+		}
 		if _, err := s.rehydrateWasmIfNeeded(ctx, existing, nil); err != nil {
 			return true, fmt.Errorf("recreate %s: rehydrate: %w", id, err)
 		}
