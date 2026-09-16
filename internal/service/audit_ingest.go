@@ -70,13 +70,12 @@ func (s *Service) StartAuditIngestServer(ctx context.Context) error {
 	if port < 0 {
 		port = 0
 	}
-	token := strings.TrimSpace(s.cfg.AuditIngestToken)
+	token, err := s.auditIngestSigningKey()
+	if err != nil {
+		return fmt.Errorf("audit ingest token: %w", err)
+	}
 	if token == "" {
-		var err error
-		token, err = newAuditIngestToken()
-		if err != nil {
-			return fmt.Errorf("audit ingest token entropy: %w", err)
-		}
+		return errors.New("audit ingest token unavailable")
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	ln, err := net.Listen("tcp", addr)
@@ -175,16 +174,100 @@ func (s *Service) IssueEgressAuditCapabilityForSandbox(sandboxID string, ttl tim
 }
 
 func (s *Service) auditIngestToken() string {
-	if s == nil {
+	key, err := s.auditIngestSigningKey()
+	if err != nil {
 		return ""
 	}
-	s.auditIngestMu.Lock()
-	ing := s.auditIngest
-	s.auditIngestMu.Unlock()
-	if ing != nil && ing.token != "" {
-		return ing.token
+	return key
+}
+
+// auditIngestKeyFile is the persisted capability signing key, beside the
+// state DB (same directory, same 0700 posture as the DB holding sealed
+// secrets and toolbox tokens). It is never exported to worker subprocesses.
+const auditIngestKeyFile = "audit-ingest.key"
+
+// auditIngestSigningKey returns the daemon-only key that scopes worker
+// egress-audit capabilities: SB_AUDIT_INGEST_TOKEN when set, otherwise a key
+// minted once and persisted beside the state DB. Persistence is what lets the
+// spill path survive a restart: workers spill while the daemon is down, each
+// line carrying a capability the previous process minted, and the drain that
+// runs at the next boot must be able to verify them — a per-boot random key
+// would turn every record spilled across a restart into a gap. Without a
+// data directory the key is process-local, as before. Returns "" (no error)
+// when egress attribution is disabled and no token is configured: nothing
+// mints or verifies capabilities in that mode.
+func (s *Service) auditIngestSigningKey() (string, error) {
+	if s == nil {
+		return "", nil
 	}
-	return strings.TrimSpace(s.cfg.AuditIngestToken)
+	if token := strings.TrimSpace(s.cfg.AuditIngestToken); token != "" {
+		return token, nil
+	}
+	s.auditIngestMu.Lock()
+	defer s.auditIngestMu.Unlock()
+	if ing := s.auditIngest; ing != nil && ing.token != "" {
+		return ing.token, nil
+	}
+	if s.auditIngestKey != "" {
+		return s.auditIngestKey, nil
+	}
+	if !s.cfg.EgressAttributionEnabled {
+		return "", nil
+	}
+	dataDir := secretAuditDataDir(s.cfg.DBPath)
+	if dataDir == "" {
+		key, err := newAuditIngestToken()
+		if err != nil {
+			return "", fmt.Errorf("audit ingest token entropy: %w", err)
+		}
+		s.auditIngestKey = key
+		return key, nil
+	}
+	path := filepath.Join(dataDir, auditIngestKeyFile)
+	if raw, err := os.ReadFile(path); err == nil {
+		if key := strings.TrimSpace(string(raw)); key != "" {
+			s.auditIngestKey = key
+			return key, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("read audit ingest key: %w", err)
+	}
+	key, err := newAuditIngestToken()
+	if err != nil {
+		return "", fmt.Errorf("audit ingest token entropy: %w", err)
+	}
+	// Write-then-rename so a crash mid-write cannot leave a truncated key
+	// that silently fails every capability minted before the crash.
+	tmp, err := os.CreateTemp(dataDir, auditIngestKeyFile+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("persist audit ingest key: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("persist audit ingest key: %w", err)
+	}
+	if _, err := tmp.WriteString(key + "\n"); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("persist audit ingest key: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("persist audit ingest key: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("persist audit ingest key: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("persist audit ingest key: %w", err)
+	}
+	s.auditIngestKey = key
+	return key, nil
 }
 
 func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Request) {

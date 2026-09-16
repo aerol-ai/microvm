@@ -168,20 +168,23 @@ type Service struct {
 	secretAuditIndex *secretAuditIndexer
 	// secretAuditChainBroken latches a failed full verification (the boot
 	// background pass); local audit reads refuse until restart.
-	secretAuditChainBroken  atomic.Bool
-	secretAuditBootVerify   sync.WaitGroup
-	secretAuditInitErr      error // retained so daemon boot can fail closed
-	secretAuditOnce         sync.Once
-	secretAuditPruneStop    chan struct{}
-	secretAuditPruneDone    sync.WaitGroup
-	auditWitnessMu          sync.Mutex
-	auditWitness            controlplane.Witness
-	auditWitnessShipMu      sync.Mutex // serializes ship + receipt rewrite
-	secretAuditWitnessOnce  sync.Once
-	secretAuditWitnessStop  chan struct{}
-	secretAuditWitnessDone  sync.WaitGroup
-	auditIngestMu           sync.Mutex
-	auditIngest             *auditIngestServer
+	secretAuditChainBroken atomic.Bool
+	secretAuditBootVerify  sync.WaitGroup
+	secretAuditInitErr     error // retained so daemon boot can fail closed
+	secretAuditOnce        sync.Once
+	secretAuditPruneStop   chan struct{}
+	secretAuditPruneDone   sync.WaitGroup
+	auditWitnessMu         sync.Mutex
+	auditWitness           controlplane.Witness
+	auditWitnessShipMu     sync.Mutex // serializes ship + receipt rewrite
+	secretAuditWitnessOnce sync.Once
+	secretAuditWitnessStop chan struct{}
+	secretAuditWitnessDone sync.WaitGroup
+	auditIngestMu          sync.Mutex
+	auditIngest            *auditIngestServer
+	// auditIngestKey caches the resolved capability signing key (see
+	// auditIngestSigningKey); guarded by auditIngestMu.
+	auditIngestKey          string
 	auditIncarnationMu      sync.RWMutex
 	pendingAuditIncarnation map[string]string
 	auditExportMu           sync.Mutex
@@ -4842,7 +4845,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// Skip warm-pool park-* ids: they are intentional inventory without a
 	// sandbox row. ListManaged already filters the park label; this is the
 	// defense-in-depth gate for any runtime that still surfaces them.
-	removeOrphans := func(rt runtime.Runtime, runtimeName string, items map[string]*models.SandboxRuntimeState) {
+	removeOrphans := func(rt runtime.Runtime, runtimeName, engine string, items map[string]*models.SandboxRuntimeState) {
 		for sandboxID, state := range items {
 			if _, ok := knownIDs[sandboxID]; ok {
 				continue
@@ -4853,6 +4856,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.logger.Warn("removing orphan runtime instance",
 				"sandbox_id", sandboxID,
 				"runtime", runtimeName,
+				"engine", engine,
 				"container_id", state.ContainerID,
 			)
 			stub := &models.Sandbox{
@@ -4860,11 +4864,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				ContainerID: state.ContainerID,
 				ContainerIP: state.ContainerIP,
 				Runtime:     runtimeName,
+				Engine:      engine,
 			}
 			if err := rt.Destroy(ctx, stub); err != nil {
 				s.logger.Warn("orphan runtime removal failed",
 					"sandbox_id", sandboxID,
 					"runtime", runtimeName,
+					"engine", engine,
 					"error", err,
 				)
 			}
@@ -4876,12 +4882,19 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 		}
 	}
-	removeOrphans(s.docker, models.RuntimeDocker, dockerManaged)
+	removeOrphans(s.docker, models.RuntimeDocker, models.ContainerEngineDocker, dockerManaged)
+	if s.containerd != nil {
+		// containerd is the default engine on clusters. finalizeStaleLocalSandbox
+		// deletes the row before runtime Destroy and names this sweep as the
+		// retry anchor for a failed Destroy, so an engine missing here leaks
+		// its instance forever after one transient failure.
+		removeOrphans(s.containerd, models.RuntimeDocker, models.ContainerEngineContainerd, containerdManaged)
+	}
 	if s.firecracker != nil {
-		removeOrphans(s.firecracker, models.RuntimeFirecracker, firecrackerManaged)
+		removeOrphans(s.firecracker, models.RuntimeFirecracker, "", firecrackerManaged)
 	}
 	if s.wasm != nil {
-		removeOrphans(s.wasm, models.RuntimeWasm, wasmManaged)
+		removeOrphans(s.wasm, models.RuntimeWasm, "", wasmManaged)
 	}
 
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already

@@ -148,6 +148,12 @@ func TestPeerDeleteRequiresOwnerOrRecordedRecipientAndCapsGeneration(t *testing.
 	ctx := context.Background()
 	st := openSealTestStore(t)
 	putSecretRow(t, st, "sb-peer-auth", "inc-auth", 3, []string{"node-b", "node-c"})
+	// Ciphertext from an unrelated lifecycle of the same sandbox ID that never
+	// named the current owner. Owning the live lifecycle is not authority over
+	// it. (A DELETE naming an incarnation with no ciphertext, tomb, or
+	// lifecycle anywhere is an idempotent no-op instead — see
+	// TestPeerDeleteWithoutLocalStateOrLifecycleIsAcknowledgedWithoutTomb.)
+	putSecretRow(t, st, "sb-peer-auth", "different-incarnation", 1, []string{"node-x", "node-y"})
 	svc := &Service{
 		cfg: config.Config{EnableCluster: true}, store: st,
 		cluster: &placementOnlyCluster{
@@ -164,6 +170,9 @@ func TestPeerDeleteRequiresOwnerOrRecordedRecipientAndCapsGeneration(t *testing.
 	}
 	if err := svc.DeleteClusterSecretsLocal(ctx, "sb-peer-auth", "different-incarnation", 1, "node-a"); !errors.Is(err, ErrClusterSecretOriginatorDenied) {
 		t.Fatalf("owner authorized to delete unrelated lifecycle: %v", err)
+	}
+	if _, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-auth", "different-incarnation"); err != nil {
+		t.Fatalf("live-lifecycle owner deleted unrelated ciphertext: %v", err)
 	}
 	if _, err := st.GetClusterSecretForSandboxIncarnation(ctx, "sb-peer-auth", "inc-auth"); err != nil {
 		t.Fatalf("unauthorized peer deleted ciphertext: %v", err)

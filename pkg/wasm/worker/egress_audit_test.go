@@ -74,6 +74,63 @@ func readWorkerSpill(t *testing.T, dir string) []workerEgressAuditEvent {
 	return out
 }
 
+func readWorkerSpillRecords(t *testing.T, dir string) []workerEgressSpillRecord {
+	t.Helper()
+	f, err := os.Open(filepath.Join(dir, workerEgressSpillFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var out []workerEgressSpillRecord
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var rec workerEgressSpillRecord
+		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+			t.Fatalf("spill line does not parse: %v", err)
+		}
+		out = append(out, rec)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// A 4xx is the daemon refusing this record's identity or shape (a stale or
+// forged capability, a bad body). Spilling it would hand the same rejected
+// capability to the same daemon's drain, so it is terminal like 429 — and,
+// unlike a refused connection, not an IPC failure.
+func TestPostOrSpillWorkerEgressTreatsRejectionAsFinal(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := strings.TrimPrefix(ln.Addr().String(), "127.0.0.1:")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/audit/egress", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "stale sandbox capability", http.StatusUnauthorized)
+	})
+	go http.Serve(ln, mux)
+
+	spill := newWorkerEgressSpiller(t.TempDir(), "n1") // not started: anything enqueued stays visible
+	rejected, ipcFail := workerEgressRejected.Value(), workerEgressIPCFail.Value()
+	postOrSpillWorkerEgress(egressAuditJob{
+		port: port, capability: "stale", node: "n1", spill: spill,
+		sandboxID: "sb-1", network: "tcp", address: "example.com:443",
+	})
+	if len(spill.ch) != 0 {
+		t.Fatalf("rejected record was spilled (%d queued)", len(spill.ch))
+	}
+	if workerEgressRejected.Value()-rejected != 1 || workerEgressIPCFail.Value() != ipcFail {
+		t.Fatalf("rejected +%d ipc_fail +%d, want 1/0", workerEgressRejected.Value()-rejected, workerEgressIPCFail.Value()-ipcFail)
+	}
+}
+
 func TestPostOrSpillWorkerEgressFallsBackToSpill(t *testing.T) {
 	dir := t.TempDir()
 	spill := newWorkerEgressSpiller(dir, "n1") // not started: drained by hand
@@ -90,6 +147,11 @@ func TestPostOrSpillWorkerEgressFallsBackToSpill(t *testing.T) {
 	got := readWorkerSpill(t, dir)
 	if len(got) != 1 || got[0].Kind != "egress" || got[0].SandboxID != "sb-1" || got[0].Destination != "host:9" || got[0].EventID == "" {
 		t.Fatalf("spill event = %+v", got)
+	}
+	// The daemon's drain rebinds identity from the capability, so the line
+	// must carry the one the worker would have sent on the ingest header.
+	if recs := readWorkerSpillRecords(t, dir); len(recs) != 1 || recs[0].Capability != "cap" {
+		t.Fatalf("spill record capability = %+v, want \"cap\"", recs)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "secrets.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("worker must not write secrets.jsonl, err=%v", err)
@@ -275,7 +337,7 @@ func TestWorkerEgressSpillerBatchesAndCoalesces(t *testing.T) {
 		}
 	}
 	// first is written ahead of the queue.
-	head := workerEgressAuditEvent{SandboxID: "sb-head", Kind: "egress", Destination: "head", Result: "success"}
+	head := workerEgressSpillRecord{Event: workerEgressAuditEvent{SandboxID: "sb-head", Kind: "egress", Destination: "head", Result: "success"}}
 	spill.enqueue(workerEgressAuditEvent{SandboxID: "sb-tail", Kind: "egress", Destination: "tail", Result: "success"})
 	if n, err := spill.drainOnce(&head); err != nil || n != 2 {
 		t.Fatalf("drain with first = %d, %v", n, err)
@@ -288,7 +350,7 @@ func TestWorkerEgressSpillerBatchesAndCoalesces(t *testing.T) {
 
 func TestWorkerEgressSpillerOverflowAndFailureKeepTheLossOwed(t *testing.T) {
 	// A tiny queue: the third record overflows and is owed as a gap.
-	small := &workerEgressSpiller{file: newWorkerEgressSpiller(t.TempDir(), "n").file, node: "n", ch: make(chan workerEgressAuditEvent, 2), kick: make(chan struct{}, 1), sleep: time.Sleep}
+	small := &workerEgressSpiller{file: newWorkerEgressSpiller(t.TempDir(), "n").file, node: "n", ch: make(chan workerEgressSpillRecord, 2), kick: make(chan struct{}, 1), sleep: time.Sleep}
 	before := workerEgressDropped.Load()
 	for i := range 3 {
 		small.enqueue(workerEgressAuditEvent{SandboxID: "sb", Destination: fmt.Sprint(i)})

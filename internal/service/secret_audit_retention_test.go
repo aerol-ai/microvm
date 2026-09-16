@@ -295,7 +295,12 @@ func TestSecretAuditChainVerifierLinksStubsByStoredHashesOnly(t *testing.T) {
 // event drains behind a newer in-memory event and still leaves the log when
 // it expires.
 func TestFileAuditSinkSpilledOldEventStillExpires(t *testing.T) {
-	sink, err := newFileAuditSinkOpts(t.TempDir(), 8, true)
+	sink, err := newFileAuditSinkFrom(t.TempDir(), fileAuditSinkOptions{
+		buffer: 8, spillEnabled: true,
+		spillVerify: func(capability string, now time.Time) (string, string, error) {
+			return auditlog.ParseAndVerifyEgressCapability(drainTestSpillKey, capability, now)
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,9 +309,12 @@ func TestFileAuditSinkSpilledOldEventStillExpires(t *testing.T) {
 	if err := sink.EmitDurable(SecretAuditEvent{Time: now, EventID: "fresh", SandboxID: "sb-fresh", Result: secretAuditResultSuccess}); err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.appendSpill(SecretAuditEvent{
-		Time: now.Add(-48 * time.Hour), EventID: "spilled-old", SandboxID: "sb-old",
-		Kind: secretAuditKindEgress, Destination: "old.example:443", Result: secretAuditResultSuccess,
+	if err := sink.appendSpillRecords(auditlog.SpillRecord{
+		Event: SecretAuditEvent{
+			Time: now.Add(-48 * time.Hour), EventID: "spilled-old", SandboxID: "sb-old",
+			Kind: secretAuditKindEgress, Destination: "old.example:443", Result: secretAuditResultSuccess,
+		},
+		Capability: mintDrainTestCapability(t, "sb-old", "inc-sb-old", now.Add(time.Hour)),
 	}); err != nil {
 		t.Fatal(err)
 	}

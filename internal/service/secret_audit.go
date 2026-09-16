@@ -97,8 +97,13 @@ const (
 var (
 	auditEventsDroppedTotal  = expvar.NewInt("aerolvm_audit_events_dropped_total")
 	auditSpillMalformedTotal = expvar.NewInt("aerolvm_audit_spill_malformed_total")
-	auditTipWriteFailTotal   = expvar.NewInt("aerolvm_audit_tip_write_fail_total")
-	secretAuditSinkHealthy   = expvar.NewInt("aerolvm_secret_audit_sink_healthy")
+	// auditSpillUnauthenticatedTotal counts egress spill lines whose
+	// capability was missing, forged, or expired. Each becomes a gap marker;
+	// a non-zero rate on a healthy node is a worker writing under a name it
+	// cannot prove.
+	auditSpillUnauthenticatedTotal = expvar.NewInt("aerolvm_audit_spill_unauthenticated_total")
+	auditTipWriteFailTotal         = expvar.NewInt("aerolvm_audit_tip_write_fail_total")
+	secretAuditSinkHealthy         = expvar.NewInt("aerolvm_secret_audit_sink_healthy")
 	// Boot-time torn-tail repairs. Each one is also a gap marker in the chain
 	// and a log line; the counters exist so the alert fires without log access.
 	auditTornTailRepairsTotal = expvar.NewInt("aerolvm_audit_torn_tail_repairs_total")
@@ -226,6 +231,11 @@ type fileAuditSink struct {
 	// egressQuota is the per-sandbox egress evidence budget, applied on the
 	// writer goroutine at every funnel a record can take. nil = unbounded.
 	egressQuota *egressAuditQuota
+	// spillVerify / spillActor / spillOwnerRef authenticate and stamp
+	// worker-written spill lines on drain; see fileAuditSinkOptions.
+	spillVerify   func(capability string, now time.Time) (sandboxID, incarnationID string, err error)
+	spillActor    func() string
+	spillOwnerRef func(sandboxID string) string
 }
 
 // fileAuditSinkOptions configures newFileAuditSinkFrom. Zero values keep the
@@ -240,6 +250,18 @@ type fileAuditSinkOptions struct {
 	egressRate        float64
 	egressBurst       int
 	egressMarkerDelay time.Duration
+	// spillVerify authenticates an egress spill line the same way the HTTP
+	// ingest authenticates a POST: it returns the sandbox and incarnation the
+	// line's capability is bound to, or an error. The drain never trusts the
+	// sandbox_id / incarnation_id / actor / owner_ref written on the line —
+	// workers share the audit directory, so a compromised worker could spill
+	// evidence under another tenant's name. nil fails closed: every egress
+	// spill line drains as a gap.
+	spillVerify func(capability string, now time.Time) (sandboxID, incarnationID string, err error)
+	// spillActor / spillOwnerRef stamp the server-controlled identity fields
+	// on an authenticated line, mirroring auditIngestServer.handleEgress.
+	spillActor    func() string
+	spillOwnerRef func(sandboxID string) string
 }
 
 func newFileAuditSink(auditDir string, buffer int) (*fileAuditSink, error) {
@@ -285,6 +307,9 @@ func newFileAuditSinkFrom(auditDir string, opts fileAuditSinkOptions) (*fileAudi
 		spillEnabled:     spillEnabled,
 		bootVerify:       bootVerify,
 		egressQuota:      newEgressAuditQuota(opts.egressRate, opts.egressBurst, opts.egressMarkerDelay),
+		spillVerify:      opts.spillVerify,
+		spillActor:       opts.spillActor,
+		spillOwnerRef:    opts.spillOwnerRef,
 	}
 	// Probe the sidecar lock read-write once: withAuditFileLock opens it
 	// read-only (a directory or unwritable path would pass), and a lock the
@@ -846,12 +871,22 @@ func (s *fileAuditSink) flushEgressQuotaMarkers(force bool) {
 // auditlog.SpillFile, shared with the WASM worker subprocesses that spill
 // into the same file.
 func (s *fileAuditSink) appendSpill(events ...SecretAuditEvent) error {
+	records := make([]auditlog.SpillRecord, len(events))
+	for i := range events {
+		records[i] = auditlog.SpillRecord{Event: events[i]}
+	}
+	return s.appendSpillRecords(records...)
+}
+
+// appendSpillRecords is appendSpill for lines that carry a capability, i.e.
+// egress records the drain is expected to chain rather than turn into gaps.
+func (s *fileAuditSink) appendSpillRecords(records ...auditlog.SpillRecord) error {
 	if s == nil || s.spillPath == "" {
 		return errors.New("secret audit spill path unset")
 	}
 	s.spillMu.Lock()
 	defer s.spillMu.Unlock()
-	return auditlog.SpillFile{Path: s.spillPath, LockPath: s.lockPath}.Append(events)
+	return auditlog.SpillFile{Path: s.spillPath, LockPath: s.lockPath}.AppendRecords(records)
 }
 
 // spillBatchMax bounds one group-committed spill append so a saturated
@@ -978,11 +1013,12 @@ func (s *fileAuditSink) drainSpill() bool {
 				text := strings.TrimSpace(string(line))
 				if text != "" {
 					var ev SecretAuditEvent
-					if json.Unmarshal([]byte(text), &ev) != nil {
+					var rec auditlog.SpillRecord
+					if json.Unmarshal([]byte(text), &rec) != nil {
 						auditSpillMalformedTotal.Add(1)
 						ev = spillMalformedGap([]byte(text))
 					} else {
-						ev = sanitizeSpillEvent(ev, now)
+						ev = s.sanitizeSpillRecord(rec, now)
 					}
 					batch = append(batch, ev)
 					if len(batch) == cap(batch) && !flush() {
@@ -1031,11 +1067,17 @@ func spillMalformedGap(seed []byte) SecretAuditEvent {
 	}
 }
 
-// sanitizeSpillEvent treats a decoded spill line as unauthenticated worker
-// input. Only egress and gap kinds are chained; secret-open (and anything
-// else) becomes a gap. Hashes are stripped so the writer re-links against
-// the live tip. Future timestamps are clamped so they cannot block retention.
-func sanitizeSpillEvent(ev SecretAuditEvent, now time.Time) SecretAuditEvent {
+// sanitizeSpillRecord treats a decoded spill line as unauthenticated worker
+// input. Gap markers are chained as gaps. An egress line is chained only when
+// its capability verifies, and then with sandbox/incarnation rebound from the
+// capability and actor/owner stamped by the daemon — the same contract as the
+// HTTP ingest, so the spill file is a path into the log for an unreachable
+// daemon, not a way around its authentication. Secret-open and anything else
+// becomes a gap. Hashes are stripped so the writer re-links against the live
+// tip. Future timestamps are clamped so they cannot block retention; a
+// capability holder can still only backdate its own sandbox's evidence.
+func (s *fileAuditSink) sanitizeSpillRecord(rec auditlog.SpillRecord, now time.Time) SecretAuditEvent {
+	ev := rec.Event
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -1059,15 +1101,43 @@ func sanitizeSpillEvent(ev SecretAuditEvent, now time.Time) SecretAuditEvent {
 			Dropped: dropped,
 		}
 	case kind == secretAuditKindEgress:
-		if len(ev.Destination) > secretAuditSpillDestMax {
-			ev.Destination = ev.Destination[:secretAuditSpillDestMax]
+		if s == nil || s.spillVerify == nil {
+			auditSpillUnauthenticatedTotal.Add(1)
+			return spillMalformedGap([]byte(ev.EventID + kind + ev.SandboxID))
 		}
-		ev.Kind = secretAuditKindEgress
-		ev.Ref = ""
-		ev.PrevHash = ""
-		ev.EventHash = ""
-		ev.WitnessedThrough = ""
-		return ev
+		sandboxID, incarnationID, err := s.spillVerify(rec.Capability, now)
+		if err != nil || strings.TrimSpace(sandboxID) == "" {
+			auditSpillUnauthenticatedTotal.Add(1)
+			return spillMalformedGap([]byte(ev.EventID + kind + ev.SandboxID))
+		}
+		destination := strings.TrimSpace(ev.Destination)
+		if len(destination) > secretAuditSpillDestMax {
+			destination = destination[:secretAuditSpillDestMax]
+		}
+		actor := ""
+		if s.spillActor != nil {
+			actor = s.spillActor()
+		}
+		ownerRef := ""
+		if s.spillOwnerRef != nil {
+			ownerRef = s.spillOwnerRef(sandboxID)
+		}
+		// Everything identity- or outcome-bearing is server-controlled; only
+		// the destination, network, time, and event id come from the worker.
+		return SecretAuditEvent{
+			Time:          ev.Time,
+			EventID:       ev.EventID,
+			Actor:         actor,
+			NodeID:        actor,
+			SandboxID:     sandboxID,
+			IncarnationID: incarnationID,
+			OwnerRef:      ownerRef,
+			Result:        secretAuditResultSuccess,
+			Reason:        secretAuditReasonOK,
+			Kind:          secretAuditKindEgress,
+			Destination:   destination,
+			Network:       strings.TrimSpace(ev.Network),
+		}
 	default:
 		auditSpillMalformedTotal.Add(1)
 		return spillMalformedGap([]byte(ev.EventID + kind + ev.SandboxID))
@@ -2156,6 +2226,23 @@ func (s *Service) ensureSecretAuditSink() {
 		sink, err := newFileAuditSinkFrom(filepath.Join(dataDir, "audit"), fileAuditSinkOptions{
 			buffer: buf, spillEnabled: spill, bootVerify: s.cfg.SecretAuditBootVerify,
 			egressRate: s.cfg.AuditEgressSandboxRate, egressBurst: s.cfg.AuditEgressSandboxBurst,
+			// Worker spill lines are authenticated with the same key that
+			// scopes their ingest capabilities. Resolved per drain, not at
+			// construction: the sink drains at boot, before the ingest server
+			// starts, and the key must be the persisted one so records spilled
+			// across a restart still verify.
+			spillVerify: func(capability string, now time.Time) (string, string, error) {
+				key, err := s.auditIngestSigningKey()
+				if err != nil {
+					return "", "", err
+				}
+				return auditlog.ParseAndVerifyEgressCapability(key, capability, now)
+			},
+			spillActor: s.auditActor,
+			spillOwnerRef: func(sandboxID string) string {
+				_, ownerRef := s.auditIdentityFor(sandboxID)
+				return ownerRef
+			},
 		})
 		if err != nil {
 			s.secretAuditInitErr = err
