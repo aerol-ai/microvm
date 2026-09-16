@@ -419,7 +419,7 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 	})
 }
 
-func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
 	recipients = normalizeSecretRecipientIDs(recipients)
 	if err := validateSecretRecipientUpdate(sandboxID, recipients, secrets, expectedIncarnationID, expectedSealGeneration); err != nil {
 		return err
@@ -433,6 +433,8 @@ func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID s
 		SecretSealGeneration:   secrets.SealGeneration,
 		IncarnationID:          strings.TrimSpace(secrets.IncarnationID),
 		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedOwnerNodeID:    strings.TrimSpace(expectedOwnerNodeID),
+		ExpectedOwnerNodeIDSet: true,
 		ExpectedSealGeneration: expectedSealGeneration,
 	})
 }
@@ -822,7 +824,7 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 			}
 			if existing.Placement.SecretSealGeneration > 0 && st.Secrets.hasUpdate() &&
 				st.Secrets.SealGeneration > existing.Placement.SecretSealGeneration && len(st.Secrets.Recipients) > 0 {
-				if err := a.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, existing.Placement.SecretSealGeneration); err != nil && firstErr == nil {
+				if err := a.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, a.nodeID, existing.Placement.SecretSealGeneration); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

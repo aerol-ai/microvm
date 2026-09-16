@@ -1528,7 +1528,11 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 	// Only now make the new generation discoverable. Before this CAS, the old
 	// placement and old peer copies remain a complete recovery path; after it,
 	// the owner plus at least one authenticated replacement hold the new bytes.
-	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, newHandle, expectedInc, expectedGen); err != nil {
+	// expectedOwner is the node this reseal believes coordinates the secret:
+	// ownerID is either selfID or "" (the leader-coordinated ownerless case)
+	// by the guard at the top of expandAndResealDeadSecretTargetsForPlacement.
+	// Fencing on it stops a promotion that outlived a reassignment.
+	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, newHandle, expectedInc, ownerID, expectedGen); err != nil {
 		return fmt.Errorf("raft promote resealed secret: %w", err)
 	}
 	resetSecretHoldersForGeneration(sandboxID, blob.IncarnationID, newGen, selfID)
@@ -1607,7 +1611,7 @@ func (s *Service) finalizeResealedSecret(ctx context.Context, c cluster.Client, 
 		Ref: local.Ref, Version: local.Version, Recipients: recipients,
 		IncarnationID: placement.IncarnationID, SealGeneration: local.SealGeneration,
 	}
-	if err := c.UpdatePlacementSecretRecipients(ctx, local.SandboxID, recipients, handle, placement.IncarnationID, placement.SecretSealGeneration); err != nil {
+	if err := c.UpdatePlacementSecretRecipients(ctx, local.SandboxID, recipients, handle, placement.IncarnationID, placement.OwnerNodeID, placement.SecretSealGeneration); err != nil {
 		return fmt.Errorf("finalize interrupted secret reseal: %w", err)
 	}
 	pending := pendingRecipientsAfterAck(recipients, holding, selfID)

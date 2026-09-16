@@ -78,7 +78,7 @@ func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.C
 func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
-func (n *Noop) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+func (n *Noop) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
 	return nil
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }

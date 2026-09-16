@@ -2770,6 +2770,18 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	} else if obsolete {
 		return s.destroyStaleLocalSandbox(ctx, sandbox, placement)
 	}
+	// Commit the exact owner/incarnation deleting fence BEFORE any destructive
+	// local work. Routes and the runtime are not recoverable once torn down,
+	// so tearing them down while the placement is still recreate-eligible
+	// leaves a window where Raft is unavailable (or ownership moves) and the
+	// cluster re-materializes a sandbox whose local materialization is already
+	// gone. Fencing first inverts that: a Raft outage fails the destroy with
+	// nothing torn down, and every step after this point is a retry from a
+	// durable deleting state (opBeginDelete is a no-op on an already-deleting
+	// placement, and the fence's TTL only expires once its owner is gone).
+	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
+		return err
+	}
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
@@ -2799,16 +2811,14 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	} else if s.testForceUnmountErr != nil {
 		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", s.testForceUnmountErr)
 	}
-	// Ownership can change while runtime destruction is in flight. Recheck
-	// before lifecycle-wide secret/checkpoint deletion; if failover won, finish
-	// only this obsolete materialization and preserve the active lifecycle.
+	// Defence in depth. The deleting fence above blocks reassignment, so this
+	// should no longer be reachable in cluster mode; it stays because a
+	// pre-fence placement (or a non-cluster path that reaches here) must still
+	// preserve an active lifecycle rather than delete its secrets.
 	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
 		return err
 	} else if obsolete {
 		return s.finalizeStaleLocalSandbox(ctx, sandbox, placement, true)
-	}
-	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
-		return err
 	}
 	// Tomb/outbox secret cleanup must succeed before the irreversible sandbox
 	// delete. cluster_secrets has no FK, so a post-delete failure leaves
@@ -5072,6 +5082,13 @@ func (s *Service) startPeriodic(ctx context.Context, interval, timeout time.Dura
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// select chooses uniformly among ready cases, so a cancelled
+				// ctx can lose the coin flip to a ready tick and start one
+				// more sweep after shutdown began — against a store the
+				// daemon is closing. Re-check before doing any work.
+				if ctx.Err() != nil {
+					return
+				}
 				sweepCtx, cancel := context.WithTimeout(ctx, timeout)
 				sweep(sweepCtx)
 				cancel()

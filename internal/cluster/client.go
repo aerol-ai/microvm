@@ -537,7 +537,7 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 // UpdatePlacementSecretRecipients commits a replacement seal recipient set
 // (and optional new provider handle after reseal). Preserves IncarnationID.
 // expectedIncarnationID / expectedSealGeneration CAS against the live placement.
-func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
 	recipients = normalizeSecretRecipientIDs(recipients)
 	if err := validateSecretRecipientUpdate(sandboxID, recipients, secrets, expectedIncarnationID, expectedSealGeneration); err != nil {
 		return err
@@ -551,6 +551,8 @@ func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID
 		SecretSealGeneration:   secrets.SealGeneration,
 		IncarnationID:          strings.TrimSpace(secrets.IncarnationID),
 		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedOwnerNodeID:    strings.TrimSpace(expectedOwnerNodeID),
+		ExpectedOwnerNodeIDSet: true,
 		ExpectedSealGeneration: expectedSealGeneration,
 	})
 }
@@ -1239,7 +1241,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			if existing.SecretSealGeneration > 0 && st.Secrets.hasUpdate() &&
 				st.Secrets.SealGeneration > existing.SecretSealGeneration && len(st.Secrets.Recipients) > 0 {
-				if err := c.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, existing.SecretSealGeneration); err != nil && firstErr == nil {
+				if err := c.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, c.nodeID, existing.SecretSealGeneration); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
