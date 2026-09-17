@@ -260,7 +260,7 @@ func TestPruneWasmCheckpointPushesKeepsLastN(t *testing.T) {
 
 	svc := New(config.Config{WasmCheckpointKeepLastN: 1}, slog.Default(), st, nil, nil, nil, nil, nil, nil)
 	for i := 0; i < 3; i++ {
-		if _, err := st.InsertWasmCheckpointPush(ctx, "sb-1", "ref-"+string(rune('a'+i)), "dig"); err != nil {
+		if _, err := st.InsertWasmCheckpointPush(ctx, "sb-1", "", "ref-"+string(rune('a'+i)), "dig"); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}

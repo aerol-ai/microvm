@@ -138,7 +138,7 @@ func (s *Service) ensureWasmSandboxRowForImport(ctx context.Context, sandboxID s
 		if err := s.store.CompareCloneGeneration(ctx, sandboxID, cloneGen); err != nil {
 			return err
 		}
-		return s.store.UpdateWasmCheckpoint(ctx, sandboxID, string(models.SandboxStatusPassivated), checkpointPath, cloneGen, "")
+		return s.store.UpdateWasmCheckpoint(ctx, sandboxID, existing.AuditIncarnationID, string(models.SandboxStatusPassivated), checkpointPath, cloneGen, "")
 	}
 	spec := s.clusterSpecForImport(sandboxID, snap)
 	now := time.Now().UTC()

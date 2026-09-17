@@ -125,7 +125,23 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{}, false
 	}
 
-	target, candidates, err := c.SelectPlacementWithCandidates(CapacityRequestFromCreate(req))
+	// Resolve the id before placement: the control plane needs it to pick the
+	// seal recipients on its side, which is what keeps a create's answer
+	// bounded instead of O(fleet) (one Member per eligible worker).
+	sandboxID := strings.TrimSpace(opts.PreferredSandboxID)
+	if sandboxID == "" {
+		generated, genErr := service.GenerateSandboxID()
+		if genErr != nil {
+			writeError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+genErr.Error())
+			return Decision{}, false
+		}
+		sandboxID = generated
+	}
+	recipientBackups := 0
+	if svc != nil && svc.WantsSecretRecipientFanout(req) {
+		recipientBackups = svc.SecretRecipientBackupCount()
+	}
+	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	if err != nil {
 		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
 			// A node-bound js-bundle whose worker is gone: the client must
@@ -145,20 +161,8 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return Decision{}, false
 	}
-	sandboxID := strings.TrimSpace(opts.PreferredSandboxID)
-	if sandboxID == "" {
-		var err error
-		sandboxID, err = service.GenerateSandboxID()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
-			return Decision{}, false
-		}
-	}
 	redacted := service.RedactClusterSecrets(req)
-	reserveSecrets := cluster.PlacementSecrets{}
-	if svc != nil && svc.WantsSecretRecipientFanout(req) {
-		reserveSecrets.Recipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, svc.SecretRecipientBackupCount())
-	}
+	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()

@@ -137,6 +137,27 @@ func TestClusterInternalHandlers_BasicCoverage(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 		}
+
+		// A request carrying a sandbox id gets the bounded recipient set and
+		// NOT the candidate fleet: that slice is what made every create's
+		// control-plane response scale with the number of workers.
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/v1/cluster/internal/select-placement",
+			strings.NewReader(`{"request":{"cpu":1,"memory_mb":256,"disk_gb":1},"sandbox_id":"sb-scale","recipient_backups":2}`))
+		h.clusterInternalSelectPlacement(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		var scoped cluster.SelectPlacementResponse
+		if err := json.Unmarshal(rr.Body.Bytes(), &scoped); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(scoped.Candidates) != 0 {
+			t.Fatalf("candidate fleet serialized to the caller: %+v", scoped.Candidates)
+		}
+		if len(scoped.Recipients) == 0 {
+			t.Fatal("no seal recipients returned for a create that wants fan-out")
+		}
 	})
 
 	t.Run("drain_state_ok", func(t *testing.T) {

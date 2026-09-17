@@ -33,7 +33,7 @@ type cgroupFS struct {
 // ensure creates (or reuses) root/name with the given caps and returns its
 // path. The parent's controllers are enabled on first use; a parent that
 // cannot enable cpu and memory is an error, not a silent no-cap.
-func (c cgroupFS) ensure(name string, cpu float64, memMB int) (string, error) {
+func (c cgroupFS) ensure(name string, cpu float64, memMB int, pidsMax int) (string, error) {
 	if c.root == "" || !filepath.IsAbs(c.root) {
 		return "", fmt.Errorf("isolate jail: cgroup root %q must be absolute", c.root)
 	}
@@ -50,7 +50,7 @@ func (c cgroupFS) ensure(name string, cpu float64, memMB int) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("isolate jail: cgroup %s: %w", name, err)
 	}
-	if err := c.applyCaps(dir, cpu, memMB); err != nil {
+	if err := c.applyCaps(dir, cpu, memMB, pidsMax); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -81,8 +81,16 @@ func (c cgroupFS) enableControllers() error {
 // applyCaps writes the caps into an existing cgroup. Zero means unlimited on
 // that axis ("max"), which is also what a warm blank host starts with until a
 // tenant claims it.
-func (c cgroupFS) applyCaps(dir string, cpu float64, memMB int) error {
-	if cpu < 0 || memMB < 0 {
+//
+// pids.max is not optional in the same sense as the other two. The seccomp
+// profile allows clone/clone3 (glibc's pthread_create needs them), and every
+// thread consumes a PID: without a bound, one group can exhaust the host's
+// PID space and take every other tenant's process creation down with it.
+// The enterprise posture therefore requires a non-zero pids.max — enforced at
+// config load, not here, so a warm blank host can still start unlimited and
+// tighten on claim.
+func (c cgroupFS) applyCaps(dir string, cpu float64, memMB int, pidsMax int) error {
+	if cpu < 0 || memMB < 0 || pidsMax < 0 {
 		return errors.New("isolate jail: cgroup caps must be >= 0")
 	}
 	cpuMax := "max " + strconv.Itoa(cgroupPeriodUS)
@@ -99,6 +107,13 @@ func (c cgroupFS) applyCaps(dir string, cpu float64, memMB int) error {
 	if err := writeControl(filepath.Join(dir, "memory.max"), memMax); err != nil {
 		return fmt.Errorf("isolate jail: memory.max: %w", err)
 	}
+	pidsLimit := "max"
+	if pidsMax > 0 {
+		pidsLimit = strconv.Itoa(pidsMax)
+	}
+	if err := writeControl(filepath.Join(dir, "pids.max"), pidsLimit); err != nil {
+		return fmt.Errorf("isolate jail: pids.max: %w", err)
+	}
 	return nil
 }
 
@@ -111,7 +126,7 @@ func (c cgroupFS) remove(dir string) error {
 	// cgroupfs directories hold only control files, which cannot be unlinked
 	// (EPERM, ignored) and vanish with the rmdir; on a plain directory
 	// (tests) the same names are real files and must go first.
-	for _, ctl := range []string{"cpu.max", "memory.max", "cgroup.subtree_control", "cgroup.procs"} {
+	for _, ctl := range []string{"cpu.max", "memory.max", "pids.max", "cgroup.subtree_control", "cgroup.procs"} {
 		_ = os.Remove(filepath.Join(dir, ctl))
 	}
 	err := os.Remove(dir)

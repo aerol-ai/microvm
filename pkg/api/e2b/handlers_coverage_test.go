@@ -387,7 +387,7 @@ func TestLoadReplayableCreateResultSandboxDBError(t *testing.T) {
 
 func TestCreateSandboxFingerprintErrorPath(t *testing.T) {
 	h := newHandlers(Deps{Service: nil})
-	_, err := createRequestFingerprint("base", models.CreateSandboxRequest{}, sandboxMeta{})
+	_, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{}, sandboxMeta{})
 	if err != nil {
 		t.Fatalf("unexpected fingerprint error: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestCreateSandboxReadyReplayLoadError(t *testing.T) {
 	id := createE2BSandbox(t, handler)
 
 	ctx := context.Background()
-	fingerprint, err := createRequestFingerprint("base", models.CreateSandboxRequest{
+	fingerprint, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{
 		Image: "ubuntu:22.04",
 		Env:   map[string]string{},
 	}, sandboxMeta{

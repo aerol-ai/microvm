@@ -748,6 +748,27 @@ func (s *Service) ociEngineForSandbox(sandbox *models.Sandbox) (runtime.Runtime,
 	return s.docker, nil
 }
 
+// imageRemoverForEngine resolves the driver that holds an image copy. An empty
+// engine is a ledger row written before the ledger became engine-aware (or by
+// a runtime with no engine of its own) and resolves to the host's configured
+// engine, which is what those rows always implicitly meant.
+func (s *Service) imageRemoverForEngine(engine string) (runtime.Runtime, error) {
+	switch strings.TrimSpace(engine) {
+	case models.ContainerEngineContainerd:
+		if s.containerd == nil {
+			return nil, fmt.Errorf("engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
+		}
+		return s.containerd, nil
+	case models.ContainerEngineDocker:
+		if s.docker == nil {
+			return nil, fmt.Errorf("engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
+		}
+		return s.docker, nil
+	default:
+		return s.ociEngineForNewCreate()
+	}
+}
+
 func (s *Service) ociEngineForNewCreate() (runtime.Runtime, error) {
 	if s.cfg.ContainerEngine == models.ContainerEngineContainerd {
 		if s.containerd == nil {
@@ -989,6 +1010,15 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		return nil, errors.New("CreateSandboxWithID: id required")
 	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		// The fast path returns a fully-hydrated row — toolbox token included
+		// — so it must never answer a caller that does not own it. A facade
+		// deriving the ID from request content (E2B) would otherwise let any
+		// tenant reclaim another tenant's ID and be handed its credentials.
+		// enforceOwner passes for the owner-watcher / internal recreate path,
+		// which carries no Access and legitimately re-materializes any row.
+		if err := enforceOwner(ctx, existing); err != nil {
+			return nil, fmt.Errorf("%w: sandbox id is already in use", models.ErrSandboxExists)
+		}
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
 		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
@@ -1141,7 +1171,7 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 		s.admitter.Release(sandbox.ID)
 	}
 	if !s.isWasmSandbox(sandbox) {
-		s.schedulePendingImageGC(ctx, sandbox.Image)
+		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
 	return nil
 }
@@ -2274,7 +2304,7 @@ func (s *Service) sealEnv(sandboxID, incarnationID string, env map[string]string
 
 // loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
 func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) (env map[string]string, err error) {
-	sealed, auditIncarnationID, auditOwnerRef, getErr := s.store.GetEnvWithIdentity(ctx, sandboxID)
+	sealed, envPresent, auditIncarnationID, auditOwnerRef, getErr := s.store.GetEnvWithIdentity(ctx, sandboxID)
 	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 
@@ -2302,6 +2332,15 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) 
 			out = map[string]string{}
 		}
 		return out, nil
+	}
+	if getErr == nil && !envPresent {
+		// The sandbox row exists but its sealed env row does not. Every create
+		// writes one (empty when the sandbox has no environment) and warm
+		// upgrades are backfilled, so absence is loss — not "no env". Mapping
+		// it to an empty map is how a start/wake without a replicated spec
+		// used to boot a sandbox stripped of its credentials; fail loud
+		// instead so the operator sees it.
+		return nil, fmt.Errorf("%w: sealed env row is missing for sandbox %s", secrets.ErrDecryptFailed, sandboxID)
 	}
 	if errors.Is(getErr, store.ErrNotFound) || (getErr == nil && len(sealed) == 0) {
 		return map[string]string{}, nil
@@ -2761,6 +2800,18 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	} else if obsolete {
 		return s.destroyStaleLocalSandbox(ctx, sandbox, placement)
 	}
+	// Commit the exact owner/incarnation deleting fence BEFORE any destructive
+	// local work. Routes and the runtime are not recoverable once torn down,
+	// so tearing them down while the placement is still recreate-eligible
+	// leaves a window where Raft is unavailable (or ownership moves) and the
+	// cluster re-materializes a sandbox whose local materialization is already
+	// gone. Fencing first inverts that: a Raft outage fails the destroy with
+	// nothing torn down, and every step after this point is a retry from a
+	// durable deleting state (opBeginDelete is a no-op on an already-deleting
+	// placement, and the fence's TTL only expires once its owner is gone).
+	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
+		return err
+	}
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
@@ -2790,16 +2841,14 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	} else if s.testForceUnmountErr != nil {
 		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", s.testForceUnmountErr)
 	}
-	// Ownership can change while runtime destruction is in flight. Recheck
-	// before lifecycle-wide secret/checkpoint deletion; if failover won, finish
-	// only this obsolete materialization and preserve the active lifecycle.
+	// Defence in depth. The deleting fence above blocks reassignment, so this
+	// should no longer be reachable in cluster mode; it stays because a
+	// pre-fence placement (or a non-cluster path that reaches here) must still
+	// preserve an active lifecycle rather than delete its secrets.
 	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
 		return err
 	} else if obsolete {
 		return s.finalizeStaleLocalSandbox(ctx, sandbox, placement, true)
-	}
-	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
-		return err
 	}
 	// Tomb/outbox secret cleanup must succeed before the irreversible sandbox
 	// delete. cluster_secrets has no FK, so a post-delete failure leaves
@@ -2836,7 +2885,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	}
 	if !s.isWasmSandbox(sandbox) {
-		s.schedulePendingImageGC(ctx, sandbox.Image)
+		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
 	return nil
 }
@@ -4783,7 +4832,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.admitter.Release(sandbox.ID)
 			}
 			if !s.isWasmSandbox(sandbox) {
-				s.schedulePendingImageGC(ctx, sandbox.Image)
+				s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 			}
 			if s.logger != nil {
 				s.logger.Info("audit reconcile destroyed",
@@ -5063,6 +5112,13 @@ func (s *Service) startPeriodic(ctx context.Context, interval, timeout time.Dura
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// select chooses uniformly among ready cases, so a cancelled
+				// ctx can lose the coin flip to a ready tick and start one
+				// more sweep after shutdown began — against a store the
+				// daemon is closing. Re-check before doing any work.
+				if ctx.Err() != nil {
+					return
+				}
 				sweepCtx, cancel := context.WithTimeout(ctx, timeout)
 				sweep(sweepCtx)
 				cancel()
@@ -5588,12 +5644,13 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 	}
 	for _, entry := range entries {
 		image := entry.Image
+		engine := entry.Engine
 		if s.imageGCWhitelisted(image) {
 			// Operator whitelisted this image after the row landed.
 			// Drop it so the ledger doesn't carry it forever; the
 			// destroy path's short-circuit keeps new rows out.
-			if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, image, entry.ScheduledAt); err != nil {
-				s.logger.Warn("pending image gc whitelist row clear failed", "image", image, "error", err)
+			if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
+				s.logger.Warn("pending image gc whitelist row clear failed", "engine", engine, "image", image, "error", err)
 			}
 			continue
 		}
@@ -5606,17 +5663,26 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 			// Image came back into use between scheduling and now.
 			// Drop the row; if it goes idle again the destroy path
 			// will re-schedule with a fresh timestamp.
-			if err := s.store.DeletePendingImageGC(ctx, image); err != nil {
-				s.logger.Warn("pending image gc row clear failed", "image", image, "error", err)
+			if err := s.store.DeletePendingImageGC(ctx, engine, image); err != nil {
+				s.logger.Warn("pending image gc row clear failed", "engine", engine, "image", image, "error", err)
 			}
 			continue
 		}
-		if err := s.docker.RemoveImage(ctx, image); err != nil {
+		remover, err := s.imageRemoverForEngine(engine)
+		if err != nil {
+			// The engine that owns this copy is not wired on this node
+			// (an operator flipped SB_CONTAINER_ENGINE). Leave the row:
+			// removing through the other engine would miss the disk we
+			// are trying to reclaim and could evict its cache instead.
+			s.logger.Warn("pending image gc engine unavailable", "engine", engine, "image", image, "error", err)
+			continue
+		}
+		if err := remover.RemoveImage(ctx, image); err != nil {
 			// Leave the row in place so the next tick retries. Note
 			// docker.RemoveImage returns nil for 404/409, so the
 			// "image vanished" and "still in use by an unknown
 			// container" cases fall through to the delete below.
-			s.logger.Warn("pending image gc remove failed", "image", image, "error", err)
+			s.logger.Warn("pending image gc remove failed", "engine", engine, "image", image, "error", err)
 			continue
 		}
 		// Conditional delete: if a destroy refreshed the row between
@@ -5626,11 +5692,11 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 		// acceptable: it gets re-pulled on the next create. The thing
 		// we MUST avoid is silently throwing away the row that would
 		// have extended the TTL.
-		if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, image, entry.ScheduledAt); err != nil {
-			s.logger.Warn("pending image gc row delete failed", "image", image, "error", err)
+		if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
+			s.logger.Warn("pending image gc row delete failed", "engine", engine, "image", image, "error", err)
 			continue
 		}
-		s.logger.Info("audit pending image gc removed", "image", image)
+		s.logger.Info("audit pending image gc removed", "engine", engine, "image", image)
 	}
 }
 
@@ -5994,7 +6060,12 @@ func (s *Service) refreshPendingImageGCOnUse(ctx context.Context, image string) 
 	}
 }
 
-func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
+// schedulePendingImageGC records one engine's copy of image for later removal.
+// engine is the sandbox's own engine, not the host default: an image pulled by
+// containerd has to be removed through containerd, and asking docker to remove
+// it neither reclaims the disk nor leaves the ledger row in a state the next
+// sweep can finish.
+func (s *Service) schedulePendingImageGC(ctx context.Context, engine, image string) {
 	if image == "" {
 		return
 	}
@@ -6014,11 +6085,11 @@ func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
 	if s.imageGCWhitelisted(image) {
 		return
 	}
-	if err := s.store.SchedulePendingImageGC(ctx, image, time.Now().UTC()); err != nil {
-		s.logger.Warn("schedule pending image gc failed", "image", image, "error", err)
+	if err := s.store.SchedulePendingImageGC(ctx, engine, image, time.Now().UTC()); err != nil {
+		s.logger.Warn("schedule pending image gc failed", "engine", engine, "image", image, "error", err)
 		return
 	}
-	s.logger.Info("audit image scheduled for gc", "image", image)
+	s.logger.Info("audit image scheduled for gc", "engine", engine, "image", image)
 }
 
 // imageGCWhitelisted reports whether image is protected from both

@@ -31,6 +31,7 @@ import (
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
+	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -317,8 +318,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	} else if err := svc.ConfigureAuditExporter(); err != nil {
 		return fmt.Errorf("configure audit export connector: %w", err)
 	}
-	if cfg.EnterpriseMode && !cfg.AuditExportEnabled() && !cp.HasAuditExporter() {
-		return errors.New("enterprise mode requires an off-node audit exporter: set SB_AUDIT_EXPORT_BACKEND=webhook|s3|bus (or SB_SECRET_AUDIT_EXPORT_URL) or wire controlplane.AuditExporter")
+	// "Enabled" is not the bar: stdout and file are enabled backends that
+	// never leave the node, so disk loss still takes the reconstructable
+	// history with it. Require a backend that ships somewhere this node
+	// cannot silently rewrite, or a programmatic exporter.
+	if cfg.EnterpriseMode && !cp.HasAuditExporter() && !auditexport.IsOffNodeBackend(cfg.ResolvedAuditExportBackend()) {
+		return fmt.Errorf("enterprise mode requires an off-node audit exporter: SB_AUDIT_EXPORT_BACKEND=%q keeps evidence on this node; set webhook|s3|bus (or SB_SECRET_AUDIT_EXPORT_URL) or wire controlplane.AuditExporter", cfg.ResolvedAuditExportBackend())
 	}
 	// Witness is installed after the sink opens; re-validate so enterprise +
 	// external witness fail closed at boot when the chain/receipts disagree.

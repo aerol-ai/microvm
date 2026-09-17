@@ -460,9 +460,30 @@ func (s *Service) ReconcileSecretDeleteOutbox(ctx context.Context) error {
 // has already attempted still looks due — with a shifted clock every page
 // re-listed the rows the previous page had just tried, and one rejoin cost a
 // 1024-row backlog six rounds of peer calls before the schedule caught up.
+//
+// rejoinedNodes narrows that override to the obligations it is actually about.
+// Without it, one member flap made every node re-attempt every backed-off row
+// it held, and at 100,000 sandboxes across 2,000 nodes a single flap became a
+// fleet-wide push storm aimed mostly at peers that never left.
 type secretOutboxPass struct {
 	now           time.Time
 	ignoreBackoff bool
+	rejoinedNodes map[string]struct{}
+}
+
+// targetsRejoinedNode reports whether an obligation is owed to a member that
+// just came back. An empty rejoinedNodes set means the pass is not a rejoin
+// pass and every row qualifies (boot, manual reconcile).
+func (p secretOutboxPass) targetsRejoinedNode(recipients []string) bool {
+	if len(p.rejoinedNodes) == 0 {
+		return true
+	}
+	for _, id := range recipients {
+		if _, ok := p.rejoinedNodes[strings.TrimSpace(id)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // reconcileSecretDeleteOutboxAt is ReconcileSecretDeleteOutbox with an explicit
@@ -502,6 +523,9 @@ func (s *Service) reconcileSecretDeleteOutboxPass(ctx context.Context, pass secr
 			}
 			rows := make([]secretOutboxRow, 0, len(recs))
 			for _, rec := range recs {
+				if !pass.targetsRejoinedNode(rec.Recipients) {
+					continue
+				}
 				// Only a staged reseal reads the placement; a plain delete
 				// is actionable without one.
 				rows = append(rows, secretOutboxRow{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID, generation: rec.Generation, needsPlacement: rec.AwaitingPromotion})
@@ -855,20 +879,21 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 				return
 			case <-ticker.C:
 				alive := s.aliveMemberSet()
-				rejoined := false
+				rejoined := make(map[string]struct{})
 				for id := range alive {
 					if _, ok := prevAlive[id]; !ok {
-						rejoined = true
-						break
+						rejoined[id] = struct{}{}
 					}
 				}
 				prevAlive = alive
-				// A member came back: every obligation to it is worth one
-				// immediate try regardless of how far it had backed off. The
-				// pass says so outright instead of moving its clock past the
-				// backoff cap, which also made rows this pass had just tried
-				// look due to the next page (see secretOutboxPass).
-				pass := secretOutboxPass{now: secretLifecycleNow(), ignoreBackoff: rejoined}
+				// A member came back: every obligation TO THAT MEMBER is worth
+				// one immediate try regardless of how far it had backed off.
+				// The pass says so outright instead of moving its clock past
+				// the backoff cap, which also made rows this pass had just
+				// tried look due to the next page (see secretOutboxPass), and
+				// it names the returning nodes so a flap does not re-attempt
+				// obligations owed to peers that never left.
+				pass := secretOutboxPass{now: secretLifecycleNow(), ignoreBackoff: len(rejoined) > 0, rejoinedNodes: rejoined}
 				if err := s.reconcileSecretDeleteOutboxPass(ctx, pass); err != nil && s.logger != nil {
 					s.logger.Warn("cluster: secret delete-outbox reconcile failed", "err", err)
 				}
@@ -876,8 +901,14 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 					s.logger.Warn("cluster: secret put-outbox reconcile failed", "err", err)
 				}
 				s.refreshSecretHolderPossession(ctx)
-				if rejoined {
-					if err := s.ReFanoutClusterSecrets(ctx); err != nil && s.logger != nil {
+				if len(rejoined) > 0 {
+					// Only the secrets whose recipient set contains a
+					// returning node need retransmitting. Re-fanning out
+					// every local secret on every flap is what turns one
+					// member restart into a fleet-wide storm: each node
+					// re-pushes its whole holdings AND asks the Raft leader
+					// for a placement snapshot per page.
+					if err := s.ReFanoutClusterSecretsForNodes(ctx, rejoined); err != nil && s.logger != nil {
 						s.logger.Warn("cluster: secret re-fanout after member rejoin failed", "err", err)
 					}
 				}
@@ -1528,7 +1559,11 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 	// Only now make the new generation discoverable. Before this CAS, the old
 	// placement and old peer copies remain a complete recovery path; after it,
 	// the owner plus at least one authenticated replacement hold the new bytes.
-	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, newHandle, expectedInc, expectedGen); err != nil {
+	// expectedOwner is the node this reseal believes coordinates the secret:
+	// ownerID is either selfID or "" (the leader-coordinated ownerless case)
+	// by the guard at the top of expandAndResealDeadSecretTargetsForPlacement.
+	// Fencing on it stops a promotion that outlived a reassignment.
+	if err := c.UpdatePlacementSecretRecipients(ctx, sandboxID, replacements, newHandle, expectedInc, ownerID, expectedGen); err != nil {
 		return fmt.Errorf("raft promote resealed secret: %w", err)
 	}
 	resetSecretHoldersForGeneration(sandboxID, blob.IncarnationID, newGen, selfID)
@@ -1607,7 +1642,7 @@ func (s *Service) finalizeResealedSecret(ctx context.Context, c cluster.Client, 
 		Ref: local.Ref, Version: local.Version, Recipients: recipients,
 		IncarnationID: placement.IncarnationID, SealGeneration: local.SealGeneration,
 	}
-	if err := c.UpdatePlacementSecretRecipients(ctx, local.SandboxID, recipients, handle, placement.IncarnationID, placement.SecretSealGeneration); err != nil {
+	if err := c.UpdatePlacementSecretRecipients(ctx, local.SandboxID, recipients, handle, placement.IncarnationID, placement.OwnerNodeID, placement.SecretSealGeneration); err != nil {
 		return fmt.Errorf("finalize interrupted secret reseal: %w", err)
 	}
 	pending := pendingRecipientsAfterAck(recipients, holding, selfID)
@@ -1698,6 +1733,9 @@ func (s *Service) reconcileSecretPutOutboxPass(ctx context.Context, pass secretO
 			}
 			rows := make([]secretOutboxRow, 0, len(recs))
 			for _, rec := range recs {
+				if !pass.targetsRejoinedNode(rec.Recipients) {
+					continue
+				}
 				rows = append(rows, secretOutboxRow{sandboxID: rec.SandboxID, incarnationID: rec.IncarnationID, generation: rec.SealGeneration, needsPlacement: true})
 			}
 			return rows, nil

@@ -103,7 +103,7 @@ func (s *Service) runWasmDurablePushSweep(ctx context.Context) {
 		if sb.Status != models.SandboxStatusPassivated && sb.Status != models.SandboxStatusPassivateFailed {
 			continue
 		}
-		s.pushWasmCheckpointBestEffort(sb.ID, path)
+		s.pushWasmCheckpointBestEffort(sb.ID, sb.AuditIncarnationID, path)
 		_ = ctx
 	}
 }

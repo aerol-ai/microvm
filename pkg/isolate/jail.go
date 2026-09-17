@@ -35,7 +35,13 @@ type JailConfig struct {
 	CgroupName    string
 	CPUQuota      float64
 	MemoryLimitMB int
-	Jitless       bool
+	// PidsMax bounds pids.max on the group cgroup. clone/clone3 are in the
+	// seccomp allowlist (pthread_create needs them) and every thread takes a
+	// PID, so without this one group can exhaust the host PID space and stop
+	// every other tenant from creating processes. Zero = unlimited, which is
+	// only for a warm blank host that has not been claimed yet.
+	PidsMax int
+	Jitless bool
 	// SeccompMode is one of SeccompEnforce (unlisted syscalls kill the
 	// process), SeccompAudit (unlisted syscalls are logged by the kernel and
 	// allowed — for the first real-host run against a new workerd build) or

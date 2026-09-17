@@ -290,6 +290,15 @@ func snapshotNameFromID(snapshotID string) (string, bool) {
 }
 
 type createFingerprintPayload struct {
+	// OwnerRef binds the fingerprint — and therefore both the create
+	// idempotency key and the deterministic sandbox ID derived from it — to
+	// the calling tenant. Without it two tenants issuing byte-identical
+	// create bodies collide on one global key: the second caller's scoped
+	// replay lookup fails, it reclaims the key, and CreateSandboxWithID then
+	// hands it the first tenant's existing row (toolbox token included).
+	// Operator/PAT callers are legitimately unscoped and share the "" slot,
+	// which is the same trust boundary every other owner-scoped path uses.
+	OwnerRef            string            `json:"ownerRef,omitempty"`
 	TemplateID          string            `json:"templateID"`
 	Metadata            map[string]string `json:"metadata,omitempty"`
 	EnvVars             map[string]string `json:"envVars,omitempty"`
@@ -305,8 +314,9 @@ type createFingerprintPayload struct {
 	MaskRequestHost     string            `json:"maskRequestHost,omitempty"`
 }
 
-func createRequestFingerprint(templateID string, serviceReq models.CreateSandboxRequest, meta sandboxMeta) (string, error) {
+func createRequestFingerprint(ownerRef, templateID string, serviceReq models.CreateSandboxRequest, meta sandboxMeta) (string, error) {
 	payload := createFingerprintPayload{
+		OwnerRef:            strings.TrimSpace(ownerRef),
 		TemplateID:          strings.TrimSpace(templateID),
 		Metadata:            cloneStringMap(meta.Metadata),
 		EnvVars:             cloneStringMap(serviceReq.Env),

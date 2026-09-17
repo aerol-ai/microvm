@@ -357,7 +357,7 @@ func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
 	}
 
 	// pushWasmCheckpointBestEffort should swallow the push error and return.
-	svc.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
+	svc.pushWasmCheckpointBestEffort("sb-wasm-push", "", "/tmp/checkpoint")
 
 	// Reopen a fresh store so we can exercise the success/prune path.
 	svc2, st2, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
@@ -378,8 +378,8 @@ func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
-	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
-	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "", "/tmp/checkpoint")
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "", "/tmp/checkpoint")
 	if len(pusher.deleteCalls) == 0 {
 		t.Fatal("expected prune to delete an older checkpoint ref")
 	}

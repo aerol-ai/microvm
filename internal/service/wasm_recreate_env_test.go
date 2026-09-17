@@ -223,7 +223,14 @@ func TestRecreateWasmDurableSandboxWithoutEnvStaysEmpty(t *testing.T) {
 	if len(rt.rehydratedEnv) != 1 || len(rt.rehydratedEnv[0]) != 0 {
 		t.Fatalf("restored environment = %v, want empty", rt.rehydratedEnv)
 	}
-	if _, err := st.GetEnv(ctx, id); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("an env-less sandbox must not gain a sealed row: %v", err)
+	// An env-less sandbox still has a row — every create writes one so that a
+	// LATER missing row reads as loss rather than "no env" — but its seal
+	// stays empty: the recreate must not invent ciphertext.
+	blob, err := st.GetEnv(ctx, id)
+	if err != nil {
+		t.Fatalf("env-less sandbox lost its env row: %v", err)
+	}
+	if len(blob) != 0 {
+		t.Fatalf("an env-less sandbox gained a %d-byte seal", len(blob))
 	}
 }

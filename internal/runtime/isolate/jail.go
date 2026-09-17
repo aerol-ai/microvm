@@ -51,6 +51,9 @@ type JailSpec struct {
 	// on that axis (the cgroup controller is left unset).
 	CPUQuota      float64
 	MemoryLimitMB int
+	// PidsMax bounds pids.max on the group cgroup (fork/thread bomb
+	// containment). Zero = unlimited; enterprise mode refuses that.
+	PidsMax int
 	// Jitless selects the reduced seccomp profile (and --jitless on the V8
 	// command line when the spawner realizes the spec).
 	Jitless bool
@@ -107,6 +110,7 @@ func BuildJailSpec(cfg Config, groupKey string, cpu float64, memoryMB int) (Jail
 		GID:           cfg.JailGID,
 		CPUQuota:      cpu,
 		MemoryLimitMB: memoryMB,
+		PidsMax:       cfg.JailPidsMax,
 		Jitless:       cfg.Jitless,
 		CgroupRoot:    cfg.JailCgroupRoot,
 		SeccompMode:   cfg.SeccompMode,
@@ -140,6 +144,9 @@ func (s JailSpec) Validate() error {
 	}
 	if s.MemoryLimitMB < 0 {
 		return fmt.Errorf("isolate jail: memory limit must be >= 0, got %d", s.MemoryLimitMB)
+	}
+	if s.PidsMax < 0 {
+		return fmt.Errorf("isolate jail: pids max must be >= 0, got %d", s.PidsMax)
 	}
 	return nil
 }

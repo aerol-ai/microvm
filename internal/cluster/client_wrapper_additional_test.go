@@ -169,13 +169,13 @@ func TestClusterClientReservationAndMutationWrappers(t *testing.T) {
 		Version:        secretspkg.RefVersion,
 		IncarnationID:  "inc-expose",
 		SealGeneration: 4,
-	}, "inc-expose", 3); err != nil {
+	}, "inc-expose", c.nodeID, 3); err != nil {
 		t.Fatalf("UpdatePlacementSecretRecipients() error = %v", err)
 	}
 	if got := c.SecretsOf("sb-expose"); got.SealGeneration != 4 || len(got.Recipients) != 1 || got.Recipients[0] != "node-z" {
 		t.Fatalf("updated secret handle = %+v", got)
 	}
-	if err := c.UpdatePlacementSecretRecipients(ctx, "", []string{"node-z"}, PlacementSecrets{}, "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+	if err := c.UpdatePlacementSecretRecipients(ctx, "", []string{"node-z"}, PlacementSecrets{}, "", "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
 		t.Fatalf("empty sandbox update = %v, want ErrSecretRecipientsCASMismatch", err)
 	}
 	if err := c.AddExposedPort(ctx, "sb-expose", 8080, ExposedPortRoute{Protocol: "http"}); err != nil {
@@ -255,7 +255,7 @@ func TestClusterAndAgentNewReadWrappersFailClosed(t *testing.T) {
 		t.Fatalf("nil-FSM point lookup = %+v", got)
 	}
 	c.SetLocalTemplateCatalogProvider(func() ([]string, bool) { return nil, true })
-	if err := c.UpdatePlacementSecretRecipients(context.Background(), "", nil, PlacementSecrets{}, "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+	if err := c.UpdatePlacementSecretRecipients(context.Background(), "", nil, PlacementSecrets{}, "", "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
 		t.Fatalf("nil cluster empty update = %v, want ErrSecretRecipientsCASMismatch", err)
 	}
 
@@ -269,7 +269,7 @@ func TestClusterAndAgentNewReadWrappersFailClosed(t *testing.T) {
 	if _, ok := a.LookupMember("node-a"); ok {
 		t.Fatal("nil agent resolved a member")
 	}
-	if err := a.UpdatePlacementSecretRecipients(context.Background(), "", nil, PlacementSecrets{}, "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+	if err := a.UpdatePlacementSecretRecipients(context.Background(), "", nil, PlacementSecrets{}, "", "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
 		t.Fatalf("nil agent empty update = %v, want ErrSecretRecipientsCASMismatch", err)
 	}
 }
@@ -277,7 +277,7 @@ func TestClusterAndAgentNewReadWrappersFailClosed(t *testing.T) {
 func TestNoopSecurityAndListContracts(t *testing.T) {
 	ctx := context.Background()
 	n := NewNoop("node-a", "http://node-a", "node-a.example.test")
-	if err := n.UpdatePlacementSecretRecipients(ctx, "sb", []string{"node-a"}, PlacementSecrets{}, "", 0); err != nil {
+	if err := n.UpdatePlacementSecretRecipients(ctx, "sb", []string{"node-a"}, PlacementSecrets{}, "", "", 0); err != nil {
 		t.Fatalf("standalone recipient update = %v", err)
 	}
 	if owner, ok, err := n.AuditOwnerRef(ctx, "sb"); err != nil || ok || owner != "" {
@@ -347,7 +347,7 @@ func TestAgentMembershipAndSecretRecipientUpdate(t *testing.T) {
 		Version:        secretspkg.RefVersion,
 		IncarnationID:  "inc-a",
 		SealGeneration: 4,
-	}, "inc-a", 3); err != nil {
+	}, "inc-a", "server-a", 3); err != nil {
 		t.Fatalf("agent recipient update: %v", err)
 	}
 	if !sawApply {

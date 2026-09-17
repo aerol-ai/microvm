@@ -113,11 +113,11 @@ func TestWasmCheckpointPushHistory(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	id1, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "aocr://sb-push:v1", "digest-1")
+	id1, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "", "aocr://sb-push:v1", "digest-1")
 	if err != nil || id1 <= 0 {
 		t.Fatalf("InsertWasmCheckpointPush first = id %d err %v", id1, err)
 	}
-	id2, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "aocr://sb-push:v2", "digest-2")
+	id2, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "", "aocr://sb-push:v2", "digest-2")
 	if err != nil || id2 <= id1 {
 		t.Fatalf("InsertWasmCheckpointPush second = id %d err %v", id2, err)
 	}
@@ -216,11 +216,13 @@ func TestWasmRegistryPushRoundTrip(t *testing.T) {
 
 	sb := sampleSandbox("sb-reg")
 	sb.Runtime = models.RuntimeWasm
+	sb.AuditIncarnationID = "inc-reg-1"
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := st.UpdateWasmRegistryPush(ctx, sb.ID, "aocr://sb-reg:latest", "sha256:dead"); err != nil {
-		t.Fatalf("UpdateWasmRegistryPush: %v", err)
+	applied, err := st.UpdateWasmRegistryPush(ctx, sb.ID, sb.AuditIncarnationID, "aocr://sb-reg:latest", "sha256:dead")
+	if err != nil || !applied {
+		t.Fatalf("UpdateWasmRegistryPush = applied %v, err %v", applied, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
 	if err != nil {
@@ -228,6 +230,25 @@ func TestWasmRegistryPushRoundTrip(t *testing.T) {
 	}
 	if got.WasmRegistryRef != "aocr://sb-reg:latest" || got.WasmRegistryDigest != "sha256:dead" {
 		t.Fatalf("registry fields = ref %q digest %q", got.WasmRegistryRef, got.WasmRegistryDigest)
+	}
+
+	// A push that lands after the id was re-created belongs to a dead
+	// lifecycle: it must not overwrite the live row's checkpoint pointer.
+	if _, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "inc-reg-0", "aocr://stale:latest", "sha256:stale"); err != nil {
+		t.Fatalf("stale UpdateWasmRegistryPush error = %v", err)
+	}
+	if applied, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "inc-reg-0", "aocr://stale:latest", "sha256:stale"); err != nil || applied {
+		t.Fatalf("stale UpdateWasmRegistryPush = applied %v, err %v; want applied=false", applied, err)
+	}
+	got, err = st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get after stale push: %v", err)
+	}
+	if got.WasmRegistryRef != "aocr://sb-reg:latest" || got.WasmRegistryDigest != "sha256:dead" {
+		t.Fatalf("stale push overwrote the live lifecycle: ref %q digest %q", got.WasmRegistryRef, got.WasmRegistryDigest)
+	}
+	if _, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "  ", "aocr://x", "sha256:x"); err == nil {
+		t.Fatal("UpdateWasmRegistryPush accepted an empty incarnation")
 	}
 }
 

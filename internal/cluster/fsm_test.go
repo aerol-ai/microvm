@@ -1685,3 +1685,90 @@ func TestFSMReassignCauseDoesNotAffectState(t *testing.T) {
 		t.Fatalf("ReassignCause changed the applied state:\n untagged=%+v\n tagged=%+v", untagged, tagged)
 	}
 }
+
+// TestFSMUpdateSecretRecipientsOwnerFence pins the reseal owner CAS. opReassign
+// moves ownership while preserving both the incarnation and the seal
+// generation, so the incarnation/generation CASes alone let a node that has
+// just lost the lifecycle land a reseal it began as owner — publishing a
+// recipient set coordinated by the wrong node. A command written before the
+// fence existed (ExpectedOwnerNodeIDSet false) must still replay.
+func TestFSMUpdateSecretRecipientsOwnerFence(t *testing.T) {
+	newFSMWithPlacement := func(t *testing.T) *placementFSM {
+		t.Helper()
+		fsm := newPlacementFSM()
+		place, _ := encodeCommand(command{
+			Op: opPlace, SandboxID: "sb-own", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
+			Spec:                 &models.CreateSandboxRequest{Image: "alpine"},
+			SecretRecipients:     []string{"n1", "n2"},
+			IncarnationID:        "inc-own",
+			SecretRef:            secretspkg.FormatRef("sb-own", "inc-own", secretspkg.RefVersion),
+			SecretVersion:        secretspkg.RefVersion,
+			SecretSealGeneration: 3,
+		})
+		if res := fsm.Apply(&raft.Log{Index: 1, Data: place}); res != nil {
+			t.Fatalf("opPlace: %v", res)
+		}
+		// Ownership moves to n9; incarnation and seal generation are untouched.
+		reassign, _ := encodeCommand(command{
+			Op: opReassign, SandboxID: "sb-own", OwnerNodeID: "n9", OwnerAPIURL: "http://n9",
+			ExpectedIncarnationID: "inc-own",
+		})
+		if res := fsm.Apply(&raft.Log{Index: 2, Data: reassign}); res != nil {
+			t.Fatalf("opReassign: %v", res)
+		}
+		return fsm
+	}
+
+	resealFrom := func(owner string, fenced bool) command {
+		return command{
+			Op:                     opUpdateSecretRecipients,
+			SandboxID:              "sb-own",
+			SecretRecipients:       []string{"n1", "stale-b"},
+			SecretRef:              secretspkg.FormatRef("sb-own", "inc-own", secretspkg.RefVersion),
+			SecretVersion:          secretspkg.RefVersion,
+			SecretSealGeneration:   4,
+			ExpectedIncarnationID:  "inc-own",
+			ExpectedOwnerNodeID:    owner,
+			ExpectedOwnerNodeIDSet: fenced,
+			ExpectedSealGeneration: 3,
+		}
+	}
+
+	t.Run("former owner is rejected", func(t *testing.T) {
+		fsm := newFSMWithPlacement(t)
+		stale, _ := encodeCommand(resealFrom("n1", true))
+		res := fsm.Apply(&raft.Log{Index: 3, Data: stale})
+		err, _ := res.(error)
+		if err == nil || !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+			t.Fatalf("stale owner reseal = %v, want ErrSecretRecipientsCASMismatch", res)
+		}
+		got, _ := fsm.get("sb-own")
+		if got.SecretSealGeneration != 3 || len(got.SecretRecipients) != 2 {
+			t.Fatalf("placement mutated by rejected reseal: %+v", got)
+		}
+	})
+
+	t.Run("current owner is accepted", func(t *testing.T) {
+		fsm := newFSMWithPlacement(t)
+		fresh, _ := encodeCommand(resealFrom("n9", true))
+		if res := fsm.Apply(&raft.Log{Index: 3, Data: fresh}); res != nil {
+			t.Fatalf("current owner reseal = %v", res)
+		}
+		got, _ := fsm.get("sb-own")
+		if got.SecretSealGeneration != 4 || got.OwnerNodeID != "n9" {
+			t.Fatalf("placement = %+v, want generation 4 under n9", got)
+		}
+	})
+
+	t.Run("unfenced legacy command still replays", func(t *testing.T) {
+		fsm := newFSMWithPlacement(t)
+		legacy, _ := encodeCommand(resealFrom("", false))
+		if res := fsm.Apply(&raft.Log{Index: 3, Data: legacy}); res != nil {
+			t.Fatalf("legacy reseal = %v", res)
+		}
+		got, _ := fsm.get("sb-own")
+		if got.SecretSealGeneration != 4 {
+			t.Fatalf("legacy reseal did not apply: %+v", got)
+		}
+	})
+}

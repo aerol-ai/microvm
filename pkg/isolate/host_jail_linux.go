@@ -49,7 +49,7 @@ func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized
 	if cg.root == "" {
 		cg.root = DefaultCgroupRoot
 	}
-	cgDir, err := cg.ensure(j.CgroupName, j.CPUQuota, j.MemoryLimitMB)
+	cgDir, err := cg.ensure(j.CgroupName, j.CPUQuota, j.MemoryLimitMB, j.PidsMax)
 	if err != nil {
 		_ = removeGroupJail(chrootBase, j.ChrootDir)
 		return nil, err

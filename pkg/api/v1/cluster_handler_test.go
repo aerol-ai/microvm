@@ -612,6 +612,15 @@ func (c *membersStubCluster) Members() []cluster.Member {
 	return c.members
 }
 
+// LocalMembers mirrors Members so the stub models ONE membership view. The
+// shard-aware ingress ring hashes cluster.IngressRingMembers, which prefers
+// local gossip; a stub that answered self here while Members() said "no
+// members" would be testing the very divergence the ring accessor exists to
+// remove.
+func (c *membersStubCluster) LocalMembers() []cluster.Member {
+	return c.members
+}
+
 func (c *membersStubCluster) PeerInternalHTTPClient() *http.Client {
 	in := c.internalClient
 	if in == nil {

@@ -1807,7 +1807,7 @@ func (c *resealPlacementCluster) Leader() string {
 	return c.Noop.Leader()
 }
 
-func (c *resealPlacementCluster) UpdatePlacementSecretRecipients(_ context.Context, sandboxID string, recipients []string, secrets cluster.PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+func (c *resealPlacementCluster) UpdatePlacementSecretRecipients(_ context.Context, sandboxID string, recipients []string, secrets cluster.PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.updateCalls++

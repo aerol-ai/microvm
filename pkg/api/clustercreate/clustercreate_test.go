@@ -130,6 +130,20 @@ func (s *clusterStub) SelectPlacementWithCandidates(req capacity.Request) (clust
 	return s.selectTarget, cands, nil
 }
 
+// SelectPlacementForCreate is the create path's entry point now: the stub has
+// to answer it too, or Prepare falls through to the embedded Noop and every
+// placement-error assertion silently passes.
+func (s *clusterStub) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (cluster.PlacementTarget, []string, error) {
+	target, candidates, err := s.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return cluster.PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
+}
+
 func (s *clusterStub) IsNodeDrained(_ string) bool {
 	return s.drained
 }

@@ -59,7 +59,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	fingerprint, err := createRequestFingerprint(req.TemplateID, serviceReq, meta)
+	fingerprint, err := createRequestFingerprint(svcmetrics.OwnerRefForCreate(r.Context()), req.TemplateID, serviceReq, meta)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return

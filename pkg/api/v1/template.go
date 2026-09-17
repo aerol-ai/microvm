@@ -99,7 +99,7 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 			local, localErr, templateListKey, h.deps.Logger, "templates")
 	})
 	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		writeClusterListError(h.deps.Logger, w, err)
 		return
 	}
 	writeClusterListCoverage(w, aggregate.failedPeers, "X-Aerol-Missing-Template-Peers")

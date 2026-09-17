@@ -68,7 +68,7 @@ func generateTestCertForNode(nodeID string) (*x509.CertPool, tls.Certificate, er
 }
 
 func TestInternalServerSetup(t *testing.T) {
-	_, err := startInternalServer(":0", nil, nil, slog.Default(), false)
+	_, err := startInternalServer(":0", nil, nil, slog.Default())
 	if err == nil {
 		t.Errorf("expected error without tls")
 	}
@@ -90,11 +90,15 @@ func TestInternalServerHandlers(t *testing.T) {
 		return applyErr
 	}
 
-	srv, err := startInternalServer("127.0.0.1:0", ct, handler, slog.Default(), false)
+	srv, err := startInternalServer("127.0.0.1:0", ct, handler, slog.Default())
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	defer srv.Close()
+
+	// Membership authorization is enforced in every mode, so this test needs
+	// an installed authorizer before any request can reach the apply handler.
+	srv.SetPeerAuthorizer(func(string) bool { return true })
 
 	if srv.Addr() == "" {
 		t.Errorf("expected bound address")
@@ -184,7 +188,13 @@ func TestInternalServerNilCheck(t *testing.T) {
 	s.Close()
 }
 
-func TestInternalServerEnterpriseApplyRequiresLiveCertIdentity(t *testing.T) {
+// TestInternalServerApplyRequiresLiveCertIdentity pins the revocation
+// boundary: a cluster-CA leaf alone never authorizes a raft apply, in ANY
+// cluster mode (enterprise used to be the only mode that checked). The boot
+// window — listener bound, gossip not yet constructed — must refuse as a
+// retryable 503, and a peer that is no longer in the live membership must get
+// a permanent 403.
+func TestInternalServerApplyRequiresLiveCertIdentity(t *testing.T) {
 	pool, tlsCert, err := generateTestCertForNode("worker-1")
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +204,7 @@ func TestInternalServerEnterpriseApplyRequiresLiveCertIdentity(t *testing.T) {
 	srv, err := startInternalServer("127.0.0.1:0", ct, func(context.Context, []byte) error {
 		calls++
 		return nil
-	}, slog.Default(), true)
+	}, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,16 +226,25 @@ func TestInternalServerEnterpriseApplyRequiresLiveCertIdentity(t *testing.T) {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return resp.StatusCode
 	}
-	if got := post("worker-1", []byte("ok")); got != http.StatusForbidden {
-		t.Fatalf("boot-window status=%d, want 403", got)
+	// Boot window: no membership view yet. Retryable, never served.
+	if got := post("worker-1", []byte("ok")); got != http.StatusServiceUnavailable {
+		t.Fatalf("boot-window status=%d, want 503", got)
 	}
-	srv.SetPeerAuthorizer(func(id string) bool { return id == "worker-1" })
+	live := map[string]bool{"worker-1": true}
+	srv.SetPeerAuthorizer(func(id string) bool { return live[id] })
 	if got := post("worker-2", []byte("ok")); got != http.StatusForbidden {
 		t.Fatalf("mismatched identity status=%d, want 403", got)
 	}
 	if got := post("worker-1", []byte("ok")); got != http.StatusNoContent {
 		t.Fatalf("authorized identity status=%d, want 204", got)
 	}
+	// Decommission worker-1: its certificate is still valid and unexpired,
+	// but it has left the live membership and must lose apply authority.
+	delete(live, "worker-1")
+	if got := post("worker-1", []byte("ok")); got != http.StatusForbidden {
+		t.Fatalf("removed-member status=%d, want 403", got)
+	}
+	live["worker-1"] = true
 	if got := post("worker-1", bytes.Repeat([]byte{'x'}, (1<<20)+1)); got != http.StatusBadRequest {
 		t.Fatalf("oversized apply status=%d, want 400", got)
 	}
@@ -243,7 +262,7 @@ func TestInternalServerDoesNotBoundStreamingBodies(t *testing.T) {
 		t.Fatal(err)
 	}
 	ct := &ClusterTLS{caPool: pool, nodeCert: cert}
-	srv, err := startInternalServer("127.0.0.1:0", ct, func(context.Context, []byte) error { return nil }, slog.Default(), false)
+	srv, err := startInternalServer("127.0.0.1:0", ct, func(context.Context, []byte) error { return nil }, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}

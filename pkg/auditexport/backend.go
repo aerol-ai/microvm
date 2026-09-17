@@ -54,6 +54,9 @@ var (
 	ErrNotImplemented = errors.New("audit export: backend not implemented")
 	// ErrUnknownBackend is returned by Open for a name nothing registered.
 	ErrUnknownBackend = errors.New("audit export: unknown backend")
+	// ErrOnNodeBackend is returned when enterprise mode selects a backend
+	// that never leaves the node (noop / stdout / file). See IsOffNodeBackend.
+	ErrOnNodeBackend = errors.New("audit export: enterprise mode requires an off-node backend (webhook, s3, bus) or a wired controlplane.AuditExporter")
 )
 
 var registry = struct {

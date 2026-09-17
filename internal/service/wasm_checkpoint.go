@@ -83,14 +83,14 @@ func (s *Service) checkpointWasmSandbox(ctx context.Context, host wasmruntime.Ch
 			"durability", sandbox.Durability,
 			"error", err,
 		)
-		_ = s.store.UpdateWasmCheckpoint(ctx, sandbox.ID,
+		_ = s.store.UpdateWasmCheckpoint(ctx, sandbox.ID, sandbox.AuditIncarnationID,
 			string(models.SandboxStatusPassivateFailed), "", sandbox.CloneGeneration, err.Error())
 		if s.admitter != nil {
 			s.admitter.Release(sandbox.ID)
 		}
 		return nil
 	}
-	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID,
+	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID, sandbox.AuditIncarnationID,
 		string(models.SandboxStatusPassivated), path, gen, ""); err != nil {
 		return err
 	}
@@ -103,7 +103,7 @@ func (s *Service) checkpointWasmSandbox(ctx context.Context, host wasmruntime.Ch
 		slog.String("clone_generation", gen),
 	)
 	if sandbox.Durability == models.DurabilityDurable && s.wasmCheckpointPusher != nil {
-		go s.pushWasmCheckpointBestEffort(sandbox.ID, path)
+		go s.pushWasmCheckpointBestEffort(sandbox.ID, sandbox.AuditIncarnationID, path)
 	}
 	return nil
 }
@@ -124,7 +124,7 @@ func (s *Service) checkpointLiveWasmSandbox(ctx context.Context, host wasmruntim
 		)
 		return nil
 	}
-	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID,
+	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID, sandbox.AuditIncarnationID,
 		string(models.SandboxStatusStarted), path, gen, ""); err != nil {
 		return err
 	}
@@ -134,7 +134,7 @@ func (s *Service) checkpointLiveWasmSandbox(ctx context.Context, host wasmruntim
 		slog.String("clone_generation", gen),
 	)
 	if sandbox.Durability == models.DurabilityDurable && s.wasmCheckpointPusher != nil {
-		go s.pushWasmCheckpointBestEffort(sandbox.ID, path)
+		go s.pushWasmCheckpointBestEffort(sandbox.ID, sandbox.AuditIncarnationID, path)
 	}
 	return nil
 }
@@ -194,7 +194,12 @@ func (s *Service) wasmCheckpointParallelism() int {
 	return s.cfg.WasmCheckpointMaxParallel
 }
 
-func (s *Service) pushWasmCheckpointBestEffort(sandboxID, memSnapDir string) {
+// pushWasmCheckpointBestEffort ships a checkpoint to AOCR detached from the
+// request that produced it. incarnationID is the lifecycle it belongs to: the
+// push holds a 5-minute budget, so the sandbox can be destroyed and its id
+// re-created before the result lands, and an unfenced write would then hand a
+// fresh sandbox the previous incarnation's memory image.
+func (s *Service) pushWasmCheckpointBestEffort(sandboxID, incarnationID, memSnapDir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	tag := "latest"
@@ -220,13 +225,24 @@ func (s *Service) pushWasmCheckpointBestEffort(sandboxID, memSnapDir string) {
 			}
 		}
 	}
-	if err := s.store.UpdateWasmRegistryPush(ctx, sandboxID, result.RegistryRef, result.Digest); err != nil {
+	applied, err := s.store.UpdateWasmRegistryPush(ctx, sandboxID, incarnationID, result.RegistryRef, result.Digest)
+	if err != nil {
 		s.logger.Warn("wasm checkpoint AOCR push metadata persist failed",
 			"sandbox_id", sandboxID,
 			"error", err,
 		)
 	}
-	if _, err := s.store.InsertWasmCheckpointPush(ctx, sandboxID, result.RegistryRef, result.Digest); err != nil {
+	if !applied {
+		// The lifecycle this push belonged to is gone. Recording the ref under
+		// the live row would point a different sandbox at it; the ref is still
+		// journalled below so the orphan sweep can reclaim the pushed artifact.
+		s.logger.Warn("wasm checkpoint AOCR push landed after its lifecycle ended",
+			"sandbox_id", sandboxID,
+			"incarnation_id", incarnationID,
+			"registry_ref", result.RegistryRef,
+		)
+	}
+	if _, err := s.store.InsertWasmCheckpointPush(ctx, sandboxID, incarnationID, result.RegistryRef, result.Digest); err != nil {
 		s.logger.Warn("wasm checkpoint push history persist failed",
 			"sandbox_id", sandboxID,
 			"error", err,

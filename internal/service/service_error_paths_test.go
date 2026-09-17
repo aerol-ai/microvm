@@ -745,7 +745,7 @@ func TestServiceHelperErrorBranches(t *testing.T) {
 			t.Fatalf("store.Close: %v", err)
 		}
 		svc.refreshPendingImageGCOnUse(ctx, "alpine:latest")
-		svc.schedulePendingImageGC(ctx, "alpine:latest")
+		svc.schedulePendingImageGC(ctx, "", "alpine:latest")
 	})
 
 	t.Run("cluster placement delete ignores foreign owners", func(t *testing.T) {

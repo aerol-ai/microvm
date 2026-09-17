@@ -56,9 +56,9 @@ func (r *jailRealized) teardown() error {
 
 // applyCaps changes the running group's cgroup caps (a warm blank host
 // claimed by a tenant takes that tenant's caps).
-func (r *jailRealized) applyCaps(cpu float64, memMB int) error {
+func (r *jailRealized) applyCaps(cpu float64, memMB int, pidsMax int) error {
 	if r == nil || r.cgroupDir == "" {
 		return nil
 	}
-	return r.cgroup.applyCaps(r.cgroupDir, cpu, memMB)
+	return r.cgroup.applyCaps(r.cgroupDir, cpu, memMB, pidsMax)
 }

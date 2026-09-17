@@ -254,8 +254,15 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 		return false, "", "", err
 	}
 	localHead = scan.head
-	// Empty chain has nothing to witness yet.
+	// Empty chain has nothing to witness yet — unless something remembers a
+	// chain that is now gone, in which case this is complete erasure and the
+	// success return below would certify the tamper as healthy.
 	if localHead == "" || localHead == auditlog.GenesisPrevHash || scan.records == 0 {
+		if s.emptyLocalChainIsErasure(remoteHead, remoteOK) {
+			secretAuditWitnessHealthy.Set(0)
+			secretAuditWitnessFailures.Add(1)
+			return false, localHead, remoteHead, nil
+		}
 		return true, localHead, "", nil
 	}
 	localReceipt, err := s.localWitnessReceiptHead()
@@ -288,6 +295,34 @@ func (s *Service) localWitnessReceiptHead() (string, error) {
 		localReceipt = tip.HeadHex
 	}
 	return strings.TrimSpace(localReceipt), nil
+}
+
+// emptyLocalChainIsErasure reports whether an empty local chain contradicts
+// evidence that this node once had one. An empty chain is normal exactly once
+// — before the first audited event — and after that it is the signature of
+// the cheapest tamper there is: delete the log. Two independent witnesses to
+// a prior chain exist, and either one is enough:
+//
+//   - the external witness still holds a head for this node;
+//   - a local receipt records a head this node shipped.
+//
+// Returning true means verification must fail. It cannot be recovered by
+// waiting: an operator who really did rebuild this node from scratch has to
+// clear the node's witnessed head (and the stale local receipt) deliberately,
+// which is the point — evidence loss is an event someone signs off on.
+func (s *Service) emptyLocalChainIsErasure(remoteHead string, remoteOK bool) bool {
+	if remoteOK {
+		if h := strings.TrimSpace(remoteHead); h != "" && h != auditlog.GenesisPrevHash {
+			return true
+		}
+	}
+	localReceipt, err := s.localWitnessReceiptHead()
+	if err != nil {
+		// An unreadable receipt file is not proof of erasure, but it is not
+		// proof of health either; fail closed.
+		return true
+	}
+	return localReceipt != "" && localReceipt != auditlog.GenesisPrevHash
 }
 
 // judgeWitnessAncestry applies the witness contract once the facts are in
@@ -336,6 +371,14 @@ func (s *Service) verifySecretAuditWitnessAtBoot(w controlplane.Witness) (ok boo
 	remoteHead = strings.TrimSpace(remoteHead)
 	localHead, _ = f.chainTip()
 	if localHead == "" || localHead == auditlog.GenesisPrevHash || (f.bootScan.records == 0 && f.bootTrusted == 0) {
+		// Same erasure rule as VerifySecretAuditWitness: booting with no
+		// chain while the witness (or a local receipt) still remembers one is
+		// the thing strict boot exists to catch.
+		if s.emptyLocalChainIsErasure(remoteHead, remoteOK) {
+			secretAuditWitnessHealthy.Set(0)
+			secretAuditWitnessFailures.Add(1)
+			return false, localHead, remoteHead, nil
+		}
 		return true, localHead, "", nil
 	}
 	localReceipt, err := s.localWitnessReceiptHead()

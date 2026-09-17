@@ -592,12 +592,29 @@ type Client interface {
 	// explicitly.
 	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error
 
+	// SelectPlacementForCreate is SelectPlacement plus the seal recipients for
+	// sandboxID, chosen where the membership already lives. It exists so a
+	// create never has to ship the candidate fleet to the caller: at 2,000
+	// nodes SelectPlacementWithCandidates makes every create's answer O(fleet)
+	// in bytes and allocations to produce at most a handful of node ids.
+	// recipientBackups <= 0 means the create wants no fan-out and skips the
+	// selection entirely.
+	SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error)
+
 	// UpdatePlacementSecretRecipients replaces Placement.SecretRecipients
 	// (and optionally the seal handle after a reseal) without touching
-	// ownership or IncarnationID. expectedIncarnationID / expectedSealGeneration
-	// are CAS pretenses: when set and the live placement differs, the FSM
-	// rejects with ErrSecretRecipientsCASMismatch.
-	UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error
+	// ownership or IncarnationID. expectedIncarnationID / expectedOwnerNodeID /
+	// expectedSealGeneration are CAS pretenses: when the live placement
+	// differs, the FSM rejects with ErrSecretRecipientsCASMismatch.
+	//
+	// expectedOwnerNodeID is not redundant with the other two. opReassign
+	// changes the owner while preserving both the incarnation and the seal
+	// generation, so without it a node that has just lost the lifecycle can
+	// still land a reseal it started as owner. Pass the node this caller
+	// believes coordinates the secret: itself when it owns the placement, or
+	// "" for the leader-coordinated ownerless case (the empty expectation is
+	// still an expectation — the FSM compares it).
+	UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error
 
 	// SpecOf returns the most-recently-replicated CreateSandboxRequest for
 	// sandboxID, or nil if no spec is recorded (pre-cluster sandbox, or no

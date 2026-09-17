@@ -1536,3 +1536,65 @@ func (c *countingFakeRuntime) RemoveImage(_ context.Context, _ string) error {
 	*c.removed++
 	return nil
 }
+
+// TestDestroyCommitsDeleteFenceBeforeLocalTeardown pins the ordering of the
+// destroy path. Routes and the runtime cannot be un-destroyed, so the exact
+// owner/incarnation deleting fence has to be durable before either is touched:
+// otherwise a Raft outage (or an ownership change) mid-destroy leaves a
+// recreate-eligible placement whose local materialization is already gone, and
+// the cluster brings back a sandbox the client was told was deleted.
+func TestDestroyCommitsDeleteFenceBeforeLocalTeardown(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("fence precedes runtime teardown", func(t *testing.T) {
+		svc, _, st := newCapacityHarness(t, nil, nil)
+		svc.cfg.EnableCluster = true
+		fc := newLifecyclePlacementCluster(true)
+		svc.AttachCluster(fc)
+
+		sb := seedSandbox(t, st, "sb-destroy-order", models.SandboxStatusStarted, 1, 1024)
+		fc.placements = []cluster.Placement{{
+			SandboxID: sb.ID, OwnerNodeID: "node-self", IncarnationID: sb.AuditIncarnationID,
+		}}
+
+		var order []string
+		fc.beginHook = func() { order = append(order, "fence") }
+		svc.testAfterRuntimeDestroy = func() { order = append(order, "runtime") }
+
+		if err := svc.DestroySandbox(ctx, sb.ID); err != nil {
+			t.Fatalf("DestroySandbox() error = %v", err)
+		}
+		if len(order) != 2 || order[0] != "fence" || order[1] != "runtime" {
+			t.Fatalf("destroy order = %v, want [fence runtime]", order)
+		}
+	})
+
+	t.Run("unavailable raft destroys nothing", func(t *testing.T) {
+		svc, _, st := newCapacityHarness(t, nil, nil)
+		svc.cfg.EnableCluster = true
+		fc := newLifecyclePlacementCluster(true)
+		svc.AttachCluster(fc)
+
+		sb := seedSandbox(t, st, "sb-destroy-fence-first", models.SandboxStatusStarted, 1, 1024)
+		fc.placements = []cluster.Placement{{
+			SandboxID: sb.ID, OwnerNodeID: "node-self", IncarnationID: sb.AuditIncarnationID,
+		}}
+		fc.beginErr = errors.New("raft unavailable")
+
+		runtimeDestroyed := false
+		svc.testAfterRuntimeDestroy = func() { runtimeDestroyed = true }
+
+		if err := svc.DestroySandbox(ctx, sb.ID); err == nil {
+			t.Fatal("DestroySandbox() succeeded with an unavailable delete fence")
+		}
+		if runtimeDestroyed {
+			t.Fatal("runtime was destroyed before the delete fence committed")
+		}
+		if len(fc.deleteCalls) != 0 {
+			t.Fatalf("final placement delete ran after a failed fence: %v", fc.deleteCalls)
+		}
+		if _, err := st.Get(ctx, sb.ID); err != nil {
+			t.Fatalf("destroy removed the retry anchor after a failed fence: %v", err)
+		}
+	})
+}

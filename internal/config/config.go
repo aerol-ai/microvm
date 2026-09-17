@@ -662,6 +662,12 @@ type Config struct {
 	// IsolateJailCgroupRoot is the parent cgroup (v2) for per-group cgroups
 	// (cpu.max / memory.max from the group's caps). SB_ISOLATE_JAIL_CGROUP_ROOT.
 	IsolateJailCgroupRoot string
+	// IsolateJailPidsMax is pids.max on each group cgroup. The jail enables
+	// the pids controller and the seccomp profile allows clone/clone3, so
+	// without a bound one tenant's thread/fork storm exhausts the host PID
+	// space for every other tenant. 0 = unlimited, which enterprise mode
+	// refuses. SB_ISOLATE_JAIL_PIDS_MAX.
+	IsolateJailPidsMax int
 	// IsolateSeccompMode selects how the jail's syscall filter behaves:
 	// "enforce" kills the group process on an unlisted syscall (default);
 	// "audit" logs it (kernel audit log) and allows it — for the first
@@ -1867,6 +1873,7 @@ func Load() (Config, error) {
 		IsolateJailGID:               getEnvInt("SB_ISOLATE_JAIL_GID", 1000),
 		IsolateJitless:               getEnvBool("SB_ISOLATE_JITLESS", false),
 		IsolateJailCgroupRoot:        getEnv("SB_ISOLATE_JAIL_CGROUP_ROOT", "/sys/fs/cgroup/aerolvm-isolate"),
+		IsolateJailPidsMax:           getEnvInt("SB_ISOLATE_JAIL_PIDS_MAX", 512),
 		IsolateSeccompMode:           strings.ToLower(strings.TrimSpace(getEnv("SB_ISOLATE_SECCOMP_MODE", "enforce"))),
 		IsolateGroupIdleTTL:          getEnvDuration("SB_ISOLATE_GROUP_IDLE_TTL", 5*time.Minute),
 		IsolatePoolEnabled:           getEnvBool("SB_ISOLATE_POOL_ENABLED", true),
@@ -2185,6 +2192,9 @@ func Load() (Config, error) {
 			if cfg.IsolateJailCgroupRoot == "" || !filepath.IsAbs(cfg.IsolateJailCgroupRoot) {
 				return Config{}, fmt.Errorf("SB_ISOLATE_JAIL_CGROUP_ROOT must be an absolute path when SB_ISOLATE_USE_JAIL=true (got %q)", cfg.IsolateJailCgroupRoot)
 			}
+			if cfg.IsolateJailPidsMax < 0 {
+				return Config{}, fmt.Errorf("SB_ISOLATE_JAIL_PIDS_MAX must be >= 0 (got %d)", cfg.IsolateJailPidsMax)
+			}
 		}
 		switch cfg.IsolateSeccompMode {
 		case "enforce", "audit", "off":
@@ -2419,6 +2429,13 @@ func Load() (Config, error) {
 		}
 		if cfg.EnableIsolate && cfg.IsolateSeccompMode != "enforce" {
 			return Config{}, fmt.Errorf("SB_ISOLATE_SECCOMP_MODE must be enforce when SB_ENTERPRISE_MODE=true and SB_ENABLE_ISOLATE=true (got %q)", cfg.IsolateSeccompMode)
+		}
+		// An unbounded pids.max leaves clone/clone3 (allowed, pthread_create
+		// needs them) able to exhaust the host PID space from inside one
+		// tenant group — a cross-tenant denial of service through a boundary
+		// the jail otherwise holds.
+		if cfg.EnableIsolate && cfg.IsolateUseJail && cfg.IsolateJailPidsMax <= 0 {
+			return Config{}, errors.New("SB_ISOLATE_JAIL_PIDS_MAX must be > 0 when SB_ENTERPRISE_MODE=true and SB_ENABLE_ISOLATE=true (an unbounded tenant cgroup can exhaust the host PID space)")
 		}
 		if cfg.EnableCluster {
 			if cfg.ClusterInsecureGossip || cfg.ClusterInsecureCredentials {

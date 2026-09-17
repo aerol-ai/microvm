@@ -37,6 +37,8 @@ type Config struct {
 	// JailCgroupRoot is the parent cgroup (v2) under which each group gets
 	// its own cgroup with the group's caps.
 	JailCgroupRoot string
+	// JailPidsMax is pids.max for each group cgroup. Zero = unlimited.
+	JailPidsMax int
 	// SeccompMode is enforce | audit | off (pkg/isolate.Seccomp*).
 	SeccompMode string
 	// ShimPath is the daemon binary the jail re-execs to drop privileges and
@@ -62,6 +64,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		JailGID:          cfg.IsolateJailGID,
 		Jitless:          cfg.IsolateJitless,
 		JailCgroupRoot:   cfg.IsolateJailCgroupRoot,
+		JailPidsMax:      cfg.IsolateJailPidsMax,
 		SeccompMode:      cfg.IsolateSeccompMode,
 		IdleTTL:          cfg.IsolateGroupIdleTTL,
 		EgressPoolSize:   cfg.IsolateEgressPoolSize,

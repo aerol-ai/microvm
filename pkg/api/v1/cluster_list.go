@@ -3,14 +3,18 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"golang.org/x/sync/singleflight"
 )
@@ -38,7 +42,47 @@ const (
 	clusterListPeerTimeout  = 5 * time.Second
 	clusterListSweepTimeout = 10 * time.Second
 	clusterListCacheTTL     = 2 * time.Second
+	// clusterListMaxConcurrentSweeps bounds sweeps across ALL callers.
+	// singleflight only coalesces identical owner keys, so without a global
+	// bound N tenants missing the cache at once start N independent fleet
+	// sweeps: at 2,000 workers and clusterListConcurrency workers each, the
+	// leader's goroutine count and peer fan-out scale with the number of
+	// distinct tenants polling, not with the size of the fleet. Four
+	// concurrent sweeps keep the worst case at a few hundred in-flight peer
+	// requests; the rest wait briefly and then get a retryable answer.
+	clusterListMaxConcurrentSweeps = 4
+	// clusterListAdmissionWait is how long a caller waits for a sweep slot
+	// before being told to retry. Short on purpose: queueing past this just
+	// converts a fast 429 into a slow 504.
+	clusterListAdmissionWait = 2 * time.Second
+	// ClusterListRetryAfterSeconds is the Retry-After for a shed list.
+	ClusterListRetryAfterSeconds = 2
 )
+
+// ErrClusterListBusy is returned when every sweep slot is taken. It is a
+// backpressure signal, not a failure: the caller retries and usually lands on
+// a warm cache entry left by the sweep that was already running.
+var ErrClusterListBusy = errors.New("cluster catalogue list is busy; retry shortly")
+
+// clusterListAdmission is the process-wide sweep bound. Buffered channel
+// rather than a counter so waiting is context-aware and release cannot be
+// forgotten (every acquire is paired with a defer).
+var clusterListAdmission = make(chan struct{}, clusterListMaxConcurrentSweeps)
+
+// acquireClusterListSlot takes one sweep slot, waiting at most
+// clusterListAdmissionWait and never past the caller's own deadline.
+func acquireClusterListSlot(ctx context.Context) (release func(), err error) {
+	timer := time.NewTimer(clusterListAdmissionWait)
+	defer timer.Stop()
+	select {
+	case clusterListAdmission <- struct{}{}:
+		return func() { <-clusterListAdmission }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrClusterListBusy
+	}
+}
 
 // clusterListAggregate is one merged sweep.
 type clusterListAggregate[T any] struct {
@@ -126,6 +170,17 @@ func (c *clusterListCache[T]) cached(r *http.Request, sweep func(*http.Request) 
 		if v, ok := c.get(key, time.Now()); ok {
 			return v, nil
 		}
+		// Admission is taken inside the singleflight so every caller
+		// coalesced onto this sweep shares one slot.
+		parentCtx := context.Background()
+		if r != nil {
+			parentCtx = r.Context()
+		}
+		release, err := acquireClusterListSlot(parentCtx)
+		if err != nil {
+			return clusterListAggregate[T]{}, err
+		}
+		defer release()
 		ctx, cancel := clusterListSweepContext(r)
 		defer cancel()
 		request := r.Clone(ctx)
@@ -141,6 +196,19 @@ func (c *clusterListCache[T]) cached(r *http.Request, sweep func(*http.Request) 
 		return clusterListAggregate[T]{}, err
 	}
 	return value.(clusterListAggregate[T]), nil
+}
+
+// writeClusterListError maps a catalogue-list failure. Sweep admission
+// backpressure is a 429 with Retry-After — the caller's next attempt usually
+// reads the cache entry the in-flight sweep is about to leave — and everything
+// else falls through to the shared store-aware mapping.
+func writeClusterListError(logger *slog.Logger, w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrClusterListBusy) {
+		w.Header().Set("Retry-After", strconv.Itoa(ClusterListRetryAfterSeconds))
+		apihttp.WriteError(w, http.StatusTooManyRequests, ErrClusterListBusy.Error())
+		return
+	}
+	apihttp.WriteStoreAwareError(logger, w, err)
 }
 
 // clusterRuntimeMemberEligible identifies workers whose local catalogue for

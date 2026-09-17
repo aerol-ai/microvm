@@ -41,7 +41,12 @@ On the open-source build:
   rewrites reset the local byte offset.
 - Enterprise deployments **must** configure an off-node event exporter.
   Witness is an additional tamper-evidence control, not a substitute for the
-  reconstructable event stream.
+  reconstructable event stream. This is enforced at boot: with
+  `SB_ENTERPRISE_MODE=true` the daemon refuses to start unless the backend is
+  `webhook`, `s3` or `bus`, or a programmatic `controlplane.AuditExporter` is
+  wired. `noop`, `stdout` and `file` all keep the evidence on the node that
+  produced it, so disk loss takes the history with it — "an exporter is
+  configured" is not the bar, "the evidence leaves the node" is.
 - See `controlplane.Witness` / `AuditExporter` / `HasExternalWitness` and the
   enterprise boot checks around `SB_SECRET_AUDIT_EXTERNAL_WITNESS` and
   `SB_SECRET_AUDIT_EXPORT_URL`.
@@ -83,7 +88,8 @@ only `ca.crt`, `node.crt`, and `node.key`.
 
 `SB_AUDIT_EXPORT_BACKEND` selects `noop` | `stdout` | `file` | `webhook` | `s3`
 | `bus` (design: `plans/audit-export-connectors.md`; defaults:
-`setup/config-defaults.md`). The split copies kube-apiserver: Raft holds only
+`setup/config-defaults.md`). The first three are on-node only and are rejected
+under `SB_ENTERPRISE_MODE=true`. The split copies kube-apiserver: Raft holds only
 live placement and a short-grace deleted-sandbox routing stub; the local JSONL
 is the buffer; the backend carries history. Nothing here runs on a sandbox
 request path.
@@ -141,6 +147,16 @@ operator can request with `POST /v1/audit/verify` in the background:
 
 Do not delete `secrets.verified` to "force" a full check — set the mode to
 `full` for one boot, or call `POST /v1/audit/verify`.
+
+An **empty** local chain is a failure, not a clean bill of health, whenever
+something still remembers a chain: the external witness holds a head for this
+node, or `witness_receipts.jsonl` records a head this node shipped. Deleting
+the log is the cheapest tamper there is, and it used to short-circuit
+verification before the witness was ever consulted. A node genuinely rebuilt
+from scratch under the same node id therefore fails witness verification until
+an operator clears that node's witnessed head (and the stale local receipt)
+deliberately — evidence loss is an event someone signs off on, not something
+the daemon papers over.
 
 ## Audit read index and on-demand verification
 

@@ -77,7 +77,7 @@ func TestPendingImageGCListWithLimit(t *testing.T) {
 	now := time.Now().UTC()
 
 	for _, img := range []string{"img-a", "img-b", "img-c"} {
-		if err := st.SchedulePendingImageGC(ctx, img, now.Add(-time.Hour)); err != nil {
+		if err := st.SchedulePendingImageGC(ctx, "", img, now.Add(-time.Hour)); err != nil {
 			t.Fatalf("SchedulePendingImageGC %s: %v", img, err)
 		}
 	}
@@ -428,17 +428,17 @@ func TestWasmStoreClosedDBErrors(t *testing.T) {
 	st.Close()
 
 	_ = st.UpsertWasmModule(ctx, WasmModuleRecord{ID: "m", ModuleRef: "r", Status: "ready"})
-	_ = st.UpdateWasmCheckpoint(ctx, "sb", "s", "/p", "g", "")
+	_ = st.UpdateWasmCheckpoint(ctx, "sb", "", "s", "/p", "g", "")
 	_ = st.PutWasmStateKV(ctx, "sb", "k", []byte("v"))
 	_, _, _ = st.GetWasmStateKV(ctx, "sb", "k")
 	_ = st.DeleteWasmStateKV(ctx, "sb", "k")
 	_ = st.DeleteAllWasmStateKV(ctx, "sb")
 	_, _ = st.ListWasmStateKVKeys(ctx, "sb")
-	_, _ = st.InsertWasmCheckpointPush(ctx, "sb", "ref", "dig")
+	_, _ = st.InsertWasmCheckpointPush(ctx, "sb", "", "ref", "dig")
 	_, _ = st.ListWasmCheckpointPushes(ctx, "sb")
 	_ = st.DeleteWasmCheckpointPush(ctx, 1)
 	_ = st.DeleteAllWasmCheckpointPushes(ctx, "sb")
-	_ = st.UpdateWasmRegistryPush(ctx, "sb", "ref", "dig")
+	_, _ = st.UpdateWasmRegistryPush(ctx, "sb", "", "ref", "dig")
 	_, _ = st.ListReadyWasmModuleRefs(ctx)
 	_, _ = st.ListWasmModulesOlderThan(ctx, time.Now())
 	_, _ = st.IsWasmDigestCatalogued(ctx, "dig")
@@ -456,7 +456,7 @@ func TestMiscStoreCoverageGaps(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 
-	if err := st.SchedulePendingImageGC(ctx, "", time.Now()); err != nil {
+	if err := st.SchedulePendingImageGC(ctx, "", "", time.Now()); err != nil {
 		t.Fatalf("SchedulePendingImageGC empty: %v", err)
 	}
 

@@ -3,6 +3,7 @@ package cluster
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"hash/fnv"
 	"slices"
 	"sort"
@@ -64,6 +65,13 @@ type IngressShardRoute struct {
 	Shard      int                 `json:"shard"`
 	ShardCount int                 `json:"shard_count"`
 	Owners     []IngressRouteOwner `json:"owners"`
+	// RingVersion identifies the membership view this answer was computed
+	// from. Route installation and route lookup hash the same ordered set of
+	// ingress node IDs, so two nodes that disagree about membership hand out
+	// routes for different rings — the upstream can be pointed at a node that
+	// never installed the shard. Publishing the version makes that divergence
+	// observable (compare across ingress nodes) instead of silent.
+	RingVersion string `json:"ring_version,omitempty"`
 }
 
 func (r PlacementPageRequest) Normalize() PlacementPageRequest {
@@ -200,15 +208,53 @@ func ingressShardFilterForIDs(ids []string, nodeID string) PlacementShardFilter 
 // should target for sandboxID. Small ingress tiers all own every sandbox route;
 // very large ingress tiers return the primary shard owner plus one failover
 // replica so a single ingress death does not create a traffic vacuum.
+// IngressRingMembers is the single membership view the shard-aware ingress
+// path may hash. Reconciliation (which shards this node installs) and the
+// route lookup (which node the upstream is sent to) must agree: an Agent's
+// Members() is a control-plane snapshot while LocalMembers() is local gossip,
+// and hashing one on the install side and the other on the lookup side routes
+// traffic to nodes that never installed the shard. Local gossip is the
+// preferred source — it is what the installer can act on — with the
+// control-plane view as the fallback for a node whose gossip is not up yet.
+func IngressRingMembers(c Client) []Member {
+	if c == nil {
+		return nil
+	}
+	if members := c.LocalMembers(); len(members) > 0 {
+		return members
+	}
+	return c.Members()
+}
+
+// IngressRingVersion fingerprints the ordered set of ingress-eligible node IDs
+// a ring was computed from. Equal versions mean two nodes will compute the
+// same owners for every sandbox; different versions mean they are mid-
+// convergence and their answers may disagree.
+func IngressRingVersion(members []Member) string {
+	ids := ingressShardNodeIDs(members)
+	if len(ids) == 0 {
+		return ""
+	}
+	sorted := slices.Clone(ids)
+	sort.Strings(sorted)
+	h := sha256.New()
+	for _, id := range sorted {
+		_, _ = h.Write([]byte(id))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
 func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRoute {
 	shardCount := DefaultPlacementShardCount
 	shard := PlacementShardForSandbox(sandboxID, shardCount)
 	owners := ingressRouteOwners(members)
 	route := IngressShardRoute{
-		SandboxID:  sandboxID,
-		Shard:      shard,
-		ShardCount: shardCount,
-		Owners:     []IngressRouteOwner{},
+		SandboxID:   sandboxID,
+		Shard:       shard,
+		ShardCount:  shardCount,
+		Owners:      []IngressRouteOwner{},
+		RingVersion: IngressRingVersion(members),
 	}
 	if len(owners) == 0 {
 		return route

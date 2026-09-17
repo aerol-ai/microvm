@@ -12,6 +12,7 @@ default) every group process runs:
 | Syscall allowlist | classic-BPF seccomp, installed before `execve` so the loader runs under it | `grep Seccomp /proc/<pid>/status` → `2` |
 | Sees only its files | chroot into `SB_ISOLATE_JAIL_CHROOT_BASE/<group>`: `/workerd`, its shared libs, `/dev/{null,zero,random,urandom}`, `/tmp`, and a writable `/run` for its sockets | `readlink /proc/<pid>/root` |
 | Bounded CPU and memory | cgroup v2 `SB_ISOLATE_JAIL_CGROUP_ROOT/aerolvm-isolate-<group>` with `cpu.max` / `memory.max` from the group's caps | `cat /proc/<pid>/cgroup` |
+| Bounded process/thread count | same cgroup's `pids.max` from `SB_ISOLATE_JAIL_PIDS_MAX` (default 512). `clone`/`clone3` are allowlisted because `pthread_create` needs them, and every thread takes a PID, so without this cap one group can exhaust the host PID namespace for all tenants. Enterprise mode refuses `0` (unlimited) | `cat /sys/fs/cgroup/aerolvm-isolate/aerolvm-isolate-<group>/pids.max` |
 
 The daemon builds the chroot base (`<base>/.base`: workerd + libraries +
 device nodes) once at start and **fails boot** if it cannot — a jail that

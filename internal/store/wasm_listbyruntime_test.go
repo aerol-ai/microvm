@@ -61,11 +61,11 @@ func TestListOrphanedWasmCheckpointPushes(t *testing.T) {
 	if err := st.Create(ctx, live); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-live", "aocr://sb-live:x", "d1"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-live", "", "aocr://sb-live:x", "d1"); err != nil {
 		t.Fatalf("InsertWasmCheckpointPush(live): %v", err)
 	}
 	// Push row for a sandbox that was never created / already destroyed.
-	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-gone", "aocr://sb-gone:y", "d2"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-gone", "", "aocr://sb-gone:y", "d2"); err != nil {
 		t.Fatalf("InsertWasmCheckpointPush(gone): %v", err)
 	}
 

@@ -184,7 +184,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
 		c.mtlsProxies = newProxyCache()
-		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger, cfg.EnterpriseMode)
+		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger)
 		if err != nil {
 			_ = rn.Close()
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
@@ -537,7 +537,7 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 // UpdatePlacementSecretRecipients commits a replacement seal recipient set
 // (and optional new provider handle after reseal). Preserves IncarnationID.
 // expectedIncarnationID / expectedSealGeneration CAS against the live placement.
-func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID string, expectedSealGeneration int64) error {
+func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
 	recipients = normalizeSecretRecipientIDs(recipients)
 	if err := validateSecretRecipientUpdate(sandboxID, recipients, secrets, expectedIncarnationID, expectedSealGeneration); err != nil {
 		return err
@@ -551,8 +551,24 @@ func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID
 		SecretSealGeneration:   secrets.SealGeneration,
 		IncarnationID:          strings.TrimSpace(secrets.IncarnationID),
 		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedOwnerNodeID:    strings.TrimSpace(expectedOwnerNodeID),
+		ExpectedOwnerNodeIDSet: true,
 		ExpectedSealGeneration: expectedSealGeneration,
 	})
+}
+
+// SelectPlacementForCreate is SelectPlacement plus the bounded seal recipient
+// set for sandboxID. The server-side member of the pair: no candidate slice
+// crosses a process boundary here, because there is no boundary to cross.
+func (c *Cluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error) {
+	target, candidates, err := c.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
 }
 
 // SecretsOf returns a copy of the provider handle paired with SpecOf's spec.
@@ -1239,7 +1255,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			if existing.SecretSealGeneration > 0 && st.Secrets.hasUpdate() &&
 				st.Secrets.SealGeneration > existing.SecretSealGeneration && len(st.Secrets.Recipients) > 0 {
-				if err := c.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, existing.SecretSealGeneration); err != nil && firstErr == nil {
+				if err := c.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, c.nodeID, existing.SecretSealGeneration); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

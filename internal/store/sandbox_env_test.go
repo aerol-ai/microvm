@@ -291,9 +291,17 @@ func TestOpenWithSecretCipherMigratesPlaintextSecrets(t *testing.T) {
 		_ = migrated.Close()
 		t.Fatalf("migrated toolbox token = %q, want %q", gotSandbox.ToolboxToken, wantToken)
 	}
-	if _, err := migrated.GetEnv(ctx, emptyID); err != ErrNotFound {
+	// Every sandbox carries an env row now, empty seal included: that is what
+	// lets a later read tell "no environment" from "sealed env lost" and fail
+	// loud on the second. A legacy row with no env keeps an empty seal.
+	emptyBlob, err := migrated.GetEnv(ctx, emptyID)
+	if err != nil {
 		_ = migrated.Close()
-		t.Fatalf("empty legacy env created a side row: %v", err)
+		t.Fatalf("empty legacy env has no side row: %v", err)
+	}
+	if len(emptyBlob) != 0 {
+		_ = migrated.Close()
+		t.Fatalf("empty legacy env sealed %d bytes, want 0", len(emptyBlob))
 	}
 	if err := migrated.Close(); err != nil {
 		t.Fatalf("close migrated store: %v", err)
@@ -376,12 +384,15 @@ func TestPlaintextSecretMigrationRollsBackOnInvalidEnv(t *testing.T) {
 	if envJSON != `{"GOOD":"value"}` || token != "token-a" || len(sealed) != 0 {
 		t.Fatalf("legacy row changed after rollback: env=%q token=%q sealed=%d bytes", envJSON, token, len(sealed))
 	}
-	var envRows int
-	if err := raw.QueryRow(`SELECT COUNT(*) FROM sandbox_env`).Scan(&envRows); err != nil {
+	// The schema backfill (outside this transaction) gives every sandbox an
+	// empty env row; the rollback must undo the migration's SEALED writes, so
+	// the rows survive with zero-length blobs.
+	var sealedEnvRows int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM sandbox_env WHERE length(sealed_blob) > 0`).Scan(&sealedEnvRows); err != nil {
 		t.Fatalf("count rolled-back env rows: %v", err)
 	}
-	if envRows != 0 {
-		t.Fatalf("sandbox_env rows after rollback = %d, want 0", envRows)
+	if sealedEnvRows != 0 {
+		t.Fatalf("sealed sandbox_env rows after rollback = %d, want 0", sealedEnvRows)
 	}
 }
 

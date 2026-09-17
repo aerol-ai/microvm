@@ -44,7 +44,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	cancel()
 	_ = st.SetFleetSuspended(ctxCancel, "tpl", true)
 	_, _ = st.RefreshPendingImageGCIfExists(ctxCancel, "tpl", time.Now())
-	_, _ = st.DeletePendingImageGCIfScheduledAt(ctxCancel, "tpl", time.Now())
+	_, _ = st.DeletePendingImageGCIfScheduledAt(ctxCancel, "", "tpl", time.Now())
 
 	_, _ = Open("invalid-dsn:::")
 	_, _ = Open("file::memory:?cache=shared")
@@ -186,7 +186,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.GetFirecrackerVMMPoolStats(ctx, "tpl")
 	_ = st.SetFleetSuspended(ctx, "tpl", true)
 	_, _ = st.RefreshPendingImageGCIfExists(ctx, "tpl", time.Now())
-	_, _ = st.DeletePendingImageGCIfScheduledAt(ctx, "tpl", time.Now())
+	_, _ = st.DeletePendingImageGCIfScheduledAt(ctx, "", "tpl", time.Now())
 
 	_ = st.AddCustomDomain(ctx, "sb", "dom", 80)
 	_ = st.RemoveCustomDomain(ctx, "sb", "dom")
@@ -245,7 +245,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.ListWasmCheckpointPushes(ctx, "sb")
 	_ = st.DeleteWasmCheckpointPush(ctx, 1)
 	_ = st.DeleteAllWasmCheckpointPushes(ctx, "sb")
-	_ = st.UpdateWasmRegistryPush(ctx, "sb", "ref", "dig")
+	_, _ = st.UpdateWasmRegistryPush(ctx, "sb", "", "ref", "dig")
 	_, _ = st.ListReadyWasmModuleRefs(ctx)
 	_, _ = st.ListWasmModulesOlderThan(ctx, time.Now())
 	_, _ = st.IsWasmDigestCatalogued(ctx, "dig")

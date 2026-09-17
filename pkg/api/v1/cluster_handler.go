@@ -599,7 +599,12 @@ func (h *handlers) clusterIngressRoute(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
-	route := cluster.IngressRouteForSandbox(c.Members(), id)
+	// Same membership view the installers hash (cluster.IngressRingMembers);
+	// an Agent's Members() is a control-plane snapshot and hashing it here
+	// while reconciliation hashes local gossip creates an ingress vacuum
+	// during convergence. RingVersion on the response makes a residual
+	// disagreement between ingress nodes observable.
+	route := cluster.IngressRouteForSandbox(cluster.IngressRingMembers(c), id)
 	if len(route.Owners) == 0 {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: no alive ingress route owners")
 		return
@@ -1252,6 +1257,20 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	var req cluster.SelectPlacementRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	// A request carrying a sandbox id wants the bounded recipient set chosen
+	// here, where the membership already lives. Serializing every eligible
+	// worker back to the caller so IT can pick two of them made each create's
+	// response scale with the fleet; only an agent on the previous build
+	// still needs that shape.
+	if sandboxID := strings.TrimSpace(req.SandboxID); sandboxID != "" {
+		target, recipients, err := c.SelectPlacementForCreate(req.Request, sandboxID, req.RecipientBackups)
+		if err != nil {
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
 		return
 	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)

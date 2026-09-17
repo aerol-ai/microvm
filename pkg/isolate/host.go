@@ -445,11 +445,11 @@ func (h *Host) Stop() error {
 // ApplyCaps changes the group's cgroup caps while it runs: a warm blank host
 // starts unlimited and takes the claiming tenant's caps here. No-op when the
 // host is not jailed (there is no cgroup to write).
-func (h *Host) ApplyCaps(cpu float64, memMB int) error {
+func (h *Host) ApplyCaps(cpu float64, memMB int, pidsMax int) error {
 	h.mu.RLock()
 	jail := h.jail
 	h.mu.RUnlock()
-	return jail.applyCaps(cpu, memMB)
+	return jail.applyCaps(cpu, memMB, pidsMax)
 }
 
 // inJail maps a host path under the chroot onto the path the jailed process

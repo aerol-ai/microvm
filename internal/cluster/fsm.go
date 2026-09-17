@@ -1278,6 +1278,18 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if cur := existing.SecretSealGeneration; cur != cmd.ExpectedSealGeneration {
 			return fmt.Errorf("%w: seal_generation want %d have %d", ErrSecretRecipientsCASMismatch, cmd.ExpectedSealGeneration, cur)
 		}
+		// Owner fence. opReassign moves ownership while PRESERVING the
+		// incarnation and the seal generation, so those two CASes alone let a
+		// former owner land a reseal it started before it lost the lifecycle,
+		// publishing a recipient set coordinated by the wrong node. Commands
+		// written before this fence existed carry no expectation (the ...Set
+		// flag is false) and stay replay-safe.
+		if cmd.ExpectedOwnerNodeIDSet {
+			expectedOwnerNodeID := strings.TrimSpace(cmd.ExpectedOwnerNodeID)
+			if strings.TrimSpace(existing.OwnerNodeID) != expectedOwnerNodeID {
+				return fmt.Errorf("%w: owner want %q have %q", ErrSecretRecipientsCASMismatch, expectedOwnerNodeID, existing.OwnerNodeID)
+			}
+		}
 		existing.SecretRecipients = append([]string(nil), cmd.SecretRecipients...)
 		secrets := applyCommandSecretUpdate(existing, true, cmd)
 		existing.SecretRef = secrets.Ref
