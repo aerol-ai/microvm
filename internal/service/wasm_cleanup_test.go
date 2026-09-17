@@ -38,7 +38,7 @@ func TestCleanupWasmSandboxArtifactsRemovesWasmMetadata(t *testing.T) {
 	if err := st.PutWasmStateKV(ctx, sb.ID, "k", []byte("v")); err != nil {
 		t.Fatalf("put wasm state kv: %v", err)
 	}
-	if _, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "registry.example/sb-clean:latest", "sha256:abc"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "", "registry.example/sb-clean:latest", "sha256:abc"); err != nil {
 		t.Fatalf("insert checkpoint push: %v", err)
 	}
 

@@ -317,7 +317,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		s.admitter.Release(sandbox.ID)
 	}
 	if !s.isWasmSandbox(sandbox) {
-		s.schedulePendingImageGC(ctx, sandbox.Image)
+		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
 
 	if s.logger != nil {

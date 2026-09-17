@@ -36,11 +36,10 @@ func (s *Service) clusterIngressShardFilter(c cluster.Client, self string) clust
 	if c == nil || self == "" {
 		return cluster.PlacementShardFilter{}
 	}
-	members := c.LocalMembers()
-	if len(members) == 0 {
-		members = c.Members()
-	}
-	return s.ingressShardFilterCache.ForNode(members, self)
+	// One accessor for both halves of the ingress ring: installation (here)
+	// and lookup (/v1/cluster/ingress-route/{id}). Hashing different views
+	// sends the upstream to a node that never installed the shard.
+	return s.ingressShardFilterCache.ForNode(cluster.IngressRingMembers(c), self)
 }
 
 func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, self string) (map[string]ingressRouteIntent, bool) {

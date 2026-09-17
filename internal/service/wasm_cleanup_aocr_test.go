@@ -94,7 +94,7 @@ func TestCleanupWasmSandboxArtifacts_DeletesAllAOCRRefs(t *testing.T) {
 		"aocr://" + id + ":sha256-newest",
 	}
 	for _, ref := range pushRefs {
-		if _, err := st.InsertWasmCheckpointPush(ctx, id, ref, "digest-of-"+ref); err != nil {
+		if _, err := st.InsertWasmCheckpointPush(ctx, id, "", ref, "digest-of-"+ref); err != nil {
 			t.Fatalf("InsertWasmCheckpointPush: %v", err)
 		}
 	}
@@ -220,7 +220,7 @@ func TestCleanupWasmSandboxArtifacts_NoVacuumOnDeleteFailure(t *testing.T) {
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("store.Create: %v", err)
 	}
-	if _, err := st.InsertWasmCheckpointPush(ctx, id, "aocr://"+id+":sha256-x", "d"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, id, "", "aocr://"+id+":sha256-x", "d"); err != nil {
 		t.Fatalf("InsertWasmCheckpointPush: %v", err)
 	}
 

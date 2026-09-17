@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -47,8 +49,15 @@ func newPendingImageGCHarness(t *testing.T, ttl time.Duration) (*Service, *store
 // Bypasses time.Now to keep tests deterministic.
 func seedPending(t *testing.T, st *store.Store, image string, at time.Time) {
 	t.Helper()
-	if err := st.SchedulePendingImageGC(context.Background(), image, at); err != nil {
-		t.Fatalf("seed pending row %q: %v", image, err)
+	seedPendingForEngine(t, st, "", image, at)
+}
+
+// seedPendingForEngine seeds a row owned by a specific container engine; the
+// janitor must remove it through that engine's driver.
+func seedPendingForEngine(t *testing.T, st *store.Store, engine, image string, at time.Time) {
+	t.Helper()
+	if err := st.SchedulePendingImageGC(context.Background(), engine, image, at); err != nil {
+		t.Fatalf("seed pending row %q/%q: %v", engine, image, err)
 	}
 }
 
@@ -197,7 +206,7 @@ func TestPendingImageGCAppliesPerImage(t *testing.T) {
 // nil-check.
 func TestSchedulePendingImageGCEmptyImageNoop(t *testing.T) {
 	svc, st, _, _ := newPendingImageGCHarness(t, time.Hour)
-	svc.schedulePendingImageGC(context.Background(), "")
+	svc.schedulePendingImageGC(context.Background(), "", "")
 	if pending := listPending(t, st); len(pending) != 0 {
 		t.Fatalf("empty image must not insert a row, got %v", pending)
 	}
@@ -251,7 +260,7 @@ func TestImageGCWhitelistEmptyMatchesNothing(t *testing.T) {
 func TestSchedulePendingImageGCSkipsWhitelisted(t *testing.T) {
 	svc, st, _, _ := newPendingImageGCHarness(t, time.Hour)
 	svc.cfg.ImageGCWhitelist = []string{"alpine"}
-	svc.schedulePendingImageGC(context.Background(), "alpine:latest")
+	svc.schedulePendingImageGC(context.Background(), "", "alpine:latest")
 	if pending := listPending(t, st); len(pending) != 0 {
 		t.Fatalf("whitelisted image must not enter the ledger, got %v", pending)
 	}
@@ -301,7 +310,7 @@ func TestPendingImageGCPreservesRefreshedRow(t *testing.T) {
 	// physically refresh the row to "now" before the conditional
 	// delete fires.
 	refreshAt := time.Now().UTC()
-	if err := st.SchedulePendingImageGC(context.Background(), image, refreshAt); err != nil {
+	if err := st.SchedulePendingImageGC(context.Background(), "", image, refreshAt); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 
@@ -332,11 +341,11 @@ func TestPendingImageGCConditionalDeleteSkipsRefreshed(t *testing.T) {
 	// Destroy of a sibling sandbox refreshed the row after the sweep
 	// listed it but before the conditional delete fired.
 	refreshAt := time.Now().UTC()
-	if err := st.SchedulePendingImageGC(context.Background(), image, refreshAt); err != nil {
+	if err := st.SchedulePendingImageGC(context.Background(), "", image, refreshAt); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 
-	ok, err := st.DeletePendingImageGCIfScheduledAt(context.Background(), image, seenAt)
+	ok, err := st.DeletePendingImageGCIfScheduledAt(context.Background(), "", image, seenAt)
 	if err != nil {
 		t.Fatalf("conditional delete: %v", err)
 	}
@@ -355,7 +364,7 @@ func TestSchedulePendingImageGCSkippedWhenDisabled(t *testing.T) {
 	svc, st, _, _ := newPendingImageGCHarness(t, time.Hour)
 	svc.cfg.ImageBuildGCEnabled = false
 
-	svc.schedulePendingImageGC(context.Background(), "alpine:latest")
+	svc.schedulePendingImageGC(context.Background(), "", "alpine:latest")
 
 	if pending := listPending(t, st); len(pending) != 0 {
 		t.Fatalf("disabled GC must not enqueue ledger rows, got %v", pending)
@@ -465,4 +474,57 @@ func TestStartPendingImageGCDisabledIsNoOp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	svc.StartPendingImageGC(ctx) // returns immediately
+}
+
+// TestPendingImageGCRemovesThroughOwningEngine pins the janitor's engine
+// dispatch. The ledger row records which engine holds a copy of the image;
+// removing it through the other engine reclaims nothing (the disk stays full)
+// and evicts a cache entry that engine is still serving from.
+func TestPendingImageGCRemovesThroughOwningEngine(t *testing.T) {
+	svc, st, dockerRemoved, _ := newPendingImageGCHarness(t, time.Hour)
+	containerdRemoved := []string{}
+	svc.containerd = &recordingRemoveRuntime{removed: &containerdRemoved}
+
+	past := time.Now().UTC().Add(-2 * time.Hour)
+	seedPendingForEngine(t, st, models.ContainerEngineContainerd, "ctd-only:latest", past)
+	seedPendingForEngine(t, st, models.ContainerEngineDocker, "docker-only:latest", past)
+	// Same image name cached by both engines: two independent cleanup rows,
+	// which the single-column primary key could not represent at all.
+	seedPendingForEngine(t, st, models.ContainerEngineContainerd, "shared:latest", past)
+	seedPendingForEngine(t, st, models.ContainerEngineDocker, "shared:latest", past)
+
+	svc.runPendingImageGC(context.Background())
+
+	wantContainerd := []string{"ctd-only:latest", "shared:latest"}
+	wantDocker := []string{"docker-only:latest", "shared:latest"}
+	sort.Strings(containerdRemoved)
+	sort.Strings(*dockerRemoved)
+	if !slices.Equal(containerdRemoved, wantContainerd) {
+		t.Fatalf("containerd removals = %v, want %v", containerdRemoved, wantContainerd)
+	}
+	if !slices.Equal(*dockerRemoved, wantDocker) {
+		t.Fatalf("docker removals = %v, want %v", *dockerRemoved, wantDocker)
+	}
+	if rows := listPending(t, st); len(rows) != 0 {
+		t.Fatalf("ledger rows after sweep = %v, want empty", rows)
+	}
+}
+
+// TestPendingImageGCKeepsRowWhenOwningEngineIsUnwired pins the other half: a
+// row whose engine is not registered on this node must survive, because
+// removing it through whatever engine happens to be wired would miss the copy
+// that is actually consuming disk.
+func TestPendingImageGCKeepsRowWhenOwningEngineIsUnwired(t *testing.T) {
+	svc, st, dockerRemoved, _ := newPendingImageGCHarness(t, time.Hour)
+	svc.containerd = nil
+
+	seedPendingForEngine(t, st, models.ContainerEngineContainerd, "ctd-orphan:latest", time.Now().UTC().Add(-2*time.Hour))
+	svc.runPendingImageGC(context.Background())
+
+	if len(*dockerRemoved) != 0 {
+		t.Fatalf("docker removals = %v, want none for a containerd-owned image", *dockerRemoved)
+	}
+	if rows := listPending(t, st); len(rows) != 1 || rows[0] != "ctd-orphan:latest" {
+		t.Fatalf("ledger rows = %v, want the row retained for retry", rows)
+	}
 }

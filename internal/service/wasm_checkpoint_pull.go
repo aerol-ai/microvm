@@ -60,7 +60,7 @@ func (s *Service) ensureWasmCheckpointLocal(ctx context.Context, sandbox *models
 	if _, err := wasmengine.ReadSnapshotDir(checkpointPath, wasmengine.EngineNameWazero()); err != nil {
 		return checkpointPath, fmt.Errorf("pulled wasm checkpoint invalid at %s: %w", checkpointPath, err)
 	}
-	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID,
+	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID, sandbox.AuditIncarnationID,
 		string(models.SandboxStatusPassivated), checkpointPath, sandbox.CloneGeneration, ""); err != nil {
 		s.logger.Warn("wasm checkpoint pull metadata persist failed",
 			"sandbox_id", sandbox.ID,

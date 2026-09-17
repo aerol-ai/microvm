@@ -3142,7 +3142,7 @@ func TestPendingImageGCDeleteFailWave23(t *testing.T) {
 	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc.cfg.ImageBuildGCTTL = time.Hour
 	now := time.Now().UTC()
-	_ = st.SchedulePendingImageGC(ctx, "alpine:gc23", now.Add(-2*time.Hour))
+	_ = st.SchedulePendingImageGC(ctx, "", "alpine:gc23", now.Add(-2*time.Hour))
 	svc.docker = &recordingRuntime{}
 	svc.testAfterPendingImageGCList = func() { _ = st.Close() }
 	svc.runPendingImageGC(ctx)
@@ -3184,7 +3184,7 @@ func TestPendingImageGCConditionalDeleteFailWave25(t *testing.T) {
 	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc.cfg.ImageBuildGCTTL = time.Hour
 	now := time.Now().UTC()
-	_ = st.SchedulePendingImageGC(ctx, "alpine:gc25", now.Add(-2*time.Hour))
+	_ = st.SchedulePendingImageGC(ctx, "", "alpine:gc25", now.Add(-2*time.Hour))
 	svc.docker = &recordingRuntime{}
 	// Close after list so HasActiveImageRef fails — skip. Instead whitelist path with close.
 	svc.cfg.ImageGCWhitelist = []string{"alpine:gc25"}

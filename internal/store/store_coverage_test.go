@@ -513,7 +513,7 @@ func TestListHelpersQueryErrorsByDroppedTables(t *testing.T) {
 			name: "InsertWasmCheckpointPush",
 			drop: "wasm_checkpoint_pushes",
 			seed: func(t *testing.T, st *Store) {},
-			call: func(st *Store) error { _, err := st.InsertWasmCheckpointPush(ctx, "sb", "ref", "dig"); return err },
+			call: func(st *Store) error { _, err := st.InsertWasmCheckpointPush(ctx, "sb", "", "ref", "dig"); return err },
 		},
 		{
 			name: "UpsertAccountMapping",
@@ -537,7 +537,7 @@ func TestListHelpersQueryErrorsByDroppedTables(t *testing.T) {
 			name: "DeletePendingImageGCIfScheduledAt",
 			drop: "pending_image_gc",
 			seed: func(t *testing.T, st *Store) {},
-			call: func(st *Store) error { _, err := st.DeletePendingImageGCIfScheduledAt(ctx, "img", now); return err },
+			call: func(st *Store) error { _, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", "img", now); return err },
 		},
 		{
 			name: "SetFleetSuspended",
@@ -1853,7 +1853,7 @@ func TestStoreLastNineLines(t *testing.T) {
 	if err := st.CreateTemplate(ctx, &models.Template{ID: "tpl-noimg", Image: ""}); err == nil {
 		t.Fatal("empty image")
 	}
-	if _, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", time.Now()); err != nil {
+	if _, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1888,13 +1888,13 @@ func TestStoreLastNineLines(t *testing.T) {
 		t.Fatal("allocate scan error")
 	}
 
-	if err := st.SchedulePendingImageGC(ctx, "img-x", now); err != nil {
+	if err := st.SchedulePendingImageGC(ctx, "", "img-x", now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.RefreshPendingImageGCIfExists(ctx, "img-x", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DeletePendingImageGCIfScheduledAt(ctx, "img-x", now.Add(time.Second)); err != nil {
+	if _, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", "img-x", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3110,7 +3110,7 @@ func TestPendingImageGCAndPortScanErrors(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	if err := st.SchedulePendingImageGC(ctx, "img-bad", now.Add(-time.Hour)); err != nil {
+	if err := st.SchedulePendingImageGC(ctx, "", "img-bad", now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(ctx, `DROP TABLE pending_image_gc`); err != nil {
@@ -3869,9 +3869,9 @@ func TestListGetWithAttachmentsAndClosedDB(t *testing.T) {
 	_ = st.SetAllowPublicTraffic(ctx, "sb", false, "")
 	_, _ = st.GetPortByHostPort(ctx, 32001)
 	_, _ = st.TransferFirecrackerTapSlot(ctx, "a", "b", now)
-	_ = st.SchedulePendingImageGC(ctx, "img", now)
+	_ = st.SchedulePendingImageGC(ctx, "", "img", now)
 	_, _ = st.ListPendingImageGCDue(ctx, now, 10)
-	_ = st.DeletePendingImageGC(ctx, "img")
+	_ = st.DeletePendingImageGC(ctx, "", "img")
 	_, _ = st.HasActiveImageRef(ctx, "img")
 	_, _, _ = st.ClaimIdempotentRequest(ctx, "scope", "fp", now, time.Minute)
 	_, _ = st.ListSnapshotAliases(ctx, "x")
@@ -4163,7 +4163,7 @@ func TestInsertWasmCheckpointPushAndVMMAllocateErrors(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, `DROP TABLE wasm_checkpoint_pushes`); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = st.InsertWasmCheckpointPush(ctx, "sb", "ref", "dig")
+	_, _ = st.InsertWasmCheckpointPush(ctx, "sb", "", "ref", "dig")
 
 	st2 := newTestStore(t)
 	_ = st2.CreateTemplate(ctx, &models.Template{ID: "tpl-a", Image: "img"})

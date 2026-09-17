@@ -748,6 +748,27 @@ func (s *Service) ociEngineForSandbox(sandbox *models.Sandbox) (runtime.Runtime,
 	return s.docker, nil
 }
 
+// imageRemoverForEngine resolves the driver that holds an image copy. An empty
+// engine is a ledger row written before the ledger became engine-aware (or by
+// a runtime with no engine of its own) and resolves to the host's configured
+// engine, which is what those rows always implicitly meant.
+func (s *Service) imageRemoverForEngine(engine string) (runtime.Runtime, error) {
+	switch strings.TrimSpace(engine) {
+	case models.ContainerEngineContainerd:
+		if s.containerd == nil {
+			return nil, fmt.Errorf("engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
+		}
+		return s.containerd, nil
+	case models.ContainerEngineDocker:
+		if s.docker == nil {
+			return nil, fmt.Errorf("engine %q: %w", engine, models.ErrContainerEngineNotRegistered)
+		}
+		return s.docker, nil
+	default:
+		return s.ociEngineForNewCreate()
+	}
+}
+
 func (s *Service) ociEngineForNewCreate() (runtime.Runtime, error) {
 	if s.cfg.ContainerEngine == models.ContainerEngineContainerd {
 		if s.containerd == nil {
@@ -1150,7 +1171,7 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 		s.admitter.Release(sandbox.ID)
 	}
 	if !s.isWasmSandbox(sandbox) {
-		s.schedulePendingImageGC(ctx, sandbox.Image)
+		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
 	return nil
 }
@@ -2864,7 +2885,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	}
 	if !s.isWasmSandbox(sandbox) {
-		s.schedulePendingImageGC(ctx, sandbox.Image)
+		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
 	return nil
 }
@@ -4811,7 +4832,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.admitter.Release(sandbox.ID)
 			}
 			if !s.isWasmSandbox(sandbox) {
-				s.schedulePendingImageGC(ctx, sandbox.Image)
+				s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 			}
 			if s.logger != nil {
 				s.logger.Info("audit reconcile destroyed",
@@ -5623,12 +5644,13 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 	}
 	for _, entry := range entries {
 		image := entry.Image
+		engine := entry.Engine
 		if s.imageGCWhitelisted(image) {
 			// Operator whitelisted this image after the row landed.
 			// Drop it so the ledger doesn't carry it forever; the
 			// destroy path's short-circuit keeps new rows out.
-			if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, image, entry.ScheduledAt); err != nil {
-				s.logger.Warn("pending image gc whitelist row clear failed", "image", image, "error", err)
+			if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
+				s.logger.Warn("pending image gc whitelist row clear failed", "engine", engine, "image", image, "error", err)
 			}
 			continue
 		}
@@ -5641,17 +5663,26 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 			// Image came back into use between scheduling and now.
 			// Drop the row; if it goes idle again the destroy path
 			// will re-schedule with a fresh timestamp.
-			if err := s.store.DeletePendingImageGC(ctx, image); err != nil {
-				s.logger.Warn("pending image gc row clear failed", "image", image, "error", err)
+			if err := s.store.DeletePendingImageGC(ctx, engine, image); err != nil {
+				s.logger.Warn("pending image gc row clear failed", "engine", engine, "image", image, "error", err)
 			}
 			continue
 		}
-		if err := s.docker.RemoveImage(ctx, image); err != nil {
+		remover, err := s.imageRemoverForEngine(engine)
+		if err != nil {
+			// The engine that owns this copy is not wired on this node
+			// (an operator flipped SB_CONTAINER_ENGINE). Leave the row:
+			// removing through the other engine would miss the disk we
+			// are trying to reclaim and could evict its cache instead.
+			s.logger.Warn("pending image gc engine unavailable", "engine", engine, "image", image, "error", err)
+			continue
+		}
+		if err := remover.RemoveImage(ctx, image); err != nil {
 			// Leave the row in place so the next tick retries. Note
 			// docker.RemoveImage returns nil for 404/409, so the
 			// "image vanished" and "still in use by an unknown
 			// container" cases fall through to the delete below.
-			s.logger.Warn("pending image gc remove failed", "image", image, "error", err)
+			s.logger.Warn("pending image gc remove failed", "engine", engine, "image", image, "error", err)
 			continue
 		}
 		// Conditional delete: if a destroy refreshed the row between
@@ -5661,11 +5692,11 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 		// acceptable: it gets re-pulled on the next create. The thing
 		// we MUST avoid is silently throwing away the row that would
 		// have extended the TTL.
-		if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, image, entry.ScheduledAt); err != nil {
-			s.logger.Warn("pending image gc row delete failed", "image", image, "error", err)
+		if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, engine, image, entry.ScheduledAt); err != nil {
+			s.logger.Warn("pending image gc row delete failed", "engine", engine, "image", image, "error", err)
 			continue
 		}
-		s.logger.Info("audit pending image gc removed", "image", image)
+		s.logger.Info("audit pending image gc removed", "engine", engine, "image", image)
 	}
 }
 
@@ -6029,7 +6060,12 @@ func (s *Service) refreshPendingImageGCOnUse(ctx context.Context, image string) 
 	}
 }
 
-func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
+// schedulePendingImageGC records one engine's copy of image for later removal.
+// engine is the sandbox's own engine, not the host default: an image pulled by
+// containerd has to be removed through containerd, and asking docker to remove
+// it neither reclaims the disk nor leaves the ledger row in a state the next
+// sweep can finish.
+func (s *Service) schedulePendingImageGC(ctx context.Context, engine, image string) {
 	if image == "" {
 		return
 	}
@@ -6049,11 +6085,11 @@ func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
 	if s.imageGCWhitelisted(image) {
 		return
 	}
-	if err := s.store.SchedulePendingImageGC(ctx, image, time.Now().UTC()); err != nil {
-		s.logger.Warn("schedule pending image gc failed", "image", image, "error", err)
+	if err := s.store.SchedulePendingImageGC(ctx, engine, image, time.Now().UTC()); err != nil {
+		s.logger.Warn("schedule pending image gc failed", "engine", engine, "image", image, "error", err)
 		return
 	}
-	s.logger.Info("audit image scheduled for gc", "image", image)
+	s.logger.Info("audit image scheduled for gc", "engine", engine, "image", image)
 }
 
 // imageGCWhitelisted reports whether image is protected from both

@@ -380,14 +380,23 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// the ResolveCustomDomain hot path.
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_custom_domains_sandbox_id ON sandbox_custom_domains(sandbox_id);`,
 		// pending_image_gc is the ledger the image janitor sweeps. Destroy
-		// paths upsert (image, now); runPendingImageGC removes rows whose
-		// scheduled_at is older than ImageBuildGCTTL once HasActiveImageRef
-		// confirms nothing references the image. Image is the PK so repeat
-		// destroys of sandboxes sharing an image collapse to one row and
-		// the TTL clock resets to the most recent destroy.
+		// paths upsert ((engine, image), now); runPendingImageGC removes rows
+		// whose scheduled_at is older than ImageBuildGCTTL once
+		// HasActiveImageRef confirms nothing references the image. The key is
+		// the PK so repeat destroys of sandboxes sharing an image collapse to
+		// one row and the TTL clock resets to the most recent destroy.
+		// engine is part of that identity: the same image reference can be
+		// cached by more than one container engine on a node (a host mid
+		// docker→containerd migration), the janitor has to remove it through
+		// the engine that actually holds it, and removing it from the wrong
+		// engine both fails to reclaim the disk and evicts a cache entry
+		// someone else is using. Rows written before the column existed carry
+		// '' and resolve to the host's configured engine.
 		`CREATE TABLE IF NOT EXISTS pending_image_gc (
-			image TEXT PRIMARY KEY,
-			scheduled_at DATETIME NOT NULL
+			engine TEXT NOT NULL DEFAULT '',
+			image TEXT NOT NULL,
+			scheduled_at DATETIME NOT NULL,
+			PRIMARY KEY (engine, image)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
 		// firecracker_tap_pool is the pre-populated network-slot pool for
@@ -586,6 +595,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS wasm_checkpoint_pushes (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
 			registry_ref TEXT NOT NULL,
 			digest TEXT NOT NULL,
 			pushed_at DATETIME NOT NULL
@@ -858,6 +868,21 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
+		// Checkpoint pushes are async and outlive their sandbox: without the
+		// lifecycle they were started for, a push that lands after the id is
+		// reused writes the old incarnation's artifact into the new one.
+		`ALTER TABLE wasm_checkpoint_pushes ADD COLUMN incarnation_id TEXT NOT NULL DEFAULT '';`,
+		// The image janitor used to remove every scheduled image through the
+		// docker driver regardless of which engine built or pulled it.
+		`ALTER TABLE pending_image_gc ADD COLUMN engine TEXT NOT NULL DEFAULT '';`,
+		// push_claimed_at turns the 'pushing' state into an expiring lease.
+		// The reconcilers exclude 'pushing' rows so two ticks cannot push the
+		// same artifact; without a claim timestamp a crash (or a cancelled
+		// context) between the claim and its terminal state left the row
+		// permanently invisible to the reconciler and the artifact
+		// permanently undistributed.
+		`ALTER TABLE sandbox_snapshots ADD COLUMN push_claimed_at DATETIME;`,
+		`ALTER TABLE firecracker_templates ADD COLUMN push_claimed_at DATETIME;`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and
@@ -871,6 +896,14 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
 		}
+	}
+	// The image-GC ledger predates engine awareness with `image` as its sole
+	// primary key, and SQLite cannot widen a primary key in place. Rebuild it
+	// once so a node that holds the same image under two engines can carry a
+	// cleanup row for each.
+	if err := migratePendingImageGCKey(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	// Partial unique index on host_port (only enforced when host_port > 0).
 	// This is the load-bearing primitive of the random-first allocator: two
@@ -1126,6 +1159,67 @@ func migrateLegacyEnvRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets
 		}
 		afterID = batch[len(batch)-1].id
 	}
+}
+
+// migratePendingImageGCKey widens pending_image_gc's primary key from (image)
+// to (engine, image). It is a no-op once engine is part of the key, so warm
+// restarts pay one PRAGMA. Existing rows keep engine=” — "whichever engine
+// this host is configured with" — which is what they always implicitly meant.
+func migratePendingImageGCKey(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(pending_image_gc)`)
+	if err != nil {
+		return fmt.Errorf("inspect pending_image_gc: %w", err)
+	}
+	engineInKey := false
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, colType    string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan pending_image_gc column: %w", err)
+		}
+		if name == "engine" && pk > 0 {
+			engineInKey = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate pending_image_gc columns: %w", err)
+	}
+	rows.Close()
+	if engineInKey {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin pending_image_gc key migration: %w", err)
+	}
+	defer tx.Rollback()
+	stmts := []string{
+		`CREATE TABLE pending_image_gc_rekeyed (
+			engine TEXT NOT NULL DEFAULT '',
+			image TEXT NOT NULL,
+			scheduled_at DATETIME NOT NULL,
+			PRIMARY KEY (engine, image)
+		);`,
+		`INSERT OR IGNORE INTO pending_image_gc_rekeyed (engine, image, scheduled_at)
+			SELECT COALESCE(engine, ''), image, scheduled_at FROM pending_image_gc;`,
+		`DROP TABLE pending_image_gc;`,
+		`ALTER TABLE pending_image_gc_rekeyed RENAME TO pending_image_gc;`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate pending_image_gc key %q: %w", stmt, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit pending_image_gc key migration: %w", err)
+	}
+	return nil
 }
 
 func migrateLegacyToolboxTokenRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets.Cipher) error {
@@ -2130,19 +2224,20 @@ func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, erro
 }
 
 // SchedulePendingImageGC records (or refreshes) a pending image-deletion
-// row. UPSERT on the image PK means concurrent or repeated destroys
-// collapse to one row and the TTL clock restarts from the most recent
-// destroy — so a busy churn pattern on the same image keeps deferring
-// removal instead of racing the janitor. Empty image is a no-op.
-func (s *Store) SchedulePendingImageGC(ctx context.Context, image string, at time.Time) error {
+// row for one engine's copy of an image. UPSERT on the (engine, image) PK
+// means concurrent or repeated destroys collapse to one row and the TTL clock
+// restarts from the most recent destroy — so a busy churn pattern on the same
+// image keeps deferring removal instead of racing the janitor. Empty image is
+// a no-op; empty engine means "this host's configured engine".
+func (s *Store) SchedulePendingImageGC(ctx context.Context, engine, image string, at time.Time) error {
 	if image == "" {
 		return nil
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO pending_image_gc(image, scheduled_at)
-		VALUES (?, ?)
-		ON CONFLICT(image) DO UPDATE SET scheduled_at = excluded.scheduled_at
-	`, image, at.UTC())
+		INSERT INTO pending_image_gc(engine, image, scheduled_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(engine, image) DO UPDATE SET scheduled_at = excluded.scheduled_at
+	`, strings.TrimSpace(engine), image, at.UTC())
 	if err != nil {
 		return fmt.Errorf("schedule pending image gc: %w", err)
 	}
@@ -2154,6 +2249,10 @@ func (s *Store) SchedulePendingImageGC(ctx context.Context, image string, at tim
 // remove/delete decision to the exact row it observed — see
 // DeletePendingImageGCIfScheduledAt for the refresh-race rationale.
 type PendingImageGCEntry struct {
+	// Engine is the container engine holding this copy of the image. Empty
+	// on rows written before the ledger became engine-aware; the janitor
+	// resolves that to the host's configured engine.
+	Engine      string
 	Image       string
 	ScheduledAt time.Time
 }
@@ -2168,7 +2267,7 @@ type PendingImageGCEntry struct {
 // can guard the conditional delete in DeletePendingImageGCIfScheduledAt.
 func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, limit int) ([]PendingImageGCEntry, error) {
 	query := `
-		SELECT image, scheduled_at FROM pending_image_gc
+		SELECT engine, image, scheduled_at FROM pending_image_gc
 		WHERE scheduled_at <= ?
 		ORDER BY scheduled_at
 	`
@@ -2185,7 +2284,7 @@ func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, lim
 	var out []PendingImageGCEntry
 	for rows.Next() {
 		var entry PendingImageGCEntry
-		if err := rows.Scan(&entry.Image, &entry.ScheduledAt); err != nil {
+		if err := rows.Scan(&entry.Engine, &entry.Image, &entry.ScheduledAt); err != nil {
 			return nil, fmt.Errorf("scan pending image gc row: %w", err)
 		}
 		out = append(out, entry)
@@ -2202,11 +2301,12 @@ func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, lim
 // regardless of timestamp — the destroy path will re-schedule with a
 // fresh timestamp if the image goes idle again. Missing rows are not
 // an error.
-func (s *Store) DeletePendingImageGC(ctx context.Context, image string) error {
+func (s *Store) DeletePendingImageGC(ctx context.Context, engine, image string) error {
 	if image == "" {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_image_gc WHERE image = ?`, image); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_image_gc WHERE engine = ? AND image = ?`,
+		strings.TrimSpace(engine), image); err != nil {
 		return fmt.Errorf("delete pending image gc: %w", err)
 	}
 	return nil
@@ -2225,6 +2325,9 @@ func (s *Store) DeletePendingImageGC(ctx context.Context, image string) error {
 // bounded by "images destroyed in the last TTL window". Returns
 // whether a row was touched, so callers can distinguish "deadline
 // pushed forward" from "no pending GC, nothing to push".
+// Refreshes every engine's row for the image: a create that uses the image
+// keeps it alive wherever it is cached, and the janitor is the only thing that
+// removes rows.
 func (s *Store) RefreshPendingImageGCIfExists(ctx context.Context, image string, at time.Time) (bool, error) {
 	if image == "" {
 		return false, nil
@@ -2256,14 +2359,14 @@ func (s *Store) RefreshPendingImageGCIfExists(ctx context.Context, image string,
 // extended TTL that destroy was supposed to buy. The janitor uses this
 // to keep the "TTL clock restarts from the most recent destroy"
 // contract under churn.
-func (s *Store) DeletePendingImageGCIfScheduledAt(ctx context.Context, image string, at time.Time) (bool, error) {
+func (s *Store) DeletePendingImageGCIfScheduledAt(ctx context.Context, engine, image string, at time.Time) (bool, error) {
 	if image == "" {
 		return false, nil
 	}
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM pending_image_gc
-		WHERE image = ? AND scheduled_at = ?
-	`, image, at.UTC())
+		WHERE engine = ? AND image = ? AND scheduled_at = ?
+	`, strings.TrimSpace(engine), image, at.UTC())
 	if err != nil {
 		return false, fmt.Errorf("conditional delete pending image gc: %w", err)
 	}
@@ -3410,9 +3513,11 @@ func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Templat
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
 			has_overlay, push_state, push_error, registry_ref, push_digest
 		FROM firecracker_templates
-		WHERE push_state IN ('pending', 'error') AND status = ?
+		WHERE (push_state IN ('pending', 'error')
+			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?)))
+			AND status = ?
 		ORDER BY created_at ASC, id ASC
-	`, string(models.TemplateStatusReady))
+	`, time.Now().UTC().Add(-PushClaimLease), string(models.TemplateStatusReady))
 	if err != nil {
 		return nil, fmt.Errorf("list templates pending push: %w", err)
 	}
@@ -3561,13 +3666,30 @@ func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
 // push reconciler. errMsg is overwritten unconditionally (including
 // to empty on success transitions) so callers don't have to remember
 // to clear it. Mirrors SetSnapshotPushState.
+// PushClaimLease bounds how long a row may sit in 'pushing' before another
+// reconciler tick may reclaim it. Longer than any realistic single artifact
+// push, short enough that a crashed daemon's claims drain on the next few
+// ticks rather than needing operator action.
+const PushClaimLease = 30 * time.Minute
+
+// pushClaimStamp records when a row entered 'pushing' and clears the stamp on
+// every terminal state, so a reclaim window only exists while a push is
+// genuinely believed to be in flight. Snapshots and templates share the
+// literal state name, so one helper serves both ledgers.
+func pushClaimStamp(state string, now time.Time) any {
+	if strings.TrimSpace(state) == models.SnapshotPushStatePushing {
+		return now
+	}
+	return nil
+}
+
 func (s *Store) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE firecracker_templates
-		SET push_state = ?, push_error = ?, updated_at = ?
+		SET push_state = ?, push_error = ?, updated_at = ?, push_claimed_at = ?
 		WHERE id = ?
-	`, strings.TrimSpace(state), errMsg, now, strings.TrimSpace(id))
+	`, strings.TrimSpace(state), errMsg, now, pushClaimStamp(state, now), strings.TrimSpace(id))
 	if err != nil {
 		return fmt.Errorf("set template push state: %w", err)
 	}
@@ -3735,8 +3857,9 @@ func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.Sandbox
 			push_state, push_error
 		FROM sandbox_snapshots
 		WHERE push_state IN ('pending', 'error')
+			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?))
 		ORDER BY created_at ASC, name ASC
-	`)
+	`, time.Now().UTC().Add(-PushClaimLease))
 	if err != nil {
 		return nil, fmt.Errorf("list snapshots pending push: %w", err)
 	}
@@ -3762,9 +3885,9 @@ func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.Sandbox
 func (s *Store) SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandbox_snapshots
-		SET push_state = ?, push_error = ?
+		SET push_state = ?, push_error = ?, push_claimed_at = ?
 		WHERE name = ?
-	`, strings.TrimSpace(state), errMsg, strings.TrimSpace(name))
+	`, strings.TrimSpace(state), errMsg, pushClaimStamp(state, time.Now().UTC()), strings.TrimSpace(name))
 	if err != nil {
 		return fmt.Errorf("set snapshot push state: %w", err)
 	}
@@ -7356,14 +7479,22 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 	return nil
 }
 
-// UpdateWasmCheckpoint persists passivation metadata on a sandbox row.
-func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, status, checkpointPath, cloneGen, lastError string) error {
+// UpdateWasmCheckpoint persists passivation metadata on a sandbox row, fenced
+// to the incarnation the checkpoint was taken for. An empty incarnation means
+// the caller has no lifecycle to fence against (pre-incarnation rows) and the
+// write applies by id alone.
+func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, incarnationID, status, checkpointPath, cloneGen, lastError string) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	query := `
 		UPDATE sandboxes
 		SET status = ?, checkpoint_path = ?, clone_generation = ?, last_error = ?, updated_at = ?
-		WHERE id = ?
-	`, status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID)
+		WHERE id = ?`
+	args := []any{status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID}
+	if incarnationID = strings.TrimSpace(incarnationID); incarnationID != "" {
+		query += ` AND audit_incarnation_id = ?`
+		args = append(args, incarnationID)
+	}
+	_, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("update wasm checkpoint: %w", err)
 	}
@@ -7494,12 +7625,12 @@ type WasmCheckpointPushRecord struct {
 }
 
 // InsertWasmCheckpointPush records a successful AOCR push for keep-last-N retention.
-func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, registryRef, digest string) (int64, error) {
+func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, incarnationID, registryRef, digest string) (int64, error) {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO wasm_checkpoint_pushes (sandbox_id, registry_ref, digest, pushed_at)
-		VALUES (?, ?, ?, ?)`,
-		strings.TrimSpace(sandboxID), strings.TrimSpace(registryRef), strings.TrimSpace(digest), now)
+		INSERT INTO wasm_checkpoint_pushes (sandbox_id, incarnation_id, registry_ref, digest, pushed_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID), strings.TrimSpace(registryRef), strings.TrimSpace(digest), now)
 	if err != nil {
 		return 0, fmt.Errorf("insert wasm checkpoint push: %w", err)
 	}
@@ -7628,18 +7759,30 @@ func (s *Store) DeleteAllWasmCheckpointPushes(ctx context.Context, sandboxID str
 	return nil
 }
 
-// UpdateWasmRegistryPush records the AOCR ref/digest after a durable checkpoint push.
-func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, registryRef, digest string) error {
+// UpdateWasmRegistryPush records the AOCR ref/digest after a durable checkpoint
+// push. incarnationID fences the write to the lifecycle the push was started
+// for: these pushes run detached with a multi-minute timeout, so one can land
+// after its sandbox is destroyed and the id re-created. applied=false means
+// the row moved on and the result belongs to a dead lifecycle.
+func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, incarnationID, registryRef, digest string) (applied bool, err error) {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return false, errors.New("update wasm registry push: incarnation id is required")
+	}
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
 		SET wasm_registry_ref = ?, wasm_registry_digest = ?, updated_at = ?
-		WHERE id = ?
-	`, strings.TrimSpace(registryRef), strings.TrimSpace(digest), now, sandboxID)
+		WHERE id = ? AND audit_incarnation_id = ?
+	`, strings.TrimSpace(registryRef), strings.TrimSpace(digest), now, sandboxID, incarnationID)
 	if err != nil {
-		return fmt.Errorf("update wasm registry push: %w", err)
+		return false, fmt.Errorf("update wasm registry push: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("update wasm registry push rows affected: %w", err)
+	}
+	return affected > 0, nil
 }
 
 // ListReadyWasmModuleRefs returns module_ref values for ready catalogue rows.

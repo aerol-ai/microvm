@@ -15,7 +15,7 @@ func TestPushWasmCheckpointBestEffortWave16(t *testing.T) {
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc.wasmCheckpointPusher = failingWasmCheckpointPusher{}
-	svc.pushWasmCheckpointBestEffort("sb-push", t.TempDir())
+	svc.pushWasmCheckpointBestEffort("sb-push", "", t.TempDir())
 
 	svc2, st2, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
 	svc2.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -23,7 +23,7 @@ func TestPushWasmCheckpointBestEffortWave16(t *testing.T) {
 		latest: WasmCheckpointPushResult{RegistryRef: "reg/sb:latest", Digest: "sha256:deadbeefcafebabe0123456789abcdef"},
 	}
 	_ = st2.Close()
-	svc2.pushWasmCheckpointBestEffort("sb-meta", t.TempDir())
+	svc2.pushWasmCheckpointBestEffort("sb-meta", "", t.TempDir())
 
 	svc3, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc3.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -31,7 +31,7 @@ func TestPushWasmCheckpointBestEffortWave16(t *testing.T) {
 		latest:    WasmCheckpointPushResult{RegistryRef: "reg/sb:latest", Digest: "sha256:deadbeefcafebabe0123456789abcdef"},
 		digestErr: errors.New("digest tag push fail"),
 	}
-	svc3.pushWasmCheckpointBestEffort("sb-dig", t.TempDir())
+	svc3.pushWasmCheckpointBestEffort("sb-dig", "", t.TempDir())
 }
 
 type configurableCheckpointPusher struct {
@@ -118,5 +118,5 @@ func TestWasmCheckpointPushBestEffortWave16(t *testing.T) {
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableWasm = true
 	svc.wasmCheckpointPusher = failingWasmCheckpointPusher{}
-	svc.pushWasmCheckpointBestEffort("w2", t.TempDir())
+	svc.pushWasmCheckpointBestEffort("w2", "", t.TempDir())
 }

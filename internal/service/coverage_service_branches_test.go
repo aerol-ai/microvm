@@ -811,7 +811,7 @@ func TestServiceHelperBranchCoverageRoundTwo(t *testing.T) {
 		}
 		svc.ReplayReservations(ctx)
 		svc.refreshPendingImageGCOnUse(ctx, "alpine:latest")
-		svc.schedulePendingImageGC(ctx, "alpine:latest")
+		svc.schedulePendingImageGC(ctx, "", "alpine:latest")
 		if err := svc.gcClusterIngressRoutes(ctx); err == nil {
 			t.Fatal("closed store should fail gcClusterIngressRoutes")
 		}
