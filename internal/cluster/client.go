@@ -557,6 +557,20 @@ func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID
 	})
 }
 
+// SelectPlacementForCreate is SelectPlacement plus the bounded seal recipient
+// set for sandboxID. The server-side member of the pair: no candidate slice
+// crosses a process boundary here, because there is no boundary to cross.
+func (c *Cluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error) {
+	target, candidates, err := c.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
+}
+
 // SecretsOf returns a copy of the provider handle paired with SpecOf's spec.
 func (c *Cluster) SecretsOf(sandboxID string) PlacementSecrets {
 	p, ok := c.fsm.get(sandboxID)

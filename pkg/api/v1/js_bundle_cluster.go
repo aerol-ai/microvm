@@ -44,7 +44,7 @@ func (h *handlers) clusterListJSBundlesWrap(w http.ResponseWriter, r *http.Reque
 			local, localErr, jsBundleListKey, h.deps.Logger, "js-bundles")
 	})
 	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		writeClusterListError(h.deps.Logger, w, err)
 		return
 	}
 	writeClusterListCoverage(w, aggregate.failedPeers, clusterJSBundleMissingHeader)

@@ -69,6 +69,17 @@ func (n *Noop) SelectPlacementWithCandidates(req capacity.Request) (PlacementTar
 	return self, []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}, nil
 }
 
+func (n *Noop) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error) {
+	target, candidates, err := n.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
+}
+
 func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }

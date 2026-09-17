@@ -59,12 +59,26 @@ type PlacementLookupResponse struct {
 
 type SelectPlacementRequest struct {
 	Request capacity.Request `json:"request"`
+	// SandboxID and RecipientBackups ask the control plane to pick the seal
+	// recipients itself and return only those. Without them the server falls
+	// back to returning the full candidate slice, which is what an agent
+	// running the previous build still expects — keep both paths until every
+	// node in a rolling upgrade sends the id.
+	SandboxID        string `json:"sandbox_id,omitempty"`
+	RecipientBackups int    `json:"recipient_backups,omitempty"`
 }
 
 type SelectPlacementResponse struct {
-	Target     PlacementTarget `json:"target"`
-	Candidates []Member        `json:"candidates,omitempty"`
-	Error      string          `json:"error,omitempty"`
+	Target PlacementTarget `json:"target"`
+	// Candidates is the legacy shape: every eligible worker, serialized to the
+	// caller so IT could pick secret recipients. At 2,000 nodes that made each
+	// create's response O(fleet) in bytes, allocations and control-plane CPU,
+	// for an answer of at most a handful of node ids. Populated only when the
+	// request did not carry a SandboxID.
+	Candidates []Member `json:"candidates,omitempty"`
+	// Recipients is the bounded answer: owner first, then the chosen backups.
+	Recipients []string `json:"recipients,omitempty"`
+	Error      string   `json:"error,omitempty"`
 }
 
 type DrainStateResponse struct {
@@ -280,20 +294,35 @@ func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 }
 
 func (a *Agent) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
+	target, _, candidates, err := a.selectPlacement(SelectPlacementRequest{Request: req})
+	return target, candidates, err
+}
+
+// SelectPlacementForCreate picks a target and the sandbox's seal recipients in
+// one control-plane round trip, returning the bounded recipient ids instead of
+// the candidate fleet.
+func (a *Agent) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error) {
+	target, recipients, _, err := a.selectPlacement(SelectPlacementRequest{
+		Request: req, SandboxID: strings.TrimSpace(sandboxID), RecipientBackups: recipientBackups,
+	})
+	return target, recipients, err
+}
+
+func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, []string, []Member, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
 	var resp SelectPlacementResponse
-	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalSelectPlacementPath, PublicInternalSelectPlacementPath, SelectPlacementRequest{Request: req}, &resp); err != nil {
-		return PlacementTarget{}, nil, err
+	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalSelectPlacementPath, PublicInternalSelectPlacementPath, body, &resp); err != nil {
+		return PlacementTarget{}, nil, nil, err
 	}
 	if resp.Error != "" {
 		if resp.Error == ErrNoPlacementTarget.Error() {
-			return PlacementTarget{}, nil, ErrNoPlacementTarget
+			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
 		}
 		if err := invalidTopologyFromMessage(resp.Error); err != nil {
-			return PlacementTarget{}, nil, err
+			return PlacementTarget{}, nil, nil, err
 		}
-		return PlacementTarget{}, nil, errors.New(resp.Error)
+		return PlacementTarget{}, nil, nil, errors.New(resp.Error)
 	}
 	if resp.Target.NodeID == a.nodeID {
 		resp.Target.APIURL = a.apiURL
@@ -301,7 +330,13 @@ func (a *Agent) SelectPlacementWithCandidates(req capacity.Request) (PlacementTa
 		resp.Target.InternalURL = a.internalURL
 		resp.Target.IsSelf = true
 	}
-	return resp.Target, resp.Candidates, nil
+	recipients := resp.Recipients
+	if len(recipients) == 0 && body.SandboxID != "" && len(resp.Candidates) > 0 {
+		// A control plane still on the previous build answered with the
+		// candidate slice; select locally so a rolling upgrade keeps sealing.
+		recipients = SelectSecretRecipients(body.SandboxID, resp.Candidates, resp.Target.NodeID, body.RecipientBackups)
+	}
+	return resp.Target, recipients, resp.Candidates, nil
 }
 
 func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {

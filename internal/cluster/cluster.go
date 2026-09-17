@@ -592,6 +592,15 @@ type Client interface {
 	// explicitly.
 	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error
 
+	// SelectPlacementForCreate is SelectPlacement plus the seal recipients for
+	// sandboxID, chosen where the membership already lives. It exists so a
+	// create never has to ship the candidate fleet to the caller: at 2,000
+	// nodes SelectPlacementWithCandidates makes every create's answer O(fleet)
+	// in bytes and allocations to produce at most a handful of node ids.
+	// recipientBackups <= 0 means the create wants no fan-out and skips the
+	// selection entirely.
+	SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error)
+
 	// UpdatePlacementSecretRecipients replaces Placement.SecretRecipients
 	// (and optionally the seal handle after a reseal) without touching
 	// ownership or IncarnationID. expectedIncarnationID / expectedOwnerNodeID /

@@ -669,6 +669,19 @@ func pendingRecipientsAfterAck(recipients, acked []string, selfID string) []stri
 // peers. Call once after cluster attach / ownership replay on worker boot so
 // failover_ready is not stuck false forever after a restart.
 func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
+	return s.ReFanoutClusterSecretsForNodes(ctx, nil)
+}
+
+// ReFanoutClusterSecretsForNodes is ReFanoutClusterSecrets restricted to the
+// secrets whose recipient set contains one of nodeIDs. A nil/empty set means
+// "every local secret" (boot, ownership replay).
+//
+// Membership churn uses the restricted form. A flap otherwise makes every node
+// re-push every secret it holds and ask the Raft leader for a placement
+// snapshot per page — at 2,000 nodes that is one member restart turning into a
+// fleet-wide retransmit and a leader thundering herd, to repair copies that
+// were never lost.
+func (s *Service) ReFanoutClusterSecretsForNodes(ctx context.Context, nodeIDs map[string]struct{}) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
@@ -692,6 +705,9 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 			return errors.Join(validationErr, err)
 		}
 		for _, rec := range rows {
+			if !secretRecipientsInclude(rec.Recipients, nodeIDs) {
+				continue
+			}
 			if _, err := s.prepareSecretRefanoutRecord(ctx, rec, true, placements, nil); err != nil {
 				validationErr = errors.Join(validationErr, err)
 			}
@@ -702,9 +718,23 @@ func (s *Service) ReFanoutClusterSecrets(ctx context.Context) error {
 		}
 	}
 	if pusher != nil && (validationErr == nil || !s.cfg.EnterpriseMode) {
-		s.startSecretRefanoutScan(ctx, pusher)
+		s.startSecretRefanoutScanForNodes(ctx, pusher, nodeIDs)
 	}
 	return validationErr
+}
+
+// secretRecipientsInclude reports whether a durable secret is owed to any node
+// in want. An empty want selects everything.
+func secretRecipientsInclude(recipients []string, want map[string]struct{}) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for _, id := range recipients {
+		if _, ok := want[strings.TrimSpace(id)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // secretRefanoutPlacements returns one authoritative placement snapshot for a
@@ -869,8 +899,12 @@ func (s *Service) prepareSecretRefanoutRecord(ctx context.Context, rec store.Clu
 }
 
 func (s *Service) startSecretRefanoutScan(ctx context.Context, pusher cluster.SecretPeerPusher) {
+	s.startSecretRefanoutScanForNodes(ctx, pusher, nil)
+}
+
+func (s *Service) startSecretRefanoutScanForNodes(ctx context.Context, pusher cluster.SecretPeerPusher, nodeIDs map[string]struct{}) {
 	s.startSecretMaintenanceScan(ctx, "cluster: paged secret re-fanout failed", func(scanCtx context.Context) error {
-		return s.runSecretRefanoutScan(scanCtx, pusher)
+		return s.runSecretRefanoutScanForNodes(scanCtx, pusher, nodeIDs)
 	})
 }
 
@@ -952,6 +986,10 @@ func (s *Service) runSecretRetirementScan(ctx context.Context) error {
 // runSecretRefanoutScan streams indexed pages through one fixed worker set.
 // Neither payload memory nor goroutine count grows with the sandbox fleet.
 func (s *Service) runSecretRefanoutScan(ctx context.Context, pusher cluster.SecretPeerPusher) error {
+	return s.runSecretRefanoutScanForNodes(ctx, pusher, nil)
+}
+
+func (s *Service) runSecretRefanoutScanForNodes(ctx context.Context, pusher cluster.SecretPeerPusher, nodeIDs map[string]struct{}) error {
 	jobs := make(chan secrets.SecretBlob)
 	var wg sync.WaitGroup
 	wg.Add(secretRefanoutWorkers)
@@ -982,6 +1020,9 @@ func (s *Service) runSecretRefanoutScan(ctx context.Context, pusher cluster.Secr
 			return errors.Join(validationErr, err)
 		}
 		for _, rec := range rows {
+			if !secretRecipientsInclude(rec.Recipients, nodeIDs) {
+				continue
+			}
 			blob, err := s.prepareSecretRefanoutRecord(ctx, rec, false, placements, nil)
 			if err != nil {
 				validationErr = errors.Join(validationErr, err)
