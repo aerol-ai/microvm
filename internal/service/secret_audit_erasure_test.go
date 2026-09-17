@@ -38,8 +38,11 @@ func TestSecretAuditWitnessRejectsErasedChain(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
+	// Assign directly instead of SetWitness: SetWitness starts the periodic
+	// ship loop, which would read the stub concurrently with the remoteHead
+	// mutations below.
 	w := &stubWitness{}
-	svc.SetWitness(w)
+	svc.auditWitness = w
 	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
 		t.Fatalf("ship: %v", err)
 	}
@@ -87,7 +90,7 @@ func TestSecretAuditWitnessAcceptsGenuinelyNewChain(t *testing.T) {
 	}}
 	svc.ensureSecretAuditSink()
 	t.Cleanup(svc.CloseSecretAuditSink)
-	svc.SetWitness(&stubWitness{})
+	svc.auditWitness = &stubWitness{}
 
 	if ok, _, _, err := svc.VerifySecretAuditWitness(); !ok || err != nil {
 		t.Fatalf("fresh node verify = ok=%v err=%v", ok, err)
