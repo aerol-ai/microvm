@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/btree"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1154,7 +1155,7 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "n1"}
 	fsm.mu.Lock()
 	fsm.placements["sb"] = Placement{SandboxID: "sb", OwnerNodeID: "n", Spec: spec, IncarnationID: "inc-sb"}
-	fsm.ownerIndex = map[string]map[string]struct{}{"n": {"sb": {}}}
+	fsm.ownerIndex = map[string]*btree.BTreeG[string]{"n": ownerIndexTree("sb")}
 	fsm.nameIndex = map[string]string{"n1": "sb"}
 	fsm.mu.Unlock()
 
@@ -1165,7 +1166,7 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	fsmOrphan := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
 	fsmOrphan.mu.Lock()
 	fsmOrphan.placements["sb"] = Placement{SandboxID: "sb", OwnerNodeID: "n", Spec: spec}
-	fsmOrphan.ownerIndex = map[string]map[string]struct{}{"n": {"sb": {}}}
+	fsmOrphan.ownerIndex = map[string]*btree.BTreeG[string]{"n": ownerIndexTree("sb")}
 	fsmOrphan.mu.Unlock()
 	if got := applyOp(t, fsmOrphan, command{Op: opOrphanOwner, NodeID: "n"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
 		t.Fatalf("orphan store fail=%v", got)

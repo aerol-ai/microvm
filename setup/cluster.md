@@ -241,10 +241,19 @@ the loss of `(N-1)/2` voters before writes stop.
   threshold without raising fault tolerance.
 - A 2-node cluster is a single point of failure with extra steps.
 - `SB_CLUSTER_MAX_AUTO_VOTERS` defaults to `5`. Once that many voters exist,
-  newly discovered nodes are added as raft **non-voters**: they receive the
-  placement log, can own sandboxes, and can forward writes to the leader, but
-  they do not enlarge quorum. This is the default safety guard for large runner
-  pools.
+  a newly discovered **server-role** node is added as a raft **non-voter**: it
+  still receives the full placement log and FSM, and can forward writes to the
+  leader, but it does not enlarge quorum.
+- **The voter cap bounds voting, not replication.** A non-voter holds the whole
+  placement map — roughly 72 MB of state at 100k sandboxes, plus a dedicated
+  replication stream from the leader. Scale-out belongs in the worker and
+  ingress tiers, which run the Agent client, hold no FSM, and never join raft
+  in any suffrage. The live **server tier is therefore capped at 7 nodes**
+  (`MaxServerTierNodes`): the default 5 voters plus two slots so a rolling
+  replacement can overlap. Above 10 live nodes a cluster with more than 7 live
+  server-role nodes fails admission with `ErrInvalidTopology` — re-role the
+  surplus nodes to `worker` or `ingress`. The cap is a constant, not an env
+  knob, for the same reason the mixed-role gate is.
 - `SB_NODE_ID` must be **stable** across restarts. A node returning with a
   new ID joins as a brand-new raft server while the old server sits in the
   configuration as dead.
@@ -425,9 +434,12 @@ cluster: added member as raft non-voter because voter cap is reached node_id=nod
 cluster gossip joined peers ...
 ```
 
-The seed leader auto-promotes new joiners to raft voters until
-`SB_CLUSTER_MAX_AUTO_VOTERS` is reached. Additional joiners are added as raft
-non-voters so they receive the placement log without increasing quorum.
+The seed leader auto-promotes new **server-role** joiners to raft voters until
+`SB_CLUSTER_MAX_AUTO_VOTERS` is reached. Additional server joiners are added as
+raft non-voters: they still receive the whole placement log, they just do not
+increase quorum. That is why the live server tier is capped at 7 nodes — see
+"Rules" above. Worker and ingress nodes never appear in these lines at all;
+they run the Agent client, advertise no raft address, and hold no FSM.
 
 ### Step 6 - Verify the cluster
 
@@ -1144,7 +1156,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial. Auto-derived. |
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses. Empty on the seed. |
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
-| `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered nodes auto-promoted as raft voters. Default `5`; additional nodes become non-voters. Set `0` for unlimited. |
+| `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered **server-role** nodes auto-promoted as raft voters. Default `5`; additional server nodes become non-voters that still replicate the full FSM. Set `0` for unlimited. Does not bound replica count — the live server tier is separately capped at 7 nodes. |
 | `SB_DEAD_OWNER_GRACE` | no | Wait before reassigning a dead node's placements. Default `30s`. |
 | `SB_OTEL_METRICS_ENDPOINT` | no | OTLP/HTTP metrics endpoint, for example `http://otel-collector:4318/v1/metrics`. Setting it enables OTEL metrics. |
 | `SB_OTEL_METRICS_ENABLED` | no | Enables OTEL metrics without an explicit endpoint; the OTEL exporter env defaults apply. |

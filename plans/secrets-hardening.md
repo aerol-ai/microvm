@@ -1281,3 +1281,95 @@ retraction, and failure when peers are unreachable — §10).
   without the flag enterprise boots refuse and open-source never marks ingress
   ready (`aerolvm_cluster_topology_ok = 0`). Nothing in this plan removes that
   requirement; the 100-ingress figure assumes it is met.
+
+---
+
+## Fleet-scale read paths — FIXED 2026-09-18
+
+Three paths still scaled a per-node cost with fleet size after the earlier
+bounded-selector work. Measured against a realistic row, not estimated: a hot
+`cluster.Placement` marshals to **751 B** (100k rows = **71.7 MB**) and a
+`cluster.Member` to **852 B** (2,000 candidates = **1.67 MB**).
+
+**1. Native v1 create downloaded the candidate fleet.**
+`clusterCreateWrap` kept its own copy of the placement/reserve/forward flow and
+called `SelectPlacementWithCandidates`, which on an agent node is an RPC whose
+response carries one `Member` per eligible worker. It sat *ahead* of the
+`WantsSecretRecipientFanout` check, so the ~1.7 MB was paid even when the
+candidates were discarded. The duplication is why the earlier fix to the shared
+flow did not reach v1.
+
+*Fix:* `clusterCreateWrap` now routes through `clustercreate.Prepare` — the same
+implementation daytona and e2b use — via new `PrepareOptions` fields
+(`Normalize`, `OwnerRef`, `SyncBody`, `MetricPrefix`, `OnForwardStale`,
+`Logger`) that carry the v1-specific behavior without forking the flow again.
+261 lines of duplicate handler deleted. `capacityRequestFromCreate` now delegates
+to `clustercreate.CapacityRequestFromCreate` (the two were byte-identical apart
+from a comment) and the dead `clusterSelfCanOwnSandbox` is gone.
+
+*Behavior change:* a placement target with neither `APIURL` nor `InternalURL` is
+now rejected up front as `ErrNoPlacementTarget` (503 + Retry-After) instead of
+forwarded. `ForwardHTTP` requires a non-empty `InternalURL`, so the old path
+forwarded into a guaranteed `ErrPeerInternalURLRequired` 503 with no retry hint.
+
+**2. Every worker's reconcile sweep pulled the global placement map.**
+`reconcileMissingSelfOwnedPlacements` called `Placements()` — 71.7 MB at target
+scale, **4.5× the agent's 16 MiB `maxControlPlaneJSONResponseBytes` cap**. It
+therefore failed *always*, fell back to `cachedPlacementsForShards` (empty on a
+cold agent), and the missing-local-row sweep silently reclaimed nothing. Two
+costs: a permanent GC vacuum — orphaned placements for destroyed sandboxes never
+retired, signalled only by one `Warn` — and 2,000 workers each forcing a server
+node to walk the FSM, redact 100k rows, and stream 16 MiB every
+`SB_RECONCILE_INTERVAL` (5 min): ~107 MB/s of pure waste against a ≤5-node tier.
+
+*Fix:* new `PlacementPageRequest.OwnerNodeID`, served from the FSM's existing
+`ownerIndex`, which is now a `btree` (like `ownerRefIndex`) so a page is
+O(log n + limit). `selfOwnedPlacementsForReconcile` walks it and returns **nil,
+not a partial list**, on a non-authoritative page, a stalled cursor, or a blown
+page budget — a partial view is indistinguishable from "no placement", and the
+caller deletes on exactly that signal. The scan fallback applies the same
+reserved/orphaned exclusion as the index so a degraded FSM cannot answer wider.
+Deleting rows stay in the index (`opBeginDelete` does not release it), because
+they are the durable anchor for a delete whose owner crashed mid-finalize.
+
+*Not a correctness risk before the fix:* `DeletePlacementExact` CASes on
+owner + incarnation, so a stale cache could never delete another node's row.
+
+**3. The voter cap did not cap Raft replicas.**
+`SB_CLUSTER_MAX_AUTO_VOTERS` (default 5) bounds voting only; a surplus
+server-role node joins via `addMemberAsNonvoter` and still receives the full log
+and FSM. Nothing bounded the server tier.
+
+*Fix:* `cluster.MaxServerTierNodes = 7` (5 voters + 2 for rolling replacement),
+enforced in `LargeClusterTopologyError` alongside the existing mixed-role gate,
+so it only applies above `MaxMixedClusterNodes` live nodes and ignores dead
+members. A constant, not an env knob — an override would reopen the foot-gun.
+
+*Not affected:* worker and ingress nodes run `Agent`, gossip `RaftAddr: ""`, and
+so return early from `handleMemberJoin`. They never enter the Raft configuration
+in any suffrage and hold no FSM. The `nonVoterByRole` branch in
+`voter_autojoin.go` is consequently unreachable in practice.
+
+**Secrets were never the fleet-scale problem.** Ciphertext goes to owner +
+`SB_SECRET_RECIPIENT_BACKUP_COUNT` backups (default 2) — 3 nodes, chosen by the
+router at reserve time and recorded on the placement. `selectReplacementRecipients`
+prefers `LocalMembers()` (gossip) over the `Members()` RPC. That design holds.
+
+### Known remaining gap
+
+`Placements()` and its `GET /v1/cluster/internal/placements` endpoint now have
+no production caller, but both still exist and still serialize the whole map if
+anything reaches them. Removing the method from `cluster.Client` touches Noop,
+Agent, Cluster and ~20 test stubs; deferred rather than bundled here.
+
+### Tests
+
+`internal/cluster/fsm_owner_page_test.go` (owner isolation, full-walk paging,
+reserved/orphaned exclusion, deleting-row retention, index/scan parity,
+20k-row bounding), `internal/cluster/topology_test.go` (server-tier cap, dead
+servers excluded), `internal/service/reconcile_owner_page_test.go` (bounded read,
+skip-on-unavailable, skip-on-stalled-cursor, multi-page walk, single-node no-op),
+`pkg/api/v1/cluster_create_bounded_test.go` (zero candidate calls, exactly one
+bounded call, bounded recipients recorded on the reservation).
+
+**Still not covered:** a live 2,000-node soak. These are in-process gates.

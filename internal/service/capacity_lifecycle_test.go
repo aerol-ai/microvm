@@ -456,6 +456,10 @@ func (c *lifecyclePlacementCluster) BeginDeletePlacementExact(_ context.Context,
 	return c.beginErr
 }
 
+func (c *lifecyclePlacementCluster) PlacementPage(req cluster.PlacementPageRequest) cluster.PlacementPageResponse {
+	return stubPlacementPage(c.placements, req)
+}
+
 func (c *lifecyclePlacementCluster) Placements() []cluster.Placement {
 	out := make([]cluster.Placement, len(c.placements))
 	copy(out, c.placements)

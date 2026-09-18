@@ -938,3 +938,7 @@ func TestStartClusterIngressReconcileEnabledPath(t *testing.T) {
 	svc.StartClusterIngressReconcile(ctx)
 	time.Sleep(20 * time.Millisecond)
 }
+
+func (c *serviceClusterStub) PlacementPage(req cluster.PlacementPageRequest) cluster.PlacementPageResponse {
+	return stubPlacementPage(c.placements, req)
+}

@@ -12,6 +12,20 @@ import (
 // must run dedicated server, worker, and ingress tiers.
 const MaxMixedClusterNodes = 10
 
+// MaxServerTierNodes caps the live server-role tier. The voter cap
+// (SB_CLUSTER_MAX_AUTO_VOTERS, default 5) bounds how many nodes *vote*, not how
+// many hold state: a surplus server-role node is added as a Raft non-voter and
+// still receives the full log and FSM — at 100k sandboxes that is ~72 MB of
+// placement state plus a leader replication stream each. Scaling out belongs in
+// the worker and ingress tiers, which run Agent and hold no FSM at all, so the
+// control plane stays a small fixed set however large the fleet grows.
+//
+// 7 = the default 5 voters plus two slots, so a rolling replacement can bring a
+// new server up before retiring the old one without tripping the gate.
+// Deliberately a constant, like MaxMixedClusterNodes: an env override here
+// would just re-open the foot-gun it exists to close.
+const MaxServerTierNodes = 7
+
 type topologyRoleSet struct {
 	server      bool
 	worker      bool
@@ -130,6 +144,10 @@ func LargeClusterTopologyError(members []Member) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: clusters with more than %d live nodes require dedicated server, worker, and ingress tiers (live=%d missing=%s)",
 			ErrInvalidTopology, MaxMixedClusterNodes, live, strings.Join(missing, ","))
+	}
+	if server > MaxServerTierNodes {
+		return fmt.Errorf("%w: the server tier is capped at %d live nodes (live_servers=%d); every server-role node carries a full Raft FSM replica, and SB_CLUSTER_MAX_AUTO_VOTERS caps only voters — extra servers join as non-voters and still replicate the whole placement map. Re-role the surplus nodes to worker or ingress",
+			ErrInvalidTopology, MaxServerTierNodes, server)
 	}
 	return nil
 }
