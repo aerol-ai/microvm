@@ -696,20 +696,30 @@ func (s *Service) ReFanoutClusterSecretsForNodes(ctx context.Context, nodeIDs ma
 		if len(rows) == 0 {
 			break
 		}
-		placements, err := s.secretRefanoutPlacements(ctx, rows)
-		if err != nil {
-			// Placement absence retires a stale lifecycle, but an unavailable
-			// authoritative placement read must never be interpreted as absence:
-			// doing so would delete every local secret during a control-plane
-			// outage immediately after worker restart.
-			return errors.Join(validationErr, err)
-		}
+		// Filter BEFORE the placement read, not after. Recipient membership is
+		// already on the local row, so a page owing this rejoining node nothing
+		// needs no authoritative lookup at all. Reading first made one member
+		// restart cost a leader placement batch for every page of every node's
+		// secrets — a fleet-wide validation burst to repair nothing.
+		owed := make([]store.ClusterSecretRecord, 0, len(rows))
 		for _, rec := range rows {
-			if !secretRecipientsInclude(rec.Recipients, nodeIDs) {
-				continue
+			if secretRecipientsInclude(rec.Recipients, nodeIDs) {
+				owed = append(owed, rec)
 			}
-			if _, err := s.prepareSecretRefanoutRecord(ctx, rec, true, placements, nil); err != nil {
-				validationErr = errors.Join(validationErr, err)
+		}
+		if len(owed) > 0 {
+			placements, err := s.secretRefanoutPlacements(ctx, owed)
+			if err != nil {
+				// Placement absence retires a stale lifecycle, but an unavailable
+				// authoritative placement read must never be interpreted as absence:
+				// doing so would delete every local secret during a control-plane
+				// outage immediately after worker restart.
+				return errors.Join(validationErr, err)
+			}
+			for _, rec := range owed {
+				if _, err := s.prepareSecretRefanoutRecord(ctx, rec, true, placements, nil); err != nil {
+					validationErr = errors.Join(validationErr, err)
+				}
 			}
 		}
 		afterRef = rows[len(rows)-1].Ref
@@ -1375,6 +1385,48 @@ func (s *Service) auditIdentityFor(sandboxID string) (incarnationID, ownerRef st
 	if s == nil {
 		return "", ""
 	}
+	// Hot path: egress audit stamps every event with this. Both fields are
+	// immutable for a lifecycle, so a hit costs no placement read at all.
+	s.auditIncarnationMu.RLock()
+	cached, ok := s.auditIdentityCache[sandboxID]
+	s.auditIncarnationMu.RUnlock()
+	if ok {
+		return cached.incarnationID, cached.ownerRef
+	}
+	incarnationID, ownerRef = s.resolveAuditIdentity(sandboxID)
+	// Only a resolved lifecycle is worth remembering. Caching "" would pin a
+	// sandbox whose placement had not landed yet into a permanently blank
+	// identity for the rest of its life.
+	if strings.TrimSpace(incarnationID) != "" {
+		s.auditIncarnationMu.Lock()
+		if s.auditIdentityCache == nil {
+			s.auditIdentityCache = make(map[string]auditIdentity)
+		}
+		s.auditIdentityCache[sandboxID] = auditIdentity{incarnationID: incarnationID, ownerRef: ownerRef}
+		s.auditIncarnationMu.Unlock()
+	}
+	return incarnationID, ownerRef
+}
+
+// auditIdentity is one sandbox lifetime's audit stamp.
+type auditIdentity struct {
+	incarnationID string
+	ownerRef      string
+}
+
+// invalidateAuditIdentity drops a sandbox's memoized stamp. Called when a
+// lifecycle starts and when one ends, so the next resolve re-reads rather
+// than serving a previous lifetime's incarnation under a reused sandbox ID.
+func (s *Service) invalidateAuditIdentity(sandboxID string) {
+	if s == nil || strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	s.auditIncarnationMu.Lock()
+	delete(s.auditIdentityCache, sandboxID)
+	s.auditIncarnationMu.Unlock()
+}
+
+func (s *Service) resolveAuditIdentity(sandboxID string) (incarnationID, ownerRef string) {
 	if c := s.Cluster(); c != nil {
 		if p, ok := c.PlacementOf(sandboxID); ok {
 			if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
@@ -1405,6 +1457,10 @@ func (s *Service) prepareAuditIncarnation(ctx context.Context, sandboxID, toolbo
 	if s == nil || strings.TrimSpace(sandboxID) == "" {
 		return "", errors.New("prepare audit incarnation: sandbox id required")
 	}
+	// A new lifetime is starting under this ID. Drop any memoized stamp before
+	// it can be served to the new one — this is the eviction that stops a
+	// recreated deterministic sandbox ID inheriting the old capability.
+	s.invalidateAuditIdentity(sandboxID)
 	if bound := strings.TrimSpace(secrets.IncarnationIDFromContext(ctx)); bound != "" {
 		s.auditIncarnationMu.Lock()
 		if s.pendingAuditIncarnation == nil {

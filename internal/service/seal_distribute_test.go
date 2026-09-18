@@ -1773,6 +1773,22 @@ func (c *resealPlacementCluster) AuthoritativePlacementsByIDs(_ context.Context,
 	return out, nil
 }
 
+// PlacementsByIDs must be overridden alongside PlacementOf: the holder
+// refresh resolves every tracked holder in one batch, and Noop's default
+// returns an empty map, which would read as "placement gone" and retire the
+// holder set instead of exercising the reseal path.
+func (c *resealPlacementCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]cluster.Placement)
+	for _, id := range ids {
+		if id == c.placement.SandboxID && id != "" {
+			out[id] = c.placement
+		}
+	}
+	return out
+}
+
 func (c *resealPlacementCluster) SecretsOf(string) cluster.PlacementSecrets {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -938,7 +938,15 @@ func (s *Service) aliveMemberSet() map[string]struct{} {
 	if c == nil {
 		return out
 	}
-	for _, m := range c.Members() {
+	// Liveness is gossip's own answer. Members() on an agent is a
+	// control-plane round trip carrying every peer (~850 B each, ~1.7 MB at
+	// 2k nodes) and this runs on a 30s maintenance tick on every node — so
+	// read the local SWIM view and fall back only when it is empty.
+	members := c.LocalMembers()
+	if len(members) == 0 {
+		members = c.Members()
+	}
+	for _, m := range members {
 		if m.Alive && m.NodeID != "" {
 			out[m.NodeID] = struct{}{}
 		}
@@ -968,6 +976,47 @@ const (
 // When any frozen target is dead, recipients are replaced via
 // Raft + recipient-bound AAD reseal (SelectReplacementRecipients) before
 // holder targets advance — pushing the old ciphertext would fail Open.
+// secretHolderPlacements resolves every tracked holder's placement in ONE
+// batch per maintenance tick. Returns ok=false when the view is unavailable;
+// callers must skip rather than treat the empty result as "these placements
+// are gone", because a missing placement retires holder state.
+//
+// Parity note: this is the non-authoritative batch, matching the PlacementOf
+// point read it replaces. Holder sets are in-memory bookkeeping rebuilt by
+// the next fan-out, not durable state, so they do not need the authoritative
+// read that destructive placement reconcilers use.
+func (s *Service) secretHolderPlacements() (map[string]cluster.Placement, bool) {
+	if s == nil || !s.cfg.EnableCluster {
+		return nil, true
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil, false
+	}
+	seen := make(map[string]struct{})
+	ids := make([]string, 0, 64)
+	secretFanoutHolders.Range(func(key, _ any) bool {
+		holderKey, _ := key.(secretHolderKey)
+		if holderKey.sandboxID == "" {
+			return true
+		}
+		if _, dup := seen[holderKey.sandboxID]; dup {
+			return true
+		}
+		seen[holderKey.sandboxID] = struct{}{}
+		ids = append(ids, holderKey.sandboxID)
+		return true
+	})
+	if len(ids) == 0 {
+		return map[string]cluster.Placement{}, true
+	}
+	out := c.PlacementsByIDs(ids)
+	if out == nil {
+		return nil, false
+	}
+	return out, true
+}
+
 func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	if s == nil {
 		return
@@ -983,6 +1032,17 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	defer cancel()
 	selfID := s.selfNodeID()
 	alive := s.aliveMemberSet()
+	// One batch for the whole tick. Both passes below used to call
+	// PlacementOf per tracked holder — on an agent that is a control-plane
+	// round trip each, twice per holder per tick, and it ran BEFORE
+	// secretHolderRefreshBatch so the cap never bounded it.
+	placements, placementsOK := s.secretHolderPlacements()
+	if !placementsOK {
+		// Not authoritative. A missing placement retires a holder, so an
+		// unavailable read must never stand in for absence: that would drop
+		// every holder set on this node during a control-plane blip.
+		return
+	}
 	type job struct {
 		sandboxID     string
 		incarnationID string
@@ -1004,11 +1064,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		}
 		var placementGeneration int64
 		if s.cfg.EnableCluster {
-			c := s.Cluster()
-			if c == nil {
-				return false
-			}
-			placement, ok := c.PlacementOf(sandboxID)
+			placement, ok := placements[sandboxID]
 			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != holderKey.incarnationID {
 				secretFanoutHolders.Delete(holderKey)
 				return true
@@ -1107,11 +1163,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			return true
 		}
 		if s.cfg.EnableCluster {
-			c := s.Cluster()
-			if c == nil {
-				return false
-			}
-			placement, ok := c.PlacementOf(sandboxID)
+			placement, ok := placements[sandboxID]
 			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != holderKey.incarnationID {
 				secretFanoutHolders.Delete(holderKey)
 				return true
