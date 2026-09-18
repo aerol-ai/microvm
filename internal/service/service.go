@@ -187,9 +187,17 @@ type Service struct {
 	auditIngestKey          string
 	auditIncarnationMu      sync.RWMutex
 	pendingAuditIncarnation map[string]string
-	auditExportMu           sync.Mutex
-	auditExportRunMu        sync.Mutex // serializes cursor/read/export/prune reset
-	auditExporter           controlplane.AuditExporter
+	// auditIdentityCache memoizes each sandbox's resolved (incarnation,
+	// owner_ref). Both are immutable for a lifecycle, and egress audit stamps
+	// every event with them — without this, one event per sandbox per second
+	// is one control-plane placement read per event on every worker, ahead of
+	// the sink's rate limiter. Evicted whenever a lifecycle starts or ends so
+	// a recreated deterministic sandbox ID can never inherit the previous
+	// lifetime's identity. Guarded by auditIncarnationMu.
+	auditIdentityCache map[string]auditIdentity
+	auditExportMu      sync.Mutex
+	auditExportRunMu   sync.Mutex // serializes cursor/read/export/prune reset
+	auditExporter      controlplane.AuditExporter
 	// auditBackend is the env-configured connector behind auditExporter (nil
 	// when a managed build injected its own exporter or none is configured).
 	auditBackend auditexport.Backend
@@ -1154,6 +1162,7 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 			return err
 		}
 	}
+	s.invalidateAuditIdentity(sandbox.ID)
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
@@ -2869,6 +2878,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
 		return err
 	}
+	s.invalidateAuditIdentity(id)
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
@@ -4822,6 +4832,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// with status "started" sitting in sandboxes would make every
 			// sweep skip this image, leaking layers across reconcile cycles
 			// until something else changed.
+			s.invalidateAuditIdentity(sandbox.ID)
 			if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
