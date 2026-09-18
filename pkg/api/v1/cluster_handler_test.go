@@ -32,8 +32,10 @@ type createForwardCluster struct {
 	forwardedCreateID  string
 	forwardedBody      string
 	selectPlacementHit int
+	selectForCreateHit int
 	selectRequests     []capacity.Request
 	selectErr          error
+	lastRecipients     []string
 
 	reserveErr   error
 	reserveCalls []reserveCall
@@ -57,6 +59,12 @@ func (c *createForwardCluster) SelectPlacement(req capacity.Request) (cluster.Pl
 
 func (c *createForwardCluster) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	c.selectPlacementHit++
+	return c.selectPlacement(req)
+}
+
+// selectPlacement is the shared body so the two entry points can be counted
+// apart — the create path must reach the bounded one, never the candidate one.
+func (c *createForwardCluster) selectPlacement(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	c.selectRequests = append(c.selectRequests, req)
 	if c.selectErr != nil {
 		return cluster.PlacementTarget{}, nil, c.selectErr
@@ -66,6 +74,22 @@ func (c *createForwardCluster) SelectPlacementWithCandidates(req capacity.Reques
 		cands = []cluster.Member{{NodeID: c.target.NodeID, APIURL: c.target.APIURL, Alive: true}}
 	}
 	return c.target, cands, nil
+}
+
+// SelectPlacementForCreate must be overridden alongside the candidate variant:
+// Noop's default calls ITS OWN SelectPlacementWithCandidates, not this stub's,
+// so a stub that only overrides the latter silently loses selectErr/target.
+func (c *createForwardCluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (cluster.PlacementTarget, []string, error) {
+	c.selectForCreateHit++
+	target, candidates, err := c.selectPlacement(req)
+	if err != nil {
+		return cluster.PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	c.lastRecipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups)
+	return target, c.lastRecipients, nil
 }
 
 func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, secrets cluster.PlacementSecrets, ttl time.Duration) error {
@@ -162,8 +186,13 @@ func TestClusterCreateWrapPinsForwardedCreateToSelectedTarget(t *testing.T) {
 	if fakeCluster.forwardedTarget != "node-b" {
 		t.Fatalf("%s = %q, want node-b", clusterCreateTargetHeader, fakeCluster.forwardedTarget)
 	}
-	if fakeCluster.selectPlacementHit != 1 {
-		t.Fatalf("SelectPlacement calls = %d, want 1", fakeCluster.selectPlacementHit)
+	// Exactly one placement decision, and it must be the bounded one: the
+	// candidate-returning variant ships a Member per eligible worker.
+	if fakeCluster.selectForCreateHit != 1 {
+		t.Fatalf("SelectPlacementForCreate calls = %d, want 1", fakeCluster.selectForCreateHit)
+	}
+	if fakeCluster.selectPlacementHit != 0 {
+		t.Fatalf("SelectPlacementWithCandidates calls = %d, want 0", fakeCluster.selectPlacementHit)
 	}
 	if len(fakeCluster.reserveCalls) != 1 {
 		t.Fatalf("ReserveOnTarget calls = %d, want 1 — reservation MUST be written before forwarding (B2)", len(fakeCluster.reserveCalls))
@@ -644,6 +673,17 @@ func (c *membersStubCluster) SelectPlacementWithCandidates(req capacity.Request)
 		return c.placement, append([]cluster.Member(nil), c.members...), nil
 	}
 	return c.Noop.SelectPlacementWithCandidates(req)
+}
+
+func (c *membersStubCluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (cluster.PlacementTarget, []string, error) {
+	target, candidates, err := c.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return cluster.PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
 }
 
 func (c *membersStubCluster) PeerDialMember(m cluster.Member) (*http.Client, string, error) {

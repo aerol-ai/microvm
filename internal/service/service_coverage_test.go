@@ -3116,6 +3116,10 @@ type missingPlacementCluster struct {
 	placements []cluster.Placement
 }
 
+func (c *missingPlacementCluster) PlacementPage(req cluster.PlacementPageRequest) cluster.PlacementPageResponse {
+	return stubPlacementPage(c.placements, req)
+}
+
 func (c *missingPlacementCluster) Placements() []cluster.Placement { return c.placements }
 
 func (c *missingPlacementCluster) PlacementsByIDs(ids []string) map[string]cluster.Placement {

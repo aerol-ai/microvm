@@ -5046,6 +5046,59 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	return nil
 }
 
+// maxSelfOwnedReconcilePages bounds one sweep's paging so a control plane that
+// keeps handing back a non-advancing cursor can't spin the reconcile goroutine.
+// At cluster.DefaultPlacementPageLimit (1000) this covers 1M rows on a single
+// owner — the whole 100k-sandbox target fleet on one node, ten times over.
+const maxSelfOwnedReconcilePages = 1000
+
+// selfOwnedPlacementsForReconcile returns every materialized placement this
+// node owns, paged through the owner-filtered index.
+//
+// It returns nil — not a partial list — the moment a page comes back
+// non-authoritative or the cursor fails to advance. A partial answer here is
+// indistinguishable from "these sandboxes have no placement", and the caller
+// deletes on exactly that signal, so anything short of a complete view must
+// skip the sweep rather than act on a fragment of it.
+func (s *Service) selfOwnedPlacementsForReconcile(ctx context.Context, c cluster.Client, self string) []cluster.Placement {
+	var (
+		out   []cluster.Placement
+		token string
+	)
+	for page := 0; page < maxSelfOwnedReconcilePages; page++ {
+		if ctx.Err() != nil {
+			return nil
+		}
+		resp := c.PlacementPage(cluster.PlacementPageRequest{OwnerNodeID: self, PageToken: token})
+		if !resp.Authoritative {
+			// Control plane unreachable or FSM not ready. Skip this sweep; the
+			// next tick retries. Never treat it as "nothing is placed."
+			if s.logger != nil {
+				s.logger.Warn("cluster placement reconcile skipped: placement view unavailable",
+					"node_id", self, "page", page)
+			}
+			return nil
+		}
+		out = append(out, resp.Placements...)
+		if resp.NextPageToken == "" {
+			return out
+		}
+		if resp.NextPageToken == token {
+			if s.logger != nil {
+				s.logger.Warn("cluster placement reconcile skipped: page cursor did not advance",
+					"node_id", self, "page_token", token)
+			}
+			return nil
+		}
+		token = resp.NextPageToken
+	}
+	if s.logger != nil {
+		s.logger.Warn("cluster placement reconcile skipped: exceeded page budget",
+			"node_id", self, "max_pages", maxSelfOwnedReconcilePages)
+	}
+	return nil
+}
+
 func (s *Service) reconcileMissingSelfOwnedPlacements(ctx context.Context, knownIDs map[string]struct{}) {
 	if !s.cfg.EnableCluster {
 		return
@@ -5058,7 +5111,12 @@ func (s *Service) reconcileMissingSelfOwnedPlacements(ctx context.Context, known
 	if self == "" {
 		return
 	}
-	for _, p := range c.Placements() {
+	// Page this node's own rows instead of pulling the global placement map.
+	// At the 100k-sandbox / 2k-worker target the unfiltered view is ~72 MB —
+	// past the agent's 16 MiB control-plane response cap — so every worker's
+	// sweep failed into an empty cached view and silently reclaimed nothing,
+	// stranding placements for sandboxes whose local row was already gone.
+	for _, p := range s.selfOwnedPlacementsForReconcile(ctx, c, self) {
 		if p.SandboxID == "" || p.OwnerNodeID != self || p.IsReserved() || p.IsOrphaned() {
 			continue
 		}

@@ -352,11 +352,15 @@ type placementFSM struct {
 	// rejects collisions in O(1) under the FSM lock instead of scanning every
 	// placement at 100k-row scale.
 	hostPortIndex map[int]hostPortClaim
-	// ownerIndex maps active owner nodeID -> placed sandbox IDs. Dead-owner
-	// eviction reads this instead of scanning the full placement table. Pending
-	// reservations are tracked separately below because they are capacity
-	// holds, not materialized sandboxes.
-	ownerIndex map[string]map[string]struct{}
+	// ownerIndex maps active owner nodeID -> placed sandbox IDs, ordered.
+	// Dead-owner eviction reads this instead of scanning the full placement
+	// table. It is a btree (not a set) so PlacementPage can seek a cursor and
+	// walk one page of a single owner's rows in O(log n + limit): at
+	// 100k sandboxes across 2k workers, each worker reconciles by paging its
+	// own ~50 rows instead of downloading the global map. Pending reservations
+	// are tracked separately below because they are capacity holds, not
+	// materialized sandboxes.
+	ownerIndex map[string]*btree.BTreeG[string]
 	// pendingReservationClaims is the per-reservation ledger behind
 	// pendingReservationCapacity. SelectPlacement reads the aggregate instead
 	// of scanning every placement row on each create. Expiries are tracked in
@@ -484,7 +488,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		placementIDs:                 newPlacementIDIndex(),
 		ownerRefIndex:                make(map[string]*btree.BTreeG[string]),
 		hostPortIndex:                make(map[int]hostPortClaim),
-		ownerIndex:                   make(map[string]map[string]struct{}),
+		ownerIndex:                   make(map[string]*btree.BTreeG[string]),
 		pendingReservationClaims:     make(map[string]pendingReservationClaim),
 		pendingReservationCapacity:   make(map[string]capacity.Request),
 		pendingReservationIDsByOwner: make(map[string]map[string]struct{}),
@@ -1771,14 +1775,14 @@ func (f *placementFSM) claimOwnerLocked(sandboxID string, p Placement) {
 		return
 	}
 	if f.ownerIndex == nil {
-		f.ownerIndex = make(map[string]map[string]struct{})
+		f.ownerIndex = make(map[string]*btree.BTreeG[string])
 	}
 	ids := f.ownerIndex[p.OwnerNodeID]
 	if ids == nil {
-		ids = make(map[string]struct{})
+		ids = newPlacementIDIndex()
 		f.ownerIndex[p.OwnerNodeID] = ids
 	}
-	ids[sandboxID] = struct{}{}
+	ids.ReplaceOrInsert(sandboxID)
 }
 
 func (f *placementFSM) releaseOwnerLocked(sandboxID string, p Placement) {
@@ -1789,12 +1793,14 @@ func (f *placementFSM) releaseOwnerLocked(sandboxID string, p Placement) {
 	if ids == nil {
 		return
 	}
-	delete(ids, sandboxID)
-	if len(ids) == 0 {
+	ids.Delete(sandboxID)
+	if ids.Len() == 0 {
 		delete(f.ownerIndex, p.OwnerNodeID)
 	}
 }
 
+// ownedPlacementIDsLocked returns every sandbox ID owned by nodeID, sorted.
+// The btree already holds them in order, so no sort is needed here.
 func (f *placementFSM) ownedPlacementIDsLocked(nodeID string) []string {
 	if nodeID == "" {
 		return nil
@@ -1803,11 +1809,11 @@ func (f *placementFSM) ownedPlacementIDsLocked(nodeID string) []string {
 	if ids == nil {
 		return nil
 	}
-	out := make([]string, 0, len(ids))
-	for id := range ids {
+	out := make([]string, 0, ids.Len())
+	ids.Ascend(func(id string) bool {
 		out = append(out, id)
-	}
-	sort.Strings(out)
+		return true
+	})
 	return out
 }
 
@@ -2586,6 +2592,15 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 }
 
 func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
+	// Owner-node paging is the narrowest filter, so it wins: a worker asking
+	// for its own rows must never pay a scan of the global table.
+	if ownerNodeID := strings.TrimSpace(req.OwnerNodeID); ownerNodeID != "" {
+		if f.ownerIndex != nil {
+			return f.pagePlacementIDsByOwnerNodeLocked(req, ownerNodeID, shardFilter, allShards, wantShards)
+		}
+		// Index missing (partial restore) — fall back to scan.
+		return f.pagePlacementIDsByScanLocked(req, shardFilter, allShards, wantShards)
+	}
 	if ownerRef := strings.TrimSpace(req.OwnerRef); ownerRef != "" {
 		if f.ownerRefIndex != nil {
 			return f.pagePlacementIDsByOwnerRefLocked(req, ownerRef, shardFilter, allShards, wantShards)
@@ -2641,6 +2656,34 @@ func (f *placementFSM) pagePlacementIDsByOwnerRefLocked(req PlacementPageRequest
 	return ids
 }
 
+// pagePlacementIDsByOwnerNodeLocked walks one owner's ordered ID set from the
+// cursor. Mirrors the OwnerRef variant; the tree keeps this O(log n + limit)
+// rather than O(total placements) per page.
+func (f *placementFSM) pagePlacementIDsByOwnerNodeLocked(req PlacementPageRequest, ownerNodeID string, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
+	tree := f.ownerIndex[ownerNodeID]
+	if tree == nil {
+		return nil
+	}
+	ids := make([]string, 0, req.Limit)
+	shardCount := shardFilter.ShardCount
+	if shardCount <= 0 {
+		shardCount = DefaultPlacementShardCount
+	}
+	tree.AscendGreaterOrEqual(req.PageToken, func(id string) bool {
+		if req.PageToken != "" && id <= req.PageToken {
+			return true
+		}
+		if !allShards {
+			if _, ok := wantShards[PlacementShardForSandbox(id, shardCount)]; !ok {
+				return true
+			}
+		}
+		ids = append(ids, id)
+		return len(ids) < req.Limit
+	})
+	return ids
+}
+
 func (f *placementFSM) pagePlacementIDsByScanLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
 	ids := make([]string, 0, len(f.placements))
 	shardCount := shardFilter.ShardCount
@@ -2648,9 +2691,19 @@ func (f *placementFSM) pagePlacementIDsByScanLocked(req PlacementPageRequest, sh
 		shardCount = DefaultPlacementShardCount
 	}
 	ownerRef := strings.TrimSpace(req.OwnerRef)
+	ownerNodeID := strings.TrimSpace(req.OwnerNodeID)
 	for id, p := range f.placements {
 		if req.PageToken != "" && id <= req.PageToken {
 			continue
+		}
+		// Match the owner index's contract exactly: it only tracks
+		// materialized rows, so the scan fallback must skip reservations and
+		// orphans too or a degraded FSM would hand back a wider set than the
+		// indexed path and the reconciler would act on rows it doesn't own.
+		if ownerNodeID != "" {
+			if strings.TrimSpace(p.OwnerNodeID) != ownerNodeID || p.IsReserved() || p.IsOrphaned() {
+				continue
+			}
 		}
 		placeOwner := strings.TrimSpace(p.OwnerRef)
 		// Never match empty OwnerRef into a tenant page — partial restores can
@@ -2876,7 +2929,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.placementIDs = newPlacementIDIndex()
 	f.ownerRefIndex = make(map[string]*btree.BTreeG[string])
 	f.hostPortIndex = make(map[int]hostPortClaim)
-	f.ownerIndex = make(map[string]map[string]struct{})
+	f.ownerIndex = make(map[string]*btree.BTreeG[string])
 	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
 	f.pendingReservationCapacity = make(map[string]capacity.Request)
 	f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})

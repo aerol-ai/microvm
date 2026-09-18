@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"github.com/google/btree"
 	"io"
 	"log/slog"
 	"strings"
@@ -90,8 +91,8 @@ func TestEvictDeadOwnerNoTargetAndReconcileEdges(t *testing.T) {
 func TestFSMOrphanOwnerStaleIndexAndReserveBatchStoreFail(t *testing.T) {
 	fsm := newPlacementFSM()
 	fsm.mu.Lock()
-	fsm.ownerIndex = map[string]map[string]struct{}{
-		"n": {"ghost": {}, "res": {}},
+	fsm.ownerIndex = map[string]*btree.BTreeG[string]{
+		"n": ownerIndexTree("ghost", "res"),
 	}
 	fsm.placements["res"] = Placement{
 		SandboxID: "res", OwnerNodeID: "n", State: PlacementStateReserved,
@@ -154,9 +155,9 @@ func TestEvictDeadOwnerReassignFailAndRemoveServerFail(t *testing.T) {
 	// Stale ownerIndex entry → !ok continue inside evict.
 	leader.fsm.mu.Lock()
 	if leader.fsm.ownerIndex == nil {
-		leader.fsm.ownerIndex = map[string]map[string]struct{}{}
+		leader.fsm.ownerIndex = map[string]*btree.BTreeG[string]{}
 	}
-	leader.fsm.ownerIndex["phantom"] = map[string]struct{}{"ghost-id": {}}
+	leader.fsm.ownerIndex["phantom"] = ownerIndexTree("ghost-id")
 	leader.fsm.mu.Unlock()
 
 	spec := &models.CreateSandboxRequest{
@@ -224,8 +225,8 @@ func TestFSMOrphanOwnerSkipReservedAndMissing(t *testing.T) {
 	})
 	// Manually poison owner index with a missing id and a reserved id so orphan skips them.
 	fsm.mu.Lock()
-	fsm.ownerIndex["n"]["ghost"] = struct{}{}
-	fsm.ownerIndex["n"]["res"] = struct{}{} // reserved also in pending; ownedPlacementIDs may still list if poisoned
+	fsm.ownerIndex["n"].ReplaceOrInsert("ghost")
+	fsm.ownerIndex["n"].ReplaceOrInsert("res") // reserved also in pending; ownedPlacementIDs may still list if poisoned
 	fsm.mu.Unlock()
 	if got := applyOp(t, fsm, command{Op: opOrphanOwner, NodeID: "n"}); got != nil {
 		t.Fatalf("orphan=%v", got)

@@ -110,9 +110,15 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 //  2. if forwarded (X-Cluster-Create-Target == self): run locally against the
 //     reservation the router already wrote. The forwarded path never re-runs
 //     SelectPlacement (B1 fix preserved).
-//  3. otherwise: SelectPlacement, mint a sandbox ID, redact secrets, and write
-//     opReserve to raft (so the cluster has *intent* before any side effect —
-//     B2 fix), then create locally or forward using that same reservation.
+//  3. otherwise: select a placement, mint a sandbox ID, redact secrets, and
+//     write opReserve to raft (so the cluster has *intent* before any side
+//     effect — B2 fix), then create locally or forward using that reservation.
+//
+// Steps 2 and 3 live in pkg/api/clustercreate, shared with the daytona and e2b
+// facades — this handler only adds the v1 body handling and the local create.
+// Keep them there: the copy that used to live here is how v1 went on shipping
+// the candidate fleet per create after the bounded selector landed everywhere
+// else.
 //
 // On forward we don't roll back the reservation when ForwardHTTP can't reach
 // the peer: ForwardHTTP doesn't return a transport error (it streams the proxy
@@ -145,192 +151,29 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		h.createSandbox(w, r)
 		return
 	}
-	c := h.deps.Service.Cluster()
-	if c == nil {
+	if h.deps.Service.Cluster() == nil {
 		h.createSandbox(w, r)
 		return
 	}
 
-	if targetNodeID := strings.TrimSpace(r.Header.Get(clusterCreateTargetHeader)); targetNodeID != "" {
-		if targetNodeID != c.SelfNodeID() {
-			cluster.RecordOwnerForwardStale()
-			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
-			return
-		}
-		// Local-only image creates cannot use the reservation-first flow: the
-		// image tag is expected to exist on the selected worker already. A
-		// cluster router may still forward these off an ingress/server node, so
-		// accept a target-pinned request without X-Cluster-Create-ID.
-		if service.ImageRequiresLocalPlacement(req) {
-			h.createSandboxOnSelectedNode(w, r, req, "")
-			return
-		}
-		// Reservation-first: a forwarded create MUST carry the ID the router
-		// minted before opReserve, so CreateSandboxWithID + RecordPlacement
-		// promote run against the same row. A missing header means the request
-		// came from a stale router that pre-dates the reservation flow — fail
-		// fast rather than minting a fresh ID and silently de-syncing the FSM
-		// from the local sandbox.
-		sandboxID := strings.TrimSpace(r.Header.Get(clusterCreateIDHeader))
-		if sandboxID == "" {
-			apihttp.WriteError(w, http.StatusBadRequest, "cluster: forwarded create missing X-Cluster-Create-ID")
-			return
-		}
-		h.createSandboxOnSelectedNode(w, r, req, sandboxID)
+	// Placement, reservation and forwarding are the same decision for native
+	// v1 as for the daytona/e2b facades, so they run through one
+	// implementation. The duplicate that used to live here is what let
+	// v1 keep calling SelectPlacementWithCandidates after the bounded
+	// selector landed — every create downloading one Member per eligible
+	// worker (~1.7 MB at 2k nodes) only to discard the slice.
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteError, clustercreate.PrepareOptions{
+		Normalize:      normalizeCreateRuntimeForPlacement,
+		OwnerRef:       service.OwnerRefForCreate(r.Context()),
+		SyncBody:       true,
+		MetricPrefix:   "v1.create",
+		OnForwardStale: cluster.RecordOwnerForwardStale,
+		Logger:         h.deps.Logger,
+	})
+	if !ok {
 		return
 	}
-
-	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := service.NormalizeCreateFailover(&req); err != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := normalizeCreateRuntimeForPlacement(&req); err != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if h.deps.Service.ClusterEnabled() {
-		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
-			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	normalizedRaw, err := json.Marshal(req)
-	if err != nil {
-		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
-		return
-	}
-	r.Body = io.NopCloser(bytes.NewReader(normalizedRaw))
-	r.ContentLength = int64(len(normalizedRaw))
-
-	if service.ImageRequiresLocalPlacement(req) {
-		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
-		if clusterSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
-			if c.IsNodeDrained(c.SelfNodeID()) {
-				apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
-				return
-			}
-			h.createSandboxOnSelectedNode(w, r, req, "")
-			return
-		}
-		target, err := c.SelectPlacement(capacityRequestFromCreate(req))
-		if err != nil {
-			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
-				// The artifact went with its node; no Retry-After, the client
-				// must re-create it (re-upload the bundle / rebuild the image).
-				apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
-				return
-			}
-			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
-				if errors.Is(err, cluster.ErrInvalidTopology) {
-					w.Header().Set("Retry-After", "300")
-				} else {
-					w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-				}
-				apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
-				return
-			}
-			apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
-			return
-		}
-		if target.IsSelf {
-			if c.IsNodeDrained(c.SelfNodeID()) {
-				apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
-				return
-			}
-			h.createSandboxOnSelectedNode(w, r, req, "")
-			return
-		}
-		if strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") && h.deps.Logger != nil {
-			h.deps.Logger.Info("cluster create: forwarding built local image to selected worker",
-				"image", req.Image, "target", target.NodeID)
-		}
-		r.Header.Set(clusterCreateTargetHeader, target.NodeID)
-		r.Header.Del(clusterCreateIDHeader)
-		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
-		return
-	}
-
-	target, candidates, err := c.SelectPlacementWithCandidates(capacityRequestFromCreate(req))
-	if err != nil {
-		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
-			// A node-bound js-bundle whose worker is gone: the client must
-			// re-upload, so no Retry-After — waiting changes nothing.
-			apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
-			return
-		}
-		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
-			if errors.Is(err, cluster.ErrInvalidTopology) {
-				w.Header().Set("Retry-After", "300")
-			} else {
-				w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-			}
-			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
-		return
-	}
-	// Cluster create: write the reservation BEFORE any Docker side effect.
-	// Remote targets need intent before forwarding; self targets need the
-	// same leader-side capacity/backpressure accounting at large scale.
-	sandboxID, err := service.GenerateSandboxID()
-	if err != nil {
-		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
-		return
-	}
-	redacted := h.deps.Service.RedactClusterSecretsConfigured(req)
-	reserveSecrets := cluster.PlacementSecrets{
-		OwnerRef: service.OwnerRefForCreate(r.Context()),
-	}
-	// Router picks the recipient set at reserve time (§3d-1). Target seals to
-	// the recorded set and must not recompute. Empty when flag off / non-HA.
-	if h.deps.Service.WantsSecretRecipientFanout(req) {
-		reserveSecrets.Recipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, h.deps.Service.SecretRecipientBackupCount())
-	}
-	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	if err := c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, clusterReservationTTL); err != nil {
-		// Name collision: deterministic 409 so clients can distinguish
-		// "pick a different name" from "cluster degraded, retry."
-		if errors.Is(err, cluster.ErrNameConflict) {
-			service.RecordFacadeIdempotencyConflict("v1.create.name")
-			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
-			return
-		}
-		// Reservation conflict (existing placed or live reservation under
-		// the same ID owned by someone else) — extremely unlikely with a
-		// freshly-minted ID, but surface it cleanly so the client retries.
-		if errors.Is(err, cluster.ErrReservationConflict) {
-			service.RecordFacadeIdempotencyConflict("v1.create.reservation")
-			apihttp.WriteError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
-			return
-		}
-		if errors.Is(err, cluster.ErrCreateBackpressure) {
-			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
-			apihttp.WriteError(w, http.StatusTooManyRequests, err.Error())
-			return
-		}
-		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
-			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
-		return
-	}
-	if target.IsSelf {
-		service.RecordCreateReservationState("reserve_local")
-		h.createSandboxOnSelectedNode(w, r, req, sandboxID)
-		return
-	}
-	service.RecordCreateReservationState("reserve_remote")
-	r.Header.Set(clusterCreateTargetHeader, target.NodeID)
-	r.Header.Set(clusterCreateIDHeader, sandboxID)
-	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	h.createSandboxOnSelectedNode(w, r, req, decision.ReservationID)
 }
 
 // createSandboxOnSelectedNode performs the local side effect once placement has
@@ -1624,67 +1467,11 @@ func (h *handlers) replicateRemoveExposedPort(ctx context.Context, id string, po
 	}
 }
 
-// capacityRequestFromCreate maps the wire CreateSandboxRequest into a
-// capacity.Request used for placement scoring. Defaults track normalizeCreateRequest
-// (via models.DefaultCPU / DefaultMemoryMB) so the score we use to pick the
-// owner matches the reservation that will actually be charged once the local
-// create runs — otherwise a request gets placed on a host that admission then
-// rejects.
+// capacityRequestFromCreate builds the placement-scoring request for a create.
+// The mapping lives in pkg/api/clustercreate so native v1 and the facades score
+// a create identically; this stays as the v1-local name its tests use.
 func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
-	cpu := req.CPU
-	mem := req.MemoryMB
-	disk := req.DiskGB
-	if cpu <= 0 {
-		cpu = models.DefaultCPU
-	}
-	if mem <= 0 {
-		mem = models.DefaultMemoryMB
-	}
-	if disk <= 0 {
-		disk = models.DefaultDiskGB
-	}
-	runtimeName := strings.TrimSpace(req.Runtime)
-	templateID := strings.TrimSpace(req.TemplateID)
-	if templateID != "" && runtimeName == "" {
-		runtimeName = models.RuntimeFirecracker
-	}
-	if runtimeName == "" {
-		runtimeName = models.RuntimeDocker
-	}
-	out := capacity.Request{
-		CPU:        cpu,
-		MemoryMB:   mem,
-		DiskGB:     diskGBForCapacity(disk, runtimeName, req.OverlaySizeGB),
-		Runtime:    runtimeName,
-		TemplateID: templateID,
-		ModuleRef:  models.ModuleRefForCreate(req),
-	}
-	if nodeID, ok := docker.BuiltImagePlacementNode(req.Image); ok {
-		out.RequiredNodeID = nodeID
-	}
-	if runtimeName == models.RuntimeIsolate {
-		if nodeID, _, ok := models.ParseJSBundleNodeRef(out.ModuleRef); ok {
-			out.RequiredNodeID = nodeID
-		}
-	}
-	if runtimeName == models.RuntimeWasm {
-		out.MemoryMB += 8
-	}
-	// GPUs == nil means "no GPU"; a non-nil GPURequest with Count <= 0 is
-	// the documented "default 1" path (see GPURequest.Count comment in
-	// pkg/models/types.go) and we mirror that here so placement scoring
-	// reserves at least one GPU. Count == -1 ("all") is also normalized
-	// to 1 for placement purposes — we can't gossip "all" cleanly, and
-	// any GPU host that has at least one card satisfies the intent.
-	if req.GPUs != nil {
-		want := req.GPUs.Count
-		if want <= 0 {
-			want = 1
-		}
-		out.GPUs = want
-		out.GPUVendor = string(req.GPUs.Vendor)
-	}
-	return out
+	return clustercreate.CapacityRequestFromCreate(req)
 }
 
 func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {

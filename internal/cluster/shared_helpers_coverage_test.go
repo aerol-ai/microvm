@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"github.com/google/btree"
+
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
@@ -18,4 +20,14 @@ func fmtErr(v any) string {
 		return ""
 	}
 	return v.(error).Error()
+}
+
+// ownerIndexTree builds a placement owner-index tree from literal IDs, for
+// tests that poison or preseed placementFSM.ownerIndex directly.
+func ownerIndexTree(ids ...string) *btree.BTreeG[string] {
+	t := newPlacementIDIndex()
+	for _, id := range ids {
+		t.ReplaceOrInsert(id)
+	}
+	return t
 }

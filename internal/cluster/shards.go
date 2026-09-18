@@ -42,6 +42,13 @@ type PlacementPageRequest struct {
 	ShardFilter PlacementShardFilter `json:"shard_filter,omitempty"`
 	// OwnerRef, when set, returns only placements for that tenant account.
 	OwnerRef string `json:"owner_ref,omitempty"`
+	// OwnerNodeID, when set, returns only placements this cluster node owns.
+	// Distinct from OwnerRef (tenant account). It is the read path a worker's
+	// reconcile sweep uses to enumerate its own rows: at 100k sandboxes the
+	// unfiltered view is ~72 MB, which every worker would otherwise pull on
+	// every sweep. Reserved and orphaned rows are excluded — the FSM's owner
+	// index only tracks materialized placements.
+	OwnerNodeID string `json:"owner_node_id,omitempty"`
 }
 
 type PlacementPageResponse struct {
@@ -87,6 +94,7 @@ func (r PlacementPageRequest) Normalize() PlacementPageRequest {
 		PageToken:   r.PageToken,
 		ShardFilter: r.ShardFilter.Normalize(),
 		OwnerRef:    strings.TrimSpace(r.OwnerRef),
+		OwnerNodeID: strings.TrimSpace(r.OwnerNodeID),
 	}
 }
 

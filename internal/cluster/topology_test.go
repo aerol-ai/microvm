@@ -149,3 +149,73 @@ func makeTopologyMembers(roles ...string) []Member {
 	}
 	return members
 }
+
+// The server tier is the only tier that holds Raft state. SB_CLUSTER_MAX_AUTO_VOTERS
+// caps voters, not replicas: a surplus server-role node joins as a non-voter and
+// still receives the full FSM. Worker and ingress scale out freely because they
+// run Agent and hold nothing.
+func TestLargeClusterTopologyCapsTheServerTier(t *testing.T) {
+	build := func(servers, workers, ingress int) []Member {
+		out := make([]Member, 0, servers+workers+ingress)
+		for i := 0; i < servers; i++ {
+			out = append(out, Member{NodeID: fmt.Sprintf("server-%03d", i), Alive: true, Role: config.NodeRoleServer})
+		}
+		for i := 0; i < workers; i++ {
+			out = append(out, Member{NodeID: fmt.Sprintf("worker-%03d", i), Alive: true, Role: config.NodeRoleWorker})
+		}
+		for i := 0; i < ingress; i++ {
+			out = append(out, Member{NodeID: fmt.Sprintf("ingress-%03d", i), Alive: true, Role: config.NodeRoleIngress})
+		}
+		return out
+	}
+
+	for _, tc := range []struct {
+		name    string
+		servers int
+		workers int
+		ingress int
+		wantErr bool
+	}{
+		{"at the cap is allowed", MaxServerTierNodes, 40, 4, false},
+		{"one over the cap fails closed", MaxServerTierNodes + 1, 40, 4, true},
+		{"a fat control plane fails closed", 50, 500, 20, true},
+		{"small clusters are exempt", MaxServerTierNodes + 3, 0, 0, false},
+		{"workers and ingress scale out freely", 3, 1900, 97, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := LargeClusterTopologyError(build(tc.servers, tc.workers, tc.ingress))
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidTopology) {
+					t.Fatalf("err = %v, want ErrInvalidTopology", err)
+				}
+				if !strings.Contains(err.Error(), "server tier is capped") {
+					t.Fatalf("err = %v, want the server-tier message", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// Dead server-role nodes must not count against the cap, or a rolling
+// replacement would wedge every create until gossip reaped the old members.
+func TestLargeClusterTopologyServerCapIgnoresDeadServers(t *testing.T) {
+	members := make([]Member, 0, MaxServerTierNodes+30)
+	for i := 0; i < MaxServerTierNodes; i++ {
+		members = append(members, Member{NodeID: fmt.Sprintf("server-%03d", i), Alive: true, Role: config.NodeRoleServer})
+	}
+	for i := 0; i < 5; i++ {
+		members = append(members, Member{NodeID: fmt.Sprintf("server-old-%03d", i), Alive: false, Role: config.NodeRoleServer})
+	}
+	for i := 0; i < 20; i++ {
+		members = append(members, Member{NodeID: fmt.Sprintf("worker-%03d", i), Alive: true, Role: config.NodeRoleWorker})
+	}
+	members = append(members, Member{NodeID: "ingress-000", Alive: true, Role: config.NodeRoleIngress})
+
+	if err := LargeClusterTopologyError(members); err != nil {
+		t.Fatalf("dead servers counted against the cap: %v", err)
+	}
+}

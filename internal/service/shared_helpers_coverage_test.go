@@ -45,6 +45,10 @@ func (c *wave30AuthCluster) BeginDeletePlacementExact(_ context.Context, sandbox
 	return c.deleteErr
 }
 
+func (c *wave30AuthCluster) PlacementPage(req cluster.PlacementPageRequest) cluster.PlacementPageResponse {
+	return stubPlacementPage(c.Placements(), req)
+}
+
 func (c *wave30AuthCluster) Placements() []cluster.Placement {
 	out := make([]cluster.Placement, 0, len(c.placements))
 	for _, p := range c.placements {

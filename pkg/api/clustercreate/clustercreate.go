@@ -1,8 +1,11 @@
 package clustercreate
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -32,6 +35,35 @@ type Decision struct {
 
 type PrepareOptions struct {
 	PreferredSandboxID string
+	// Normalize runs after the shared create normalizations and before
+	// placement. v1 uses it to settle runtime/template_id, which decides
+	// which workers are even eligible. Facades translate their own wire
+	// shape first and pass nil.
+	Normalize func(*models.CreateSandboxRequest) error
+	// OwnerRef is the tenant account recorded on the reservation's secret
+	// handle. Empty leaves the handle untenanted.
+	OwnerRef string
+	// SyncBody re-marshals the normalized request into r.Body so a forwarded
+	// create carries the normalizations the router applied. Native v1 sets
+	// this because the peer re-decodes the same CreateSandboxRequest shape;
+	// facades must NOT, because they forward their own wire body and
+	// re-translate it on the target.
+	SyncBody bool
+	// MetricPrefix labels idempotency-conflict metrics. Defaults to
+	// "cluster.create" when empty.
+	MetricPrefix string
+	// OnForwardStale fires when a forwarded create lands on the wrong node.
+	OnForwardStale func()
+	// Logger, when set, records placement decisions worth tracing.
+	Logger *slog.Logger
+}
+
+func (o PrepareOptions) metric(suffix string) string {
+	prefix := strings.TrimSpace(o.MetricPrefix)
+	if prefix == "" {
+		prefix = "cluster.create"
+	}
+	return prefix + "." + suffix
 }
 
 func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req models.CreateSandboxRequest, writeError ErrorWriter, opts PrepareOptions) (Decision, bool) {
@@ -50,7 +82,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 
 	if targetNodeID := strings.TrimSpace(r.Header.Get(HeaderTarget)); targetNodeID != "" {
 		if targetNodeID != c.SelfNodeID() {
-			service.RecordFacadeIdempotencyConflict("cluster.create.forward")
+			if opts.OnForwardStale != nil {
+				opts.OnForwardStale()
+			}
+			service.RecordFacadeIdempotencyConflict(opts.metric("forward"))
 			writeError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return Decision{}, false
 		}
@@ -73,11 +108,28 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
+	if opts.Normalize != nil {
+		if err := opts.Normalize(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+	}
 	if svc.ClusterEnabled() {
 		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return Decision{}, false
 		}
+	}
+	// Publish the normalized spec on the wire before any forward so the
+	// target acts on the same request the router placed.
+	if opts.SyncBody {
+		normalized, err := json.Marshal(req)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
+			return Decision{}, false
+		}
+		r.Body = io.NopCloser(bytes.NewReader(normalized))
+		r.ContentLength = int64(len(normalized))
 	}
 	if service.ImageRequiresLocalPlacement(req) {
 		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
@@ -119,6 +171,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 			return Decision{}, false
 		}
+		if opts.Logger != nil && strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") {
+			opts.Logger.Info("cluster create: forwarding built local image to selected worker",
+				"image", req.Image, "target", target.NodeID)
+		}
 		r.Header.Set(HeaderTarget, target.NodeID)
 		r.Header.Del(HeaderID)
 		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
@@ -138,7 +194,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		sandboxID = generated
 	}
 	recipientBackups := 0
-	if svc != nil && svc.WantsSecretRecipientFanout(req) {
+	if svc.WantsSecretRecipientFanout(req) {
 		recipientBackups = svc.SecretRecipientBackupCount()
 	}
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
@@ -162,13 +218,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{}, false
 	}
 	redacted := service.RedactClusterSecrets(req)
-	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients}
+	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: strings.TrimSpace(opts.OwnerRef)}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
 	if err != nil {
 		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
-			service.RecordFacadeIdempotencyConflict("cluster.create.reservation")
+			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
 			handled, local := routeExistingPlacement(w, r, c, sandboxID, writeError)
 			if local {
 				return Decision{ReservationID: sandboxID}, true
@@ -178,12 +234,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			}
 		}
 		if errors.Is(err, cluster.ErrNameConflict) {
-			service.RecordFacadeIdempotencyConflict("cluster.create.name")
+			service.RecordFacadeIdempotencyConflict(opts.metric("name"))
 			writeError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrReservationConflict) {
-			service.RecordFacadeIdempotencyConflict("cluster.create.reservation")
+			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
 			writeError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return Decision{}, false
 		}

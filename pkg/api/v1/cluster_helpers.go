@@ -40,19 +40,6 @@ func clusterMemberSupportsRuntime(m cluster.Member, runtimeName string) bool {
 	return false
 }
 
-func clusterSelfCanOwnSandbox(c cluster.Client) bool {
-	if c == nil {
-		return true
-	}
-	selfID := c.SelfNodeID()
-	for _, m := range c.Members() {
-		if m.NodeID == selfID {
-			return clusterMemberCanOwnSandbox(m.Role)
-		}
-	}
-	return true
-}
-
 func copyHeaderValues(dst, src http.Header) {
 	for key, values := range src {
 		for _, value := range values {

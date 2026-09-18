@@ -49,30 +49,6 @@ func TestClusterHelpersCoverage(t *testing.T) {
 		t.Fatal("docker runtime should not match firecracker-only member")
 	}
 
-	if !clusterSelfCanOwnSandbox(nil) {
-		t.Fatal("nil cluster should allow self ownership")
-	}
-	serverCluster := &membersStubCluster{
-		Noop: cluster.NewNoop("server-a", "http://server-a", ""),
-		members: []cluster.Member{
-			{NodeID: "server-a", Role: config.NodeRoleServer},
-		},
-	}
-	if clusterSelfCanOwnSandbox(serverCluster) {
-		t.Fatal("server role should not own sandboxes")
-	}
-	workerCluster := &membersStubCluster{
-		Noop: cluster.NewNoop("worker-a", "http://worker-a", ""),
-		members: []cluster.Member{
-			{NodeID: "worker-a", Role: config.NodeRoleWorker},
-		},
-	}
-	if !clusterSelfCanOwnSandbox(workerCluster) {
-		t.Fatal("worker role should own sandboxes")
-	}
-	if !clusterSelfCanOwnSandbox(&membersStubCluster{Noop: cluster.NewNoop("orphan", "", "")}) {
-		t.Fatal("missing self member should default to true")
-	}
 }
 
 func TestClusterTemplatePeersFiltersMembers(t *testing.T) {
@@ -540,7 +516,12 @@ func TestClusterCreateWrapLocalImageCoverageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("placement_empty_target_urls_still_forwards", func(t *testing.T) {
+	// A target with neither APIURL nor InternalURL is unreachable: the real
+	// ForwardHTTP rejects it with ErrPeerInternalURLRequired (503). v1 used to
+	// forward anyway and inherit that 503 without a Retry-After; routing
+	// through the shared create flow rejects it up front as "no placement
+	// target" instead, which is the same outcome with a retry hint.
+	t.Run("placement_empty_target_urls_rejected_as_unreachable", func(t *testing.T) {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 		fake := &createForwardCluster{
 			Noop:   cluster.NewNoop("server-a", "http://server-a", ""),
@@ -554,11 +535,11 @@ func TestClusterCreateWrapLocalImageCoverageBranches(t *testing.T) {
 		h := &handlers{deps: Deps{Service: svc, Logger: logger}}
 		rr := httptest.NewRecorder()
 		h.clusterCreateWrap(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(builtBody)))
-		if rr.Code != http.StatusAccepted {
-			t.Fatalf("status = %d, want 202 forward", rr.Code)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 for an unreachable target", rr.Code)
 		}
-		if fake.forwardedTarget != "worker-b" {
-			t.Fatalf("forwarded target = %q", fake.forwardedTarget)
+		if fake.forwardedTarget != "" {
+			t.Fatalf("forwarded target = %q, want no forward to an unreachable node", fake.forwardedTarget)
 		}
 	})
 
