@@ -251,6 +251,7 @@ func (a *Agent) invalidatePeerClient(nodeID string) {
 		return
 	}
 	a.peerClients.invalidate(nodeID)
+	a.mtlsProxies.invalidate(nodeID)
 }
 
 func (a *Agent) SelfAPIURL() string { return a.apiURL }
@@ -1395,19 +1396,32 @@ func decodeControlPlaneJSON(r io.Reader, out any) error {
 	return json.Unmarshal(payload, out)
 }
 
+// controlPlaneMembers returns the server-role peers this agent may send a
+// control-plane request to, in random order.
+//
+// It reads the maintained server index rather than snapshotting the fleet and
+// filtering: every RPC went through the second shape, which allocates all
+// 2,000 members (~1.16 MB) to choose among a handful of candidates.
 func (a *Agent) controlPlaneMembers() []Member {
-	if a.gossip == nil {
+	if a == nil || a.gossip == nil {
 		return nil
 	}
-	var out []Member
-	for _, m := range a.gossip.members() {
-		if m.NodeID == "" || m.NodeID == a.nodeID || !m.Alive {
-			continue
+	index := a.gossip.currentMemberIndex()
+	var candidates []Member
+	if index != nil {
+		candidates = index.controlPlaneSnapshot()
+	} else {
+		// No index yet (very early boot): fall back to the scan.
+		for _, m := range a.gossip.members() {
+			if m.NodeID == "" || !m.Alive || m.InternalURL == "" || !CanServeControlPlaneRole(m.Role) {
+				continue
+			}
+			candidates = append(candidates, m)
 		}
-		if !CanServeControlPlaneRole(m.Role) {
-			continue
-		}
-		if m.InternalURL == "" {
+	}
+	out := candidates[:0]
+	for _, m := range candidates {
+		if m.NodeID == a.nodeID {
 			continue
 		}
 		out = append(out, m)

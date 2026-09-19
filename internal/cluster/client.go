@@ -315,6 +315,7 @@ func (c *Cluster) invalidatePeerClient(nodeID string) {
 		return
 	}
 	c.peerClients.invalidate(nodeID)
+	c.mtlsProxies.invalidate(nodeID)
 }
 
 func (c *Cluster) currentInternalClient() *http.Client {

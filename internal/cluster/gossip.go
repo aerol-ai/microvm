@@ -157,10 +157,46 @@ type gossipMemberIndex struct {
 	mu      sync.RWMutex
 	members map[string]Member
 	seen    map[string]int64
+	// controlPlane is the maintained subset of members that can answer a
+	// control-plane request: alive, control-plane-capable role, non-empty
+	// InternalURL, not self-filtered (callers still drop themselves).
+	//
+	// Every Agent RPC has to pick a server, and doing that by snapshotting the
+	// whole membership first allocates the entire fleet — roughly 1.16 MB per
+	// discovery at 2,000 nodes — to choose from a handful of candidates. The
+	// subset is small and changes only on membership churn, so it is kept
+	// alongside the map instead of being re-derived per call.
+	controlPlane []Member
 }
 
 func newGossipMemberIndex() *gossipMemberIndex {
 	return &gossipMemberIndex{members: make(map[string]Member), seen: make(map[string]int64)}
+}
+
+// rebuildControlPlaneLocked refreshes the server-role index. Caller holds the
+// write lock.
+func (i *gossipMemberIndex) rebuildControlPlaneLocked() {
+	out := make([]Member, 0, len(i.controlPlane))
+	for _, m := range i.members {
+		if m.NodeID == "" || !m.Alive || m.InternalURL == "" {
+			continue
+		}
+		if !CanServeControlPlaneRole(m.Role) {
+			continue
+		}
+		out = append(out, m)
+	}
+	i.controlPlane = out
+}
+
+// controlPlaneSnapshot returns a copy of the maintained server subset.
+func (i *gossipMemberIndex) controlPlaneSnapshot() []Member {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return append([]Member(nil), i.controlPlane...)
 }
 
 func (i *gossipMemberIndex) upsert(m Member) {
@@ -176,6 +212,7 @@ func (i *gossipMemberIndex) upsert(m Member) {
 		i.seen[m.NodeID] = now
 	}
 	i.members[m.NodeID] = m
+	i.rebuildControlPlaneLocked()
 	i.recordMetricsLocked(now)
 	i.mu.Unlock()
 }
@@ -208,6 +245,7 @@ func (i *gossipMemberIndex) replace(members []Member) {
 	}
 	i.recordLeaseLossesLocked(next)
 	i.members = next
+	i.rebuildControlPlaneLocked()
 	i.recordMetricsLocked(now)
 	i.mu.Unlock()
 }

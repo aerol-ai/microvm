@@ -21,6 +21,28 @@ func newProxyCache() *proxyCache {
 	return &proxyCache{proxies: make(map[string]*httputil.ReverseProxy)}
 }
 
+// invalidate drops every proxy pinned to nodeID. Called when gossip reports a
+// peer gone, alongside the per-node HTTP client eviction: without it the map
+// kept one ReverseProxy per (node, URL) pair for every peer the process had
+// ever forwarded to, retired nodes and superseded URLs included.
+func (pc *proxyCache) invalidate(nodeID string) {
+	if pc == nil {
+		return
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return
+	}
+	prefix := nodeID + "\x00"
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	for key := range pc.proxies {
+		if strings.HasPrefix(key, prefix) {
+			delete(pc.proxies, key)
+		}
+	}
+}
+
 // getForPeer keeps the cache identity-bound: the same URL reached for a
 // different expected node must not reuse a transport pinned to another leaf.
 func (pc *proxyCache) getForPeer(nodeID, baseURL string, rt http.RoundTripper) (*httputil.ReverseProxy, error) {
