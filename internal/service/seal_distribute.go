@@ -696,17 +696,7 @@ func (s *Service) ReFanoutClusterSecretsForNodes(ctx context.Context, nodeIDs ma
 		if len(rows) == 0 {
 			break
 		}
-		// Filter BEFORE the placement read, not after. Recipient membership is
-		// already on the local row, so a page owing this rejoining node nothing
-		// needs no authoritative lookup at all. Reading first made one member
-		// restart cost a leader placement batch for every page of every node's
-		// secrets — a fleet-wide validation burst to repair nothing.
-		owed := make([]store.ClusterSecretRecord, 0, len(rows))
-		for _, rec := range rows {
-			if secretRecipientsInclude(rec.Recipients, nodeIDs) {
-				owed = append(owed, rec)
-			}
-		}
+		owed := secretRowsOwedTo(rows, nodeIDs)
 		if len(owed) > 0 {
 			placements, err := s.secretRefanoutPlacements(ctx, owed)
 			if err != nil {
@@ -735,6 +725,32 @@ func (s *Service) ReFanoutClusterSecretsForNodes(ctx context.Context, nodeIDs ma
 
 // secretRecipientsInclude reports whether a durable secret is owed to any node
 // in want. An empty want selects everything.
+// secretRowsOwedTo narrows a page of local ciphertext rows to the ones whose
+// recipient set includes one of the given nodes. nil/empty want means "all
+// rows" (a full re-fanout).
+//
+// Both rejoin passes MUST filter with this BEFORE forming a placement batch.
+// Recipient membership is already on the local row, so a page owing the
+// returning node nothing needs no authoritative lookup at all. Validating
+// first made one unrelated member restart cost a leader placement batch for
+// every page of every node's secrets: with 100k HA sandboxes at three local
+// ciphertext copies each, ~300k placement ids validated fleet-wide, ~10k
+// authoritative batch RPCs at the 32-row page size — to repair nothing. The
+// synchronous and asynchronous passes drifted apart once already, which is
+// why the rule lives in one function they both call.
+func secretRowsOwedTo(rows []store.ClusterSecretRecord, want map[string]struct{}) []store.ClusterSecretRecord {
+	if len(want) == 0 {
+		return rows
+	}
+	owed := make([]store.ClusterSecretRecord, 0, len(rows))
+	for _, rec := range rows {
+		if secretRecipientsInclude(rec.Recipients, want) {
+			owed = append(owed, rec)
+		}
+	}
+	return owed
+}
+
 func secretRecipientsInclude(recipients []string, want map[string]struct{}) bool {
 	if len(want) == 0 {
 		return true
@@ -1025,26 +1041,28 @@ func (s *Service) runSecretRefanoutScanForNodes(ctx context.Context, pusher clus
 		if len(rows) == 0 {
 			return validationErr
 		}
-		placements, err := s.secretRefanoutPlacements(ctx, rows)
-		if err != nil {
-			return errors.Join(validationErr, err)
-		}
-		for _, rec := range rows {
-			if !secretRecipientsInclude(rec.Recipients, nodeIDs) {
-				continue
-			}
-			blob, err := s.prepareSecretRefanoutRecord(ctx, rec, false, placements, nil)
+		// Same rule as the synchronous pass: narrow to the rows actually owed
+		// to the returning nodes BEFORE asking the leader to validate them.
+		owed := secretRowsOwedTo(rows, nodeIDs)
+		if len(owed) > 0 {
+			placements, err := s.secretRefanoutPlacements(ctx, owed)
 			if err != nil {
-				validationErr = errors.Join(validationErr, err)
-				continue
+				return errors.Join(validationErr, err)
 			}
-			if blob == nil {
-				continue
-			}
-			select {
-			case jobs <- *blob:
-			case <-ctx.Done():
-				return errors.Join(validationErr, ctx.Err())
+			for _, rec := range owed {
+				blob, err := s.prepareSecretRefanoutRecord(ctx, rec, false, placements, nil)
+				if err != nil {
+					validationErr = errors.Join(validationErr, err)
+					continue
+				}
+				if blob == nil {
+					continue
+				}
+				select {
+				case jobs <- *blob:
+				case <-ctx.Done():
+					return errors.Join(validationErr, ctx.Err())
+				}
 			}
 		}
 		afterRef = rows[len(rows)-1].Ref
