@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -96,6 +97,9 @@ type Cluster struct {
 	recreator        SandboxRecreator
 	recreatorMu      sync.Mutex
 	ownerWatcherStop context.CancelFunc
+	// replicaBudgetLogUnix throttles the raft replica-admission refusal log;
+	// reconcileVoters re-offers every gossip member every 5s.
+	replicaBudgetLogUnix atomic.Int64
 	// recreateFailures counts consecutive recreate failures per sandbox so
 	// the watcher can escalate to "ask for reassignment" instead of looping
 	// forever on a permanent local failure (image gone, runtime missing,
