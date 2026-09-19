@@ -2285,7 +2285,14 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if err != nil {
 		return err
 	}
-	return s.store.CreateWithSealedEnv(ctx, sandbox, sealed)
+	if err := s.store.CreateWithSealedEnv(ctx, sandbox, sealed); err != nil {
+		return err
+	}
+	// The row is the authority from here on. Complete the lifecycle identity
+	// so audit stamps carry the tenant owner instead of the blank one the
+	// pre-persist nonce necessarily resolves to.
+	s.finalizeAuditIdentity(sandbox.ID, sandbox.AuditIncarnationID, sandbox.OwnerRef)
+	return nil
 }
 
 // sealEnv marshals env and encrypts it for at-rest storage. Returns nil when
