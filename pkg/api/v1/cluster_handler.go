@@ -1102,6 +1102,84 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+// clusterInternalOwnedRecovery serves a worker its OWN failover-recreate
+// placements. A dedicated worker has no FSM, so without this it can never
+// learn that the dead-owner reconciler handed it a sandbox — the reassignment
+// lands in Raft and nothing materializes it.
+//
+// The owner is the mTLS-authenticated peer identity, never a request field, so
+// a node can only ask for its own work. The response deliberately keeps the
+// spec and secret handle that the paged/point placement reads redact: the
+// owner is the one party that must be able to rebuild and re-open them, and it
+// is the same data a server-role owner reads from its local FSM.
+func (h *handlers) clusterInternalOwnedRecovery(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	ownerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	if strings.TrimSpace(ownerID) == "" {
+		apihttp.WriteError(w, http.StatusForbidden, "cluster: peer identity required")
+		return
+	}
+	var req cluster.OwnedRecoveryRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	owned, ok := c.(interface {
+		OwnedRecoveryPlacements(string, int, string) cluster.OwnedRecoveryResponse
+	})
+	if !ok {
+		// Only a server-role node holds the FSM this answer comes from.
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, owned.OwnedRecoveryPlacements(ownerID, req.Limit, req.PageToken))
+}
+
+// clusterInternalReassignStuck lets the current owner of a placement ask the
+// leader to move it after repeated local recreate failures. Target selection
+// stays with the FSM, which is the only holder of drain state, pending
+// reservations and capacity leases.
+func (h *handlers) clusterInternalReassignStuck(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	requesterID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	if strings.TrimSpace(requesterID) == "" {
+		apihttp.WriteError(w, http.StatusForbidden, "cluster: peer identity required")
+		return
+	}
+	var req cluster.ReassignStuckRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	reassigner, ok := c.(interface {
+		ReassignStuckPlacement(context.Context, string, string, string) error
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	if err := reassigner.ReassignStuckPlacement(r.Context(), requesterID, req.SandboxID, req.IncarnationID); err != nil {
+		switch {
+		case errors.Is(err, cluster.ErrUnknownSandbox):
+			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		case errors.Is(err, cluster.ErrStuckReassignNotOwner):
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
+		default:
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
 func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {

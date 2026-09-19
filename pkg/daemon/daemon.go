@@ -559,10 +559,18 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// dead-owner eviction. Wired here (after both objects exist) to keep
 		// the cluster→service direction one-way through the SandboxRecreator
 		// interface, avoiding an import cycle.
+		//
+		// Both *Cluster and *Agent implement it: a dedicated worker owns
+		// sandboxes too, and when only *Cluster did, this probe silently
+		// skipped every worker-role node and its reassigned placements were
+		// never materialized. A miss is now loud rather than invisible.
 		if withRecreator, ok := clusterClient.(interface {
 			AttachRecreator(cluster.SandboxRecreator)
 		}); ok {
 			withRecreator.AttachRecreator(svc)
+		} else {
+			logger.Error("cluster: client exposes no AttachRecreator; failover recreation is disabled on this node",
+				"node_role", cfg.NodeRole)
 		}
 		// Phase 6 PR-D: template-aware placement. The capacity lease
 		// cache asks the service for the local "ready" template

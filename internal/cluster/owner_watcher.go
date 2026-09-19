@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -104,53 +105,88 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 	}
 	placements := c.fsm.fullPlacementsForOwner(c.nodeID)
 	for id, p := range placements {
-		if !placementWantsFailoverRecreate(p) {
-			continue
+		recreateOwnedPlacement(ctx, ownerRecreateDeps{
+			recreator: r,
+			failures:  c.recreateFailures,
+			logger:    c.logger,
+			escalate:  func(ctx context.Context, id string, p Placement) { c.tryReassignStuckPlacement(ctx, id, p) },
+		}, id, p)
+	}
+}
+
+// ownerRecreateDeps is everything one owner-recreate attempt needs. It exists
+// so the dedicated-worker loop and the server-side owner watcher run the SAME
+// recreation, failure-accounting and escalation logic: a worker that cannot
+// recreate its reassigned sandboxes is a failover that silently did not
+// happen, and a second copy of this logic is how the two would drift.
+type ownerRecreateDeps struct {
+	recreator SandboxRecreator
+	failures  *recreateFailureTracker
+	logger    *slog.Logger
+	// escalate hands a repeatedly failing placement to whoever can move it.
+	// The server does it through its own FSM; a worker asks the leader.
+	escalate func(context.Context, string, Placement)
+}
+
+func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id string, p Placement) {
+	if deps.recreator == nil {
+		return
+	}
+	if !placementWantsFailoverRecreate(p) {
+		return
+	}
+	if deps.failures != nil && deps.failures.isPermanent(id) {
+		return
+	}
+	if p.Spec == nil {
+		// Pre-cluster sandbox or never-replicated spec. Without a spec we
+		// can't reconstruct the container; leave it unhandled. The
+		// dead-owner reconciler still won't reassign such placements
+		// because there's no way to recover them.
+		return
+	}
+	spec := *p.Spec
+	ports := exposedPortRoutesForPlacement(p)
+	// Pass the secret provider handle through unchanged — only the service
+	// is allowed to resolve and merge credentials.
+	attempted := true
+	var err error
+	if reporter, ok := deps.recreator.(SandboxRecreateReporter); ok {
+		attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, secretsFromPlacement(p), ports)
+	} else {
+		err = deps.recreator.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports)
+	}
+	if attempted || err != nil {
+		recordFailoverRecreate(err)
+	}
+	if err == nil {
+		if deps.failures != nil {
+			deps.failures.clear(id)
 		}
-		if c.recreateFailures != nil && c.recreateFailures.isPermanent(id) {
-			continue
+		return
+	}
+	// Recipient-denied cannot be fixed by reassigning to another
+	// arbitrary node (D5 / outside-voice #7) — stop churn permanently.
+	if errors.Is(err, secrets.ErrRecipientDenied) {
+		if deps.failures != nil {
+			deps.failures.markPermanent(id)
 		}
-		if p.Spec == nil {
-			// Pre-cluster sandbox or never-replicated spec. Without a spec we
-			// can't reconstruct the container; leave it unhandled. The
-			// dead-owner reconciler still won't reassign such placements
-			// because there's no way to recover them.
-			continue
+		if deps.logger != nil {
+			deps.logger.Error("cluster: recreate permanently failed: recipient denied; not reassigning",
+				"sandbox_id", id, "err", err)
 		}
-		spec := *p.Spec
-		ports := exposedPortRoutesForPlacement(p)
-		// Pass the secret provider handle through unchanged — only the service
-		// is allowed to resolve and merge credentials.
-		attempted := true
-		var err error
-		if reporter, ok := r.(SandboxRecreateReporter); ok {
-			attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, secretsFromPlacement(p), ports)
-		} else {
-			err = r.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports)
-		}
-		if attempted || err != nil {
-			recordFailoverRecreate(err)
-		}
-		if err != nil {
-			// Recipient-denied cannot be fixed by reassigning to another
-			// arbitrary node (D5 / outside-voice #7) — stop churn permanently.
-			if errors.Is(err, secrets.ErrRecipientDenied) {
-				if c.recreateFailures != nil {
-					c.recreateFailures.markPermanent(id)
-				}
-				c.logger.Error("cluster: recreate permanently failed: recipient denied; not reassigning",
-					"sandbox_id", id, "err", err)
-				continue
-			}
-			fails := c.recreateFailures.record(id)
-			c.logger.Warn("cluster: recreate owned sandbox failed",
-				"sandbox_id", id, "consecutive_failures", fails, "err", err)
-			if fails >= maxRecreateFailuresBeforeReassign {
-				c.tryReassignStuckPlacement(ctx, id, p)
-			}
-			continue
-		}
-		c.recreateFailures.clear(id)
+		return
+	}
+	fails := 0
+	if deps.failures != nil {
+		fails = deps.failures.record(id)
+	}
+	if deps.logger != nil {
+		deps.logger.Warn("cluster: recreate owned sandbox failed",
+			"sandbox_id", id, "consecutive_failures", fails, "err", err)
+	}
+	if fails >= maxRecreateFailuresBeforeReassign && deps.escalate != nil {
+		deps.escalate(ctx, id, p)
 	}
 }
 
