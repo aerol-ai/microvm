@@ -111,6 +111,9 @@ type Agent struct {
 	cacheMu        sync.RWMutex
 	placementCache []Placement
 	shardCache     map[string][]Placement
+	// shardCacheOrder is the insertion order of shardCache keys, oldest first,
+	// so superseded ring generations can be evicted.
+	shardCacheOrder []string
 	// placementVersion tracks the highest placement version observed via
 	// shard/page/point reads. It keeps PlacementVersion() off the full-map
 	// endpoint on worker/ingress-only agents.
@@ -972,21 +975,27 @@ func (a *Agent) Placements() []Placement {
 	return a.PlacementsForShards(PlacementShardFilter{})
 }
 
+// PlacementsForShards reads this node's slice of the placement view, PAGED.
+//
+// It used to be one unbounded request. A minimal 100k-placement answer encodes
+// to ~28 MB, well past the agent's 16 MB JSON response ceiling, so the read
+// failed and a cold agent fell back to an empty view — and the unfiltered
+// endpoint does have a production caller: an ingress tier at or below
+// MaxReplicatedIngressRouteNodes reaches it through an all-shards filter.
+// Paging the page endpoint keeps every response bounded by
+// MaxPlacementPageLimit rows instead of raising the ceiling.
 func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	start := time.Now()
 	filter = filter.Normalize()
-	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
-	defer cancel()
-	var out []Placement
-	if filter.allShards() {
-		if err := a.doControlPlaneJSON(ctx, http.MethodGet, PublicInternalPlacementsPath, PublicInternalPlacementsPath, nil, &out); err != nil {
-			a.logger.Warn("cluster agent: placements lookup failed; using cached placement view", "err", err)
-			cached := a.cachedPlacementsForShards(filter)
-			recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
-			return cached
-		}
-	} else if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsQueryPath, PublicInternalPlacementsQueryPath, filter, &out); err != nil {
-		a.logger.Warn("cluster agent: shard placement lookup failed; using cached shard view", "err", err, "shards", len(filter.Shards))
+	if filter.noShards() {
+		// This node serves no public routes. Not a cache miss, not an empty
+		// fleet — simply no work, and no control-plane read either.
+		return nil
+	}
+	out, err := a.fetchPlacementPages(filter)
+	if err != nil {
+		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",
+			"err", err, "shards", len(filter.Shards), "all_shards", filter.allShards())
 		cached := a.cachedPlacementsForShards(filter)
 		recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
 		return cached
@@ -995,15 +1004,72 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	if filter.allShards() {
 		a.placementCache = clonePlacements(out)
 	}
-	if a.shardCache == nil {
-		a.shardCache = make(map[string][]Placement)
-	}
-	a.shardCache[placementShardFilterCacheKey(filter)] = clonePlacements(out)
+	a.storeShardCacheLocked(placementShardFilterCacheKey(filter), out)
 	shardEntries := len(a.shardCache)
 	a.cacheMu.Unlock()
 	a.observePlacementVersions(out)
 	recordPlacementCacheRefresh(time.Since(start), len(out), shardEntries, nil)
 	return out
+}
+
+// maxPlacementPages bounds the page walk. At MaxPlacementPageLimit rows per
+// page this covers far more than the 100k-sandbox target; it exists so a
+// control plane that keeps emitting cursors cannot spin a reconcile tick
+// forever.
+const maxPlacementPages = 1024
+
+// fetchPlacementPages walks the paged endpoint until the cursor is exhausted.
+// Every response stays inside the JSON size ceiling, which one unbounded read
+// of a 100k-placement view does not.
+//
+// The walk refuses to trust a cursor that cannot make progress: an empty page
+// that still carries a token, or a token identical to the one just sent, ends
+// the walk rather than looping.
+func (a *Agent) fetchPlacementPages(filter PlacementShardFilter) ([]Placement, error) {
+	var out []Placement
+	req := PlacementPageRequest{Limit: MaxPlacementPageLimit, ShardFilter: filter}
+	for page := 0; page < maxPlacementPages; page++ {
+		ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
+		var resp PlacementPageResponse
+		err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsPagePath, PublicInternalPlacementsPagePath, req.Normalize(), &resp)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, resp.Placements...)
+		if resp.NextPageToken == "" || len(resp.Placements) == 0 || resp.NextPageToken == req.PageToken {
+			return out, nil
+		}
+		req.PageToken = resp.NextPageToken
+	}
+	a.logger.Warn("cluster agent: placement page walk hit its page cap; view may be truncated",
+		"pages", maxPlacementPages, "placements", len(out))
+	return out, nil
+}
+
+// maxAgentShardCacheEntries bounds the fallback shard cache. A node's filter
+// changes only when the ingress ring changes, and a fallback is only ever
+// useful for the filter in force now or the one just superseded — but the map
+// was keyed by filter and never evicted, so every historical ring left a full
+// cloned placement slice behind forever.
+const maxAgentShardCacheEntries = 2
+
+// storeShardCacheLocked records the newest shard view and retires superseded
+// generations. Caller holds a.cacheMu.
+func (a *Agent) storeShardCacheLocked(key string, placements []Placement) {
+	if a.shardCache == nil {
+		a.shardCache = make(map[string][]Placement, maxAgentShardCacheEntries)
+		a.shardCacheOrder = nil
+	}
+	if _, exists := a.shardCache[key]; !exists {
+		a.shardCacheOrder = append(a.shardCacheOrder, key)
+		for len(a.shardCacheOrder) > maxAgentShardCacheEntries {
+			evict := a.shardCacheOrder[0]
+			a.shardCacheOrder = a.shardCacheOrder[1:]
+			delete(a.shardCache, evict)
+		}
+	}
+	a.shardCache[key] = clonePlacements(placements)
 }
 
 func (a *Agent) shardCacheEntryCount() int {

@@ -51,23 +51,23 @@ func ingressBenchmarkMembers() []Member {
 func TestIngressShardCacheTracksTopologyAndOwnsResult(t *testing.T) {
 	members := ingressBenchmarkMembers()
 	var cache IngressShardFilterCache
-	want := IngressShardFilterForNode(members, "node-0000")
-	got := cache.ForNode(members, "node-0000")
+	want := IngressShardFilterForNode(members, "node-0000", config.NodeRoleIngress)
+	got := cache.ForNode(members, "node-0000", config.NodeRoleIngress)
 	if !slices.Equal(got.Shards, want.Shards) {
 		t.Fatal("cached result differs")
 	}
 	got.Shards[0] = -1
 	cacheStorage := &cache.filter.Shards[0]
 	slices.Reverse(members)
-	if got := cache.ForNode(members, "node-0000"); !slices.Equal(got.Shards, want.Shards) {
+	if got := cache.ForNode(members, "node-0000", config.NodeRoleIngress); !slices.Equal(got.Shards, want.Shards) {
 		t.Fatal("caller mutated cache or membership order remapped it")
 	}
 	if &cache.filter.Shards[0] != cacheStorage {
 		t.Fatal("unchanged topology rebuilt the filter")
 	}
 	members[len(members)-1].Alive = false
-	want = IngressShardFilterForNode(members, "node-0001")
-	if got := cache.ForNode(members, "node-0001"); !slices.Equal(got.Shards, want.Shards) {
+	want = IngressShardFilterForNode(members, "node-0001", config.NodeRoleIngress)
+	if got := cache.ForNode(members, "node-0001", config.NodeRoleIngress); !slices.Equal(got.Shards, want.Shards) {
 		t.Fatal("membership change did not invalidate cache")
 	}
 }
@@ -88,10 +88,10 @@ func TestIngressShardAllocationBudget(t *testing.T) {
 	var cache IngressShardFilterCache
 	// A fixed allocation budget catches the original millions-of-allocations
 	// per-tick regression without a hardware-sensitive wall-clock assertion.
-	if allocs := testing.AllocsPerRun(10, func() { cache.ForNode(members, "node-0001") }); allocs > 30 {
+	if allocs := testing.AllocsPerRun(10, func() { cache.ForNode(members, "node-0001", config.NodeRoleIngress) }); allocs > 30 {
 		t.Fatalf("cached filter allocated %.0f objects, budget 30", allocs)
 	}
-	if allocs := testing.AllocsPerRun(1, func() { IngressShardFilterForNode(members, "node-0001") }); allocs > 30 {
+	if allocs := testing.AllocsPerRun(1, func() { IngressShardFilterForNode(members, "node-0001", config.NodeRoleIngress) }); allocs > 30 {
 		t.Fatalf("cold filter allocated %.0f objects, budget 30", allocs)
 	}
 }
@@ -101,16 +101,16 @@ func BenchmarkIngressShardFilter100Ingress2000Nodes(b *testing.B) {
 	b.Run("cold", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			IngressShardFilterForNode(members, "node-0000")
+			IngressShardFilterForNode(members, "node-0000", config.NodeRoleIngress)
 		}
 	})
 	b.Run("cached", func(b *testing.B) {
 		var cache IngressShardFilterCache
-		cache.ForNode(members, "node-0000")
+		cache.ForNode(members, "node-0000", config.NodeRoleIngress)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			cache.ForNode(members, "node-0000")
+			cache.ForNode(members, "node-0000", config.NodeRoleIngress)
 		}
 	})
 }
@@ -123,7 +123,7 @@ func TestIngressShardFilterReplicatesSmallIngressTier(t *testing.T) {
 		{NodeID: "ing-c", Role: config.NodeRoleIngress, Alive: true},
 	}
 
-	filter := IngressShardFilterForNode(members, "ing-b")
+	filter := IngressShardFilterForNode(members, "ing-b", config.NodeRoleIngress)
 	if filter.ShardCount != 0 || len(filter.Shards) != 0 {
 		t.Fatalf("filter = %+v, want empty all-shards filter for small ingress tier", filter)
 	}
@@ -139,7 +139,7 @@ func TestIngressShardFilterShardsLargeIngressTier(t *testing.T) {
 		})
 	}
 
-	filter := IngressShardFilterForNode(members, "ing-05")
+	filter := IngressShardFilterForNode(members, "ing-05", config.NodeRoleIngress)
 	if filter.ShardCount != DefaultPlacementShardCount {
 		t.Fatalf("shard count = %d, want %d", filter.ShardCount, DefaultPlacementShardCount)
 	}

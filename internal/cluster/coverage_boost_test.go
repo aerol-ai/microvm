@@ -369,14 +369,17 @@ func TestAgentPlacementsShardQueryCaches(t *testing.T) {
 	shard := PlacementShardForSandbox("sb-shard-cache", DefaultPlacementShardCount)
 	filter := PlacementShardFilter{ShardCount: DefaultPlacementShardCount, Shards: []int{shard}}
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsQueryPath {
-			var got PlacementShardFilter
-			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-				t.Fatalf("decode shard filter: %v", err)
+		if r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsPagePath {
+			var req PlacementPageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode placement page request: %v", err)
 			}
-			capture.appendShardFilter(got)
+			capture.appendShardFilter(req.ShardFilter)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]Placement{{SandboxID: "sb-shard-cache", Version: 7}})
+			_ = json.NewEncoder(w).Encode(PlacementPageResponse{
+				Placements:    []Placement{{SandboxID: "sb-shard-cache", Version: 7}},
+				Authoritative: true,
+			})
 			return true
 		}
 		return false
@@ -392,6 +395,9 @@ func TestAgentPlacementsShardQueryCaches(t *testing.T) {
 	cached := agent.PlacementsForShards(filter)
 	if len(cached) != 1 {
 		t.Fatalf("cached shard placements = %+v", cached)
+	}
+	if filters := capture.shardFiltersSnapshot(); len(filters) != 2 {
+		t.Fatalf("shard filters = %+v, want one paged read per call", filters)
 	}
 }
 

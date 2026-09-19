@@ -34,12 +34,24 @@ type ingressRouteIntent struct {
 
 func (s *Service) clusterIngressShardFilter(c cluster.Client, self string) cluster.PlacementShardFilter {
 	if c == nil || self == "" {
-		return cluster.PlacementShardFilter{}
+		return cluster.NoPlacementShards()
 	}
 	// One accessor for both halves of the ingress ring: installation (here)
 	// and lookup (/v1/cluster/ingress-route/{id}). Hashing different views
 	// sends the upstream to a node that never installed the shard.
-	return s.ingressShardFilterCache.ForNode(cluster.IngressRingMembers(c), self)
+	//
+	// The role is passed in so a node that serves no ingress asks for NO
+	// shards. Previously it was absent from the ingress id list and the helper
+	// synthesized a membership for it, which gave a dedicated worker a slice
+	// of unrelated shards at 100 ingress nodes and the entire placement map at
+	// small ingress counts.
+	return s.ingressShardFilterCache.ForNode(cluster.IngressRingMembers(c), self, s.cfg.NodeRole)
+}
+
+// servesClusterIngress reports whether this node installs peer-forwarding
+// public routes at all. A dedicated worker or server does not.
+func (s *Service) servesClusterIngress() bool {
+	return s != nil && s.cfg.IsIngress()
 }
 
 func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, self string) (map[string]ingressRouteIntent, bool) {

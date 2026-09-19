@@ -391,30 +391,34 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementsPath:
-			if failAllReads {
-				http.Error(w, "boom", http.StatusInternalServerError)
-				return true
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(allPlacements)
-			return true
-		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsQueryPath:
-			var filter PlacementShardFilter
-			if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
-				t.Fatalf("decode shard filter: %v", err)
-			}
-			capture.appendShardFilter(filter)
-			if failShardQuery {
-				http.Error(w, "boom", http.StatusInternalServerError)
-				return true
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(shardPlacements)
+			// Paged reads replaced the unbounded GET; reaching it is a bug.
+			t.Errorf("agent issued an unbounded placements GET")
+			http.Error(w, "unbounded read", http.StatusInternalServerError)
 			return true
 		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsPagePath:
 			var req PlacementPageRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatalf("decode placement page request: %v", err)
+			}
+			// PlacementsForShards walks this endpoint at the max page size;
+			// a direct PlacementPage call uses the default limit.
+			if req.Limit == MaxPlacementPageLimit {
+				capture.appendShardFilter(req.ShardFilter)
+				if failShardQuery && !req.ShardFilter.allShards() {
+					http.Error(w, "boom", http.StatusInternalServerError)
+					return true
+				}
+				if failAllReads && req.ShardFilter.allShards() {
+					http.Error(w, "boom", http.StatusInternalServerError)
+					return true
+				}
+				body := shardPlacements
+				if req.ShardFilter.allShards() {
+					body = allPlacements
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(PlacementPageResponse{Placements: body, Authoritative: true})
+				return true
 			}
 			capture.appendPageRequest(req)
 			w.Header().Set("Content-Type", "application/json")
@@ -448,8 +452,17 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 	if !page.Authoritative || len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-page" || page.NextPageToken != "next-page" {
 		t.Fatalf("PlacementPage() = %+v, want authoritative paged response", page)
 	}
+	// Order: all-shards (Placements), shard, shard (fails -> cached),
+	// all-shards (fails -> cached). The shard filter must reach the control
+	// plane normalized and deduplicated.
 	filters := capture.shardFiltersSnapshot()
-	if len(filters) != 2 || filters[0].ShardCount != 32 || len(filters[0].Shards) != 2 {
+	if len(filters) != 4 {
+		t.Fatalf("shard filters = %+v, want four paged reads", filters)
+	}
+	if !filters[0].allShards() || !filters[3].allShards() {
+		t.Fatalf("shard filters = %+v, want the Placements() reads to ask for all shards", filters)
+	}
+	if filters[1].ShardCount != 32 || len(filters[1].Shards) != 2 {
 		t.Fatalf("shard filters = %+v, want normalized deduplicated filter", filters)
 	}
 	pages := capture.pageRequestsSnapshot()

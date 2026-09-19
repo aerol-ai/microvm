@@ -315,7 +315,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 		t.Fatalf("default-protocol port intent missing: %s", defaultKey)
 	}
 
-	_ = routeShardFilterLogValue(cluster.IngressShardFilterForNode(nil, "self"))
+	_ = routeShardFilterLogValue(cluster.IngressShardFilterForNode(nil, "self", config.NodeRoleIngress))
 }
 
 func TestGCUnexpectedClusterIngressRoutes(t *testing.T) {

@@ -15,7 +15,7 @@ func TestIngressShardFilterAppendsSelfAndDedups(t *testing.T) {
 	}
 	// Duplicate id should be ignored by ingressShardNodeIDs / ingressRouteOwners.
 	members = append(members, Member{NodeID: "ing-00", Alive: true, Role: config.NodeRoleIngress, APIURL: "http://dup"})
-	filter := IngressShardFilterForNode(members, "self-extra")
+	filter := IngressShardFilterForNode(members, "self-extra", config.NodeRoleIngress)
 	if filter.ShardCount == 0 && len(filter.Shards) == 0 {
 		// self-extra was appended; with > Max nodes we should get a non-empty shard filter
 		t.Fatalf("expected sharded filter for oversized ingress + self, got %+v", filter)
