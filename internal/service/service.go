@@ -210,6 +210,14 @@ type Service struct {
 	secretAuditExportDone sync.WaitGroup
 	secretRefanoutMu      sync.Mutex
 	secretRefanoutRunning bool
+	// secretHolderCursor resumes the holder-refresh page. One tick captures at
+	// most secretHolderRefreshScan holder keys — the batch placement endpoint
+	// refuses more ids than cluster.MaxPlacementPageLimit, and its failure
+	// makes the whole tick skip — so a node holding more than that must walk
+	// its holders across ticks instead of losing all of them. Guarded by
+	// secretHolderCursorMu.
+	secretHolderCursorMu sync.Mutex
+	secretHolderCursor   string
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
 	mounts           *mounts.Manager
