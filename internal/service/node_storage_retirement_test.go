@@ -676,3 +676,94 @@ func (s *selectiveDurableAuditSink) EmitDurable(ev SecretAuditEvent) error {
 	return nil
 }
 func (s *selectiveDurableAuditSink) Close() {}
+
+// A partial discharge — some recipients' evidence journalled, some not —
+// must remove exactly the journalled ones from the durable obligation.
+func TestReconcileDischargesOnlyTheRecipientsWithEvidence(t *testing.T) {
+	cl := &retirementCluster{
+		Noop: cluster.NewNoop("node-self", "http://node-self", ""),
+		members: []cluster.Member{
+			{NodeID: "node-self", Alive: true},
+			{NodeID: "node-a", Alive: false},
+			{NodeID: "node-b", Alive: false},
+		},
+	}
+	svc, st := newRetirementService(t, cl)
+	svc.cfg.EnterpriseMode = true
+	svc.secretAudit = &selectiveDurableAuditSink{failFor: "node-b"}
+	svc.secretAuditOnce.Do(func() {})
+	svc.testSecretPeerPusher = &fakePeerPusher{deleteErr: errors.New("peer unreachable")}
+	t.Cleanup(svc.CloseSecretAuditSink)
+	ctx := context.Background()
+
+	copied := time.Now().Add(-time.Hour).UTC()
+	if err := st.UpsertSecretDeleteOutboxCopiedAt(ctx, "sb-partial", "inc", []string{"node-a", "node-b"}, 1, copied); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"node-a", "node-b"} {
+		if err := svc.RetireNodeStorage(ctx, id, "op", "disk destroyed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-partial", "inc")
+	if err != nil || rec == nil {
+		t.Fatalf("outbox row: %v", err)
+	}
+	svc.reconcileSecretDeleteOutboxRecord(ctx, rec, nil)
+
+	after, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-partial", "inc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == nil || len(after.Recipients) != 1 || after.Recipients[0] != "node-b" {
+		t.Fatalf("remaining recipients = %+v, want only the one whose evidence failed", after)
+	}
+}
+
+// withoutRecipients is the partial-discharge bookkeeping: it drops exactly
+// the journalled ids and keeps the order of the rest.
+func TestWithoutRecipients(t *testing.T) {
+	all := []string{"a", "b", "c"}
+	if got := withoutRecipients(all, nil); len(got) != 3 {
+		t.Fatalf("no drops changed the set: %v", got)
+	}
+	got := withoutRecipients(all, []string{" b "})
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Fatalf("remaining = %v, want [a c]", got)
+	}
+}
+
+// Standalone mode keeps using the local table, and a service with no store
+// refuses rather than pretending.
+func TestNodeStorageRetirementStandaloneAndUnconfigured(t *testing.T) {
+	ctx := context.Background()
+	var none *Service
+	if err := none.RetireNodeStorage(ctx, "n", "op", ""); err == nil {
+		t.Fatal("attestation without a store was accepted")
+	}
+	if _, err := none.RevokeNodeStorageRetirement(ctx, "n"); err == nil {
+		t.Fatal("revoke without a store was accepted")
+	}
+	if _, err := none.ListNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("list without a store was accepted")
+	}
+	if got := none.nodeStorageRetirements(ctx); got != nil {
+		t.Fatalf("retirements without a store = %v", got)
+	}
+
+	svc, _ := newRetirementService(t, nil)
+	if err := svc.RetireNodeStorage(ctx, "node-gone", "op", "disk destroyed"); err != nil {
+		t.Fatalf("standalone attestation: %v", err)
+	}
+	if got := svc.nodeStorageRetirements(ctx); len(got) != 1 {
+		t.Fatalf("standalone retirements = %v, want the local row", got)
+	}
+	removed, err := svc.RevokeNodeStorageRetirement(ctx, "node-gone")
+	if err != nil || !removed {
+		t.Fatalf("standalone revoke: removed=%v err=%v", removed, err)
+	}
+	if removed, err := svc.RevokeNodeStorageRetirement(ctx, "node-gone"); err != nil || removed {
+		t.Fatalf("second revoke: removed=%v err=%v (must be idempotent)", removed, err)
+	}
+}

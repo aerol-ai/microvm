@@ -231,3 +231,35 @@ func TestCapacityRefreshStillReachesNewPeers(t *testing.T) {
 		t.Fatal("a peer with no lease was never contacted; reserving budget for renewals must not starve first contact")
 	}
 }
+
+// The renewal phase can legitimately use the whole sweep. First contact then
+// waits for the next tick — a node with no lease is not schedulable either
+// way — and the phase helper itself is a no-op without members or budget.
+func TestCapacityFetchPhaseGuards(t *testing.T) {
+	leases := newCapacityLeaseCache("server", nil, 5*time.Second, nil)
+	if leases.hasLease("never-seen") {
+		t.Fatal("a peer that was never fetched reported a lease")
+	}
+	leases.set("seen", step3FatCapacity(), time.Now())
+	if !leases.hasLease("seen") {
+		t.Fatal("a fetched peer reported no lease")
+	}
+	var none *capacityLeaseCache
+	if none.hasLease("any") {
+		t.Fatal("a nil cache reported a lease")
+	}
+
+	rt := &slowPeerTransport{}
+	c := &Cluster{nodeID: "server", capacityLeases: leases, internalClient: &http.Client{Transport: rt}}
+	members := []Member{{NodeID: "healthy", InternalURL: "https://healthy", Role: config.NodeRoleWorker, Alive: true}}
+	c.runCapacityFetchPhase(context.Background(), nil, time.Second)
+	c.runCapacityFetchPhase(context.Background(), members, 0)
+	if rt.healthy.Load() != 0 {
+		t.Fatal("a phase with no members or no budget still made requests")
+	}
+
+	// A cancelled sweep stops dispatching rather than running past its tick.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.runCapacityFetchPhase(ctx, members, time.Second)
+}

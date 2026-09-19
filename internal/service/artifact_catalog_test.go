@@ -204,3 +204,36 @@ func TestJSBundleCatalogPublishesPerTenant(t *testing.T) {
 		t.Fatalf("catalogue still holds %d rows after the delete", len(page.Rows))
 	}
 }
+
+// Every publish entry point is inert without a cluster, a node id or a local
+// store — the catalogue must never be half-published, and standalone mode
+// must not try.
+func TestArtifactCatalogPublishIsInertWithoutACluster(t *testing.T) {
+	ctx := context.Background()
+	st := openSealTestStore(t)
+
+	var none *Service
+	none.PublishTemplateCatalog(ctx)
+	none.PublishJSBundleCatalog(ctx, "tenant")
+
+	standalone := &Service{store: st}
+	standalone.PublishTemplateCatalog(ctx)
+	if _, ok := standalone.ClusterArtifactCatalog(ctx, cluster.ArtifactKindTemplate, ""); ok {
+		t.Fatal("standalone mode reported a catalogue")
+	}
+
+	// Cluster enabled but the client is a Noop: it publishes nothing and
+	// reads nothing, so the list keeps its own behavior.
+	noop := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cluster.NewNoop("node-a", "http://node-a", "")}
+	noop.PublishTemplateCatalog(ctx)
+	if _, ok := noop.ClusterArtifactCatalog(ctx, cluster.ArtifactKindTemplate, ""); ok {
+		t.Fatal("a Noop cluster reported a catalogue")
+	}
+
+	// Bundles need the bundle store; without it there is nothing to publish.
+	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: newCatalogCluster("node-a")}
+	svc.PublishJSBundleCatalog(ctx, "tenant")
+	if got := svc.cluster.(*catalogCluster).publishCount(); got != 0 {
+		t.Fatalf("published %d bundle slices without a bundle store", got)
+	}
+}

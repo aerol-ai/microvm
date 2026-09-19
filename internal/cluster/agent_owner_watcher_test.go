@@ -468,3 +468,59 @@ func TestReassignStuckPlacementFencesOwnerThroughTheMutation(t *testing.T) {
 		t.Fatalf("owner = %q; the stale escalation bounced the sandbox off its new home", after.OwnerNodeID)
 	}
 }
+
+// A cancelled tick keeps its place instead of restarting the walk, and an
+// unauthoritative answer changes nothing at all: a worker must never conclude
+// "I own nothing" from a control plane it could not reach.
+func TestOwnedRecoveryWatcherKeepsItsPlaceOnInterruption(t *testing.T) {
+	c := &Cluster{fsm: newPlacementFSM()}
+	seedOwnedRecoveryRows(c, "worker-self", ownedRecoveryScanBudget+ownedRecoveryPageLimit, "z-must-recover")
+
+	authoritative := true
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req OwnedRecoveryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		resp := c.OwnedRecoveryPlacements("worker-self", req.Limit, req.PageToken)
+		resp.Authoritative = authoritative
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	agent.AttachRecreator(&workerRecreator{})
+
+	// One tick advances the cursor into the walk.
+	agent.recreateOwnedSandboxes(context.Background())
+	mid := agent.ownedRecoveryCursor
+
+	// An unreachable / unauthoritative control plane must not move it.
+	authoritative = false
+	agent.recreateOwnedSandboxes(context.Background())
+	if agent.ownedRecoveryCursor != mid {
+		t.Fatalf("cursor moved from %q to %q on a non-authoritative answer", mid, agent.ownedRecoveryCursor)
+	}
+
+	// A cancelled context stops the tick where it is.
+	authoritative = true
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	agent.recreateOwnedSandboxes(ctx)
+}
+
+// An owner query with no owner, or against a node with no FSM, answers
+// nothing rather than somebody else's recovery work.
+func TestOwnedRecoveryPlacementsRefusesBlankOwner(t *testing.T) {
+	var none *Cluster
+	if got := none.OwnedRecoveryPlacements("worker", 10, ""); got.Authoritative || len(got.Placements) != 0 {
+		t.Fatalf("nil cluster answered %+v", got)
+	}
+	c := &Cluster{fsm: newPlacementFSM()}
+	if got := c.OwnedRecoveryPlacements("  ", 10, ""); got.Authoritative || len(got.Placements) != 0 {
+		t.Fatalf("blank owner answered %+v", got)
+	}
+	// An over-large limit is clamped rather than honored.
+	seedOwnedRecoveryRows(c, "worker-self", 2, "z-ha")
+	if got := c.OwnedRecoveryPlacements("worker-self", ownedRecoveryPageLimit*10, ""); len(got.Placements) != 1 {
+		t.Fatalf("clamped page returned %d rows", len(got.Placements))
+	}
+}

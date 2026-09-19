@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -109,5 +110,74 @@ func TestClusterInternalRegistryReadsRequirePlacementState(t *testing.T) {
 	h.clusterInternalArtifactCatalog(catalogRR, req)
 	if catalogRR.Code != http.StatusServiceUnavailable {
 		t.Fatalf("catalogue read on a stateless node = %d, want 503", catalogRR.Code)
+	}
+}
+
+type stubCatalogService struct {
+	page cluster.ArtifactCatalogPage
+	ok   bool
+}
+
+func (s stubCatalogService) ClusterArtifactCatalog(context.Context, string, string) (cluster.ArtifactCatalogPage, bool) {
+	return s.page, s.ok
+}
+
+// A catalogue the control plane could not answer for must read as "no
+// catalogue" so the sweep still asks peers, and a row this build cannot
+// decode must not take the rest of the catalogue with it — its publisher
+// simply keeps being asked.
+func TestReadClusterArtifactCatalogDecodesAndFallsBack(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/templates", nil)
+
+	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](req, nil, "template", ""); ok {
+		t.Fatal("a nil service reported a catalogue")
+	}
+	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](nil, stubCatalogService{ok: true}, "template", ""); ok {
+		t.Fatal("a nil request reported a catalogue")
+	}
+	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](req, stubCatalogService{}, "template", ""); ok {
+		t.Fatal("an unavailable catalogue was reported as usable; the sweep must still run")
+	}
+
+	svc := stubCatalogService{ok: true, page: cluster.ArtifactCatalogPage{
+		Rows: []cluster.ArtifactCatalogRow{
+			{ID: "good", Payload: []byte(`{"sandbox_id":"good"}`)},
+			{ID: "unreadable", Payload: []byte(`not json`)},
+		},
+		Publishers: []string{"worker-a"},
+	}}
+	rows, publishers, ok := readClusterArtifactCatalog[*cluster.Placement](req, svc, "template", "")
+	if !ok || len(publishers) != 1 {
+		t.Fatalf("ok=%v publishers=%v", ok, publishers)
+	}
+	if len(rows) != 1 || rows[0].SandboxID != "good" {
+		t.Fatalf("rows = %+v, want the decodable row only", rows)
+	}
+}
+
+// Both internal reads refuse a malformed body and a node with no cluster at
+// all rather than answering with an empty set.
+func TestClusterInternalArtifactCatalogRejectsBadInput(t *testing.T) {
+	stub := &registryStubCluster{Noop: cluster.NewNoop("srv", "http://srv", "")}
+	h := newOwnedRecoveryHandlers(t, stub)
+
+	rr := httptest.NewRecorder()
+	bad := withPeer(httptest.NewRequest(http.MethodPost, cluster.PublicInternalArtifactCatalogPath, strings.NewReader("{")), "wrk-a")
+	h.clusterInternalArtifactCatalog(rr, bad)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("malformed catalogue request = %d, want 400", rr.Code)
+	}
+
+	// A node with no cluster attached answers 503 rather than an empty set.
+	standalone := newOwnedRecoveryHandlers(t, nil)
+	noneRR := httptest.NewRecorder()
+	standalone.clusterInternalArtifactCatalog(noneRR, withPeer(httptest.NewRequest(http.MethodPost, cluster.PublicInternalArtifactCatalogPath, strings.NewReader(`{}`)), "wrk-a"))
+	if noneRR.Code != http.StatusServiceUnavailable {
+		t.Fatalf("catalogue read with no cluster = %d, want 503", noneRR.Code)
+	}
+	retireRR := httptest.NewRecorder()
+	standalone.clusterInternalNodeStorageRetirements(retireRR, withPeer(httptest.NewRequest(http.MethodGet, cluster.PublicInternalNodeStorageRetirementsPath, nil), "wrk-a"))
+	if retireRR.Code != http.StatusServiceUnavailable {
+		t.Fatalf("retirement read with no cluster = %d, want 503", retireRR.Code)
 	}
 }
