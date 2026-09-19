@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +14,17 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
-const capacityLeaseFetchConcurrency = 32
+const (
+	capacityLeaseFetchConcurrency = 32
+	// capacityLeaseBackoffBase / Max pace a peer that keeps failing. Without
+	// per-peer backoff every tick re-attempted every unreachable endpoint:
+	// 256 timing-out peers at a 2s dial timeout is ~16s of pool work across
+	// 32 workers, which is longer than the minimum 15s lease TTL, so healthy
+	// peers' refreshes were postponed past their own expiry by other peers'
+	// failures.
+	capacityLeaseBackoffBase = 15 * time.Second
+	capacityLeaseBackoffMax  = 2 * time.Minute
+)
 
 type capacityLease struct {
 	snapshot capacity.Snapshot
@@ -28,6 +39,10 @@ type capacityLeaseCache struct {
 
 	mu     sync.RWMutex
 	leases map[string]capacityLease
+	// nextAttempt / failures schedule each peer INDEPENDENTLY, so one slow
+	// or dead endpoint cannot postpone a healthy peer's refresh.
+	nextAttempt map[string]time.Time
+	failures    map[string]int
 
 	// localTemplateInventory is the Phase 6 PR-D hook for template-aware
 	// placement. cmd/sandboxd registers a callback that reads from the
@@ -50,11 +65,13 @@ func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval 
 		ttl = 15 * time.Second
 	}
 	return &capacityLeaseCache{
-		selfID:   selfID,
-		admitter: admitter,
-		ttl:      ttl,
-		logger:   logger,
-		leases:   make(map[string]capacityLease),
+		selfID:      selfID,
+		admitter:    admitter,
+		ttl:         ttl,
+		logger:      logger,
+		leases:      make(map[string]capacityLease),
+		nextAttempt: make(map[string]time.Time),
+		failures:    make(map[string]int),
 	}
 }
 
@@ -140,6 +157,91 @@ func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated 
 	c.mu.Unlock()
 }
 
+// due reports whether nodeID may be attempted now. A peer in backoff is
+// skipped so its failures do not consume pool slots healthy peers need.
+func (c *capacityLeaseCache) due(nodeID string, now time.Time) bool {
+	if c == nil {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	next, ok := c.nextAttempt[nodeID]
+	return !ok || !now.Before(next)
+}
+
+// recordFetchResult resets or extends a peer's backoff.
+func (c *capacityLeaseCache) recordFetchResult(nodeID string, now time.Time, err error) {
+	if c == nil || nodeID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.nextAttempt == nil {
+		c.nextAttempt = make(map[string]time.Time)
+	}
+	if c.failures == nil {
+		c.failures = make(map[string]int)
+	}
+	if err == nil {
+		delete(c.failures, nodeID)
+		delete(c.nextAttempt, nodeID)
+		return
+	}
+	fails := c.failures[nodeID] + 1
+	c.failures[nodeID] = fails
+	backoff := capacityLeaseBackoffBase << min(fails-1, 8)
+	if backoff > capacityLeaseBackoffMax || backoff <= 0 {
+		backoff = capacityLeaseBackoffMax
+	}
+	c.nextAttempt[nodeID] = now.Add(backoff)
+}
+
+// staleness orders the fetch queue: the peer closest to losing its lease goes
+// first, so a long tail of failures cannot push a healthy peer past its TTL.
+func (c *capacityLeaseCache) staleness(nodeID string, now time.Time) time.Duration {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	lease, ok := c.leases[nodeID]
+	if !ok {
+		// Never seen: most urgent.
+		return time.Duration(1) << 62
+	}
+	return now.Sub(lease.updated)
+}
+
+// retain drops bookkeeping for nodes that are no longer in the membership
+// view. Without it the lease, backoff and failure maps kept one entry per node
+// the process had ever gossiped with — retired nodes included, forever.
+func (c *capacityLeaseCache) retain(live map[string]struct{}) int {
+	if c == nil || len(live) == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	dropped := 0
+	for id := range c.leases {
+		if id == c.selfID {
+			continue
+		}
+		if _, ok := live[id]; !ok {
+			delete(c.leases, id)
+			delete(c.nextAttempt, id)
+			delete(c.failures, id)
+			dropped++
+		}
+	}
+	for id := range c.nextAttempt {
+		if _, ok := live[id]; !ok && id != c.selfID {
+			delete(c.nextAttempt, id)
+			delete(c.failures, id)
+		}
+	}
+	return dropped
+}
+
 func (c *capacityLeaseCache) apply(members []Member, now time.Time) []Member {
 	if c == nil {
 		return members
@@ -201,14 +303,52 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 	c.capacityLeases.refreshLocal(now)
 
 	members := c.gossip.members()
+	live := make(map[string]struct{}, len(members))
+	queue := make([]Member, 0, len(members))
+	for _, m := range members {
+		if m.NodeID == "" {
+			continue
+		}
+		live[m.NodeID] = struct{}{}
+		if m.NodeID == c.nodeID || !m.Alive || !CanOwnSandboxRole(m.Role) || m.InternalURL == "" {
+			continue
+		}
+		// Peers in backoff are skipped entirely this tick. A dead endpoint
+		// must not hold a pool slot a healthy peer needs before its TTL.
+		if !c.capacityLeases.due(m.NodeID, now) {
+			continue
+		}
+		queue = append(queue, m)
+	}
+	// Retire bookkeeping for nodes gossip no longer knows about.
+	c.capacityLeases.retain(live)
+
+	// Most-stale first: the peer closest to losing its lease is refreshed
+	// before one that was just updated.
+	sort.Slice(queue, func(i, j int) bool {
+		si := c.capacityLeases.staleness(queue[i].NodeID, now)
+		sj := c.capacityLeases.staleness(queue[j].NodeID, now)
+		if si == sj {
+			return queue[i].NodeID < queue[j].NodeID
+		}
+		return si > sj
+	})
+
+	// Bound the sweep so it cannot run into the next tick and so a long tail
+	// of slow peers cannot consume the whole TTL. Whatever is left is picked
+	// up next tick, and the staleness ordering above stops it being starved.
+	sweepCtx, cancel := context.WithTimeout(ctx, c.capacityLeaseSweepBudget())
+	defer cancel()
+
 	jobs := make(chan Member)
 	var wg sync.WaitGroup
-	for i := 0; i < capacityLeaseFetchConcurrency; i++ {
+	for range capacityLeaseFetchConcurrency {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for m := range jobs {
-				snap, err := c.fetchMemberCapacity(ctx, m)
+				snap, err := c.fetchMemberCapacity(sweepCtx, m)
+				c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), err)
 				if err != nil {
 					if c.logger != nil {
 						c.logger.Debug("cluster: capacity heartbeat fetch failed", "node_id", m.NodeID, "error", err)
@@ -220,20 +360,31 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 		}()
 	}
 
-	for _, m := range members {
-		if ctx.Err() != nil {
+	for _, m := range queue {
+		if sweepCtx.Err() != nil {
 			break
 		}
-		if m.NodeID == "" || m.NodeID == c.nodeID || !m.Alive || !CanOwnSandboxRole(m.Role) {
-			continue
+		select {
+		case jobs <- m:
+		case <-sweepCtx.Done():
 		}
-		if m.InternalURL == "" {
-			continue
-		}
-		jobs <- m
 	}
 	close(jobs)
 	wg.Wait()
+}
+
+// capacityLeaseSweepBudget keeps one sweep comfortably inside the lease TTL,
+// so an overrun cannot be the reason a healthy peer's lease expires.
+func (c *Cluster) capacityLeaseSweepBudget() time.Duration {
+	ttl := 15 * time.Second
+	if c.capacityLeases != nil && c.capacityLeases.ttl > 0 {
+		ttl = c.capacityLeases.ttl
+	}
+	budget := ttl / 3
+	if budget < time.Second {
+		budget = time.Second
+	}
+	return budget
 }
 
 func (c *Cluster) fetchMemberCapacity(ctx context.Context, m Member) (capacity.Snapshot, error) {
