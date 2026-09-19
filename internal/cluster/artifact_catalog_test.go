@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -224,5 +225,54 @@ func TestArtifactCatalogForPeerCarriesPublishers(t *testing.T) {
 	var none *Cluster
 	if page := none.ArtifactCatalogForPeer(ArtifactKindTemplate, ""); page.Authoritative {
 		t.Fatal("a node with no placement state claimed an authoritative catalogue")
+	}
+}
+
+// The catalogue is answered over the same response ceiling as a placement
+// page, and it grows with the fleet's artifacts. Publishers that do not fit
+// are left out WHOLE, so the aggregator keeps asking them rather than
+// believing a partial slice is their whole inventory.
+func TestArtifactCatalogPageIsBoundedByBytes(t *testing.T) {
+	fsm := newPlacementFSM()
+	key := artifactCatalogKey(ArtifactKindTemplate, "")
+	byNode := map[string]artifactCatalogEntry{}
+	// Each node publishes ~1 MiB, so the budget runs out well before the last.
+	for i := range 32 {
+		rows := map[string]ArtifactCatalogRow{}
+		for j := range 64 {
+			id := fmt.Sprintf("tpl-%02d-%02d", i, j)
+			rows[id] = ArtifactCatalogRow{ID: id, Payload: make([]byte, maxArtifactCatalogRowBytes)}
+		}
+		byNode[fmt.Sprintf("worker-%02d", i)] = artifactCatalogEntry{Rows: rows}
+	}
+	fsm.artifactCatalog[key] = byNode
+
+	page := fsm.artifactCatalogPage(ArtifactKindTemplate, "")
+	if !page.Truncated {
+		t.Fatal("the fixture no longer exceeds the page budget")
+	}
+	if len(page.Publishers) == 0 || len(page.Publishers) == len(byNode) {
+		t.Fatalf("publishers = %d of %d; a truncated answer must list the nodes it fully covered and no others",
+			len(page.Publishers), len(byNode))
+	}
+	payload, err := json.Marshal(page)
+	if err != nil {
+		t.Fatalf("marshal page: %v", err)
+	}
+	if len(payload) > maxControlPlaneJSONResponseBytes {
+		t.Fatalf("catalogue page encodes to %d bytes, past the %d ceiling", len(payload), maxControlPlaneJSONResponseBytes)
+	}
+	// Every listed publisher's rows must all be present, or the aggregator
+	// would stop asking a node whose inventory it only half received.
+	have := map[string]struct{}{}
+	for _, row := range page.Rows {
+		have[row.ID] = struct{}{}
+	}
+	for _, nodeID := range page.Publishers {
+		for id := range byNode[nodeID].Rows {
+			if _, ok := have[id]; !ok {
+				t.Fatalf("publisher %s is listed but row %s is missing", nodeID, id)
+			}
+		}
 	}
 }

@@ -44,6 +44,14 @@ const (
 	// maxArtifactCatalogRowBytes bounds one row. Rows are small metadata
 	// (id, name, status, sizes); anything larger is a bug or an attack.
 	maxArtifactCatalogRowBytes = 16 << 10
+	// artifactCatalogPageByteBudget keeps one answer inside the control-plane
+	// JSON response ceiling with room for the envelope. Publishers past the
+	// budget are simply left out of the answer, and the aggregator asks them
+	// directly.
+	artifactCatalogPageByteBudget = 12 << 20
+	// artifactCatalogRowOverheadBytes is the JSON envelope per row (the id and
+	// payload keys, quoting, base64 expansion). It only has to over-estimate.
+	artifactCatalogRowOverheadBytes = 64
 )
 
 // ArtifactCatalogRow is one artifact's metadata as its holder serialized it.
@@ -64,6 +72,11 @@ type ArtifactCatalogPage struct {
 	// Authoritative distinguishes "nothing published yet" from "could not
 	// ask". A non-authoritative answer must fall back to the fan-out.
 	Authoritative bool `json:"authoritative,omitempty"`
+	// Truncated reports that publishers were left out to keep the answer
+	// inside the response ceiling. It changes nothing for correctness — the
+	// omitted nodes are simply not in Publishers, so the aggregator still
+	// asks them — and exists so the cost is visible.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // ArtifactCatalogRequest is the agent-facing read.
@@ -190,19 +203,52 @@ func (f *placementFSM) artifactCatalogPage(kind, tenant string) ArtifactCatalogP
 	if len(byNode) == 0 {
 		return page
 	}
+	// Whole publishers, in a stable order, under a byte budget. A catalogue
+	// is answered over the same 16 MiB control-plane ceiling that the
+	// placement pages are, and this one grows with the fleet's artifacts, so
+	// an unbounded answer would fail the read exactly the way an unbounded
+	// placement page did. Including a node PARTIALLY would be worse than
+	// excluding it: the publisher list is what tells the aggregator which
+	// nodes it no longer has to ask, so a node is only listed once all of its
+	// rows are in the answer.
+	nodeIDs := make([]string, 0, len(byNode))
+	for nodeID := range byNode {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Strings(nodeIDs)
+
 	seen := make(map[string]struct{})
-	publishers := make([]string, 0, len(byNode))
-	for nodeID, entry := range byNode {
-		publishers = append(publishers, nodeID)
+	publishers := make([]string, 0, len(nodeIDs))
+	budget := artifactCatalogPageByteBudget
+	for _, nodeID := range nodeIDs {
+		entry := byNode[nodeID]
+		ids := make([]string, 0, len(entry.Rows))
+		cost := 0
 		for id, row := range entry.Rows {
+			ids = append(ids, id)
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			cost += len(row.Payload) + len(id) + artifactCatalogRowOverheadBytes
+		}
+		if cost > budget {
+			// Out of room. Everything after this node stays unpublished from
+			// the aggregator's point of view, which means it keeps asking
+			// those nodes directly — slower, never wrong.
+			page.Truncated = true
+			break
+		}
+		budget -= cost
+		sort.Strings(ids)
+		for _, id := range ids {
 			if _, dup := seen[id]; dup {
 				continue
 			}
 			seen[id] = struct{}{}
-			page.Rows = append(page.Rows, row)
+			page.Rows = append(page.Rows, entry.Rows[id])
 		}
+		publishers = append(publishers, nodeID)
 	}
-	sort.Strings(publishers)
 	sort.Slice(page.Rows, func(i, j int) bool { return page.Rows[i].ID < page.Rows[j].ID })
 	page.Publishers = publishers
 	return page
