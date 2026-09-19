@@ -255,6 +255,19 @@ func ingressShardFilterForIDs(ids []string, nodeID string) PlacementShardFilter 
 // preferred source — it is what the installer can act on — with the
 // control-plane view as the fallback for a node whose gossip is not up yet.
 func IngressRingMembers(c Client) []Member {
+	return IdentityMembers(c)
+}
+
+// IdentityMembers is the membership view for callers that need only identity,
+// role, liveness or endpoints — never capacity or artifact inventories.
+//
+// Identity/liveness gossip is already fleet-wide and local, so these callers
+// have the answer in-process. Members() on an agent is a control-plane round
+// trip that redistributes the whole membership record (~850 B per peer, ~1.7 MB
+// at 2,000 nodes) including capacity snapshots and template/module inventories
+// the caller is about to throw away. Local gossip first; the control plane is
+// the fallback for a node whose gossip is not up yet.
+func IdentityMembers(c Client) []Member {
 	if c == nil {
 		return nil
 	}

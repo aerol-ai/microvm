@@ -68,6 +68,13 @@ type SelectPlacementRequest struct {
 	// node in a rolling upgrade sends the id.
 	SandboxID        string `json:"sandbox_id,omitempty"`
 	RecipientBackups int    `json:"recipient_backups,omitempty"`
+	// TargetOnly asks for the chosen node and nothing else. Build, template,
+	// JS-bundle and local-image routing all want a single target, but the
+	// only shape that existed without a SandboxID also serialized every
+	// eligible worker back to the caller — O(fleet) bytes for a one-field
+	// answer. An older server ignores the flag and simply returns the
+	// candidates the caller then discards, so this is rolling-upgrade safe.
+	TargetOnly bool `json:"target_only,omitempty"`
 }
 
 type SelectPlacementResponse struct {
@@ -294,8 +301,9 @@ func (a *Agent) OwnerOfName(name string) (string, OwnerInfo, error) {
 	return lookup.SandboxID, owner, nil
 }
 
+// SelectPlacement asks the control plane for a target and nothing else.
 func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
-	target, _, err := a.SelectPlacementWithCandidates(req)
+	target, _, _, err := a.selectPlacement(SelectPlacementRequest{Request: req, TargetOnly: true})
 	return target, err
 }
 
@@ -958,7 +966,9 @@ func (a *Agent) LookupMember(id string) (Member, bool) {
 			return m, true
 		}
 	}
-	for _, m := range a.Members() {
+	// Identity lookup only: the local gossip view answers it without a
+	// control-plane round trip that would carry the whole fleet.
+	for _, m := range a.LocalMembers() {
 		if m.NodeID == id {
 			return m, true
 		}
@@ -967,11 +977,12 @@ func (a *Agent) LookupMember(id string) (Member, bool) {
 }
 
 // IngressTargets aggregates live ingress-role members' PublicHost values.
-// Agents have no FSM but Members() already falls back to the local gossip
-// view when the control plane is unreachable, so the same aggregator works
-// for both cases.
+// Identity and role are gossip facts, so this reads the local view and only
+// falls back to the control plane when gossip has nothing yet — the aggregate
+// is a handful of hostnames, not a reason to redistribute capacity snapshots
+// for the whole fleet.
 func (a *Agent) IngressTargets() models.IngressTarget {
-	return aggregateIngressTargets(a.Members())
+	return aggregateIngressTargets(IdentityMembers(a))
 }
 
 func (a *Agent) Placements() []Placement {
