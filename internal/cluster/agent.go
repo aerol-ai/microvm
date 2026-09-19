@@ -32,6 +32,14 @@ const (
 	PublicInternalPlacementsQueryPath = "/v1/cluster/internal/placements/query"
 	PublicInternalPlacementsPagePath  = "/v1/cluster/internal/placements/page"
 	PublicInternalPlacementsByIDsPath = "/v1/cluster/internal/placements-by-ids"
+	// PublicInternalOwnedRecoveryPath serves a node its OWN failover-recreate
+	// placements (spec + secret handle). It is how a dedicated worker — which
+	// has no FSM — learns that a placement was reassigned to it.
+	PublicInternalOwnedRecoveryPath = "/v1/cluster/internal/placements/owned-recovery"
+	// PublicInternalReassignStuckPath lets an owner that keeps failing to
+	// recreate a sandbox ask the leader to move it. Target selection stays on
+	// the FSM side.
+	PublicInternalReassignStuckPath   = "/v1/cluster/internal/placements/reassign-stuck"
 	PublicInternalRecoveryPath        = "/v1/cluster/internal/recovery/"
 	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
 	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
@@ -116,6 +124,15 @@ type Agent struct {
 	// endpoint on worker/ingress-only agents.
 	placementVersion          atomic.Uint64
 	lastNoControlPlaneLogUnix atomic.Int64
+
+	// recreator is the service-layer hook the worker owner watcher calls to
+	// materialize placements the FSM assigned to this node. Attached after
+	// construction, exactly as *Cluster does, so the cluster->service
+	// direction stays one-way.
+	recreatorMu      sync.RWMutex
+	recreator        SandboxRecreator
+	recreateFailures *recreateFailureTracker
+	ownerWatcherStop context.CancelFunc
 }
 
 func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Agent, error) {
@@ -214,6 +231,11 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 			return ok && m.Alive
 		})
 	}
+	// Worker/ingress nodes own sandboxes too. Without this loop a placement
+	// reassigned to a dedicated worker is never materialized by anything:
+	// the only automatic recreation loop belonged to *Cluster, and pkg/daemon's
+	// AttachRecreator probe silently skipped an Agent.
+	a.startOwnerWatcher()
 	return a, nil
 }
 
@@ -1122,6 +1144,7 @@ func (a *Agent) Leader() string {
 
 func (a *Agent) Close() error {
 	var firstErr error
+	a.stopOwnerWatcher()
 	if a.gossip != nil {
 		if err := a.gossip.Close(); err != nil {
 			firstErr = fmt.Errorf("cluster agent: gossip close: %w", err)
