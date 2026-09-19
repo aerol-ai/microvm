@@ -872,6 +872,11 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 			s.logger.Warn("cluster: retained audit ACL prune failed", "err", err)
 		}
 		s.refreshSecretLifecycleMetrics(ctx)
+		// Publish this node's artifact inventory once at boot: a publish that
+		// failed before the process died has no other retry, and a node whose
+		// catalogue entry predates a restart would otherwise keep advertising
+		// whatever it held then.
+		s.ReconcileArtifactCatalog(ctx)
 		prevAlive := s.aliveMemberSet()
 		for {
 			select {
@@ -912,6 +917,10 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 				// has ever seen.
 				s.pruneAuditIdentityFences(time.Now())
 				s.pruneAuditOwnershipLeaseFences(time.Now())
+				// Republish the artifact inventory if it moved, or if the last
+				// attempt failed. This is the retry that makes publication a
+				// reconciliation rather than a best-effort side effect.
+				s.ReconcileArtifactCatalog(ctx)
 				if len(rejoined) > 0 {
 					// Only the secrets whose recipient set contains a
 					// returning node need retransmitting. Re-fanning out
@@ -2186,7 +2195,23 @@ func (s *Service) reconcileSecretDeleteOutboxRecord(parent context.Context, rec 
 	// deletion was journalled late is not pinned forever. See
 	// node_storage_retirement.go.
 	if retired := s.nodeStorageRetirements(parent); len(retired) > 0 {
-		remaining, discharged := dischargeRetiredStorageRecipients(peers, retired, rec.CreatedAt, rec.RecipientCopiedAt)
+		_, candidates := dischargeRetiredStorageRecipients(peers, retired, rec.CreatedAt, rec.RecipientCopiedAt)
+		// The cached set only decides whether to LOOK. Removing an obligation
+		// without an ACK cannot be taken back, so the decision itself is made
+		// against the leader's current attestations: a revoke on another node
+		// must stop this one discharging immediately, not a cache TTL later.
+		remaining, discharged := peers, []string(nil)
+		if len(candidates) > 0 {
+			authoritative, err := s.authoritativeNodeStorageRetirements(parent)
+			if err != nil {
+				if s.logger != nil {
+					s.logger.Warn("cluster: authoritative storage-retirement read failed; obligations stay pending this tick",
+						"sandbox_id", sandboxID, "err", err)
+				}
+			} else {
+				remaining, discharged = dischargeRetiredStorageRecipients(peers, authoritative, rec.CreatedAt, rec.RecipientCopiedAt)
+			}
+		}
 		if len(discharged) > 0 {
 			// Only recipients whose evidence was actually journalled leave the
 			// obligation. The outbox row is what brings a failed discharge

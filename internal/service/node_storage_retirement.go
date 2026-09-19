@@ -198,6 +198,64 @@ func (s *Service) nodeStorageRetirementWriter() (interface {
 	return w, ok
 }
 
+// authoritativeNodeStorageRetirements answers from the Raft leader, never
+// from this node's 30-second discovery cache or a follower's FSM.
+//
+// The cache is fine for deciding whether a discharge MIGHT apply; it must not
+// authorize one. An operator who revokes an attestation on one node would
+// otherwise have every other owner still discharging obligations against it
+// for up to a full cache TTL — and a discharge cannot be taken back. In
+// standalone mode the local table is the authority, so this returns it.
+func (s *Service) authoritativeNodeStorageRetirements(ctx context.Context) (map[string]time.Time, error) {
+	if s == nil || s.store == nil {
+		return nil, errors.New("store is not configured")
+	}
+	if !s.cfg.EnableCluster {
+		// Standalone: the local table IS the authority.
+		recs, err := s.store.ListNodeStorageRetirements(ctx)
+		if err != nil {
+			return nil, err
+		}
+		byNode := make(map[string]time.Time, len(recs))
+		for _, rec := range recs {
+			byNode[rec.NodeID] = rec.AttestedAt
+		}
+		return byNode, nil
+	}
+	reader, ok := s.authoritativeRetirementReader()
+	if !ok {
+		// Clustered, but this node cannot ask the leader. The local table is
+		// not the authority here, so there is nothing to authorize an
+		// irreversible discharge with.
+		return nil, errors.New("cluster: authoritative node storage retirement read is unavailable")
+	}
+	recs, err := reader.AuthoritativeNodeStorageRetirements(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byNode := make(map[string]time.Time, len(recs))
+	for _, rec := range recs {
+		byNode[rec.NodeID] = rec.AttestedAt()
+	}
+	return byNode, nil
+}
+
+func (s *Service) authoritativeRetirementReader() (interface {
+	AuthoritativeNodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error)
+}, bool) {
+	if s == nil || !s.cfg.EnableCluster {
+		return nil, false
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil, false
+	}
+	r, ok := c.(interface {
+		AuthoritativeNodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error)
+	})
+	return r, ok
+}
+
 func (s *Service) nodeStorageRetirementReader() (interface {
 	NodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error)
 }, bool) {

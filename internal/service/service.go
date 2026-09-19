@@ -189,12 +189,13 @@ type Service struct {
 	// short-lived, lifecycle-fenced lease instead of a control-plane read per
 	// record. See internal/service/audit_ownership_lease.go.
 	auditLeaseOnce sync.Once
-	// artifactCatalogPublished debounces catalogue publishes: an unchanged
-	// local inventory must not re-enter the Raft log on every list.
-	artifactCatalogPublished publishedArtifactFingerprints
-	auditLeases              *auditOwnershipLeases
-	auditIncarnationMu       sync.RWMutex
-	pendingAuditIncarnation  map[string]string
+	// artifactCatalog tracks, per artifact kind, what the local inventory has
+	// reached and what the replicated catalogue has accepted. See
+	// artifact_catalog.go.
+	artifactCatalog         artifactCatalogState
+	auditLeases             *auditOwnershipLeases
+	auditIncarnationMu      sync.RWMutex
+	pendingAuditIncarnation map[string]string
 	// auditIdentityCache memoizes each sandbox's resolved (incarnation,
 	// owner_ref). Both are immutable for a lifecycle, and egress audit stamps
 	// every event with them — without this, one event per sandbox per second
@@ -518,6 +519,10 @@ type Service struct {
 	// DestroySandbox so attachment / wasm-cleanup / cluster-secret failure
 	// arms can be forced (e.g. by closing the store). Nil in production.
 	testAfterStoreDeleteOnDestroy func()
+	// testDuringSandboxRowDelete runs between the pre-delete audit fences and
+	// the row removal, which is the window a concurrent audit resolve lands
+	// in. See deleteSandboxRowAndFenceAudit.
+	testDuringSandboxRowDelete func()
 	// testAfterTemplateGCList runs after ListGCEligibleTemplates succeeds in
 	// runTemplateGC so IsTemplateReferenced / VMM-ref failure arms can be
 	// forced. Nil in production.
@@ -1186,9 +1191,7 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 			return err
 		}
 	}
-	s.invalidateAuditIdentity(sandbox.ID)
-	s.invalidateAuditOwnershipLease(sandbox.ID)
-	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err := s.deleteSandboxRowAndFenceAudit(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
 	if !runtimeAlreadyGone {
@@ -2916,9 +2919,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
 		return err
 	}
-	s.invalidateAuditIdentity(id)
-	s.invalidateAuditOwnershipLease(id)
-	if err := s.store.Delete(ctx, id); err != nil {
+	if err := s.deleteSandboxRowAndFenceAudit(ctx, id); err != nil {
 		return err
 	}
 	if s.testAfterStoreDeleteOnDestroy != nil {
@@ -2937,6 +2938,34 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
 	return nil
+}
+
+// deleteSandboxRowAndFenceAudit removes the authoritative local row and
+// brackets it with the audit lifecycle fences.
+//
+// Invalidating only BEFORE the removal leaves a window: a resolve that starts
+// after the invalidation still finds the row, and installs a POSITIVE
+// identity and binding lease under the current epoch. Nothing retires those
+// once the row is gone, so a capability for the destroyed lifetime keeps
+// being accepted until the TTL expires. The second invalidation closes the
+// window from both ends — it retires anything installed during the removal,
+// and it bumps the epoch again, which fences a resolve still in flight from
+// installing its answer at all.
+//
+// Every path that removes the row goes through here so the ordering cannot
+// drift apart again.
+func (s *Service) deleteSandboxRowAndFenceAudit(ctx context.Context, sandboxID string) error {
+	s.invalidateAuditIdentity(sandboxID)
+	s.invalidateAuditOwnershipLease(sandboxID)
+	if s.testDuringSandboxRowDelete != nil {
+		s.testDuringSandboxRowDelete()
+	}
+	err := s.store.Delete(ctx, sandboxID)
+	// Fence after the transition whatever the outcome: a delete that failed
+	// part way must not leave a lease minted from the window either.
+	s.invalidateAuditIdentity(sandboxID)
+	s.invalidateAuditOwnershipLease(sandboxID)
+	return err
 }
 
 func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, placement cluster.Placement, reason string) {
@@ -4880,9 +4909,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// with status "started" sitting in sandboxes would make every
 			// sweep skip this image, leaking layers across reconcile cycles
 			// until something else changed.
-			s.invalidateAuditIdentity(sandbox.ID)
-			s.invalidateAuditOwnershipLease(sandbox.ID)
-			if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			if err := s.deleteSandboxRowAndFenceAudit(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
 			s.forgetWakeFlight(sandbox.ID)

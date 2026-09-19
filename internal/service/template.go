@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -184,7 +185,7 @@ func (s *Service) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	if err := s.store.CreateTemplate(ctx, template); err != nil {
+	if err := s.createTemplateRow(ctx, template); err != nil {
 		return nil, err
 	}
 
@@ -226,7 +227,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		defer cancel()
 
 		// ----- Phase A: rootfs -----
-		if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusBuildingRootfs, "", "", 0); uerr != nil {
+		if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusBuildingRootfs, "", "", 0); uerr != nil {
 			s.logger.Warn("template build: status update to building_rootfs failed", "template_id", id, "error", uerr)
 			// Continue: a stale status row is recoverable; bailing now
 			// leaves the on-disk artifacts unbuilt with no chance of
@@ -253,7 +254,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 			if rmErr := os.RemoveAll(dir); rmErr != nil {
 				s.logger.Warn("template build: rootfs failure cleanup failed", "template_id", id, "error", rmErr)
 			}
-			if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusFailed, "", err.Error(), 0); uerr != nil {
+			if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusFailed, "", err.Error(), 0); uerr != nil {
 				s.logger.Warn("template build: status update to failed failed", "template_id", id, "error", uerr)
 			}
 			s.logger.Info("audit template build finished", "template_id", id, "status", models.TemplateStatusFailed, "phase", "rootfs", "error", err.Error())
@@ -287,7 +288,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 				reason = "SB_FIRECRACKER_SNAPSHOT_ENABLED=false"
 			}
 			s.logger.Info("template build: skipping snapshot phase", "template_id", id, "reason", reason)
-			if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusReadyNoSnapshot, rootfsOut, "", rootfsSizeBytes); uerr != nil {
+			if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusReadyNoSnapshot, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 				s.logger.Warn("template build: status update to ready_no_snapshot failed", "template_id", id, "error", uerr)
 			}
 			s.logger.Info("audit template build finished", "template_id", id, "status", models.TemplateStatusReadyNoSnapshot, "size_bytes", rootfsSizeBytes)
@@ -305,7 +306,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 			if uerr := s.store.UpdateTemplateSnapshotFailed(ctx, id, snapErrMsg); uerr != nil {
 				s.logger.Warn("template build: snapshot_error update failed", "template_id", id, "error", uerr)
 			}
-			if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusReadyNoSnapshot, rootfsOut, "", rootfsSizeBytes); uerr != nil {
+			if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusReadyNoSnapshot, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 				s.logger.Warn("template build: status update to ready_no_snapshot failed", "template_id", id, "error", uerr)
 			}
 			s.logger.Info("audit template build finished", "template_id", id, "status", models.TemplateStatusReadyNoSnapshot, "size_bytes", rootfsSizeBytes)
@@ -313,7 +314,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		}
 
 		// ----- Phase B: snapshot -----
-		if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusSnapshotting, rootfsOut, "", rootfsSizeBytes); uerr != nil {
+		if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusSnapshotting, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 			s.logger.Warn("template build: status update to snapshotting failed", "template_id", id, "error", uerr)
 		}
 		snap, snapErr := s.templateSnapshotter.SnapshotTemplate(ctx, TemplateSnapshotRequest{
@@ -336,7 +337,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 			if uerr := s.store.UpdateTemplateSnapshotFailed(ctx, id, snapErr.Error()); uerr != nil {
 				s.logger.Warn("template build: snapshot_error update failed", "template_id", id, "error", uerr)
 			}
-			if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusReadyNoSnapshot, rootfsOut, "", rootfsSizeBytes); uerr != nil {
+			if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusReadyNoSnapshot, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 				s.logger.Warn("template build: status update to ready_no_snapshot failed", "template_id", id, "error", uerr)
 			}
 			s.logger.Info("audit template build finished", "template_id", id, "status", models.TemplateStatusReadyNoSnapshot, "size_bytes", rootfsSizeBytes, "snapshot_error", snapErr.Error())
@@ -360,7 +361,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 			// Don't try to roll back — the on-disk artifacts are valid,
 			// the row is just stale. Operators can re-trigger the build.
 		}
-		if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusReady, rootfsOut, "", rootfsSizeBytes); uerr != nil {
+		if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusReady, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 			s.logger.Warn("template build: final status update failed", "template_id", id, "error", uerr)
 		}
 		// Phase 6 PR 6-B.1: flag the just-built template for AOCR push so
@@ -419,6 +420,38 @@ func (s *Service) ListTemplates(ctx context.Context) ([]*models.Template, error)
 	return s.store.ListTemplates(ctx)
 }
 
+// createTemplateRow / setTemplateStatus / deleteTemplateRow are the ONLY
+// places this package changes the template inventory. Each marks the
+// replicated catalogue dirty, so publication cannot be forgotten by a new
+// call site — which is how a created or GC'd template stayed invisible to,
+// or advertised by, a catalogue the aggregator had already stopped
+// double-checking.
+func (s *Service) createTemplateRow(ctx context.Context, template *models.Template) error {
+	if err := s.store.CreateTemplate(ctx, template); err != nil {
+		return err
+	}
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	return nil
+}
+
+func (s *Service) setTemplateStatus(ctx context.Context, id string, status models.TemplateStatus, rootfsPath, errMsg string, sizeBytes int64) error {
+	if err := s.store.UpdateTemplateStatus(ctx, id, status, rootfsPath, errMsg, sizeBytes); err != nil {
+		return err
+	}
+	// A build finishing is an inventory change like any other: the row the
+	// catalogue advertises now says "ready" and carries a size.
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	return nil
+}
+
+func (s *Service) deleteTemplateRow(ctx context.Context, id string) error {
+	if err := s.store.DeleteTemplate(ctx, id); err != nil {
+		return err
+	}
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	return nil
+}
+
 // DeleteTemplate refuses when an active sandbox still references the
 // template — yanking the rootfs out from under a running Firecracker
 // guest would surface as a delayed I/O error inside the guest, hours
@@ -472,13 +505,7 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string) error {
 			s.logger.Warn("template delete: rootfs cleanup failed", "template_id", id, "error", rmErr)
 		}
 	}
-	if err := s.store.DeleteTemplate(ctx, id); err != nil {
-		return err
-	}
-	// A publish REPLACES this node's slice, so the deleted row leaves the
-	// replicated catalogue by republishing what is left.
-	s.PublishTemplateCatalog(ctx)
-	return nil
+	return s.deleteTemplateRow(ctx, id)
 }
 
 // StartTemplateGC launches the periodic janitor that drops unreferenced
@@ -564,7 +591,7 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 				// at a missing file is much worse.
 			}
 		}
-		if err := s.store.DeleteTemplate(ctx, t.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		if err := s.deleteTemplateRow(ctx, t.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 			s.logger.Warn("template gc row delete failed", "template_id", t.ID, "error", err)
 			continue
 		}

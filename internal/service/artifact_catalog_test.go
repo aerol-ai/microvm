@@ -3,108 +3,283 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// catalogCluster records what a node publishes and serves it back, standing
-// in for the replicated FSM catalogue.
+// catalogCluster records the chunk sequences a node publishes and serves back
+// the last committed snapshot, standing in for the replicated FSM.
 type catalogCluster struct {
 	*cluster.Noop
 	mu        sync.Mutex
-	publishes int
-	rows      map[string][]cluster.ArtifactCatalogRow
+	chunks    []cluster.ArtifactCatalogSnapshot
+	snapshots int
+	committed map[string]map[string]cluster.ArtifactCatalogRow // kind -> id -> row
+	failing   bool                                             // refuse every publish
 	readErr   error
 }
 
 func newCatalogCluster(self string) *catalogCluster {
-	return &catalogCluster{Noop: cluster.NewNoop(self, "http://"+self, ""), rows: map[string][]cluster.ArtifactCatalogRow{}}
+	return &catalogCluster{
+		Noop:      cluster.NewNoop(self, "http://"+self, ""),
+		committed: map[string]map[string]cluster.ArtifactCatalogRow{},
+	}
 }
 
-func (c *catalogCluster) PublishArtifactCatalog(_ context.Context, kind, tenant, nodeID string, rows []cluster.ArtifactCatalogRow) error {
+func (c *catalogCluster) PublishArtifactCatalog(_ context.Context, chunk cluster.ArtifactCatalogSnapshot) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.publishes++
-	c.rows[kind+"\x00"+tenant+"\x00"+nodeID] = rows
+	if c.failing {
+		return errors.New("control plane unavailable")
+	}
+	c.chunks = append(c.chunks, chunk)
+	if chunk.First {
+		c.committed[chunk.Kind+"\x00pending"] = map[string]cluster.ArtifactCatalogRow{}
+	}
+	pending := c.committed[chunk.Kind+"\x00pending"]
+	if pending == nil {
+		pending = map[string]cluster.ArtifactCatalogRow{}
+		c.committed[chunk.Kind+"\x00pending"] = pending
+	}
+	for _, row := range chunk.Rows {
+		pending[row.ID] = row
+	}
+	if chunk.Final {
+		c.committed[chunk.Kind] = pending
+		delete(c.committed, chunk.Kind+"\x00pending")
+		c.snapshots++
+	}
 	return nil
 }
 
-func (c *catalogCluster) ArtifactCatalog(_ context.Context, kind, tenant string) (cluster.ArtifactCatalogPage, error) {
+func (c *catalogCluster) ArtifactCatalog(_ context.Context, req cluster.ArtifactCatalogRequest) (cluster.ArtifactCatalogPage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.readErr != nil {
 		return cluster.ArtifactCatalogPage{}, c.readErr
 	}
 	page := cluster.ArtifactCatalogPage{Authoritative: true}
-	for key, rows := range c.rows {
-		if key[:len(kind)] != kind {
+	for id, row := range c.committed[req.Kind] {
+		if row.Tenant != req.Tenant {
 			continue
 		}
-		page.Rows = append(page.Rows, rows...)
+		page.Rows = append(page.Rows, c.committed[req.Kind][id])
+	}
+	if c.snapshots > 0 {
+		page.Publishers = []string{c.SelfNodeID()}
 	}
 	return page, nil
 }
 
-func (c *catalogCluster) publishCount() int {
+func (c *catalogCluster) publishedSnapshots() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.publishes
+	return c.snapshots
 }
 
-// The catalogue only replaces the fleet-wide sweep if nodes actually publish
-// — and publishing must not become a Raft write per list request.
-func TestTemplateCatalogPublishIsDebouncedByInventory(t *testing.T) {
+func (c *catalogCluster) rowIDs(kind string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.committed[kind]))
+	for id := range c.committed[kind] {
+		out = append(out, id)
+	}
+	return out
+}
+
+func newCatalogService(t *testing.T) (*Service, *catalogCluster) {
+	t.Helper()
 	st := openSealTestStore(t)
 	cl := newCatalogCluster("worker-a")
 	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cl}
+	return svc, cl
+}
+
+// Publication was wired to a handful of call sites, so a create, a build
+// finishing or a GC sweep left the catalogue advertising an inventory the
+// node no longer had — and the aggregator skips a node it already covers, so
+// nothing asked it again. Every inventory mutation marks the kind dirty and
+// the reconciler publishes the inventory as it is now.
+func TestTemplateInventoryMutationsReachTheCatalogue(t *testing.T) {
+	svc, cl := newCatalogService(t)
 	ctx := context.Background()
 
-	if err := st.CreateTemplate(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
-		t.Fatalf("seed template: %v", err)
+	// Create.
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusPending}); err != nil {
+		t.Fatal(err)
 	}
-	svc.PublishTemplateCatalog(ctx)
-	if got := cl.publishCount(); got != 1 {
-		t.Fatalf("publishes = %d, want 1", got)
+	svc.ReconcileArtifactCatalog(ctx)
+	if got := cl.rowIDs(cluster.ArtifactKindTemplate); len(got) != 1 || got[0] != "tpl-1" {
+		t.Fatalf("catalogue after create = %v, want the new template", got)
 	}
-	// The list handlers publish from rows they already hold; the same
-	// fingerprint debounces both entry points.
-	rows, err := svc.ListTemplates(ctx)
+
+	// Build status change: the row the catalogue advertises now says ready.
+	if err := svc.setTemplateStatus(ctx, "tpl-1", models.TemplateStatusReady, "/rootfs.ext4", "", 1234); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	rows := cl.rowIDs(cluster.ArtifactKindTemplate)
+	if len(rows) != 1 {
+		t.Fatalf("catalogue = %v", rows)
+	}
+	cl.mu.Lock()
+	payload := cl.committed[cluster.ArtifactKindTemplate]["tpl-1"].Payload
+	cl.mu.Unlock()
+	var published models.Template
+	if err := json.Unmarshal(payload, &published); err != nil {
+		t.Fatalf("decode published row: %v", err)
+	}
+	if published.Status != models.TemplateStatusReady {
+		t.Fatalf("published status = %q; a build completing never reached the catalogue", published.Status)
+	}
+
+	// GC deletion.
+	if err := svc.deleteTemplateRow(ctx, "tpl-1"); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	if got := cl.rowIDs(cluster.ArtifactKindTemplate); len(got) != 0 {
+		t.Fatalf("catalogue after deletion = %v; the node still advertises an artifact it does not have", got)
+	}
+}
+
+// An unchanged inventory must not re-enter the raft log on every tick.
+func TestArtifactCatalogReconcileIsIdleWhenNothingChanged(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+
+	svc.ReconcileArtifactCatalog(ctx)
+	first := cl.publishedSnapshots()
+	if first == 0 {
+		t.Fatal("boot published nothing; an empty inventory is the answer that stops the fleet sweep")
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	svc.ReconcileArtifactCatalog(ctx)
+	if got := cl.publishedSnapshots(); got != first {
+		t.Fatalf("published %d snapshots for an unchanged inventory, want %d", got, first)
+	}
+}
+
+// A failed publication must be retried, not logged and forgotten: the node is
+// already covered by its previous snapshot, so the aggregator will not ask it
+// and nothing else would notice the inventory had moved on.
+func TestArtifactCatalogPublishRetriesUntilItSucceeds(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+
+	svc.ReconcileArtifactCatalog(ctx)
+	committed := cl.publishedSnapshots()
+
+	// The next publication cannot reach the control plane.
+	cl.mu.Lock()
+	cl.failing = true
+	cl.mu.Unlock()
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-late", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	if got := cl.publishedSnapshots(); got != committed {
+		t.Fatalf("a failed publication committed a snapshot anyway (%d)", got)
+	}
+
+	// Transport recovers: the next pass publishes the inventory as it is now.
+	cl.mu.Lock()
+	cl.failing = false
+	cl.mu.Unlock()
+	svc.ReconcileArtifactCatalog(ctx)
+	if got := cl.rowIDs(cluster.ArtifactKindTemplate); len(got) != 1 || got[0] != "tpl-late" {
+		t.Fatalf("catalogue after recovery = %v; the failed publication was never retried", got)
+	}
+}
+
+// A publication that succeeds while the inventory moves on must not mark the
+// node clean: the catalogue would then advertise the older snapshot with
+// nothing scheduled to correct it.
+func TestArtifactCatalogRepublishesWhenTheInventoryMovedMidPublish(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+	svc.ReconcileArtifactCatalog(ctx)
+
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	// The mutation lands while the publication of the previous inventory is
+	// in flight — modelled by marking dirty again before the commit.
+	revision, needed := svc.artifactCatalog.begin(cluster.ArtifactKindTemplate)
+	if !needed {
+		t.Fatal("the fixture no longer has anything to publish")
+	}
+	svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	svc.artifactCatalog.commit(cluster.ArtifactKindTemplate, revision)
+
+	if _, needed := svc.artifactCatalog.begin(cluster.ArtifactKindTemplate); !needed {
+		t.Fatal("the node marked itself clean although its inventory moved while the publication was in flight")
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	if got := cl.rowIDs(cluster.ArtifactKindTemplate); len(got) != 1 {
+		t.Fatalf("catalogue = %v, want the current inventory", got)
+	}
+}
+
+// A worker with no bundles for a tenant still answers for it: the publication
+// covers the KIND, so an empty tenant does not send every list back to the
+// fleet.
+func TestJSBundleCatalogueCoversTenantsWithNothing(t *testing.T) {
+	svc, _ := newCatalogService(t)
+	bundleStore, err := jsbundle.NewStore(jsbundle.StoreConfig{Dir: filepath.Join(t.TempDir(), "bundles")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.PublishTemplateCatalogRows(ctx, rows)
-	if got := cl.publishCount(); got != 1 {
-		t.Fatalf("publishes = %d after a row-carrying publish of the same inventory", got)
+	svc.SetIsolateBundleStore(bundleStore)
+	svc.cfg.EnableIsolate = true
+	ctx := context.Background()
+
+	svc.ReconcileArtifactCatalog(ctx)
+	page, ok := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactCatalogRequest{
+		Kind:   cluster.ArtifactKindJSBundle,
+		Tenant: "tenant-with-nothing",
+	})
+	if !ok {
+		t.Fatal("catalogue read failed")
 	}
-	// An unchanged inventory must not re-enter the log.
-	svc.PublishTemplateCatalog(ctx)
-	svc.PublishTemplateCatalog(ctx)
-	if got := cl.publishCount(); got != 1 {
-		t.Fatalf("publishes = %d after two no-op calls; an unchanged inventory must write nothing", got)
+	if len(page.Rows) != 0 {
+		t.Fatalf("rows = %+v, want none", page.Rows)
 	}
-	// A change republishes.
-	if err := st.CreateTemplate(ctx, &models.Template{ID: "tpl-2", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
-		t.Fatal(err)
-	}
-	svc.PublishTemplateCatalog(ctx)
-	if got := cl.publishCount(); got != 2 {
-		t.Fatalf("publishes = %d, want the changed inventory republished", got)
+	if len(page.Publishers) != 1 {
+		t.Fatalf("publishers = %v; a node that published an empty inventory has answered for this tenant", page.Publishers)
 	}
 
-	page, ok := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactKindTemplate, "")
-	if !ok || len(page.Rows) != 2 {
-		t.Fatalf("catalogue read ok=%v rows=%d, want both templates", ok, len(page.Rows))
+	// An upload for one tenant is published with its tenancy on the row.
+	tenantCtx := controlplane.ContextWithAccess(ctx, controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "tenant-a"},
+	})
+	created, err := svc.CreateJSBundle(tenantCtx, models.CreateJSBundleRequest{Name: "hook", Source: jsBundleSrc})
+	if err != nil {
+		t.Fatal(err)
 	}
-	var decoded models.Template
-	if err := json.Unmarshal(page.Rows[0].Payload, &decoded); err != nil {
-		t.Fatalf("catalogue row is not a template: %v", err)
+	svc.ReconcileArtifactCatalog(ctx)
+	mine, ok := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactCatalogRequest{
+		Kind:   cluster.ArtifactKindJSBundle,
+		Tenant: "tenant-a",
+	})
+	if !ok || len(mine.Rows) != 1 || mine.Rows[0].ID != created.Digest {
+		t.Fatalf("tenant-a catalogue = %+v ok=%v", mine.Rows, ok)
 	}
-	if decoded.ID == "" {
-		t.Fatal("catalogue row lost the template metadata the list has to return")
+	other, _ := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactCatalogRequest{
+		Kind:   cluster.ArtifactKindJSBundle,
+		Tenant: "tenant-b",
+	})
+	if len(other.Rows) != 0 {
+		t.Fatalf("tenant-b sees %+v; the catalogue must not disclose another tenant's digests", other.Rows)
 	}
 }
 
@@ -113,167 +288,116 @@ func TestTemplateCatalogPublishIsDebouncedByInventory(t *testing.T) {
 func TestClusterArtifactCatalogFallsBackWhenUnavailable(t *testing.T) {
 	st := openSealTestStore(t)
 	standalone := &Service{cfg: config.Config{}, store: st}
-	if _, ok := standalone.ClusterArtifactCatalog(context.Background(), cluster.ArtifactKindTemplate, ""); ok {
+	req := cluster.ArtifactCatalogRequest{Kind: cluster.ArtifactKindTemplate}
+	if _, ok := standalone.ClusterArtifactCatalog(context.Background(), req); ok {
 		t.Fatal("standalone mode reported a cluster catalogue")
 	}
+	standalone.ReconcileArtifactCatalog(context.Background())
 
 	cl := newCatalogCluster("worker-a")
 	cl.readErr = context.DeadlineExceeded
 	clustered := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cl}
-	if _, ok := clustered.ClusterArtifactCatalog(context.Background(), cluster.ArtifactKindTemplate, ""); ok {
+	if _, ok := clustered.ClusterArtifactCatalog(context.Background(), req); ok {
 		t.Fatal("an unreachable control plane reported a usable catalogue; the sweep must still run")
 	}
-}
 
-// A failed publish must not be remembered as published, or the node stays
-// invisible to the catalogue until its inventory happens to change again.
-func TestArtifactCatalogPublishRetriesAfterFailure(t *testing.T) {
-	st := openSealTestStore(t)
-	cl := &failingCatalogCluster{catalogCluster: newCatalogCluster("worker-a"), fail: true}
-	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cl}
-	ctx := context.Background()
-
-	if err := st.CreateTemplate(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
-		t.Fatal(err)
-	}
-	svc.PublishTemplateCatalog(ctx)
-	if got := cl.publishCount(); got != 1 {
-		t.Fatalf("attempts = %d, want the first publish attempted", got)
-	}
-
-	cl.mu.Lock()
-	cl.fail = false
-	cl.mu.Unlock()
-	svc.PublishTemplateCatalog(ctx)
-	if got := cl.publishCount(); got != 2 {
-		t.Fatalf("attempts = %d; a failed publish was remembered as published, so the node never re-registers", got)
-	}
-}
-
-type failingCatalogCluster struct {
-	*catalogCluster
-	fail bool
-}
-
-func (c *failingCatalogCluster) PublishArtifactCatalog(ctx context.Context, kind, tenant, nodeID string, rows []cluster.ArtifactCatalogRow) error {
-	c.mu.Lock()
-	failing := c.fail
-	c.mu.Unlock()
-	if failing {
-		c.mu.Lock()
-		c.publishes++
-		c.mu.Unlock()
-		return context.DeadlineExceeded
-	}
-	return c.catalogCluster.PublishArtifactCatalog(ctx, kind, tenant, nodeID, rows)
-}
-
-// Bundles are tenant-scoped, and so is their catalogue slice: an upload
-// publishes the uploading tenant's rows, and a delete publishes what is left.
-func TestJSBundleCatalogPublishesPerTenant(t *testing.T) {
-	svc := newBundleService(t)
-	cl := newCatalogCluster("worker-a")
-	svc.cfg.EnableCluster = true
-	svc.cluster = cl
-	ctx := context.Background()
-
-	created, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "hook", Source: jsBundleSrc})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cl.publishCount(); got != 1 {
-		t.Fatalf("publishes after upload = %d, want 1", got)
-	}
-	page, ok := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactKindJSBundle, "")
-	if !ok || len(page.Rows) != 1 || page.Rows[0].ID != created.Digest {
-		t.Fatalf("catalogue = %+v ok=%v, want the uploaded digest", page.Rows, ok)
-	}
-	var decoded models.JSBundle
-	if err := json.Unmarshal(page.Rows[0].Payload, &decoded); err != nil || decoded.Digest != created.Digest {
-		t.Fatalf("catalogue row = %+v err=%v", decoded, err)
-	}
-
-	if err := svc.DeleteJSBundle(ctx, created.Digest); err != nil {
-		t.Fatal(err)
-	}
-	if got := cl.publishCount(); got != 2 {
-		t.Fatalf("publishes after delete = %d; a delete must republish the remaining slice", got)
-	}
-	page, _ = svc.ClusterArtifactCatalog(ctx, cluster.ArtifactKindJSBundle, "")
-	if len(page.Rows) != 0 {
-		t.Fatalf("catalogue still holds %d rows after the delete", len(page.Rows))
-	}
-}
-
-// Every publish entry point is inert without a cluster, a node id or a local
-// store — the catalogue must never be half-published, and standalone mode
-// must not try.
-func TestArtifactCatalogPublishIsInertWithoutACluster(t *testing.T) {
-	ctx := context.Background()
-	st := openSealTestStore(t)
-
-	var none *Service
-	none.PublishTemplateCatalog(ctx)
-	none.PublishJSBundleCatalog(ctx, "tenant")
-
-	standalone := &Service{store: st}
-	standalone.PublishTemplateCatalog(ctx)
-	if _, ok := standalone.ClusterArtifactCatalog(ctx, cluster.ArtifactKindTemplate, ""); ok {
-		t.Fatal("standalone mode reported a catalogue")
-	}
-
-	// Cluster enabled but the client is a Noop: it publishes nothing and
-	// reads nothing, so the list keeps its own behavior.
+	// A Noop cluster publishes nothing and reads nothing.
 	noop := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cluster.NewNoop("node-a", "http://node-a", "")}
-	noop.PublishTemplateCatalog(ctx)
-	if _, ok := noop.ClusterArtifactCatalog(ctx, cluster.ArtifactKindTemplate, ""); ok {
+	noop.ReconcileArtifactCatalog(context.Background())
+	if _, ok := noop.ClusterArtifactCatalog(context.Background(), req); ok {
 		t.Fatal("a Noop cluster reported a catalogue")
 	}
+}
 
-	// Bundles need the bundle store; without it there is nothing to publish.
-	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: newCatalogCluster("node-a")}
-	svc.PublishJSBundleCatalog(ctx, "tenant")
-	if got := svc.cluster.(*catalogCluster).publishCount(); got != 0 {
-		t.Fatalf("published %d bundle slices without a bundle store", got)
+// An inventory that cannot be read is not an empty one: publishing an empty
+// snapshot would tell the aggregator this node holds nothing.
+func TestArtifactCatalogPublishSkipsWhenTheLocalListFails(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	for _, chunk := range cl.chunks {
+		if chunk.Kind == cluster.ArtifactKindTemplate {
+			t.Fatal("published a template snapshot from a store that could not be read")
+		}
 	}
 }
 
-// A local list that cannot be read is not an empty inventory: publishing an
-// empty slice would tell the aggregator this node holds nothing and stop it
-// being asked.
-func TestArtifactCatalogPublishSkipsWhenTheLocalListFails(t *testing.T) {
-	st := openSealTestStore(t)
-	cl := newCatalogCluster("worker-a")
-	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cl}
+// An inventory larger than the catalogue's per-node cap is not published at
+// all: the node stays uncovered and the aggregator keeps asking it, which is
+// slower but never advertises a truncated inventory as a whole one.
+func TestArtifactCatalogSkipsAnOversizedInventory(t *testing.T) {
+	svc, cl := newCatalogService(t)
 	ctx := context.Background()
 
-	if err := st.CreateTemplate(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
-		t.Fatal(err)
+	for i := range cluster.MaxArtifactCatalogRowsPerNode() + 1 {
+		if err := svc.store.CreateTemplate(ctx, &models.Template{
+			ID: fmt.Sprintf("tpl-%05d", i), Image: "alpine", Status: models.TemplateStatusReady,
+		}); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
 	}
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
-	}
-	svc.PublishTemplateCatalog(ctx)
-	if got := cl.publishCount(); got != 0 {
-		t.Fatalf("published %d slices from a store that could not be read", got)
+	svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	svc.ReconcileArtifactCatalog(ctx)
+
+	for _, chunk := range cl.chunks {
+		if chunk.Kind == cluster.ArtifactKindTemplate && len(chunk.Rows) > 0 {
+			t.Fatal("an inventory over the per-node cap was published anyway")
+		}
 	}
 }
 
 // Rows the catalogue cannot represent are skipped without taking the rest of
-// the slice with them.
-func TestArtifactCatalogPublishSkipsUnusableRows(t *testing.T) {
-	st := openSealTestStore(t)
-	cl := newCatalogCluster("worker-a")
-	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cl}
+// the inventory with them.
+func TestArtifactCatalogSkipsUnusableRows(t *testing.T) {
+	svc, cl := newCatalogService(t)
 	ctx := context.Background()
 
-	svc.PublishTemplateCatalogRows(ctx, []*models.Template{
-		nil,
-		{ID: "  "},
-		{ID: "tpl-good", Image: "alpine", Status: models.TemplateStatusReady},
-	})
-	page, ok := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactKindTemplate, "")
-	if !ok || len(page.Rows) != 1 || page.Rows[0].ID != "tpl-good" {
-		t.Fatalf("catalogue = %+v ok=%v, want only the usable row", page.Rows, ok)
+	if err := svc.store.CreateTemplate(ctx, &models.Template{ID: "tpl-good", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	svc.ReconcileArtifactCatalog(ctx)
+	if got := cl.rowIDs(cluster.ArtifactKindTemplate); len(got) != 1 || got[0] != "tpl-good" {
+		t.Fatalf("catalogue = %v, want the usable row", got)
+	}
+
+	// A nil / blank-id row never reaches the wire.
+	rows, ok := svc.localArtifactRows(ctx, cluster.ArtifactKindTemplate)
+	if !ok {
+		t.Fatal("local inventory read failed")
+	}
+	for _, row := range rows {
+		if row.ID == "" {
+			t.Fatal("a row without an id was built for publication")
+		}
+	}
+	if _, ok := svc.localArtifactRows(ctx, "not-a-kind"); ok {
+		t.Fatal("an unknown kind reported a usable inventory")
+	}
+}
+
+// A node with no bundle store publishes an empty bundle inventory rather than
+// nothing: "this node holds no bundles" is what stops every tenant's list
+// asking it again.
+func TestArtifactCatalogPublishesEmptyBundleInventoryWithoutAStore(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+	svc.ReconcileArtifactCatalog(ctx)
+
+	published := false
+	for _, chunk := range cl.chunks {
+		if chunk.Kind == cluster.ArtifactKindJSBundle && chunk.Final {
+			published = true
+		}
+	}
+	if !published {
+		t.Fatal("a node without a bundle store published no bundle inventory at all")
 	}
 }

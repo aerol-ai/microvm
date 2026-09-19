@@ -97,3 +97,94 @@ func TestSecretDeleteOutboxDefaultsProvenanceFromTheSealedRow(t *testing.T) {
 		t.Fatalf("provenance %v is later than the sealed row's own write; it must not be dated at journal time", at)
 	}
 }
+
+// A reseal retires the previous generation's recipients. Their copies were
+// distributed when THAT generation was written, so stamping them with the new
+// generation's write time makes a retirement attested between the two
+// generations unable to discharge the copy it actually covers.
+func TestRetiredRecipientsKeepThePreviousGenerationsWriteTime(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	ref := secrets.FormatRef("sb-reseal", "inc", secrets.RefVersion)
+
+	genOneWrittenAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: ref, SandboxID: "sb-reseal", Version: secrets.RefVersion,
+		Recipients: []string{"peer-old", "peer-keep"}, SealedPayload: []byte("gen1"),
+		SealGeneration: 1, CreatedAt: genOneWrittenAt, UpdatedAt: genOneWrittenAt,
+	}); err != nil {
+		t.Fatalf("seed generation 1: %v", err)
+	}
+
+	// The reseal to generation 2 drops peer-old and rewrites the row.
+	retire := []string{"peer-old"}
+	if _, err := st.PutClusterSecret(ctx, ClusterSecretRecord{
+		Ref: ref, SandboxID: "sb-reseal", Version: secrets.RefVersion,
+		Recipients: []string{"peer-keep", "peer-new"}, SealedPayload: []byte("gen2"),
+		SealGeneration: 2, RetireRecipients: &retire,
+	}); err != nil {
+		t.Fatalf("reseal to generation 2: %v", err)
+	}
+
+	rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-reseal", "inc")
+	if err != nil || rec == nil {
+		t.Fatalf("outbox row: %v", err)
+	}
+	at, ok := rec.RecipientCopiedAt["peer-old"]
+	if !ok {
+		t.Fatal("the retired recipient has no provenance at all")
+	}
+	if !at.Equal(genOneWrittenAt) {
+		t.Fatalf("retired recipient's provenance = %v, want the generation-1 write time %v; it was stamped with the reseal that removed it",
+			at, genOneWrittenAt)
+	}
+}
+
+// An ACK shrinks the recipient list. Leaving the removed recipient's
+// provenance behind hands its stale timestamp to the NEXT obligation for that
+// node, so a later copy inherits an earlier disk's date.
+func TestAckShrinkDropsTheRemovedRecipientsProvenance(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+
+	old := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
+	if err := st.UpsertSecretDeleteOutboxCopiedAt(ctx, "sb-ack", "inc", []string{"peer-a", "peer-b"}, 1, old); err != nil {
+		t.Fatal(err)
+	}
+	// peer-a ACKs; peer-b stays pending, so the row survives.
+	if err := st.UpdateSecretDeleteOutboxRecipients(ctx, "sb-ack", "inc", []string{"peer-b"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-ack", "inc")
+	if err != nil || rec == nil {
+		t.Fatalf("outbox row: %v", err)
+	}
+	if _, stale := rec.RecipientCopiedAt["peer-a"]; stale {
+		t.Fatal("the ACKed recipient's provenance survived the shrink")
+	}
+	if got := rec.RecipientCopiedAt["peer-b"]; !got.Equal(old) {
+		t.Fatalf("the pending recipient lost its own provenance: %v", got)
+	}
+
+	// peer-a gets a NEW copy at a later generation: its provenance must be
+	// the new copy's, not the one it already had deleted.
+	later := time.Now().UTC().Truncate(time.Second)
+	if err := st.UpsertSecretDeleteOutboxCopiedAt(ctx, "sb-ack", "inc", []string{"peer-a"}, 2, later); err != nil {
+		t.Fatal(err)
+	}
+	rec, err = st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-ack", "inc")
+	if err != nil || rec == nil {
+		t.Fatalf("outbox row: %v", err)
+	}
+	if got := rec.RecipientCopiedAt["peer-a"]; !got.Equal(later) {
+		t.Fatalf("re-added recipient's provenance = %v, want the new copy's time %v; it inherited the obsolete one", got, later)
+	}
+}

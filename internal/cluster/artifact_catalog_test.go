@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
 
@@ -23,47 +24,52 @@ func TestArtifactCatalogPublishReplacesOnlyThePublishersSlice(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 	ctx := context.Background()
 
-	rows := func(ids ...string) []ArtifactCatalogRow {
-		out := make([]ArtifactCatalogRow, 0, len(ids))
-		for _, id := range ids {
-			payload, _ := json.Marshal(map[string]string{"id": id})
-			out = append(out, ArtifactCatalogRow{ID: id, Payload: payload})
-		}
-		return out
-	}
-
-	if err := c.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "worker-a", rows("tpl-1", "tpl-2")); err != nil {
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-a", 1, catalogRows("", "tpl-1", "tpl-2")); err != nil {
 		t.Fatalf("publish worker-a: %v", err)
 	}
-	if err := c.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "worker-b", rows("tpl-2", "tpl-3")); err != nil {
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-b", "inc-b", 1, catalogRows("", "tpl-2", "tpl-3")); err != nil {
 		t.Fatalf("publish worker-b: %v", err)
 	}
 
-	page, err := c.ArtifactCatalog(ctx, ArtifactKindTemplate, "")
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if len(page.Rows) != 3 {
-		t.Fatalf("rows = %d, want 3 deduped across both publishers", len(page.Rows))
+	// The catalogue reports rows per (node, id): two nodes holding the same
+	// artifact is the replication fact it exists to record, and the list
+	// aggregator dedupes by its own key. Collapsing here would also break the
+	// (node, id) cursor, which cannot carry "ids already seen".
+	if len(page.Rows) != 4 {
+		t.Fatalf("rows = %d, want one per (node, artifact)", len(page.Rows))
+	}
+	distinct := map[string]struct{}{}
+	for _, row := range page.Rows {
+		distinct[row.ID] = struct{}{}
+	}
+	if len(distinct) != 3 {
+		t.Fatalf("distinct artifacts = %d, want 3", len(distinct))
 	}
 	if len(page.Publishers) != 2 {
 		t.Fatalf("publishers = %v, want both nodes", page.Publishers)
 	}
 
 	// worker-a deletes tpl-1 by republishing what is left.
-	if err := c.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "worker-a", rows("tpl-2")); err != nil {
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-a", 2, catalogRows("", "tpl-2")); err != nil {
 		t.Fatalf("republish worker-a: %v", err)
 	}
-	page, err = c.ArtifactCatalog(ctx, ArtifactKindTemplate, "")
+	page, err = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ids := make([]string, 0, len(page.Rows))
+	ids := map[string]struct{}{}
 	for _, row := range page.Rows {
-		ids = append(ids, row.ID)
+		ids[row.ID] = struct{}{}
 	}
-	if len(ids) != 2 || ids[0] != "tpl-2" || ids[1] != "tpl-3" {
-		t.Fatalf("rows = %v; a republish must replace only the publisher's own slice", ids)
+	if _, gone := ids["tpl-1"]; gone {
+		t.Fatal("the republished node still advertises the artifact it dropped")
+	}
+	if _, kept := ids["tpl-3"]; !kept {
+		t.Fatal("a republish by one node dropped another node's rows")
 	}
 }
 
@@ -75,47 +81,93 @@ func TestArtifactCatalogIsTenantScoped(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 	ctx := context.Background()
 
-	row := ArtifactCatalogRow{ID: "sha256-aaa", Payload: []byte(`{"digest":"aaa"}`)}
-	if err := c.PublishArtifactCatalog(ctx, ArtifactKindJSBundle, "tenant-a", "worker-a", []ArtifactCatalogRow{row}); err != nil {
+	row := ArtifactCatalogRow{ID: "sha256-aaa", Tenant: "tenant-a", Payload: []byte(`{"digest":"aaa"}`)}
+	if err := publishWholeCatalog(ctx, c, ArtifactKindJSBundle, "worker-a", "inc-a", 1, []ArtifactCatalogRow{row}); err != nil {
 		t.Fatal(err)
 	}
 
-	mine, err := c.ArtifactCatalog(ctx, ArtifactKindJSBundle, "tenant-a")
+	mine, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "tenant-a"})
 	if err != nil || len(mine.Rows) != 1 {
 		t.Fatalf("tenant-a rows = %+v err=%v", mine.Rows, err)
 	}
-	other, err := c.ArtifactCatalog(ctx, ArtifactKindJSBundle, "tenant-b")
+	other, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "tenant-b"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(other.Rows) != 0 || len(other.Publishers) != 0 {
-		t.Fatalf("tenant-b sees %+v; a tenant's catalogue must not disclose another's digests", other)
+	if len(other.Rows) != 0 {
+		t.Fatalf("tenant-b sees %+v; a tenant's catalogue must not disclose another's digests", other.Rows)
+	}
+	// Coverage is per KIND, so the publisher answers for a tenant it holds
+	// nothing for — that is what stops an empty tenant's list sweeping the
+	// fleet forever.
+	if len(other.Publishers) != 1 || other.Publishers[0] != "worker-a" {
+		t.Fatalf("tenant-b publishers = %v, want the node that published an inventory without its rows", other.Publishers)
 	}
 }
 
-// Publishes are validated before they reach the log: an unknown kind, a
-// missing publisher, an oversized slice or an oversized row are refused.
+// catalogRows builds tenant-scoped rows for a test publication.
+func catalogRows(tenant string, ids ...string) []ArtifactCatalogRow {
+	out := make([]ArtifactCatalogRow, 0, len(ids))
+	for _, id := range ids {
+		payload, _ := json.Marshal(map[string]string{"id": id})
+		out = append(out, ArtifactCatalogRow{ID: id, Tenant: tenant, Payload: payload})
+	}
+	return out
+}
+
+// publishWholeCatalog sends an inventory as the chunk sequence a publisher
+// would.
+func publishWholeCatalog(ctx context.Context, c *Cluster, kind, nodeID, incarnation string, revision int64, rows []ArtifactCatalogRow) error {
+	for _, chunk := range ChunkArtifactCatalogSnapshot(kind, nodeID, incarnation, revision, rows) {
+		if err := c.PublishArtifactCatalog(ctx, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Publishes are validated before they reach the log, and the chunk caps are
+// aligned with what the apply transport actually accepts: a whole inventory
+// of ordinary rows is far larger than one command may carry.
 func TestArtifactCatalogPublishIsBounded(t *testing.T) {
 	c, cleanup := newTestCluster(t, "srv-catalog-bounds", true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 	ctx := context.Background()
 
-	if err := c.PublishArtifactCatalog(ctx, "not-a-kind", "", "worker", nil); err == nil {
+	valid := ArtifactCatalogSnapshot{Kind: ArtifactKindTemplate, NodeID: "worker", Incarnation: "inc", Revision: 1, First: true, Final: true}
+
+	bad := valid
+	bad.Kind = "not-a-kind"
+	if err := c.PublishArtifactCatalog(ctx, bad); err == nil {
 		t.Fatal("unknown catalogue kind accepted")
 	}
-	if err := c.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "", nil); err == nil {
+	bad = valid
+	bad.NodeID = ""
+	if err := c.PublishArtifactCatalog(ctx, bad); err == nil {
 		t.Fatal("publish without a node id accepted")
 	}
-	oversize := make([]ArtifactCatalogRow, maxArtifactCatalogRowsPerNode+1)
-	for i := range oversize {
-		oversize[i] = ArtifactCatalogRow{ID: "x"}
+	bad = valid
+	bad.Incarnation = ""
+	if err := c.PublishArtifactCatalog(ctx, bad); err == nil {
+		t.Fatal("publish without a publisher incarnation accepted")
 	}
-	if err := c.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "worker", oversize); err == nil {
-		t.Fatalf("a publish of %d rows was accepted", len(oversize))
+	bad = valid
+	bad.Revision = 0
+	if err := c.PublishArtifactCatalog(ctx, bad); err == nil {
+		t.Fatal("publish without a revision accepted")
 	}
-	fat := []ArtifactCatalogRow{{ID: "fat", Payload: make([]byte, maxArtifactCatalogRowBytes+1)}}
-	if err := c.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "worker", fat); err == nil {
+	bad = valid
+	bad.Rows = make([]ArtifactCatalogRow, MaxArtifactCatalogChunkRows+1)
+	for i := range bad.Rows {
+		bad.Rows[i] = ArtifactCatalogRow{ID: fmt.Sprintf("r-%d", i)}
+	}
+	if err := c.PublishArtifactCatalog(ctx, bad); err == nil {
+		t.Fatalf("a chunk of %d rows was accepted", len(bad.Rows))
+	}
+	bad = valid
+	bad.Rows = []ArtifactCatalogRow{{ID: "fat", Payload: make([]byte, maxArtifactCatalogRowBytes+1)}}
+	if err := c.PublishArtifactCatalog(ctx, bad); err == nil {
 		t.Fatal("an oversized row was accepted")
 	}
 }
@@ -124,10 +176,8 @@ func TestArtifactCatalogPublishIsBounded(t *testing.T) {
 // every list back to the fleet-wide sweep.
 func TestArtifactCatalogSurvivesSnapshotRestore(t *testing.T) {
 	fsm := newPlacementFSM()
-	key := artifactCatalogKey(ArtifactKindJSBundle, "tenant-a")
-	fsm.artifactCatalog[key] = map[string]artifactCatalogEntry{
-		"worker-a": {Rows: map[string]ArtifactCatalogRow{"sha256-aaa": {ID: "sha256-aaa", Payload: []byte(`{"digest":"aaa"}`)}}},
-	}
+	seedCommittedCatalog(fsm, ArtifactKindJSBundle, "worker-a", "inc-a", 1,
+		ArtifactCatalogRow{ID: "sha256-aaa", Tenant: "tenant-a", Payload: []byte(`{"digest":"aaa"}`)})
 
 	snap, err := fsm.Snapshot()
 	if err != nil {
@@ -141,7 +191,7 @@ func TestArtifactCatalogSurvivesSnapshotRestore(t *testing.T) {
 	if err := restored.Restore(io.NopCloser(sink.Buffer)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	page := restored.artifactCatalogPage(ArtifactKindJSBundle, "tenant-a")
+	page := restored.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "tenant-a"})
 	if len(page.Rows) != 1 || page.Rows[0].ID != "sha256-aaa" || len(page.Publishers) != 1 {
 		t.Fatalf("restored catalogue = %+v", page)
 	}
@@ -152,7 +202,7 @@ func TestArtifactCatalogSurvivesSnapshotRestore(t *testing.T) {
 // read must refuse a non-authoritative answer rather than report a tenant's
 // artifacts as absent.
 func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
-	var published []ArtifactCatalogPublishRequest
+	var published []ArtifactCatalogSnapshot
 	var lastRead ArtifactCatalogRequest
 	authoritative := true
 	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,8 +214,10 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 				t.Errorf("decode forwarded command: %v", err)
 				return
 			}
-			published = append(published, ArtifactCatalogPublishRequest{
-				Kind: cmd.ArtifactKind, Tenant: cmd.ArtifactTenant, NodeID: cmd.NodeID, Rows: cmd.ArtifactRows,
+			published = append(published, ArtifactCatalogSnapshot{
+				Kind: cmd.ArtifactKind, NodeID: cmd.NodeID, Incarnation: cmd.ArtifactIncarnation,
+				Revision: cmd.ArtifactRevision, Rows: cmd.ArtifactRows,
+				First: cmd.ArtifactChunkFirst, Final: cmd.ArtifactChunkFinal,
 			})
 			w.WriteHeader(http.StatusNoContent)
 		case PublicInternalArtifactCatalogPath:
@@ -184,18 +236,27 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 	}))
 	ctx := context.Background()
 
-	rows := []ArtifactCatalogRow{{ID: "sha256-aaa", Payload: []byte(`{}`)}}
-	if err := agent.PublishArtifactCatalog(ctx, ArtifactKindJSBundle, "tenant-a", "worker-self", rows); err != nil {
-		t.Fatalf("PublishArtifactCatalog: %v", err)
+	rows := []ArtifactCatalogRow{{ID: "sha256-aaa", Tenant: "tenant-a", Payload: []byte(`{}`)}}
+	for _, chunk := range ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-self", "inc-1", 7, rows) {
+		if err := agent.PublishArtifactCatalog(ctx, chunk); err != nil {
+			t.Fatalf("PublishArtifactCatalog: %v", err)
+		}
 	}
-	if len(published) != 1 || published[0].Kind != ArtifactKindJSBundle || published[0].Tenant != "tenant-a" || published[0].NodeID != "worker-self" {
+	if len(published) != 1 || published[0].Kind != ArtifactKindJSBundle || published[0].NodeID != "worker-self" {
 		t.Fatalf("forwarded publish = %+v", published)
 	}
-	if err := agent.PublishArtifactCatalog(ctx, "bogus", "", "worker-self", nil); err == nil {
+	if published[0].Incarnation != "inc-1" || published[0].Revision != 7 || !published[0].First || !published[0].Final {
+		t.Fatalf("forwarded publish lost its version or its chunk framing: %+v", published[0])
+	}
+	if len(published[0].Rows) != 1 || published[0].Rows[0].Tenant != "tenant-a" {
+		t.Fatalf("forwarded rows = %+v; tenancy rides the row so coverage can answer for an empty tenant", published[0].Rows)
+	}
+	bogus := ArtifactCatalogSnapshot{Kind: "bogus", NodeID: "worker-self", Incarnation: "inc-1", Revision: 1, First: true, Final: true}
+	if err := agent.PublishArtifactCatalog(ctx, bogus); err == nil {
 		t.Fatal("an unknown catalogue kind was forwarded to the control plane")
 	}
 
-	page, err := agent.ArtifactCatalog(ctx, ArtifactKindJSBundle, "tenant-a")
+	page, err := agent.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "tenant-a"})
 	if err != nil {
 		t.Fatalf("ArtifactCatalog: %v", err)
 	}
@@ -207,7 +268,7 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 	}
 
 	authoritative = false
-	if _, err := agent.ArtifactCatalog(ctx, ArtifactKindJSBundle, "tenant-a"); err == nil {
+	if _, err := agent.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "tenant-a"}); err == nil {
 		t.Fatal("a non-authoritative catalogue answer was accepted; the caller would report a tenant's bundles as absent")
 	}
 }
@@ -216,17 +277,15 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 // so the aggregator knows which nodes it still has to ask.
 func TestArtifactCatalogForPeerCarriesPublishers(t *testing.T) {
 	fsm := newPlacementFSM()
-	fsm.artifactCatalog[artifactCatalogKey(ArtifactKindTemplate, "")] = map[string]artifactCatalogEntry{
-		"worker-a": {Rows: map[string]ArtifactCatalogRow{"tpl-1": {ID: "tpl-1", Payload: []byte(`{}`)}}},
-	}
+	seedCommittedCatalog(fsm, ArtifactKindTemplate, "worker-a", "inc-a", 1, ArtifactCatalogRow{ID: "tpl-1", Payload: []byte(`{}`)})
 	c := &Cluster{fsm: fsm}
 
-	page := c.ArtifactCatalogForPeer(ArtifactKindTemplate, "")
+	page := c.ArtifactCatalogForPeer(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
 	if !page.Authoritative || len(page.Rows) != 1 || len(page.Publishers) != 1 || page.Publishers[0] != "worker-a" {
 		t.Fatalf("peer page = %+v", page)
 	}
 	var none *Cluster
-	if page := none.ArtifactCatalogForPeer(ArtifactKindTemplate, ""); page.Authoritative {
+	if page := none.ArtifactCatalogForPeer(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}); page.Authoritative {
 		t.Fatal("a node with no placement state claimed an authoritative catalogue")
 	}
 }
@@ -235,127 +294,83 @@ func TestArtifactCatalogForPeerCarriesPublishers(t *testing.T) {
 // page, and it grows with the fleet's artifacts. Publishers that do not fit
 // are left out WHOLE, so the aggregator keeps asking them rather than
 // believing a partial slice is their whole inventory.
-func TestArtifactCatalogPageIsBoundedByBytes(t *testing.T) {
+// seedCommittedCatalog installs a committed snapshot directly, for tests that
+// are about the read side rather than the publish protocol.
+func seedCommittedCatalog(fsm *placementFSM, kind, nodeID, incarnation string, revision int64, rows ...ArtifactCatalogRow) {
+	state := fsm.artifactCatalog[artifactCatalogKindKey(kind)]
+	if state == nil {
+		state = &artifactCatalogKindState{
+			Committed: map[string]artifactCatalogNodeState{},
+			Pending:   map[string]artifactCatalogNodeState{},
+		}
+		fsm.artifactCatalog[artifactCatalogKindKey(kind)] = state
+	}
+	byID := make(map[string]ArtifactCatalogRow, len(rows))
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	state.Committed[nodeID] = artifactCatalogNodeState{Incarnation: incarnation, Revision: revision, Rows: byID}
+}
+
+// The catalogue is answered over the same response ceiling as a placement
+// page, and it grows with the fleet's artifacts. A single response budget
+// with the remainder dropped sent most of a large fleet back to the peer
+// sweep even though the FSM already held its metadata — so the read is paged,
+// and the cursor carries what a page cannot.
+func TestArtifactCatalogReadIsPagedNotTruncated(t *testing.T) {
 	fsm := newPlacementFSM()
-	key := artifactCatalogKey(ArtifactKindTemplate, "")
-	byNode := map[string]artifactCatalogEntry{}
-	// Each node publishes ~1 MiB, so the budget runs out well before the last.
-	for i := range 32 {
-		rows := map[string]ArtifactCatalogRow{}
-		for j := range 64 {
-			id := fmt.Sprintf("tpl-%02d-%02d", i, j)
-			rows[id] = ArtifactCatalogRow{ID: id, Payload: make([]byte, maxArtifactCatalogRowBytes)}
+	const (
+		nodes        = 32
+		rowsPerNode  = 64
+		expectedRows = nodes * rowsPerNode
+	)
+	for i := range nodes {
+		rows := make([]ArtifactCatalogRow, 0, rowsPerNode)
+		for j := range rowsPerNode {
+			rows = append(rows, ArtifactCatalogRow{
+				ID:      fmt.Sprintf("tpl-%02d-%02d", i, j),
+				Payload: make([]byte, maxArtifactCatalogRowBytes),
+			})
 		}
-		byNode[fmt.Sprintf("worker-%02d", i)] = artifactCatalogEntry{Rows: rows}
+		seedCommittedCatalog(fsm, ArtifactKindTemplate, fmt.Sprintf("worker-%02d", i), "inc", 1, rows...)
 	}
-	fsm.artifactCatalog[key] = byNode
 
-	page := fsm.artifactCatalogPage(ArtifactKindTemplate, "")
-	if !page.Truncated {
-		t.Fatal("the fixture no longer exceeds the page budget")
-	}
-	if len(page.Publishers) == 0 || len(page.Publishers) == len(byNode) {
-		t.Fatalf("publishers = %d of %d; a truncated answer must list the nodes it fully covered and no others",
-			len(page.Publishers), len(byNode))
-	}
-	payload, err := json.Marshal(page)
-	if err != nil {
-		t.Fatalf("marshal page: %v", err)
-	}
-	if len(payload) > maxControlPlaneJSONResponseBytes {
-		t.Fatalf("catalogue page encodes to %d bytes, past the %d ceiling", len(payload), maxControlPlaneJSONResponseBytes)
-	}
-	// Every listed publisher's rows must all be present, or the aggregator
-	// would stop asking a node whose inventory it only half received.
-	have := map[string]struct{}{}
-	for _, row := range page.Rows {
-		have[row.ID] = struct{}{}
-	}
-	for _, nodeID := range page.Publishers {
-		for id := range byNode[nodeID].Rows {
-			if _, ok := have[id]; !ok {
-				t.Fatalf("publisher %s is listed but row %s is missing", nodeID, id)
+	seen := map[string]struct{}{}
+	token := ""
+	pages := 0
+	for {
+		page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate, PageToken: token})
+		pages++
+		if len(page.Publishers) != nodes {
+			t.Fatalf("page %d lists %d publishers, want all %d; coverage is a property of the kind, not of the page",
+				pages, len(page.Publishers), nodes)
+		}
+		payload, err := json.Marshal(page)
+		if err != nil {
+			t.Fatalf("marshal page: %v", err)
+		}
+		if len(payload) > maxControlPlaneJSONResponseBytes {
+			t.Fatalf("page %d encodes to %d bytes, past the %d ceiling", pages, len(payload), maxControlPlaneJSONResponseBytes)
+		}
+		for _, row := range page.Rows {
+			if _, dup := seen[row.ID]; dup {
+				t.Fatalf("row %s was returned twice across pages", row.ID)
 			}
+			seen[row.ID] = struct{}{}
+		}
+		if page.NextPageToken == "" || page.NextPageToken == token {
+			break
+		}
+		token = page.NextPageToken
+		if pages > 64 {
+			t.Fatal("the walk did not terminate")
 		}
 	}
-}
-
-// Every entry point refuses input that would make the catalogue meaningless,
-// and a node that holds no state says so instead of answering empty.
-func TestArtifactCatalogEntryPointGuards(t *testing.T) {
-	ctx := context.Background()
-	var noCluster *Cluster
-	var noAgent *Agent
-
-	if err := noCluster.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "n", nil); err == nil {
-		t.Fatal("publish on a nil cluster was accepted")
+	if pages < 2 {
+		t.Fatal("the fixture no longer needs more than one page")
 	}
-	if _, err := noCluster.ArtifactCatalog(ctx, ArtifactKindTemplate, ""); err == nil {
-		t.Fatal("read on a nil cluster was accepted")
-	}
-	if _, err := (&Cluster{}).ArtifactCatalog(ctx, ArtifactKindTemplate, ""); err == nil {
-		t.Fatal("read on a cluster with no FSM was accepted")
-	}
-	if err := noAgent.PublishArtifactCatalog(ctx, ArtifactKindTemplate, "", "n", nil); err == nil {
-		t.Fatal("publish on a nil agent was accepted")
-	}
-	if _, err := noAgent.ArtifactCatalog(ctx, ArtifactKindTemplate, ""); err == nil {
-		t.Fatal("read on a nil agent was accepted")
-	}
-
-	var noFSM *placementFSM
-	_ = noFSM
-	empty := newPlacementFSM().artifactCatalogPage(ArtifactKindTemplate, "unknown-tenant")
-	if !empty.Authoritative || len(empty.Rows) != 0 || empty.Truncated {
-		t.Fatalf("empty catalogue page = %+v; nothing published is an authoritative empty answer", empty)
-	}
-}
-
-// The same guards for the retirement registry.
-func TestNodeStorageRetirementEntryPointGuards(t *testing.T) {
-	ctx := context.Background()
-	var noCluster *Cluster
-	var noAgent *Agent
-	now := time.Now()
-
-	if err := noCluster.RetireNodeStorage(ctx, "n", "op", "", now); err == nil {
-		t.Fatal("attestation on a nil cluster was accepted")
-	}
-	if err := (&Cluster{}).RetireNodeStorage(ctx, "", "op", "", now); err == nil {
-		t.Fatal("attestation with no node id was accepted")
-	}
-	if err := noCluster.RevokeNodeStorageRetirement(ctx, "n"); err == nil {
-		t.Fatal("revoke on a nil cluster was accepted")
-	}
-	if err := (&Cluster{}).RevokeNodeStorageRetirement(ctx, " "); err == nil {
-		t.Fatal("revoke with no node id was accepted")
-	}
-	if _, err := noCluster.NodeStorageRetirements(ctx); err == nil {
-		t.Fatal("read on a nil cluster was accepted")
-	}
-	if _, err := (&Cluster{}).NodeStorageRetirements(ctx); err == nil {
-		t.Fatal("read on a cluster with no FSM was accepted")
-	}
-	if err := noAgent.RetireNodeStorage(ctx, "n", "op", "", now); err == nil {
-		t.Fatal("attestation on a nil agent was accepted")
-	}
-	if err := noAgent.RevokeNodeStorageRetirement(ctx, "n"); err == nil {
-		t.Fatal("revoke on a nil agent was accepted")
-	}
-	if _, err := noAgent.NodeStorageRetirements(ctx); err == nil {
-		t.Fatal("read on a nil agent was accepted")
-	}
-
-	// A zero attestation time is unusable as a fence.
-	if got := (NodeStorageRetirement{}).AttestedAt(); !got.IsZero() {
-		t.Fatalf("zero attestation carried a time: %v", got)
-	}
-	if got := (NodeStorageRetirement{AttestedUnix: 1700000000}).AttestedAt(); got.Unix() != 1700000000 {
-		t.Fatalf("attested at %v", got)
-	}
-	var noneCluster *Cluster
-	if page := noneCluster.NodeStorageRetirementsForPeer(); page.Authoritative {
-		t.Fatal("a nil cluster claimed an authoritative retirement set")
+	if len(seen) != expectedRows {
+		t.Fatalf("the paged walk returned %d of %d rows; a truncated read sends the rest back to the peer sweep", len(seen), expectedRows)
 	}
 }
 
@@ -376,28 +391,43 @@ func TestReplicatedRegistryCommandValidation(t *testing.T) {
 		return nil
 	}
 
-	if err := apply(command{Op: opPublishArtifactCatalog, NodeID: "worker-a"}); err == nil {
+	publish := func(cmd command) command {
+		cmd.Op = opPublishArtifactCatalog
+		if cmd.ArtifactIncarnation == "" {
+			cmd.ArtifactIncarnation = "inc-a"
+		}
+		if cmd.ArtifactRevision == 0 {
+			cmd.ArtifactRevision = 1
+		}
+		cmd.ArtifactChunkFirst, cmd.ArtifactChunkFinal = true, true
+		return cmd
+	}
+
+	if err := apply(publish(command{NodeID: "worker-a"})); err == nil {
 		t.Fatal("a publish with no kind was applied")
 	}
-	if err := apply(command{Op: opPublishArtifactCatalog, ArtifactKind: ArtifactKindTemplate}); err == nil {
+	if err := apply(publish(command{ArtifactKind: ArtifactKindTemplate})); err == nil {
 		t.Fatal("a publish with no node id was applied")
 	}
-	over := make([]ArtifactCatalogRow, maxArtifactCatalogRowsPerNode+1)
-	for i := range over {
-		over[i] = ArtifactCatalogRow{ID: "x"}
+	if err := apply(publish(command{ArtifactKind: ArtifactKindTemplate, NodeID: "worker-a", ArtifactIncarnation: " "})); err == nil {
+		t.Fatal("a publish with no publisher incarnation was applied")
 	}
-	if err := apply(command{Op: opPublishArtifactCatalog, ArtifactKind: ArtifactKindTemplate, NodeID: "worker-a", ArtifactRows: over}); err == nil {
-		t.Fatal("an oversized publish was applied")
+	over := make([]ArtifactCatalogRow, MaxArtifactCatalogChunkRows+1)
+	for i := range over {
+		over[i] = ArtifactCatalogRow{ID: fmt.Sprintf("r-%d", i)}
+	}
+	if err := apply(publish(command{ArtifactKind: ArtifactKindTemplate, NodeID: "worker-a", ArtifactRows: over})); err == nil {
+		t.Fatalf("a chunk of %d rows was applied", len(over))
 	}
 	// Rows that are individually unusable are dropped, not the whole publish.
-	if err := apply(command{Op: opPublishArtifactCatalog, ArtifactKind: ArtifactKindTemplate, NodeID: "worker-a", ArtifactRows: []ArtifactCatalogRow{
+	if err := apply(publish(command{ArtifactKind: ArtifactKindTemplate, NodeID: "worker-a", ArtifactRows: []ArtifactCatalogRow{
 		{ID: " ", Payload: []byte(`{}`)},
 		{ID: "fat", Payload: make([]byte, maxArtifactCatalogRowBytes+1)},
 		{ID: "good", Payload: []byte(`{}`)},
-	}}); err != nil {
+	}})); err != nil {
 		t.Fatalf("publish with unusable rows: %v", err)
 	}
-	page := fsm.artifactCatalogPage(ArtifactKindTemplate, "")
+	page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
 	if len(page.Rows) != 1 || page.Rows[0].ID != "good" {
 		t.Fatalf("catalogue = %+v, want only the usable row", page.Rows)
 	}
@@ -417,7 +447,7 @@ func TestReplicatedRegistryCommandValidation(t *testing.T) {
 	}
 
 	for _, id := range []string{"node-b", "node-a"} {
-		if err := apply(command{Op: opRetireNodeStorage, NodeID: id, StorageRetirement: &NodeStorageRetirement{NodeID: id, AttestedUnix: 5}}); err != nil {
+		if err := apply(command{Op: opRetireNodeStorage, NodeID: id, StorageRetirement: &NodeStorageRetirement{NodeID: id, AttestedUnixNano: 5}}); err != nil {
 			t.Fatalf("attest %s: %v", id, err)
 		}
 	}
@@ -463,5 +493,203 @@ func TestPlacementPageNamesAnUndeliverableRow(t *testing.T) {
 	}
 	if page.NextPageToken == "" {
 		t.Fatal("the walk cannot progress past an undeliverable row")
+	}
+}
+
+// A snapshot is delivered in chunks because one node's inventory is allowed
+// to be far larger than a raft command: 4,096 ordinary rows encode to ~1.6 MB
+// against a 1 MiB apply cap, so publishing it whole was refused and the node
+// kept serving whatever it had published before.
+func TestArtifactCatalogChunksFitTheApplyTransport(t *testing.T) {
+	// Ordinary bundle metadata, not maximum-sized or malformed rows: a
+	// content digest, its module ref, a name, an entrypoint and a size.
+	rows := make([]ArtifactCatalogRow, 0, maxArtifactCatalogRowsPerNode)
+	for i := range maxArtifactCatalogRowsPerNode {
+		digest := fmt.Sprintf("%064x", i)
+		payload, err := json.Marshal(models.JSBundle{
+			Digest:     digest,
+			ModuleRef:  "sha256:" + digest,
+			Name:       fmt.Sprintf("handler-%04d", i),
+			MainModule: "index.js",
+			SizeBytes:  int64(4096 + i),
+		})
+		if err != nil {
+			t.Fatalf("encode bundle %d: %v", i, err)
+		}
+		rows = append(rows, ArtifactCatalogRow{ID: digest, Tenant: "tenant-a", Payload: payload})
+	}
+
+	// The shape the previous implementation sent: one command carrying the
+	// whole inventory. It is ordinary metadata, not maximum-sized rows.
+	whole, err := encodeCommand(artifactCatalogCommand(ArtifactCatalogSnapshot{
+		Kind: ArtifactKindJSBundle, NodeID: "worker-a", Incarnation: "inc-a", Revision: 1,
+		Rows: rows, First: true, Final: true,
+	}))
+	if err != nil {
+		t.Fatalf("encode whole inventory: %v", err)
+	}
+	if len(whole) <= maxInternalApplyBytes {
+		t.Fatalf("the fixture inventory encodes to %d bytes, inside the %d apply cap; it no longer models the case",
+			len(whole), maxInternalApplyBytes)
+	}
+
+	chunks := ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-a", "inc-a", 3, rows)
+	if len(chunks) < 2 {
+		t.Fatal("the fixture no longer needs chunking")
+	}
+	if !chunks[0].First || chunks[0].Final {
+		t.Fatalf("first chunk framing = %+v", chunks[0])
+	}
+	if last := chunks[len(chunks)-1]; !last.Final || last.First {
+		t.Fatalf("last chunk framing = %+v", last)
+	}
+	seen := 0
+	for i, chunk := range chunks {
+		encoded, encErr := encodeCommand(artifactCatalogCommand(chunk))
+		if encErr != nil {
+			t.Fatalf("encode chunk %d: %v", i, encErr)
+		}
+		// maxInternalApplyBytes is what the apply handler and the internal
+		// listener enforce; a command over it never reaches the FSM.
+		if len(encoded) > maxInternalApplyBytes {
+			t.Fatalf("chunk %d encodes to %d bytes, over the %d apply cap", i, len(encoded), maxInternalApplyBytes)
+		}
+		if err := validateArtifactCatalogChunk(chunk); err != nil {
+			t.Fatalf("chunk %d failed its own validation: %v", i, err)
+		}
+		seen += len(chunk.Rows)
+	}
+	if seen != len(rows) {
+		t.Fatalf("chunking carried %d of %d rows", seen, len(rows))
+	}
+}
+
+// An inventory that is empty is still a statement — "this node holds nothing
+// of this kind" — and losing it is what keeps a tenant with no artifacts
+// anywhere asking every compatible worker on every cold list.
+func TestArtifactCatalogPublishesAnEmptyInventory(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-empty-catalog", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	chunks := ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-empty", "inc-a", 1, nil)
+	if len(chunks) != 1 || !chunks[0].First || !chunks[0].Final {
+		t.Fatalf("an empty inventory must still be one framed publication: %+v", chunks)
+	}
+	if err := c.PublishArtifactCatalog(ctx, chunks[0]); err != nil {
+		t.Fatalf("publish empty inventory: %v", err)
+	}
+
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "tenant-with-nothing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Rows) != 0 {
+		t.Fatalf("rows = %+v, want none", page.Rows)
+	}
+	if len(page.Publishers) != 1 || page.Publishers[0] != "worker-empty" {
+		t.Fatalf("publishers = %v; a node that published an empty inventory has answered for every tenant", page.Publishers)
+	}
+}
+
+// Two publications can reach the log in the opposite order to the one their
+// inventories were read in. The older one must not win, and a publisher that
+// restarts must not be fenced out by the revisions its previous process left
+// behind.
+func TestArtifactCatalogFencesOutOfOrderAndRestartedPublishers(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-catalog-order", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-1", 2, catalogRows("", "tpl-new")); err != nil {
+		t.Fatal(err)
+	}
+	// The older read lands afterwards.
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-1", 1, catalogRows("", "tpl-old")); err != nil {
+		t.Fatal(err)
+	}
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Rows) != 1 || page.Rows[0].ID != "tpl-new" {
+		t.Fatalf("catalogue = %+v; a late older publication overwrote newer state", page.Rows)
+	}
+
+	// The node restarts: its revisions begin again at 1, and that publication
+	// is newer than anything its previous process left.
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-2", 1, catalogRows("", "tpl-after-restart")); err != nil {
+		t.Fatal(err)
+	}
+	page, err = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Rows) != 1 || page.Rows[0].ID != "tpl-after-restart" {
+		t.Fatalf("catalogue = %+v; a restarted publisher was fenced by its dead process's revisions", page.Rows)
+	}
+}
+
+// A snapshot interrupted between chunks must leave the previous committed
+// answer standing: committing what arrived would advertise half an inventory
+// as a node's whole one, and the aggregator stops asking a node it covers.
+func TestArtifactCatalogDoesNotCommitAHalfDeliveredSnapshot(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-catalog-partial", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-1", 1, catalogRows("", "tpl-a", "tpl-b")); err != nil {
+		t.Fatal(err)
+	}
+	// A new snapshot starts but never finishes.
+	partial := ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 2,
+		Rows: catalogRows("", "tpl-c"), First: true,
+	}
+	if err := c.PublishArtifactCatalog(ctx, partial); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]struct{}{}
+	for _, row := range page.Rows {
+		ids[row.ID] = struct{}{}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("catalogue = %v; a half-delivered snapshot became the node's advertised inventory", ids)
+	}
+	if _, leaked := ids["tpl-c"]; leaked {
+		t.Fatal("an uncommitted chunk is visible to readers")
+	}
+
+	// Finishing the sequence commits it as a whole.
+	final := partial
+	final.First, final.Final = false, true
+	final.Rows = catalogRows("", "tpl-d")
+	if err := c.PublishArtifactCatalog(ctx, final); err != nil {
+		t.Fatal(err)
+	}
+	page, err = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids = map[string]struct{}{}
+	for _, row := range page.Rows {
+		ids[row.ID] = struct{}{}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("committed catalogue = %v, want exactly the new snapshot's rows", ids)
+	}
+	if _, ok := ids["tpl-c"]; !ok {
+		t.Fatalf("committed catalogue = %v, missing the snapshot's first chunk", ids)
+	}
+	if _, ok := ids["tpl-d"]; !ok {
+		t.Fatalf("committed catalogue = %v, missing the snapshot's final chunk", ids)
 	}
 }

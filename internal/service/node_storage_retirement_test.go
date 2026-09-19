@@ -14,10 +14,15 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 )
 
+// retirementCluster is a clustered node whose attestation registry is
+// replicated — which is the only shape a clustered node has: the local table
+// is the authority in standalone mode only. Tests that need two nodes to
+// share one registry hand both the same *replicatedRetirementRegistry.
 type retirementCluster struct {
 	*cluster.Noop
-	mu      sync.Mutex
-	members []cluster.Member
+	mu       sync.Mutex
+	members  []cluster.Member
+	registry *replicatedRetirementRegistry
 }
 
 func (c *retirementCluster) LocalMembers() []cluster.Member {
@@ -27,6 +32,48 @@ func (c *retirementCluster) LocalMembers() []cluster.Member {
 }
 
 func (c *retirementCluster) Members() []cluster.Member { return c.LocalMembers() }
+
+func (c *retirementCluster) sharedRegistry() *replicatedRetirementRegistry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.registry == nil {
+		c.registry = &replicatedRetirementRegistry{}
+	}
+	return c.registry
+}
+
+func (c *retirementCluster) RetireNodeStorage(_ context.Context, nodeID, actor, reason string, attestedAt time.Time) error {
+	c.sharedRegistry().retire(cluster.NodeStorageRetirement{
+		NodeID: nodeID, Actor: actor, Reason: reason, AttestedUnixNano: attestedAt.UTC().UnixNano(),
+	})
+	return nil
+}
+
+func (c *retirementCluster) RevokeNodeStorageRetirement(_ context.Context, nodeID string) error {
+	reg := c.sharedRegistry()
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	delete(reg.entries, nodeID)
+	return nil
+}
+
+func (c *retirementCluster) NodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error) {
+	reg := c.sharedRegistry()
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if reg.err != nil {
+		return nil, reg.err
+	}
+	out := make([]cluster.NodeStorageRetirement, 0, len(reg.entries))
+	for _, rec := range reg.entries {
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+func (c *retirementCluster) AuthoritativeNodeStorageRetirements(ctx context.Context) ([]cluster.NodeStorageRetirement, error) {
+	return c.NodeStorageRetirements(ctx)
+}
 
 func newRetirementService(t *testing.T, cl cluster.Client) (*Service, *store.Store) {
 	t.Helper()
@@ -420,42 +467,22 @@ func (r *replicatedRetirementRegistry) retire(rec cluster.NodeStorageRetirement)
 	r.entries[rec.NodeID] = rec
 }
 
+// registryCluster is a retirementCluster whose registry is SHARED with other
+// nodes in the test, which is what makes "the operator called a different
+// node" expressible.
 type registryCluster struct {
 	*retirementCluster
 	registry *replicatedRetirementRegistry
 }
 
-func (c *registryCluster) RetireNodeStorage(_ context.Context, nodeID, actor, reason string, attestedAt time.Time) error {
-	c.registry.retire(cluster.NodeStorageRetirement{
-		NodeID: nodeID, Actor: actor, Reason: reason, AttestedUnix: attestedAt.UTC().Unix(),
-	})
-	return nil
-}
-
-func (c *registryCluster) RevokeNodeStorageRetirement(_ context.Context, nodeID string) error {
-	c.registry.mu.Lock()
-	defer c.registry.mu.Unlock()
-	delete(c.registry.entries, nodeID)
-	return nil
-}
-
-func (c *registryCluster) NodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error) {
-	c.registry.mu.Lock()
-	defer c.registry.mu.Unlock()
-	if c.registry.err != nil {
-		return nil, c.registry.err
-	}
-	out := make([]cluster.NodeStorageRetirement, 0, len(c.registry.entries))
-	for _, rec := range c.registry.entries {
-		out = append(out, rec)
-	}
-	return out, nil
-}
-
 func newRegistryCluster(self string, registry *replicatedRetirementRegistry, members []cluster.Member) *registryCluster {
 	return &registryCluster{
-		retirementCluster: &retirementCluster{Noop: cluster.NewNoop(self, "http://"+self, ""), members: members},
-		registry:          registry,
+		retirementCluster: &retirementCluster{
+			Noop:     cluster.NewNoop(self, "http://"+self, ""),
+			members:  members,
+			registry: registry,
+		},
+		registry: registry,
 	}
 }
 
@@ -825,7 +852,7 @@ func TestNodeStorageRetirementSurfacesReplicationFailures(t *testing.T) {
 	if removed, err := svc.RevokeNodeStorageRetirement(ctx, "node-gone"); err != nil || removed {
 		t.Fatalf("revoke of an unattested node: removed=%v err=%v", removed, err)
 	}
-	registry.retire(cluster.NodeStorageRetirement{NodeID: "node-gone", AttestedUnix: time.Now().Unix()})
+	registry.retire(cluster.NodeStorageRetirement{NodeID: "node-gone", AttestedUnixNano: time.Now().UnixNano()})
 	if _, err := svc.RevokeNodeStorageRetirement(ctx, "node-gone"); err == nil {
 		t.Fatal("a failed replicated revoke was reported as removed")
 	}
@@ -839,4 +866,118 @@ func TestNodeStorageRetirementSurfacesReplicationFailures(t *testing.T) {
 	if _, err := svc.ListNodeStorageRetirements(ctx); err == nil {
 		t.Fatal("an unreadable registry listed cleanly")
 	}
+}
+
+// revocableRegistry separates what a cached discovery read sees from what the
+// leader currently holds, which is the difference a revoke makes.
+type revocableRegistry struct {
+	*registryCluster
+	authoritative func() []cluster.NodeStorageRetirement
+	authReads     int
+}
+
+func (c *revocableRegistry) AuthoritativeNodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error) {
+	c.registry.mu.Lock()
+	c.authReads++
+	c.registry.mu.Unlock()
+	if c.authoritative != nil {
+		return c.authoritative(), nil
+	}
+	return c.NodeStorageRetirements(context.Background())
+}
+
+// Each owner caches the attestation set for a maintenance tick, and a revoke
+// only invalidates the node that served the operator's request. A cached
+// attestation must not authorize an irreversible discharge after the revoke
+// has committed — the decision is made against the leader's current set.
+func TestRevokedRetirementStopsDischargeOnOtherOwners(t *testing.T) {
+	registry := &replicatedRetirementRegistry{}
+	members := []cluster.Member{{NodeID: "node-gone", Alive: false}}
+	entry, _ := newRetirementService(t, newRegistryCluster("ingress", registry, members))
+
+	ownerCluster := &revocableRegistry{registryCluster: newRegistryCluster("worker", registry, members)}
+	owner, ownerStore := newRetirementService(t, ownerCluster)
+	owner.cluster = ownerCluster
+	owner.testSecretPeerPusher = &fakePeerPusher{deleteErr: errors.New("peer unreachable")}
+	t.Cleanup(owner.CloseSecretAuditSink)
+	ctx := context.Background()
+
+	if err := ownerStore.UpsertSecretDeleteOutboxCopiedAt(ctx, "sb-revoked", "inc", []string{"node-gone"}, 1, time.Now().Add(-time.Hour).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := entry.RetireNodeStorage(ctx, "node-gone", "op", "disk destroyed"); err != nil {
+		t.Fatal(err)
+	}
+	// The owner caches the attestation for this tick.
+	if got := owner.nodeStorageRetirements(ctx); len(got) != 1 {
+		t.Fatalf("owner cached %d attestations, want 1", len(got))
+	}
+
+	// The operator revokes through the ingress. The owner's cache still holds
+	// the attestation — that is the whole point of the test.
+	removed, err := entry.RevokeNodeStorageRetirement(ctx, "node-gone")
+	if err != nil || !removed {
+		t.Fatalf("revoke: removed=%v err=%v", removed, err)
+	}
+	if got := owner.nodeStorageRetirements(ctx); len(got) != 1 {
+		t.Fatalf("owner's cache = %d entries; the fixture must model a stale cache", len(got))
+	}
+
+	rec, err := ownerStore.GetSecretDeleteOutboxForIncarnation(ctx, "sb-revoked", "inc")
+	if err != nil || rec == nil {
+		t.Fatalf("outbox row: %v", err)
+	}
+	owner.reconcileSecretDeleteOutboxRecord(ctx, rec, nil)
+
+	after, err := ownerStore.GetSecretDeleteOutboxForIncarnation(ctx, "sb-revoked", "inc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == nil || len(after.Recipients) != 1 {
+		t.Fatal("a stale cached attestation discharged the obligation after the operator's revoke committed; the removal cannot be taken back")
+	}
+	if ownerCluster.authReads == 0 {
+		t.Fatal("the discharge decision never consulted the authoritative set")
+	}
+}
+
+// An authoritative read that cannot reach the leader leaves the obligation
+// pending rather than falling back to the cache.
+func TestDischargeSkipsWhenTheAuthoritativeReadFails(t *testing.T) {
+	registry := &replicatedRetirementRegistry{}
+	members := []cluster.Member{{NodeID: "node-gone", Alive: false}}
+	base := newRegistryCluster("worker", registry, members)
+	cl := &errorAuthoritativeRegistry{registryCluster: base}
+	svc, st := newRetirementService(t, cl)
+	svc.cluster = cl
+	svc.testSecretPeerPusher = &fakePeerPusher{deleteErr: errors.New("peer unreachable")}
+	t.Cleanup(svc.CloseSecretAuditSink)
+	ctx := context.Background()
+
+	if err := st.UpsertSecretDeleteOutboxCopiedAt(ctx, "sb-noleader", "inc", []string{"node-gone"}, 1, time.Now().Add(-time.Hour).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	registry.retire(cluster.NodeStorageRetirement{NodeID: "node-gone", AttestedUnixNano: time.Now().UnixNano()})
+
+	rec, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-noleader", "inc")
+	if err != nil || rec == nil {
+		t.Fatalf("outbox row: %v", err)
+	}
+	svc.reconcileSecretDeleteOutboxRecord(ctx, rec, nil)
+
+	after, err := st.GetSecretDeleteOutboxForIncarnation(ctx, "sb-noleader", "inc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == nil || len(after.Recipients) != 1 {
+		t.Fatal("an unreachable leader let the cached set authorize the discharge")
+	}
+}
+
+type errorAuthoritativeRegistry struct {
+	*registryCluster
+}
+
+func (c *errorAuthoritativeRegistry) AuthoritativeNodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error) {
+	return nil, errors.New("not leader")
 }

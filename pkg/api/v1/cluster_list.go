@@ -505,32 +505,64 @@ func writeClusterListCoverage(w http.ResponseWriter, failedPeers int, missingHea
 }
 
 // readClusterArtifactCatalog decodes the replicated metadata for one
-// catalogue into the list's own row type. A catalogue the control plane could
-// not answer for reads as "no catalogue", so the sweep falls back to asking
-// peers — never to reporting a tenant's artifacts as absent.
+// catalogue into the list's own row type, walking the cursor to the end.
+//
+// A catalogue the control plane could not answer for reads as "no catalogue",
+// so the sweep falls back to asking peers — never to reporting a tenant's
+// artifacts as absent. A partial walk does the same: coverage is only claimed
+// for a page set that was read in full, or the aggregator would skip nodes
+// whose rows it never received.
 func readClusterArtifactCatalog[T any](r *http.Request, svc clusterArtifactCatalogService, kind, tenant string) ([]T, []string, bool) {
 	if svc == nil || r == nil {
 		return nil, nil, false
 	}
-	page, ok := svc.ClusterArtifactCatalog(r.Context(), kind, tenant)
-	if !ok {
-		return nil, nil, false
-	}
-	rows := make([]T, 0, len(page.Rows))
-	for _, row := range page.Rows {
-		var decoded T
-		if err := json.Unmarshal(row.Payload, &decoded); err != nil {
-			// A row this build cannot read is not a reason to drop the whole
-			// catalogue, but its publisher must still be asked directly.
-			continue
+	var (
+		rows       []T
+		publishers []string
+		token      string
+	)
+	for page := 0; page < maxClusterArtifactCatalogPages; page++ {
+		got, ok := svc.ClusterArtifactCatalog(r.Context(), cluster.ArtifactCatalogRequest{
+			Kind:      kind,
+			Tenant:    tenant,
+			PageToken: token,
+		})
+		if !ok {
+			return nil, nil, false
 		}
-		rows = append(rows, decoded)
+		if page == 0 {
+			// Coverage is a property of the kind and complete on the first
+			// page; the cursor only carries rows.
+			publishers = got.Publishers
+		}
+		for _, row := range got.Rows {
+			var decoded T
+			if err := json.Unmarshal(row.Payload, &decoded); err != nil {
+				// A row this build cannot read is not a reason to drop the
+				// whole catalogue; the sweep still has the node's own list if
+				// it needs it.
+				continue
+			}
+			rows = append(rows, decoded)
+		}
+		if got.NextPageToken == "" || got.NextPageToken == token {
+			return rows, publishers, true
+		}
+		token = got.NextPageToken
 	}
-	return rows, page.Publishers, true
+	// The walk did not finish. Claiming coverage now would drop every row
+	// behind the cursor from the answer.
+	return nil, nil, false
 }
+
+// maxClusterArtifactCatalogPages bounds one list's walk. At
+// cluster.MaxArtifactCatalogPageRows per page this covers far more artifacts
+// than a tenant can hold; it exists so a control plane that keeps emitting
+// cursors cannot spin a list request forever.
+const maxClusterArtifactCatalogPages = 512
 
 // clusterArtifactCatalogService is the service capability the readers need,
 // declared here so the handlers stay testable with a stub.
 type clusterArtifactCatalogService interface {
-	ClusterArtifactCatalog(ctx context.Context, kind, tenant string) (cluster.ArtifactCatalogPage, bool)
+	ClusterArtifactCatalog(ctx context.Context, req cluster.ArtifactCatalogRequest) (cluster.ArtifactCatalogPage, bool)
 }

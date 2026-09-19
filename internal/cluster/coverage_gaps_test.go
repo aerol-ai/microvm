@@ -592,14 +592,14 @@ func TestFetchMemberCapacityFailClosedNoPublicDowngrade(t *testing.T) {
 		NodeID:      "worker-1",
 		APIURL:      public.URL,
 		InternalURL: internal.URL,
-	})
+	}, capacityLeaseFetchTimeout)
 	if err == nil {
 		t.Fatal("expected fail-closed error on internal 503")
 	}
 	if publicHits != 0 {
 		t.Fatalf("public hits = %d, want 0", publicHits)
 	}
-	_, err = c.fetchMemberCapacity(context.Background(), Member{NodeID: "worker-2"})
+	_, err = c.fetchMemberCapacity(context.Background(), Member{NodeID: "worker-2"}, capacityLeaseFetchTimeout)
 	if err == nil {
 		t.Fatal("expected error without peer URL")
 	}

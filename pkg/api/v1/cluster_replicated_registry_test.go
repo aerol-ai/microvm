@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,17 +16,27 @@ type registryStubCluster struct {
 	*cluster.Noop
 	askedKind   string
 	askedTenant string
+	// leader overrides the Noop's "I am the leader" answer so the
+	// authoritative gate can be exercised from a follower.
+	leader string
+}
+
+func (c *registryStubCluster) Leader() string {
+	if c.leader != "" {
+		return c.leader
+	}
+	return c.Noop.Leader()
 }
 
 func (c *registryStubCluster) NodeStorageRetirementsForPeer() cluster.NodeStorageRetirementsResponse {
 	return cluster.NodeStorageRetirementsResponse{
-		Retirements:   []cluster.NodeStorageRetirement{{NodeID: "node-gone", AttestedUnix: 7}},
+		Retirements:   []cluster.NodeStorageRetirement{{NodeID: "node-gone", AttestedUnixNano: 7}},
 		Authoritative: true,
 	}
 }
 
-func (c *registryStubCluster) ArtifactCatalogForPeer(kind, tenant string) cluster.ArtifactCatalogPage {
-	c.askedKind, c.askedTenant = kind, tenant
+func (c *registryStubCluster) ArtifactCatalogForPeer(req cluster.ArtifactCatalogRequest) cluster.ArtifactCatalogPage {
+	c.askedKind, c.askedTenant = req.Kind, req.Tenant
 	return cluster.ArtifactCatalogPage{
 		Rows:          []cluster.ArtifactCatalogRow{{ID: "tpl-1", Payload: []byte(`{"id":"tpl-1"}`)}},
 		Publishers:    []string{"worker-a"},
@@ -114,12 +125,26 @@ func TestClusterInternalRegistryReadsRequirePlacementState(t *testing.T) {
 }
 
 type stubCatalogService struct {
-	page cluster.ArtifactCatalogPage
-	ok   bool
+	pages []cluster.ArtifactCatalogPage
+	ok    bool
+	reads int
 }
 
-func (s stubCatalogService) ClusterArtifactCatalog(context.Context, string, string) (cluster.ArtifactCatalogPage, bool) {
-	return s.page, s.ok
+func (s *stubCatalogService) ClusterArtifactCatalog(_ context.Context, req cluster.ArtifactCatalogRequest) (cluster.ArtifactCatalogPage, bool) {
+	s.reads++
+	if !s.ok {
+		return cluster.ArtifactCatalogPage{}, false
+	}
+	for _, page := range s.pages {
+		// The stub keys its pages on the cursor the reader sends back.
+		if page.NextPageToken == req.PageToken || (req.PageToken == "" && page.NextPageToken == "") {
+			return page, true
+		}
+	}
+	if len(s.pages) == 0 {
+		return cluster.ArtifactCatalogPage{Authoritative: true}, true
+	}
+	return s.pages[len(s.pages)-1], true
 }
 
 // A catalogue the control plane could not answer for must read as "no
@@ -132,20 +157,20 @@ func TestReadClusterArtifactCatalogDecodesAndFallsBack(t *testing.T) {
 	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](req, nil, "template", ""); ok {
 		t.Fatal("a nil service reported a catalogue")
 	}
-	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](nil, stubCatalogService{ok: true}, "template", ""); ok {
+	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](nil, &stubCatalogService{ok: true}, "template", ""); ok {
 		t.Fatal("a nil request reported a catalogue")
 	}
-	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](req, stubCatalogService{}, "template", ""); ok {
+	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](req, &stubCatalogService{}, "template", ""); ok {
 		t.Fatal("an unavailable catalogue was reported as usable; the sweep must still run")
 	}
 
-	svc := stubCatalogService{ok: true, page: cluster.ArtifactCatalogPage{
+	svc := &stubCatalogService{ok: true, pages: []cluster.ArtifactCatalogPage{{
 		Rows: []cluster.ArtifactCatalogRow{
 			{ID: "good", Payload: []byte(`{"sandbox_id":"good"}`)},
 			{ID: "unreadable", Payload: []byte(`not json`)},
 		},
 		Publishers: []string{"worker-a"},
-	}}
+	}}}
 	rows, publishers, ok := readClusterArtifactCatalog[*cluster.Placement](req, svc, "template", "")
 	if !ok || len(publishers) != 1 {
 		t.Fatalf("ok=%v publishers=%v", ok, publishers)
@@ -179,5 +204,92 @@ func TestClusterInternalArtifactCatalogRejectsBadInput(t *testing.T) {
 	standalone.clusterInternalNodeStorageRetirements(retireRR, withPeer(httptest.NewRequest(http.MethodGet, cluster.PublicInternalNodeStorageRetirementsPath, nil), "wrk-a"))
 	if retireRR.Code != http.StatusServiceUnavailable {
 		t.Fatalf("retirement read with no cluster = %d, want 503", retireRR.Code)
+	}
+}
+
+// The catalogue read is paged: a single response budget with the remainder
+// dropped sent most of a large fleet back to the peer sweep even though the
+// FSM already held its metadata. The aggregator therefore walks the cursor,
+// and only claims coverage for a walk that finished.
+func TestReadClusterArtifactCatalogWalksEveryPage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/templates", nil)
+	svc := &stubCatalogService{ok: true, pages: []cluster.ArtifactCatalogPage{
+		{
+			Rows:          []cluster.ArtifactCatalogRow{{ID: "a", Payload: []byte(`{"sandbox_id":"a"}`)}},
+			Publishers:    []string{"worker-a", "worker-b"},
+			NextPageToken: "",
+			Authoritative: true,
+		},
+		{
+			Rows:          []cluster.ArtifactCatalogRow{{ID: "b", Payload: []byte(`{"sandbox_id":"b"}`)}},
+			Authoritative: true,
+		},
+	}}
+	// First read (empty cursor) returns page 0 with a cursor; the stub then
+	// answers the cursor with the final page.
+	svc.pages[0].NextPageToken = ""
+	svc.pages[1].NextPageToken = ""
+
+	rows, publishers, ok := readClusterArtifactCatalog[*cluster.Placement](req, svc, "template", "")
+	if !ok {
+		t.Fatal("a complete walk was reported as unusable")
+	}
+	if len(publishers) != 2 {
+		t.Fatalf("publishers = %v; coverage is complete on the first page", publishers)
+	}
+	if len(rows) != 1 || rows[0].SandboxID != "a" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if svc.reads != 1 {
+		t.Fatalf("made %d reads for a single-page catalogue", svc.reads)
+	}
+}
+
+// A walk that cannot finish must not claim coverage: the aggregator would
+// skip nodes whose rows it never received.
+func TestReadClusterArtifactCatalogRefusesAnUnfinishedWalk(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/templates", nil)
+	// A control plane that keeps handing back a fresh cursor forever.
+	svc := &endlessCursorCatalog{}
+	if _, _, ok := readClusterArtifactCatalog[*cluster.Placement](req, svc, "template", ""); ok {
+		t.Fatal("an unfinished walk claimed coverage; the rows behind the cursor would be dropped from the answer")
+	}
+	if svc.reads <= 1 {
+		t.Fatalf("made %d reads; the walk must follow the cursor before giving up", svc.reads)
+	}
+}
+
+type endlessCursorCatalog struct{ reads int }
+
+func (c *endlessCursorCatalog) ClusterArtifactCatalog(context.Context, cluster.ArtifactCatalogRequest) (cluster.ArtifactCatalogPage, bool) {
+	c.reads++
+	return cluster.ArtifactCatalogPage{
+		Rows:          []cluster.ArtifactCatalogRow{{ID: fmt.Sprintf("row-%d", c.reads), Payload: []byte(`{}`)}},
+		NextPageToken: fmt.Sprintf("cursor-%d", c.reads),
+		Authoritative: true,
+	}, true
+}
+
+// Discharging a deletion obligation without an ACK is irreversible, so the
+// read that authorizes it asks the LEADER: a follower whose FSM has not yet
+// applied an operator's revoke would otherwise authorize a removal that was
+// already withdrawn.
+func TestClusterInternalNodeStorageRetirementsAuthoritativeNeedsLeadership(t *testing.T) {
+	stub := &registryStubCluster{Noop: cluster.NewNoop("srv-follower", "http://srv", ""), leader: "srv-leader"}
+	h := newOwnedRecoveryHandlers(t, stub)
+
+	req := withPeer(httptest.NewRequest(http.MethodGet, cluster.PublicInternalNodeStorageRetirementsPath+"?authoritative=true", nil), "wrk-a")
+	rr := httptest.NewRecorder()
+	h.clusterInternalNodeStorageRetirements(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("authoritative read on a non-leader = %d, want 503", rr.Code)
+	}
+
+	// The ordinary discovery read is answerable by any server.
+	plain := withPeer(httptest.NewRequest(http.MethodGet, cluster.PublicInternalNodeStorageRetirementsPath, nil), "wrk-a")
+	plainRR := httptest.NewRecorder()
+	h.clusterInternalNodeStorageRetirements(plainRR, plain)
+	if plainRR.Code != http.StatusOK {
+		t.Fatalf("discovery read = %d, want 200", plainRR.Code)
 	}
 }

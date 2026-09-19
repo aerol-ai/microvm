@@ -795,6 +795,16 @@ func (h *handlers) clusterInternalNodeStorageRetirements(w http.ResponseWriter, 
 		apihttp.WriteError(w, http.StatusForbidden, "cluster: peer identity required")
 		return
 	}
+	if r.URL.Query().Get("authoritative") == "true" {
+		// Discharging a deletion obligation without an ACK is irreversible, so
+		// it asks the leader explicitly: a follower whose FSM has not yet
+		// applied an operator's revoke would otherwise authorize a removal the
+		// operator has already withdrawn.
+		if leader := c.Leader(); leader == "" || leader != c.SelfNodeID() {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+			return
+		}
+	}
 	reader, ok := c.(interface {
 		NodeStorageRetirementsForPeer() cluster.NodeStorageRetirementsResponse
 	})
@@ -826,13 +836,13 @@ func (h *handlers) clusterInternalArtifactCatalog(w http.ResponseWriter, r *http
 		return
 	}
 	reader, ok := c.(interface {
-		ArtifactCatalogForPeer(string, string) cluster.ArtifactCatalogPage
+		ArtifactCatalogForPeer(cluster.ArtifactCatalogRequest) cluster.ArtifactCatalogPage
 	})
 	if !ok {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, reader.ArtifactCatalogForPeer(req.Kind, req.Tenant))
+	apihttp.WriteJSON(w, http.StatusOK, reader.ArtifactCatalogForPeer(req))
 }
 
 // clusterRevokeNodeStorageRetirement withdraws an attestation made in error.

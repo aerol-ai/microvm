@@ -64,7 +64,7 @@ func TestFetchCapacitySnapshot(t *testing.T) {
 
 func TestFetchMemberCapacityNoUrl(t *testing.T) {
 	c := &Cluster{}
-	_, err := c.fetchMemberCapacity(context.Background(), Member{NodeID: "m1", APIURL: ""})
+	_, err := c.fetchMemberCapacity(context.Background(), Member{NodeID: "m1", APIURL: ""}, capacityLeaseFetchTimeout)
 	if !errors.Is(err, ErrPeerInternalURLRequired) {
 		t.Errorf("expected missing url error, got %v", err)
 	}
@@ -91,7 +91,7 @@ func TestFetchMemberCapacityFailClosedOnInternal503(t *testing.T) {
 		NodeID:      "m1",
 		APIURL:      public.URL,
 		InternalURL: internal.URL,
-	})
+	}, capacityLeaseFetchTimeout)
 	if err == nil {
 		t.Fatal("expected internal 503 to fail closed (no public downgrade)")
 	}
