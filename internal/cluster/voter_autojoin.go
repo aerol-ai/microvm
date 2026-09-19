@@ -265,33 +265,28 @@ func (c *Cluster) currentReplicaCount(exclude string) (int, bool) {
 // configuration. applyMemberJoinLocked needs the count and the mutation to
 // share one read, so the counting rule lives here rather than behind another
 // GetConfiguration call.
+//
+// EVERY configured server counts, including one gossip currently reports as
+// dead. It is still in the configuration, so the leader still replicates the
+// log and the FSM to it, and gossip and raft partition independently — a
+// member that SWIM has given up on may still be receiving entries. Handing
+// its slot to a replacement is how a 7-node tier becomes a 9-node one: the
+// flapped member comes back before the dead-owner reconciler removes it, and
+// an already-configured server takes the existing-member path, which does not
+// consult the budget at all.
+//
+// A slot frees when the removal is COMMITTED (dead_owner.go's RemoveServer,
+// or an operator's), which is also what stops replication to it. Replacement
+// therefore trails eviction rather than racing it.
 func (c *Cluster) replicaCountFrom(servers []raft.Server, exclude string) int {
-	dead := c.deadGossipNodeIDs()
 	count := 0
 	for _, srv := range servers {
-		id := string(srv.ID)
-		if id == exclude {
-			continue
-		}
-		if _, gone := dead[id]; gone {
+		if string(srv.ID) == exclude {
 			continue
 		}
 		count++
 	}
 	return count
-}
-
-func (c *Cluster) deadGossipNodeIDs() map[string]struct{} {
-	out := map[string]struct{}{}
-	if c == nil || c.gossip == nil {
-		return out
-	}
-	for _, m := range c.gossip.members() {
-		if id := strings.TrimSpace(m.NodeID); id != "" && !m.Alive {
-			out[id] = struct{}{}
-		}
-	}
-	return out
 }
 
 // replicaBudgetLogInterval throttles the refusal log. reconcileVoters retries

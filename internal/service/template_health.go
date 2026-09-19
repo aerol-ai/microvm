@@ -284,7 +284,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 		// keeps working until an operator intervenes.
 		snapErrMsg := fmt.Sprintf("rebuild: cid allocate: %s", err.Error())
 		_ = s.store.UpdateTemplateSnapshotFailed(ctx, templateID, snapErrMsg)
-		_ = s.store.UpdateTemplateStatus(ctx, templateID,
+		_ = s.setTemplateStatus(ctx, templateID,
 			models.TemplateStatusReadyNoSnapshot, template.RootfsPath, "",
 			template.RootfsSizeBytes)
 		return fmt.Errorf("cid allocate: %w", err)
@@ -294,7 +294,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 	memOut := filepath.Join(dir, snapshotMemoryFilename)
 	stateOut := filepath.Join(dir, snapshotStateFilename)
 
-	if uerr := s.store.UpdateTemplateStatus(ctx, templateID,
+	if uerr := s.setTemplateStatus(ctx, templateID,
 		models.TemplateStatusSnapshotting, template.RootfsPath, "",
 		template.RootfsSizeBytes); uerr != nil {
 		s.logger.Warn("snapshot rebuild: status update to snapshotting failed",
@@ -323,7 +323,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 			s.logger.Warn("snapshot rebuild: snapshot_error update failed",
 				"template_id", templateID, "error", uerr)
 		}
-		if uerr := s.store.UpdateTemplateStatus(ctx, templateID,
+		if uerr := s.setTemplateStatus(ctx, templateID,
 			models.TemplateStatusReadyNoSnapshot, template.RootfsPath, "",
 			template.RootfsSizeBytes); uerr != nil {
 			s.logger.Warn("snapshot rebuild: status update to ready_no_snapshot failed",
@@ -348,7 +348,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 			"template_id", templateID, "error", uerr)
 		return fmt.Errorf("snapshot ready update: %w", uerr)
 	}
-	if uerr := s.store.UpdateTemplateStatus(ctx, templateID,
+	if uerr := s.setTemplateStatus(ctx, templateID,
 		models.TemplateStatusReady, template.RootfsPath, "",
 		template.RootfsSizeBytes); uerr != nil {
 		s.logger.Warn("snapshot rebuild: final status update failed",

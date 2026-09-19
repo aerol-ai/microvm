@@ -20,19 +20,23 @@ import (
 // The payload is tiny administrative metadata — one row per decommissioned
 // node — so replicating it costs nothing like the placement state does.
 type NodeStorageRetirement struct {
-	NodeID       string `json:"node_id"`
-	Actor        string `json:"actor,omitempty"`
-	Reason       string `json:"reason,omitempty"`
-	AttestedUnix int64  `json:"attested_unix"`
+	NodeID string `json:"node_id"`
+	Actor  string `json:"actor,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// AttestedUnixNano is the fence discharge compares copy provenance
+	// against, in NANOSECONDS. Second granularity would round the attestation
+	// backwards, so a copy distributed a few hundred milliseconds before it
+	// would read as newer than the attestation and stay pinned forever.
+	AttestedUnixNano int64 `json:"attested_unix_nano"`
 }
 
 // AttestedAt is the fence discharge decisions compare obligation provenance
 // against.
 func (r NodeStorageRetirement) AttestedAt() time.Time {
-	if r.AttestedUnix <= 0 {
+	if r.AttestedUnixNano <= 0 {
 		return time.Time{}
 	}
-	return time.Unix(r.AttestedUnix, 0).UTC()
+	return time.Unix(0, r.AttestedUnixNano).UTC()
 }
 
 // NodeStorageRetirementsResponse is the agent-facing read.
@@ -60,10 +64,10 @@ func (c *Cluster) RetireNodeStorage(ctx context.Context, nodeID, actor, reason s
 		Op:     opRetireNodeStorage,
 		NodeID: nodeID,
 		StorageRetirement: &NodeStorageRetirement{
-			NodeID:       nodeID,
-			Actor:        strings.TrimSpace(actor),
-			Reason:       strings.TrimSpace(reason),
-			AttestedUnix: attestedAt.UTC().Unix(),
+			NodeID:           nodeID,
+			Actor:            strings.TrimSpace(actor),
+			Reason:           strings.TrimSpace(reason),
+			AttestedUnixNano: attestedAt.UTC().UnixNano(),
 		},
 	})
 }
@@ -118,10 +122,10 @@ func (a *Agent) RetireNodeStorage(ctx context.Context, nodeID, actor, reason str
 		Op:     opRetireNodeStorage,
 		NodeID: nodeID,
 		StorageRetirement: &NodeStorageRetirement{
-			NodeID:       nodeID,
-			Actor:        strings.TrimSpace(actor),
-			Reason:       strings.TrimSpace(reason),
-			AttestedUnix: attestedAt.UTC().Unix(),
+			NodeID:           nodeID,
+			Actor:            strings.TrimSpace(actor),
+			Reason:           strings.TrimSpace(reason),
+			AttestedUnixNano: attestedAt.UTC().UnixNano(),
 		},
 	})
 }
@@ -142,14 +146,36 @@ func (a *Agent) RevokeNodeStorageRetirement(ctx context.Context, nodeID string) 
 // unavailable control plane is an ERROR, never an empty set: discharging an
 // obligation is irreversible, and so is failing to discharge one that the
 // operator attested.
+//
+// This is the DISCOVERY read, answerable by any server. A caller about to act
+// irreversibly uses AuthoritativeNodeStorageRetirements.
 func (a *Agent) NodeStorageRetirements(ctx context.Context) ([]NodeStorageRetirement, error) {
+	return a.nodeStorageRetirements(ctx, false)
+}
+
+// AuthoritativeNodeStorageRetirements asks the control plane for the LEADER's
+// answer. A worker discharging an obligation without an ACK is doing
+// something irreversible, so it must not be authorized by a server whose FSM
+// has not yet applied the operator's revoke.
+func (a *Agent) AuthoritativeNodeStorageRetirements(ctx context.Context) ([]NodeStorageRetirement, error) {
+	return a.nodeStorageRetirements(ctx, true)
+}
+
+func (a *Agent) nodeStorageRetirements(ctx context.Context, authoritative bool) ([]NodeStorageRetirement, error) {
 	if a == nil {
 		return nil, fmt.Errorf("cluster: agent is not configured")
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, controlPlaneRequestTimeout)
 	defer cancel()
+	path := PublicInternalNodeStorageRetirementsPath
+	if authoritative {
+		path += "?authoritative=true"
+	}
 	var resp NodeStorageRetirementsResponse
-	if err := a.doControlPlaneJSON(reqCtx, http.MethodGet, PublicInternalNodeStorageRetirementsPath, PublicInternalNodeStorageRetirementsPath, nil, &resp); err != nil {
+	// Both paths carry the query: the internal one is what is actually
+	// dialled, and dropping "authoritative=true" there would silently turn a
+	// leader read into a follower read.
+	if err := a.doControlPlaneJSON(reqCtx, http.MethodGet, path, path, nil, &resp); err != nil {
 		return nil, fmt.Errorf("cluster: read node storage retirements: %w", err)
 	}
 	if !resp.Authoritative {

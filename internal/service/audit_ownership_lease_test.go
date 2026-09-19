@@ -416,3 +416,80 @@ func TestAuditOwnershipLeaseFencesArePruned(t *testing.T) {
 		t.Fatalf("the fence sweep dropped %d live leases", pruned)
 	}
 }
+
+// Destroy invalidates the lease and then removes the row. A resolve that
+// lands in between finds the row still present and installs a POSITIVE lease
+// under the current epoch — and nothing retired it once the row was gone, so
+// the destroyed lifetime's capability kept being accepted until the TTL. The
+// fences have to bracket the row removal, not precede it.
+func TestEgressAuditBindingRejectsLeaseMintedDuringDeletion(t *testing.T) {
+	st := openSealTestStore(t)
+	svc := &Service{store: st}
+	ctx := context.Background()
+
+	sb := &models.Sandbox{
+		ID:                 "sb-destroying",
+		Image:              "wasm",
+		Runtime:            models.RuntimeWasm,
+		AuditIncarnationID: "inc-1",
+		OwnerRef:           "tenant-a",
+		Status:             models.SandboxStatusStarted,
+	}
+	if err := svc.persistSandboxCreate(ctx, sb); err != nil {
+		t.Fatalf("persistSandboxCreate: %v", err)
+	}
+	if err := svc.validateEgressAuditBinding(ctx, sb.ID, "inc-1"); err != nil {
+		t.Fatalf("a live lifetime's own capability was rejected: %v", err)
+	}
+
+	// The audit request that lands mid-destroy: the row is still there, so it
+	// resolves to a valid, positive lease.
+	svc.testDuringSandboxRowDelete = func() {
+		if err := svc.validateEgressAuditBinding(ctx, sb.ID, "inc-1"); err != nil {
+			t.Errorf("mid-destroy resolve rejected while the row still exists: %v", err)
+		}
+	}
+	if err := svc.deleteSandboxRowAndFenceAudit(ctx, sb.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if err := svc.validateEgressAuditBinding(ctx, sb.ID, "inc-1"); err == nil {
+		t.Fatal("a capability for the destroyed lifetime is still accepted; the lease minted during the removal outlived the row")
+	}
+}
+
+// The same bracket has to hold when the row removal itself fails: a partial
+// destroy must not leave a lease minted from the window behind.
+func TestEgressAuditBindingFencesEvenWhenDeleteFails(t *testing.T) {
+	st := openSealTestStore(t)
+	svc := &Service{store: st}
+	ctx := context.Background()
+
+	sb := &models.Sandbox{
+		ID:                 "sb-partial-destroy",
+		Image:              "wasm",
+		Runtime:            models.RuntimeWasm,
+		AuditIncarnationID: "inc-1",
+		OwnerRef:           "tenant-a",
+		Status:             models.SandboxStatusStarted,
+	}
+	if err := svc.persistSandboxCreate(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	svc.testDuringSandboxRowDelete = func() {
+		if err := svc.validateEgressAuditBinding(ctx, sb.ID, "inc-1"); err != nil {
+			t.Errorf("mid-destroy resolve rejected while the row still exists: %v", err)
+		}
+		// The row goes away underneath the delete, which then reports
+		// ErrNotFound — the caller treats that as success.
+		if err := st.Delete(ctx, sb.ID); err != nil {
+			t.Errorf("racing delete: %v", err)
+		}
+	}
+	if err := svc.deleteSandboxRowAndFenceAudit(ctx, sb.ID); err == nil {
+		t.Fatal("the fixture no longer models a delete that does not find its row")
+	}
+	if err := svc.validateEgressAuditBinding(ctx, sb.ID, "inc-1"); err == nil {
+		t.Fatal("a lease minted during a failed removal is still accepted")
+	}
+}

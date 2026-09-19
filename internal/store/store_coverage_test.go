@@ -1186,7 +1186,7 @@ func TestApplySecretRetirementAndGenerationHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := applySecretRetirementInTx(ctx, tx, ClusterSecretRecord{Ref: "bad", RetireRecipients: &[]string{"p"}}); err == nil {
+	if err := applySecretRetirementInTx(ctx, tx, ClusterSecretRecord{Ref: "bad", RetireRecipients: &[]string{"p"}}, sql.NullTime{}); err == nil {
 		_ = tx.Rollback()
 		t.Fatal("invalid ref retirement")
 	}
@@ -1196,7 +1196,7 @@ func TestApplySecretRetirementAndGenerationHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := applySecretRetirementInTx(ctx, tx, ClusterSecretRecord{Ref: secrets.FormatRef("sb-ret", "inc-ret", secrets.RefVersion)}); err != nil {
+	if err := applySecretRetirementInTx(ctx, tx, ClusterSecretRecord{Ref: secrets.FormatRef("sb-ret", "inc-ret", secrets.RefVersion)}, sql.NullTime{}); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("nil retire list: %v", err)
 	}
@@ -1205,7 +1205,7 @@ func TestApplySecretRetirementAndGenerationHelpers(t *testing.T) {
 		Ref:       secrets.FormatRef("sb-ret", "inc-ret", secrets.RefVersion),
 		SandboxID: "sb-ret", SealGeneration: 2,
 		Recipients: []string{"keep-peer"}, RetireRecipients: &retire,
-	}); err != nil {
+	}, sql.NullTime{}); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("retire: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,7 +64,7 @@ func TestNodeStorageRetirementIsReplicatedControlPlaneState(t *testing.T) {
 func TestNodeStorageRetirementSurvivesSnapshotRestore(t *testing.T) {
 	fsm := newPlacementFSM()
 	fsm.storageRetirements["node-gone"] = NodeStorageRetirement{
-		NodeID: "node-gone", Actor: "op", Reason: "shredded", AttestedUnix: time.Now().Unix(),
+		NodeID: "node-gone", Actor: "op", Reason: "shredded", AttestedUnixNano: time.Now().UnixNano(),
 	}
 
 	snap, err := fsm.Snapshot()
@@ -105,7 +106,7 @@ func TestAgentNodeStorageRetirementRoundTrip(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		case PublicInternalNodeStorageRetirementsPath:
 			_ = json.NewEncoder(w).Encode(NodeStorageRetirementsResponse{
-				Retirements:   []NodeStorageRetirement{{NodeID: "node-gone", AttestedUnix: 42}},
+				Retirements:   []NodeStorageRetirement{{NodeID: "node-gone", AttestedUnixNano: 42}},
 				Authoritative: authoritative,
 			})
 		default:
@@ -121,8 +122,8 @@ func TestAgentNodeStorageRetirementRoundTrip(t *testing.T) {
 	if len(applied) != 1 || applied[0].Op != opRetireNodeStorage || applied[0].StorageRetirement == nil {
 		t.Fatalf("forwarded commands = %+v", applied)
 	}
-	if got := applied[0].StorageRetirement.AttestedUnix; got != attestedAt.UTC().Unix() {
-		t.Fatalf("attested unix = %d, want %d; every replica fences against the same time", got, attestedAt.UTC().Unix())
+	if got := applied[0].StorageRetirement.AttestedUnixNano; got != attestedAt.UTC().UnixNano() {
+		t.Fatalf("attested unix = %d, want %d; every replica fences against the same time", got, attestedAt.UTC().UnixNano())
 	}
 	if err := agent.RetireNodeStorage(ctx, "", "op", "", attestedAt); err == nil {
 		t.Fatal("an attestation with no node id was forwarded")
@@ -144,5 +145,51 @@ func TestAgentNodeStorageRetirementRoundTrip(t *testing.T) {
 	authoritative = false
 	if _, err := agent.NodeStorageRetirements(ctx); err == nil {
 		t.Fatal("a non-authoritative retirement read was accepted as the attestation set")
+	}
+}
+
+// A worker's authoritative read asks the control plane for the LEADER's
+// answer; the discovery read does not.
+func TestAgentAuthoritativeRetirementReadAsksForTheLeader(t *testing.T) {
+	var paths []string
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		_ = json.NewEncoder(w).Encode(NodeStorageRetirementsResponse{Authoritative: true})
+	}))
+	ctx := context.Background()
+
+	if _, err := agent.NodeStorageRetirements(ctx); err != nil {
+		t.Fatalf("discovery read: %v", err)
+	}
+	if _, err := agent.AuthoritativeNodeStorageRetirements(ctx); err != nil {
+		t.Fatalf("authoritative read: %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("requests = %v", paths)
+	}
+	if strings.Contains(paths[0], "authoritative=true") {
+		t.Fatalf("the discovery read asked for the leader: %q", paths[0])
+	}
+	if !strings.Contains(paths[1], "authoritative=true") {
+		t.Fatalf("the authoritative read did not ask for the leader: %q", paths[1])
+	}
+
+	var none *Agent
+	if _, err := none.AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("an unconfigured agent answered an authoritative read")
+	}
+}
+
+// A zero attestation time cannot fence anything, so it reads as "no time".
+func TestNodeStorageRetirementAttestedAtPrecision(t *testing.T) {
+	if got := (NodeStorageRetirement{}).AttestedAt(); !got.IsZero() {
+		t.Fatalf("zero attestation carried a time: %v", got)
+	}
+	// Sub-second precision matters: a copy distributed a few hundred
+	// milliseconds before the attestation must not read as newer than it.
+	at := time.Now().UTC()
+	rec := NodeStorageRetirement{AttestedUnixNano: at.UnixNano()}
+	if got := rec.AttestedAt(); !got.Equal(at) {
+		t.Fatalf("attested at %v, want %v", got, at)
 	}
 }

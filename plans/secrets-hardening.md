@@ -248,13 +248,20 @@ local `node_storage_retirements` table) and is:
   rather than a row on the node that served the call. Workers and ingress read
   it from the server tier; an unreachable control plane leaves obligations
   pending rather than reading as "no attestations";
+- **authoritative at the point of decision** — the per-node cache is discovery
+  only. A discharge reads the LEADER's current attestations first, because a
+  revoke an operator issued on one node must stop every other owner
+  discharging immediately, and a discharge cannot be taken back;
 - **fenced per recipient by copy provenance** — a recipient's obligation is
   discharged only when THAT recipient's ciphertext copy was distributed before
   the attestation. The delete outbox carries a per-recipient timestamp for
   exactly this: an upsert merges recipients into an existing row and preserves
   its creation time, so a row-wide fence both discharges obligations created
   after the attestation (a reused node id) and pins copies that predate the
-  destruction but were journalled after it;
+  destruction but were journalled after it. The timestamp is the PREVIOUS
+  generation's write time, captured before a reseal overwrites the row, and it
+  is dropped when its obligation is ACKed so a later copy to the same node
+  cannot inherit an earlier disk's date;
 - **self-revoking** — a node that is alive again can ACK, so the maintenance
   tick withdraws its attestation and its obligations become pending once more;
 - **refused for live nodes**, and operator-only

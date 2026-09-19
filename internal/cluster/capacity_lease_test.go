@@ -252,14 +252,84 @@ func TestCapacityFetchPhaseGuards(t *testing.T) {
 	rt := &slowPeerTransport{}
 	c := &Cluster{nodeID: "server", capacityLeases: leases, internalClient: &http.Client{Transport: rt}}
 	members := []Member{{NodeID: "healthy", InternalURL: "https://healthy", Role: config.NodeRoleWorker, Alive: true}}
-	c.runCapacityFetchPhase(context.Background(), nil, time.Second)
-	c.runCapacityFetchPhase(context.Background(), members, 0)
+	full := capacityFetchPass{attemptTimeout: capacityLeaseFetchTimeout, recordFailures: true}
+	if left := c.runCapacityFetchPhase(context.Background(), nil, time.Second, full); len(left) != 0 {
+		t.Fatalf("a phase with no members returned %d stragglers", len(left))
+	}
+	if left := c.runCapacityFetchPhase(context.Background(), members, 0, full); len(left) != len(members) {
+		t.Fatal("a phase with no budget claimed to have refreshed peers")
+	}
 	if rt.healthy.Load() != 0 {
 		t.Fatal("a phase with no members or no budget still made requests")
 	}
+	c.runCapacityFetchClass(context.Background(), nil, time.Second)
+	c.runCapacityFetchClass(context.Background(), members, 0)
 
 	// A cancelled sweep stops dispatching rather than running past its tick.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	c.runCapacityFetchPhase(ctx, members, time.Second)
+	c.runCapacityFetchPhase(ctx, members, time.Second, full)
+}
+
+// namedSlowTransport answers instantly for one host and hangs for every other
+// until the request deadline.
+type namedSlowTransport struct {
+	fast     string
+	attempts atomic.Int64
+	fastHits atomic.Int64
+}
+
+func (r *namedSlowTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.attempts.Add(1)
+	if req.URL.Host == r.fast {
+		r.fastHits.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"can_admit":true}`)),
+			Header:     make(http.Header),
+		}, nil
+	}
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+// Reserving budget for renewals is not a progress guarantee for any
+// particular renewal: the queue is oldest-first over one shared budget, so a
+// group of established peers that go slow occupies every slot for the whole
+// renewal phase and a peer that would have answered in a millisecond loses
+// its lease anyway. Losing a usable node from scheduling because OTHER nodes
+// are slow is the failure this must not have.
+func TestCapacityRenewalReachesPeersThatAnswerQuickly(t *testing.T) {
+	idx := newGossipMemberIndex()
+	leases := newCapacityLeaseCache("server", nil, 5*time.Second, nil)
+	members := make([]Member, 0, 97)
+	for i := range 96 {
+		id := fmt.Sprintf("slow-%03d", i)
+		members = append(members, Member{NodeID: id, InternalURL: "https://" + id, Role: config.NodeRoleWorker, Alive: true})
+		// Established leases, closer to expiry than the healthy one.
+		leases.set(id, step3FatCapacity(), time.Now().Add(-14*time.Second))
+	}
+	members = append(members, Member{NodeID: "healthy", InternalURL: "https://healthy", Role: config.NodeRoleWorker, Alive: true})
+	leases.set("healthy", step3FatCapacity(), time.Now().Add(-13*time.Second))
+	idx.replace(members)
+
+	rt := &namedSlowTransport{fast: "healthy"}
+	c := &Cluster{
+		nodeID:         "server",
+		gossip:         &gossipNode{memberIndex: idx},
+		capacityLeases: leases,
+		internalClient: &http.Client{Transport: rt},
+	}
+	c.refreshCapacityLeases(context.Background())
+
+	if rt.fastHits.Load() == 0 {
+		t.Fatalf("the healthy peer was never attempted (%d attempts went to slow peers); its lease expires because other nodes are slow", rt.attempts.Load())
+	}
+	leases.mu.RLock()
+	age := time.Since(leases.leases["healthy"].updated)
+	ttl := leases.ttl
+	leases.mu.RUnlock()
+	if age > ttl {
+		t.Fatalf("healthy lease is %s old against a %s TTL; it expired while answering instantly", age, ttl)
+	}
 }

@@ -24,6 +24,17 @@ const (
 	// failures.
 	capacityLeaseBackoffBase = 15 * time.Second
 	capacityLeaseBackoffMax  = 2 * time.Minute
+	// capacityLeaseFetchTimeout is what a peer gets when we are willing to
+	// wait for it.
+	capacityLeaseFetchTimeout = 2 * time.Second
+	// capacityLeaseQuickProbeTimeout is the first pass. Reserving budget for
+	// renewals bounds the CLASS, not any peer in it: at 32 slots and a 2s
+	// timeout, ~96 established peers going slow occupy every slot for the
+	// whole renewal phase, and a peer that would have answered in a
+	// millisecond loses its lease because other nodes are slow. A short first
+	// pass costs a slow peer a fraction of a slot, so every peer that can
+	// answer promptly is reached regardless of how many cannot.
+	capacityLeaseQuickProbeTimeout = 300 * time.Millisecond
 )
 
 type capacityLease struct {
@@ -392,14 +403,46 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 	// sooner.
 	renewalBudget := budget * capacityLeaseRenewalBudgetNumerator / capacityLeaseRenewalBudgetDenominator
 	start := time.Now()
-	c.runCapacityFetchPhase(ctx, renewals, renewalBudget)
+	c.runCapacityFetchClass(ctx, renewals, renewalBudget)
 	remaining := budget - time.Since(start)
 	if remaining <= 0 {
 		// The renewal phase used the whole sweep. First contact retries next
 		// tick; a node with no lease is not yet schedulable either way.
 		return
 	}
-	c.runCapacityFetchPhase(ctx, firstContact, remaining)
+	c.runCapacityFetchClass(ctx, firstContact, remaining)
+}
+
+// runCapacityFetchClass fetches one class of peers in two passes under its
+// own budget: a quick probe that every prompt peer answers, then the full
+// timeout for whoever did not. Without the quick pass, a peer's refresh
+// depends on how many OTHER peers in its class are slow — which is how a
+// healthy node loses a lease it could have renewed instantly.
+func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, budget time.Duration) {
+	if len(members) == 0 || budget <= 0 {
+		return
+	}
+	start := time.Now()
+	// A quick-probe timeout is not evidence that a peer is unhealthy — a
+	// loaded node can miss 300ms — so it does not feed the backoff.
+	unanswered := c.runCapacityFetchPhase(ctx, members, budget, capacityFetchPass{
+		attemptTimeout: capacityLeaseQuickProbeTimeout,
+	})
+	remaining := budget - time.Since(start)
+	if len(unanswered) == 0 || remaining <= 0 {
+		return
+	}
+	c.runCapacityFetchPhase(ctx, unanswered, remaining, capacityFetchPass{
+		attemptTimeout: capacityLeaseFetchTimeout,
+		recordFailures: true,
+	})
+}
+
+// capacityFetchPass is one pass's policy: how long a peer gets, and whether a
+// failure counts against its backoff.
+type capacityFetchPass struct {
+	attemptTimeout time.Duration
+	recordFailures bool
 }
 
 // capacityLeaseRenewalBudget* reserve three fifths of the sweep for peers that
@@ -413,29 +456,39 @@ const (
 
 // runCapacityFetchPhase fetches one class of peers under its own slice of the
 // sweep budget.
-func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, budget time.Duration) {
+func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, budget time.Duration, pass capacityFetchPass) []Member {
 	if len(members) == 0 || budget <= 0 {
-		return
+		return members
 	}
 	phaseCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	jobs := make(chan Member)
-	var wg sync.WaitGroup
+	var (
+		mu        sync.Mutex
+		refreshed = make(map[string]struct{}, len(members))
+		wg        sync.WaitGroup
+	)
 	for range capacityLeaseFetchConcurrency {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for m := range jobs {
-				snap, err := c.fetchMemberCapacity(phaseCtx, m)
-				c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), err)
+				snap, err := c.fetchMemberCapacity(phaseCtx, m, pass.attemptTimeout)
 				if err != nil {
+					if pass.recordFailures {
+						c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), err)
+					}
 					if c.logger != nil {
 						c.logger.Debug("cluster: capacity heartbeat fetch failed", "node_id", m.NodeID, "error", err)
 					}
 					continue
 				}
+				c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), nil)
 				c.capacityLeases.set(m.NodeID, snap, time.Now())
+				mu.Lock()
+				refreshed[m.NodeID] = struct{}{}
+				mu.Unlock()
 			}
 		}()
 	}
@@ -451,6 +504,17 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 	}
 	close(jobs)
 	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	out := make([]Member, 0, len(members)-len(refreshed))
+	for _, m := range members {
+		if _, ok := refreshed[m.NodeID]; ok {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // capacityLeaseSweepBudget keeps one sweep comfortably inside the lease TTL,
@@ -467,8 +531,11 @@ func (c *Cluster) capacityLeaseSweepBudget() time.Duration {
 	return budget
 }
 
-func (c *Cluster) fetchMemberCapacity(ctx context.Context, m Member) (capacity.Snapshot, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+func (c *Cluster) fetchMemberCapacity(ctx context.Context, m Member, attemptTimeout time.Duration) (capacity.Snapshot, error) {
+	if attemptTimeout <= 0 {
+		attemptTimeout = capacityLeaseFetchTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 	defer cancel()
 	client, base, err := c.PeerDialMember(m)
 	if err != nil {

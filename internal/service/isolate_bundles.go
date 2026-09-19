@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -74,8 +75,9 @@ func (s *Service) CreateJSBundle(ctx context.Context, req models.CreateJSBundleR
 		return nil, err
 	}
 	// Keep the replicated catalogue current so a cluster list answers from
-	// the control plane instead of asking every isolate-capable worker.
-	s.PublishJSBundleCatalog(ctx, owner)
+	// the control plane instead of asking every isolate-capable worker. The
+	// reconciler publishes; marking is cheap enough for every mutation.
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindJSBundle)
 	return s.jsBundleView(digest, strings.TrimSpace(req.Name), bundle), nil
 }
 
@@ -171,9 +173,9 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 		}
 		return err
 	}
-	// A publish REPLACES this node's slice, so a removed bundle disappears
-	// from the catalogue by republishing what is left.
-	s.PublishJSBundleCatalog(ctx, owner)
+	// A publication replaces this node's whole inventory, so a removed bundle
+	// disappears from the catalogue when the reconciler next runs.
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindJSBundle)
 	return nil
 }
 
