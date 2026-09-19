@@ -1390,47 +1390,151 @@ func (s *Service) auditIdentityFor(sandboxID string) (incarnationID, ownerRef st
 	s.auditIncarnationMu.RLock()
 	cached, ok := s.auditIdentityCache[sandboxID]
 	s.auditIncarnationMu.RUnlock()
-	if ok {
+	if ok && cached.complete {
 		return cached.incarnationID, cached.ownerRef
 	}
-	incarnationID, ownerRef = s.resolveAuditIdentity(sandboxID)
-	// Only a resolved lifecycle is worth remembering. Caching "" would pin a
-	// sandbox whose placement had not landed yet into a permanently blank
-	// identity for the rest of its life.
-	if strings.TrimSpace(incarnationID) != "" {
-		s.auditIncarnationMu.Lock()
-		if s.auditIdentityCache == nil {
-			s.auditIdentityCache = make(map[string]auditIdentity)
-		}
-		s.auditIdentityCache[sandboxID] = auditIdentity{incarnationID: incarnationID, ownerRef: ownerRef}
-		s.auditIncarnationMu.Unlock()
+	// The epoch read with the miss is the lifecycle this resolve belongs to.
+	// Anything that starts or ends a lifetime bumps it, so a slow resolve that
+	// returns after the boundary can no longer install its answer.
+	epoch := cached.epoch
+	incarnationID, ownerRef, complete := s.resolveAuditIdentity(sandboxID)
+	// Only a COMPLETE resolved lifecycle is worth remembering. Caching ""
+	// would pin a sandbox whose placement had not landed yet into a
+	// permanently blank identity; caching the pre-persist nonce would pin a
+	// blank tenant owner, because that nonce exists precisely while no sandbox
+	// row (and so no owner_ref) is readable yet.
+	if !complete || strings.TrimSpace(incarnationID) == "" {
+		return incarnationID, ownerRef
 	}
+	s.auditIncarnationMu.Lock()
+	if s.auditIdentityCache == nil {
+		s.auditIdentityCache = make(map[string]auditIdentity)
+	}
+	if current := s.auditIdentityCache[sandboxID]; current.epoch == epoch {
+		s.auditIdentityCache[sandboxID] = auditIdentity{
+			incarnationID: incarnationID,
+			ownerRef:      ownerRef,
+			complete:      true,
+			epoch:         epoch,
+		}
+	}
+	s.auditIncarnationMu.Unlock()
 	return incarnationID, ownerRef
 }
 
-// auditIdentity is one sandbox lifetime's audit stamp.
+// auditIdentity is one sandbox lifetime's audit stamp, plus the lifecycle
+// fence that keeps a slow resolve from restoring a previous lifetime's answer
+// over the current one.
 type auditIdentity struct {
 	incarnationID string
 	ownerRef      string
+	// complete marks an identity that came from an authoritative, persisted
+	// source: the cluster placement or the sandbox row. A pre-persist nonce is
+	// provisional — it has no tenant owner yet — and is never cached.
+	complete bool
+	// epoch increments on every lifecycle boundary for this sandbox id. A fill
+	// is installed only while the epoch still matches the one observed at the
+	// miss.
+	epoch uint64
+	// fencedAt stamps a pure fence: an entry that carries no identity and
+	// exists only to hold the epoch until in-flight resolves have drained.
+	fencedAt time.Time
 }
 
-// invalidateAuditIdentity drops a sandbox's memoized stamp. Called when a
+// auditIdentityFenceTTL is how long a pure fence is retained after a
+// lifecycle boundary. It only has to outlive the slowest in-flight resolve
+// (one placement read or one SQLite row read), so minutes is generous; the
+// bound exists so a node that churns sandbox ids does not accumulate one map
+// entry per id ever seen.
+const auditIdentityFenceTTL = 10 * time.Minute
+
+// invalidateAuditIdentity ends a sandbox's memoized stamp. Called when a
 // lifecycle starts and when one ends, so the next resolve re-reads rather
 // than serving a previous lifetime's incarnation under a reused sandbox ID.
+//
+// It leaves a fence rather than deleting outright: deleting alone lets a
+// lookup that started before the boundary complete afterwards and reinstall
+// the old incarnation and tenant owner indefinitely — misattributed evidence,
+// and capabilities issued against a dead lifecycle that the current-lifecycle
+// binding check then rejects.
 func (s *Service) invalidateAuditIdentity(sandboxID string) {
 	if s == nil || strings.TrimSpace(sandboxID) == "" {
 		return
 	}
 	s.auditIncarnationMu.Lock()
-	delete(s.auditIdentityCache, sandboxID)
+	if s.auditIdentityCache == nil {
+		s.auditIdentityCache = make(map[string]auditIdentity)
+	}
+	s.auditIdentityCache[sandboxID] = auditIdentity{
+		epoch:    s.auditIdentityCache[sandboxID].epoch + 1,
+		fencedAt: time.Now(),
+	}
 	s.auditIncarnationMu.Unlock()
 }
 
-func (s *Service) resolveAuditIdentity(sandboxID string) (incarnationID, ownerRef string) {
+// pruneAuditIdentityFences drops fences older than auditIdentityFenceTTL.
+// Live identities are untouched; those are evicted by their own lifecycle
+// boundary. Called from the secret-maintenance tick.
+func (s *Service) pruneAuditIdentityFences(now time.Time) int {
+	if s == nil {
+		return 0
+	}
+	s.auditIncarnationMu.Lock()
+	defer s.auditIncarnationMu.Unlock()
+	pruned := 0
+	for id, entry := range s.auditIdentityCache {
+		if entry.complete || entry.fencedAt.IsZero() {
+			continue
+		}
+		if now.Sub(entry.fencedAt) > auditIdentityFenceTTL {
+			delete(s.auditIdentityCache, id)
+			pruned++
+		}
+	}
+	return pruned
+}
+
+// finalizeAuditIdentity installs the identity a create just made durable and
+// retires the pre-persist bridge.
+//
+// Without it, a WASM create that supplied its own AuditIncarnationID skips
+// prepareAuditIncarnation inside persistSandboxCreate, so nothing marks the
+// boundary after the row lands: the capability issuer's provisional
+// (incarnation, "") resolve would keep being re-derived from the pending map
+// and every egress event for that lifetime would carry a blank tenant owner.
+// Installing under a bumped epoch also fences any resolve still in flight for
+// the previous lifetime under a reused deterministic sandbox id.
+func (s *Service) finalizeAuditIdentity(sandboxID, incarnationID, ownerRef string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if s == nil || sandboxID == "" || incarnationID == "" {
+		return
+	}
+	s.auditIncarnationMu.Lock()
+	if s.auditIdentityCache == nil {
+		s.auditIdentityCache = make(map[string]auditIdentity)
+	}
+	s.auditIdentityCache[sandboxID] = auditIdentity{
+		incarnationID: incarnationID,
+		ownerRef:      strings.TrimSpace(ownerRef),
+		complete:      true,
+		epoch:         s.auditIdentityCache[sandboxID].epoch + 1,
+	}
+	if s.pendingAuditIncarnation[sandboxID] == incarnationID {
+		delete(s.pendingAuditIncarnation, sandboxID)
+	}
+	s.auditIncarnationMu.Unlock()
+}
+
+// resolveAuditIdentity returns the lifecycle id, the tenant owner, and whether
+// the pair is a COMPLETE persisted identity. The pre-persist nonce branch is
+// deliberately incomplete: WASM asks its capability issuer to resolve the
+// incarnation before the sandbox row exists, so the owner is not knowable yet.
+func (s *Service) resolveAuditIdentity(sandboxID string) (incarnationID, ownerRef string, complete bool) {
 	if c := s.Cluster(); c != nil {
 		if p, ok := c.PlacementOf(sandboxID); ok {
 			if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
-				return inc, strings.TrimSpace(p.OwnerRef)
+				return inc, strings.TrimSpace(p.OwnerRef), true
 			}
 		}
 	}
@@ -1438,15 +1542,16 @@ func (s *Service) resolveAuditIdentity(sandboxID string) (incarnationID, ownerRe
 	pending := strings.TrimSpace(s.pendingAuditIncarnation[sandboxID])
 	s.auditIncarnationMu.RUnlock()
 	if pending != "" {
-		return pending, ""
+		return pending, "", false
 	}
 	if s.store != nil {
 		inc, owner, err := s.store.CurrentSandboxAuditIdentity(context.Background(), sandboxID)
 		if err == nil {
-			return strings.TrimSpace(inc), strings.TrimSpace(owner)
+			inc = strings.TrimSpace(inc)
+			return inc, strings.TrimSpace(owner), inc != ""
 		}
 	}
-	return "", ""
+	return "", "", false
 }
 
 // prepareAuditIncarnation makes a lifecycle nonce available before the WASM
