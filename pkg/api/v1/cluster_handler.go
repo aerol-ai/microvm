@@ -1116,6 +1116,19 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
 		return
 	}
+	// Target-only callers (build, template, JS bundle, local-image routing)
+	// get the chosen node and nothing else. Serializing every eligible worker
+	// for a one-field answer is the same O(fleet) response shape the
+	// sandbox-id path already removed from creates.
+	if req.TargetOnly {
+		target, err := c.SelectPlacement(req.Request)
+		if err != nil {
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
+		return
+	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
 	if err != nil {
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})

@@ -927,7 +927,8 @@ func (s *Service) ClusterTopologyError() error {
 	if c == nil {
 		return nil
 	}
-	return s.clusterTopologyErrorFor(c.Members())
+	// Roles and liveness only — no capacity or inventory needed.
+	return s.clusterTopologyErrorFor(cluster.IdentityMembers(c))
 }
 
 // clusterTopologyErrorFor evaluates the production-topology contract against a
@@ -4349,7 +4350,9 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	if s.cfg.EnableCluster {
 		clusterTopology = "ok"
 		if c := s.Cluster(); c != nil {
-			members := c.Members()
+			// Health reports node counts and the topology contract, both
+			// of which are identity/role facts.
+			members := cluster.IdentityMembers(c)
 			clusterNodes = cluster.LiveMemberCount(members)
 			if err := s.clusterTopologyErrorFor(members); err != nil {
 				clusterTopology = err.Error()
@@ -4624,7 +4627,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// black-holes ~(N-1)/N of public traffic.
 	if s.cfg.EnableCluster {
 		if c := s.Cluster(); c != nil {
-			if err := s.clusterTopologyErrorFor(c.Members()); err != nil {
+			if err := s.clusterTopologyErrorFor(cluster.IdentityMembers(c)); err != nil {
 				s.logger.Warn("cluster topology violation", "error", err.Error())
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"expvar"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,16 +27,17 @@ import (
 
 type createForwardCluster struct {
 	*cluster.Noop
-	target             cluster.PlacementTarget
-	forwardedPeer      string
-	forwardedTarget    string
-	forwardedCreateID  string
-	forwardedBody      string
-	selectPlacementHit int
-	selectForCreateHit int
-	selectRequests     []capacity.Request
-	selectErr          error
-	lastRecipients     []string
+	target              cluster.PlacementTarget
+	forwardedPeer       string
+	forwardedTarget     string
+	forwardedCreateID   string
+	forwardedBody       string
+	selectPlacementHit  int
+	selectForCreateHit  int
+	selectTargetOnlyHit int
+	selectRequests      []capacity.Request
+	selectErr           error
+	lastRecipients      []string
 
 	reserveErr   error
 	reserveCalls []reserveCall
@@ -53,7 +55,8 @@ type reserveCall struct {
 }
 
 func (c *createForwardCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
-	target, _, err := c.SelectPlacementWithCandidates(req)
+	c.selectTargetOnlyHit++
+	target, _, err := c.selectPlacement(req)
 	return target, err
 }
 
@@ -551,8 +554,13 @@ func TestClusterCreateWrapRoutesLocalOnlyImageOffNonWorkerNode(t *testing.T) {
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusAccepted, rr.Body.String())
 	}
-	if fakeCluster.selectPlacementHit != 1 {
-		t.Fatalf("SelectPlacement calls = %d, want 1", fakeCluster.selectPlacementHit)
+	// Local-image routing wants one node, so it must go through the bounded
+	// target-only selector and never the candidate-producing one.
+	if fakeCluster.selectTargetOnlyHit != 1 {
+		t.Fatalf("target-only SelectPlacement calls = %d, want 1", fakeCluster.selectTargetOnlyHit)
+	}
+	if fakeCluster.selectPlacementHit != 0 {
+		t.Fatalf("SelectPlacementWithCandidates calls = %d, want 0 for a one-node answer", fakeCluster.selectPlacementHit)
 	}
 	if fakeCluster.forwardedPeer != "http://worker-b:21212" {
 		t.Fatalf("forwarded peer = %q, want worker-b", fakeCluster.forwardedPeer)
@@ -1459,5 +1467,58 @@ func TestClusterMembersIncludesDrainedField(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("node-b missing from members list: %q", rr.Body.String())
+	}
+}
+
+// Build, template, JS-bundle and local-image routing all want one node. The
+// target-only request must not come back with the whole eligible fleet
+// attached, and it must not reach the candidate-producing selector at all.
+func TestClusterInternalSelectPlacementTargetOnly(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fake := &createForwardCluster{
+		Noop:   cluster.NewNoop("node-a", "http://node-a", ""),
+		target: cluster.PlacementTarget{NodeID: "wrk-7", APIURL: "http://wrk-7"},
+	}
+	for i := range 500 {
+		fake.members = append(fake.members, cluster.Member{NodeID: fmt.Sprintf("wrk-%03d", i), APIURL: "http://w", Alive: true})
+	}
+	svc.AttachCluster(fake)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/internal/select-placement",
+		strings.NewReader(`{"request":{"cpu":1,"memory_mb":256,"disk_gb":1},"target_only":true}`))
+	h.clusterInternalSelectPlacement(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp cluster.SelectPlacementResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Target.NodeID != "wrk-7" {
+		t.Fatalf("target = %+v", resp.Target)
+	}
+	if len(resp.Candidates) != 0 {
+		t.Fatalf("target-only response carried %d candidates; the answer is one node", len(resp.Candidates))
+	}
+	if fake.selectTargetOnlyHit != 1 || fake.selectPlacementHit != 0 {
+		t.Fatalf("target-only=%d candidates=%d; the target-only path must not reach the candidate selector",
+			fake.selectTargetOnlyHit, fake.selectPlacementHit)
+	}
+
+	// A caller that does not set the flag still gets the legacy shape, so a
+	// rolling upgrade keeps working in both directions.
+	legacy := httptest.NewRecorder()
+	legacyReq := httptest.NewRequest(http.MethodPost, "/v1/cluster/internal/select-placement",
+		strings.NewReader(`{"request":{"cpu":1,"memory_mb":256,"disk_gb":1}}`))
+	h.clusterInternalSelectPlacement(legacy, legacyReq)
+	var legacyResp cluster.SelectPlacementResponse
+	if err := json.Unmarshal(legacy.Body.Bytes(), &legacyResp); err != nil {
+		t.Fatalf("decode legacy: %v", err)
+	}
+	if len(legacyResp.Candidates) != 500 {
+		t.Fatalf("legacy response candidates = %d, want 500", len(legacyResp.Candidates))
 	}
 }

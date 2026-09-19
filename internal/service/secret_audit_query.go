@@ -753,7 +753,8 @@ func (s *Service) ListSecretAudit(ctx context.Context, sandboxID string, opts Se
 	preferKnown := false
 	if c := s.Cluster(); c != nil {
 		selfID = c.SelfNodeID()
-		members = c.Members()
+		// Audit fan-out needs peer identity and endpoints, not capacity.
+		members = cluster.IdentityMembers(c)
 		if p, ok := c.PlacementOf(sandboxID); ok {
 			if !p.AuditNodesTruncated {
 				addPreferredAuditNode(prefer, p.OwnerNodeID)
