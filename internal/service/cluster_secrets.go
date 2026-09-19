@@ -886,6 +886,11 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 					}
 				}
 				prevAlive = alive
+				// Do this BEFORE the delete pass: a node whose storage an
+				// operator attested destroyed, but which is alive again, can
+				// ACK — so its attestation is withdrawn and its obligations
+				// become pending again before anything can discharge them.
+				s.reapLiveNodeStorageRetirements(ctx)
 				// A member came back: every obligation TO THAT MEMBER is worth
 				// one immediate try regardless of how far it had backed off.
 				// The pass says so outright instead of moving its clock past
@@ -901,10 +906,6 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 					s.logger.Warn("cluster: secret put-outbox reconcile failed", "err", err)
 				}
 				s.refreshSecretHolderPossession(ctx)
-				// A node whose storage an operator attested destroyed, but
-				// which is alive again, can ACK — so its attestation is
-				// withdrawn and its obligations become pending once more.
-				s.reapLiveNodeStorageRetirements(ctx)
 				if len(rejoined) > 0 {
 					// Only the secrets whose recipient set contains a
 					// returning node need retransmitting. Re-fanning out

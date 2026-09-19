@@ -210,12 +210,12 @@ type Service struct {
 	secretAuditExportDone sync.WaitGroup
 	secretRefanoutMu      sync.Mutex
 	secretRefanoutRunning bool
+	// testAuditFetcher overrides peer audit fan-out in tests.
+	testAuditFetcher cluster.AuditPeerFetcher
 	// nodeRetirements caches the operator storage-destruction attestations
 	// consulted by the delete-outbox pass. See node_storage_retirement.go.
 	nodeRetirementMu sync.Mutex
 	nodeRetirements  *nodeStorageRetirementCache
-	// testAuditFetcher overrides peer audit fan-out in tests.
-	testAuditFetcher cluster.AuditPeerFetcher
 	mounts           *mounts.Manager
 	admitter         *capacity.Admitter
 	images           ImageDistributionProvider
