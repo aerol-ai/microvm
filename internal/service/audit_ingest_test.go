@@ -400,6 +400,10 @@ func TestValidateEgressAuditBindingClusterAndStoreFailures(t *testing.T) {
 	if err := clustered.validateEgressAuditBinding(context.Background(), "sb", "inc"); !errors.Is(err, errAuditIngestBindingStale) {
 		t.Fatalf("missing cluster error = %v", err)
 	}
+	// Swapping the cluster client under a live Service is a test-only move:
+	// production replaces the SANDBOX, not the control plane, and every real
+	// lifecycle boundary drops the binding lease. Drop it explicitly here so
+	// each stub is actually exercised.
 	clustered.cluster = &placementOnlyCluster{
 		Noop: cluster.NewNoop("self", "", ""),
 		placement: cluster.Placement{
@@ -408,6 +412,7 @@ func TestValidateEgressAuditBindingClusterAndStoreFailures(t *testing.T) {
 			IncarnationID: "inc",
 		},
 	}
+	clustered.invalidateAuditOwnershipLease("sb")
 	if err := clustered.validateEgressAuditBinding(context.Background(), "sb", "inc"); !errors.Is(err, errAuditIngestBindingStale) {
 		t.Fatalf("foreign-owner error = %v", err)
 	}
@@ -419,6 +424,7 @@ func TestValidateEgressAuditBindingClusterAndStoreFailures(t *testing.T) {
 			IncarnationID: "inc",
 		},
 	}
+	clustered.invalidateAuditOwnershipLease("sb")
 	if err := clustered.validateEgressAuditBinding(context.Background(), "sb", "inc"); !errors.Is(err, errAuditIngestBindingStale) {
 		t.Fatalf("orphaned-owner error = %v", err)
 	}
@@ -430,6 +436,7 @@ func TestValidateEgressAuditBindingClusterAndStoreFailures(t *testing.T) {
 			IncarnationID: "inc-current",
 		},
 	}
+	clustered.invalidateAuditOwnershipLease("sb")
 	if err := clustered.validateEgressAuditBinding(context.Background(), "sb", "inc-old"); !errors.Is(err, errAuditIngestBindingStale) {
 		t.Fatalf("stale-incarnation error = %v", err)
 	}
