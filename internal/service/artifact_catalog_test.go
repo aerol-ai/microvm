@@ -157,3 +157,40 @@ func (c *failingCatalogCluster) PublishArtifactCatalog(ctx context.Context, kind
 	}
 	return c.catalogCluster.PublishArtifactCatalog(ctx, kind, tenant, nodeID, rows)
 }
+
+// Bundles are tenant-scoped, and so is their catalogue slice: an upload
+// publishes the uploading tenant's rows, and a delete publishes what is left.
+func TestJSBundleCatalogPublishesPerTenant(t *testing.T) {
+	svc := newBundleService(t)
+	cl := newCatalogCluster("worker-a")
+	svc.cfg.EnableCluster = true
+	svc.cluster = cl
+	ctx := context.Background()
+
+	created, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "hook", Source: jsBundleSrc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.publishCount(); got != 1 {
+		t.Fatalf("publishes after upload = %d, want 1", got)
+	}
+	page, ok := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactKindJSBundle, "")
+	if !ok || len(page.Rows) != 1 || page.Rows[0].ID != created.Digest {
+		t.Fatalf("catalogue = %+v ok=%v, want the uploaded digest", page.Rows, ok)
+	}
+	var decoded models.JSBundle
+	if err := json.Unmarshal(page.Rows[0].Payload, &decoded); err != nil || decoded.Digest != created.Digest {
+		t.Fatalf("catalogue row = %+v err=%v", decoded, err)
+	}
+
+	if err := svc.DeleteJSBundle(ctx, created.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.publishCount(); got != 2 {
+		t.Fatalf("publishes after delete = %d; a delete must republish the remaining slice", got)
+	}
+	page, _ = svc.ClusterArtifactCatalog(ctx, cluster.ArtifactKindJSBundle, "")
+	if len(page.Rows) != 0 {
+		t.Fatalf("catalogue still holds %d rows after the delete", len(page.Rows))
+	}
+}
