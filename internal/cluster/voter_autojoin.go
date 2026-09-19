@@ -76,6 +76,8 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 	nonVoterByRole := c.peerForcedNonVoter(nodeID)
 
 	if srv, ok := c.configuredServer(nodeID); ok {
+		// Already a replica. Address and suffrage corrections are not new
+		// state carriers, so the replica budget does not apply to them.
 		if srv.Suffrage == raft.Voter {
 			if string(srv.Address) == raftAddr {
 				return
@@ -98,11 +100,134 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 		return
 	}
 
+	// This is a NEW raft replica. The membership mutator is the only place
+	// that can actually bound replication: topology/placement validation
+	// rejects an oversized server tier after the fact, and rejecting new
+	// sandbox placement does not un-replicate a log and FSM that a surplus
+	// node is already receiving. The daemon also starts the cluster before it
+	// checks topology, and an open-source topology violation logs and
+	// continues — so admission is the only enforcement point that holds.
+	if c.raftReplicaAdmissionBlocked(nodeID) {
+		c.logReplicaBudgetRefusal(nodeID, raftAddr)
+		return
+	}
+
 	if nonVoterByRole || c.voterCapReached() {
 		c.addMemberAsNonvoter(nodeID, raftAddr)
 		return
 	}
 	c.addMemberAsVoter(nodeID, raftAddr)
+}
+
+// raftReplicaBudget is how many state-carrying raft replicas this cluster may
+// hold. Every replica — voter or non-voter — receives the full log and FSM,
+// which at 100k sandboxes is tens of MB of placement state plus a leader
+// replication stream each.
+//
+// The regime matches LargeClusterTopologyError exactly, on purpose. A cluster
+// at or below MaxMixedClusterNodes is the explicitly supported small/local
+// topology where every node may be mixed, and every mixed node is
+// server-role; capping those at the dedicated-tier budget would break a
+// deployment shape the product supports. Above that line the fleet must run
+// dedicated tiers, and the server tier is what MaxServerTierNodes bounds.
+func (c *Cluster) raftReplicaBudget() int {
+	if c == nil {
+		return 0
+	}
+	if c.gossip == nil {
+		// No membership view to classify the regime with. Use the permissive
+		// small-cluster budget rather than refusing every join.
+		return MaxMixedClusterNodes
+	}
+	if LiveMemberCount(c.gossip.members()) <= MaxMixedClusterNodes {
+		return MaxMixedClusterNodes
+	}
+	return MaxServerTierNodes
+}
+
+// raftReplicaAdmissionBlocked reports whether admitting nodeID would push the
+// configuration past the replica budget.
+func (c *Cluster) raftReplicaAdmissionBlocked(nodeID string) bool {
+	budget := c.raftReplicaBudget()
+	if budget <= 0 {
+		return false
+	}
+	replicas, ok := c.currentReplicaCount(nodeID)
+	if !ok {
+		// The configuration could not be read. Refuse rather than admit
+		// blind — the 5s reconcile loop retries, and an unadmitted server is
+		// recoverable while an over-replicated log is not.
+		return true
+	}
+	return replicas >= budget
+}
+
+// currentReplicaCount counts configured raft servers other than exclude that
+// still carry a replica.
+//
+// A member gossip reports as dead is not counted: the dead-owner reconciler
+// RemoveServer's it, and counting it would block the rolling replacement the
+// spare slots in MaxServerTierNodes exist for. A configured server absent
+// from gossip entirely IS counted — an unknown entry is assumed to still be
+// replicating.
+func (c *Cluster) currentReplicaCount(exclude string) (int, bool) {
+	cfg := c.raft.raft.GetConfiguration()
+	if err := cfg.Error(); err != nil {
+		return 0, false
+	}
+	dead := c.deadGossipNodeIDs()
+	count := 0
+	for _, srv := range cfg.Configuration().Servers {
+		id := string(srv.ID)
+		if id == exclude {
+			continue
+		}
+		if _, gone := dead[id]; gone {
+			continue
+		}
+		count++
+	}
+	return count, true
+}
+
+func (c *Cluster) deadGossipNodeIDs() map[string]struct{} {
+	out := map[string]struct{}{}
+	if c == nil || c.gossip == nil {
+		return out
+	}
+	for _, m := range c.gossip.members() {
+		if id := strings.TrimSpace(m.NodeID); id != "" && !m.Alive {
+			out[id] = struct{}{}
+		}
+	}
+	return out
+}
+
+// replicaBudgetLogInterval throttles the refusal log. reconcileVoters retries
+// every 5s for every gossip member, so an un-re-roled surplus server would
+// otherwise fill the log forever.
+const replicaBudgetLogInterval = time.Minute
+
+func (c *Cluster) logReplicaBudgetRefusal(nodeID, raftAddr string) {
+	raftReplicaAdmissionRefused.Add(1)
+	now := time.Now().Unix()
+	last := c.replicaBudgetLogUnix.Load()
+	if now-last < int64(replicaBudgetLogInterval/time.Second) {
+		return
+	}
+	if !c.replicaBudgetLogUnix.CompareAndSwap(last, now) {
+		return
+	}
+	if c.logger == nil {
+		return
+	}
+	budget := c.raftReplicaBudget()
+	c.logger.Error("cluster: refusing raft replica admission; the server tier is at its budget",
+		"node_id", nodeID,
+		"raft_addr", raftAddr,
+		"replica_budget", budget,
+		"hint", "every server-role node replicates the whole placement FSM; re-role the surplus nodes to worker or ingress",
+	)
 }
 
 // peerForcedNonVoter returns true when the joining peer gossiped a role that

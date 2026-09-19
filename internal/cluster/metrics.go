@@ -30,6 +30,12 @@ var (
 	raftSnapshotRestoreErrs = expvar.NewMap("aerolvm_raft_snapshot_restore_errors_total")
 	raftSnapshotRestoreLast = expvar.NewInt("aerolvm_raft_snapshot_restore_last_nanos")
 
+	// raftReplicaAdmissionRefused counts joins the leader refused because the
+	// raft configuration is already at its replica budget. A non-zero and
+	// growing value means surplus server-role nodes are running that the
+	// operator has to re-role to worker or ingress.
+	raftReplicaAdmissionRefused = expvar.NewInt("aerolvm_raft_replica_admission_refused_total")
+
 	gossipMembersTotal      = expvar.NewInt("aerolvm_gossip_members_total")
 	gossipMembersAlive      = expvar.NewInt("aerolvm_gossip_members_alive")
 	workerLeasesTotal       = expvar.NewInt("aerolvm_worker_leases_total")
