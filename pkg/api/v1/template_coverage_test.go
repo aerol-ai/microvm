@@ -75,7 +75,7 @@ func TestForwardTemplateToLeaderBranches(t *testing.T) {
 	if _, ok := templateMemberByID(&membersStubCluster{Noop: cluster.NewNoop("self", "http://self", "")}, "nope"); ok {
 		t.Fatal("expected miss")
 	}
-	if n := clusterRuntimeUnavailablePeerCount(nil, models.RuntimeFirecracker); n != 0 {
+	if n := clusterRuntimeUnavailablePeerCount(nil, models.RuntimeFirecracker, nil, nil); n != 0 {
 		t.Fatalf("nil cluster count = %d", n)
 	}
 }

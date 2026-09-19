@@ -222,14 +222,63 @@ func clusterRuntimeMemberEligible(c cluster.Client, member cluster.Member, runti
 		clusterMemberSupportsRuntime(member, runtimeName)
 }
 
-// clusterRuntimePeers returns the eligible workers that can be asked now.
-func clusterRuntimePeers(c cluster.Client, runtimeName string) []cluster.Member {
+// clusterArtifactLocationIndex reads a peer's gossiped inventory for one
+// catalogue: the artifact keys it holds, and whether that list is
+// authoritative. A nil index means "no location information for this
+// catalogue" and every eligible peer is asked, as before.
+//
+// This is the registry the catalogue sweep needs, and for templates it
+// already exists — capacity heartbeats publish LocalTemplateCatalogIDs for
+// O(1) control-plane routing. The sweep simply was not consulting it, so an
+// administrative list fanned out to every runtime worker in the fleet and
+// merged each one's complete answer.
+type clusterArtifactLocationIndex func(cluster.Member) (keys []string, known bool)
+
+// clusterTemplateLocationIndex is the template catalogue's location index.
+// It lists every locally-owned row regardless of lifecycle status, which is
+// exactly the set the administrative list can return.
+func clusterTemplateLocationIndex(m cluster.Member) ([]string, bool) {
+	return m.Capacity.LocalTemplateCatalogIDs, m.Capacity.LocalTemplateCatalogInventoryKnown
+}
+
+// clusterPeerCanContribute reports whether asking this peer could add a row
+// the caller does not already have.
+//
+// It is a strict narrowing, never a behaviour change: the sweep dedupes by key
+// with local rows winning, so a peer whose authoritative inventory is entirely
+// covered by `have` could only ever return rows that are discarded. A peer
+// with no published inventory (pre-upgrade, just joined) is always asked.
+func clusterPeerCanContribute(index clusterArtifactLocationIndex, m cluster.Member, have map[string]struct{}) bool {
+	if index == nil {
+		return true
+	}
+	keys, known := index(m)
+	if !known {
+		return true
+	}
+	for _, k := range keys {
+		if k = strings.TrimSpace(k); k == "" {
+			continue
+		}
+		if _, dup := have[k]; !dup {
+			return true
+		}
+	}
+	return false
+}
+
+// clusterRuntimePeers returns the eligible workers that can be asked now,
+// narrowed by the catalogue's location index.
+func clusterRuntimePeers(c cluster.Client, runtimeName string, index clusterArtifactLocationIndex, have map[string]struct{}) []cluster.Member {
 	if c == nil {
 		return nil
 	}
 	out := make([]cluster.Member, 0)
 	for _, m := range c.Members() {
 		if !clusterRuntimeMemberEligible(c, m, runtimeName) || !m.Alive || strings.TrimSpace(m.InternalURL) == "" {
+			continue
+		}
+		if !clusterPeerCanContribute(index, m, have) {
 			continue
 		}
 		out = append(out, m)
@@ -240,7 +289,7 @@ func clusterRuntimePeers(c cluster.Client, runtimeName string) []cluster.Member 
 // clusterRuntimeUnavailablePeerCount counts eligible workers that cannot be
 // asked (dead or without an internal endpoint). They are reported as missing
 // coverage rather than pretended absent.
-func clusterRuntimeUnavailablePeerCount(c cluster.Client, runtimeName string) int {
+func clusterRuntimeUnavailablePeerCount(c cluster.Client, runtimeName string, index clusterArtifactLocationIndex, have map[string]struct{}) int {
 	if c == nil {
 		return 0
 	}
@@ -250,6 +299,12 @@ func clusterRuntimeUnavailablePeerCount(c cluster.Client, runtimeName string) in
 			continue
 		}
 		if !m.Alive || strings.TrimSpace(m.InternalURL) == "" {
+			// A peer whose authoritative inventory adds nothing is not
+			// missing coverage — its rows are already in the answer. Counting
+			// it would mark a complete list partial.
+			if !clusterPeerCanContribute(index, m, have) {
+				continue
+			}
 			count++
 		}
 	}
@@ -341,10 +396,8 @@ func clusterListFromPeer[T any](parent *http.Request, c cluster.Client, peer clu
 func clusterListSweep[T any](r *http.Request, c cluster.Client, runtimeName, forwardedHeader string,
 	local []T, localErr error, key func(T) string, logger interface {
 		Warn(string, ...any)
-	}, what string,
+	}, what string, index clusterArtifactLocationIndex,
 ) (clusterListAggregate[T], error) {
-	peers := clusterRuntimePeers(c, runtimeName)
-	unavailable := clusterRuntimeUnavailablePeerCount(c, runtimeName)
 	if localErr != nil && logger != nil {
 		logger.Warn("cluster "+what+": local list failed", "err", localErr)
 	}
@@ -358,6 +411,10 @@ func clusterListSweep[T any](r *http.Request, c cluster.Client, runtimeName, for
 		seen[k] = struct{}{}
 		merged = append(merged, row)
 	}
+	// The local rows are known BEFORE the fan-out, so the location index can
+	// drop every peer that could only return rows this answer already holds.
+	peers := clusterRuntimePeers(c, runtimeName, index, seen)
+	unavailable := clusterRuntimeUnavailablePeerCount(c, runtimeName, index, seen)
 	successful := 0
 	for result := range clusterListFromPeers[T](r, c, peers, forwardedHeader) {
 		if result.err != nil {
