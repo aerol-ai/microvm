@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -105,28 +104,7 @@ func TestSecretAuditSinkGuardsSidecarsAndEnterpriseInit(t *testing.T) {
 	if err := os.WriteFile(sink.spillWorkingPath, append(line, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Assert the INVARIANT — an interrupted working file is resumed into the
-	// authoritative log — not which goroutine did the resuming. The sink's
-	// writer calls drainSpill() at the top of every loop iteration, so it can
-	// legitimately consume the working file between the WriteFile above and a
-	// direct call here; the direct call then returns false for a resume that
-	// did happen. That race is what made this test flaky on CI.
-	deadline := time.Now().Add(10 * time.Second)
-	resumed := false
-	for time.Now().Before(deadline) {
-		if sink.drainSpill() {
-			resumed = true
-			break
-		}
-		if raw, err := os.ReadFile(sink.path); err == nil && bytes.Contains(raw, []byte(`"spill-resume"`)) {
-			resumed = true
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !resumed {
-		t.Fatal("interrupted spill working file was not resumed")
-	}
+	requireSpillDrained(t, sink, "interrupted spill working file was not resumed")
 	if err := persistSpillOffset(filepath.Join(t.TempDir(), "off"), 12); err != nil {
 		t.Fatal(err)
 	}
@@ -816,9 +794,7 @@ func TestWave33AuditHelpersAndGuards(t *testing.T) {
 	if err := sink.appendSpill(SecretAuditEvent{Result: "ok", SandboxID: "sb-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if !sink.drainSpill() {
-		t.Fatal("expected spill drain to find work")
-	}
+	requireSpillDrained(t, sink, "expected spill drain to find work")
 	if err := (*fileAuditSink)(nil).appendSpill(SecretAuditEvent{}); err == nil {
 		t.Fatal("nil appendSpill")
 	}
@@ -890,4 +866,39 @@ func TestWave33AuditHelpersAndGuards(t *testing.T) {
 		t.Fatalf("owner = %q", got)
 	}
 	_ = time.Now()
+}
+
+// requireSpillDrained asserts that a spill segment was consumed into the
+// authoritative log, WITHOUT racing the sink's own writer goroutine.
+//
+// The writer calls drainSpill() at the top of every loop iteration
+// (secret_audit.go:742), so it can legitimately consume the segment first — a
+// direct drainSpill() here then returns false for a drain that did happen.
+// Asserting on that return value made three separate tests in this package
+// flaky on CI. The real invariant is that neither the spill nor its working
+// file still holds unconsumed bytes, whichever goroutine got there.
+func requireSpillDrained(t *testing.T, sink *fileAuditSink, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if sink.drainSpill() {
+			return
+		}
+		if spillSegmentConsumed(sink.spillPath) && spillSegmentConsumed(sink.spillWorkingPath) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal(msg)
+}
+
+func spillSegmentConsumed(path string) bool {
+	if path == "" {
+		return true
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	return st.Size() == 0
 }

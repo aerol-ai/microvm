@@ -92,9 +92,7 @@ func TestDrainSpillRejectsForgedSecretOpenAndFutureTimestamps(t *testing.T) {
 	if err := os.WriteFile(sink.spillPath, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !sink.drainSpill() {
-		t.Fatal("drainSpill returned false")
-	}
+	requireSpillDrained(t, sink, "drainSpill returned false")
 
 	raw, err := os.ReadFile(sink.path)
 	if err != nil {
@@ -174,9 +172,7 @@ func TestDrainSpillBindsEgressIdentityToVerifiedCapability(t *testing.T) {
 	if err := os.WriteFile(sink.spillPath, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !sink.drainSpill() {
-		t.Fatal("drainSpill returned false")
-	}
+	requireSpillDrained(t, sink, "drainSpill returned false")
 	raw, err := os.ReadFile(sink.path)
 	if err != nil {
 		t.Fatal(err)
@@ -239,9 +235,7 @@ func TestDrainSpillWithoutVerifierFailsClosed(t *testing.T) {
 	if err := os.WriteFile(sink.spillPath, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !sink.drainSpill() {
-		t.Fatal("drainSpill returned false")
-	}
+	requireSpillDrained(t, sink, "drainSpill returned false")
 	raw, err := os.ReadFile(sink.path)
 	if err != nil {
 		t.Fatal(err)
@@ -268,9 +262,7 @@ func TestDrainSpillCapsOversizedLineWithoutBreakingChain(t *testing.T) {
 	if err := os.WriteFile(sink.spillPath, append(huge, ok...), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !sink.drainSpill() {
-		t.Fatal("drainSpill returned false")
-	}
+	requireSpillDrained(t, sink, "drainSpill returned false")
 	raw, err := os.ReadFile(sink.path)
 	if err != nil {
 		t.Fatal(err)
