@@ -842,6 +842,9 @@ func (h *handlers) clusterInternalArtifactCatalog(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 		return
 	}
+	// A node may only ever ask for its OWN publisher epoch: the fencing token
+	// comes from the authenticated identity, never from the body.
+	req.ForNodeID = strings.TrimSpace(peerID)
 	apihttp.WriteJSON(w, http.StatusOK, reader.ArtifactCatalogForPeer(req))
 }
 

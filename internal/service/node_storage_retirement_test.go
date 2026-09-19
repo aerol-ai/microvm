@@ -1017,3 +1017,33 @@ func TestAuthoritativeRetirementsUseTheRightAuthority(t *testing.T) {
 		t.Fatal("a service with no store answered an authoritative read")
 	}
 }
+
+// Compile-time proof that BOTH production cluster clients can authorize a
+// discharge. The service requires this capability, and a type that lacks it
+// fails closed forever on an attestation the operator did make — which is
+// exactly what a stub-only test cannot catch.
+var (
+	_ authoritativeRetirementReader = (*cluster.Cluster)(nil)
+	_ authoritativeRetirementReader = (*cluster.Agent)(nil)
+)
+
+// The service's capability check must accept the concrete production types,
+// not just a stub that happens to implement the method.
+func TestProductionClusterTypesCanAuthorizeDischarge(t *testing.T) {
+	for name, c := range map[string]cluster.Client{
+		"server/mixed":   (*cluster.Cluster)(nil),
+		"worker/ingress": (*cluster.Agent)(nil),
+	} {
+		svc := &Service{cfg: config.Config{EnableCluster: true}, cluster: c}
+		if _, ok := svc.authoritativeRetirementReader(); !ok {
+			t.Fatalf("%s node cannot authorize a storage-retirement discharge; its obligations stay pending forever", name)
+		}
+	}
+
+	// A client without the capability still fails closed rather than falling
+	// back to a table that is not the authority in cluster mode.
+	noop := &Service{cfg: config.Config{EnableCluster: true}, cluster: cluster.NewNoop("n", "http://n", "")}
+	if _, ok := noop.authoritativeRetirementReader(); ok {
+		t.Fatal("a client with no authoritative read reported the capability")
+	}
+}

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -118,7 +120,15 @@ func catalogRows(tenant string, ids ...string) []ArtifactCatalogRow {
 // publishWholeCatalog sends an inventory as the chunk sequence a publisher
 // would.
 func publishWholeCatalog(ctx context.Context, c *Cluster, kind, nodeID, incarnation string, revision int64, rows []ArtifactCatalogRow) error {
-	for _, chunk := range ChunkArtifactCatalogSnapshot(kind, nodeID, incarnation, revision, rows) {
+	// Tests name a process with a string; the wire carries the authority's
+	// fencing token, so map each distinct name to a distinct epoch.
+	epoch := int64(1)
+	if n, err := strconv.Atoi(strings.TrimPrefix(incarnation, "inc-")); err == nil {
+		epoch = int64(n)
+	} else if incarnation != "" {
+		epoch = int64(len(incarnation))
+	}
+	for _, chunk := range ChunkArtifactCatalogSnapshot(kind, nodeID, epoch, revision, rows) {
 		if err := c.PublishArtifactCatalog(ctx, chunk); err != nil {
 			return err
 		}
@@ -135,7 +145,7 @@ func TestArtifactCatalogPublishIsBounded(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 	ctx := context.Background()
 
-	valid := ArtifactCatalogSnapshot{Kind: ArtifactKindTemplate, NodeID: "worker", Incarnation: "inc", Revision: 1, First: true, Final: true}
+	valid := ArtifactCatalogSnapshot{Kind: ArtifactKindTemplate, NodeID: "worker", Epoch: 1, Revision: 1, First: true, Final: true}
 
 	bad := valid
 	bad.Kind = "not-a-kind"
@@ -148,9 +158,9 @@ func TestArtifactCatalogPublishIsBounded(t *testing.T) {
 		t.Fatal("publish without a node id accepted")
 	}
 	bad = valid
-	bad.Incarnation = ""
+	bad.Epoch = 0
 	if err := c.PublishArtifactCatalog(ctx, bad); err == nil {
-		t.Fatal("publish without a publisher incarnation accepted")
+		t.Fatal("publish without a publisher epoch accepted")
 	}
 	bad = valid
 	bad.Revision = 0
@@ -176,7 +186,7 @@ func TestArtifactCatalogPublishIsBounded(t *testing.T) {
 // every list back to the fleet-wide sweep.
 func TestArtifactCatalogSurvivesSnapshotRestore(t *testing.T) {
 	fsm := newPlacementFSM()
-	seedCommittedCatalog(fsm, ArtifactKindJSBundle, "worker-a", "inc-a", 1,
+	seedCommittedCatalog(fsm, ArtifactKindJSBundle, "worker-a", 1, 1,
 		ArtifactCatalogRow{ID: "sha256-aaa", Tenant: "tenant-a", Payload: []byte(`{"digest":"aaa"}`)})
 
 	snap, err := fsm.Snapshot()
@@ -215,7 +225,7 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 				return
 			}
 			published = append(published, ArtifactCatalogSnapshot{
-				Kind: cmd.ArtifactKind, NodeID: cmd.NodeID, Incarnation: cmd.ArtifactIncarnation,
+				Kind: cmd.ArtifactKind, NodeID: cmd.NodeID, Epoch: cmd.ArtifactEpoch,
 				Revision: cmd.ArtifactRevision, Rows: cmd.ArtifactRows,
 				First: cmd.ArtifactChunkFirst, Final: cmd.ArtifactChunkFinal,
 			})
@@ -237,7 +247,7 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	rows := []ArtifactCatalogRow{{ID: "sha256-aaa", Tenant: "tenant-a", Payload: []byte(`{}`)}}
-	for _, chunk := range ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-self", "inc-1", 7, rows) {
+	for _, chunk := range ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-self", 7, 7, rows) {
 		if err := agent.PublishArtifactCatalog(ctx, chunk); err != nil {
 			t.Fatalf("PublishArtifactCatalog: %v", err)
 		}
@@ -245,13 +255,13 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 	if len(published) != 1 || published[0].Kind != ArtifactKindJSBundle || published[0].NodeID != "worker-self" {
 		t.Fatalf("forwarded publish = %+v", published)
 	}
-	if published[0].Incarnation != "inc-1" || published[0].Revision != 7 || !published[0].First || !published[0].Final {
+	if published[0].Epoch != 7 || published[0].Revision != 7 || !published[0].First || !published[0].Final {
 		t.Fatalf("forwarded publish lost its version or its chunk framing: %+v", published[0])
 	}
 	if len(published[0].Rows) != 1 || published[0].Rows[0].Tenant != "tenant-a" {
 		t.Fatalf("forwarded rows = %+v; tenancy rides the row so coverage can answer for an empty tenant", published[0].Rows)
 	}
-	bogus := ArtifactCatalogSnapshot{Kind: "bogus", NodeID: "worker-self", Incarnation: "inc-1", Revision: 1, First: true, Final: true}
+	bogus := ArtifactCatalogSnapshot{Kind: "bogus", NodeID: "worker-self", Epoch: 1, Revision: 1, First: true, Final: true}
 	if err := agent.PublishArtifactCatalog(ctx, bogus); err == nil {
 		t.Fatal("an unknown catalogue kind was forwarded to the control plane")
 	}
@@ -277,7 +287,7 @@ func TestAgentArtifactCatalogRoundTrip(t *testing.T) {
 // so the aggregator knows which nodes it still has to ask.
 func TestArtifactCatalogForPeerCarriesPublishers(t *testing.T) {
 	fsm := newPlacementFSM()
-	seedCommittedCatalog(fsm, ArtifactKindTemplate, "worker-a", "inc-a", 1, ArtifactCatalogRow{ID: "tpl-1", Payload: []byte(`{}`)})
+	seedCommittedCatalog(fsm, ArtifactKindTemplate, "worker-a", 1, 1, ArtifactCatalogRow{ID: "tpl-1", Payload: []byte(`{}`)})
 	c := &Cluster{fsm: fsm}
 
 	page := c.ArtifactCatalogForPeer(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
@@ -296,7 +306,7 @@ func TestArtifactCatalogForPeerCarriesPublishers(t *testing.T) {
 // believing a partial slice is their whole inventory.
 // seedCommittedCatalog installs a committed snapshot directly, for tests that
 // are about the read side rather than the publish protocol.
-func seedCommittedCatalog(fsm *placementFSM, kind, nodeID, incarnation string, revision int64, rows ...ArtifactCatalogRow) {
+func seedCommittedCatalog(fsm *placementFSM, kind, nodeID string, epoch, revision int64, rows ...ArtifactCatalogRow) {
 	state := fsm.artifactCatalog[artifactCatalogKindKey(kind)]
 	if state == nil {
 		state = &artifactCatalogKindState{
@@ -305,11 +315,11 @@ func seedCommittedCatalog(fsm *placementFSM, kind, nodeID, incarnation string, r
 		}
 		fsm.artifactCatalog[artifactCatalogKindKey(kind)] = state
 	}
-	byID := make(map[string]ArtifactCatalogRow, len(rows))
+	byKey := make(map[string]ArtifactCatalogRow, len(rows))
 	for _, row := range rows {
-		byID[row.ID] = row
+		byKey[artifactCatalogRowKey(row.Tenant, row.ID)] = row
 	}
-	state.Committed[nodeID] = artifactCatalogNodeState{Incarnation: incarnation, Revision: revision, Rows: byID}
+	state.Committed[nodeID] = artifactCatalogNodeState{Epoch: epoch, Revision: revision, Rows: byKey}
 }
 
 // The catalogue is answered over the same response ceiling as a placement
@@ -332,7 +342,7 @@ func TestArtifactCatalogReadIsPagedNotTruncated(t *testing.T) {
 				Payload: make([]byte, maxArtifactCatalogRowBytes),
 			})
 		}
-		seedCommittedCatalog(fsm, ArtifactKindTemplate, fmt.Sprintf("worker-%02d", i), "inc", 1, rows...)
+		seedCommittedCatalog(fsm, ArtifactKindTemplate, fmt.Sprintf("worker-%02d", i), 1, 1, rows...)
 	}
 
 	seen := map[string]struct{}{}
@@ -393,8 +403,8 @@ func TestReplicatedRegistryCommandValidation(t *testing.T) {
 
 	publish := func(cmd command) command {
 		cmd.Op = opPublishArtifactCatalog
-		if cmd.ArtifactIncarnation == "" {
-			cmd.ArtifactIncarnation = "inc-a"
+		if cmd.ArtifactEpoch == 0 {
+			cmd.ArtifactEpoch = 1
 		}
 		if cmd.ArtifactRevision == 0 {
 			cmd.ArtifactRevision = 1
@@ -409,8 +419,8 @@ func TestReplicatedRegistryCommandValidation(t *testing.T) {
 	if err := apply(publish(command{ArtifactKind: ArtifactKindTemplate})); err == nil {
 		t.Fatal("a publish with no node id was applied")
 	}
-	if err := apply(publish(command{ArtifactKind: ArtifactKindTemplate, NodeID: "worker-a", ArtifactIncarnation: " "})); err == nil {
-		t.Fatal("a publish with no publisher incarnation was applied")
+	if err := apply(publish(command{ArtifactKind: ArtifactKindTemplate, NodeID: "worker-a", ArtifactEpoch: -1})); err == nil {
+		t.Fatal("a publish with no publisher epoch was applied")
 	}
 	over := make([]ArtifactCatalogRow, MaxArtifactCatalogChunkRows+1)
 	for i := range over {
@@ -522,7 +532,7 @@ func TestArtifactCatalogChunksFitTheApplyTransport(t *testing.T) {
 	// The shape the previous implementation sent: one command carrying the
 	// whole inventory. It is ordinary metadata, not maximum-sized rows.
 	whole, err := encodeCommand(artifactCatalogCommand(ArtifactCatalogSnapshot{
-		Kind: ArtifactKindJSBundle, NodeID: "worker-a", Incarnation: "inc-a", Revision: 1,
+		Kind: ArtifactKindJSBundle, NodeID: "worker-a", Epoch: 1, Revision: 1,
 		Rows: rows, First: true, Final: true,
 	}))
 	if err != nil {
@@ -533,7 +543,7 @@ func TestArtifactCatalogChunksFitTheApplyTransport(t *testing.T) {
 			len(whole), maxInternalApplyBytes)
 	}
 
-	chunks := ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-a", "inc-a", 3, rows)
+	chunks := ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-a", 1, 3, rows)
 	if len(chunks) < 2 {
 		t.Fatal("the fixture no longer needs chunking")
 	}
@@ -573,7 +583,7 @@ func TestArtifactCatalogPublishesAnEmptyInventory(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 	ctx := context.Background()
 
-	chunks := ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-empty", "inc-a", 1, nil)
+	chunks := ChunkArtifactCatalogSnapshot(ArtifactKindJSBundle, "worker-empty", 1, 1, nil)
 	if len(chunks) != 1 || !chunks[0].First || !chunks[0].Final {
 		t.Fatalf("an empty inventory must still be one framed publication: %+v", chunks)
 	}
@@ -594,21 +604,21 @@ func TestArtifactCatalogPublishesAnEmptyInventory(t *testing.T) {
 }
 
 // Two publications can reach the log in the opposite order to the one their
-// inventories were read in. The older one must not win, and a publisher that
-// restarts must not be fenced out by the revisions its previous process left
-// behind.
-func TestArtifactCatalogFencesOutOfOrderAndRestartedPublishers(t *testing.T) {
+// inventories were read in. The older one must not win, and the publisher
+// must be told so rather than believing it is published.
+func TestArtifactCatalogFencesOutOfOrderPublications(t *testing.T) {
 	c, cleanup := newTestCluster(t, "srv-catalog-order", true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 	ctx := context.Background()
 
-	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-1", 2, catalogRows("", "tpl-new")); err != nil {
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", 1, 2, catalogRows("", "tpl-new")); err != nil {
 		t.Fatal(err)
 	}
 	// The older read lands afterwards.
-	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-1", 1, catalogRows("", "tpl-old")); err != nil {
-		t.Fatal(err)
+	err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", 1, 1, catalogRows("", "tpl-old"))
+	if !strings.Contains(fmt.Sprint(err), "superseded") {
+		t.Fatalf("a late older publication returned %v; the publisher would mark itself clean", err)
 	}
 	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
 	if err != nil {
@@ -618,9 +628,13 @@ func TestArtifactCatalogFencesOutOfOrderAndRestartedPublishers(t *testing.T) {
 		t.Fatalf("catalogue = %+v; a late older publication overwrote newer state", page.Rows)
 	}
 
-	// The node restarts: its revisions begin again at 1, and that publication
-	// is newer than anything its previous process left.
-	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-2", 1, catalogRows("", "tpl-after-restart")); err != nil {
+	// The node restarts: it takes the next epoch from the authority and its
+	// revisions start again, which must still outrank everything before it.
+	epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", epoch+1, 1, catalogRows("", "tpl-after-restart")); err != nil {
 		t.Fatal(err)
 	}
 	page, err = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
@@ -646,7 +660,7 @@ func TestArtifactCatalogDoesNotCommitAHalfDeliveredSnapshot(t *testing.T) {
 	}
 	// A new snapshot starts but never finishes.
 	partial := ArtifactCatalogSnapshot{
-		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 2,
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 2,
 		Rows: catalogRows("", "tpl-c"), First: true,
 	}
 	if err := c.PublishArtifactCatalog(ctx, partial); err != nil {
@@ -700,7 +714,7 @@ func TestArtifactCatalogDoesNotCommitAHalfDeliveredSnapshot(t *testing.T) {
 // inventories as one node's current state.
 func TestArtifactCatalogDropsOrphanedChunks(t *testing.T) {
 	fsm := newPlacementFSM()
-	apply := func(chunk ArtifactCatalogSnapshot) {
+	applyResult := func(chunk ArtifactCatalogSnapshot) error {
 		t.Helper()
 		raw, err := encodeCommand(artifactCatalogCommand(chunk))
 		if err != nil {
@@ -708,16 +722,27 @@ func TestArtifactCatalogDropsOrphanedChunks(t *testing.T) {
 		}
 		if resp := fsm.Apply(&raft.Log{Data: raw}); resp != nil {
 			if err, ok := resp.(error); ok {
-				t.Fatalf("apply: %v", err)
+				return err
 			}
+		}
+		return nil
+	}
+	apply := func(chunk ArtifactCatalogSnapshot) {
+		t.Helper()
+		if err := applyResult(chunk); err != nil {
+			t.Fatalf("apply: %v", err)
 		}
 	}
 
-	// A continuation whose snapshot was never started.
-	apply(ArtifactCatalogSnapshot{
-		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 1,
+	// A continuation whose snapshot was never started must not be
+	// acknowledged: success would tell the publisher its revision is
+	// published and stop it retrying.
+	if err := applyResult(ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 1,
 		Rows: catalogRows("", "orphan"), Final: true,
-	})
+	}); err == nil {
+		t.Fatal("a continuation chunk with no pending snapshot was acknowledged as published")
+	}
 	if page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}); len(page.Rows) != 0 {
 		t.Fatalf("an orphaned chunk was committed: %+v", page.Rows)
 	}
@@ -725,15 +750,15 @@ func TestArtifactCatalogDropsOrphanedChunks(t *testing.T) {
 	// A snapshot starts, then a NEWER one starts before the first finishes:
 	// the stale continuation must not join the new pending snapshot.
 	apply(ArtifactCatalogSnapshot{
-		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 2,
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 2,
 		Rows: catalogRows("", "old-first"), First: true,
 	})
 	apply(ArtifactCatalogSnapshot{
-		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 3,
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 3,
 		Rows: catalogRows("", "new-first"), First: true,
 	})
 	apply(ArtifactCatalogSnapshot{
-		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 2,
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 2,
 		Rows: catalogRows("", "old-final"), Final: true,
 	})
 	if page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}); len(page.Rows) != 0 {
@@ -742,7 +767,7 @@ func TestArtifactCatalogDropsOrphanedChunks(t *testing.T) {
 
 	// The current snapshot still completes normally.
 	apply(ArtifactCatalogSnapshot{
-		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 3,
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 3,
 		Rows: catalogRows("", "new-final"), Final: true,
 	})
 	page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
@@ -766,7 +791,7 @@ func TestArtifactCatalogChunkByteCapIsEnforced(t *testing.T) {
 		rows = append(rows, ArtifactCatalogRow{ID: fmt.Sprintf("r-%02d", i), Payload: make([]byte, maxArtifactCatalogRowBytes)})
 	}
 	chunk := ArtifactCatalogSnapshot{
-		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 1,
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 1,
 		Rows: rows, First: true, Final: true,
 	}
 	if len(chunk.Rows) > MaxArtifactCatalogChunkRows {
@@ -776,9 +801,339 @@ func TestArtifactCatalogChunkByteCapIsEnforced(t *testing.T) {
 		t.Fatal("a chunk inside the row cap but over the byte cap was accepted; it would be refused by the apply transport instead")
 	}
 	// The chunker never produces one.
-	for _, produced := range ChunkArtifactCatalogSnapshot(ArtifactKindTemplate, "worker-a", "inc-1", 1, rows) {
+	for _, produced := range ChunkArtifactCatalogSnapshot(ArtifactKindTemplate, "worker-a", 1, 1, rows) {
 		if err := validateArtifactCatalogChunk(produced); err != nil {
 			t.Fatalf("the chunker produced an invalid chunk: %v", err)
 		}
+	}
+}
+
+// JS bundle ids are CONTENT digests, so two tenants uploading identical
+// content legitimately hold the same id on one worker. Keying the inventory
+// by id alone let the second row erase the first while the catalogue kept
+// claiming the worker covered both tenants — so the aggregator never asked it
+// for the row it had dropped.
+func TestArtifactCatalogKeepsIdenticalDigestsForDifferentTenants(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-digest-collision", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	const digest = "sha256-identical-content"
+	rows := []ArtifactCatalogRow{
+		{ID: digest, Tenant: "tenant-a", Payload: []byte(`{"digest":"identical","tenant":"a"}`)},
+		{ID: digest, Tenant: "tenant-b", Payload: []byte(`{"digest":"identical","tenant":"b"}`)},
+	}
+	if err := publishWholeCatalog(ctx, c, ArtifactKindJSBundle, "worker-a", "inc-1", 1, rows); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: tenant})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Rows) != 1 {
+			t.Fatalf("%s reads %d rows, want its own copy of the shared digest", tenant, len(page.Rows))
+		}
+		if len(page.Publishers) != 1 {
+			t.Fatalf("%s publishers = %v", tenant, page.Publishers)
+		}
+	}
+}
+
+// A raft snapshot taken BETWEEN chunks must replay the log suffix to the same
+// state as a replica that never restored it. Persisting only the committed
+// snapshots meant the restored replica silently dropped the publication while
+// the others committed it — and the publisher was told it succeeded.
+func TestArtifactCatalogSnapshotBetweenChunksReplaysIdentically(t *testing.T) {
+	apply := func(fsm *placementFSM, chunk ArtifactCatalogSnapshot) {
+		t.Helper()
+		raw, err := encodeCommand(artifactCatalogCommand(chunk))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if resp := fsm.Apply(&raft.Log{Data: raw}); resp != nil {
+			if err, ok := resp.(error); ok {
+				t.Fatalf("apply: %v", err)
+			}
+		}
+	}
+	seed := func(fsm *placementFSM) {
+		for _, chunk := range ChunkArtifactCatalogSnapshot(ArtifactKindTemplate, "worker-a", 1, 1, catalogRows("", "tpl-old")) {
+			apply(fsm, chunk)
+		}
+	}
+
+	uninterrupted := newPlacementFSM()
+	seed(uninterrupted)
+	interrupted := newPlacementFSM()
+	seed(interrupted)
+
+	first := ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 2,
+		Rows: catalogRows("", "tpl-new-1"), First: true,
+	}
+	final := ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 2,
+		Rows: catalogRows("", "tpl-new-2"), Final: true,
+	}
+	apply(uninterrupted, first)
+	apply(interrupted, first)
+
+	// The interrupted replica snapshots here — between the chunks — and is
+	// restored from it, then replays the same final command.
+	snap, err := interrupted.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	restored := newPlacementFSM()
+	if err := restored.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	apply(uninterrupted, final)
+	apply(restored, final)
+
+	want := map[string]struct{}{}
+	for _, row := range uninterrupted.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}).Rows {
+		want[row.ID] = struct{}{}
+	}
+	got := map[string]struct{}{}
+	for _, row := range restored.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}).Rows {
+		got[row.ID] = struct{}{}
+	}
+	if len(want) != 2 {
+		t.Fatalf("the uninterrupted replica holds %v; the fixture no longer models a two-chunk publication", want)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("restored replica holds %v, the uninterrupted one holds %v; a snapshot between chunks diverged permanently", got, want)
+	}
+	for id := range want {
+		if _, ok := got[id]; !ok {
+			t.Fatalf("restored replica is missing %s", id)
+		}
+	}
+}
+
+// A UUID identifies a process but does not ORDER processes: treating any
+// different identifier as newer let a request delayed in transport from a
+// process that has already been replaced take ownership back and republish
+// its obsolete inventory. The new process has marked itself clean, so nothing
+// corrects it.
+func TestArtifactCatalogFencesASupersededPublisher(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-fencing", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	// The old process publishes, then dies.
+	oldEpoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", oldEpoch+1, 8, catalogRows("", "tpl-deleted")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The new process asks the authority for its fencing token and publishes.
+	newEpoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newEpoch <= oldEpoch {
+		t.Fatalf("the authority handed out epoch %d after %d; a restart must be able to supersede", newEpoch, oldEpoch)
+	}
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", newEpoch+1, 1, catalogRows("", "tpl-current")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A request from the dead process, delayed in transport, arrives now —
+	// with a HIGHER revision than the new process has reached.
+	err = publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", oldEpoch+1, 9, catalogRows("", "tpl-deleted"))
+	if err == nil {
+		t.Fatal("a superseded process's delayed publication was accepted")
+	}
+
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Rows) != 1 || page.Rows[0].ID != "tpl-current" {
+		t.Fatalf("catalogue = %+v; a superseded process republished its obsolete inventory", page.Rows)
+	}
+}
+
+func publishAtEpoch(ctx context.Context, c *Cluster, kind, nodeID string, epoch, revision int64, rows []ArtifactCatalogRow) error {
+	for _, chunk := range ChunkArtifactCatalogSnapshot(kind, nodeID, epoch, revision, rows) {
+		if err := c.PublishArtifactCatalog(ctx, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A node that is permanently gone can never publish the corrective empty
+// inventory, so its rows and its coverage would outlive it forever — the
+// aggregator keeps skipping a machine that no longer exists and keeps
+// merging its artifacts into every list. The operator's terminal attestation
+// is the boundary that removes them.
+func TestStorageRetirementRemovesTheNodesCatalogueMetadata(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-catalog-retire", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-gone", 3, 1, catalogRows("", "tpl-on-dead-node")); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-live", 1, 1, catalogRows("", "tpl-on-live-node")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.RetireNodeStorage(ctx, "worker-gone", "operator", "disk destroyed", time.Now()); err != nil {
+		t.Fatalf("RetireNodeStorage: %v", err)
+	}
+
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range page.Rows {
+		if row.ID == "tpl-on-dead-node" {
+			t.Fatal("a destroyed node's artifacts are still advertised")
+		}
+	}
+	if slices.Contains(page.Publishers, "worker-gone") {
+		t.Fatal("a destroyed node is still claimed as covering the catalogue, so the aggregator keeps skipping it")
+	}
+	if !slices.Contains(page.Publishers, "worker-live") {
+		t.Fatal("retiring one node dropped another node's coverage")
+	}
+
+	// It survives compaction: the removal is state, not a read-time filter.
+	snap, err := c.fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatal(err)
+	}
+	restored := newPlacementFSM()
+	if err := restored.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatal(err)
+	}
+	restoredPage := restored.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if slices.Contains(restoredPage.Publishers, "worker-gone") {
+		t.Fatal("the destroyed node's coverage came back through the snapshot")
+	}
+
+	// A request still in flight from the destroyed node must not re-add it.
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-gone", 3, 2, catalogRows("", "tpl-on-dead-node")); err == nil {
+		t.Fatal("a delayed publication from a retired node was accepted")
+	}
+
+	// If the attestation was wrong and the node comes back, it publishes
+	// again under a fresh token.
+	epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-gone", epoch+1, 1, catalogRows("", "tpl-back")); err != nil {
+		t.Fatalf("a returning node could not republish: %v", err)
+	}
+	page, _ = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if !slices.Contains(page.Publishers, "worker-gone") {
+		t.Fatal("a node that came back and republished is still uncovered")
+	}
+}
+
+// The epoch lookup is how a publisher gets its fencing token, on both client
+// types, and a node may only ever learn its own.
+func TestArtifactCatalogPublisherEpochLookup(t *testing.T) {
+	fsm := newPlacementFSM()
+	seedCommittedCatalog(fsm, ArtifactKindTemplate, "worker-a", 5, 2, ArtifactCatalogRow{ID: "tpl", Payload: []byte(`{}`)})
+	c := &Cluster{fsm: fsm}
+	ctx := context.Background()
+
+	epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
+	if err != nil || epoch != 5 {
+		t.Fatalf("epoch = %d err=%v, want the committed 5", epoch, err)
+	}
+	if epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "never-published"); err != nil || epoch != 0 {
+		t.Fatalf("unknown node epoch = %d err=%v, want 0", epoch, err)
+	}
+	if _, err := c.ArtifactCatalogPublisherEpoch(ctx, "no-such-kind", "worker-a"); err != nil {
+		t.Fatalf("unknown kind: %v", err)
+	}
+	var none *Cluster
+	if _, err := none.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a"); err == nil {
+		t.Fatal("a nil cluster answered an epoch lookup")
+	}
+
+	// A half-delivered publication has already claimed its epoch, so the next
+	// token must be past it.
+	state := fsm.artifactCatalog[artifactCatalogKindKey(ArtifactKindTemplate)]
+	state.Pending["worker-a"] = artifactCatalogNodeState{Epoch: 9, Revision: 1, Rows: map[string]ArtifactCatalogRow{}}
+	if epoch, _ := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a"); epoch != 9 {
+		t.Fatalf("epoch = %d; a pending publication's token was ignored", epoch)
+	}
+
+	// The agent asks the control plane, which fills the answer from the
+	// authenticated peer identity.
+	var asked ArtifactCatalogRequest
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&asked); err != nil {
+			t.Error(err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ArtifactCatalogPage{Authoritative: true, PublisherEpoch: 4})
+	}))
+	got, err := agent.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-self")
+	if err != nil || got != 4 {
+		t.Fatalf("agent epoch = %d err=%v", got, err)
+	}
+	if asked.ForNodeID != "worker-self" {
+		t.Fatalf("agent asked for %q; a node may only learn its own token", asked.ForNodeID)
+	}
+	var noAgent *Agent
+	if _, err := noAgent.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "n"); err == nil {
+		t.Fatal("a nil agent answered an epoch lookup")
+	}
+}
+
+// A voluntary withdrawal removes rows and coverage without raising the epoch,
+// so the same publisher can keep going once its inventory fits again.
+func TestArtifactCatalogVoluntaryWithdrawalKeepsThePublishersEpoch(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-withdraw", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", 2, 1, catalogRows("", "tpl-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PublishArtifactCatalog(ctx, WithdrawArtifactCatalogCoverage(ArtifactKindTemplate, "worker-a", 2, 2)); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Rows) != 0 || len(page.Publishers) != 0 {
+		t.Fatalf("after withdrawal page = %+v, want no rows and no coverage", page)
+	}
+
+	// The same publisher continues under its own epoch.
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", 2, 3, catalogRows("", "tpl-b")); err != nil {
+		t.Fatalf("republish after withdrawal: %v", err)
+	}
+	page, _ = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if len(page.Rows) != 1 || len(page.Publishers) != 1 {
+		t.Fatalf("page after republish = %+v", page)
 	}
 }

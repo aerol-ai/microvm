@@ -115,12 +115,15 @@ type command struct {
 	// fleet-wide list fan-out into a local read.
 	ArtifactKind string               `json:"artifact_kind,omitempty"`
 	ArtifactRows []ArtifactCatalogRow `json:"artifact_rows,omitempty"`
-	// ArtifactIncarnation + ArtifactRevision version one publisher's
-	// snapshot; ArtifactChunkFirst/Final delimit its chunk sequence.
-	ArtifactIncarnation string `json:"artifact_incarnation,omitempty"`
-	ArtifactRevision    int64  `json:"artifact_revision,omitempty"`
-	ArtifactChunkFirst  bool   `json:"artifact_chunk_first,omitempty"`
-	ArtifactChunkFinal  bool   `json:"artifact_chunk_final,omitempty"`
+	// ArtifactEpoch + ArtifactRevision version one publisher's snapshot;
+	// ArtifactChunkFirst/Final delimit its chunk sequence.
+	ArtifactEpoch      int64 `json:"artifact_epoch,omitempty"`
+	ArtifactRevision   int64 `json:"artifact_revision,omitempty"`
+	ArtifactChunkFirst bool  `json:"artifact_chunk_first,omitempty"`
+	ArtifactChunkFinal bool  `json:"artifact_chunk_final,omitempty"`
+	// ArtifactWithdraw removes the publisher's coverage instead of replacing
+	// its inventory.
+	ArtifactWithdraw bool `json:"artifact_withdraw,omitempty"`
 	// StorageRetirement carries the operator attestation for
 	// opRetireNodeStorage (NodeID names the attested node). Deletion
 	// obligations live on whichever node owns them, so the attestation has to
@@ -1515,9 +1518,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// complete coverage.
 		kind := artifactCatalogKindKey(cmd.ArtifactKind)
 		nodeID := strings.TrimSpace(cmd.NodeID)
-		incarnation := strings.TrimSpace(cmd.ArtifactIncarnation)
-		if kind == "" || nodeID == "" || incarnation == "" || cmd.ArtifactRevision <= 0 {
-			return fmt.Errorf("placementFSM: opPublishArtifactCatalog requires kind, node_id, incarnation and revision")
+		if kind == "" || nodeID == "" || cmd.ArtifactEpoch <= 0 || cmd.ArtifactRevision <= 0 {
+			return fmt.Errorf("placementFSM: opPublishArtifactCatalog requires kind, node_id, epoch and revision")
 		}
 		if len(cmd.ArtifactRows) > MaxArtifactCatalogChunkRows {
 			return fmt.Errorf("placementFSM: opPublishArtifactCatalog carries %d rows, over the %d chunk cap", len(cmd.ArtifactRows), MaxArtifactCatalogChunkRows)
@@ -1541,23 +1543,48 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		// An older publication that arrives late must not overwrite newer
 		// state: two inventory reads can reach the log in the opposite order
-		// to the one they were taken in.
-		if !state.Committed[nodeID].supersedes(incarnation, cmd.ArtifactRevision) {
+		// to the one they were taken in, and a replaced process can still
+		// have requests in flight. Answering with an ERROR (not silence) is
+		// what lets the publisher tell "published" from "superseded" and
+		// re-seed its epoch instead of marking itself clean.
+		if !state.Committed[nodeID].supersedes(cmd.ArtifactEpoch, cmd.ArtifactRevision) {
+			delete(state.Pending, nodeID)
+			return fmt.Errorf("%w: %s/%s epoch %d revision %d is not newer than the committed epoch %d revision %d",
+				ErrArtifactCatalogSuperseded, kind, nodeID, cmd.ArtifactEpoch, cmd.ArtifactRevision,
+				state.Committed[nodeID].Epoch, state.Committed[nodeID].Revision)
+		}
+		if cmd.ArtifactWithdraw {
+			// An explicit "I cannot represent my inventory": rows and
+			// coverage go, the epoch watermark stays.
+			state.Committed[nodeID] = artifactCatalogNodeState{
+				Epoch:     cmd.ArtifactEpoch,
+				Revision:  cmd.ArtifactRevision,
+				Withdrawn: true,
+				Rows:      map[string]ArtifactCatalogRow{},
+			}
 			delete(state.Pending, nodeID)
 			return nil
 		}
 		pending, building := state.Pending[nodeID]
 		if cmd.ArtifactChunkFirst {
 			pending = artifactCatalogNodeState{
-				Incarnation: incarnation,
-				Revision:    cmd.ArtifactRevision,
-				Rows:        make(map[string]ArtifactCatalogRow, len(cmd.ArtifactRows)),
+				Epoch:    cmd.ArtifactEpoch,
+				Revision: cmd.ArtifactRevision,
+				Rows:     make(map[string]ArtifactCatalogRow, len(cmd.ArtifactRows)),
 			}
-		} else if !building || pending.Incarnation != incarnation || pending.Revision != cmd.ArtifactRevision {
-			// A continuation chunk with nothing to attach to: its snapshot
-			// was never started here, or a newer one replaced it. Dropping it
-			// is what keeps half a snapshot from being committed as a whole
-			// one; the publisher's retry starts again from its first chunk.
+		} else if !building {
+			// A continuation chunk whose snapshot was never started here.
+			// Answering success would tell the publisher its revision is
+			// published and stop it retrying, so this is an ERROR: the
+			// publisher stays dirty and re-sends from its first chunk.
+			// Deterministic on every replica, because every replica sees the
+			// same log and the same restored snapshot.
+			return fmt.Errorf("placementFSM: opPublishArtifactCatalog continuation for %s/%s revision %d has no pending snapshot",
+				kind, nodeID, cmd.ArtifactRevision)
+		} else if pending.Epoch != cmd.ArtifactEpoch || pending.Revision != cmd.ArtifactRevision {
+			// A newer snapshot replaced the one this chunk belongs to.
+			// Dropping it is correct — the newer publication owns the node
+			// now — and its own publisher is no longer waiting on this.
 			return nil
 		}
 		for _, row := range cmd.ArtifactRows {
@@ -1565,7 +1592,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			if id == "" || len(row.Payload) > maxArtifactCatalogRowBytes {
 				continue
 			}
-			pending.Rows[id] = ArtifactCatalogRow{ID: id, Tenant: strings.TrimSpace(row.Tenant), Payload: row.Payload}
+			tenant := strings.TrimSpace(row.Tenant)
+			// Keyed by (tenant, id): a content digest is not unique across
+			// tenants, and collapsing them silently drops one tenant's row
+			// from a node the catalogue still claims to cover.
+			pending.Rows[artifactCatalogRowKey(tenant, id)] = ArtifactCatalogRow{ID: id, Tenant: tenant, Payload: row.Payload}
 		}
 		if !cmd.ArtifactChunkFinal {
 			state.Pending[nodeID] = pending
@@ -1592,6 +1623,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		rec := *cmd.StorageRetirement
 		rec.NodeID = nodeID
 		f.storageRetirements[nodeID] = rec
+		// A node whose storage was destroyed can never publish the corrective
+		// empty inventory, so this attestation is also the terminal boundary
+		// for its artifact metadata: rows and coverage go, the epoch
+		// watermark stays to fence anything still in flight from it.
+		f.withdrawArtifactCatalogCoverageLocked(nodeID)
 		return nil
 	case opRevokeNodeStorage:
 		nodeID := strings.TrimSpace(cmd.NodeID)
@@ -3040,11 +3076,13 @@ type fsmSnapshotPayload struct {
 	// StorageRetirements is the operator attestation set. Optional; older
 	// snapshots decode it as nil and the FSM treats that as "none".
 	StorageRetirements map[string]NodeStorageRetirement
-	// ArtifactCatalog is the replicated template / JS-bundle metadata,
-	// keyed by kind then publishing node. Optional; an older snapshot decodes
-	// it as nil, which reads as "nobody has published", and the list path
-	// falls back to the fan-out.
-	ArtifactCatalog map[string]map[string]artifactCatalogNodeState
+	// ArtifactCatalog is the replicated template / JS-bundle metadata, keyed
+	// by kind. It carries the half-delivered publications as well as the
+	// committed ones, so restoring it and replaying the log suffix reaches
+	// the same state as a replica that never restored. Optional; an older
+	// snapshot decodes it as nil, which reads as "nobody has published", and
+	// the list path falls back to the fan-out.
+	ArtifactCatalog map[string]artifactCatalogSnapshotState
 }
 
 type placementSnapshotRow struct {
@@ -3079,23 +3117,22 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	for id, rec := range f.storageRetirements {
 		retirements[id] = rec
 	}
-	// Only the COMMITTED snapshots are carried: a half-delivered publication
-	// belongs to a publisher that will re-send it, and restoring it would
-	// risk committing a partial inventory as a whole one.
-	catalog := make(map[string]map[string]artifactCatalogNodeState, len(f.artifactCatalog))
+	// BOTH the committed snapshots and the half-delivered ones. Pending state
+	// is replicated state: the first chunk of a publication changed it, so a
+	// snapshot that omits it does not describe the log position it claims to.
+	// A replica restored from such a snapshot then replays the final chunk,
+	// finds nothing to attach it to, and drops a publication every other
+	// replica committed — diverging permanently while the publisher is told
+	// it succeeded.
+	catalog := make(map[string]artifactCatalogSnapshotState, len(f.artifactCatalog))
 	for kind, state := range f.artifactCatalog {
 		if state == nil {
 			continue
 		}
-		copied := make(map[string]artifactCatalogNodeState, len(state.Committed))
-		for nodeID, entry := range state.Committed {
-			rows := make(map[string]ArtifactCatalogRow, len(entry.Rows))
-			for id, row := range entry.Rows {
-				rows[id] = row
-			}
-			copied[nodeID] = artifactCatalogNodeState{Incarnation: entry.Incarnation, Revision: entry.Revision, Rows: rows}
+		catalog[kind] = artifactCatalogSnapshotState{
+			Committed: cloneArtifactCatalogNodes(state.Committed),
+			Pending:   cloneArtifactCatalogNodes(state.Pending),
 		}
-		catalog[kind] = copied
 	}
 	return &fsmSnapshot{
 		version:            version,
@@ -3279,11 +3316,16 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		f.storageRetirements = payload.StorageRetirements
 	}
 	f.artifactCatalog = make(map[string]*artifactCatalogKindState, len(payload.ArtifactCatalog))
-	for kind, byNode := range payload.ArtifactCatalog {
-		f.artifactCatalog[kind] = &artifactCatalogKindState{
-			Committed: byNode,
-			Pending:   make(map[string]artifactCatalogNodeState),
+	for kind, state := range payload.ArtifactCatalog {
+		committed := state.Committed
+		if committed == nil {
+			committed = make(map[string]artifactCatalogNodeState)
 		}
+		pending := state.Pending
+		if pending == nil {
+			pending = make(map[string]artifactCatalogNodeState)
+		}
+		f.artifactCatalog[kind] = &artifactCatalogKindState{Committed: committed, Pending: pending}
 	}
 	return nil
 }
@@ -3293,7 +3335,7 @@ type fsmSnapshot struct {
 	rows               []placementSnapshotRow
 	drainedNodes       map[string]bool
 	storageRetirements map[string]NodeStorageRetirement
-	artifactCatalog    map[string]map[string]artifactCatalogNodeState
+	artifactCatalog    map[string]artifactCatalogSnapshotState
 	auditACLs          map[string]AuditACL
 	volumes            []models.Volume
 	volumeAttachments  []models.VolumeAttachment

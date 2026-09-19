@@ -251,7 +251,14 @@ local `node_storage_retirements` table) and is:
 - **authoritative at the point of decision** — the per-node cache is discovery
   only. A discharge reads the LEADER's current attestations first, because a
   revoke an operator issued on one node must stop every other owner
-  discharging immediately, and a discharge cannot be taken back;
+  discharging immediately, and a discharge cannot be taken back. Both cluster
+  client types answer that read (a follower forwards), so server and mixed
+  nodes can discharge their own outboxes;
+- **terminal for the node's artifact metadata** — the attestation is also the
+  boundary that removes the destroyed node's template/bundle catalogue rows
+  and its coverage, and raises its publisher epoch past anything that process
+  could still have in flight. A machine that never returns can never publish
+  the corrective empty inventory itself;
 - **fenced per recipient by copy provenance** — a recipient's obligation is
   discharged only when THAT recipient's ciphertext copy was distributed before
   the attestation. The delete outbox carries a per-recipient timestamp for

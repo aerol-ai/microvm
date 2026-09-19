@@ -333,3 +333,47 @@ func TestCapacityRenewalReachesPeersThatAnswerQuickly(t *testing.T) {
 		t.Fatalf("healthy lease is %s old against a %s TTL; it expired while answering instantly", age, ttl)
 	}
 }
+
+// A shorter first pass moves the starvation threshold; it does not make the
+// sweep fair. With enough established peers going slow, the quick pass alone
+// exhausts the renewal budget, the full pass that would record failures never
+// runs, nothing enters backoff, and the next sweep re-attempts the same
+// prefix in the same order — so a peer sorted behind them is never tried at
+// all and loses a lease it would have renewed instantly.
+func TestCapacityRenewalMakesProgressAcrossSweeps(t *testing.T) {
+	const slowPeers = 384
+	idx := newGossipMemberIndex()
+	leases := newCapacityLeaseCache("server", nil, 5*time.Second, nil)
+	members := make([]Member, 0, slowPeers+1)
+	for i := range slowPeers {
+		id := fmt.Sprintf("slow-%03d", i)
+		members = append(members, Member{NodeID: id, InternalURL: "https://" + id, Role: config.NodeRoleWorker, Alive: true})
+		leases.set(id, step3FatCapacity(), time.Now().Add(-14*time.Second))
+	}
+	members = append(members, Member{NodeID: "zz-healthy", InternalURL: "https://healthy", Role: config.NodeRoleWorker, Alive: true})
+	leases.set("zz-healthy", step3FatCapacity(), time.Now().Add(-13*time.Second))
+	idx.replace(members)
+
+	rt := &namedSlowTransport{fast: "healthy"}
+	c := &Cluster{
+		nodeID:         "server",
+		gossip:         &gossipNode{memberIndex: idx},
+		capacityLeases: leases,
+		internalClient: &http.Client{Transport: rt},
+	}
+	// Two sweeps, as an operator would see over two ticks.
+	c.refreshCapacityLeases(context.Background())
+	c.refreshCapacityLeases(context.Background())
+
+	if rt.fastHits.Load() == 0 {
+		t.Fatalf("after two sweeps the healthy peer was never attempted (%d attempts went to slow peers); its lease expires because other nodes are slow",
+			rt.attempts.Load())
+	}
+	leases.mu.RLock()
+	age := time.Since(leases.leases["zz-healthy"].updated)
+	ttl := leases.ttl
+	leases.mu.RUnlock()
+	if age > ttl {
+		t.Fatalf("healthy lease is %s old against a %s TTL", age, ttl)
+	}
+}

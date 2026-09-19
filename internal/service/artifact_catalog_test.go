@@ -26,22 +26,38 @@ type catalogCluster struct {
 	committed map[string]map[string]cluster.ArtifactCatalogRow // kind -> id -> row
 	failing   bool                                             // refuse every publish
 	readErr   error
+	epochErr  error
+	supersede bool             // answer every publish with ErrArtifactCatalogSuperseded
+	epochs    map[string]int64 // kind\x00node -> committed epoch
+	covered   map[string]bool  // kind -> this node claims coverage
 }
 
 func newCatalogCluster(self string) *catalogCluster {
 	return &catalogCluster{
 		Noop:      cluster.NewNoop(self, "http://"+self, ""),
 		committed: map[string]map[string]cluster.ArtifactCatalogRow{},
+		epochs:    map[string]int64{},
+		covered:   map[string]bool{},
 	}
 }
 
 func (c *catalogCluster) PublishArtifactCatalog(_ context.Context, chunk cluster.ArtifactCatalogSnapshot) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.supersede {
+		return fmt.Errorf("%w: test", cluster.ErrArtifactCatalogSuperseded)
+	}
 	if c.failing {
 		return errors.New("control plane unavailable")
 	}
 	c.chunks = append(c.chunks, chunk)
+	if chunk.Withdraw {
+		delete(c.committed, chunk.Kind)
+		delete(c.committed, chunk.Kind+"\x00pending")
+		c.covered[chunk.Kind] = false
+		c.epochs[chunk.Kind+"\x00"+chunk.NodeID] = chunk.Epoch
+		return nil
+	}
 	if chunk.First {
 		c.committed[chunk.Kind+"\x00pending"] = map[string]cluster.ArtifactCatalogRow{}
 	}
@@ -56,9 +72,22 @@ func (c *catalogCluster) PublishArtifactCatalog(_ context.Context, chunk cluster
 	if chunk.Final {
 		c.committed[chunk.Kind] = pending
 		delete(c.committed, chunk.Kind+"\x00pending")
+		c.epochs[chunk.Kind+"\x00"+chunk.NodeID] = chunk.Epoch
+		c.covered[chunk.Kind] = true
 		c.snapshots++
 	}
 	return nil
+}
+
+// ArtifactCatalogPublisherEpoch is the authority's fencing token: the
+// catalogue's committed epoch for that node.
+func (c *catalogCluster) ArtifactCatalogPublisherEpoch(_ context.Context, kind, nodeID string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.epochErr != nil {
+		return 0, c.epochErr
+	}
+	return c.epochs[kind+"\x00"+nodeID], nil
 }
 
 func (c *catalogCluster) ArtifactCatalog(_ context.Context, req cluster.ArtifactCatalogRequest) (cluster.ArtifactCatalogPage, error) {
@@ -74,10 +103,18 @@ func (c *catalogCluster) ArtifactCatalog(_ context.Context, req cluster.Artifact
 		}
 		page.Rows = append(page.Rows, c.committed[req.Kind][id])
 	}
-	if c.snapshots > 0 {
+	if c.covered[req.Kind] {
 		page.Publishers = []string{c.SelfNodeID()}
 	}
 	return page, nil
+}
+
+// covers reports whether the node currently claims coverage of a kind — the
+// thing that makes the aggregator skip it.
+func (c *catalogCluster) covers(kind string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.covered[kind]
 }
 
 func (c *catalogCluster) publishedSnapshots() int {
@@ -399,5 +436,157 @@ func TestArtifactCatalogPublishesEmptyBundleInventoryWithoutAStore(t *testing.T)
 	}
 	if !published {
 		t.Fatal("a node without a bundle store published no bundle inventory at all")
+	}
+}
+
+// A publisher takes its fencing token from the AUTHORITY, and stops
+// publishing when it cannot get one: publishing without a token is how a
+// replaced process takes ownership back.
+func TestArtifactCatalogWaitsForItsFencingToken(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+
+	cl.mu.Lock()
+	cl.epochErr = errors.New("control plane unavailable")
+	cl.mu.Unlock()
+	svc.ReconcileArtifactCatalog(ctx)
+	if cl.publishedSnapshots() != 0 {
+		t.Fatal("published without a fencing token from the authority")
+	}
+
+	cl.mu.Lock()
+	cl.epochErr = nil
+	cl.epochs[cluster.ArtifactKindTemplate+"\x00worker-a"] = 7
+	cl.mu.Unlock()
+	svc.ReconcileArtifactCatalog(ctx)
+
+	var epoch int64
+	for _, chunk := range cl.chunks {
+		if chunk.Kind == cluster.ArtifactKindTemplate {
+			epoch = chunk.Epoch
+		}
+	}
+	if epoch != 8 {
+		t.Fatalf("published under epoch %d, want the authority's 7 plus one", epoch)
+	}
+}
+
+// A publication the authority refuses as superseded must retire the token and
+// ask for a fresh one, not retry forever under an epoch it has moved past.
+func TestArtifactCatalogReseedsAfterBeingSuperseded(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+	svc.ReconcileArtifactCatalog(ctx)
+
+	cl.mu.Lock()
+	cl.supersede = true
+	cl.epochs[cluster.ArtifactKindTemplate+"\x00worker-a"] = 42
+	cl.mu.Unlock()
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+
+	cl.mu.Lock()
+	cl.supersede = false
+	cl.mu.Unlock()
+	svc.ReconcileArtifactCatalog(ctx)
+
+	var epoch int64
+	for _, chunk := range cl.chunks {
+		if chunk.Kind == cluster.ArtifactKindTemplate {
+			epoch = chunk.Epoch
+		}
+	}
+	if epoch != 43 {
+		t.Fatalf("republished under epoch %d; a superseded publisher must re-seed from the authority (42) rather than reuse its stale token", epoch)
+	}
+	if got := cl.rowIDs(cluster.ArtifactKindTemplate); len(got) != 1 || got[0] != "tpl-1" {
+		t.Fatalf("catalogue = %v, want the current inventory", got)
+	}
+}
+
+// Crossing the per-node cap after the node is already covered is the case
+// that matters: the aggregator skips a covered node, so "peers will keep
+// being asked" is false and the catalogue advertises an inventory the node
+// no longer has, forever. Coverage has to be WITHDRAWN when it cannot be
+// represented.
+func TestArtifactCatalogWithdrawsCoverageWhenTheInventoryOverflows(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-first", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	if !cl.covers(cluster.ArtifactKindTemplate) {
+		t.Fatal("the fixture never established coverage")
+	}
+
+	if err := svc.deleteTemplateRow(ctx, "tpl-first"); err != nil {
+		t.Fatal(err)
+	}
+	for i := range cluster.MaxArtifactCatalogRowsPerNode() + 1 {
+		if err := svc.createTemplateRow(ctx, &models.Template{
+			ID: fmt.Sprintf("tpl-%05d", i), Image: "alpine", Status: models.TemplateStatusReady,
+		}); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	svc.ReconcileArtifactCatalog(ctx)
+
+	if cl.covers(cluster.ArtifactKindTemplate) {
+		t.Fatal("the node still claims coverage with an inventory it cannot publish; the aggregator will never ask it again")
+	}
+	if got := cl.rowIDs(cluster.ArtifactKindTemplate); len(got) != 0 {
+		t.Fatalf("catalogue still advertises %d rows from an inventory that cannot be represented", len(got))
+	}
+}
+
+// The push reconciler is wired independently of the Service and writes the
+// registry ref, digest and push state straight to SQLite — all of them fields
+// the catalogue publishes. Without a seam, a successful push left the
+// fleet-visible row saying "pending" with an empty reference, and nothing
+// marked the kind dirty, so no maintenance pass repaired it.
+func TestTemplatePushMetadataInvalidatesTheCatalogue(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+
+	if err := svc.createTemplateRow(ctx, &models.Template{
+		ID: "tpl-push", Image: "alpine", Status: models.TemplateStatusReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+
+	// The reconciler's own store surface, as the daemon wires it.
+	pushStore := svc.TemplatePushStore(svc.store)
+	if err := pushStore.SetTemplatePushState(ctx, "tpl-push", models.TemplatePushStatePushing, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := pushStore.UpdateTemplatePushDistribution(ctx, "tpl-push", "aocr.example.com/tpl-push:latest", "sha256:abc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pushStore.SetTemplatePushState(ctx, "tpl-push", models.TemplatePushStateActive, ""); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+
+	cl.mu.Lock()
+	payload := cl.committed[cluster.ArtifactKindTemplate]["tpl-push"].Payload
+	cl.mu.Unlock()
+	var published models.Template
+	if err := json.Unmarshal(payload, &published); err != nil {
+		t.Fatalf("decode published row: %v", err)
+	}
+	if published.RegistryRef == "" || published.PushState != models.TemplatePushStateActive {
+		t.Fatalf("published row = %+v; a successful push never reached the catalogue", published)
+	}
+
+	// The list surface a peer would read agrees.
+	rows, err := svc.ListTemplates(ctx)
+	if err != nil || len(rows) != 1 || rows[0].RegistryRef != published.RegistryRef {
+		t.Fatalf("local rows = %+v err=%v", rows, err)
 	}
 }

@@ -3,9 +3,12 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // NodeStorageRetirement is an operator's attestation that a node's storage was
@@ -82,6 +85,69 @@ func (c *Cluster) RevokeNodeStorageRetirement(ctx context.Context, nodeID string
 		return fmt.Errorf("cluster: RevokeNodeStorageRetirement requires non-empty nodeID")
 	}
 	return c.applyCommand(ctx, command{Op: opRevokeNodeStorage, NodeID: nodeID})
+}
+
+// AuthoritativeNodeStorageRetirements answers from the leader, forwarding
+// when this node is a follower.
+//
+// Discharging a deletion obligation without an ACK is irreversible, so it may
+// not be authorized by a lagging replica or a cached set: an operator who
+// revokes an attestation on one node must not have another node still
+// discharging against it. A follower's own FSM says Authoritative=true about
+// its own state and still cannot order itself against the revoke.
+//
+// Server and mixed nodes need this as much as workers do — they hold delete
+// outboxes of their own, and without it every one of them fails closed
+// forever on an attestation the operator did make.
+func (c *Cluster) AuthoritativeNodeStorageRetirements(ctx context.Context) ([]NodeStorageRetirement, error) {
+	if c == nil || c.fsm == nil || c.raft == nil || c.raft.raft == nil {
+		return nil, fmt.Errorf("cluster: authoritative node storage retirement read unavailable")
+	}
+	if c.raft.raft.State() == raft.Leader {
+		return c.fsm.nodeStorageRetirementsSnapshot(), nil
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, controlPlaneRequestTimeout)
+	defer cancel()
+	leader := c.Leader()
+	if leader == "" {
+		return nil, ErrNotLeader
+	}
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return nil, ErrPeerInternalURLRequired
+	}
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return nil, ErrPeerInternalURLRequired
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet,
+		strings.TrimRight(peerInternal, "/")+PublicInternalNodeStorageRetirementsPath+"?authoritative=true", nil)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: build authoritative retirement read: %w", err)
+	}
+	SetPeerNodeIDHeader(req, c.nodeID)
+	if c.patToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	resp, err := c.ClientForPeer(leader).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: authoritative retirement read: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return nil, ErrNotLeader
+		}
+		return nil, fmt.Errorf("cluster: authoritative retirement read: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var out NodeStorageRetirementsResponse
+	if err := decodeControlPlaneJSON(resp.Body, &out); err != nil {
+		return nil, fmt.Errorf("cluster: decode authoritative retirement read: %w", err)
+	}
+	if !out.Authoritative {
+		return nil, fmt.Errorf("cluster: authoritative retirement read was not authoritative")
+	}
+	return out.Retirements, nil
 }
 
 // NodeStorageRetirements reads the replicated attestation set from the local

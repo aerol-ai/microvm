@@ -240,9 +240,14 @@ func (s *Service) authoritativeNodeStorageRetirements(ctx context.Context) (map[
 	return byNode, nil
 }
 
-func (s *Service) authoritativeRetirementReader() (interface {
+// authoritativeRetirementReader is the capability a node needs to authorize a
+// discharge. Both production cluster clients implement it; the compile-time
+// assertions live next to the tests.
+type authoritativeRetirementReader interface {
 	AuthoritativeNodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error)
-}, bool) {
+}
+
+func (s *Service) authoritativeRetirementReader() (authoritativeRetirementReader, bool) {
 	if s == nil || !s.cfg.EnableCluster {
 		return nil, false
 	}
@@ -250,9 +255,7 @@ func (s *Service) authoritativeRetirementReader() (interface {
 	if c == nil {
 		return nil, false
 	}
-	r, ok := c.(interface {
-		AuthoritativeNodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error)
-	})
+	r, ok := c.(authoritativeRetirementReader)
 	return r, ok
 }
 
