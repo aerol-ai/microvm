@@ -219,6 +219,23 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			updated_at DATETIME NOT NULL,
 			PRIMARY KEY (sandbox_id, incarnation_id)
 		);`,
+		// Terminal storage retirement (D5). A deletion obligation to a peer is
+		// discharged ONLY by an authenticated ACK or by an explicit operator
+		// attestation recorded here that the node's storage was destroyed.
+		// Membership disappearance and TTLs are deliberately not accepted:
+		// a removed node may still hold a disk full of ciphertext.
+		//
+		// attested_at fences the attestation to the obligations that already
+		// existed when it was made. Node IDs are operator-chosen and can be
+		// reused, so an obligation created after the attestation belongs to a
+		// different physical node and must still be ACK'd.
+		`CREATE TABLE IF NOT EXISTS node_storage_retirements (
+			node_id TEXT PRIMARY KEY,
+			attested_at DATETIME NOT NULL,
+			actor TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL
+		);`,
 		// Durable create fan-out outbox: when the in-memory create-path queue is
 		// saturated, remaining peer PUTs are persisted and retried by the same
 		// reconciler ticker as delete outbox. Identity is (sandbox, incarnation,
@@ -1345,6 +1362,11 @@ func validateCurrentSecretSchema(db *sql.DB) error {
 			"incarnation_id":  2,
 			"owner_ref":       0,
 			"established_seq": 0,
+		},
+		"node_storage_retirements": {
+			"node_id":     1,
+			"attested_at": 0,
+			"actor":       0,
 		},
 	} {
 		if err := validateRequiredTableShape(db, table, required); err != nil {
@@ -8054,4 +8076,84 @@ func (s *Store) CurrentSandboxAuditIdentity(ctx context.Context, sandboxID strin
 		return "", "", fmt.Errorf("get current sandbox audit identity: %w", err)
 	}
 	return strings.TrimSpace(incarnationID), strings.TrimSpace(ownerRef), nil
+}
+
+// NodeStorageRetirement is an operator's attestation that a node's storage was
+// destroyed. It is the only thing besides an authenticated ACK that may
+// discharge a deletion obligation owed to that node.
+type NodeStorageRetirement struct {
+	NodeID     string
+	AttestedAt time.Time
+	Actor      string
+	Reason     string
+	CreatedAt  time.Time
+}
+
+// PutNodeStorageRetirement records (or re-records) an attestation. Idempotent
+// by node id: re-attesting moves attested_at forward, which widens the set of
+// covered obligations to those that existed at the new attestation time and
+// never narrows it.
+func (s *Store) PutNodeStorageRetirement(ctx context.Context, nodeID, actor, reason string, attestedAt time.Time) error {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return errors.New("put node storage retirement: node id required")
+	}
+	if attestedAt.IsZero() {
+		attestedAt = time.Now().UTC()
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO node_storage_retirements (node_id, attested_at, actor, reason, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(node_id) DO UPDATE SET
+			attested_at = MAX(node_storage_retirements.attested_at, excluded.attested_at),
+			actor = excluded.actor,
+			reason = excluded.reason
+	`, nodeID, attestedAt.UTC(), strings.TrimSpace(actor), strings.TrimSpace(reason), now)
+	if err != nil {
+		return fmt.Errorf("put node storage retirement: %w", err)
+	}
+	return nil
+}
+
+// DeleteNodeStorageRetirement revokes an attestation. Called by an operator
+// who attested in error, and automatically when a node with that id is alive
+// again — a live node can ACK, so its obligations are real.
+func (s *Store) DeleteNodeStorageRetirement(ctx context.Context, nodeID string) (bool, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM node_storage_retirements WHERE node_id = ?`, nodeID)
+	if err != nil {
+		return false, fmt.Errorf("delete node storage retirement: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, nil
+	}
+	return n > 0, nil
+}
+
+// ListNodeStorageRetirements returns every recorded attestation. The set is
+// bounded by the number of nodes an operator has ever decommissioned, so it is
+// read whole and cached by the caller for a maintenance tick.
+func (s *Store) ListNodeStorageRetirements(ctx context.Context) ([]NodeStorageRetirement, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT node_id, attested_at, actor, reason, created_at
+		FROM node_storage_retirements ORDER BY node_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list node storage retirements: %w", err)
+	}
+	defer rows.Close()
+	out := make([]NodeStorageRetirement, 0, 8)
+	for rows.Next() {
+		var rec NodeStorageRetirement
+		if err := rows.Scan(&rec.NodeID, &rec.AttestedAt, &rec.Actor, &rec.Reason, &rec.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan node storage retirement: %w", err)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }

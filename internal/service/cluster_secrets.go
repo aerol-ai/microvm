@@ -886,6 +886,11 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 					}
 				}
 				prevAlive = alive
+				// Do this BEFORE the delete pass: a node whose storage an
+				// operator attested destroyed, but which is alive again, can
+				// ACK — so its attestation is withdrawn and its obligations
+				// become pending again before anything can discharge them.
+				s.reapLiveNodeStorageRetirements(ctx)
 				// A member came back: every obligation TO THAT MEMBER is worth
 				// one immediate try regardless of how far it had backed off.
 				// The pass says so outright instead of moving its clock past
@@ -2140,6 +2145,22 @@ func (s *Service) reconcileSecretDeleteOutboxRecord(parent context.Context, rec 
 	// and may later rejoin; the cluster transport keeps unknown/dead recipients
 	// pending until an authenticated delete ACK is received.
 	peers := nonSelfRecipients(rec.Recipients, selfID)
+	// The one sanctioned exception: an operator has attested, for this exact
+	// node identity, that its storage was destroyed. Those obligations are
+	// discharged without an ACK and their evidence says so explicitly. The
+	// attestation is fenced by the obligation's journalling time, so a reused
+	// node id inherits nothing. See node_storage_retirement.go.
+	if retired := s.nodeStorageRetirements(parent); len(retired) > 0 {
+		remaining, discharged := dischargeRetiredStorageRecipients(peers, retired, rec.CreatedAt)
+		if len(discharged) > 0 {
+			s.recordStorageRetirementDischarge(sandboxID, rec.IncarnationID, rec.Generation, discharged)
+			peers = remaining
+			if err := s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, peers, rec.Generation); err != nil && s.logger != nil {
+				s.logger.Warn("cluster: secret delete-outbox discharge update failed",
+					"sandbox_id", sandboxID, "err", err)
+			}
+		}
+	}
 	if len(peers) == 0 {
 		_ = s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, nil, rec.Generation)
 		return

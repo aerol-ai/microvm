@@ -233,9 +233,31 @@ is retained, and generation-conditional deletion protects a concurrent PUT.
 Removed/decommissioned node IDs remain pending in
 the delete outbox until their authenticated generation-scoped DELETE ACKs;
 membership disappearance is never treated as cleanup success.
-An authoritative storage-destruction/terminal-retirement protocol is still
-not implemented. Permanent loss can therefore retain outbox/tomb metadata
-indefinitely; bounded per-tick retries are not a bound on retained rows.
+
+**Terminal storage retirement (implemented).** A deletion obligation is
+discharged by exactly two things: an authenticated generation-scoped DELETE
+ACK, or an operator's explicit attestation that the node's storage was
+destroyed. Gossip absence and TTLs are still never accepted. The attestation
+is recorded in `node_storage_retirements` and is:
+
+- **identity-exact** — it names one node ID; nothing is inferred;
+- **time-fenced** — it discharges only obligations that already existed when
+  it was made, because node IDs are operator-chosen and reusable, so an
+  obligation journalled afterwards belongs to a different physical node and
+  must still be ACK'd;
+- **self-revoking** — a node that is alive again can ACK, so the maintenance
+  tick withdraws its attestation and its obligations become pending once more;
+- **refused for live nodes**, and operator-only
+  (`POST|DELETE /v1/cluster/nodes/{id}/storage-retired`,
+  `GET /v1/cluster/storage-retirements`);
+- **audited** with its own reason (`storage_retired`), so the evidence never
+  claims the holder confirmed deletion when an operator attested instead, and
+  `aerolvm_secret_obligations_storage_retired_total` makes unconfirmed
+  deletions visible.
+
+Permanent loss therefore no longer retains outbox rows indefinitely, and the
+discharge path is an authenticated, evidence-producing act rather than a
+timeout.
 
 ### 3d. Corrections that ride along
 

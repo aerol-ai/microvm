@@ -225,6 +225,10 @@ type Service struct {
 	secretHolderCursor   string
 	// testAuditFetcher overrides peer audit fan-out in tests.
 	testAuditFetcher cluster.AuditPeerFetcher
+	// nodeRetirements caches the operator storage-destruction attestations
+	// consulted by the delete-outbox pass. See node_storage_retirement.go.
+	nodeRetirementMu sync.Mutex
+	nodeRetirements  *nodeStorageRetirementCache
 	mounts           *mounts.Manager
 	admitter         *capacity.Admitter
 	images           ImageDistributionProvider
