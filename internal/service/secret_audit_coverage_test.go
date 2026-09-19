@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -104,7 +105,26 @@ func TestSecretAuditSinkGuardsSidecarsAndEnterpriseInit(t *testing.T) {
 	if err := os.WriteFile(sink.spillWorkingPath, append(line, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !sink.drainSpill() {
+	// Assert the INVARIANT — an interrupted working file is resumed into the
+	// authoritative log — not which goroutine did the resuming. The sink's
+	// writer calls drainSpill() at the top of every loop iteration, so it can
+	// legitimately consume the working file between the WriteFile above and a
+	// direct call here; the direct call then returns false for a resume that
+	// did happen. That race is what made this test flaky on CI.
+	deadline := time.Now().Add(10 * time.Second)
+	resumed := false
+	for time.Now().Before(deadline) {
+		if sink.drainSpill() {
+			resumed = true
+			break
+		}
+		if raw, err := os.ReadFile(sink.path); err == nil && bytes.Contains(raw, []byte(`"spill-resume"`)) {
+			resumed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !resumed {
 		t.Fatal("interrupted spill working file was not resumed")
 	}
 	if err := persistSpillOffset(filepath.Join(t.TempDir(), "off"), 12); err != nil {
