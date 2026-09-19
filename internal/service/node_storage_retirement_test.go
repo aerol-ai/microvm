@@ -981,3 +981,39 @@ type errorAuthoritativeRegistry struct {
 func (c *errorAuthoritativeRegistry) AuthoritativeNodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error) {
 	return nil, errors.New("not leader")
 }
+
+// Standalone mode has no leader to ask: the local table IS the authority, and
+// a discharge is decided against it. In cluster mode the same call must fail
+// closed when the node cannot reach the registry at all, because the local
+// table is not authoritative there.
+func TestAuthoritativeRetirementsUseTheRightAuthority(t *testing.T) {
+	ctx := context.Background()
+
+	standalone, st := newRetirementService(t, nil)
+	if err := standalone.RetireNodeStorage(ctx, "node-gone", "op", "disk destroyed"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := standalone.authoritativeNodeStorageRetirements(ctx)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("standalone authoritative set = %v err=%v, want the local row", got, err)
+	}
+	if _, ok := got["node-gone"]; !ok {
+		t.Fatalf("standalone authoritative set = %v", got)
+	}
+	_ = st
+
+	// Clustered, but the client cannot answer a leader read.
+	clustered := &Service{
+		cfg:     config.Config{EnableCluster: true},
+		store:   standalone.store,
+		cluster: cluster.NewNoop("node-a", "http://node-a", ""),
+	}
+	if _, err := clustered.authoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("a clustered node fell back to its local table to authorize an irreversible discharge")
+	}
+
+	var none *Service
+	if _, err := none.authoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("a service with no store answered an authoritative read")
+	}
+}

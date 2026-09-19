@@ -693,3 +693,92 @@ func TestArtifactCatalogDoesNotCommitAHalfDeliveredSnapshot(t *testing.T) {
 		t.Fatalf("committed catalogue = %v, missing the snapshot's final chunk", ids)
 	}
 }
+
+// A continuation chunk with nothing to attach to — its snapshot was never
+// started here, or a newer one replaced it — is dropped rather than folded
+// into whatever is pending. Committing it would publish a mix of two
+// inventories as one node's current state.
+func TestArtifactCatalogDropsOrphanedChunks(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(chunk ArtifactCatalogSnapshot) {
+		t.Helper()
+		raw, err := encodeCommand(artifactCatalogCommand(chunk))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if resp := fsm.Apply(&raft.Log{Data: raw}); resp != nil {
+			if err, ok := resp.(error); ok {
+				t.Fatalf("apply: %v", err)
+			}
+		}
+	}
+
+	// A continuation whose snapshot was never started.
+	apply(ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 1,
+		Rows: catalogRows("", "orphan"), Final: true,
+	})
+	if page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}); len(page.Rows) != 0 {
+		t.Fatalf("an orphaned chunk was committed: %+v", page.Rows)
+	}
+
+	// A snapshot starts, then a NEWER one starts before the first finishes:
+	// the stale continuation must not join the new pending snapshot.
+	apply(ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 2,
+		Rows: catalogRows("", "old-first"), First: true,
+	})
+	apply(ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 3,
+		Rows: catalogRows("", "new-first"), First: true,
+	})
+	apply(ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 2,
+		Rows: catalogRows("", "old-final"), Final: true,
+	})
+	if page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}); len(page.Rows) != 0 {
+		t.Fatalf("a superseded snapshot's final chunk committed: %+v", page.Rows)
+	}
+
+	// The current snapshot still completes normally.
+	apply(ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 3,
+		Rows: catalogRows("", "new-final"), Final: true,
+	})
+	page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	ids := map[string]struct{}{}
+	for _, row := range page.Rows {
+		ids[row.ID] = struct{}{}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("committed = %v, want exactly the current snapshot's two chunks", ids)
+	}
+	if _, ok := ids["old-first"]; ok {
+		t.Fatalf("committed = %v; a superseded snapshot's rows leaked into the current one", ids)
+	}
+}
+
+// The chunk byte cap is what keeps a command inside the apply transport even
+// when its row COUNT is legal.
+func TestArtifactCatalogChunkByteCapIsEnforced(t *testing.T) {
+	rows := make([]ArtifactCatalogRow, 0, 64)
+	for i := range 64 {
+		rows = append(rows, ArtifactCatalogRow{ID: fmt.Sprintf("r-%02d", i), Payload: make([]byte, maxArtifactCatalogRowBytes)})
+	}
+	chunk := ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Incarnation: "inc-1", Revision: 1,
+		Rows: rows, First: true, Final: true,
+	}
+	if len(chunk.Rows) > MaxArtifactCatalogChunkRows {
+		t.Fatal("the fixture is over the row cap, so it would be refused for the wrong reason")
+	}
+	if err := validateArtifactCatalogChunk(chunk); err == nil {
+		t.Fatal("a chunk inside the row cap but over the byte cap was accepted; it would be refused by the apply transport instead")
+	}
+	// The chunker never produces one.
+	for _, produced := range ChunkArtifactCatalogSnapshot(ArtifactKindTemplate, "worker-a", "inc-1", 1, rows) {
+		if err := validateArtifactCatalogChunk(produced); err != nil {
+			t.Fatalf("the chunker produced an invalid chunk: %v", err)
+		}
+	}
+}
