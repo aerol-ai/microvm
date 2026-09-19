@@ -33,6 +33,13 @@ func (s *Scenario) Satisfies(uc UseCase) bool {
 			return false
 		}
 	}
+	// Excludes is checked after Requires so a case listing both is skipped by
+	// the exclusion, not accidentally admitted by the requirement.
+	for _, blocked := range uc.Excludes {
+		if s.caps[blocked] {
+			return false
+		}
+	}
 	return true
 }
 
@@ -46,4 +53,18 @@ func (s *Scenario) MissingCaps(uc UseCase) []Capability {
 		}
 	}
 	return missing
+}
+
+// BlockingCaps returns the Excludes capabilities the scenario actually holds —
+// the reason an otherwise-satisfied use case skips. Reported separately from
+// MissingCaps so a skip message can say "not applicable here because the
+// scenario IS enterprise" rather than the misleading "missing capability".
+func (s *Scenario) BlockingCaps(uc UseCase) []Capability {
+	var blocking []Capability
+	for _, blocked := range uc.Excludes {
+		if s.caps[blocked] {
+			blocking = append(blocking, blocked)
+		}
+	}
+	return blocking
 }

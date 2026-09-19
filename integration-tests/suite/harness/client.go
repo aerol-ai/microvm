@@ -93,6 +93,13 @@ func Require(t *testing.T, sc *Scenario, ucID string, alsoCovers ...string) UseC
 		t.Logf("ucid=%s", id)
 	}
 	if !sc.Satisfies(uc) {
+		// Distinguish the two skip reasons: a missing requirement reads as
+		// "this scenario can't do that", an exclusion as "this scenario is the
+		// wrong profile for that". Reporting an exclusion as a missing
+		// capability sends whoever reads the matrix looking for a cap to add.
+		if blocking := sc.BlockingCaps(uc); len(blocking) > 0 {
+			t.Skipf("scenario %q holds excluded capabilities %v for %s (not applicable to this profile)", sc.Name, blocking, ucID)
+		}
 		t.Skipf("scenario %q lacks capabilities %v for %s", sc.Name, sc.MissingCaps(uc), ucID)
 	}
 	return uc
