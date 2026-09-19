@@ -75,16 +75,35 @@ func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval 
 	}
 }
 
-func (c *capacityLeaseCache) refreshLocal(now time.Time) {
-	if c == nil || c.admitter == nil || c.selfID == "" {
+// setAdmitter swaps the local capacity source. The lease loop reads admitter
+// from another goroutine, so this is not a plain field assignment: tests that
+// install a real admitter on an already-running cluster were racing
+// refreshLocal's read and its Snapshot() call.
+func (c *capacityLeaseCache) setAdmitter(a *capacity.Admitter) {
+	if c == nil {
 		return
 	}
-	snap := c.admitter.Snapshot()
+	c.mu.Lock()
+	c.admitter = a
+	c.mu.Unlock()
+}
+
+func (c *capacityLeaseCache) refreshLocal(now time.Time) {
+	if c == nil || c.selfID == "" {
+		return
+	}
+	// One acquisition for everything the overlay needs, admitter included —
+	// it is written by setAdmitter from another goroutine.
 	c.mu.RLock()
+	admitter := c.admitter
 	templateInventory := c.localTemplateInventory
 	templateCatalog := c.localTemplateCatalog
 	wasmModuleInventory := c.localWasmModuleInventory
 	c.mu.RUnlock()
+	if admitter == nil {
+		return
+	}
+	snap := admitter.Snapshot()
 	// Overlay PR-D template inventory before storing — placement reads
 	// straight off this lease, so without the overlay our own snapshot
 	// would advertise no templates and the unknown-allow rule would

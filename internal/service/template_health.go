@@ -200,7 +200,13 @@ func (s *Service) kickSnapshotRebuild(templateID string) {
 	if timeout <= 0 {
 		timeout = defaultTemplateBuildTimeout
 	}
+	// Track the goroutine so callers can join it. A rebuild writes into the
+	// templates directory, and an untracked one outlives whoever owns that
+	// directory: tests saw TempDir cleanup race a still-writing rebuild
+	// ("directory not empty"), and a daemon shutdown has the same shape.
+	s.templateRebuildWG.Add(1)
 	go func() {
+		defer s.templateRebuildWG.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := s.RebuildTemplateSnapshot(ctx, templateID); err != nil {
@@ -208,6 +214,26 @@ func (s *Service) kickSnapshotRebuild(templateID string) {
 				"template_id", templateID, "error", err)
 		}
 	}()
+}
+
+// WaitForTemplateRebuilds blocks until every in-flight snapshot rebuild has
+// finished, or until the deadline elapses. Returns false on timeout so a
+// caller can report a stuck rebuild rather than hang.
+func (s *Service) WaitForTemplateRebuilds(timeout time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		s.templateRebuildWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // RebuildTemplateSnapshot reruns the snapshot phase against an

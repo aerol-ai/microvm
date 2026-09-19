@@ -224,7 +224,10 @@ type Service struct {
 	secretHolderCursorMu sync.Mutex
 	secretHolderCursor   string
 	// testAuditFetcher overrides peer audit fan-out in tests.
-	testAuditFetcher cluster.AuditPeerFetcher
+	// templateRebuildWG tracks in-flight snapshot rebuilds so their filesystem
+	// work can be joined before the templates directory is torn down.
+	templateRebuildWG sync.WaitGroup
+	testAuditFetcher  cluster.AuditPeerFetcher
 	// nodeRetirements caches the operator storage-destruction attestations
 	// consulted by the delete-outbox pass. See node_storage_retirement.go.
 	nodeRetirementMu sync.Mutex
