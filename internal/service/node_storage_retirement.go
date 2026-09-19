@@ -98,7 +98,17 @@ func (s *Service) RetireNodeStorage(ctx context.Context, nodeID, actor, reason s
 			}
 		}
 	}
-	if err := s.store.PutNodeStorageRetirement(ctx, nodeID, actor, reason, time.Now().UTC()); err != nil {
+	attestedAt := time.Now().UTC()
+	// In cluster mode the attestation belongs to the replicated control
+	// plane. The deletion obligations it discharges live in the delete outbox
+	// of whichever node owns the secret, and an operator's request lands on
+	// an arbitrary entry node — a local row would be invisible to every owner
+	// and would make list/revoke depend on which node was called.
+	if writer, ok := s.nodeStorageRetirementWriter(); ok {
+		if err := writer.RetireNodeStorage(ctx, nodeID, actor, reason, attestedAt); err != nil {
+			return err
+		}
+	} else if err := s.store.PutNodeStorageRetirement(ctx, nodeID, actor, reason, attestedAt); err != nil {
 		return err
 	}
 	s.invalidateNodeStorageRetirements()
@@ -115,7 +125,23 @@ func (s *Service) RevokeNodeStorageRetirement(ctx context.Context, nodeID string
 	if s == nil || s.store == nil {
 		return false, errors.New("store is not configured")
 	}
-	removed, err := s.store.DeleteNodeStorageRetirement(ctx, strings.TrimSpace(nodeID))
+	nodeID = strings.TrimSpace(nodeID)
+	if writer, ok := s.nodeStorageRetirementWriter(); ok {
+		existing, err := s.clusterNodeStorageRetirements(ctx)
+		if err != nil {
+			return false, err
+		}
+		if _, present := existing[nodeID]; !present {
+			return false, nil
+		}
+		if err := writer.RevokeNodeStorageRetirement(ctx, nodeID); err != nil {
+			return false, err
+		}
+		s.invalidateNodeStorageRetirements()
+		nodeStorageRetirementsRevoked.Add(1)
+		return true, nil
+	}
+	removed, err := s.store.DeleteNodeStorageRetirement(ctx, nodeID)
 	if err != nil {
 		return false, err
 	}
@@ -131,7 +157,81 @@ func (s *Service) ListNodeStorageRetirements(ctx context.Context) ([]store.NodeS
 	if s == nil || s.store == nil {
 		return nil, errors.New("store is not configured")
 	}
+	if reader, ok := s.nodeStorageRetirementReader(); ok {
+		recs, err := reader.NodeStorageRetirements(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]store.NodeStorageRetirement, 0, len(recs))
+		for _, rec := range recs {
+			out = append(out, store.NodeStorageRetirement{
+				NodeID:     rec.NodeID,
+				Actor:      rec.Actor,
+				Reason:     rec.Reason,
+				AttestedAt: rec.AttestedAt(),
+			})
+		}
+		return out, nil
+	}
 	return s.store.ListNodeStorageRetirements(ctx)
+}
+
+// nodeStorageRetirementWriter / nodeStorageRetirementReader expose the
+// replicated attestation registry when this node runs in cluster mode. Both
+// *Cluster (local FSM) and *Agent (control-plane RPC) implement them; Noop
+// does not, which is what keeps standalone mode on the local table.
+func (s *Service) nodeStorageRetirementWriter() (interface {
+	RetireNodeStorage(context.Context, string, string, string, time.Time) error
+	RevokeNodeStorageRetirement(context.Context, string) error
+}, bool) {
+	if s == nil || !s.cfg.EnableCluster {
+		return nil, false
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil, false
+	}
+	w, ok := c.(interface {
+		RetireNodeStorage(context.Context, string, string, string, time.Time) error
+		RevokeNodeStorageRetirement(context.Context, string) error
+	})
+	return w, ok
+}
+
+func (s *Service) nodeStorageRetirementReader() (interface {
+	NodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error)
+}, bool) {
+	if s == nil || !s.cfg.EnableCluster {
+		return nil, false
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil, false
+	}
+	r, ok := c.(interface {
+		NodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error)
+	})
+	return r, ok
+}
+
+// clusterNodeStorageRetirements reads the replicated set. An unreachable
+// control plane is an error, never an empty set: reading "no attestations"
+// from a failed RPC would silently re-pin obligations an operator discharged,
+// and reading a stale one could discharge an obligation that was revoked.
+func (s *Service) clusterNodeStorageRetirements(ctx context.Context) (map[string]time.Time, error) {
+	reader, ok := s.nodeStorageRetirementReader()
+	if !ok {
+		return nil, errors.New("cluster: node storage retirement registry is unavailable")
+	}
+	recs, err := reader.NodeStorageRetirements(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byNode := make(map[string]time.Time, len(recs))
+	for _, rec := range recs {
+		byNode[rec.NodeID] = rec.AttestedAt()
+	}
+	return byNode, nil
 }
 
 func (s *Service) invalidateNodeStorageRetirements() {
@@ -158,16 +258,28 @@ func (s *Service) nodeStorageRetirements(ctx context.Context) map[string]time.Ti
 	}
 	s.nodeRetirementMu.Unlock()
 
-	recs, err := s.store.ListNodeStorageRetirements(ctx)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("cluster: node storage retirement list failed", "err", err)
+	var byNode map[string]time.Time
+	if _, clustered := s.nodeStorageRetirementReader(); clustered {
+		replicated, err := s.clusterNodeStorageRetirements(ctx)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("cluster: node storage retirement read failed; obligations stay pending this tick", "err", err)
+			}
+			return nil
 		}
-		return nil
-	}
-	byNode := make(map[string]time.Time, len(recs))
-	for _, rec := range recs {
-		byNode[rec.NodeID] = rec.AttestedAt
+		byNode = replicated
+	} else {
+		recs, err := s.store.ListNodeStorageRetirements(ctx)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("cluster: node storage retirement list failed", "err", err)
+			}
+			return nil
+		}
+		byNode = make(map[string]time.Time, len(recs))
+		for _, rec := range recs {
+			byNode[rec.NodeID] = rec.AttestedAt
+		}
 	}
 	s.nodeRetirementMu.Lock()
 	s.nodeRetirements = &nodeStorageRetirementCache{byNode: byNode, expiresAt: now.Add(nodeStorageRetirementCacheTTL)}
@@ -216,9 +328,22 @@ func (s *Service) reapLiveNodeStorageRetirements(ctx context.Context) {
 // dischargeRetiredStorageRecipients splits an obligation's pending recipients
 // into those still owed an ACK and those covered by an attestation.
 //
-// createdAt is the obligation's journalling time and is the fence: an
-// attestation only covers what already existed when it was made.
-func dischargeRetiredStorageRecipients(recipients []string, retired map[string]time.Time, createdAt time.Time) (pending, discharged []string) {
+// The fence is PER RECIPIENT, and it compares the time that recipient's
+// ciphertext COPY was distributed — not the time the deletion job was
+// written. Both directions of the row-wide alternative are wrong:
+//
+//   - An upsert merges a new recipient into an existing row and preserves the
+//     original created_at, so a recipient added after the attestation would
+//     inherit an older row's age and be discharged without an ACK.
+//   - A copy distributed before the disk was destroyed can have its deletion
+//     journalled afterwards. That job belongs to the destroyed disk, but a
+//     created_at fence reads it as a reused node id and pins it forever
+//     against a node that can never ACK.
+//
+// copiedAt carries SecretDeleteOutboxRecord.RecipientCopiedAt; rows written
+// before that column existed fall back to the row-wide createdAt, which is
+// exactly the behavior they were written under.
+func dischargeRetiredStorageRecipients(recipients []string, retired map[string]time.Time, createdAt time.Time, copiedAt map[string]time.Time) (pending, discharged []string) {
 	if len(recipients) == 0 || len(retired) == 0 {
 		return recipients, nil
 	}
@@ -226,10 +351,17 @@ func dischargeRetiredStorageRecipients(recipients []string, retired map[string]t
 	for _, id := range recipients {
 		trimmed := strings.TrimSpace(id)
 		attestedAt, ok := retired[trimmed]
-		if ok && !createdAt.IsZero() && createdAt.After(attestedAt) {
-			// Journalled after the attestation: a different physical node
-			// behind a reused id. Still owed a real ACK.
-			ok = false
+		if ok {
+			provenance := createdAt
+			if at, found := copiedAt[trimmed]; found && !at.IsZero() {
+				provenance = at
+			}
+			if !provenance.IsZero() && provenance.After(attestedAt) {
+				// This copy was handed over after the operator attested the
+				// disk destroyed, so it lives on a different physical node
+				// behind a reused id. Still owed a real ACK.
+				ok = false
+			}
 		}
 		if ok {
 			discharged = append(discharged, trimmed)
@@ -244,43 +376,56 @@ func dischargeRetiredStorageRecipients(recipients []string, retired map[string]t
 // were closed by attestation rather than by an ACK. The distinct reason is the
 // point: a reader must be able to tell "the holder confirmed deletion" from
 // "an operator attested the disk is gone".
-func (s *Service) recordStorageRetirementDischarge(sandboxID, incarnationID string, generation int64, discharged []string) {
+//
+// It returns the node ids whose evidence is safe to act on. A durable sink
+// that could not persist the record yields NOTHING for that node: the
+// obligation is the only thing that will bring the discharge back for another
+// attempt, so removing it on a failed write would lose both the retry and the
+// per-sandbox discharge history, leaving only a node-level attestation that
+// cannot say which lifecycles it covered. A warning in the log is not
+// evidence.
+func (s *Service) recordStorageRetirementDischarge(sandboxID, incarnationID string, generation int64, discharged []string) []string {
 	if s == nil || len(discharged) == 0 {
-		return
+		return nil
 	}
-	secretObligationsDischargedTotal.Add(int64(len(discharged)))
 	sink := s.secretAuditSink()
 	_, ownerRef := s.auditIdentityFor(sandboxID)
 	now := time.Now().UTC()
+	recorded := make([]string, 0, len(discharged))
 	for _, nodeID := range discharged {
+		if sink != nil {
+			event := SecretAuditEvent{
+				Time:          now,
+				Actor:         s.auditActor(),
+				NodeID:        nodeID,
+				SandboxID:     sandboxID,
+				IncarnationID: incarnationID,
+				OwnerRef:      ownerRef,
+				Ref:           secretDeleteObligationRef(sandboxID, incarnationID),
+				Result:        secretAuditResultSuccess,
+				Reason:        secretAuditReasonStorageRetired,
+				Kind:          secretAuditKindSecretOpen,
+			}
+			if durable, ok := sink.(DurableSecretAuditSink); ok {
+				if err := durable.EmitDurable(event); err != nil {
+					if s.logger != nil {
+						s.logger.Warn("cluster: storage-retirement discharge evidence not persisted; the obligation is retained so the discharge can be retried",
+							"sandbox_id", sandboxID, "node_id", nodeID, "err", err)
+					}
+					continue
+				}
+			} else {
+				sink.Emit(event)
+			}
+		}
 		if s.logger != nil {
 			s.logger.Warn("cluster: secret deletion obligation discharged by storage-retirement attestation, not by an ACK",
 				"sandbox_id", sandboxID, "node_id", nodeID, "generation", generation)
 		}
-		if sink == nil {
-			continue
-		}
-		event := SecretAuditEvent{
-			Time:          now,
-			Actor:         s.auditActor(),
-			NodeID:        nodeID,
-			SandboxID:     sandboxID,
-			IncarnationID: incarnationID,
-			OwnerRef:      ownerRef,
-			Ref:           secretDeleteObligationRef(sandboxID, incarnationID),
-			Result:        secretAuditResultSuccess,
-			Reason:        secretAuditReasonStorageRetired,
-			Kind:          secretAuditKindSecretOpen,
-		}
-		if durable, ok := sink.(DurableSecretAuditSink); ok {
-			if err := durable.EmitDurable(event); err != nil && s.logger != nil {
-				s.logger.Warn("cluster: storage-retirement discharge evidence not persisted",
-					"sandbox_id", sandboxID, "node_id", nodeID, "err", err)
-			}
-			continue
-		}
-		sink.Emit(event)
+		recorded = append(recorded, nodeID)
 	}
+	secretObligationsDischargedTotal.Add(int64(len(recorded)))
+	return recorded
 }
 
 func secretDeleteObligationRef(sandboxID, incarnationID string) string {

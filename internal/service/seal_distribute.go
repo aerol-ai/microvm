@@ -63,6 +63,11 @@ type holderNodeSet struct {
 	targets    map[string]struct{}  // intended recipients, retained across probe failures
 	lastProbe  time.Time            // fair scheduling independent of holder ACK time
 	lastExpand time.Time            // fair scheduling for reseal/finalization attempts
+	// retired marks a set that has been removed from secretFanoutHolders.
+	// A writer that read the pointer just before the removal would otherwise
+	// lock an orphan and silently drop the state it was recording; lockHolderSet
+	// sends it back to the map for the live set instead.
+	retired bool
 }
 
 type secretHolderKey struct {
@@ -100,6 +105,29 @@ func holderSetFor(sandboxID, incarnationID string) *holderNodeSet {
 	return v.(*holderNodeSet)
 }
 
+// lockHolderSet resolves the live holder set for a key and locks it. The
+// retry exists because retirement removes the map entry while holding the
+// set's own mutex: a writer that resolved the pointer first would wake up
+// owning a set nobody can read back.
+func lockHolderSet(sandboxID, incarnationID string) *holderNodeSet {
+	for {
+		hs := holderSetFor(sandboxID, incarnationID)
+		hs.mu.Lock()
+		if !hs.retired {
+			return hs
+		}
+		hs.mu.Unlock()
+	}
+}
+
+// retireHolderSetLocked removes the set from the map while its mutex is held,
+// so the decision to retire and the removal cannot straddle a concurrent
+// reseal. Callers must hold hs.mu.
+func retireHolderSetLocked(key secretHolderKey, hs *holderNodeSet) {
+	hs.retired = true
+	secretFanoutHolders.CompareAndDelete(key, hs)
+}
+
 // addSecretHolderNodes records generation-scoped ACKs. Stale-generation ACKs
 // are ignored so delayed gen1 fan-out cannot keep failover_ready true for gen2.
 func addSecretHolderNodes(sandboxID, incarnationID string, gen int64, nodeIDs ...string) {
@@ -107,8 +135,7 @@ func addSecretHolderNodes(sandboxID, incarnationID string, gen int64, nodeIDs ..
 	if strings.TrimSpace(sandboxID) == "" || incarnationID == "" {
 		return
 	}
-	hs := holderSetFor(sandboxID, incarnationID)
-	hs.mu.Lock()
+	hs := lockHolderSet(sandboxID, incarnationID)
 	defer hs.mu.Unlock()
 	if gen > 0 && hs.gen != 0 && gen != hs.gen {
 		return
@@ -150,8 +177,7 @@ func resetSecretHolders(sandboxID, incarnationID string, gen int64, authoritativ
 	if strings.TrimSpace(sandboxID) == "" || incarnationID == "" {
 		return
 	}
-	hs := holderSetFor(sandboxID, incarnationID)
-	hs.mu.Lock()
+	hs := lockHolderSet(sandboxID, incarnationID)
 	defer hs.mu.Unlock()
 	if !authoritative && gen > 0 && hs.gen > gen {
 		return
@@ -187,8 +213,7 @@ func setSecretHolderTargets(sandboxID, incarnationID string, gen int64, nodeIDs 
 	if strings.TrimSpace(sandboxID) == "" || incarnationID == "" {
 		return
 	}
-	hs := holderSetFor(sandboxID, incarnationID)
-	hs.mu.Lock()
+	hs := lockHolderSet(sandboxID, incarnationID)
 	defer hs.mu.Unlock()
 	if gen > 0 && hs.gen > gen {
 		return
@@ -252,19 +277,39 @@ func secretHolderCount(sandboxID, incarnationID string) int {
 
 func clearSecretFanoutHolders(sandboxID string) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	secretFanoutHolders.Range(func(key, _ any) bool {
-		if holderKey, ok := key.(secretHolderKey); ok && holderKey.sandboxID == sandboxID {
-			secretFanoutHolders.Delete(holderKey)
+	secretFanoutHolders.Range(func(key, val any) bool {
+		holderKey, ok := key.(secretHolderKey)
+		if !ok || holderKey.sandboxID != sandboxID {
+			return true
 		}
+		if hs, _ := val.(*holderNodeSet); hs != nil {
+			hs.mu.Lock()
+			retireHolderSetLocked(holderKey, hs)
+			hs.mu.Unlock()
+			return true
+		}
+		secretFanoutHolders.Delete(holderKey)
 		return true
 	})
 }
 
 func clearSecretFanoutHoldersForIncarnation(sandboxID, incarnationID string) {
-	secretFanoutHolders.Delete(secretHolderKey{
+	key := secretHolderKey{
 		sandboxID:     strings.TrimSpace(sandboxID),
 		incarnationID: strings.TrimSpace(incarnationID),
-	})
+	}
+	v, ok := secretFanoutHolders.Load(key)
+	if !ok {
+		return
+	}
+	hs, _ := v.(*holderNodeSet)
+	if hs == nil {
+		secretFanoutHolders.Delete(key)
+		return
+	}
+	hs.mu.Lock()
+	retireHolderSetLocked(key, hs)
+	hs.mu.Unlock()
 }
 
 // pruneDeadSecretHolders drops holders that are not currently alive so a peer

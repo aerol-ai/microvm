@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -247,5 +248,223 @@ func TestReassignStuckPlacementRejectsNonOwner(t *testing.T) {
 	}
 	if err := c.ReassignStuckPlacement(context.Background(), "wrk-new", "sb-absent", ""); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("unknown sandbox reassign = %v, want ErrUnknownSandbox", err)
+	}
+}
+
+// seedOwnedRecoveryRows fills an FSM with n ineligible rows for owner, then one
+// failover-recreate row that sorts after all of them.
+func seedOwnedRecoveryRows(c *Cluster, owner string, ineligible int, haID string) {
+	for i := range ineligible {
+		p := failoverRecreatePlacement(fmt.Sprintf("a-%05d", i), owner)
+		// No failover policy and no spec: owned, but not recovery work.
+		p.Spec = nil
+		c.fsm.placements[p.SandboxID] = p
+		c.fsm.claimOwnerLocked(p.SandboxID, p)
+	}
+	ha := failoverRecreatePlacement(haID, owner)
+	c.fsm.placements[ha.SandboxID] = ha
+	c.fsm.claimOwnerLocked(ha.SandboxID, ha)
+}
+
+// OwnedRecoveryPlacements pages the owner index and THEN drops rows that are
+// not recovery work, so a page can legitimately come back empty with more
+// work behind it. A dense worker whose eligible rows sort after a page's
+// worth of ineligible ones must still be recovered.
+func TestOwnedRecoveryFillsPagePastIneligibleRows(t *testing.T) {
+	c := &Cluster{fsm: newPlacementFSM()}
+	seedOwnedRecoveryRows(c, "worker-self", ownedRecoveryPageLimit, "z-must-recover")
+
+	page := c.OwnedRecoveryPlacements("worker-self", ownedRecoveryPageLimit, "")
+	if len(page.Placements) != 1 {
+		t.Fatalf("first page returned %d recovery rows, want 1; %d ineligible rows sorted ahead of it", len(page.Placements), ownedRecoveryPageLimit)
+	}
+	if page.Placements[0].SandboxID != "z-must-recover" {
+		t.Fatalf("first page returned %q, want the failover-recreate row", page.Placements[0].SandboxID)
+	}
+}
+
+// Past the per-request scan budget the response is legitimately empty with a
+// live cursor. The worker must follow that cursor instead of restarting the
+// walk, or the rows behind it are never recovered.
+func TestOwnedRecoveryWatcherFollowsEmptyPageCursor(t *testing.T) {
+	c := &Cluster{fsm: newPlacementFSM()}
+	seedOwnedRecoveryRows(c, "worker-self", ownedRecoveryScanBudget+ownedRecoveryPageLimit, "z-must-recover")
+
+	first := c.OwnedRecoveryPlacements("worker-self", ownedRecoveryPageLimit, "")
+	if len(first.Placements) != 0 || first.NextPageToken == "" {
+		t.Fatalf("bad fixture: first page has %d rows and cursor %q; it must be the empty-page-with-cursor case",
+			len(first.Placements), first.NextPageToken)
+	}
+
+	var tokens []string
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req OwnedRecoveryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		tokens = append(tokens, req.PageToken)
+		_ = json.NewEncoder(w).Encode(c.OwnedRecoveryPlacements("worker-self", req.Limit, req.PageToken))
+	}))
+	rec := &workerRecreator{}
+	agent.AttachRecreator(rec)
+
+	// One tick is page-budgeted; the cursor carries the rest to the next one.
+	for range 4 {
+		agent.recreateOwnedSandboxes(context.Background())
+	}
+
+	if !slices.Contains(rec.recreated(), "z-must-recover") {
+		t.Fatalf("recovered %v after four ticks; the sandbox behind the empty pages was never recreated", rec.recreated())
+	}
+	if len(tokens) > 1 && tokens[1] == "" {
+		t.Fatal("the second request restarted the walk from the beginning instead of following the cursor")
+	}
+}
+
+// The cursor is kept across ticks, but a completed walk must start over:
+// otherwise a placement assigned later — after the cursor passed its key —
+// would never be seen.
+func TestOwnedRecoveryWatcherRestartsWalkAfterCompletion(t *testing.T) {
+	c := &Cluster{fsm: newPlacementFSM()}
+	seedOwnedRecoveryRows(c, "worker-self", 4, "z-first")
+
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req OwnedRecoveryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(c.OwnedRecoveryPlacements("worker-self", req.Limit, req.PageToken))
+	}))
+	rec := &workerRecreator{}
+	agent.AttachRecreator(rec)
+	agent.recreateOwnedSandboxes(context.Background())
+
+	if agent.ownedRecoveryCursor != "" {
+		t.Fatalf("cursor = %q after a completed walk; the next tick would skip everything before it", agent.ownedRecoveryCursor)
+	}
+
+	// A placement assigned after the first sweep must be picked up.
+	late := failoverRecreatePlacement("a-late", "worker-self")
+	c.fsm.placements[late.SandboxID] = late
+	c.fsm.claimOwnerLocked(late.SandboxID, late)
+	agent.recreateOwnedSandboxes(context.Background())
+
+	if !slices.Contains(rec.recreated(), "a-late") {
+		t.Fatalf("recovered %v; a placement assigned after the walk completed was never picked up", rec.recreated())
+	}
+}
+
+// placeFailoverPlacement commits a failover-recreate placement owned by
+// ownerID through the real raft log, so reassignment CASes see committed state.
+func placeFailoverPlacement(t *testing.T, c *Cluster, id, ownerID string) Placement {
+	t.Helper()
+	p := failoverRecreatePlacement(id, ownerID)
+	raw, err := encodeCommand(command{
+		Op: opPlace, SandboxID: p.SandboxID, OwnerNodeID: ownerID,
+		OwnerAPIURL: "http://" + ownerID, IncarnationID: p.IncarnationID, Spec: p.Spec,
+	})
+	if err != nil {
+		t.Fatalf("encodeCommand: %v", err)
+	}
+	if err := c.raft.raft.Apply(raw, 2*time.Second).Error(); err != nil {
+		t.Fatalf("apply opPlace: %v", err)
+	}
+	return p
+}
+
+// The worker RPC runs on a control-plane server, so excluding "self" excludes
+// the wrong node. The node to avoid is the one the placement is stuck on —
+// otherwise the failing worker, which usually has the most free capacity
+// precisely because its sandboxes are not running, is handed the sandbox
+// straight back and the success reply clears the failure counter that asked
+// for the move.
+func TestReassignStuckPlacementExcludesTheFailingWorker(t *testing.T) {
+	c, cleanup := newTestClusterWithRole(t, "srv-reassign-exclude", config.NodeRoleServer, true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	idx := newGossipMemberIndex()
+	idx.replace([]Member{
+		recreateCandidate("stuck-worker", config.NodeRoleWorker, 100),
+		recreateCandidate("healthy-worker", config.NodeRoleWorker, 10),
+	})
+	c.gossip.setMemberIndex(idx)
+
+	p := placeFailoverPlacement(t, c, "sb-stuck-exclude", "stuck-worker")
+	if err := c.ReassignStuckPlacement(context.Background(), "stuck-worker", p.SandboxID, p.IncarnationID); err != nil {
+		t.Fatalf("ReassignStuckPlacement: %v", err)
+	}
+
+	after, ok := c.fsm.get(p.SandboxID)
+	if !ok {
+		t.Fatal("placement disappeared")
+	}
+	if after.OwnerNodeID == "stuck-worker" {
+		t.Fatal("the placement was reassigned to the worker it was stuck on; recovery keeps retrying the node it was meant to abandon")
+	}
+	if after.OwnerNodeID != "healthy-worker" {
+		t.Fatalf("new owner = %q, want healthy-worker", after.OwnerNodeID)
+	}
+}
+
+// With no alternative the placement stays where it is — but the caller must
+// be told, or it clears the failure counter driving its escalation.
+func TestReassignStuckPlacementReportsWhenNoAlternateExists(t *testing.T) {
+	c, cleanup := newTestClusterWithRole(t, "srv-reassign-none", config.NodeRoleServer, true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	idx := newGossipMemberIndex()
+	idx.replace([]Member{recreateCandidate("lonely-worker", config.NodeRoleWorker, 100)})
+	c.gossip.setMemberIndex(idx)
+
+	p := placeFailoverPlacement(t, c, "sb-no-alternate", "lonely-worker")
+	err := c.ReassignStuckPlacement(context.Background(), "lonely-worker", p.SandboxID, p.IncarnationID)
+	if !errors.Is(err, ErrNoReassignTarget) {
+		t.Fatalf("reassign with no alternate = %v, want ErrNoReassignTarget", err)
+	}
+
+	after, _ := c.fsm.get(p.SandboxID)
+	if after.OwnerNodeID != "lonely-worker" {
+		t.Fatalf("owner = %q; a placement with no alternate must stay put rather than be orphaned", after.OwnerNodeID)
+	}
+}
+
+// opReassign preserves the incarnation, so the incarnation CAS alone cannot
+// fence a placement that has already been moved. A late escalation must not
+// bounce a sandbox off the node that has just taken it over.
+func TestReassignStuckPlacementFencesOwnerThroughTheMutation(t *testing.T) {
+	c, cleanup := newTestClusterWithRole(t, "srv-reassign-fence", config.NodeRoleServer, true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	idx := newGossipMemberIndex()
+	idx.replace([]Member{
+		recreateCandidate("stuck-worker", config.NodeRoleWorker, 100),
+		recreateCandidate("healthy-worker", config.NodeRoleWorker, 10),
+	})
+	c.gossip.setMemberIndex(idx)
+
+	p := placeFailoverPlacement(t, c, "sb-already-moved", "stuck-worker")
+	// The placement moves on — same incarnation, new owner — before the
+	// escalation's own command reaches the FSM.
+	stale := p
+	moved, _ := c.fsm.get(p.SandboxID)
+	moved.OwnerNodeID = "healthy-worker"
+	c.fsm.mu.Lock()
+	c.fsm.releaseOwnerLocked(p.SandboxID, p)
+	c.fsm.placements[p.SandboxID] = moved
+	c.fsm.claimOwnerLocked(p.SandboxID, moved)
+	c.fsm.mu.Unlock()
+
+	err := c.tryReassignStuckPlacement(context.Background(), stale.SandboxID, stale)
+	if !errors.Is(err, ErrStuckReassignNotOwner) {
+		t.Fatalf("reassign against a superseded owner = %v, want ErrStuckReassignNotOwner", err)
+	}
+	after, _ := c.fsm.get(p.SandboxID)
+	if after.OwnerNodeID != "healthy-worker" {
+		t.Fatalf("owner = %q; the stale escalation bounced the sandbox off its new home", after.OwnerNodeID)
 	}
 }

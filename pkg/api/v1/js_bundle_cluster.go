@@ -5,6 +5,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -40,14 +41,15 @@ func (h *handlers) clusterListJSBundlesWrap(w http.ResponseWriter, r *http.Reque
 	}
 	aggregate, err := h.jsBundleLists.cached(r, func(req *http.Request) (clusterListAggregate[*models.JSBundle], error) {
 		local, localErr := h.deps.Service.ListJSBundles(req.Context())
-		// No location index yet for isolate bundles. The catalogue's key is a
-		// content digest, so publishing a node-wide digest list in the
-		// capacity snapshot would let any peer infer the existence and
-		// byte-equality of other tenants' code. That is a disclosure decision,
-		// not a mechanical addition, so this sweep keeps asking every
-		// isolate-capable worker until the index is designed.
+		// Still no gossip location index for isolate bundles, on purpose: the
+		// catalogue's key is a content digest, and gossip reaches every node,
+		// so a node-wide digest list would let any peer infer the existence
+		// and byte-equality of other tenants' code. The replicated catalogue
+		// below is the narrowing instead — it is keyed BY TENANT and lives in
+		// the server tier, which already holds every tenant's placements.
 		return clusterListSweep(req, c, models.RuntimeIsolate, clusterJSBundleForwardedHeader,
-			local, localErr, jsBundleListKey, h.deps.Logger, "js-bundles", nil)
+			local, localErr, jsBundleListKey, h.deps.Logger, "js-bundles", nil,
+			h.jsBundleCatalogReader())
 	})
 	if err != nil {
 		writeClusterListError(h.deps.Logger, w, err)
@@ -55,6 +57,14 @@ func (h *handlers) clusterListJSBundlesWrap(w http.ResponseWriter, r *http.Reque
 	}
 	writeClusterListCoverage(w, aggregate.failedPeers, clusterJSBundleMissingHeader)
 	apihttp.WriteJSON(w, http.StatusOK, aggregate.rows)
+}
+
+// jsBundleCatalogReader reads the replicated bundle metadata for the calling
+// tenant only.
+func (h *handlers) jsBundleCatalogReader() clusterArtifactCatalog[*models.JSBundle] {
+	return func(req *http.Request) ([]*models.JSBundle, []string, bool) {
+		return readClusterArtifactCatalog[*models.JSBundle](req, h.deps.Service, cluster.ArtifactKindJSBundle, clusterlist.OwnerRefFromContext(req.Context()))
+	}
 }
 
 // jsBundleListKey dedupes by content digest: the same bytes uploaded to two

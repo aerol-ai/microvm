@@ -53,6 +53,12 @@ const (
 	// for ids whose boundary this process never observed (a crash between
 	// create and destroy, say). Past it, expired entries are swept.
 	auditOwnershipLeaseMaxEntries = 100_000
+	// auditOwnershipLeaseFenceTTL is how long a pure fence — an entry that
+	// carries no answer and exists only to hold the epoch — is retained after
+	// a lifecycle boundary. It only has to outlive the slowest in-flight
+	// resolve (one placement read or one SQLite row read). Same reasoning and
+	// same value as auditIdentityFenceTTL.
+	auditOwnershipLeaseFenceTTL = 10 * time.Minute
 )
 
 var (
@@ -69,6 +75,24 @@ type auditOwnershipLease struct {
 	// retries.
 	ownedBySelf bool
 	expiresAt   time.Time
+	// epoch increments on every lifecycle boundary for this sandbox id. A
+	// resolve that started before the boundary can no longer install — or be
+	// answered from — after it. Same fence as the audit identity cache
+	// (auditIdentity.epoch); without it, deleting the entry only means the
+	// in-flight read reinstalls its old answer a moment later, and the stale
+	// permit survives for a full TTL.
+	epoch uint64
+	// fencedAt stamps a pure fence: an entry that carries no answer and holds
+	// only the epoch until in-flight resolves have drained.
+	fencedAt time.Time
+}
+
+// leaseResolution is what one refresh flight produces: the answer plus the
+// lifecycle it belongs to, so a caller that joined the flight after a
+// boundary can tell that the answer is not about its lifecycle.
+type leaseResolution struct {
+	lease auditOwnershipLease
+	epoch uint64
 }
 
 // auditOwnershipLeases holds the per-sandbox leases and the single-flight
@@ -86,42 +110,85 @@ func (s *Service) ownershipLeases() *auditOwnershipLeases {
 	return s.auditLeases
 }
 
-// invalidateAuditOwnershipLease drops a sandbox's binding lease. Called at
-// every local lifecycle boundary so the common cases — destroyed, recreated,
-// reclaimed — are rejected on the next event instead of at TTL.
+// invalidateAuditOwnershipLease ends a sandbox's binding lease. Called at
+// every local lifecycle boundary — a lifetime ENDING and a lifetime STARTING
+// — so the common cases (destroyed, recreated, reclaimed, and a new lifetime
+// under a reused id) are answered from the control plane on the next event
+// instead of from the previous lifetime's answer.
+//
+// It leaves a fence rather than deleting outright: a delete alone lets a
+// resolve that started before the boundary finish afterwards and install its
+// old answer, which keeps the retired capability valid for a further TTL.
 func (s *Service) invalidateAuditOwnershipLease(sandboxID string) {
 	if s == nil || strings.TrimSpace(sandboxID) == "" {
 		return
 	}
 	l := s.ownershipLeases()
 	l.mu.Lock()
-	delete(l.entries, sandboxID)
+	l.entries[sandboxID] = auditOwnershipLease{
+		epoch:    l.entries[sandboxID].epoch + 1,
+		fencedAt: time.Now(),
+	}
 	l.mu.Unlock()
 }
 
-func (l *auditOwnershipLeases) get(sandboxID string, now time.Time) (auditOwnershipLease, bool) {
+// observe returns the live lease if there is one, plus the epoch the caller's
+// resolve belongs to. A fence has no expiry, so it reads as a miss that still
+// carries its lifecycle.
+func (l *auditOwnershipLeases) observe(sandboxID string, now time.Time) (auditOwnershipLease, bool, uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry, ok := l.entries[sandboxID]
 	if !ok || !now.Before(entry.expiresAt) {
-		return auditOwnershipLease{}, false
+		return auditOwnershipLease{}, false, entry.epoch
 	}
-	return entry, true
+	return entry, true, entry.epoch
 }
 
-func (l *auditOwnershipLeases) put(sandboxID string, entry auditOwnershipLease, now time.Time) {
+// put installs a refresh result only while the lifecycle it was resolved
+// under is still current.
+func (l *auditOwnershipLeases) put(sandboxID string, entry auditOwnershipLease, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if current, ok := l.entries[sandboxID]; ok && current.epoch != entry.epoch {
+		return false
+	}
 	if len(l.entries) >= auditOwnershipLeaseMaxEntries {
 		for id, e := range l.entries {
-			if !now.Before(e.expiresAt) {
+			if e.fencedAt.IsZero() && !now.Before(e.expiresAt) {
 				delete(l.entries, id)
 			}
 		}
 	}
 	if len(l.entries) < auditOwnershipLeaseMaxEntries {
 		l.entries[sandboxID] = entry
+		return true
 	}
+	return false
+}
+
+// pruneAuditOwnershipLeaseFences drops fences older than the fence TTL. Live
+// leases are untouched; those are replaced by their own refresh or dropped by
+// the sandbox's next boundary. Called from the secret-maintenance tick, next
+// to pruneAuditIdentityFences, for the same reason.
+func (s *Service) pruneAuditOwnershipLeaseFences(now time.Time) int {
+	if s == nil {
+		return 0
+	}
+	l := s.ownershipLeases()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	pruned := 0
+	for id, entry := range l.entries {
+		if entry.fencedAt.IsZero() {
+			continue
+		}
+		if now.Sub(entry.fencedAt) > auditOwnershipLeaseFenceTTL {
+			delete(l.entries, id)
+			pruned++
+		}
+	}
+	return pruned
 }
 
 // validateEgressAuditBinding prevents a capability retained by a terminated or
@@ -139,7 +206,7 @@ func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, inc
 	}
 	now := time.Now()
 	leases := s.ownershipLeases()
-	if lease, ok := leases.get(sandboxID, now); ok {
+	if lease, ok, _ := leases.observe(sandboxID, now); ok {
 		auditBindingLeaseHits.Add(1)
 		return bindingVerdict(lease, incarnationID)
 	}
@@ -149,21 +216,34 @@ func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, inc
 	resolved, err, _ := leases.group.Do(sandboxID, func() (any, error) {
 		// Re-check under the flight: a concurrent refresh may have just
 		// installed a fresh lease.
-		if lease, ok := leases.get(sandboxID, time.Now()); ok {
-			return lease, nil
+		at := time.Now()
+		if lease, ok, epoch := leases.observe(sandboxID, at); ok {
+			return leaseResolution{lease: lease, epoch: epoch}, nil
 		}
+		// The epoch read with the miss is the lifecycle this resolve belongs
+		// to; a boundary crossed while the read is in flight makes the answer
+		// unusable, both for installing and for answering callers.
+		_, _, epoch := leases.observe(sandboxID, at)
 		lease, err := s.resolveAuditBinding(ctx, sandboxID)
 		if err != nil {
-			return auditOwnershipLease{}, err
+			return leaseResolution{}, err
 		}
+		lease.epoch = epoch
 		leases.put(sandboxID, lease, time.Now())
-		return lease, nil
+		return leaseResolution{lease: lease, epoch: epoch}, nil
 	})
 	if err != nil {
 		return err
 	}
-	lease, _ := resolved.(auditOwnershipLease)
-	return bindingVerdict(lease, incarnationID)
+	res, _ := resolved.(leaseResolution)
+	// Singleflight reuse is a second way to inherit a stale answer: a caller
+	// that arrived after the boundary can be handed a flight that started
+	// before it. Fail closed instead — the next event re-resolves under the
+	// current lifecycle.
+	if _, _, current := leases.observe(sandboxID, time.Now()); current != res.epoch {
+		return errAuditIngestBindingStale
+	}
+	return bindingVerdict(res.lease, incarnationID)
 }
 
 func bindingVerdict(lease auditOwnershipLease, incarnationID string) error {

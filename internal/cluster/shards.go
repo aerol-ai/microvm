@@ -63,6 +63,12 @@ type PlacementPageResponse struct {
 	// plane. Empty Authoritative pages mean "tenant (or fleet) has zero rows"
 	// — not "placement view unavailable". Agents set this false on CP errors.
 	Authoritative bool `json:"authoritative,omitempty"`
+	// SkippedSandboxIDs names rows that could not be delivered because one row
+	// alone exceeds the response byte budget. They are neither present nor
+	// absent, and a caller that makes cleanup decisions from this view (route
+	// GC deletes routes for placements it cannot see) must treat them as
+	// unavailable rather than deleted.
+	SkippedSandboxIDs []string `json:"skipped_sandbox_ids,omitempty"`
 }
 
 type IngressRouteOwner struct {

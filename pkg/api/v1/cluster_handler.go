@@ -780,6 +780,61 @@ func (h *handlers) clusterRetireNodeStorage(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// clusterInternalNodeStorageRetirements serves the replicated attestation set
+// to obligation owners. A worker holds no FSM, and the outbox rows an
+// attestation discharges live on the owner — never on the node the operator's
+// request reached — so the set has to be readable from the server tier.
+func (h *handlers) clusterInternalNodeStorageRetirements(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	peerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	if strings.TrimSpace(peerID) == "" {
+		apihttp.WriteError(w, http.StatusForbidden, "cluster: peer identity required")
+		return
+	}
+	reader, ok := c.(interface {
+		NodeStorageRetirementsForPeer() cluster.NodeStorageRetirementsResponse
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, reader.NodeStorageRetirementsForPeer())
+}
+
+// clusterInternalArtifactCatalog serves the replicated template / JS-bundle
+// metadata to nodes that hold no FSM, and accepts a node's published slice.
+// The publisher is the mTLS-authenticated peer identity, never a body field:
+// a node may only ever publish its own inventory.
+func (h *handlers) clusterInternalArtifactCatalog(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	peerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	if strings.TrimSpace(peerID) == "" {
+		apihttp.WriteError(w, http.StatusForbidden, "cluster: peer identity required")
+		return
+	}
+	var req cluster.ArtifactCatalogRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	reader, ok := c.(interface {
+		ArtifactCatalogForPeer(string, string) cluster.ArtifactCatalogPage
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, reader.ArtifactCatalogForPeer(req.Kind, req.Tenant))
+}
+
 // clusterRevokeNodeStorageRetirement withdraws an attestation made in error.
 // Obligations to that node become pending again. Idempotent.
 func (h *handlers) clusterRevokeNodeStorageRetirement(w http.ResponseWriter, r *http.Request) {

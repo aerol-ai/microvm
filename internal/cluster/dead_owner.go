@@ -219,6 +219,11 @@ func (c *Cluster) orphanOwner(ctx context.Context, nodeID string) error {
 }
 
 func (c *Cluster) removeDeadOwnerServer(nodeID string) {
+	// Same lock as admission: a removal that lands between another caller's
+	// replica count and its AddVoter would make that count describe a
+	// configuration the mutation is not applied to.
+	c.raftMembershipMu.Lock()
+	defer c.raftMembershipMu.Unlock()
 	if _, ok := c.configuredServer(nodeID); ok {
 		f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, c.commitTimeout)
 		if err := f.Error(); err != nil {

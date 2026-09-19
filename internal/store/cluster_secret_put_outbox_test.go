@@ -262,6 +262,7 @@ func TestStaleRetirementMergeCannotDropNewerDeleteObligation(t *testing.T) {
 		[]string{"peer-newer"},
 		4,
 		true,
+		time.Time{},
 	); err != nil {
 		t.Fatal(err)
 	}
