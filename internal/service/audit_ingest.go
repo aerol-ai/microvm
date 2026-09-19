@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
 
@@ -321,6 +320,16 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// Cheap, purely local shape checks run BEFORE the binding check. The
+	// binding check is the one that can reach the control plane, so anything
+	// that can refuse a record without leaving this process belongs ahead of
+	// it.
+	destination := strings.TrimSpace(req.Destination)
+	if sandboxID == "" || destination == "" {
+		auditIngestRejectedTotal.Add(1)
+		http.Error(w, "sandbox_id and destination required", http.StatusBadRequest)
+		return
+	}
 	if err := ing.svc.validateEgressAuditBinding(r.Context(), sandboxID, incarnationID); err != nil {
 		auditIngestRejectedTotal.Add(1)
 		if errors.Is(err, errAuditIngestBindingStale) {
@@ -328,12 +337,6 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 		} else {
 			http.Error(w, "sandbox validation unavailable", http.StatusServiceUnavailable)
 		}
-		return
-	}
-	destination := strings.TrimSpace(req.Destination)
-	if sandboxID == "" || destination == "" {
-		auditIngestRejectedTotal.Add(1)
-		http.Error(w, "sandbox_id and destination required", http.StatusBadRequest)
 		return
 	}
 	// Receipt time is authoritative. A worker capability authenticates the
@@ -382,45 +385,6 @@ func (ing *auditIngestServer) handleEgress(w http.ResponseWriter, r *http.Reques
 	}
 	auditIngestAcceptedTotal.Add(1)
 	w.WriteHeader(http.StatusAccepted)
-}
-
-// validateEgressAuditBinding prevents a capability retained by a terminated or
-// reassigned worker from continuing to append evidence under its old sandbox.
-// Cluster placement is authoritative when enabled; standalone mode uses the
-// local sandbox row. Incarnation and owner checks also fence failover races.
-func (s *Service) validateEgressAuditBinding(ctx context.Context, sandboxID, incarnationID string) error {
-	if s == nil || strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(incarnationID) == "" {
-		return errAuditIngestBindingStale
-	}
-	if s.cfg.EnableCluster {
-		c := s.Cluster()
-		if c == nil {
-			return errAuditIngestBindingStale
-		}
-		p, ok := c.PlacementOf(sandboxID)
-		// An orphan has no active owner and therefore no legitimate worker. Do
-		// not let a capability retained by the dead owner's process continue to
-		// append after Raft has fenced that owner.
-		if !ok || strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(c.SelfNodeID()) || strings.TrimSpace(p.IncarnationID) != strings.TrimSpace(incarnationID) {
-			return errAuditIngestBindingStale
-		}
-		return nil
-	}
-	if s.store == nil {
-		return errAuditIngestBindingStale
-	}
-	sandbox, err := s.store.Get(ctx, sandboxID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return errAuditIngestBindingStale
-		}
-		return err
-	}
-	current := strings.TrimSpace(sandbox.AuditIncarnationID)
-	if strings.TrimSpace(current) == "" || strings.TrimSpace(current) != strings.TrimSpace(incarnationID) {
-		return errAuditIngestBindingStale
-	}
-	return nil
 }
 
 func newAuditIngestToken() (string, error) {

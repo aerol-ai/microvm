@@ -184,7 +184,12 @@ type Service struct {
 	auditIngest            *auditIngestServer
 	// auditIngestKey caches the resolved capability signing key (see
 	// auditIngestSigningKey); guarded by auditIngestMu.
-	auditIngestKey          string
+	auditIngestKey string
+	// auditLeases answers the per-event egress audit binding check from a
+	// short-lived, lifecycle-fenced lease instead of a control-plane read per
+	// record. See internal/service/audit_ownership_lease.go.
+	auditLeaseOnce          sync.Once
+	auditLeases             *auditOwnershipLeases
 	auditIncarnationMu      sync.RWMutex
 	pendingAuditIncarnation map[string]string
 	// auditIdentityCache memoizes each sandbox's resolved (incarnation,
@@ -1163,6 +1168,7 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 		}
 	}
 	s.invalidateAuditIdentity(sandbox.ID)
+	s.invalidateAuditOwnershipLease(sandbox.ID)
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
@@ -2879,6 +2885,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		return err
 	}
 	s.invalidateAuditIdentity(id)
+	s.invalidateAuditOwnershipLease(id)
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
@@ -4833,6 +4840,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// sweep skip this image, leaking layers across reconcile cycles
 			// until something else changed.
 			s.invalidateAuditIdentity(sandbox.ID)
+			s.invalidateAuditOwnershipLease(sandbox.ID)
 			if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
