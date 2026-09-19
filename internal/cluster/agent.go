@@ -54,7 +54,15 @@ const (
 	PublicInternalSecretPath = "/v1/cluster/internal/secrets"
 	// PublicInternalSandboxAuditPath is the prefix for peer-local secret audit
 	// reads. Full path: .../sandboxes/{id}/audit
-	PublicInternalSandboxAuditPath      = "/v1/cluster/internal/sandboxes/"
+	PublicInternalSandboxAuditPath = "/v1/cluster/internal/sandboxes/"
+	// PublicInternalNodeStorageRetirementsPath serves the replicated operator
+	// attestations that a node's storage was destroyed. Obligation owners are
+	// workers, which hold no FSM, so they read the set from the server tier
+	// rather than from a table on whichever node the operator called.
+	PublicInternalNodeStorageRetirementsPath = "/v1/cluster/internal/node-storage-retirements"
+	// PublicInternalArtifactCatalogPath serves and accepts the replicated
+	// template / JS-bundle metadata catalogue.
+	PublicInternalArtifactCatalogPath   = "/v1/cluster/internal/artifact-catalog"
 	controlPlaneRequestTimeout          = 5 * time.Second
 	controlPlanePlacementRequestTimeout = 10 * time.Second
 	maxControlPlaneJSONResponseBytes    = 16 << 20
@@ -145,6 +153,11 @@ type Agent struct {
 	recreator        SandboxRecreator
 	recreateFailures *recreateFailureTracker
 	ownerWatcherStop context.CancelFunc
+	// ownedRecoveryCursor resumes the owner-index walk on the next tick. Only
+	// the owner-watcher goroutine touches it. It exists so a page budget can
+	// bound one tick's work without the walk losing its place — the reason
+	// the previous "stop on an empty page" rule starved dense workers.
+	ownedRecoveryCursor string
 }
 
 func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Agent, error) {
@@ -1070,7 +1083,26 @@ func (a *Agent) fetchPlacementPages(filter PlacementShardFilter) ([]Placement, e
 		err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsPagePath, PublicInternalPlacementsPagePath, req.Normalize(), &resp)
 		cancel()
 		if err != nil {
+			// A row count is not a size bound: route metadata (up to
+			// models.MaxCustomDomainsPerSandbox custom hostnames) rides these
+			// rows, so a full page of valid wide rows can exceed the response
+			// ceiling. Ask for fewer rows and retry the SAME cursor —
+			// repeating an identical request cannot recover a cold ingress.
+			if errors.Is(err, errControlPlaneResponseTooLarge) && req.Limit > 1 {
+				req.Limit = max(1, req.Limit/4)
+				a.logger.Warn("cluster agent: placement page exceeded the response ceiling; retrying with a smaller page",
+					"limit", req.Limit, "page_token", req.PageToken)
+				continue
+			}
 			return nil, err
+		}
+		if len(resp.SkippedSandboxIDs) > 0 {
+			// A row too large to deliver at all leaves a hole. Callers make
+			// cleanup decisions from this view, so a hole must read as
+			// "unavailable" (cached fallback), never as "these placements are
+			// gone".
+			return nil, fmt.Errorf("cluster: control plane could not deliver %d placement row(s): %v",
+				len(resp.SkippedSandboxIDs), resp.SkippedSandboxIDs)
 		}
 		out = append(out, resp.Placements...)
 		if resp.NextPageToken == "" || len(resp.Placements) == 0 || resp.NextPageToken == req.PageToken {
@@ -1491,10 +1523,16 @@ func decodeControlPlaneJSON(r io.Reader, out any) error {
 		return err
 	}
 	if len(payload) > maxControlPlaneJSONResponseBytes {
-		return fmt.Errorf("cluster control-plane JSON response exceeds %d bytes", maxControlPlaneJSONResponseBytes)
+		return fmt.Errorf("%w: %d bytes", errControlPlaneResponseTooLarge, maxControlPlaneJSONResponseBytes)
 	}
 	return json.Unmarshal(payload, out)
 }
+
+// errControlPlaneResponseTooLarge is recognizable so a paged caller can ask
+// for a smaller page instead of giving up. A control plane running the
+// previous build pages by row count only, and row width is not bounded by the
+// row count, so the client has to be able to shrink its own request.
+var errControlPlaneResponseTooLarge = errors.New("cluster control-plane JSON response exceeds the size ceiling")
 
 // controlPlaneMembers returns the server-role peers this agent may send a
 // control-plane request to, in random order.

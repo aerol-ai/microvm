@@ -217,6 +217,14 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			attempts INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
+			-- Per-recipient provenance: node id -> RFC3339 time at which THAT
+			-- recipient's ciphertext copy was distributed. The row-wide
+			-- created_at cannot stand in for it: an upsert merges recipients
+			-- into an existing row and deliberately preserves the original
+			-- creation time, so a recipient added later would inherit the
+			-- older row's age. Storage-retirement attestations are fenced
+			-- against this map, one recipient at a time.
+			recipient_provenance_json TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (sandbox_id, incarnation_id)
 		);`,
 		// Terminal storage retirement (D5). A deletion obligation to a peer is
@@ -722,6 +730,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// Pre-hardening databases already have cluster_secrets, so its new fence
 		// must also be additive rather than relying on CREATE TABLE IF NOT EXISTS.
 		`ALTER TABLE cluster_secrets ADD COLUMN seal_generation INTEGER NOT NULL DEFAULT 0;`,
+		// Per-recipient copy provenance for the delete outbox (see the DDL).
+		// Rows written before this column fall back to the row-wide
+		// created_at, which is what the fence used to compare against.
+		`ALTER TABLE cluster_secret_delete_outbox ADD COLUMN recipient_provenance_json TEXT NOT NULL DEFAULT '';`,
 		// Protocol of an exposed port: "http" (Caddy HTTP reverse proxy,
 		// historical behavior), "tcp" (caddy-l4 listener at host_port), or
 		// "tls" (caddy-l4 SNI route on the shared TLS listener).
@@ -5010,7 +5022,34 @@ func applySecretRetirementInTx(ctx context.Context, tx *sql.Tx, rec ClusterSecre
 	if err != nil || parsed.IncarnationID == "" {
 		return errors.New("stage secret retirement: current incarnation_id is required")
 	}
-	return upsertSecretDeleteOutboxTx(ctx, tx, rec.SandboxID, parsed.IncarnationID, *rec.RetireRecipients, rec.Recipients, rec.SealGeneration, true)
+	// The retired recipients hold the PREVIOUS generation's ciphertext, which
+	// was distributed when that row was last written. Journalling "now" as
+	// their provenance would date every old copy to the moment its deletion
+	// was scheduled, which is exactly what makes a retirement attestation
+	// unable to tell an old disk from a reused node id.
+	copiedAt, err := clusterSecretCopiedAtTx(ctx, tx, rec.SandboxID, parsed.IncarnationID)
+	if err != nil {
+		return err
+	}
+	return upsertSecretDeleteOutboxTx(ctx, tx, rec.SandboxID, parsed.IncarnationID, *rec.RetireRecipients, rec.Recipients, rec.SealGeneration, true, copiedAt)
+}
+
+// clusterSecretCopiedAtTx returns when the sandbox's sealed row was last
+// written — the best durable evidence of when its recipients received their
+// copies. A missing row (already deleted) yields the zero time, which the
+// outbox reads as "as of now".
+func clusterSecretCopiedAtTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string) (time.Time, error) {
+	var updatedAt time.Time
+	err := tx.QueryRowContext(ctx, `
+		SELECT updated_at FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read cluster secret copy provenance: %w", err)
+	}
+	return updatedAt, nil
 }
 
 // applyPutOutboxInTx journals or clears put-outbox inside an open Put TX.
@@ -5394,7 +5433,14 @@ type SecretDeleteOutboxRecord struct {
 	SandboxID     string
 	IncarnationID string
 	Recipients    []string
-	Generation    int64
+	// RecipientCopiedAt is when each recipient's ciphertext copy was
+	// distributed. Recipients merged into an existing row keep their own
+	// timestamp, which is the whole point: the row-wide CreatedAt is
+	// preserved across merges and therefore describes the oldest obligation,
+	// not this one. Empty for rows written before the column existed;
+	// callers fall back to CreatedAt there.
+	RecipientCopiedAt map[string]time.Time
+	Generation        int64
 	// AwaitingPromotion prevents a staged reseal retirement from deleting the
 	// only usable old replica before Raft publishes the new generation.
 	AwaitingPromotion bool
@@ -5406,6 +5452,17 @@ type SecretDeleteOutboxRecord struct {
 // UpsertSecretDeleteOutbox journals deletion from recipients retired by a
 // reseal without deleting or tombstoning the active local generation.
 func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) error {
+	return s.UpsertSecretDeleteOutboxCopiedAt(ctx, sandboxID, incarnationID, recipients, generation, time.Time{})
+}
+
+// UpsertSecretDeleteOutboxCopiedAt is UpsertSecretDeleteOutbox with the
+// provenance of the copies being deleted. copiedAt is when THESE recipients
+// received the ciphertext this job deletes — not when the job was written.
+// The distinction is what lets a storage-retirement attestation discharge an
+// obligation for a copy that existed before the disk was destroyed, while
+// still refusing one for a copy handed to a reused node id afterwards. A zero
+// copiedAt means "as of now".
+func (s *Store) UpsertSecretDeleteOutboxCopiedAt(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64, copiedAt time.Time) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	recipients = secrets.NormalizeRecipients(recipients)
@@ -5423,7 +5480,7 @@ func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID, incarna
 		return fmt.Errorf("begin secret delete outbox: %w", err)
 	}
 	defer tx.Rollback()
-	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false); err != nil {
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false, copiedAt); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -5432,7 +5489,7 @@ func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID, incarna
 	return nil
 }
 
-func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string, recipients, protectedRecipients []string, generation int64, awaitingPromotion bool) error {
+func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string, recipients, protectedRecipients []string, generation int64, awaitingPromotion bool, copiedAt time.Time) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	incarnationID = strings.TrimSpace(incarnationID)
 	recipients = secrets.NormalizeRecipients(recipients)
@@ -5446,19 +5503,20 @@ func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID, inca
 		return errors.New("secret delete outbox generation must be positive")
 	}
 	var (
-		existingRaw   string
-		existingGen   int64
-		existingAwait int
-		createdAt     time.Time
+		existingRaw        string
+		existingProvenance string
+		existingGen        int64
+		existingAwait      int
+		createdAt          time.Time
 		// A stale merge may add a still-valid cleanup obligation, but it must
 		// never use its older view of the active recipient set to remove a peer
 		// from the newer generation's durable job.
 		applyProtectedRecipients = true
 	)
 	err := tx.QueryRowContext(ctx, `
-		SELECT recipients_json, generation, awaiting_promotion, created_at
+		SELECT recipients_json, recipient_provenance_json, generation, awaiting_promotion, created_at
 		FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND incarnation_id = ?
-	`, sandboxID, incarnationID).Scan(&existingRaw, &existingGen, &existingAwait, &createdAt)
+	`, sandboxID, incarnationID).Scan(&existingRaw, &existingProvenance, &existingGen, &existingAwait, &createdAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("read secret delete outbox for merge: %w", err)
 	}
@@ -5505,25 +5563,85 @@ func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID, inca
 	if createdAt.IsZero() {
 		createdAt = now
 	}
+	if copiedAt.IsZero() {
+		// No provenance supplied. If the sealed row is still here, its last
+		// write is when these recipients received their copies — a far better
+		// answer than "now", which would date every old copy to the moment
+		// its deletion happened to be scheduled. Once the row is gone (the
+		// usual case for a delete job) the caller's own copiedAt is the only
+		// source, and now is the conservative fallback.
+		fromRow, err := clusterSecretCopiedAtTx(ctx, tx, sandboxID, incarnationID)
+		if err != nil {
+			return err
+		}
+		copiedAt = fromRow
+		if copiedAt.IsZero() {
+			copiedAt = now
+		}
+	}
+	provenance, err := mergeSecretDeleteProvenance(existingProvenance, recipients, copiedAt.UTC())
+	if err != nil {
+		return err
+	}
 	awaiting := 0
 	if awaitingPromotion {
 		awaiting = 1
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO cluster_secret_delete_outbox
-			(sandbox_id, incarnation_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+			(sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
 		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET
 			recipients_json = excluded.recipients_json,
+			recipient_provenance_json = excluded.recipient_provenance_json,
 			generation = excluded.generation,
 			awaiting_promotion = excluded.awaiting_promotion,
 			attempts = 0,
 			updated_at = excluded.updated_at
-	`, sandboxID, incarnationID, string(raw), generation, awaiting, createdAt, now)
+	`, sandboxID, incarnationID, string(raw), provenance, generation, awaiting, createdAt, now)
 	if err != nil {
 		return fmt.Errorf("upsert secret delete outbox: %w", err)
 	}
 	return nil
+}
+
+// mergeSecretDeleteProvenance keeps each recipient's own copy timestamp and
+// stamps newly added recipients with copiedAt. Recipients that are no longer
+// owed anything drop out, so the map cannot outgrow the recipient list.
+func mergeSecretDeleteProvenance(existingRaw string, recipients []string, copiedAt time.Time) (string, error) {
+	existing := map[string]time.Time{}
+	if strings.TrimSpace(existingRaw) != "" {
+		if err := json.Unmarshal([]byte(existingRaw), &existing); err != nil {
+			return "", fmt.Errorf("decode secret delete outbox provenance: %w", err)
+		}
+	}
+	merged := make(map[string]time.Time, len(recipients))
+	for _, id := range recipients {
+		if at, ok := existing[id]; ok && !at.IsZero() {
+			merged[id] = at
+			continue
+		}
+		merged[id] = copiedAt
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("marshal secret delete outbox provenance: %w", err)
+	}
+	return string(out), nil
+}
+
+// decodeSecretDeleteProvenance reads the per-recipient copy times. A row
+// written before the column existed has none; the caller falls back to the
+// row-wide created_at, which is what the fence compared against before.
+func decodeSecretDeleteProvenance(raw string) (map[string]time.Time, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	out := map[string]time.Time{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("decode secret delete outbox provenance: %w", err)
+	}
+	return out, nil
 }
 
 // MarkSecretDeleteOutboxPromoted makes a staged retirement eligible after the
@@ -5583,6 +5701,13 @@ func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sa
 	`, sandboxID, incarnationID, now, generation); err != nil {
 		return 0, fmt.Errorf("tombstone cluster secret: %w", err)
 	}
+	// Read the copy provenance BEFORE the row goes away: these recipients
+	// received their ciphertext when this row was last written, not when the
+	// deletion was journalled.
+	copiedAt, err := clusterSecretCopiedAtTx(ctx, tx, sandboxID, incarnationID)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)); err != nil {
 		return 0, fmt.Errorf("delete cluster secrets: %w", err)
 	}
@@ -5592,7 +5717,7 @@ func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sa
 	`, sandboxID, incarnationID); err != nil {
 		return 0, fmt.Errorf("delete cluster secret put outbox: %w", err)
 	}
-	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false); err != nil {
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false, copiedAt); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -5641,13 +5766,13 @@ func (s *Store) GetSecretDeleteOutboxForIncarnation(ctx context.Context, sandbox
 		return nil, nil
 	}
 	row := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, incarnation_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
+		SELECT sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
 		WHERE sandbox_id = ? AND incarnation_id = ?
 	`, sandboxID, incarnationID)
 	var rec SecretDeleteOutboxRecord
-	var recipientsJSON string
-	if err := row.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	var recipientsJSON, provenanceJSON string
+	if err := row.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &provenanceJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -5658,6 +5783,11 @@ func (s *Store) GetSecretDeleteOutboxForIncarnation(ctx context.Context, sandbox
 			return nil, fmt.Errorf("decode secret delete outbox recipients: %w", err)
 		}
 	}
+	provenance, err := decodeSecretDeleteProvenance(provenanceJSON)
+	if err != nil {
+		return nil, err
+	}
+	rec.RecipientCopiedAt = provenance
 	return &rec, nil
 }
 
@@ -5953,7 +6083,7 @@ func (s *Store) listSecretDeleteOutbox(ctx context.Context, where string, args [
 		return nil, errors.New("secret delete outbox batch limit must be positive")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, incarnation_id, recipients_json, generation, awaiting_promotion, attempts, created_at, updated_at
+		SELECT sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at
 		FROM cluster_secret_delete_outbox
 		`+where+`
 		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
@@ -5966,8 +6096,8 @@ func (s *Store) listSecretDeleteOutbox(ctx context.Context, where string, args [
 	var out []SecretDeleteOutboxRecord
 	for rows.Next() {
 		var rec SecretDeleteOutboxRecord
-		var recipientsJSON string
-		if err := rows.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		var recipientsJSON, provenanceJSON string
+		if err := rows.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &provenanceJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if recipientsJSON != "" {
@@ -5975,6 +6105,11 @@ func (s *Store) listSecretDeleteOutbox(ctx context.Context, where string, args [
 				return nil, fmt.Errorf("decode secret delete outbox recipients for %q: %w", rec.SandboxID, err)
 			}
 		}
+		provenance, err := decodeSecretDeleteProvenance(provenanceJSON)
+		if err != nil {
+			return nil, fmt.Errorf("secret delete outbox %q: %w", rec.SandboxID, err)
+		}
+		rec.RecipientCopiedAt = provenance
 		out = append(out, rec)
 	}
 	return out, rows.Err()

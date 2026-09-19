@@ -109,7 +109,11 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 			recreator: r,
 			failures:  c.recreateFailures,
 			logger:    c.logger,
-			escalate:  func(ctx context.Context, id string, p Placement) { c.tryReassignStuckPlacement(ctx, id, p) },
+			escalate: func(ctx context.Context, id string, p Placement) {
+				// The local watcher keeps retrying on failure; the log in
+				// tryReassignStuckPlacement already carries the reason.
+				_ = c.tryReassignStuckPlacement(ctx, id, p)
+			},
 		}, id, p)
 	}
 }
@@ -190,42 +194,67 @@ func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id stri
 	}
 }
 
+// ErrNoReassignTarget reports that no live node other than the failing owner
+// can host the placement. The caller keeps retrying where it is rather than
+// orphaning a recoverable sandbox — but it must not be told the placement
+// moved, or it resets the failure counter that drives the escalation.
+var ErrNoReassignTarget = errors.New("cluster: no alternate node available for stuck placement")
+
 // tryReassignStuckPlacement asks the cluster to hand a stuck placement to a
-// different node. Excludes self from the candidate set — there's no point
-// re-electing the node that's been failing — and is a no-op if no other live
-// node can fit the spec (we keep retrying locally rather than orphan a
-// recoverable placement). The failure counter resets on a successful
-// reassign so the new owner gets a fresh window.
-func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Placement) {
+// different node. It excludes the node the placement is stuck ON — which is
+// the placement's current owner, NOT necessarily the node running this code.
+// The local watcher is the owner, so the two coincided; the worker RPC path
+// runs on a control-plane server, and excluding that server instead left the
+// failing worker in the candidate set. With the most free capacity it would
+// be chosen again and the RPC would report success, resetting the very
+// failure counter that asked for the move.
+//
+// Returns nil only when the FSM accepted a fenced ownership transition, so
+// the caller's "reassigned" bookkeeping reflects something that happened.
+func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Placement) error {
 	if !placementWantsFailoverRecreate(p) {
-		return
+		return ErrNoReassignTarget
 	}
-	target, ok := c.selectRecreationTarget(p, c.nodeID)
+	stuckOwner := strings.TrimSpace(p.OwnerNodeID)
+	if stuckOwner == "" {
+		// An orphaned placement has no owner to avoid; keep the old
+		// self-exclusion so a server that just failed it isn't re-elected.
+		stuckOwner = c.nodeID
+	}
+	target, ok := c.selectRecreationTarget(p, stuckOwner)
 	if !ok {
 		c.logger.Warn("cluster: no alternate node available for stuck placement; will keep retrying locally",
-			"sandbox_id", id)
-		return
+			"sandbox_id", id, "stuck_owner", stuckOwner)
+		return ErrNoReassignTarget
 	}
 	cmd := command{
-		Op:                    opReassign,
-		SandboxID:             id,
-		OwnerNodeID:           target.NodeID,
-		OwnerAPIURL:           target.APIURL,
-		OwnerDataPlaneHost:    target.DataPlaneHost,
-		ExpectedIncarnationID: strings.TrimSpace(p.IncarnationID),
-		ReassignCause:         reassignCauseFailover,
+		Op:                 opReassign,
+		SandboxID:          id,
+		OwnerNodeID:        target.NodeID,
+		OwnerAPIURL:        target.APIURL,
+		OwnerDataPlaneHost: target.DataPlaneHost,
+		// Fence BOTH axes through the mutation. opReassign preserves the
+		// incarnation, so the incarnation CAS alone cannot tell "still stuck
+		// on the owner I read" from "already moved to a new owner" — and a
+		// late escalation must not bounce a sandbox off the node that has
+		// just taken it over.
+		ExpectedIncarnationID:  strings.TrimSpace(p.IncarnationID),
+		ExpectedOwnerNodeID:    stuckOwner,
+		ExpectedOwnerNodeIDSet: true,
+		ReassignCause:          reassignCauseFailover,
 	}
 	if err := c.applyCommand(ctx, cmd); err != nil {
 		c.logger.Warn("cluster: reassign stuck placement failed; will retry on next tick",
 			"sandbox_id", id, "target", target.NodeID, "err", err)
-		return
+		return err
 	}
 	// The leader apply wrapper increments the metric only when its FSM reports
 	// a real transition. This acknowledgement is deliberately not used as the
 	// metric signal because this path can forward to a remote leader.
 	c.recreateFailures.clear(id)
 	c.logger.Warn("cluster: reassigned stuck placement to alternate owner",
-		"sandbox_id", id, "from", c.nodeID, "to", target.NodeID)
+		"sandbox_id", id, "from", stuckOwner, "to", target.NodeID)
+	return nil
 }
 
 // selectRecreationTarget picks a placement target for a failover recreate,

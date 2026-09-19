@@ -73,15 +73,23 @@ func (s *Service) CreateJSBundle(ctx context.Context, req models.CreateJSBundleR
 	if err != nil {
 		return nil, err
 	}
+	// Keep the replicated catalogue current so a cluster list answers from
+	// the control plane instead of asking every isolate-capable worker.
+	s.PublishJSBundleCatalog(ctx, owner)
 	return s.jsBundleView(digest, strings.TrimSpace(req.Name), bundle), nil
 }
 
 // ListJSBundles returns the caller's stored bundles.
 func (s *Service) ListJSBundles(ctx context.Context) ([]*models.JSBundle, error) {
+	return s.listJSBundlesForTenant(ownerRefForCreate(ctx))
+}
+
+// listJSBundlesForTenant is the tenant-scoped body of ListJSBundles, split out
+// so the catalogue publisher can read the same rows without a request context.
+func (s *Service) listJSBundlesForTenant(owner string) ([]*models.JSBundle, error) {
 	if s.isolateBundles == nil {
 		return nil, fmt.Errorf("js-bundles require the isolate runtime (SB_ENABLE_ISOLATE=true): %w", models.ErrRuntimeNotImplemented)
 	}
-	owner := ownerRefForCreate(ctx)
 	// Invert name pointers so each digest reports its alias (if any).
 	nameByDigest := make(map[string]string)
 	for name, d := range s.isolateBundles.NamesForTenant(owner) {
@@ -163,6 +171,9 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 		}
 		return err
 	}
+	// A publish REPLACES this node's slice, so a removed bundle disappears
+	// from the catalogue by republishing what is left.
+	s.PublishJSBundleCatalog(ctx, owner)
 	return nil
 }
 

@@ -187,6 +187,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalPlacementsByIDsPath, internalOp(http.HandlerFunc(h.clusterInternalPlacementsByIDs)))
 	mux.Handle("POST "+cluster.PublicInternalOwnedRecoveryPath, internalOp(http.HandlerFunc(h.clusterInternalOwnedRecovery)))
 	mux.Handle("POST "+cluster.PublicInternalReassignStuckPath, internalOp(http.HandlerFunc(h.clusterInternalReassignStuck)))
+	mux.Handle("GET "+cluster.PublicInternalNodeStorageRetirementsPath, internalOp(http.HandlerFunc(h.clusterInternalNodeStorageRetirements)))
+	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalog)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
 	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", internalOp(http.HandlerFunc(h.clusterInternalRecoveryGet)))
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, internalOp(http.HandlerFunc(h.clusterInternalSelectPlacement)))

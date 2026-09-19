@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -350,5 +351,204 @@ func TestSecretHolderPageWrapsWithCursor(t *testing.T) {
 		if seen[id] == 0 {
 			t.Fatalf("%s never visited across %d pages of 2", id, len(ids))
 		}
+	}
+}
+
+// resealingPlacementCluster holds the authoritative placement read open so
+// the test can land a reseal in that window — the same window
+// expandAndResealDeadSecretTargets runs in when a peer dies.
+type resealingPlacementCluster struct {
+	*blockingPlacementCluster
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *resealingPlacementCluster) AuthoritativePlacementsByIDs(ctx context.Context, ids []string) (map[string]cluster.Placement, error) {
+	c.once.Do(func() {
+		close(c.entered)
+		<-c.release
+	})
+	return c.blockingPlacementCluster.AuthoritativePlacementsByIDs(ctx, ids)
+}
+
+// A reseal advances the generation on the SAME *holderNodeSet and the reseal
+// path retires the old entry, so a refresh that captured the older generation
+// must not take the fresh state with it: neither by deleting the pointer it
+// still matches, nor by leaving the reseal's own write on a set that is no
+// longer in the map. Either way the confirmed ACKs and repair targets are
+// gone and no later refresh can visit them, because the entry it would visit
+// does not exist.
+func TestSecretHolderRefreshKeepsConcurrentlyResealedHolder(t *testing.T) {
+	const (
+		id  = "sb-resealed-mid-validation"
+		inc = "inc-resealed"
+	)
+	base := newBlockingPlacementCluster("node-a")
+	base.members = []cluster.Member{{NodeID: "node-a", Alive: true}, {NodeID: "node-b", Alive: true}}
+	base.placements[id] = cluster.Placement{
+		SandboxID: id, OwnerNodeID: "node-a", IncarnationID: inc,
+		SecretSealGeneration: 1, SecretRecipients: []string{"node-a", "node-b"},
+	}
+	cl := &resealingPlacementCluster{
+		blockingPlacementCluster: base,
+		entered:                  make(chan struct{}),
+		release:                  make(chan struct{}),
+	}
+
+	clearSecretFanoutHolders(id)
+	t.Cleanup(func() { clearSecretFanoutHolders(id) })
+	resetSecretHoldersForGeneration(id, inc, 1, "node-a")
+	setSecretHolderTargets(id, inc, 1, []string{"node-a", "node-b"})
+
+	svc := &Service{
+		cfg:                  config.Config{EnableCluster: true},
+		cluster:              cl,
+		testSecretPeerPusher: &fakePeerPusher{},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.refreshSecretHolderPossession(context.Background())
+	}()
+
+	<-cl.entered
+	// The reseal lands while the refresh's placement read is in flight: a new
+	// generation with its own freshly ACKed holders, on the same set.
+	base.mu.Lock()
+	p := base.placements[id]
+	p.SecretSealGeneration = 2
+	base.placements[id] = p
+	base.mu.Unlock()
+	resetSecretHoldersForGeneration(id, inc, 2, "node-a", "node-b")
+	setSecretHolderTargets(id, inc, 2, []string{"node-a", "node-b"})
+	close(cl.release)
+	<-done
+
+	v, ok := secretFanoutHolders.Load(secretHolderKey{sandboxID: id, incarnationID: inc})
+	if !ok {
+		t.Fatal("the reseal's holder state is not in the map; a verdict reached against generation 1 discarded generation 2's confirmed ACKs and repair targets")
+	}
+	hs := v.(*holderNodeSet)
+	hs.mu.Lock()
+	gen := hs.gen
+	holders := len(hs.nodes)
+	hs.mu.Unlock()
+	if gen != 2 {
+		t.Fatalf("live holder generation = %d, want 2 (the reseal's generation)", gen)
+	}
+	if holders == 0 {
+		t.Fatal("the reseal's confirmed holders were dropped")
+	}
+}
+
+// The generation fence itself: retiring on a verdict reached against an older
+// generation must leave a set that has since advanced in place alone, and
+// must still retire one that has not moved.
+func TestRetireSecretHolderEntryAtGenFencesOnGeneration(t *testing.T) {
+	const inc = "inc-fence"
+	for _, tc := range []struct {
+		name       string
+		verdictGen int64
+		liveGen    int64
+		wantGone   bool
+	}{
+		{name: "same generation retires", verdictGen: 1, liveGen: 1, wantGone: true},
+		{name: "advanced in place survives", verdictGen: 1, liveGen: 2, wantGone: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "sb-fence-" + tc.name
+			clearSecretFanoutHolders(id)
+			t.Cleanup(func() { clearSecretFanoutHolders(id) })
+			resetSecretHoldersForGeneration(id, inc, tc.liveGen, "node-a")
+
+			key := secretHolderKey{sandboxID: id, incarnationID: inc}
+			v, ok := secretFanoutHolders.Load(key)
+			if !ok {
+				t.Fatal("fixture did not create a holder set")
+			}
+			// The same pointer the page would have captured: resealing
+			// mutates this object rather than replacing it.
+			retireSecretHolderEntryAtGen(secretHolderEntry{key: key, hs: v.(*holderNodeSet)}, tc.verdictGen)
+
+			_, present := secretFanoutHolders.Load(key)
+			if tc.wantGone && present {
+				t.Fatal("entry survived a verdict reached against its own generation; stale holder state leaks")
+			}
+			if !tc.wantGone && !present {
+				t.Fatal("entry retired on a verdict reached against an older generation; the pointer CAS cannot tell the generations apart")
+			}
+		})
+	}
+}
+
+// A verdict that holds at every generation — the placement is gone — must
+// still retire the entry, or a deleted sandbox's holder state leaks forever.
+func TestSecretHolderRefreshRetiresDeletedPlacementAtAnyGeneration(t *testing.T) {
+	const (
+		id  = "sb-deleted-holder"
+		inc = "inc-deleted"
+	)
+	cl := newBlockingPlacementCluster("node-a")
+	cl.members = []cluster.Member{{NodeID: "node-a", Alive: true}, {NodeID: "node-b", Alive: true}}
+
+	clearSecretFanoutHolders(id)
+	t.Cleanup(func() { clearSecretFanoutHolders(id) })
+	resetSecretHoldersForGeneration(id, inc, 1, "node-a")
+	setSecretHolderTargets(id, inc, 1, []string{"node-a", "node-b"})
+
+	svc := &Service{
+		cfg:                  config.Config{EnableCluster: true, SecretRecipientBackupCount: 2},
+		cluster:              cl,
+		testSecretPeerPusher: &fakePeerPusher{},
+	}
+	svc.refreshSecretHolderPossession(context.Background())
+
+	if _, ok := secretFanoutHolders.Load(secretHolderKey{sandboxID: id, incarnationID: inc}); ok {
+		t.Fatal("holder state for a placement that no longer exists was kept; the generation fence must not block gone/deleting verdicts")
+	}
+}
+
+// Retirement removes the map entry while holding the set's mutex, so a writer
+// that resolved the pointer just before it must not end up recording ACKs on
+// a set nobody can read back.
+func TestHolderSetWriterFollowsRetirementToTheLiveSet(t *testing.T) {
+	const (
+		id  = "sb-retired-under-writer"
+		inc = "inc-retired"
+	)
+	clearSecretFanoutHolders(id)
+	t.Cleanup(func() { clearSecretFanoutHolders(id) })
+	resetSecretHoldersForGeneration(id, inc, 1, "node-a")
+
+	key := secretHolderKey{sandboxID: id, incarnationID: inc}
+	v, ok := secretFanoutHolders.Load(key)
+	if !ok {
+		t.Fatal("fixture did not create a holder set")
+	}
+	stale := v.(*holderNodeSet)
+
+	// Hold the set so the writer below parks on its mutex after it has
+	// already resolved this exact pointer — the window retirement runs in.
+	stale.mu.Lock()
+	wrote := make(chan struct{})
+	go func() {
+		defer close(wrote)
+		addSecretHolderNodes(id, inc, 1, "node-b")
+	}()
+	time.Sleep(20 * time.Millisecond)
+	retireHolderSetLocked(key, stale)
+	stale.mu.Unlock()
+	<-wrote
+
+	live, ok := secretFanoutHolders.Load(key)
+	if !ok {
+		t.Fatal("the ACK recorded across a retirement went to a set that is not reachable from the holder map")
+	}
+	if live.(*holderNodeSet) == stale {
+		t.Fatal("the retired set is still the live set")
+	}
+	if !slices.Contains(secretHolderNodeIDs(id, inc), "node-b") {
+		t.Fatal("the ACK recorded after retirement is invisible to readers")
 	}
 }

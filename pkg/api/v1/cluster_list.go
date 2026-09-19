@@ -269,13 +269,18 @@ func clusterPeerCanContribute(index clusterArtifactLocationIndex, m cluster.Memb
 
 // clusterRuntimePeers returns the eligible workers that can be asked now,
 // narrowed by the catalogue's location index.
-func clusterRuntimePeers(c cluster.Client, runtimeName string, index clusterArtifactLocationIndex, have map[string]struct{}) []cluster.Member {
+func clusterRuntimePeers(c cluster.Client, runtimeName string, index clusterArtifactLocationIndex, have map[string]struct{}, published map[string]struct{}) []cluster.Member {
 	if c == nil {
 		return nil
 	}
 	out := make([]cluster.Member, 0)
 	for _, m := range c.Members() {
 		if !clusterRuntimeMemberEligible(c, m, runtimeName) || !m.Alive || strings.TrimSpace(m.InternalURL) == "" {
+			continue
+		}
+		// A node whose metadata is already in the replicated catalogue has
+		// nothing to add: its rows are in the answer.
+		if _, covered := published[strings.TrimSpace(m.NodeID)]; covered {
 			continue
 		}
 		if !clusterPeerCanContribute(index, m, have) {
@@ -286,16 +291,27 @@ func clusterRuntimePeers(c cluster.Client, runtimeName string, index clusterArti
 	return out
 }
 
+// clusterArtifactCatalog reads the replicated metadata for this request's
+// catalogue: the rows themselves plus the nodes they cover. ok=false means
+// there is no catalogue to read (standalone, or the control plane could not
+// answer), and the sweep behaves exactly as it did before.
+type clusterArtifactCatalog[T any] func(*http.Request) (rows []T, publishers []string, ok bool)
+
 // clusterRuntimeUnavailablePeerCount counts eligible workers that cannot be
 // asked (dead or without an internal endpoint). They are reported as missing
 // coverage rather than pretended absent.
-func clusterRuntimeUnavailablePeerCount(c cluster.Client, runtimeName string, index clusterArtifactLocationIndex, have map[string]struct{}) int {
+func clusterRuntimeUnavailablePeerCount(c cluster.Client, runtimeName string, index clusterArtifactLocationIndex, have map[string]struct{}, published map[string]struct{}) int {
 	if c == nil {
 		return 0
 	}
 	count := 0
 	for _, m := range c.Members() {
 		if !clusterRuntimeMemberEligible(c, m, runtimeName) {
+			continue
+		}
+		// Its rows are in the catalogue, so a dead node is not missing
+		// coverage — we already have its metadata.
+		if _, covered := published[strings.TrimSpace(m.NodeID)]; covered {
 			continue
 		}
 		if !m.Alive || strings.TrimSpace(m.InternalURL) == "" {
@@ -396,7 +412,7 @@ func clusterListFromPeer[T any](parent *http.Request, c cluster.Client, peer clu
 func clusterListSweep[T any](r *http.Request, c cluster.Client, runtimeName, forwardedHeader string,
 	local []T, localErr error, key func(T) string, logger interface {
 		Warn(string, ...any)
-	}, what string, index clusterArtifactLocationIndex,
+	}, what string, index clusterArtifactLocationIndex, catalog clusterArtifactCatalog[T],
 ) (clusterListAggregate[T], error) {
 	if localErr != nil && logger != nil {
 		logger.Warn("cluster "+what+": local list failed", "err", localErr)
@@ -411,10 +427,36 @@ func clusterListSweep[T any](r *http.Request, c cluster.Client, runtimeName, for
 		seen[k] = struct{}{}
 		merged = append(merged, row)
 	}
+	// The replicated catalogue answers for every node that has published its
+	// inventory, so the sweep is left with the nodes nobody has metadata for
+	// — a set that empties as a rolling upgrade completes. Without it, a
+	// dense fleet costs one request per worker per uncached list, whatever
+	// the gossip location index says, because an entry node holds no rows of
+	// its own to narrow against.
+	published := map[string]struct{}{}
+	if catalog != nil {
+		rows, publishers, ok := catalog(r)
+		if ok {
+			for _, nodeID := range publishers {
+				published[strings.TrimSpace(nodeID)] = struct{}{}
+			}
+			for _, row := range rows {
+				k := key(row)
+				if k == "" {
+					continue
+				}
+				if _, dup := seen[k]; dup {
+					continue
+				}
+				seen[k] = struct{}{}
+				merged = append(merged, row)
+			}
+		}
+	}
 	// The local rows are known BEFORE the fan-out, so the location index can
 	// drop every peer that could only return rows this answer already holds.
-	peers := clusterRuntimePeers(c, runtimeName, index, seen)
-	unavailable := clusterRuntimeUnavailablePeerCount(c, runtimeName, index, seen)
+	peers := clusterRuntimePeers(c, runtimeName, index, seen, published)
+	unavailable := clusterRuntimeUnavailablePeerCount(c, runtimeName, index, seen, published)
 	successful := 0
 	for result := range clusterListFromPeers[T](r, c, peers, forwardedHeader) {
 		if result.err != nil {
@@ -460,4 +502,35 @@ func writeClusterListCoverage(w http.ResponseWriter, failedPeers int, missingHea
 		w.Header().Set("X-Aerol-Partial", "true")
 		w.Header().Set(missingHeader, fmt.Sprint(failedPeers))
 	}
+}
+
+// readClusterArtifactCatalog decodes the replicated metadata for one
+// catalogue into the list's own row type. A catalogue the control plane could
+// not answer for reads as "no catalogue", so the sweep falls back to asking
+// peers — never to reporting a tenant's artifacts as absent.
+func readClusterArtifactCatalog[T any](r *http.Request, svc clusterArtifactCatalogService, kind, tenant string) ([]T, []string, bool) {
+	if svc == nil || r == nil {
+		return nil, nil, false
+	}
+	page, ok := svc.ClusterArtifactCatalog(r.Context(), kind, tenant)
+	if !ok {
+		return nil, nil, false
+	}
+	rows := make([]T, 0, len(page.Rows))
+	for _, row := range page.Rows {
+		var decoded T
+		if err := json.Unmarshal(row.Payload, &decoded); err != nil {
+			// A row this build cannot read is not a reason to drop the whole
+			// catalogue, but its publisher must still be asked directly.
+			continue
+		}
+		rows = append(rows, decoded)
+	}
+	return rows, page.Publishers, true
+}
+
+// clusterArtifactCatalogService is the service capability the readers need,
+// declared here so the handlers stay testable with a stub.
+type clusterArtifactCatalogService interface {
+	ClusterArtifactCatalog(ctx context.Context, kind, tenant string) (cluster.ArtifactCatalogPage, bool)
 }

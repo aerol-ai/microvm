@@ -95,8 +95,13 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 
 	aggregate, err := h.templateLists.cached(r, func(req *http.Request) (clusterListAggregate[*models.Template], error) {
 		local, localErr := h.deps.Service.ListTemplates(req.Context())
+		// Register this node's slice of the catalogue from the rows already
+		// read, so the fleet converges off the fan-out instead of staying on
+		// it. Debounced; a steady inventory writes nothing.
+		h.deps.Service.PublishTemplateCatalogRows(req.Context(), local)
 		return clusterListSweep(req, c, models.RuntimeFirecracker, clusterTemplateForwardedHeader,
-			local, localErr, templateListKey, h.deps.Logger, "templates", clusterTemplateLocationIndex)
+			local, localErr, templateListKey, h.deps.Logger, "templates", clusterTemplateLocationIndex,
+			h.templateCatalogReader())
 	})
 	if err != nil {
 		writeClusterListError(h.deps.Logger, w, err)
@@ -104,6 +109,14 @@ func (h *handlers) clusterListTemplatesWrap(w http.ResponseWriter, r *http.Reque
 	}
 	writeClusterListCoverage(w, aggregate.failedPeers, "X-Aerol-Missing-Template-Peers")
 	apihttp.WriteJSON(w, http.StatusOK, aggregate.rows)
+}
+
+// templateCatalogReader reads the replicated template metadata. Templates are
+// not tenant-scoped, so the catalogue key carries the empty tenant.
+func (h *handlers) templateCatalogReader() clusterArtifactCatalog[*models.Template] {
+	return func(req *http.Request) ([]*models.Template, []string, bool) {
+		return readClusterArtifactCatalog[*models.Template](req, h.deps.Service, cluster.ArtifactKindTemplate, "")
+	}
 }
 
 func templateListKey(tpl *models.Template) string {
@@ -310,6 +323,10 @@ func (h *handlers) listTemplates(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// This is also the path a peer's sweep hits, so it is where a node that
+	// is still being asked directly registers its slice of the replicated
+	// catalogue and stops being asked.
+	h.deps.Service.PublishTemplateCatalogRows(r.Context(), templates)
 	apihttp.WriteJSON(w, http.StatusOK, templates)
 }
 

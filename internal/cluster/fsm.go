@@ -46,6 +46,9 @@ const (
 	opPruneAuditACL          opCode = 19 // bounded-retention cleanup for post-delete owner ACLs
 	opUpdateSecretRecipients opCode = 20 // replace Placement.SecretRecipients (+ optional secret handle) without touching ownership/incarnation
 	opBeginDelete            opCode = 21 // freeze one exact owner/lifecycle before irreversible finalization
+	opRetireNodeStorage      opCode = 22 // operator attestation that a node's storage was destroyed
+	opRevokeNodeStorage      opCode = 23 // withdraw such an attestation
+	opPublishArtifactCatalog opCode = 24 // replace one node's slice of a template / JS-bundle catalogue
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -106,6 +109,19 @@ type command struct {
 	// command (not read from node config) so every replica evicts identically;
 	// zero means the compiled-in default.
 	AuditIndexMax int64 `json:"audit_index_max,omitempty"`
+	// ArtifactKind/ArtifactTenant/ArtifactRows carry one node's published
+	// slice of a template or JS-bundle catalogue (see artifact_catalog.go).
+	// NodeID names the publisher. Replicating this metadata is what turns a
+	// fleet-wide list fan-out into a local read.
+	ArtifactKind   string               `json:"artifact_kind,omitempty"`
+	ArtifactTenant string               `json:"artifact_tenant,omitempty"`
+	ArtifactRows   []ArtifactCatalogRow `json:"artifact_rows,omitempty"`
+	// StorageRetirement carries the operator attestation for
+	// opRetireNodeStorage (NodeID names the attested node). Deletion
+	// obligations live on whichever node owns them, so the attestation has to
+	// be replicated administrative metadata rather than a row on whichever
+	// node the operator's request happened to reach.
+	StorageRetirement *NodeStorageRetirement `json:"storage_retirement,omitempty"`
 	// NodeID + Drained are populated by opSetNodeDrainState. NodeID is the
 	// target of the drain mark; Drained is the desired state (true = exclude
 	// from SelectPlacement, false = uncordon). All other ops leave them zero.
@@ -385,6 +401,19 @@ type placementFSM struct {
 	// no-drains steady state; cleared rows are deleted so the map size tracks
 	// active drains, not historical ones.
 	drainedNodes map[string]bool
+
+	// storageRetirements holds operator attestations that a node's storage was
+	// destroyed, keyed by node id. Bounded by the number of nodes an operator
+	// has ever decommissioned. It lives here, not in a node-local table,
+	// because the nodes that hold the deletion obligations an attestation
+	// discharges are never the node the operator's API call reached.
+	storageRetirements map[string]NodeStorageRetirement
+
+	// artifactCatalog is the replicated template / JS-bundle metadata,
+	// keyed by (kind, tenant) and then by publishing node. See
+	// artifact_catalog.go for why it exists and what it deliberately does
+	// not put in gossip.
+	artifactCatalog map[string]map[string]artifactCatalogEntry
 	// customHostnameIndex maps a canonical (lower-case, trimmed) hostname to
 	// the sandbox ID currently holding it. This is the cluster-wide TLS-ask
 	// answer source — ingress nodes that don't own a sandbox themselves can
@@ -495,6 +524,8 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		reservedIndex:                make(map[string]struct{}),
 		deletingIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
+		storageRetirements:           make(map[string]NodeStorageRetirement),
+		artifactCatalog:              make(map[string]map[string]artifactCatalogEntry),
 		customHostnameIndex:          make(map[string]string),
 		auditACLs:                    make(map[string]AuditACL),
 		auditACLLatest:               make(map[string]string),
@@ -1043,6 +1074,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
 			return fmt.Errorf("%w: reassign want %q have %q", ErrIncarnationConflict, expectedIncarnationID, existing.IncarnationID)
 		}
+		// Owner fence. opReassign PRESERVES the incarnation, so the
+		// incarnation CAS above cannot tell a placement that is still stuck
+		// on the owner the caller read from one that has already been moved.
+		// Commands written before this fence existed carry no expectation
+		// (the ...Set flag is false) and stay replay-safe.
+		if cmd.ExpectedOwnerNodeIDSet {
+			expectedOwnerNodeID := strings.TrimSpace(cmd.ExpectedOwnerNodeID)
+			if strings.TrimSpace(existing.OwnerNodeID) != expectedOwnerNodeID {
+				return fmt.Errorf("%w: reassign owner want %q have %q", ErrStuckReassignNotOwner, expectedOwnerNodeID, existing.OwnerNodeID)
+			}
+		}
 		if existing.IsDeleting() {
 			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 		}
@@ -1460,6 +1502,64 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		} else {
 			delete(f.drainedNodes, cmd.NodeID)
 		}
+		return nil
+	case opPublishArtifactCatalog:
+		// A publish REPLACES that node's slice, so a delete is expressed by
+		// republishing without the row. Rows from other nodes are untouched:
+		// two nodes holding the same artifact both keep their entry, and the
+		// reader dedupes by id.
+		kind := strings.TrimSpace(cmd.ArtifactKind)
+		nodeID := strings.TrimSpace(cmd.NodeID)
+		if kind == "" || nodeID == "" {
+			return fmt.Errorf("placementFSM: opPublishArtifactCatalog requires kind and node_id")
+		}
+		if len(cmd.ArtifactRows) > maxArtifactCatalogRowsPerNode {
+			return fmt.Errorf("placementFSM: opPublishArtifactCatalog carries %d rows, over the %d cap", len(cmd.ArtifactRows), maxArtifactCatalogRowsPerNode)
+		}
+		key := artifactCatalogKey(kind, cmd.ArtifactTenant)
+		if f.artifactCatalog == nil {
+			f.artifactCatalog = make(map[string]map[string]artifactCatalogEntry)
+		}
+		byNode := f.artifactCatalog[key]
+		if byNode == nil {
+			byNode = make(map[string]artifactCatalogEntry)
+			f.artifactCatalog[key] = byNode
+		}
+		entry := artifactCatalogEntry{Rows: make(map[string]ArtifactCatalogRow, len(cmd.ArtifactRows))}
+		for _, row := range cmd.ArtifactRows {
+			id := strings.TrimSpace(row.ID)
+			if id == "" || len(row.Payload) > maxArtifactCatalogRowBytes {
+				continue
+			}
+			entry.Rows[id] = ArtifactCatalogRow{ID: id, Payload: row.Payload}
+		}
+		byNode[nodeID] = entry
+		return nil
+	case opRetireNodeStorage:
+		// Idempotent: re-attesting the same node replaces the record rather
+		// than adding a second. Recorded with the attestation time the leader
+		// stamped, so every replica agrees on the fence the discharge rule
+		// compares against.
+		nodeID := strings.TrimSpace(cmd.NodeID)
+		if nodeID == "" {
+			return fmt.Errorf("placementFSM: opRetireNodeStorage requires node_id")
+		}
+		if cmd.StorageRetirement == nil {
+			return fmt.Errorf("placementFSM: opRetireNodeStorage requires the attestation")
+		}
+		if f.storageRetirements == nil {
+			f.storageRetirements = make(map[string]NodeStorageRetirement)
+		}
+		rec := *cmd.StorageRetirement
+		rec.NodeID = nodeID
+		f.storageRetirements[nodeID] = rec
+		return nil
+	case opRevokeNodeStorage:
+		nodeID := strings.TrimSpace(cmd.NodeID)
+		if nodeID == "" {
+			return fmt.Errorf("placementFSM: opRevokeNodeStorage requires node_id")
+		}
+		delete(f.storageRetirements, nodeID)
 		return nil
 	case opUpsertVolume:
 		// Idempotent get-or-create. A duplicate create (same tenant+name)
@@ -2585,8 +2685,32 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 		ids = ids[:req.Limit]
 	}
 	out := make([]Placement, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, cloneHotPlacement(f.placements[id]))
+	var skipped []string
+	budget := placementPageByteBudget
+	trimmed := false
+	for i, id := range ids {
+		row := cloneHotPlacement(f.placements[id])
+		size := encodedPlacementSize(row)
+		if size > budget && len(out) == 0 {
+			// One row alone does not fit. Skipping it is the only way the
+			// walk can progress; naming it is what keeps the caller from
+			// reading the hole as "this placement is gone".
+			skipped = append(skipped, id)
+			continue
+		}
+		if size > budget {
+			// Stop here and let the cursor carry the rest. The row count is
+			// a poor proxy for the response size: route metadata, including
+			// up to models.MaxCustomDomainsPerSandbox custom hostnames, lives
+			// in these hot rows, so a full page of valid wide rows encodes
+			// past the 16 MiB ceiling and the whole read fails.
+			ids = ids[:i]
+			hasMore = true
+			trimmed = true
+			break
+		}
+		budget -= size
+		out = append(out, row)
 	}
 	next := ""
 	// Only emit a cursor when a later ID exists — exact limit boundaries
@@ -2594,7 +2718,31 @@ func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResp
 	if hasMore && len(ids) > 0 {
 		next = ids[len(ids)-1]
 	}
-	return PlacementPageResponse{Placements: out, NextPageToken: next, Authoritative: true}
+	if trimmed && next == "" && len(out) > 0 {
+		// Defensive: a trim must always leave a cursor, or the rows behind it
+		// are unreachable.
+		next = out[len(out)-1].SandboxID
+	}
+	return PlacementPageResponse{Placements: out, NextPageToken: next, Authoritative: true, SkippedSandboxIDs: skipped}
+}
+
+// placementPageByteBudget keeps one page inside the agent's JSON response
+// ceiling (maxControlPlaneJSONResponseBytes) with room for the envelope and
+// for encoders that are less compact than encodedPlacementSize measures.
+const placementPageByteBudget = 12 << 20
+
+// encodedPlacementSize is the row's JSON cost, plus one byte for the comma.
+// Marshalling twice (once here, once in the handler) is the price of a real
+// byte budget; estimating from field lengths silently under-counts the moment
+// a field is added.
+func encodedPlacementSize(p Placement) int {
+	b, err := json.Marshal(p)
+	if err != nil {
+		// Unmeasurable rows are charged the whole budget so they cannot
+		// smuggle an oversized response past the check.
+		return placementPageByteBudget + 1
+	}
+	return len(b) + 1
 }
 
 func (f *placementFSM) pagePlacementIDsLocked(req PlacementPageRequest, shardFilter PlacementShardFilter, allShards bool, wantShards map[int]struct{}) []string {
@@ -2752,6 +2900,23 @@ func (f *placementFSM) pagePlacementIDsFromTreeLocked(req PlacementPageRequest, 
 	return ids
 }
 
+// nodeStorageRetirementsSnapshot copies the attestation set. Callers compare
+// obligation provenance against these times, so they must not hold the FSM
+// lock while doing it.
+func (f *placementFSM) nodeStorageRetirementsSnapshot() []NodeStorageRetirement {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if len(f.storageRetirements) == 0 {
+		return nil
+	}
+	out := make([]NodeStorageRetirement, 0, len(f.storageRetirements))
+	for _, rec := range f.storageRetirements {
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
 // isNodeDrained reports whether nodeID has been marked drained via
 // opSetNodeDrainState. SelectPlacement reads this to filter the candidate set;
 // callers outside placement scoring can use it for observability (e.g. the
@@ -2833,6 +2998,13 @@ type fsmSnapshotPayload struct {
 	// snapshots decode it as nil and the FSM treats that as "no volumes."
 	Volumes           []models.Volume
 	VolumeAttachments []models.VolumeAttachment
+	// StorageRetirements is the operator attestation set. Optional; older
+	// snapshots decode it as nil and the FSM treats that as "none".
+	StorageRetirements map[string]NodeStorageRetirement
+	// ArtifactCatalog is the replicated template / JS-bundle metadata.
+	// Optional; an older snapshot decodes it as nil, which reads as "nobody
+	// has published", and the list path falls back to the fan-out.
+	ArtifactCatalog map[string]map[string]artifactCatalogEntry
 }
 
 type placementSnapshotRow struct {
@@ -2863,15 +3035,33 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	for id, acl := range f.auditACLs {
 		auditACLs[id] = cloneAuditACL(acl)
 	}
+	retirements := make(map[string]NodeStorageRetirement, len(f.storageRetirements))
+	for id, rec := range f.storageRetirements {
+		retirements[id] = rec
+	}
+	catalog := make(map[string]map[string]artifactCatalogEntry, len(f.artifactCatalog))
+	for key, byNode := range f.artifactCatalog {
+		copied := make(map[string]artifactCatalogEntry, len(byNode))
+		for nodeID, entry := range byNode {
+			rows := make(map[string]ArtifactCatalogRow, len(entry.Rows))
+			for id, row := range entry.Rows {
+				rows[id] = row
+			}
+			copied[nodeID] = artifactCatalogEntry{Rows: rows}
+		}
+		catalog[key] = copied
+	}
 	return &fsmSnapshot{
-		version:           version,
-		rows:              rows,
-		drainedNodes:      drained,
-		auditACLs:         auditACLs,
-		volumes:           f.volumesSnapshotLocked(),
-		volumeAttachments: f.volumeAttachmentsSnapshotLocked(),
-		recoveryStore:     f.recoveryStore,
-		recoveryRefs:      recoveryRefs,
+		version:            version,
+		rows:               rows,
+		drainedNodes:       drained,
+		storageRetirements: retirements,
+		artifactCatalog:    catalog,
+		auditACLs:          auditACLs,
+		volumes:            f.volumesSnapshotLocked(),
+		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
+		recoveryStore:      f.recoveryStore,
+		recoveryRefs:       recoveryRefs,
 	}, nil
 }
 
@@ -3036,18 +3226,31 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	} else {
 		f.drainedNodes = payload.DrainedNodes
 	}
+	// Snapshots written before storage retirement existed carry none.
+	if payload.StorageRetirements == nil {
+		f.storageRetirements = make(map[string]NodeStorageRetirement)
+	} else {
+		f.storageRetirements = payload.StorageRetirements
+	}
+	if payload.ArtifactCatalog == nil {
+		f.artifactCatalog = make(map[string]map[string]artifactCatalogEntry)
+	} else {
+		f.artifactCatalog = payload.ArtifactCatalog
+	}
 	return nil
 }
 
 type fsmSnapshot struct {
-	version           uint64
-	rows              []placementSnapshotRow
-	drainedNodes      map[string]bool
-	auditACLs         map[string]AuditACL
-	volumes           []models.Volume
-	volumeAttachments []models.VolumeAttachment
-	recoveryStore     placementRecoveryStore
-	recoveryRefs      []string
+	version            uint64
+	rows               []placementSnapshotRow
+	drainedNodes       map[string]bool
+	storageRetirements map[string]NodeStorageRetirement
+	artifactCatalog    map[string]map[string]artifactCatalogEntry
+	auditACLs          map[string]AuditACL
+	volumes            []models.Volume
+	volumeAttachments  []models.VolumeAttachment
+	recoveryStore      placementRecoveryStore
+	recoveryRefs       []string
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
@@ -3058,12 +3261,14 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 	}()
 	enc := gob.NewEncoder(counting)
 	if err := enc.Encode(fsmSnapshotPayload{
-		Version:           s.version,
-		Rows:              s.rows,
-		DrainedNodes:      s.drainedNodes,
-		AuditACLs:         s.auditACLs,
-		Volumes:           s.volumes,
-		VolumeAttachments: s.volumeAttachments,
+		Version:            s.version,
+		Rows:               s.rows,
+		DrainedNodes:       s.drainedNodes,
+		StorageRetirements: s.storageRetirements,
+		ArtifactCatalog:    s.artifactCatalog,
+		AuditACLs:          s.auditACLs,
+		Volumes:            s.volumes,
+		VolumeAttachments:  s.volumeAttachments,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

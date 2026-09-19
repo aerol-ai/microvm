@@ -237,23 +237,34 @@ membership disappearance is never treated as cleanup success.
 **Terminal storage retirement (implemented).** A deletion obligation is
 discharged by exactly two things: an authenticated generation-scoped DELETE
 ACK, or an operator's explicit attestation that the node's storage was
-destroyed. Gossip absence and TTLs are still never accepted. The attestation
-is recorded in `node_storage_retirements` and is:
+destroyed. Gossip absence and TTLs are still never accepted. In cluster mode
+the attestation lives in the replicated placement FSM (standalone keeps the
+local `node_storage_retirements` table) and is:
 
 - **identity-exact** — it names one node ID; nothing is inferred;
-- **time-fenced** — it discharges only obligations that already existed when
-  it was made, because node IDs are operator-chosen and reusable, so an
-  obligation journalled afterwards belongs to a different physical node and
-  must still be ACK'd;
+- **cluster-wide** — the obligations it discharges live in the delete outbox
+  of whichever node owns the secret, and an operator's request lands on an
+  arbitrary entry node, so the record is replicated administrative metadata
+  rather than a row on the node that served the call. Workers and ingress read
+  it from the server tier; an unreachable control plane leaves obligations
+  pending rather than reading as "no attestations";
+- **fenced per recipient by copy provenance** — a recipient's obligation is
+  discharged only when THAT recipient's ciphertext copy was distributed before
+  the attestation. The delete outbox carries a per-recipient timestamp for
+  exactly this: an upsert merges recipients into an existing row and preserves
+  its creation time, so a row-wide fence both discharges obligations created
+  after the attestation (a reused node id) and pins copies that predate the
+  destruction but were journalled after it;
 - **self-revoking** — a node that is alive again can ACK, so the maintenance
   tick withdraws its attestation and its obligations become pending once more;
 - **refused for live nodes**, and operator-only
   (`POST|DELETE /v1/cluster/nodes/{id}/storage-retired`,
   `GET /v1/cluster/storage-retirements`);
-- **audited** with its own reason (`storage_retired`), so the evidence never
-  claims the holder confirmed deletion when an operator attested instead, and
-  `aerolvm_secret_obligations_storage_retired_total` makes unconfirmed
-  deletions visible.
+- **audited before it is acted on** with its own reason (`storage_retired`):
+  the obligation is what brings a failed discharge back for another attempt,
+  so a durable-sink write that fails RETAINS the recipient rather than closing
+  it with only a log line. `aerolvm_secret_obligations_storage_retired_total`
+  counts what was actually journalled.
 
 Permanent loss therefore no longer retains outbox rows indefinitely, and the
 discharge path is an authenticated, evidence-producing act rather than a

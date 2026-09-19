@@ -338,10 +338,15 @@ func TestBootVerifyCheckpointSurvivesTornTailAndRetention(t *testing.T) {
 	if second.secretAuditInitErr != nil || f.bootRepair == nil || f.bootTrusted != cp.Offset {
 		t.Fatalf("torn tail after checkpoint: err=%v repair=%+v trusted=%d", second.secretAuditInitErr, f.bootRepair, f.bootTrusted)
 	}
-	if secretAuditFullScans.Load() != scans {
-		t.Fatal("torn-tail repair after a checkpoint read the whole file")
-	}
+	// secretAuditFullScans is global and the checkpoint boot above already
+	// started its background proof pass, so the delta is only stable once
+	// that pass has finished. Exactly one full scan means the boot path
+	// itself read only the tail — sampling before the Wait races the
+	// goroutine this boot deliberately spawned.
 	second.secretAuditBootVerify.Wait()
+	if got := secretAuditFullScans.Load() - scans; got != 1 {
+		t.Fatalf("torn-tail repair after a checkpoint made %d full passes (want exactly the background one)", got)
+	}
 	if second.secretAuditChainBroken.Load() {
 		t.Fatal("repaired chain reported broken")
 	}
@@ -375,10 +380,13 @@ func TestBootVerifyCheckpointSurvivesTornTailAndRetention(t *testing.T) {
 	scans = secretAuditFullScans.Load()
 	third := bootVerifyService(t, dbPath, secretAuditBootVerifyCheckpoint, nil)
 	third.ensureSecretAuditSink()
-	if third.secretAuditInitErr != nil || third.secretAuditFile.bootTrusted == 0 || secretAuditFullScans.Load() != scans {
-		t.Fatalf("boot after prune: err=%v trusted=%d passes=%d", third.secretAuditInitErr, third.secretAuditFile.bootTrusted, secretAuditFullScans.Load()-scans)
+	if third.secretAuditInitErr != nil || third.secretAuditFile.bootTrusted == 0 {
+		t.Fatalf("boot after prune: err=%v trusted=%d", third.secretAuditInitErr, third.secretAuditFile.bootTrusted)
 	}
 	third.secretAuditBootVerify.Wait()
+	if got := secretAuditFullScans.Load() - scans; got != 1 {
+		t.Fatalf("boot after prune made %d full passes (want exactly the background one)", got)
+	}
 	if third.secretAuditChainBroken.Load() {
 		t.Fatal("pruned chain reported broken")
 	}

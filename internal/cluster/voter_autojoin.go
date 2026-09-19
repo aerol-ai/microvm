@@ -73,9 +73,64 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 		// Metadata hasn't propagated yet. The reconcile loop will catch this.
 		return
 	}
+	// Fast path, deliberately outside the membership lock: reconcileVoters
+	// re-offers every gossip member every 5s, so a 2000-node fleet's steady
+	// state must not queue behind a mutex that a raft round can hold for
+	// commitTimeout.
+	if c.memberJoinSettled(nodeID, raftAddr) {
+		return
+	}
+	c.raftMembershipMu.Lock()
+	defer c.raftMembershipMu.Unlock()
+	c.applyMemberJoinLocked(nodeID, raftAddr)
+}
+
+// memberJoinSettled reports whether nodeID is already configured the way
+// applyMemberJoinLocked would leave it, so the caller can skip the lock. It
+// mirrors the no-op branches of applyMemberJoinLocked exactly; anything it
+// gets wrong costs one extra locked re-check, never a wrong membership.
+func (c *Cluster) memberJoinSettled(nodeID, raftAddr string) bool {
+	srv, ok := c.configuredServer(nodeID)
+	if !ok {
+		return false
+	}
+	if string(srv.Address) != raftAddr {
+		return false
+	}
+	if srv.Suffrage == raft.Voter {
+		return !c.peerForcedNonVoter(nodeID)
+	}
+	return c.peerForcedNonVoter(nodeID) || c.voterCapReached()
+}
+
+// applyMemberJoinLocked decides and performs the membership mutation for
+// nodeID. It must run under raftMembershipMu, which every membership mutation
+// on this node takes: the replica budget is counted from the same
+// configuration read the mutation is then applied to, and the AddVoter/
+// AddNonvoter future only returns once the configuration entry is committed,
+// so the next caller counts it. Serializing the check with the mutation is
+// what makes the budget a bound rather than a suggestion — with a per-join
+// goroutine, an unsynchronized count admits every concurrent joiner.
+//
+// raft's own compare-and-set (the prevIndex argument) cannot carry this:
+// hashicorp/raft v1.7.3 builds the GetConfiguration future without
+// latestIndex, so Index() is always 0 and passing it would mean "match any
+// configuration". The lock is the whole guarantee, which is why RemoveServer
+// takes it too.
+func (c *Cluster) applyMemberJoinLocked(nodeID, raftAddr string) {
+	cfgFuture := c.raft.raft.GetConfiguration()
+	if err := cfgFuture.Error(); err != nil {
+		// Refuse rather than admit blind — the 5s reconcile loop retries, and
+		// an unadmitted server is recoverable while an over-replicated log is
+		// not.
+		c.logger.Warn("cluster: could not read raft configuration for member join; will retry on next reconcile",
+			"node_id", nodeID, "raft_addr", raftAddr, "err", err)
+		return
+	}
+	servers := cfgFuture.Configuration().Servers
 	nonVoterByRole := c.peerForcedNonVoter(nodeID)
 
-	if srv, ok := c.configuredServer(nodeID); ok {
+	if srv, ok := findConfiguredServer(servers, nodeID); ok {
 		// Already a replica. Address and suffrage corrections are not new
 		// state carriers, so the replica budget does not apply to them.
 		if srv.Suffrage == raft.Voter {
@@ -89,7 +144,7 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 			c.addMemberAsVoter(nodeID, raftAddr)
 			return
 		}
-		if nonVoterByRole || c.voterCapReached() {
+		if nonVoterByRole || voterCountFrom(servers) >= c.maxAutoVoters() {
 			if string(srv.Address) == raftAddr {
 				return
 			}
@@ -107,16 +162,44 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 	// node is already receiving. The daemon also starts the cluster before it
 	// checks topology, and an open-source topology violation logs and
 	// continues — so admission is the only enforcement point that holds.
-	if c.raftReplicaAdmissionBlocked(nodeID) {
+	if budget := c.raftReplicaBudget(); budget > 0 && c.replicaCountFrom(servers, nodeID) >= budget {
 		c.logReplicaBudgetRefusal(nodeID, raftAddr)
 		return
 	}
 
-	if nonVoterByRole || c.voterCapReached() {
+	if nonVoterByRole || voterCountFrom(servers) >= c.maxAutoVoters() {
 		c.addMemberAsNonvoter(nodeID, raftAddr)
 		return
 	}
 	c.addMemberAsVoter(nodeID, raftAddr)
+}
+
+func findConfiguredServer(servers []raft.Server, nodeID string) (raft.Server, bool) {
+	for _, srv := range servers {
+		if string(srv.ID) == nodeID {
+			return srv, true
+		}
+	}
+	return raft.Server{}, false
+}
+
+func voterCountFrom(servers []raft.Server) int {
+	count := 0
+	for _, srv := range servers {
+		if srv.Suffrage == raft.Voter {
+			count++
+		}
+	}
+	return count
+}
+
+// maxAutoVoters returns the voter cap, normalized so "no cap configured"
+// compares as unreachable instead of as zero.
+func (c *Cluster) maxAutoVoters() int {
+	if c.cfg.ClusterMaxAutoVoters <= 0 {
+		return int(^uint(0) >> 1)
+	}
+	return c.cfg.ClusterMaxAutoVoters
 }
 
 // raftReplicaBudget is how many state-carrying raft replicas this cluster may
@@ -175,9 +258,17 @@ func (c *Cluster) currentReplicaCount(exclude string) (int, bool) {
 	if err := cfg.Error(); err != nil {
 		return 0, false
 	}
+	return c.replicaCountFrom(cfg.Configuration().Servers, exclude), true
+}
+
+// replicaCountFrom counts state-carrying replicas in an already-read
+// configuration. applyMemberJoinLocked needs the count and the mutation to
+// share one read, so the counting rule lives here rather than behind another
+// GetConfiguration call.
+func (c *Cluster) replicaCountFrom(servers []raft.Server, exclude string) int {
 	dead := c.deadGossipNodeIDs()
 	count := 0
-	for _, srv := range cfg.Configuration().Servers {
+	for _, srv := range servers {
 		id := string(srv.ID)
 		if id == exclude {
 			continue
@@ -187,7 +278,7 @@ func (c *Cluster) currentReplicaCount(exclude string) (int, bool) {
 		}
 		count++
 	}
-	return count, true
+	return count
 }
 
 func (c *Cluster) deadGossipNodeIDs() map[string]struct{} {
@@ -272,6 +363,9 @@ func isForcedNonVoterRole(role string) bool {
 	return hasKnown
 }
 
+// addMemberAsVoter appends the voter configuration entry. Callers hold
+// raftMembershipMu so the budget decision and this mutation cannot interleave
+// with another membership change.
 func (c *Cluster) addMemberAsVoter(nodeID, raftAddr string) {
 	f := c.raft.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, c.commitTimeout)
 	if err := f.Error(); err != nil {
@@ -283,6 +377,8 @@ func (c *Cluster) addMemberAsVoter(nodeID, raftAddr string) {
 		"node_id", nodeID, "raft_addr", raftAddr)
 }
 
+// addMemberAsNonvoter appends the non-voter configuration entry under the
+// same lock discipline as addMemberAsVoter.
 func (c *Cluster) addMemberAsNonvoter(nodeID, raftAddr string) {
 	f := c.raft.raft.AddNonvoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, c.commitTimeout)
 	if err := f.Error(); err != nil {

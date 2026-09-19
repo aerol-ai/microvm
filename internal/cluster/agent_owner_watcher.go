@@ -52,6 +52,20 @@ var ErrStuckReassignNotOwner = errors.New("cluster: reassign requester is not th
 // the next tick rather than making one node's recovery a fleet-sized read.
 const ownedRecoveryPageLimit = 256
 
+// ownedRecoveryScanBudget bounds how many owner-index rows ONE request may
+// inspect while looking for eligible recovery work. The index carries every
+// placement the node owns, but only failover-recreate rows with a spec are
+// eligible, so a dense worker can hold thousands of ineligible rows before
+// the first eligible one. Filling the page server-side keeps the worker from
+// paying a round trip per ineligible run; the budget keeps the leader from
+// paying an unbounded scan for one poll.
+const ownedRecoveryScanBudget = 4 * ownedRecoveryPageLimit
+
+// maxOwnedRecoveryPagesPerTick bounds one tick's paging. The cursor is kept
+// across ticks (see Agent.ownedRecoveryCursor), so this caps the work per
+// tick without ever abandoning the rest of the walk.
+const maxOwnedRecoveryPagesPerTick = 16
+
 // AttachRecreator wires the service-layer recreate hook used by the worker
 // owner watcher. It mirrors Cluster.AttachRecreator so pkg/daemon attaches the
 // same hook whatever role the node runs — a dedicated worker previously had no
@@ -118,16 +132,24 @@ func (a *Agent) recreateOwnedSandboxes(ctx context.Context) {
 		logger:    a.logger,
 		escalate:  a.requestReassignStuckPlacement,
 	}
-	pageToken := ""
-	for {
+	// Resume where the last tick stopped. An empty filtered page is NOT the
+	// end of the walk: OwnedRecoveryPlacements pages the owner index and then
+	// drops rows without failover-recreate or a spec, so a page can be empty
+	// and still have work behind it. Treating that as completion restarts the
+	// walk from the beginning every tick, and a dense worker whose eligible
+	// rows sort after its ineligible ones is never recovered at all.
+	pageToken := a.ownedRecoveryCursor
+	for pages := 0; pages < maxOwnedRecoveryPagesPerTick; pages++ {
 		page, ok := a.fetchOwnedRecoveryPage(ctx, pageToken)
 		if !ok {
 			// Not authoritative. A worker must not conclude "I own nothing"
-			// from an unreachable control plane; the next tick retries.
+			// from an unreachable control plane; the next tick retries from
+			// the same cursor.
 			return
 		}
 		for _, p := range page.Placements {
 			if ctx.Err() != nil {
+				a.ownedRecoveryCursor = pageToken
 				return
 			}
 			id := strings.TrimSpace(p.SandboxID)
@@ -136,11 +158,16 @@ func (a *Agent) recreateOwnedSandboxes(ctx context.Context) {
 			}
 			recreateOwnedPlacement(ctx, deps, id, p)
 		}
-		if page.NextPageToken == "" || len(page.Placements) == 0 || page.NextPageToken == pageToken {
+		// A cursor that does not progress cannot be walked further; restart
+		// from the beginning next tick rather than spinning on it.
+		if page.NextPageToken == "" || page.NextPageToken == pageToken {
+			a.ownedRecoveryCursor = ""
 			return
 		}
 		pageToken = page.NextPageToken
 	}
+	// Out of page budget for this tick, with the walk unfinished.
+	a.ownedRecoveryCursor = pageToken
 }
 
 func (a *Agent) fetchOwnedRecoveryPage(ctx context.Context, pageToken string) (OwnedRecoveryResponse, bool) {
@@ -191,27 +218,47 @@ func (c *Cluster) OwnedRecoveryPlacements(ownerID string, limit int, pageToken s
 	}
 	// The owner index is the bounded read: a worker asking for its own rows
 	// must never pay a scan of the global placement table.
-	page := c.fsm.placementPage(PlacementPageRequest{
-		Limit:       limit,
-		PageToken:   pageToken,
-		OwnerNodeID: ownerID,
-	})
-	out := OwnedRecoveryResponse{NextPageToken: page.NextPageToken, Authoritative: true}
-	for _, hot := range page.Placements {
-		full, ok := c.fsm.get(hot.SandboxID)
-		if !ok {
-			continue
+	out := OwnedRecoveryResponse{Authoritative: true}
+	cursor := pageToken
+	// Keep walking the owner index until the page is full, the owner's rows
+	// are exhausted, or the scan budget is spent. Returning an empty page with
+	// a live cursor is legitimate here — most of a dense worker's rows are
+	// ineligible — so the filling happens on this side, where one index walk
+	// replaces a round trip per ineligible run.
+	for scanned := 0; scanned < ownedRecoveryScanBudget; {
+		want := limit - len(out.Placements)
+		if want <= 0 {
+			break
 		}
-		// Re-check the owner against the full record: the page came from the
-		// index, and a reassignment could have landed between the two reads.
-		if strings.TrimSpace(full.OwnerNodeID) != ownerID {
-			continue
+		page := c.fsm.placementPage(PlacementPageRequest{
+			Limit:       want,
+			PageToken:   cursor,
+			OwnerNodeID: ownerID,
+		})
+		scanned += len(page.Placements)
+		for _, hot := range page.Placements {
+			full, ok := c.fsm.get(hot.SandboxID)
+			if !ok {
+				continue
+			}
+			// Re-check the owner against the full record: the page came from
+			// the index, and a reassignment could have landed between the two
+			// reads.
+			if strings.TrimSpace(full.OwnerNodeID) != ownerID {
+				continue
+			}
+			if !placementWantsFailoverRecreate(full) || full.Spec == nil {
+				continue
+			}
+			out.Placements = append(out.Placements, full)
 		}
-		if !placementWantsFailoverRecreate(full) || full.Spec == nil {
-			continue
+		if page.NextPageToken == "" || page.NextPageToken == cursor {
+			cursor = page.NextPageToken
+			break
 		}
-		out.Placements = append(out.Placements, full)
+		cursor = page.NextPageToken
 	}
+	out.NextPageToken = cursor
 	return out
 }
 
@@ -239,6 +286,9 @@ func (c *Cluster) ReassignStuckPlacement(ctx context.Context, requesterID, sandb
 	if incarnationID != "" && strings.TrimSpace(p.IncarnationID) != strings.TrimSpace(incarnationID) {
 		return ErrStuckReassignNotOwner
 	}
-	c.tryReassignStuckPlacement(ctx, sandboxID, p)
-	return nil
+	// Report the outcome. A worker that is told "reassigned" clears the
+	// failure counter driving its escalation, so answering success for a
+	// move that did not happen turns a stuck sandbox into an endless local
+	// retry loop with no escalation left.
+	return c.tryReassignStuckPlacement(ctx, sandboxID, p)
 }

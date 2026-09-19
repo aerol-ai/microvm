@@ -83,6 +83,13 @@ type Cluster struct {
 	// fresh lease before a worker can receive new sandboxes.
 	capacityLeases    *capacityLeaseCache
 	capacityLeaseStop context.CancelFunc
+	// raftMembershipMu serializes every leader-side raft membership mutation
+	// with the replica-budget count that gates it. NotifyJoin starts a
+	// goroutine per join, so an unsynchronized check-then-add lets N
+	// concurrent joins all observe a configuration below the budget and all
+	// be admitted. Nothing repairs that afterwards: an already-configured
+	// server skips the admission check on every later reconcile.
+	raftMembershipMu sync.Mutex
 	// reservationAdmissionMu serializes leader-side reservation admission.
 	// Capacity leases are outside the Raft FSM, so the leader must check
 	// target capacity + per-worker pending caps under one queue before
@@ -1052,7 +1059,9 @@ func (c *Cluster) removeMemberLocal(ctx context.Context, nodeID string, force bo
 			timeout = remaining
 		}
 	}
+	c.raftMembershipMu.Lock()
 	f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, timeout)
+	c.raftMembershipMu.Unlock()
 	if err := f.Error(); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
 			return ErrNotLeader

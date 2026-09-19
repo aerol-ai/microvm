@@ -1969,11 +1969,11 @@ func TestStoreCross95EmptyGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := upsertSecretDeleteOutboxTx(ctx, tx, "", "inc", nil, nil, 1, false); err != nil {
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, "", "inc", nil, nil, 1, false, time.Time{}); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("empty sandbox outbox: %v", err)
 	}
-	if err := upsertSecretDeleteOutboxTx(ctx, tx, "sb", "", []string{"peer"}, nil, 1, false); err == nil {
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, "sb", "", []string{"peer"}, nil, 1, false, time.Time{}); err == nil {
 		_ = tx.Rollback()
 		t.Fatal("empty incarnation outbox")
 	}

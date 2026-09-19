@@ -472,7 +472,13 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string) error {
 			s.logger.Warn("template delete: rootfs cleanup failed", "template_id", id, "error", rmErr)
 		}
 	}
-	return s.store.DeleteTemplate(ctx, id)
+	if err := s.store.DeleteTemplate(ctx, id); err != nil {
+		return err
+	}
+	// A publish REPLACES this node's slice, so the deleted row leaves the
+	// replicated catalogue by republishing what is left.
+	s.PublishTemplateCatalog(ctx)
+	return nil
 }
 
 // StartTemplateGC launches the periodic janitor that drops unreferenced

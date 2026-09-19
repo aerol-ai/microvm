@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -182,5 +183,163 @@ func TestRaftReplicaBudgetAllowsExistingMemberCorrections(t *testing.T) {
 	}
 	if c.raftReplicaAdmissionBlocked("srv-filler-0") {
 		t.Fatal("an existing replica was counted against its own admission")
+	}
+}
+
+// NotifyJoin starts a goroutine per join, so the budget only bounds the tier
+// if the count and the membership mutation happen under one lock. Before the
+// fix, 32 simultaneous joins against a nearly-full configuration all observed
+// room and all were admitted (14 replicas observed, 38 under -race), and
+// nothing repairs that: an already-configured server skips admission on every
+// later reconcile.
+func TestRaftReplicaAdmissionBoundedUnderConcurrentJoins(t *testing.T) {
+	c, cleanup := newReplicaBudgetCluster(t, "srv-concurrent")
+	defer cleanup()
+
+	const joiners = 32
+	members := []Member{{NodeID: c.nodeID, Role: config.NodeRoleServer, Alive: true, RaftAddr: "127.0.0.1:1"}}
+	for i := range joiners {
+		members = append(members, Member{
+			NodeID:   fmt.Sprintf("join-%02d", i),
+			Role:     config.NodeRoleServer,
+			Alive:    true,
+			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 33000+i),
+		})
+	}
+	// Put the live count above MaxMixedClusterNodes so the dedicated-tier
+	// budget (not the small-cluster allowance) is the one under test.
+	for i := range 12 {
+		members = append(members, Member{NodeID: fmt.Sprintf("wrk-%03d", i), Role: config.NodeRoleWorker, Alive: true})
+	}
+	seedGossipView(t, c, members)
+
+	// Fill every slot but one with configured replicas gossip doesn't know
+	// about, so none of them is discounted as dead.
+	for i := range MaxServerTierNodes - 2 {
+		id := fmt.Sprintf("existing-%d", i)
+		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 34000+i)), 0, c.commitTimeout).Error(); err != nil {
+			t.Fatalf("AddNonvoter(%s): %v", id, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range joiners {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			c.handleMemberJoin(fmt.Sprintf("join-%02d", i))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	got := raftServerIDs(t, c)
+	if len(got) > MaxServerTierNodes {
+		t.Fatalf("%d concurrent joins grew the configuration to %d replicas (%v); the budget is %d and every replica receives the whole log and FSM",
+			joiners, len(got), got, MaxServerTierNodes)
+	}
+	if len(got) != MaxServerTierNodes {
+		t.Fatalf("configuration holds %d replicas (%v); the one free slot should still have been filled", len(got), got)
+	}
+}
+
+// Removal shares the admission lock. hashicorp/raft v1.7.3 gives no usable
+// configuration index for a compare-and-set, so if a RemoveServer could land
+// between a joiner's replica count and its AddVoter, the count would describe
+// a configuration the mutation never sees. Joins and evictions racing each
+// other must still leave the tier inside its budget.
+func TestRaftMembershipMutationsSerializeWithRemoval(t *testing.T) {
+	c, cleanup := newReplicaBudgetCluster(t, "srv-mixed-churn")
+	defer cleanup()
+
+	const joiners = 16
+	members := []Member{{NodeID: c.nodeID, Role: config.NodeRoleServer, Alive: true, RaftAddr: "127.0.0.1:1"}}
+	for i := range joiners {
+		members = append(members, Member{
+			NodeID:   fmt.Sprintf("churn-%02d", i),
+			Role:     config.NodeRoleServer,
+			Alive:    true,
+			RaftAddr: fmt.Sprintf("127.0.0.1:%d", 36000+i),
+		})
+	}
+	for i := range 12 {
+		members = append(members, Member{NodeID: fmt.Sprintf("wrk-%03d", i), Role: config.NodeRoleWorker, Alive: true})
+	}
+	seedGossipView(t, c, members)
+
+	evictable := make([]string, 0, 3)
+	for i := range MaxServerTierNodes - 1 {
+		id := fmt.Sprintf("leaving-%d", i)
+		if err := c.raft.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", 37000+i)), 0, c.commitTimeout).Error(); err != nil {
+			t.Fatalf("AddNonvoter(%s): %v", id, err)
+		}
+		if i < 3 {
+			evictable = append(evictable, id)
+		}
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range joiners {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			c.handleMemberJoin(fmt.Sprintf("churn-%02d", i))
+		}(i)
+	}
+	for _, id := range evictable {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			c.removeDeadOwnerServer(id)
+		}(id)
+	}
+	close(start)
+	wg.Wait()
+
+	if got := raftServerIDs(t, c); len(got) > MaxServerTierNodes {
+		t.Fatalf("joins racing evictions left %d replicas (%v); the budget is %d", len(got), got, MaxServerTierNodes)
+	}
+}
+
+// The unlocked fast path exists so a 2000-node reconcile sweep doesn't queue
+// behind a raft round. It must agree with the locked decision, or a settled
+// member gets re-offered forever (or, worse, a correction is skipped).
+func TestMemberJoinSettledMatchesLockedDecision(t *testing.T) {
+	c, cleanup := newReplicaBudgetCluster(t, "srv-settled")
+	defer cleanup()
+
+	members := []Member{
+		{NodeID: c.nodeID, Role: config.NodeRoleServer, Alive: true, RaftAddr: "127.0.0.1:1"},
+		{NodeID: "srv-peer", Role: config.NodeRoleServer, Alive: true, RaftAddr: "127.0.0.1:38001"},
+		{NodeID: "wrk-peer", Role: config.NodeRoleWorker, Alive: true, RaftAddr: "127.0.0.1:38002"},
+	}
+	seedGossipView(t, c, members)
+
+	if c.memberJoinSettled("srv-peer", "127.0.0.1:38001") {
+		t.Fatal("an unconfigured member reported as settled; it would never be admitted")
+	}
+	c.handleMemberJoin("srv-peer")
+	if !c.memberJoinSettled("srv-peer", "127.0.0.1:38001") {
+		t.Fatal("a member configured exactly as the policy wants is still re-offered on every 5s sweep")
+	}
+	if c.memberJoinSettled("srv-peer", "127.0.0.1:39999") {
+		t.Fatal("an address change reported as settled; the correction would never run")
+	}
+
+	c.handleMemberJoin("wrk-peer")
+	srv, ok := c.configuredServer("wrk-peer")
+	if !ok {
+		t.Fatal("worker-role peer was not configured at all")
+	}
+	if srv.Suffrage != raft.Nonvoter {
+		t.Fatalf("worker-role peer got suffrage %v; role-forced non-voters must never become voters", srv.Suffrage)
+	}
+	if !c.memberJoinSettled("wrk-peer", "127.0.0.1:38002") {
+		t.Fatal("a correctly configured non-voter is still re-offered on every sweep")
 	}
 }

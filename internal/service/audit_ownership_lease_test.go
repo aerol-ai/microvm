@@ -284,3 +284,135 @@ func TestAuditOwnershipLeaseMapIsBounded(t *testing.T) {
 		t.Fatal("the sweep dropped the entry it was making room for")
 	}
 }
+
+// waitForBindingRead blocks until the fake control plane has actually been
+// asked, so a test can act inside the in-flight window rather than guessing
+// at it with a sleep.
+func waitForBindingRead(t *testing.T, cl *bindingCluster) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cl.readCount() > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the placement read never started")
+}
+
+// Invalidation has to fence, not just delete. A placement read that started
+// before the boundary finishes after it, and an unfenced refill reinstalls
+// the answer it read — so a capability the local lifecycle just destroyed
+// keeps being accepted for a further TTL, contradicting the "rejected on the
+// next event" guarantee this file documents.
+func TestEgressAuditBindingRejectsRefillFromReadStartedBeforeInvalidation(t *testing.T) {
+	const sandboxID = "sb-refill"
+	cl := newBindingCluster("node-a")
+	cl.placement = cluster.Placement{SandboxID: sandboxID, OwnerNodeID: "node-a", IncarnationID: "inc-old"}
+	cl.present = true
+	cl.block = make(chan struct{})
+	svc := &Service{cfg: config.Config{EnableCluster: true}, cluster: cl}
+
+	inFlight := make(chan error, 1)
+	go func() { inFlight <- svc.validateEgressAuditBinding(context.Background(), sandboxID, "inc-old") }()
+
+	// Wait until the placement read is actually in flight, then destroy the
+	// sandbox locally: the placement is gone and the lease is invalidated
+	// while the old answer is still on its way back.
+	waitForBindingRead(t, cl)
+	cl.mu.Lock()
+	cl.present = false
+	cl.mu.Unlock()
+	svc.invalidateAuditOwnershipLease(sandboxID)
+	close(cl.block)
+	<-inFlight
+
+	if err := svc.validateEgressAuditBinding(context.Background(), sandboxID, "inc-old"); err == nil {
+		t.Fatal("a capability for a destroyed lifetime was accepted after the boundary; the in-flight read reinstalled its pre-boundary answer")
+	}
+}
+
+// A caller that arrives after the boundary must not be answered from a flight
+// that started before it, even though singleflight will happily share it.
+func TestEgressAuditBindingSingleFlightDoesNotShareAcrossBoundary(t *testing.T) {
+	const sandboxID = "sb-shared-flight"
+	cl := newBindingCluster("node-a")
+	cl.placement = cluster.Placement{SandboxID: sandboxID, OwnerNodeID: "node-a", IncarnationID: "inc-old"}
+	cl.present = true
+	cl.block = make(chan struct{})
+	svc := &Service{cfg: config.Config{EnableCluster: true}, cluster: cl}
+
+	first := make(chan error, 1)
+	go func() { first <- svc.validateEgressAuditBinding(context.Background(), sandboxID, "inc-old") }()
+	waitForBindingRead(t, cl)
+
+	// The boundary lands, then a second caller joins the still-open flight.
+	svc.invalidateAuditOwnershipLease(sandboxID)
+	joined := make(chan error, 1)
+	go func() { joined <- svc.validateEgressAuditBinding(context.Background(), sandboxID, "inc-old") }()
+	time.Sleep(20 * time.Millisecond)
+	close(cl.block)
+	<-first
+
+	if err := <-joined; err == nil {
+		t.Fatal("a caller that arrived after the lifecycle boundary was accepted from a flight that started before it")
+	}
+}
+
+// Only destruction paths invalidated the lease. A create is a lifecycle
+// boundary too: anything that resolved the binding before the row existed
+// leaves a negative lease, and that lease then rejects the new lifetime's own
+// valid capability.
+func TestEgressAuditBindingAcceptsLifetimePersistedAfterNegativeLease(t *testing.T) {
+	st := openSealTestStore(t)
+	svc := &Service{store: st}
+	ctx := context.Background()
+
+	if err := svc.validateEgressAuditBinding(ctx, "sb-reused", "inc-new"); err == nil {
+		t.Fatal("a sandbox that does not exist yet must be rejected")
+	}
+
+	sb := &models.Sandbox{
+		ID:                 "sb-reused",
+		Image:              "wasm",
+		Runtime:            models.RuntimeWasm,
+		AuditIncarnationID: "inc-new",
+		OwnerRef:           "tenant-a",
+		Status:             models.SandboxStatusStarted,
+	}
+	if err := svc.persistSandboxCreate(ctx, sb); err != nil {
+		t.Fatalf("persistSandboxCreate: %v", err)
+	}
+
+	if err := svc.validateEgressAuditBinding(ctx, "sb-reused", "inc-new"); err != nil {
+		t.Fatalf("the durably persisted lifetime's own capability was rejected by a lease taken before it existed: %v", err)
+	}
+}
+
+// Fences are the only lease entries no sandbox boundary will evict, so they
+// get a retirement policy rather than accumulating one row per id.
+func TestAuditOwnershipLeaseFencesArePruned(t *testing.T) {
+	svc := &Service{}
+	svc.invalidateAuditOwnershipLease("sb-fenced")
+	l := svc.ownershipLeases()
+
+	if pruned := svc.pruneAuditOwnershipLeaseFences(time.Now()); pruned != 0 {
+		t.Fatalf("pruned %d fresh fences; an in-flight resolve could still need them", pruned)
+	}
+	l.mu.Lock()
+	entry := l.entries["sb-fenced"]
+	epoch := entry.epoch
+	l.mu.Unlock()
+	if epoch == 0 {
+		t.Fatal("invalidation did not bump the lifecycle epoch, so nothing fences an in-flight resolve")
+	}
+
+	if pruned := svc.pruneAuditOwnershipLeaseFences(time.Now().Add(auditOwnershipLeaseFenceTTL + time.Minute)); pruned != 1 {
+		t.Fatalf("pruned %d expired fences, want 1", pruned)
+	}
+	// A live lease must survive the sweep.
+	l.put("sb-live", auditOwnershipLease{ownedBySelf: true, incarnationID: "inc", expiresAt: time.Now().Add(time.Minute)}, time.Now())
+	if pruned := svc.pruneAuditOwnershipLeaseFences(time.Now().Add(time.Hour)); pruned != 0 {
+		t.Fatalf("the fence sweep dropped %d live leases", pruned)
+	}
+}

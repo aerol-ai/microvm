@@ -911,6 +911,7 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 				// policy rather than accumulating one row per sandbox id this node
 				// has ever seen.
 				s.pruneAuditIdentityFences(time.Now())
+				s.pruneAuditOwnershipLeaseFences(time.Now())
 				if len(rejoined) > 0 {
 					// Only the secrets whose recipient set contains a
 					// returning node need retransmitting. Re-fanning out
@@ -1020,11 +1021,38 @@ func (e secretHolderEntry) cursor() string {
 // different key, and a replaced entry under the same key gets a different
 // pointer — either way the CAS fails and the fresh state survives a verdict
 // that was reached against the older snapshot.
+//
+// Use this form only for verdicts that hold at every seal generation (the
+// placement is gone, deleting, or on another incarnation). A verdict that was
+// reached against one generation must use retireSecretHolderEntryAtGen.
 func retireSecretHolderEntry(e secretHolderEntry) {
+	retireHolderEntry(e, -1)
+}
+
+// retireSecretHolderEntryAtGen retires the entry only while the live set still
+// carries the generation the verdict was reached against. Resealing advances
+// the generation in place on the SAME *holderNodeSet (see
+// resetSecretHolders), so a pointer CAS cannot distinguish "the entry I
+// judged" from "a newer generation that reused the object". Deleting the
+// newer one discards confirmed ACKs and repair targets that the periodic
+// refresh can no longer visit, because the entry it would visit is gone.
+func retireSecretHolderEntryAtGen(e secretHolderEntry, gen int64) {
+	retireHolderEntry(e, gen)
+}
+
+// retireHolderEntry performs the generation check and the map removal under
+// the set's own mutex, so a reseal cannot land between the decision and the
+// deletion. gen < 0 skips the generation check.
+func retireHolderEntry(e secretHolderEntry, gen int64) {
 	if e.hs == nil {
 		return
 	}
-	secretFanoutHolders.CompareAndDelete(e.key, e.hs)
+	e.hs.mu.Lock()
+	defer e.hs.mu.Unlock()
+	if gen >= 0 && e.hs.gen != gen {
+		return
+	}
+	retireHolderSetLocked(e.key, e.hs)
 }
 
 // secretHolderPage captures up to limit holder entries in stable key order,
@@ -1326,9 +1354,15 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			placement, ok := placements[j.entry.key.sandboxID]
 			placementPeers := nonSelfRecipients(secrets.NormalizeRecipients(placement.SecretRecipients), selfID)
 			sort.Strings(placementPeers)
-			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != j.entry.key.incarnationID ||
-				placement.SecretSealGeneration != j.gen || !sameStringSlice(placementPeers, j.peers) {
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != j.entry.key.incarnationID {
 				retireSecretHolderEntry(j.entry)
+				continue
+			}
+			if placement.SecretSealGeneration != j.gen || !sameStringSlice(placementPeers, j.peers) {
+				// This verdict is only about the generation this job read. A
+				// reseal that advanced the same set in place while the
+				// authoritative read was in flight owns the entry now.
+				retireSecretHolderEntryAtGen(j.entry, j.gen)
 				continue
 			}
 			validated = append(validated, j)
@@ -1384,7 +1418,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			// hand back a replacement this probe's result does not describe.
 			hs := j.entry.hs
 			hs.mu.Lock()
-			if hs.gen != j.gen && hs.gen != 0 {
+			if hs.retired || (hs.gen != j.gen && hs.gen != 0) {
 				hs.mu.Unlock()
 				return
 			}
@@ -1555,8 +1589,7 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 	if holderIncarnationID == "" {
 		return errors.New("current placement secret incarnation is required for reseal")
 	}
-	hs := holderSetFor(sandboxID, holderIncarnationID)
-	hs.mu.Lock()
+	hs := lockHolderSet(sandboxID, holderIncarnationID)
 	frozen := mapKeys(hs.targets)
 	gen := hs.gen
 	hs.mu.Unlock()
@@ -2148,16 +2181,29 @@ func (s *Service) reconcileSecretDeleteOutboxRecord(parent context.Context, rec 
 	// The one sanctioned exception: an operator has attested, for this exact
 	// node identity, that its storage was destroyed. Those obligations are
 	// discharged without an ACK and their evidence says so explicitly. The
-	// attestation is fenced by the obligation's journalling time, so a reused
-	// node id inherits nothing. See node_storage_retirement.go.
+	// attestation is fenced per recipient by when that recipient's copy was
+	// distributed, so a reused node id inherits nothing and an old copy whose
+	// deletion was journalled late is not pinned forever. See
+	// node_storage_retirement.go.
 	if retired := s.nodeStorageRetirements(parent); len(retired) > 0 {
-		remaining, discharged := dischargeRetiredStorageRecipients(peers, retired, rec.CreatedAt)
+		remaining, discharged := dischargeRetiredStorageRecipients(peers, retired, rec.CreatedAt, rec.RecipientCopiedAt)
 		if len(discharged) > 0 {
-			s.recordStorageRetirementDischarge(sandboxID, rec.IncarnationID, rec.Generation, discharged)
-			peers = remaining
-			if err := s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, peers, rec.Generation); err != nil && s.logger != nil {
-				s.logger.Warn("cluster: secret delete-outbox discharge update failed",
-					"sandbox_id", sandboxID, "err", err)
+			// Only recipients whose evidence was actually journalled leave the
+			// obligation. The outbox row is what brings a failed discharge
+			// back for another attempt, so clearing it on an audit-write
+			// failure discards both the retry and the only per-sandbox record
+			// of what the attestation covered.
+			recorded := s.recordStorageRetirementDischarge(sandboxID, rec.IncarnationID, rec.Generation, discharged)
+			if len(recorded) > 0 {
+				if len(recorded) == len(discharged) {
+					peers = remaining
+				} else {
+					peers = withoutRecipients(peers, recorded)
+				}
+				if err := s.store.UpdateSecretDeleteOutboxRecipients(context.Background(), sandboxID, rec.IncarnationID, peers, rec.Generation); err != nil && s.logger != nil {
+					s.logger.Warn("cluster: secret delete-outbox discharge update failed",
+						"sandbox_id", sandboxID, "err", err)
+				}
 			}
 		}
 	}
@@ -2186,6 +2232,27 @@ func (s *Service) reconcileSecretDeleteOutboxRecord(parent context.Context, rec 
 		s.logger.Warn("cluster: secret delete-outbox recipient update failed",
 			"sandbox_id", sandboxID, "err", err)
 	}
+}
+
+// withoutRecipients drops exactly the recipients whose discharge evidence was
+// journalled. A partial discharge keeps the rest — including any whose audit
+// write failed — so the obligation can bring them back next tick.
+func withoutRecipients(all, drop []string) []string {
+	if len(drop) == 0 {
+		return all
+	}
+	dropped := make(map[string]struct{}, len(drop))
+	for _, id := range drop {
+		dropped[strings.TrimSpace(id)] = struct{}{}
+	}
+	out := make([]string, 0, len(all))
+	for _, id := range all {
+		if _, cleared := dropped[strings.TrimSpace(id)]; cleared {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 func (s *Service) selfNodeID() string {

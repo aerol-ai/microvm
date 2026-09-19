@@ -215,6 +215,19 @@ func (c *capacityLeaseCache) recordFetchResult(nodeID string, now time.Time, err
 	c.nextAttempt[nodeID] = now.Add(backoff)
 }
 
+// hasLease reports whether nodeID already holds a lease that can expire. It
+// is the difference between "this node is schedulable until its TTL runs out"
+// and "this node has never been reached", which the sweep budgets separately.
+func (c *capacityLeaseCache) hasLease(nodeID string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.leases[nodeID]
+	return ok
+}
+
 // staleness orders the fetch queue: the peer closest to losing its lease goes
 // first, so a long tail of failures cannot push a healthy peer past its TTL.
 func (c *capacityLeaseCache) staleness(nodeID string, now time.Time) time.Duration {
@@ -342,21 +355,69 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 	// Retire bookkeeping for nodes gossip no longer knows about.
 	c.capacityLeases.retain(live)
 
-	// Most-stale first: the peer closest to losing its lease is refreshed
-	// before one that was just updated.
-	sort.Slice(queue, func(i, j int) bool {
-		si := c.capacityLeases.staleness(queue[i].NodeID, now)
-		sj := c.capacityLeases.staleness(queue[j].NodeID, now)
+	// Split before ordering. Every never-seen peer sorts ahead of every
+	// existing lease (staleness treats "no lease" as maximally urgent), and a
+	// newly visible peer is not in backoff yet — so a burst of slow newcomers
+	// consumed the entire sweep before one healthy node was attempted, and
+	// its lease expired while it was answering in milliseconds. A restart
+	// burst or a fleet expansion reaches that shape well below 2,000 nodes.
+	renewals := make([]Member, 0, len(queue))
+	firstContact := make([]Member, 0, len(queue))
+	for _, m := range queue {
+		if c.capacityLeases.hasLease(m.NodeID) {
+			renewals = append(renewals, m)
+			continue
+		}
+		firstContact = append(firstContact, m)
+	}
+	// Renewals: the peer closest to losing its lease goes first.
+	sort.Slice(renewals, func(i, j int) bool {
+		si := c.capacityLeases.staleness(renewals[i].NodeID, now)
+		sj := c.capacityLeases.staleness(renewals[j].NodeID, now)
 		if si == sj {
-			return queue[i].NodeID < queue[j].NodeID
+			return renewals[i].NodeID < renewals[j].NodeID
 		}
 		return si > sj
 	})
+	// First contact is inherently unordered; keep it deterministic so a
+	// congested sweep makes the same progress every tick instead of
+	// re-shuffling which newcomers get attempted.
+	sort.Slice(firstContact, func(i, j int) bool { return firstContact[i].NodeID < firstContact[j].NodeID })
 
-	// Bound the sweep so it cannot run into the next tick and so a long tail
-	// of slow peers cannot consume the whole TTL. Whatever is left is picked
-	// up next tick, and the staleness ordering above stops it being starved.
-	sweepCtx, cancel := context.WithTimeout(ctx, c.capacityLeaseSweepBudget())
+	budget := c.capacityLeaseSweepBudget()
+	// Reserve the first slice of the sweep for peers that already have a
+	// lease to lose. Renewals are normally a handful of milliseconds, so
+	// first contact still gets nearly the whole budget; when they are not,
+	// keeping a usable node schedulable beats discovering a new one a tick
+	// sooner.
+	renewalBudget := budget * capacityLeaseRenewalBudgetNumerator / capacityLeaseRenewalBudgetDenominator
+	start := time.Now()
+	c.runCapacityFetchPhase(ctx, renewals, renewalBudget)
+	remaining := budget - time.Since(start)
+	if remaining <= 0 {
+		// The renewal phase used the whole sweep. First contact retries next
+		// tick; a node with no lease is not yet schedulable either way.
+		return
+	}
+	c.runCapacityFetchPhase(ctx, firstContact, remaining)
+}
+
+// capacityLeaseRenewalBudget* reserve three fifths of the sweep for peers that
+// already hold a lease. The split is what makes the reservation a guarantee
+// rather than an ordering preference: ordering alone still lets a long enough
+// run of slow newcomers occupy every request slot for the whole sweep.
+const (
+	capacityLeaseRenewalBudgetNumerator   = 3
+	capacityLeaseRenewalBudgetDenominator = 5
+)
+
+// runCapacityFetchPhase fetches one class of peers under its own slice of the
+// sweep budget.
+func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, budget time.Duration) {
+	if len(members) == 0 || budget <= 0 {
+		return
+	}
+	phaseCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	jobs := make(chan Member)
@@ -366,7 +427,7 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			for m := range jobs {
-				snap, err := c.fetchMemberCapacity(sweepCtx, m)
+				snap, err := c.fetchMemberCapacity(phaseCtx, m)
 				c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), err)
 				if err != nil {
 					if c.logger != nil {
@@ -379,13 +440,13 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 		}()
 	}
 
-	for _, m := range queue {
-		if sweepCtx.Err() != nil {
+	for _, m := range members {
+		if phaseCtx.Err() != nil {
 			break
 		}
 		select {
 		case jobs <- m:
-		case <-sweepCtx.Done():
+		case <-phaseCtx.Done():
 		}
 	}
 	close(jobs)

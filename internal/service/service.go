@@ -188,10 +188,13 @@ type Service struct {
 	// auditLeases answers the per-event egress audit binding check from a
 	// short-lived, lifecycle-fenced lease instead of a control-plane read per
 	// record. See internal/service/audit_ownership_lease.go.
-	auditLeaseOnce          sync.Once
-	auditLeases             *auditOwnershipLeases
-	auditIncarnationMu      sync.RWMutex
-	pendingAuditIncarnation map[string]string
+	auditLeaseOnce sync.Once
+	// artifactCatalogPublished debounces catalogue publishes: an unchanged
+	// local inventory must not re-enter the Raft log on every list.
+	artifactCatalogPublished publishedArtifactFingerprints
+	auditLeases              *auditOwnershipLeases
+	auditIncarnationMu       sync.RWMutex
+	pendingAuditIncarnation  map[string]string
 	// auditIdentityCache memoizes each sandbox's resolved (incarnation,
 	// owner_ref). Both are immutable for a lifecycle, and egress audit stamps
 	// every event with them — without this, one event per sandbox per second
@@ -2314,6 +2317,12 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	// so audit stamps carry the tenant owner instead of the blank one the
 	// pre-persist nonce necessarily resolves to.
 	s.finalizeAuditIdentity(sandbox.ID, sandbox.AuditIncarnationID, sandbox.OwnerRef)
+	// A lifetime STARTING is a lifecycle boundary too. Anything that resolved
+	// the binding before this row existed — a capability probe, a retry of the
+	// previous lifetime under a reused deterministic id — left a negative
+	// lease that would reject this lifetime's own valid capability until it
+	// expired. Two map writes under a mutex; no I/O on the boot path.
+	s.invalidateAuditOwnershipLease(sandbox.ID)
 	return nil
 }
 
