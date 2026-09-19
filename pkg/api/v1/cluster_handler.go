@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -734,6 +735,123 @@ func (h *handlers) clusterDeleteOrphan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// clusterRetireNodeStorage records an operator's attestation that {id}'s
+// storage has been destroyed, which is the ONLY thing besides an authenticated
+// DELETE ACK that may discharge a pending secret-deletion obligation to that
+// node. Membership disappearance and TTLs are deliberately not accepted: a
+// decommissioned node may still hold a disk full of ciphertext.
+//
+// Operator-only, and refused while gossip still reports the node alive.
+// Idempotent: re-attesting moves the fence forward.
+func (h *handlers) clusterRetireNodeStorage(w http.ResponseWriter, r *http.Request) {
+	if !clusterOperatorAccess(r) {
+		apihttp.WriteError(w, http.StatusForbidden, "storage retirement is operator-only")
+		return
+	}
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "node id required")
+		return
+	}
+	var body struct {
+		Reason string `json:"reason,omitempty"`
+	}
+	if r.ContentLength > 0 {
+		if err := apihttp.DecodeJSON(w, r, &body); err != nil {
+			apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
+	actor := clusterOperatorActor(r)
+	if err := h.deps.Service.RetireNodeStorage(r.Context(), id, actor, body.Reason); err != nil {
+		if errors.Is(err, service.ErrNodeStorageRetirementAlive) {
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// clusterRevokeNodeStorageRetirement withdraws an attestation made in error.
+// Obligations to that node become pending again. Idempotent.
+func (h *handlers) clusterRevokeNodeStorageRetirement(w http.ResponseWriter, r *http.Request) {
+	if !clusterOperatorAccess(r) {
+		apihttp.WriteError(w, http.StatusForbidden, "storage retirement is operator-only")
+		return
+	}
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "node id required")
+		return
+	}
+	if _, err := h.deps.Service.RevokeNodeStorageRetirement(r.Context(), id); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// clusterListNodeStorageRetirements lets an operator see which nodes have an
+// attestation on file, so "why is this obligation gone?" has an answer.
+func (h *handlers) clusterListNodeStorageRetirements(w http.ResponseWriter, r *http.Request) {
+	if !clusterOperatorAccess(r) {
+		apihttp.WriteError(w, http.StatusForbidden, "storage retirement is operator-only")
+		return
+	}
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	recs, err := h.deps.Service.ListNodeStorageRetirements(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, map[string]any{
+			"node_id":     rec.NodeID,
+			"attested_at": rec.AttestedAt.UTC(),
+			"actor":       rec.Actor,
+			"reason":      rec.Reason,
+		})
+	}
+	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"retirements": out})
+}
+
+// clusterOperatorAccess gates the storage-retirement endpoints. An open-source
+// build carries no control-plane access record, so the PAT that already
+// guards /v1/cluster/** is the operator credential there.
+func clusterOperatorAccess(r *http.Request) bool {
+	access, ok := controlplane.AccessFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	return access.Operator
+}
+
+func clusterOperatorActor(r *http.Request) string {
+	if access, ok := controlplane.AccessFromContext(r.Context()); ok {
+		if actor := strings.TrimSpace(access.Identity.ExternalID); actor != "" {
+			return actor
+		}
+		if actor := strings.TrimSpace(access.Identity.OwnerRef); actor != "" {
+			return actor
+		}
+	}
+	return "operator"
 }
 
 func (h *handlers) setNodeDrainState(w http.ResponseWriter, r *http.Request, drained bool) {
