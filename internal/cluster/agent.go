@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1071,22 +1073,28 @@ func (a *Agent) fetchPlacementsByIDs(ctx context.Context, ids []string, authorit
 	if len(cleaned) == 0 {
 		return map[string]Placement{}, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, controlPlanePlacementRequestTimeout)
-	defer cancel()
-	var out map[string]Placement
-	req := placementsByIDsRequest{IDs: cleaned}
 	path := PublicInternalPlacementsByIDsPath
 	if authoritative {
 		path += "?authoritative=true"
 	}
-	if err := a.doControlPlaneJSON(ctx, http.MethodPost, path, path, req, &out); err != nil {
-		return nil, err
+	// The handler rejects a body with more than MaxPlacementPageLimit ids, and
+	// a rejected batch is indistinguishable from "control plane unavailable"
+	// to every caller — which turns one oversized request into a skipped pass
+	// over ALL of a node's ids, not just the surplus. Callers page their own
+	// work, but chunk here too so no future caller can re-open that hole.
+	merged := make(map[string]Placement, len(cleaned))
+	for chunk := range slices.Chunk(cleaned, MaxPlacementPageLimit) {
+		reqCtx, cancel := context.WithTimeout(ctx, controlPlanePlacementRequestTimeout)
+		var out map[string]Placement
+		err := a.doControlPlaneJSON(reqCtx, http.MethodPost, path, path, placementsByIDsRequest{IDs: chunk}, &out)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(merged, out)
 	}
-	if out == nil {
-		out = map[string]Placement{}
-	}
-	a.observePlacementVersions(placementsMapValues(out))
-	return out, nil
+	a.observePlacementVersions(placementsMapValues(merged))
+	return merged, nil
 }
 
 type placementsByIDsRequest struct {

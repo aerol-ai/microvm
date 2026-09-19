@@ -967,7 +967,103 @@ const (
 	secretHolderRefreshWorkers = 64
 	secretHolderProbeTimeout   = 5 * time.Second
 	secretHolderRefreshBudget  = 25 * time.Second
+	// secretHolderRefreshScan caps how many holder entries one tick CAPTURES,
+	// before any RPC. The batch placement endpoint rejects more than
+	// cluster.MaxPlacementPageLimit ids in one request and the agent's failure
+	// result is "not authoritative", which makes the whole tick skip — so a
+	// node whose holder map is bigger than the endpoint limit (density skew,
+	// scale-in, a tenant packed onto few nodes) would stop refreshing ALL of
+	// its holders, not just the surplus. Page instead, resuming from a stored
+	// cursor so later entries are not starved.
+	secretHolderRefreshScan = 4096
 )
+
+func init() {
+	// A captured page is turned into exactly one placement batch, so the scan
+	// cap can never exceed what the endpoint accepts.
+	if secretHolderRefreshScan > cluster.MaxPlacementPageLimit {
+		panic("secretHolderRefreshScan exceeds cluster.MaxPlacementPageLimit")
+	}
+}
+
+// secretHolderEntry is one captured holder record: the map key plus the exact
+// *holderNodeSet the capture saw. Every decision in a refresh pass is made
+// against this captured identity and never against a fresh scan of the live
+// map: a create that lands while the placement batch is in flight adds a
+// holder the batch was never asked about, and reading its absence from that
+// response as proof of deletion discarded confirmed ACKs and repair targets
+// for a live sandbox.
+type secretHolderEntry struct {
+	key secretHolderKey
+	hs  *holderNodeSet
+}
+
+// cursor is the stable total order the fair page walks. Keys are compared as
+// (sandboxID, incarnationID); the NUL separator keeps a sandbox id that is a
+// prefix of another from interleaving.
+func (e secretHolderEntry) cursor() string {
+	return e.key.sandboxID + "\x00" + e.key.incarnationID
+}
+
+// retireSecretHolderEntry drops a holder entry ONLY while the live map still
+// holds the very *holderNodeSet the page captured. A newer incarnation gets a
+// different key, and a replaced entry under the same key gets a different
+// pointer — either way the CAS fails and the fresh state survives a verdict
+// that was reached against the older snapshot.
+func retireSecretHolderEntry(e secretHolderEntry) {
+	if e.hs == nil {
+		return
+	}
+	secretFanoutHolders.CompareAndDelete(e.key, e.hs)
+}
+
+// secretHolderPage captures up to limit holder entries in stable key order,
+// resuming after cursor and wrapping around, and returns the cursor the next
+// tick should resume from ("" once a single page covered everything).
+func secretHolderPage(cursor string, limit int) (page []secretHolderEntry, next string, total int) {
+	all := make([]secretHolderEntry, 0, 64)
+	secretFanoutHolders.Range(func(key, val any) bool {
+		holderKey, _ := key.(secretHolderKey)
+		hs, _ := val.(*holderNodeSet)
+		if holderKey.sandboxID == "" || holderKey.incarnationID == "" || hs == nil {
+			return true
+		}
+		all = append(all, secretHolderEntry{key: holderKey, hs: hs})
+		return true
+	})
+	total = len(all)
+	if total == 0 || limit <= 0 {
+		return nil, "", total
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].cursor() < all[j].cursor() })
+	if total <= limit {
+		return all, "", total
+	}
+	start := sort.Search(total, func(i int) bool { return all[i].cursor() > cursor })
+	page = make([]secretHolderEntry, 0, limit)
+	for i := range limit {
+		page = append(page, all[(start+i)%total])
+	}
+	return page, page[len(page)-1].cursor(), total
+}
+
+// takeSecretHolderCursor reads and clears the resume point for this tick. It
+// is cleared on read so an early return (control-plane blip, budget expiry)
+// cannot pin the page on one window forever; the deferred store in the
+// refresh puts the advanced cursor back.
+func (s *Service) takeSecretHolderCursor() string {
+	s.secretHolderCursorMu.Lock()
+	defer s.secretHolderCursorMu.Unlock()
+	cursor := s.secretHolderCursor
+	s.secretHolderCursor = ""
+	return cursor
+}
+
+func (s *Service) setSecretHolderCursor(cursor string) {
+	s.secretHolderCursorMu.Lock()
+	s.secretHolderCursor = cursor
+	s.secretHolderCursorMu.Unlock()
+}
 
 // refreshSecretHolderPossession re-probes intended remote recipients that are
 // approaching ACK TTL. Targets are independent from confirmed ACKs, so a
@@ -976,16 +1072,20 @@ const (
 // When any frozen target is dead, recipients are replaced via
 // Raft + recipient-bound AAD reseal (SelectReplacementRecipients) before
 // holder targets advance — pushing the old ciphertext would fail Open.
-// secretHolderPlacements resolves every tracked holder's placement in ONE
-// batch per maintenance tick. Returns ok=false when the view is unavailable;
+// secretHolderPlacements resolves the CAPTURED page's placements in ONE batch
+// per maintenance tick. Returns ok=false when the view is unavailable;
 // callers must skip rather than treat the empty result as "these placements
 // are gone", because a missing placement retires holder state.
+//
+// It resolves only the ids the page captured, and the caller may only judge
+// those same entries: a holder added after this snapshot is simply not part
+// of this tick's work.
 //
 // Parity note: this is the non-authoritative batch, matching the PlacementOf
 // point read it replaces. Holder sets are in-memory bookkeeping rebuilt by
 // the next fan-out, not durable state, so they do not need the authoritative
 // read that destructive placement reconcilers use.
-func (s *Service) secretHolderPlacements() (map[string]cluster.Placement, bool) {
+func (s *Service) secretHolderPlacements(page []secretHolderEntry) (map[string]cluster.Placement, bool) {
 	if s == nil || !s.cfg.EnableCluster {
 		return nil, true
 	}
@@ -993,20 +1093,15 @@ func (s *Service) secretHolderPlacements() (map[string]cluster.Placement, bool) 
 	if c == nil {
 		return nil, false
 	}
-	seen := make(map[string]struct{})
-	ids := make([]string, 0, 64)
-	secretFanoutHolders.Range(func(key, _ any) bool {
-		holderKey, _ := key.(secretHolderKey)
-		if holderKey.sandboxID == "" {
-			return true
+	seen := make(map[string]struct{}, len(page))
+	ids := make([]string, 0, len(page))
+	for _, e := range page {
+		if _, dup := seen[e.key.sandboxID]; dup {
+			continue
 		}
-		if _, dup := seen[holderKey.sandboxID]; dup {
-			return true
-		}
-		seen[holderKey.sandboxID] = struct{}{}
-		ids = append(ids, holderKey.sandboxID)
-		return true
-	})
+		seen[e.key.sandboxID] = struct{}{}
+		ids = append(ids, e.key.sandboxID)
+	}
 	if len(ids) == 0 {
 		return map[string]cluster.Placement{}, true
 	}
@@ -1032,11 +1127,22 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	defer cancel()
 	selfID := s.selfNodeID()
 	alive := s.aliveMemberSet()
+	// Capture a bounded page of holder keys BEFORE any RPC, and judge only
+	// those captured entries. Submitting the whole holder map in one batch
+	// tripped the endpoint's id limit on a skewed node and skipped every
+	// probe; re-scanning the live map after the batch treated holders created
+	// during the RPC as deleted.
+	page, nextCursor, totalHolders := secretHolderPage(s.takeSecretHolderCursor(), secretHolderRefreshScan)
+	defer func() { s.setSecretHolderCursor(nextCursor) }()
+	if totalHolders > len(page) && s.logger != nil {
+		s.logger.Debug("cluster: secret holder refresh is paging",
+			"holders", totalHolders, "page", len(page), "resume_after", nextCursor)
+	}
 	// One batch for the whole tick. Both passes below used to call
 	// PlacementOf per tracked holder — on an agent that is a control-plane
 	// round trip each, twice per holder per tick, and it ran BEFORE
 	// secretHolderRefreshBatch so the cap never bounded it.
-	placements, placementsOK := s.secretHolderPlacements()
+	placements, placementsOK := s.secretHolderPlacements(page)
 	if !placementsOK {
 		// Not authoritative. A missing placement retires a holder, so an
 		// unavailable read must never stand in for absence: that would drop
@@ -1044,30 +1150,24 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		return
 	}
 	type job struct {
-		sandboxID     string
-		incarnationID string
-		gen           int64
-		peers         []string
-		lastProbe     time.Time
-		lastExpand    time.Time
+		entry      secretHolderEntry
+		gen        int64
+		peers      []string
+		lastProbe  time.Time
+		lastExpand time.Time
 	}
 	var expandJobs []job
-	secretFanoutHolders.Range(func(key, val any) bool {
+	for _, entry := range page {
 		if refreshCtx.Err() != nil {
-			return false
+			break
 		}
-		holderKey, _ := key.(secretHolderKey)
-		sandboxID := holderKey.sandboxID
-		hs, _ := val.(*holderNodeSet)
-		if sandboxID == "" || holderKey.incarnationID == "" || hs == nil {
-			return true
-		}
+		hs := entry.hs
 		var placementGeneration int64
 		if s.cfg.EnableCluster {
-			placement, ok := placements[sandboxID]
-			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != holderKey.incarnationID {
-				secretFanoutHolders.Delete(holderKey)
-				return true
+			placement, ok := placements[entry.key.sandboxID]
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != entry.key.incarnationID {
+				retireSecretHolderEntry(entry)
+				continue
 			}
 			placementGeneration = placement.SecretSealGeneration
 		}
@@ -1078,16 +1178,12 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			(placementGeneration > 0 && holderGeneration > placementGeneration)
 		hs.mu.Unlock()
 		if needs {
-			expandJobs = append(expandJobs, job{
-				sandboxID: sandboxID, incarnationID: holderKey.incarnationID,
-				gen: holderGeneration, lastExpand: lastExpand,
-			})
+			expandJobs = append(expandJobs, job{entry: entry, gen: holderGeneration, lastExpand: lastExpand})
 		}
-		return true
-	})
+	}
 	sort.Slice(expandJobs, func(i, j int) bool {
 		if expandJobs[i].lastExpand.Equal(expandJobs[j].lastExpand) {
-			return expandJobs[i].sandboxID < expandJobs[j].sandboxID
+			return expandJobs[i].entry.cursor() < expandJobs[j].entry.cursor()
 		}
 		if expandJobs[i].lastExpand.IsZero() {
 			return true
@@ -1101,19 +1197,17 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		expandJobs = expandJobs[:secretHolderRefreshBatch]
 	}
 	expandIDs := make([]string, 0, len(expandJobs))
-	expandIncarnations := make(map[string]string, len(expandJobs))
 	expandAttemptedAt := time.Now()
 	for _, j := range expandJobs {
-		expandIDs = append(expandIDs, j.sandboxID)
-		expandIncarnations[j.sandboxID] = j.incarnationID
-		if val, ok := secretFanoutHolders.Load(secretHolderKey{sandboxID: j.sandboxID, incarnationID: j.incarnationID}); ok {
-			hs := val.(*holderNodeSet)
-			hs.mu.Lock()
-			if hs.gen == j.gen {
-				hs.lastExpand = expandAttemptedAt
-			}
-			hs.mu.Unlock()
+		expandIDs = append(expandIDs, j.entry.key.sandboxID)
+		// Stamp the captured holder set directly. Re-loading the key could
+		// hand back a replacement entry created after the capture, whose
+		// scheduling clock this pass has no business moving.
+		j.entry.hs.mu.Lock()
+		if j.entry.hs.gen == j.gen {
+			j.entry.hs.lastExpand = expandAttemptedAt
 		}
+		j.entry.hs.mu.Unlock()
 	}
 	var expandPlacements map[string]cluster.Placement
 	if s.cfg.EnableCluster && len(expandIDs) > 0 {
@@ -1123,18 +1217,22 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			if s.logger != nil {
 				s.logger.Warn("cluster: authoritative placement read for secret reseal sweep failed", "err", err, "sandboxes", len(expandIDs))
 			}
-			expandIDs = nil
+			expandJobs = nil
 		}
 	}
-	for _, sandboxID := range expandIDs {
+	for _, j := range expandJobs {
 		if refreshCtx.Err() != nil {
 			break
 		}
+		sandboxID := j.entry.key.sandboxID
 		var err error
 		if s.cfg.EnableCluster {
 			placement, ok := expandPlacements[sandboxID]
-			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != expandIncarnations[sandboxID] {
-				clearSecretFanoutHolders(sandboxID)
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != j.entry.key.incarnationID {
+				// Retire only the incarnation this page judged. The previous
+				// sandbox-wide clear also deleted a newer incarnation's entry
+				// that this authoritative read was never asked about.
+				retireSecretHolderEntry(j.entry)
 				continue
 			}
 			err = s.expandAndResealDeadSecretTargetsForPlacement(refreshCtx, s.Cluster(), placement)
@@ -1152,25 +1250,19 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	// Refresh after two thirds of the TTL, leaving one full ticker interval to
 	// retry before an ACK expires.
 	refreshBefore := now.Add(-(secretHolderACKTTL * 2 / 3))
-	secretFanoutHolders.Range(func(key, val any) bool {
+	for _, entry := range page {
 		if refreshCtx.Err() != nil {
-			return false
+			break
 		}
-		holderKey, _ := key.(secretHolderKey)
-		sandboxID := holderKey.sandboxID
-		hs, _ := val.(*holderNodeSet)
-		if sandboxID == "" || holderKey.incarnationID == "" || hs == nil {
-			return true
-		}
+		hs := entry.hs
 		if s.cfg.EnableCluster {
-			placement, ok := placements[sandboxID]
-			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != holderKey.incarnationID {
-				secretFanoutHolders.Delete(holderKey)
-				return true
+			placement, ok := placements[entry.key.sandboxID]
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != entry.key.incarnationID {
+				retireSecretHolderEntry(entry)
+				continue
 			}
 		}
 		hs.mu.Lock()
-		incarnationID := holderKey.incarnationID
 		gen := hs.gen
 		peers := make([]string, 0, len(hs.targets))
 		needsProbe := false
@@ -1186,16 +1278,15 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		}
 		lastProbe := hs.lastProbe
 		hs.mu.Unlock()
-		if !needsProbe || len(peers) == 0 || incarnationID == "" || gen <= 0 {
-			return true
+		if !needsProbe || len(peers) == 0 || gen <= 0 {
+			continue
 		}
 		sort.Strings(peers)
-		jobs = append(jobs, job{sandboxID: sandboxID, incarnationID: incarnationID, gen: gen, peers: peers, lastProbe: lastProbe})
-		return true
-	})
+		jobs = append(jobs, job{entry: entry, gen: gen, peers: peers, lastProbe: lastProbe})
+	}
 	sort.Slice(jobs, func(i, j int) bool {
 		if jobs[i].lastProbe.Equal(jobs[j].lastProbe) {
-			return jobs[i].sandboxID < jobs[j].sandboxID
+			return jobs[i].entry.cursor() < jobs[j].entry.cursor()
 		}
 		if jobs[i].lastProbe.IsZero() {
 			return true
@@ -1211,7 +1302,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	if s.cfg.EnableCluster && len(jobs) > 0 {
 		ids := make([]string, 0, len(jobs))
 		for _, j := range jobs {
-			ids = append(ids, j.sandboxID)
+			ids = append(ids, j.entry.key.sandboxID)
 		}
 		placements, err := s.authoritativeSecretPlacements(refreshCtx, ids)
 		if err != nil {
@@ -1222,12 +1313,12 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		}
 		validated := jobs[:0]
 		for _, j := range jobs {
-			placement, ok := placements[j.sandboxID]
+			placement, ok := placements[j.entry.key.sandboxID]
 			placementPeers := nonSelfRecipients(secrets.NormalizeRecipients(placement.SecretRecipients), selfID)
 			sort.Strings(placementPeers)
-			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != j.incarnationID ||
+			if !ok || placement.IsDeleting() || strings.TrimSpace(placement.IncarnationID) != j.entry.key.incarnationID ||
 				placement.SecretSealGeneration != j.gen || !sameStringSlice(placementPeers, j.peers) {
-				clearSecretFanoutHoldersForIncarnation(j.sandboxID, j.incarnationID)
+				retireSecretHolderEntry(j.entry)
 				continue
 			}
 			validated = append(validated, j)
@@ -1235,14 +1326,11 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		jobs = validated
 	}
 	for _, j := range jobs {
-		if v, ok := secretFanoutHolders.Load(secretHolderKey{sandboxID: j.sandboxID, incarnationID: j.incarnationID}); ok {
-			hs := v.(*holderNodeSet)
-			hs.mu.Lock()
-			if hs.gen == j.gen {
-				hs.lastProbe = now
-			}
-			hs.mu.Unlock()
+		j.entry.hs.mu.Lock()
+		if j.entry.hs.gen == j.gen {
+			j.entry.hs.lastProbe = now
 		}
+		j.entry.hs.mu.Unlock()
 	}
 
 	sem := make(chan struct{}, secretHolderRefreshWorkers)
@@ -1267,8 +1355,10 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			sandboxID := j.entry.key.sandboxID
+			incarnationID := j.entry.key.incarnationID
 			probeCtx, probeCancel := context.WithTimeout(refreshCtx, secretHolderProbeTimeout)
-			holding, probeErr := pusher.ProbeSecretOnPeers(probeCtx, j.sandboxID, j.incarnationID, j.peers, j.gen)
+			holding, probeErr := pusher.ProbeSecretOnPeers(probeCtx, sandboxID, incarnationID, j.peers, j.gen)
 			probeCancel()
 			if probeErr != nil {
 				probeFailures.Lock()
@@ -1279,7 +1369,10 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 				probeFailures.Unlock()
 			}
 			missing := make([]string, 0)
-			hs := holderSetFor(j.sandboxID, j.incarnationID)
+			// The captured set, not a LoadOrStore: re-deriving it would
+			// resurrect an entry a concurrent delete just retired, and could
+			// hand back a replacement this probe's result does not describe.
+			hs := j.entry.hs
 			hs.mu.Lock()
 			if hs.gen != j.gen && hs.gen != 0 {
 				hs.mu.Unlock()
@@ -1314,12 +1407,12 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			if len(missing) == 0 || probeErr != nil || s.store == nil {
 				return
 			}
-			rec, loadErr := s.store.GetClusterSecretForSandboxIncarnation(refreshCtx, j.sandboxID, j.incarnationID)
+			rec, loadErr := s.store.GetClusterSecretForSandboxIncarnation(refreshCtx, sandboxID, incarnationID)
 			if loadErr != nil || rec == nil || rec.SealGeneration < j.gen {
 				return
 			}
 			parsed, parseErr := secrets.ParseRef(rec.Ref)
-			if parseErr != nil || parsed.SandboxID != rec.SandboxID || parsed.Version != rec.Version || parsed.IncarnationID != j.incarnationID {
+			if parseErr != nil || parsed.SandboxID != rec.SandboxID || parsed.Version != rec.Version || parsed.IncarnationID != incarnationID {
 				recordSecretFanoutFailure()
 				return
 			}
@@ -1336,7 +1429,7 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 			acked, pushErr := pusher.PushSecretBlobToPeers(pushCtx, blob, missing)
 			pushCancel()
 			if len(acked) > 0 {
-				addSecretHolderNodes(j.sandboxID, j.incarnationID, j.gen, acked...)
+				addSecretHolderNodes(sandboxID, incarnationID, j.gen, acked...)
 			}
 			if pushErr != nil {
 				probeFailures.Lock()
