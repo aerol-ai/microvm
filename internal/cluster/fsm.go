@@ -2520,6 +2520,9 @@ func (f *placementFSM) snapshot() map[string]Placement {
 
 func (f *placementFSM) placementsForShards(filter PlacementShardFilter) []Placement {
 	filter = filter.Normalize()
+	if filter.noShards() {
+		return nil
+	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	if filter.allShards() {
@@ -2561,6 +2564,9 @@ func (f *placementFSM) placementsForShards(filter PlacementShardFilter) []Placem
 func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResponse {
 	req = req.Normalize()
 	shardFilter := req.ShardFilter.Normalize()
+	if shardFilter.noShards() {
+		return PlacementPageResponse{Placements: []Placement{}, Authoritative: true}
+	}
 	allShards := shardFilter.allShards()
 	wantShards := make(map[int]struct{}, len(shardFilter.Shards))
 	for _, shard := range shardFilter.Shards {

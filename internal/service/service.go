@@ -5548,6 +5548,14 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 	if !s.cfg.EnableCluster {
 		return
 	}
+	// Role gate FIRST. A node that serves no ingress installs no
+	// peer-forwarding routes, so it has no cluster-wide keep-set to compute —
+	// and computing one made every worker's zombie-route sweep read placements
+	// it has no use for. The sweep still GCs this node's OWN sandbox routes;
+	// that keep-set is built from the local store above.
+	if !s.servesClusterIngress() {
+		return
+	}
 	c := s.Cluster()
 	if c == nil {
 		return
@@ -5844,6 +5852,12 @@ func (s *Service) StartClusterIngressReconcile(ctx context.Context) {
 
 func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	if !s.cfg.EnableCluster || !s.caddy.Enabled() {
+		return nil
+	}
+	// Peer-forwarding routes belong to the ingress tier. A dedicated worker or
+	// server reconciling them downloaded a placement view it never installs
+	// anything from.
+	if !s.servesClusterIngress() {
 		return nil
 	}
 	c := s.Cluster()

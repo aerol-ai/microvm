@@ -34,6 +34,11 @@ const (
 type PlacementShardFilter struct {
 	ShardCount int   `json:"shard_count,omitempty"`
 	Shards     []int `json:"shards,omitempty"`
+	// None selects NO shards at all. It exists because the zero value already
+	// means "all shards": a node with no public-route work of its own had no
+	// way to say so, and the difference between "nothing" and "the whole
+	// fleet" is a full placement download per node on every reconcile tick.
+	None bool `json:"none,omitempty"`
 }
 
 type PlacementPageRequest struct {
@@ -104,6 +109,9 @@ func (f PlacementShardFilter) Normalize() PlacementShardFilter {
 	if shardCount <= 0 {
 		shardCount = DefaultPlacementShardCount
 	}
+	if f.None {
+		return PlacementShardFilter{ShardCount: shardCount, None: true}
+	}
 	if len(f.Shards) == 0 {
 		return PlacementShardFilter{ShardCount: shardCount}
 	}
@@ -125,7 +133,16 @@ func (f PlacementShardFilter) Normalize() PlacementShardFilter {
 
 func (f PlacementShardFilter) allShards() bool {
 	f = f.Normalize()
-	return len(f.Shards) == 0
+	return !f.None && len(f.Shards) == 0
+}
+
+// noShards reports an explicit "this node has no shard work".
+func (f PlacementShardFilter) noShards() bool { return f.None }
+
+// NoPlacementShards is the filter a node with no public-route responsibility
+// asks with.
+func NoPlacementShards() PlacementShardFilter {
+	return PlacementShardFilter{ShardCount: DefaultPlacementShardCount, None: true}
 }
 
 // PlacementShardForSandbox maps sandboxID to a stable shard ID in [0, count).
@@ -143,7 +160,16 @@ func PlacementShardForSandbox(sandboxID string, count int) int {
 // public route table to each ingress node so ordinary DNS round-robin / TCP
 // load balancers work for every sandbox. Very large ingress tiers shard the
 // table and require a shard-aware upstream router.
-func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFilter {
+//
+// selfRole is this node's own SB_NODE_ROLE. A node that does not serve ingress
+// gets NoPlacementShards: it has no public-route work, and synthesizing a ring
+// membership for it (the old behavior when it was absent from the ingress ids)
+// handed a dedicated worker either a slice of unrelated shards or, at small
+// ingress counts, the entire placement map.
+func IngressShardFilterForNode(members []Member, nodeID, selfRole string) PlacementShardFilter {
+	if !CanServeIngressRole(selfRole) {
+		return NoPlacementShards()
+	}
 	return ingressShardFilterForIDs(ingressShardNodeIDs(members), nodeID)
 }
 
@@ -151,18 +177,22 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 // Capacity heartbeats and endpoint changes do not change HRW ownership. Compare
 // the sorted live ingress IDs, not the entire membership (or a lossy hash).
 type IngressShardFilterCache struct {
-	mu     sync.Mutex
-	nodeID string
-	ids    []string
-	filter PlacementShardFilter
+	mu       sync.Mutex
+	nodeID   string
+	selfRole string
+	ids      []string
+	filter   PlacementShardFilter
 }
 
-func (c *IngressShardFilterCache) ForNode(members []Member, nodeID string) PlacementShardFilter {
+func (c *IngressShardFilterCache) ForNode(members []Member, nodeID, selfRole string) PlacementShardFilter {
+	if !CanServeIngressRole(selfRole) {
+		return NoPlacementShards()
+	}
 	ids := ingressShardNodeIDs(members)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.nodeID != nodeID || !slices.Equal(c.ids, ids) {
-		c.nodeID, c.ids = nodeID, slices.Clone(ids)
+	if c.nodeID != nodeID || c.selfRole != selfRole || !slices.Equal(c.ids, ids) {
+		c.nodeID, c.selfRole, c.ids = nodeID, selfRole, slices.Clone(ids)
 		c.filter = ingressShardFilterForIDs(ids, nodeID)
 	}
 	filter := c.filter
