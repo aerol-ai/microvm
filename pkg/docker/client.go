@@ -1461,7 +1461,17 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 	return json.NewDecoder(response.Body).Decode(responseBody)
 }
 
+// ErrClientNotConfigured is returned instead of dereferencing a nil transport.
+// Every caller already handles a request error; a nil dereference here does
+// not stay local, because several callers run on detached janitor goroutines
+// (built-image GC, image GC, the events stream) where a panic takes the whole
+// daemon down rather than failing one sweep.
+var ErrClientNotConfigured = errors.New("docker: client has no HTTP transport configured")
+
 func (c *Client) doRequest(ctx context.Context, method, path string, query url.Values, requestBody any, headers map[string]string) (*http.Response, error) {
+	if c == nil || c.httpClient == nil {
+		return nil, ErrClientNotConfigured
+	}
 	var body io.Reader
 	if requestBody != nil {
 		encoded, err := json.Marshal(requestBody)
