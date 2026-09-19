@@ -523,6 +523,14 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// D9 opt-in, mirroring /v1: env is omitted by default and returned only on
+	// an explicit request, which internal/service audits. Without this the
+	// facade could never return env at all — resolveSandbox goes through the
+	// no-options Get — so a Daytona client had no way to read it back.
+	if err := h.hydrateEnvIfRequested(r, sandbox); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
@@ -782,6 +790,37 @@ func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
+}
+
+// hydrateEnvIfRequested re-reads the sandbox with IncludeEnv when the caller
+// passed ?include_env=true, and copies the env onto the sandbox the handler
+// already holds. A no-op otherwise, so the default response carries no env and
+// emits no audit event.
+//
+// Accepts the same spellings as /v1's parseIncludeEnv (true|1|yes,
+// case-insensitive) so the two surfaces cannot drift apart.
+func (h *handlers) hydrateEnvIfRequested(r *http.Request, sandbox *models.Sandbox) error {
+	if sandbox == nil || !includeEnvRequested(r) || h.deps.Service == nil {
+		return nil
+	}
+	withEnv, err := h.deps.Service.GetSandboxWithOptions(r.Context(), sandbox.ID, service.GetSandboxOptions{
+		IncludeEnv:    true,
+		CorrelationID: r.Header.Get("X-Correlation-Id"),
+	})
+	if err != nil {
+		return err
+	}
+	sandbox.Env = withEnv.Env
+	return nil
+}
+
+func includeEnvRequested(r *http.Request) bool {
+	switch strings.TrimSpace(strings.ToLower(r.URL.Query().Get("include_env"))) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models.Sandbox, string, error) {

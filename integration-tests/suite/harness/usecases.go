@@ -110,6 +110,35 @@ const (
 	// Terraform/obs.tf provisions the dedicated obs EC2. Advertisement +
 	// provisioning only — same shape as CapGvisor/CapIsolate.
 	CapObservability Capability = "observability"
+	// Security-hardening capabilities (plans/integration-test-security.md §6.3).
+	// Advertisement-only, same shape as CapGvisor/CapIsolate: provisioning turns
+	// the feature on, the capability tells the matrix the case is applicable.
+	//
+	// CapSecrets marks a scenario where the secret/audit cases are meaningful
+	// at all. It is deliberately separate from CapCluster: the single-node
+	// profile exercises the provider seam and the audit chain with the cluster
+	// fan-out reduced to a no-op.
+	CapSecrets Capability = "secrets"
+	// CapSecretsKMS means SB_SECRET_PROVIDER=awskms against a REAL key. The KMS
+	// provider does not enforce the recipient set (its Open ignores nodeID and
+	// leans on IAM), so recipient-binding cases must EXCLUDE it rather than
+	// re-run against it.
+	CapSecretsKMS Capability = "secrets-kms"
+	// CapEnterprise means SB_ENTERPRISE_MODE=true. Mostly used in Excludes:
+	// cases that push config into a state the enterprise validator refuses
+	// (backup count below 2, zero retention) must not run here.
+	CapEnterprise Capability = "enterprise"
+	// CapClusterMTLS means every node holds a CA-signed cert with a node:<id>
+	// SAN and no insecure escape hatch is set.
+	CapClusterMTLS Capability = "cluster-mtls"
+	// CapAuditExport means an off-node exporter is configured AND its sink is
+	// readable by the suite (an S3 prefix, or the audit-receiver's probe
+	// endpoint). Both halves matter: enterprise boot requires an off-node
+	// backend, but a case can only assert delivery if it can read the sink.
+	CapAuditExport Capability = "audit-export"
+	// CapAuditWitness means the external witness is wired to a receiver that
+	// retains chain heads and issues receipts.
+	CapAuditWitness Capability = "audit-witness"
 	// CapSimulations gates the suite/sims workload catalogue and UC-108
 	// (per-sim pass/fail). Opt-in like CapBenchmark: slow, provisions long-
 	// lived services, and needs AEROL_SIMS=1. UC-108 must never roll up to a
@@ -123,6 +152,19 @@ type UseCase struct {
 	Title string
 	// Requires lists capabilities a scenario must have for this UC to run.
 	Requires []Capability
+	// Excludes lists capabilities that make this UC INAPPLICABLE. A scenario
+	// holding any of them skips the case exactly as a missing Requires does.
+	//
+	// This exists because some cases must mutate daemon config into a state a
+	// hardened profile refuses to boot with: UC-116 sets
+	// SB_SECRET_RECIPIENT_BACKUP_COUNT=1 and UC-123 sets zero retention, both
+	// of which internal/config rejects under SB_ENTERPRISE_MODE. Without
+	// Excludes those cases run on an enterprise scenario and take the node
+	// down instead of asserting anything. Expressing it as a positive
+	// "non-enterprise" capability was rejected: every scenario would have to
+	// remember to advertise it, so a forgotten entry fails OPEN — the node
+	// still dies. Excludes fails closed by default.
+	Excludes []Capability
 	// Implemented marks whether a test function exists yet. False => the
 	// report shows PENDING (a real gap) rather than a green/skip. The full
 	// suite is implemented, so this is true for every current entry; it stays

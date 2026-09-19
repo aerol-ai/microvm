@@ -81,11 +81,24 @@ type paginatedSnapshotsResponse struct {
 }
 
 type sandboxResponse struct {
-	ID                  string            `json:"id"`
-	OrganizationID      string            `json:"organizationId"`
-	Name                string            `json:"name"`
-	Snapshot            *string           `json:"snapshot,omitempty"`
-	User                string            `json:"user"`
+	ID             string  `json:"id"`
+	OrganizationID string  `json:"organizationId"`
+	Name           string  `json:"name"`
+	Snapshot       *string `json:"snapshot,omitempty"`
+	User           string  `json:"user"`
+	// Env MUST stay present (no omitempty) even when empty: the Daytona SDK's
+	// deserializer rejects a sandbox payload with no `env` key outright, and
+	// contract_test.go's TestDaytonaSDKContracts fails the whole read surface
+	// if it is dropped. So the facade cannot signal "not returned" the way /v1
+	// does by omission.
+	//
+	// Under D9 internal/service returns a nil Env unless
+	// GetSandboxOptions.IncludeEnv is set, so the default response here is
+	// `"env": {}`. That is a known wire-level ambiguity — empty and withheld
+	// look identical to a Daytona client. Callers that need the real value opt
+	// in with ?include_env=true, which is audited. Resolving the ambiguity
+	// properly needs a Daytona-side signal the SDK understands; tracked in
+	// TODOS.md.
 	Env                 map[string]string `json:"env"`
 	Labels              map[string]string `json:"labels"`
 	Public              bool              `json:"public"`

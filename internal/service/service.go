@@ -4700,7 +4700,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			return err
 		}
 	}
-	managed := mergeManagedRuntimes(dockerManaged, containerdManaged, firecrackerManaged, wasmManaged)
+	isolateManaged := map[string]*models.SandboxRuntimeState{}
+	if s.isolate != nil {
+		isolateManaged, err = s.isolate.ListManaged(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	managed := mergeManagedRuntimes(dockerManaged, containerdManaged, firecrackerManaged, wasmManaged, isolateManaged)
 
 	s.reconcileLocalClusterOwnership(ctx, known, managed)
 
@@ -5059,6 +5066,19 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 	if s.wasm != nil {
 		removeOrphans(s.wasm, models.RuntimeWasm, "", wasmManaged)
+	}
+	if s.isolate != nil {
+		// Isolate leaks more than a process: a jailed group owns a cgroup and a
+		// uid-owned chroot tree under SB_ISOLATE_JAIL_CHROOT_BASE, so a skipped
+		// sweep strands host state, not just a PID.
+		//
+		// LIMIT: isolate's ListManaged reads the driver's in-memory byID map
+		// (internal/runtime/isolate/driver.go), not the host, so this sweep only
+		// reclaims groups leaked within one daemon lifetime — which is exactly
+		// the finalizeStaleLocalSandbox case that names this sweep as its retry
+		// anchor. Surviving a restart needs a host-backed enumeration seam on
+		// HostSupervisor; tracked in TODOS.md.
+		removeOrphans(s.isolate, models.RuntimeIsolate, "", isolateManaged)
 	}
 
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already

@@ -301,3 +301,46 @@ passed, zero-deployments premise re-verified in-tree). Branch
   under overload. Workers no longer open the audit JSONL directly.
 - **Where:** `pkg/wasm/worker/egress_audit.go`, daemon spawn environment, and
   `internal/service/wasm_audit_ingest.go`.
+
+## Isolate orphan sweep survives a daemon restart (runtime) — part 2
+
+- **What:** Give `internal/runtime/isolate` a host-backed enumeration so
+  `Reconcile`'s orphan sweep can find workerd groups leaked across a restart.
+  Today `Driver.ListManaged` (`internal/runtime/isolate/driver.go:205-213`)
+  returns the driver's in-memory `byID` map, and `HostSupervisor`
+  (`internal/runtime/isolate/seams.go:48-50`) exposes only `SpawnGroup` — there
+  is no way to ask the host what is running.
+- **Why:** part 1 (wiring isolate into `mergeManagedRuntimes` + `removeOrphans`,
+  `internal/service/service.go`) shipped with this change and covers the case
+  `finalizeStaleLocalSandbox` depends on: a transient `Destroy` failure while
+  the daemon stays up. It cannot cover a crash. A jailed group owns a cgroup
+  under `SB_ISOLATE_JAIL_CGROUP_ROOT` and a uid-owned chroot tree under
+  `SB_ISOLATE_JAIL_CHROOT_BASE`, so a leak across a restart strands host state
+  permanently and invisibly.
+- **Caveat (why it's a TODO, not part of the same change):** it needs a new
+  seam (`ListGroups` on `HostSupervisor`) plus a real cgroup or chroot walk with
+  its own failure modes — enumerate-while-spawning races, partial teardown, and
+  a jail-off mode where neither directory exists. That is a design decision, not
+  a mechanical addition.
+- **Start:** `pkg/isolate/cgroup.go` + `chroot.go` already know the layout
+  (`linkGroupJail`/`removeGroupJail` name the per-group dirs). Add `ListGroups`
+  to `HostSupervisor`, implement it over the cgroup root, have
+  `Driver.ListManaged` union it with `byID`, and extend
+  `internal/service/reconcile_isolate_orphan_test.go`.
+
+## Daytona facade cannot distinguish "no env" from "env withheld" (API)
+
+- **What:** Decide and implement a Daytona-side signal for D9's withheld env.
+- **Why:** under D9 `internal/service` returns a nil `Env` unless
+  `GetSandboxOptions.IncludeEnv` is set, so the facade's default response
+  serializes `"env": {}` (`pkg/api/daytona/dto.go`), which asserts the sandbox
+  has no environment rather than that none was returned. `?include_env=true`
+  now exists as the opt-in (`hydrateEnvIfRequested` in `handlers.go`), but the
+  default is still ambiguous.
+- **Caveat (why it's a TODO):** the obvious fix — `json:"env,omitempty"` — was
+  tried and **reverted**: the Daytona SDK's deserializer rejects a sandbox
+  payload with no `env` key, and `TestDaytonaSDKContracts` fails across the whole
+  read surface. Any fix has to stay inside what the real SDK accepts, so it
+  needs a Daytona-compatible convention, not a Go struct tag.
+- **Start:** `pkg/api/daytona/contract_test.go` is the gate any change must
+  pass; `pkg/api/daytona/include_env_test.go` covers the opt-in that exists now.
