@@ -106,14 +106,17 @@ func (s *Service) PublishTemplateCatalog(ctx context.Context) {
 		}
 		return
 	}
-	s.publishTemplateRows(ctx, templates)
+	s.PublishTemplateCatalogRows(ctx, templates)
 }
 
-// publishTemplateRows is the body of PublishTemplateCatalog for callers that
-// already hold the rows — the list path reads them anyway, and reading the
-// table twice per list would be the sort of hidden cost this change exists to
-// remove.
-func (s *Service) publishTemplateRows(ctx context.Context, templates []*models.Template) {
+// PublishTemplateCatalogRows is PublishTemplateCatalog for a caller that
+// already holds the rows. The list handlers use it to self-heal: a node whose
+// inventory predates the catalogue (or whose publish failed) registers itself
+// the first time anyone reads its list — including the sweep that is still
+// asking it directly. Debounced by a fingerprint, so a steady inventory
+// writes nothing, and reading the table twice per list would be exactly the
+// hidden cost this change exists to remove.
+func (s *Service) PublishTemplateCatalogRows(ctx context.Context, templates []*models.Template) {
 	publisher, nodeID, ok := s.artifactCatalogPublisher()
 	if !ok {
 		return

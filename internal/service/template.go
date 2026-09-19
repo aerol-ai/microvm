@@ -416,16 +416,7 @@ func (s *Service) GetTemplate(ctx context.Context, id string) (*models.Template,
 // ListTemplates is the read path behind GET /v1/templates. Returns rows
 // in newest-first order matching the snapshot list shape.
 func (s *Service) ListTemplates(ctx context.Context) ([]*models.Template, error) {
-	rows, err := s.store.ListTemplates(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// Self-heal: a node whose inventory predates the catalogue (or whose
-	// publish failed) registers itself the first time anyone reads its list,
-	// including the sweep that is still asking it directly. Debounced by a
-	// fingerprint, so a steady inventory writes nothing.
-	s.publishTemplateRows(ctx, rows)
-	return rows, nil
+	return s.store.ListTemplates(ctx)
 }
 
 // DeleteTemplate refuses when an active sandbox still references the

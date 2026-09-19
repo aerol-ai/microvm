@@ -70,6 +70,16 @@ func TestTemplateCatalogPublishIsDebouncedByInventory(t *testing.T) {
 	if got := cl.publishCount(); got != 1 {
 		t.Fatalf("publishes = %d, want 1", got)
 	}
+	// The list handlers publish from rows they already hold; the same
+	// fingerprint debounces both entry points.
+	rows, err := svc.ListTemplates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.PublishTemplateCatalogRows(ctx, rows)
+	if got := cl.publishCount(); got != 1 {
+		t.Fatalf("publishes = %d after a row-carrying publish of the same inventory", got)
+	}
 	// An unchanged inventory must not re-enter the log.
 	svc.PublishTemplateCatalog(ctx)
 	svc.PublishTemplateCatalog(ctx)
