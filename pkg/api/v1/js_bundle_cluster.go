@@ -40,8 +40,14 @@ func (h *handlers) clusterListJSBundlesWrap(w http.ResponseWriter, r *http.Reque
 	}
 	aggregate, err := h.jsBundleLists.cached(r, func(req *http.Request) (clusterListAggregate[*models.JSBundle], error) {
 		local, localErr := h.deps.Service.ListJSBundles(req.Context())
+		// No location index yet for isolate bundles. The catalogue's key is a
+		// content digest, so publishing a node-wide digest list in the
+		// capacity snapshot would let any peer infer the existence and
+		// byte-equality of other tenants' code. That is a disclosure decision,
+		// not a mechanical addition, so this sweep keeps asking every
+		// isolate-capable worker until the index is designed.
 		return clusterListSweep(req, c, models.RuntimeIsolate, clusterJSBundleForwardedHeader,
-			local, localErr, jsBundleListKey, h.deps.Logger, "js-bundles")
+			local, localErr, jsBundleListKey, h.deps.Logger, "js-bundles", nil)
 	})
 	if err != nil {
 		writeClusterListError(h.deps.Logger, w, err)
