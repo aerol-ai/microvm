@@ -237,3 +237,43 @@ func TestArtifactCatalogPublishIsInertWithoutACluster(t *testing.T) {
 		t.Fatalf("published %d bundle slices without a bundle store", got)
 	}
 }
+
+// A local list that cannot be read is not an empty inventory: publishing an
+// empty slice would tell the aggregator this node holds nothing and stop it
+// being asked.
+func TestArtifactCatalogPublishSkipsWhenTheLocalListFails(t *testing.T) {
+	st := openSealTestStore(t)
+	cl := newCatalogCluster("worker-a")
+	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cl}
+	ctx := context.Background()
+
+	if err := st.CreateTemplate(ctx, &models.Template{ID: "tpl-1", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	svc.PublishTemplateCatalog(ctx)
+	if got := cl.publishCount(); got != 0 {
+		t.Fatalf("published %d slices from a store that could not be read", got)
+	}
+}
+
+// Rows the catalogue cannot represent are skipped without taking the rest of
+// the slice with them.
+func TestArtifactCatalogPublishSkipsUnusableRows(t *testing.T) {
+	st := openSealTestStore(t)
+	cl := newCatalogCluster("worker-a")
+	svc := &Service{cfg: config.Config{EnableCluster: true}, store: st, cluster: cl}
+	ctx := context.Background()
+
+	svc.PublishTemplateCatalogRows(ctx, []*models.Template{
+		nil,
+		{ID: "  "},
+		{ID: "tpl-good", Image: "alpine", Status: models.TemplateStatusReady},
+	})
+	page, ok := svc.ClusterArtifactCatalog(ctx, cluster.ArtifactKindTemplate, "")
+	if !ok || len(page.Rows) != 1 || page.Rows[0].ID != "tpl-good" {
+		t.Fatalf("catalogue = %+v ok=%v, want only the usable row", page.Rows, ok)
+	}
+}

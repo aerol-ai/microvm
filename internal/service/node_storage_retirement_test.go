@@ -767,3 +767,76 @@ func TestNodeStorageRetirementStandaloneAndUnconfigured(t *testing.T) {
 		t.Fatalf("second revoke: removed=%v err=%v (must be idempotent)", removed, err)
 	}
 }
+
+// errorRegistryCluster fails every replicated write, which is what a leader
+// election or an unreachable control plane looks like from an entry node.
+type errorRegistryCluster struct {
+	*retirementCluster
+	writeErr error
+	registry *replicatedRetirementRegistry
+}
+
+func (c *errorRegistryCluster) RetireNodeStorage(context.Context, string, string, string, time.Time) error {
+	return c.writeErr
+}
+
+func (c *errorRegistryCluster) RevokeNodeStorageRetirement(context.Context, string) error {
+	return c.writeErr
+}
+
+func (c *errorRegistryCluster) NodeStorageRetirements(context.Context) ([]cluster.NodeStorageRetirement, error) {
+	c.registry.mu.Lock()
+	defer c.registry.mu.Unlock()
+	if c.registry.err != nil {
+		return nil, c.registry.err
+	}
+	out := make([]cluster.NodeStorageRetirement, 0, len(c.registry.entries))
+	for _, rec := range c.registry.entries {
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+// A replicated write that fails must surface: an operator who is told the
+// storage was attested would otherwise believe obligations are being
+// discharged when nothing was recorded anywhere.
+func TestNodeStorageRetirementSurfacesReplicationFailures(t *testing.T) {
+	registry := &replicatedRetirementRegistry{}
+	cl := &errorRegistryCluster{
+		retirementCluster: &retirementCluster{
+			Noop:    cluster.NewNoop("ingress", "http://ingress", ""),
+			members: []cluster.Member{{NodeID: "node-gone", Alive: false}},
+		},
+		writeErr: errors.New("not the leader"),
+		registry: registry,
+	}
+	svc, _ := newRetirementService(t, cl)
+	ctx := context.Background()
+
+	if err := svc.RetireNodeStorage(ctx, "node-gone", "op", "disk destroyed"); err == nil {
+		t.Fatal("a failed replicated attestation was reported as recorded")
+	}
+	if recs, err := svc.ListNodeStorageRetirements(ctx); err != nil || len(recs) != 0 {
+		t.Fatalf("list = %+v err=%v; nothing was recorded", recs, err)
+	}
+
+	// Revoking something absent from the replicated set is a no-op, and a
+	// failed read is an error rather than "nothing to revoke".
+	if removed, err := svc.RevokeNodeStorageRetirement(ctx, "node-gone"); err != nil || removed {
+		t.Fatalf("revoke of an unattested node: removed=%v err=%v", removed, err)
+	}
+	registry.retire(cluster.NodeStorageRetirement{NodeID: "node-gone", AttestedUnix: time.Now().Unix()})
+	if _, err := svc.RevokeNodeStorageRetirement(ctx, "node-gone"); err == nil {
+		t.Fatal("a failed replicated revoke was reported as removed")
+	}
+
+	registry.mu.Lock()
+	registry.err = errors.New("control plane unreachable")
+	registry.mu.Unlock()
+	if _, err := svc.RevokeNodeStorageRetirement(ctx, "node-gone"); err == nil {
+		t.Fatal("a revoke on an unreadable registry was accepted")
+	}
+	if _, err := svc.ListNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("an unreadable registry listed cleanly")
+	}
+}
