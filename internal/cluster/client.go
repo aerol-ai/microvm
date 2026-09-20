@@ -96,6 +96,13 @@ type Cluster struct {
 	// appending opReserve/opReserveBatch. Otherwise two routers can both
 	// validate against the same pending snapshot and overfill a worker.
 	reservationAdmissionMu sync.Mutex
+	// authoritativeBarrierOnce/authoritativeBarrier admit ONE fsm barrier at
+	// a time. A raft barrier cannot be cancelled, so the goroutine waiting on
+	// one outlives an abandoned read; holding the slot until raft returns is
+	// what keeps that at one goroutine rather than one per caller. See
+	// awaitAuthoritativeFSM.
+	authoritativeBarrierOnce sync.Once
+	authoritativeBarrier     chan struct{}
 
 	// recreator is the service-layer hook the owner watcher uses to bring up
 	// a sandbox the FSM says we own but the local store doesn't have. Set via

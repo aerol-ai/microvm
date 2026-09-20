@@ -383,3 +383,56 @@ func TestAuthoritativeRetirementReadWaitsForTheFSM(t *testing.T) {
 		t.Fatal("the peer path served an unverified answer")
 	}
 }
+
+// The barrier makes the read authoritative, but raft gives no way to CANCEL
+// one: Barrier's timeout bounds enqueueing the entry, not waiting for the FSM
+// to apply it, and neither future wait watches ctx.Done(). A stuck FSM
+// therefore holds the caller — the secret-outbox maintenance loop, or a peer
+// handler whose client has already gone — for as long as it stays stuck, and
+// then answers with a nil error although the deadline has long passed.
+func TestAuthoritativeRetirementReadHonoursItsDeadline(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-deadline", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	// Gate the FSM the way a slow apply does: hold its lock, then put an
+	// entry in flight so the FSM goroutine is parked inside Apply. Every
+	// later entry — including a barrier — queues behind it.
+	c.fsm.mu.Lock()
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			c.fsm.mu.Unlock()
+		}
+	}()
+	go func() {
+		_ = c.RetireNodeStorage(context.Background(), "node-gone", "operator", "disk destroyed", time.Now())
+	}()
+	// Let the entry reach Apply and block there.
+	time.Sleep(300 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := c.AuthoritativeNodeStorageRetirements(ctx)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(start)
+		if elapsed > 2*time.Second {
+			t.Fatalf("a read with a 50ms deadline returned after %s", elapsed)
+		}
+		if err == nil {
+			t.Fatal("a read whose deadline expired returned success; it must fail closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a read with a 50ms deadline was still blocked after 2s: the caller's deadline does not bound the authority read")
+	}
+
+	c.fsm.mu.Unlock()
+	unlocked = true
+}

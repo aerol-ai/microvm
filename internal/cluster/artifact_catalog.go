@@ -698,3 +698,27 @@ func (f *placementFSM) artifactCatalogPage(req ArtifactCatalogRequest) ArtifactC
 // artifactCatalogCursor is the (node, id) walk position. The NUL separator
 // keeps a node id that is a prefix of another from interleaving.
 func artifactCatalogCursor(nodeID, id string) string { return nodeID + "\x00" + id }
+
+// clearPendingForPublication drops a half-assembled snapshot on behalf of a
+// publication that is being REFUSED or replayed — but only when the assembly
+// belongs to that same publication or an older one.
+//
+// Pending is keyed by node, and an older publisher's late chunk is exactly
+// the case where the assembly under that key belongs to somebody else: the
+// replacement process that already took a higher epoch. Dropping it
+// unconditionally cancelled the replacement's snapshot, and its final chunk
+// then landed on nothing ("has no pending snapshot"). Refusing an old request
+// must not be a write.
+func clearPendingForPublication(state *artifactCatalogKindState, nodeID string, epoch, revision int64) {
+	if state == nil || state.Pending == nil {
+		return
+	}
+	pending, ok := state.Pending[nodeID]
+	if !ok {
+		return
+	}
+	if pending.Epoch > epoch || (pending.Epoch == epoch && pending.Revision > revision) {
+		return
+	}
+	delete(state.Pending, nodeID)
+}

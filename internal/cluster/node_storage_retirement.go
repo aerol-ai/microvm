@@ -175,11 +175,62 @@ func (c *Cluster) awaitAuthoritativeFSM(ctx context.Context) error {
 	if timeout <= 0 {
 		timeout = controlPlaneRequestTimeout
 	}
+	// The caller's deadline bounds the WHOLE operation, and a caller that
+	// brought none still gets one. Neither raft future below is cancellable:
+	// Barrier's timeout bounds enqueueing the entry, not waiting for the FSM
+	// to apply it, so a stuck FSM would otherwise hold this caller — a
+	// maintenance loop, or a peer handler whose client is already gone —
+	// indefinitely, and then answer with a nil error long after its deadline.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	if dl, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(dl); remaining > 0 && remaining < timeout {
 			timeout = remaining
 		}
 	}
+
+	// One barrier at a time. The goroutine below cannot be cancelled, so
+	// without this an unbounded number of abandoned reads would park an
+	// unbounded number of goroutines inside raft; the slot is released only
+	// when raft actually returns, and everyone else fails closed on their own
+	// deadline instead of piling up.
+	select {
+	case c.barrierSlot() <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("cluster: authoritative read gave up waiting for an in-flight fsm barrier: %w", ctx.Err())
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		defer func() { <-c.barrierSlot() }()
+		done <- c.verifyLeaderAndBarrier(timeout)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// Fail CLOSED: the barrier never completed, so nothing here is
+		// authoritative and the caller must not treat the local FSM as such.
+		return fmt.Errorf("cluster: authoritative read did not complete its fsm barrier: %w", ctx.Err())
+	}
+}
+
+// barrierSlot is the single-admission channel, created on first use so a
+// Cluster built as a struct literal behaves like a constructed one.
+func (c *Cluster) barrierSlot() chan struct{} {
+	c.authoritativeBarrierOnce.Do(func() {
+		c.authoritativeBarrier = make(chan struct{}, 1)
+	})
+	return c.authoritativeBarrier
+}
+
+// verifyLeaderAndBarrier is the uninterruptible half: a quorum round proving
+// this node is still the leader, then a barrier proving its FSM has applied
+// everything committed before now.
+func (c *Cluster) verifyLeaderAndBarrier(timeout time.Duration) error {
 	if err := c.raft.raft.VerifyLeader().Error(); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
 			return ErrNotLeader

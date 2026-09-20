@@ -1561,11 +1561,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// superseded, and says so — silence would let the publisher mark
 		// itself clean.
 		if committed.Epoch == cmd.ArtifactEpoch && committed.Revision == cmd.ArtifactRevision && !committed.Withdrawn {
-			delete(state.Pending, nodeID)
+			clearPendingForPublication(state, nodeID, cmd.ArtifactEpoch, cmd.ArtifactRevision)
 			return nil
 		}
 		if !committed.supersedes(cmd.ArtifactEpoch, cmd.ArtifactRevision) {
-			delete(state.Pending, nodeID)
+			clearPendingForPublication(state, nodeID, cmd.ArtifactEpoch, cmd.ArtifactRevision)
 			return fmt.Errorf("%w: %s/%s epoch %d revision %d is not newer than the committed epoch %d revision %d",
 				ErrArtifactCatalogSuperseded, kind, nodeID, cmd.ArtifactEpoch, cmd.ArtifactRevision,
 				committed.Epoch, committed.Revision)
