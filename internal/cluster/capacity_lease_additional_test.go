@@ -349,3 +349,141 @@ func TestCapacityFirstContactAcquiresLeasesFromSlowButHealthyPeers(t *testing.T)
 		t.Fatalf("none of the %d established slow-but-healthy leases was renewed in two further sweeps", len(acquired))
 	}
 }
+
+// The supported fleet has to be refreshable inside the lease TTL, for peers
+// that need the FULL request path — the ones the quick probe can never
+// discover. This is capacity planning, not timing: how many peers one sweep
+// can finish is (pool x budget / per-peer cost), and every peer has to be
+// reached at least once per TTL or placement starts rejecting healthy nodes
+// as CapacityStale.
+func TestCapacitySweepCoversTheSupportedFleetWithinTheLeaseTTL(t *testing.T) {
+	const fleet = 2000
+	cache := newCapacityLeaseCache("self", nil, 5*time.Second, nil)
+	c := &Cluster{capacityLeases: cache}
+
+	ttl := cache.ttl
+	budget := c.capacityLeaseSweepBudget()
+	// Renewals must be able to use the whole sweep when there is no
+	// first-contact work competing for it.
+	pool := passConcurrency(fleet, budget, capacityLeaseFetchTimeout, capacityLeaseFullPassMaxConcurrency)
+	perSweep := int(float64(pool) * (float64(budget) / float64(capacityLeaseFetchTimeout)))
+	sweepsPerTTL := int(ttl / budget)
+	if sweepsPerTTL < 1 {
+		sweepsPerTTL = 1
+	}
+	if covered := perSweep * sweepsPerTTL; covered < fleet {
+		t.Fatalf("a %s TTL allows %d sweeps of %d peers = %d, short of the %d-node fleet: healthy workers go CapacityStale and placement stops using them (pool=%d budget=%s)",
+			ttl, sweepsPerTTL, perSweep, covered, fleet, pool, budget)
+	}
+}
+
+// A request the SWEEP cut short is not the peer's failure. The full pass
+// gives each attempt its own timeout, but a request dispatched near the end
+// of the phase only gets the phase's remaining time; charging that to the
+// peer puts a healthy node into a 15s backoff whose next eligible attempt is
+// already past its lease expiry.
+func TestCapacityPhaseDeadlineIsNotChargedToThePeer(t *testing.T) {
+	answered := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(400 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 4})
+	}))
+	defer answered.Close()
+
+	peerTransport := newInternalTransport(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test-only
+	peerClient := &http.Client{Transport: peerTransport}
+	c := &Cluster{
+		nodeID:         "self",
+		internalClient: &http.Client{Transport: peerTransport},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),
+		gossip:         &gossipNode{memberIndex: newGossipMemberIndex()},
+	}
+	healthy := Member{NodeID: "healthy", Alive: true, Role: config.NodeRoleWorker, APIURL: answered.URL, InternalURL: answered.URL}
+	c.gossip.memberIndex.upsert(healthy)
+	c.peerClients.m.Store(healthy.NodeID, peerClient)
+
+	// The phase runs out well before the peer's own 2s allowance.
+	c.runCapacityFetchPhase(context.Background(), []Member{healthy}, 100*time.Millisecond, capacityFetchPass{
+		attemptTimeout: capacityLeaseFetchTimeout,
+		recordFailures: true,
+	})
+	if !c.capacityLeases.due(healthy.NodeID, time.Now()) {
+		t.Fatal("a peer whose request the sweep itself cut short was put into failure backoff; it is skipped until long after its lease expires, although it never failed")
+	}
+
+	// A peer that fails on its OWN account must still back off.
+	dead := Member{NodeID: "dead", Alive: true, Role: config.NodeRoleWorker, APIURL: "https://127.0.0.1:1", InternalURL: "https://127.0.0.1:1"}
+	c.gossip.memberIndex.upsert(dead)
+	c.peerClients.m.Store(dead.NodeID, peerClient)
+	c.runCapacityFetchPhase(context.Background(), []Member{dead}, 5*time.Second, capacityFetchPass{
+		attemptTimeout: capacityLeaseFetchTimeout,
+		recordFailures: true,
+	})
+	if c.capacityLeases.due(dead.NodeID, time.Now()) {
+		t.Fatal("a peer that refused the connection was not backed off; real failures must still be paced")
+	}
+}
+
+// End-to-end form of the same property: a fleet of peers that all need the
+// full request path must have EVERY lease refreshed within one TTL window,
+// not merely "some progress". A peer whose lease goes stale is dropped by
+// placement, so partial coverage means healthy capacity disappears.
+func TestCapacityRenewsEveryLeaseWithinOneTTLWindow(t *testing.T) {
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(1200 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 4, HostMemoryTotalMB: 8192})
+	}))
+	defer slow.Close()
+
+	peerTransport := newInternalTransport(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test-only
+	peerClient := &http.Client{Transport: peerTransport}
+	c := &Cluster{
+		nodeID:         "self",
+		internalClient: &http.Client{Transport: peerTransport},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),
+		gossip:         &gossipNode{memberIndex: newGossipMemberIndex()},
+	}
+
+	// Sized past what the old 128-slot / three-fifths-of-the-sweep renewal
+	// path could cover in a TTL window (3 x 128 x 3s/1.2s = 960), so the test
+	// measures throughput rather than wall-clock luck.
+	const fleet = 1200
+	seeded := time.Now()
+	for i := range fleet {
+		id := fmt.Sprintf("slow-%04d", i)
+		c.gossip.memberIndex.upsert(Member{NodeID: id, Alive: true, Role: config.NodeRoleWorker, APIURL: slow.URL, InternalURL: slow.URL})
+		c.peerClients.m.Store(id, peerClient)
+		// Every peer already holds a lease: these are RENEWALS, so there is
+		// no first-contact work competing for the sweep.
+		c.capacityLeases.set(id, capacity.Snapshot{HostCPUCores: 4}, seeded)
+	}
+
+	// One TTL window is three sweeps at the default cadence.
+	start := time.Now()
+	for range 3 {
+		c.refreshCapacityLeases(context.Background())
+	}
+
+	var stale []string
+	c.capacityLeases.mu.RLock()
+	for i := range fleet {
+		id := fmt.Sprintf("slow-%04d", i)
+		if lease, ok := c.capacityLeases.leases[id]; !ok || lease.updated.Before(start) {
+			stale = append(stale, id)
+		}
+	}
+	c.capacityLeases.mu.RUnlock()
+	if len(stale) > 0 {
+		t.Fatalf("%d of %d healthy peers were not refreshed in a full TTL window; placement drops a CapacityStale worker, so that capacity is gone despite every endpoint answering inside its timeout",
+			len(stale), fleet)
+	}
+}

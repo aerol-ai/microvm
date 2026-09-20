@@ -253,10 +253,10 @@ func TestCapacityFetchPhaseGuards(t *testing.T) {
 	c := &Cluster{nodeID: "server", capacityLeases: leases, internalClient: &http.Client{Transport: rt}}
 	members := []Member{{NodeID: "healthy", InternalURL: "https://healthy", Role: config.NodeRoleWorker, Alive: true}}
 	full := capacityFetchPass{attemptTimeout: capacityLeaseFetchTimeout, recordFailures: true}
-	if left, _ := c.runCapacityFetchPhase(context.Background(), nil, time.Second, full); len(left) != 0 {
+	if left := c.runCapacityFetchPhase(context.Background(), nil, time.Second, full); len(left) != 0 {
 		t.Fatalf("a phase with no members returned %d stragglers", len(left))
 	}
-	if left, _ := c.runCapacityFetchPhase(context.Background(), members, 0, full); len(left) != len(members) {
+	if left := c.runCapacityFetchPhase(context.Background(), members, 0, full); len(left) != len(members) {
 		t.Fatal("a phase with no budget claimed to have refreshed peers")
 	}
 	if rt.healthy.Load() != 0 {

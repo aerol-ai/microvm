@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -49,11 +50,19 @@ const (
 	capacityLeaseQuickProbeMaxConcurrency = 512
 	// capacityLeaseFullPassMaxConcurrency bounds the full pass's pool. The
 	// full pass is the only one that can get an answer out of a peer slower
-	// than the probe, so it has to scale with the fleet too — but its
-	// per-peer cost is 2s rather than 300ms, so it is capped lower and is
-	// expected to converge over a few sweeps rather than cover the fleet in
-	// one.
-	capacityLeaseFullPassMaxConcurrency = 128
+	// than the probe, so at fleet scale it is what decides whether leases
+	// survive at all, and the cap has to be derived from that rather than
+	// picked:
+	//
+	//	2,000 peers x 2s worst-case request / 15s TTL = 267 sustained.
+	//
+	// A sweep covers pool*(budget/2s) peers and a TTL holds three sweeps, so
+	// 512 finishes the supported fleet with room for a sweep spent probing
+	// and for peers that take the whole timeout. At 128 it did not: three
+	// sweeps reached 960 of 2,000, and the rest went CapacityStale — which
+	// placement treats as "do not use", so healthy capacity disappeared while
+	// every endpoint was answering well inside its timeout.
+	capacityLeaseFullPassMaxConcurrency = 512
 	// capacityLeaseQuickPassBudget* is the share of a class's budget the
 	// quick pass may spend. The rest is RESERVED for the full pass: sizing
 	// the quick pool to cover the class means it spends the whole budget
@@ -540,7 +549,14 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 	// for a sweep or two; with the budget split that is pure harm — the class
 	// it delayed is slow but healthy, its lease has the same TTL as everyone
 	// else's, and nothing is competing for the time it was being denied.
-	renewalBudget := budget * capacityLeaseRenewalBudgetNumerator / capacityLeaseRenewalBudgetDenominator
+	// The renewal reservation is a FLOOR for renewals, not a ceiling: with no
+	// peer waiting to be discovered there is nothing for the rest of the
+	// sweep to do, and capping renewals at three fifths of it threw away the
+	// throughput that keeps leases alive.
+	renewalBudget := budget
+	if len(firstContact) > 0 {
+		renewalBudget = budget * capacityLeaseRenewalBudgetNumerator / capacityLeaseRenewalBudgetDenominator
+	}
 	start := time.Now()
 	c.runCapacityFetchClass(ctx, renewals, renewalBudget)
 	remaining := budget - time.Since(start)
@@ -590,24 +606,11 @@ func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, b
 	// loaded node can miss 300ms — so it does not feed the backoff. It IS
 	// evidence about responsiveness, which is what schedules the peer from
 	// here on.
-	unanswered, attempted := c.runCapacityFetchPhase(ctx, probeable, quickBudget, capacityFetchPass{
-		attemptTimeout: capacityLeaseQuickProbeTimeout,
-		concurrency:    passConcurrency(len(probeable), quickBudget, capacityLeaseQuickProbeTimeout, capacityLeaseQuickProbeMaxConcurrency),
+	unanswered := c.runCapacityFetchPhase(ctx, probeable, quickBudget, capacityFetchPass{
+		attemptTimeout:      capacityLeaseQuickProbeTimeout,
+		marksResponsiveness: true,
+		concurrency:         passConcurrency(len(probeable), quickBudget, capacityLeaseQuickProbeTimeout, capacityLeaseQuickProbeMaxConcurrency),
 	})
-	missed := make(map[string]struct{}, len(unanswered))
-	for _, m := range unanswered {
-		missed[m.NodeID] = struct{}{}
-	}
-	for id := range attempted {
-		if _, miss := missed[id]; !miss {
-			// Answering is recorded by the worker, from the measured
-			// response time.
-			continue
-		}
-		// Only a peer that was actually DIALLED is classified: one the
-		// budget never reached is not known to be slow.
-		c.capacityLeases.recordResponsiveness(id, false)
-	}
 	full = append(full, unanswered...)
 	remaining := budget - time.Since(start)
 	if len(full) == 0 || remaining <= 0 {
@@ -658,6 +661,11 @@ func passConcurrency(members int, budget, attemptTimeout time.Duration, max int)
 type capacityFetchPass struct {
 	attemptTimeout time.Duration
 	recordFailures bool
+	// marksResponsiveness makes a peer that does not answer THIS pass count
+	// as slower than the quick probe. Only the probe pass sets it: missing a
+	// 2s request says the peer failed, which the backoff handles, not that it
+	// is merely slow. A peer the sweep cut short is not marked either way.
+	marksResponsiveness bool
 	// concurrency overrides the default pool size for this pass; 0 means
 	// capacityLeaseFetchConcurrency.
 	concurrency int
@@ -674,9 +682,9 @@ const (
 
 // runCapacityFetchPhase fetches one class of peers under its own slice of the
 // sweep budget.
-func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, budget time.Duration, pass capacityFetchPass) ([]Member, map[string]struct{}) {
+func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, budget time.Duration, pass capacityFetchPass) []Member {
 	if len(members) == 0 || budget <= 0 {
-		return members, nil
+		return members
 	}
 	phaseCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -685,7 +693,6 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 	var (
 		mu        sync.Mutex
 		refreshed = make(map[string]struct{}, len(members))
-		attempted = make(map[string]struct{}, len(members))
 		wg        sync.WaitGroup
 	)
 	concurrency := pass.concurrency
@@ -698,14 +705,23 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 			defer wg.Done()
 			for m := range jobs {
 				c.capacityLeases.recordAttempt(m.NodeID, time.Now())
-				mu.Lock()
-				attempted[m.NodeID] = struct{}{}
-				mu.Unlock()
 				dialled := time.Now()
 				snap, err := c.fetchMemberCapacity(phaseCtx, m, pass.attemptTimeout)
 				if err != nil {
-					if pass.recordFailures {
-						c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), err)
+					// A request this sweep cut short says nothing about the
+					// peer. It is dispatched with whatever is left of the
+					// phase rather than its own allowance, so charging the
+					// coordinator's deadline to the peer gave a healthy node
+					// a 15s backoff whose next eligible attempt was already
+					// past its lease expiry — it lost the lease without ever
+					// failing.
+					if !curtailedByPhase(phaseCtx, err) {
+						if pass.marksResponsiveness {
+							c.capacityLeases.recordResponsiveness(m.NodeID, false)
+						}
+						if pass.recordFailures {
+							c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), err)
+						}
 					}
 					if c.logger != nil {
 						c.logger.Debug("cluster: capacity heartbeat fetch failed", "node_id", m.NodeID, "error", err)
@@ -716,8 +732,8 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 				// only in the quick pass. Without this a peer classified
 				// slow could never come back: the quick pass deliberately
 				// skips known-slow peers, so nothing would ever re-measure
-				// one that recovered, and it would stay paced for the life
-				// of the process.
+				// one that recovered, and it would stay slow for the life of
+				// the process.
 				c.capacityLeases.recordResponsiveness(m.NodeID, time.Since(dialled) <= capacityLeaseQuickProbeTimeout)
 				c.capacityLeases.recordFetchResult(m.NodeID, time.Now(), nil)
 				c.capacityLeases.set(m.NodeID, snap, time.Now())
@@ -749,7 +765,7 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 		}
 		out = append(out, m)
 	}
-	return out, attempted
+	return out
 }
 
 // capacityLeaseSweepBudget keeps one sweep comfortably inside the lease TTL,
@@ -806,4 +822,20 @@ func fetchCapacitySnapshot(ctx context.Context, client *http.Client, endpoint, p
 
 func hasCapacitySnapshot(s capacity.Snapshot) bool {
 	return s.HostCPUCores > 0 || s.HostMemoryTotalMB > 0
+}
+
+// curtailedByPhase reports whether a failed attempt was ended by the sweep
+// rather than by the peer. A phase gives each request its own timeout, but a
+// request dispatched near the end of the phase inherits only the phase's
+// remaining time — so a cancellation while the phase itself is over is the
+// coordinator's budget running out, not evidence about the peer, and must not
+// feed the failure backoff.
+func curtailedByPhase(phaseCtx context.Context, err error) bool {
+	if err == nil || phaseCtx == nil {
+		return false
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return false
+	}
+	return phaseCtx.Err() != nil
 }
