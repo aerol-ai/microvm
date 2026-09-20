@@ -291,3 +291,45 @@ func TestClusterAuthoritativeRetirementReadForwardsToTheLeader(t *testing.T) {
 		t.Fatal("a nil cluster answered an authoritative read")
 	}
 }
+
+// The forwarding path's preconditions: no leader, no internal client, and no
+// internal URL for the leader are all fail-closed, because a discharge
+// authorized by nothing is not authorized at all.
+func TestClusterAuthoritativeRetirementReadPreconditions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupL := newTestCluster(t, "srv-precond-leader", true, nil)
+	defer cleanupL()
+	follower, cleanupF := newTestCluster(t, "srv-precond-follower", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupF()
+	waitForLeader(t, leader, 10*time.Second)
+	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	waitForLeader(t, follower, 10*time.Second)
+	ctx := context.Background()
+
+	leaderID := follower.Leader()
+	if leaderID == "" {
+		t.Fatal("follower reported no leader")
+	}
+
+	// Gossip knows the leader but has no internal URL for it.
+	index := newGossipMemberIndex()
+	index.upsert(Member{NodeID: leaderID, Alive: true})
+	noURL := &Cluster{nodeID: follower.nodeID, fsm: follower.fsm, raft: follower.raft, gossip: &gossipNode{memberIndex: index}}
+	noURL.setInternalClient(http.DefaultClient)
+	if _, err := noURL.AuthoritativeNodeStorageRetirements(ctx); !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("missing internal URL = %v, want ErrPeerInternalURLRequired", err)
+	}
+
+	// No internal client at all.
+	noClient := &Cluster{nodeID: follower.nodeID, fsm: follower.fsm, raft: follower.raft, gossip: &gossipNode{memberIndex: index}}
+	if _, err := noClient.AuthoritativeNodeStorageRetirements(ctx); !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("missing internal client = %v, want ErrPeerInternalURLRequired", err)
+	}
+
+	// A node with no FSM cannot answer either.
+	if _, err := (&Cluster{}).AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("a cluster with no placement state answered an authoritative read")
+	}
+}

@@ -1137,3 +1137,75 @@ func TestArtifactCatalogVoluntaryWithdrawalKeepsThePublishersEpoch(t *testing.T)
 		t.Fatalf("page after republish = %+v", page)
 	}
 }
+
+// Guards on the catalogue's read and withdrawal helpers: an unknown kind, an
+// unknown node, and a pending publication that is ahead of the committed one.
+func TestArtifactCatalogReadGuards(t *testing.T) {
+	fsm := newPlacementFSM()
+
+	// A kind nobody has published reads as an authoritative empty answer,
+	// including its epoch question.
+	page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate, ForNodeID: "worker-a"})
+	if !page.Authoritative || len(page.Rows) != 0 || page.PublisherEpoch != 0 {
+		t.Fatalf("unpublished kind = %+v", page)
+	}
+
+	// A kind whose only state is a half-delivered publication still answers
+	// the epoch question, so the publisher does not reuse a claimed token.
+	seedCommittedCatalog(fsm, ArtifactKindJSBundle, "worker-a", 2, 1, ArtifactCatalogRow{ID: "b", Tenant: "t", Payload: []byte(`{}`)})
+	state := fsm.artifactCatalog[artifactCatalogKindKey(ArtifactKindJSBundle)]
+	state.Pending["worker-a"] = artifactCatalogNodeState{Epoch: 6, Revision: 1, Rows: map[string]ArtifactCatalogRow{}}
+	page = fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "t", ForNodeID: "worker-a"})
+	if page.PublisherEpoch != 6 {
+		t.Fatalf("publisher epoch = %d, want the pending publication's 6", page.PublisherEpoch)
+	}
+
+	// Withdrawing a node nobody knows is a no-op, and so is withdrawing with
+	// a blank id.
+	fsm.mu.Lock()
+	fsm.withdrawArtifactCatalogCoverageLocked("")
+	fsm.withdrawArtifactCatalogCoverageLocked("never-seen")
+	fsm.mu.Unlock()
+	page = fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindJSBundle, Tenant: "t"})
+	if len(page.Publishers) != 1 {
+		t.Fatalf("withdrawing an unknown node changed coverage: %+v", page.Publishers)
+	}
+
+	// Retiring a node whose PENDING publication is ahead raises the watermark
+	// past it, not past the older committed one.
+	fsm.mu.Lock()
+	fsm.withdrawArtifactCatalogCoverageLocked("worker-a")
+	fsm.mu.Unlock()
+	if got := fsm.artifactCatalogPublisherEpoch(ArtifactKindJSBundle, "worker-a"); got != 7 {
+		t.Fatalf("watermark = %d, want one past the pending epoch 6", got)
+	}
+}
+
+// Fairness bookkeeping: the attempt clock is per peer, retires with the
+// membership, and is inert on a nil cache.
+func TestCapacityAttemptClockBookkeeping(t *testing.T) {
+	c := newCapacityLeaseCache("server", nil, 5*time.Second, nil)
+	now := time.Now()
+
+	if got := c.attemptedAt("never"); !got.IsZero() {
+		t.Fatalf("an unattempted peer reported %v; it must sort first", got)
+	}
+	c.recordAttempt("peer-a", now)
+	c.recordAttempt("", now)
+	if got := c.attemptedAt("peer-a"); !got.Equal(now) {
+		t.Fatalf("attempt clock = %v, want %v", got, now)
+	}
+
+	// A peer gossip no longer knows about takes its bookkeeping with it.
+	c.set("peer-a", step3FatCapacity(), now)
+	c.retain(map[string]struct{}{"server": {}})
+	if got := c.attemptedAt("peer-a"); !got.IsZero() {
+		t.Fatal("a retired peer kept its attempt clock")
+	}
+
+	var none *capacityLeaseCache
+	none.recordAttempt("peer", now)
+	if got := none.attemptedAt("peer"); !got.IsZero() {
+		t.Fatal("a nil cache answered an attempt lookup")
+	}
+}

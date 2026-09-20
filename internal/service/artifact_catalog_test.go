@@ -590,3 +590,85 @@ func TestTemplatePushMetadataInvalidatesTheCatalogue(t *testing.T) {
 		t.Fatalf("local rows = %+v err=%v", rows, err)
 	}
 }
+
+// The withdrawal is a publication like any other: when the authority refuses
+// it the node must re-seed its token and stay dirty, not believe its coverage
+// is gone.
+func TestArtifactCatalogWithdrawalIsRetriedAndReseeds(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	ctx := context.Background()
+
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-first", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReconcileArtifactCatalog(ctx)
+	for i := range cluster.MaxArtifactCatalogRowsPerNode() + 1 {
+		if err := svc.createTemplateRow(ctx, &models.Template{
+			ID: fmt.Sprintf("tpl-%05d", i), Image: "alpine", Status: models.TemplateStatusReady,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The withdrawal cannot reach the control plane.
+	cl.mu.Lock()
+	cl.failing = true
+	cl.mu.Unlock()
+	svc.ReconcileArtifactCatalog(ctx)
+	if !cl.covers(cluster.ArtifactKindTemplate) {
+		t.Fatal("coverage was dropped locally although the withdrawal never landed")
+	}
+
+	// The authority says the publisher is superseded: the token is retired.
+	cl.mu.Lock()
+	cl.failing = false
+	cl.supersede = true
+	cl.epochs[cluster.ArtifactKindTemplate+"\x00worker-a"] = 11
+	cl.mu.Unlock()
+	svc.ReconcileArtifactCatalog(ctx)
+
+	cl.mu.Lock()
+	cl.supersede = false
+	cl.mu.Unlock()
+	svc.ReconcileArtifactCatalog(ctx)
+
+	if cl.covers(cluster.ArtifactKindTemplate) {
+		t.Fatal("the retried withdrawal never removed the stale coverage")
+	}
+	var lastEpoch int64
+	for _, chunk := range cl.chunks {
+		if chunk.Kind == cluster.ArtifactKindTemplate && chunk.Withdraw {
+			lastEpoch = chunk.Epoch
+		}
+	}
+	if lastEpoch != 12 {
+		t.Fatalf("withdrew under epoch %d, want the authority's 11 plus one", lastEpoch)
+	}
+}
+
+// The push seam forwards reads untouched, passes failures through, and is
+// inert without a service.
+func TestTemplatePushStoreSeamBehaviour(t *testing.T) {
+	svc, _ := newCatalogService(t)
+	ctx := context.Background()
+	if err := svc.createTemplateRow(ctx, &models.Template{ID: "tpl-seam", Image: "alpine", Status: models.TemplateStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+
+	seam := svc.TemplatePushStore(svc.store)
+	if _, err := seam.ListTemplatesPendingPush(ctx); err != nil {
+		t.Fatalf("pending-push read through the seam: %v", err)
+	}
+	// A failing write is reported, not swallowed.
+	if err := seam.SetTemplatePushState(ctx, "tpl-missing", models.TemplatePushStateActive, ""); err == nil {
+		t.Fatal("a push-state write for a missing row reported success")
+	}
+
+	var none *Service
+	if got := none.TemplatePushStore(svc.store); got == nil {
+		t.Fatal("a nil service must hand back the inner store rather than a nil seam")
+	}
+	if got := svc.TemplatePushStore(nil); got != nil {
+		t.Fatal("wrapping a nil store produced a seam")
+	}
+}
