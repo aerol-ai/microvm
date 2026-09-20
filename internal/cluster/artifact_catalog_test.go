@@ -1473,3 +1473,96 @@ func TestApplyListenersClassifyTheSupersededVerdict(t *testing.T) {
 		t.Fatalf("an ordinary apply failure answered %d", got)
 	}
 }
+
+// A replay of an already-committed publication is answered as success — but
+// it must not take the REPLACEMENT publisher's half-assembled snapshot with
+// it. Pending is keyed by node, so deleting it unconditionally cancels an
+// assembly that belongs to a newer epoch, and the newer publisher's final
+// chunk then lands on nothing.
+func TestArtifactCatalogReplayDoesNotCancelNewerAssembly(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-replay-pending", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	first, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "process-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: first, Revision: 1,
+		Rows: catalogRows("", "tpl-old"), First: true, Final: true,
+	}
+	if err := c.PublishArtifactCatalog(ctx, committed); err != nil {
+		t.Fatal(err)
+	}
+
+	// The replacement process takes a token and starts publishing.
+	second, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "process-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PublishArtifactCatalog(ctx, ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: second, Revision: 1,
+		Rows: catalogRows("", "tpl-new-a"), First: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The predecessor's final chunk is redelivered after a lost ACK.
+	if err := c.PublishArtifactCatalog(ctx, committed); err != nil {
+		t.Fatalf("replay of a committed publication was refused: %v", err)
+	}
+
+	// The replacement finishes.
+	if err := c.PublishArtifactCatalog(ctx, ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: second, Revision: 1,
+		Rows: catalogRows("", "tpl-new-b"), Final: true,
+	}); err != nil {
+		t.Fatalf("the newer publisher's final chunk failed after an older replay: %v", err)
+	}
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(page.Rows))
+	for _, row := range page.Rows {
+		ids = append(ids, row.ID)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []string{"tpl-new-a", "tpl-new-b"}) {
+		t.Fatalf("catalogue = %v; an older replay cancelled the newer assembly and left the stale inventory standing", ids)
+	}
+}
+
+// The same applies to a REFUSED older publication: rejecting it must not
+// disturb a newer snapshot being assembled for the same node.
+func TestArtifactCatalogStaleRejectionDoesNotCancelNewerAssembly(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-reject-pending", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", 5, 3, catalogRows("", "tpl-old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PublishArtifactCatalog(ctx, ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 6, Revision: 1,
+		Rows: catalogRows("", "tpl-new-a"), First: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An older publisher's chunk arrives late and is correctly refused.
+	if err := c.PublishArtifactCatalog(ctx, ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 5, Revision: 1,
+		Rows: catalogRows("", "tpl-stale"), First: true, Final: true,
+	}); err == nil {
+		t.Fatal("a superseded publication was accepted")
+	}
+	if err := c.PublishArtifactCatalog(ctx, ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 6, Revision: 1,
+		Rows: catalogRows("", "tpl-new-b"), Final: true,
+	}); err != nil {
+		t.Fatalf("the newer publisher's final chunk failed after an older one was refused: %v", err)
+	}
+}
