@@ -54,6 +54,14 @@ type capacityLeaseCache struct {
 	// or dead endpoint cannot postpone a healthy peer's refresh.
 	nextAttempt map[string]time.Time
 	failures    map[string]int
+	// lastAttempt is when each peer was last DISPATCHED, successfully or not.
+	// It is the fairness clock: a sweep that runs out of budget half way
+	// leaves the rest of the queue with an older attempt time, so the next
+	// sweep starts with them instead of re-attempting the same prefix. Sorting
+	// by staleness alone made a long run of slow peers permanent: the peers
+	// behind them were never dispatched, so they never entered backoff and
+	// never moved out of the way.
+	lastAttempt map[string]time.Time
 
 	// localTemplateInventory is the Phase 6 PR-D hook for template-aware
 	// placement. cmd/sandboxd registers a callback that reads from the
@@ -83,6 +91,7 @@ func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval 
 		leases:      make(map[string]capacityLease),
 		nextAttempt: make(map[string]time.Time),
 		failures:    make(map[string]int),
+		lastAttempt: make(map[string]time.Time),
 	}
 }
 
@@ -226,6 +235,32 @@ func (c *capacityLeaseCache) recordFetchResult(nodeID string, now time.Time, err
 	c.nextAttempt[nodeID] = now.Add(backoff)
 }
 
+// recordAttempt stamps the fairness clock. Called when a peer is dispatched,
+// whatever the outcome: an attempt that timed out still used a slot, and the
+// peers that did not get one are the ones owed the next sweep.
+func (c *capacityLeaseCache) recordAttempt(nodeID string, now time.Time) {
+	if c == nil || nodeID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastAttempt == nil {
+		c.lastAttempt = make(map[string]time.Time)
+	}
+	c.lastAttempt[nodeID] = now
+}
+
+// attemptedAt reports when a peer was last dispatched; the zero time means
+// "not yet this round", which sorts first.
+func (c *capacityLeaseCache) attemptedAt(nodeID string) time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastAttempt[nodeID]
+}
+
 // hasLease reports whether nodeID already holds a lease that can expire. It
 // is the difference between "this node is schedulable until its TTL runs out"
 // and "this node has never been reached", which the sweep budgets separately.
@@ -280,6 +315,11 @@ func (c *capacityLeaseCache) retain(live map[string]struct{}) int {
 		if _, ok := live[id]; !ok && id != c.selfID {
 			delete(c.nextAttempt, id)
 			delete(c.failures, id)
+		}
+	}
+	for id := range c.lastAttempt {
+		if _, ok := live[id]; !ok && id != c.selfID {
+			delete(c.lastAttempt, id)
 		}
 	}
 	return dropped
@@ -381,8 +421,16 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 		}
 		firstContact = append(firstContact, m)
 	}
-	// Renewals: the peer closest to losing its lease goes first.
+	// Renewals: peers not yet attempted in this round go first, then the peer
+	// closest to losing its lease. The attempt clock is what carries progress
+	// across sweeps — without it a budget that runs out half way means the
+	// same prefix is retried forever and everything behind it starves.
 	sort.Slice(renewals, func(i, j int) bool {
+		ai := c.capacityLeases.attemptedAt(renewals[i].NodeID)
+		aj := c.capacityLeases.attemptedAt(renewals[j].NodeID)
+		if !ai.Equal(aj) {
+			return ai.Before(aj)
+		}
 		si := c.capacityLeases.staleness(renewals[i].NodeID, now)
 		sj := c.capacityLeases.staleness(renewals[j].NodeID, now)
 		if si == sj {
@@ -390,10 +438,16 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 		}
 		return si > sj
 	})
-	// First contact is inherently unordered; keep it deterministic so a
-	// congested sweep makes the same progress every tick instead of
-	// re-shuffling which newcomers get attempted.
-	sort.Slice(firstContact, func(i, j int) bool { return firstContact[i].NodeID < firstContact[j].NodeID })
+	// First contact gets the same fairness clock: a congested sweep must not
+	// re-offer the same newcomers forever while the rest are never dialled.
+	sort.Slice(firstContact, func(i, j int) bool {
+		ai := c.capacityLeases.attemptedAt(firstContact[i].NodeID)
+		aj := c.capacityLeases.attemptedAt(firstContact[j].NodeID)
+		if !ai.Equal(aj) {
+			return ai.Before(aj)
+		}
+		return firstContact[i].NodeID < firstContact[j].NodeID
+	})
 
 	budget := c.capacityLeaseSweepBudget()
 	// Reserve the first slice of the sweep for peers that already have a
@@ -474,6 +528,7 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 		go func() {
 			defer wg.Done()
 			for m := range jobs {
+				c.capacityLeases.recordAttempt(m.NodeID, time.Now())
 				snap, err := c.fetchMemberCapacity(phaseCtx, m, pass.attemptTimeout)
 				if err != nil {
 					if pass.recordFailures {

@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -42,6 +43,11 @@ import (
 // let any peer infer the existence and byte-equality of another tenant's
 // code. The Raft FSM is server-tier-only state that already holds every
 // tenant's placements, so the catalogue adds no disclosure surface.
+
+// ErrArtifactCatalogSuperseded reports a publication from a process the
+// catalogue has already moved past. The publisher re-seeds its epoch from the
+// authority and republishes rather than believing it is clean.
+var ErrArtifactCatalogSuperseded = errors.New("cluster: artifact catalogue publication is superseded")
 
 const (
 	// ArtifactKindTemplate / ArtifactKindJSBundle name the two catalogues.
@@ -101,6 +107,12 @@ type ArtifactCatalogPage struct {
 	// Authoritative distinguishes "nothing published yet" from "could not
 	// ask". A non-authoritative answer must fall back to the fan-out.
 	Authoritative bool `json:"authoritative,omitempty"`
+	// PublisherEpoch is the epoch the catalogue holds for the node that
+	// ASKED. A publisher takes the next one, which is how a restarted process
+	// outranks requests its predecessor may still have in flight. It is
+	// filled from the authenticated peer identity on the peer path, never
+	// from the request body.
+	PublisherEpoch int64 `json:"publisher_epoch,omitempty"`
 }
 
 // ArtifactCatalogRequest is the agent-facing read.
@@ -109,6 +121,10 @@ type ArtifactCatalogRequest struct {
 	Tenant    string `json:"tenant,omitempty"`
 	Limit     int    `json:"limit,omitempty"`
 	PageToken string `json:"page_token,omitempty"`
+	// ForNodeID asks for that node's publisher epoch alongside the page. The
+	// peer handler overrides it with the authenticated identity; a node may
+	// only ever ask for its own.
+	ForNodeID string `json:"for_node_id,omitempty"`
 }
 
 // ArtifactCatalogSnapshot is one node's whole inventory of one kind, as the
@@ -119,18 +135,25 @@ type ArtifactCatalogSnapshot struct {
 	// NodeID is the publisher. Callers never supply another node's id: the
 	// peer-facing path takes it from the authenticated identity.
 	NodeID string `json:"node_id"`
-	// Incarnation identifies the publishing PROCESS. A restarted node starts
-	// its revisions again, so a plain counter comparison would reject
-	// everything it publishes until it caught up; a new incarnation is always
-	// newer than the committed one.
-	Incarnation string `json:"incarnation"`
-	// Revision orders publications from one process. Monotonic per process.
+	// Epoch is the AUTHORITY-ISSUED fencing token for the publishing process:
+	// a node reads the catalogue's committed epoch at boot and takes the next
+	// one. A process identifier alone (a UUID) identifies a process without
+	// ordering processes, so a request delayed in transport from a replaced
+	// process could take ownership back and republish an obsolete inventory.
+	Epoch int64 `json:"epoch"`
+	// Revision orders publications WITHIN one epoch.
 	Revision int64                `json:"revision"`
 	Rows     []ArtifactCatalogRow `json:"rows"`
 	// First starts a new snapshot (discarding any half-delivered one) and
 	// Final commits it. A single-chunk snapshot sets both.
 	First bool `json:"first,omitempty"`
 	Final bool `json:"final,omitempty"`
+	// Withdraw removes this node's coverage instead of replacing it. A node
+	// whose inventory cannot be represented — over the per-node cap — must
+	// say so: the aggregator skips a node it believes it covers, so leaving
+	// the old coverage in place advertises an inventory the node no longer
+	// has and nothing ever asks it again.
+	Withdraw bool `json:"withdraw,omitempty"`
 }
 
 func artifactCatalogKindKey(kind string) string { return strings.TrimSpace(kind) }
@@ -141,16 +164,30 @@ func artifactCatalogKindKey(kind string) string { return strings.TrimSpace(kind)
 // wrong.
 func MaxArtifactCatalogRowsPerNode() int { return maxArtifactCatalogRowsPerNode }
 
+// WithdrawArtifactCatalogCoverage builds the publication that removes this
+// node's coverage of a kind.
+func WithdrawArtifactCatalogCoverage(kind, nodeID string, epoch, revision int64) ArtifactCatalogSnapshot {
+	return ArtifactCatalogSnapshot{
+		Kind:     strings.TrimSpace(kind),
+		NodeID:   strings.TrimSpace(nodeID),
+		Epoch:    epoch,
+		Revision: revision,
+		First:    true,
+		Final:    true,
+		Withdraw: true,
+	}
+}
+
 // ChunkArtifactCatalogSnapshot splits an inventory into commands that fit the
 // apply transport. The sequence is always non-empty: an EMPTY inventory is a
 // real statement ("this node holds nothing of this kind"), and losing it is
 // what keeps a tenant's list asking every worker forever.
-func ChunkArtifactCatalogSnapshot(kind, nodeID, incarnation string, revision int64, rows []ArtifactCatalogRow) []ArtifactCatalogSnapshot {
+func ChunkArtifactCatalogSnapshot(kind, nodeID string, epoch, revision int64, rows []ArtifactCatalogRow) []ArtifactCatalogSnapshot {
 	base := ArtifactCatalogSnapshot{
-		Kind:        strings.TrimSpace(kind),
-		NodeID:      strings.TrimSpace(nodeID),
-		Incarnation: strings.TrimSpace(incarnation),
-		Revision:    revision,
+		Kind:     strings.TrimSpace(kind),
+		NodeID:   strings.TrimSpace(nodeID),
+		Epoch:    epoch,
+		Revision: revision,
 	}
 	if len(rows) == 0 {
 		only := base
@@ -189,6 +226,17 @@ func (c *Cluster) PublishArtifactCatalog(ctx context.Context, chunk ArtifactCata
 	return c.applyCommand(ctx, artifactCatalogCommand(chunk))
 }
 
+// ArtifactCatalogPublisherEpoch returns the epoch the catalogue currently
+// holds for (kind, nodeID). A publisher takes the NEXT one, which is how a
+// restarted process outranks every request its predecessor may still have in
+// flight.
+func (c *Cluster) ArtifactCatalogPublisherEpoch(_ context.Context, kind, nodeID string) (int64, error) {
+	if c == nil || c.fsm == nil {
+		return 0, fmt.Errorf("cluster: node holds no placement state")
+	}
+	return c.fsm.artifactCatalogPublisherEpoch(kind, nodeID), nil
+}
+
 // ArtifactCatalog reads one page of one catalogue from the local FSM.
 func (c *Cluster) ArtifactCatalog(_ context.Context, req ArtifactCatalogRequest) (ArtifactCatalogPage, error) {
 	if c == nil || c.fsm == nil {
@@ -216,6 +264,20 @@ func (a *Agent) PublishArtifactCatalog(ctx context.Context, chunk ArtifactCatalo
 	return a.applyCommand(ctx, artifactCatalogCommand(chunk))
 }
 
+// ArtifactCatalogPublisherEpoch asks the control plane for THIS node's
+// fencing token. The server fills it from the authenticated peer identity, so
+// a node can only ever learn its own.
+func (a *Agent) ArtifactCatalogPublisherEpoch(ctx context.Context, kind, nodeID string) (int64, error) {
+	if a == nil {
+		return 0, fmt.Errorf("cluster: agent is not configured")
+	}
+	page, err := a.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: kind, Limit: 1, ForNodeID: strings.TrimSpace(nodeID)})
+	if err != nil {
+		return 0, err
+	}
+	return page.PublisherEpoch, nil
+}
+
 // ArtifactCatalog reads one page from the server tier. An unreachable control
 // plane is an error: the caller falls back to the fan-out rather than
 // reporting a tenant's artifacts as absent.
@@ -237,14 +299,15 @@ func (a *Agent) ArtifactCatalog(ctx context.Context, req ArtifactCatalogRequest)
 
 func artifactCatalogCommand(chunk ArtifactCatalogSnapshot) command {
 	return command{
-		Op:                  opPublishArtifactCatalog,
-		ArtifactKind:        strings.TrimSpace(chunk.Kind),
-		NodeID:              strings.TrimSpace(chunk.NodeID),
-		ArtifactIncarnation: strings.TrimSpace(chunk.Incarnation),
-		ArtifactRevision:    chunk.Revision,
-		ArtifactRows:        chunk.Rows,
-		ArtifactChunkFirst:  chunk.First,
-		ArtifactChunkFinal:  chunk.Final,
+		Op:                 opPublishArtifactCatalog,
+		ArtifactWithdraw:   chunk.Withdraw,
+		ArtifactKind:       strings.TrimSpace(chunk.Kind),
+		NodeID:             strings.TrimSpace(chunk.NodeID),
+		ArtifactEpoch:      chunk.Epoch,
+		ArtifactRevision:   chunk.Revision,
+		ArtifactRows:       chunk.Rows,
+		ArtifactChunkFirst: chunk.First,
+		ArtifactChunkFinal: chunk.Final,
 	}
 }
 
@@ -257,8 +320,8 @@ func validateArtifactCatalogChunk(chunk ArtifactCatalogSnapshot) error {
 	if strings.TrimSpace(chunk.NodeID) == "" {
 		return fmt.Errorf("cluster: artifact catalogue publish requires a node id")
 	}
-	if strings.TrimSpace(chunk.Incarnation) == "" {
-		return fmt.Errorf("cluster: artifact catalogue publish requires a publisher incarnation")
+	if chunk.Epoch <= 0 {
+		return fmt.Errorf("cluster: artifact catalogue publish requires a publisher epoch")
 	}
 	if chunk.Revision <= 0 {
 		return fmt.Errorf("cluster: artifact catalogue publish requires a positive revision")
@@ -284,10 +347,81 @@ func validateArtifactCatalogChunk(chunk ArtifactCatalogSnapshot) error {
 
 // artifactCatalogNodeState is one node's inventory of one kind.
 type artifactCatalogNodeState struct {
-	Incarnation string
-	Revision    int64
-	// Rows is id -> row for every tenant this node holds of the kind.
+	Epoch    int64
+	Revision int64
+	// Withdrawn marks a node that has no coverage: it either could not
+	// represent its inventory, or its storage was attested destroyed. The
+	// entry is kept because its epoch is the watermark that fences a
+	// publication still in flight from the process that is gone.
+	Withdrawn bool
+	// Rows is (tenant, id) -> row. The id alone is NOT unique: JS bundle ids
+	// are content digests, so two tenants uploading identical content hold
+	// the same id on one worker, and keying by id let the second erase the
+	// first while the catalogue still claimed to cover both.
 	Rows map[string]ArtifactCatalogRow
+}
+
+// artifactCatalogRowKey identifies a row inside one node's inventory.
+func artifactCatalogRowKey(tenant, id string) string {
+	return strings.TrimSpace(tenant) + "\x00" + strings.TrimSpace(id)
+}
+
+// artifactCatalogSnapshotState is how one kind's catalogue is serialized into
+// a raft snapshot: both halves, because both are replicated state.
+type artifactCatalogSnapshotState struct {
+	Committed map[string]artifactCatalogNodeState
+	Pending   map[string]artifactCatalogNodeState
+}
+
+func cloneArtifactCatalogNodes(in map[string]artifactCatalogNodeState) map[string]artifactCatalogNodeState {
+	out := make(map[string]artifactCatalogNodeState, len(in))
+	for nodeID, entry := range in {
+		rows := make(map[string]ArtifactCatalogRow, len(entry.Rows))
+		for key, row := range entry.Rows {
+			rows[key] = row
+		}
+		out[nodeID] = artifactCatalogNodeState{
+			Epoch: entry.Epoch, Revision: entry.Revision, Withdrawn: entry.Withdrawn, Rows: rows,
+		}
+	}
+	return out
+}
+
+// withdrawArtifactCatalogCoverageLocked drops a node's rows and coverage for
+// every kind and RAISES its epoch watermark past anything that process could
+// still have in flight, so a delayed publication cannot re-add a node whose
+// storage an operator attested destroyed. A node that comes back asks the
+// authority for the next epoch and publishes normally. Caller holds f.mu.
+func (f *placementFSM) withdrawArtifactCatalogCoverageLocked(nodeID string) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return
+	}
+	for _, state := range f.artifactCatalog {
+		if state == nil {
+			continue
+		}
+		entry, committed := state.Committed[nodeID]
+		pending, building := state.Pending[nodeID]
+		if !committed && !building {
+			continue
+		}
+		epoch, revision := entry.Epoch, entry.Revision
+		if building && (pending.Epoch > epoch || (pending.Epoch == epoch && pending.Revision > revision)) {
+			epoch, revision = pending.Epoch, pending.Revision
+		}
+		_ = revision
+		state.Committed[nodeID] = artifactCatalogNodeState{
+			// One past the highest epoch this node has used: every request
+			// from the retired process, whatever its revision, is now older
+			// than the watermark.
+			Epoch:     epoch + 1,
+			Revision:  0,
+			Withdrawn: true,
+			Rows:      map[string]ArtifactCatalogRow{},
+		}
+		delete(state.Pending, nodeID)
+	}
 }
 
 // artifactCatalogKindState separates the committed snapshot from a
@@ -300,16 +434,29 @@ type artifactCatalogKindState struct {
 }
 
 // supersedes reports whether an incoming publication is newer than what is
-// held. A different publisher incarnation is always newer: the process that
-// held the old revisions is gone.
-func (s artifactCatalogNodeState) supersedes(incarnation string, revision int64) bool {
-	if s.Rows == nil && s.Revision == 0 && s.Incarnation == "" {
-		return true
-	}
-	if s.Incarnation != incarnation {
-		return true
+// held, ordered by (epoch, revision). A LOWER epoch is a superseded process:
+// its requests are refused however high their revision, which is what stops a
+// delayed request from a replaced process taking ownership back.
+func (s artifactCatalogNodeState) supersedes(epoch, revision int64) bool {
+	if s.Epoch != epoch {
+		return epoch > s.Epoch
 	}
 	return revision > s.Revision
+}
+
+func (f *placementFSM) artifactCatalogPublisherEpoch(kind, nodeID string) int64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	state := f.artifactCatalog[artifactCatalogKindKey(kind)]
+	if state == nil {
+		return 0
+	}
+	epoch := state.Committed[strings.TrimSpace(nodeID)].Epoch
+	// A half-delivered publication has already claimed its epoch.
+	if pending := state.Pending[strings.TrimSpace(nodeID)].Epoch; pending > epoch {
+		epoch = pending
+	}
+	return epoch
 }
 
 func (f *placementFSM) artifactCatalogPage(req ArtifactCatalogRequest) ArtifactCatalogPage {
@@ -323,12 +470,22 @@ func (f *placementFSM) artifactCatalogPage(req ArtifactCatalogRequest) ArtifactC
 	defer f.mu.RUnlock()
 	page := ArtifactCatalogPage{Authoritative: true}
 	state := f.artifactCatalog[artifactCatalogKindKey(req.Kind)]
-	if state == nil || len(state.Committed) == 0 {
+	if state == nil {
+		return page
+	}
+	if len(state.Committed) == 0 {
+		if forNode := strings.TrimSpace(req.ForNodeID); forNode != "" {
+			page.PublisherEpoch = state.Pending[forNode].Epoch
+		}
 		return page
 	}
 
 	nodeIDs := make([]string, 0, len(state.Committed))
-	for nodeID := range state.Committed {
+	for nodeID, entry := range state.Committed {
+		if entry.Withdrawn {
+			// No rows and no coverage: the aggregator asks this node again.
+			continue
+		}
 		nodeIDs = append(nodeIDs, nodeID)
 	}
 	sort.Strings(nodeIDs)
@@ -336,6 +493,12 @@ func (f *placementFSM) artifactCatalogPage(req ArtifactCatalogRequest) ArtifactC
 	// holding nothing for this tenant has still answered for it. It is
 	// therefore complete on the first page, independent of the cursor.
 	page.Publishers = nodeIDs
+	if forNode := strings.TrimSpace(req.ForNodeID); forNode != "" {
+		page.PublisherEpoch = state.Committed[forNode].Epoch
+		if pending := state.Pending[forNode].Epoch; pending > page.PublisherEpoch {
+			page.PublisherEpoch = pending
+		}
+	}
 
 	// The walk is ordered by (node, id) so the cursor is a single comparable
 	// string and a page boundary never loses or repeats a row.
@@ -343,12 +506,14 @@ func (f *placementFSM) artifactCatalogPage(req ArtifactCatalogRequest) ArtifactC
 	lastCursor := ""
 	for _, nodeID := range nodeIDs {
 		entry := state.Committed[nodeID]
+		// Within one tenant an id IS unique, so the walk position stays
+		// (node, id) even though the inventory is keyed by (tenant, id).
 		ids := make([]string, 0, len(entry.Rows))
-		for id, row := range entry.Rows {
+		for _, row := range entry.Rows {
 			if strings.TrimSpace(row.Tenant) != tenant {
 				continue
 			}
-			ids = append(ids, id)
+			ids = append(ids, row.ID)
 		}
 		sort.Strings(ids)
 		for _, id := range ids {
@@ -356,7 +521,7 @@ func (f *placementFSM) artifactCatalogPage(req ArtifactCatalogRequest) ArtifactC
 			if req.PageToken != "" && cursor <= req.PageToken {
 				continue
 			}
-			row := entry.Rows[id]
+			row := entry.Rows[artifactCatalogRowKey(tenant, id)]
 			cost := len(row.Payload) + len(row.ID) + len(row.Tenant) + artifactCatalogRowOverheadBytes
 			if len(page.Rows) >= limit || (len(page.Rows) > 0 && cost > budget) {
 				// Out of room, not out of rows: the cursor carries the rest.

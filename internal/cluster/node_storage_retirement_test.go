@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -191,5 +193,143 @@ func TestNodeStorageRetirementAttestedAtPrecision(t *testing.T) {
 	rec := NodeStorageRetirement{AttestedUnixNano: at.UnixNano()}
 	if got := rec.AttestedAt(); !got.Equal(at) {
 		t.Fatalf("attested at %v, want %v", got, at)
+	}
+}
+
+// A follower's own FSM cannot order itself against a revoke, so the
+// authoritative read forwards to the leader. Server and mixed nodes hold
+// delete outboxes of their own, so this path has to work for them — without
+// it every one of them fails closed forever on an attestation the operator
+// did make.
+func TestClusterAuthoritativeRetirementReadForwardsToTheLeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupL := newTestCluster(t, "srv-retire-leader", true, nil)
+	defer cleanupL()
+	follower, cleanupF := newTestCluster(t, "srv-retire-follower", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupF()
+	waitForLeader(t, leader, 10*time.Second)
+	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	waitForLeader(t, follower, 10*time.Second)
+	ctx := context.Background()
+
+	// The leader answers from its own FSM.
+	if err := leader.RetireNodeStorage(ctx, "node-gone", "operator", "disk destroyed", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := leader.AuthoritativeNodeStorageRetirements(ctx)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("leader read = %+v err=%v", recs, err)
+	}
+
+	// A follower forwards. The probe reuses the leader's raft so the HTTP
+	// branches do not need a second election; only its gossip view and
+	// internal client differ.
+	var status int
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("authoritative") != "true" {
+			http.Error(w, "the forwarded read did not ask for the leader", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+
+	leaderID := follower.Leader()
+	if leaderID == "" {
+		t.Fatal("follower reported no leader")
+	}
+	// The probe reuses the FOLLOWER's raft, so it really is a follower; only
+	// its gossip view and internal client are redirected at the stub.
+	probeFor := func(internalURL string, client *http.Client) *Cluster {
+		index := newGossipMemberIndex()
+		index.upsert(Member{NodeID: leaderID, Alive: true, InternalURL: internalURL})
+		probe := &Cluster{
+			nodeID:   follower.nodeID,
+			patToken: "tok",
+			fsm:      follower.fsm,
+			raft:     follower.raft,
+			gossip:   &gossipNode{memberIndex: index},
+		}
+		probe.setInternalClient(client)
+		return probe
+	}
+
+	status, body = http.StatusOK, `{"retirements":[{"node_id":"node-gone","attested_unix_nano":7}],"authoritative":true}`
+	got, err := probeFor(srv.URL, srv.Client()).AuthoritativeNodeStorageRetirements(ctx)
+	if err != nil || len(got) != 1 || got[0].NodeID != "node-gone" {
+		t.Fatalf("forwarded read = %+v err=%v", got, err)
+	}
+
+	// An answer that is not authoritative is refused rather than trusted.
+	status, body = http.StatusOK, `{"retirements":[],"authoritative":false}`
+	if _, err := probeFor(srv.URL, srv.Client()).AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("a non-authoritative answer was accepted")
+	}
+
+	status, body = http.StatusOK, "{not-json"
+	if _, err := probeFor(srv.URL, srv.Client()).AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("decode error expected")
+	}
+	status, body = http.StatusServiceUnavailable, "not leader"
+	if _, err := probeFor(srv.URL, srv.Client()).AuthoritativeNodeStorageRetirements(ctx); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("503 = %v", err)
+	}
+	status, body = http.StatusInternalServerError, "boom"
+	if _, err := probeFor(srv.URL, srv.Client()).AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("500 expected")
+	}
+	if _, err := probeFor("http://127.0.0.1:1", http.DefaultClient).AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("dial error expected")
+	}
+
+	var none *Cluster
+	if _, err := none.AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("a nil cluster answered an authoritative read")
+	}
+}
+
+// The forwarding path's preconditions: no leader, no internal client, and no
+// internal URL for the leader are all fail-closed, because a discharge
+// authorized by nothing is not authorized at all.
+func TestClusterAuthoritativeRetirementReadPreconditions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupL := newTestCluster(t, "srv-precond-leader", true, nil)
+	defer cleanupL()
+	follower, cleanupF := newTestCluster(t, "srv-precond-follower", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupF()
+	waitForLeader(t, leader, 10*time.Second)
+	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	waitForLeader(t, follower, 10*time.Second)
+	ctx := context.Background()
+
+	leaderID := follower.Leader()
+	if leaderID == "" {
+		t.Fatal("follower reported no leader")
+	}
+
+	// Gossip knows the leader but has no internal URL for it.
+	index := newGossipMemberIndex()
+	index.upsert(Member{NodeID: leaderID, Alive: true})
+	noURL := &Cluster{nodeID: follower.nodeID, fsm: follower.fsm, raft: follower.raft, gossip: &gossipNode{memberIndex: index}}
+	noURL.setInternalClient(http.DefaultClient)
+	if _, err := noURL.AuthoritativeNodeStorageRetirements(ctx); !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("missing internal URL = %v, want ErrPeerInternalURLRequired", err)
+	}
+
+	// No internal client at all.
+	noClient := &Cluster{nodeID: follower.nodeID, fsm: follower.fsm, raft: follower.raft, gossip: &gossipNode{memberIndex: index}}
+	if _, err := noClient.AuthoritativeNodeStorageRetirements(ctx); !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("missing internal client = %v, want ErrPeerInternalURLRequired", err)
+	}
+
+	// A node with no FSM cannot answer either.
+	if _, err := (&Cluster{}).AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("a cluster with no placement state answered an authoritative read")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -15,6 +16,48 @@ type TemplateArtifactPushStore interface {
 	ListTemplatesPendingPush(ctx context.Context) ([]*models.Template, error)
 	SetTemplatePushState(ctx context.Context, id, state, errMsg string) error
 	UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error
+}
+
+// TemplatePushStore wraps the raw store the push reconciler writes through so
+// every push-metadata change also invalidates the replicated catalogue.
+//
+// The reconciler is wired independently of the Service and writes
+// RegistryRef, PushDigest and PushState straight to SQLite. Those fields are
+// part of the row the catalogue publishes, so without this seam a successful
+// push left the fleet-visible DTO saying "pending" with an empty registry
+// reference — and nothing marked the kind dirty, so no maintenance pass ever
+// repaired it. Wrapping the STORE rather than adding a callback means a
+// future writer on this path is covered by construction.
+func (s *Service) TemplatePushStore(inner TemplateArtifactPushStore) TemplateArtifactPushStore {
+	if s == nil || inner == nil {
+		return inner
+	}
+	return &templatePushStoreSeam{inner: inner, svc: s}
+}
+
+type templatePushStoreSeam struct {
+	inner TemplateArtifactPushStore
+	svc   *Service
+}
+
+func (t *templatePushStoreSeam) ListTemplatesPendingPush(ctx context.Context) ([]*models.Template, error) {
+	return t.inner.ListTemplatesPendingPush(ctx)
+}
+
+func (t *templatePushStoreSeam) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
+	if err := t.inner.SetTemplatePushState(ctx, id, state, errMsg); err != nil {
+		return err
+	}
+	t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	return nil
+}
+
+func (t *templatePushStoreSeam) UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error {
+	if err := t.inner.UpdateTemplatePushDistribution(ctx, id, ref, digest); err != nil {
+		return err
+	}
+	t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	return nil
 }
 
 // TemplateArtifactPushReconciler walks rows the build success path

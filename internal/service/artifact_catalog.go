@@ -3,11 +3,12 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"expvar"
 	"strings"
 	"sync"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
-	"github.com/google/uuid"
 )
 
 // Publishing this node's artifact metadata into the replicated catalogue.
@@ -34,6 +35,11 @@ import (
 // is the answer that keeps a tenant with no artifacts anywhere from sending
 // every list back to the whole fleet.
 
+// artifactCatalogCoverageWithdrawn counts inventories this node could not
+// represent. A non-zero value means its artifacts are being listed by the
+// peer sweep rather than the catalogue.
+var artifactCatalogCoverageWithdrawn = expvar.NewInt("aerolvm_artifact_catalogue_coverage_withdrawn_total")
+
 // artifactCatalogPublisher is the cluster capability this needs. Both the
 // server-role Cluster (local apply) and the worker/ingress Agent (forwarded
 // apply) provide it; Noop does not, which keeps standalone mode inert.
@@ -50,22 +56,50 @@ type artifactCatalogReader interface {
 // and what the catalogue has accepted. dirty is set by every mutation and
 // cleared only by a publication of a revision that is still current.
 type artifactCatalogState struct {
-	mu          sync.Mutex
-	incarnation string
-	revision    map[string]int64
-	published   map[string]int64
+	mu        sync.Mutex
+	epoch     map[string]int64
+	revision  map[string]int64
+	published map[string]int64
 }
 
-func (s *artifactCatalogState) publisherIncarnation() string {
+// publisherEpoch returns the fencing token this process publishes under, or 0
+// when it has not been issued yet. The token comes from the AUTHORITY (the
+// catalogue's committed epoch plus one), not from the process, so a request
+// still in flight from a replaced process is refused however high its
+// revision.
+func (s *artifactCatalogState) publisherEpoch(kind string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.incarnation == "" {
-		// Identifies this PROCESS. A restart resets the revision counter, so
-		// without it the FSM would fence everything the new process publishes
-		// until it counted past the dead one's last revision.
-		s.incarnation = uuid.NewString()
+	return s.epoch[kind]
+}
+
+// seedEpoch records the token the authority issued. It never goes backwards
+// within a process.
+func (s *artifactCatalogState) seedEpoch(kind string, epoch int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.epoch == nil {
+		s.epoch = make(map[string]int64)
 	}
-	return s.incarnation
+	if epoch > s.epoch[kind] {
+		s.epoch[kind] = epoch
+		// A new epoch restarts the revision sequence, and nothing published
+		// under the old one counts as published.
+		if s.revision == nil {
+			s.revision = make(map[string]int64)
+		}
+		s.revision[kind] = 1
+		delete(s.published, kind)
+	}
+}
+
+// retireEpoch drops the token after the authority refuses it, so the next
+// pass asks for a fresh one.
+func (s *artifactCatalogState) retireEpoch(kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.epoch, kind)
+	delete(s.published, kind)
 }
 
 // markDirty bumps the kind's revision and returns it.
@@ -139,6 +173,12 @@ func (s *Service) ReconcileArtifactCatalog(ctx context.Context) {
 }
 
 func (s *Service) reconcileArtifactKind(ctx context.Context, publisher artifactCatalogPublisher, nodeID, kind string) {
+	epoch, ok := s.ensurePublisherEpoch(ctx, kind, nodeID)
+	if !ok {
+		// No fencing token: publishing without one is how a replaced process
+		// takes ownership back. Stay dirty and ask again next pass.
+		return
+	}
 	revision, needed := s.artifactCatalog.begin(kind)
 	if !needed {
 		return
@@ -151,26 +191,72 @@ func (s *Service) reconcileArtifactKind(ctx context.Context, publisher artifactC
 		return
 	}
 	if len(rows) > cluster.MaxArtifactCatalogRowsPerNode() {
+		// "Peers will keep being asked" is only true for a node nobody has
+		// covered yet. A node already in the catalogue would keep its last
+		// inventory advertised and keep being SKIPPED, so an inventory that
+		// cannot be represented has to withdraw the coverage explicitly.
 		if s.logger != nil {
-			s.logger.Warn("cluster: artifact inventory exceeds the catalogue cap; peers will keep being asked directly",
-				"kind", kind, "rows", len(rows))
+			s.logger.Warn("cluster: artifact inventory exceeds the catalogue cap; withdrawing coverage so peers are asked directly",
+				"kind", kind, "rows", len(rows), "cap", cluster.MaxArtifactCatalogRowsPerNode())
 		}
+		if err := publisher.PublishArtifactCatalog(ctx, cluster.WithdrawArtifactCatalogCoverage(kind, nodeID, epoch, revision)); err != nil {
+			if errors.Is(err, cluster.ErrArtifactCatalogSuperseded) {
+				s.artifactCatalog.retireEpoch(kind)
+			}
+			if s.logger != nil {
+				s.logger.Warn("cluster: artifact catalogue coverage withdrawal failed; retrying on the next maintenance pass",
+					"kind", kind, "err", err)
+			}
+			return
+		}
+		artifactCatalogCoverageWithdrawn.Add(1)
+		s.artifactCatalog.commit(kind, revision)
 		return
 	}
-	incarnation := s.artifactCatalog.publisherIncarnation()
-	for _, chunk := range cluster.ChunkArtifactCatalogSnapshot(kind, nodeID, incarnation, revision, rows) {
+	for _, chunk := range cluster.ChunkArtifactCatalogSnapshot(kind, nodeID, epoch, revision, rows) {
 		if err := publisher.PublishArtifactCatalog(ctx, chunk); err != nil {
+			if errors.Is(err, cluster.ErrArtifactCatalogSuperseded) {
+				// Another process owns this node's catalogue entry, or our
+				// token is stale. Drop it and ask the authority again rather
+				// than retrying under an epoch it has moved past.
+				s.artifactCatalog.retireEpoch(kind)
+			}
 			// The kind stays dirty, so the next tick starts the snapshot
 			// again from its first chunk. A half-delivered snapshot is never
 			// committed, so the catalogue keeps serving the previous one.
 			if s.logger != nil {
 				s.logger.Warn("cluster: artifact catalogue publish failed; retrying on the next maintenance pass",
-					"kind", kind, "revision", revision, "err", err)
+					"kind", kind, "epoch", epoch, "revision", revision, "err", err)
 			}
 			return
 		}
 	}
 	s.artifactCatalog.commit(kind, revision)
+}
+
+// ensurePublisherEpoch obtains this process's fencing token for a kind,
+// asking the authority once and reusing it afterwards.
+func (s *Service) ensurePublisherEpoch(ctx context.Context, kind, nodeID string) (int64, bool) {
+	if epoch := s.artifactCatalog.publisherEpoch(kind); epoch > 0 {
+		return epoch, true
+	}
+	c := s.Cluster()
+	reader, ok := c.(interface {
+		ArtifactCatalogPublisherEpoch(ctx context.Context, kind, nodeID string) (int64, error)
+	})
+	if !ok {
+		return 0, false
+	}
+	committed, err := reader.ArtifactCatalogPublisherEpoch(ctx, kind, nodeID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("cluster: artifact catalogue publisher epoch read failed; publication deferred",
+				"kind", kind, "err", err)
+		}
+		return 0, false
+	}
+	s.artifactCatalog.seedEpoch(kind, committed+1)
+	return s.artifactCatalog.publisherEpoch(kind), true
 }
 
 // localArtifactRows builds this node's rows for one kind. ok=false means the

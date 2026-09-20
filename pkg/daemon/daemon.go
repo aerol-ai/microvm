@@ -1465,7 +1465,9 @@ func startTemplateArtifactPushReconciler(ctx context.Context, logger *slog.Logge
 			"error", err)
 		return
 	}
-	r := service.NewTemplateArtifactPushReconciler(pusher, db, logger, cfg.SnapshotPushMaxInFlight)
+	// Through the service's seam, so a push that changes the row's registry
+	// ref or push state also invalidates the replicated artifact catalogue.
+	r := service.NewTemplateArtifactPushReconciler(pusher, svc.TemplatePushStore(db), logger, cfg.SnapshotPushMaxInFlight)
 	if r == nil {
 		return
 	}
