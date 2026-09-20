@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"expvar"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/google/uuid"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 )
@@ -60,6 +63,14 @@ type artifactCatalogState struct {
 	epoch     map[string]int64
 	revision  map[string]int64
 	published map[string]int64
+	// holder is this process's identity, generated once, and holderGen
+	// distinguishes one ALLOCATION ATTEMPT from the next. The authority hands
+	// the same token back to the same (holder, generation), which is what
+	// makes a retry after a lost response idempotent; retiring a refused
+	// token bumps the generation so the next attempt is issued a fresh one
+	// rather than the number that was just refused.
+	holder    string
+	holderGen map[string]int64
 }
 
 // publisherEpoch returns the fencing token this process publishes under, or 0
@@ -100,6 +111,14 @@ func (s *artifactCatalogState) retireEpoch(kind string) {
 	defer s.mu.Unlock()
 	delete(s.epoch, kind)
 	delete(s.published, kind)
+	// The next allocation for THIS kind must be a new token: re-asking under
+	// the same identity would be answered with the one the authority just
+	// refused. The other kind's generation is untouched, so its own retry
+	// stays idempotent.
+	if s.holderGen == nil {
+		s.holderGen = make(map[string]int64)
+	}
+	s.holderGen[kind]++
 }
 
 // markDirty bumps the kind's revision and returns it.
@@ -236,27 +255,45 @@ func (s *Service) reconcileArtifactKind(ctx context.Context, publisher artifactC
 
 // ensurePublisherEpoch obtains this process's fencing token for a kind,
 // asking the authority once and reusing it afterwards.
+//
+// The token is ALLOCATED, not read-and-incremented: two processes for the
+// same node that each read the committed epoch pick the same successor, and
+// the catalogue can then no longer order them. artifactCatalogHolder is this
+// process's identity, which makes a retried allocation return the token
+// already issued instead of burning a fresh one per attempt.
 func (s *Service) ensurePublisherEpoch(ctx context.Context, kind, nodeID string) (int64, bool) {
 	if epoch := s.artifactCatalog.publisherEpoch(kind); epoch > 0 {
 		return epoch, true
 	}
 	c := s.Cluster()
-	reader, ok := c.(interface {
-		ArtifactCatalogPublisherEpoch(ctx context.Context, kind, nodeID string) (int64, error)
+	allocator, ok := c.(interface {
+		AllocateArtifactCatalogEpoch(ctx context.Context, kind, nodeID, holder string) (int64, error)
 	})
 	if !ok {
 		return 0, false
 	}
-	committed, err := reader.ArtifactCatalogPublisherEpoch(ctx, kind, nodeID)
+	issued, err := allocator.AllocateArtifactCatalogEpoch(ctx, kind, nodeID, s.artifactCatalogHolder(kind))
 	if err != nil {
 		if s.logger != nil {
-			s.logger.Warn("cluster: artifact catalogue publisher epoch read failed; publication deferred",
+			s.logger.Warn("cluster: artifact catalogue publisher epoch allocation failed; publication deferred",
 				"kind", kind, "err", err)
 		}
 		return 0, false
 	}
-	s.artifactCatalog.seedEpoch(kind, committed+1)
+	s.artifactCatalog.seedEpoch(kind, issued)
 	return s.artifactCatalog.publisherEpoch(kind), true
+}
+
+// artifactCatalogHolder is this process's identity for one kind's token
+// allocation: stable for the life of the process, distinct from any
+// predecessor's, and advanced when a token is refused.
+func (s *Service) artifactCatalogHolder(kind string) string {
+	s.artifactCatalog.mu.Lock()
+	defer s.artifactCatalog.mu.Unlock()
+	if s.artifactCatalog.holder == "" {
+		s.artifactCatalog.holder = uuid.NewString()
+	}
+	return s.artifactCatalog.holder + "/" + kind + "/" + strconv.FormatInt(s.artifactCatalog.holderGen[kind], 10)
 }
 
 // localArtifactRows builds this node's rows for one kind. ok=false means the

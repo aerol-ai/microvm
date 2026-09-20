@@ -797,13 +797,24 @@ func (h *handlers) clusterInternalNodeStorageRetirements(w http.ResponseWriter, 
 	}
 	if r.URL.Query().Get("authoritative") == "true" {
 		// Discharging a deletion obligation without an ACK is irreversible, so
-		// it asks the leader explicitly: a follower whose FSM has not yet
-		// applied an operator's revoke would otherwise authorize a removal the
-		// operator has already withdrawn.
-		if leader := c.Leader(); leader == "" || leader != c.SelfNodeID() {
-			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+		// it goes through the SAME barriered read a server-role node uses:
+		// leadership alone does not mean this node's FSM has applied the
+		// operator's revoke, and reading the FSM directly here would authorize
+		// a removal that was already withdrawn.
+		authoritative, ok := c.(interface {
+			NodeStorageRetirementsForPeerAuthoritative(context.Context) (cluster.NodeStorageRetirementsResponse, error)
+		})
+		if !ok {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 			return
 		}
+		resp, err := authoritative.NodeStorageRetirementsForPeerAuthoritative(r.Context())
+		if err != nil {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, resp)
+		return
 	}
 	reader, ok := c.(interface {
 		NodeStorageRetirementsForPeer() cluster.NodeStorageRetirementsResponse
@@ -846,6 +857,48 @@ func (h *handlers) clusterInternalArtifactCatalog(w http.ResponseWriter, r *http
 	// comes from the authenticated identity, never from the body.
 	req.ForNodeID = strings.TrimSpace(peerID)
 	apihttp.WriteJSON(w, http.StatusOK, reader.ArtifactCatalogForPeer(req))
+}
+
+// clusterInternalArtifactCatalogEpoch issues one publisher its fencing token.
+// The node is the mTLS-authenticated peer identity, never a body field: a
+// node may only ever be issued its own token, and binding it to the identity
+// is what stops one node fencing another's publications.
+//
+// Allocation is a raft write, so a non-leader answers 503 and the caller
+// walks on to the leader.
+func (h *handlers) clusterInternalArtifactCatalogEpoch(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	peerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	if strings.TrimSpace(peerID) == "" {
+		apihttp.WriteError(w, http.StatusForbidden, "cluster: peer identity required")
+		return
+	}
+	var req cluster.ArtifactCatalogEpochRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	allocator, ok := c.(interface {
+		AllocateArtifactCatalogEpoch(ctx context.Context, kind, nodeID, holder string) (int64, error)
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	epoch, err := allocator.AllocateArtifactCatalogEpoch(r.Context(), req.Kind, strings.TrimSpace(peerID), req.Holder)
+	if err != nil {
+		if errors.Is(err, cluster.ErrNotLeader) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not the leader")
+			return
+		}
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: artifact catalogue epoch allocation failed: "+err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.ArtifactCatalogEpochResponse{Epoch: epoch})
 }
 
 // clusterRevokeNodeStorageRetirement withdraws an attestation made in error.
@@ -984,17 +1037,15 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
 			return
 		}
-		if errors.Is(err, cluster.ErrCreateBackpressure) {
-			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
-			apihttp.WriteError(w, http.StatusTooManyRequests, err.Error())
-			return
+		// Everything else is classified by the cluster package, so this
+		// listener and the node-to-node one answer a given verdict with the
+		// same status. It matters for the artifact catalogue: a superseded
+		// publication has to reach the publisher AS superseded, or it keeps
+		// republishing under a token the authority has moved past.
+		if retryAfter := cluster.ApplyErrorRetryAfterSeconds(err); retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		}
-		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
-			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		apihttp.WriteError(w, cluster.ApplyErrorStatus(err), err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

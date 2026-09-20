@@ -333,3 +333,53 @@ func TestClusterAuthoritativeRetirementReadPreconditions(t *testing.T) {
 		t.Fatal("a cluster with no placement state answered an authoritative read")
 	}
 }
+
+// Leadership is not an authority claim on its own: raft applies to the FSM
+// asynchronously, so a node can win an election while its FSM still holds an
+// attestation the operator already revoked. The authoritative read therefore
+// takes a quorum round (VerifyLeader) and waits for the apply queue to drain
+// (Barrier) before answering, and the PEER path uses the same read rather
+// than touching the FSM directly.
+func TestAuthoritativeRetirementReadWaitsForTheFSM(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "srv-barrier", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if err := c.RetireNodeStorage(ctx, "node-gone", "operator", "disk destroyed", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RevokeNodeStorageRetirement(ctx, "node-gone"); err != nil {
+		t.Fatal(err)
+	}
+	// The barrier is what makes this read see the revoke that was committed
+	// a moment ago rather than whatever the FSM happened to have applied.
+	recs, err := c.AuthoritativeNodeStorageRetirements(ctx)
+	if err != nil {
+		t.Fatalf("authoritative read: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Fatalf("read returned %+v after a committed revoke", recs)
+	}
+
+	// The peer-facing form answers from the same barriered path.
+	resp, err := c.NodeStorageRetirementsForPeerAuthoritative(ctx)
+	if err != nil || !resp.Authoritative || len(resp.Retirements) != 0 {
+		t.Fatalf("peer authoritative read = %+v err=%v", resp, err)
+	}
+
+	// A node that is no longer able to prove leadership must fail closed
+	// rather than serve its own FSM.
+	if err := c.raft.raft.Shutdown().Error(); err != nil {
+		t.Fatalf("shutdown raft: %v", err)
+	}
+	if _, err := c.AuthoritativeNodeStorageRetirements(ctx); err == nil {
+		t.Fatal("a node that cannot prove leadership still answered an authoritative read")
+	}
+	if _, err := c.NodeStorageRetirementsForPeerAuthoritative(ctx); err == nil {
+		t.Fatal("the peer path served an unverified answer")
+	}
+}

@@ -35,6 +35,23 @@ const (
 	// pass costs a slow peer a fraction of a slot, so every peer that can
 	// answer promptly is reached regardless of how many cannot.
 	capacityLeaseQuickProbeTimeout = 300 * time.Millisecond
+	// capacityLeaseQuickProbeMaxConcurrency bounds the quick pass's pool.
+	// The quick pass is the only part of a sweep whose per-peer cost is
+	// bounded (300ms, one small GET), so it is the only part that can be
+	// sized to COVER the fleet inside the sweep budget. At 32 slots it
+	// cannot: 2,000 peers need 2,000*300ms/32 = 18.75s, five times a 3s
+	// renewal slice, so a fleet whose stalest peers are slow spends the
+	// whole sweep on them and never dials a peer that would have answered
+	// in a microsecond. Sizing the pool from (peers * probe / budget)
+	// bounds the CLASS by wall clock instead of by queue position.
+	capacityLeaseQuickProbeMaxConcurrency = 256
+	// capacityLeaseSlowProbePaceSweeps is how many sweep budgets a peer that
+	// keeps missing the quick probe waits before it is dialled again. Missing
+	// the quick probe is not a failure — the peer is alive and answers the
+	// full pass — so it never enters the failure backoff, and without pacing
+	// every sweep pays full price for every slow peer forever. Two sweeps
+	// keeps a slow-but-answering peer inside a 15s lease TTL.
+	capacityLeaseSlowProbePaceSweeps = 2
 )
 
 type capacityLease struct {
@@ -62,6 +79,12 @@ type capacityLeaseCache struct {
 	// behind them were never dispatched, so they never entered backoff and
 	// never moved out of the way.
 	lastAttempt map[string]time.Time
+	// slowProbes counts consecutive sweeps in which a peer was dialled by
+	// the quick pass and did not answer it. It is a RESPONSIVENESS clock,
+	// not a health one: a peer at 1 is alive and answering, just not within
+	// the probe, and the two are scheduled differently — see
+	// capacityLeaseSlowProbePaceSweeps.
+	slowProbes map[string]int
 
 	// localTemplateInventory is the Phase 6 PR-D hook for template-aware
 	// placement. cmd/sandboxd registers a callback that reads from the
@@ -92,7 +115,58 @@ func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval 
 		nextAttempt: make(map[string]time.Time),
 		failures:    make(map[string]int),
 		lastAttempt: make(map[string]time.Time),
+		slowProbes:  make(map[string]int),
 	}
+}
+
+// recordQuickProbe notes whether a peer answered the quick pass. Answering
+// clears the responsiveness clock; missing advances it, which both moves the
+// peer out of the reserved responsive slice and paces its next probe.
+func (c *capacityLeaseCache) recordQuickProbe(nodeID string, answered bool) {
+	if c == nil || nodeID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.slowProbes == nil {
+		c.slowProbes = make(map[string]int)
+	}
+	if answered {
+		delete(c.slowProbes, nodeID)
+		return
+	}
+	if c.slowProbes[nodeID] < capacityLeaseSlowProbePaceSweeps {
+		c.slowProbes[nodeID]++
+	}
+}
+
+// quickProbeMisses reports how many consecutive quick probes a peer has
+// missed. Zero means responsive: it answered the last one it was dialled for,
+// or has not been classified yet.
+func (c *capacityLeaseCache) quickProbeMisses(nodeID string) int {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.slowProbes[nodeID]
+}
+
+// slowProbePaced reports whether a peer known to miss the quick probe was
+// dialled too recently to be worth dialling again this sweep. Pacing applies
+// only to the slow class, so a responsive peer is never held back.
+func (c *capacityLeaseCache) slowProbePaced(nodeID string, now time.Time, sweepBudget time.Duration) bool {
+	if c == nil || sweepBudget <= 0 {
+		return false
+	}
+	c.mu.RLock()
+	misses := c.slowProbes[nodeID]
+	last := c.lastAttempt[nodeID]
+	c.mu.RUnlock()
+	if misses <= 0 || last.IsZero() {
+		return false
+	}
+	return now.Sub(last) < time.Duration(misses)*sweepBudget
 }
 
 // setAdmitter swaps the local capacity source. The lease loop reads admitter
@@ -322,6 +396,11 @@ func (c *capacityLeaseCache) retain(live map[string]struct{}) int {
 			delete(c.lastAttempt, id)
 		}
 	}
+	for id := range c.slowProbes {
+		if _, ok := live[id]; !ok && id != c.selfID {
+			delete(c.slowProbes, id)
+		}
+	}
 	return dropped
 }
 
@@ -450,14 +529,37 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 	})
 
 	budget := c.capacityLeaseSweepBudget()
-	// Reserve the first slice of the sweep for peers that already have a
-	// lease to lose. Renewals are normally a handful of milliseconds, so
-	// first contact still gets nearly the whole budget; when they are not,
-	// keeping a usable node schedulable beats discovering a new one a tick
-	// sooner.
+	// Split the renewals again, by RESPONSIVENESS. Reserving a slice of the
+	// sweep for "peers that hold a lease" bounds that class as a whole, but
+	// every peer in it still competes for the same slots — and a peer that
+	// is alive but slow never enters the failure backoff, because missing a
+	// 300ms probe is not evidence of a fault. So a fleet where most peers
+	// answer in ~1s spends its entire renewal slice on them, sweep after
+	// sweep, while the peers that answer instantly are never dialled and
+	// lose the leases they could have renewed in microseconds.
+	//
+	// Responsive peers go first and cost almost nothing, so the slow class
+	// still gets nearly the whole slice; and a slow peer is paced, so the
+	// cost of the slow class per sweep falls instead of repeating in full.
+	responsive := make([]Member, 0, len(renewals))
+	slow := make([]Member, 0, len(renewals))
+	for _, m := range renewals {
+		if c.capacityLeases.quickProbeMisses(m.NodeID) == 0 {
+			responsive = append(responsive, m)
+			continue
+		}
+		if c.capacityLeases.slowProbePaced(m.NodeID, now, budget) {
+			continue
+		}
+		slow = append(slow, m)
+	}
 	renewalBudget := budget * capacityLeaseRenewalBudgetNumerator / capacityLeaseRenewalBudgetDenominator
 	start := time.Now()
-	c.runCapacityFetchClass(ctx, renewals, renewalBudget)
+	c.runCapacityFetchClass(ctx, responsive, renewalBudget)
+	renewalRemaining := renewalBudget - time.Since(start)
+	if renewalRemaining > 0 {
+		c.runCapacityFetchClass(ctx, slow, renewalRemaining)
+	}
 	remaining := budget - time.Since(start)
 	if remaining <= 0 {
 		// The renewal phase used the whole sweep. First contact retries next
@@ -478,10 +580,23 @@ func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, b
 	}
 	start := time.Now()
 	// A quick-probe timeout is not evidence that a peer is unhealthy — a
-	// loaded node can miss 300ms — so it does not feed the backoff.
-	unanswered := c.runCapacityFetchPhase(ctx, members, budget, capacityFetchPass{
+	// loaded node can miss 300ms — so it does not feed the backoff. It IS
+	// evidence about responsiveness, which is what schedules the peer next
+	// sweep.
+	unanswered, attempted := c.runCapacityFetchPhase(ctx, members, budget, capacityFetchPass{
 		attemptTimeout: capacityLeaseQuickProbeTimeout,
+		concurrency:    quickProbeConcurrency(len(members), budget),
 	})
+	missed := make(map[string]struct{}, len(unanswered))
+	for _, m := range unanswered {
+		missed[m.NodeID] = struct{}{}
+	}
+	for id := range attempted {
+		_, miss := missed[id]
+		// Only a peer that was actually DIALLED is classified: one the
+		// budget never reached is not known to be slow.
+		c.capacityLeases.recordQuickProbe(id, !miss)
+	}
 	remaining := budget - time.Since(start)
 	if len(unanswered) == 0 || remaining <= 0 {
 		return
@@ -492,11 +607,35 @@ func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, b
 	})
 }
 
+// quickProbeConcurrency sizes the quick pass so it can cover every peer it is
+// given within the budget. Each peer costs at most one probe timeout, so the
+// pool only has to grow with the fleet; the full pass keeps the small pool
+// because its per-peer cost is an order of magnitude higher.
+func quickProbeConcurrency(members int, budget time.Duration) int {
+	if members <= 0 || budget <= 0 {
+		return capacityLeaseFetchConcurrency
+	}
+	needed := int((time.Duration(members)*capacityLeaseQuickProbeTimeout + budget - 1) / budget)
+	if needed < capacityLeaseFetchConcurrency {
+		needed = capacityLeaseFetchConcurrency
+	}
+	if needed > capacityLeaseQuickProbeMaxConcurrency {
+		needed = capacityLeaseQuickProbeMaxConcurrency
+	}
+	if needed > members {
+		needed = members
+	}
+	return needed
+}
+
 // capacityFetchPass is one pass's policy: how long a peer gets, and whether a
 // failure counts against its backoff.
 type capacityFetchPass struct {
 	attemptTimeout time.Duration
 	recordFailures bool
+	// concurrency overrides the default pool size for this pass; 0 means
+	// capacityLeaseFetchConcurrency.
+	concurrency int
 }
 
 // capacityLeaseRenewalBudget* reserve three fifths of the sweep for peers that
@@ -510,9 +649,9 @@ const (
 
 // runCapacityFetchPhase fetches one class of peers under its own slice of the
 // sweep budget.
-func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, budget time.Duration, pass capacityFetchPass) []Member {
+func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, budget time.Duration, pass capacityFetchPass) ([]Member, map[string]struct{}) {
 	if len(members) == 0 || budget <= 0 {
-		return members
+		return members, nil
 	}
 	phaseCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -521,14 +660,22 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 	var (
 		mu        sync.Mutex
 		refreshed = make(map[string]struct{}, len(members))
+		attempted = make(map[string]struct{}, len(members))
 		wg        sync.WaitGroup
 	)
-	for range capacityLeaseFetchConcurrency {
+	concurrency := pass.concurrency
+	if concurrency <= 0 {
+		concurrency = capacityLeaseFetchConcurrency
+	}
+	for range concurrency {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for m := range jobs {
 				c.capacityLeases.recordAttempt(m.NodeID, time.Now())
+				mu.Lock()
+				attempted[m.NodeID] = struct{}{}
+				mu.Unlock()
 				snap, err := c.fetchMemberCapacity(phaseCtx, m, pass.attemptTimeout)
 				if err != nil {
 					if pass.recordFailures {
@@ -569,7 +716,7 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 		}
 		out = append(out, m)
 	}
-	return out
+	return out, attempted
 }
 
 // capacityLeaseSweepBudget keeps one sweep comfortably inside the lease TTL,

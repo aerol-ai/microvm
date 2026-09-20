@@ -62,10 +62,16 @@ const (
 	PublicInternalNodeStorageRetirementsPath = "/v1/cluster/internal/node-storage-retirements"
 	// PublicInternalArtifactCatalogPath serves and accepts the replicated
 	// template / JS-bundle metadata catalogue.
-	PublicInternalArtifactCatalogPath   = "/v1/cluster/internal/artifact-catalog"
-	controlPlaneRequestTimeout          = 5 * time.Second
-	controlPlanePlacementRequestTimeout = 10 * time.Second
-	maxControlPlaneJSONResponseBytes    = 16 << 20
+	PublicInternalArtifactCatalogPath = "/v1/cluster/internal/artifact-catalog"
+	// PublicInternalArtifactCatalogEpochPath allocates ONE publisher its
+	// fencing token. It is deliberately separate from the catalogue read: a
+	// publisher needs a single number, and serving it from the general page
+	// would hand every publisher the fleet's whole coverage list and scan
+	// every node's inventory under the FSM lock to produce it.
+	PublicInternalArtifactCatalogEpochPath = "/v1/cluster/internal/artifact-catalog/epoch"
+	controlPlaneRequestTimeout             = 5 * time.Second
+	controlPlanePlacementRequestTimeout    = 10 * time.Second
+	maxControlPlaneJSONResponseBytes       = 16 << 20
 )
 
 type PlacementLookupResponse struct {
@@ -1501,6 +1507,12 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 		}
 		if resp.StatusCode == http.StatusNotFound && strings.Contains(message, ErrUnknownMember.Error()) {
 			return ErrUnknownMember
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrArtifactCatalogSuperseded.Error()) {
+			// A publisher has to be able to tell "your token is stale" from
+			// a transient apply failure: one re-seeds, the other retries
+			// unchanged. See ApplyErrorStatus in apply_verdict.go.
+			return fmt.Errorf("%w: %s", ErrArtifactCatalogSuperseded, message)
 		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
 			return ErrMemberStillAlive
