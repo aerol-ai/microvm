@@ -49,6 +49,7 @@ const (
 	opRetireNodeStorage      opCode = 22 // operator attestation that a node's storage was destroyed
 	opRevokeNodeStorage      opCode = 23 // withdraw such an attestation
 	opPublishArtifactCatalog opCode = 24 // replace one node's slice of a template / JS-bundle catalogue
+	opAllocateArtifactEpoch  opCode = 25 // issue one publisher its fencing token for a catalogue kind
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -124,6 +125,11 @@ type command struct {
 	// ArtifactWithdraw removes the publisher's coverage instead of replacing
 	// its inventory.
 	ArtifactWithdraw bool `json:"artifact_withdraw,omitempty"`
+	// ArtifactHolder identifies the PROCESS asking for a token on
+	// opAllocateArtifactEpoch. It makes a retried allocation idempotent: the
+	// same holder is handed back the epoch it was already issued instead of
+	// burning a new one on every lost response.
+	ArtifactHolder string `json:"artifact_holder,omitempty"`
 	// StorageRetirement carries the operator attestation for
 	// opRetireNodeStorage (NodeID names the attested node). Deletion
 	// obligations live on whichever node owns them, so the attestation has to
@@ -183,6 +189,13 @@ type reservationCommand struct {
 	IncarnationID        string                       `json:"incarnation_id,omitempty"`
 	OwnerRef             string                       `json:"owner_ref,omitempty"`
 	ExpiresUnix          int64                        `json:"expires_unix,omitempty"`
+}
+
+// artifactEpochApplyResult carries the token opAllocateArtifactEpoch issued
+// back to the caller that submitted the entry. Followers apply the same entry
+// and reach the same number; only the submitting leader reads the response.
+type artifactEpochApplyResult struct {
+	Epoch int64
 }
 
 // reassignApplyResult is returned only for failover-tagged opReassign entries.
@@ -1541,17 +1554,33 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if state.Pending == nil {
 			state.Pending = make(map[string]artifactCatalogNodeState)
 		}
-		// An older publication that arrives late must not overwrite newer
-		// state: two inventory reads can reach the log in the opposite order
-		// to the one they were taken in, and a replaced process can still
-		// have requests in flight. Answering with an ERROR (not silence) is
-		// what lets the publisher tell "published" from "superseded" and
-		// re-seed its epoch instead of marking itself clean.
-		if !state.Committed[nodeID].supersedes(cmd.ArtifactEpoch, cmd.ArtifactRevision) {
+		committed := state.Committed[nodeID]
+		// A publication whose exact version is already committed is a REPLAY
+		// after a lost acknowledgement: the state it asks for is in place, so
+		// it succeeds. Anything else at or below the committed version is
+		// superseded, and says so — silence would let the publisher mark
+		// itself clean.
+		if committed.Epoch == cmd.ArtifactEpoch && committed.Revision == cmd.ArtifactRevision && !committed.Withdrawn {
+			delete(state.Pending, nodeID)
+			return nil
+		}
+		if !committed.supersedes(cmd.ArtifactEpoch, cmd.ArtifactRevision) {
 			delete(state.Pending, nodeID)
 			return fmt.Errorf("%w: %s/%s epoch %d revision %d is not newer than the committed epoch %d revision %d",
 				ErrArtifactCatalogSuperseded, kind, nodeID, cmd.ArtifactEpoch, cmd.ArtifactRevision,
-				state.Committed[nodeID].Epoch, state.Committed[nodeID].Revision)
+				committed.Epoch, committed.Revision)
+		}
+		// It must also be newer than whatever is being ASSEMBLED. Ordering
+		// against the committed state alone let a delayed first chunk from an
+		// older epoch — still newer than what was committed — reset a newer
+		// publication mid-flight, and the newer final chunk then found a
+		// mismatched pending snapshot and was acknowledged anyway.
+		if assembling, ok := state.Pending[nodeID]; ok &&
+			!(assembling.Epoch == cmd.ArtifactEpoch && assembling.Revision == cmd.ArtifactRevision) &&
+			!assembling.supersedes(cmd.ArtifactEpoch, cmd.ArtifactRevision) {
+			return fmt.Errorf("%w: %s/%s epoch %d revision %d is not newer than the publication being assembled at epoch %d revision %d",
+				ErrArtifactCatalogSuperseded, kind, nodeID, cmd.ArtifactEpoch, cmd.ArtifactRevision,
+				assembling.Epoch, assembling.Revision)
 		}
 		if cmd.ArtifactWithdraw {
 			// An explicit "I cannot represent my inventory": rows and
@@ -1582,10 +1611,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return fmt.Errorf("placementFSM: opPublishArtifactCatalog continuation for %s/%s revision %d has no pending snapshot",
 				kind, nodeID, cmd.ArtifactRevision)
 		} else if pending.Epoch != cmd.ArtifactEpoch || pending.Revision != cmd.ArtifactRevision {
-			// A newer snapshot replaced the one this chunk belongs to.
-			// Dropping it is correct — the newer publication owns the node
-			// now — and its own publisher is no longer waiting on this.
-			return nil
+			// A newer snapshot replaced the one this chunk belongs to. The
+			// newer publication owns the node now, and this one is NOT
+			// published — saying otherwise is how a publisher marked itself
+			// clean while none of its inventory was committed.
+			return fmt.Errorf("%w: %s/%s epoch %d revision %d was replaced mid-publication by epoch %d revision %d",
+				ErrArtifactCatalogSuperseded, kind, nodeID, cmd.ArtifactEpoch, cmd.ArtifactRevision,
+				pending.Epoch, pending.Revision)
 		}
 		for _, row := range cmd.ArtifactRows {
 			id := strings.TrimSpace(row.ID)
@@ -1605,6 +1637,49 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		state.Committed[nodeID] = pending
 		delete(state.Pending, nodeID)
 		return nil
+	case opAllocateArtifactEpoch:
+		// Issue a publisher its fencing token. This is an ALLOCATION, not a
+		// read: a process that reads the current epoch and locally picks "one
+		// more" has claimed nothing, so two processes that both read before
+		// either published choose the same number and the loser's revisions
+		// then outrank the winner's. Handing the number out through the log
+		// makes every token distinct and ordered against every other.
+		kind := artifactCatalogKindKey(cmd.ArtifactKind)
+		nodeID := strings.TrimSpace(cmd.NodeID)
+		holder := strings.TrimSpace(cmd.ArtifactHolder)
+		if kind == "" || nodeID == "" || holder == "" {
+			return fmt.Errorf("placementFSM: opAllocateArtifactEpoch requires kind, node_id and holder")
+		}
+		if f.artifactCatalog == nil {
+			f.artifactCatalog = make(map[string]*artifactCatalogKindState)
+		}
+		state := f.artifactCatalog[kind]
+		if state == nil {
+			state = &artifactCatalogKindState{
+				Committed: make(map[string]artifactCatalogNodeState),
+				Pending:   make(map[string]artifactCatalogNodeState),
+			}
+			f.artifactCatalog[kind] = state
+		}
+		if state.Issued == nil {
+			state.Issued = make(map[string]artifactCatalogIssuedEpoch)
+		}
+		// A retry from the same process is answered with the token it already
+		// holds. Without this, every lost response burns an epoch and the
+		// publisher's own in-flight chunks are fenced by its own retry.
+		if held, ok := state.Issued[nodeID]; ok && held.Holder == holder && held.Epoch > 0 {
+			return artifactEpochApplyResult{Epoch: held.Epoch}
+		}
+		next := state.Issued[nodeID].Epoch
+		if committed := state.Committed[nodeID].Epoch; committed > next {
+			next = committed
+		}
+		if pending := state.Pending[nodeID].Epoch; pending > next {
+			next = pending
+		}
+		next++
+		state.Issued[nodeID] = artifactCatalogIssuedEpoch{Epoch: next, Holder: holder}
+		return artifactEpochApplyResult{Epoch: next}
 	case opRetireNodeStorage:
 		// Idempotent: re-attesting the same node replaces the record rather
 		// than adding a second. Recorded with the attestation time the leader
@@ -3132,6 +3207,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		catalog[kind] = artifactCatalogSnapshotState{
 			Committed: cloneArtifactCatalogNodes(state.Committed),
 			Pending:   cloneArtifactCatalogNodes(state.Pending),
+			Issued:    cloneArtifactCatalogIssued(state.Issued),
 		}
 	}
 	return &fsmSnapshot{
@@ -3325,7 +3401,11 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		if pending == nil {
 			pending = make(map[string]artifactCatalogNodeState)
 		}
-		f.artifactCatalog[kind] = &artifactCatalogKindState{Committed: committed, Pending: pending}
+		issued := state.Issued
+		if issued == nil {
+			issued = make(map[string]artifactCatalogIssuedEpoch)
+		}
+		f.artifactCatalog[kind] = &artifactCatalogKindState{Committed: committed, Pending: pending, Issued: issued}
 	}
 	return nil
 }

@@ -1,12 +1,17 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
+
+	"github.com/hashicorp/raft"
 )
 
 // Replicated artifact catalogue.
@@ -226,15 +231,119 @@ func (c *Cluster) PublishArtifactCatalog(ctx context.Context, chunk ArtifactCata
 	return c.applyCommand(ctx, artifactCatalogCommand(chunk))
 }
 
-// ArtifactCatalogPublisherEpoch returns the epoch the catalogue currently
-// holds for (kind, nodeID). A publisher takes the NEXT one, which is how a
-// restarted process outranks every request its predecessor may still have in
-// flight.
-func (c *Cluster) ArtifactCatalogPublisherEpoch(_ context.Context, kind, nodeID string) (int64, error) {
-	if c == nil || c.fsm == nil {
+// ArtifactCatalogEpochRequest asks the authority for one publisher token.
+// The node is NOT a body field: the server fills it from the authenticated
+// peer identity, so a node can only ever be issued its own.
+type ArtifactCatalogEpochRequest struct {
+	Kind string `json:"kind"`
+	// Holder identifies the requesting process. A retry from the same holder
+	// is answered with the token it already has rather than a new one.
+	Holder string `json:"holder"`
+}
+
+// ArtifactCatalogEpochResponse carries exactly the issued token.
+type ArtifactCatalogEpochResponse struct {
+	Epoch int64 `json:"epoch"`
+}
+
+// AllocateArtifactCatalogEpoch issues this process its fencing token through
+// the replicated log.
+//
+// Why an allocation and not a read: reading the committed epoch and locally
+// choosing "one more" claims nothing. Two processes for the same node — a
+// restart overlapping its predecessor, or a node rejoining while its old
+// process drains — both read the same value, both pick the same successor,
+// and the catalogue can no longer order them: whichever has the higher
+// REVISION wins, which is the opposite of what the token is for. Allocating
+// through the log makes every token distinct and monotonic.
+func (c *Cluster) AllocateArtifactCatalogEpoch(ctx context.Context, kind, nodeID, holder string) (int64, error) {
+	if c == nil || c.raft == nil || c.raft.raft == nil {
 		return 0, fmt.Errorf("cluster: node holds no placement state")
 	}
-	return c.fsm.artifactCatalogPublisherEpoch(kind, nodeID), nil
+	kind = artifactCatalogKindKey(kind)
+	nodeID = strings.TrimSpace(nodeID)
+	holder = strings.TrimSpace(holder)
+	if kind == "" || nodeID == "" || holder == "" {
+		return 0, fmt.Errorf("cluster: artifact catalogue epoch allocation requires kind, node and holder")
+	}
+	if c.raft.raft.State() != raft.Leader {
+		// Only the leader can allocate, and a token has to reach the caller,
+		// which the generic forwarded apply cannot carry back.
+		return c.forwardArtifactCatalogEpochToLeader(ctx, kind, nodeID, holder)
+	}
+	payload, err := encodeCommand(command{
+		Op: opAllocateArtifactEpoch, ArtifactKind: kind, NodeID: nodeID, ArtifactHolder: holder,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("cluster: encode command: %w", err)
+	}
+	result, err := c.applyEncodedLocalResult(ctx, payload)
+	if err != nil {
+		return 0, err
+	}
+	issued, ok := result.(artifactEpochApplyResult)
+	if !ok || issued.Epoch <= 0 {
+		return 0, fmt.Errorf("cluster: artifact catalogue epoch allocation returned no token")
+	}
+	return issued.Epoch, nil
+}
+
+// forwardArtifactCatalogEpochToLeader posts the allocation to the leader and
+// reads back the issued token. The forwarding node authenticates as itself,
+// which is the same identity the leader would bind the token to.
+func (c *Cluster) forwardArtifactCatalogEpochToLeader(ctx context.Context, kind, nodeID, holder string) (int64, error) {
+	if nodeID != c.nodeID {
+		// A peer's allocation can only be served by the leader; telling the
+		// peer to retry sends it to one.
+		return 0, ErrNotLeader
+	}
+	leader := c.Leader()
+	if leader == "" {
+		return 0, ErrNotLeader
+	}
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return 0, ErrPeerInternalURLRequired
+	}
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return 0, ErrPeerInternalURLRequired
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, controlPlaneRequestTimeout)
+	defer cancel()
+	body, err := json.Marshal(ArtifactCatalogEpochRequest{Kind: kind, Holder: holder})
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
+		strings.TrimRight(peerInternal, "/")+PublicInternalArtifactCatalogEpochPath, bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("cluster: build artifact catalogue epoch allocation: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	SetPeerNodeIDHeader(req, c.nodeID)
+	if c.patToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	resp, err := c.ClientForPeer(leader).Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("cluster: artifact catalogue epoch allocation: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return 0, ErrNotLeader
+		}
+		return 0, fmt.Errorf("cluster: artifact catalogue epoch allocation: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var out ArtifactCatalogEpochResponse
+	if err := decodeControlPlaneJSON(resp.Body, &out); err != nil {
+		return 0, fmt.Errorf("cluster: decode artifact catalogue epoch allocation: %w", err)
+	}
+	if out.Epoch <= 0 {
+		return 0, fmt.Errorf("cluster: artifact catalogue epoch allocation returned no token")
+	}
+	return out.Epoch, nil
 }
 
 // ArtifactCatalog reads one page of one catalogue from the local FSM.
@@ -264,18 +373,30 @@ func (a *Agent) PublishArtifactCatalog(ctx context.Context, chunk ArtifactCatalo
 	return a.applyCommand(ctx, artifactCatalogCommand(chunk))
 }
 
-// ArtifactCatalogPublisherEpoch asks the control plane for THIS node's
-// fencing token. The server fills it from the authenticated peer identity, so
-// a node can only ever learn its own.
-func (a *Agent) ArtifactCatalogPublisherEpoch(ctx context.Context, kind, nodeID string) (int64, error) {
+// AllocateArtifactCatalogEpoch asks the control plane to issue THIS node's
+// fencing token. The server fills the node from the authenticated peer
+// identity, so a node can only ever be issued its own.
+//
+// It deliberately does not go through the catalogue page: a publisher needs
+// one number, and the page answers with every publisher's coverage (tens of
+// kilobytes at fleet scale) after scanning every node's inventory under the
+// FSM read lock.
+func (a *Agent) AllocateArtifactCatalogEpoch(ctx context.Context, kind, _ string, holder string) (int64, error) {
 	if a == nil {
 		return 0, fmt.Errorf("cluster: agent is not configured")
 	}
-	page, err := a.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: kind, Limit: 1, ForNodeID: strings.TrimSpace(nodeID)})
-	if err != nil {
-		return 0, err
+	reqCtx, cancel := context.WithTimeout(ctx, controlPlaneRequestTimeout)
+	defer cancel()
+	var resp ArtifactCatalogEpochResponse
+	if err := a.doControlPlaneJSON(reqCtx, http.MethodPost,
+		PublicInternalArtifactCatalogEpochPath, PublicInternalArtifactCatalogEpochPath,
+		ArtifactCatalogEpochRequest{Kind: artifactCatalogKindKey(kind), Holder: strings.TrimSpace(holder)}, &resp); err != nil {
+		return 0, fmt.Errorf("cluster: allocate artifact catalogue epoch: %w", err)
 	}
-	return page.PublisherEpoch, nil
+	if resp.Epoch <= 0 {
+		return 0, fmt.Errorf("cluster: artifact catalogue epoch allocation returned no token")
+	}
+	return resp.Epoch, nil
 }
 
 // ArtifactCatalog reads one page from the server tier. An unreachable control
@@ -366,11 +487,23 @@ func artifactCatalogRowKey(tenant, id string) string {
 	return strings.TrimSpace(tenant) + "\x00" + strings.TrimSpace(id)
 }
 
+// artifactCatalogIssuedEpoch is a token the authority handed to one process.
+// Holder is the process identity it was issued to, which is what makes a
+// retried allocation idempotent instead of burning a fresh epoch per attempt.
+type artifactCatalogIssuedEpoch struct {
+	Epoch  int64
+	Holder string
+}
+
 // artifactCatalogSnapshotState is how one kind's catalogue is serialized into
-// a raft snapshot: both halves, because both are replicated state.
+// a raft snapshot: all three parts, because all three are replicated state.
+// Issued has to survive a restore or a restored leader would re-issue tokens
+// it has already handed out, and two live processes would publish under the
+// same epoch.
 type artifactCatalogSnapshotState struct {
 	Committed map[string]artifactCatalogNodeState
 	Pending   map[string]artifactCatalogNodeState
+	Issued    map[string]artifactCatalogIssuedEpoch
 }
 
 func cloneArtifactCatalogNodes(in map[string]artifactCatalogNodeState) map[string]artifactCatalogNodeState {
@@ -403,12 +536,21 @@ func (f *placementFSM) withdrawArtifactCatalogCoverageLocked(nodeID string) {
 		}
 		entry, committed := state.Committed[nodeID]
 		pending, building := state.Pending[nodeID]
-		if !committed && !building {
+		issued, tokened := state.Issued[nodeID]
+		if !committed && !building && !tokened {
 			continue
 		}
 		epoch, revision := entry.Epoch, entry.Revision
 		if building && (pending.Epoch > epoch || (pending.Epoch == epoch && pending.Revision > revision)) {
 			epoch, revision = pending.Epoch, pending.Revision
+		}
+		// A token that was ISSUED but not yet published under is the most
+		// dangerous of the three: the process holding it has published
+		// nothing, so neither Committed nor Pending records it, and a
+		// watermark raised only past those would let that process republish
+		// the destroyed node's inventory after the attestation.
+		if tokened && issued.Epoch > epoch {
+			epoch, revision = issued.Epoch, 0
 		}
 		_ = revision
 		state.Committed[nodeID] = artifactCatalogNodeState{
@@ -421,6 +563,10 @@ func (f *placementFSM) withdrawArtifactCatalogCoverageLocked(nodeID string) {
 			Rows:      map[string]ArtifactCatalogRow{},
 		}
 		delete(state.Pending, nodeID)
+		// The ledger is cleared, not raised: a node that comes back asks for
+		// a fresh token, and the allocation counts from the withdrawn
+		// committed watermark, which is already past everything it held.
+		delete(state.Issued, nodeID)
 	}
 }
 
@@ -431,6 +577,19 @@ func (f *placementFSM) withdrawArtifactCatalogCoverageLocked(nodeID string) {
 type artifactCatalogKindState struct {
 	Committed map[string]artifactCatalogNodeState
 	Pending   map[string]artifactCatalogNodeState
+	// Issued is the token ledger: (node) -> the epoch last handed out and to
+	// which process. It is the high-water mark a new allocation counts from,
+	// so a token issued to a process that never published still orders every
+	// later one after it.
+	Issued map[string]artifactCatalogIssuedEpoch
+}
+
+func cloneArtifactCatalogIssued(in map[string]artifactCatalogIssuedEpoch) map[string]artifactCatalogIssuedEpoch {
+	out := make(map[string]artifactCatalogIssuedEpoch, len(in))
+	for nodeID, issued := range in {
+		out[nodeID] = issued
+	}
+	return out
 }
 
 // supersedes reports whether an incoming publication is newer than what is

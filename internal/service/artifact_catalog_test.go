@@ -27,9 +27,11 @@ type catalogCluster struct {
 	failing   bool                                             // refuse every publish
 	readErr   error
 	epochErr  error
-	supersede bool             // answer every publish with ErrArtifactCatalogSuperseded
-	epochs    map[string]int64 // kind\x00node -> committed epoch
-	covered   map[string]bool  // kind -> this node claims coverage
+	supersede bool              // answer every publish with ErrArtifactCatalogSuperseded
+	epochs    map[string]int64  // kind\x00node -> committed epoch
+	issued    map[string]int64  // kind\x00node -> last token handed out
+	holders   map[string]string // kind\x00node -> who holds that token
+	covered   map[string]bool   // kind -> this node claims coverage
 }
 
 func newCatalogCluster(self string) *catalogCluster {
@@ -79,15 +81,33 @@ func (c *catalogCluster) PublishArtifactCatalog(_ context.Context, chunk cluster
 	return nil
 }
 
-// ArtifactCatalogPublisherEpoch is the authority's fencing token: the
-// catalogue's committed epoch for that node.
-func (c *catalogCluster) ArtifactCatalogPublisherEpoch(_ context.Context, kind, nodeID string) (int64, error) {
+// AllocateArtifactCatalogEpoch issues a fencing token the way the authority
+// does: a distinct, monotonic number per holder, and the same one back for a
+// retry from a holder that already has one.
+func (c *catalogCluster) AllocateArtifactCatalogEpoch(_ context.Context, kind, nodeID, holder string) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.epochErr != nil {
 		return 0, c.epochErr
 	}
-	return c.epochs[kind+"\x00"+nodeID], nil
+	key := kind + "\x00" + nodeID
+	if c.holders == nil {
+		c.holders = map[string]string{}
+	}
+	if c.holders[key] == holder && c.issued[key] > 0 {
+		return c.issued[key], nil
+	}
+	next := c.issued[key]
+	if committed := c.epochs[key]; committed > next {
+		next = committed
+	}
+	next++
+	if c.issued == nil {
+		c.issued = map[string]int64{}
+	}
+	c.issued[key] = next
+	c.holders[key] = holder
+	return next, nil
 }
 
 func (c *catalogCluster) ArtifactCatalog(_ context.Context, req cluster.ArtifactCatalogRequest) (cluster.ArtifactCatalogPage, error) {
@@ -670,5 +690,38 @@ func TestTemplatePushStoreSeamBehaviour(t *testing.T) {
 	}
 	if got := svc.TemplatePushStore(nil); got != nil {
 		t.Fatal("wrapping a nil store produced a seam")
+	}
+}
+
+// The publisher's identity has to distinguish a RETRY from a re-seed. A
+// retry after a lost response must be answered with the token already
+// issued — otherwise every lost response burns an epoch and the publisher's
+// own in-flight chunks are fenced by its own retry. A re-seed after the
+// authority refused the token must NOT be, or the publisher is handed back
+// the number it was just refused and loops forever.
+func TestArtifactCatalogHolderIdentityDistinguishesRetryFromReseed(t *testing.T) {
+	svc, _ := newCatalogService(t)
+
+	first := svc.artifactCatalogHolder(cluster.ArtifactKindTemplate)
+	if first == "" {
+		t.Fatal("no holder identity")
+	}
+	if again := svc.artifactCatalogHolder(cluster.ArtifactKindTemplate); again != first {
+		t.Fatalf("holder changed between calls (%q -> %q); a retry would be issued a second token", first, again)
+	}
+
+	// A different kind is a different identity: the two catalogues are
+	// fenced independently.
+	if other := svc.artifactCatalogHolder(cluster.ArtifactKindJSBundle); other == first {
+		t.Fatalf("both kinds published under holder %q; one kind's re-seed would re-token the other", other)
+	}
+
+	svc.artifactCatalog.retireEpoch(cluster.ArtifactKindTemplate)
+	if reseed := svc.artifactCatalogHolder(cluster.ArtifactKindTemplate); reseed == first {
+		t.Fatalf("holder is still %q after the authority refused the token; the re-seed is answered with the refused epoch", reseed)
+	}
+	// The untouched kind's retry stays idempotent.
+	if other := svc.artifactCatalogHolder(cluster.ArtifactKindJSBundle); other != svc.artifactCatalogHolder(cluster.ArtifactKindJSBundle) {
+		t.Fatal("the other kind's identity moved when this kind re-seeded")
 	}
 }

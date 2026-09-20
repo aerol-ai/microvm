@@ -1397,7 +1397,14 @@ func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []by
 // Caller is responsible for verifying we're the leader before this point —
 // raft itself returns ErrNotLeader if we lost leadership between the check
 // and the Apply call, which is mapped back to cluster.ErrNotLeader.
-func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err error) {
+func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
+	_, err := c.applyEncodedLocalResult(ctx, payload)
+	return err
+}
+
+// applyEncodedLocalResult is applyEncodedLocal for the ops whose FSM answer
+// the caller needs (an allocated token, say). Everything else discards it.
+func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (result any, err error) {
 	done := beginRaftApply()
 	defer func() { done(err) }()
 	timeout := c.commitTimeout
@@ -1410,23 +1417,23 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err er
 	if applyErr := f.Error(); applyErr != nil {
 		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
 			err = ErrNotLeader
-			return ErrNotLeader
+			return nil, ErrNotLeader
 		}
 		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
-		return err
+		return nil, err
 	}
 	response := f.Response()
 	if appErr, ok := response.(error); ok && appErr != nil {
 		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
-		return err
+		return nil, err
 	}
-	if result, ok := response.(reassignApplyResult); ok && result.Changed {
+	if reassigned, ok := response.(reassignApplyResult); ok && reassigned.Changed {
 		// This runs once on the leader after its FSM confirms the ownership
 		// transition. Followers apply the same log entry but never execute this
 		// wrapper, and a lost HTTP acknowledgement cannot erase the count.
 		recordFailoverReassign()
 	}
-	return nil
+	return response, nil
 }
 
 // forwardApplyToLeader posts an encoded raft command to the current leader's
@@ -1473,23 +1480,7 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	message := strings.TrimSpace(string(body))
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
-	}
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		if strings.Contains(message, ErrCapacityExceeded.Error()) {
-			return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
-		}
-		if strings.Contains(message, ErrNoPlacementTarget.Error()) {
-			return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
-		}
-		if strings.Contains(message, ErrCreateBackpressure.Error()) {
-			return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
-		}
-		return ErrNotLeader
-	}
-	return fmt.Errorf("cluster: leader-forward apply: status %d: %s", resp.StatusCode, message)
+	return forwardApplyStatus(resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 // waitForLeader blocks until raft reports a leader or the deadline passes.

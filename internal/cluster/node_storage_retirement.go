@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,6 +105,15 @@ func (c *Cluster) AuthoritativeNodeStorageRetirements(ctx context.Context) ([]No
 		return nil, fmt.Errorf("cluster: authoritative node storage retirement read unavailable")
 	}
 	if c.raft.raft.State() == raft.Leader {
+		// Leadership is not enough. Election and log replication do not imply
+		// this node's FSM has APPLIED everything that was committed before it
+		// won: a follower can acknowledge replication of an operator's revoke,
+		// become leader, and still be serving the old attestation. Authorizing
+		// an irreversible discharge from that state is exactly the case this
+		// read exists to prevent, so it takes a quorum-backed barrier first.
+		if err := c.awaitAuthoritativeFSM(ctx); err != nil {
+			return nil, err
+		}
 		return c.fsm.nodeStorageRetirementsSnapshot(), nil
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, controlPlaneRequestTimeout)
@@ -148,6 +158,52 @@ func (c *Cluster) AuthoritativeNodeStorageRetirements(ctx context.Context) ([]No
 		return nil, fmt.Errorf("cluster: authoritative retirement read was not authoritative")
 	}
 	return out.Retirements, nil
+}
+
+// awaitAuthoritativeFSM makes a local FSM read linearizable: VerifyLeader is
+// the quorum round that proves this node is STILL the leader (a deposed one's
+// FSM is not the authority), and Barrier waits for every entry committed
+// before now to be applied, because raft applies asynchronously.
+//
+// Anything that authorizes an irreversible act reads through here; a second
+// leadership check alone would not close the apply lag.
+func (c *Cluster) awaitAuthoritativeFSM(ctx context.Context) error {
+	if c == nil || c.raft == nil || c.raft.raft == nil {
+		return fmt.Errorf("cluster: authoritative read unavailable")
+	}
+	timeout := c.commitTimeout
+	if timeout <= 0 {
+		timeout = controlPlaneRequestTimeout
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if err := c.raft.raft.VerifyLeader().Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
+			return ErrNotLeader
+		}
+		return fmt.Errorf("cluster: verify leader for authoritative read: %w", err)
+	}
+	if err := c.raft.raft.Barrier(timeout).Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
+			return ErrNotLeader
+		}
+		return fmt.Errorf("cluster: fsm barrier for authoritative read: %w", err)
+	}
+	return nil
+}
+
+// NodeStorageRetirementsForPeerAuthoritative is the peer-facing form of the
+// same authoritative read: the barrier belongs to the read, not to the caller,
+// so a worker asking the leader gets the same guarantee a server does.
+func (c *Cluster) NodeStorageRetirementsForPeerAuthoritative(ctx context.Context) (NodeStorageRetirementsResponse, error) {
+	recs, err := c.AuthoritativeNodeStorageRetirements(ctx)
+	if err != nil {
+		return NodeStorageRetirementsResponse{}, err
+	}
+	return NodeStorageRetirementsResponse{Retirements: recs, Authoritative: true}, nil
 }
 
 // NodeStorageRetirements reads the replicated attestation set from the local

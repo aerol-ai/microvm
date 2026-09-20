@@ -2,12 +2,15 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,5 +144,116 @@ func TestRefreshCapacityLeasesHandlesErrorsAndFallbacks(t *testing.T) {
 	}
 	if _, ok := c.capacityLeases.leases["skip-empty"]; ok {
 		t.Fatal("refreshCapacityLeases() created a lease for skip-empty member")
+	}
+}
+
+// A fleet where most peers are SLOW BUT ALIVE is the shape the renewal
+// reservation does not survive on its own. 1,296 peers that answer in ~1.2s
+// miss the 300ms quick probe, and because a quick-probe miss is deliberately
+// not a failure, they never enter backoff — so every sweep re-probes all of
+// them at full cost. They and the 704 peers that answer instantly are all
+// renewals, so they compete for the same reserved slice, and at 32 slots the
+// slow ones occupy it for the whole sweep. The healthy peers are never
+// dialled and their leases expire while they are answering in microseconds.
+func TestCapacitySweepKeepsRenewingResponsivePeersUnderASlowFleet(t *testing.T) {
+	var slowHits, fastHits atomic.Int64
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowHits.Add(1)
+		select {
+		case <-time.After(1200 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 4, HostMemoryTotalMB: 8192})
+	}))
+	defer slow.Close()
+	fast := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fastHits.Add(1)
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16384})
+	}))
+	defer fast.Close()
+
+	// One shared peer transport, as production has: every peer is dialled
+	// through the same pool, which is why one class of peers can occupy it.
+	peerTransport := newInternalTransport(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test-only
+	peerClient := &http.Client{Transport: peerTransport}
+	c := &Cluster{
+		nodeID:         "self",
+		internalClient: &http.Client{Transport: peerTransport},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),
+		gossip:         &gossipNode{memberIndex: newGossipMemberIndex()},
+	}
+
+	const (
+		slowPeers = 1296
+		fastPeers = 704
+	)
+	// Every peer already holds a lease, so all 2,000 are renewals. The slow
+	// ones are the stalest, which is how they reach the front of the queue.
+	// Seed the per-peer client cache so the dial skips node-SAN binding
+	// (httptest certs carry no node: SAN); everything else — the shared
+	// transport, the worker pool, the sweep — is the production path.
+	seedPeer := func(id string) { c.peerClients.m.Store(id, peerClient) }
+	stale := time.Now().Add(-12 * time.Second)
+	fresh := time.Now().Add(-9 * time.Second)
+	healthy := make([]string, 0, fastPeers)
+	for i := range slowPeers {
+		id := fmt.Sprintf("slow-%04d", i)
+		c.gossip.memberIndex.upsert(Member{NodeID: id, Alive: true, Role: config.NodeRoleWorker, APIURL: slow.URL, InternalURL: slow.URL})
+		seedPeer(id)
+		c.capacityLeases.set(id, capacity.Snapshot{HostCPUCores: 4}, stale)
+	}
+	for i := range fastPeers {
+		id := fmt.Sprintf("fast-%04d", i)
+		healthy = append(healthy, id)
+		c.gossip.memberIndex.upsert(Member{NodeID: id, Alive: true, Role: config.NodeRoleWorker, APIURL: fast.URL, InternalURL: fast.URL})
+		seedPeer(id)
+		c.capacityLeases.set(id, capacity.Snapshot{HostCPUCores: 8}, fresh)
+	}
+
+	sweepStart := time.Now()
+	c.refreshCapacityLeases(context.Background())
+
+	// Every responsive peer must have been refreshed IN THIS SWEEP: renewing
+	// a lease that costs microseconds cannot be contingent on how many other
+	// peers are slow.
+	var missed int
+	for _, id := range healthy {
+		c.capacityLeases.mu.RLock()
+		lease, ok := c.capacityLeases.leases[id]
+		c.capacityLeases.mu.RUnlock()
+		if !ok || lease.updated.Before(sweepStart) {
+			missed++
+		}
+	}
+	if missed > 0 {
+		t.Fatalf("%d of %d responsive peers were not renewed in a sweep spent on slow ones; their leases expire while they answer instantly", missed, fastPeers)
+	}
+	if fastHits.Load() < fastPeers {
+		t.Fatalf("responsive peers were dialled %d times, want at least %d", fastHits.Load(), fastPeers)
+	}
+
+	// The slow peers that were probed must now be PACED, which only shows in
+	// the next sweep: without it every sweep pays full price for all 1,296
+	// again, because missing a quick probe never enters the failure backoff.
+	slowAfterFirst := slowHits.Load()
+	fastAfterFirst := fastHits.Load()
+	secondSweep := time.Now()
+	c.refreshCapacityLeases(context.Background())
+
+	if probes := slowHits.Load() - slowAfterFirst; probes >= slowAfterFirst {
+		t.Fatalf("the second sweep re-probed %d slow peers after %d in the first; a slow peer that is alive is never backed off, so nothing paces it", probes, slowAfterFirst)
+	}
+	if renewed := fastHits.Load() - fastAfterFirst; renewed < fastPeers {
+		t.Fatalf("the second sweep renewed %d responsive peers, want all %d", renewed, fastPeers)
+	}
+	for _, id := range healthy {
+		c.capacityLeases.mu.RLock()
+		lease := c.capacityLeases.leases[id]
+		c.capacityLeases.mu.RUnlock()
+		if lease.updated.Before(secondSweep) {
+			t.Fatalf("responsive peer %s was not renewed by the second sweep", id)
+		}
 	}
 }

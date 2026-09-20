@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
@@ -630,11 +632,11 @@ func TestArtifactCatalogFencesOutOfOrderPublications(t *testing.T) {
 
 	// The node restarts: it takes the next epoch from the authority and its
 	// revisions start again, which must still outrank everything before it.
-	epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
+	epoch, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "restarted-process")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", epoch+1, 1, catalogRows("", "tpl-after-restart")); err != nil {
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", epoch, 1, catalogRows("", "tpl-after-restart")); err != nil {
 		t.Fatal(err)
 	}
 	page, err = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
@@ -757,10 +759,15 @@ func TestArtifactCatalogDropsOrphanedChunks(t *testing.T) {
 		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 3,
 		Rows: catalogRows("", "new-first"), First: true,
 	})
-	apply(ArtifactCatalogSnapshot{
+	// The superseded publication's final chunk is refused, not acknowledged:
+	// none of its inventory is committed, so telling its publisher otherwise
+	// would leave the node advertising an inventory it never published.
+	if err := applyResult(ArtifactCatalogSnapshot{
 		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 2,
 		Rows: catalogRows("", "old-final"), Final: true,
-	})
+	}); err == nil {
+		t.Fatal("a superseded publication's final chunk was acknowledged as published")
+	}
 	if page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate}); len(page.Rows) != 0 {
 		t.Fatalf("a superseded snapshot's final chunk committed: %+v", page.Rows)
 	}
@@ -931,29 +938,29 @@ func TestArtifactCatalogFencesASupersededPublisher(t *testing.T) {
 	ctx := context.Background()
 
 	// The old process publishes, then dies.
-	oldEpoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
+	oldEpoch, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "old-process")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", oldEpoch+1, 8, catalogRows("", "tpl-deleted")); err != nil {
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", oldEpoch, 8, catalogRows("", "tpl-deleted")); err != nil {
 		t.Fatal(err)
 	}
 
 	// The new process asks the authority for its fencing token and publishes.
-	newEpoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
+	newEpoch, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "new-process")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if newEpoch <= oldEpoch {
 		t.Fatalf("the authority handed out epoch %d after %d; a restart must be able to supersede", newEpoch, oldEpoch)
 	}
-	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", newEpoch+1, 1, catalogRows("", "tpl-current")); err != nil {
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", newEpoch, 1, catalogRows("", "tpl-current")); err != nil {
 		t.Fatal(err)
 	}
 
 	// A request from the dead process, delayed in transport, arrives now —
 	// with a HIGHER revision than the new process has reached.
-	err = publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", oldEpoch+1, 9, catalogRows("", "tpl-deleted"))
+	err = publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", oldEpoch, 9, catalogRows("", "tpl-deleted"))
 	if err == nil {
 		t.Fatal("a superseded process's delayed publication was accepted")
 	}
@@ -1039,11 +1046,11 @@ func TestStorageRetirementRemovesTheNodesCatalogueMetadata(t *testing.T) {
 
 	// If the attestation was wrong and the node comes back, it publishes
 	// again under a fresh token.
-	epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-gone")
+	epoch, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-gone", "returning-process")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-gone", epoch+1, 1, catalogRows("", "tpl-back")); err != nil {
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-gone", epoch, 1, catalogRows("", "tpl-back")); err != nil {
 		t.Fatalf("a returning node could not republish: %v", err)
 	}
 	page, _ = c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
@@ -1052,57 +1059,60 @@ func TestStorageRetirementRemovesTheNodesCatalogueMetadata(t *testing.T) {
 	}
 }
 
-// The epoch lookup is how a publisher gets its fencing token, on both client
-// types, and a node may only ever learn its own.
-func TestArtifactCatalogPublisherEpochLookup(t *testing.T) {
-	fsm := newPlacementFSM()
-	seedCommittedCatalog(fsm, ArtifactKindTemplate, "worker-a", 5, 2, ArtifactCatalogRow{ID: "tpl", Payload: []byte(`{}`)})
-	c := &Cluster{fsm: fsm}
+// Token allocation is a raft write, so a non-leader forwards it, a nil
+// cluster refuses it, and the agent asks the control plane over its own
+// endpoint.
+func TestArtifactCatalogEpochAllocationEdges(t *testing.T) {
 	ctx := context.Background()
 
-	epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a")
-	if err != nil || epoch != 5 {
-		t.Fatalf("epoch = %d err=%v, want the committed 5", epoch, err)
-	}
-	if epoch, err := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "never-published"); err != nil || epoch != 0 {
-		t.Fatalf("unknown node epoch = %d err=%v, want 0", epoch, err)
-	}
-	if _, err := c.ArtifactCatalogPublisherEpoch(ctx, "no-such-kind", "worker-a"); err != nil {
-		t.Fatalf("unknown kind: %v", err)
-	}
 	var none *Cluster
-	if _, err := none.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a"); err == nil {
-		t.Fatal("a nil cluster answered an epoch lookup")
+	if _, err := none.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "p"); err == nil {
+		t.Fatal("a nil cluster issued a token")
 	}
 
-	// A half-delivered publication has already claimed its epoch, so the next
-	// token must be past it.
-	state := fsm.artifactCatalog[artifactCatalogKindKey(ArtifactKindTemplate)]
-	state.Pending["worker-a"] = artifactCatalogNodeState{Epoch: 9, Revision: 1, Rows: map[string]ArtifactCatalogRow{}}
-	if epoch, _ := c.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-a"); epoch != 9 {
-		t.Fatalf("epoch = %d; a pending publication's token was ignored", epoch)
-	}
-
-	// The agent asks the control plane, which fills the answer from the
-	// authenticated peer identity.
-	var asked ArtifactCatalogRequest
-	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&asked); err != nil {
-			t.Error(err)
-			return
+	c, cleanup := newTestCluster(t, "srv-epoch-edges", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	for _, tc := range []struct{ name, kind, node, holder string }{
+		{"no kind", "", "worker-a", "p"},
+		{"no node", ArtifactKindTemplate, "", "p"},
+		{"no holder", ArtifactKindTemplate, "worker-a", ""},
+	} {
+		if _, err := c.AllocateArtifactCatalogEpoch(ctx, tc.kind, tc.node, tc.holder); err == nil {
+			t.Fatalf("%s: allocation succeeded", tc.name)
 		}
-		_ = json.NewEncoder(w).Encode(ArtifactCatalogPage{Authoritative: true, PublisherEpoch: 4})
-	}))
-	got, err := agent.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "worker-self")
-	if err != nil || got != 4 {
-		t.Fatalf("agent epoch = %d err=%v", got, err)
 	}
-	if asked.ForNodeID != "worker-self" {
-		t.Fatalf("agent asked for %q; a node may only learn its own token", asked.ForNodeID)
+
+	// Distinct kinds keep distinct ledgers: a template token must not
+	// consume a JS-bundle one.
+	tpl, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "p")
+	if err != nil {
+		t.Fatal(err)
 	}
+	js, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindJSBundle, "worker-a", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tpl != 1 || js != 1 {
+		t.Fatalf("template=%d js-bundle=%d; the two catalogues share a ledger", tpl, js)
+	}
+
+	// A follower cannot allocate: it forwards, and says so when no leader is
+	// reachable.
+	follower := &Cluster{nodeID: "srv-follower", raft: c.raft}
+	if _, err := follower.forwardArtifactCatalogEpochToLeader(ctx, ArtifactKindTemplate, "some-other-node", "p"); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("a peer's allocation on a non-leader returned %v, want ErrNotLeader", err)
+	}
+
 	var noAgent *Agent
-	if _, err := noAgent.ArtifactCatalogPublisherEpoch(ctx, ArtifactKindTemplate, "n"); err == nil {
-		t.Fatal("a nil agent answered an epoch lookup")
+	if _, err := noAgent.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "n", "p"); err == nil {
+		t.Fatal("a nil agent issued a token")
+	}
+	refusing := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(ArtifactCatalogEpochResponse{Epoch: 0})
+	}))
+	if _, err := refusing.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-self", "p"); err == nil {
+		t.Fatal("an empty allocation response was treated as a token")
 	}
 }
 
@@ -1207,5 +1217,259 @@ func TestCapacityAttemptClockBookkeeping(t *testing.T) {
 	none.recordAttempt("peer", now)
 	if got := none.attemptedAt("peer"); !got.IsZero() {
 		t.Fatal("a nil cache answered an attempt lookup")
+	}
+}
+
+// Ordering was checked against the COMMITTED state only, so a delayed first
+// chunk from an older epoch could still look newer than what was committed
+// and reset a newer publication that was mid-assembly. The newer final chunk
+// then found a mismatched pending snapshot and returned success anyway — so
+// its publisher marked itself clean while none of its inventory was ever
+// committed, and the delayed old publication became the catalogue's answer.
+func TestArtifactCatalogOrdersAgainstPendingAsWellAsCommitted(t *testing.T) {
+	fsm := newPlacementFSM()
+	applyResult := func(chunk ArtifactCatalogSnapshot) error {
+		t.Helper()
+		raw, err := encodeCommand(artifactCatalogCommand(chunk))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if resp := fsm.Apply(&raft.Log{Data: raw}); resp != nil {
+			if err, ok := resp.(error); ok {
+				return err
+			}
+		}
+		return nil
+	}
+	chunk := func(epoch, revision int64, id string, first, final bool) ArtifactCatalogSnapshot {
+		return ArtifactCatalogSnapshot{
+			Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: epoch, Revision: revision,
+			Rows: catalogRows("", id), First: first, Final: final,
+		}
+	}
+
+	// Committed (epoch 1, revision 1).
+	if err := applyResult(chunk(1, 1, "tpl-committed", true, true)); err != nil {
+		t.Fatal(err)
+	}
+	// The current process starts (2,1).
+	if err := applyResult(chunk(2, 1, "tpl-new-first", true, false)); err != nil {
+		t.Fatal(err)
+	}
+	// A delayed first chunk from the OLD epoch arrives: newer than what is
+	// committed, older than what is being assembled.
+	if err := applyResult(chunk(1, 2, "tpl-delayed-first", true, false)); err == nil {
+		t.Fatal("a delayed older publication reset a newer pending one")
+	}
+	// The current process finishes. It must not be told it succeeded unless
+	// its inventory is actually committed.
+	if err := applyResult(chunk(2, 1, "tpl-new-final", false, true)); err != nil {
+		t.Fatalf("the current publication was refused: %v", err)
+	}
+
+	page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	ids := map[string]struct{}{}
+	for _, row := range page.Rows {
+		ids[row.ID] = struct{}{}
+	}
+	if _, ok := ids["tpl-delayed-first"]; ok {
+		t.Fatalf("catalogue = %v; the delayed old publication won", ids)
+	}
+	if _, ok := ids["tpl-new-final"]; !ok {
+		t.Fatalf("catalogue = %v; the current publication was acknowledged but not committed", ids)
+	}
+}
+
+// A final chunk whose snapshot is gone must not be acknowledged — unless the
+// exact same revision is already committed, which is an ordinary replay after
+// a lost acknowledgement and is idempotent.
+func TestArtifactCatalogAcknowledgesOnlyCommittedRevisions(t *testing.T) {
+	fsm := newPlacementFSM()
+	applyResult := func(chunk ArtifactCatalogSnapshot) error {
+		t.Helper()
+		raw, err := encodeCommand(artifactCatalogCommand(chunk))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if resp := fsm.Apply(&raft.Log{Data: raw}); resp != nil {
+			if err, ok := resp.(error); ok {
+				return err
+			}
+		}
+		return nil
+	}
+	full := ArtifactCatalogSnapshot{
+		Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 5,
+		Rows: catalogRows("", "tpl-a"), First: true, Final: true,
+	}
+	if err := applyResult(full); err != nil {
+		t.Fatal(err)
+	}
+	// Replay of the same publication after a lost acknowledgement: the state
+	// it asked for is already in place, so it is a success, not a conflict.
+	if err := applyResult(full); err != nil {
+		t.Fatalf("replaying an already-committed publication returned %v; the publisher would retry forever", err)
+	}
+	page := fsm.artifactCatalogPage(ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if len(page.Rows) != 1 || page.Rows[0].ID != "tpl-a" {
+		t.Fatalf("catalogue = %+v after a replay", page.Rows)
+	}
+}
+
+// Reading the current epoch and locally choosing "one more" claims nothing:
+// two processes that read before either has published choose the SAME epoch,
+// and the survivor's revisions then lose to the predecessor's higher ones.
+// An epoch has to be ALLOCATED by the authority.
+func TestArtifactCatalogEpochAllocationIsAtomic(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-epoch-alloc", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	first, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "process-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "process-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second <= first {
+		t.Fatalf("two processes were issued %d and %d; neither publication had landed, so a read-and-increment gives both the same token", first, second)
+	}
+
+	// The predecessor's delayed publication cannot outrank the successor's,
+	// however high its revision.
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", second, 1, catalogRows("", "tpl-current")); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-a", first, 99, catalogRows("", "tpl-stale")); err == nil {
+		t.Fatal("a delayed publication from the predecessor was accepted")
+	}
+
+	// A retry from the SAME process gets the same token back rather than
+	// burning a new one.
+	again, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-a", "process-2")
+	if err != nil || again != second {
+		t.Fatalf("retry allocated %d, want the same %d", again, second)
+	}
+}
+
+// Retirement must fence epochs that were ISSUED but never published, or a
+// process that took a token before the attestation can still republish the
+// destroyed node's artifacts afterwards.
+func TestStorageRetirementFencesIssuedButUnpublishedEpochs(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-epoch-retire", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-gone", 1, 1, catalogRows("", "tpl-old")); err != nil {
+		t.Fatal(err)
+	}
+	// The doomed process takes a token and has not published under it yet.
+	issued, err := c.AllocateArtifactCatalogEpoch(ctx, ArtifactKindTemplate, "worker-gone", "doomed-process")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.RetireNodeStorage(ctx, "worker-gone", "operator", "disk destroyed", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishAtEpoch(ctx, c, ArtifactKindTemplate, "worker-gone", issued, 1, catalogRows("", "tpl-resurrected")); err == nil {
+		t.Fatal("a publication under a token issued before the attestation was accepted; the destroyed node's artifacts came back")
+	}
+	page, err := c.ArtifactCatalog(ctx, ArtifactCatalogRequest{Kind: ArtifactKindTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Rows) != 0 || len(page.Publishers) != 0 {
+		t.Fatalf("catalogue = %+v after retirement", page)
+	}
+}
+
+// The publisher path must not drag fleet-wide coverage or scan unrelated
+// inventories: it needs one node's token, nothing else.
+func TestArtifactCatalogEpochAllocationDoesNotReturnTheFleet(t *testing.T) {
+	var lastPath string
+	var body []byte
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastPath = r.URL.Path
+		body, _ = io.ReadAll(r.Body)
+		_ = json.NewEncoder(w).Encode(ArtifactCatalogEpochResponse{Epoch: 4})
+	}))
+
+	epoch, err := agent.AllocateArtifactCatalogEpoch(context.Background(), ArtifactKindTemplate, "worker-self", "process-1")
+	if err != nil || epoch != 4 {
+		t.Fatalf("epoch = %d err=%v", epoch, err)
+	}
+	if lastPath != PublicInternalArtifactCatalogEpochPath {
+		t.Fatalf("asked %q; the token lookup must not go through the catalogue page", lastPath)
+	}
+	var req ArtifactCatalogEpochRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if req.Kind != ArtifactKindTemplate || req.Holder != "process-1" {
+		t.Fatalf("request = %+v", req)
+	}
+}
+
+// A publisher on a worker reaches the catalogue over HTTP. If the supersede
+// verdict arrives as an untyped 500, errors.Is is false, the publisher never
+// retires its refused token, and it retries forever under an epoch the
+// authority has moved past — its coverage stops tracking its inventory for
+// the life of the process. The identity has to survive BOTH apply listeners
+// and BOTH forwarding clients.
+func TestSupersededVerdictSurvivesTheApplyBoundary(t *testing.T) {
+	superseded := fmt.Errorf("%w: template/worker-a epoch 1 revision 2", ErrArtifactCatalogSuperseded)
+
+	t.Run("agent over the public apply endpoint", func(t *testing.T) {
+		agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// What the v1 handler writes for this verdict.
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"` + superseded.Error() + `"}`))
+		}))
+		err := agent.PublishArtifactCatalog(context.Background(), ArtifactCatalogSnapshot{
+			Kind: ArtifactKindTemplate, NodeID: "worker-a", Epoch: 1, Revision: 2,
+			Rows: catalogRows("", "tpl-1"), First: true, Final: true,
+		})
+		if !errors.Is(err, ErrArtifactCatalogSuperseded) {
+			t.Fatalf("agent publish returned %v; the publisher cannot tell it must re-seed its token", err)
+		}
+	})
+
+	t.Run("server over the internal apply listener", func(t *testing.T) {
+		// The listener classifies, the forwarding client inverts: run the
+		// real round trip rather than asserting on either half alone.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if retryAfter := ApplyErrorRetryAfterSeconds(superseded); retryAfter > 0 {
+				w.Header().Set("Retry-After", fmt.Sprint(retryAfter))
+			}
+			http.Error(w, superseded.Error(), ApplyErrorStatus(superseded))
+		}))
+		defer srv.Close()
+		resp, err := srv.Client().Post(srv.URL+InternalAPIPath, "application/octet-stream", bytes.NewReader([]byte("payload")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if err := forwardApplyStatus(resp.StatusCode, strings.TrimSpace(string(body))); !errors.Is(err, ErrArtifactCatalogSuperseded) {
+			t.Fatalf("leader-forward returned %v; a forwarding server cannot tell it must re-seed", err)
+		}
+	})
+}
+
+// Both listeners have to CLASSIFY the verdict, not just carry a message: a
+// generic 500 is indistinguishable from a transient apply failure, which the
+// publisher is right to retry unchanged.
+func TestApplyListenersClassifyTheSupersededVerdict(t *testing.T) {
+	superseded := fmt.Errorf("%w: template/worker-a", ErrArtifactCatalogSuperseded)
+	if got := ApplyErrorStatus(superseded); got != http.StatusConflict {
+		t.Fatalf("internal listener answered %d, want %d so the verdict is distinguishable from a transient failure", got, http.StatusConflict)
+	}
+	if got := ApplyErrorStatus(errors.New("disk full")); got != http.StatusInternalServerError {
+		t.Fatalf("an ordinary apply failure answered %d", got)
 	}
 }
