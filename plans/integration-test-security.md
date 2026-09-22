@@ -271,7 +271,15 @@ New flags, default **on** (the ask: the integration test owns the build):
 | `--no-build` | reuse the last published `AEROL_BUILD_ID` (fast re-provision) |
 
 `wait_for_bootstrap_assets` (`run.sh:483-501`) must skip the GitHub reachability
-poll in local-build mode and instead `HEAD` the three presigned URLs.
+poll in local-build mode and instead probe the presigned URLs directly.
+
+> **CORRECTED during execution (2026-09-23).** This section originally said
+> `HEAD` the presigned URLs. That does not work: a SigV4 presigned URL signs the
+> HTTP **method**, so a `HEAD` against a GET-presigned URL fails
+> `SignatureDoesNotMatch` and would have rejected every healthy build. Measured
+> against the real bucket: `HEAD → 403`, `GET --range 0-0 → 206`. The
+> implementation uses a one-byte ranged GET, which is the same signed method,
+> costs one byte, and proves signature validity as well as reachability.
 
 The scenario report gains a `build` block (`AEROL_BUILD_ID`, git sha, dirty
 flag) so `reports/*.json` says which tree produced the numbers.
@@ -280,9 +288,14 @@ flag) so `reports/*.json` says which tree produced the numbers.
 
 ```
 make itest-build                 # build only
-make itest-build publish         # build + upload, print URLs
+make itest-publish               # build + upload, print presigned tfvars
 make itest-artifacts-init        # one-time bucket bootstrap
 ```
+
+(`make itest-build publish` in the draft would have made `publish` a second
+*goal*, not a flag; the harness's bare-word flag convention is reserved for
+`run.sh` flags, so publish is its own target. `BUILD_FLAGS="--ref main"` passes
+through to `build.sh` for the UC-165 baseline arm.)
 
 ---
 
@@ -867,28 +880,31 @@ and merged first. T1-T4 + T7-T11 are the infrastructure PR. T12-T17 stack by UC
 group. T1-T4 do not depend on T5 and can be built in parallel with it — they
 only need `single-node`, which still bootstraps fine.
 
-| # | Task | Depends on | Exit criterion |
-|---|---|---|---|
-| T1 | `lib/build.sh` build + checksums + buildinfo | — | `sandboxd_linux_amd64` is a valid ELF, checksums verify |
-| T2 | Artifacts bucket + presign + `itest-artifacts-init` | T1 | `urls` prints working presigned URLs |
-| T3 | TF vars `sandboxd_url`/`toolboxd_url`/`checksums_url` → bootstrap | T2 | `single-node` provisions from a local build |
-| T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) |
-| T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch |
-| T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` |
-| T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) |
-| T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay |
-| T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries |
-| T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 |
-| T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable |
-| T11 | `harness/secrets.go` helpers (§7.1) | T10, T10b | `WithNodeEnv` always restores on failure; `SecretHolders()` works |
-| T12 | UC groups A-D (sealing, failover, reseal, env) | T11 | **UC-117 green on S2** |
-| T13 | UC groups E-G (audit chain, export, limits) | T11 | chain verifies; backoff proven |
-| T14 | UC groups H-I (mTLS, enterprise gates) | T11 | full boot-gate matrix, fleet healthy after |
-| T15 | UC groups J-K (retirement, jail) | T11 | |
-| T16 | UC group L + **`main` baseline arm** (§7 UC-165/166, D5) | T12, T1 (`--ref`) | both arms measured in one run; band met |
-| T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR |
-| T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline |
-| T18 | Flagship run S5 + S6, publish reports | all | matrix in `reports/index.md` |
+Status column added during execution. **DONE** means the exit criterion was met
+and verified, not merely that code was written.
+
+| # | Task | Depends on | Exit criterion | Status |
+|---|---|---|---|---|
+| T1 | `lib/build.sh` build + checksums + buildinfo | — | `sandboxd_linux_amd64` is a valid ELF, checksums verify | **DONE** 2026-09-23 — `ELF 64-bit LSB, x86-64`, `shasum -c` all OK; `--ref main` worktree arm builds too |
+| T2 | Artifacts bucket + presign + `itest-artifacts-init` | T1 | `urls` prints working presigned URLs | **DONE** 2026-09-23 — `s3://aerol-itest-artifacts-263611243038`; anonymous ranged GET 206, unsigned GET 403; install.sh's own `awk $2 == name` selection replayed against the live URLs and the downloaded bytes verify |
+| T3 | TF vars `sandboxd_url`/`toolboxd_url`/`checksums_url` → bootstrap | T2 | `single-node` provisions from a local build | **CODE DONE** 2026-09-23 — vars added (default `""`, so prod renders unchanged), threaded through **both** `nodes.tf` templatefile call sites, `terraform validate` passes. Exit criterion needs the live run. |
+| T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **CODE DONE** 2026-09-23 — flag parsing reworked to while/shift (`--version` needs a value), `prepare_artifacts` + ranged-GET probe wired, `artifacts.tfvars` chained last, report `build` block added, guards covered by offline tests. Exit criterion needs the live run. |
+| T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | |
+| T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | |
+| T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | |
+| T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | |
+| T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | |
+| T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | |
+| T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable | |
+| T11 | `harness/secrets.go` helpers (§7.1) | T10, T10b | `WithNodeEnv` always restores on failure; `SecretHolders()` works | |
+| T12 | UC groups A-D (sealing, failover, reseal, env) | T11 | **UC-117 green on S2** | |
+| T13 | UC groups E-G (audit chain, export, limits) | T11 | chain verifies; backoff proven | |
+| T14 | UC groups H-I (mTLS, enterprise gates) | T11 | full boot-gate matrix, fleet healthy after | |
+| T15 | UC groups J-K (retirement, jail) | T11 | | |
+| T16 | UC group L + **`main` baseline arm** (§7 UC-165/166, D5) | T12, T1 (`--ref`) | both arms measured in one run; band met | |
+| T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR | |
+| T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline | |
+| T18 | Flagship run S5 + S6, publish reports | all | matrix in `reports/index.md` | |
 
 T12 is the milestone that matters: **UC-117 green on S2** means the defect the
 whole secrets-hardening program exists to fix is proven fixed on real

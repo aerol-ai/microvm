@@ -130,6 +130,9 @@ resource "aws_instance" "seed" {
     caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
     cluster_join_script_url                  = var.cluster_join_script_url
+    sandboxd_url                             = var.sandboxd_url
+    toolboxd_url                             = var.toolboxd_url
+    checksums_url                            = var.checksums_url
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
@@ -327,6 +330,9 @@ resource "aws_instance" "joiner" {
     caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
     cluster_join_script_url                  = var.cluster_join_script_url
+    sandboxd_url                             = var.sandboxd_url
+    toolboxd_url                             = var.toolboxd_url
+    checksums_url                            = var.checksums_url
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint

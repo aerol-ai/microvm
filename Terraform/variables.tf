@@ -550,6 +550,38 @@ variable "caddy_binary_url" {
   default     = ""
 }
 
+# Locally-built artifact overrides (integration harness, plans/integration-test-security.md §4.3).
+#
+# All three default to "" so a production render is byte-identical to before
+# this block existed: install.sh falls back to its own releases/latest
+# resolution when no --sandboxd-url is passed.
+#
+# These exist because the security matrix must provision an UNMERGED branch.
+# The harness cross-compiles locally and presigns the artifacts, and
+# install.sh already strips the query string off the URL when deriving the
+# asset name, so a presigned S3 URL needs no installer change.
+#
+# sandboxd_url and toolboxd_url must be set together: checksums_url names ONE
+# file that has to carry an entry for every asset install.sh verifies, so a
+# half-override would fail verification on the node rather than here.
+variable "sandboxd_url" {
+  description = "Override URL for the sandboxd binary. Empty => install.sh resolves the release asset."
+  type        = string
+  default     = ""
+}
+
+variable "toolboxd_url" {
+  description = "Override URL for the toolboxd binary. Empty => install.sh resolves the release asset."
+  type        = string
+  default     = ""
+}
+
+variable "checksums_url" {
+  description = "Override URL for the checksums file covering sandboxd_url/toolboxd_url. Required when either is set — install.sh refuses an unverified install."
+  type        = string
+  default     = ""
+}
+
 variable "cluster_init_script_url" {
   description = "URL of cluster-init.sh."
   type        = string

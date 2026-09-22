@@ -15,7 +15,8 @@ BIN_DIR ?= bin
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
 	integration-benchmark-gvisor-docker integration-benchmark-gvisor-docker-only \
 	integration-single-fc integration-benchmark-fc-single integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
-	integration-cert-store-init integration-clear-lease
+	integration-cert-store-init integration-clear-lease \
+	itest-build itest-publish itest-artifacts-init
 
 fmt:
 	$(GO) fmt ./...
@@ -74,9 +75,13 @@ clean:
 #   make integration-cluster-hetero FLAGS=--keep
 # Supported words: keep (leave infra up), prod-tls (real Let's Encrypt),
 # metal-on-demand (force firecracker bare-metal off spot),
-# no-disruptive (skip node-kill UCs on cluster-hetero).
+# no-disruptive (skip node-kill UCs on cluster-hetero),
+# released (provision from releases/latest instead of a local build),
+# no-build (reuse the last published local build).
+# A pinned tag needs a value, so it goes through the explicit form:
+#   make integration-single FLAGS=--version=v0.7.21
 FLAGS ?=
-INTEGRATION_FLAG_WORDS := keep prod-tls metal-on-demand no-disruptive
+INTEGRATION_FLAG_WORDS := keep prod-tls metal-on-demand no-disruptive released no-build
 RUN_EXTRA := $(filter $(INTEGRATION_FLAG_WORDS),$(MAKECMDGOALS))
 RUN_FLAGS := $(strip $(FLAGS) $(patsubst %,--%,$(RUN_EXTRA)))
 # Swallow the bare flag-words as no-op goals so `make` doesn't try to build them
@@ -91,6 +96,32 @@ endif
 # instead of re-issuing it against Let's Encrypt. Idempotent; safe to re-run.
 integration-cert-store-init:
 	integration-tests/lib/provision.sh cert-store-init
+
+# Local artifact pipeline (plans/integration-test-security.md §4). Scenarios
+# build + publish on their own, so these are for iterating on the build itself
+# or for pre-warming the cache before a matrix run.
+#
+# BUILD_FLAGS passes through to build.sh:
+#   make itest-build BUILD_FLAGS="--ref main"            # UC-165 baseline arm
+#   make itest-build BUILD_FLAGS="--arch amd64,arm64"
+#   make itest-build BUILD_FLAGS=--with-caddy
+BUILD_FLAGS ?=
+
+# One-time (per operator/account) bootstrap of the PERSISTENT artifacts bucket
+# the harness publishes locally-built binaries to. Like the cert bucket, it
+# lives OUTSIDE every scenario's Terraform state so a per-scenario destroy can
+# never wipe artifacts another scenario is still installing from. Idempotent.
+itest-artifacts-init:
+	integration-tests/lib/build.sh artifacts-init
+
+itest-build:
+	integration-tests/lib/build.sh build $(BUILD_FLAGS)
+
+# Uploads the current build and prints the presigned tfvars on stdout, so
+# `make itest-publish > /tmp/artifacts.tfvars` composes into a manual
+# terraform apply. Scenarios do this for themselves.
+itest-publish:
+	@integration-tests/lib/build.sh publish $(BUILD_FLAGS)
 
 integration-local:
 	integration-tests/run.sh local-mode $(RUN_FLAGS)

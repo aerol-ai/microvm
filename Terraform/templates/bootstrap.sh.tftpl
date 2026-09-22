@@ -31,6 +31,7 @@
 #   bundle_bucket, aws_region, seed_private_ip,
 #   install_script_url, caddy_binary_url,
 #   cluster_init_script_url, cluster_join_script_url,
+#   sandboxd_url, toolboxd_url, checksums_url,
 #   seed_wait_max_seconds, extra_user_data
 #
 # Order of operations matches the scripts' contracts:
@@ -135,6 +136,16 @@ if [ -n '${acme_email}' ]; then
 fi
 %{ if caddy_binary_url != "" ~}
 INSTALL_ARGS+=(--caddy-binary-url '${caddy_binary_url}')
+%{ endif ~}
+%{ if sandboxd_url != "" ~}
+# Locally-built artifacts (integration harness only; empty in production).
+# install.sh derives each asset name with basename "$${URL%%\?*}", so the
+# presigned query string is stripped and checksums.txt still matches by name.
+INSTALL_ARGS+=(
+  --sandboxd-url '${sandboxd_url}'
+  --toolboxd-url '${toolboxd_url}'
+  --checksums-url '${checksums_url}'
+)
 %{ endif ~}
 %{ if with_gvisor ~}
 INSTALL_ARGS+=(--with-gvisor)
