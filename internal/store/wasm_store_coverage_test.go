@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -377,24 +378,30 @@ func TestWasmCheckpointRefInUse(t *testing.T) {
 	_, _ = st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-dead", "reg/sb:d-shared-dead", "sha256:shared-dead")
 
 	for _, tc := range []struct {
-		name    string
-		sandbox string
-		exclude int64
-		ref     string
-		digest  string
-		want    bool
+		name     string
+		sandbox  string
+		exclude  int64
+		lifetime string
+		ref      string
+		digest   string
+		want     bool
 	}{
-		{"no live sandbox: nothing to protect", "sb-absent", 0, "reg/x:latest", "sha256:x", false},
-		{"rolling :latest resolves to the live checkpoint", sb.ID, 0, "reg/sb:latest", "", true},
-		{"the live row's own ref", sb.ID, 0, "reg/sb:d-current", "sha256:other", true},
-		{"a different tag for the live row's manifest", sb.ID, 0, "reg/sb:d-alias", "sha256:current", true},
-		{"a manifest the live lifetime still retains", sb.ID, 0, "reg/sb:d-kept", "", true},
-		{"a live history row does not protect itself", sb.ID, liveHistory, "reg/sb:d-kept", "sha256:kept", false},
-		{"dead rows sharing a manifest protect nothing", sb.ID, deadA, "reg/sb:d-shared-dead", "sha256:shared-dead", false},
-		{"cleanup-only is not a digest", sb.ID, 0, "reg/sb:d-unrelated", "cleanup-only", false},
+		{"no live sandbox: nothing to protect", "sb-absent", 0, "", "reg/x:latest", "sha256:x", false},
+		{"the pre-scoping id-wide :latest may resolve to the live checkpoint", sb.ID, 0, "inc-dead", "reg/sb:latest", "", true},
+		{"the live lifetime's own rolling pointer", sb.ID, 0, "inc-live", "reg/sb:0123abcd-latest", "", true},
+		// Nothing the live lifetime publishes can move a dead lifetime's
+		// pointer, so deleting it cannot touch the live checkpoint.
+		{"a dead lifetime's rolling pointer is free", sb.ID, 0, "inc-dead", "reg/sb:0123abcd-latest", "", false},
+		{"the live row's own ref", sb.ID, 0, "inc-dead", "reg/sb:d-current", "sha256:other", true},
+		{"a different tag for the live row's manifest", sb.ID, 0, "inc-dead", "reg/sb:d-alias", "sha256:current", true},
+		{"a manifest the live lifetime still retains", sb.ID, 0, "inc-dead", "reg/sb:d-kept", "", true},
+		{"a live history row does not protect itself", sb.ID, liveHistory, "inc-live", "reg/sb:d-kept", "sha256:kept", false},
+		{"dead rows sharing a manifest protect nothing", sb.ID, deadA, "inc-dead", "reg/sb:d-shared-dead", "sha256:shared-dead", false},
+		{"cleanup-only is not a digest", sb.ID, 0, "", "reg/sb:d-unrelated", "cleanup-only", false},
+		{"a digest pin is not a rolling pointer", sb.ID, 0, "inc-dead", "reg/sb@sha256:" + strings.Repeat("b", 64), "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := st.WasmCheckpointRefInUse(ctx, tc.sandbox, tc.exclude, tc.ref, tc.digest)
+			got, err := st.WasmCheckpointRefInUse(ctx, tc.sandbox, tc.exclude, tc.lifetime, tc.ref, tc.digest)
 			if err != nil {
 				t.Fatal(err)
 			}

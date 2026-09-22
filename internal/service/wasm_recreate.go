@@ -15,12 +15,29 @@ import (
 
 // recreateWasmDurableSandbox restores a durable WASM sandbox on a new owner
 // after cluster failover: pull mem.snap from AOCR when needed, rehydrate, replay ports.
-func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
+//
+// incarnationID is the lifetime being restored, taken from the authoritative
+// placement. It has to be known BEFORE the checkpoint is fetched: the seed row
+// used to get its lifetime only when it was persisted, after the pull, so the
+// pull had nothing to bind to and read the id-wide :latest — whichever
+// lifetime pushed last, a destroyed one included — and then adopted that
+// snapshot's clone generation as if it were current.
+func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id, incarnationID string, spec models.CreateSandboxRequest, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return true, fmt.Errorf("recreate %s: placement carries no lifetime (incarnation); refusing to restore an unidentified checkpoint", id)
+	}
 	existing, err := s.store.Get(ctx, id)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return true, err
 	}
 	if existing != nil {
+		// A local row from a DIFFERENT lifetime is not a retry of this restore;
+		// rehydrating it would bring back the previous lifetime's state under
+		// the current one's placement. Reconciliation retires the stale row.
+		if local := strings.TrimSpace(existing.AuditIncarnationID); local != "" && local != incarnationID {
+			return true, fmt.Errorf("recreate %s: local row belongs to lifetime %s, placement is %s", id, local, incarnationID)
+		}
 		attempted := existing.Status == models.SandboxStatusPassivated
 		if _, err := s.ensureWasmCheckpointLocal(ctx, existing); err != nil {
 			return true, fmt.Errorf("recreate %s: %w", id, err)
@@ -54,6 +71,9 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spe
 		Image:              strings.TrimSpace(spec.Image),
 		Status:             models.SandboxStatusPassivated,
 		AllowPublicTraffic: spec.AllowPublicTraffic,
+		// Set before the pull, so the checkpoint fetched is this lifetime's
+		// and the clone generation adopted below is too.
+		AuditIncarnationID: incarnationID,
 	}
 	if _, err := s.ensureWasmCheckpointLocal(ctx, seed); err != nil {
 		return true, fmt.Errorf("recreate %s: pull checkpoint: %w", id, err)

@@ -7977,6 +7977,21 @@ func (s *Store) ListOrphanedWasmCheckpointPushes(ctx context.Context, limit int)
 		LIMIT ?`, limit)
 }
 
+// checkpointRefTag is the tag part of a registry ref ("" for a digest pin).
+func checkpointRefTag(ref string) string {
+	rest := ref
+	if i := strings.LastIndex(rest, "/"); i >= 0 {
+		rest = rest[i+1:]
+	}
+	if strings.Contains(rest, "@") {
+		return ""
+	}
+	if i := strings.LastIndex(rest, ":"); i >= 0 {
+		return rest[i+1:]
+	}
+	return ""
+}
+
 // WasmCheckpointRefInUse reports whether deleting ref would take away a
 // manifest the LIVE sandbox with this id still depends on. excludePushID is
 // the row being cleaned up, so it does not protect itself.
@@ -7995,7 +8010,13 @@ func (s *Store) ListOrphanedWasmCheckpointPushes(ctx context.Context, limit int)
 //
 // A dead lifetime's rows protect nothing: that is what lets two of them that
 // share a manifest still be reclaimed.
-func (s *Store) WasmCheckpointRefInUse(ctx context.Context, sandboxID string, excludePushID int64, registryRef, digest string) (bool, error) {
+//
+// rowIncarnation is the lifetime that recorded the row. A rolling pointer
+// (<lifetime>-latest) is only ever written by its own lifetime, so it is in
+// use exactly when that lifetime is the live one — and a dead lifetime's
+// pointer is safe to delete however the live lifetime is doing, because
+// nothing the live lifetime publishes can ever move it.
+func (s *Store) WasmCheckpointRefInUse(ctx context.Context, sandboxID string, excludePushID int64, rowIncarnation, registryRef, digest string) (bool, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	registryRef = strings.TrimSpace(registryRef)
 	digest = strings.TrimSpace(digest)
@@ -8012,8 +8033,14 @@ func (s *Store) WasmCheckpointRefInUse(ctx context.Context, sandboxID string, ex
 	if err != nil {
 		return false, fmt.Errorf("wasm checkpoint ref in use: %w", err)
 	}
-	if strings.HasSuffix(registryRef, ":latest") {
+	switch tag := checkpointRefTag(registryRef); {
+	case tag == "latest":
+		// The id-wide pointer that predates lifetime-scoped tags: every
+		// lifetime of this id shared it, so it may resolve to the live
+		// checkpoint and stays while the id is live.
 		return true, nil
+	case strings.HasSuffix(tag, "-latest"):
+		return strings.TrimSpace(rowIncarnation) != "" && strings.TrimSpace(rowIncarnation) == strings.TrimSpace(liveIncarnation), nil
 	}
 	if registryRef != "" && registryRef == strings.TrimSpace(liveRef) {
 		return true, nil
