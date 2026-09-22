@@ -157,7 +157,7 @@ did not. Fixed there; the helper still returns the error because
 success". Regression test verified to fail without the fix. Re-verified live:
 `DELETE → 204`, `GET` after → 404, 3/3.
 
-### 3.7 FOUND, NOT FIXED — a stop can silently delete the sandbox (containerd)
+### 3.7 FOUND + FIXED — a stop could silently delete the sandbox (containerd)
 
 Surfaced by `UC-14` on the re-run; **intermittent** (1 of 2 probes vanished),
 which is why run 1 passed it. Node journal, twice:
@@ -180,10 +180,71 @@ class of bug for `TaskPaused`/`TaskResumed` ("mapping TaskPaused→stop made an
 internal CreateSnapshot pause tear the live sandbox down"); `TaskDelete` was
 missed.
 
-Fixing it needs care beyond the one-line remap: the real destroy path must still
-register (confirm the driver's `Destroy` emits `/containers/delete`), and the
-orphan sweep's contract depends on these events, so it interacts with UC-167.
-Tracked as its own task rather than folded into the harness PR.
+The driver's own code settles it:
+
+| | |
+|---|---|
+| `Stop` (`lifecycle.go:381-386`) | `task.Kill(SIGTERM)` → `task.Delete(ctx)` — the **task** only; the container survives |
+| `Destroy` (`lifecycle.go:436`) | … → `container.Delete(ctx, WithSnapshotCleanup)` — publishes `/containers/delete` |
+
+**Fixed.** `/tasks/delete` joins `TaskPaused`/`TaskResumed` in the ignored set;
+`/containers/delete` is added as a second subscription filter and mapped to
+`destroy`, so genuine destroys still register promptly instead of waiting for
+reconcile. `ContainerDelete` names the container with `GetID()` rather than
+`GetContainerID()`, and precedence is asserted — task events carry both, where
+`ID` is the *exec* id.
+
+Verified live: stop/start went from 1-of-2 sandboxes vanishing to **4/4
+surviving and restarting**.
+
+Known follow-up (recorded, not a regression): a warm-adopted `park-*`
+container's destroy event can no longer resolve its `sandbox_id` label, because
+the container is gone by the time `/containers/delete` arrives. Those rows fall
+to the reconcile orphan sweep instead of prompt deletion — slower, but correct.
+Also newly visible: `handle docker event failed … unknown sandbox placement`
+now WARNs on every API-driven destroy, because `container.Delete` is the last
+step of `Destroy` so the event always arrives after the placement is gone.
+Benign, but noisy in cluster runs.
+
+### 3.8 FOUND + FIXED — route upsert raced Caddy's @id index
+
+Fixing §3.7 let **UC-15** (start a stopped sandbox) reach code that had never
+run, which failed with a bare `insert caddy route failed: 400`.
+
+The bare status was itself the problem: this client discarded the admin API's
+response body, so the cause existed only in Caddy's journal on the box — which
+does not survive teardown, making it a dead end in CI. After making the client
+carry Caddy's own text, the answer appeared immediately:
+
+```
+indexing config: duplicate ID 'sandbox-sb-…' found at
+  /config/apps/http/servers/srv0/routes/0 and /config/apps/http/servers/srv0/routes/N
+```
+
+Caddy rebuilds its `@id` index when it loads a config. While that is in flight,
+`PATCH /id/<routeID>` answers **404 for a route that IS present**. `upsertRoute`
+read that as "absent", inserted a second copy, and Caddy rejected the whole
+config. It affects any route upsert during a reload — start, `expose_port`,
+custom domains — and measured **2 of 8** stop→start cycles on a public sandbox.
+
+A duplicate-ID rejection is positive proof the route exists, so the in-place
+PATCH was right all along and is simply retried. Scoped to that one message: an
+insert that fails for any other reason still fails immediately.
+
+Verified live: **0 of 12** failures, and the full suite went to
+**pass 58 · fail 0**.
+
+### 3.9 Why these three matter for the plan
+
+None was visible to `make test`, which stayed green throughout. All three sit on
+the ordinary lifecycle path — destroy, stop, start — not in the secrets surface
+this plan was written to exercise. They were found by the *first* scenario the
+harness ran, before a single security use case existed.
+
+That is the argument for §1's ordering: the branch could not be trusted on real
+infrastructure at all, and the local-build pipeline is what made the branch
+runnable. It also means the S1-S6 matrix should be expected to surface more of
+this class before it reaches the F1-F22 surface.
 
 ### 3.4 Coverage reality check
 
