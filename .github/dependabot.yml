@@ -4,6 +4,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # containerd v1.7.34 assigns specs.LinuxPids.Limit as int64.
+      # runtime-spec v1.3.0 changed that field to *int64 and fails the build.
+      - dependency-name: "github.com/opencontainers/runtime-spec"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
