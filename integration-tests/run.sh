@@ -911,7 +911,17 @@ run_one() {
   if [[ "$caps_domain" == "true" ]]; then
     base_url=$(echo "$targets" | jq -r '.base_url')
     wait_for_dns "$leased" || inconclusive=1
-    wait_for_tls "$leased" || inconclusive=1
+    # TLS is a PRE-WAIT, not a verdict. wait_for_health below talks to the same
+    # https:// base URL, so a healthy API proves the handshake works — whereas
+    # treating a TLS timeout as fatal marks a perfectly good box inconclusive
+    # and throws away the whole suite run.
+    #
+    # That is not hypothetical: an instance REPLACEMENT (new box must obtain and
+    # load the cert while the old A record is still cached) blew the 300s budget
+    # on 2026-09-23, and the box was serving a valid Let's Encrypt cert minutes
+    # later. Replacement is the COMMON case now, because the local-build
+    # pipeline changes user_data on every code change.
+    wait_for_tls "$leased" || echo "tls: pre-wait timed out; deferring to the health probe" >&2
     wait_for_health "$base_url" "$pat" || inconclusive=1
   else
     # local-mode: SSH tunnel to the seed, talk to localhost:21212. Unlike the

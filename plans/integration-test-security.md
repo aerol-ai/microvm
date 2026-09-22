@@ -234,6 +234,19 @@ insert that fails for any other reason still fails immediately.
 Verified live: **0 of 12** failures, and the full suite went to
 **pass 58 · fail 0**.
 
+### 3.8a Harness: a TLS timeout threw away a healthy run
+
+`run_one` treated `wait_for_tls` as a verdict (`|| inconclusive=1`) even though
+`wait_for_health` immediately afterward talks to the same `https://` base URL —
+so a healthy API already proves the handshake. An instance **replacement** blew
+the 300s budget (the new box must obtain and load the cert while the old A
+record is still cached) and the whole suite run was discarded as inconclusive;
+the box was serving a valid Let's Encrypt cert minutes later.
+
+Replacement is now the COMMON case, because the local-build pipeline changes
+`user_data` on every code change. TLS is now a bounded pre-wait that logs and
+defers to the health probe.
+
 ### 3.9 Why these three matter for the plan
 
 None was visible to `make test`, which stayed green throughout. All three sit on
@@ -1002,7 +1015,7 @@ and verified, not merely that code was written.
 | T1 | `lib/build.sh` build + checksums + buildinfo | — | `sandboxd_linux_amd64` is a valid ELF, checksums verify | **DONE** 2026-09-23 — `ELF 64-bit LSB, x86-64`, `shasum -c` all OK; `--ref main` worktree arm builds too |
 | T2 | Artifacts bucket + presign + `itest-artifacts-init` | T1 | `urls` prints working presigned URLs | **DONE** 2026-09-23 — `s3://aerol-itest-artifacts-263611243038`; anonymous ranged GET 206, unsigned GET 403; install.sh's own `awk $2 == name` selection replayed against the live URLs and the downloaded bytes verify |
 | T3 | TF vars `sandboxd_url`/`toolboxd_url`/`checksums_url` → bootstrap | T2 | `single-node` provisions from a local build | **DONE** 2026-09-23 — live on `sandbox.hith.chat`: `/health` returned `version":"itest-7b9c7b666f89-dirty-53bab30c2d7e"`, and the node's own cloud-init log shows `sandboxd_linux_amd64: OK` / `toolboxd_linux_amd64: OK` from install.sh's checksum verification against our presigned artifacts. First time this branch has run on real infrastructure. |
-| T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **DONE (with 2 defects found)** 2026-09-23 — run 1: **pass 57 · fail 1 · skip 55 · missing 0 · inconclusive 0**, report carries the `build` block. The single failure was a REAL branch bug, not harness breakage (see §3.6). Fixed and re-verified live; re-run had UC-16 green. A second, pre-existing flake (UC-14) surfaced on the re-run — see §3.7. |
+| T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **DONE** 2026-09-23 — final state on a **freshly provisioned instance, never hot-patched**: **pass 58 · fail 0 · skip 55 · missing 0 · inconclusive 0**, suite exit 0, report carries the `build` block (`407155348862`, clean tree). Got there via run 1 = 57/1 and three real branch defects found and fixed (§3.6-§3.8); UC-15 is the 58th, which had never run before because §3.7 deleted the sandbox on stop. |
 | T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | |
 | T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | |
 | T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | |
