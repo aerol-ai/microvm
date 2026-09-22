@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/observability"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
@@ -235,7 +236,8 @@ func (s *Service) pushWasmCheckpointBestEffort(sandboxID, incarnationID, memSnap
 	if !applied {
 		// The lifecycle this push belonged to is gone. Recording the ref under
 		// the live row would point a different sandbox at it; the ref is still
-		// journalled below so the orphan sweep can reclaim the pushed artifact.
+		// journalled below, under the DEAD incarnation, so the orphan sweep
+		// can reclaim the pushed artifact.
 		s.logger.Warn("wasm checkpoint AOCR push landed after its lifecycle ended",
 			"sandbox_id", sandboxID,
 			"incarnation_id", incarnationID,
@@ -248,15 +250,23 @@ func (s *Service) pushWasmCheckpointBestEffort(sandboxID, incarnationID, memSnap
 			"error", err,
 		)
 	}
-	s.pruneWasmCheckpointPushes(ctx, sandboxID)
+	if !applied {
+		// A rejected push is a cleanup obligation for the orphan sweep, not a
+		// retention event: it must not spend the live lifetime's keep-last-N
+		// budget, which is how late pushes from a destroyed incarnation used
+		// to push the replacement's valid checkpoint out and delete it.
+		return
+	}
+	s.pruneWasmCheckpointPushes(ctx, sandboxID, incarnationID)
 }
 
-func (s *Service) pruneWasmCheckpointPushes(ctx context.Context, sandboxID string) {
+// pruneWasmCheckpointPushes applies keep-last-N to ONE lifetime's checkpoints.
+func (s *Service) pruneWasmCheckpointPushes(ctx context.Context, sandboxID, incarnationID string) {
 	keep := s.cfg.WasmCheckpointKeepLastN
 	if keep <= 0 {
 		return
 	}
-	recs, err := s.store.ListWasmCheckpointPushes(ctx, sandboxID)
+	recs, err := s.store.ListWasmCheckpointPushesForIncarnation(ctx, sandboxID, incarnationID)
 	if err != nil {
 		s.logger.Warn("wasm checkpoint push history list failed",
 			"sandbox_id", sandboxID,
@@ -265,22 +275,41 @@ func (s *Service) pruneWasmCheckpointPushes(ctx context.Context, sandboxID strin
 		return
 	}
 	for i := keep; i < len(recs); i++ {
-		rec := recs[i]
-		if s.wasmCheckpointPusher != nil && strings.TrimSpace(rec.RegistryRef) != "" {
-			if err := s.wasmCheckpointPusher.DeleteRef(ctx, rec.RegistryRef); err != nil {
-				s.logger.Warn("wasm checkpoint AOCR tag delete failed",
-					"sandbox_id", sandboxID,
-					"registry_ref", rec.RegistryRef,
-					"error", err,
-				)
+		s.reclaimWasmCheckpointPush(ctx, recs[i], "retention")
+	}
+}
+
+// reclaimWasmCheckpointPush retires one history row: it deletes the pushed
+// manifest and then the row — unless the manifest is still in use by the live
+// sandbox, in which case only the row goes and the live lifetime keeps owning
+// the artifact. Both retention and the orphan sweep go through here, so neither
+// can delete what the other must keep.
+//
+// No-vacuum rule: the row is the only record tying the sandbox to its manifest,
+// so a failed delete keeps the row for the next sweep.
+func (s *Service) reclaimWasmCheckpointPush(ctx context.Context, rec store.WasmCheckpointPushRecord, reason string) {
+	ref := strings.TrimSpace(rec.RegistryRef)
+	if ref != "" && s.wasmCheckpointPusher != nil {
+		inUse, err := s.store.WasmCheckpointRefInUse(ctx, rec.SandboxID, rec.ID, ref, rec.Digest)
+		if err != nil {
+			// Unknown is not "free": deleting on a failed check is how the live
+			// checkpoint goes. Keep the row and try again next time.
+			s.logger.Warn("wasm checkpoint ref in-use check failed; retaining row",
+				"reason", reason, "push_id", rec.ID, "sandbox_id", rec.SandboxID, "error", err)
+			return
+		}
+		if !inUse {
+			if err := s.wasmCheckpointPusher.DeleteRef(ctx, ref); err != nil {
+				s.logger.Warn("wasm checkpoint AOCR ref delete failed; will retry",
+					"reason", reason, "push_id", rec.ID, "sandbox_id", rec.SandboxID,
+					"registry_ref", ref, "error", err)
+				return
 			}
 		}
-		if err := s.store.DeleteWasmCheckpointPush(ctx, rec.ID); err != nil {
-			s.logger.Warn("wasm checkpoint push history prune failed",
-				"push_id", rec.ID,
-				"error", err,
-			)
-		}
+	}
+	if err := s.store.DeleteWasmCheckpointPush(ctx, rec.ID); err != nil {
+		s.logger.Warn("wasm checkpoint push history row delete failed",
+			"reason", reason, "push_id", rec.ID, "sandbox_id", rec.SandboxID, "error", err)
 	}
 }
 

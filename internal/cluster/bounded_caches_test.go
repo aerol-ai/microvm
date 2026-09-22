@@ -63,9 +63,17 @@ func TestCapacityLeaseBacksOffFailingPeersIndependently(t *testing.T) {
 	if !c.due("peer-a", now) {
 		t.Fatal("an unseen peer must be due immediately")
 	}
+	// One failure is noise: the backoff base is the whole lease TTL, so pacing
+	// on the first miss would cost a transiently slow peer its lease. It is
+	// retried on the next sweep.
+	c.recordFetchResult("peer-a", now, fmt.Errorf("dial timeout"))
+	if !c.due("peer-a", now.Add(time.Second)) {
+		t.Fatal("a peer that failed once was backed off; one transient miss must not cost it its lease")
+	}
+	// Two in a row is a signal: from here the peer is paced.
 	c.recordFetchResult("peer-a", now, fmt.Errorf("dial timeout"))
 	if c.due("peer-a", now.Add(time.Second)) {
-		t.Fatal("a failing peer was re-attempted on the very next tick")
+		t.Fatal("a peer failing repeatedly was re-attempted on the very next tick")
 	}
 	if !c.due("peer-a", now.Add(capacityLeaseBackoffMax+time.Second)) {
 		t.Fatal("a failing peer is never retried")

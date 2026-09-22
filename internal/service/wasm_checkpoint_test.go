@@ -366,26 +366,38 @@ func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
 	pusher := &recordingCheckpointStore{destRef: "test://sb-wasm-push:latest"}
 	svc2.wasmCheckpointPusher = pusher
 	if err := st2.Create(ctx, &models.Sandbox{
-		ID:              "sb-wasm-push",
-		Runtime:         models.RuntimeWasm,
-		Status:          models.SandboxStatusPassivated,
-		Durability:      models.DurabilityDurable,
-		CheckpointPath:  "/tmp/checkpoint",
-		CloneGeneration: "gen-1",
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		LastActiveAt:    now,
+		ID:                 "sb-wasm-push",
+		Runtime:            models.RuntimeWasm,
+		Status:             models.SandboxStatusPassivated,
+		Durability:         models.DurabilityDurable,
+		CheckpointPath:     "/tmp/checkpoint",
+		CloneGeneration:    "gen-1",
+		AuditIncarnationID: "inc-push",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
-	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "", "/tmp/checkpoint")
-	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "", "/tmp/checkpoint")
-	if len(pusher.deleteCalls) == 0 {
-		t.Fatal("expected prune to delete an older checkpoint ref")
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "inc-push", "/tmp/checkpoint")
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "inc-push", "/tmp/checkpoint")
+	recs, err := st2.ListWasmCheckpointPushes(ctx, "sb-wasm-push")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("keep-last-1 retained %d rows", len(recs))
+	}
+	// This fake returns the SAME digest for every push, so the pruned row and
+	// the live row name one manifest. Deleting a checkpoint ref deletes its
+	// manifest, so retention must drop the row and keep the artifact the live
+	// sandbox still points at.
+	if len(pusher.deleteCalls) != 0 {
+		t.Fatalf("retention deleted %v, the manifest the live row still points at", pusher.deleteCalls)
 	}
 
 	if err := st2.Close(); err != nil {
 		t.Fatalf("store.Close: %v", err)
 	}
-	svc2.pruneWasmCheckpointPushes(ctx, "sb-wasm-push")
+	svc2.pruneWasmCheckpointPushes(ctx, "sb-wasm-push", "inc-push")
 }

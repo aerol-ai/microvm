@@ -366,7 +366,11 @@ func TestCapacitySweepCoversTheSupportedFleetWithinTheLeaseTTL(t *testing.T) {
 	// Renewals must be able to use the whole sweep when there is no
 	// first-contact work competing for it.
 	pool := passConcurrency(fleet, budget, capacityLeaseFetchTimeout, capacityLeaseFullPassMaxConcurrency)
-	perSweep := int(float64(pool) * (float64(budget) / float64(capacityLeaseFetchTimeout)))
+	// Requests complete in whole BATCHES: one dispatched too late to finish
+	// inside the sweep yields nothing. A continuous pool*budget/timeout
+	// overstates throughput by up to a batch, which is how a fleet running
+	// near the timeout slipped past an earlier version of this check.
+	perSweep := pool * int(budget/capacityLeaseFetchTimeout)
 	sweepsPerTTL := int(ttl / budget)
 	if sweepsPerTTL < 1 {
 		sweepsPerTTL = 1
@@ -415,16 +419,26 @@ func TestCapacityPhaseDeadlineIsNotChargedToThePeer(t *testing.T) {
 		t.Fatal("a peer whose request the sweep itself cut short was put into failure backoff; it is skipped until long after its lease expires, although it never failed")
 	}
 
-	// A peer that fails on its OWN account must still back off.
+	// A peer that fails on its OWN account must still be charged: once is
+	// retried (one miss is noise), twice in a row is paced.
 	dead := Member{NodeID: "dead", Alive: true, Role: config.NodeRoleWorker, APIURL: "https://127.0.0.1:1", InternalURL: "https://127.0.0.1:1"}
 	c.gossip.memberIndex.upsert(dead)
 	c.peerClients.m.Store(dead.NodeID, peerClient)
-	c.runCapacityFetchPhase(context.Background(), []Member{dead}, 5*time.Second, capacityFetchPass{
-		attemptTimeout: capacityLeaseFetchTimeout,
-		recordFailures: true,
-	})
+	for range 2 {
+		c.runCapacityFetchPhase(context.Background(), []Member{dead}, 5*time.Second, capacityFetchPass{
+			attemptTimeout: capacityLeaseFetchTimeout,
+			recordFailures: true,
+		})
+	}
 	if c.capacityLeases.due(dead.NodeID, time.Now()) {
-		t.Fatal("a peer that refused the connection was not backed off; real failures must still be paced")
+		t.Fatal("a peer that refused the connection twice was not backed off; real failures must still be paced")
+	}
+	// ...whereas the curtailed peer above never accrued a failure at all.
+	c.capacityLeases.mu.RLock()
+	curtailedFails := c.capacityLeases.failures[healthy.NodeID]
+	c.capacityLeases.mu.RUnlock()
+	if curtailedFails != 0 {
+		t.Fatalf("the curtailed peer accrued %d failures", curtailedFails)
 	}
 }
 
@@ -485,5 +499,129 @@ func TestCapacityRenewsEveryLeaseWithinOneTTLWindow(t *testing.T) {
 	if len(stale) > 0 {
 		t.Fatalf("%d of %d healthy peers were not refreshed in a full TTL window; placement drops a CapacityStale worker, so that capacity is gone despite every endpoint answering inside its timeout",
 			len(stale), fleet)
+	}
+}
+
+// A request the sweep cut short must not cost the peer its PLACE either. The
+// fairness clock orders the next sweep by when each peer was last attempted;
+// advancing it at dispatch meant a curtailed peer sorted LAST next time, was
+// dispatched at the tail again and curtailed again — every sweep. No backoff
+// was involved, yet those leases never renewed.
+func TestCapacityCurtailedAttemptKeepsItsFairnessPosition(t *testing.T) {
+	answered := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(400 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 4})
+	}))
+	defer answered.Close()
+
+	peerTransport := newInternalTransport(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test-only
+	c := &Cluster{
+		nodeID:         "self",
+		internalClient: &http.Client{Transport: peerTransport},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),
+		gossip:         &gossipNode{memberIndex: newGossipMemberIndex()},
+	}
+	peer := Member{NodeID: "tail", Alive: true, Role: config.NodeRoleWorker, APIURL: answered.URL, InternalURL: answered.URL}
+	c.gossip.memberIndex.upsert(peer)
+	c.peerClients.m.Store(peer.NodeID, &http.Client{Transport: peerTransport})
+
+	before := c.capacityLeases.attemptedAt(peer.NodeID)
+	c.runCapacityFetchPhase(context.Background(), []Member{peer}, 100*time.Millisecond, capacityFetchPass{
+		attemptTimeout: capacityLeaseFetchTimeout,
+		recordFailures: true,
+	})
+	if after := c.capacityLeases.attemptedAt(peer.NodeID); !after.Equal(before) {
+		t.Fatalf("a curtailed attempt moved the peer's fairness clock from %v to %v: it now sorts behind everyone that completed and is curtailed again next sweep", before, after)
+	}
+
+	// A completed attempt DOES move it, or the rotation would never advance.
+	c.runCapacityFetchPhase(context.Background(), []Member{peer}, 5*time.Second, capacityFetchPass{
+		attemptTimeout: capacityLeaseFetchTimeout,
+		recordFailures: true,
+	})
+	if after := c.capacityLeases.attemptedAt(peer.NodeID); !after.After(before) {
+		t.Fatal("a completed attempt did not advance the fairness clock")
+	}
+}
+
+// The whole property at the real cadence: a fleet whose peers all need the
+// full request path, running near the sweep's throughput, plus ONE newcomer
+// that never answers. Every healthy lease must be refreshed in every TTL
+// window — not "some progress", and not only while nothing else is pending.
+//
+// Two defects compounded here. A curtailed request lost its place in the
+// rotation (above), so the same peers were cut short every sweep. And any
+// first-contact work at all — a single unresolved newcomer — cut renewals to
+// three fifths of the sweep, because the classes were TIME-sliced: one slow
+// peer needs one slot for two seconds, but took two seconds of the WHOLE pool.
+//
+// 1.6s per peer rather than something nearer the 2s timeout: the point is
+// throughput, and the margin keeps -race scheduling overhead from turning a
+// healthy answer into a genuine timeout.
+func TestCapacityRenewsEveryLeaseEveryTTLWindowWithANewcomerPending(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs six real-cadence sweeps")
+	}
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(1600 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 4, HostMemoryTotalMB: 8192})
+	}))
+	defer slow.Close()
+	blackHole := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer blackHole.Close()
+
+	peerTransport := newInternalTransport(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test-only
+	peerClient := &http.Client{Transport: peerTransport}
+	c := &Cluster{
+		nodeID:         "self",
+		internalClient: &http.Client{Transport: peerTransport},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),
+		gossip:         &gossipNode{memberIndex: newGossipMemberIndex()},
+	}
+
+	const fleet = 1500
+	seeded := time.Now()
+	ids := make([]string, 0, fleet)
+	for i := range fleet {
+		id := fmt.Sprintf("slow-%04d", i)
+		ids = append(ids, id)
+		c.gossip.memberIndex.upsert(Member{NodeID: id, Alive: true, Role: config.NodeRoleWorker, APIURL: slow.URL, InternalURL: slow.URL})
+		c.peerClients.m.Store(id, peerClient)
+		c.capacityLeases.set(id, capacity.Snapshot{HostCPUCores: 4}, seeded)
+	}
+	// One newcomer that is visible but never answers: first contact stays
+	// pending for the whole test.
+	c.gossip.memberIndex.upsert(Member{NodeID: "newcomer", Alive: true, Role: config.NodeRoleWorker, APIURL: blackHole.URL, InternalURL: blackHole.URL})
+	c.peerClients.m.Store("newcomer", peerClient)
+
+	for window := 1; window <= 2; window++ {
+		windowStart := time.Now()
+		for range 3 { // one TTL window at the default cadence
+			c.refreshCapacityLeases(context.Background())
+		}
+		var stale int
+		c.capacityLeases.mu.RLock()
+		for _, id := range ids {
+			if lease, ok := c.capacityLeases.leases[id]; !ok || lease.updated.Before(windowStart) {
+				stale++
+			}
+		}
+		c.capacityLeases.mu.RUnlock()
+		if stale > 0 {
+			t.Fatalf("TTL window %d: %d of %d healthy leases were not refreshed while one newcomer was pending; placement drops each of them as CapacityStale",
+				window, stale, fleet)
+		}
 	}
 }

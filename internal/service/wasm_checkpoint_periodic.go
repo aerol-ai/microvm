@@ -108,8 +108,9 @@ func (s *Service) runWasmDurablePushSweep(ctx context.Context) {
 	}
 }
 
-// runWasmOrphanRefSweep retries DeleteRef for push-history rows whose sandbox
-// is already gone, dropping each row once its manifest is confirmed absent
+// runWasmOrphanRefSweep retries DeleteRef for push-history rows no live
+// sandbox lifetime owns — the sandbox is gone, or the row belongs to an
+// incarnation that was replaced — dropping each row once its manifest is confirmed absent
 // (DeleteRef returns nil, which includes the already-deleted case). A row whose
 // delete still fails is left for the next sweep, so a transient registry outage
 // delays reclamation but never strands the row permanently — closing the
@@ -124,18 +125,10 @@ func (s *Service) runWasmOrphanRefSweep(ctx context.Context) {
 		return
 	}
 	for _, p := range orphans {
-		ref := strings.TrimSpace(p.RegistryRef)
-		if ref != "" {
-			if err := s.wasmCheckpointPusher.DeleteRef(ctx, ref); err != nil {
-				s.logger.Warn("wasm orphan-ref sweep: delete failed; will retry",
-					"push_id", p.ID, "sandbox_id", p.SandboxID, "registry_ref", ref, "error", err)
-				continue
-			}
-		}
-		if err := s.store.DeleteWasmCheckpointPush(ctx, p.ID); err != nil {
-			s.logger.Warn("wasm orphan-ref sweep: row delete failed",
-				"push_id", p.ID, "sandbox_id", p.SandboxID, "error", err)
-		}
+		// An orphan is a row no live lifetime owns, but its manifest can
+		// still be the live one's — the shared :latest tag, or a digest both
+		// lifetimes produced. reclaimWasmCheckpointPush keeps those.
+		s.reclaimWasmCheckpointPush(ctx, p, "orphan-sweep")
 	}
 }
 

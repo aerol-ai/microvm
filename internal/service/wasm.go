@@ -23,8 +23,10 @@ func (s *Service) isWasmSandbox(sandbox *models.Sandbox) bool {
 // reserve admission, dispatch to the driver, persist the row. Create on the
 // driver still returns ErrRuntimeNotImplemented until Phase 2 lands the cold path.
 func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cleanupCancel()
+	// Rollback gets its own budget, started when a rollback begins: a cold
+	// module pull and compile can outlast any budget taken here.
+	var rollback rollbackBudget
+	defer rollback.Release()
 	if req.GPUs != nil {
 		return nil, fmt.Errorf("runtime %q does not yet support GPUs (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)
@@ -150,7 +152,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	// mirroring the Docker image path. Nil/empty creds seal to nil.
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.wasm.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
+		_ = s.wasm.Destroy(rollback.Context(), &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -216,16 +218,16 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			// UpsertSandboxRoute loop and via syncWasmCustomDomainRoutes below,
 			// and both key on IngressCustomDomainHTTPRouteID — so the leaf delete
 			// covers both. 404 per leaf is a no-op, safe on a partial install.
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-			_ = s.wasm.Destroy(cleanupCtx, sandbox)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+			_ = s.wasm.Destroy(rollback.Context(), sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, err
 		}
 	}
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.wasm.Destroy(cleanupCtx, sandbox)
+		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+		_ = s.wasm.Destroy(rollback.Context(), sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -235,18 +237,18 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	}
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-			_ = s.wasm.Destroy(cleanupCtx, sandbox)
+			_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+			_ = s.wasm.Destroy(rollback.Context(), sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, err
 		}
 	}
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
-		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.wasm.Destroy(cleanupCtx, sandbox)
+		_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+		_ = s.wasm.Destroy(rollback.Context(), sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -257,17 +259,17 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if len(req.CustomDomains) > 0 {
 		storedCD, getErr := s.store.Get(ctx, sandbox.ID)
 		if getErr != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-			_ = s.wasm.Destroy(cleanupCtx, sandbox)
+			_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+			_ = s.wasm.Destroy(rollback.Context(), sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, getErr
 		}
 		if err := s.syncWasmCustomDomainRoutes(ctx, storedCD); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, storedCD)
-			_ = s.wasm.Destroy(cleanupCtx, sandbox)
+			_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), storedCD)
+			_ = s.wasm.Destroy(rollback.Context(), sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, err

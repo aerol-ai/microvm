@@ -264,7 +264,7 @@ func TestPruneWasmCheckpointPushesKeepsLastN(t *testing.T) {
 			t.Fatalf("insert: %v", err)
 		}
 	}
-	svc.pruneWasmCheckpointPushes(ctx, "sb-1")
+	svc.pruneWasmCheckpointPushes(ctx, "sb-1", "")
 	recs, err := st.ListWasmCheckpointPushes(ctx, "sb-1")
 	if err != nil {
 		t.Fatalf("list: %v", err)
