@@ -526,6 +526,55 @@ wait_for_download_url() {
   return 1
 }
 
+# verify_leased_zone fails fast when the leased domain's Cloudflare zone does
+# not exist in the account the token can see.
+#
+# WHY: dns.tf resolves the zone through `data.cloudflare_zones` and indexes the
+# result with `one(...)`. A zone that is not in the account yields an EMPTY
+# list, so the apply dies at dns.tf:48 with "Attempt to get attribute from null
+# value" — a message that names neither the domain nor the real cause. That
+# costs a full plan cycle and reads like a Terraform bug rather than a stale
+# domains.yml. Observed 2026-09-23 when taral.co left the account while
+# scenarios/domains.yml still listed sandbox.taral.co first in the pool.
+#
+# Mirrors dns.tf's own derivation: strip the leftmost label for a subdomain
+# ("sandbox.example.com" -> "example.com"), otherwise use the name as-is.
+# Best-effort on transport failure — a flaky Cloudflare API must not block a
+# provision that would otherwise work; only a definitive "zone absent" aborts.
+verify_leased_zone() {
+  local domain="$1"
+  [[ -n "$domain" ]] || return 0
+
+  local token
+  token=$(yq -r '.cloudflare.api_token // ""' "${REPO_ROOT}/config/secrets.yml" 2>/dev/null || echo "")
+  [[ -n "$token" ]] || return 0
+
+  local zone labels
+  IFS='.' read -r -a labels <<<"$domain"
+  if (( ${#labels[@]} > 2 )); then
+    zone=$(printf '%s.' "${labels[@]:1}"); zone="${zone%.}"
+  else
+    zone="$domain"
+  fi
+
+  local body
+  body=$(curl -sS --max-time 20 -H "Authorization: Bearer ${token}" \
+    "https://api.cloudflare.com/client/v4/zones?name=${zone}" 2>/dev/null || echo "")
+  [[ -n "$body" ]] || { echo "zone precheck: Cloudflare API unreachable, continuing" >&2; return 0; }
+  if [[ "$(jq -r '.success // false' <<<"$body" 2>/dev/null)" != "true" ]]; then
+    echo "zone precheck: Cloudflare API returned an error, continuing" >&2
+    return 0
+  fi
+  if [[ "$(jq -r '.result | length' <<<"$body" 2>/dev/null)" == "0" ]]; then
+    echo "leased domain ${domain} needs Cloudflare zone '${zone}', which this token cannot see." >&2
+    echo "  Either the zone left the account or the token lost access to it." >&2
+    echo "  Fix: remove ${domain} from integration-tests/scenarios/domains.yml and" >&2
+    echo "  delete integration-tests/.tf/<scenario>/.leased-domain to re-lease." >&2
+    return 1
+  fi
+  echo "zone precheck: ${domain} -> zone ${zone} present"
+}
+
 # BUILD_SH is the local artifact pipeline (plans/integration-test-security.md §4).
 BUILD_SH="${HERE}/lib/build.sh"
 
@@ -717,6 +766,9 @@ run_one() {
 
   # SAFETY GATE — before any apply.
   bash "$PROVISION" check-safety "$state_key" "${leased:-none.itest.invalid}" "$prod_domain" "$cluster_name"
+  if [[ "$caps_domain" == "true" ]]; then
+    verify_leased_zone "$leased"
+  fi
 
   # Decide + publish this scenario's artifacts before the asset check, so the
   # check probes the URLs the nodes will really use. Runs after the safety gate
