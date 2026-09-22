@@ -262,8 +262,8 @@ func TestCapacityFetchPhaseGuards(t *testing.T) {
 	if rt.healthy.Load() != 0 {
 		t.Fatal("a phase with no members or no budget still made requests")
 	}
-	c.runCapacityFetchClass(context.Background(), nil, time.Second)
-	c.runCapacityFetchClass(context.Background(), members, 0)
+	c.runCapacityFetchClass(context.Background(), nil, time.Second, capacityLeaseFullPassMaxConcurrency)
+	c.runCapacityFetchClass(context.Background(), members, 0, capacityLeaseFullPassMaxConcurrency)
 
 	// A cancelled sweep stops dispatching rather than running past its tick.
 	ctx, cancel := context.WithCancel(context.Background())

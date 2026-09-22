@@ -7829,12 +7829,19 @@ func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]st
 
 // WasmCheckpointPushRecord is one AOCR push history row.
 type WasmCheckpointPushRecord struct {
-	ID          int64
-	SandboxID   string
-	RegistryRef string
-	Digest      string
-	PushedAt    time.Time
+	ID        int64
+	SandboxID string
+	// IncarnationID is the sandbox lifetime the push belonged to. Empty on
+	// cleanup-only rows a destroy recorded for refs it had no push row for.
+	IncarnationID string
+	RegistryRef   string
+	Digest        string
+	PushedAt      time.Time
 }
+
+// wasmCheckpointCleanupOnlyDigest marks a row a destroy path wrote to track a
+// ref it had no push row for; it names no real manifest digest.
+const wasmCheckpointCleanupOnlyDigest = "cleanup-only"
 
 // InsertWasmCheckpointPush records a successful AOCR push for keep-last-N retention.
 func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, incarnationID, registryRef, digest string) (int64, error) {
@@ -7865,7 +7872,7 @@ func (s *Store) EnsureWasmCheckpointCleanupRef(ctx context.Context, sandboxID, r
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO wasm_checkpoint_pushes (sandbox_id, registry_ref, digest, pushed_at)
-		SELECT ?, ?, 'cleanup-only', ?
+		SELECT ?, ?, '`+wasmCheckpointCleanupOnlyDigest+`', ?
 		WHERE NOT EXISTS (
 			SELECT 1 FROM wasm_checkpoint_pushes
 			WHERE sandbox_id = ? AND registry_ref = ?
@@ -7895,13 +7902,36 @@ func (s *Store) EnsureWasmCheckpointCleanupRef(ctx context.Context, sandboxID, r
 	return id, nil
 }
 
-// ListWasmCheckpointPushes returns push history newest-first.
+// ListWasmCheckpointPushes returns every push history row for a sandbox id,
+// across ALL of its incarnations, newest-first. It is for the terminal destroy
+// path, where the id itself is going away; retention must use
+// ListWasmCheckpointPushesForIncarnation instead.
 func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) ([]WasmCheckpointPushRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, sandbox_id, registry_ref, digest, pushed_at
+	return s.queryWasmCheckpointPushes(ctx, `
+		SELECT id, sandbox_id, incarnation_id, registry_ref, digest, pushed_at
 		FROM wasm_checkpoint_pushes
 		WHERE sandbox_id = ?
 		ORDER BY pushed_at DESC, id DESC`, strings.TrimSpace(sandboxID))
+}
+
+// ListWasmCheckpointPushesForIncarnation returns ONE lifetime's pushes,
+// newest-first — the set keep-last-N retention is allowed to count and prune.
+//
+// Retention used to count every push for the sandbox id. Pushes are detached
+// with a multi-minute budget, so a destroyed incarnation's pushes can finish
+// after the id was re-created; ordered by completion time they then displaced
+// the replacement's checkpoint from its own retention window, and retention
+// deleted the manifest the live row still pointed at.
+func (s *Store) ListWasmCheckpointPushesForIncarnation(ctx context.Context, sandboxID, incarnationID string) ([]WasmCheckpointPushRecord, error) {
+	return s.queryWasmCheckpointPushes(ctx, `
+		SELECT id, sandbox_id, incarnation_id, registry_ref, digest, pushed_at
+		FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ? AND incarnation_id = ?
+		ORDER BY pushed_at DESC, id DESC`, strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID))
+}
+
+func (s *Store) queryWasmCheckpointPushes(ctx context.Context, query string, args ...any) ([]WasmCheckpointPushRecord, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list wasm checkpoint pushes: %w", err)
 	}
@@ -7909,7 +7939,7 @@ func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) 
 	var out []WasmCheckpointPushRecord
 	for rows.Next() {
 		var rec WasmCheckpointPushRecord
-		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
+		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.IncarnationID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, rec)
@@ -7923,30 +7953,84 @@ func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) 
 // succeeded; the orphan-ref sweep retries each ref and drops the row once the
 // manifest is confirmed gone, so the tracking table can never leak unbounded
 // rows for sandboxes that are already gone.
+//
+// A row is orphaned when no LIVE sandbox lifetime owns it. For a row that
+// names its incarnation that means no sandbox row carries that id AND that
+// incarnation — the sandbox id alone is not enough, because a destroyed
+// sandbox's id can be re-created, and a push the fenced metadata write
+// rejected as belonging to the dead lifetime was otherwise never reclaimed:
+// the id existed, so the row never looked orphaned. Cleanup-only rows carry no
+// incarnation and fall back to the id rule.
 func (s *Store) ListOrphanedWasmCheckpointPushes(ctx context.Context, limit int) ([]WasmCheckpointPushRecord, error) {
 	if limit <= 0 {
 		limit = 256
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT p.id, p.sandbox_id, p.registry_ref, p.digest, p.pushed_at
+	return s.queryWasmCheckpointPushes(ctx, `
+		SELECT p.id, p.sandbox_id, p.incarnation_id, p.registry_ref, p.digest, p.pushed_at
 		FROM wasm_checkpoint_pushes p
-		LEFT JOIN sandboxes s ON s.id = p.sandbox_id
-		WHERE s.id IS NULL
+		WHERE NOT EXISTS (
+			SELECT 1 FROM sandboxes s
+			WHERE s.id = p.sandbox_id
+			  AND (p.incarnation_id = '' OR s.audit_incarnation_id = p.incarnation_id)
+		)
 		ORDER BY p.pushed_at ASC, p.id ASC
 		LIMIT ?`, limit)
+}
+
+// WasmCheckpointRefInUse reports whether deleting ref would take away a
+// manifest the LIVE sandbox with this id still depends on. excludePushID is
+// the row being cleaned up, so it does not protect itself.
+//
+// Deleting a checkpoint ref resolves its tag and deletes the MANIFEST, which
+// removes every tag pointing at that digest. So a ref is in use not only when
+// the live row names it, but when anything the live lifetime keeps resolves to
+// the same manifest:
+//
+//   - the rolling :latest tag is shared by every incarnation of a sandbox id
+//     and resolves at delete time to whatever was pushed last — deleting it
+//     through a dead lifetime's row deletes the live one's checkpoint;
+//   - a digest tag is content-addressed, so two lifetimes that checkpointed
+//     identical memory share it;
+//   - the live lifetime's own retained history rows are its recovery points.
+//
+// A dead lifetime's rows protect nothing: that is what lets two of them that
+// share a manifest still be reclaimed.
+func (s *Store) WasmCheckpointRefInUse(ctx context.Context, sandboxID string, excludePushID int64, registryRef, digest string) (bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	registryRef = strings.TrimSpace(registryRef)
+	digest = strings.TrimSpace(digest)
+	if digest == wasmCheckpointCleanupOnlyDigest {
+		digest = ""
+	}
+	var liveRef, liveDigest, liveIncarnation string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(wasm_registry_ref, ''), COALESCE(wasm_registry_digest, ''), COALESCE(audit_incarnation_id, '')
+		FROM sandboxes WHERE id = ?`, sandboxID).Scan(&liveRef, &liveDigest, &liveIncarnation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("list orphaned wasm checkpoint pushes: %w", err)
+		return false, fmt.Errorf("wasm checkpoint ref in use: %w", err)
 	}
-	defer rows.Close()
-	var out []WasmCheckpointPushRecord
-	for rows.Next() {
-		var rec WasmCheckpointPushRecord
-		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
+	if strings.HasSuffix(registryRef, ":latest") {
+		return true, nil
 	}
-	return out, rows.Err()
+	if registryRef != "" && registryRef == strings.TrimSpace(liveRef) {
+		return true, nil
+	}
+	if digest != "" && digest == strings.TrimSpace(liveDigest) {
+		return true, nil
+	}
+	var held int
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COUNT(1) FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ? AND incarnation_id = ? AND id != ?
+		  AND ((? != '' AND registry_ref = ?) OR (? != '' AND digest = ?))`,
+		sandboxID, liveIncarnation, excludePushID, registryRef, registryRef, digest, digest).Scan(&held)
+	if err != nil {
+		return false, fmt.Errorf("wasm checkpoint ref in use: %w", err)
+	}
+	return held > 0, nil
 }
 
 // DeleteWasmCheckpointPush removes one push history row by id.

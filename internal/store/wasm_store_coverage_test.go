@@ -308,3 +308,99 @@ func TestScanSandboxGPUAndNetQuotaFields(t *testing.T) {
 		t.Fatal("NetworkQuotaExceededAt should be set after MarkNetworkQuotaExceeded")
 	}
 }
+
+// A row is orphaned when no LIVE lifetime owns it, not merely when the id is
+// gone: a destroyed sandbox's id can be re-created, and the rejected pushes of
+// the dead lifetime must still be reclaimable.
+func TestOrphanedWasmCheckpointPushesRespectIncarnation(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-orphan-inc")
+	sb.Runtime = models.RuntimeWasm
+	sb.AuditIncarnationID = "inc-live"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	live, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-live", "reg/sb:live", "sha256:live")
+	dead, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-dead", "reg/sb:dead", "sha256:dead")
+	gone, _ := st.InsertWasmCheckpointPush(ctx, "sb-gone", "inc-x", "reg/gone:x", "sha256:x")
+	cleanup, err := st.EnsureWasmCheckpointCleanupRef(ctx, "sb-gone-2", "reg/gone2:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveCleanup, err := st.EnsureWasmCheckpointCleanupRef(ctx, sb.ID, "reg/sb:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orphans, err := st.ListOrphanedWasmCheckpointPushes(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]bool{}
+	for _, o := range orphans {
+		got[o.ID] = true
+	}
+	for id, want := range map[int64]bool{live: false, dead: true, gone: true, cleanup: true, liveCleanup: false} {
+		if got[id] != want {
+			t.Fatalf("row %d orphaned=%v, want %v (orphans=%+v)", id, got[id], want, orphans)
+		}
+	}
+
+	scoped, err := st.ListWasmCheckpointPushesForIncarnation(ctx, sb.ID, "inc-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].ID != live || scoped[0].IncarnationID != "inc-live" {
+		t.Fatalf("incarnation-scoped history = %+v", scoped)
+	}
+}
+
+// Deleting a checkpoint ref deletes its MANIFEST. WasmCheckpointRefInUse is the
+// guard every deleter consults, so each way a dead lifetime's row can share the
+// live lifetime's manifest has to be recognised — and a dead row must never
+// protect anything, or two dead rows sharing a manifest could never be freed.
+func TestWasmCheckpointRefInUse(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-inuse")
+	sb.Runtime = models.RuntimeWasm
+	sb.AuditIncarnationID = "inc-live"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "inc-live", "reg/sb:d-current", "sha256:current"); err != nil {
+		t.Fatal(err)
+	}
+	liveHistory, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-live", "reg/sb:d-kept", "sha256:kept")
+	deadA, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-dead", "reg/sb:d-shared-dead", "sha256:shared-dead")
+	_, _ = st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-dead", "reg/sb:d-shared-dead", "sha256:shared-dead")
+
+	for _, tc := range []struct {
+		name    string
+		sandbox string
+		exclude int64
+		ref     string
+		digest  string
+		want    bool
+	}{
+		{"no live sandbox: nothing to protect", "sb-absent", 0, "reg/x:latest", "sha256:x", false},
+		{"rolling :latest resolves to the live checkpoint", sb.ID, 0, "reg/sb:latest", "", true},
+		{"the live row's own ref", sb.ID, 0, "reg/sb:d-current", "sha256:other", true},
+		{"a different tag for the live row's manifest", sb.ID, 0, "reg/sb:d-alias", "sha256:current", true},
+		{"a manifest the live lifetime still retains", sb.ID, 0, "reg/sb:d-kept", "", true},
+		{"a live history row does not protect itself", sb.ID, liveHistory, "reg/sb:d-kept", "sha256:kept", false},
+		{"dead rows sharing a manifest protect nothing", sb.ID, deadA, "reg/sb:d-shared-dead", "sha256:shared-dead", false},
+		{"cleanup-only is not a digest", sb.ID, 0, "reg/sb:d-unrelated", "cleanup-only", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := st.WasmCheckpointRefInUse(ctx, tc.sandbox, tc.exclude, tc.ref, tc.digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("in use = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -1487,13 +1487,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		ctx, cancel = context.WithTimeout(ctx, t)
 		defer cancel()
 	}
-	// cleanupCtx is detached from the createSandbox timeout so that rollback
+	// Rollback is detached from the createSandbox timeout so that rollback
 	// calls (docker.Destroy, caddy.DeleteSandboxRoute) are not immediately
 	// cancelled when the timeout fires mid-operation. Without this, orphaned
 	// containers are left running with no store row when the timeout fires
 	// after docker.Create has returned but before the store row is written.
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cleanupCancel()
+	// Its budget starts when a rollback begins — see rollbackBudget.
+	var rollback rollbackBudget
+	defer rollback.Release()
 	if err := s.ClusterTopologyError(); err != nil {
 		return nil, err
 	}
@@ -1602,8 +1603,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	platformVolumesCommitted := false
 	defer func() {
 		if !platformVolumesCommitted {
-			s.cleanupPlatformVolumeAttachments(cleanupCtx, platformAttachments)
-			s.cleanupCreatedPlatformVolumes(cleanupCtx, platformAttachments)
+			s.cleanupPlatformVolumeAttachments(rollback.Context(), platformAttachments)
+			s.cleanupCreatedPlatformVolumes(rollback.Context(), platformAttachments)
 		}
 	}()
 	// "firecracker" is the second runtime, dispatched to the native
@@ -1805,7 +1806,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 		partial.Runtime = chosenRuntime
 		partial.Engine = chosenEngine
-		_ = ociRt.Destroy(cleanupCtx, partial)
+		_ = ociRt.Destroy(rollback.Context(), partial)
 	}
 
 	state, err := ociRt.Create(ctx, req, sandboxID, toolboxToken, binds)
@@ -1899,7 +1900,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			// installed. deleteSandboxPublicRoutes (not DeleteSandboxRoute) tears
 			// down the main route AND every custom-domain leaf — 404 per leaf is
 			// a no-op, so it's safe on a partial install.
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
 			releaseAdmission()
@@ -1911,7 +1912,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
 		rollbackDestroy(sandbox)
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateStoreCreate(ctx, sandbox.ID, err); dupErr == nil {
@@ -1936,8 +1937,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			platformAttachments[i].IncarnationID = sandbox.AuditIncarnationID
 		}
 		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
 			releaseAdmission()
@@ -1963,8 +1964,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
-			_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+			_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
 			rollbackDestroy(sandbox)
 			cleanupMounts()
 			releaseAdmission()
@@ -1975,8 +1976,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		// Same rollback chain as a mount-persist failure. ErrCustomDomainConflict
 		// flows through unchanged so the API layer can map it to 409.
-		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
+		_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
 		rollbackDestroy(sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -2031,10 +2032,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 // cleanup contract (TAP slot release, runDir teardown) sits inside
 // Destroy, so we don't have to know the driver's internals here.
 func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
-	// cleanupCtx is independent of ctx so that rollback calls succeed even
-	// when ctx was cancelled by the outer createSandbox timeout guard.
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cleanupCancel()
+	// Rollback is independent of ctx so that rollback calls succeed even when
+	// ctx was cancelled by the outer createSandbox timeout guard, and its
+	// budget starts when a rollback begins — a Firecracker cold boot can
+	// outlast one taken here. See rollbackBudget.
+	var rollback rollbackBudget
+	defer rollback.Release()
 
 	if len(req.Mounts) > models.MaxMountsPerSandbox {
 		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
@@ -2128,7 +2131,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.firecracker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
+		_ = s.firecracker.Destroy(rollback.Context(), &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
 		releaseAdmission()
 		return nil, err
 	}
@@ -2191,8 +2194,8 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 			// deleteSandboxPublicRoutes (not DeleteSandboxRoute) so a non-atomic
 			// partial UpsertSandboxRoute — main route + per-custom-domain leaves —
 			// is fully torn down. See the docker path for the rationale.
-			_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-			_ = s.firecracker.Destroy(cleanupCtx, sandbox)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+			_ = s.firecracker.Destroy(rollback.Context(), sandbox)
 			releaseAdmission()
 			return nil, err
 		}
@@ -2200,16 +2203,16 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 
 	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, idOverride)
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
+		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+		_ = s.firecracker.Destroy(rollback.Context(), sandbox)
 		releaseAdmission()
 		return nil, err
 	}
 
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
-		_ = s.store.RollbackSandboxCreate(cleanupCtx, sandbox.ID, sandbox.AuditIncarnationID)
-		_ = s.deleteSandboxPublicRoutes(cleanupCtx, sandbox)
-		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
+		_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+		_ = s.firecracker.Destroy(rollback.Context(), sandbox)
 		releaseAdmission()
 		return nil, err
 	}

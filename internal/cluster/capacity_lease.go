@@ -304,7 +304,19 @@ func (c *capacityLeaseCache) recordFetchResult(nodeID string, now time.Time, err
 	}
 	fails := c.failures[nodeID] + 1
 	c.failures[nodeID] = fails
-	backoff := capacityLeaseBackoffBase << min(fails-1, 8)
+	// One failure is noise; two in a row is a signal. The backoff base is the
+	// lease TTL, so backing off on the FIRST failure guaranteed that a single
+	// transient timeout — a GC pause on the peer, a network blip, a 2.1s
+	// answer — cost the peer its lease, and placement dropped a node that
+	// would have answered on the very next attempt. Retrying once on the next
+	// sweep fits inside the TTL; a peer that is really gone fails twice and is
+	// paced from then on, so a dead endpoint still cannot hold slots sweep
+	// after sweep.
+	if fails < 2 {
+		delete(c.nextAttempt, nodeID)
+		return
+	}
+	backoff := capacityLeaseBackoffBase << min(fails-2, 8)
 	if backoff > capacityLeaseBackoffMax || backoff <= 0 {
 		backoff = capacityLeaseBackoffMax
 	}
@@ -531,41 +543,34 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 	})
 
 	budget := c.capacityLeaseSweepBudget()
-	// Split the renewals again, by RESPONSIVENESS. Reserving a slice of the
-	// sweep for "peers that hold a lease" bounds that class as a whole, but
-	// every peer in it still competes for the same slots — and a peer that
-	// is alive but slow never enters the failure backoff, because missing a
-	// 300ms probe is not evidence of a fault. So a fleet where most peers
-	// answer in ~1s spends its entire renewal slice on them, sweep after
-	// sweep, while the peers that answer instantly are never dialled and
-	// lose the leases they could have renewed in microseconds.
+	// Renewals and first contact run CONCURRENTLY, each on its own pool, and
+	// each for the whole sweep.
 	//
-	// Responsive peers go first and cost almost nothing, so the slow class
-	// still gets nearly the whole slice; and a slow peer is paced, so the
-	// cost of the slow class per sweep falls instead of repeating in full.
-	// Responsiveness is handled inside runCapacityFetchClass, which gives the
-	// probe and the full request each their own reserved share. An earlier
-	// version also PACED peers that kept missing the probe, holding them back
-	// for a sweep or two; with the budget split that is pure harm — the class
-	// it delayed is slow but healthy, its lease has the same TTL as everyone
-	// else's, and nothing is competing for the time it was being denied.
-	// The renewal reservation is a FLOOR for renewals, not a ceiling: with no
-	// peer waiting to be discovered there is nothing for the rest of the
-	// sweep to do, and capping renewals at three fifths of it threw away the
-	// throughput that keeps leases alive.
-	renewalBudget := budget
+	// They used to share one pool by TIME: renewals got three fifths of the
+	// sweep whenever any first-contact work existed. But a slow peer needs one
+	// slot for two seconds, not two seconds of the whole pool — so a single
+	// newcomer that never answered took 40% of every sweep from renewals, and
+	// a fleet running near throughput lost leases to it. Splitting by SLOTS
+	// gives each class what it can use: renewals keep their full pool and
+	// budget however many newcomers are pending, and discovery gets whatever
+	// renewals leave — never less than a floor — so a burst of slow newcomers
+	// still cannot crowd out a lease that has to stay alive.
+	renewalMax := capacityLeaseFullPassMaxConcurrency
+	firstContactMax := renewalMax
+	if len(renewals) > 0 {
+		spare := renewalMax - passConcurrency(len(renewals), budget, capacityLeaseFetchTimeout, renewalMax)
+		firstContactMax = max(spare, capacityLeaseFirstContactMinConcurrency)
+	}
+	var discovery sync.WaitGroup
 	if len(firstContact) > 0 {
-		renewalBudget = budget * capacityLeaseRenewalBudgetNumerator / capacityLeaseRenewalBudgetDenominator
+		discovery.Add(1)
+		go func() {
+			defer discovery.Done()
+			c.runCapacityFetchClass(ctx, firstContact, budget, firstContactMax)
+		}()
 	}
-	start := time.Now()
-	c.runCapacityFetchClass(ctx, renewals, renewalBudget)
-	remaining := budget - time.Since(start)
-	if remaining <= 0 {
-		// The renewal phase used the whole sweep. First contact retries next
-		// tick; a node with no lease is not yet schedulable either way.
-		return
-	}
-	c.runCapacityFetchClass(ctx, firstContact, remaining)
+	c.runCapacityFetchClass(ctx, renewals, budget, renewalMax)
+	discovery.Wait()
 }
 
 // runCapacityFetchClass fetches one class of peers in two passes, each under
@@ -580,7 +585,7 @@ func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
 // the only pass that could have got an answer never runs — leaving a fleet
 // unschedulable although every endpoint would have replied well inside the
 // full timeout.
-func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, budget time.Duration) {
+func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, budget time.Duration, maxConcurrency int) {
 	if len(members) == 0 || budget <= 0 {
 		return
 	}
@@ -609,7 +614,7 @@ func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, b
 	unanswered := c.runCapacityFetchPhase(ctx, probeable, quickBudget, capacityFetchPass{
 		attemptTimeout:      capacityLeaseQuickProbeTimeout,
 		marksResponsiveness: true,
-		concurrency:         passConcurrency(len(probeable), quickBudget, capacityLeaseQuickProbeTimeout, capacityLeaseQuickProbeMaxConcurrency),
+		concurrency:         passConcurrency(len(probeable), quickBudget, capacityLeaseQuickProbeTimeout, min(capacityLeaseQuickProbeMaxConcurrency, maxConcurrency)),
 	})
 	full = append(full, unanswered...)
 	remaining := budget - time.Since(start)
@@ -619,7 +624,7 @@ func (c *Cluster) runCapacityFetchClass(ctx context.Context, members []Member, b
 	c.runCapacityFetchPhase(ctx, full, remaining, capacityFetchPass{
 		attemptTimeout: capacityLeaseFetchTimeout,
 		recordFailures: true,
-		concurrency:    passConcurrency(len(full), remaining, capacityLeaseFetchTimeout, capacityLeaseFullPassMaxConcurrency),
+		concurrency:    passConcurrency(len(full), remaining, capacityLeaseFetchTimeout, min(capacityLeaseFullPassMaxConcurrency, maxConcurrency)),
 	})
 }
 
@@ -671,14 +676,10 @@ type capacityFetchPass struct {
 	concurrency int
 }
 
-// capacityLeaseRenewalBudget* reserve three fifths of the sweep for peers that
-// already hold a lease. The split is what makes the reservation a guarantee
-// rather than an ordering preference: ordering alone still lets a long enough
-// run of slow newcomers occupy every request slot for the whole sweep.
-const (
-	capacityLeaseRenewalBudgetNumerator   = 3
-	capacityLeaseRenewalBudgetDenominator = 5
-)
+// capacityLeaseFirstContactMinConcurrency is the floor discovery keeps while
+// renewals are using their whole pool: enough that a new node is always being
+// reached, too few for a burst of slow newcomers to matter to a renewal.
+const capacityLeaseFirstContactMinConcurrency = 64
 
 // runCapacityFetchPhase fetches one class of peers under its own slice of the
 // sweep budget.
@@ -704,9 +705,16 @@ func (c *Cluster) runCapacityFetchPhase(ctx context.Context, members []Member, b
 		go func() {
 			defer wg.Done()
 			for m := range jobs {
-				c.capacityLeases.recordAttempt(m.NodeID, time.Now())
 				dialled := time.Now()
 				snap, err := c.fetchMemberCapacity(phaseCtx, m, pass.attemptTimeout)
+				// The fairness clock moves only for an attempt that resolved
+				// on the PEER's terms. It orders the next sweep, so advancing
+				// it for a request this sweep cut short sent that peer to the
+				// back of the queue — where it was dispatched last and cut
+				// short again, every sweep, without ever being backed off.
+				if err == nil || !curtailedByPhase(phaseCtx, err) {
+					c.capacityLeases.recordAttempt(m.NodeID, dialled)
+				}
 				if err != nil {
 					// A request this sweep cut short says nothing about the
 					// peer. It is dispatched with whatever is left of the
