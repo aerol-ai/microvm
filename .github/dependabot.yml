@@ -14,6 +14,11 @@ updates:
     directory: "/docs"
     schedule:
       interval: "weekly"
+    ignore:
+      # astro-mermaid@2.1.0 peers mermaid ^10 || ^11. A mermaid 12 bump
+      # fails npm ci (ERESOLVE) on Cloudflare Pages.
+      - dependency-name: "mermaid"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "npm"
     directory: "/sdk/typescript"
