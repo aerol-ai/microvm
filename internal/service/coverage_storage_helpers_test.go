@@ -130,11 +130,11 @@ func (r *recordingCheckpointStore) DestRefTagged(sandboxID, tag string) string {
 	return fmt.Sprintf("test://%s:%s", sandboxID, tag)
 }
 
-func (r *recordingCheckpointStore) PushOnceTo(context.Context, string, string, string) (WasmCheckpointPushResult, error) {
+func (r *recordingCheckpointStore) PushOnceTo(context.Context, string, string, string, string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{RegistryRef: r.destRef, Digest: "sha256:deadbeef"}, nil
 }
 
-func (r *recordingCheckpointStore) PullOnce(_ context.Context, registryRef, dstDir string) error {
+func (r *recordingCheckpointStore) PullOnce(_ context.Context, registryRef, _, dstDir string) error {
 	r.mu.Lock()
 	r.pullCalls = append(r.pullCalls, checkpointPullCall{RegistryRef: registryRef, DstDir: dstDir})
 	r.mu.Unlock()
@@ -618,25 +618,33 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 
 		pusher := &recordingCheckpointStore{}
 		svc.wasmCheckpointPusher = pusher
-		if _, err := svc.ensureWasmCheckpointLocal(ctx, durable); err == nil || !strings.Contains(err.Error(), "no AOCR ref") {
-			t.Fatalf("durable checkpoint without ref = %v", err)
+		// With no lifetime there is no checkpoint it is safe to fetch: the old
+		// fallback read the id-wide :latest, i.e. whichever lifetime pushed
+		// last. Refused before any pull is attempted.
+		if _, err := svc.ensureWasmCheckpointLocal(ctx, durable); err == nil || !strings.Contains(err.Error(), "no sandbox lifetime") {
+			t.Fatalf("durable checkpoint without a lifetime = %v", err)
+		}
+		if len(pusher.pullCalls) != 0 {
+			t.Fatalf("a checkpoint with no lifetime to bind to was pulled anyway: %v", pusher.pullCalls)
 		}
 
 		pusher.destRef = "test://sb-durable:latest"
 		if err := st.Create(ctx, &models.Sandbox{
-			ID:         "sb-durable",
-			Runtime:    models.RuntimeWasm,
-			Durability: models.DurabilityDurable,
-			Status:     models.SandboxStatusStarted,
-			CreatedAt:  time.Now().UTC(),
-			UpdatedAt:  time.Now().UTC(),
+			ID:                 "sb-durable",
+			Runtime:            models.RuntimeWasm,
+			Durability:         models.DurabilityDurable,
+			Status:             models.SandboxStatusStarted,
+			AuditIncarnationID: "inc-sb-durable",
+			CreatedAt:          time.Now().UTC(),
+			UpdatedAt:          time.Now().UTC(),
 		}); err != nil {
 			t.Fatalf("Create durable sandbox: %v", err)
 		}
 		gotPath, err := svc.ensureWasmCheckpointLocal(ctx, &models.Sandbox{
-			ID:         "sb-durable",
-			Runtime:    models.RuntimeWasm,
-			Durability: models.DurabilityDurable,
+			ID:                 "sb-durable",
+			Runtime:            models.RuntimeWasm,
+			Durability:         models.DurabilityDurable,
+			AuditIncarnationID: "inc-sb-durable",
 		})
 		if err != nil {
 			t.Fatalf("ensureWasmCheckpointLocal durable pull: %v", err)
@@ -659,13 +667,13 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		if cpusher.DestRefTagged(" ", "latest") != "" {
 			t.Fatal("blank sandbox id should return empty dest ref")
 		}
-		if _, err := cpusher.PushOnce(context.Background(), "", "/tmp"); err == nil {
-			t.Fatal("PushOnce should reject empty sandbox id")
+		if _, err := cpusher.PushOnceTo(context.Background(), "", "inc", "/tmp", "aocr.test/x:y"); err == nil {
+			t.Fatal("PushOnceTo should reject empty sandbox id")
 		}
-		if _, err := cpusher.PushOnceTo(context.Background(), "sb", "/tmp", ""); err == nil {
+		if _, err := cpusher.PushOnceTo(context.Background(), "sb", "inc", "/tmp", ""); err == nil {
 			t.Fatal("PushOnceTo should reject empty destination")
 		}
-		if err := cpusher.PullOnce(context.Background(), "", "/tmp"); err == nil {
+		if err := cpusher.PullOnce(context.Background(), "", "inc", "/tmp"); err == nil {
 			t.Fatal("PullOnce should reject empty registry ref")
 		}
 		if err := cpusher.DeleteRef(context.Background(), ""); err == nil {

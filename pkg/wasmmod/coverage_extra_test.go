@@ -294,7 +294,7 @@ func TestPullSnapshotArtifactMissingConfigAfterCopy(t *testing.T) {
 	}
 
 	dst := t.TempDir()
-	err := PullSnapshotArtifact(context.Background(), cfg, ref, dst)
+	err := PullSnapshotArtifact(context.Background(), cfg, ref, "inc-test", dst)
 	if err == nil || !strings.Contains(err.Error(), "missing config.json") {
 		t.Fatalf("want missing config error, got %v", err)
 	}
@@ -312,7 +312,7 @@ func TestDeleteSnapshotRefSecondDeleteSucceeds(t *testing.T) {
 	ref := reg.ref("latest")
 	ctx := context.Background()
 
-	if _, err := PushSnapshotArtifact(ctx, cfg, writeTestSnapshotDir(t), ref); err != nil {
+	if _, err := PushSnapshotArtifact(ctx, cfg, writeTestSnapshotDir(t), ref, "inc-test"); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 	if err := DeleteSnapshotRef(ctx, cfg, ref); err != nil {
@@ -349,7 +349,7 @@ func TestDeleteSnapshotRefValidateFailure(t *testing.T) {
 }
 
 func TestPullSnapshotArtifactValidateAndCopyFailures(t *testing.T) {
-	if err := PullSnapshotArtifact(context.Background(), ORASPullConfig{}, "ref", t.TempDir()); err == nil {
+	if err := PullSnapshotArtifact(context.Background(), ORASPullConfig{}, "ref", "inc-test", t.TempDir()); err == nil {
 		t.Fatal("expected validate error")
 	}
 
@@ -360,11 +360,11 @@ func TestPullSnapshotArtifactValidateAndCopyFailures(t *testing.T) {
 	}
 	cfg := ORASPullConfig{Host: "h", ClusterID: "c1", PATPath: patFile}
 	ref := reg.ref("latest")
-	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}, writeTestSnapshotDir(t), ref); err != nil {
+	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}, writeTestSnapshotDir(t), ref, "inc-test"); err != nil {
 		t.Fatalf("push setup: %v", err)
 	}
 	reg.close()
-	if err := PullSnapshotArtifact(context.Background(), cfg, ref, t.TempDir()); err == nil {
+	if err := PullSnapshotArtifact(context.Background(), cfg, ref, "inc-test", t.TempDir()); err == nil {
 		t.Fatal("expected copy failure after registry closed")
 	}
 }
@@ -378,7 +378,7 @@ func TestPushSnapshotArtifactCopyFailure(t *testing.T) {
 	cfg := ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}
 	ref := reg.ref("latest")
 	reg.close()
-	if _, err := PushSnapshotArtifact(context.Background(), cfg, writeTestSnapshotDir(t), ref); err == nil {
+	if _, err := PushSnapshotArtifact(context.Background(), cfg, writeTestSnapshotDir(t), ref, "inc-test"); err == nil {
 		t.Fatal("expected push copy failure after registry closed")
 	}
 }
@@ -468,7 +468,7 @@ func TestFileDigestIOCopyErrorOnDirectory(t *testing.T) {
 
 func TestPushSnapshotArtifactValidateAndBadRepo(t *testing.T) {
 	dir := writeTestSnapshotDir(t)
-	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{}, dir, "host/repo:tag"); err == nil {
+	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{}, dir, "host/repo:tag", "inc-test"); err == nil {
 		t.Fatal("expected validate error")
 	}
 	patFile := filepath.Join(t.TempDir(), "pat")
@@ -476,7 +476,7 @@ func TestPushSnapshotArtifactValidateAndBadRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := ORASPushConfig{Host: "h", ClusterID: "c", PATPath: patFile}
-	if _, err := PushSnapshotArtifact(context.Background(), cfg, dir, "http://\x00bad"); err == nil {
+	if _, err := PushSnapshotArtifact(context.Background(), cfg, dir, "http://\x00bad", "inc-test"); err == nil {
 		t.Fatal("expected newAuthedRepo error")
 	}
 }
@@ -507,7 +507,7 @@ func TestPullSnapshotArtifactFileStoreFailure(t *testing.T) {
 	}
 	cfg := ORASPullConfig{Host: "h", ClusterID: "c1", PATPath: patFile}
 	ref := reg.ref("latest")
-	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}, writeTestSnapshotDir(t), ref); err != nil {
+	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}, writeTestSnapshotDir(t), ref, "inc-test"); err != nil {
 		t.Fatalf("push setup: %v", err)
 	}
 	blocker := filepath.Join(t.TempDir(), "blocker")
@@ -515,7 +515,7 @@ func TestPullSnapshotArtifactFileStoreFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(blocker, "dst")
-	if err := PullSnapshotArtifact(context.Background(), cfg, ref, dst); err == nil {
+	if err := PullSnapshotArtifact(context.Background(), cfg, ref, "inc-test", dst); err == nil {
 		t.Fatal("expected mkdir/file store failure")
 	}
 }
@@ -548,7 +548,7 @@ func TestPushSnapshotArtifactMkdirTempFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := ORASPushConfig{Host: "h", ClusterID: "c", PATPath: patFile}
-	_, err := PushSnapshotArtifact(context.Background(), cfg, writeTestSnapshotDir(t), "127.0.0.1:1/repo:tag")
+	_, err := PushSnapshotArtifact(context.Background(), cfg, writeTestSnapshotDir(t), "127.0.0.1:1/repo:tag", "inc-test")
 	if err == nil {
 		t.Fatal("expected mkdir temp failure")
 	}
@@ -563,14 +563,14 @@ func TestPullSnapshotArtifactDstFileNotDirectory(t *testing.T) {
 	}
 	cfg := ORASPullConfig{Host: "h", ClusterID: "c1", PATPath: patFile}
 	ref := reg.ref("latest")
-	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}, writeTestSnapshotDir(t), ref); err != nil {
+	if _, err := PushSnapshotArtifact(context.Background(), ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}, writeTestSnapshotDir(t), ref, "inc-test"); err != nil {
 		t.Fatalf("push setup: %v", err)
 	}
 	dstFile := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(dstFile, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := PullSnapshotArtifact(context.Background(), cfg, ref, dstFile); err == nil {
+	if err := PullSnapshotArtifact(context.Background(), cfg, ref, "inc-test", dstFile); err == nil {
 		t.Fatal("expected file store error when dst is a file")
 	}
 }
@@ -586,7 +586,7 @@ func TestDeleteSnapshotRefDeleteFailure(t *testing.T) {
 	}
 	cfg := ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}
 	ref := reg.ref("latest")
-	if _, err := PushSnapshotArtifact(context.Background(), cfg, writeTestSnapshotDir(t), ref); err != nil {
+	if _, err := PushSnapshotArtifact(context.Background(), cfg, writeTestSnapshotDir(t), ref, "inc-test"); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 	if err := DeleteSnapshotRef(context.Background(), cfg, ref); err == nil {
@@ -644,7 +644,7 @@ func TestPushSnapshotArtifactUnreadableConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	pushCfg := ORASPushConfig{Host: "h", ClusterID: "c", PATPath: patFile}
-	_, err := PushSnapshotArtifact(context.Background(), pushCfg, dir, "127.0.0.1:1/repo:tag")
+	_, err := PushSnapshotArtifact(context.Background(), pushCfg, dir, "127.0.0.1:1/repo:tag", "inc-test")
 	if err == nil || !strings.Contains(err.Error(), "add config") {
 		t.Fatalf("want add config error, got %v", err)
 	}

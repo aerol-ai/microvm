@@ -48,7 +48,7 @@ func (p *configurableCheckpointPusher) DestRefTagged(sandboxID, tag string) stri
 	return "reg/" + sandboxID + ":" + tag
 }
 
-func (p *configurableCheckpointPusher) PushOnceTo(_ context.Context, _, _, destRef string) (WasmCheckpointPushResult, error) {
+func (p *configurableCheckpointPusher) PushOnceTo(_ context.Context, _, _, _, destRef string) (WasmCheckpointPushResult, error) {
 	p.n++
 	if p.n > 1 && p.digestErr != nil {
 		return WasmCheckpointPushResult{}, p.digestErr
@@ -58,7 +58,9 @@ func (p *configurableCheckpointPusher) PushOnceTo(_ context.Context, _, _, destR
 	return out, nil
 }
 
-func (p *configurableCheckpointPusher) PullOnce(context.Context, string, string) error { return nil }
+func (p *configurableCheckpointPusher) PullOnce(context.Context, string, string, string) error {
+	return nil
+}
 
 func (p *configurableCheckpointPusher) DeleteRef(context.Context, string) error { return nil }
 

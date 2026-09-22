@@ -51,7 +51,7 @@ func TestRecreateWasmDurableSandboxRetryRestoresSealedEnv(t *testing.T) {
 	}
 
 	rt.rehydrateErr = errors.New("restore boom")
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, spec, nil); err == nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil); err == nil {
 		t.Fatal("seeded restore failure did not surface")
 	}
 	if _, err := st.Get(ctx, id); err != nil {
@@ -67,7 +67,7 @@ func TestRecreateWasmDurableSandboxRetryRestoresSealedEnv(t *testing.T) {
 	rt.rehydrateErr = nil
 	retrySpec := spec
 	retrySpec.Env = nil
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, retrySpec, nil); err != nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", retrySpec, nil); err != nil {
 		t.Fatalf("retry after a failed restore: %v", err)
 	}
 	if len(rt.rehydratedEnv) != 1 {
@@ -102,7 +102,8 @@ func TestRecreateWasmDurableSandboxRepairsMissingSealedEnvFromSpec(t *testing.T)
 		t.Fatalf("seed row without sealed env: %v", err)
 	}
 
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, models.CreateSandboxRequest{
+	// The placement is the same lifetime as the seeded row.
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-"+id, models.CreateSandboxRequest{
 		Runtime:    models.RuntimeWasm,
 		Durability: models.DurabilityDurable,
 		ModuleRef:  "file:///tmp/demo.wasm",
@@ -213,11 +214,11 @@ func TestRecreateWasmDurableSandboxWithoutEnvStaysEmpty(t *testing.T) {
 		ModuleRef:  "file:///tmp/demo.wasm",
 	}
 	rt.rehydrateErr = errors.New("restore boom")
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, spec, nil); err == nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil); err == nil {
 		t.Fatal("seeded restore failure did not surface")
 	}
 	rt.rehydrateErr = nil
-	if _, err := svc.recreateWasmDurableSandbox(ctx, id, spec, nil); err != nil {
+	if _, err := svc.recreateWasmDurableSandbox(ctx, id, "inc-1", spec, nil); err != nil {
 		t.Fatalf("retry without env: %v", err)
 	}
 	if len(rt.rehydratedEnv) != 1 || len(rt.rehydratedEnv[0]) != 0 {

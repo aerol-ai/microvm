@@ -312,10 +312,10 @@ func (s *wasmCheckpointPusherStub) DestRefFor(sandboxID string) string { return 
 func (s *wasmCheckpointPusherStub) DestRefTagged(sandboxID, tag string) string {
 	return "test://sb:" + tag
 }
-func (s *wasmCheckpointPusherStub) PushOnceTo(ctx context.Context, sandboxID, memSnapDir, destRef string) (WasmCheckpointPushResult, error) {
+func (s *wasmCheckpointPusherStub) PushOnceTo(ctx context.Context, sandboxID, _, memSnapDir, destRef string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{RegistryRef: destRef, Digest: "sha256:123"}, nil
 }
-func (s *wasmCheckpointPusherStub) PullOnce(ctx context.Context, registryRef, destDir string) error {
+func (s *wasmCheckpointPusherStub) PullOnce(ctx context.Context, registryRef, _, destDir string) error {
 	return nil
 }
 func (s *wasmCheckpointPusherStub) DeleteRef(ctx context.Context, registryRef string) error {
@@ -328,11 +328,13 @@ func (f failingWasmCheckpointPusher) DestRefFor(string) string { return "test://
 func (f failingWasmCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
 	return "test://" + sandboxID + ":" + tag
 }
-func (f failingWasmCheckpointPusher) PushOnceTo(context.Context, string, string, string) (WasmCheckpointPushResult, error) {
+func (f failingWasmCheckpointPusher) PushOnceTo(context.Context, string, string, string, string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{}, errors.New("push failed")
 }
-func (f failingWasmCheckpointPusher) PullOnce(context.Context, string, string) error { return nil }
-func (f failingWasmCheckpointPusher) DeleteRef(context.Context, string) error        { return nil }
+func (f failingWasmCheckpointPusher) PullOnce(context.Context, string, string, string) error {
+	return nil
+}
+func (f failingWasmCheckpointPusher) DeleteRef(context.Context, string) error { return nil }
 
 func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
 	ctx := context.Background()

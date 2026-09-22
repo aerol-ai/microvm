@@ -105,7 +105,16 @@ func (s *Service) untrackedWasmRefs(sandbox *models.Sandbox, pushes []store.Wasm
 		}
 	}
 	var out []string
-	if latest := strings.TrimSpace(s.wasmCheckpointPusher.DestRefTagged(sandbox.ID, "latest")); latest != "" {
+	// The id is going away, so both rolling pointers go: this lifetime's own,
+	// and the id-wide :latest that predates lifetime-scoped tags.
+	for _, latest := range []string{
+		s.wasmCheckpointLatestRef(sandbox.ID, sandbox.AuditIncarnationID),
+		s.wasmCheckpointPusher.DestRefTagged(sandbox.ID, "latest"),
+	} {
+		latest = strings.TrimSpace(latest)
+		if latest == "" {
+			continue
+		}
 		if _, ok := tracked[latest]; !ok {
 			out = append(out, latest)
 			tracked[latest] = struct{}{}

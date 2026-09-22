@@ -14,7 +14,6 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
-	"github.com/aerol-ai/microvm/pkg/wasmmod"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -201,11 +200,24 @@ func (s *Service) wasmCheckpointParallelism() int {
 // re-created before the result lands, and an unfenced write would then hand a
 // fresh sandbox the previous incarnation's memory image.
 func (s *Service) pushWasmCheckpointBestEffort(sandboxID, incarnationID, memSnapDir string) {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		// Without a lifetime there is nothing to bind the artifact to, and an
+		// unbound checkpoint could later be restored into a different lifetime
+		// of this sandbox id.
+		s.logger.Warn("wasm checkpoint AOCR push skipped: sandbox has no lifetime (incarnation) to bind it to",
+			"sandbox_id", sandboxID)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	tag := "latest"
-	dest := s.wasmCheckpointPusher.DestRefTagged(sandboxID, tag)
-	result, err := s.wasmCheckpointPusher.PushOnceTo(ctx, sandboxID, memSnapDir, dest)
+	// Both refs are scoped to THIS lifetime. Every push used to write the
+	// id-wide :latest first, and the incarnation fence only ran afterwards on
+	// SQLite — which cannot undo a registry write. A destroyed lifetime's late
+	// push then re-pointed the tag a failover owner restores from, and orphan
+	// GC deleting that lifetime's manifest took the live alias with it.
+	dest := s.wasmCheckpointLatestRef(sandboxID, incarnationID)
+	result, err := s.wasmCheckpointPusher.PushOnceTo(ctx, sandboxID, incarnationID, memSnapDir, dest)
 	if err != nil {
 		s.logger.Warn("wasm checkpoint AOCR push failed",
 			"sandbox_id", sandboxID,
@@ -213,12 +225,14 @@ func (s *Service) pushWasmCheckpointBestEffort(sandboxID, incarnationID, memSnap
 		)
 		return
 	}
-	if digestTag := wasmmod.WasmCheckpointDigestTag(result.Digest); digestTag != "latest" {
-		if taggedDest := s.wasmCheckpointPusher.DestRefTagged(sandboxID, digestTag); taggedDest != dest {
-			if _, tagErr := s.wasmCheckpointPusher.PushOnceTo(ctx, sandboxID, memSnapDir, taggedDest); tagErr != nil {
+	if strings.TrimSpace(result.Digest) != "" {
+		if taggedDest := s.wasmCheckpointDigestRef(sandboxID, incarnationID, result.Digest); taggedDest != "" && taggedDest != dest {
+			if _, tagErr := s.wasmCheckpointPusher.PushOnceTo(ctx, sandboxID, incarnationID, memSnapDir, taggedDest); tagErr != nil {
+				// The row falls back to this lifetime's rolling pointer, which
+				// no other lifetime can move.
 				s.logger.Warn("wasm checkpoint digest-tagged AOCR push failed",
 					"sandbox_id", sandboxID,
-					"tag", digestTag,
+					"ref", taggedDest,
 					"error", tagErr,
 				)
 			} else {
@@ -290,7 +304,7 @@ func (s *Service) pruneWasmCheckpointPushes(ctx context.Context, sandboxID, inca
 func (s *Service) reclaimWasmCheckpointPush(ctx context.Context, rec store.WasmCheckpointPushRecord, reason string) {
 	ref := strings.TrimSpace(rec.RegistryRef)
 	if ref != "" && s.wasmCheckpointPusher != nil {
-		inUse, err := s.store.WasmCheckpointRefInUse(ctx, rec.SandboxID, rec.ID, ref, rec.Digest)
+		inUse, err := s.store.WasmCheckpointRefInUse(ctx, rec.SandboxID, rec.ID, rec.IncarnationID, ref, rec.Digest)
 		if err != nil {
 			// Unknown is not "free": deleting on a failed check is how the live
 			// checkpoint goes. Keep the row and try again next time.

@@ -27,11 +27,13 @@ func (r *recordingWasmCheckpointStore) DestRefTagged(id, tag string) string {
 	return "aocr://" + id + ":" + tag
 }
 
-func (r *recordingWasmCheckpointStore) PushOnceTo(context.Context, string, string, string) (WasmCheckpointPushResult, error) {
+func (r *recordingWasmCheckpointStore) PushOnceTo(context.Context, string, string, string, string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{}, nil
 }
 
-func (r *recordingWasmCheckpointStore) PullOnce(context.Context, string, string) error { return nil }
+func (r *recordingWasmCheckpointStore) PullOnce(context.Context, string, string, string) error {
+	return nil
+}
 
 func (r *recordingWasmCheckpointStore) DeleteRef(_ context.Context, ref string) error {
 	r.deleted = append(r.deleted, ref)

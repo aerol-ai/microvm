@@ -1242,6 +1242,20 @@ func (s *Service) obsoleteLocalPlacement(ctx context.Context, sandbox *models.Sa
 	return placement, obsolete, nil
 }
 
+// placementIncarnation is the lifetime the placement being recreated belongs
+// to: what the owner watcher handed over, else the placement itself.
+func (s *Service) placementIncarnation(id string, secrets cluster.PlacementSecrets) string {
+	if inc := strings.TrimSpace(secrets.IncarnationID); inc != "" {
+		return inc
+	}
+	if c := s.Cluster(); c != nil {
+		if p, ok := c.PlacementOf(id); ok {
+			return strings.TrimSpace(p.IncarnationID)
+		}
+	}
+	return ""
+}
+
 // RecreateSandbox satisfies cluster.SandboxRecreator. The cluster owner
 // watcher invokes this for any FSM placement that points to self. If the
 // sandbox already exists locally, we still replay the replicated port intents:
@@ -1283,7 +1297,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		if err != nil {
 			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
-		attempted, err := s.recreateWasmDurableSandbox(ctx, id, merged, exposedPorts)
+		attempted, err := s.recreateWasmDurableSandbox(ctx, id, s.placementIncarnation(id, secrets), merged, exposedPorts)
 		if err != nil {
 			return true, err
 		}
