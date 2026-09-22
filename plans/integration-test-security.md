@@ -132,6 +132,59 @@ The good news: `install.sh` already supports `--sandboxd-url`, `--toolboxd-url`,
 `basename "${URL%%\?*}"` (`install.sh:790-791`) — **the query string is
 stripped, so presigned S3 URLs work as-is.** No `install.sh` change is needed.
 
+### 3.6 FOUND + FIXED — every successful DELETE answered 404
+
+The first live run of the local-build harness immediately paid for itself.
+`UC-16` failed with `destroy sb-…: sandbox not found`, and a direct probe
+reproduced it **3/3** — each time with the container removed and the row gone,
+i.e. the destroy *succeeded* and only the reply was wrong.
+
+`DestroySandbox` races its own side effects: `rt.Destroy` makes the engine emit
+die+destroy, `handleDestroyEvent` removes the sandbox row, and `DestroySandbox`
+then reaches its own `store.Delete`, gets `ErrNotFound`, and returns it —
+`WriteStoreAwareError` turns that into 404.
+
+Not a new intolerance (`main` returns the same bare error) but a new **ordering**:
+this branch deliberately moved `store.Delete` to the end of the destroy boundary
+so the secret tomb, wasm cleanup and placement delete precede it. That widened
+the window enough that the event watcher wins every time.
+
+`events.go` already documents the mirror-image race as benign, and the two other
+callers of `deleteSandboxRowAndFenceAudit` both guard with
+`!errors.Is(err, store.ErrNotFound)`. `DestroySandbox` was the one call site that
+did not. Fixed there; the helper still returns the error because
+`audit_ownership_lease_test` asserts it and states "the caller treats that as
+success". Regression test verified to fail without the fix. Re-verified live:
+`DELETE → 204`, `GET` after → 404, 3/3.
+
+### 3.7 FOUND, NOT FIXED — a stop can silently delete the sandbox (containerd)
+
+Surfaced by `UC-14` on the re-run; **intermittent** (1 of 2 probes vanished),
+which is why run 1 passed it. Node journal, twice:
+
+```
+die (stop_mode=manual, exit 0)  →  POST /stop 200  →  "destroyed via docker event" (+2ms)  →  GET 404
+```
+
+Root cause: `internal/runtime/containerd/events.go:77` maps
+`runtime.TaskDeleteEventTopic` to action `"destroy"`. In containerd
+`TaskDeleteEventTopic` is **`/tasks/delete`** — the *task* (the process) being
+reaped, which happens on any normal stop. The **container** object survives and
+is restartable. Docker's `destroy` means the container was removed; containerd's
+analogue is `/containers/delete`, not `/tasks/delete`.
+
+So on the containerd engine — **the default for every non-local deployment** —
+stopping a sandbox can delete its row, breaking stop/start (UC-14/UC-15) and
+losing the sandbox. The same file already reasons carefully about this exact
+class of bug for `TaskPaused`/`TaskResumed` ("mapping TaskPaused→stop made an
+internal CreateSnapshot pause tear the live sandbox down"); `TaskDelete` was
+missed.
+
+Fixing it needs care beyond the one-line remap: the real destroy path must still
+register (confirm the driver's `Destroy` emits `/containers/delete`), and the
+orphan sweep's contract depends on these events, so it interacts with UC-167.
+Tracked as its own task rather than folded into the harness PR.
+
 ### 3.4 Coverage reality check
 
 | | |
@@ -887,8 +940,8 @@ and verified, not merely that code was written.
 |---|---|---|---|---|
 | T1 | `lib/build.sh` build + checksums + buildinfo | — | `sandboxd_linux_amd64` is a valid ELF, checksums verify | **DONE** 2026-09-23 — `ELF 64-bit LSB, x86-64`, `shasum -c` all OK; `--ref main` worktree arm builds too |
 | T2 | Artifacts bucket + presign + `itest-artifacts-init` | T1 | `urls` prints working presigned URLs | **DONE** 2026-09-23 — `s3://aerol-itest-artifacts-263611243038`; anonymous ranged GET 206, unsigned GET 403; install.sh's own `awk $2 == name` selection replayed against the live URLs and the downloaded bytes verify |
-| T3 | TF vars `sandboxd_url`/`toolboxd_url`/`checksums_url` → bootstrap | T2 | `single-node` provisions from a local build | **CODE DONE** 2026-09-23 — vars added (default `""`, so prod renders unchanged), threaded through **both** `nodes.tf` templatefile call sites, `terraform validate` passes. Exit criterion needs the live run. |
-| T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **CODE DONE** 2026-09-23 — flag parsing reworked to while/shift (`--version` needs a value), `prepare_artifacts` + ranged-GET probe wired, `artifacts.tfvars` chained last, report `build` block added, guards covered by offline tests. Exit criterion needs the live run. |
+| T3 | TF vars `sandboxd_url`/`toolboxd_url`/`checksums_url` → bootstrap | T2 | `single-node` provisions from a local build | **DONE** 2026-09-23 — live on `sandbox.hith.chat`: `/health` returned `version":"itest-7b9c7b666f89-dirty-53bab30c2d7e"`, and the node's own cloud-init log shows `sandboxd_linux_amd64: OK` / `toolboxd_linux_amd64: OK` from install.sh's checksum verification against our presigned artifacts. First time this branch has run on real infrastructure. |
+| T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **DONE (with 2 defects found)** 2026-09-23 — run 1: **pass 57 · fail 1 · skip 55 · missing 0 · inconclusive 0**, report carries the `build` block. The single failure was a REAL branch bug, not harness breakage (see §3.6). Fixed and re-verified live; re-run had UC-16 green. A second, pre-existing flake (UC-14) surfaced on the re-run — see §3.7. |
 | T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | |
 | T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | |
 | T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | |
