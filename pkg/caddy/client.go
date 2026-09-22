@@ -599,12 +599,41 @@ func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[stri
 		return err
 	}
 	if status >= 400 {
+		// Caddy rebuilds its @id index when it loads a config, and
+		// /id/<routeID> answers 404 while that rebuild is in flight even
+		// though the route IS in the config. The PATCH above then looks like
+		// "route absent", this PUT inserts a SECOND copy, and Caddy rejects
+		// the whole config with "duplicate ID ... found at ... and ...".
+		//
+		// The duplicate is proof the route exists, so the in-place update was
+		// the right operation all along — just issued a moment too early.
+		// Re-run it rather than failing the caller's start/expose_port.
+		//
+		// Measured live on single-node 2026-09-23: 2 of 8 stop→start cycles
+		// on a public sandbox failed this way, surfacing as a bare 400 from
+		// POST /v1/sandboxes/{id}/start.
+		if isDuplicateRouteID(detail) {
+			status, detail, err = c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+			if err != nil {
+				return err
+			}
+			if status < 400 {
+				return nil
+			}
+		}
 		// routeID is named explicitly: this error reaches the API as a bare
 		// 400 on POST /v1/sandboxes/{id}/start, and without it there is
 		// nothing tying the failure to a sandbox.
 		return caddyErr("insert caddy route "+routeID, status, detail)
 	}
 	return nil
+}
+
+// isDuplicateRouteID reports whether Caddy rejected an insert because the @id
+// is already present. Matched on the message because the admin API returns a
+// plain {"error":"..."} with no code to switch on.
+func isDuplicateRouteID(detail string) bool {
+	return strings.Contains(detail, "duplicate ID")
 }
 
 // DeleteRouteByID is the zombie-GC entry point: the reconcile sweep finds an
