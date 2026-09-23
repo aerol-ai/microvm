@@ -693,10 +693,20 @@ wait_for_bootstrap_assets() {
     echo "=== checking local artifact URLs ==="
     local name
     for name in sandboxd_url toolboxd_url checksums_url \
-      install_script_url cluster_init_script_url cluster_join_script_url; do
+      install_script_url cluster_init_script_url cluster_join_script_url \
+      cluster_sign_node_script_url; do
       local url
       url=$(tfvar_string_from_files "$name" "$artifacts_file")
-      [[ -n "$url" ]] || { echo "artifacts file has no ${name}: ${artifacts_file}" >&2; return 1; }
+      if [[ -z "$url" ]]; then
+        # cluster-sign-node.sh only exists on refs that carry the CSR
+        # rendezvous; a build of an older ref legitimately omits it.
+        if [[ "$name" == "cluster_sign_node_script_url" ]]; then
+          echo "artifacts: no ${name} in this build (older ref) — seed will use the released signer" >&2
+          continue
+        fi
+        echo "artifacts file has no ${name}: ${artifacts_file}" >&2
+        return 1
+      fi
       probe_artifact_url "$url" "$name"
     done
     return 0
