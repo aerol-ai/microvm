@@ -3,6 +3,47 @@
 Deferred work items with enough context to pick up cold. Each entry says
 what, why, the caveat that motivated capturing it, and where to start.
 
+## Warm-adopted (`park-*`) destroys fall to reconcile (containerd)
+
+- **What:** Restore prompt row deletion for a warm-adopted container, or
+  confirm the reconcile sweep is sufficient and close this out.
+- **Why:** `internal/runtime/containerd/events.go` used to map `/tasks/delete`
+  to `destroy`, which fired while the container still existed, so
+  `StreamEvents`' `LoadContainer` could still read the `aerolvm.sandbox_id`
+  label and name the real sandbox. That mapping was a bug (a manual stop
+  deleted the sandbox — see the fix commit) and now only `/containers/delete`
+  maps to `destroy`. By then the container is gone, so the label lookup fails
+  and the event carries the `park-*` container id, which matches no store row.
+- **Caveat (why it's a TODO, not a bug):** the outcome is correct, just
+  slower — those rows are reclaimed by the reconcile orphan sweep instead of
+  immediately. The alternative (caching container id → sandbox id before
+  deletion) adds state to the event path for a latency win that may not
+  matter. Measure how long a warm-adopted row actually lingers first.
+- **Depends on / blocked by:** nothing. Needs a scenario that exercises
+  warm-pool adoption plus destroy.
+- **Start:** `internal/runtime/containerd/events.go` (`StreamEvents`'
+  `sandboxIDFromContainer` call), then the sweep in
+  `internal/service/service.go` (`removeOrphans`).
+
+## Destroy events WARN about an already-deleted placement (cluster)
+
+- **What:** Stop `handle docker event failed … cluster: unknown sandbox
+  placement` from WARNing on every API-driven destroy.
+- **Why:** `Driver.Destroy` ends with `container.Delete`, so the
+  `/containers/delete` event now always arrives AFTER `DestroySandbox` has
+  already removed the placement. `handleDestroyEvent` then tries its own
+  `beginSelfOwnedClusterPlacementDeleteStrict` and logs a warning for work
+  that is legitimately already done. Previously the (incorrectly mapped)
+  `/tasks/delete` arrived earlier, so this rarely fired.
+- **Caveat (why it's a TODO, not a bug):** purely cosmetic — the destroy
+  succeeds and the placement is correctly gone. But it WARNs once per destroy,
+  so it will be constant noise in cluster runs and could mask a real
+  finalization failure, which is the actual risk.
+- **Depends on / blocked by:** nothing.
+- **Start:** `internal/service/events.go` `handleDestroyEvent` — treat "no
+  such placement" as benign there the same way its `store.Delete` already
+  treats `ErrNotFound`.
+
 ## Audit Firecracker outbound NAT path (networking)
 
 - **What:** Trace an FC sandbox's outbound connectivity on a live host

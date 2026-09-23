@@ -2936,7 +2936,19 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
 		return err
 	}
-	if err := s.deleteSandboxRowAndFenceAudit(ctx, id); err != nil {
+	// ErrNotFound is benign here and must not fail the destroy: rt.Destroy above
+	// makes Docker emit die+destroy, and handleDestroyEvent removes the row for
+	// the same sandbox concurrently (events.go, which tolerates the mirror-image
+	// race for exactly this reason). Everything between the two — secret tomb,
+	// wasm cleanup, placement delete — widened that window enough that the event
+	// watcher wins essentially every time, so an unguarded error here turned
+	// every successful DELETE /v1/sandboxes/{id} into a 404 while the sandbox
+	// was in fact fully deleted (observed 3/3 on single-node, 2026-09-23).
+	//
+	// The helper keeps returning the error on purpose — audit_ownership_lease_test
+	// asserts that, and the fence must still run — so tolerance belongs at the
+	// call site, matching the other callers of this helper.
+	if err := s.deleteSandboxRowAndFenceAudit(ctx, id); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
 	if s.testAfterStoreDeleteOnDestroy != nil {

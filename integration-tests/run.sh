@@ -8,6 +8,14 @@
 #   integration-tests/run.sh <scenario> [--bench-only]    # UC-94/UC-95 only (provision if needed)
 #   integration-tests/run.sh all       [flags]
 #
+# Artifact source (plans/integration-test-security.md §4.4). The DEFAULT is now
+# a local cross-compile of the working tree, because the security matrix has to
+# run against an unmerged branch:
+#   (default)         build locally -> publish -> provision from presigned URLs
+#   --released        provision from releases/latest (the pre-§4 behaviour)
+#   --version <tag>   provision from a pinned release tag (A/B vs known-good)
+#   --no-build        reuse the last published build id (fast re-provision)
+#
 # Scenarios: single-node | single-node-containerd | single-node-wasm |
 #            single-node-isolate | single-node-isolate-jail | local-mode | cluster-3-mixed |
 #            cluster-3-mixed-docker | cluster-3-mixed-containerd | cluster-3-mixed-fc |
@@ -34,6 +42,10 @@ PROD_TLS=0
 METAL_ON_DEMAND=0
 NO_DISRUPTIVE=0
 COLLECT_LOGS_ONLY=0
+# Artifact source. BUILD_MODE is local|released|version; see the usage block.
+BUILD_MODE="local"
+PIN_VERSION=""
+NO_BUILD=0
 BENCH_ONLY=0
 DESTROY_ONLY=0
 OBS_SNAPSHOT_ONLY=0
@@ -46,12 +58,25 @@ SSH_TUNNEL_PID=""
 # Local port the harness forwards to the seed's 127.0.0.1:21212.
 LOCAL_API_PORT=21212
 
-for arg in "$@"; do
+# while/shift rather than `for arg in "$@"`: --version takes a value, which a
+# valueless for-loop cannot consume.
+while [[ $# -gt 0 ]]; do
+  arg="$1"
   case "$arg" in
     --keep) KEEP=1 ;;
     --prod-tls) PROD_TLS=1 ;;
     --metal-on-demand) METAL_ON_DEMAND=1 ;;
     --no-disruptive) NO_DISRUPTIVE=1 ;;
+    # Artifact source (§4.4). Mutually exclusive; last one wins, which keeps
+    # `make integration-single FLAGS=--released` predictable.
+    --released) BUILD_MODE="released"; PIN_VERSION="" ;;
+    --version)
+      shift
+      [[ $# -gt 0 ]] || { echo "--version needs a release tag (e.g. --version v0.7.21)" >&2; exit 2; }
+      BUILD_MODE="version"; PIN_VERSION="$1"
+      ;;
+    --version=*) BUILD_MODE="version"; PIN_VERSION="${arg#--version=}" ;;
+    --no-build) NO_BUILD=1 ;;
     # Collect logs from an ALREADY-RUNNING scenario (provisioned earlier with
     # --keep) and exit. No apply, no suite, no teardown — just dump every node's
     # forensics into reports/<scenario>-failure-logs.txt. Use this to iterate on
@@ -70,8 +95,16 @@ for arg in "$@"; do
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
+  shift
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--no-build]" >&2; exit 2; }
+# A pinned tag and "reuse the last local build" describe different artifact
+# sources; silently honouring one would provision something the operator did
+# not ask for.
+if [[ "$BUILD_MODE" != "local" && "$NO_BUILD" == "1" ]]; then
+  echo "--no-build only applies to the default local-build mode (got --${BUILD_MODE})" >&2
+  exit 2
+fi
 # Reject shell metacharacters so a polluted SCENARIO env (or make injection)
 # cannot turn one run.sh invocation into multiple shell commands.
 if [[ "$SCENARIO" == *[$';#&|<>']* ]] || [[ "$SCENARIO" == *$'\n'* ]]; then
@@ -101,6 +134,19 @@ tf_varfile_args() {
   printf -- '-var-file=%s -var-file=%s' "$PROD_TFVARS" "${HERE}/scenarios/${scenario}.tfvars"
   local cert_tfvars="${HERE}/.tf/${scenario}/cert-storage.tfvars"
   [[ -f "$cert_tfvars" ]] && printf -- ' -var-file=%s' "$cert_tfvars"
+  # Locally-built artifact URLs (§4.4), chained LAST so they override any
+  # sandboxd_url/install_script_url a scenario file happens to pin. Written by
+  # prepare_artifacts before apply and deliberately LEFT ON DISK afterwards, so
+  # the teardown/destroy that shares this function sees the identical variable
+  # set it applied with.
+  local artifacts_tfvars="${HERE}/.tf/${scenario}/artifacts.tfvars"
+  [[ -f "$artifacts_tfvars" ]] && printf -- ' -var-file=%s' "$artifacts_tfvars"
+}
+
+# artifacts_tfvars_path echoes where prepare_artifacts writes (and the var-file
+# chain reads) one scenario's artifact URL overrides.
+artifacts_tfvars_path() {
+  printf '%s\n' "${HERE}/.tf/${1}/artifacts.tfvars"
 }
 
 # on_demand_tfvar maps the --metal-on-demand flag to the force_on_demand TF var
@@ -480,12 +526,183 @@ wait_for_download_url() {
   return 1
 }
 
+# verify_leased_zone fails fast when the leased domain's Cloudflare zone does
+# not exist in the account the token can see.
+#
+# WHY: dns.tf resolves the zone through `data.cloudflare_zones` and indexes the
+# result with `one(...)`. A zone that is not in the account yields an EMPTY
+# list, so the apply dies at dns.tf:48 with "Attempt to get attribute from null
+# value" — a message that names neither the domain nor the real cause. That
+# costs a full plan cycle and reads like a Terraform bug rather than a stale
+# domains.yml. Observed 2026-09-23 when taral.co left the account while
+# scenarios/domains.yml still listed sandbox.taral.co first in the pool.
+#
+# Mirrors dns.tf's own derivation: strip the leftmost label for a subdomain
+# ("sandbox.example.com" -> "example.com"), otherwise use the name as-is.
+# Best-effort on transport failure — a flaky Cloudflare API must not block a
+# provision that would otherwise work; only a definitive "zone absent" aborts.
+verify_leased_zone() {
+  local domain="$1"
+  [[ -n "$domain" ]] || return 0
+
+  local token
+  token=$(yq -r '.cloudflare.api_token // ""' "${REPO_ROOT}/config/secrets.yml" 2>/dev/null || echo "")
+  [[ -n "$token" ]] || return 0
+
+  local zone labels
+  IFS='.' read -r -a labels <<<"$domain"
+  if (( ${#labels[@]} > 2 )); then
+    zone=$(printf '%s.' "${labels[@]:1}"); zone="${zone%.}"
+  else
+    zone="$domain"
+  fi
+
+  local body
+  body=$(curl -sS --max-time 20 -H "Authorization: Bearer ${token}" \
+    "https://api.cloudflare.com/client/v4/zones?name=${zone}" 2>/dev/null || echo "")
+  [[ -n "$body" ]] || { echo "zone precheck: Cloudflare API unreachable, continuing" >&2; return 0; }
+  if [[ "$(jq -r '.success // false' <<<"$body" 2>/dev/null)" != "true" ]]; then
+    echo "zone precheck: Cloudflare API returned an error, continuing" >&2
+    return 0
+  fi
+  if [[ "$(jq -r '.result | length' <<<"$body" 2>/dev/null)" == "0" ]]; then
+    echo "leased domain ${domain} needs Cloudflare zone '${zone}', which this token cannot see." >&2
+    echo "  Either the zone left the account or the token lost access to it." >&2
+    echo "  Fix: remove ${domain} from integration-tests/scenarios/domains.yml and" >&2
+    echo "  delete integration-tests/.tf/<scenario>/.leased-domain to re-lease." >&2
+    return 1
+  fi
+  echo "zone precheck: ${domain} -> zone ${zone} present"
+}
+
+# BUILD_SH is the local artifact pipeline (plans/integration-test-security.md §4).
+BUILD_SH="${HERE}/lib/build.sh"
+
+# RELEASE_BASE mirrors install.sh's own release URL construction, so a
+# --version pin resolves to exactly the assets install.sh would have picked.
+RELEASE_BASE="https://github.com/aerol-ai/microvm/releases"
+
+# prepare_artifacts decides what binaries this scenario installs and writes the
+# answer to <sdir>/artifacts.tfvars, which tf_varfile_args chains last.
+#
+# WHY the default is a LOCAL build: every scenario before §4 provisioned from
+# releases/latest, so a branch could only be tested after it merged and
+# released. The security matrix has to run against an unmerged branch, so the
+# harness owns the build. --released restores the old behaviour verbatim.
+#
+# Exports AEROL_BUILD_* for the report's build block, so reports/*.json records
+# which tree produced its numbers.
+prepare_artifacts() {
+  local scenario="$1"
+  local out
+  out="$(artifacts_tfvars_path "$scenario")"
+  mkdir -p "$(dirname "$out")"
+
+  case "$BUILD_MODE" in
+    released)
+      # No override file at all: Terraform's defaults already point at
+      # releases/latest, so this renders byte-identically to the pre-§4 harness.
+      rm -f "$out"
+      export AEROL_BUILD_MODE="released"
+      echo "=== artifacts: releases/latest (--released) ==="
+      return 0
+      ;;
+    version)
+      # Pin every asset explicitly rather than passing a version through to
+      # install.sh: the pin then shows up in the var-file, the plan, and the
+      # report, instead of being invisible inside the node's bootstrap.
+      echo "=== artifacts: pinned release ${PIN_VERSION} ==="
+      local base="${RELEASE_BASE}/download/${PIN_VERSION}"
+      cat >"$out" <<EOF
+# generated by run.sh --version ${PIN_VERSION}
+sandboxd_url            = "${base}/sandboxd_linux_amd64"
+toolboxd_url            = "${base}/toolboxd_linux_amd64"
+checksums_url           = "${base}/checksums.txt"
+install_script_url      = "${base}/install.sh"
+cluster_init_script_url = "${base}/cluster-init.sh"
+cluster_join_script_url = "${base}/cluster-join.sh"
+EOF
+      export AEROL_BUILD_MODE="version"
+      export AEROL_BUILD_VERSION="$PIN_VERSION"
+      return 0
+      ;;
+  esac
+
+  # Default: local build.
+  local build_id
+  if [[ "$NO_BUILD" == "1" ]]; then
+    build_id=$("$BUILD_SH" build-id)
+    echo "=== artifacts: reusing published build ${build_id} (--no-build) ==="
+    "$BUILD_SH" urls >"$out"
+  else
+    echo "=== artifacts: building locally ==="
+    build_id=$("$BUILD_SH" build)
+    "$BUILD_SH" publish >"$out"
+  fi
+
+  export AEROL_BUILD_MODE="local"
+  export AEROL_BUILD_ID="$build_id"
+  # buildinfo.json is the build's own record; reading it here keeps run.sh from
+  # re-deriving the sha and the dirty flag and getting a different answer.
+  local info="${REPO_ROOT}/integration-tests/.build/${build_id}/buildinfo.json"
+  if [[ -f "$info" ]]; then
+    AEROL_BUILD_GIT_SHA=$(jq -r '.git_sha // ""' "$info")
+    AEROL_BUILD_DIRTY=$(jq -r '.dirty // false' "$info")
+    export AEROL_BUILD_GIT_SHA AEROL_BUILD_DIRTY
+  fi
+  echo "=== artifacts: build ${build_id} published ==="
+  if [[ "${AEROL_BUILD_DIRTY:-false}" == "true" ]]; then
+    echo "NOTE: building from a DIRTY tree — this run is not reproducible from git." >&2
+  fi
+}
+
+# probe_artifact_url checks that an anonymous HTTP client can actually fetch a
+# presigned URL.
+#
+# It uses a one-byte RANGED GET, not HEAD. A SigV4 presigned URL signs the HTTP
+# METHOD, so a HEAD against a GET-presigned URL fails with SignatureDoesNotMatch
+# — the plan's §4.4 wording says "HEAD the three presigned URLs", which would
+# reject every healthy build. A ranged GET is the same signed method, costs one
+# byte, and still proves reachability + signature validity.
+probe_artifact_url() {
+  local url="$1" label="$2"
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    --range 0-0 --connect-timeout 10 --max-time 30 "$url" 2>/dev/null || echo 000)
+  if [[ "$code" =~ ^(200|206|30[0-9])$ ]]; then
+    echo "artifact ready: ${label}"
+    return 0
+  fi
+  echo "artifact ${label} not fetchable (HTTP ${code}): ${url}" >&2
+  return 1
+}
+
 wait_for_bootstrap_assets() {
   local tfvars_file="$1"
+  local artifacts_file="${2:-}"
   local timeout="${AEROL_BOOTSTRAP_ASSET_WAIT_TIMEOUT:-900}"
   local default_base="https://github.com/aerol-ai/microvm/releases/latest/download"
-  local install_url cluster_init_url cluster_join_url
 
+  # Local-build mode: the assets are objects WE just uploaded, so there is
+  # nothing to wait for — a release-publishing race cannot exist. Polling
+  # GitHub here would be worse than useless: it would pass against
+  # releases/latest while the node installs something else entirely. Probe the
+  # presigned URLs we are actually going to hand the node instead, which also
+  # catches an expired or malformed presign before 3 instances boot against it.
+  if [[ -n "$artifacts_file" && -f "$artifacts_file" ]]; then
+    echo "=== checking local artifact URLs ==="
+    local name
+    for name in sandboxd_url toolboxd_url checksums_url \
+      install_script_url cluster_init_script_url cluster_join_script_url; do
+      local url
+      url=$(tfvar_string_from_files "$name" "$artifacts_file")
+      [[ -n "$url" ]] || { echo "artifacts file has no ${name}: ${artifacts_file}" >&2; return 1; }
+      probe_artifact_url "$url" "$name"
+    done
+    return 0
+  fi
+
+  local install_url cluster_init_url cluster_join_url
   install_url=$(tfvar_string_from_files install_script_url "$PROD_TFVARS" "$tfvars_file")
   cluster_init_url=$(tfvar_string_from_files cluster_init_script_url "$PROD_TFVARS" "$tfvars_file")
   cluster_join_url=$(tfvar_string_from_files cluster_join_script_url "$PROD_TFVARS" "$tfvars_file")
@@ -549,7 +766,15 @@ run_one() {
 
   # SAFETY GATE — before any apply.
   bash "$PROVISION" check-safety "$state_key" "${leased:-none.itest.invalid}" "$prod_domain" "$cluster_name"
-  wait_for_bootstrap_assets "$tfvars_file"
+  if [[ "$caps_domain" == "true" ]]; then
+    verify_leased_zone "$leased"
+  fi
+
+  # Decide + publish this scenario's artifacts before the asset check, so the
+  # check probes the URLs the nodes will really use. Runs after the safety gate
+  # because nothing should touch AWS until the tripwires have passed.
+  prepare_artifacts "$scenario"
+  wait_for_bootstrap_assets "$tfvars_file" "$(artifacts_tfvars_path "$scenario")"
 
   # Config overlay: start from prod config, neutralize prod-only side effects,
   # set the leased domain. Secrets are symlinked (never copied).
@@ -686,7 +911,17 @@ run_one() {
   if [[ "$caps_domain" == "true" ]]; then
     base_url=$(echo "$targets" | jq -r '.base_url')
     wait_for_dns "$leased" || inconclusive=1
-    wait_for_tls "$leased" || inconclusive=1
+    # TLS is a PRE-WAIT, not a verdict. wait_for_health below talks to the same
+    # https:// base URL, so a healthy API proves the handshake works — whereas
+    # treating a TLS timeout as fatal marks a perfectly good box inconclusive
+    # and throws away the whole suite run.
+    #
+    # That is not hypothetical: an instance REPLACEMENT (new box must obtain and
+    # load the cert while the old A record is still cached) blew the 300s budget
+    # on 2026-09-23, and the box was serving a valid Let's Encrypt cert minutes
+    # later. Replacement is the COMMON case now, because the local-build
+    # pipeline changes user_data on every code change.
+    wait_for_tls "$leased" || echo "tls: pre-wait timed out; deferring to the health probe" >&2
     wait_for_health "$base_url" "$pat" || inconclusive=1
   else
     # local-mode: SSH tunnel to the seed, talk to localhost:21212. Unlike the

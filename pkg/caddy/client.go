@@ -579,7 +579,7 @@ func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[stri
 	}
 
 	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
+	status, detail, err := c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
 	if err != nil {
 		return err
 	}
@@ -587,21 +587,53 @@ func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[stri
 		return nil
 	}
 	if status != http.StatusNotFound {
-		return fmt.Errorf("patch caddy route failed: %d", status)
+		return caddyErr("patch caddy route", status, detail)
 	}
 
 	// Fresh route: insert at the front of the routes array. PUT to an array
 	// index is Caddy's "insert before" — existing entries shift right, so
 	// the catch-all fallback (if any) stays at the tail.
 	insertURL := fmt.Sprintf("%s/config/apps/http/servers/%s/routes/0", c.baseURL, c.serverID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
+	status, detail, err = c.sendJSONDetail(ctx, http.MethodPut, insertURL, body)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("insert caddy route failed: %d", status)
+		// Caddy rebuilds its @id index when it loads a config, and
+		// /id/<routeID> answers 404 while that rebuild is in flight even
+		// though the route IS in the config. The PATCH above then looks like
+		// "route absent", this PUT inserts a SECOND copy, and Caddy rejects
+		// the whole config with "duplicate ID ... found at ... and ...".
+		//
+		// The duplicate is proof the route exists, so the in-place update was
+		// the right operation all along — just issued a moment too early.
+		// Re-run it rather than failing the caller's start/expose_port.
+		//
+		// Measured live on single-node 2026-09-23: 2 of 8 stop→start cycles
+		// on a public sandbox failed this way, surfacing as a bare 400 from
+		// POST /v1/sandboxes/{id}/start.
+		if isDuplicateRouteID(detail) {
+			status, detail, err = c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+			if err != nil {
+				return err
+			}
+			if status < 400 {
+				return nil
+			}
+		}
+		// routeID is named explicitly: this error reaches the API as a bare
+		// 400 on POST /v1/sandboxes/{id}/start, and without it there is
+		// nothing tying the failure to a sandbox.
+		return caddyErr("insert caddy route "+routeID, status, detail)
 	}
 	return nil
+}
+
+// isDuplicateRouteID reports whether Caddy rejected an insert because the @id
+// is already present. Matched on the message because the admin API returns a
+// plain {"error":"..."} with no code to switch on.
+func isDuplicateRouteID(detail string) bool {
+	return strings.Contains(detail, "duplicate ID")
 }
 
 // DeleteRouteByID is the zombie-GC entry point: the reconcile sweep finds an
@@ -664,17 +696,54 @@ func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
 }
 
 func (c *Client) sendJSON(ctx context.Context, method, target string, body []byte) (int, error) {
+	status, _, err := c.sendJSONDetail(ctx, method, target, body)
+	return status, err
+}
+
+// caddyErrDetailMax bounds how much of an admin-API error body we keep. Caddy
+// returns a short JSON object ({"error":"..."}), so this is generous; the cap
+// only exists so a pathological response cannot blow up a log line.
+const caddyErrDetailMax = 512
+
+// sendJSONDetail is sendJSON plus the response body on an error status.
+//
+// WHY it exists: Caddy's admin API explains itself ("unknown object ID 'x'",
+// "invalid traversal path", …) and this client used to throw that away, so
+// every failure surfaced as a bare "insert caddy route failed: 400". An
+// intermittent 400 on the restart path (live, 2026-09-23) could not be
+// diagnosed from the daemon logs at all — only by reading Caddy's own journal
+// on the box, which is not available after teardown.
+//
+// The body is read ONLY for status >= 400, so the success path keeps the same
+// "drain nothing, close" behaviour and cost.
+func (c *Client) sendJSONDetail(ctx context.Context, method, target string, body []byte) (int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("%s %s: %w", method, target, err)
+		return 0, "", fmt.Errorf("%s %s: %w", method, target, err)
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode, nil
+	if resp.StatusCode < 400 {
+		return resp.StatusCode, "", nil
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, caddyErrDetailMax))
+	if readErr != nil {
+		return resp.StatusCode, "", nil
+	}
+	return resp.StatusCode, strings.TrimSpace(string(raw)), nil
+}
+
+// caddyErr formats an admin-API failure with Caddy's own explanation when it
+// gave one, so the status code is never the only clue.
+func caddyErr(what string, status int, detail string) error {
+	if detail == "" {
+		return fmt.Errorf("%s failed: %d", what, status)
+	}
+	return fmt.Errorf("%s failed: %d: %s", what, status, detail)
 }
 
 func sandboxRouteID(id string) string {
