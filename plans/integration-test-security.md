@@ -533,6 +533,31 @@ Cost: $1/month prorated + $0.03/10k requests — negligible, and it must be a
 *real* key: `pkg/secrets/fake_kms.go` already covers the offline contract, so a
 fake here would test nothing new.
 
+> **T7 verified 2026-09-23.** Strict boot defaults ON, because `config.go:2414`
+> *requires* it for awskms whenever `SB_ENTERPRISE_MODE` is true — defaulting it
+> off would make S4/S6 fail at daemon start with a config error rather than run.
+> `AWS_REGION` is pinned rather than left to the SDK's IMDS fallback, so a
+> missing region is a clear boot failure instead of an opaque KMS timeout at
+> seal time.
+>
+> **Ordering matters and is now asserted:** the KMS block renders BEFORE the
+> `extra_sandboxd_env` loop, because `cluster.env` is a systemd
+> `EnvironmentFile` where the last assignment wins. That is what lets a scenario
+> override a Terraform-set default. If the order flips, the override silently
+> stops working and the scenario looks configured when it is not — mutation-
+> verified in `bootstrap_render_test.go`.
+>
+> The hand-written overlay the exit criterion calls for is now a supported file:
+> `.tf/<scenario>/override.tfvars`, chained last in `tf_varfile_args` and read by
+> both apply and destroy. Gitignored, so it cannot be mistaken for a committed
+> scenario.
+>
+> **Bonus coverage this run produced for free:** D9's "omit env by default,
+> audited opt-in" and the Daytona `"env":{}` contract (the reverted `omitempty`)
+> were both confirmed live, and the audit chain + audit read API (F6/F7,
+> normally T13) returned a well-formed event with `ref`, `actor`, `node_id`,
+> `result` and a chain `event_id`.
+
 ### 5.4 Audit export sinks
 
 - **s3** — new `audit_export_enabled` bool → bucket
@@ -1027,7 +1052,7 @@ and verified, not merely that code was written.
 | T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **DONE** 2026-09-23 — final state on a **freshly provisioned instance, never hot-patched**: **pass 58 · fail 0 · skip 55 · missing 0 · inconclusive 0**, suite exit 0, report carries the `build` block (`407155348862`, clean tree). Got there via run 1 = 57/1 and three real branch defects found and fixed (§3.6-§3.8); UC-15 is the 58th, which had never run before because §3.7 deleted the sandbox on stop. |
 | T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | **DONE** 2026-09-23 — **3 members**, the first multi-node cluster this branch has formed. Rendezvous timeline: seed published all 3 artifacts (incl. cred bundle) at 05:38:24, both joiners uploaded CSRs and both certs were signed by 05:38:48, 3 members at 05:39:33. Security property verified on the live certs: each SAN is `DNS:node:<Terraform-assigned name>` resolved from `nodes/<IAM caller identity>`, never from the uploader. |
 | T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | **DONE** 2026-09-23 — global `extra_sandboxd_env` merged under each node's `sandboxd_env`, rendered into `cluster.env` **before** the final `systemctl restart sandboxd` (asserted by an offline render test, which also fails if the block moves after the restart). |
-| T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | |
+| T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | **DONE** 2026-09-23 — real CMK `cd1a8f8c` + `alias/aerolvm-itest-single-node-secrets`. **Boots:** `secret provider boot canary ok provider=awskms`, strict boot on, 0 restarts. **Seals:** env set at create is withheld from the default read (`{}`); `?include_env=true` returned it decrypted, and the audit chain recorded the opt-in with the exact `correlation_id` sent. Full suite **pass 58 · fail 0 · skip 55 · 0 inconclusive** with the provider active. |
 | T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | |
 | T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | |
 | T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | |
