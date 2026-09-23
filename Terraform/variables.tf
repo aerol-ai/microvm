@@ -235,6 +235,7 @@ variable "nodes" {
       with_amd_gpu     (bool,    default var.default_with_amd_gpu)
       idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
       extra_user_data  (string,  default ""; appended to bootstrap.sh)
+      sandboxd_env     (map(string), default {}; merged over var.extra_sandboxd_env)
       tags             (map(string), default {})
   EOT
   type = map(object({
@@ -254,7 +255,11 @@ variable "nodes" {
     with_amd_gpu      = optional(bool)
     idle_timeout_min  = optional(number)
     extra_user_data   = optional(string, "")
-    tags              = optional(map(string), {})
+    # sandboxd_env is merged OVER var.extra_sandboxd_env for this node, so a
+    # hetero topology can give ingress-only and worker-only nodes different
+    # SB_* profiles (audit rate limits, jail settings) from one node map.
+    sandboxd_env = optional(map(string), {})
+    tags         = optional(map(string), {})
     # spot requests this node as an EC2 spot instance (one-time, terminate on
     # reclaim). Default false → on-demand, identical to prior behaviour. Only
     # the integration test harness sets this true; prod node maps omit it.
@@ -269,6 +274,16 @@ variable "nodes" {
   validation {
     condition     = length([for k, v in var.nodes : k if try(v.seed, false)]) == 1
     error_message = "Exactly one node in var.nodes must have seed = true."
+  }
+
+  # Node names become SB_NODE_ID and are stamped into each node cert as
+  # DNS:node:<id> by cluster-sign-node.sh, which enforces exactly this charset
+  # and rejects anything else. Catching it here keeps a bad name from failing
+  # 5 minutes into cloud-init, on the box, where the message is only visible
+  # in /var/log/aerolvm-bootstrap.log.
+  validation {
+    condition     = alltrue([for k, _ in var.nodes : can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", k))])
+    error_message = "Every node name must start with an alphanumeric and contain only alphanumerics, dot, underscore, or hyphen (max 128 chars) — cluster-sign-node.sh rejects anything else."
   }
 
   # Mirror cluster-init.sh + cluster-join.sh validate_node_role(): every role
@@ -550,6 +565,37 @@ variable "caddy_binary_url" {
   default     = ""
 }
 
+# Extra SB_* environment for sandboxd, rendered into /etc/sandboxd/cluster.env
+# BEFORE the bootstrap's final `systemctl restart sandboxd`.
+#
+# WHY this exists: the branch's 55 new SB_* knobs (secrets provider, audit
+# sinks, enterprise gates, mTLS) had NO provisioning path. config/cluster.yml
+# has no secrets/audit section, and the only lever was extra_user_data — which
+# runs AFTER the final restart, so a scenario had to append to the env file and
+# restart a second time. That is workable for one flag and unusable as the
+# mechanism for a profile matrix.
+#
+# Values that are only known at apply time (a KMS key ARN, an audit bucket
+# name, a webhook URL) stay as dedicated template vars; this map is for the
+# static per-scenario profile.
+#
+# Empty by default, so a production render is byte-identical to before.
+variable "extra_sandboxd_env" {
+  description = "Extra SB_* env vars written to /etc/sandboxd/cluster.env before the final sandboxd restart. Merged under each node's own sandboxd_env."
+  type        = map(string)
+  default     = {}
+
+  # A newline would let one entry inject arbitrary additional variables into
+  # the env file, and '=' in a KEY would silently produce an unreadable line.
+  validation {
+    condition = alltrue([
+      for k, v in var.extra_sandboxd_env :
+      can(regex("^[A-Za-z_][A-Za-z0-9_]*$", k)) && !can(regex("[\n\r]", v))
+    ])
+    error_message = "extra_sandboxd_env keys must be valid shell identifiers and values must not contain newlines."
+  }
+}
+
 # Locally-built artifact overrides (integration harness, plans/integration-test-security.md §4.3).
 #
 # All three default to "" so a production render is byte-identical to before
@@ -592,6 +638,14 @@ variable "cluster_join_script_url" {
   description = "URL of cluster-join.sh."
   type        = string
   default     = "https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh"
+}
+
+# Only the SEED downloads this. It signs joiner CSRs with the cluster CA key,
+# which never leaves the seed, so joiners have no use for it.
+variable "cluster_sign_node_script_url" {
+  description = "URL of cluster-sign-node.sh (seed only; signs joiner CSRs with ca.key)."
+  type        = string
+  default     = "https://github.com/aerol-ai/microvm/releases/latest/download/cluster-sign-node.sh"
 }
 
 variable "bundle_bucket_force_destroy" {

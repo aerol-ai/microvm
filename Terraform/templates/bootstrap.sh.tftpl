@@ -31,7 +31,9 @@
 #   bundle_bucket, aws_region, seed_private_ip,
 #   install_script_url, caddy_binary_url,
 #   cluster_init_script_url, cluster_join_script_url,
+#   cluster_sign_node_script_url (seed only),
 #   sandboxd_url, toolboxd_url, checksums_url,
+#   joiner_role_unique_id, sandboxd_env (map),
 #   seed_wait_max_seconds, extra_user_data
 #
 # Order of operations matches the scripts' contracts:
@@ -201,11 +203,17 @@ GOSSIP_KEY="$(openssl rand -base64 32)"
 
 curl_download '${cluster_init_script_url}' -o /tmp/cluster-init.sh
 chmod +x /tmp/cluster-init.sh
+# --node-id pins the gossip/Raft identity to the Terraform node name instead
+# of the EC2 hostname. The signing rendezvous below needs an id BOTH sides can
+# agree on without trusting the joiner, and only Terraform knows one; it also
+# makes /v1/cluster/members readable (node names, not ip-10-42-1-43).
 sudo /tmp/cluster-init.sh \
   --role '${role}' \
+  --node-id '${node_name}' \
   --ingress-advertise-host '${domain}' \
   --gossip-key "$GOSSIP_KEY" \
-  --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz
+  --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz \
+  --cred-bundle-out /tmp/aerolvm-cred-bundle.tar.gz
 
 # Publish artifacts joiners need. Bucket is private + SSE-encrypted.
 printf '%s' "$GOSSIP_KEY" > /tmp/gossip-key.txt
@@ -215,8 +223,86 @@ aws --region '${aws_region}' s3 cp /tmp/gossip-key.txt \
 aws --region '${aws_region}' s3 cp /tmp/aerolvm-tls-bundle.tar.gz \
     "s3://${bundle_bucket}/aerolvm-tls-bundle.tar.gz" \
     --sse AES256
+# The credential encryption key ships SEPARATELY from the ca.crt trust bundle
+# (cluster-init.sh keeps them apart to limit blast radius if ca.crt is copied
+# more widely). cluster-join.sh REQUIRES --cred-bundle and aborts without it,
+# so a joiner cannot bootstrap until this object exists.
+aws --region '${aws_region}' s3 cp /tmp/aerolvm-cred-bundle.tar.gz \
+    "s3://${bundle_bucket}/aerolvm-cred-bundle.tar.gz" \
+    --sse AES256
 
 echo "[bootstrap] seed published bundle to s3://${bundle_bucket}/"
+
+###############################################################################
+# 2a-bis. Seed: CSR signing loop.
+#
+# ca.key never leaves this host, so joiners cannot self-sign. Each joiner
+# uploads its CSR to csr/<caller-identity>/node.csr and waits for
+# crt/<caller-identity>.crt to appear.
+#
+# SECURITY: the node id is taken from nodes/<caller-identity> — an object only
+# Terraform writes — and NEVER from the uploaded path or the CSR itself.
+# cluster-sign-node.sh stamps DNS:node:<id> from its --node-id flag without
+# inspecting the CSR's subject, so an id chosen by the uploader would let any
+# joiner mint a cert for another node and impersonate it over cluster mTLS.
+# IAM confines each joiner to csr/$${aws:userid}/, which AWS assigns.
+#
+# Runs in the background so the seed's own bootstrap finishes; bounded by
+# seed_wait_max_seconds so a stuck loop cannot hold the box forever. Signing is
+# serial: cluster-sign-node.sh uses `openssl -CAcreateserial` and removes
+# ca.srl afterwards, which two concurrent signers would race.
+###############################################################################
+sudo tee /usr/local/bin/aerolvm-csr-signer.sh >/dev/null <<'SIGNER'
+#!/usr/bin/env bash
+set -uo pipefail
+BUCKET="$1"; REGION="$2"; DEADLINE_TS="$3"
+log() { echo "[csr-signer] $*"; }
+while [ "$(date +%s)" -lt "$DEADLINE_TS" ]; do
+  # List the csr/ prefix one directory deep; each entry is one caller identity.
+  for ident in $(aws --region "$REGION" s3 ls "s3://$BUCKET/csr/" 2>/dev/null                  | awk '$1 == "PRE" { sub(/\/$/, "", $2); print $2 }'); do
+    if aws --region "$REGION" s3api head-object --bucket "$BUCKET"          --key "crt/$ident.crt" >/dev/null 2>&1; then
+      continue  # already signed; idempotent across loop passes and restarts
+    fi
+    tmp="$(mktemp -d)"
+    if ! aws --region "$REGION" s3 cp "s3://$BUCKET/csr/$ident/node.csr"          "$tmp/node.csr" >/dev/null 2>&1; then
+      rm -rf "$tmp"; continue
+    fi
+    # Authoritative id for this uploader. Absent => Terraform has not recorded
+    # this instance (or something wrote an unexpected prefix): refuse to sign
+    # rather than guess, and say so loudly.
+    if ! aws --region "$REGION" s3 cp "s3://$BUCKET/nodes/$ident"          "$tmp/node-id" >/dev/null 2>&1; then
+      log "no nodes/$ident mapping; refusing to sign (id must not come from the uploader)"
+      rm -rf "$tmp"; continue
+    fi
+    node_id="$(tr -d '[:space:]' < "$tmp/node-id")"
+    if [ -z "$node_id" ]; then
+      log "empty node id for $ident; refusing to sign"
+      rm -rf "$tmp"; continue
+    fi
+    if /usr/local/bin/cluster-sign-node.sh --csr "$tmp/node.csr"          --node-id "$node_id" --out "$tmp/node.crt" >/dev/null 2>&1; then
+      if aws --region "$REGION" s3 cp "$tmp/node.crt"            "s3://$BUCKET/crt/$ident.crt" --sse AES256 >/dev/null 2>&1; then
+        log "signed node:$node_id for $ident"
+      else
+        log "upload of crt/$ident.crt failed; will retry"
+      fi
+    else
+      log "signing failed for $ident (node:$node_id)"
+    fi
+    rm -rf "$tmp"
+  done
+  sleep 5
+done
+log "deadline reached; exiting"
+SIGNER
+sudo chmod 0755 /usr/local/bin/aerolvm-csr-signer.sh
+curl_download '${cluster_sign_node_script_url}' -o /tmp/cluster-sign-node.sh
+sudo install -m 0755 /tmp/cluster-sign-node.sh /usr/local/bin/cluster-sign-node.sh
+
+sudo systemd-run --unit=aerolvm-csr-signer --description='AerolVM CSR signing rendezvous' \
+  /usr/local/bin/aerolvm-csr-signer.sh '${bundle_bucket}' '${aws_region}' \
+  "$(( $(date +%s) + ${seed_wait_max_seconds} ))" \
+  || echo "[bootstrap] WARNING: could not start the CSR signer; joiners will not get certs" >&2
+echo "[bootstrap] seed CSR signer started (deadline ${seed_wait_max_seconds}s)"
 %{ else ~}
 ###############################################################################
 # 2b. Joiner: cluster-join.sh
@@ -230,7 +316,9 @@ while :; do
   if aws --region '${aws_region}' s3api head-object \
        --bucket '${bundle_bucket}' --key 'gossip-key.txt' >/dev/null 2>&1 \
      && aws --region '${aws_region}' s3api head-object \
-       --bucket '${bundle_bucket}' --key 'aerolvm-tls-bundle.tar.gz' >/dev/null 2>&1; then
+       --bucket '${bundle_bucket}' --key 'aerolvm-tls-bundle.tar.gz' >/dev/null 2>&1 \
+     && aws --region '${aws_region}' s3api head-object \
+       --bucket '${bundle_bucket}' --key 'aerolvm-cred-bundle.tar.gz' >/dev/null 2>&1; then
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -245,16 +333,114 @@ aws --region '${aws_region}' s3 cp \
     "s3://${bundle_bucket}/gossip-key.txt" /tmp/gossip-key.txt
 aws --region '${aws_region}' s3 cp \
     "s3://${bundle_bucket}/aerolvm-tls-bundle.tar.gz" /tmp/aerolvm-tls-bundle.tar.gz
+# cluster-join.sh REQUIRES --cred-bundle: the credential encryption key ships
+# separately from the ca.crt trust tarball so copying ca.crt around does not
+# also hand out the key.
+aws --region '${aws_region}' s3 cp \
+    "s3://${bundle_bucket}/aerolvm-cred-bundle.tar.gz" /tmp/aerolvm-cred-bundle.tar.gz
 GOSSIP_KEY="$(cat /tmp/gossip-key.txt)"
 
 curl_download '${cluster_join_script_url}' -o /tmp/cluster-join.sh
 chmod +x /tmp/cluster-join.sh
-sudo /tmp/cluster-join.sh \
-  --role '${role}' \
-  --ingress-advertise-host '${domain}' \
-  --gossip-key "$GOSSIP_KEY" \
-  --peers '${seed_private_ip}:7001' \
+
+###############################################################################
+# 2b-bis. CSR rendezvous.
+#
+# ca.key never leaves the seed, so this is a two-pass join:
+#   pass 1  mints node.key + node.csr locally and EXITS 2 on purpose, before
+#           restarting the daemon (cluster-join.sh's "CSR ready" path).
+#   ...     upload the CSR, wait for the seed's signer to publish the cert.
+#   pass 2  installs --signed-cert, writes cluster.env, restarts sandboxd.
+#
+# The upload prefix is this instance's own IAM caller identity, which it cannot
+# choose: IAM only grants PutObject under csr/$${aws:userid}/. The seed maps
+# that identity to a node id through an object only Terraform writes, so a
+# joiner cannot ask for a cert bound to another node's identity.
+###############################################################################
+JOIN_ARGS=(
+  --role '${role}'
+  --node-id '${node_name}'
+  --ingress-advertise-host '${domain}'
+  --gossip-key "$GOSSIP_KEY"
+  --peers '${seed_private_ip}:7001'
   --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+  --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz
+)
+
+# Pass 1. Exit 2 is the documented "CSR ready, stopping before daemon restart"
+# signal, so it is the SUCCESS case here; anything else is fatal. Exit 0 means
+# a node.crt was already present (a re-run), so there is nothing to sign.
+set +e
+sudo /tmp/cluster-join.sh "$${JOIN_ARGS[@]}"
+join_rc=$?
+set -e
+if [ "$join_rc" -eq 0 ]; then
+  echo "[bootstrap] joiner already held a signed cert; join complete"
+elif [ "$join_rc" -ne 2 ]; then
+  echo "[bootstrap] cluster-join pass 1 failed with $join_rc" >&2
+  exit "$join_rc"
+else
+  # Terraform records the authoritative identity under this exact key, using
+  # the joiner role's unique id plus the instance id. Deriving it here (rather
+  # than calling sts) keeps the joiner and the seed reading the same string
+  # even if the instance profile is ever attached to a different role.
+  INSTANCE_ID="$(cloud-init query instance_id 2>/dev/null \
+    || curl -fsS -H "X-aws-ec2-metadata-token: $(curl -fsS -X PUT \
+         -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+         http://169.254.169.254/latest/api/token)" \
+       http://169.254.169.254/latest/meta-data/instance-id)"
+  if [ -z "$INSTANCE_ID" ]; then
+    echo "[bootstrap] could not determine instance id for the CSR rendezvous" >&2
+    exit 1
+  fi
+  # The upload path must be EXACTLY what IAM evaluates as $${aws:userid}, or
+  # the PutObject is denied; and it must equal the key Terraform wrote the
+  # identity mapping under, or the seed refuses to sign. Both sides derive it
+  # as "<joiner-role-unique-id>:<instance-id>", which relies on EC2 using the
+  # instance id as the role session name. That is the documented behaviour, but
+  # it is an assumption, so verify it rather than discover a mismatch as an
+  # opaque 403 or a cert that never arrives.
+  EXPECTED_IDENT="${joiner_role_unique_id}:$${INSTANCE_ID}"
+  CALLER_IDENT="$(aws sts get-caller-identity --query UserId --output text 2>/dev/null || true)"
+  if [ -z "$${CALLER_IDENT}" ]; then
+    CALLER_IDENT="$${EXPECTED_IDENT}"
+  elif [ "$${CALLER_IDENT}" != "$${EXPECTED_IDENT}" ]; then
+    echo "[bootstrap] IAM caller identity is '$${CALLER_IDENT}' but the seed's nodes/ mapping is keyed on '$${EXPECTED_IDENT}'" >&2
+    echo "[bootstrap] refusing to continue: the CSR would be rejected or signed under the wrong identity" >&2
+    exit 1
+  fi
+  echo "[bootstrap] uploading CSR as $${CALLER_IDENT}"
+
+  if [ ! -f /etc/sandboxd/tls/node.csr ]; then
+    echo "[bootstrap] cluster-join reported CSR ready but /etc/sandboxd/tls/node.csr is missing" >&2
+    exit 1
+  fi
+  sudo aws --region '${aws_region}' s3 cp /etc/sandboxd/tls/node.csr \
+      "s3://${bundle_bucket}/csr/$${CALLER_IDENT}/node.csr" --sse AES256
+
+  # Wait for the seed's signer. Bounded by the same budget as the artifact
+  # wait: if the signer died the joiner must fail loudly rather than hang for
+  # the life of the box.
+  crt_deadline=$(( $(date +%s) + ${seed_wait_max_seconds} ))
+  while :; do
+    if aws --region '${aws_region}' s3api head-object \
+         --bucket '${bundle_bucket}' --key "crt/$${CALLER_IDENT}.crt" >/dev/null 2>&1; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$crt_deadline" ]; then
+      echo "[bootstrap] timed out waiting for crt/$${CALLER_IDENT}.crt — is the seed's aerolvm-csr-signer running?" >&2
+      exit 1
+    fi
+    echo "[bootstrap] waiting for the seed to sign $${CALLER_IDENT}..."
+    sleep 5
+  done
+  aws --region '${aws_region}' s3 cp \
+      "s3://${bundle_bucket}/crt/$${CALLER_IDENT}.crt" /tmp/node.crt
+
+  # Pass 2 installs the cert, writes cluster.env and restarts the daemon.
+  sudo /tmp/cluster-join.sh "$${JOIN_ARGS[@]}" --signed-cert /tmp/node.crt
+  echo "[bootstrap] joiner installed a seed-signed cert and joined"
+fi
 %{ endif ~}
 
 ###############################################################################
@@ -660,6 +846,16 @@ SB_CONTAINERD_SOCKET=${containerd_cfg.socket}
 SB_CONTAINERD_NAMESPACE=${containerd_cfg.namespace}
 SB_CONTAINERD_CNI_PLUGIN_DIR=${containerd_cfg.cni_plugin_dir}
 SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabled}
+
+# Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
+# node's own sandboxd_env. Rendered LAST inside this block so a per-node entry
+# wins over anything above it, and written BEFORE the final
+# `systemctl restart sandboxd` below — which is the whole point. The previous
+# only lever, extra_user_data, runs AFTER that restart, so setting any SB_*
+# meant appending to the env file and restarting a second time.
+%{ for k, v in sandboxd_env ~}
+${k}=${v}
+%{ endfor ~}
 EOF
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null

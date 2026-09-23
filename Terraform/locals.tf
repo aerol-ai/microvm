@@ -82,6 +82,7 @@ locals {
       with_amd_gpu     = n.with_amd_gpu == null ? var.default_with_amd_gpu : n.with_amd_gpu
       idle_timeout_min = n.idle_timeout_min == null ? var.default_idle_timeout_min : n.idle_timeout_min
       extra_user_data  = n.extra_user_data
+      sandboxd_env     = n.sandboxd_env
       tags             = n.tags
       spot             = n.spot
     }
