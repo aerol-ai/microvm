@@ -34,6 +34,7 @@
 #   cluster_sign_node_script_url (seed only),
 #   sandboxd_url, toolboxd_url, checksums_url,
 #   joiner_role_unique_id, sandboxd_env (map),
+#   secret_kms_key_arn ("" = disabled), secret_kms_strict_boot (bool),
 #   seed_wait_max_seconds, extra_user_data
 #
 # Order of operations matches the scripts' contracts:
@@ -846,6 +847,21 @@ SB_CONTAINERD_SOCKET=${containerd_cfg.socket}
 SB_CONTAINERD_NAMESPACE=${containerd_cfg.namespace}
 SB_CONTAINERD_CNI_PLUGIN_DIR=${containerd_cfg.cni_plugin_dir}
 SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabled}
+
+%{ if secret_kms_key_arn != "" ~}
+# Managed by Terraform bootstrap: cluster secret provider backed by a real KMS
+# CMK. The daemon reaches it through the instance role — pkg/secrets/awskms.go
+# uses the default AWS credential chain — so no static keys are involved.
+#
+# AWS_REGION is pinned rather than left to IMDS discovery: the SDK's region
+# fallback is one more thing to go wrong on a box whose whole job is to prove
+# the provider works, and a wrong/absent region surfaces as an opaque KMS
+# timeout at seal time rather than a clear boot failure.
+SB_SECRET_PROVIDER=awskms
+SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
+SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
+AWS_REGION=${aws_region}
+%{ endif ~}
 
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
 # node's own sandboxd_env. Rendered LAST inside this block so a per-node entry

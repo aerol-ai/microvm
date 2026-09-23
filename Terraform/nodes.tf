@@ -135,6 +135,8 @@ resource "aws_instance" "seed" {
     toolboxd_url                             = var.toolboxd_url
     checksums_url                            = var.checksums_url
     joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
+    secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
+    secret_kms_strict_boot                   = var.secret_kms_strict_boot
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
@@ -338,6 +340,8 @@ resource "aws_instance" "joiner" {
     toolboxd_url                             = var.toolboxd_url
     checksums_url                            = var.checksums_url
     joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
+    secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
+    secret_kms_strict_boot                   = var.secret_kms_strict_boot
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint

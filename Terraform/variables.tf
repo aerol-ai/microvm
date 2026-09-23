@@ -565,6 +565,34 @@ variable "caddy_binary_url" {
   default     = ""
 }
 
+# Real AWS KMS for the cluster secret provider (plans/integration-test-security.md §5.3).
+#
+# D3: this is deliberately a REAL key, not the offline fake. pkg/secrets'
+# fake_kms.go already covers the provider contract offline, so a fake here
+# would prove nothing new — what is untested is the daemon reaching a real CMK
+# through the instance role, which only a real key exercises.
+#
+# Off by default, so a production render is byte-identical and no key is ever
+# created for a deployment that did not ask for one. Cost when on is ~$1/month
+# prorated plus $0.03/10k requests.
+variable "secret_kms_enabled" {
+  description = "Create a KMS CMK and point sandboxd's secret provider at it (SB_SECRET_PROVIDER=awskms)."
+  type        = bool
+  default     = false
+}
+
+# Strict boot makes the daemon FAIL to start when the awskms boot canary does
+# not round-trip, instead of silently continuing with a provider that cannot
+# decrypt. config.go additionally REQUIRES it for awskms whenever
+# SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
+# from failing at daemon start with a config error. A scenario can still turn
+# it off through extra_sandboxd_env, which is rendered after this block.
+variable "secret_kms_strict_boot" {
+  description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
+  type        = bool
+  default     = true
+}
+
 # Extra SB_* environment for sandboxd, rendered into /etc/sandboxd/cluster.env
 # BEFORE the bootstrap's final `systemctl restart sandboxd`.
 #

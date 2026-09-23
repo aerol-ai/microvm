@@ -141,6 +141,14 @@ tf_varfile_args() {
   # set it applied with.
   local artifacts_tfvars="${HERE}/.tf/${scenario}/artifacts.tfvars"
   [[ -f "$artifacts_tfvars" ]] && printf -- ' -var-file=%s' "$artifacts_tfvars"
+  # Operator escape hatch, chained LAST so it wins over everything above.
+  # Hand-written and never generated: it is how a scenario is exercised with a
+  # variable that does not have a committed scenario file yet (e.g. proving
+  # secret_kms_enabled boots before T10 creates the KMS scenario pairs). Lives
+  # under .tf/ so it is gitignored and cannot be mistaken for a committed
+  # scenario, and it is read by BOTH apply and destroy like the others.
+  local override_tfvars="${HERE}/.tf/${scenario}/override.tfvars"
+  [[ -f "$override_tfvars" ]] && printf -- ' -var-file=%s' "$override_tfvars"
 }
 
 # artifacts_tfvars_path echoes where prepare_artifacts writes (and the var-file

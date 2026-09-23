@@ -103,7 +103,9 @@ locals {
     image_build_gc_interval = "x"
     image_build_gc_ttl = "x"
     extra_user_data = "x"
-    sandboxd_env = { SB_SECRET_PROVIDER = "awskms", SB_ENTERPRISE_MODE = "true" }
+    sandboxd_env           = { SB_ENTERPRISE_MODE = "true", SB_AUDIT_EXPORT_MODE = "file" }
+    secret_kms_key_arn     = ""
+    secret_kms_strict_boot = true
     shard_aware_ingress = false
     caddy_storage_s3_enabled = false
     caddy_storage_s3_bucket = "x"
@@ -145,3 +147,20 @@ locals {
 }
 output "seed"   { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = true })) }
 output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false })) }
+
+# Same joiner, but with the KMS secret provider turned on, so the conditional
+# block and its interaction with the sandboxd_env override layer are both
+# covered.
+output "joiner_kms" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed            = false
+    secret_kms_key_arn = "arn:aws:kms:us-east-1:111122223333:key/abcd-1234"
+    sandboxd_env = {
+      SB_ENTERPRISE_MODE = "true"
+      # Proves the override layering: this must WIN over the KMS block's value
+      # because extra_sandboxd_env is rendered last and systemd's
+      # EnvironmentFile takes the last assignment.
+      SB_SECRET_PROVIDER_STRICT_BOOT = "false"
+    }
+  }))
+}

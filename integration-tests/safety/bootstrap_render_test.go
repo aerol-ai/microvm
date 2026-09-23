@@ -71,7 +71,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		t.Fatalf("rendering bootstrap.sh.tftpl failed: %v\n%s", err, out)
 	}
 
-	for _, branch := range []string{"seed", "joiner"} {
+	for _, branch := range []string{"seed", "joiner", "joiner_kms"} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
 			if err != nil {
@@ -113,6 +113,11 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 					// The id must come from the Terraform-written mapping,
 					// never from the uploader's path or CSR.
 					"nodes/$ident",
+				},
+				"joiner_kms": {
+					"SB_SECRET_PROVIDER=awskms",
+					"SB_SECRET_AWS_KMS_KEY_ID=arn:aws:kms:us-east-1:111122223333:key/abcd-1234",
+					"AWS_REGION=",
 				},
 				"joiner": {
 					"--cred-bundle /tmp/aerolvm-cred-bundle.tar.gz",
@@ -212,8 +217,10 @@ func TestBootstrapRendersExtraSandboxdEnvBeforeRestart(t *testing.T) {
 		t.Fatalf("output: %v\n%s", err, out)
 	}
 
-	// The fixture sets these two through sandboxd_env.
-	envIdx := strings.Index(out, "SB_SECRET_PROVIDER=awskms")
+	// The fixture sets these two through sandboxd_env. They are deliberately
+	// NOT keys the KMS block also writes, so this test measures the
+	// extra_sandboxd_env block itself rather than a KMS default.
+	envIdx := strings.Index(out, "SB_AUDIT_EXPORT_MODE=file")
 	if envIdx < 0 {
 		t.Fatal("sandboxd_env entries were not rendered into the ops-env block")
 	}
@@ -228,5 +235,91 @@ func TestBootstrapRendersExtraSandboxdEnvBeforeRestart(t *testing.T) {
 	if !(envIdx < teeIdx && teeIdx < restartIdx) {
 		t.Fatalf("sandboxd_env must be written into cluster.env before the final restart; got env=%d tee=%d restart=%d",
 			envIdx, teeIdx, restartIdx)
+	}
+}
+
+// renderBootstrap is the shared setup for the ordering/gating assertions below.
+func renderBootstrap(t *testing.T, output string) string {
+	t.Helper()
+	tf, err := exec.LookPath("terraform")
+	if err != nil {
+		t.Skip("terraform not on PATH")
+	}
+	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
+	tplPath, _ := filepath.Abs(filepath.Join(repoRoot, "Terraform", "templates", "bootstrap.sh.tftpl"))
+	fixture, err := os.ReadFile(filepath.Join("testdata", "bootstrap_render", "main.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"),
+		[]byte(strings.ReplaceAll(string(fixture), "__TEMPLATE__", tplPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command(tf, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "TF_IN_AUTOMATION=1", "CHECKPOINT_DISABLE=1")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("init", "-backend=false", "-input=false"); err != nil {
+		t.Fatalf("terraform init: %v\n%s", err, out)
+	}
+	if out, err := run("apply", "-auto-approve", "-input=false"); err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	out, err := run("output", "-raw", output)
+	if err != nil {
+		t.Fatalf("output %s: %v\n%s", output, err, out)
+	}
+	return out
+}
+
+// secret_kms_enabled=false must emit NOTHING. A node that quietly got
+// SB_SECRET_PROVIDER=awskms without a key would fail daemon start outright
+// (config.go rejects awskms with no SB_SECRET_AWS_KMS_KEY_ID), and a
+// production render has to stay byte-identical to before this variable
+// existed.
+func TestBootstrapOmitsKMSWhenDisabled(t *testing.T) {
+	out := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{
+		"SB_SECRET_PROVIDER=",
+		"SB_SECRET_AWS_KMS_KEY_ID=",
+		"SB_SECRET_PROVIDER_STRICT_BOOT=",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("KMS is disabled but the render still contains %q", forbidden)
+		}
+	}
+}
+
+// The KMS block is written BEFORE the extra_sandboxd_env block on purpose:
+// cluster.env is a systemd EnvironmentFile, where the LAST assignment of a
+// variable wins, so a scenario must be able to override a Terraform-set
+// default through extra_sandboxd_env. If the order ever flips, the override
+// silently stops working — the daemon would keep Terraform's value and the
+// scenario would look like it was configured when it was not.
+func TestBootstrapKMSBlockPrecedesEnvOverride(t *testing.T) {
+	out := renderBootstrap(t, "joiner_kms")
+
+	kmsIdx := strings.Index(out, "SB_SECRET_PROVIDER=awskms")
+	if kmsIdx < 0 {
+		t.Fatal("KMS block missing from a render with secret_kms_key_arn set")
+	}
+	// The fixture sets STRICT_BOOT twice: true from the KMS block, then false
+	// from sandboxd_env. The override must come last.
+	first := strings.Index(out, "SB_SECRET_PROVIDER_STRICT_BOOT=true")
+	override := strings.Index(out, "SB_SECRET_PROVIDER_STRICT_BOOT=false")
+	if first < 0 || override < 0 {
+		t.Fatalf("expected both the KMS default and the sandboxd_env override; got first=%d override=%d", first, override)
+	}
+	if override < first {
+		t.Fatal("extra_sandboxd_env is rendered BEFORE the KMS block, so a scenario can no longer override it")
+	}
+	// And the whole thing still has to land before the final restart.
+	restartIdx := strings.LastIndex(out, "\nsudo systemctl restart sandboxd\n")
+	if restartIdx < 0 || override > restartIdx {
+		t.Fatalf("secret env must be written before the final restart; override=%d restart=%d", override, restartIdx)
 	}
 }
