@@ -598,6 +598,14 @@ emit_urls() {
     checksums.txt
     "${BOOTSTRAP_SCRIPTS[@]}"
   )
+  # Present on this branch, absent on older refs. When it IS published it must
+  # be the URL the seed uses: the CSR signing rendezvous needs the branch's
+  # signer, not whatever releases/latest happens to hold.
+  local have_sign_node=0
+  if "${AWSCLI[@]}" --region "$region" s3api head-object \
+      --bucket "$bucket" --key "${prefix}/cluster-sign-node.sh" >/dev/null 2>&1; then
+    have_sign_node=1
+  fi
   local k
   for k in "${required[@]}"; do
     "${AWSCLI[@]}" --region "$region" s3api head-object \
@@ -614,6 +622,9 @@ emit_urls() {
   printf 'install_script_url      = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/install.sh")"
   printf 'cluster_init_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-init.sh")"
   printf 'cluster_join_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-join.sh")"
+  if (( have_sign_node )); then
+    printf 'cluster_sign_node_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-sign-node.sh")"
+  fi
 
   # §3.3, the caddy trap. install.sh checksum-verifies the Caddy download
   # against OUR checksums.txt unless --caddy-binary-url was passed explicitly.
