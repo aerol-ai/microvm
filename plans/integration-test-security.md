@@ -79,7 +79,7 @@ must cover.
 
 Each was verified against the branch tip (`25e748a9`).
 
-### 3.1 BLOCKER — cluster bootstrap is broken on this branch
+### 3.1 RESOLVED (2026-09-23) — cluster bootstrap was broken on this branch
 
 `scripts/cluster-join.sh` was rewritten so that `ca.key` never leaves the seed.
 A joiner now mints `node.key` + `node.csr` locally and **exits 2 before
@@ -101,6 +101,15 @@ multi-node scenario fails to form a cluster on this branch.** This is not a
 test-harness gap; it is a shipping defect in the PR — the documented install
 path no longer works unattended. Fixing it is Phase 2 and is a prerequisite for
 literally everything else here.
+
+> **FIXED (T5/T6, 2026-09-23).** `cluster-3-mixed` forms **3 members**. The seed
+> publishes the cred bundle and runs a bounded `aerolvm-csr-signer` loop;
+> joiners do a two-pass join (`exit 2` is the "CSR ready" success signal),
+> uploading their CSR under an IAM-assigned prefix they cannot choose. The seed
+> takes the node id from `nodes/<caller identity>` — an object only Terraform
+> writes — because `cluster-sign-node.sh` stamps `DNS:node:<id>` from its flag
+> and never inspects the CSR, so a caller-chosen id would let any joiner mint a
+> cert for another node. Verified on the live certs (§10, T5).
 
 ### 3.2 No provisioning path for any new knob
 
@@ -1016,8 +1025,8 @@ and verified, not merely that code was written.
 | T2 | Artifacts bucket + presign + `itest-artifacts-init` | T1 | `urls` prints working presigned URLs | **DONE** 2026-09-23 — `s3://aerol-itest-artifacts-263611243038`; anonymous ranged GET 206, unsigned GET 403; install.sh's own `awk $2 == name` selection replayed against the live URLs and the downloaded bytes verify |
 | T3 | TF vars `sandboxd_url`/`toolboxd_url`/`checksums_url` → bootstrap | T2 | `single-node` provisions from a local build | **DONE** 2026-09-23 — live on `sandbox.hith.chat`: `/health` returned `version":"itest-7b9c7b666f89-dirty-53bab30c2d7e"`, and the node's own cloud-init log shows `sandboxd_linux_amd64: OK` / `toolboxd_linux_amd64: OK` from install.sh's checksum verification against our presigned artifacts. First time this branch has run on real infrastructure. |
 | T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **DONE** 2026-09-23 — final state on a **freshly provisioned instance, never hot-patched**: **pass 58 · fail 0 · skip 55 · missing 0 · inconclusive 0**, suite exit 0, report carries the `build` block (`407155348862`, clean tree). Got there via run 1 = 57/1 and three real branch defects found and fixed (§3.6-§3.8); UC-15 is the 58th, which had never run before because §3.7 deleted the sandbox on stop. |
-| T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | |
-| T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | |
+| T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | **DONE** 2026-09-23 — **3 members**, the first multi-node cluster this branch has formed. Rendezvous timeline: seed published all 3 artifacts (incl. cred bundle) at 05:38:24, both joiners uploaded CSRs and both certs were signed by 05:38:48, 3 members at 05:39:33. Security property verified on the live certs: each SAN is `DNS:node:<Terraform-assigned name>` resolved from `nodes/<IAM caller identity>`, never from the uploader. |
+| T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | **DONE** 2026-09-23 — global `extra_sandboxd_env` merged under each node's `sandboxd_env`, rendered into `cluster.env` **before** the final `systemctl restart sandboxd` (asserted by an offline render test, which also fails if the block moves after the restart). |
 | T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | |
 | T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | |
 | T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | |
