@@ -106,6 +106,10 @@ locals {
     sandboxd_env           = { SB_ENTERPRISE_MODE = "true", SB_AUDIT_EXPORT_MODE = "file" }
     secret_kms_key_arn     = ""
     secret_kms_strict_boot = true
+    audit_export_backend   = ""
+    audit_export_file_path = "/var/log/aerol-audit-export.jsonl"
+    audit_export_s3_bucket = ""
+    audit_export_s3_prefix = "aerolvm-itest-x"
     shard_aware_ingress = false
     caddy_storage_s3_enabled = false
     caddy_storage_s3_bucket = "x"
@@ -151,6 +155,26 @@ output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_se
 # Same joiner, but with the KMS secret provider turned on, so the conditional
 # block and its interaction with the sandboxd_env override layer are both
 # covered.
+# Audit export shipping to S3. Separate output because the backend is
+# single-valued: a node ships to file OR s3, never both, so each has to be
+# rendered on its own.
+output "joiner_audit_s3" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                = false
+    audit_export_backend   = "s3"
+    audit_export_s3_bucket = "aerolvm-itest-x-audit-abc123"
+  }))
+}
+
+# The same node flipped to the on-node file sink, which is what a
+# non-enterprise scenario uses (pkg/auditexport rejects file under enterprise).
+output "joiner_audit_file" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed              = false
+    audit_export_backend = "file"
+  }))
+}
+
 output "joiner_kms" {
   value = templatefile("__TEMPLATE__", merge(local.base, {
     is_seed            = false

@@ -35,6 +35,8 @@
 #   sandboxd_url, toolboxd_url, checksums_url,
 #   joiner_role_unique_id, sandboxd_env (map),
 #   secret_kms_key_arn ("" = disabled), secret_kms_strict_boot (bool),
+#   audit_export_backend ("" = daemon default), audit_export_file_path,
+#   audit_export_s3_bucket ("" = no bucket provisioned), audit_export_s3_prefix,
 #   seed_wait_max_seconds, extra_user_data
 #
 # Order of operations matches the scripts' contracts:
@@ -860,7 +862,35 @@ SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabl
 SB_SECRET_PROVIDER=awskms
 SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
 SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
+%{ endif ~}
+%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" ~}
+# One assignment for every AWS-backed sink. Pinned rather than left to the
+# SDK's IMDS region fallback: an absent region surfaces as an opaque timeout at
+# seal/ship time instead of a clear failure.
 AWS_REGION=${aws_region}
+%{ endif ~}
+
+%{ if audit_export_backend != "" ~}
+# Managed by Terraform bootstrap: audit export sink.
+#
+# SB_AUDIT_EXPORT_BACKEND selects exactly ONE backend — there is no fan-out, so
+# a node ships to file OR s3, never both. A scenario that wants to prove both
+# connectors sets a different backend per node through sandboxd_env.
+#
+# The file path and the S3 coordinates are BOTH written whenever a backend is
+# selected, so flipping the backend is a one-variable change and never a
+# "backend set but its config missing" boot failure. pkg/auditexport ignores
+# the settings that do not belong to the selected backend.
+SB_AUDIT_EXPORT_BACKEND=${audit_export_backend}
+SB_AUDIT_EXPORT_FILE_PATH=${audit_export_file_path}
+%{ if audit_export_s3_bucket != "" ~}
+SB_AUDIT_EXPORT_S3_BUCKET=${audit_export_s3_bucket}
+SB_AUDIT_EXPORT_S3_REGION=${aws_region}
+# Scenario-scoped, NOT per-node: auditexport.ObjectKey already interleaves
+# node=<id> into the key (<prefix>/node=<id>/yyyy/mm/dd/<batch>.jsonl), so a
+# per-node prefix would just repeat the node twice in every path.
+SB_AUDIT_EXPORT_S3_PREFIX=${audit_export_s3_prefix}
+%{ endif ~}
 %{ endif ~}
 
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this

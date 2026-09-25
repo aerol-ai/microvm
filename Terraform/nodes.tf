@@ -137,6 +137,10 @@ resource "aws_instance" "seed" {
     joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
     secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
     secret_kms_strict_boot                   = var.secret_kms_strict_boot
+    audit_export_backend                     = var.audit_export_backend
+    audit_export_file_path                   = var.audit_export_file_path
+    audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+    audit_export_s3_prefix                   = var.cluster_name
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
@@ -342,6 +346,10 @@ resource "aws_instance" "joiner" {
     joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
     secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
     secret_kms_strict_boot                   = var.secret_kms_strict_boot
+    audit_export_backend                     = var.audit_export_backend
+    audit_export_file_path                   = var.audit_export_file_path
+    audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+    audit_export_s3_prefix                   = var.cluster_name
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint

@@ -71,7 +71,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		t.Fatalf("rendering bootstrap.sh.tftpl failed: %v\n%s", err, out)
 	}
 
-	for _, branch := range []string{"seed", "joiner", "joiner_kms"} {
+	for _, branch := range []string{"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file"} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
 			if err != nil {
@@ -113,6 +113,16 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 					// The id must come from the Terraform-written mapping,
 					// never from the uploader's path or CSR.
 					"nodes/$ident",
+				},
+				"joiner_audit_s3": {
+					"SB_AUDIT_EXPORT_BACKEND=s3",
+					"SB_AUDIT_EXPORT_S3_BUCKET=aerolvm-itest-x-audit-abc123",
+					"SB_AUDIT_EXPORT_S3_PREFIX=aerolvm-itest-x",
+					"AWS_REGION=",
+				},
+				"joiner_audit_file": {
+					"SB_AUDIT_EXPORT_BACKEND=file",
+					"SB_AUDIT_EXPORT_FILE_PATH=/var/log/aerol-audit-export.jsonl",
 				},
 				"joiner_kms": {
 					"SB_SECRET_PROVIDER=awskms",
@@ -321,5 +331,49 @@ func TestBootstrapKMSBlockPrecedesEnvOverride(t *testing.T) {
 	restartIdx := strings.LastIndex(out, "\nsudo systemctl restart sandboxd\n")
 	if restartIdx < 0 || override > restartIdx {
 		t.Fatalf("secret env must be written before the final restart; override=%d restart=%d", override, restartIdx)
+	}
+}
+
+// SB_AUDIT_EXPORT_BACKEND selects exactly ONE backend (pkg/auditexport has no
+// fan-out), so these assertions pin the two things that follow from that and
+// are easy to break silently:
+//
+//   - a node with the file backend must NOT be handed S3 coordinates that
+//     imply evidence is leaving the box when it is not;
+//   - AWS_REGION must be written exactly once even when both AWS-backed sinks
+//     are on, because a duplicated assignment in cluster.env is the kind of
+//     thing that looks harmless until the two values disagree.
+func TestBootstrapAuditExportBackendIsSingular(t *testing.T) {
+	fileOut := renderBootstrap(t, "joiner_audit_file")
+	if !strings.Contains(fileOut, "SB_AUDIT_EXPORT_BACKEND=file") {
+		t.Fatal("file backend not rendered")
+	}
+	if strings.Contains(fileOut, "SB_AUDIT_EXPORT_S3_BUCKET=") {
+		t.Error("the file backend was handed S3 coordinates; a node ships to one backend, not both")
+	}
+
+	s3Out := renderBootstrap(t, "joiner_audit_s3")
+	if strings.Count(s3Out, "SB_AUDIT_EXPORT_BACKEND=") != 1 {
+		t.Errorf("expected exactly one backend assignment, got %d", strings.Count(s3Out, "SB_AUDIT_EXPORT_BACKEND="))
+	}
+	if n := strings.Count(s3Out, "\nAWS_REGION="); n != 1 {
+		t.Errorf("AWS_REGION assigned %d times, want exactly 1", n)
+	}
+}
+
+// Nothing audit-related may appear when no backend is selected — otherwise a
+// production render stops being byte-identical to before these variables
+// existed, and a deployment that never asked for export gets a file path
+// pointing somewhere nothing reads.
+func TestBootstrapOmitsAuditExportWhenUnset(t *testing.T) {
+	out := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{
+		"SB_AUDIT_EXPORT_BACKEND=",
+		"SB_AUDIT_EXPORT_FILE_PATH=",
+		"SB_AUDIT_EXPORT_S3_BUCKET=",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("no audit backend selected but the render contains %q", forbidden)
+		}
 	}
 }

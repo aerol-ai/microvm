@@ -593,6 +593,44 @@ variable "secret_kms_strict_boot" {
   default     = true
 }
 
+# Audit export sinks (plans/integration-test-security.md §5.4).
+#
+# IMPORTANT, and not what the plan originally assumed: SB_AUDIT_EXPORT_BACKEND
+# selects exactly ONE of noop|stdout|file|webhook|s3|bus
+# (pkg/auditexport/config.go). There is no fan-out backend, so a single node
+# cannot ship to file AND s3 at once. A scenario that wants both proves them on
+# DIFFERENT NODES, via each node's own sandboxd_env — which is precisely what
+# the per-node override exists for.
+#
+# Note also that pkg/auditexport rejects file and stdout when enterprise mode
+# is on ("keeps audit evidence on this node"), so enterprise scenarios must
+# pick webhook, s3 or bus.
+variable "audit_export_enabled" {
+  description = "Create the audit-export S3 bucket and grant nodes PutObject on it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_export_backend" {
+  description = "Value for SB_AUDIT_EXPORT_BACKEND. Empty leaves the daemon default (noop, or webhook when an export URL is set)."
+  type        = string
+  default     = ""
+
+  validation {
+    # Mirrors pkg/auditexport's backend set. Catching a typo here beats a
+    # daemon that starts with the backend silently resolved to noop and a
+    # scenario that then asserts on records nothing ever shipped.
+    condition     = contains(["", "noop", "stdout", "file", "webhook", "s3", "bus"], var.audit_export_backend)
+    error_message = "audit_export_backend must be one of: noop, stdout, file, webhook, s3, bus (or empty)."
+  }
+}
+
+variable "audit_export_file_path" {
+  description = "SB_AUDIT_EXPORT_FILE_PATH. Written whenever audit_export_backend is set, so flipping to the file backend needs no other change."
+  type        = string
+  default     = "/var/log/aerol-audit-export.jsonl"
+}
+
 # Extra SB_* environment for sandboxd, rendered into /etc/sandboxd/cluster.env
 # BEFORE the bootstrap's final `systemctl restart sandboxd`.
 #
