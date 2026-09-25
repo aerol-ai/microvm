@@ -3,6 +3,29 @@
 Deferred work items with enough context to pick up cold. Each entry says
 what, why, the caveat that motivated capturing it, and where to start.
 
+## A scenario destroy can need two passes (integration harness)
+
+- **What:** Find out why `run.sh --destroy-only` returned non-zero with 3
+  resources still standing, and either retry inside the teardown or make the
+  failure name what it could not delete.
+- **Why:** Observed 2026-09-23 tearing down `single-node` with
+  `secret_kms_enabled = true`. The first destroy exited non-zero leaving 3
+  resources; an immediate identical re-run destroyed them and exited 0, so it
+  is a transient (most likely an eventual-consistency retry around the KMS key
+  or an IAM detach), not a config error.
+- **Caveat (why it matters, not just cosmetic):** run.sh's EXIT trap runs
+  **one** destroy. When it fails the harness only prints "run
+  `make integration-reap`" — and reap terminates **EC2 instances only**, not
+  the VPC, IAM roles, S3 buckets or KMS aliases. So an unattended failing run
+  silently leaves billable non-EC2 resources behind, and the message points at
+  a tool that cannot clean them up.
+- **Depends on / blocked by:** nothing. The root cause was not captured because
+  the first run's output was consumed by a pipe; re-run a KMS-enabled scenario
+  teardown with the full log kept.
+- **Start:** `integration-tests/run.sh` teardown path and `--destroy-only`;
+  consider one bounded retry plus surfacing terraform's own error, and widening
+  `scripts/integration-reap.sh` or documenting that it is EC2-only.
+
 ## Warm-adopted (`park-*`) destroys fall to reconcile (containerd)
 
 - **What:** Restore prompt row deletion for a warm-adopted container, or
