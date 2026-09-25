@@ -256,13 +256,15 @@ build_one_arch() {
   assert_linux_elf "${out}/toolboxd_linux_${arch}" "$arch"
 
   if (( WITH_RECEIVER )); then
-    if [[ ! -d "${src}/cmd/audit-receiver" ]]; then
-      die "--with-receiver: cmd/audit-receiver does not exist in this tree yet (plan §6.4 / task T9)"
+    # Under integration-tests/, never cmd/ — it is a scenario fixture, not a
+    # shipped binary, and nothing in a release should build it.
+    if [[ ! -d "${src}/integration-tests/cmd/audit-receiver" ]]; then
+      die "--with-receiver: integration-tests/cmd/audit-receiver does not exist on this ref (added in T9)"
     fi
     log "build: audit-receiver_linux_${arch} (CGO=0)"
     ( cd "$src" && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
         go build -trimpath -ldflags "-s -w ${ldflags}" \
-        -o "${out}/audit-receiver_linux_${arch}" ./cmd/audit-receiver )
+        -o "${out}/audit-receiver_linux_${arch}" ./integration-tests/cmd/audit-receiver )
     assert_linux_elf "${out}/audit-receiver_linux_${arch}" "$arch"
   fi
 
