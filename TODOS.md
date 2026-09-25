@@ -3,6 +3,27 @@
 Deferred work items with enough context to pick up cold. Each entry says
 what, why, the caveat that motivated capturing it, and where to start.
 
+## Caddy route upsert does not retry a transport EOF (unconfirmed)
+
+- **What:** Decide whether `upsertRoute` should retry a dropped connection the
+  way it now retries a duplicate-ID 400.
+- **Why:** Both are Caddy-config-reload transients, but only one is handled. A
+  400 whose body names a duplicate id is retried as a PATCH; a reload that
+  drops the admin connection mid-request returns a transport error from
+  `httpClient.Do` and fails the caller immediately. Seen once as
+  `start: PATCH http://127.0.0.1:2019/id/sandbox-…: EOF` failing UC-15.
+- **Caveat — NOT confirmed as a product bug:** that observation happened while
+  a daemon restart and concurrent sandbox churn were deliberately being driven
+  against the box *during* the suite, i.e. self-inflicted. An immediate clean
+  re-run with no interference was 58 pass / 0 fail. So this is a hypothesis
+  about a real mechanism, not a reproduced defect — do not "fix" it without a
+  reproduction, or the retry itself becomes untested code on the boot path.
+- **Depends on / blocked by:** a reproduction. Cluster scenarios generate real
+  concurrent route churn, so T12+ is the natural place for it to reappear.
+- **Start:** `pkg/caddy/client.go` `upsertRoute` / `sendJSONDetail`; note the
+  retry would have to be bounded and idempotency-safe, since PATCH-then-EOF may
+  mean the write landed.
+
 ## A scenario destroy can need two passes (integration harness)
 
 - **What:** Find out why `run.sh --destroy-only` returned non-zero with 3
