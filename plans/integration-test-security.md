@@ -570,6 +570,29 @@ fake here would test nothing new.
   with the existing `harness.SSHRun`.
 - **webhook** — see §6.4.
 
+> **CORRECTED during execution (2026-09-25).** This section, and the S2 profile
+> in §6.2, assumed a node could export to **file AND s3 at once**. It cannot.
+> `SB_AUDIT_EXPORT_BACKEND` selects exactly one of
+> `noop|stdout|file|webhook|s3|bus` and `pkg/auditexport` has no fan-out
+> backend. A scenario that wants both connectors proves them on **different
+> nodes**, through each node's own `sandboxd_env` — which is exactly what T6's
+> per-node override is for, and which single-node cannot express at all.
+>
+> Second constraint from the same package: `file` and `stdout` are **rejected
+> when enterprise mode is on** ("keeps audit evidence on this node"), so S4 and
+> S6 must use `webhook`, `s3` or `bus`. S1's "enterprise off, file export" is
+> fine as written.
+>
+> `SB_AUDIT_EXPORT_S3_PREFIX` is scenario-scoped, not per-node:
+> `auditexport.ObjectKey` already interleaves `node=<id>` into the key, so a
+> per-node prefix repeats the node twice in every path.
+>
+> IAM is **PutObject only**. A node must not be able to read the fleet's audit
+> trail back, nor delete its own records to cover a compromise — which is the
+> whole reason evidence ships off-node. The audit bucket is also kept separate
+> from the bootstrap bundle bucket, because that one is readable by every
+> joiner.
+
 ---
 
 ## 6. Phase 3 — the security profile matrix ("versions")
@@ -1053,7 +1076,7 @@ and verified, not merely that code was written.
 | T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | **DONE** 2026-09-23 — **3 members**, the first multi-node cluster this branch has formed. Rendezvous timeline: seed published all 3 artifacts (incl. cred bundle) at 05:38:24, both joiners uploaded CSRs and both certs were signed by 05:38:48, 3 members at 05:39:33. Security property verified on the live certs: each SAN is `DNS:node:<Terraform-assigned name>` resolved from `nodes/<IAM caller identity>`, never from the uploader. |
 | T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | **DONE** 2026-09-23 — global `extra_sandboxd_env` merged under each node's `sandboxd_env`, rendered into `cluster.env` **before** the final `systemctl restart sandboxd` (asserted by an offline render test, which also fails if the block moves after the restart). |
 | T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | **DONE** 2026-09-23 — real CMK `cd1a8f8c` + `alias/aerolvm-itest-single-node-secrets`. **Boots:** `secret provider boot canary ok provider=awskms`, strict boot on, 0 restarts. **Seals:** env set at create is withheld from the default read (`{}`); `?include_env=true` returned it decrypted, and the audit chain recorded the opt-in with the exact `correlation_id` sent. Full suite **pass 58 · fail 0 · skip 55 · 0 inconclusive** with the provider active. |
-| T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | |
+| T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | **DONE** 2026-09-23 — **exit criterion corrected**: a node exports to exactly ONE backend, so "both" is proven by flipping the backend on one box, not by running both at once. **s3:** records at `aerolvm-itest-single-node/node=<id>/2026/09/25/<batch>.jsonl` carrying the exact `correlation_id` sent. **file:** `/var/log/aerol-audit-export.jsonl` (0600 root) grew 1130→1673 bytes with the event. Clean suite re-run **pass 58 · fail 0 · 0 inconclusive** with KMS + s3 export both active. |
 | T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | |
 | T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | |
 | T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable | |
