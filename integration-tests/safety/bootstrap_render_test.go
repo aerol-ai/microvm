@@ -71,7 +71,10 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		t.Fatalf("rendering bootstrap.sh.tftpl failed: %v\n%s", err, out)
 	}
 
-	for _, branch := range []string{"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file"} {
+	for _, branch := range []string{
+		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
+		"seed_receiver", "joiner_receiver",
+	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
 			if err != nil {
@@ -123,6 +126,15 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 				"joiner_audit_file": {
 					"SB_AUDIT_EXPORT_BACKEND=file",
 					"SB_AUDIT_EXPORT_FILE_PATH=/var/log/aerol-audit-export.jsonl",
+				},
+				"seed_receiver": {
+					"aerol-audit-receiver.service",
+					"/usr/local/bin/audit-receiver",
+					"SB_SECRET_AUDIT_EXPORT_URL=http://127.0.0.1:9099/audit",
+					"SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=recv-hmac-abc",
+				},
+				"joiner_receiver": {
+					"SB_SECRET_AUDIT_EXPORT_URL=http://10.42.1.5:9099/audit",
 				},
 				"joiner_kms": {
 					"SB_SECRET_PROVIDER=awskms",
@@ -374,6 +386,58 @@ func TestBootstrapOmitsAuditExportWhenUnset(t *testing.T) {
 	} {
 		if strings.Contains(out, forbidden) {
 			t.Errorf("no audit backend selected but the render contains %q", forbidden)
+		}
+	}
+}
+
+// Only the SEED may run the receiver. Two receivers would split the fleet's
+// audit evidence across two stores, so a scenario asserting "N records
+// arrived" would be reading half the picture and passing anyway.
+//
+// The secrets must also stay out of ExecStart: systemd expands ${VAR} there,
+// which would put the bearer token and HMAC key into argv where every process
+// on the box — sandboxes included — can read them from `ps`.
+func TestBootstrapRunsAuditReceiverOnSeedOnly(t *testing.T) {
+	seed := renderBootstrap(t, "seed_receiver")
+	joiner := renderBootstrap(t, "joiner_receiver")
+
+	if !strings.Contains(seed, "aerol-audit-receiver.service") {
+		t.Fatal("seed does not install the receiver unit")
+	}
+	if strings.Contains(joiner, "aerol-audit-receiver.service") {
+		t.Error("a joiner installs the receiver unit too; two receivers split the audit evidence")
+	}
+
+	// Both still export, but to different endpoints.
+	if !strings.Contains(seed, "SB_SECRET_AUDIT_EXPORT_URL=http://127.0.0.1:9099/audit") {
+		t.Error("seed does not export to its own loopback receiver")
+	}
+	if !strings.Contains(joiner, "SB_SECRET_AUDIT_EXPORT_URL=http://10.42.1.5:9099/audit") {
+		t.Error("joiner does not export to the seed's receiver")
+	}
+
+	for _, line := range strings.Split(seed, "\n") {
+		if !strings.HasPrefix(line, "ExecStart=/usr/local/bin/audit-receiver") {
+			continue
+		}
+		for _, secret := range []string{"recv-token-xyz", "recv-hmac-abc", "AEROL_RECEIVER_TOKEN", "AEROL_RECEIVER_HMAC"} {
+			if strings.Contains(line, secret) {
+				t.Errorf("receiver ExecStart references %q; systemd expands it into argv, exposing it via ps:\n  %s", secret, line)
+			}
+		}
+	}
+}
+
+// With the receiver disabled, none of its unit, env or secrets may appear.
+func TestBootstrapOmitsAuditReceiverWhenDisabled(t *testing.T) {
+	out := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{
+		"aerol-audit-receiver",
+		"SB_SECRET_AUDIT_EXPORT_URL=",
+		"SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("receiver disabled but the render contains %q", forbidden)
 		}
 	}
 }

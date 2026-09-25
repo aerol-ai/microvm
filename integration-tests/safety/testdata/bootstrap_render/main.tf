@@ -109,7 +109,12 @@ locals {
     audit_export_backend   = ""
     audit_export_file_path = "/var/log/aerol-audit-export.jsonl"
     audit_export_s3_bucket = ""
-    audit_export_s3_prefix = "aerolvm-itest-x"
+    audit_export_s3_prefix  = "aerolvm-itest-x"
+    audit_receiver_url      = ""
+    audit_receiver_port     = 9099
+    audit_receiver_token    = ""
+    audit_receiver_hmac_key = ""
+    audit_receiver_endpoint = ""
     shard_aware_ingress = false
     caddy_storage_s3_enabled = false
     caddy_storage_s3_bucket = "x"
@@ -172,6 +177,30 @@ output "joiner_audit_file" {
   value = templatefile("__TEMPLATE__", merge(local.base, {
     is_seed              = false
     audit_export_backend = "file"
+  }))
+}
+
+# Seed with the audit receiver fixture enabled: exercises the systemd unit
+# block AND the webhook export env the same render must emit.
+output "seed_receiver" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                 = true
+    audit_receiver_url      = "https://example.invalid/audit-receiver_linux_amd64"
+    audit_receiver_token    = "recv-token-xyz"
+    audit_receiver_hmac_key = "recv-hmac-abc"
+    audit_receiver_endpoint = "http://127.0.0.1:9099"
+  }))
+}
+
+# A joiner must get the export env pointed at the SEED, and must NOT install
+# the receiver unit — two receivers would split the evidence.
+output "joiner_receiver" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                 = false
+    audit_receiver_url      = "https://example.invalid/audit-receiver_linux_amd64"
+    audit_receiver_token    = "recv-token-xyz"
+    audit_receiver_hmac_key = "recv-hmac-abc"
+    audit_receiver_endpoint = "http://10.42.1.5:9099"
   }))
 }
 

@@ -126,6 +126,7 @@ resource "aws_instance" "seed" {
     bundle_bucket                            = aws_s3_bucket.bundle.bucket
     aws_region                               = var.aws_region
     seed_private_ip                          = ""
+    audit_receiver_endpoint                  = local.audit_receiver_seed_endpoint
     install_script_url                       = var.install_script_url
     caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
@@ -141,6 +142,10 @@ resource "aws_instance" "seed" {
     audit_export_file_path                   = var.audit_export_file_path
     audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
     audit_export_s3_prefix                   = var.cluster_name
+    audit_receiver_url                       = var.audit_receiver_url
+    audit_receiver_port                      = var.audit_receiver_port
+    audit_receiver_token                     = local.audit_receiver_token_value
+    audit_receiver_hmac_key                  = local.audit_receiver_hmac_value
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
@@ -335,6 +340,7 @@ resource "aws_instance" "joiner" {
     bundle_bucket                            = aws_s3_bucket.bundle.bucket
     aws_region                               = var.aws_region
     seed_private_ip                          = aws_instance.seed.private_ip
+    audit_receiver_endpoint                  = var.audit_receiver_enabled ? "http://${aws_instance.seed.private_ip}:${var.audit_receiver_port}" : ""
     install_script_url                       = var.install_script_url
     caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
@@ -350,6 +356,10 @@ resource "aws_instance" "joiner" {
     audit_export_file_path                   = var.audit_export_file_path
     audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
     audit_export_s3_prefix                   = var.cluster_name
+    audit_receiver_url                       = var.audit_receiver_url
+    audit_receiver_port                      = var.audit_receiver_port
+    audit_receiver_token                     = local.audit_receiver_token_value
+    audit_receiver_hmac_key                  = local.audit_receiver_hmac_value
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint

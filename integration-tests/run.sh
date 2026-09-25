@@ -644,7 +644,11 @@ EOF
     "$BUILD_SH" urls >"$out"
   else
     echo "=== artifacts: building locally ==="
-    build_id=$("$BUILD_SH" build)
+    # --with-receiver on every build: the fixture is CGO-free and adds ~2s, and
+    # the alternative is a scenario that enables the receiver discovering at
+    # apply time that this build did not produce one. Skipped automatically on
+    # refs that predate it.
+    build_id=$("$BUILD_SH" build --with-receiver)
     "$BUILD_SH" publish >"$out"
   fi
 

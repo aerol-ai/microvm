@@ -631,6 +631,30 @@ variable "audit_export_file_path" {
   default     = "/var/log/aerol-audit-export.jsonl"
 }
 
+# Audit receiver fixture (plans/integration-test-security.md §6.4).
+#
+# One small binary, built by the same pipeline and shipped over the same
+# presigned URL, run as a systemd unit on the seed. Webhook export and the
+# audit-chain witness both need something listening; without it a scenario can
+# only assert that the daemon TRIED to export.
+variable "audit_receiver_enabled" {
+  description = "Run the audit-receiver fixture on the seed and point webhook export at it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_receiver_port" {
+  description = "Port the audit receiver listens on (VPC-internal only)."
+  type        = number
+  default     = 9099
+}
+
+variable "audit_receiver_url" {
+  description = "Download URL for the audit-receiver binary. Emitted by integration-tests/lib/build.sh publish."
+  type        = string
+  default     = ""
+}
+
 # Extra SB_* environment for sandboxd, rendered into /etc/sandboxd/cluster.env
 # BEFORE the bootstrap's final `systemctl restart sandboxd`.
 #

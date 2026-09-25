@@ -258,14 +258,20 @@ build_one_arch() {
   if (( WITH_RECEIVER )); then
     # Under integration-tests/, never cmd/ — it is a scenario fixture, not a
     # shipped binary, and nothing in a release should build it.
+    #
+    # Absent on refs older than T9. Skipped rather than fatal for the same
+    # reason cluster-sign-node.sh is: run.sh asks for the receiver on every
+    # build, and `--ref main` (UC-165's latency baseline) must stay buildable.
     if [[ ! -d "${src}/integration-tests/cmd/audit-receiver" ]]; then
-      die "--with-receiver: integration-tests/cmd/audit-receiver does not exist on this ref (added in T9)"
+      # NOT `return`: the caddy block below is in this same function.
+      log "build: integration-tests/cmd/audit-receiver absent from this ref — skipping (optional)"
+    else
+      log "build: audit-receiver_linux_${arch} (CGO=0)"
+      ( cd "$src" && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
+          go build -trimpath -ldflags "-s -w ${ldflags}" \
+          -o "${out}/audit-receiver_linux_${arch}" ./integration-tests/cmd/audit-receiver )
+      assert_linux_elf "${out}/audit-receiver_linux_${arch}" "$arch"
     fi
-    log "build: audit-receiver_linux_${arch} (CGO=0)"
-    ( cd "$src" && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
-        go build -trimpath -ldflags "-s -w ${ldflags}" \
-        -o "${out}/audit-receiver_linux_${arch}" ./integration-tests/cmd/audit-receiver )
-    assert_linux_elf "${out}/audit-receiver_linux_${arch}" "$arch"
   fi
 
   if (( WITH_CADDY )); then
@@ -392,9 +398,27 @@ build_matches_request() {
     [[ -f "${out}/sandboxd_linux_${arch}" ]] || return 1
     [[ -f "${out}/toolboxd_linux_${arch}" ]] || return 1
     (( WITH_CADDY ))    && { [[ -f "${out}/caddy_linux_${arch}" ]]          || return 1; }
-    (( WITH_RECEIVER )) && { [[ -f "${out}/audit-receiver_linux_${arch}" ]] || return 1; }
+    # The receiver is source-dependent: a ref that predates it legitimately
+    # produces no artifact, so requiring one here would make every build on
+    # such a ref a cache MISS forever. Compare against what the recorded build
+    # actually produced instead of against the request.
+    if (( WITH_RECEIVER )) && [[ "$(build_recorded_receiver "$out")" == "true" ]]; then
+      [[ -f "${out}/audit-receiver_linux_${arch}" ]] || return 1
+    fi
   done
   return 0
+}
+
+# build_recorded_receiver echoes whether the completed build in $1 actually
+# produced a receiver binary (as opposed to having merely been asked for one).
+build_recorded_receiver() {
+  local info="$1/buildinfo.json"
+  [[ -f "$info" ]] || { echo false; return; }
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.receiver_built // false' "$info"
+  else
+    grep -q '"receiver_built": true' "$info" && echo true || echo false
+  fi
 }
 
 # write_checksums emits GNU two-space format over every published file.
@@ -431,6 +455,7 @@ write_buildinfo() {
   "arches": [$(printf '"%s",' "${ARCHES[@]}" | sed 's/,$//')],
   "with_caddy": $( ((WITH_CADDY)) && echo true || echo false ),
   "with_receiver": $( ((WITH_RECEIVER)) && echo true || echo false ),
+  "receiver_built": $( compgen -G "${out}/audit-receiver_linux_*" >/dev/null && echo true || echo false ),
   "zig_version": "$(zig version)",
   "zig_target_amd64": "${ZIG_TARGET_amd64}",
   "zig_target_arm64": "${ZIG_TARGET_arm64}",
@@ -603,6 +628,11 @@ emit_urls() {
   # Present on this branch, absent on older refs. When it IS published it must
   # be the URL the seed uses: the CSR signing rendezvous needs the branch's
   # signer, not whatever releases/latest happens to hold.
+  local have_receiver=0
+  if "${AWSCLI[@]}" --region "$region" s3api head-object \
+      --bucket "$bucket" --key "${prefix}/audit-receiver_linux_${arch}" >/dev/null 2>&1; then
+    have_receiver=1
+  fi
   local have_sign_node=0
   if "${AWSCLI[@]}" --region "$region" s3api head-object \
       --bucket "$bucket" --key "${prefix}/cluster-sign-node.sh" >/dev/null 2>&1; then
@@ -626,6 +656,9 @@ emit_urls() {
   printf 'cluster_join_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-join.sh")"
   if (( have_sign_node )); then
     printf 'cluster_sign_node_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-sign-node.sh")"
+  fi
+  if (( have_receiver )); then
+    printf 'audit_receiver_url      = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/audit-receiver_linux_${arch}")"
   fi
 
   # §3.3, the caddy trap. install.sh checksum-verifies the Caddy download

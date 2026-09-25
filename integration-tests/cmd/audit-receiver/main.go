@@ -48,6 +48,18 @@ func main() {
 	)
 	flag.Parse()
 
+	// Secrets come from the environment when the flag is empty. systemd
+	// EXPANDS ${VAR} inside ExecStart, so passing them as flags would put the
+	// bearer token and HMAC key straight into argv, where every process on the
+	// box — including sandboxes — can read them from `ps`. /proc/<pid>/environ
+	// is root-only, so the environment is the right place for them.
+	if *token == "" {
+		*token = os.Getenv("AEROL_RECEIVER_TOKEN")
+	}
+	if *hmacKey == "" {
+		*hmacKey = os.Getenv("AEROL_RECEIVER_HMAC")
+	}
+
 	srv, err := newReceiver(*token, *hmacKey, *logPath, *failNext)
 	if err != nil {
 		log.Fatalf("audit-receiver: %v", err)

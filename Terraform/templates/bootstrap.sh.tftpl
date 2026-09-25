@@ -37,6 +37,8 @@
 #   secret_kms_key_arn ("" = disabled), secret_kms_strict_boot (bool),
 #   audit_export_backend ("" = daemon default), audit_export_file_path,
 #   audit_export_s3_bucket ("" = no bucket provisioned), audit_export_s3_prefix,
+#   audit_receiver_url, audit_receiver_port, audit_receiver_token,
+#   audit_receiver_hmac_key, audit_receiver_endpoint ("" = receiver disabled),
 #   seed_wait_max_seconds, extra_user_data
 #
 # Order of operations matches the scripts' contracts:
@@ -306,6 +308,51 @@ sudo systemd-run --unit=aerolvm-csr-signer --description='AerolVM CSR signing re
   "$(( $(date +%s) + ${seed_wait_max_seconds} ))" \
   || echo "[bootstrap] WARNING: could not start the CSR signer; joiners will not get certs" >&2
 echo "[bootstrap] seed CSR signer started (deadline ${seed_wait_max_seconds}s)"
+
+%{ if audit_receiver_endpoint != "" && audit_receiver_url != "" ~}
+###############################################################################
+# 2a-ter. Seed: audit receiver fixture (plans/integration-test-security.md §6.4)
+#
+# Webhook export and the audit-chain witness both need something listening.
+# Started BEFORE the ops-env block below points the daemon at it, so the first
+# export attempt is not a guaranteed failure that then has to back off.
+###############################################################################
+curl_download '${audit_receiver_url}' -o /tmp/audit-receiver
+sudo install -m 0755 /tmp/audit-receiver /usr/local/bin/audit-receiver
+
+# The token and HMAC key are passed through the ENVIRONMENT, never ExecStart.
+# systemd expands $${VAR} inside ExecStart, so a flag would put them in argv
+# where every process on the box — sandboxes included — can read them from
+# `ps`. /proc/<pid>/environ is root-only; the receiver reads
+# AEROL_RECEIVER_TOKEN / AEROL_RECEIVER_HMAC when the flags are empty.
+sudo install -d -m 0700 /etc/aerol-audit-receiver
+sudo tee /etc/aerol-audit-receiver/env >/dev/null <<RECVENV
+AEROL_RECEIVER_TOKEN=${audit_receiver_token}
+AEROL_RECEIVER_HMAC=${audit_receiver_hmac_key}
+RECVENV
+sudo chmod 0600 /etc/aerol-audit-receiver/env
+
+sudo tee /etc/systemd/system/aerol-audit-receiver.service >/dev/null <<'RECVUNIT'
+[Unit]
+Description=AerolVM audit receiver (integration fixture)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/aerol-audit-receiver/env
+ExecStart=/usr/local/bin/audit-receiver --addr :RECEIVER_PORT --audit-log /var/log/aerol-audit-webhook.jsonl
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+RECVUNIT
+sudo sed -i "s/RECEIVER_PORT/${audit_receiver_port}/" /etc/systemd/system/aerol-audit-receiver.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now aerol-audit-receiver.service \
+  || echo "[bootstrap] WARNING: audit receiver failed to start" >&2
+echo "[bootstrap] audit receiver started on :${audit_receiver_port}"
+%{ endif ~}
 %{ else ~}
 ###############################################################################
 # 2b. Joiner: cluster-join.sh
@@ -870,6 +917,15 @@ SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
 AWS_REGION=${aws_region}
 %{ endif ~}
 
+%{ if audit_receiver_endpoint != "" ~}
+# Managed by Terraform bootstrap: webhook audit export + witness target.
+# SB_SECRET_AUDIT_EXPORT_URL is also what makes the daemon resolve an unset
+# SB_AUDIT_EXPORT_BACKEND to "webhook" (pkg/auditexport/config.go), so a
+# scenario gets webhook export by enabling the receiver alone.
+SB_SECRET_AUDIT_EXPORT_URL=${audit_receiver_endpoint}/audit
+SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN=${audit_receiver_token}
+SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=${audit_receiver_hmac_key}
+%{ endif ~}
 %{ if audit_export_backend != "" ~}
 # Managed by Terraform bootstrap: audit export sink.
 #
