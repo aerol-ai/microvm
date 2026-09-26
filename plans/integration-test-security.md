@@ -1426,6 +1426,36 @@ owed was to stop mis-attributing it: the suite no longer picks the seed as a
 victim, and an owner-kill case whose owner IS the seed now skips with that
 reason rather than destroying the fleet and reddening whatever ran next.
 
+## 7.8 A discarded flagship run, and the harness bug behind it
+
+S5's first attempt reported `cluster: expected 8 members, never reached
+(last 4)`, was marked inconclusive at 0/174, and ended with:
+
+```
+integration-tests/run.sh: line 1508: unexpected EOF while looking for matching `''
+```
+
+on a file that `bash -n` accepts and that git shows as clean. The cause was
+not the cluster. **run.sh was edited while an instance of it was running.**
+Bash reads a script incrementally by byte offset, so an insertion earlier in
+the file makes the RUNNING process resume at the wrong offset and misexecute
+from that point on — including, evidently, through the member-wait gate. The
+"4 of 8" was the harness reading its own half-written source, not a
+membership finding, and a ~$14 flagship run had to be thrown away.
+
+This is the third time editing the tree mid-run has cost a run in this
+programme, and the first time it has corrupted a result rather than merely
+rebuilding something. Two rules follow, and the second is the one that
+actually holds:
+
+1. Do not edit `run.sh` (or anything it sources) while a run is in flight.
+2. Make rule 1 unnecessary: `run.sh` copies itself to a temp file and
+   `exec`s that, so the running invocation is immune to edits of the
+   working tree. `HERE` still resolves against the original path, so every
+   relative lookup is unaffected.
+
+The same hazard applies to `lib/*.sh`, which run.sh sources.
+
 ## 8. Make targets and reports
 
 ```make
