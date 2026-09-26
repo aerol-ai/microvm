@@ -1293,6 +1293,60 @@ partial AND names the missing node. A silently short history is the failure,
 because it reads as "this access never happened" when it means "I could not
 ask the node that knows".
 
+## 7.6 Three reds that were not the product (2026-09-27)
+
+The S2 re-verify pass turned up three failures, and none of them was the
+behaviour under test. Recording them because each is a class of mistake this
+suite will make again.
+
+**UC-114 — a refusal read as a broken probe.** The case asserts that a caller
+reaching the internal port without a peer identity is refused. mTLS refuses
+it at the TLS handshake — the server demands a client certificate, gets none,
+and tears the connection down — so curl exits 56 with no HTTP status at all.
+The case reported `probe: exit status 56` and failed against a product doing
+exactly the right thing. Refusal below HTTP is *stronger* than a 403, and the
+test now says so.
+
+The parser could not simply treat "no status" as a refusal: `curl: command
+not found` produces the same empty output, and that would be a false pass on
+a probe that never ran. Classification is now keyed on curl's own exit code
+(35/56/58/60/77 are TLS refusals; 7/127 are not), which is why the probe
+scripts append `$?`.
+
+**UC-134 — an injected fault blamed on the subject.** The case stops a node
+and then polls audit coverage. The ingress answers 502 for a few seconds
+while it still holds a route to the machine that just went away. Fataling on
+the first one failed the case 15s into a 3-minute poll and blamed audit
+honesty for an ingress hiccup the test itself caused. It polls through it
+now, and fails with a *distinct* message if the read never comes back — so
+the case still cannot pass by the read merely failing.
+
+**UC-135 — the previous case's debris.** It killed the owner, waited out its
+full 8-minute deadline for a reassignment, and reported a failover bug. The
+cluster was one member short: UC-134's cleanup had fired `systemctl start`
+and returned in milliseconds, while the node takes tens of seconds to rejoin
+gossip and Raft. This is the same gap that cost a live run 79 cases, in a
+second place. Every restore now waits, and a function-scoped guard enforces
+it — a whole-file scan had called the file safe because a *different* test in
+it used `KillNodeDaemon`.
+
+The common shape: **a test that injects a fault must not attribute the
+fault's own side effects to the property it is measuring, and must not leave
+them for the next test.** Two of the three reds would have been filed as
+product bugs.
+
+### Product fix found on the way: enterprise boot fail-closed
+
+Preparing S4 surfaced that the witness node-id bug in TODOS.md would bite its
+disruptive restarts. `ValidateSecretAuditWitness` derived the node id from
+the cluster handle, but the Service is built with
+`cluster.NewNoop("standalone", …)` and the real cluster attaches later — so a
+boot check that ran first asked the witness about `standalone` while the
+shipper had stored the head under the real id. An enterprise node fails
+CLOSED on a mismatch that does not exist, intermittently. Fixed: all four
+derivations go through `witnessNodeID()`, preferring `cfg.NodeID` — the same
+value the real cluster is built from, so nothing changes on a healthy node.
+
 ## 8. Make targets and reports
 
 ```make

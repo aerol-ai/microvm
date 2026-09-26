@@ -3,42 +3,35 @@
 Deferred work items with enough context to pick up cold. Each entry says
 what, why, the caveat that motivated capturing it, and where to start.
 
-## Enterprise boot can fail its own witness check (audit) — REPRODUCED
+## Enterprise boot can fail its own witness check (audit) — FIXED
 
-- **What:** `ValidateSecretAuditWitness` can look the witnessed head up under
-  the node id `"standalone"` while the shipping path publishes it under the
-  real cluster node id, so the comparison fails against a head that IS
+- **What:** `ValidateSecretAuditWitness` looked the witnessed head up under
+  the node id `"standalone"` while the shipping path published it under the
+  real cluster node id, so the comparison failed against a head that WAS
   witnessed.
-- **Why it matters:** the daemon fails CLOSED — an enterprise node refuses to
-  start. Observed on a live single-node box with
-  `SB_ENTERPRISE_MODE=true`:
+- **Why it mattered:** the daemon failed CLOSED — an enterprise node refused
+  to start. Observed on a live single-node box with `SB_ENTERPRISE_MODE=true`:
 
       secret audit witness mismatch:
         local_head="7334bf03cb2b4ab7bc858bba55a44e3c3fda66031837eb079026503240e7ce7b"
         witnessed_head=""
 
   The witness had that EXACT head stored, under
-  `aerolvm-itest-single-node-node1`. Only the lookup key was wrong.
-- **Mechanism:** both call sites derive `nodeID` as
-  `s.Cluster().SelfNodeID()`, but the service is constructed with
-  `cluster.NewNoop("standalone", …)` (`internal/service/service.go:595`,
-  `internal/cluster/noop.go:43`) and the real cluster is attached later. When
-  the boot check runs before `AttachCluster`, it queries `standalone`; the
-  periodic shipper always runs after, so it writes the real id. The two never
-  meet.
-- **Caveat — INTERMITTENT, and that is the worrying part.** It failed twice,
-  then three consecutive restarts were clean, which fits a race with cluster
-  attachment rather than a fixed ordering. An intermittent fail-closed on boot
-  is worse than a deterministic one: it will look like flake.
-- **Also note:** a fresh node never hits it, because the check short-circuits
-  on an empty chain tip — so this only bites a node that has already recorded
-  audit events, i.e. every restart in production.
-- **Depends on / blocked by:** nothing. Needs a product decision: either defer
-  the check until the cluster identity is final, or resolve the node id from
-  config (`SB_NODE_ID`) rather than from the cluster handle.
-- **Start:** `internal/service/secret_audit_witness.go` lines ~139, ~422 (the
-  two `nodeID` derivations) and wherever `ValidateSecretAuditWitness` is
-  sequenced relative to `AttachCluster` in `pkg/daemon`.
+  `aerolvm-itest-single-node-node1`. Only the lookup key was wrong. It
+  reproduced intermittently, which is worse than a deterministic failure: a
+  node that refuses to start only sometimes reads as flake.
+- **Fix:** all four `nodeID` derivations in
+  `internal/service/secret_audit_witness.go` now go through
+  `witnessNodeID()`, which prefers `cfg.NodeID` and falls back to the cluster
+  handle. `cfg.NodeID` is the same value `pkg/daemon` builds the real cluster
+  from (`daemon.go` → `cluster.Config.NodeID` → `agent.go` / `client.go`), so
+  the preference is invisible on a healthy node and the race window is gone.
+  This is the second of the two options this entry originally proposed —
+  resolving the id from config rather than deferring the check — because it
+  removes the ordering dependency instead of relying on a new one.
+- **Regression tests:** `secret_audit_witness_nodeid_test.go`, including a
+  guard that fails if any witness call site reads `c.SelfNodeID()` directly
+  again. Mutation-checked.
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 
