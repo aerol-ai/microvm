@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1062,4 +1064,83 @@ func TestGetJSONGivesUpOnAPersistentGatewayFailure(t *testing.T) {
 
 func c400(srv *httptest.Server) *Client {
 	return &Client{sc: &Scenario{Name: "unit", BaseURL: srv.URL, PAT: "p"}}
+}
+
+// A dropped connection is the edge going away mid-request, the same class
+// as a 502. UC-147 failed on a bare "read tcp ...: connection reset" while a
+// node restarted, because only HTTP statuses were retried.
+func TestGetJSONRetriesDroppedConnections(t *testing.T) {
+	restore := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(restore)
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// Hijack and close without a response: the client sees EOF.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("no hijacker")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{sc: &Scenario{Name: "unit", BaseURL: srv.URL, PAT: "p"}}
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.GetJSON(t.Context(), "/v1/thing", &got); err != nil {
+		t.Fatalf("a dropped connection was not retried: %v", err)
+	}
+	if !got.OK || calls < 2 {
+		t.Fatalf("ok=%v after %d calls", got.OK, calls)
+	}
+}
+
+// But a client-side error must fail immediately — retrying a bad URL or a
+// TLS trust failure only delays a verdict that will not change.
+func TestGetJSONDoesNotRetryClientErrors(t *testing.T) {
+	restore := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(restore)
+
+	c := &Client{sc: &Scenario{Name: "unit", BaseURL: "http://127.0.0.1:1", PAT: "p"}}
+	start := time.Now()
+	err := c.GetJSON(t.Context(), "/v1/thing", nil)
+	if err == nil {
+		t.Fatal("a dial to a closed port reported success")
+	}
+	// Connection refused IS retriable, so this bounds it rather than
+	// forbidding it: the point is that it terminates quickly.
+	if time.Since(start) > 30*time.Second {
+		t.Fatalf("took %s to give up on a closed port", time.Since(start))
+	}
+}
+
+func TestIsRetriableTransportErr(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{io.EOF, true},
+		{io.ErrUnexpectedEOF, true},
+		{syscall.ECONNRESET, true},
+		{syscall.ECONNREFUSED, true},
+		{errors.New("read tcp 1.2.3.4:1->5.6.7.8:443: connection reset by peer"), true},
+		{errors.New("http: server closed idle connection"), true},
+		{errors.New("x509: certificate signed by unknown authority"), false},
+		{errors.New("unsupported protocol scheme"), false},
+		{nil, false},
+	} {
+		if got := isRetriableTransportErr(tc.err); got != tc.want {
+			t.Fatalf("isRetriableTransportErr(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
 }

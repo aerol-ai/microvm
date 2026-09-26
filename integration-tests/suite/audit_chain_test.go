@@ -133,21 +133,25 @@ func TestAuditReadsFanOutToPeers(t *testing.T) {
 	if page.Coverage.Partial {
 		t.Fatalf("coverage is partial on a healthy cluster: answered=%v missing=%v", page.Coverage.Answered, page.Coverage.Missing)
 	}
-	// Every node that holds a sealed copy must have been asked. That — not a
-	// raw count — is what "the read fanned out" means: the answer covers
-	// everywhere this sandbox's history could be.
-	for _, h := range holders {
-		if !containsString(page.Coverage.Answered, h) {
-			t.Fatalf("holder %s was not among the nodes that answered %v; the history may be missing the events only it holds",
-				h, page.Coverage.Answered)
-		}
-	}
+	// Secret holders are NOT audit-record holders, and conflating them is
+	// what the live run caught: node1 held a sealed copy, only node3
+	// answered, and that was correct — node1 had never served this sandbox
+	// so it has no audit history for it. The fan-out is scoped by who wrote
+	// records, not by who holds ciphertext.
+	//
+	// What must be true is that the read reaches the node that DID write
+	// them. If the node serving the request is not the owner, that is the
+	// fan-out working, and it is the property §7 group E is about.
 	owner := resolvePlacementOwner(t, c, sb.ID)
-	if owner != "" && !containsString(page.Coverage.Answered, owner) {
-		t.Fatalf("the owner %s is not among the nodes that answered %v", owner, page.Coverage.Answered)
+	if owner == "" {
+		t.Fatal("no placement owner recorded; there is no node whose records the read must reach")
 	}
-	if len(holders) < 2 {
-		t.Logf("only %d holder(s); the read had nowhere further to reach, so this run did not exercise multi-node fan-out", len(holders))
+	if !containsString(page.Coverage.Answered, owner) {
+		t.Fatalf("the owner %s is not among the nodes that answered %v: the read cannot have seen the events only it holds",
+			owner, page.Coverage.Answered)
+	}
+	if len(page.Coverage.Answered) == 1 && page.Coverage.Answered[0] == owner {
+		t.Logf("only the owner answered; this request happened to be served by the owner itself, so it did not exercise a cross-node hop (holders were %v)", holders)
 	}
 }
 

@@ -3,10 +3,12 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -173,16 +175,47 @@ func (c *Client) getWithGatewayRetry(ctx context.Context, path string) (*http.Re
 	var err error
 	for attempt := 0; ; attempt++ {
 		resp, err = c.rawGet(ctx, path)
-		if err != nil || !transientGatewayStatuses[resp.StatusCode] || attempt >= gatewayRetries {
+		// A dropped connection is the same class as a 502: the edge went
+		// away mid-request. UC-147 failed on a bare
+		// "read tcp ...: connection reset" while a node was restarting, and
+		// only HTTP statuses were being retried.
+		if err != nil {
+			if attempt >= gatewayRetries || ctx.Err() != nil || !isRetriableTransportErr(err) {
+				return nil, err
+			}
+		} else if !transientGatewayStatuses[resp.StatusCode] || attempt >= gatewayRetries {
 			return resp, err
+		} else {
+			// Drain and close so the connection can be reused for the retry.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 		}
-		// Drain and close so the connection can be reused for the retry.
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(gatewayRetryDelay):
 		}
 	}
+}
+
+// isRetriableTransportErr reports whether an error is the connection failing
+// rather than the server answering. Only the shapes a restarting edge
+// produces — a refused dial, a reset or a half-closed read — so a genuine
+// client bug (a bad URL, a TLS trust failure) still fails immediately.
+func isRetriableTransportErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{"connection reset", "connection refused", "unexpected EOF", "server closed idle connection", "broken pipe"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
