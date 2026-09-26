@@ -377,16 +377,30 @@ lease_domain_for_scenario() {
   echo "$domain"
 }
 
-# allow_disruptive_for decides AEROL_ALLOW_DISRUPTIVE for the suite. cluster-hetero
-# enables node-kill / failover fault injection by default; other scenarios stay
-# off unless the operator exported AEROL_ALLOW_DISRUPTIVE already.
+# allow_disruptive_for decides AEROL_ALLOW_DISRUPTIVE for the suite.
+#
+# Driven by a `disruptive: true` field in the scenario's .caps.yml, NOT by the
+# scenario's name. The name match this replaced (`== "cluster-hetero"`) was a
+# silent correctness hole: harness.DisruptiveAllowed() turns a 0 into a
+# t.Skip, never a failure, so ANY scenario not literally named cluster-hetero
+# reported every D-tagged use case as a clean ⚪ skip. A whole matrix could go
+# green having exercised none of the failover cases — including UC-117, the
+# case the entire secrets-hardening program exists to prove.
+#
+# cluster-hetero keeps its behaviour because its caps file now says so.
+# AEROL_ALLOW_DISRUPTIVE still wins when the operator sets it, and
+# --no-disruptive still turns everything off.
 allow_disruptive_for() {
-  local scenario="$1"
+  local scenario="$1" caps_file="$2"
   if [[ -n "${AEROL_ALLOW_DISRUPTIVE:-}" ]]; then
     echo "$AEROL_ALLOW_DISRUPTIVE"
     return
   fi
-  if [[ "$scenario" == "cluster-hetero" && "$NO_DISRUPTIVE" != "1" ]]; then
+  if [[ "$NO_DISRUPTIVE" == "1" ]]; then
+    echo "0"
+    return
+  fi
+  if [[ -f "$caps_file" ]] && [[ "$(yq -r '.disruptive // false' "$caps_file")" == "true" ]]; then
     echo "1"
     return
   fi
@@ -1063,9 +1077,9 @@ run_one() {
 
   echo "=== running suite against ${base_url} ==="
   local allow_disruptive
-  allow_disruptive=$(allow_disruptive_for "$scenario")
+  allow_disruptive=$(allow_disruptive_for "$scenario" "$caps_file")
   if [[ "$allow_disruptive" == "1" ]]; then
-    echo "disruptive fault-injection tests enabled (UC-58b on cluster-hetero)" >&2
+    echo "disruptive fault-injection tests enabled for ${scenario} (caps: disruptive: true)" >&2
   fi
   # go test runs with cwd = the package dir (integration-tests/suite), so bench
   # artifact paths from the Makefile must be absolute or WriteFile lands under

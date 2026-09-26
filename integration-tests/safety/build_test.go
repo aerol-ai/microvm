@@ -336,3 +336,107 @@ func TestPruneBuildCacheIsNoopWhenUnderLimit(t *testing.T) {
 		}
 	}
 }
+
+// allow_disruptive_for decides whether the D-tagged use cases actually RUN.
+// It is a silent gate: harness.DisruptiveAllowed() turns a 0 into t.Skip, not
+// a failure, so getting this wrong makes a matrix go green having exercised
+// none of the failover cases — including UC-117, the case the whole
+// secrets-hardening program exists to prove. It used to key off the scenario
+// NAME, which meant every scenario except one literally called
+// "cluster-hetero" silently skipped them.
+func TestAllowDisruptiveIsDrivenByCapsNotName(t *testing.T) {
+	run := func(t *testing.T, caps string, env map[string]string, noDisruptive bool) string {
+		t.Helper()
+		dir := t.TempDir()
+		capsFile := filepath.Join(dir, "s.caps.yml")
+		if caps != "" {
+			if err := os.WriteFile(capsFile, []byte(caps), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		nd := "0"
+		if noDisruptive {
+			nd = "1"
+		}
+		script := "set -uo pipefail\nNO_DISRUPTIVE=" + nd + "\n" +
+			// Pull just the function out of run.sh; sourcing the whole script
+			// would run its argument parser and exit.
+			"eval \"$(sed -n '/^allow_disruptive_for()/,/^}/p' " + runScript(t) + ")\"\n" +
+			"allow_disruptive_for some-scenario " + capsFile
+		cmd := exec.Command("bash", "-c", script)
+		cmd.Env = append(os.Environ(), "AEROL_ALLOW_DISRUPTIVE=")
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("allow_disruptive_for: %v\n%s", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	cases := []struct {
+		name         string
+		caps         string
+		env          map[string]string
+		noDisruptive bool
+		want         string
+	}{
+		{
+			name: "caps say disruptive",
+			caps: "name: s\ncapabilities: [cluster]\ndisruptive: true\n",
+			want: "1",
+		},
+		{
+			// The regression: a scenario NOT named cluster-hetero that declares
+			// itself disruptive must now actually run the D cases.
+			name: "caps omit disruptive",
+			caps: "name: s\ncapabilities: [cluster]\n",
+			want: "0",
+		},
+		{
+			name: "explicitly false",
+			caps: "name: s\ncapabilities: [cluster]\ndisruptive: false\n",
+			want: "0",
+		},
+		{
+			// --no-disruptive must still win over the caps file.
+			name:         "no-disruptive overrides caps",
+			caps:         "name: s\ncapabilities: [cluster]\ndisruptive: true\n",
+			noDisruptive: true,
+			want:         "0",
+		},
+		{
+			// An operator export still wins over everything.
+			name: "operator export wins",
+			caps: "name: s\ncapabilities: [cluster]\n",
+			env:  map[string]string{"AEROL_ALLOW_DISRUPTIVE": "1"},
+			want: "1",
+		},
+		{
+			name: "missing caps file is not disruptive",
+			caps: "",
+			want: "0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := run(t, tc.caps, tc.env, tc.noDisruptive); got != tc.want {
+				t.Fatalf("allow_disruptive_for = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// cluster-hetero must keep the behaviour it had when the gate was a name
+// match, now declared in its caps file rather than implied by run.sh.
+func TestClusterHeteroStillDeclaresDisruptive(t *testing.T) {
+	caps := filepath.Join(filepath.Dir(runScript(t)), "scenarios", "cluster-hetero.caps.yml")
+	raw, err := os.ReadFile(caps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "disruptive: true") {
+		t.Fatal("cluster-hetero lost its disruptive declaration; its node-kill cases would silently skip")
+	}
+}
