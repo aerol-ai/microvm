@@ -590,12 +590,41 @@ cmd_publish() {
     || die "s3://${bucket} does not exist — run 'build.sh artifacts-init' once per account"
 
   local prefix="builds/${build_id}"
-  # Re-upload is skipped on an id we already published: the id IS the content
-  # hash, so identical id means identical bytes. This is what makes an iterate-
-  # against---keep loop cost nothing.
+  # Re-upload is skipped on an id we already published: the id is derived from
+  # the commit, so the same id means the same bytes for the assets that were
+  # built BOTH times. That is what makes an iterate-against---keep loop cost
+  # nothing.
+  #
+  # It is NOT enough on its own. The OPTIONAL assets (--with-receiver,
+  # --with-itest-witness, arm64) are built on demand, so the same id can name
+  # a larger artifact set than the one already in the bucket. Skipping on the
+  # id alone silently published nothing, and the failure surfaced much later
+  # and somewhere else:
+  #
+  #   publish: 12a207585609 already in s3://… — skipping upload
+  #   build.sh: --witness-daemon: sandboxd-witness_linux_amd64 is not published
+  #
+  # So the skip has to prove the bucket holds everything this build produced,
+  # not just that the id is known.
+  local missing=0 f base
   if "${AWSCLI[@]}" --region "$region" s3api head-object \
       --bucket "$bucket" --key "${prefix}/buildinfo.json" >/dev/null 2>&1; then
-    log "publish: ${build_id} already in s3://${bucket}/${prefix} — skipping upload"
+    for f in "${out}"/*; do
+      [[ -f "$f" ]] || continue
+      base="$(basename "$f")"
+      if ! "${AWSCLI[@]}" --region "$region" s3api head-object \
+          --bucket "$bucket" --key "${prefix}/${base}" >/dev/null 2>&1; then
+        log "publish: ${base} is missing from s3://${bucket}/${prefix} — re-uploading this build"
+        missing=1
+        break
+      fi
+    done
+  else
+    missing=1
+  fi
+
+  if [[ "$missing" == "0" ]]; then
+    log "publish: ${build_id} already in s3://${bucket}/${prefix} with every asset — skipping upload"
   else
     log "publish: uploading ${build_id} → s3://${bucket}/${prefix}"
     # buildinfo.json is uploaded LAST for the same reason it is written last:
