@@ -890,14 +890,27 @@ func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
 			return nil
 		}
 		nodeID := heteroNodeID(t, c, targets, node.Name)
-		if containsString(clusterNodeIDs(t, c), nodeID) {
-			// In the member list. Give gossip a beat to propagate the
-			// InternalURL before placement can pick it.
+		if !containsString(clusterNodeIDs(t, c), nodeID) {
+			last = "not in the member list yet (" + nodeID + ")"
 			time.Sleep(5 * time.Second)
-			return nil
+			continue
 		}
-		last = "not in the member list yet (" + nodeID + ")"
+		// Membership is not enough. Restarting a node can unseat the Raft
+		// LEADER, and reserving a placement is a raft write — during the
+		// election that follows, every create fails
+		// "cluster: reserve placement failed: cluster: not raft leader".
+		// The live run lost nine cases to that window, all of them creates
+		// in the test that happened to run next.
+		leader, lerr := clusterLeader(c)
+		if lerr != nil || leader == "" {
+			last = "no raft leader yet"
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		// In the member list and a leader is seated. Give gossip a beat to
+		// propagate the InternalURL before placement can pick this node.
 		time.Sleep(5 * time.Second)
+		return nil
 	}
 	return fmt.Errorf("node %s did not rejoin within 4m: %s", node.Name, last)
 }
@@ -916,4 +929,20 @@ func lastNonEmptyLineSuite(out string) string {
 		}
 	}
 	return ""
+}
+
+// clusterLeader returns the current Raft leader's node id, or "" when an
+// election is in flight. A write-bearing operation started in that window
+// fails "not raft leader" rather than waiting, so callers that just
+// restarted a node must let a leader settle first.
+func clusterLeader(c *harness.Client) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var resp struct {
+		Leader string `json:"leader"`
+	}
+	if err := c.GetJSON(ctx, "/v1/cluster/leader", &resp); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(resp.Leader), nil
 }
