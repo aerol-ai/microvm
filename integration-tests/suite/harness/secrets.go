@@ -734,3 +734,186 @@ func seedFirst(in []IntegrationNode) []IntegrationNode {
 	}
 	return append(seeds, rest...)
 }
+
+// The audit receiver (integration-tests/cmd/audit-receiver) runs as a systemd
+// unit on one node and serves HTTPS, because enterprise mode refuses a plain
+// http webhook URL.
+//
+// The suite reaches it over SSH + loopback rather than across the network.
+// That needs no security-group opening, no DNS, and no second TLS trust
+// decision in the test process — and the receiver's control endpoints
+// (/_probe, /_stats, /_chaos) are deliberately unauthenticated, so not
+// exposing them to the internet is the point.
+const (
+	receiverEnvFile  = "/etc/aerol-audit-receiver/env"
+	receiverUnitFile = "/etc/systemd/system/aerol-audit-receiver.service"
+)
+
+// FindReceiverNode returns the node running the audit receiver.
+func FindReceiverNode(t *testing.T, targets *IntegrationTargets) (IntegrationNode, bool) {
+	t.Helper()
+	if targets == nil {
+		return IntegrationNode{}, false
+	}
+	// Seed first: that is where the mixed scenarios put it.
+	for _, node := range seedFirst(targets.Nodes) {
+		target, _ := SSHTarget(node)
+		out, err := SSHRun(t, target, "test -f "+receiverUnitFile+" && echo YES || echo NO")
+		if err == nil && strings.Contains(out, "YES") {
+			return node, true
+		}
+	}
+	return IntegrationNode{}, false
+}
+
+// ReceiverRequest runs an HTTP request against the audit receiver from the
+// node it runs on. Returns the body.
+//
+// --insecure is correct here and nowhere else: the request never leaves the
+// loopback interface, and the receiver's certificate is issued for the
+// `aerol-audit-receiver` /etc/hosts alias rather than for 127.0.0.1. What is
+// being tested is the exporter's delivery, not this curl's trust chain.
+func ReceiverRequest(t *testing.T, node IntegrationNode, method, path string) (string, error) {
+	t.Helper()
+	target, ok := SSHTarget(node)
+	if !ok {
+		return "", fmt.Errorf("node %s has no SSH address", node.Name)
+	}
+	script := `sudo bash -c 'port=$(grep -o -- "--addr :[0-9]*" ` + receiverUnitFile + ` | head -1 | cut -d: -f2); ` +
+		`[ -n "$port" ] || { echo "NOPORT" >&2; exit 4; }; ` +
+		`curl -sS --insecure --max-time 30 -X ` + method + ` "https://127.0.0.1:$port` + path + `"'`
+	out, err := SSHRun(t, target, script)
+	if err != nil {
+		return out, fmt.Errorf("receiver %s %s on %s: %w (%s)", method, path, node.Name, err, strings.TrimSpace(out))
+	}
+	return out, nil
+}
+
+// ReceiverStats is GET /_stats on the audit receiver.
+type ReceiverStats struct {
+	Batches    int `json:"batches"`
+	Records    int `json:"records"`
+	Duplicates int `json:"duplicates"`
+	Rejected   int `json:"rejected"`
+	FailNext   int `json:"fail_next"`
+	Nodes      int `json:"nodes"`
+}
+
+// ReceiverStatsFor reads the receiver's counters.
+func ReceiverStatsFor(t *testing.T, node IntegrationNode) (ReceiverStats, error) {
+	t.Helper()
+	var st ReceiverStats
+	body, err := ReceiverRequest(t, node, "GET", "/_stats")
+	if err != nil {
+		return st, err
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &st); err != nil {
+		return st, fmt.Errorf("decode receiver stats %q: %w", strings.TrimSpace(body), err)
+	}
+	return st, nil
+}
+
+// ReceiverRecords reads the last n records the receiver accepted.
+func ReceiverRecords(t *testing.T, node IntegrationNode, n int) ([]auditlog.Event, error) {
+	t.Helper()
+	body, err := ReceiverRequest(t, node, "GET", "/_probe/"+strconv.Itoa(n))
+	if err != nil {
+		return nil, err
+	}
+	var out []auditlog.Event
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &out); err != nil {
+		return nil, fmt.Errorf("decode receiver records: %w", err)
+	}
+	return out, nil
+}
+
+// AwaitReceiverRecords polls until pred is satisfied by the receiver's last n
+// records, so a case asserts on delivery rather than on timing.
+func AwaitReceiverRecords(t *testing.T, node IntegrationNode, n int, timeout time.Duration, pred func([]auditlog.Event) bool) []auditlog.Event {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last []auditlog.Event
+	var lastErr error
+	for time.Now().Before(deadline) {
+		recs, err := ReceiverRecords(t, node, n)
+		if err == nil {
+			last, lastErr = recs, nil
+			if pred(recs) {
+				return recs
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(5 * time.Second)
+	}
+	if lastErr != nil {
+		t.Fatalf("the receiver never delivered records satisfying the predicate within %s; last error: %v", timeout, lastErr)
+	}
+	t.Fatalf("the receiver never delivered records satisfying the predicate within %s (%d records seen)", timeout, len(last))
+	return last
+}
+
+// PlantWitnessHead records a chain head for nodeID at the audit receiver,
+// bypassing the node that would normally report it.
+//
+// This is the only honest way to test the witness boot gate (UC-144). The
+// gate calls Witness.LastWitnessedHead at boot and refuses to start when the
+// external record disagrees with the local chain, so the fault has to be
+// injected at the witness, not at the node. Faking it with a made-up env knob
+// would produce a case that skips forever — which the plan calls the worst of
+// the available options.
+//
+// The receiver's /witness endpoint takes the bearer token only (no HMAC), and
+// the token lives in the receiver's own 0600 env file, which is why this runs
+// over SSH on the receiver's host.
+func PlantWitnessHead(t *testing.T, receiverNode IntegrationNode, nodeID, headHex string) error {
+	t.Helper()
+	target, ok := SSHTarget(receiverNode)
+	if !ok {
+		return fmt.Errorf("receiver node %s has no SSH address", receiverNode.Name)
+	}
+	body := fmt.Sprintf(`[{"NodeID":%q,"HeadHex":%q,"EventID":"itest-planted","Observed":%q}]`,
+		nodeID, headHex, time.Now().UTC().Format(time.RFC3339))
+	script := `sudo bash -c 'set -a; . ` + receiverEnvFile + `; set +a; ` +
+		`port=$(grep -o -- "--addr :[0-9]*" ` + receiverUnitFile + ` | head -1 | cut -d: -f2); ` +
+		`[ -n "$port" ] || { echo NOPORT >&2; exit 4; }; ` +
+		`curl -sS --insecure --max-time 30 -o /dev/null -w "%{http_code}" ` +
+		`-H "Authorization: Bearer $AEROL_RECEIVER_TOKEN" -H "Content-Type: application/json" ` +
+		`-X POST --data ` + shellSingleQuote(body) + ` "https://127.0.0.1:$port/witness"'`
+	out, err := SSHRun(t, target, script)
+	if err != nil {
+		return fmt.Errorf("plant witness head on %s: %w (%s)", receiverNode.Name, err, strings.TrimSpace(out))
+	}
+	if code := strings.TrimSpace(out); !strings.HasPrefix(code, "2") {
+		return fmt.Errorf("the receiver refused the planted head with status %s", code)
+	}
+	return nil
+}
+
+// WitnessedHeadFor reads what the receiver currently holds for nodeID.
+// Returns ok=false for a 404, which means "never recorded" and is distinct
+// from a transport error.
+func WitnessedHeadFor(t *testing.T, receiverNode IntegrationNode, nodeID string) (headHex string, ok bool, err error) {
+	t.Helper()
+	body, err := ReceiverRequest(t, receiverNode, "GET", "/witness/"+url.PathEscape(nodeID))
+	if err != nil {
+		return "", false, err
+	}
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" || strings.Contains(trimmed, "no head for node") {
+		return "", false, nil
+	}
+	var head struct {
+		HeadHex string `json:"HeadHex"`
+	}
+	if jerr := json.Unmarshal([]byte(trimmed), &head); jerr != nil {
+		return "", false, fmt.Errorf("decode witnessed head %q: %w", trimmed, jerr)
+	}
+	return head.HeadHex, head.HeadHex != "", nil
+}
+
+// shellSingleQuote wraps s for safe inclusion inside a single-quoted shell
+// word that is itself already inside one.
+func shellSingleQuote(s string) string {
+	return "'\"'\"'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'\"'\"'"
+}

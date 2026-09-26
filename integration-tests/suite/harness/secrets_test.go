@@ -791,3 +791,66 @@ func TestWithClusterEnvConfiguresEveryNodeThenRestoresAll(t *testing.T) {
 		t.Fatalf("restore ran on %d nodes, want 2", n)
 	}
 }
+
+// The planted witness head is built into a shell command that is already
+// inside `sudo bash -c '...'`. Getting the quoting wrong does not fail
+// loudly — it produces a malformed request, the receiver 400s, and UC-144
+// reports "the receiver refused the planted head", which reads like a
+// product problem rather than a quoting bug in this file.
+func TestShellSingleQuoteSurvivesNesting(t *testing.T) {
+	// The expansion the remote shell performs: close the outer quote, emit a
+	// literal quote, reopen. Applied twice, it wraps the payload in a
+	// single-quoted word inside the outer single-quoted word.
+	got := shellSingleQuote(`{"NodeID":"n1","HeadHex":"abc"}`)
+	if !strings.HasPrefix(got, `'"'"'`) || !strings.HasSuffix(got, `'"'"'`) {
+		t.Fatalf("not wrapped in the close/escape/reopen idiom: %s", got)
+	}
+	// Bare, unescaped single quotes inside would terminate the word early.
+	inner := strings.TrimSuffix(strings.TrimPrefix(got, `'"'"'`), `'"'"'`)
+	if strings.Contains(inner, "'") {
+		t.Fatalf("payload carries an unescaped single quote: %s", inner)
+	}
+	// A payload that itself contains a quote must survive too.
+	withQuote := shellSingleQuote(`a'b`)
+	if strings.Count(withQuote, `'"'"'`) < 3 {
+		t.Fatalf("an embedded quote was not escaped: %s", withQuote)
+	}
+}
+
+func TestReceiverStatsDecodesTheFixtureShape(t *testing.T) {
+	// Exactly what integration-tests/cmd/audit-receiver's /_stats writes.
+	const body = `{"batches":3,"records":42,"duplicates":1,"rejected":0,"fail_next":5,"nodes":2}`
+	var st ReceiverStats
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Batches != 3 || st.Records != 42 || st.Duplicates != 1 || st.Rejected != 0 || st.FailNext != 5 || st.Nodes != 2 {
+		t.Fatalf("decoded %+v", st)
+	}
+}
+
+// The receiver's /witness/{node} answers 404 with a body, which must read as
+// "never recorded" rather than as a head or an error — UC-144 branches on
+// exactly that distinction when deciding what to restore.
+func TestWitnessedHeadForDistinguishesNeverRecorded(t *testing.T) {
+	fake := &fakeSSH{}
+	prev := sshRunner
+	sshRunner = func(_ *testing.T, _, script string) (string, error) {
+		fake.mu.Lock()
+		fake.runs = append(fake.runs, script)
+		fake.mu.Unlock()
+		if strings.Contains(script, "/witness/") {
+			return "no head for node\n", nil
+		}
+		return "", nil
+	}
+	t.Cleanup(func() { sshRunner = prev })
+
+	head, ok, err := WitnessedHeadFor(t, IntegrationNode{Name: "n", PublicIP: "203.0.113.10"}, "node-a")
+	if err != nil {
+		t.Fatalf("a 404 body surfaced as an error: %v", err)
+	}
+	if ok || head != "" {
+		t.Fatalf("a 404 body decoded as a head: %q (ok=%v)", head, ok)
+	}
+}

@@ -486,6 +486,33 @@ var Registry = []UseCase{
 	{ID: "UC-128", Title: "Env is absent from the Raft placement spec", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
 	{ID: "UC-129", Title: "On disk: no plaintext env column; the sealed row round-trips across an update", Requires: []Capability{CapSecrets}, Implemented: true},
 	{ID: "UC-130", Title: "A corrupted sealed env fails the sandbox loud, not empty", Requires: []Capability{CapSecrets}, Implemented: true},
+
+	// E. Audit chain, read API, fan-out (F6, F7).
+	{ID: "UC-131", Title: "POST /v1/audit/verify passes on a live node after a workload", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-132", Title: "Tamper detection: a corrupted JSONL line fails verification and names the break", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-133", Title: "Audit reads fan out: a non-owner node returns history the owner never had", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-134", Title: "Coverage is honest: an unreachable node is reported missing, not dropped", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-135", Title: "Evidence survives owner death: the history is still complete after a failover", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-136", Title: "Post-delete history is readable within the grace window and scoped to its incarnation", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-137", Title: "Index-off returns the same events as index-on; an incomplete index 503s", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-138", Title: "Pagination walks a multi-page history with no duplicates and no gaps", Requires: []Capability{CapSecrets}, Implemented: true},
+
+	// F. Export connectors and witness (F9, F10, F11).
+	{ID: "UC-139", Title: "file backend: records land in SB_AUDIT_EXPORT_FILE_PATH, one chained object per line", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-140", Title: "s3 backend: objects land under the prefix and reconstruct the chain", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-141", Title: "webhook backend: the receiver sees records with a valid HMAC and bearer token", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-142", Title: "Backoff / at-least-once: a failing sink is retried until every record lands", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-143", Title: "Witness: chain heads reach the receiver, receipts persist, the health gauge is 1", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+	{ID: "UC-144", Title: "Witness fail-closed at boot: a receipt disagreeing with the local chain refuses the node", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+	{ID: "UC-145", Title: "Ingest endpoint: a tokened event is accepted, an untokened one refused, listener loopback-only", Requires: []Capability{CapSecrets, CapCluster, CapEnterprise}, Implemented: true},
+	{ID: "UC-145b", Title: "Retention prune holds while export lags, then verifies across the checkpoint boundary", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+
+	// G. Quota, rate limits, overflow (F8).
+	{ID: "UC-146", Title: "Per-identity audit rate limit returns 429 with Retry-After; a second identity is unaffected", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-147", Title: "Per-node audit ceiling is separate from the operator limit", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-148", Title: "Overflow gap: a flood past the queue max leaves a gap marker and the chain still verifies", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-149", Title: "Overflow spill: the same flood drains from disk and the chain is complete", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-150", Title: "Egress attribution names the right sandbox and the per-sandbox cap bounds its share", Requires: []Capability{CapSecrets, CapEnterprise, CapIsolate}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

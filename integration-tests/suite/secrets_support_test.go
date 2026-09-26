@@ -8,12 +8,15 @@ package suite
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -380,4 +383,196 @@ func redactedKeys(env map[string]string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// containsString is slices.Contains, named for readability at the call sites
+// where the haystack is a coverage list.
+func containsString(xs []string, want string) bool { return slices.Contains(xs, want) }
+
+// sameEventIDs compares two histories by event id. Order is not asserted —
+// the fan-out merge is free to interleave — but the SET must match, which is
+// what "the same history" means.
+func sameEventIDs(a, b []auditlog.Event) bool {
+	ids := func(evs []auditlog.Event) map[string]bool {
+		m := make(map[string]bool, len(evs))
+		for _, ev := range evs {
+			if ev.EventID != "" {
+				m[ev.EventID] = true
+			}
+		}
+		return m
+	}
+	am, bm := ids(a), ids(b)
+	if len(am) != len(bm) {
+		return false
+	}
+	for id := range am {
+		if !bm[id] {
+			return false
+		}
+	}
+	return true
+}
+
+// auditLogPath is where the node keeps its hash-chained evidence.
+// The audit directory is the DB's directory: internal/service derives it with
+// secretAuditDataDir(cfg.DBPath). There is no SB_SECRET_AUDIT_DIR — an early
+// draft assumed one, which would have pointed every script below at a path
+// that does not exist and turned four cases into silent skips.
+const auditLogScript = sqliteSourceEnv +
+	`db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; dir=$(dirname "$db"); log="$dir/secrets.jsonl"; `
+
+// tamperMiddleAuditLineScript edits a line in the MIDDLE of the chain and
+// keeps a pristine copy alongside.
+//
+// The middle matters. A tail edit is indistinguishable from a torn write
+// after a crash — which the product deliberately tolerates and records as a
+// gap — so tampering with the tail would assert nothing about tamper
+// detection.
+const tamperMiddleAuditLineScript = `sudo bash -c '` + auditLogScript +
+	`n=$(wc -l < "$log" 2>/dev/null || echo 0); ` +
+	`[ "$n" -ge 4 ] || { echo TOOSHORT; exit 0; }; ` +
+	`cp -a "$log" "$log.itest-backup"; ` +
+	`mid=$(( n / 2 )); ` +
+	`awk -v m="$mid" '"'"'NR==m { sub(/"reason":"/, "\"reason\":\"tampered-"); } { print }'"'"' "$log.itest-backup" > "$log.tmp" && ` +
+	`cat "$log.tmp" > "$log" && rm -f "$log.tmp" && echo TAMPERED'`
+
+// restoreTamperedAuditLogScript puts the pristine copy back. Writing through
+// the existing inode (cat >, not mv) because the daemon holds the file open:
+// a rename would leave it appending to an unlinked inode.
+const restoreTamperedAuditLogScript = `sudo bash -c '` + auditLogScript +
+	`[ -f "$log.itest-backup" ] || { echo NOBACKUP; exit 0; }; ` +
+	`cat "$log.itest-backup" > "$log" && rm -f "$log.itest-backup" && echo RESTORED'`
+
+// missingEventIDs returns the ids present in before but absent from after.
+func missingEventIDs(before, after []auditlog.Event) []string {
+	have := make(map[string]bool, len(after))
+	for _, ev := range after {
+		if ev.EventID != "" {
+			have[ev.EventID] = true
+		}
+	}
+	var missing []string
+	for _, ev := range before {
+		if ev.EventID != "" && !have[ev.EventID] {
+			missing = append(missing, ev.EventID)
+		}
+	}
+	return missing
+}
+
+func firstN(xs []string, n int) []string {
+	if len(xs) > n {
+		return xs[:n]
+	}
+	return xs
+}
+
+// pickNonSeedNode prefers a joiner. Refusing the seed's boot on a cluster
+// costs the rendezvous every joiner needs to rejoin, which turns one red case
+// into a split cluster.
+func pickNonSeedNode(targets *harness.IntegrationTargets) (harness.IntegrationNode, bool) {
+	if targets == nil {
+		return harness.IntegrationNode{}, false
+	}
+	for _, n := range targets.Nodes {
+		if n.Seed {
+			continue
+		}
+		if _, ok := harness.SSHTarget(n); ok {
+			return n, true
+		}
+	}
+	return harness.IntegrationNode{}, false
+}
+
+// witnessReceiptScript reports whether a witness receipt is on disk. The
+// receipt is the proof that survives a restart; a witness that ships heads
+// but persists nothing loses the evidence the moment the node reboots.
+const witnessReceiptScript = `sudo bash -c '` + auditLogScript +
+	`if [ -s "$dir/witness_receipts.jsonl" ] || [ -s "$dir/witness_tip.json" ]; then echo FOUND; else echo MISSING; fi'`
+
+// auditIngestBindScript prints the address the ingest listener is bound to,
+// or NONE when it is not configured.
+const auditIngestBindScript = `sudo bash -c '` + sqliteSourceEnv +
+	`p="${SB_AUDIT_INGEST_PORT:-0}"; ` +
+	`[ "$p" != "0" ] || { echo NONE; exit 0; }; ` +
+	`ss -ltn 2>/dev/null | awk -v p=":$p" '"'"'$4 ~ p"$" { print $4; found=1 } END { if (!found) print "NONE" }'"'"' | head -1'`
+
+// auditIngestUntokenedScript POSTs an event with no token and prints the
+// status. Run on the node because the listener is (and must be) loopback.
+const auditIngestUntokenedScript = `sudo bash -c '` + sqliteSourceEnv +
+	`p="${SB_AUDIT_INGEST_PORT:-0}"; ` +
+	`[ "$p" != "0" ] || { echo NONE; exit 0; }; ` +
+	`curl -sS -o /dev/null -w "%{http_code}" --max-time 20 -X POST ` +
+	`-H "Content-Type: application/json" --data "{\\"kind\\":\\"egress\\",\\"sandbox_id\\":\\"itest-forged\\"}" ` +
+	`"http://127.0.0.1:$p/audit/events"'`
+
+// envOr reads an environment variable with a default.
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+// assertChainedJSONL checks that an exported stream is one JSON object per
+// line, each carrying the chain links, and that none of it contains the
+// secret. An export that ships unchained records is an export whose contents
+// cannot be shown to be complete.
+func assertChainedJSONL(t *testing.T, what, body, secret string) {
+	t.Helper()
+	harness.AssertNoPlaintext(t, what, body, secret)
+
+	lines := 0
+	chained := 0
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lines++
+		var ev auditlog.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("%s: line %d is not one JSON object per line: %v", what, lines, err)
+		}
+		if ev.EventHash != "" && ev.PrevHash != "" {
+			chained++
+		}
+	}
+	if lines == 0 {
+		t.Fatalf("%s contained no records", what)
+	}
+	if chained == 0 {
+		t.Fatalf("%s delivered %d records and NONE carried chain links; the export cannot be shown to be complete", what, lines)
+	}
+}
+
+// assertExpvarEquals reads /v1/metrics and asserts a gauge's value. The gauge
+// is what an operator alerts on: a subsystem that works while reporting
+// unhealthy is a page that fires forever, and one that fails while reporting
+// healthy is a page that never fires.
+func assertExpvarEquals(t *testing.T, c *harness.Client, name string, want int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	body, err := c.GetText(ctx, "/v1/metrics")
+	if err != nil {
+		t.Fatalf("read /v1/metrics: %v", err)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, name) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[len(fields)-1] == strconv.Itoa(want) {
+			return
+		}
+		t.Fatalf("%s = %s, want %d", name, fields[len(fields)-1], want)
+	}
+	t.Fatalf("%s is not exported by /v1/metrics at all; there is nothing for an operator to alert on", name)
 }
