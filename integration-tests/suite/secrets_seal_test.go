@@ -281,7 +281,9 @@ func TestPeerSecretPushRefusesAForeignIdentity(t *testing.T) {
 
 	// Sanity: with the node's own certificate the same request is served, so a
 	// refusal below is about the identity and not about the URL being wrong.
-	if probe := harness.ProbePeerSecret(t, node, view); probe.Err != nil {
+	if probe := harness.ProbePeerSecret(t, node, view); probe.HandshakeRejected {
+		t.Fatalf("the node's OWN certificate was rejected at the TLS handshake; this case cannot distinguish a refused identity from a broken probe")
+	} else if probe.Err != nil {
 		t.Fatalf("control probe with the node's own certificate failed: %v", probe.Err)
 	} else if probe.Status == 403 || probe.Status == 401 {
 		t.Fatalf("the node's OWN certificate was refused (%d); this case cannot distinguish identity from URL", probe.Status)
@@ -296,6 +298,17 @@ func TestPeerSecretPushRefusesAForeignIdentity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			probe := harness.ProbePeerSecretUnauthenticated(t, node, view, tc.bearer)
+
+			// Refusal at the TLS layer is the STRONGEST outcome: the server
+			// demanded a client certificate, got none, and tore the
+			// connection down before any request was served. curl reports
+			// exit 56 and no HTTP status, which the first version of this
+			// case treated as a broken probe — so the product doing exactly
+			// the right thing read as a test error.
+			if probe.HandshakeRejected {
+				t.Logf("UC-114 PASS (%s): refused at the TLS handshake, below HTTP entirely", tc.name)
+				return
+			}
 			if probe.Err != nil {
 				t.Fatalf("probe: %v", probe.Err)
 			}
@@ -305,6 +318,7 @@ func TestPeerSecretPushRefusesAForeignIdentity(t *testing.T) {
 			if probe.Status == 404 {
 				t.Fatalf("the route answered 404 for %s; a missing-route answer would hide a missing authz check", tc.name)
 			}
+			t.Logf("UC-114 PASS (%s): refused with status %d", tc.name, probe.Status)
 		})
 	}
 }

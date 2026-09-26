@@ -300,13 +300,25 @@ func (c *Client) AuditPageFor(ctx context.Context, sandboxID string, q AuditQuer
 // AuditEvents is the fatal wrapper around AuditPageFor.
 func AuditEvents(t *testing.T, c *Client, sandboxID string, q AuditQuery) AuditPage {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	page, err := c.AuditPageFor(ctx, sandboxID, q)
+	page, err := TryAuditEvents(c, sandboxID, q)
 	if err != nil {
 		t.Fatalf("read audit events for %s: %v", sandboxID, err)
 	}
 	return page
+}
+
+// TryAuditEvents is AuditEvents without the t.Fatal, for callers polling
+// through a fault they injected themselves.
+//
+// UC-134 stops a node and then reads audit coverage. The ingress can briefly
+// answer 502 while it still holds a route to the machine that just went away
+// — an artifact of the fault, not the audit read being dishonest, which is
+// the only thing UC-134 asserts. Fataling on the first 502 failed the case
+// 15s into a 3-minute poll and blamed audit for an ingress hiccup.
+func TryAuditEvents(c *Client, sandboxID string, q AuditQuery) (AuditPage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return c.AuditPageFor(ctx, sandboxID, q)
 }
 
 // AllAuditPages walks every page via next_cursor and returns the flattened
@@ -708,6 +720,15 @@ type PeerSecretProbe struct {
 	Node   string
 	Status int
 	Err    error
+	// HandshakeRejected means the connection was torn down before any HTTP
+	// status existed — the server demanded a client certificate and got
+	// none, so mTLS refused at the transport layer.
+	//
+	// For an AUTHENTICATED probe that is a failure (our own certificate
+	// should work). For UC-114 it is the PASS: a refusal delivered below
+	// HTTP is stronger than a 403, and treating it as a probe error hid
+	// the product doing exactly the right thing.
+	HandshakeRejected bool
 }
 
 // Present reports whether the node holds a copy. The route answers 200/204 for
@@ -753,6 +774,22 @@ const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/sandboxd.env 2
 const peerProbeCredentials = `-H "Authorization: Bearer $SB_PAT_TOKEN" ` +
 	`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" `
 
+// probeCurlSuffix closes the `bash -c` and appends curl's OWN exit code.
+//
+// A refused TLS handshake and a broken probe both produce http_code 000 with
+// empty-ish output, and only the first is a pass for UC-114. Guessing from
+// emptiness would let `curl: command not found` read as "the server refused
+// me" — the exact false pass this suite exists to prevent. curl's exit code
+// separates them without ambiguity: 35/56/58/60 are TLS/connection failures,
+// 127/2 are a broken invocation.
+const probeCurlSuffix = `; printf "|%s\n" "$?"'`
+
+// curlTLSRejectionExits are the exit codes that mean "the peer would not
+// complete a TLS conversation with this identity". 56 (failure receiving
+// network data) is what a server demanding a client certificate produces
+// when none is offered: it tears the connection down mid-handshake.
+var curlTLSRejectionExits = map[int]bool{35: true, 56: true, 58: true, 60: true, 77: true}
+
 // ProbePeerSecret asks node whether it holds the sealed row for a sandbox at
 // or above minGeneration.
 //
@@ -782,7 +819,7 @@ func ProbePeerSecret(t *testing.T, node IntegrationNode, view SecretHoldersView)
 	}
 	q := fmt.Sprintf("?min_generation=%d&incarnation_id=%s", gen, url.QueryEscape(view.IncarnationID))
 	script := internalCurlPrefix + peerProbeCredentials +
-		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"'`
+		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"` + probeCurlSuffix
 	out, err := SSHRun(t, target, script)
 	return peerProbeFromOutput(node.Name, out, err)
 }
@@ -804,7 +841,7 @@ func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, view Sec
 	}
 	q := fmt.Sprintf("?min_generation=%d&incarnation_id=%s", maxInt64(view.SealGeneration, 1), url.QueryEscape(view.IncarnationID))
 	script := internalCurlPrefix + `--cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` + auth +
-		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"'`
+		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"` + probeCurlSuffix
 	out, err := SSHRun(t, target, script)
 	return peerProbeFromOutput(node.Name, out, err)
 }
@@ -820,21 +857,46 @@ func peerProbeFromOutput(nodeName, out string, err error) PeerSecretProbe {
 		}
 		return p
 	}
-	code, convErr := strconv.Atoi(fields[len(fields)-1])
+
+	// The last field is "<http_code>|<curl exit>". Older output without the
+	// exit code still parses as a bare status, so a stale script degrades to
+	// the previous behaviour rather than silently reporting a refusal.
+	last := fields[len(fields)-1]
+	curlExit := -1
+	if bar := strings.LastIndex(last, "|"); bar >= 0 {
+		if rc, convErr := strconv.Atoi(last[bar+1:]); convErr == nil {
+			curlExit = rc
+		}
+		last = last[:bar]
+	}
+
+	code, convErr := strconv.Atoi(last)
 	if convErr != nil {
 		if p.Err == nil {
-			p.Err = fmt.Errorf("peer probe on %s: unparsable status %q (output %q)", nodeName, fields[len(fields)-1], out)
+			p.Err = fmt.Errorf("peer probe on %s: unparsable status %q (output %q)", nodeName, last, out)
 		}
 		return p
 	}
 	p.Status = code
-	if code == 0 && p.Err == nil {
-		p.Err = fmt.Errorf("peer probe on %s could not connect (curl status 0)", nodeName)
-	}
+
 	if code != 0 {
 		// A transport error alongside a real HTTP status is curl's exit code
 		// for the status itself; the status is the answer.
 		p.Err = nil
+		return p
+	}
+
+	// No HTTP status came back. Whether that is a refusal or a broken probe
+	// is curl's exit code to say, not ours to infer.
+	if curlTLSRejectionExits[curlExit] {
+		p.HandshakeRejected = true
+		if p.Err == nil {
+			p.Err = fmt.Errorf("peer probe on %s: TLS refused (curl exit %d)", nodeName, curlExit)
+		}
+		return p
+	}
+	if p.Err == nil {
+		p.Err = fmt.Errorf("peer probe on %s could not connect (curl exit %d, no HTTP status)", nodeName, curlExit)
 	}
 	return p
 }

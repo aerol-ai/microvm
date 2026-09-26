@@ -141,8 +141,19 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 
 	// Give gossip a moment, then read again.
 	deadline := time.Now().Add(3 * time.Minute)
+	var lastErr error
 	for time.Now().Before(deadline) {
-		page := harness.AuditEvents(t, c, sb.ID, harness.AuditQuery{Limit: 100})
+		page, err := harness.TryAuditEvents(c, sb.ID, harness.AuditQuery{Limit: 100})
+		if err != nil {
+			// We just stopped a node. A gateway that still holds a route to
+			// it answers 502 for a few seconds; that is the fault we
+			// injected talking, not the audit read. Keep polling — if it
+			// never clears, the deadline below fails with this error.
+			lastErr = err
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		lastErr = nil
 		if page.Coverage.Partial && len(page.Coverage.Missing) > 0 {
 			t.Logf("UC-134 PASS: coverage reports %v missing while %v answered", page.Coverage.Missing, page.Coverage.Answered)
 			return
@@ -152,6 +163,10 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 				full.Coverage.Answered, page.Coverage.Answered)
 		}
 		time.Sleep(10 * time.Second)
+	}
+	if lastErr != nil {
+		t.Fatalf("the audit read never succeeded after stopping %s (last error: %v): coverage honesty could not be observed because the read itself never came back",
+			victim.Name, lastErr)
 	}
 	t.Fatalf("a stopped node never appeared in coverage.missing; the read never admitted it could not ask everyone")
 }
