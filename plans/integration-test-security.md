@@ -996,6 +996,34 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 | UC-154 | Operator-only routes (`/v1/cluster/internal/*`, `/v1/audit/verify`, storage-retirement) reject a tenant-scoped token with 403 and accept the fleet PAT | S |
 | UC-155 | Removed peer is **revoked**: drain + remove a node, then replay its client cert → refused | M,C,D |
 
+> **T14 IMPLEMENTATION FINDINGS (outside voice, verified 2026-09-26).**
+>
+> - **UC-158 and UC-159 are folded into UC-156's matrix, not separate tests.**
+>   The off-node-exporter refusal (`daemon.go:326`) is one more forbidden row,
+>   and "the matrix must not leave the fleet degraded" is a property of EVERY
+>   row — asserting it once at the end cannot attribute the damage to the row
+>   that caused it, and every row after that one would then fail for a reason
+>   unrelated to what it tests. `assertNodeBackInService` runs after each row
+>   and checks both "the unit is active" AND "the node is back in the member
+>   list", because a node that is running but out of the member list is
+>   exactly the 2+1 split this project has produced before.
+> - **Every gate row asserts the MESSAGE, not just the refusal.** A bad
+>   binary, a full disk or a bound port also make a node fail to start, so a
+>   matrix that checked only `Started == false` would go green having proven
+>   nothing. The `want` fragments are lifted from `config.go`'s enterprise
+>   block and `daemon.go`, not invented.
+> - **Group I prefers a joiner over the seed.** Refusing the seed's boot on a
+>   cluster removes the rendezvous every joiner needs, which turns one red row
+>   into a split cluster.
+> - **UC-153 forges a certificate with a VALID `node:<id>` SAN on an untrusted
+>   issuer.** That is the forgery that distinguishes "does the server check the
+>   name?" from "does the server check who SIGNED the name?" — only the second
+>   is an identity check.
+> - **UC-154's negative half needs a tenant-scoped token the suite cannot
+>   mint.** It runs the PAT-acceptance half unconditionally and logs plainly
+>   that the tenant-refusal half did not run unless `AEROL_TENANT_TOKEN` is
+>   set, rather than reporting a pass for an assertion it skipped.
+
 ### I. Enterprise profile (F14)
 
 | UC | Assertion | Caps |
