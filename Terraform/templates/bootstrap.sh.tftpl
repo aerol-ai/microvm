@@ -944,6 +944,13 @@ SB_SECRET_AUDIT_EXPORT_URL=${audit_receiver_endpoint}/audit
 SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN=${audit_receiver_token}
 SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=${audit_receiver_hmac_key}
 SB_AUDIT_EXPORT_WEBHOOK_CA_FILE=/etc/sandboxd/audit-receiver-ca.pem
+# Consumed ONLY by a daemon built with -tags itestwitness, which is how an
+# enterprise scenario gets the non-noop controlplane.Witness that pkg/daemon
+# requires. A stock sandboxd ignores these two entirely, so setting them
+# unconditionally costs nothing and keeps the enterprise and non-enterprise
+# renders identical.
+AEROL_ITEST_WITNESS_URL=${audit_receiver_endpoint}
+AEROL_ITEST_WITNESS_TOKEN=${audit_receiver_token}
 %{ endif ~}
 %{ if audit_export_backend != "" ~}
 # Managed by Terraform bootstrap: audit export sink.
