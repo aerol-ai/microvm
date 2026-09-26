@@ -166,6 +166,10 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", op(http.HandlerFunc(h.clusterRemoveMember)))
 	mux.Handle("GET "+PathPrefix+"/cluster/leader", op(http.HandlerFunc(h.clusterLeader)))
 	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", op(http.HandlerFunc(h.clusterPlacement)))
+	// Operator-only, like every other /cluster route: the recipient set names
+	// which nodes hold a tenant's sealed secret, which is fleet topology a
+	// tenant token must not read.
+	mux.Handle("GET "+PathPrefix+"/cluster/sandboxes/{id}/secret-holders", op(http.HandlerFunc(h.clusterSecretHolders)))
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
 	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
