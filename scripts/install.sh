@@ -1236,19 +1236,43 @@ install_amd_gpu() {
 	echo "Verify with: rocm-smi"
 }
 
-install_runsc_binary() {
-	# Download the latest runsc release from gVisor's official storage bucket
-	# and install it to /usr/local/bin. The bucket layout is:
-	#   storage.googleapis.com/gvisor/releases/release/latest/<arch>/{runsc,runsc.sha512}
-	# where <arch> is x86_64 or aarch64. We verify the SHA-512 published next
-	# to the binary before installing — the upstream-recommended pattern from
-	# https://gvisor.dev/docs/user_guide/install/.
+# gvisor_fetch_release downloads and verifies the gVisor release tarball ONCE
+# per install, extracting it into a shared directory both installers read.
+#
+# Upstream changed its release layout: the bucket no longer publishes bare
+# runsc / containerd-shim-runsc-v1 objects, only
+#   releases/release/latest/<arch>/gvisor.tar.{bz2,zstd}(.sha512)
+# so every `--with-gvisor` install failed at download with a plain 404:
+#
+#   curl: (22) The requested URL returned error: 404
+#   --with-gvisor: failed to download runsc from .../latest/x86_64/runsc
+#
+# install.sh exits on that, so sandboxd was never installed at all on a
+# gvisor node. It took out all four workers of an 8-node scenario while the
+# servers — which do not set with_gvisor — came up fine, so the cluster
+# reported "expected 8 members, never reached (last 4)" and looked like a
+# membership bug.
+GVISOR_RELEASE_DIR=""
+GVISOR_TMP_DIRS=()
+gvisor_cleanup_tmp() {
+	local d
+	for d in ${GVISOR_TMP_DIRS+"${GVISOR_TMP_DIRS[@]}"}; do
+		[[ -n "$d" ]] && rm -rf "$d"
+	done
+	GVISOR_TMP_DIRS=()
+}
+trap gvisor_cleanup_tmp EXIT
+
+gvisor_fetch_release() {
+	if [[ -n "$GVISOR_RELEASE_DIR" && -x "${GVISOR_RELEASE_DIR}/runsc" ]]; then
+		return 0
+	fi
 	local arch
 	case "$(uname -m)" in
 		x86_64|amd64)   arch="x86_64" ;;
 		aarch64|arm64)  arch="aarch64" ;;
 		*)
-			echo "--with-gvisor: unsupported architecture $(uname -m) for runsc" >&2
+			echo "--with-gvisor: unsupported architecture $(uname -m) for gVisor" >&2
 			exit 1
 			;;
 	esac
@@ -1256,32 +1280,58 @@ install_runsc_binary() {
 	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
-	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
-	trap "rm -rf '$tmp_dir'" RETURN
+	# Cleaned on exit rather than on RETURN: the extracted tree is shared by
+	# install_runsc_binary and install_runsc_shim, so a RETURN trap would
+	# delete it out from under the second caller. It is ~500MB extracted, on
+	# a 20GB root volume, so leaving it behind is not an option either.
+	GVISOR_TMP_DIRS+=("$tmp_dir")
 
-	echo "Downloading runsc for ${arch} from ${base}"
-	if ! curl_download "${base}/runsc" -o "${tmp_dir}/runsc"; then
-		echo "--with-gvisor: failed to download runsc from ${base}/runsc" >&2
+	echo "Downloading gVisor release for ${arch} from ${base}"
+	if ! curl_download "${base}/gvisor.tar.bz2" -o "${tmp_dir}/gvisor.tar.bz2"; then
+		echo "--with-gvisor: failed to download gvisor.tar.bz2 from ${base}/gvisor.tar.bz2" >&2
 		exit 1
 	fi
-	if ! curl_download "${base}/runsc.sha512" -o "${tmp_dir}/runsc.sha512"; then
-		echo "--with-gvisor: failed to download runsc.sha512 from ${base}/runsc.sha512" >&2
+	if ! curl_download "${base}/gvisor.tar.bz2.sha512" -o "${tmp_dir}/gvisor.tar.bz2.sha512"; then
+		echo "--with-gvisor: failed to download gvisor.tar.bz2.sha512" >&2
 		exit 1
 	fi
 
-	# gVisor's published checksum file uses the binary path under the bucket,
-	# not just the basename. Rewrite it to match what we have on disk so
-	# sha512sum -c finds the file. Format is "<hash>  <path>".
+	# The published checksum names the file as "gvisor.tar.bz2", which is what
+	# we wrote, but rewrite it anyway so a future rename upstream cannot turn
+	# verification into a silent no-op.
 	(
 		cd "$tmp_dir"
-		awk '{print $1"  runsc"}' runsc.sha512 > runsc.sha512.local
-		if ! sha512sum -c runsc.sha512.local; then
-			echo "--with-gvisor: runsc checksum verification failed" >&2
+		awk '{print $1"  gvisor.tar.bz2"}' gvisor.tar.bz2.sha512 > gvisor.sha512.local
+		if ! sha512sum -c gvisor.sha512.local; then
+			echo "--with-gvisor: gvisor.tar.bz2 checksum verification failed" >&2
 			exit 1
 		fi
 	)
 
-	install -m 0755 "${tmp_dir}/runsc" /usr/local/bin/runsc
+	if ! tar xjf "${tmp_dir}/gvisor.tar.bz2" -C "$tmp_dir"; then
+		echo "--with-gvisor: failed to extract gvisor.tar.bz2" >&2
+		exit 1
+	fi
+	# runsc now ships with a gvisor-bin/ payload beside it (gvisor_sentry,
+	# checkpointgofer, the metric server…). Installing the single binary and
+	# dropping the rest would produce a runsc that fails at first container
+	# start rather than at install time.
+	if [[ ! -x "${tmp_dir}/runsc" ]]; then
+		echo "--with-gvisor: gvisor.tar.bz2 did not contain runsc (upstream layout changed again?)" >&2
+		exit 1
+	fi
+	GVISOR_RELEASE_DIR="$tmp_dir"
+}
+
+install_runsc_binary() {
+	gvisor_fetch_release
+	install -m 0755 "${GVISOR_RELEASE_DIR}/runsc" /usr/local/bin/runsc
+	if [[ -d "${GVISOR_RELEASE_DIR}/gvisor-bin" ]]; then
+		install -d -m 0755 /usr/local/bin/gvisor-bin
+		find "${GVISOR_RELEASE_DIR}/gvisor-bin" -maxdepth 1 -type f -exec \
+			install -m 0755 {} /usr/local/bin/gvisor-bin/ \;
+		echo "Installed gVisor support binaries to /usr/local/bin/gvisor-bin"
+	fi
 	echo "Installed runsc to /usr/local/bin/runsc"
 }
 
@@ -1296,43 +1346,12 @@ install_runsc_shim() {
 		echo "containerd-shim-runsc-v1 already installed"
 		return 0
 	fi
-
-	local arch
-	case "$(uname -m)" in
-		x86_64|amd64)   arch="x86_64" ;;
-		aarch64|arm64)  arch="aarch64" ;;
-		*)
-			echo "--with-gvisor: unsupported architecture $(uname -m) for containerd-shim-runsc-v1" >&2
-			exit 1
-			;;
-	esac
-
-	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
-	local tmp_dir
-	tmp_dir="$(mktemp -d)"
-	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
-	trap "rm -rf '$tmp_dir'" RETURN
-
-	echo "Downloading containerd-shim-runsc-v1 for ${arch} from ${base}"
-	if ! curl_download "${base}/containerd-shim-runsc-v1" -o "${tmp_dir}/containerd-shim-runsc-v1"; then
-		echo "--with-gvisor: failed to download containerd-shim-runsc-v1 from ${base}/containerd-shim-runsc-v1" >&2
+	gvisor_fetch_release
+	if [[ ! -x "${GVISOR_RELEASE_DIR}/containerd-shim-runsc-v1" ]]; then
+		echo "--with-gvisor: gvisor.tar.bz2 did not contain containerd-shim-runsc-v1" >&2
 		exit 1
 	fi
-	if ! curl_download "${base}/containerd-shim-runsc-v1.sha512" -o "${tmp_dir}/containerd-shim-runsc-v1.sha512"; then
-		echo "--with-gvisor: failed to download containerd-shim-runsc-v1.sha512" >&2
-		exit 1
-	fi
-
-	(
-		cd "$tmp_dir"
-		awk '{print $1"  containerd-shim-runsc-v1"}' containerd-shim-runsc-v1.sha512 > shim.sha512.local
-		if ! sha512sum -c shim.sha512.local; then
-			echo "--with-gvisor: containerd-shim-runsc-v1 checksum verification failed" >&2
-			exit 1
-		fi
-	)
-
-	install -m 0755 "${tmp_dir}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
+	install -m 0755 "${GVISOR_RELEASE_DIR}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
 	echo "Installed containerd-shim-runsc-v1 to /usr/local/bin/containerd-shim-runsc-v1"
 }
 
