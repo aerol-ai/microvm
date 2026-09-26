@@ -472,6 +472,12 @@ func (f *fakeSSH) install(t *testing.T) {
 	t.Helper()
 	prev := sshRunner
 	sshRunner = func(_ *testing.T, _, script string) (string, error) {
+		// The reachability probe must answer, or RequireNodeSSH skips every
+		// test that uses this fake — the fake stands in for a node we CAN
+		// reach, and its unreachable counterpart is unreachableSSH below.
+		if strings.Contains(script, "aerol-ssh-ok") {
+			return "aerol-ssh-ok\n", nil
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.runs = append(f.runs, script)
@@ -480,7 +486,21 @@ func (f *fakeSSH) install(t *testing.T) {
 		}
 		return "", nil
 	}
-	t.Cleanup(func() { sshRunner = prev })
+	// The probe result is cached per target for the whole run, so a test that
+	// installs a different fake would otherwise inherit the previous one's
+	// answer.
+	resetSSHReachability()
+	t.Cleanup(func() {
+		sshRunner = prev
+		resetSSHReachability()
+	})
+}
+
+// resetSSHReachability clears the per-run probe cache. Test-only.
+func resetSSHReachability() {
+	sshReachableMu.Lock()
+	defer sshReachableMu.Unlock()
+	sshReachable = map[string]bool{}
 }
 
 func (f *fakeSSH) ran(substr string) bool {
@@ -853,4 +873,47 @@ func TestWitnessedHeadForDistinguishesNeverRecorded(t *testing.T) {
 	if ok || head != "" {
 		t.Fatalf("a 404 body decoded as a head: %q (ok=%v)", head, ok)
 	}
+}
+
+// An unreachable node must SKIP the case, not fail it: whether this machine
+// holds a key for the fleet is a fact about the operator's laptop, and a red
+// row sends whoever reads the matrix looking for a defect that is not there.
+// A silent pass would be worse still.
+func TestRequireNodeSSHSkipsWhenUnreachable(t *testing.T) {
+	prev := sshRunner
+	sshRunner = func(*testing.T, string, string) (string, error) {
+		return "Permission denied (publickey).", errors.New("exit status 255")
+	}
+	resetSSHReachability()
+	t.Cleanup(func() { sshRunner = prev; resetSSHReachability() })
+
+	// A skip is not observable from the parent, so assert the decision the
+	// skip is made from instead: the probe must report the node unreachable,
+	// and it must be cached rather than re-dialled.
+	calls := 0
+	sshRunner = func(*testing.T, string, string) (string, error) {
+		calls++
+		return "Permission denied (publickey).", errors.New("exit status 255")
+	}
+	node := IntegrationNode{Name: "node1", PublicIP: "203.0.113.10"}
+	target, _ := SSHTarget(node)
+	for i := 0; i < 3; i++ {
+		probeNodeSSH(t, target)
+	}
+	if calls != 1 {
+		t.Fatalf("the probe dialled %d times; it must be cached, or every SSH case pays the connect timeout again", calls)
+	}
+	sshReachableMu.Lock()
+	reachable := sshReachable[target]
+	sshReachableMu.Unlock()
+	if reachable {
+		t.Fatal("a node answering 'Permission denied' was recorded as reachable")
+	}
+}
+
+// And a reachable node must not skip.
+func TestRequireNodeSSHPassesWhenReachable(t *testing.T) {
+	fake := &fakeSSH{active: "active"}
+	fake.install(t)
+	RequireNodeSSH(t, IntegrationNode{Name: "node1", PublicIP: "203.0.113.10"})
 }

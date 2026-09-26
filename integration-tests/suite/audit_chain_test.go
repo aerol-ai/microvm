@@ -8,6 +8,7 @@ package suite
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,12 +170,29 @@ func TestPostDeleteAuditIsScopedToItsIncarnation(t *testing.T) {
 	// A DIFFERENT incarnation id must not see them. This is the leak: ids are
 	// reusable, so an unscoped read hands the next tenant the previous
 	// tenant's access record.
-	other := harness.AuditEvents(t, c, first.ID, harness.AuditQuery{Limit: 100, IncarnationID: firstIncarnation + "-not-mine"})
+	//
+	// Two answers are correct, and the live run showed which one the product
+	// gives: AuthorizeSandboxAuditAccess cannot match a retained ACL for an
+	// unknown incarnation, so it answers 404 "sandbox not found" — it refuses
+	// to confirm the id exists at all, which is STRONGER than an empty page
+	// and is what the one-way ACL format is for. An empty page is acceptable
+	// too. What must never come back is the first incarnation's events.
+	other, err := c.AuditPageFor(ctx, first.ID, harness.AuditQuery{Limit: 100, IncarnationID: firstIncarnation + "-not-mine"})
+	if err != nil {
+		if !strings.Contains(err.Error(), "404") {
+			t.Fatalf("a read scoped to a foreign incarnation failed with something other than a 404 refusal: %v", err)
+		}
+		t.Logf("UC-136 PASS: a foreign incarnation is refused outright (404), not merely filtered")
+		return
+	}
 	for _, ev := range other.Events {
 		if ev.IncarnationID == firstIncarnation {
 			t.Fatalf("a read scoped to a foreign incarnation returned incarnation %s's events: a recreated id leaks the previous tenant's history",
 				firstIncarnation)
 		}
+	}
+	if len(other.Events) > 0 {
+		t.Fatalf("a read scoped to a foreign incarnation returned %d events carrying no incarnation id; they cannot be shown to belong to the caller", len(other.Events))
 	}
 }
 
