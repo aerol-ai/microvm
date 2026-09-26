@@ -193,7 +193,14 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 		c.toolboxPort = port
 		c.readinessPollInit = 5 * time.Millisecond
 		c.readinessPollMax = 10 * time.Millisecond
-		c.toolboxWaitTimeout = 2 * time.Second
+		// Generous, because this test asserts WHICH arm of the race wins,
+		// not how fast it wins. Under -race the create path is several times
+		// slower and 2s was not enough for create + inspect + socket
+		// creation + the push — both arms then hit the deadline and the
+		// health arm's bare "context deadline exceeded" surfaced, which
+		// looks like a product timeout. The socket push ends the wait
+		// immediately, so a larger bound costs nothing when it works.
+		c.toolboxWaitTimeout = 30 * time.Second
 		c.httpClient = &http.Client{Transport: wrapped, Timeout: c.httpClient.Timeout}
 		c.streamClient = &http.Client{Transport: wrapped}
 	})
