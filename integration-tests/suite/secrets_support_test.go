@@ -867,6 +867,28 @@ func countGapMarkers(events []auditlog.Event) int {
 // node, TestClusterForms then saw 2 of 3 members, and 79 cases failed —
 // nearly every sandbox create in the suite, most of them nothing to do with
 // secrets.
+// restoreNodeDaemon restarts sandboxd on a node a test stopped and does not
+// return until the node is back in the cluster.
+//
+// A cleanup that only fires `systemctl start` returns in milliseconds while
+// the node takes tens of seconds to rejoin gossip and Raft. The next test
+// then runs against a fleet that is one member short without knowing it:
+// UC-134 stopped a node and failed, its cleanup "restored" it, and UC-135 —
+// which kills the owner — then waited out its full 8-minute deadline for a
+// reassignment that could not happen, and reported it as a failover bug.
+// Blaming the product for the previous test's debris is the worst kind of
+// red, because it is the kind someone acts on.
+func restoreNodeDaemon(t *testing.T, node harness.IntegrationNode, target string) {
+	t.Helper()
+	if out, err := harness.SSHRun(t, target, "sudo systemctl start sandboxd"); err != nil {
+		t.Errorf("RESTORE FAILED: sandboxd is left stopped on %s and the rest of this run is suspect: %v\n%s", node.Name, err, out)
+		return
+	}
+	if err := waitNodeRejoined(t, node); err != nil {
+		t.Errorf("RESTORE INCOMPLETE: sandboxd was restarted on %s but it did not rejoin the cluster: %v; every later case in this run is against a smaller fleet", node.Name, err)
+	}
+}
+
 func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
 	t.Helper()
 	targets := harness.LoadIntegrationTargets()

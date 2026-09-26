@@ -75,11 +75,7 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 	if out, err := harness.SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
 		t.Fatalf("stop sandboxd on %s: %v\n%s", victim.Name, err, out)
 	}
-	t.Cleanup(func() {
-		if out, err := harness.SSHRun(t, target, "sudo systemctl start sandboxd"); err != nil {
-			t.Errorf("RESTORE FAILED: sandboxd is left stopped on %s and the rest of this run is suspect: %v\n%s", victim.Name, err, out)
-		}
-	})
+	t.Cleanup(func() { restoreNodeDaemon(t, victim, target) })
 
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {

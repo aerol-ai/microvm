@@ -136,10 +136,7 @@ func (s *Service) shipSecretAuditHead(ctx context.Context) error {
 	if head == "" || head == auditlog.GenesisPrevHash {
 		return nil
 	}
-	nodeID := ""
-	if c := s.Cluster(); c != nil {
-		nodeID = c.SelfNodeID()
-	}
+	nodeID := s.witnessNodeID()
 	lastLocal, _ := lastWitnessedHead(s.secretAuditWitnessPath())
 	if tip, _ := readWitnessTip(s.secretAuditWitnessTipPath()); tip.HeadHex != "" {
 		lastLocal = tip.HeadHex
@@ -235,10 +232,7 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 		return true, scan.head, "", nil
 	}
 
-	nodeID := ""
-	if c := s.Cluster(); c != nil {
-		nodeID = c.SelfNodeID()
-	}
+	nodeID := s.witnessNodeID()
 	ctx, cancel := context.WithTimeout(context.Background(), secretAuditWitnessShipTimeout)
 	defer cancel()
 	remoteHead, remoteOK, err := w.LastWitnessedHead(ctx, nodeID)
@@ -356,10 +350,7 @@ func (s *Service) judgeWitnessAncestry(localHead, localReceipt, remoteHead strin
 // else falls back to one full probing pass.
 func (s *Service) verifySecretAuditWitnessAtBoot(w controlplane.Witness) (ok bool, localHead, witnessedHead string, err error) {
 	f := s.secretAuditFile
-	nodeID := ""
-	if c := s.Cluster(); c != nil {
-		nodeID = c.SelfNodeID()
-	}
+	nodeID := s.witnessNodeID()
 	ctx, cancel := context.WithTimeout(context.Background(), secretAuditWitnessShipTimeout)
 	defer cancel()
 	remoteHead, remoteOK, err := w.LastWitnessedHead(ctx, nodeID)
@@ -419,10 +410,7 @@ func (s *Service) requireCurrentSecretAuditWitness(ctx context.Context) (string,
 	if head == "" || head == auditlog.GenesisPrevHash {
 		return head, nil
 	}
-	nodeID := ""
-	if c := s.Cluster(); c != nil {
-		nodeID = c.SelfNodeID()
-	}
+	nodeID := s.witnessNodeID()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -436,6 +424,40 @@ func (s *Service) requireCurrentSecretAuditWitness(ctx context.Context) (string,
 		return "", fmt.Errorf("current secret audit head is not witnessed (local=%q remote=%q)", head, strings.TrimSpace(remoteHead))
 	}
 	return head, nil
+}
+
+// witnessNodeID is the identity every witness lookup and every witness ship
+// must agree on.
+//
+// It cannot come from the cluster handle. The Service is constructed with
+// cluster.NewNoop("standalone", …) and the real cluster is attached later by
+// AttachCluster, so a boot-time witness check that ran before the attach
+// queried the witness under "standalone" while the periodic shipper — which
+// always runs after — had stored the head under the real node id. The two
+// never met, and an enterprise node fails CLOSED on that mismatch:
+//
+//	secret audit witness mismatch: local_head="7334bf03…" witnessed_head=""
+//
+// with the witness holding that exact head under the right key all along.
+// It reproduced intermittently, which is worse than a hard failure: a node
+// that refuses to start only sometimes reads as flake.
+//
+// cfg.NodeID is the same value the real cluster is built from (pkg/daemon
+// passes it as cluster.Config.NodeID), so preferring it changes nothing on a
+// healthy node and removes the window entirely. The cluster handle stays as
+// the fallback for a Service configured without SB_NODE_ID, where
+// "standalone" is the correct answer rather than a race.
+func (s *Service) witnessNodeID() string {
+	if s == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(s.cfg.NodeID); id != "" {
+		return id
+	}
+	if c := s.Cluster(); c != nil {
+		return c.SelfNodeID()
+	}
+	return ""
 }
 
 // ValidateSecretAuditWitness fails closed when a real external witness is

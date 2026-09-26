@@ -71,6 +71,12 @@ func TestRemovedPeerCertificateIsRevoked(t *testing.T) {
 		if out, err := harness.SSHRun(t, target, "sudo systemctl restart sandboxd"); err != nil {
 			t.Errorf("RESTORE FAILED: %s was removed from the cluster and could not be restarted; the rest of this run is against a smaller fleet: %v\n%s",
 				victim.Name, err, out)
+			return
+		}
+		// A removed member has to re-join from scratch, so this wait matters
+		// more here than anywhere else in the suite.
+		if err := waitNodeRejoined(t, victim); err != nil {
+			t.Errorf("RESTORE INCOMPLETE: %s was restarted but never rejoined after removal: %v; every later case in this run is against a smaller fleet", victim.Name, err)
 		}
 	})
 
