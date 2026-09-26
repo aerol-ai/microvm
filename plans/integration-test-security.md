@@ -720,6 +720,46 @@ on the **ingress** node (hetero) or the seed (mixed):
 
 It is a test fixture and lives under `integration-tests/`, never in `pkg/`.
 
+### 6.4a Enterprise cannot boot the shipped binary — four stacked constraints
+
+Discovered while verifying T9 (2026-09-26). The witness is **not an HTTP
+endpoint** in the shipped build: `SB_SECRET_AUDIT_EXTERNAL_WITNESS` requires a
+non-noop `controlplane.Witness`, `cmd/sandboxd` passes `nil` to `daemon.Run`,
+so the provider is `controlplane.Noop()` and `daemon.go:293` refuses to start.
+Enterprise mode *forces* that flag (`config.go:2394`). So **S4 and S6 could not
+boot at all**, taking §7 group I, F10 and F14 with them.
+
+Resolved (user decision) with a **test-only daemon**: `cmd/sandboxd` gained a
+nil `providerFactory` var, and `provider_itest.go` — compiled only with
+`-tags itestwitness`, which nothing in the Makefile or release workflow passes
+— supplies an HTTP Witness pointed at the receiver. It lives in `package main`
+rather than a second `cmd/` so the wasm-worker, isolate-jail-shim and
+resident-host re-exec paths are shared, not duplicated. `build.sh
+--with-itest-witness` emits it as a **separate** `sandboxd-witness_linux_<arch>`
+artifact, so the default path still provisions the binary a release ships.
+
+Verified live, in order, on one box:
+
+| | |
+|---|---|
+| shipped binary + `SB_SECRET_AUDIT_EXTERNAL_WITNESS=true` | refuses: *"requires a non-noop controlplane.Witness"* |
+| tagged binary, same config | boots; head `abe49336…` appears at `/witness/<node>` |
+
+**Four constraints S4/S6 must satisfy, all measured:**
+
+1. **Non-noop witness** → the `-tags itestwitness` artifact.
+2. **`file`/`stdout` audit backends are rejected** under enterprise ("keeps
+   audit evidence on this node") → use `webhook`, `s3` or `bus`.
+3. **The webhook URL must be HTTPS** under enterprise — *"audit export webhook
+   URL must use https when SB_ENTERPRISE_MODE=true"*. **The receiver is
+   plain HTTP today, so it needs TLS before any enterprise scenario runs.**
+   This is the one piece of §6.4 still outstanding.
+4. **The witness must be on from FIRST BOOT.** Retrofitting it onto a node that
+   already has local audit history fails with
+   `witness mismatch: local_head="…" witnessed_head=""` — correct behaviour
+   (it detects a witness missing history), but it means the scenario must
+   configure the witness in the initial bootstrap, never flip it on later.
+
 ---
 
 ## 7. Phase 4 — use cases
@@ -1077,7 +1117,7 @@ and verified, not merely that code was written.
 | T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | **DONE** 2026-09-23 — global `extra_sandboxd_env` merged under each node's `sandboxd_env`, rendered into `cluster.env` **before** the final `systemctl restart sandboxd` (asserted by an offline render test, which also fails if the block moves after the restart). |
 | T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | **DONE** 2026-09-23 — real CMK `cd1a8f8c` + `alias/aerolvm-itest-single-node-secrets`. **Boots:** `secret provider boot canary ok provider=awskms`, strict boot on, 0 restarts. **Seals:** env set at create is withheld from the default read (`{}`); `?include_env=true` returned it decrypted, and the audit chain recorded the opt-in with the exact `correlation_id` sent. Full suite **pass 58 · fail 0 · skip 55 · 0 inconclusive** with the provider active. |
 | T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | **DONE** 2026-09-23 — **exit criterion corrected**: a node exports to exactly ONE backend, so "both" is proven by flipping the backend on one box, not by running both at once. **s3:** records at `aerolvm-itest-single-node/node=<id>/2026/09/25/<batch>.jsonl` carrying the exact `correlation_id` sent. **file:** `/var/log/aerol-audit-export.jsonl` (0600 root) grew 1130→1673 bytes with the event. Clean suite re-run **pass 58 · fail 0 · 0 inconclusive** with KMS + s3 export both active. |
-| T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | |
+| T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | **DONE** 2026-09-26 — all three verified live. **webhook:** backend resolved to `webhook` from the export URL alone, 5 batches / 0 rejected (so bearer + HMAC verified). **witness:** head `abe49336…` recorded and returned by `/witness/<SB_NODE_ID>`. **chaos:** `fail_next=3` consumed as 503s, then the exporter backed off and redelivered (`batches` 3→4). Needed a `-tags itestwitness` daemon — see §6.4a. |
 | T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | |
 | T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable | |
 | T11 | `harness/secrets.go` helpers (§7.1) | T10, T10b | `WithNodeEnv` always restores on failure; `SecretHolders()` works | |
