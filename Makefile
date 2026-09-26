@@ -16,7 +16,10 @@ BIN_DIR ?= bin
 	integration-benchmark-gvisor-docker integration-benchmark-gvisor-docker-only \
 	integration-single-fc integration-benchmark-fc-single integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
 	integration-cert-store-init integration-clear-lease \
-	itest-build itest-publish itest-artifacts-init
+	itest-build itest-publish itest-artifacts-init \
+	integration-secrets-single integration-secrets-cluster integration-secrets-kms \
+	integration-secrets-enterprise integration-secrets-hetero integration-secrets-hetero-kms \
+	integration-secrets-gate integration-bench-cluster
 
 fmt:
 	$(GO) fmt ./...
@@ -122,6 +125,38 @@ itest-build:
 # terraform apply. Scenarios do this for themselves.
 itest-publish:
 	@integration-tests/lib/build.sh publish $(BUILD_FLAGS)
+
+# Security matrix (plans/integration-test-security.md §6.2). Cadence: the gate
+# (S1→S4, ~$0.75, ~1.5h) every push; the flagship (S5+S6, ~$28, ~2h) once
+# pre-merge and after any internal/cluster, fan-out or reseal change.
+integration-secrets-single:
+	integration-tests/run.sh single-node-secrets $(RUN_FLAGS)
+
+integration-secrets-cluster:
+	integration-tests/run.sh cluster-3-mixed-secrets $(RUN_FLAGS)
+
+integration-secrets-kms:
+	integration-tests/run.sh cluster-3-mixed-secrets-kms $(RUN_FLAGS)
+
+integration-secrets-enterprise:
+	integration-tests/run.sh cluster-3-mixed-secrets-enterprise $(RUN_FLAGS)
+
+# S1→S4 in order, cheapest first: a red S1 means the cluster scenarios are not
+# worth paying for. Sequential on purpose — they share the domain pool.
+integration-secrets-gate: integration-secrets-single integration-secrets-cluster integration-secrets-kms integration-secrets-enterprise
+
+# Flagship. 8 nodes including a c5.metal, on-demand (spot reclaim makes
+# multi-node convergence flaky and metal exceeds the spot quota).
+integration-secrets-hetero:
+	integration-tests/run.sh cluster-hetero-secrets $(RUN_FLAGS)
+
+integration-secrets-hetero-kms:
+	integration-tests/run.sh cluster-hetero-secrets-kms $(RUN_FLAGS)
+
+# The latency arm UC-165's band is measured against (D5: baseline is
+# main-built binaries via `make itest-build BUILD_FLAGS="--ref main"`).
+integration-bench-cluster:
+	AEROL_BENCH=1 integration-tests/run.sh cluster-3-mixed-bench $(RUN_FLAGS)
 
 integration-local:
 	integration-tests/run.sh local-mode $(RUN_FLAGS)

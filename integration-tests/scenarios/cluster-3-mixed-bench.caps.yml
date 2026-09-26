@@ -1,0 +1,13 @@
+name: cluster-3-mixed-bench
+capabilities:
+  - docker
+  - platform-volumes
+  - domain
+  - cluster
+  # Enables the create-latency and density cases (UC-94/UC-95) that the
+  # security band in UC-165 is measured against.
+  - benchmark
+#
+# Never disruptive: killing a node mid-benchmark would poison the latency
+# distribution the whole arm exists to measure.
+disruptive: false

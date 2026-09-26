@@ -22,6 +22,10 @@
 #            cluster-3-mixed-gvisor | cluster-3-mixed-gvisor-docker |
 #            cluster-3-mixed-wasm | cluster-hetero |
 #            single-node-fc | single-node-fc-arm64 | cluster-arm64
+# Security matrix (§6.2): single-node-secrets | cluster-3-mixed-secrets |
+#            cluster-3-mixed-secrets-kms | cluster-3-mixed-secrets-enterprise |
+#            cluster-hetero-secrets | cluster-hetero-secrets-kms |
+#            cluster-3-mixed-bench
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -620,6 +624,18 @@ prepare_artifacts() {
   out="$(artifacts_tfvars_path "$scenario")"
   mkdir -p "$(dirname "$out")"
 
+  # A scenario that advertises audit-witness needs the -tags itestwitness
+  # daemon: enterprise forces SB_SECRET_AUDIT_EXTERNAL_WITNESS and pkg/daemon
+  # refuses to boot without a non-noop controlplane.Witness. Derived from the
+  # capability rather than a separate knob, so the scenario cannot claim the
+  # capability and silently get a daemon that cannot honour it.
+  local witness_flag=()
+  local caps="${HERE}/scenarios/${scenario}.caps.yml"
+  if [[ -f "$caps" ]] && yq -r '.capabilities | contains(["audit-witness"])' "$caps" | grep -q true; then
+    witness_flag=(--witness-daemon)
+    echo "scenario ${scenario} advertises audit-witness: using the -tags itestwitness daemon" >&2
+  fi
+
   case "$BUILD_MODE" in
     released)
       # No override file at all: Terraform's defaults already point at
@@ -655,15 +671,15 @@ EOF
   if [[ "$NO_BUILD" == "1" ]]; then
     build_id=$("$BUILD_SH" build-id)
     echo "=== artifacts: reusing published build ${build_id} (--no-build) ==="
-    "$BUILD_SH" urls >"$out"
+    "$BUILD_SH" urls --with-receiver "${witness_flag[@]}" >"$out"
   else
     echo "=== artifacts: building locally ==="
     # --with-receiver on every build: the fixture is CGO-free and adds ~2s, and
     # the alternative is a scenario that enables the receiver discovering at
     # apply time that this build did not produce one. Skipped automatically on
     # refs that predate it.
-    build_id=$("$BUILD_SH" build --with-receiver)
-    "$BUILD_SH" publish >"$out"
+    build_id=$("$BUILD_SH" build --with-receiver "${witness_flag[@]}")
+    "$BUILD_SH" publish --with-receiver "${witness_flag[@]}" >"$out"
   fi
 
   export AEROL_BUILD_MODE="local"
