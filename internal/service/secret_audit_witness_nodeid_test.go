@@ -1,13 +1,16 @@
 package service
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // TestWitnessNodeIDPrefersTheConfiguredIdentity pins the fix for an
@@ -66,21 +69,126 @@ func TestWitnessNodeIDIgnoresBlankConfiguredID(t *testing.T) {
 	}
 }
 
-// Every witness call site must go through the helper. A new one that reads
-// s.Cluster().SelfNodeID() directly reintroduces exactly this bug, and it
-// would only show up as an intermittent refusal to boot on a live node.
+// Only the two designated helpers may touch the cluster handle. Any other
+// witness call site that reads s.Cluster().SelfNodeID() reintroduces exactly
+// this bug, and it would show up only as an intermittent refusal to boot on
+// a live node.
 func TestNoWitnessCallSiteReadsTheClusterHandleDirectly(t *testing.T) {
 	raw, err := os.ReadFile("secret_audit_witness.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	src := string(raw)
+
+	allowed := []string{
+		"func (s *Service) witnessNodeID()",
+		"func (s *Service) witnessNodeIDCandidates()",
+	}
 	body := src
-	if i := strings.Index(src, "func (s *Service) witnessNodeID()"); i >= 0 {
-		end := strings.Index(src[i:], "\n}\n")
-		body = src[:i] + src[i+end:]
+	stripped := 0
+	for _, sig := range allowed {
+		i := strings.Index(body, sig)
+		if i < 0 {
+			t.Fatalf("%s is gone; this guard no longer checks what it claims to", sig)
+		}
+		end := strings.Index(body[i:], "\n}\n")
+		if end < 0 {
+			t.Fatalf("could not delimit %s", sig)
+		}
+		body = body[:i] + body[i+end:]
+		stripped++
 	}
-	if strings.Contains(body, "c.SelfNodeID()") {
-		t.Fatal("a witness call site derives the node id from the cluster handle again; use witnessNodeID() — the handle is the Noop's \"standalone\" until AttachCluster runs")
+	if stripped != len(allowed) {
+		t.Fatalf("stripped %d of %d helpers", stripped, len(allowed))
 	}
+	if strings.Contains(body, "SelfNodeID()") {
+		t.Error("a witness call site derives the node id from the cluster handle again; use witnessNodeID() — the handle is the Noop's \"standalone\" until AttachCluster runs")
+	}
+}
+
+// The upgrade case, and the reason the read path accepts either id.
+//
+// A single-node enterprise box never runs AttachCluster, so the older build
+// shipped every head under the Noop's "standalone". Reading only under the
+// new canonical id would find nothing and fail that node CLOSED on its next
+// boot — turning an intermittent bug into a certain one for exactly the
+// deployments that already have audit history, which is worse than the bug.
+func TestWitnessNodeIDCandidatesCoverThePreUpgradeIdentity(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath: filepath.Join(t.TempDir(), "state.db"),
+		NodeID: "aerolvm-itest-node1",
+	}}
+	svc.cluster = cluster.NewNoop("standalone", "", "")
+
+	got := svc.witnessNodeIDCandidates()
+	want := []string{"aerolvm-itest-node1", "standalone"}
+	if len(got) != len(want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidates = %v, want %v (canonical must come first: it is what ships)", got, want)
+		}
+	}
+
+	// No duplicate once the handle agrees, so the witness is not asked twice
+	// for the same key on every healthy node.
+	svc.cluster = cluster.NewNoop("aerolvm-itest-node1", "", "")
+	if got := svc.witnessNodeIDCandidates(); len(got) != 1 || got[0] != "aerolvm-itest-node1" {
+		t.Fatalf("candidates = %v, want exactly one id when the handle agrees", got)
+	}
+
+	if got := (*Service)(nil).witnessNodeIDCandidates(); got != nil {
+		t.Fatalf("nil receiver = %v, want nil", got)
+	}
+}
+
+// lastWitnessedHeadAny must actually consult the second candidate, and must
+// not report a head that no candidate holds.
+func TestLastWitnessedHeadAnyFindsAPreUpgradeReceipt(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath: filepath.Join(t.TempDir(), "state.db"),
+		NodeID: "node1",
+	}}
+	svc.cluster = cluster.NewNoop("standalone", "", "")
+
+	w := &nodeKeyedWitness{heads: map[string]string{"standalone": "deadbeef"}}
+	head, ok, err := svc.lastWitnessedHeadAny(context.Background(), w)
+	if err != nil || !ok || head != "deadbeef" {
+		t.Fatalf("head=%q ok=%v err=%v; the pre-upgrade receipt under \"standalone\" was not found, so this node would fail closed on upgrade", head, ok, err)
+	}
+	if !slices.Contains(w.asked, "node1") || !slices.Contains(w.asked, "standalone") {
+		t.Fatalf("asked = %v, want both candidates tried", w.asked)
+	}
+
+	// The canonical id wins when both hold something.
+	w = &nodeKeyedWitness{heads: map[string]string{"node1": "new", "standalone": "old"}}
+	if head, _, _ := svc.lastWitnessedHeadAny(context.Background(), w); head != "new" {
+		t.Fatalf("head = %q, want the canonical id's head", head)
+	}
+
+	// Nothing anywhere stays nothing — the fallback must not invent a head.
+	w = &nodeKeyedWitness{heads: map[string]string{}}
+	if head, ok, err := svc.lastWitnessedHeadAny(context.Background(), w); ok || head != "" || err != nil {
+		t.Fatalf("head=%q ok=%v err=%v, want an honest miss", head, ok, err)
+	}
+}
+
+type nodeKeyedWitness struct {
+	heads map[string]string
+	asked []string
+	err   error
+}
+
+func (w *nodeKeyedWitness) WitnessHeads(context.Context, []controlplane.AuditHead) (controlplane.WitnessReceipt, error) {
+	return controlplane.WitnessReceipt{}, nil
+}
+
+func (w *nodeKeyedWitness) LastWitnessedHead(_ context.Context, nodeID string) (string, bool, error) {
+	w.asked = append(w.asked, nodeID)
+	if w.err != nil {
+		return "", false, w.err
+	}
+	h, ok := w.heads[nodeID]
+	return h, ok, nil
 }

@@ -232,10 +232,9 @@ func (s *Service) VerifySecretAuditWitness() (ok bool, localHead, witnessedHead 
 		return true, scan.head, "", nil
 	}
 
-	nodeID := s.witnessNodeID()
 	ctx, cancel := context.WithTimeout(context.Background(), secretAuditWitnessShipTimeout)
 	defer cancel()
-	remoteHead, remoteOK, err := w.LastWitnessedHead(ctx, nodeID)
+	remoteHead, remoteOK, err := s.lastWitnessedHeadAny(ctx, w)
 	if err != nil {
 		secretAuditWitnessHealthy.Set(0)
 		secretAuditWitnessFailures.Add(1)
@@ -350,10 +349,9 @@ func (s *Service) judgeWitnessAncestry(localHead, localReceipt, remoteHead strin
 // else falls back to one full probing pass.
 func (s *Service) verifySecretAuditWitnessAtBoot(w controlplane.Witness) (ok bool, localHead, witnessedHead string, err error) {
 	f := s.secretAuditFile
-	nodeID := s.witnessNodeID()
 	ctx, cancel := context.WithTimeout(context.Background(), secretAuditWitnessShipTimeout)
 	defer cancel()
-	remoteHead, remoteOK, err := w.LastWitnessedHead(ctx, nodeID)
+	remoteHead, remoteOK, err := s.lastWitnessedHeadAny(ctx, w)
 	if err != nil {
 		secretAuditWitnessHealthy.Set(0)
 		secretAuditWitnessFailures.Add(1)
@@ -410,13 +408,12 @@ func (s *Service) requireCurrentSecretAuditWitness(ctx context.Context) (string,
 	if head == "" || head == auditlog.GenesisPrevHash {
 		return head, nil
 	}
-	nodeID := s.witnessNodeID()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, secretAuditWitnessShipTimeout)
 	defer cancel()
-	remoteHead, ok, err := w.LastWitnessedHead(checkCtx, nodeID)
+	remoteHead, ok, err := s.lastWitnessedHeadAny(checkCtx, w)
 	if err != nil {
 		return "", err
 	}
@@ -458,6 +455,57 @@ func (s *Service) witnessNodeID() string {
 		return c.SelfNodeID()
 	}
 	return ""
+}
+
+// witnessNodeIDCandidates lists every id this node's heads could be stored
+// under, canonical one first.
+//
+// The canonical id is what ships from now on. The second exists purely for
+// upgrade compatibility: a node that ran the older build shipped its heads
+// under whatever the cluster handle returned — on a single-node box that is
+// the Noop's "standalone", forever, because AttachCluster never runs there.
+// Reading only under the new id would find nothing and fail the node CLOSED
+// on its next boot, which would turn an intermittent bug into a certain one
+// for exactly the deployments that already have audit history. That is a
+// worse outcome than the bug.
+//
+// Accepting either is not a cross-node hole: both candidates are THIS node's
+// own identities, so the only thing widened is which of its own past
+// receipts it recognises.
+func (s *Service) witnessNodeIDCandidates() []string {
+	if s == nil {
+		return nil
+	}
+	canonical := s.witnessNodeID()
+	out := []string{canonical}
+	if c := s.Cluster(); c != nil {
+		if legacy := strings.TrimSpace(c.SelfNodeID()); legacy != "" && legacy != canonical {
+			out = append(out, legacy)
+		}
+	}
+	return out
+}
+
+// lastWitnessedHeadAny asks the witness under each candidate id and returns
+// the first head it finds, so a pre-upgrade receipt still counts.
+func (s *Service) lastWitnessedHeadAny(ctx context.Context, w controlplane.Witness) (string, bool, error) {
+	var firstErr error
+	for _, id := range s.witnessNodeIDCandidates() {
+		head, ok, err := w.LastWitnessedHead(ctx, id)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if ok && strings.TrimSpace(head) != "" {
+			return head, true, nil
+		}
+	}
+	if firstErr != nil {
+		return "", false, firstErr
+	}
+	return "", false, nil
 }
 
 // ValidateSecretAuditWitness fails closed when a real external witness is
