@@ -1221,6 +1221,38 @@ and it is the only check that covers leak paths nobody thought to enumerate.
 
 ---
 
+## 7.4 Live findings (run 7, 2026-09-26)
+
+**PRODUCT FINDING — a read-only platform volume accepted a write.** UC-84 on
+`single-node-secrets`:
+
+```
+platform_volumes_test.go:164: write to read-only volume succeeded (exit=0)
+```
+
+The case is sound and the evidence is not ambiguous: it seeds the volume
+read-write, mounts it `ReadOnly: true` in a second sandbox, **reads the seed
+back successfully** — proving the mount is present and functional — and then
+writes, which succeeds. So the mount exists and ignores the flag; this is not
+a missing mount.
+
+The spec-level plumbing is intact: `PlatformVolumeMount.ReadOnly` reaches
+`mountSpecForVolume` → `BuildMountSpecForSource`, which sets
+`MountSpec.ReadOnly`. The gap is downstream, where `pkg/mounts` realises the
+spec and binds it into the container — the host mount and/or the container
+bind is not marked `ro`.
+
+Security-relevant: a tenant handed read-only access to a shared volume can
+modify it, and every other reader sees the modification.
+
+NOT fixed here — `pkg/mounts` carries its own review rules (pr-review.md §5,
+mount inputs run on the host) and this is unrelated to the secrets work. It
+needs confirming on a non-secrets scenario to establish whether it is a
+regression or long-standing, then its own PR.
+
+This is the FIRST product defect the programme has surfaced. Everything red
+before it was the harness.
+
 ## 8. Make targets and reports
 
 ```make
