@@ -170,6 +170,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		Preopens:       append([]wasmengine.Preopen(nil), inst.preopens...),
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, memoryMB, d.cfg.DefaultWallTimeout)
+	if err := d.bindAuditCapability(sandboxID, &caps); err != nil {
+		cleanup()
+		return nil, err
+	}
 
 	instStart := time.Now()
 	if err := client.Instantiate(sandboxID, caps); err != nil {

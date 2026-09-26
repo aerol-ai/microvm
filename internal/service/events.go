@@ -270,6 +270,40 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 			}
 		}
 	}
+	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
+		return err
+	} else if obsolete {
+		// The runtime is already gone, but failover/reassignment preserved the
+		// sandbox lifecycle elsewhere. Remove only this node's stale row and
+		// local tracking; never fan out secret or external-checkpoint deletion.
+		return s.finalizeStaleLocalSandbox(ctx, sandbox, placement, true)
+	}
+	// Retain authorization before committing delete intent. If the node fails
+	// after the Raft fence, leader-side expiry may remove the placement; the
+	// retained ACL must already be durable so audit history remains attributable.
+	if err := s.retainSandboxAuditACL(ctx, sandbox); err != nil {
+		return fmt.Errorf("retain sandbox audit ACL: %w", err)
+	}
+	if err := s.beginSelfOwnedClusterPlacementDeleteStrict(ctx, sandbox); err != nil {
+		return err
+	}
+
+	// Secret tomb/outbox before store.Delete / placement delete so recipients
+	// can still be resolved from the sealed row or placement. Shared with
+	// DestroySandbox and reconcile-destroyed — cluster_secrets has no FK.
+	if err := s.DeleteClusterSecrets(ctx, sandbox.ID, sandbox.AuditIncarnationID); err != nil {
+		return fmt.Errorf("delete cluster secrets: %w", err)
+	}
+
+	// WASM state is child data without an FK, so it must be finalized before the
+	// parent row disappears. Failed registry deletes remain as durable push rows
+	// and become eligible for the orphan-ref sweep after parent deletion.
+	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+		return err
+	}
+	if err := s.deleteSelfOwnedClusterPlacementStrict(ctx, sandbox); err != nil {
+		return err
+	}
 
 	// store.Delete must happen BEFORE schedulePendingImageGC. The
 	// pending-image janitor uses HasActiveImageRef at sweep time; a stale
@@ -279,16 +313,11 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
-	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
-		return err
-	}
-
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}
-	s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "docker-destroy-event")
 	if !s.isWasmSandbox(sandbox) {
-		s.schedulePendingImageGC(ctx, sandbox.Image)
+		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
 
 	if s.logger != nil {

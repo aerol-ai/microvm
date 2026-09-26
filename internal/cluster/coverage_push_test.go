@@ -66,7 +66,7 @@ func TestClusterAssertOwnershipReservedReplaysPortsAndDomains(t *testing.T) {
 	c.gossip.delegate.admitter = admitter
 	c.gossip.delegate.mu.Unlock()
 	c.gossip.refreshMemberIndex()
-	c.capacityLeases.admitter = admitter
+	c.capacityLeases.setAdmitter(admitter)
 	c.capacityLeases.set(c.nodeID, admitter.Snapshot(), time.Now())
 
 	ctx := context.Background()
@@ -179,14 +179,14 @@ func TestClusterSecretsAndExposedPortHelpers(t *testing.T) {
 	waitForLeader(t, c, 5*time.Second)
 
 	ctx := context.Background()
-	secrets := PlacementSecrets{Ref: "ref-1", Version: 2}
+	secrets := testPlacementSecrets("sb-helpers", "inc-helpers", 1)
 	if err := c.RecordPlacement(ctx, "sb-helpers", &models.CreateSandboxRequest{Image: "alpine"}, secrets); err != nil {
 		t.Fatalf("RecordPlacement: %v", err)
 	}
 	if got := c.SecretsOf("missing"); got.Ref != "" {
 		t.Fatalf("SecretsOf(missing) = %+v, want zero", got)
 	}
-	if got := c.SecretsOf("sb-helpers"); got.Ref != "ref-1" || got.Version != 2 {
+	if got := c.SecretsOf("sb-helpers"); got.Ref != testSecretRef("sb-helpers", "inc-helpers") || got.Version != 1 || got.SealGeneration != 1 {
 		t.Fatalf("SecretsOf = %+v", got)
 	}
 	if err := c.AddExposedPort(ctx, "sb-helpers", 3000, ExposedPortRoute{Protocol: "http"}); err != nil {
@@ -311,10 +311,9 @@ func TestAgentAssertOwnershipLookupErrorPreservesFirstErr(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -489,10 +488,9 @@ func TestAgentAssertOwnershipRecordPlacementFailureOnFresh(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -538,10 +536,9 @@ func TestAgentAssertOwnershipUpsertSpecFailureOnSelfOwned(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -696,10 +693,9 @@ func newAgentAssertOwnershipTestServer(
 		}
 	}))
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -872,10 +868,9 @@ func TestAgentAssertOwnershipAddExposedPortFailureOnSelfOwned(t *testing.T) {
 	defer srv.Close()
 
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     srv.URL,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: srv.Client(),
+		nodeID: "worker-self",
+		apiURL: srv.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		gossip: &gossipNode{
 			memberIndex: newGossipMemberIndex(),
 		},
@@ -886,6 +881,7 @@ func TestAgentAssertOwnershipAddExposedPortFailureOnSelfOwned(t *testing.T) {
 
 	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:           "sb-port-fail",
+		Secrets:      PlacementSecrets{IncarnationID: "inc-port-fail"},
 		ExposedPorts: map[int]ExposedPortRoute{4444: {Protocol: "http"}},
 	}})
 	if err == nil {
@@ -906,6 +902,7 @@ func TestClusterAssertOwnershipReturnsErrorOnDuplicateHostname(t *testing.T) {
 	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-host-a",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-host-a"},
 		CustomHostnames: []string{host},
 	}}); err != nil {
 		t.Fatalf("first AssertOwnership: %v", err)
@@ -913,6 +910,7 @@ func TestClusterAssertOwnershipReturnsErrorOnDuplicateHostname(t *testing.T) {
 	err := c.AssertOwnership(ctx, []LocalSandboxState{{
 		ID:              "sb-host-b",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-host-b"},
 		CustomHostnames: []string{host},
 	}})
 	if err == nil {
@@ -985,7 +983,7 @@ func TestGossipMembersFallsBackToScan(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 5*time.Second)
 
-	c.gossip.memberIndex = nil
+	c.gossip.setMemberIndex(nil)
 	members := c.gossip.members()
 	if len(members) == 0 {
 		t.Fatal("members() with nil index expected scan fallback")
@@ -1005,6 +1003,7 @@ func TestAgentAssertOwnershipClaimOrphanReplaysPortsAfterSuccess(t *testing.T) {
 					SandboxID:           "sb-orphan-replay",
 					OwnerState:          PlacementOwnerStateOrphaned,
 					OrphanedOwnerNodeID: "worker-self",
+					IncarnationID:       "inc-orphan-replay",
 				},
 				Orphaned: true,
 			})
@@ -1017,6 +1016,7 @@ func TestAgentAssertOwnershipClaimOrphanReplaysPortsAfterSuccess(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-orphan-replay",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-orphan-replay"},
 		ExposedPorts:    map[int]ExposedPortRoute{5555: {Protocol: "http"}},
 		CustomHostnames: []string{"orphan-replay.example.com"},
 	}}); err != nil {

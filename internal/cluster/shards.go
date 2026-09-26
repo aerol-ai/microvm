@@ -1,8 +1,15 @@
 package cluster
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"hash/fnv"
+	"slices"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 )
 
 // DefaultPlacementShardCount is the stable shard space for placement-index
@@ -27,17 +34,41 @@ const (
 type PlacementShardFilter struct {
 	ShardCount int   `json:"shard_count,omitempty"`
 	Shards     []int `json:"shards,omitempty"`
+	// None selects NO shards at all. It exists because the zero value already
+	// means "all shards": a node with no public-route work of its own had no
+	// way to say so, and the difference between "nothing" and "the whole
+	// fleet" is a full placement download per node on every reconcile tick.
+	None bool `json:"none,omitempty"`
 }
 
 type PlacementPageRequest struct {
 	Limit       int                  `json:"limit,omitempty"`
 	PageToken   string               `json:"page_token,omitempty"`
 	ShardFilter PlacementShardFilter `json:"shard_filter,omitempty"`
+	// OwnerRef, when set, returns only placements for that tenant account.
+	OwnerRef string `json:"owner_ref,omitempty"`
+	// OwnerNodeID, when set, returns only placements this cluster node owns.
+	// Distinct from OwnerRef (tenant account). It is the read path a worker's
+	// reconcile sweep uses to enumerate its own rows: at 100k sandboxes the
+	// unfiltered view is ~72 MB, which every worker would otherwise pull on
+	// every sweep. Reserved and orphaned rows are excluded — the FSM's owner
+	// index only tracks materialized placements.
+	OwnerNodeID string `json:"owner_node_id,omitempty"`
 }
 
 type PlacementPageResponse struct {
 	Placements    []Placement `json:"placements"`
 	NextPageToken string      `json:"next_page_token,omitempty"`
+	// Authoritative is true when the page was produced by a ready FSM / control
+	// plane. Empty Authoritative pages mean "tenant (or fleet) has zero rows"
+	// — not "placement view unavailable". Agents set this false on CP errors.
+	Authoritative bool `json:"authoritative,omitempty"`
+	// SkippedSandboxIDs names rows that could not be delivered because one row
+	// alone exceeds the response byte budget. They are neither present nor
+	// absent, and a caller that makes cleanup decisions from this view (route
+	// GC deletes routes for placements it cannot see) must treat them as
+	// unavailable rather than deleted.
+	SkippedSandboxIDs []string `json:"skipped_sandbox_ids,omitempty"`
 }
 
 type IngressRouteOwner struct {
@@ -52,6 +83,13 @@ type IngressShardRoute struct {
 	Shard      int                 `json:"shard"`
 	ShardCount int                 `json:"shard_count"`
 	Owners     []IngressRouteOwner `json:"owners"`
+	// RingVersion identifies the membership view this answer was computed
+	// from. Route installation and route lookup hash the same ordered set of
+	// ingress node IDs, so two nodes that disagree about membership hand out
+	// routes for different rings — the upstream can be pointed at a node that
+	// never installed the shard. Publishing the version makes that divergence
+	// observable (compare across ingress nodes) instead of silent.
+	RingVersion string `json:"ring_version,omitempty"`
 }
 
 func (r PlacementPageRequest) Normalize() PlacementPageRequest {
@@ -66,6 +104,8 @@ func (r PlacementPageRequest) Normalize() PlacementPageRequest {
 		Limit:       limit,
 		PageToken:   r.PageToken,
 		ShardFilter: r.ShardFilter.Normalize(),
+		OwnerRef:    strings.TrimSpace(r.OwnerRef),
+		OwnerNodeID: strings.TrimSpace(r.OwnerNodeID),
 	}
 }
 
@@ -74,6 +114,9 @@ func (f PlacementShardFilter) Normalize() PlacementShardFilter {
 	shardCount := f.ShardCount
 	if shardCount <= 0 {
 		shardCount = DefaultPlacementShardCount
+	}
+	if f.None {
+		return PlacementShardFilter{ShardCount: shardCount, None: true}
 	}
 	if len(f.Shards) == 0 {
 		return PlacementShardFilter{ShardCount: shardCount}
@@ -96,7 +139,16 @@ func (f PlacementShardFilter) Normalize() PlacementShardFilter {
 
 func (f PlacementShardFilter) allShards() bool {
 	f = f.Normalize()
-	return len(f.Shards) == 0
+	return !f.None && len(f.Shards) == 0
+}
+
+// noShards reports an explicit "this node has no shard work".
+func (f PlacementShardFilter) noShards() bool { return f.None }
+
+// NoPlacementShards is the filter a node with no public-route responsibility
+// asks with.
+func NoPlacementShards() PlacementShardFilter {
+	return PlacementShardFilter{ShardCount: DefaultPlacementShardCount, None: true}
 }
 
 // PlacementShardForSandbox maps sandboxID to a stable shard ID in [0, count).
@@ -114,11 +166,50 @@ func PlacementShardForSandbox(sandboxID string, count int) int {
 // public route table to each ingress node so ordinary DNS round-robin / TCP
 // load balancers work for every sandbox. Very large ingress tiers shard the
 // table and require a shard-aware upstream router.
-func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFilter {
+//
+// selfRole is this node's own SB_NODE_ROLE. A node that does not serve ingress
+// gets NoPlacementShards: it has no public-route work, and synthesizing a ring
+// membership for it (the old behavior when it was absent from the ingress ids)
+// handed a dedicated worker either a slice of unrelated shards or, at small
+// ingress counts, the entire placement map.
+func IngressShardFilterForNode(members []Member, nodeID, selfRole string) PlacementShardFilter {
+	if !CanServeIngressRole(selfRole) {
+		return NoPlacementShards()
+	}
+	return ingressShardFilterForIDs(ingressShardNodeIDs(members), nodeID)
+}
+
+// IngressShardFilterCache retains only the last topology for one reconciler.
+// Capacity heartbeats and endpoint changes do not change HRW ownership. Compare
+// the sorted live ingress IDs, not the entire membership (or a lossy hash).
+type IngressShardFilterCache struct {
+	mu       sync.Mutex
+	nodeID   string
+	selfRole string
+	ids      []string
+	filter   PlacementShardFilter
+}
+
+func (c *IngressShardFilterCache) ForNode(members []Member, nodeID, selfRole string) PlacementShardFilter {
+	if !CanServeIngressRole(selfRole) {
+		return NoPlacementShards()
+	}
+	ids := ingressShardNodeIDs(members)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.nodeID != nodeID || c.selfRole != selfRole || !slices.Equal(c.ids, ids) {
+		c.nodeID, c.selfRole, c.ids = nodeID, selfRole, slices.Clone(ids)
+		c.filter = ingressShardFilterForIDs(ids, nodeID)
+	}
+	filter := c.filter
+	filter.Shards = slices.Clone(filter.Shards)
+	return filter
+}
+
+func ingressShardFilterForIDs(ids []string, nodeID string) PlacementShardFilter {
 	if nodeID == "" {
 		return PlacementShardFilter{}
 	}
-	ids := ingressShardNodeIDs(members)
 	found := false
 	for _, id := range ids {
 		if id == nodeID {
@@ -144,9 +235,10 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 		return PlacementShardFilter{}
 	}
 
-	shards := make([]int, 0, DefaultPlacementShardCount/len(ids)+1)
+	shards := make([]int, 0, 2*DefaultPlacementShardCount/len(ids)+1)
 	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
-		if shard%len(ids) == selfIndex {
+		primary, backup := rendezvousIngressTopTwo(shard, ids)
+		if primary == selfIndex || backup == selfIndex {
 			shards = append(shards, shard)
 		}
 	}
@@ -158,16 +250,68 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 
 // IngressRouteForSandbox returns the ingress owner set an upstream router
 // should target for sandboxID. Small ingress tiers all own every sandbox route;
-// very large ingress tiers return the stable shard owner.
+// very large ingress tiers return the primary shard owner plus one failover
+// replica so a single ingress death does not create a traffic vacuum.
+// IngressRingMembers is the single membership view the shard-aware ingress
+// path may hash. Reconciliation (which shards this node installs) and the
+// route lookup (which node the upstream is sent to) must agree: an Agent's
+// Members() is a control-plane snapshot while LocalMembers() is local gossip,
+// and hashing one on the install side and the other on the lookup side routes
+// traffic to nodes that never installed the shard. Local gossip is the
+// preferred source — it is what the installer can act on — with the
+// control-plane view as the fallback for a node whose gossip is not up yet.
+func IngressRingMembers(c Client) []Member {
+	return IdentityMembers(c)
+}
+
+// IdentityMembers is the membership view for callers that need only identity,
+// role, liveness or endpoints — never capacity or artifact inventories.
+//
+// Identity/liveness gossip is already fleet-wide and local, so these callers
+// have the answer in-process. Members() on an agent is a control-plane round
+// trip that redistributes the whole membership record (~850 B per peer, ~1.7 MB
+// at 2,000 nodes) including capacity snapshots and template/module inventories
+// the caller is about to throw away. Local gossip first; the control plane is
+// the fallback for a node whose gossip is not up yet.
+func IdentityMembers(c Client) []Member {
+	if c == nil {
+		return nil
+	}
+	if members := c.LocalMembers(); len(members) > 0 {
+		return members
+	}
+	return c.Members()
+}
+
+// IngressRingVersion fingerprints the ordered set of ingress-eligible node IDs
+// a ring was computed from. Equal versions mean two nodes will compute the
+// same owners for every sandbox; different versions mean they are mid-
+// convergence and their answers may disagree.
+func IngressRingVersion(members []Member) string {
+	ids := ingressShardNodeIDs(members)
+	if len(ids) == 0 {
+		return ""
+	}
+	sorted := slices.Clone(ids)
+	sort.Strings(sorted)
+	h := sha256.New()
+	for _, id := range sorted {
+		_, _ = h.Write([]byte(id))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
 func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRoute {
 	shardCount := DefaultPlacementShardCount
 	shard := PlacementShardForSandbox(sandboxID, shardCount)
 	owners := ingressRouteOwners(members)
 	route := IngressShardRoute{
-		SandboxID:  sandboxID,
-		Shard:      shard,
-		ShardCount: shardCount,
-		Owners:     []IngressRouteOwner{},
+		SandboxID:   sandboxID,
+		Shard:       shard,
+		ShardCount:  shardCount,
+		Owners:      []IngressRouteOwner{},
+		RingVersion: IngressRingVersion(members),
 	}
 	if len(owners) == 0 {
 		return route
@@ -176,13 +320,101 @@ func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRout
 		route.Owners = owners
 		return route
 	}
-	route.Owners = append(route.Owners, owners[shard%len(owners)])
+	ids := ingressShardNodeIDs(members)
+	for _, idx := range rendezvousIngressOwnerIndexes(shard, ids, 2) {
+		if idx >= 0 && idx < len(owners) {
+			route.Owners = append(route.Owners, owners[idx])
+		}
+	}
 	return route
 }
 
+// rendezvousIngressOwnerIndex picks a stable shard owner via highest-random-weight
+// hashing so membership N→N-1 remaps ~1/N shards instead of ~99%.
+func rendezvousIngressOwnerIndex(shard int, nodeIDs []string) int {
+	idxs := rendezvousIngressOwnerIndexes(shard, nodeIDs, 1)
+	if len(idxs) == 0 {
+		return -1
+	}
+	return idxs[0]
+}
+
+// rendezvousIngressOwnerIndexes returns up to n distinct HRW owners for shard.
+func rendezvousIngressOwnerIndexes(shard int, nodeIDs []string, n int) []int {
+	if len(nodeIDs) == 0 || n <= 0 {
+		return nil
+	}
+	if n <= 2 {
+		first, second := rendezvousIngressTopTwo(shard, nodeIDs)
+		if n == 1 || second < 0 {
+			return []int{first}
+		}
+		return []int{first, second}
+	}
+	type scored struct {
+		idx   int
+		score uint64
+		id    string
+	}
+	all := make([]scored, 0, len(nodeIDs))
+	for i, id := range nodeIDs {
+		all = append(all, scored{idx: i, score: rendezvousScore(shard, id), id: id})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].score == all[j].score {
+			return all[i].id < all[j].id
+		}
+		return all[i].score > all[j].score
+	})
+	if n > len(all) {
+		n = len(all)
+	}
+	out := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, all[i].idx)
+	}
+	return out
+}
+
+// The routing contract uses at most two winners. Keep the same hash and lexical
+// tie-break as the full ordering, without allocating/sorting N scored entries.
+func rendezvousIngressTopTwo(shard int, ids []string) (first, second int) {
+	first, second = -1, -1
+	var firstScore, secondScore uint64
+	for i, id := range ids {
+		score := rendezvousScore(shard, id)
+		if first < 0 || score > firstScore || (score == firstScore && id < ids[first]) {
+			second, secondScore = first, firstScore
+			first, firstScore = i, score
+		} else if second < 0 || score > secondScore || (score == secondScore && id < ids[second]) {
+			second, secondScore = i, score
+		}
+	}
+	return first, second
+}
+
+func rendezvousScore(shard int, nodeID string) uint64 {
+	// SHA-256 avoids FNV clustering on sequential node IDs (ing-00..ing-N)
+	// which left some owners with zero shards under naive FNV-HRW.
+	// Preserve the wire-compatible decimal-shard/NUL/node input. A stack
+	// buffer eliminates fmt's per-candidate allocations for normal node IDs.
+	var buf [256]byte
+	input := strconv.AppendInt(buf[:0], int64(shard), 10)
+	input = append(input, 0)
+	input = append(input, nodeID...)
+	sum := sha256.Sum256(input)
+	return binary.BigEndian.Uint64(sum[:8])
+}
+
 func ingressShardNodeIDs(members []Member) []string {
-	seen := make(map[string]struct{}, len(members))
-	ids := make([]string, 0, len(members))
+	count := 0
+	for _, m := range members {
+		if m.NodeID != "" && m.Alive && CanServeIngressRole(m.Role) {
+			count++
+		}
+	}
+	seen := make(map[string]struct{}, count)
+	ids := make([]string, 0, count)
 	for _, m := range members {
 		if m.NodeID == "" || !m.Alive || !CanServeIngressRole(m.Role) {
 			continue

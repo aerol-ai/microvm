@@ -3,10 +3,10 @@ package worker
 import (
 	"bytes"
 	"context"
-
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestNetMediator_SetBlocks(t *testing.T) {
@@ -65,6 +65,58 @@ func TestNetMediator_DialContext(t *testing.T) {
 	in, out := m.DrainUsage("sb1")
 	if in != 2 || out != 2 {
 		t.Fatalf("expected 2/2, got %d/%d", in, out)
+	}
+}
+
+func TestNetMediator_DialContext_EgressObserver(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	addr := ln.Addr().String()
+	done := make(chan struct{}, 1)
+	var gotSandbox, gotNet, gotAddr string
+	m := newNetMediator()
+	m.SetEgressObserver(func(sandboxID, network, address string) {
+		gotSandbox, gotNet, gotAddr = sandboxID, network, address
+		done <- struct{}{}
+	})
+	conn, err := m.DialContext(context.Background(), "sb-obs", "tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("observer not called after successful dial")
+	}
+	if gotSandbox != "sb-obs" || gotNet != "tcp" || gotAddr != addr {
+		t.Fatalf("observer got (%q,%q,%q), want (sb-obs,tcp,%s)", gotSandbox, gotNet, gotAddr, addr)
+	}
+
+	// Failed dial must not fire the observer.
+	called := false
+	m.SetEgressObserver(func(string, string, string) { called = true })
+	_, err = m.DialContext(context.Background(), "sb-obs", "tcp", "127.0.0.1:1")
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if called {
+		t.Fatal("observer must not fire on dial failure")
 	}
 }
 

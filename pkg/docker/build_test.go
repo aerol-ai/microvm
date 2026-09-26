@@ -61,6 +61,25 @@ func TestBuildTagForIsDeterministicAndSensitiveToInputs(t *testing.T) {
 	}
 }
 
+func TestBuildTagForNodeRoundTripAndRejectsMalformedAffinity(t *testing.T) {
+	tag := BuildTagForNode("FROM alpine", nil, "worker-a")
+	if got, ok := BuiltImagePlacementNode(tag); !ok || got != "worker-a" {
+		t.Fatalf("BuiltImagePlacementNode(%q) = %q, %v; want worker-a, true", tag, got, ok)
+	}
+	if got, ok := BuiltImagePlacementNode(BuildTagFor("FROM alpine", nil)); ok || got != "" {
+		t.Fatalf("ordinary tag unexpectedly had affinity: %q, %v", got, ok)
+	}
+	for _, malformed := range []string{
+		BuiltImageNamespace + "/node-/abc:latest",
+		BuiltImageNamespace + "/node-not_base32/abc:latest",
+		BuiltImageNamespace + "/node-mzxw6/",
+	} {
+		if got, ok := BuiltImagePlacementNode(malformed); ok || got != "" {
+			t.Fatalf("malformed tag %q unexpectedly decoded: %q, %v", malformed, got, ok)
+		}
+	}
+}
+
 func TestBuildGroupKeyDistinguishesContent(t *testing.T) {
 	base := buildGroupKey("aerolvm-build/x:latest", "FROM alpine", []byte("ctx-a"))
 	if base == buildGroupKey("aerolvm-build/y:latest", "FROM alpine", []byte("ctx-a")) {

@@ -3,10 +3,10 @@ package containerd
 import (
 	"context"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
-	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/oci"
 )
 
 // runscShimName is the containerd runtime handler for gVisor (runsc).

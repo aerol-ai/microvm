@@ -35,7 +35,7 @@ func TestWasmDurableFailoverMultiNodeClusterSoak(t *testing.T) {
 	const sandboxID = "sb-wasm-multinode"
 	place := command{
 		Op: opPlace, SandboxID: sandboxID, OwnerNodeID: "fol-wasm-soak",
-		OwnerAPIURL: "http://fol-wasm-soak", Spec: spec,
+		OwnerAPIURL: "http://fol-wasm-soak", Spec: spec, IncarnationID: "inc-wasm-multinode",
 	}
 	payload, err := encodeCommand(place)
 	if err != nil {
@@ -48,7 +48,7 @@ func TestWasmDurableFailoverMultiNodeClusterSoak(t *testing.T) {
 		8080: {Protocol: "http"},
 		5432: {Protocol: "tcp", HostPort: 25432},
 	} {
-		add := command{Op: opAddExposedPort, SandboxID: sandboxID, Port: port, Protocol: route.Protocol, HostPort: route.HostPort}
+		add := command{Op: opAddExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: "inc-wasm-multinode", Port: port, Protocol: route.Protocol, HostPort: route.HostPort}
 		payload, err = encodeCommand(add)
 		if err != nil {
 			t.Fatalf("encode opAddExposedPort: %v", err)

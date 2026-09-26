@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"strings"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/namespaces"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 const (

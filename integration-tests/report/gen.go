@@ -64,8 +64,46 @@ type Result struct {
 // Report is the serialized per-scenario artifact.
 type Report struct {
 	Scenario string   `json:"scenario"`
+	Build    *Build   `json:"build,omitempty"`
 	Results  []Result `json:"results"`
 	Summary  Summary  `json:"summary"`
+}
+
+// Build records WHICH TREE produced the artifacts the scenario ran against.
+//
+// Without it a reports/*.json is unattributable: once the harness can provision
+// from a locally cross-compiled branch (plans/integration-test-security.md §4),
+// "pass 57/fail 0" no longer implies a released version, and a latency number
+// compared against the wrong arm is worse than no number. Dirty is the field
+// that matters most — it means the numbers came from a tree that exists on
+// exactly one laptop and cannot be reproduced from git.
+//
+// Populated from the environment because gen runs after teardown, in a separate
+// process from the build, and has no other channel. Nil when the scenario used
+// a published release, where the release tag already answers the question.
+type Build struct {
+	ID      string `json:"id,omitempty"`
+	Mode    string `json:"mode,omitempty"` // local | released | version
+	GitSHA  string `json:"git_sha,omitempty"`
+	Dirty   bool   `json:"dirty,omitempty"`
+	Version string `json:"version,omitempty"` // pinned release tag when mode=version
+}
+
+// buildFromEnv reads the AEROL_BUILD_* variables run.sh exports. Returns nil
+// when none is set, so a released-artifact run serializes no build block at all
+// rather than a misleading empty one.
+func buildFromEnv() *Build {
+	b := Build{
+		ID:      os.Getenv("AEROL_BUILD_ID"),
+		Mode:    os.Getenv("AEROL_BUILD_MODE"),
+		GitSHA:  os.Getenv("AEROL_BUILD_GIT_SHA"),
+		Dirty:   os.Getenv("AEROL_BUILD_DIRTY") == "true",
+		Version: os.Getenv("AEROL_BUILD_VERSION"),
+	}
+	if b.ID == "" && b.Mode == "" && b.GitSHA == "" && b.Version == "" {
+		return nil
+	}
+	return &b
 }
 
 type Summary struct {
@@ -289,12 +327,34 @@ func mdCell(s string) string {
 	return s
 }
 
+// buildLabel is the one-line human form of a Build for the markdown header.
+func buildLabel(b *Build) string {
+	switch {
+	case b.Version != "":
+		return b.Mode + " " + b.Version
+	case b.ID != "":
+		return b.Mode + " " + b.ID
+	default:
+		return b.Mode
+	}
+}
+
 func renderMarkdown(rep Report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Integration report — %s\n\n", rep.Scenario)
 	s := rep.Summary
 	fmt.Fprintf(&b, "pass %d · fail %d · skip %d · pending %d · inconclusive %d · missing %d · total %d\n\n",
 		s.Pass, s.Fail, s.Skip, s.Pending, s.Inconclusive, s.Missing, s.Total)
+	if bi := rep.Build; bi != nil {
+		fmt.Fprintf(&b, "build: `%s`", buildLabel(bi))
+		if bi.Dirty {
+			// Called out inline, not buried in the JSON: a dirty tree makes the
+			// run irreproducible, and that has to be visible to whoever reads
+			// the matrix rather than the artifact.
+			b.WriteString(" **(dirty tree — not reproducible from git)**")
+		}
+		b.WriteString("\n\n")
+	}
 	b.WriteString("| UC | Title | Status | Detail |\n|----|-------|--------|--------|\n")
 	for _, r := range rep.Results {
 		fmt.Fprintf(&b, "| %s | %s | %s %s | %s |\n",
@@ -334,7 +394,7 @@ func main() {
 	}
 
 	results := classify(events, harness.Registry, *inconclusive)
-	rep := Report{Scenario: *scenario, Results: results, Summary: summarize(results)}
+	rep := Report{Scenario: *scenario, Build: buildFromEnv(), Results: results, Summary: summarize(results)}
 
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)

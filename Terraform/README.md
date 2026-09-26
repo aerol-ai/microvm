@@ -117,6 +117,15 @@ Per-node fields:
 | `extra_user_data`   | `""`                             | shell, appended to bootstrap                     |
 | `tags`              | `{}`                             |                                                  |
 
+**Ingress tier size.** Up to 10 ingress-capable nodes (`ingress`, any hybrid
+containing it, or `mixed`) work behind the Cloudflare records this module
+creates. More than 10 requires a shard-aware router that resolves owners
+through `GET /v1/cluster/ingress-route/{id}`, declared with
+`shard_aware_ingress = true` (writes `SB_CLUSTER_SHARD_AWARE_INGRESS` on every
+node); `terraform plan` refuses a larger tier without it because the daemon
+would refuse to boot it. Do not set it with a plain LB in front - see
+`setup/runbooks/cluster-ingress-topology.md`.
+
 ### Role rules (validated at plan time, mirrors `cluster-init.sh` / `cluster-join.sh`)
 
 - Each comma token must be in `{server, worker, ingress, mixed}`.

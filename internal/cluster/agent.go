@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,19 +27,51 @@ import (
 )
 
 const (
-	PublicInternalApplyPath             = "/v1/cluster/internal/apply"
-	PublicInternalPlacementPath         = "/v1/cluster/internal/placement/"
-	PublicInternalPlacementByNamePath   = "/v1/cluster/internal/placement-by-name/"
-	PublicInternalPlacementsPath        = "/v1/cluster/internal/placements"
-	PublicInternalPlacementsQueryPath   = "/v1/cluster/internal/placements/query"
-	PublicInternalPlacementsPagePath    = "/v1/cluster/internal/placements/page"
-	PublicInternalRecoveryPath          = "/v1/cluster/internal/recovery/"
-	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
-	PublicInternalVolumePath            = "/v1/cluster/internal/volume"
-	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
-	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
-	controlPlaneRequestTimeout          = 5 * time.Second
-	controlPlanePlacementRequestTimeout = 10 * time.Second
+	PublicInternalApplyPath           = "/v1/cluster/internal/apply"
+	PublicInternalPlacementPath       = "/v1/cluster/internal/placement/"
+	PublicInternalPlacementByNamePath = "/v1/cluster/internal/placement-by-name/"
+	PublicInternalPlacementsPath      = "/v1/cluster/internal/placements"
+	PublicInternalPlacementsQueryPath = "/v1/cluster/internal/placements/query"
+	PublicInternalPlacementsPagePath  = "/v1/cluster/internal/placements/page"
+	PublicInternalPlacementsByIDsPath = "/v1/cluster/internal/placements-by-ids"
+	// PublicInternalOwnedRecoveryPath serves a node its OWN failover-recreate
+	// placements (spec + secret handle). It is how a dedicated worker — which
+	// has no FSM — learns that a placement was reassigned to it.
+	PublicInternalOwnedRecoveryPath = "/v1/cluster/internal/placements/owned-recovery"
+	// PublicInternalReassignStuckPath lets an owner that keeps failing to
+	// recreate a sandbox ask the leader to move it. Target selection stays on
+	// the FSM side.
+	PublicInternalReassignStuckPath   = "/v1/cluster/internal/placements/reassign-stuck"
+	PublicInternalRecoveryPath        = "/v1/cluster/internal/recovery/"
+	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
+	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
+	PublicInternalDrainStatePath      = "/v1/cluster/internal/drain/"
+	PublicInternalAuditACLPath        = "/v1/cluster/internal/audit-acl/"
+	PublicInternalClusterLeaderPath   = "/v1/cluster/leader"
+	// PublicInternalSecretPath receives peer fan-out of sealed secret blobs
+	// (POST upsert) and delete-fanout (DELETE .../{sandboxID}). Auth is PAT +
+	// d.Auth like every other /v1/cluster/internal/... route.
+	PublicInternalSecretPath = "/v1/cluster/internal/secrets"
+	// PublicInternalSandboxAuditPath is the prefix for peer-local secret audit
+	// reads. Full path: .../sandboxes/{id}/audit
+	PublicInternalSandboxAuditPath = "/v1/cluster/internal/sandboxes/"
+	// PublicInternalNodeStorageRetirementsPath serves the replicated operator
+	// attestations that a node's storage was destroyed. Obligation owners are
+	// workers, which hold no FSM, so they read the set from the server tier
+	// rather than from a table on whichever node the operator called.
+	PublicInternalNodeStorageRetirementsPath = "/v1/cluster/internal/node-storage-retirements"
+	// PublicInternalArtifactCatalogPath serves and accepts the replicated
+	// template / JS-bundle metadata catalogue.
+	PublicInternalArtifactCatalogPath = "/v1/cluster/internal/artifact-catalog"
+	// PublicInternalArtifactCatalogEpochPath allocates ONE publisher its
+	// fencing token. It is deliberately separate from the catalogue read: a
+	// publisher needs a single number, and serving it from the general page
+	// would hand every publisher the fleet's whole coverage list and scan
+	// every node's inventory under the FSM lock to produce it.
+	PublicInternalArtifactCatalogEpochPath = "/v1/cluster/internal/artifact-catalog/epoch"
+	controlPlaneRequestTimeout             = 5 * time.Second
+	controlPlanePlacementRequestTimeout    = 10 * time.Second
+	maxControlPlaneJSONResponseBytes       = 16 << 20
 )
 
 type PlacementLookupResponse struct {
@@ -49,11 +83,33 @@ type PlacementLookupResponse struct {
 
 type SelectPlacementRequest struct {
 	Request capacity.Request `json:"request"`
+	// SandboxID and RecipientBackups ask the control plane to pick the seal
+	// recipients itself and return only those. Without them the server falls
+	// back to returning the full candidate slice, which is what an agent
+	// running the previous build still expects — keep both paths until every
+	// node in a rolling upgrade sends the id.
+	SandboxID        string `json:"sandbox_id,omitempty"`
+	RecipientBackups int    `json:"recipient_backups,omitempty"`
+	// TargetOnly asks for the chosen node and nothing else. Build, template,
+	// JS-bundle and local-image routing all want a single target, but the
+	// only shape that existed without a SandboxID also serialized every
+	// eligible worker back to the caller — O(fleet) bytes for a one-field
+	// answer. An older server ignores the flag and simply returns the
+	// candidates the caller then discards, so this is rolling-upgrade safe.
+	TargetOnly bool `json:"target_only,omitempty"`
 }
 
 type SelectPlacementResponse struct {
 	Target PlacementTarget `json:"target"`
-	Error  string          `json:"error,omitempty"`
+	// Candidates is the legacy shape: every eligible worker, serialized to the
+	// caller so IT could pick secret recipients. At 2,000 nodes that made each
+	// create's response O(fleet) in bytes, allocations and control-plane CPU,
+	// for an answer of at most a handful of node ids. Populated only when the
+	// request did not carry a SandboxID.
+	Candidates []Member `json:"candidates,omitempty"`
+	// Recipients is the bounded answer: owner first, then the chosen backups.
+	Recipients []string `json:"recipients,omitempty"`
+	Error      string   `json:"error,omitempty"`
 }
 
 type DrainStateResponse struct {
@@ -74,24 +130,40 @@ type Agent struct {
 
 	gossip *gossipNode
 
-	patToken   string
-	httpClient *http.Client
+	patToken string
 
 	internalURL    string
 	tls            *ClusterTLS
 	internalServer *internalServer
 	internalClient *http.Client
-	publicProxies  *proxyCache
 	mtlsProxies    *proxyCache
+	peerClients    peerClientCache
 
 	cacheMu        sync.RWMutex
 	placementCache []Placement
 	shardCache     map[string][]Placement
+	// shardCacheOrder is the insertion order of shardCache keys, oldest first,
+	// so superseded ring generations can be evicted.
+	shardCacheOrder []string
 	// placementVersion tracks the highest placement version observed via
 	// shard/page/point reads. It keeps PlacementVersion() off the full-map
 	// endpoint on worker/ingress-only agents.
 	placementVersion          atomic.Uint64
 	lastNoControlPlaneLogUnix atomic.Int64
+
+	// recreator is the service-layer hook the worker owner watcher calls to
+	// materialize placements the FSM assigned to this node. Attached after
+	// construction, exactly as *Cluster does, so the cluster->service
+	// direction stays one-way.
+	recreatorMu      sync.RWMutex
+	recreator        SandboxRecreator
+	recreateFailures *recreateFailureTracker
+	ownerWatcherStop context.CancelFunc
+	// ownedRecoveryCursor resumes the owner-index walk on the next tick. Only
+	// the owner-watcher goroutine touches it. It exists so a page budget can
+	// bound one tick's work without the walk losing its place — the reason
+	// the previous "stop on an empty page" rule starved dense workers.
+	ownedRecoveryCursor string
 }
 
 func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Agent, error) {
@@ -113,6 +185,9 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	if err != nil {
 		return nil, fmt.Errorf("cluster.NewAgent: load tls: %w", err)
 	}
+	if clusterTLS != nil && clusterTLS.NodeID() != nodeID {
+		return nil, fmt.Errorf("cluster.NewAgent: node certificate identity %q does not match node id %q", clusterTLS.NodeID(), nodeID)
+	}
 
 	commitTimeout := cfg.ClusterRaftCommitTimeout
 	if commitTimeout <= 0 {
@@ -126,9 +201,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		apiURL:        cfg.SelfAPIAdvertiseURL,
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
 		patToken:      cfg.PATToken,
-		httpClient:    &http.Client{Timeout: commitTimeout + 2*time.Second},
 		tls:           clusterTLS,
-		publicProxies: newProxyCache(defaultPublicTransport),
 	}
 
 	if clusterTLS != nil {
@@ -139,7 +212,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 			Timeout:   commitTimeout + 2*time.Second,
 			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
-		a.mtlsProxies = newProxyCache(newMTLSProxyTransport(clusterTLS.clientConfig()))
+		a.mtlsProxies = newProxyCache()
 		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, a.ApplyEncoded, logger)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
@@ -174,6 +247,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
 		Events:         nil,
+		OnLeave:        a.invalidatePeerClient,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {
@@ -182,10 +256,55 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		return nil, fmt.Errorf("cluster.NewAgent: gossip: %w", err)
 	}
 	a.gossip = gn
+	if a.internalServer != nil {
+		a.internalServer.SetPeerAuthorizer(func(nodeID string) bool {
+			m, ok := gn.lookupMember(nodeID)
+			return ok && m.Alive
+		})
+	}
+	// Worker/ingress nodes own sandboxes too. Without this loop a placement
+	// reassigned to a dedicated worker is never materialized by anything:
+	// the only automatic recreation loop belonged to *Cluster, and pkg/daemon's
+	// AttachRecreator probe silently skipped an Agent.
+	a.startOwnerWatcher()
 	return a, nil
 }
 
 func (a *Agent) SelfNodeID() string { return a.nodeID }
+
+// PeerInternalHTTPClient exposes the cert-pinned client for cluster list fan-out.
+func (a *Agent) PeerInternalHTTPClient() *http.Client {
+	if a == nil {
+		return nil
+	}
+	return a.internalClient
+}
+
+// ClientForPeer returns a cached mTLS HTTP client that verifies DNS SAN
+// node:<nodeID>. Legacy shared-SAN-only peer certs are rejected.
+func (a *Agent) ClientForPeer(nodeID string) *http.Client {
+	if a == nil {
+		return nil
+	}
+	return a.peerClients.get(a.internalClient, nodeID)
+}
+
+// PeerDialMember selects the peer client/URL using the per-node mTLS cache.
+func (a *Agent) PeerDialMember(m Member) (*http.Client, string, error) {
+	if a == nil {
+		return PeerDial(m, nil)
+	}
+	return PeerDialCached(m, a.internalClient, a.ClientForPeer(m.NodeID))
+}
+
+func (a *Agent) invalidatePeerClient(nodeID string) {
+	if a == nil {
+		return
+	}
+	a.peerClients.invalidate(nodeID)
+	a.mtlsProxies.invalidate(nodeID)
+}
+
 func (a *Agent) SelfAPIURL() string { return a.apiURL }
 
 func (a *Agent) OwnerOf(sandboxID string) (OwnerInfo, error) {
@@ -223,21 +342,42 @@ func (a *Agent) OwnerOfName(name string) (string, OwnerInfo, error) {
 	return lookup.SandboxID, owner, nil
 }
 
+// SelectPlacement asks the control plane for a target and nothing else.
 func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
+	target, _, _, err := a.selectPlacement(SelectPlacementRequest{Request: req, TargetOnly: true})
+	return target, err
+}
+
+func (a *Agent) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
+	target, _, candidates, err := a.selectPlacement(SelectPlacementRequest{Request: req})
+	return target, candidates, err
+}
+
+// SelectPlacementForCreate picks a target and the sandbox's seal recipients in
+// one control-plane round trip, returning the bounded recipient ids instead of
+// the candidate fleet.
+func (a *Agent) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error) {
+	target, recipients, _, err := a.selectPlacement(SelectPlacementRequest{
+		Request: req, SandboxID: strings.TrimSpace(sandboxID), RecipientBackups: recipientBackups,
+	})
+	return target, recipients, err
+}
+
+func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, []string, []Member, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
 	var resp SelectPlacementResponse
-	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalSelectPlacementPath, PublicInternalSelectPlacementPath, SelectPlacementRequest{Request: req}, &resp); err != nil {
-		return PlacementTarget{}, err
+	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalSelectPlacementPath, PublicInternalSelectPlacementPath, body, &resp); err != nil {
+		return PlacementTarget{}, nil, nil, err
 	}
 	if resp.Error != "" {
 		if resp.Error == ErrNoPlacementTarget.Error() {
-			return PlacementTarget{}, ErrNoPlacementTarget
+			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
 		}
 		if err := invalidTopologyFromMessage(resp.Error); err != nil {
-			return PlacementTarget{}, err
+			return PlacementTarget{}, nil, nil, err
 		}
-		return PlacementTarget{}, errors.New(resp.Error)
+		return PlacementTarget{}, nil, nil, errors.New(resp.Error)
 	}
 	if resp.Target.NodeID == a.nodeID {
 		resp.Target.APIURL = a.apiURL
@@ -245,33 +385,91 @@ func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 		resp.Target.InternalURL = a.internalURL
 		resp.Target.IsSelf = true
 	}
-	return resp.Target, nil
+	recipients := resp.Recipients
+	if len(recipients) == 0 && body.SandboxID != "" && len(resp.Candidates) > 0 {
+		// A control plane still on the previous build answered with the
+		// candidate slice; select locally so a rolling upgrade keeps sealing.
+		recipients = SelectSecretRecipients(body.SandboxID, resp.Candidates, resp.Target.NodeID, body.RecipientBackups)
+	}
+	return resp.Target, recipients, resp.Candidates, nil
 }
 
 func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
+	expectedIncarnationID := strings.TrimSpace(secrets.IncarnationID)
+	incarnationID := expectedIncarnationID
+	if incarnationID == "" {
+		lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			incarnationID = strings.TrimSpace(lookup.Placement.IncarnationID)
+			expectedIncarnationID = incarnationID
+			if incarnationID == "" {
+				return fmt.Errorf("%w: existing placement has no incarnation", ErrIncarnationConflict)
+			}
+		} else {
+			incarnationID, err = MintIncarnationID()
+			if err != nil {
+				return err
+			}
+		}
+	}
 	cmd := command{
-		Op:                 opPlace,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        a.nodeID,
-		OwnerAPIURL:        a.apiURL,
-		OwnerDataPlaneHost: a.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
+		Op:                    opPlace,
+		SandboxID:             sandboxID,
+		OwnerNodeID:           a.nodeID,
+		OwnerAPIURL:           a.apiURL,
+		OwnerDataPlaneHost:    a.dataPlaneHost,
+		Spec:                  spec,
+		SecretRef:             secrets.Ref,
+		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:  secrets.SealGeneration,
+		IncarnationID:         incarnationID,
+		ExpectedIncarnationID: expectedIncarnationID,
+		OwnerRef:              secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
 }
 
 func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if strings.TrimSpace(secrets.IncarnationID) == "" {
+		lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrUnknownSandbox
+		}
+		secrets.IncarnationID = strings.TrimSpace(lookup.Placement.IncarnationID)
+	}
+	if secrets.IncarnationID == "" {
+		return fmt.Errorf("%w: claim requires current incarnation", ErrIncarnationConflict)
+	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
 	cmd := command{
-		Op:                 opClaimOrphan,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        a.nodeID,
-		OwnerAPIURL:        a.apiURL,
-		OwnerDataPlaneHost: a.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
+		Op:                   opClaimOrphan,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          a.nodeID,
+		OwnerAPIURL:          a.apiURL,
+		OwnerDataPlaneHost:   a.dataPlaneHost,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretRecipients:     normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration: secrets.SealGeneration,
+		IncarnationID:        strings.TrimSpace(secrets.IncarnationID),
+		OwnerRef:             secrets.OwnerRef,
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -280,12 +478,54 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
+	if strings.TrimSpace(secrets.IncarnationID) == "" {
+		lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrUnknownSandbox
+		}
+		secrets.IncarnationID = strings.TrimSpace(lookup.Placement.IncarnationID)
+	}
+	if secrets.IncarnationID == "" {
+		return fmt.Errorf("%w: spec update requires current incarnation", ErrIncarnationConflict)
+	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
 	return a.applyCommand(ctx, command{
-		Op:            opUpsertSpec,
-		SandboxID:     sandboxID,
-		Spec:          spec,
-		SecretRef:     secrets.Ref,
-		SecretVersion: secrets.Version,
+		Op:                    opUpsertSpec,
+		SandboxID:             sandboxID,
+		Spec:                  spec,
+		SecretRef:             secrets.Ref,
+		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:  secrets.SealGeneration,
+		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
+	})
+}
+
+func (a *Agent) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
+	recipients = normalizeSecretRecipientIDs(recipients)
+	if err := validateSecretRecipientUpdate(sandboxID, recipients, secrets, expectedIncarnationID, expectedSealGeneration); err != nil {
+		return err
+	}
+	return a.applyCommand(ctx, command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              sandboxID,
+		SecretRecipients:       recipients,
+		SecretRef:              secrets.Ref,
+		SecretVersion:          secrets.Version,
+		SecretSealGeneration:   secrets.SealGeneration,
+		IncarnationID:          strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedOwnerNodeID:    strings.TrimSpace(expectedOwnerNodeID),
+		ExpectedOwnerNodeIDSet: true,
+		ExpectedSealGeneration: expectedSealGeneration,
 	})
 }
 
@@ -317,7 +557,15 @@ func (a *Agent) AddExposedPort(ctx context.Context, sandboxID string, port int, 
 	if port <= 0 {
 		return nil
 	}
-	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, Port: port, Protocol: route.Protocol, HostPort: route.HostPort, PublicURL: route.PublicURL}
+	incarnationID, found, err := a.currentPlacementIncarnation(ctx, sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return a.addExposedPortForIncarnation(ctx, sandboxID, incarnationID, port, route)
+}
+
+func (a *Agent) addExposedPortForIncarnation(ctx context.Context, sandboxID, incarnationID string, port int, route ExposedPortRoute) error {
+	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port, Protocol: route.Protocol, HostPort: route.HostPort, PublicURL: route.PublicURL}
 	return a.applyCommand(ctx, cmd)
 }
 
@@ -325,7 +573,11 @@ func (a *Agent) RemoveExposedPort(ctx context.Context, sandboxID string, port in
 	if port <= 0 {
 		return nil
 	}
-	return a.applyCommand(ctx, command{Op: opRemoveExposedPort, SandboxID: sandboxID, Port: port})
+	incarnationID, found, err := a.currentPlacementIncarnation(ctx, sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return a.applyCommand(ctx, command{Op: opRemoveExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port})
 }
 
 func (a *Agent) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute {
@@ -344,7 +596,16 @@ func (a *Agent) AddCustomDomain(ctx context.Context, sandboxID, hostname string)
 	if sandboxID == "" || hostname == "" {
 		return nil
 	}
-	return a.applyCommand(ctx, command{Op: opAddCustomDomain, SandboxID: sandboxID, Hostname: hostname})
+	incarnationID, found, err := a.currentPlacementIncarnation(ctx, sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return a.addCustomDomainForIncarnation(ctx, sandboxID, incarnationID, hostname)
+}
+
+func (a *Agent) addCustomDomainForIncarnation(ctx context.Context, sandboxID, incarnationID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	return a.applyCommand(ctx, command{Op: opAddCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname})
 }
 
 func (a *Agent) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
@@ -352,7 +613,27 @@ func (a *Agent) RemoveCustomDomain(ctx context.Context, sandboxID, hostname stri
 	if sandboxID == "" || hostname == "" {
 		return nil
 	}
-	return a.applyCommand(ctx, command{Op: opRemoveCustomDomain, SandboxID: sandboxID, Hostname: hostname})
+	incarnationID, found, err := a.currentPlacementIncarnation(ctx, sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return a.applyCommand(ctx, command{Op: opRemoveCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname})
+}
+
+func (a *Agent) currentPlacementIncarnation(ctx context.Context, sandboxID string) (string, bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return "", false, nil
+	}
+	lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	incarnationID := strings.TrimSpace(lookup.Placement.IncarnationID)
+	if incarnationID == "" {
+		return "", true, fmt.Errorf("%w: placement mutation requires current incarnation", ErrIncarnationConflict)
+	}
+	return incarnationID, true, nil
 }
 
 // CustomDomainsOf returns the hostnames bound to sandboxID. Agent doesn't run
@@ -380,28 +661,125 @@ func (a *Agent) ResolveCustomDomain(hostname string) (string, bool) {
 }
 
 func (a *Agent) DeletePlacement(ctx context.Context, sandboxID string) error {
-	return a.applyCommand(ctx, command{Op: opDelete, SandboxID: sandboxID})
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	// Same distributable GET any control-plane member uses for port/domain
+	// mutations. An authoritative leader POST here serialized every destroy
+	// onto the Raft leader and 503'd ACKs across elections.
+	lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
+	if err != nil || !ok {
+		return err
+	}
+	return a.DeletePlacementExact(ctx, sandboxID, lookup.Placement.OwnerNodeID, lookup.Placement.IncarnationID)
+}
+
+func (a *Agent) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	expectedOwnerNodeID = strings.TrimSpace(expectedOwnerNodeID)
+	expectedIncarnationID = strings.TrimSpace(expectedIncarnationID)
+	if sandboxID == "" {
+		return nil
+	}
+	if expectedIncarnationID == "" {
+		return fmt.Errorf("%w: exact placement delete requires current incarnation", ErrIncarnationConflict)
+	}
+	return a.applyCommand(ctx, command{
+		Op: opDelete, SandboxID: sandboxID,
+		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
+		ExpiresUnix: auditACLExpiryUnix(a.cfg.AuditDeletedGrace), AuditIndexMax: int64(a.cfg.AuditDeletedIndexMax),
+	})
+}
+
+func (a *Agent) BeginDeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	expectedOwnerNodeID = strings.TrimSpace(expectedOwnerNodeID)
+	expectedIncarnationID = strings.TrimSpace(expectedIncarnationID)
+	if sandboxID == "" {
+		return nil
+	}
+	if expectedOwnerNodeID == "" || expectedIncarnationID == "" {
+		return fmt.Errorf("%w: begin placement delete requires owner and incarnation", ErrIncarnationConflict)
+	}
+	return a.applyCommand(ctx, command{
+		Op: opBeginDelete, SandboxID: sandboxID,
+		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true,
+		ExpectedIncarnationID: expectedIncarnationID, ExpiresUnix: placementDeleteExpiryUnix(),
+	})
+}
+
+func (a *Agent) AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error) {
+	acl, ok, err := a.AuditACLForSandbox(ctx, sandboxID, "")
+	return acl.OwnerRef, ok, err
+}
+
+func (a *Agent) AuditACLForSandbox(ctx context.Context, sandboxID, incarnationID string) (AuditACL, bool, error) {
+	var out AuditACLResponse
+	path := PublicInternalAuditACLPath + url.PathEscape(strings.TrimSpace(sandboxID))
+	if incarnationID = strings.TrimSpace(incarnationID); incarnationID != "" {
+		path += "?incarnation_id=" + url.QueryEscape(incarnationID)
+	}
+	if err := a.doControlPlaneJSON(ctx, http.MethodGet, path, path, nil, &out); err != nil {
+		return AuditACL{}, false, err
+	}
+	out.ACL.OwnerRef = strings.TrimSpace(out.ACL.OwnerRef)
+	return out.ACL, out.Exists, nil
+}
+
+func (a *Agent) PruneAuditACL(context.Context, time.Time) error {
+	// The Raft leader owns periodic ACL retention. Worker agents observe the
+	// result through control-plane reads and must not forward duplicate sweeps.
+	return nil
 }
 
 func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
 	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
+	incarnationID := strings.TrimSpace(secrets.IncarnationID)
+	if incarnationID == "" {
+		var mintErr error
+		incarnationID, mintErr = MintIncarnationID()
+		if mintErr != nil {
+			return mintErr
+		}
+	}
 	return a.applyCommand(ctx, command{
-		Op:                 opReserve,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
-		Spec:               redacted,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		ExpiresUnix:        time.Now().Add(ttl).Unix(),
+		Op:                   opReserve,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          target.NodeID,
+		OwnerAPIURL:          target.APIURL,
+		OwnerDataPlaneHost:   target.DataPlaneHost,
+		Spec:                 redacted,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		SecretRecipients:     append([]string(nil), secrets.Recipients...),
+		IncarnationID:        incarnationID,
+		OwnerRef:             secrets.OwnerRef,
+		ExpiresUnix:          time.Now().Add(ttl).Unix(),
 	})
 }
 
 func (a *Agent) CancelReservation(ctx context.Context, sandboxID string) error {
-	return a.applyCommand(ctx, command{Op: opCancelReserve, SandboxID: sandboxID})
+	lookup, ok, err := a.lookupPlacement(ctx, strings.TrimSpace(sandboxID))
+	if err != nil {
+		return err
+	}
+	if !ok || !lookup.Placement.IsReserved() {
+		return nil
+	}
+	incarnationID := strings.TrimSpace(lookup.Placement.IncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: cancel reservation requires current incarnation", ErrIncarnationConflict)
+	}
+	return a.applyCommand(ctx, command{Op: opCancelReserve, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID})
 }
 
 func (a *Agent) SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error {
@@ -412,32 +790,35 @@ func (a *Agent) SetNodeDrainState(ctx context.Context, nodeID string, drained bo
 }
 
 func (a *Agent) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
+	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return fmt.Errorf("cluster: ReassignPlacement requires sandbox id")
 	}
 	if target.NodeID == "" {
 		return fmt.Errorf("cluster: ReassignPlacement requires target node id")
 	}
+	lookup, ok, err := a.lookupPlacement(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrUnknownSandbox
+	}
+	incarnationID := strings.TrimSpace(lookup.Placement.IncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: reassign placement requires current incarnation", ErrIncarnationConflict)
+	}
 	return a.applyCommand(ctx, command{
-		Op:                 opReassign,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
+		Op:                    opReassign,
+		SandboxID:             sandboxID,
+		OwnerNodeID:           target.NodeID,
+		OwnerAPIURL:           target.APIURL,
+		OwnerDataPlaneHost:    target.DataPlaneHost,
+		ExpectedIncarnationID: incarnationID,
 	})
 }
 
 func (a *Agent) wasmMigratePAT() string { return a.patToken }
-
-func (a *Agent) wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error) {
-	if a.internalClient != nil && internalURL != "" {
-		return a.internalClient, internalURL, nil
-	}
-	if apiURL == "" {
-		return nil, "", fmt.Errorf("cluster agent: peer API URL unknown")
-	}
-	return a.httpClient, apiURL, nil
-}
 
 func (a *Agent) RemoveMember(ctx context.Context, nodeID string, force bool) error {
 	if nodeID == "" {
@@ -483,18 +864,22 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 			}
 			continue
 		}
+		incarnationID := strings.TrimSpace(st.Secrets.IncarnationID)
+		if ok {
+			incarnationID = strings.TrimSpace(existing.Placement.IncarnationID)
+		}
 		switch {
 		case !ok:
 			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
 			for port, route := range st.ExposedPorts {
-				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := a.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := a.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -503,28 +888,43 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 				firstErr = err
 			}
 			for port, route := range st.ExposedPorts {
-				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := a.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := a.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned():
-			if existing.Placement.Spec == nil && st.Spec != nil {
-				if err := a.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
+			needsSecretBackfill := existing.Placement.SecretSealGeneration <= 0 && st.Secrets.hasUpdate()
+			if (existing.Placement.Spec == nil && st.Spec != nil) || needsSecretBackfill {
+				var spec *models.CreateSandboxRequest
+				if existing.Placement.Spec == nil {
+					spec = st.Spec
+				}
+				replaySecrets := PlacementSecrets{IncarnationID: incarnationID}
+				if needsSecretBackfill {
+					replaySecrets = st.Secrets
+				}
+				if err := a.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if existing.Placement.SecretSealGeneration > 0 && st.Secrets.hasUpdate() &&
+				st.Secrets.SealGeneration > existing.Placement.SecretSealGeneration && len(st.Secrets.Recipients) > 0 {
+				if err := a.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, a.nodeID, existing.Placement.SecretSealGeneration); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for port, route := range st.ExposedPorts {
-				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := a.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := a.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -536,12 +936,12 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 				continue
 			}
 			for port, route := range st.ExposedPorts {
-				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := a.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := a.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -560,7 +960,8 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 }
 
 func (a *Agent) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request) {
-	forwardHTTPWithMetrics(a.mtlsProxies, a.publicProxies, target, w, r)
+	SetPeerNodeIDHeader(r, a.nodeID)
+	forwardHTTPWithMetrics(a.mtlsProxies, a.ClientForPeer, target, w, r)
 }
 
 func (a *Agent) AttachInternalHandler(h http.Handler) {
@@ -585,33 +986,71 @@ func (a *Agent) Members() []Member {
 	return a.gossip.members()
 }
 
+// LocalMembers returns the gossip view only — never the control-plane HTTP
+// members call. Used by list failover_ready so a page of sandboxes does not
+// trigger N membership RPCs.
+func (a *Agent) LocalMembers() []Member {
+	if a == nil || a.gossip == nil {
+		return nil
+	}
+	return a.gossip.members()
+}
+
+// LookupMember resolves one peer by ID via the local gossip index (O(1)),
+// falling back to a membership scan only when the index misses.
+func (a *Agent) LookupMember(id string) (Member, bool) {
+	if a == nil || id == "" {
+		return Member{}, false
+	}
+	if a.gossip != nil {
+		if m, ok := a.gossip.lookupMember(id); ok {
+			return m, true
+		}
+	}
+	// Identity lookup only: the local gossip view answers it without a
+	// control-plane round trip that would carry the whole fleet.
+	for _, m := range a.LocalMembers() {
+		if m.NodeID == id {
+			return m, true
+		}
+	}
+	return Member{}, false
+}
+
 // IngressTargets aggregates live ingress-role members' PublicHost values.
-// Agents have no FSM but Members() already falls back to the local gossip
-// view when the control plane is unreachable, so the same aggregator works
-// for both cases.
+// Identity and role are gossip facts, so this reads the local view and only
+// falls back to the control plane when gossip has nothing yet — the aggregate
+// is a handful of hostnames, not a reason to redistribute capacity snapshots
+// for the whole fleet.
 func (a *Agent) IngressTargets() models.IngressTarget {
-	return aggregateIngressTargets(a.Members())
+	return aggregateIngressTargets(IdentityMembers(a))
 }
 
 func (a *Agent) Placements() []Placement {
 	return a.PlacementsForShards(PlacementShardFilter{})
 }
 
+// PlacementsForShards reads this node's slice of the placement view, PAGED.
+//
+// It used to be one unbounded request. A minimal 100k-placement answer encodes
+// to ~28 MB, well past the agent's 16 MB JSON response ceiling, so the read
+// failed and a cold agent fell back to an empty view — and the unfiltered
+// endpoint does have a production caller: an ingress tier at or below
+// MaxReplicatedIngressRouteNodes reaches it through an all-shards filter.
+// Paging the page endpoint keeps every response bounded by
+// MaxPlacementPageLimit rows instead of raising the ceiling.
 func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	start := time.Now()
 	filter = filter.Normalize()
-	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
-	defer cancel()
-	var out []Placement
-	if filter.allShards() {
-		if err := a.doControlPlaneJSON(ctx, http.MethodGet, PublicInternalPlacementsPath, PublicInternalPlacementsPath, nil, &out); err != nil {
-			a.logger.Warn("cluster agent: placements lookup failed; using cached placement view", "err", err)
-			cached := a.cachedPlacementsForShards(filter)
-			recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
-			return cached
-		}
-	} else if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsQueryPath, PublicInternalPlacementsQueryPath, filter, &out); err != nil {
-		a.logger.Warn("cluster agent: shard placement lookup failed; using cached shard view", "err", err, "shards", len(filter.Shards))
+	if filter.noShards() {
+		// This node serves no public routes. Not a cache miss, not an empty
+		// fleet — simply no work, and no control-plane read either.
+		return nil
+	}
+	out, err := a.fetchPlacementPages(filter)
+	if err != nil {
+		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",
+			"err", err, "shards", len(filter.Shards), "all_shards", filter.allShards())
 		cached := a.cachedPlacementsForShards(filter)
 		recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
 		return cached
@@ -620,15 +1059,91 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	if filter.allShards() {
 		a.placementCache = clonePlacements(out)
 	}
-	if a.shardCache == nil {
-		a.shardCache = make(map[string][]Placement)
-	}
-	a.shardCache[placementShardFilterCacheKey(filter)] = clonePlacements(out)
+	a.storeShardCacheLocked(placementShardFilterCacheKey(filter), out)
 	shardEntries := len(a.shardCache)
 	a.cacheMu.Unlock()
 	a.observePlacementVersions(out)
 	recordPlacementCacheRefresh(time.Since(start), len(out), shardEntries, nil)
 	return out
+}
+
+// maxPlacementPages bounds the page walk. At MaxPlacementPageLimit rows per
+// page this covers far more than the 100k-sandbox target; it exists so a
+// control plane that keeps emitting cursors cannot spin a reconcile tick
+// forever.
+const maxPlacementPages = 1024
+
+// fetchPlacementPages walks the paged endpoint until the cursor is exhausted.
+// Every response stays inside the JSON size ceiling, which one unbounded read
+// of a 100k-placement view does not.
+//
+// The walk refuses to trust a cursor that cannot make progress: an empty page
+// that still carries a token, or a token identical to the one just sent, ends
+// the walk rather than looping.
+func (a *Agent) fetchPlacementPages(filter PlacementShardFilter) ([]Placement, error) {
+	var out []Placement
+	req := PlacementPageRequest{Limit: MaxPlacementPageLimit, ShardFilter: filter}
+	for page := 0; page < maxPlacementPages; page++ {
+		ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
+		var resp PlacementPageResponse
+		err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsPagePath, PublicInternalPlacementsPagePath, req.Normalize(), &resp)
+		cancel()
+		if err != nil {
+			// A row count is not a size bound: route metadata (up to
+			// models.MaxCustomDomainsPerSandbox custom hostnames) rides these
+			// rows, so a full page of valid wide rows can exceed the response
+			// ceiling. Ask for fewer rows and retry the SAME cursor —
+			// repeating an identical request cannot recover a cold ingress.
+			if errors.Is(err, errControlPlaneResponseTooLarge) && req.Limit > 1 {
+				req.Limit = max(1, req.Limit/4)
+				a.logger.Warn("cluster agent: placement page exceeded the response ceiling; retrying with a smaller page",
+					"limit", req.Limit, "page_token", req.PageToken)
+				continue
+			}
+			return nil, err
+		}
+		if len(resp.SkippedSandboxIDs) > 0 {
+			// A row too large to deliver at all leaves a hole. Callers make
+			// cleanup decisions from this view, so a hole must read as
+			// "unavailable" (cached fallback), never as "these placements are
+			// gone".
+			return nil, fmt.Errorf("cluster: control plane could not deliver %d placement row(s): %v",
+				len(resp.SkippedSandboxIDs), resp.SkippedSandboxIDs)
+		}
+		out = append(out, resp.Placements...)
+		if resp.NextPageToken == "" || len(resp.Placements) == 0 || resp.NextPageToken == req.PageToken {
+			return out, nil
+		}
+		req.PageToken = resp.NextPageToken
+	}
+	a.logger.Warn("cluster agent: placement page walk hit its page cap; view may be truncated",
+		"pages", maxPlacementPages, "placements", len(out))
+	return out, nil
+}
+
+// maxAgentShardCacheEntries bounds the fallback shard cache. A node's filter
+// changes only when the ingress ring changes, and a fallback is only ever
+// useful for the filter in force now or the one just superseded — but the map
+// was keyed by filter and never evicted, so every historical ring left a full
+// cloned placement slice behind forever.
+const maxAgentShardCacheEntries = 2
+
+// storeShardCacheLocked records the newest shard view and retires superseded
+// generations. Caller holds a.cacheMu.
+func (a *Agent) storeShardCacheLocked(key string, placements []Placement) {
+	if a.shardCache == nil {
+		a.shardCache = make(map[string][]Placement, maxAgentShardCacheEntries)
+		a.shardCacheOrder = nil
+	}
+	if _, exists := a.shardCache[key]; !exists {
+		a.shardCacheOrder = append(a.shardCacheOrder, key)
+		for len(a.shardCacheOrder) > maxAgentShardCacheEntries {
+			evict := a.shardCacheOrder[0]
+			a.shardCacheOrder = a.shardCacheOrder[1:]
+			delete(a.shardCache, evict)
+		}
+	}
+	a.shardCache[key] = clonePlacements(placements)
 }
 
 func (a *Agent) shardCacheEntryCount() int {
@@ -644,8 +1159,11 @@ func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	var out PlacementPageResponse
 	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsPagePath, PublicInternalPlacementsPagePath, req, &out); err != nil {
 		a.logger.Warn("cluster agent: placement page lookup failed", "err", err, "limit", req.Limit, "page_token", req.PageToken)
-		return PlacementPageResponse{}
+		// Explicit not-ready: empty + Authoritative=false so list returns 503
+		// instead of treating a CP error as an empty tenant.
+		return PlacementPageResponse{Authoritative: false}
 	}
+	out.Authoritative = true
 	a.observePlacementVersions(out.Placements)
 	return out
 }
@@ -657,6 +1175,79 @@ func (a *Agent) PlacementOf(sandboxID string) (Placement, bool) {
 	}
 	a.observePlacementVersion(lookup.Placement.Version)
 	return lookup.Placement, true
+}
+
+// PlacementsByIDs batch-looks up IDs via a single control-plane POST.
+// Prefer this over Placements() when only a page of IDs is needed.
+func (a *Agent) PlacementsByIDs(ids []string) map[string]Placement {
+	out, err := a.fetchPlacementsByIDs(context.Background(), ids, false)
+	if err != nil {
+		a.logger.Warn("cluster agent: placements-by-ids lookup failed", "err", err, "n", len(ids))
+		// nil is the explicit not-authoritative result. Never turn one failed
+		// batch into N point reads at fleet scale.
+		return nil
+	}
+	return out
+}
+
+func (a *Agent) AuthoritativePlacementsByIDs(ctx context.Context, ids []string) (map[string]Placement, error) {
+	return a.fetchPlacementsByIDs(ctx, ids, true)
+}
+
+func (a *Agent) fetchPlacementsByIDs(ctx context.Context, ids []string, authoritative bool) (map[string]Placement, error) {
+	cleaned := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		cleaned = append(cleaned, id)
+	}
+	if len(cleaned) == 0 {
+		return map[string]Placement{}, nil
+	}
+	path := PublicInternalPlacementsByIDsPath
+	if authoritative {
+		path += "?authoritative=true"
+	}
+	// The handler rejects a body with more than MaxPlacementPageLimit ids, and
+	// a rejected batch is indistinguishable from "control plane unavailable"
+	// to every caller — which turns one oversized request into a skipped pass
+	// over ALL of a node's ids, not just the surplus. Callers page their own
+	// work, but chunk here too so no future caller can re-open that hole.
+	merged := make(map[string]Placement, len(cleaned))
+	for chunk := range slices.Chunk(cleaned, MaxPlacementPageLimit) {
+		reqCtx, cancel := context.WithTimeout(ctx, controlPlanePlacementRequestTimeout)
+		var out map[string]Placement
+		err := a.doControlPlaneJSON(reqCtx, http.MethodPost, path, path, placementsByIDsRequest{IDs: chunk}, &out)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(merged, out)
+	}
+	a.observePlacementVersions(placementsMapValues(merged))
+	return merged, nil
+}
+
+type placementsByIDsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func placementsMapValues(m map[string]Placement) []Placement {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]Placement, 0, len(m))
+	for _, p := range m {
+		out = append(out, p)
+	}
+	return out
 }
 
 func (a *Agent) PlacementVersion() uint64 {
@@ -677,6 +1268,7 @@ func (a *Agent) Leader() string {
 
 func (a *Agent) Close() error {
 	var firstErr error
+	a.stopOwnerWatcher()
 	if a.gossip != nil {
 		if err := a.gossip.Close(); err != nil {
 			firstErr = fmt.Errorf("cluster agent: gossip close: %w", err)
@@ -734,6 +1326,9 @@ func (a *Agent) applyCommand(ctx context.Context, cmd command) error {
 	if err := validateCommandRecoverySize(cmd); err != nil {
 		return err
 	}
+	if err := validateCommandLifecycle(cmd); err != nil {
+		return err
+	}
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
@@ -784,20 +1379,10 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 }
 
 func (a *Agent) tryControlPlaneMember(ctx context.Context, m Member, method, publicPath, internalPath string, body []byte, out any) error {
-	if a.internalClient != nil && m.InternalURL != "" {
-		err := a.doHTTPRequest(ctx, a.internalClient, strings.TrimRight(m.InternalURL, "/")+internalPath, method, body, out)
-		if err == nil {
-			return nil
-		}
-		if !isStatus(err, http.StatusServiceUnavailable) {
-			return err
-		}
-		return err
+	if a.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {
+		return ErrPeerInternalURLRequired
 	}
-	if m.APIURL == "" {
-		return errors.New("cluster agent: server API URL unknown for " + m.NodeID)
-	}
-	return a.doHTTPRequest(ctx, a.httpClient, strings.TrimRight(m.APIURL, "/")+publicPath, method, body, out)
+	return a.doHTTPRequest(ctx, a.ClientForPeer(m.NodeID), strings.TrimRight(m.InternalURL, "/")+internalPath, method, body, out)
 }
 
 func (a *Agent) logNoControlPlaneMembers(method, publicPath, internalPath string) {
@@ -851,10 +1436,10 @@ func (a *Agent) controlPlaneDiagnosticSnapshot() (total, alive, serverRole, self
 		if m.NodeID == a.nodeID {
 			self++
 		}
-		if m.APIURL == "" && m.InternalURL == "" {
+		if m.InternalURL == "" {
 			missingEndpoint++
 		}
-		if m.NodeID != "" && m.NodeID != a.nodeID && m.Alive && CanServeControlPlaneRole(m.Role) && (m.APIURL != "" || m.InternalURL != "") {
+		if m.NodeID != "" && m.NodeID != a.nodeID && m.Alive && CanServeControlPlaneRole(m.Role) && m.InternalURL != "" {
 			candidates++
 		}
 	}
@@ -872,7 +1457,7 @@ func controlPlaneMemberDiagnostic(m Member, selfID string) string {
 	if !CanServeControlPlaneRole(m.Role) {
 		flags = append(flags, "role-not-control-plane")
 	}
-	if m.APIURL == "" && m.InternalURL == "" {
+	if m.InternalURL == "" {
 		flags = append(flags, "missing-endpoint")
 	}
 	if len(flags) == 0 {
@@ -896,6 +1481,7 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	SetPeerNodeIDHeader(req, a.nodeID)
 	if a.patToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.patToken)
 	}
@@ -922,6 +1508,12 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 		if resp.StatusCode == http.StatusNotFound && strings.Contains(message, ErrUnknownMember.Error()) {
 			return ErrUnknownMember
 		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrArtifactCatalogSuperseded.Error()) {
+			// A publisher has to be able to tell "your token is stale" from
+			// a transient apply failure: one re-seeds, the other retries
+			// unchanged. See ApplyErrorStatus in apply_verdict.go.
+			return fmt.Errorf("%w: %s", ErrArtifactCatalogSuperseded, message)
+		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
 			return ErrMemberStillAlive
 		}
@@ -934,22 +1526,52 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 		io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return decodeControlPlaneJSON(resp.Body, out)
 }
 
+func decodeControlPlaneJSON(r io.Reader, out any) error {
+	payload, err := io.ReadAll(io.LimitReader(r, maxControlPlaneJSONResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(payload) > maxControlPlaneJSONResponseBytes {
+		return fmt.Errorf("%w: %d bytes", errControlPlaneResponseTooLarge, maxControlPlaneJSONResponseBytes)
+	}
+	return json.Unmarshal(payload, out)
+}
+
+// errControlPlaneResponseTooLarge is recognizable so a paged caller can ask
+// for a smaller page instead of giving up. A control plane running the
+// previous build pages by row count only, and row width is not bounded by the
+// row count, so the client has to be able to shrink its own request.
+var errControlPlaneResponseTooLarge = errors.New("cluster control-plane JSON response exceeds the size ceiling")
+
+// controlPlaneMembers returns the server-role peers this agent may send a
+// control-plane request to, in random order.
+//
+// It reads the maintained server index rather than snapshotting the fleet and
+// filtering: every RPC went through the second shape, which allocates all
+// 2,000 members (~1.16 MB) to choose among a handful of candidates.
 func (a *Agent) controlPlaneMembers() []Member {
-	if a.gossip == nil {
+	if a == nil || a.gossip == nil {
 		return nil
 	}
-	var out []Member
-	for _, m := range a.gossip.members() {
-		if m.NodeID == "" || m.NodeID == a.nodeID || !m.Alive {
-			continue
+	index := a.gossip.currentMemberIndex()
+	var candidates []Member
+	if index != nil {
+		candidates = index.controlPlaneSnapshot()
+	} else {
+		// No index yet (very early boot): fall back to the scan.
+		for _, m := range a.gossip.members() {
+			if m.NodeID == "" || !m.Alive || m.InternalURL == "" || !CanServeControlPlaneRole(m.Role) {
+				continue
+			}
+			candidates = append(candidates, m)
 		}
-		if !CanServeControlPlaneRole(m.Role) {
-			continue
-		}
-		if m.APIURL == "" && m.InternalURL == "" {
+	}
+	out := candidates[:0]
+	for _, m := range candidates {
+		if m.NodeID == a.nodeID {
 			continue
 		}
 		out = append(out, m)

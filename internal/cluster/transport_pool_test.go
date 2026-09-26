@@ -13,9 +13,8 @@ import (
 )
 
 // TestInternalTransportPoolSizing pins the idle-pool sizing on the transports
-// New and NewAgent actually install (both build from newInternalTransport /
-// newMTLSProxyTransport, so asserting on the constructors covers both call
-// sites and they can't drift apart).
+// New and NewAgent install this transport for leader RPCs and node-pinned
+// owner proxies, so the two paths cannot drift apart.
 func TestInternalTransportPoolSizing(t *testing.T) {
 	t.Parallel()
 	tr := newInternalTransport(&tls.Config{}) //nolint:gosec // sizing test only
@@ -30,14 +29,6 @@ func TestInternalTransportPoolSizing(t *testing.T) {
 	}
 	if tr.TLSClientConfig == nil {
 		t.Fatal("internal transport must carry the mTLS client config")
-	}
-
-	pr := newMTLSProxyTransport(&tls.Config{}) //nolint:gosec // sizing test only
-	if pr.MaxIdleConns != 100 || pr.MaxIdleConnsPerHost != 10 {
-		t.Fatalf("proxy pool = %d/%d, want 100/10", pr.MaxIdleConns, pr.MaxIdleConnsPerHost)
-	}
-	if pr.TLSClientConfig == nil {
-		t.Fatal("proxy transport must carry the mTLS client config")
 	}
 }
 

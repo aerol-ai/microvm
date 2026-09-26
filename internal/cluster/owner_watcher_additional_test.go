@@ -51,14 +51,14 @@ func TestOwnerWatcherRecreateFailureAndReassign(t *testing.T) {
 		recreateCandidate("leader", "worker", 10),
 		recreateCandidate("alt-worker", "worker", 100),
 	})
-	c.gossip = &gossipNode{memberIndex: index}
+	c.gossip.memberIndex.replace(index.snapshot())
 
 	rec := &failingRecreator{recordingRecreator: newRecordingRecreator()}
 	c.AttachRecreator(rec)
 	c.recreateFailures = &recreateFailureTracker{counts: make(map[string]int)}
 
 	spec := failoverRecreateSpec()
-	cmd := command{Op: opPlace, SandboxID: "sb-fail", OwnerNodeID: "leader", Spec: spec}
+	cmd := command{Op: opPlace, SandboxID: "sb-fail", OwnerNodeID: "leader", Spec: spec, IncarnationID: "inc-fail"}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply: %v", err)

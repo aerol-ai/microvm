@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
+	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/config"

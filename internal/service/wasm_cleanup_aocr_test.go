@@ -27,11 +27,13 @@ func (r *recordingWasmCheckpointStore) DestRefTagged(id, tag string) string {
 	return "aocr://" + id + ":" + tag
 }
 
-func (r *recordingWasmCheckpointStore) PushOnceTo(context.Context, string, string, string) (WasmCheckpointPushResult, error) {
+func (r *recordingWasmCheckpointStore) PushOnceTo(context.Context, string, string, string, string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{}, nil
 }
 
-func (r *recordingWasmCheckpointStore) PullOnce(context.Context, string, string) error { return nil }
+func (r *recordingWasmCheckpointStore) PullOnce(context.Context, string, string, string) error {
+	return nil
+}
 
 func (r *recordingWasmCheckpointStore) DeleteRef(_ context.Context, ref string) error {
 	r.deleted = append(r.deleted, ref)
@@ -94,7 +96,7 @@ func TestCleanupWasmSandboxArtifacts_DeletesAllAOCRRefs(t *testing.T) {
 		"aocr://" + id + ":sha256-newest",
 	}
 	for _, ref := range pushRefs {
-		if _, err := st.InsertWasmCheckpointPush(ctx, id, ref, "digest-of-"+ref); err != nil {
+		if _, err := st.InsertWasmCheckpointPush(ctx, id, "", ref, "digest-of-"+ref); err != nil {
 			t.Fatalf("InsertWasmCheckpointPush: %v", err)
 		}
 	}
@@ -220,7 +222,7 @@ func TestCleanupWasmSandboxArtifacts_NoVacuumOnDeleteFailure(t *testing.T) {
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("store.Create: %v", err)
 	}
-	if _, err := st.InsertWasmCheckpointPush(ctx, id, "aocr://"+id+":sha256-x", "d"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, id, "", "aocr://"+id+":sha256-x", "d"); err != nil {
 		t.Fatalf("InsertWasmCheckpointPush: %v", err)
 	}
 
@@ -232,8 +234,8 @@ func TestCleanupWasmSandboxArtifacts_NoVacuumOnDeleteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListWasmCheckpointPushes: %v", err)
 	}
-	if len(pushes) != 1 {
-		t.Fatalf("failed DeleteRef should retain the tracking row, got %d rows", len(pushes))
+	if len(pushes) != 2 {
+		t.Fatalf("failed DeleteRef should retain digest and :latest tracking rows, got %d rows", len(pushes))
 	}
 
 	// Sandbox row goes away (destroy completes). The row is now orphaned but the
@@ -245,12 +247,12 @@ func TestCleanupWasmSandboxArtifacts_NoVacuumOnDeleteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListOrphanedWasmCheckpointPushes: %v", err)
 	}
-	if len(orphans) != 1 {
-		t.Fatalf("expected 1 orphaned push row, got %d", len(orphans))
+	if len(orphans) != 2 {
+		t.Fatalf("expected 2 orphaned push rows, got %d", len(orphans))
 	}
 	svc.runWasmOrphanRefSweep(ctx) // DeleteRef still failing → row retained
-	if orphans, _ := st.ListOrphanedWasmCheckpointPushes(ctx, 0); len(orphans) != 1 {
-		t.Fatalf("orphan row must survive a failed sweep, got %d", len(orphans))
+	if orphans, _ := st.ListOrphanedWasmCheckpointPushes(ctx, 0); len(orphans) != 2 {
+		t.Fatalf("orphan rows must survive a failed sweep, got %d", len(orphans))
 	}
 
 	// Registry recovers: the next sweep deletes the ref and drops the row.
@@ -259,8 +261,17 @@ func TestCleanupWasmSandboxArtifacts_NoVacuumOnDeleteFailure(t *testing.T) {
 	if orphans, _ := st.ListOrphanedWasmCheckpointPushes(ctx, 0); len(orphans) != 0 {
 		t.Fatalf("orphan-ref sweep must reclaim the row once DeleteRef succeeds, got %d", len(orphans))
 	}
-	if len(pusher.deleted) != 1 || pusher.deleted[0] != "aocr://"+id+":sha256-x" {
-		t.Fatalf("sweep deleted refs = %v, want the retained per-digest ref", pusher.deleted)
+	wantDeleted := map[string]bool{
+		"aocr://" + id + ":sha256-x": true,
+		"aocr://" + id + ":latest":   true,
+	}
+	if len(pusher.deleted) != len(wantDeleted) {
+		t.Fatalf("sweep deleted refs = %v, want digest and :latest refs", pusher.deleted)
+	}
+	for _, ref := range pusher.deleted {
+		if !wantDeleted[ref] {
+			t.Fatalf("sweep deleted unexpected ref %q", ref)
+		}
 	}
 }
 

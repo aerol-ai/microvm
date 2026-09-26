@@ -49,6 +49,13 @@ type HostSupervisor interface {
 	SpawnGroup(ctx context.Context, spec JailSpec) (GroupHost, error)
 }
 
+// capsApplier is implemented by hosts whose resource caps can change while
+// they run (pkg/isolate.Host via its cgroup). The group router uses it when a
+// warm blank host is claimed by a tenant.
+type capsApplier interface {
+	ApplyCaps(cpu float64, memMB int, pidsMax int) error
+}
+
 // WarmPool hands out blank workerd group hosts. Production implementation:
 // internal/pool/isolate (Phase 3). ok=false means empty or disabled — the
 // caller cold-spawns. The group router runs before the pool: only a tenant's

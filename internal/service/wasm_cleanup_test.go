@@ -38,7 +38,7 @@ func TestCleanupWasmSandboxArtifactsRemovesWasmMetadata(t *testing.T) {
 	if err := st.PutWasmStateKV(ctx, sb.ID, "k", []byte("v")); err != nil {
 		t.Fatalf("put wasm state kv: %v", err)
 	}
-	if _, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "registry.example/sb-clean:latest", "sha256:abc"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "", "registry.example/sb-clean:latest", "sha256:abc"); err != nil {
 		t.Fatalf("insert checkpoint push: %v", err)
 	}
 
@@ -90,15 +90,16 @@ func TestDestroyWasmSandboxDoesNotScheduleDockerImageGC(t *testing.T) {
 
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
-		ID:           "sb-wasm-destroy",
-		Runtime:      models.RuntimeWasm,
-		Image:        "file:///tmp/demo.wasm",
-		Status:       models.SandboxStatusStarted,
-		ContainerID:  "wasm:sb-wasm-destroy",
-		ContainerIP:  "127.0.0.1",
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 "sb-wasm-destroy",
+		Runtime:            models.RuntimeWasm,
+		Image:              "file:///tmp/demo.wasm",
+		Status:             models.SandboxStatusStarted,
+		ContainerID:        "wasm:sb-wasm-destroy",
+		ContainerIP:        "127.0.0.1",
+		AuditIncarnationID: "inc-sb-wasm-destroy",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("create sandbox: %v", err)

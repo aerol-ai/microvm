@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/events"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/events"
 )
 
 func TestLiveTransportCloseNilSafe(t *testing.T) {

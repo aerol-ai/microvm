@@ -2,6 +2,7 @@ package clustercreate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
@@ -54,6 +55,7 @@ type clusterStub struct {
 	onRecord    func()
 
 	selfNodePanic bool
+	placements    map[string]cluster.Placement
 }
 
 func (s *clusterStub) SelfNodeID() string {
@@ -91,22 +93,55 @@ func (s *clusterStub) ForwardHTTP(target cluster.Endpoint, w http.ResponseWriter
 	_, _ = w.Write([]byte("forwarded"))
 }
 
-func (s *clusterStub) DeletePlacement(_ context.Context, _ string) error {
+func (s *clusterStub) DeletePlacement(_ context.Context, sandboxID string) error {
 	s.deletes++
+	if s.deleteErr == nil {
+		delete(s.placements, sandboxID)
+	}
 	return s.deleteErr
 }
 
-func (s *clusterStub) CancelReservation(_ context.Context, _ string) error {
+func (s *clusterStub) DeletePlacementExact(ctx context.Context, sandboxID, _, _ string) error {
+	return s.DeletePlacement(ctx, sandboxID)
+}
+
+func (s *clusterStub) CancelReservation(_ context.Context, sandboxID string) error {
 	s.cancels++
+	if s.cancelErr == nil {
+		delete(s.placements, sandboxID)
+	}
 	return s.cancelErr
 }
 
 func (s *clusterStub) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	target, _, err := s.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (s *clusterStub) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	s.selectReqs = append(s.selectReqs, req)
 	if s.selectErr != nil {
-		return cluster.PlacementTarget{}, s.selectErr
+		return cluster.PlacementTarget{}, nil, s.selectErr
 	}
-	return s.selectTarget, nil
+	cands := s.members
+	if len(cands) == 0 {
+		cands = []cluster.Member{{NodeID: s.selectTarget.NodeID, APIURL: s.selectTarget.APIURL, Alive: true}}
+	}
+	return s.selectTarget, cands, nil
+}
+
+// SelectPlacementForCreate is the create path's entry point now: the stub has
+// to answer it too, or Prepare falls through to the embedded Noop and every
+// placement-error assertion silently passes.
+func (s *clusterStub) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (cluster.PlacementTarget, []string, error) {
+	target, candidates, err := s.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return cluster.PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
 }
 
 func (s *clusterStub) IsNodeDrained(_ string) bool {
@@ -128,14 +163,73 @@ func (s *clusterStub) ReserveOnTarget(_ context.Context, sandboxID string, targe
 		secrets:   secrets,
 		ttl:       ttl,
 	})
+	incarnationID := strings.TrimSpace(secrets.IncarnationID)
+	if incarnationID == "" {
+		incarnationID = "inc-" + sandboxID
+	}
+	if s.placements == nil {
+		s.placements = make(map[string]cluster.Placement)
+	}
+	s.placements[sandboxID] = cluster.Placement{
+		SandboxID:        sandboxID,
+		OwnerNodeID:      target.NodeID,
+		IncarnationID:    incarnationID,
+		SecretRecipients: append([]string(nil), secrets.Recipients...),
+		ExpiresUnix:      time.Now().Add(ttl).Unix(),
+		State:            cluster.PlacementStateReserved,
+	}
 	return s.reserveErr
 }
 
-func (s *clusterStub) RecordPlacement(_ context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets cluster.PlacementSecrets) error {
+func (s *clusterStub) PlacementOf(sandboxID string) (cluster.Placement, bool) {
+	p, ok := s.placements[sandboxID]
+	return p, ok
+}
+
+func (s *clusterStub) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement)
+	for _, id := range ids {
+		if p, ok := s.placements[id]; ok {
+			out[id] = p
+			continue
+		}
+		// CreateOnSelectedNode's non-HTTP unit tests enter after Prepare has
+		// already reserved the requested ID. Model that precondition instead
+		// of weakening the production reserved-placement fence.
+		out[id] = cluster.Placement{
+			SandboxID: id, OwnerNodeID: s.Noop.SelfNodeID(), IncarnationID: "inc-" + id,
+			State: cluster.PlacementStateReserved, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		}
+	}
+	return out, nil
+}
+
+func seedReservedPlacement(s *clusterStub, sandboxID string) {
+	if s.placements == nil {
+		s.placements = make(map[string]cluster.Placement)
+	}
+	s.placements[sandboxID] = cluster.Placement{
+		SandboxID: sandboxID, OwnerNodeID: s.Noop.SelfNodeID(), IncarnationID: "inc-" + sandboxID,
+		State: cluster.PlacementStateReserved, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+	}
+}
+
+func (s *clusterStub) RecordPlacement(_ context.Context, sandboxID string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
 	if s.onRecord != nil {
 		s.onRecord()
 	}
-	s.recordCalls = append(s.recordCalls, recordCall{sandboxID: sandboxID, spec: spec, secrets: secrets})
+	s.recordCalls = append(s.recordCalls, recordCall{sandboxID: sandboxID, spec: spec, secrets: placementSecrets})
+	if s.placements == nil {
+		s.placements = make(map[string]cluster.Placement)
+	}
+	incarnationID := strings.TrimSpace(placementSecrets.IncarnationID)
+	if incarnationID == "" {
+		incarnationID = "inc-" + sandboxID
+	}
+	s.placements[sandboxID] = cluster.Placement{
+		SandboxID: sandboxID, OwnerNodeID: s.Noop.SelfNodeID(), IncarnationID: incarnationID,
+		State: cluster.PlacementStatePlaced,
+	}
 	return s.recordErr
 }
 
@@ -279,7 +373,7 @@ func cloneRuntimeState(state *models.SandboxRuntimeState) *models.SandboxRuntime
 
 func testServiceWithCluster(c cluster.Client) *service.Service {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc := service.New(config.Config{EnableCluster: true}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(c)
 	return svc
 }
@@ -316,7 +410,7 @@ func newCreateServiceWithRuntime(t *testing.T, c cluster.Client, rt *fakeRuntime
 		}
 	}
 
-	cfg := config.Config{EnableCaddy: false, ToolboxPort: 2280}
+	cfg := config.Config{EnableCaddy: false, EnableCluster: c != nil, ToolboxPort: 2280}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(cfg, logger, st, rt, nil, caddy.New(cfg), cipher, mgr, nil)
 	if c != nil {
@@ -568,10 +662,15 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 			err            error
 			wantStatus     int
 			wantRetryAfter string
+			wantCode       string
 		}{
 			{name: "no_target", err: cluster.ErrNoPlacementTarget, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
 			{name: "invalid_topology", err: cluster.ErrInvalidTopology, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "300"},
 			{name: "generic", err: errors.New("boom"), wantStatus: http.StatusInternalServerError},
+			// A node-bound artifact whose worker is gone is written directly
+			// with a machine-readable code and no Retry-After (re-create, do
+			// not wait); it bypasses the caller's writeError.
+			{name: "artifact_node_unavailable", err: cluster.ErrArtifactNodeUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: models.ErrorCodeArtifactNodeUnavailable},
 		}
 
 		for _, tc := range tests {
@@ -579,14 +678,20 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 				stub := &clusterStub{Noop: cluster.NewNoop("node-a", "", ""), selectErr: tc.err}
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
-				var status int
+				status := 0
 				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
 					status = code
 				}, PrepareOptions{})
 				if ok {
 					t.Fatal("Prepare returned ok=true, want false")
 				}
-				if status != tc.wantStatus {
+				if tc.wantCode != "" {
+					var body models.ErrorResponse
+					_ = json.Unmarshal(w.Body.Bytes(), &body)
+					if w.Code != tc.wantStatus || body.Code != tc.wantCode {
+						t.Fatalf("direct write = %d %+v, want %d code %q", w.Code, body, tc.wantStatus, tc.wantCode)
+					}
+				} else if status != tc.wantStatus {
 					t.Fatalf("status = %d, want %d", status, tc.wantStatus)
 				}
 				if got := w.Header().Get("Retry-After"); got != tc.wantRetryAfter {
@@ -885,7 +990,7 @@ func TestPrepare_ReservePaths(t *testing.T) {
 func TestCreateOnSelectedNode(t *testing.T) {
 	t.Run("create_with_reservation_promotes_without_spec", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		svc, st := newCreateService(t, stub, false)
+		svc, st := newCreateService(t, stub, true)
 		resp, err := CreateOnSelectedNode(context.Background(), svc, nil, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-fixed", CreateOptions{})
 		if err != nil {
 			t.Fatalf("CreateOnSelectedNode: %v", err)
@@ -893,11 +998,17 @@ func TestCreateOnSelectedNode(t *testing.T) {
 		if resp.Sandbox.ID != "sb-fixed" {
 			t.Fatalf("sandbox id = %q, want sb-fixed", resp.Sandbox.ID)
 		}
+		if resp.Sandbox.AuditIncarnationID != "inc-sb-fixed" {
+			t.Fatalf("sandbox incarnation = %q, want leader-confirmed reservation incarnation", resp.Sandbox.AuditIncarnationID)
+		}
 		if len(stub.recordCalls) != 1 {
 			t.Fatalf("RecordPlacement calls = %d, want 1", len(stub.recordCalls))
 		}
 		if stub.recordCalls[0].spec != nil {
 			t.Fatalf("recorded spec = %+v, want nil when PromoteWithSpec is false", stub.recordCalls[0].spec)
+		}
+		if stub.recordCalls[0].secrets.IncarnationID != resp.Sandbox.AuditIncarnationID {
+			t.Fatalf("promoted secret lifecycle %q differs from sandbox lifecycle %q", stub.recordCalls[0].secrets.IncarnationID, resp.Sandbox.AuditIncarnationID)
 		}
 		if _, err := st.Get(context.Background(), "sb-fixed"); err != nil {
 			t.Fatalf("store.Get(sb-fixed): %v", err)
@@ -905,7 +1016,12 @@ func TestCreateOnSelectedNode(t *testing.T) {
 	})
 
 	t.Run("create_with_reservation_promotes_with_redacted_spec", func(t *testing.T) {
-		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		stub := &clusterStub{
+			Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+			placements: map[string]cluster.Placement{
+				"sb-secret": {SandboxID: "sb-secret", OwnerNodeID: "node-a", IncarnationID: "inc-sb-secret", State: cluster.PlacementStateReserved},
+			},
+		}
 		svc, _ := newCreateService(t, stub, true)
 		req := models.CreateSandboxRequest{
 			Image: "private.example.com/app:latest",
@@ -936,7 +1052,7 @@ func TestCreateOnSelectedNode(t *testing.T) {
 
 	t.Run("create_without_reservation_uses_create_sandbox", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		svc, _ := newCreateService(t, stub, false)
+		svc, _ := newCreateService(t, stub, true)
 		resp, err := CreateOnSelectedNode(context.Background(), svc, nil, models.CreateSandboxRequest{Image: "alpine:3.20"}, "", CreateOptions{})
 		if err != nil {
 			t.Fatalf("CreateOnSelectedNode: %v", err)
@@ -951,7 +1067,7 @@ func TestCreateOnSelectedNode(t *testing.T) {
 
 	t.Run("create_failure_cancels_reservation", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		svc, _ := newCreateService(t, stub, false)
+		svc, _ := newCreateService(t, stub, true)
 		_, err := CreateOnSelectedNode(context.Background(), svc, nil, models.CreateSandboxRequest{}, "sb-bad", CreateOptions{})
 		if err == nil {
 			t.Fatal("CreateOnSelectedNode unexpectedly succeeded")
@@ -972,7 +1088,7 @@ func TestCreateOnSelectedNode(t *testing.T) {
 			createDelay: 40 * time.Millisecond,
 			createErr:   errors.New("boom"),
 		}
-		svc, st := newCreateServiceWithRuntime(t, stub, rt, false)
+		svc, st := newCreateServiceWithRuntime(t, stub, rt, true)
 		_, err := CreateOnSelectedNode(context.Background(), svc, nil, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-overlap-fail", CreateOptions{})
 		if err == nil {
 			t.Fatal("CreateOnSelectedNode unexpectedly succeeded")
@@ -998,7 +1114,7 @@ func TestCreateOnSelectedNode(t *testing.T) {
 			createDelay: 40 * time.Millisecond,
 			createErr:   errors.New("create boom"),
 		}
-		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
 		_, err := CreateOnSelectedNode(context.Background(), svc, nil, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-retract-fail", CreateOptions{})
 		if err == nil || !strings.Contains(err.Error(), "create boom") {
 			t.Fatalf("error = %v, want original create error", err)
@@ -1013,7 +1129,7 @@ func TestCreateOnSelectedNode(t *testing.T) {
 			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 			recordErr: errors.New("raft write failed"),
 		}
-		svc, st := newCreateService(t, stub, false)
+		svc, st := newCreateService(t, stub, true)
 		_, err := CreateOnSelectedNode(context.Background(), svc, nil, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-rollback", CreateOptions{})
 		if err == nil || !strings.Contains(err.Error(), "raft write failed") {
 			t.Fatalf("error = %v, want record placement failure", err)
@@ -1032,64 +1148,46 @@ func TestCreateOnSelectedNode(t *testing.T) {
 	})
 }
 
-func TestRollbackAndBestEffortHelpers(t *testing.T) {
-	t.Run("rollback_destroy_delete_and_cancel", func(t *testing.T) {
-		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "", "")}
-		svc, st := newCreateService(t, stub, false)
-		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-to-rollback"); err != nil {
-			t.Fatalf("CreateSandboxWithID: %v", err)
+func TestRollbackAndReservationHelpers(t *testing.T) {
+	t.Run("rollback_destroy", func(t *testing.T) {
+		svc, st := newCreateService(t, nil, true)
+		resp, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"})
+		if err != nil {
+			t.Fatalf("CreateSandbox: %v", err)
 		}
-		rollbackCreate(context.Background(), svc, stub, nil, "sb-to-rollback", "sb-to-rollback")
-		if stub.cancels != 1 {
-			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
-		}
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
-		}
-		if _, err := st.Get(context.Background(), "sb-to-rollback"); !errors.Is(err, store.ErrNotFound) {
-			t.Fatalf("store.Get(sb-to-rollback) err = %v, want ErrNotFound", err)
+		RollbackLocalCreate(context.Background(), svc, nil, resp.Sandbox.ID)
+		if _, err := st.Get(context.Background(), resp.Sandbox.ID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("store.Get(%s) err = %v, want ErrNotFound", resp.Sandbox.ID, err)
 		}
 	})
 
-	t.Run("delete_and_cancel_reservation_best_effort", func(t *testing.T) {
+	t.Run("cancel_reservation_best_effort", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "", "")}
 		svc := testServiceWithCluster(stub)
 
-		DeletePlacementBestEffort(context.Background(), svc, nil, "sb-1")
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
-		}
 		CancelReservationBestEffort(context.Background(), svc, nil, "sb-1")
 		if stub.cancels != 1 {
 			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
 		}
 
-		DeletePlacementBestEffort(context.Background(), nil, nil, "sb-1")
-		DeletePlacementBestEffort(context.Background(), svc, nil, "")
 		CancelReservationBestEffort(context.Background(), nil, nil, "sb-1")
 		CancelReservationBestEffort(context.Background(), svc, nil, "")
 
-		if stub.deletes != 1 || stub.cancels != 1 {
-			t.Fatalf("guard calls changed counts: deletes=%d cancels=%d", stub.deletes, stub.cancels)
+		if stub.cancels != 1 {
+			t.Fatalf("guard calls changed count: cancels=%d", stub.cancels)
 		}
 	})
 
-	t.Run("best_effort_helpers_ignore_nil_cluster_and_loggable_errors", func(t *testing.T) {
+	t.Run("cancel_helper_ignores_nil_cluster_and_logs_errors", func(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		svcNoCluster := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
-		DeletePlacementBestEffort(context.Background(), svcNoCluster, logger, "sb-nocluster")
 		CancelReservationBestEffort(context.Background(), svcNoCluster, logger, "sb-nocluster")
 
 		stub := &clusterStub{
 			Noop:      cluster.NewNoop("node-a", "", ""),
-			deleteErr: errors.New("delete failed"),
 			cancelErr: errors.New("cancel failed"),
 		}
-		DeletePlacementBestEffort(context.Background(), testServiceWithCluster(stub), logger, "sb-log")
 		cancelReservation(context.Background(), stub, logger, "sb-log")
-		if stub.deletes != 1 {
-			t.Fatalf("DeletePlacement calls = %d, want 1", stub.deletes)
-		}
 		if stub.cancels != 1 {
 			t.Fatalf("CancelReservation calls = %d, want 1", stub.cancels)
 		}
@@ -1097,8 +1195,35 @@ func TestRollbackAndBestEffortHelpers(t *testing.T) {
 
 	t.Run("rollback_handles_destroy_failure_without_cluster", func(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-		svc, _ := newCreateService(t, nil, false)
-		rollbackCreate(context.Background(), svc, nil, logger, "missing-sandbox", "")
+		svc, _ := newCreateService(t, nil, true)
+		RollbackLocalCreate(context.Background(), svc, logger, "missing-sandbox")
+	})
+
+	t.Run("rollback_retains_placement_when_destroy_fails", func(t *testing.T) {
+		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "", "")}
+		rt := newFakeRuntime()
+		rt.destroyErr = errors.New("runtime destroy failed")
+		svc, st := newCreateServiceWithRuntime(t, stub, rt, true)
+		resp, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-live-rollback")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Model the placement this rollback owns. A fabricated different
+		// incarnation represents an ID-reused stale local row and correctly takes
+		// the local-only cleanup path, which is not the failure mode under test.
+		stub.placements = map[string]cluster.Placement{
+			resp.Sandbox.ID: {
+				SandboxID: resp.Sandbox.ID, OwnerNodeID: stub.SelfNodeID(),
+				IncarnationID: resp.Sandbox.AuditIncarnationID,
+			},
+		}
+		RollbackLocalCreate(context.Background(), svc, nil, "sb-live-rollback")
+		if stub.deletes != 0 {
+			t.Fatalf("failed destroy released placement %d times, want 0", stub.deletes)
+		}
+		if _, err := st.Get(context.Background(), "sb-live-rollback"); err != nil {
+			t.Fatalf("failed destroy lost reconciliation anchor: %v", err)
+		}
 	})
 }
 
@@ -1106,7 +1231,7 @@ func TestOverlapCreateAndPromote_Guards(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	t.Run("empty_reservation_id", func(t *testing.T) {
-		svc, _ := newCreateService(t, nil, false)
+		svc, _ := newCreateService(t, nil, true)
 		if _, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "  ", OverlapOptions{}); err == nil || !strings.Contains(err.Error(), "requires reservationID") {
 			t.Fatalf("error = %v, want reservationID guard", err)
 		}
@@ -1119,7 +1244,7 @@ func TestOverlapCreateAndPromote_Guards(t *testing.T) {
 	})
 
 	t.Run("no_cluster_falls_back_sequential", func(t *testing.T) {
-		svc, st := newCreateService(t, nil, false)
+		svc, st := newCreateService(t, nil, true)
 		resp, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-seq", OverlapOptions{})
 		if err != nil {
 			t.Fatalf("OverlapCreateAndPromote: %v", err)
@@ -1143,9 +1268,10 @@ func TestOverlapCreateAndPromote_PanicRecovery(t *testing.T) {
 
 	t.Run("create_leg_panic_retracts", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		seedReservedPlacement(stub, "sb-panic-create")
 		rt := newFakeRuntime()
 		rt.createPanic = true
-		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
 		_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-panic-create", OverlapOptions{})
 		of, ok := AsOverlapFailure(err)
 		if !ok || of.Phase != OverlapPhaseCreate || !strings.Contains(of.Error(), "panicked") {
@@ -1167,6 +1293,7 @@ func TestOverlapCreateAndPromote_PanicRecovery(t *testing.T) {
 func TestOverlapCreateAndPromote_PromoteWaitsForCreate(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	seedReservedPlacement(stub, "sb-ordered")
 	rt := newFakeRuntime()
 	rt.createDelay = 100 * time.Millisecond
 	var promotedEarly atomic.Bool
@@ -1175,7 +1302,7 @@ func TestOverlapCreateAndPromote_PromoteWaitsForCreate(t *testing.T) {
 			promotedEarly.Store(true)
 		}
 	}
-	svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+	svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
 	resp, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-ordered", OverlapOptions{})
 	if err != nil {
 		t.Fatalf("OverlapCreateAndPromote: %v", err)
@@ -1194,14 +1321,15 @@ func TestOverlapCreateAndPromote_PromoteWaitsForCreate(t *testing.T) {
 func TestOverlapCreateAndPromote_SealFailRetracts(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	t.Run("seal_leg_panic_maps_to_seal_phase", func(t *testing.T) {
+	t.Run("binding_panic_maps_to_seal_phase", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		stub.selfNodePanic = true // fires inside the seal leg goroutine
-		svc, st := newCreateService(t, stub, false)
+		seedReservedPlacement(stub, "sb-seal-panic")
+		stub.selfNodePanic = true // recovered by the pre-leg authoritative binding
+		svc, st := newCreateService(t, stub, true)
 		_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-seal-panic", OverlapOptions{PromoteWithSpec: true})
 		of, ok := AsOverlapFailure(err)
-		if !ok || of.Phase != OverlapPhaseSeal || !strings.Contains(of.Error(), "panicked") {
-			t.Fatalf("error = %v, want seal-phase panic failure", err)
+		if !ok || of.Phase != OverlapPhaseSeal || !strings.Contains(of.Error(), "self node id panic") {
+			t.Fatalf("error = %v, want seal-phase binding panic failure", err)
 		}
 		if len(stub.recordCalls) != 0 {
 			t.Fatalf("RecordPlacement calls = %d, want 0 after seal failure", len(stub.recordCalls))
@@ -1216,6 +1344,7 @@ func TestOverlapCreateAndPromote_SealFailRetracts(t *testing.T) {
 
 	t.Run("create_error_takes_precedence_when_both_legs_fail", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+		seedReservedPlacement(stub, "sb-both-fail")
 		// No cipher + registry password: BOTH legs fail on "cipher not
 		// initialized" — the surfaced phase must be create (check order).
 		svc, _ := newCreateService(t, stub, false)
@@ -1240,7 +1369,8 @@ func TestOverlapCreateAndPromote_PromoteFailureRetracts(t *testing.T) {
 		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 		recordErr: errors.New("raft commit failed"),
 	}
-	svc, st := newCreateService(t, stub, false)
+	seedReservedPlacement(stub, "sb-promote-fail")
+	svc, st := newCreateService(t, stub, true)
 	_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-promote-fail", OverlapOptions{PromoteWithSpec: true})
 	of, ok := AsOverlapFailure(err)
 	if !ok || of.Phase != OverlapPhasePromote || !strings.Contains(of.Error(), "raft commit failed") {
@@ -1257,7 +1387,8 @@ func TestOverlapCreateAndPromote_PromoteFailureRetracts(t *testing.T) {
 func TestOverlapCreateAndPromote_RecordsTimingStages(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-	svc, _ := newCreateService(t, stub, false)
+	seedReservedPlacement(stub, "sb-timing")
+	svc, _ := newCreateService(t, stub, true)
 	timing := &createtiming.CreateTiming{}
 	_, err := OverlapCreateAndPromote(context.Background(), svc, logger, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-timing", OverlapOptions{Timing: timing})
 	if err != nil {
@@ -1321,17 +1452,24 @@ func TestRetractErrorBranches(t *testing.T) {
 			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 			cancelErr: errors.New("raft cancel failed"),
 		}
-		svc, st := newCreateService(t, stub, false)
-		_ = st.Close() // secrets + destroy both hit the closed store
-		retractReservedCreate(context.Background(), svc, stub, logger, "sb-retract-err", nil)
+		svc, _ := newCreateService(t, stub, true)
+		retractReservedCreate(context.Background(), svc, stub, logger, "sb-retract-err", errors.New("create boom"))
 		if stub.cancels != 1 || stub.deletes != 0 {
 			t.Fatalf("retract calls cancel=%d delete=%d, want 1/0", stub.cancels, stub.deletes)
 		}
 	})
 
 	t.Run("reserved_destroy_notfound_after_create_failure_stays_ok", func(t *testing.T) {
-		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		svc, _ := newCreateService(t, stub, false)
+		stub := &clusterStub{
+			Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+			placements: map[string]cluster.Placement{
+				"sb-retract-quiet": {
+					SandboxID: "sb-retract-quiet", OwnerNodeID: "node-a",
+					IncarnationID: "inc-retract-quiet", State: cluster.PlacementStateReserved,
+				},
+			},
+		}
+		svc, _ := newCreateService(t, stub, true)
 		okBefore := promoteRetractCount("ok")
 		failBefore := promoteRetractCount("destroy_failed")
 		// The sandbox was never persisted (create leg failed and rolled its own
@@ -1354,7 +1492,7 @@ func TestRetractErrorBranches(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 		rt := newFakeRuntime()
 		rt.destroyErr = errors.New("destroy boom")
-		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
 		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-retract-real-fail"); err != nil {
 			t.Fatalf("CreateSandboxWithID: %v", err)
 		}
@@ -1370,7 +1508,7 @@ func TestRetractErrorBranches(t *testing.T) {
 	})
 
 	t.Run("reserved_nil_cluster_skips_placement_ops", func(t *testing.T) {
-		svc, _ := newCreateService(t, nil, false)
+		svc, _ := newCreateService(t, nil, true)
 		retractReservedCreate(context.Background(), svc, nil, logger, "sb-no-cluster",
 			errors.New("create boom"))
 	})
@@ -1380,31 +1518,37 @@ func TestRetractErrorBranches(t *testing.T) {
 			Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 			deleteErr: errors.New("raft delete failed"),
 		}
-		svc, st := newCreateService(t, stub, false)
-		_ = st.Close()
-		retractFailedPromote(context.Background(), svc, stub, logger, "sb-promote-err")
+		svc, _ := newCreateService(t, stub, true)
+		seedReservedPlacement(stub, "sb-promote-err")
+		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-promote-err"); err != nil {
+			t.Fatal(err)
+		}
+		retractFailedPromote(context.Background(), svc, logger, "sb-promote-err")
 		if stub.deletes != 1 || stub.cancels != 0 {
 			t.Fatalf("retract calls delete=%d cancel=%d, want 1/0", stub.deletes, stub.cancels)
 		}
 	})
 
 	t.Run("promote_nil_cluster_skips_placement_ops", func(t *testing.T) {
-		svc, _ := newCreateService(t, nil, false)
-		retractFailedPromote(context.Background(), svc, nil, logger, "sb-promote-nocluster")
+		svc, _ := newCreateService(t, nil, true)
+		retractFailedPromote(context.Background(), svc, logger, "sb-promote-nocluster")
 	})
 
 	t.Run("promote_destroy_failure_records_destroy_failed", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 		rt := newFakeRuntime()
 		rt.destroyErr = errors.New("destroy boom")
-		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
 		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-destroy-fail"); err != nil {
 			t.Fatalf("CreateSandboxWithID: %v", err)
 		}
 		failBefore := promoteRetractCount("destroy_failed")
-		retractFailedPromote(context.Background(), svc, stub, logger, "sb-destroy-fail")
+		retractFailedPromote(context.Background(), svc, logger, "sb-destroy-fail")
 		if got := promoteRetractCount("destroy_failed") - failBefore; got != 1 {
 			t.Fatalf("retract destroy_failed delta = %d, want 1", got)
+		}
+		if stub.deletes != 0 {
+			t.Fatalf("destroy failure released placement %d times, want 0", stub.deletes)
 		}
 	})
 
@@ -1412,18 +1556,21 @@ func TestRetractErrorBranches(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 		rt := newFakeRuntime()
 		rt.destroyErr = errors.New("destroy boom")
-		svc, _ := newCreateServiceWithRuntime(t, stub, rt, false)
+		svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
 		if _, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-seal-destroy-fail"); err != nil {
 			t.Fatalf("CreateSandboxWithID: %v", err)
 		}
 		retractReservedCreate(context.Background(), svc, stub, logger, "sb-seal-destroy-fail", nil)
+		if stub.cancels != 0 {
+			t.Fatalf("destroy failure released reservation %d times, want 0", stub.cancels)
+		}
 	})
 
 	t.Run("promote_delete_secrets_failure", func(t *testing.T) {
 		stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-		svc, st := newCreateService(t, stub, false)
+		svc, st := newCreateService(t, stub, true)
 		_ = st.Close()
-		retractFailedPromote(context.Background(), svc, stub, logger, "sb-secrets-fail")
+		retractFailedPromote(context.Background(), svc, logger, "sb-secrets-fail")
 	})
 }
 

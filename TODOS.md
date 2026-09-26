@@ -3,6 +3,128 @@
 Deferred work items with enough context to pick up cold. Each entry says
 what, why, the caveat that motivated capturing it, and where to start.
 
+## Enterprise boot can fail its own witness check (audit) — REPRODUCED
+
+- **What:** `ValidateSecretAuditWitness` can look the witnessed head up under
+  the node id `"standalone"` while the shipping path publishes it under the
+  real cluster node id, so the comparison fails against a head that IS
+  witnessed.
+- **Why it matters:** the daemon fails CLOSED — an enterprise node refuses to
+  start. Observed on a live single-node box with
+  `SB_ENTERPRISE_MODE=true`:
+
+      secret audit witness mismatch:
+        local_head="7334bf03cb2b4ab7bc858bba55a44e3c3fda66031837eb079026503240e7ce7b"
+        witnessed_head=""
+
+  The witness had that EXACT head stored, under
+  `aerolvm-itest-single-node-node1`. Only the lookup key was wrong.
+- **Mechanism:** both call sites derive `nodeID` as
+  `s.Cluster().SelfNodeID()`, but the service is constructed with
+  `cluster.NewNoop("standalone", …)` (`internal/service/service.go:595`,
+  `internal/cluster/noop.go:43`) and the real cluster is attached later. When
+  the boot check runs before `AttachCluster`, it queries `standalone`; the
+  periodic shipper always runs after, so it writes the real id. The two never
+  meet.
+- **Caveat — INTERMITTENT, and that is the worrying part.** It failed twice,
+  then three consecutive restarts were clean, which fits a race with cluster
+  attachment rather than a fixed ordering. An intermittent fail-closed on boot
+  is worse than a deterministic one: it will look like flake.
+- **Also note:** a fresh node never hits it, because the check short-circuits
+  on an empty chain tip — so this only bites a node that has already recorded
+  audit events, i.e. every restart in production.
+- **Depends on / blocked by:** nothing. Needs a product decision: either defer
+  the check until the cluster identity is final, or resolve the node id from
+  config (`SB_NODE_ID`) rather than from the cluster handle.
+- **Start:** `internal/service/secret_audit_witness.go` lines ~139, ~422 (the
+  two `nodeID` derivations) and wherever `ValidateSecretAuditWitness` is
+  sequenced relative to `AttachCluster` in `pkg/daemon`.
+
+## Caddy route upsert does not retry a transport EOF (unconfirmed)
+
+- **What:** Decide whether `upsertRoute` should retry a dropped connection the
+  way it now retries a duplicate-ID 400.
+- **Why:** Both are Caddy-config-reload transients, but only one is handled. A
+  400 whose body names a duplicate id is retried as a PATCH; a reload that
+  drops the admin connection mid-request returns a transport error from
+  `httpClient.Do` and fails the caller immediately. Seen once as
+  `start: PATCH http://127.0.0.1:2019/id/sandbox-…: EOF` failing UC-15.
+- **Caveat — NOT confirmed as a product bug:** that observation happened while
+  a daemon restart and concurrent sandbox churn were deliberately being driven
+  against the box *during* the suite, i.e. self-inflicted. An immediate clean
+  re-run with no interference was 58 pass / 0 fail. So this is a hypothesis
+  about a real mechanism, not a reproduced defect — do not "fix" it without a
+  reproduction, or the retry itself becomes untested code on the boot path.
+- **Depends on / blocked by:** a reproduction. Cluster scenarios generate real
+  concurrent route churn, so T12+ is the natural place for it to reappear.
+- **Start:** `pkg/caddy/client.go` `upsertRoute` / `sendJSONDetail`; note the
+  retry would have to be bounded and idempotency-safe, since PATCH-then-EOF may
+  mean the write landed.
+
+## A scenario destroy can need two passes (integration harness)
+
+- **What:** Find out why `run.sh --destroy-only` returned non-zero with 3
+  resources still standing, and either retry inside the teardown or make the
+  failure name what it could not delete.
+- **Why:** Observed 2026-09-23 tearing down `single-node` with
+  `secret_kms_enabled = true`. The first destroy exited non-zero leaving 3
+  resources; an immediate identical re-run destroyed them and exited 0, so it
+  is a transient (most likely an eventual-consistency retry around the KMS key
+  or an IAM detach), not a config error.
+- **Caveat (why it matters, not just cosmetic):** run.sh's EXIT trap runs
+  **one** destroy. When it fails the harness only prints "run
+  `make integration-reap`" — and reap terminates **EC2 instances only**, not
+  the VPC, IAM roles, S3 buckets or KMS aliases. So an unattended failing run
+  silently leaves billable non-EC2 resources behind, and the message points at
+  a tool that cannot clean them up.
+- **Depends on / blocked by:** nothing. The root cause was not captured because
+  the first run's output was consumed by a pipe; re-run a KMS-enabled scenario
+  teardown with the full log kept.
+- **Start:** `integration-tests/run.sh` teardown path and `--destroy-only`;
+  consider one bounded retry plus surfacing terraform's own error, and widening
+  `scripts/integration-reap.sh` or documenting that it is EC2-only.
+
+## Warm-adopted (`park-*`) destroys fall to reconcile (containerd)
+
+- **What:** Restore prompt row deletion for a warm-adopted container, or
+  confirm the reconcile sweep is sufficient and close this out.
+- **Why:** `internal/runtime/containerd/events.go` used to map `/tasks/delete`
+  to `destroy`, which fired while the container still existed, so
+  `StreamEvents`' `LoadContainer` could still read the `aerolvm.sandbox_id`
+  label and name the real sandbox. That mapping was a bug (a manual stop
+  deleted the sandbox — see the fix commit) and now only `/containers/delete`
+  maps to `destroy`. By then the container is gone, so the label lookup fails
+  and the event carries the `park-*` container id, which matches no store row.
+- **Caveat (why it's a TODO, not a bug):** the outcome is correct, just
+  slower — those rows are reclaimed by the reconcile orphan sweep instead of
+  immediately. The alternative (caching container id → sandbox id before
+  deletion) adds state to the event path for a latency win that may not
+  matter. Measure how long a warm-adopted row actually lingers first.
+- **Depends on / blocked by:** nothing. Needs a scenario that exercises
+  warm-pool adoption plus destroy.
+- **Start:** `internal/runtime/containerd/events.go` (`StreamEvents`'
+  `sandboxIDFromContainer` call), then the sweep in
+  `internal/service/service.go` (`removeOrphans`).
+
+## Destroy events WARN about an already-deleted placement (cluster)
+
+- **What:** Stop `handle docker event failed … cluster: unknown sandbox
+  placement` from WARNing on every API-driven destroy.
+- **Why:** `Driver.Destroy` ends with `container.Delete`, so the
+  `/containers/delete` event now always arrives AFTER `DestroySandbox` has
+  already removed the placement. `handleDestroyEvent` then tries its own
+  `beginSelfOwnedClusterPlacementDeleteStrict` and logs a warning for work
+  that is legitimately already done. Previously the (incorrectly mapped)
+  `/tasks/delete` arrived earlier, so this rarely fired.
+- **Caveat (why it's a TODO, not a bug):** purely cosmetic — the destroy
+  succeeds and the placement is correctly gone. But it WARNs once per destroy,
+  so it will be constant noise in cluster runs and could mask a real
+  finalization failure, which is the actual risk.
+- **Depends on / blocked by:** nothing.
+- **Start:** `internal/service/events.go` `handleDestroyEvent` — treat "no
+  such placement" as benign there the same way its `store.Delete` already
+  treats `ErrNotFound`.
+
 ## Audit Firecracker outbound NAT path (networking)
 
 - **What:** Trace an FC sandbox's outbound connectivity on a live host
@@ -222,3 +344,125 @@ passed, zero-deployments premise re-verified in-tree). Branch
 - **Depends on / blocked by:** rides naturally on the §9 create-stage instrumentation
   (`plans/investor-benchmark-observability.md` §9) once that lands.
 - **Start:** `internal/service/metrics.go` (create), `internal/pool/{wasm,isolate,vmm,dockerpool}/metrics.go`.
+
+## Flaky `internal/cluster` memberlist tests (testing, `internal/cluster`) — mitigated 2026-08-08
+
+- **What:** Loopback port-binding flakiness in the `internal/cluster`
+  memberlist/SWIM harnesses (`use of closed network connection` after
+  push/pull sync).
+- **Why it mattered:** The cluster suite is the only guard on the highest-risk
+  package; intermittent red trained people to re-run rather than read failures.
+- **Mitigation:** Serialize construct/Close of real raft/memberlist harnesses
+  via `testClusterMu` + 50ms settle after Close in
+  `newTestClusterWithAPI`, `newTestClusterWithRole`,
+  `newTestClusterWithRoleAndGrace`, `newTestClusterWithTLSDir`,
+  `newTestAgentWithRole`, and `newTestAgentWithTLS`. Lock is **not** held for
+  cluster lifetime (multi-node tests still create two clusters concurrently).
+- **Verify:** `go test -count=1 ./internal/cluster/` (and `-count=3` if chasing).
+- **Residual:** Local machine contention can still surface; if flakes return,
+  widen settle or serialize the whole short-lived gossip pair.
+- **Depends on / blocked by:** nothing. Independent of secrets-hardening product
+  code; fixed alongside the GAP follow-ups so cluster signal stays trustworthy.
+
+## Per-node identity for cluster-internal HTTP (security, `pkg/api` + `internal/cluster`) — landed 2026-09-02
+
+- **Landed:** Every cluster role exposes a dedicated TLS 1.3 internal listener;
+  clients pin the peer to a required `node:<SB_NODE_ID>` SAN, servers bind that
+  identity to live membership, and every delegated internal/public-shaped route
+  is authorized before dispatch. The fleet PAT remains defense in depth.
+- **Rotation:** atomically replaced leaf/key files hot-reload for new
+  handshakes; expiry metrics and alerts are present. Automated issuance,
+  revocation distribution, and coordinated CA rotation remain operator work.
+- **Where documented:** `docs/src/content/docs/cluster-secrets.mdx` (known
+  limitation), `setup/runbooks/secrets-and-audit.md`,
+  `docs/designs/secrets-hardening.md` Deferred,
+  `plans/secrets-hardening.md` re-review row #6.
+- **Where:** `internal/cluster/{tls,internal_server,peer_dial}.go`, the global
+  `pkg/api` cluster-control-header guard, config validation, docs, and runbook.
+
+## Durable secret-delete outbox / ACK ledger (cluster secrets) — landed 2026-08-09
+
+- **What:** Generation-scoped tombstones + persistent cleanup outbox so peer
+  DELETE fan-out survives daemon crash, retries until every recipient ACKs,
+  and rejects stale PUTs until a newer seal generation clears the tomb.
+- **Landed:** originator tomb+row-delete+outbox in one SQLite TX; per-recipient
+  pending shrink (offline peers stay pending, never treated as success);
+  DELETE carries `generation`; peer tombs with seal_generation gating so stale
+  DELETEs cannot wipe a reseal; boot + 30s periodic reconcile (O(1) per job);
+  reseal stages retired-recipient cleanup atomically with the new sealed row,
+  gates deletion on Raft promotion, and preserves older pending recipients.
+- **Residual:** long partitions require operator action based on the shipped
+  outbox age/backlog metrics; KMS CMK policy is separate. `failover_ready` now HEAD-probes
+  remote holders for the current `seal_generation` (not ACK memory alone);
+  member rejoin triggers outbox reconcile + re-fanout.
+- **Where:** `internal/store` outbox/tombs, `internal/service/cluster_secrets.go`,
+  `internal/cluster/secret_replication.go`, daemon boot + ticker.
+
+## Indexed / central secret-audit store (scale) — parked residual 2026-08-09
+
+- **What:** Replace full JSONL scan + sequential all-member fan-out with an
+  indexed durable store or central sink; E2b witness.
+- **Interim landed:** sidecar flock; Close/Prune `sendMu`; verified startup chain;
+  authenticated, idempotent HTTPS batch export with durable watermark; gap markers with
+  `kind=gap` (included in kind-filtered pages); compound cursor; malformed
+  JSONL → gap event; wasm queue-full writes a durable gap marker; post-delete
+  ACL via `sandbox_audit_acl` + Placement.OwnerRef.
+- **Residual:** local fallback queries and startup verification still scan the
+  JSONL file. Enterprise mode requires the external exporter/receiver; receiver
+  indexing, WORM retention, and operational verification remain deployment gates.
+- **Start:** `internal/service/secret_audit_query.go`; E2b witness sink may
+  double as the central store.
+
+## WASM egress audit via bounded IPC (not shared JSONL) — landed 2026-09-02
+
+- **Landed:** Worker subprocesses enqueue through the daemon's
+  authoritative audit writer (bounded channel, drop counter, gap markers)
+  instead of opening `secrets.jsonl` themselves.
+- **Mechanism:** authenticated Unix-socket ingest, bounded worker pool, durable
+  acknowledgement through the authoritative writer, and explicit gap accounting
+  under overload. Workers no longer open the audit JSONL directly.
+- **Where:** `pkg/wasm/worker/egress_audit.go`, daemon spawn environment, and
+  `internal/service/wasm_audit_ingest.go`.
+
+## Isolate orphan sweep survives a daemon restart (runtime) — part 2
+
+- **What:** Give `internal/runtime/isolate` a host-backed enumeration so
+  `Reconcile`'s orphan sweep can find workerd groups leaked across a restart.
+  Today `Driver.ListManaged` (`internal/runtime/isolate/driver.go:205-213`)
+  returns the driver's in-memory `byID` map, and `HostSupervisor`
+  (`internal/runtime/isolate/seams.go:48-50`) exposes only `SpawnGroup` — there
+  is no way to ask the host what is running.
+- **Why:** part 1 (wiring isolate into `mergeManagedRuntimes` + `removeOrphans`,
+  `internal/service/service.go`) shipped with this change and covers the case
+  `finalizeStaleLocalSandbox` depends on: a transient `Destroy` failure while
+  the daemon stays up. It cannot cover a crash. A jailed group owns a cgroup
+  under `SB_ISOLATE_JAIL_CGROUP_ROOT` and a uid-owned chroot tree under
+  `SB_ISOLATE_JAIL_CHROOT_BASE`, so a leak across a restart strands host state
+  permanently and invisibly.
+- **Caveat (why it's a TODO, not part of the same change):** it needs a new
+  seam (`ListGroups` on `HostSupervisor`) plus a real cgroup or chroot walk with
+  its own failure modes — enumerate-while-spawning races, partial teardown, and
+  a jail-off mode where neither directory exists. That is a design decision, not
+  a mechanical addition.
+- **Start:** `pkg/isolate/cgroup.go` + `chroot.go` already know the layout
+  (`linkGroupJail`/`removeGroupJail` name the per-group dirs). Add `ListGroups`
+  to `HostSupervisor`, implement it over the cgroup root, have
+  `Driver.ListManaged` union it with `byID`, and extend
+  `internal/service/reconcile_isolate_orphan_test.go`.
+
+## Daytona facade cannot distinguish "no env" from "env withheld" (API)
+
+- **What:** Decide and implement a Daytona-side signal for D9's withheld env.
+- **Why:** under D9 `internal/service` returns a nil `Env` unless
+  `GetSandboxOptions.IncludeEnv` is set, so the facade's default response
+  serializes `"env": {}` (`pkg/api/daytona/dto.go`), which asserts the sandbox
+  has no environment rather than that none was returned. `?include_env=true`
+  now exists as the opt-in (`hydrateEnvIfRequested` in `handlers.go`), but the
+  default is still ambiguous.
+- **Caveat (why it's a TODO):** the obvious fix — `json:"env,omitempty"` — was
+  tried and **reverted**: the Daytona SDK's deserializer rejects a sandbox
+  payload with no `env` key, and `TestDaytonaSDKContracts` fails across the whole
+  read surface. Any fix has to stay inside what the real SDK accepts, so it
+  needs a Daytona-compatible convention, not a Go struct tag.
+- **Start:** `pkg/api/daytona/contract_test.go` is the gate any change must
+  pass; `pkg/api/daytona/include_env_test.go` covers the opt-in that exists now.

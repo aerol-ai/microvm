@@ -65,8 +65,19 @@ func sshBaseArgs() []string {
 	return args
 }
 
+// sshRunner is the seam every SSH call goes through. It is a package var so
+// the offline tests can prove WithNodeEnv's restore contract — that a node is
+// never left down by a failing use case — without a host to SSH into. Nothing
+// but a test ever reassigns it.
+var sshRunner = execSSHRun
+
 // SSHRun runs a remote shell command via SSH. Returns combined stdout/stderr.
 func SSHRun(t *testing.T, target, script string) (string, error) {
+	t.Helper()
+	return sshRunner(t, target, script)
+}
+
+func execSSHRun(t *testing.T, target, script string) (string, error) {
 	t.Helper()
 	args := append(sshBaseArgs(), target, script)
 	cmd := exec.Command("ssh", args...)

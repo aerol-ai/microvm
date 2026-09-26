@@ -19,6 +19,12 @@ import (
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
+// workerAuditCapabilityTTL spans long-lived and passivated WASM sandboxes.
+// Capabilities remain bound to one sandbox and are invalidated fleet-wide on
+// daemon restart because the signing key is generated per daemon boot unless
+// an operator explicitly supplies one.
+const workerAuditCapabilityTTL = 365 * 24 * time.Hour
+
 // wireWasmRuntime constructs the WASM driver and optional warm pool. The returned
 // pool is non-nil only when SB_WASM_POOL_ENABLED=true; the caller should Close
 // it on daemon shutdown.
@@ -60,6 +66,9 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	supervisor := worker.NewSupervisor(worker.DefaultSpawner)
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)
+	driver.SetAuditCapabilityIssuer(func(sandboxID string) (string, string, error) {
+		return svc.IssueEgressAuditCapabilityForSandbox(sandboxID, workerAuditCapabilityTTL)
+	})
 	// Resident-module host (compile-once/instantiate-many): opt-in, default off.
 	// A second supervisor owns the shared host processes so their lifecycle is
 	// independent of per-sandbox workers. Wired only when enabled — otherwise the

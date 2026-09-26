@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/daemon"
+	"github.com/aerol-ai/microvm/pkg/isolate"
 )
 
 func TestRunDelegatesToDaemonRun(t *testing.T) {
@@ -224,5 +225,37 @@ func TestMainWasmResidentHostError(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "resident boom") {
 		t.Fatalf("stderr = %q, want resident boom", stderr.String())
+	}
+}
+
+func TestMainIsolateJailShimDispatch(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", isolate.JailShimFlag}
+
+	origShim := runIsolateJailShim
+	t.Cleanup(func() { runIsolateJailShim = origShim })
+	called := false
+	runIsolateJailShim = func(args []string) error {
+		called = true
+		if len(args) != 0 {
+			t.Fatalf("shim args = %v, want none", args)
+		}
+		return nil
+	}
+	origExit := osExit
+	exitCode := -1
+	osExit = func(code int) { exitCode = code }
+	t.Cleanup(func() { osExit = origExit })
+
+	main()
+	if !called || exitCode != -1 {
+		t.Fatalf("shim called=%v exit=%d", called, exitCode)
+	}
+	// A shim failure exits 125 — distinct from workerd's own exit codes.
+	runIsolateJailShim = func([]string) error { return errors.New("chroot: permission denied") }
+	main()
+	if exitCode != 125 {
+		t.Fatalf("shim failure exit = %d, want 125", exitCode)
 	}
 }

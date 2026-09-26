@@ -1,11 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,17 +15,42 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	secretCipher *secrets.Cipher
+}
+
+// SetSecretCipher configures at-rest toolbox-token sealing. Production wiring
+// always supplies it; a missing cipher fails any token-bearing write or sealed
+// token read rather than falling back to plaintext.
+func (s *Store) SetSecretCipher(cipher *secrets.Cipher) {
+	if s == nil {
+		return
+	}
+	s.secretCipher = cipher
 }
 
 const sqliteBusyTimeoutMS = 5000
 
 func Open(path string) (*Store, error) {
-	// The DB stores secrets (env_json, toolbox_token, sealed mount blobs).
+	return open(path, nil)
+}
+
+// OpenWithSecretCipher opens the store with the cipher needed to migrate
+// plaintext secret columns created by releases before secrets hardening. New
+// databases can still use Open and configure the cipher later with
+// SetSecretCipher, but production startup must use this entry point so warm
+// upgrades can seal legacy values before the plaintext columns are removed.
+func OpenWithSecretCipher(path string, secretCipher *secrets.Cipher) (*Store, error) {
+	return open(path, secretCipher)
+}
+
+func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
+	// The DB stores encrypted secrets and sandbox metadata.
 	// Lock the directory and file to owner-only so a custom DBPath, a dev
 	// run on a shared host, or any setup that doesn't go through the
 	// installer can't leak them via the default 0o755 / umask-derived modes.
@@ -66,14 +93,13 @@ func Open(path string) (*Store, error) {
 			memory_mb INTEGER NOT NULL,
 			disk_gb INTEGER NOT NULL,
 			os_user TEXT NOT NULL,
-			env_json TEXT NOT NULL,
 			network_block_all INTEGER NOT NULL DEFAULT 0,
 			network_allow_out_json TEXT NOT NULL DEFAULT '[]',
 			network_deny_out_json TEXT NOT NULL DEFAULT '[]',
 			allow_public_traffic INTEGER NOT NULL DEFAULT 1,
 			mask_request_host TEXT NOT NULL DEFAULT '',
 			toolbox_enabled INTEGER NOT NULL DEFAULT 1,
-			toolbox_token TEXT NOT NULL DEFAULT '',
+			toolbox_token_sealed BLOB NOT NULL DEFAULT X'',
 			ssh_public_key TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '',
 			container_command_json TEXT NOT NULL DEFAULT '[]',
@@ -115,6 +141,18 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		// sandbox_env mirrors sandbox_mounts: sealed env lives off the hot
+		// row so List/netstats scanners never AES-GCM-open every sandbox
+		// (plans/secrets-hardening D8). FK CASCADE on destroy.
+		// toolbox_token_sealed stays on the row but scanSandbox does not
+		// decrypt it; only Get calls openToolboxToken.
+		`CREATE TABLE IF NOT EXISTS sandbox_env (
+			sandbox_id TEXT PRIMARY KEY,
+			sealed_blob BLOB NOT NULL,
+			created_at DATETIME NOT NULL,
+			binding_version INTEGER NOT NULL DEFAULT 1 CHECK (binding_version = 1),
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
 		// sandbox_custom_domains attaches operator-provided public hostnames
 		// to a sandbox. hostname is the PRIMARY KEY: a hostname maps to
 		// exactly one sandbox at a time, and the PK rejects concurrent
@@ -153,7 +191,107 @@ func Open(path string) (*Store, error) {
 			version INTEGER NOT NULL,
 			recipients_json TEXT NOT NULL DEFAULT '[]',
 			sealed_payload BLOB NOT NULL,
+			seal_generation INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
+		// cluster_secret_tombs blocks stale peer PUTs after local delete so an
+		// in-flight fan-out retry cannot resurrect a destroyed sandbox's row.
+		// generation bumps on each originator delete; durable peer cleanup is
+		// tracked in cluster_secret_delete_outbox (boot reconciler).
+		`CREATE TABLE IF NOT EXISTS cluster_secret_tombs (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL,
+			deleted_at DATETIME NOT NULL,
+			generation INTEGER NOT NULL DEFAULT 1,
+			PRIMARY KEY (sandbox_id, incarnation_id)
+		);`,
+		// Durable delete outbox: survives daemon crash; boot reconciler retries
+		// peer DELETE until ACK'd, then drops the row (tomb remains until reseal).
+		`CREATE TABLE IF NOT EXISTS cluster_secret_delete_outbox (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			generation INTEGER NOT NULL DEFAULT 1,
+			awaiting_promotion INTEGER NOT NULL DEFAULT 0,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			-- Per-recipient provenance: node id -> RFC3339 time at which THAT
+			-- recipient's ciphertext copy was distributed. The row-wide
+			-- created_at cannot stand in for it: an upsert merges recipients
+			-- into an existing row and deliberately preserves the original
+			-- creation time, so a recipient added later would inherit the
+			-- older row's age. Storage-retirement attestations are fenced
+			-- against this map, one recipient at a time.
+			recipient_provenance_json TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (sandbox_id, incarnation_id)
+		);`,
+		// Terminal storage retirement (D5). A deletion obligation to a peer is
+		// discharged ONLY by an authenticated ACK or by an explicit operator
+		// attestation recorded here that the node's storage was destroyed.
+		// Membership disappearance and TTLs are deliberately not accepted:
+		// a removed node may still hold a disk full of ciphertext.
+		//
+		// attested_at fences the attestation to the obligations that already
+		// existed when it was made. Node IDs are operator-chosen and can be
+		// reused, so an obligation created after the attestation belongs to a
+		// different physical node and must still be ACK'd.
+		`CREATE TABLE IF NOT EXISTS node_storage_retirements (
+			node_id TEXT PRIMARY KEY,
+			attested_at DATETIME NOT NULL,
+			actor TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL
+		);`,
+		// Durable create fan-out outbox: when the in-memory create-path queue is
+		// saturated, remaining peer PUTs are persisted and retried by the same
+		// reconciler ticker as delete outbox. Identity is (sandbox, incarnation,
+		// seal_generation) so a completed older fan-out cannot delete a newer job.
+		`CREATE TABLE IF NOT EXISTS cluster_secret_put_outbox (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			seal_generation INTEGER NOT NULL DEFAULT 0,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id, seal_generation)
+		);`,
+		`CREATE TABLE IF NOT EXISTS sandbox_audit_acl (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT '',
+			established_seq INTEGER NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id)
+		);`,
+		// Per-sandbox posting lists over the local secret-audit JSONL so one
+		// sandbox's page is O(page), not a scan of every retained fleet event.
+		// Derived from the file (secret_audit_index_meta.generation pins which
+		// file); a disagreement rebuilds it. Chunked so a hot sandbox costs one
+		// row rewrite per append batch, not one row per event. WITHOUT ROWID:
+		// the composite key is the only access path and the payload is small.
+		`CREATE TABLE IF NOT EXISTS secret_audit_index (
+			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
+			chunk_seq INTEGER NOT NULL,
+			first_offset INTEGER NOT NULL,
+			last_offset INTEGER NOT NULL,
+			min_time INTEGER NOT NULL,
+			max_time INTEGER NOT NULL,
+			last_time INTEGER NOT NULL,
+			n INTEGER NOT NULL,
+			entries BLOB NOT NULL,
+			PRIMARY KEY (sandbox_id, incarnation_id, chunk_seq)
+		) WITHOUT ROWID;`,
+		`CREATE TABLE IF NOT EXISTS secret_audit_index_meta (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			generation TEXT NOT NULL,
+			indexed_through INTEGER NOT NULL DEFAULT 0,
+			last_line_offset INTEGER NOT NULL DEFAULT 0,
+			last_event_hash TEXT NOT NULL DEFAULT '',
+			allow_break INTEGER NOT NULL DEFAULT 0,
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
@@ -238,6 +376,26 @@ func Open(path string) (*Store, error) {
 		// names by default.
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
+		// Reconcile and retention are ordered bounded scans. These composite
+		// indexes avoid temp B-trees/full scans when the fleet has millions of
+		// completed or pending secret lifecycle rows.
+		`CREATE INDEX IF NOT EXISTS idx_cluster_secret_delete_outbox_retry
+			ON cluster_secret_delete_outbox(updated_at, created_at, sandbox_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_cluster_secret_put_outbox_retry
+			ON cluster_secret_put_outbox(updated_at, created_at, sandbox_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_cluster_secret_tombs_deleted
+			ON cluster_secret_tombs(deleted_at, sandbox_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_audit_acl_updated
+			ON sandbox_audit_acl(updated_at, sandbox_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_audit_acl_latest
+			ON sandbox_audit_acl(sandbox_id, established_seq DESC);`,
+		// The table primary key already indexes (sandbox_id, incarnation_id),
+		// so remove the redundant duplicate index from earlier hardening drafts.
+		`DROP INDEX IF EXISTS idx_sandbox_audit_acl_incarnation;`,
+		// Retention shifts the audit index by byte offset: whole chunks below
+		// the pruned prefix are deleted and the straddling ones trimmed.
+		`CREATE INDEX IF NOT EXISTS idx_secret_audit_index_last_offset
+			ON secret_audit_index(last_offset);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
@@ -247,14 +405,23 @@ func Open(path string) (*Store, error) {
 		// the ResolveCustomDomain hot path.
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_custom_domains_sandbox_id ON sandbox_custom_domains(sandbox_id);`,
 		// pending_image_gc is the ledger the image janitor sweeps. Destroy
-		// paths upsert (image, now); runPendingImageGC removes rows whose
-		// scheduled_at is older than ImageBuildGCTTL once HasActiveImageRef
-		// confirms nothing references the image. Image is the PK so repeat
-		// destroys of sandboxes sharing an image collapse to one row and
-		// the TTL clock resets to the most recent destroy.
+		// paths upsert ((engine, image), now); runPendingImageGC removes rows
+		// whose scheduled_at is older than ImageBuildGCTTL once
+		// HasActiveImageRef confirms nothing references the image. The key is
+		// the PK so repeat destroys of sandboxes sharing an image collapse to
+		// one row and the TTL clock resets to the most recent destroy.
+		// engine is part of that identity: the same image reference can be
+		// cached by more than one container engine on a node (a host mid
+		// docker→containerd migration), the janitor has to remove it through
+		// the engine that actually holds it, and removing it from the wrong
+		// engine both fails to reclaim the disk and evicts a cache entry
+		// someone else is using. Rows written before the column existed carry
+		// '' and resolve to the host's configured engine.
 		`CREATE TABLE IF NOT EXISTS pending_image_gc (
-			image TEXT PRIMARY KEY,
-			scheduled_at DATETIME NOT NULL
+			engine TEXT NOT NULL DEFAULT '',
+			image TEXT NOT NULL,
+			scheduled_at DATETIME NOT NULL,
+			PRIMARY KEY (engine, image)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
 		// firecracker_tap_pool is the pre-populated network-slot pool for
@@ -453,6 +620,7 @@ func Open(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS wasm_checkpoint_pushes (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			sandbox_id TEXT NOT NULL,
+			incarnation_id TEXT NOT NULL DEFAULT '',
 			registry_ref TEXT NOT NULL,
 			digest TEXT NOT NULL,
 			pushed_at DATETIME NOT NULL
@@ -496,6 +664,7 @@ func Open(path string) (*Store, error) {
 				tenant TEXT NOT NULL,
 				volume_id TEXT NOT NULL,
 				sandbox_id TEXT NOT NULL,
+				incarnation_id TEXT NOT NULL,
 				target TEXT NOT NULL,
 				source TEXT NOT NULL,
 				created_at DATETIME NOT NULL,
@@ -532,7 +701,6 @@ func Open(path string) (*Store, error) {
 	// swallow so cold installs (where CREATE TABLE above already includes
 	// the column) and warm upgrades (where the column is new) both succeed.
 	migrations := []string{
-		`ALTER TABLE sandboxes ADD COLUMN toolbox_token TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN ssh_public_key TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN stop_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
@@ -555,6 +723,17 @@ func Open(path string) (*Store, error) {
 		// table. Required for cluster failover to re-pull private images on a
 		// new owner — the runtime layer drops creds after the initial pull.
 		`ALTER TABLE sandboxes ADD COLUMN registry_auth_sealed BLOB NOT NULL DEFAULT X'';`,
+		// AES-GCM-sealed toolbox token. This migration is required for warm
+		// upgrades because CREATE TABLE IF NOT EXISTS does not add the column to
+		// a pre-hardening sandboxes table.
+		`ALTER TABLE sandboxes ADD COLUMN toolbox_token_sealed BLOB NOT NULL DEFAULT X'';`,
+		// Pre-hardening databases already have cluster_secrets, so its new fence
+		// must also be additive rather than relying on CREATE TABLE IF NOT EXISTS.
+		`ALTER TABLE cluster_secrets ADD COLUMN seal_generation INTEGER NOT NULL DEFAULT 0;`,
+		// Per-recipient copy provenance for the delete outbox (see the DDL).
+		// Rows written before this column fall back to the row-wide
+		// created_at, which is what the fence used to compare against.
+		`ALTER TABLE cluster_secret_delete_outbox ADD COLUMN recipient_provenance_json TEXT NOT NULL DEFAULT '';`,
 		// Protocol of an exposed port: "http" (Caddy HTTP reverse proxy,
 		// historical behavior), "tcp" (caddy-l4 listener at host_port), or
 		// "tls" (caddy-l4 SNI route on the shared TLS listener).
@@ -685,6 +864,10 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN clone_generation TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_digest TEXT NOT NULL DEFAULT '';`,
+		// Exact live-lifecycle pointer. Retained audit ACLs intentionally allow
+		// many incarnations per sandbox ID, so timestamp ordering is not a safe
+		// substitute for this association (wall clocks can move backwards).
+		`ALTER TABLE sandboxes ADD COLUMN audit_incarnation_id TEXT NOT NULL DEFAULT '';`,
 		// Selective-egress CIDR policy (E2B network.allowOut / denyOut). JSON
 		// arrays so the start/reconcile paths can reinstall the host-firewall
 		// rules after a restart, the same way network_block_all is reapplied.
@@ -714,6 +897,28 @@ func Open(path string) (*Store, error) {
 		// empty-string sentinels keep scanSandbox free of NullString
 		// plumbing). Unused by other runtimes today.
 		`ALTER TABLE sandboxes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';`,
+		// Checkpoint pushes are async and outlive their sandbox: without the
+		// lifecycle they were started for, a push that lands after the id is
+		// reused writes the old incarnation's artifact into the new one.
+		`ALTER TABLE wasm_checkpoint_pushes ADD COLUMN incarnation_id TEXT NOT NULL DEFAULT '';`,
+		// The image janitor used to remove every scheduled image through the
+		// docker driver regardless of which engine built or pulled it.
+		`ALTER TABLE pending_image_gc ADD COLUMN engine TEXT NOT NULL DEFAULT '';`,
+		// push_claimed_at turns the 'pushing' state into an expiring lease.
+		// The reconcilers exclude 'pushing' rows so two ticks cannot push the
+		// same artifact; without a claim timestamp a crash (or a cancelled
+		// context) between the claim and its terminal state left the row
+		// permanently invisible to the reconciler and the artifact
+		// permanently undistributed.
+		`ALTER TABLE sandbox_snapshots ADD COLUMN push_claimed_at DATETIME;`,
+		`ALTER TABLE firecracker_templates ADD COLUMN push_claimed_at DATETIME;`,
+		// Backfill an empty env row for every sandbox that predates the
+		// "always write a row" rule above. Without it a warm upgrade cannot
+		// tell an env-less sandbox from one whose sealed env was lost, and
+		// the fail-loud read in loadEnv would refuse to start healthy
+		// sandboxes. INSERT OR IGNORE keeps it idempotent across restarts.
+		`INSERT OR IGNORE INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+			SELECT id, X'', CURRENT_TIMESTAMP FROM sandboxes;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -721,7 +926,14 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
 		}
 	}
-
+	// The image-GC ledger predates engine awareness with `image` as its sole
+	// primary key, and SQLite cannot widen a primary key in place. Rebuild it
+	// once so a node that holds the same image under two engines can carry a
+	// cleanup row for each.
+	if err := migratePendingImageGCKey(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// Partial unique index on host_port (only enforced when host_port > 0).
 	// This is the load-bearing primitive of the random-first allocator: two
 	// concurrent ExposePort calls race to INSERT a host_port row, and only
@@ -760,10 +972,21 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
 	}
+	if err := migrateLegacyPlaintextSecrets(db, secretCipher); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := migrateEnvBinding(db, secretCipher); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := validateCurrentSecretSchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
-	// SQLite materialized the DB file (and the WAL/SHM sidecars on the
-	// first write) using the process umask — typically 0o644, leaving
-	// env_json and toolbox_token world-readable. Tighten to owner-only.
+	// SQLite materialized the DB file (and the WAL/SHM sidecars on the first
+	// write) using the process umask — typically 0o644. Tighten to owner-only.
 	// Sidecars may not exist on a fresh DB if no transaction has run yet;
 	// ignore not-found and let the next writer create them with the now
 	// owner-only directory mode protecting them in transit.
@@ -774,7 +997,428 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, secretCipher: secretCipher}, nil
+}
+
+const legacySecretMigrationBatchSize = 256
+
+type legacySecretColumns struct {
+	envJSON      bool
+	toolboxToken bool
+}
+
+// migrateLegacyPlaintextSecrets upgrades the two secret columns that existed
+// before secrets hardening. All sealing, side-row writes, plaintext scrubbing,
+// and column drops share one transaction: a malformed row, encryption error,
+// or DDL failure leaves the original schema and every plaintext value intact
+// for a corrected retry. Rows are paged by the sandbox primary key so a large
+// node does not hold every sandbox's secrets in memory during startup.
+func migrateLegacyPlaintextSecrets(db *sql.DB, secretCipher *secrets.Cipher) (retErr error) {
+	columns, err := inspectLegacySecretColumns(db)
+	if err != nil {
+		return err
+	}
+	if !columns.envJSON && !columns.toolboxToken {
+		return nil
+	}
+	if secretCipher == nil {
+		return errors.New("migrate legacy plaintext secrets: secret cipher is required")
+	}
+
+	// Scrub deleted/shortened record content before the transaction is
+	// checkpointed into the main database. Reset this connection afterward so
+	// the one-time upgrade does not add secure-delete overhead to normal GC.
+	if _, err := db.Exec(`PRAGMA secure_delete = ON`); err != nil {
+		return fmt.Errorf("enable secure delete for legacy secret migration: %w", err)
+	}
+	defer func() {
+		if _, err := db.Exec(`PRAGMA secure_delete = OFF`); retErr == nil && err != nil {
+			retErr = fmt.Errorf("disable secure delete after legacy secret migration: %w", err)
+		}
+	}()
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin legacy secret migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	migratedAt := time.Now().UTC()
+	if columns.envJSON {
+		if err := migrateLegacyEnvRows(ctx, tx, secretCipher, migratedAt); err != nil {
+			return err
+		}
+	}
+	if columns.toolboxToken {
+		if err := migrateLegacyToolboxTokenRows(ctx, tx, secretCipher); err != nil {
+			return err
+		}
+	}
+
+	// Overwrite before DROP COLUMN so secure_delete clears both live cells and
+	// discarded record content. The outer transaction still makes this atomic
+	// with every sealed write.
+	if columns.envJSON {
+		if _, err := tx.ExecContext(ctx, `UPDATE sandboxes SET env_json = '{}'`); err != nil {
+			return fmt.Errorf("scrub legacy sandbox env: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE sandboxes DROP COLUMN env_json`); err != nil {
+			return fmt.Errorf("drop legacy sandbox env column: %w", err)
+		}
+	}
+	if columns.toolboxToken {
+		if _, err := tx.ExecContext(ctx, `UPDATE sandboxes SET toolbox_token = ''`); err != nil {
+			return fmt.Errorf("scrub legacy toolbox tokens: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE sandboxes DROP COLUMN toolbox_token`); err != nil {
+			return fmt.Errorf("drop legacy toolbox token column: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit legacy secret migration: %w", err)
+	}
+
+	// WAL mode may leave the pre-migration database pages in the main file
+	// until a checkpoint. Startup owns the only connection here, so force and
+	// truncate the checkpoint before accepting requests.
+	var busy, logFrames, checkpointedFrames int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames); err != nil {
+		return fmt.Errorf("checkpoint legacy secret migration: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("checkpoint legacy secret migration: database remained busy (%d WAL frames, %d checkpointed)", logFrames, checkpointedFrames)
+	}
+	return nil
+}
+
+func inspectLegacySecretColumns(db *sql.DB) (legacySecretColumns, error) {
+	rows, err := db.Query(`PRAGMA table_info(sandboxes)`)
+	if err != nil {
+		return legacySecretColumns{}, fmt.Errorf("inspect legacy sandbox secret schema: %w", err)
+	}
+	defer rows.Close()
+
+	var columns legacySecretColumns
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return legacySecretColumns{}, fmt.Errorf("scan legacy sandbox secret schema: %w", err)
+		}
+		switch name {
+		case "env_json":
+			columns.envJSON = true
+		case "toolbox_token":
+			columns.toolboxToken = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return legacySecretColumns{}, fmt.Errorf("iterate legacy sandbox secret schema: %w", err)
+	}
+	return columns, nil
+}
+
+func migrateLegacyEnvRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets.Cipher, migratedAt time.Time) error {
+	afterID := ""
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, env_json
+			FROM sandboxes
+			WHERE id > ?
+			ORDER BY id
+			LIMIT ?
+		`, afterID, legacySecretMigrationBatchSize)
+		if err != nil {
+			return fmt.Errorf("read legacy sandbox env batch: %w", err)
+		}
+		type legacyEnvRow struct {
+			id  string
+			raw string
+		}
+		batch := make([]legacyEnvRow, 0, legacySecretMigrationBatchSize)
+		for rows.Next() {
+			var row legacyEnvRow
+			if err := rows.Scan(&row.id, &row.raw); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan legacy sandbox env: %w", err)
+			}
+			batch = append(batch, row)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate legacy sandbox env: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close legacy sandbox env rows: %w", err)
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+
+		for _, row := range batch {
+			var env map[string]string
+			if err := json.Unmarshal([]byte(row.raw), &env); err != nil {
+				return fmt.Errorf("decode legacy sandbox env for %q: %w", row.id, err)
+			}
+			if len(env) == 0 {
+				continue
+			}
+			incarnationID, err := envIncarnationForMigration(ctx, tx, row.id)
+			if err != nil {
+				return err
+			}
+			sealed, err := secretCipher.EncryptWithAAD([]byte(row.raw), secrets.EnvAAD(row.id, incarnationID))
+			if err != nil {
+				return fmt.Errorf("seal legacy sandbox env for %q: %w", row.id, err)
+			}
+			// Upsert, not insert: the schema backfill has already placed an
+			// empty-seal row for every sandbox (so a missing row can mean
+			// "lost"), and this migration fills in the real ciphertext.
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+				VALUES (?, ?, ?)
+				ON CONFLICT(sandbox_id) DO UPDATE SET
+					sealed_blob = excluded.sealed_blob,
+					created_at = excluded.created_at
+			`, row.id, sealed, migratedAt); err != nil {
+				return fmt.Errorf("store migrated sandbox env for %q: %w", row.id, err)
+			}
+		}
+		afterID = batch[len(batch)-1].id
+	}
+}
+
+// migratePendingImageGCKey widens pending_image_gc's primary key from (image)
+// to (engine, image). It is a no-op once engine is part of the key, so warm
+// restarts pay one PRAGMA. Existing rows keep engine=” — "whichever engine
+// this host is configured with" — which is what they always implicitly meant.
+func migratePendingImageGCKey(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(pending_image_gc)`)
+	if err != nil {
+		return fmt.Errorf("inspect pending_image_gc: %w", err)
+	}
+	engineInKey := false
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, colType    string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan pending_image_gc column: %w", err)
+		}
+		if name == "engine" && pk > 0 {
+			engineInKey = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate pending_image_gc columns: %w", err)
+	}
+	rows.Close()
+	if engineInKey {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin pending_image_gc key migration: %w", err)
+	}
+	defer tx.Rollback()
+	stmts := []string{
+		`CREATE TABLE pending_image_gc_rekeyed (
+			engine TEXT NOT NULL DEFAULT '',
+			image TEXT NOT NULL,
+			scheduled_at DATETIME NOT NULL,
+			PRIMARY KEY (engine, image)
+		);`,
+		`INSERT OR IGNORE INTO pending_image_gc_rekeyed (engine, image, scheduled_at)
+			SELECT COALESCE(engine, ''), image, scheduled_at FROM pending_image_gc;`,
+		`DROP TABLE pending_image_gc;`,
+		`ALTER TABLE pending_image_gc_rekeyed RENAME TO pending_image_gc;`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate pending_image_gc key %q: %w", stmt, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit pending_image_gc key migration: %w", err)
+	}
+	return nil
+}
+
+func migrateLegacyToolboxTokenRows(ctx context.Context, tx *sql.Tx, secretCipher *secrets.Cipher) error {
+	afterID := ""
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, toolbox_token, toolbox_token_sealed
+			FROM sandboxes
+			WHERE id > ?
+			ORDER BY id
+			LIMIT ?
+		`, afterID, legacySecretMigrationBatchSize)
+		if err != nil {
+			return fmt.Errorf("read legacy toolbox token batch: %w", err)
+		}
+		type legacyToolboxRow struct {
+			id     string
+			token  string
+			sealed []byte
+		}
+		batch := make([]legacyToolboxRow, 0, legacySecretMigrationBatchSize)
+		for rows.Next() {
+			var row legacyToolboxRow
+			if err := rows.Scan(&row.id, &row.token, &row.sealed); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan legacy toolbox token: %w", err)
+			}
+			batch = append(batch, row)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate legacy toolbox tokens: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close legacy toolbox token rows: %w", err)
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+
+		for _, row := range batch {
+			if row.token == "" {
+				continue
+			}
+			if len(row.sealed) != 0 {
+				return fmt.Errorf("migrate legacy toolbox token for %q: sealed value already exists", row.id)
+			}
+			sealed, err := secretCipher.EncryptWithAAD([]byte(row.token), toolboxTokenAAD(row.id))
+			if err != nil {
+				return fmt.Errorf("seal legacy toolbox token for %q: %w", row.id, err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE sandboxes SET toolbox_token_sealed = ? WHERE id = ?`, sealed, row.id); err != nil {
+				return fmt.Errorf("store migrated toolbox token for %q: %w", row.id, err)
+			}
+		}
+		afterID = batch[len(batch)-1].id
+	}
+}
+
+// validateCurrentSecretSchema checks the post-migration storage contract at
+// boot so a malformed database fails before the first create/read.
+func validateCurrentSecretSchema(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(sandboxes)`)
+	if err != nil {
+		return fmt.Errorf("inspect sandboxes secret schema: %w", err)
+	}
+	defer rows.Close()
+	hasSealedToolbox := false
+	hasAuditIncarnation := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan sandboxes secret schema: %w", err)
+		}
+		switch name {
+		case "env_json", "toolbox_token":
+			return fmt.Errorf("unsupported plaintext secret schema: sandboxes.%s is present", name)
+		case "toolbox_token_sealed":
+			hasSealedToolbox = true
+		case "audit_incarnation_id":
+			hasAuditIncarnation = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate sandboxes secret schema: %w", err)
+	}
+	if !hasSealedToolbox {
+		return errors.New("unsupported secret schema: sandboxes.toolbox_token_sealed is required")
+	}
+	if !hasAuditIncarnation {
+		return errors.New("unsupported secret schema: sandboxes.audit_incarnation_id is required")
+	}
+	// The hardening release is intentionally one-way. CREATE TABLE IF NOT
+	// EXISTS cannot repair older table shapes, so reject them here instead of
+	// booting successfully and discovering a missing generation fence or an
+	// unfenced primary key during the first secret/audit operation.
+	for table, required := range map[string]map[string]int{
+		"cluster_secrets": {
+			"ref":             1,
+			"seal_generation": 0,
+		},
+		"cluster_secret_tombs": {
+			"sandbox_id":     1,
+			"incarnation_id": 2,
+			"generation":     0,
+		},
+		"cluster_secret_delete_outbox": {
+			"sandbox_id":         1,
+			"incarnation_id":     2,
+			"generation":         0,
+			"awaiting_promotion": 0,
+		},
+		"cluster_secret_put_outbox": {
+			"sandbox_id":      1,
+			"incarnation_id":  2,
+			"seal_generation": 3,
+			"recipients_json": 0,
+		},
+		"sandbox_audit_acl": {
+			"sandbox_id":      1,
+			"incarnation_id":  2,
+			"owner_ref":       0,
+			"established_seq": 0,
+		},
+		"node_storage_retirements": {
+			"node_id":     1,
+			"attested_at": 0,
+			"actor":       0,
+		},
+	} {
+		if err := validateRequiredTableShape(db, table, required); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRequiredTableShape(db *sql.DB, table string, required map[string]int) error {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%q)`, table))
+	if err != nil {
+		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	defer rows.Close()
+	found := make(map[string]int, len(required))
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan %s schema: %w", table, err)
+		}
+		if _, ok := required[name]; ok {
+			found[name] = primaryKey
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s schema: %w", table, err)
+	}
+	for column, wantPK := range required {
+		gotPK, ok := found[column]
+		if !ok {
+			return fmt.Errorf("unsupported secret schema: %s.%s is required", table, column)
+		}
+		if gotPK != wantPK {
+			return fmt.Errorf("unsupported secret schema: %s.%s primary-key position is %d, want %d", table, column, gotPK, wantPK)
+		}
+	}
+	return nil
 }
 
 func sqliteDSN(path string) string {
@@ -797,11 +1441,81 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+type dbExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
-	envJSON, err := marshalJSON(sandbox.Env, "{}")
-	if err != nil {
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
 		return err
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sandbox create: %w", err)
+	}
+	defer tx.Rollback()
+	if err := s.insertSandbox(ctx, tx, sandbox); err != nil {
+		return err
+	}
+	// An empty env is recorded as an empty row, never as an absent one. That
+	// is what lets a later read tell "this sandbox has no environment" from
+	// "this sandbox's sealed environment is gone" and fail loud on the second
+	// (plans/secrets-hardening: a start must never silently boot without the
+	// credentials it was created with).
+	if err := putEnvExec(ctx, tx, sandbox.ID, []byte{}); err != nil {
+		return err
+	}
+	if strings.TrimSpace(sandbox.AuditIncarnationID) != "" {
+		if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox create: %w", err)
+	}
+	return nil
+}
+
+// CreateWithSealedEnv inserts the sandbox row and optional sealed env blob in
+// one transaction so a crash cannot leave a healthy sandbox with empty env
+// (plans/secrets-hardening outside-voice #3). Empty sealedEnv skips the env
+// write (same as Create).
+//
+// Environment plaintext is never written to the sandbox row; sandbox_env is
+// the only at-rest representation.
+func (s *Store) CreateWithSealedEnv(ctx context.Context, sandbox *models.Sandbox, sealedEnv []byte) error {
+	if len(sealedEnv) == 0 {
+		return s.Create(ctx, sandbox)
+	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin create+env tx: %w", err)
+	}
+	defer tx.Rollback()
+	// Persist without plaintext env_json; sealed row is the source of truth.
+	cleared := *sandbox
+	cleared.Env = nil
+	if err := s.insertSandbox(ctx, tx, &cleared); err != nil {
+		return err
+	}
+	if err := putEnvExec(ctx, tx, sandbox.ID, sealedEnv); err != nil {
+		return err
+	}
+	if strings.TrimSpace(sandbox.AuditIncarnationID) != "" {
+		if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, sandbox.AuditIncarnationID, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit create+env tx: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *models.Sandbox) error {
 	commandJSON, err := marshalJSON(sandbox.ContainerCommand, "[]")
 	if err != nil {
 		return err
@@ -814,14 +1528,15 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
-	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+	toolboxTokenSealed, err := s.toolboxTokenStorage(sandbox)
+	if err != nil {
 		return err
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -838,7 +1553,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
@@ -851,14 +1566,13 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.MemoryMB,
 		sandbox.DiskGB,
 		sandbox.OSUser,
-		envJSON,
 		boolToInt(sandbox.NetworkBlockAll),
 		mustMarshalStringSlice(sandbox.NetworkAllowOut),
 		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		allowPublicTrafficToInt(sandbox.AllowPublicTraffic),
 		strings.TrimSpace(sandbox.MaskRequestHost),
 		boolToInt(sandbox.ToolboxEnabled),
-		sandbox.ToolboxToken,
+		toolboxTokenSealed,
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
@@ -897,6 +1611,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
+		strings.TrimSpace(sandbox.AuditIncarnationID),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -943,6 +1658,50 @@ func nullableBlob(b []byte) []byte {
 	return b
 }
 
+func toolboxTokenAAD(sandboxID string) []byte {
+	return []byte("aerolvm/toolbox-token/" + strings.TrimSpace(sandboxID))
+}
+
+// openToolboxToken AES-GCM-opens toolbox_token_sealed onto ToolboxToken.
+// Get is the only caller: List/ListByOwner/ListByRuntime leave the blob
+// sealed so a fleet scan never decrypts every row (the same reason env
+// lives in sandbox_env) and so one undecryptable token cannot fail the
+// whole List and stall every reconcile loop on the node.
+func (s *Store) openToolboxToken(sandbox *models.Sandbox) error {
+	if sandbox == nil || len(sandbox.ToolboxTokenSealed) == 0 {
+		return nil
+	}
+	if sandbox.ToolboxToken != "" {
+		return nil
+	}
+	if s.secretCipher == nil {
+		return errors.New("sealed toolbox token cannot be opened: store cipher is not configured")
+	}
+	plain, err := s.secretCipher.DecryptWithAAD(sandbox.ToolboxTokenSealed, toolboxTokenAAD(sandbox.ID))
+	if err != nil {
+		return fmt.Errorf("open toolbox token for sandbox %q: %w", sandbox.ID, err)
+	}
+	sandbox.ToolboxToken = string(plain)
+	return nil
+}
+
+func (s *Store) toolboxTokenStorage(sandbox *models.Sandbox) ([]byte, error) {
+	if sandbox == nil {
+		return []byte{}, nil
+	}
+	if sandbox.ToolboxToken == "" {
+		return nullableBlob(sandbox.ToolboxTokenSealed), nil
+	}
+	if s.secretCipher == nil {
+		return nil, errors.New("seal toolbox token: store cipher is not configured")
+	}
+	sealed, err := s.secretCipher.EncryptWithAAD([]byte(sandbox.ToolboxToken), toolboxTokenAAD(sandbox.ID))
+	if err != nil {
+		return nil, fmt.Errorf("seal toolbox token: %w", err)
+	}
+	return sealed, nil
+}
+
 func sandboxDurability(sandbox *models.Sandbox) string {
 	if sandbox == nil || strings.TrimSpace(sandbox.Durability) == "" {
 		return models.DurabilityPassivatable
@@ -962,10 +1721,6 @@ func sandboxFailoverPolicy(sandbox *models.Sandbox) string {
 }
 
 func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
-	envJSON, err := marshalJSON(sandbox.Env, "{}")
-	if err != nil {
-		return err
-	}
 	commandJSON, err := marshalJSON(sandbox.ContainerCommand, "[]")
 	if err != nil {
 		return err
@@ -978,14 +1733,45 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	toolboxTokenSealed, err := s.toolboxTokenStorage(sandbox)
+	if err != nil {
+		return err
+	}
 	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
 		return err
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	var exec dbExecer = s.db
+	var tx *sql.Tx
+	if incarnationID != "" {
+		tx, err = s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin sandbox upsert: %w", err)
+		}
+		defer tx.Rollback()
+		exec = tx
+
+		// Upsert may insert a row, but it must not silently replace the durable
+		// lifecycle identity of an existing sandbox.
+		var currentIncarnationID string
+		lookupErr := tx.QueryRowContext(ctx, `
+			SELECT audit_incarnation_id
+			FROM sandboxes
+			WHERE id = ?
+		`, sandbox.ID).Scan(&currentIncarnationID)
+		if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+			return fmt.Errorf("resolve live sandbox audit incarnation: %w", lookupErr)
+		}
+		if lookupErr == nil && strings.TrimSpace(currentIncarnationID) != "" && strings.TrimSpace(currentIncarnationID) != incarnationID {
+			return errors.New("upsert sandbox: sandbox incarnation conflict")
+		}
+	}
+
+	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1002,7 +1788,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
@@ -1014,14 +1800,13 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			memory_mb = excluded.memory_mb,
 			disk_gb = excluded.disk_gb,
 			os_user = excluded.os_user,
-			env_json = excluded.env_json,
 			network_block_all = excluded.network_block_all,
 			network_allow_out_json = excluded.network_allow_out_json,
 			network_deny_out_json = excluded.network_deny_out_json,
 			allow_public_traffic = excluded.allow_public_traffic,
 			mask_request_host = excluded.mask_request_host,
 			toolbox_enabled = excluded.toolbox_enabled,
-			toolbox_token = excluded.toolbox_token,
+			toolbox_token_sealed = excluded.toolbox_token_sealed,
 			ssh_public_key = excluded.ssh_public_key,
 			last_error = excluded.last_error,
 			container_command_json = excluded.container_command_json,
@@ -1054,7 +1839,11 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			wasm_registry_digest = excluded.wasm_registry_digest,
 			owner_ref = excluded.owner_ref,
 			fleet_suspended = excluded.fleet_suspended,
-			tenant_id = excluded.tenant_id
+			tenant_id = excluded.tenant_id,
+			audit_incarnation_id = CASE
+				WHEN excluded.audit_incarnation_id <> '' THEN excluded.audit_incarnation_id
+				ELSE sandboxes.audit_incarnation_id
+			END
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -1066,14 +1855,13 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.MemoryMB,
 		sandbox.DiskGB,
 		sandbox.OSUser,
-		envJSON,
 		boolToInt(sandbox.NetworkBlockAll),
 		mustMarshalStringSlice(sandbox.NetworkAllowOut),
 		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		allowPublicTrafficToInt(sandbox.AllowPublicTraffic),
 		strings.TrimSpace(sandbox.MaskRequestHost),
 		boolToInt(sandbox.ToolboxEnabled),
-		sandbox.ToolboxToken,
+		toolboxTokenSealed,
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
@@ -1112,6 +1900,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
+		incarnationID,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -1119,13 +1908,34 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		}
 		return fmt.Errorf("upsert sandbox: %w", err)
 	}
+	// Upsert can insert a row (a sandbox that never went through Create), and
+	// the "a missing env row means the seal was lost" rule only holds if every
+	// path that can create a sandbox also creates its env row. OR IGNORE so an
+	// existing sealed environment is never clobbered by an ordinary update.
+	// Selected from sandboxes rather than inserted blind: the row can be gone
+	// again by now (a concurrent destroy), and an env row for a sandbox that
+	// no longer exists is an FK violation, not an error worth failing on.
+	if _, err := exec.ExecContext(ctx, `
+		INSERT OR IGNORE INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+		SELECT id, X'', ? FROM sandboxes WHERE id = ?
+	`, time.Now().UTC(), sandbox.ID); err != nil {
+		return fmt.Errorf("ensure sandbox env row: %w", err)
+	}
+	if tx != nil {
+		if err := upsertSandboxAuditACLExec(ctx, tx, sandbox.ID, sandbox.OwnerRef, incarnationID, time.Now().UTC()); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit sandbox upsert: %w", err)
+		}
+	}
 	return nil
 }
 
 func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1142,16 +1952,19 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
 
-	sandbox, err := scanSandbox(row)
+	sandbox, err := s.scanSandbox(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
+		return nil, err
+	}
+	if err := s.openToolboxToken(sandbox); err != nil {
 		return nil, err
 	}
 
@@ -1173,7 +1986,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1190,7 +2003,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -1202,7 +2015,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	var sandboxes []*models.Sandbox
 	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
-		sandbox, err := scanSandbox(rows)
+		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1241,7 +2054,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1258,7 +2071,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -1270,7 +2083,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 
 	var sandboxes []*models.Sandbox
 	for rows.Next() {
-		sandbox, err := scanSandbox(rows)
+		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1287,13 +2100,14 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 // per-runtime background sweeps (wasm periodic checkpoint, wasm durable-push
 // retry) use it instead of List so they scan only their own rows rather than
 // the whole fleet on every tick — at a node packing thousands of mixed-runtime
-// sandboxes, List would load (and scanSandbox-decode) every docker/firecracker
-// row just to filter them back out. Like ListByOwner, ports and custom domains
-// are not attached: the sweep callers only need identity + lifecycle fields.
+// sandboxes, List would load every docker/firecracker row just to filter them
+// back out. Like ListByOwner, ports and custom domains are not attached: the
+// sweep callers only need identity + lifecycle fields. Toolbox tokens stay
+// sealed; those sweeps never need the bearer.
 func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token_sealed, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1310,7 +2124,7 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended,
-			tenant_id
+			tenant_id, audit_incarnation_id
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -1322,7 +2136,7 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 
 	var sandboxes []*models.Sandbox
 	for rows.Next() {
-		sandbox, err := scanSandbox(rows)
+		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1444,19 +2258,20 @@ func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, erro
 }
 
 // SchedulePendingImageGC records (or refreshes) a pending image-deletion
-// row. UPSERT on the image PK means concurrent or repeated destroys
-// collapse to one row and the TTL clock restarts from the most recent
-// destroy — so a busy churn pattern on the same image keeps deferring
-// removal instead of racing the janitor. Empty image is a no-op.
-func (s *Store) SchedulePendingImageGC(ctx context.Context, image string, at time.Time) error {
+// row for one engine's copy of an image. UPSERT on the (engine, image) PK
+// means concurrent or repeated destroys collapse to one row and the TTL clock
+// restarts from the most recent destroy — so a busy churn pattern on the same
+// image keeps deferring removal instead of racing the janitor. Empty image is
+// a no-op; empty engine means "this host's configured engine".
+func (s *Store) SchedulePendingImageGC(ctx context.Context, engine, image string, at time.Time) error {
 	if image == "" {
 		return nil
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO pending_image_gc(image, scheduled_at)
-		VALUES (?, ?)
-		ON CONFLICT(image) DO UPDATE SET scheduled_at = excluded.scheduled_at
-	`, image, at.UTC())
+		INSERT INTO pending_image_gc(engine, image, scheduled_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(engine, image) DO UPDATE SET scheduled_at = excluded.scheduled_at
+	`, strings.TrimSpace(engine), image, at.UTC())
 	if err != nil {
 		return fmt.Errorf("schedule pending image gc: %w", err)
 	}
@@ -1468,6 +2283,10 @@ func (s *Store) SchedulePendingImageGC(ctx context.Context, image string, at tim
 // remove/delete decision to the exact row it observed — see
 // DeletePendingImageGCIfScheduledAt for the refresh-race rationale.
 type PendingImageGCEntry struct {
+	// Engine is the container engine holding this copy of the image. Empty
+	// on rows written before the ledger became engine-aware; the janitor
+	// resolves that to the host's configured engine.
+	Engine      string
 	Image       string
 	ScheduledAt time.Time
 }
@@ -1482,7 +2301,7 @@ type PendingImageGCEntry struct {
 // can guard the conditional delete in DeletePendingImageGCIfScheduledAt.
 func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, limit int) ([]PendingImageGCEntry, error) {
 	query := `
-		SELECT image, scheduled_at FROM pending_image_gc
+		SELECT engine, image, scheduled_at FROM pending_image_gc
 		WHERE scheduled_at <= ?
 		ORDER BY scheduled_at
 	`
@@ -1499,7 +2318,7 @@ func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, lim
 	var out []PendingImageGCEntry
 	for rows.Next() {
 		var entry PendingImageGCEntry
-		if err := rows.Scan(&entry.Image, &entry.ScheduledAt); err != nil {
+		if err := rows.Scan(&entry.Engine, &entry.Image, &entry.ScheduledAt); err != nil {
 			return nil, fmt.Errorf("scan pending image gc row: %w", err)
 		}
 		out = append(out, entry)
@@ -1516,11 +2335,12 @@ func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, lim
 // regardless of timestamp — the destroy path will re-schedule with a
 // fresh timestamp if the image goes idle again. Missing rows are not
 // an error.
-func (s *Store) DeletePendingImageGC(ctx context.Context, image string) error {
+func (s *Store) DeletePendingImageGC(ctx context.Context, engine, image string) error {
 	if image == "" {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_image_gc WHERE image = ?`, image); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_image_gc WHERE engine = ? AND image = ?`,
+		strings.TrimSpace(engine), image); err != nil {
 		return fmt.Errorf("delete pending image gc: %w", err)
 	}
 	return nil
@@ -1539,6 +2359,9 @@ func (s *Store) DeletePendingImageGC(ctx context.Context, image string) error {
 // bounded by "images destroyed in the last TTL window". Returns
 // whether a row was touched, so callers can distinguish "deadline
 // pushed forward" from "no pending GC, nothing to push".
+// Refreshes every engine's row for the image: a create that uses the image
+// keeps it alive wherever it is cached, and the janitor is the only thing that
+// removes rows.
 func (s *Store) RefreshPendingImageGCIfExists(ctx context.Context, image string, at time.Time) (bool, error) {
 	if image == "" {
 		return false, nil
@@ -1570,14 +2393,14 @@ func (s *Store) RefreshPendingImageGCIfExists(ctx context.Context, image string,
 // extended TTL that destroy was supposed to buy. The janitor uses this
 // to keep the "TTL clock restarts from the most recent destroy"
 // contract under churn.
-func (s *Store) DeletePendingImageGCIfScheduledAt(ctx context.Context, image string, at time.Time) (bool, error) {
+func (s *Store) DeletePendingImageGCIfScheduledAt(ctx context.Context, engine, image string, at time.Time) (bool, error) {
 	if image == "" {
 		return false, nil
 	}
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM pending_image_gc
-		WHERE image = ? AND scheduled_at = ?
-	`, image, at.UTC())
+		WHERE engine = ? AND image = ? AND scheduled_at = ?
+	`, strings.TrimSpace(engine), image, at.UTC())
 	if err != nil {
 		return false, fmt.Errorf("conditional delete pending image gc: %w", err)
 	}
@@ -1848,6 +2671,35 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// RollbackSandboxCreate removes a sandbox that never completed its create
+// transaction together with only its explicit audit-incarnation row inserted
+// by Create. Older incarnation rows may belong to a previously deleted sandbox
+// that reused the same deterministic ID; deleting them would create a retained
+// evidence authorization vacuum. A normal Delete intentionally retains the
+// current row.
+func (s *Store) RollbackSandboxCreate(ctx context.Context, id, incarnationID string) error {
+	id = strings.TrimSpace(id)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if id == "" {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sandbox create rollback: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete sandbox during create rollback: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sandbox_audit_acl WHERE sandbox_id = ? AND incarnation_id = ?`, id, incarnationID); err != nil {
+		return fmt.Errorf("delete sandbox audit acl during create rollback: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox create rollback: %w", err)
 	}
 	return nil
 }
@@ -2374,6 +3226,9 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 	if id == "" {
 		return errors.New("create template: id is required")
 	}
+	if !models.ValidTemplateID(id) {
+		return errors.New("create template: invalid id")
+	}
 	image := strings.TrimSpace(template.Image)
 	if image == "" {
 		return errors.New("create template: image is required")
@@ -2692,9 +3547,11 @@ func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Templat
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
 			has_overlay, push_state, push_error, registry_ref, push_digest
 		FROM firecracker_templates
-		WHERE push_state IN ('pending', 'error') AND status = ?
+		WHERE (push_state IN ('pending', 'error')
+			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?)))
+			AND status = ?
 		ORDER BY created_at ASC, id ASC
-	`, string(models.TemplateStatusReady))
+	`, time.Now().UTC().Add(-PushClaimLease), string(models.TemplateStatusReady))
 	if err != nil {
 		return nil, fmt.Errorf("list templates pending push: %w", err)
 	}
@@ -2801,54 +3658,72 @@ func (s *Store) ListTemplatesReadyBefore(ctx context.Context, cutoff time.Time) 
 	return items, nil
 }
 
-// ListReadyTemplateIDs returns the IDs of every template whose
-// artifacts are usable on this host: `status IN ('ready',
-// 'ready_no_snapshot')`. The Phase 6 PR-D capacity heartbeat hands this
-// list to peers so placement can prefer the node that already has the
-// template's artifacts cached.
-//
-// Returns IDs only (no payload columns) — the snapshot is gossiped
-// every few seconds and a full row projection would balloon heartbeats
-// once a cluster has hundreds of templates. The unknown-allow rule in
-// placement.go nodeFits means a momentary "empty list" mid-startup is
-// safe: peers fall back to "any host" placement until the heartbeat
-// catches up.
-func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
+// ListTemplateInventoryIDs returns both the ready-only placement inventory and
+// the all-lifecycle administrative catalogue in one lightweight query. Keeping
+// these sets distinct prevents a pending or failed template from looking
+// absent to item routing without making it eligible for sandbox placement.
+func (s *Store) ListTemplateInventoryIDs(ctx context.Context) (readyIDs, catalogIDs []string, err error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id
+		SELECT id, status
 		FROM firecracker_templates
-		WHERE status IN (?, ?)
 		ORDER BY id ASC
-	`, string(models.TemplateStatusReady), string(models.TemplateStatusReadyNoSnapshot))
+	`)
 	if err != nil {
-		return nil, fmt.Errorf("list ready template ids: %w", err)
+		return nil, nil, fmt.Errorf("list template inventory ids: %w", err)
 	}
 	defer rows.Close()
-	var ids []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan template id: %w", err)
+		var id, status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return nil, nil, fmt.Errorf("scan template inventory id: %w", err)
 		}
-		ids = append(ids, id)
+		catalogIDs = append(catalogIDs, id)
+		if status == string(models.TemplateStatusReady) || status == string(models.TemplateStatusReadyNoSnapshot) {
+			readyIDs = append(readyIDs, id)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate template ids: %w", err)
+		return nil, nil, fmt.Errorf("iterate template inventory ids: %w", err)
 	}
-	return ids, nil
+	return readyIDs, catalogIDs, nil
+
+}
+
+// ListReadyTemplateIDs returns the IDs whose artifacts are usable on this
+// host. The administrative catalogue is intentionally discarded here.
+func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
+	ready, _, err := s.ListTemplateInventoryIDs(ctx)
+	return ready, err
 }
 
 // SetTemplatePushState is a narrow single-column update used by the
 // push reconciler. errMsg is overwritten unconditionally (including
 // to empty on success transitions) so callers don't have to remember
 // to clear it. Mirrors SetSnapshotPushState.
+// PushClaimLease bounds how long a row may sit in 'pushing' before another
+// reconciler tick may reclaim it. Longer than any realistic single artifact
+// push, short enough that a crashed daemon's claims drain on the next few
+// ticks rather than needing operator action.
+const PushClaimLease = 30 * time.Minute
+
+// pushClaimStamp records when a row entered 'pushing' and clears the stamp on
+// every terminal state, so a reclaim window only exists while a push is
+// genuinely believed to be in flight. Snapshots and templates share the
+// literal state name, so one helper serves both ledgers.
+func pushClaimStamp(state string, now time.Time) any {
+	if strings.TrimSpace(state) == models.SnapshotPushStatePushing {
+		return now
+	}
+	return nil
+}
+
 func (s *Store) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE firecracker_templates
-		SET push_state = ?, push_error = ?, updated_at = ?
+		SET push_state = ?, push_error = ?, updated_at = ?, push_claimed_at = ?
 		WHERE id = ?
-	`, strings.TrimSpace(state), errMsg, now, strings.TrimSpace(id))
+	`, strings.TrimSpace(state), errMsg, now, pushClaimStamp(state, now), strings.TrimSpace(id))
 	if err != nil {
 		return fmt.Errorf("set template push state: %w", err)
 	}
@@ -3016,8 +3891,9 @@ func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.Sandbox
 			push_state, push_error
 		FROM sandbox_snapshots
 		WHERE push_state IN ('pending', 'error')
+			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?))
 		ORDER BY created_at ASC, name ASC
-	`)
+	`, time.Now().UTC().Add(-PushClaimLease))
 	if err != nil {
 		return nil, fmt.Errorf("list snapshots pending push: %w", err)
 	}
@@ -3043,9 +3919,9 @@ func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.Sandbox
 func (s *Store) SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandbox_snapshots
-		SET push_state = ?, push_error = ?
+		SET push_state = ?, push_error = ?, push_claimed_at = ?
 		WHERE name = ?
-	`, strings.TrimSpace(state), errMsg, strings.TrimSpace(name))
+	`, strings.TrimSpace(state), errMsg, pushClaimStamp(state, time.Now().UTC()), strings.TrimSpace(name))
 	if err != nil {
 		return fmt.Errorf("set snapshot push state: %w", err)
 	}
@@ -3546,13 +4422,13 @@ func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.Expos
 	return ports, nil
 }
 
-func scanSandbox(scanner interface {
+func (s *Store) scanSandbox(scanner interface {
 	Scan(dest ...any) error
 }) (*models.Sandbox, error) {
 	var sandbox models.Sandbox
-	var envJSON string
 	var networkBlocked int
 	var toolboxEnabled int
+	var toolboxTokenSealed []byte
 	var commandJSON string
 	var tagsJSON string
 	var gpusJSON string
@@ -3579,14 +4455,13 @@ func scanSandbox(scanner interface {
 		&sandbox.MemoryMB,
 		&sandbox.DiskGB,
 		&sandbox.OSUser,
-		&envJSON,
 		&networkBlocked,
 		&allowOutJSON,
 		&denyOutJSON,
 		&allowPublicTraffic,
 		&sandbox.MaskRequestHost,
 		&toolboxEnabled,
-		&sandbox.ToolboxToken,
+		&toolboxTokenSealed,
 		&sandbox.SSHPublicKey,
 		&sandbox.LastError,
 		&commandJSON,
@@ -3625,6 +4500,7 @@ func scanSandbox(scanner interface {
 		&sandbox.OwnerRef,
 		&fleetSuspended,
 		&sandbox.TenantID,
+		&sandbox.AuditIncarnationID,
 	)
 	if err != nil {
 		return nil, err
@@ -3636,14 +4512,12 @@ func scanSandbox(scanner interface {
 		sandbox.NetworkQuotaExceededAt = &t
 	}
 	sandbox.RegistryAuthSealed = nullableBlob(registryAuthSealed)
+	sandbox.ToolboxTokenSealed = nullableBlob(toolboxTokenSealed)
 	sandbox.AutoImportPending = autoImportPending == 1
 	sandbox.WakeArmed = wakeArmed == 1
 
-	if envJSON != "" {
-		if err := json.Unmarshal([]byte(envJSON), &sandbox.Env); err != nil {
-			return nil, fmt.Errorf("decode sandbox env: %w", err)
-		}
-	}
+	// Environment data is intentionally absent from the hot sandbox row.
+	// Explicit service reads decrypt the sandbox_env side row on demand.
 	if commandJSON != "" {
 		if err := json.Unmarshal([]byte(commandJSON), &sandbox.ContainerCommand); err != nil {
 			return nil, fmt.Errorf("decode container command: %w", err)
@@ -3919,6 +4793,29 @@ func isSandboxIDConflict(err error, id string) bool {
 
 var ErrNotFound = errors.New("sandbox not found")
 
+// ErrClusterSecretTombBlocksPut is returned when a peer/originator PUT carries
+// seal_generation <= an active delete tomb generation.
+var ErrClusterSecretTombBlocksPut = errors.New("cluster secret tomb blocks put")
+
+// ErrClusterSecretPayloadConflict is returned when a PUT repeats an existing
+// seal_generation with a different ciphertext (forked seal).
+var ErrClusterSecretPayloadConflict = errors.New("cluster secret payload conflict")
+
+// ErrClusterSecretStaleGeneration is returned when a peer/originator PUT carries
+// a seal_generation strictly older than a row already stored for the same ref
+// or sandbox. Peers must map this to a non-2xx response so Push does not ACK.
+var ErrClusterSecretStaleGeneration = errors.New("cluster secret stale generation")
+
+// ErrClusterSecretDeleteGenerationTooNew rejects a peer DELETE that attempts
+// to jump beyond the local lifecycle high-water mark by more than one. This
+// prevents a wire-supplied generation from permanently fencing legitimate
+// reseals (and avoids poisoning the next-generation counter).
+var ErrClusterSecretDeleteGenerationTooNew = errors.New("cluster secret delete generation exceeds local high-water mark")
+
+// ErrClusterSecretGenerationExhausted is returned instead of overflowing the
+// signed generation counter after an imported/corrupt max-int high-water mark.
+var ErrClusterSecretGenerationExhausted = errors.New("cluster secret generation exhausted")
+
 // afterTransferTapReads is set only by tests to inject a concurrent ownership
 // move between TransferFirecrackerTapSlot's reads and its UPDATE.
 var afterTransferTapReads func()
@@ -3958,33 +4855,52 @@ var ErrTemplateInUse = errors.New("template is referenced by an active sandbox")
 // ClusterSecretRecord is an opaque cluster-secret payload addressed by ref.
 // The store never decrypts SealedPayload; service owns the envelope format.
 type ClusterSecretRecord struct {
-	Ref           string
-	SandboxID     string
-	Version       int
-	Recipients    []string
-	SealedPayload []byte
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	Ref            string
+	SandboxID      string
+	Version        int
+	Recipients     []string
+	SealedPayload  []byte
+	SealGeneration int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	// PutOutboxIncarnationID + PutOutboxRecipients journal remaining peer PUTs
+	// in the same transaction as the sealed row when PutOutboxRecipients != nil.
+	PutOutboxIncarnationID string
+	PutOutboxRecipients    *[]string
+	// RetireRecipients stages peer deletion atomically with a resealed row.
+	// Reconciliation waits for Raft to publish SealGeneration first.
+	RetireRecipients *[]string
 }
 
-func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) error {
+// PutClusterSecret upserts a sealed row and returns the seal_generation that
+// landed. The caller must allocate the generation before sealing because it is
+// authenticated inside the envelope; synthesizing one here would make the row
+// identity disagree with its ciphertext binding.
+func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (int64, error) {
 	rec.Ref = strings.TrimSpace(rec.Ref)
 	rec.SandboxID = strings.TrimSpace(rec.SandboxID)
 	if rec.Ref == "" {
-		return errors.New("cluster secret ref is required")
+		return 0, errors.New("cluster secret ref is required")
 	}
 	if rec.SandboxID == "" {
-		return errors.New("cluster secret sandbox_id is required")
+		return 0, errors.New("cluster secret sandbox_id is required")
 	}
 	if rec.Version <= 0 {
-		return errors.New("cluster secret version must be positive")
+		return 0, errors.New("cluster secret version must be positive")
+	}
+	if rec.SealGeneration <= 0 {
+		return 0, errors.New("cluster secret seal generation must be positive")
 	}
 	if len(rec.SealedPayload) == 0 {
-		return errors.New("cluster secret sealed payload is required")
+		return 0, errors.New("cluster secret sealed payload is required")
+	}
+	parsedRef, err := secrets.ParseRef(rec.Ref)
+	if err != nil || parsedRef.SandboxID != rec.SandboxID || parsedRef.Version != rec.Version || strings.TrimSpace(parsedRef.IncarnationID) == "" {
+		return 0, errors.New("cluster secret ref must match sandbox_id, version, and a non-empty incarnation_id")
 	}
 	recipientsJSON, err := json.Marshal(rec.Recipients)
 	if err != nil {
-		return fmt.Errorf("marshal cluster secret recipients: %w", err)
+		return 0, fmt.Errorf("marshal cluster secret recipients: %w", err)
 	}
 	now := time.Now().UTC()
 	if rec.CreatedAt.IsZero() {
@@ -3993,19 +4909,210 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) e
 	if rec.UpdatedAt.IsZero() {
 		rec.UpdatedAt = now
 	}
-	_, err = s.db.ExecContext(ctx, `
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin put cluster secret: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Reject out-of-order peer fan-out that would downgrade a newer seal.
+	// Returning nil here used to look like an ACK to PushSecretBlobToPeers;
+	// peers must see a typed error → non-2xx so the originator keeps outbox.
+	var existingGen sql.NullInt64
+	var existingSandboxID string
+	var existingPayload []byte
+	// The PREVIOUS generation's write time, captured before this put
+	// overwrites it. Recipients retired by this reseal hold the previous
+	// generation's ciphertext, so that is when their copies were distributed;
+	// reading updated_at after the row has been rewritten would stamp every
+	// retired copy with the NEW generation's time and make a retirement
+	// attested between the two generations unable to discharge the copy it
+	// actually covers.
+	var existingUpdatedAt sql.NullTime
+	scanErr := tx.QueryRowContext(ctx, `
+		SELECT seal_generation, sandbox_id, sealed_payload, updated_at FROM cluster_secrets WHERE ref = ?
+	`, rec.Ref).Scan(&existingGen, &existingSandboxID, &existingPayload, &existingUpdatedAt)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read existing cluster secret generation: %w", scanErr)
+	}
+	if existingGen.Valid && existingSandboxID != rec.SandboxID {
+		return 0, fmt.Errorf("%w: ref %q already belongs to sandbox %q", ErrClusterSecretPayloadConflict, rec.Ref, existingSandboxID)
+	}
+	if existingGen.Valid && existingGen.Int64 > rec.SealGeneration {
+		return 0, fmt.Errorf("%w: existing seal_generation %d > %d for ref %q", ErrClusterSecretStaleGeneration, existingGen.Int64, rec.SealGeneration, rec.Ref)
+	}
+	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration {
+		if bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
+			// Same generation + same ciphertext: idempotent noop (still apply
+			// tomb and outbox transitions below so an originator retry recovers).
+		} else {
+			return 0, fmt.Errorf("%w: seal_generation %d payload conflict for ref %q", ErrClusterSecretPayloadConflict, rec.SealGeneration, rec.Ref)
+		}
+	}
+	// Recheck tomb inside the write TX so a peer DELETE that committed after
+	// pre-validation cannot be erased by a stale/equal-generation PUT.
+	var tombGen sql.NullInt64
+	var tombIncarnationID string
+	tombErr := tx.QueryRowContext(ctx, `
+		SELECT incarnation_id, generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, rec.SandboxID, parsedRef.IncarnationID).Scan(&tombIncarnationID, &tombGen)
+	if tombErr != nil && !errors.Is(tombErr, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read cluster secret tomb before put: %w", tombErr)
+	}
+	if tombGen.Valid && tombIncarnationID == parsedRef.IncarnationID && tombGen.Int64 > 0 && rec.SealGeneration <= tombGen.Int64 {
+		return 0, fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrClusterSecretTombBlocksPut, rec.SandboxID, tombGen.Int64)
+	}
+
+	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
+		// Equal-generation identical payload: skip the row rewrite but still
+		// apply the generation's tomb and outbox transitions.
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?
+		`, rec.SandboxID, parsedRef.IncarnationID); err != nil {
+			return 0, fmt.Errorf("clear cluster secret tomb on put: %w", err)
+		}
+		if err := applySecretRetirementInTx(ctx, tx, rec, existingUpdatedAt); err != nil {
+			return 0, err
+		}
+		if err := applyPutOutboxInTx(ctx, tx, rec); err != nil {
+			return 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("commit put cluster secret: %w", err)
+		}
+		return rec.SealGeneration, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cluster_secrets (
-			ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+			ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(ref) DO UPDATE SET
 			sandbox_id = excluded.sandbox_id,
 			version = excluded.version,
 			recipients_json = excluded.recipients_json,
 			sealed_payload = excluded.sealed_payload,
+			seal_generation = excluded.seal_generation,
 			updated_at = excluded.updated_at
-	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC())
+		WHERE excluded.seal_generation > cluster_secrets.seal_generation
+	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.SealGeneration, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC()); err != nil {
+		return 0, fmt.Errorf("put cluster secret: %w", err)
+	}
+	// Only a strictly newer seal may clear tomb/outbox (atomic with the row write).
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?
+	`, rec.SandboxID, parsedRef.IncarnationID); err != nil {
+		return 0, fmt.Errorf("clear cluster secret tomb on put: %w", err)
+	}
+	if err := applySecretRetirementInTx(ctx, tx, rec, existingUpdatedAt); err != nil {
+		return 0, err
+	}
+	if err := applyPutOutboxInTx(ctx, tx, rec); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit put cluster secret: %w", err)
+	}
+	return rec.SealGeneration, nil
+}
+
+// applySecretRetirementInTx stages recipients removed by a reseal in the same
+// transaction as the new encrypted generation. Ordinary puts preserve an older
+// delete job: generation fencing makes it harmless to a newer replica, while
+// clearing it could strand ciphertext on a peer excluded from the new set.
+// applySecretRetirementInTx stages the recipients this put retires.
+// previousUpdatedAt is the sealed row's write time as it was BEFORE this put
+// — the caller captures it, because by the time this runs the row already
+// carries the new generation's timestamp and re-reading it would date the
+// retired copies to the reseal that removed them.
+func applySecretRetirementInTx(ctx context.Context, tx *sql.Tx, rec ClusterSecretRecord, previousUpdatedAt sql.NullTime) error {
+	if rec.RetireRecipients == nil {
+		return nil
+	}
+	parsed, err := secrets.ParseRef(rec.Ref)
+	if err != nil || parsed.IncarnationID == "" {
+		return errors.New("stage secret retirement: current incarnation_id is required")
+	}
+	var copiedAt time.Time
+	if previousUpdatedAt.Valid {
+		copiedAt = previousUpdatedAt.Time.UTC()
+	}
+	return upsertSecretDeleteOutboxTx(ctx, tx, rec.SandboxID, parsed.IncarnationID, *rec.RetireRecipients, rec.Recipients, rec.SealGeneration, true, copiedAt)
+}
+
+// clusterSecretCopiedAtTx returns when the sandbox's sealed row was last
+// written — the best durable evidence of when its recipients received their
+// copies. A missing row (already deleted) yields the zero time, which the
+// outbox reads as "as of now".
+func clusterSecretCopiedAtTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string) (time.Time, error) {
+	var updatedAt time.Time
+	err := tx.QueryRowContext(ctx, `
+		SELECT updated_at FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
 	if err != nil {
-		return fmt.Errorf("put cluster secret: %w", err)
+		return time.Time{}, fmt.Errorf("read cluster secret copy provenance: %w", err)
+	}
+	return updatedAt, nil
+}
+
+// applyPutOutboxInTx journals or clears put-outbox inside an open Put TX.
+// When PutOutboxRecipients is nil, clear any prior job (peer PUT / local-only).
+// When non-nil, replace with the supplied peer list (may be empty → delete).
+func applyPutOutboxInTx(ctx context.Context, tx *sql.Tx, rec ClusterSecretRecord) error {
+	parsed, err := secrets.ParseRef(rec.Ref)
+	if err != nil || parsed.IncarnationID == "" {
+		return errors.New("secret put outbox requires a current-format sealed ref")
+	}
+	incarnationID := parsed.IncarnationID
+	if rec.PutOutboxRecipients == nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ? AND incarnation_id = ?`, rec.SandboxID, incarnationID); err != nil {
+			return fmt.Errorf("clear secret put outbox on put: %w", err)
+		}
+		return nil
+	}
+	peers := secrets.NormalizeRecipients(*rec.PutOutboxRecipients)
+	requestedIncarnationID := strings.TrimSpace(rec.PutOutboxIncarnationID)
+	if len(peers) == 0 {
+		if requestedIncarnationID != "" && requestedIncarnationID != incarnationID {
+			return errors.New("secret put outbox incarnation_id must match the sealed ref")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ? AND incarnation_id = ?`, rec.SandboxID, incarnationID); err != nil {
+			return fmt.Errorf("clear secret put outbox on put: %w", err)
+		}
+		return nil
+	}
+	if requestedIncarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
+	}
+	if requestedIncarnationID != incarnationID {
+		return errors.New("secret put outbox incarnation_id must match the sealed ref")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation != ?
+	`, rec.SandboxID, incarnationID, rec.SealGeneration); err != nil {
+		return fmt.Errorf("clear stale secret put outbox: %w", err)
+	}
+	raw, err := json.Marshal(peers)
+	if err != nil {
+		return fmt.Errorf("marshal put outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cluster_secret_put_outbox (
+			sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		) VALUES (?, ?, ?, ?, 0, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id, seal_generation) DO UPDATE SET
+			recipients_json = excluded.recipients_json,
+			attempts = 0,
+			updated_at = excluded.updated_at
+	`, rec.SandboxID, incarnationID, rec.SealGeneration, string(raw), now, now); err != nil {
+		return fmt.Errorf("upsert secret put outbox on put: %w", err)
 	}
 	return nil
 }
@@ -4016,13 +5123,13 @@ func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecre
 		return nil, ErrNotFound
 	}
 	row := s.db.QueryRowContext(ctx, `
-		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
+		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
 		FROM cluster_secrets
 		WHERE ref = ?
 	`, ref)
 	var rec ClusterSecretRecord
 	var recipientsJSON string
-	if err := row.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	if err := row.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.SealGeneration, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -4037,15 +5144,1584 @@ func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecre
 	return &rec, nil
 }
 
-func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID string) error {
+// GetClusterSecretForSandboxIncarnation returns only the current-format row
+// for an exact sandbox lifecycle. Sandbox IDs can be reused, so reconciliation
+// and readiness code must not select a higher-generation row from an older
+// incarnation.
+func (s *Store) GetClusterSecretForSandboxIncarnation(ctx context.Context, sandboxID, incarnationID string) (*ClusterSecretRecord, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return nil, ErrNotFound
+	}
+	return s.GetClusterSecret(ctx, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion))
+}
+
+// DeleteClusterSecretRowsForIncarnation removes only one sandbox lifecycle.
+// This prevents a delayed teardown from erasing a replacement that reused the
+// same sandbox ID.
+func (s *Store) DeleteClusterSecretRowsForIncarnation(ctx context.Context, sandboxID, incarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if sandboxID == "" {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
-		return fmt.Errorf("delete cluster secrets: %w", err)
+	if incarnationID == "" {
+		return errors.New("delete cluster secret rows: incarnation_id is required")
+	}
+	ref := secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, ref); err != nil {
+		return fmt.Errorf("delete cluster secret lifecycle rows: %w", err)
 	}
 	return nil
+}
+
+// ClearClusterSecretTombForIncarnation removes one lifecycle's delete fence.
+func (s *Store) ClearClusterSecretTombForIncarnation(ctx context.Context, sandboxID, incarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?`, sandboxID, incarnationID); err != nil {
+		return fmt.Errorf("clear cluster secret tomb: %w", err)
+	}
+	return nil
+}
+
+// UpsertSandboxAuditACL records the tenant OwnerRef for audit authorization
+// after the sandbox row (and placement) are gone. Rows are incarnation-scoped.
+func (s *Store) UpsertSandboxAuditACL(ctx context.Context, sandboxID, ownerRef, incarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	ownerRef = strings.TrimSpace(ownerRef)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return errors.New("upsert sandbox audit acl: sandbox id and incarnation id are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sandbox audit acl upsert: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentIncarnationID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT audit_incarnation_id
+		FROM sandboxes
+		WHERE id = ?
+	`, sandboxID).Scan(&currentIncarnationID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("resolve live sandbox audit incarnation: %w", err)
+	}
+	if err == nil && strings.TrimSpace(currentIncarnationID) != "" && strings.TrimSpace(currentIncarnationID) != incarnationID {
+		return fmt.Errorf("upsert sandbox audit acl: sandbox incarnation conflict")
+	}
+	if err == nil && strings.TrimSpace(currentIncarnationID) == "" {
+		result, updateErr := tx.ExecContext(ctx, `
+			UPDATE sandboxes
+			SET audit_incarnation_id = ?
+			WHERE id = ? AND audit_incarnation_id = ''
+		`, incarnationID, sandboxID)
+		if updateErr != nil {
+			return fmt.Errorf("bind live sandbox audit incarnation: %w", updateErr)
+		}
+		if affected, rowsErr := result.RowsAffected(); rowsErr != nil || affected != 1 {
+			if rowsErr != nil {
+				return fmt.Errorf("bind live sandbox audit incarnation rows affected: %w", rowsErr)
+			}
+			return errors.New("bind live sandbox audit incarnation: concurrent lifecycle change")
+		}
+	}
+	if err := upsertSandboxAuditACLExec(ctx, tx, sandboxID, ownerRef, incarnationID, time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox audit acl upsert: %w", err)
+	}
+	return nil
+}
+
+func upsertSandboxAuditACLExec(ctx context.Context, exec dbExecer, sandboxID, ownerRef, incarnationID string, now time.Time) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	ownerRef = strings.TrimSpace(ownerRef)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return errors.New("upsert sandbox audit acl: sandbox id and incarnation id are required")
+	}
+	_, err := exec.ExecContext(ctx, `
+		INSERT INTO sandbox_audit_acl (sandbox_id, incarnation_id, owner_ref, established_seq, updated_at)
+		VALUES (?, ?, ?, COALESCE((
+			SELECT MAX(established_seq) + 1
+			FROM sandbox_audit_acl
+			WHERE sandbox_id = ?
+		), 1), ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET owner_ref = excluded.owner_ref, updated_at = excluded.updated_at
+	`, sandboxID, incarnationID, ownerRef, sandboxID, now)
+	if err != nil {
+		return fmt.Errorf("upsert sandbox audit acl: %w", err)
+	}
+	return nil
+}
+
+// PruneSandboxAuditACL removes post-delete authorization metadata after its
+// audit retention window. For a reused live sandbox ID, only its newest ACL is
+// protected; older incarnations remain retention-bounded instead of surviving
+// forever merely because a different lifecycle currently owns the same ID.
+func (s *Store) PruneSandboxAuditACL(ctx context.Context, cutoff time.Time) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM sandbox_audit_acl
+		WHERE updated_at < ?
+		  AND incarnation_id <> COALESCE((
+			SELECT sandbox.audit_incarnation_id
+			FROM sandboxes AS sandbox
+			WHERE sandbox.id = sandbox_audit_acl.sandbox_id
+		  ), '')
+	`, cutoff.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("prune sandbox audit acl: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count pruned sandbox audit acl: %w", err)
+	}
+	return n, nil
+}
+
+// GetSandboxAuditACLOwnerRef returns the retained audit OwnerRef for the
+// exact (sandbox, incarnation) pair. Empty lifecycle identifiers are rejected
+// rather than treated as wildcards or legacy rows.
+func (s *Store) GetSandboxAuditACLOwnerRef(ctx context.Context, sandboxID, incarnationID string) (string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return "", nil
+	}
+	var ref string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT owner_ref FROM sandbox_audit_acl
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&ref)
+	if err == nil {
+		return strings.TrimSpace(ref), nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return "", fmt.Errorf("get sandbox audit acl: %w", err)
+}
+
+// HasSandboxAuditACL reports whether the exact retained sandbox incarnation
+// exists, including operator-owned rows whose owner_ref is intentionally empty.
+func (s *Store) HasSandboxAuditACL(ctx context.Context, sandboxID, incarnationID string) (bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM sandbox_audit_acl
+		WHERE sandbox_id = ? AND incarnation_id = ?
+		LIMIT 1
+	`, sandboxID, incarnationID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check sandbox audit acl: %w", err)
+	}
+	return true, nil
+}
+
+// SandboxAuditIncarnations returns the live lifecycle of every listed sandbox
+// that has a row, in a handful of round trips. A standalone node has no Raft
+// placement to say which sealed rows are still someone's; this is its
+// authority: a sealed row whose (sandbox, incarnation) is not here is orphaned.
+func (s *Store) SandboxAuditIncarnations(ctx context.Context, ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	pending := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		pending = append(pending, id)
+	}
+	for len(pending) > 0 {
+		chunk := pending
+		if len(chunk) > clusterSecretSummaryChunk {
+			chunk = pending[:clusterSecretSummaryChunk]
+		}
+		pending = pending[len(chunk):]
+		args := make([]any, len(chunk))
+		marks := make([]string, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+			marks[i] = "?"
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT id, audit_incarnation_id FROM sandboxes WHERE id IN (`+strings.Join(marks, ",")+`)
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("read sandbox audit incarnations: %w", err)
+		}
+		for rows.Next() {
+			var id, inc string
+			if err := rows.Scan(&id, &inc); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan sandbox audit incarnation: %w", err)
+			}
+			out[id] = strings.TrimSpace(inc)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate sandbox audit incarnations: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+// CurrentSandboxAuditIncarnation returns the exact lifecycle linked by the
+// live sandbox row. Retained ACLs are historical authorization records, not a
+// clock-ordered source of truth for the current lifecycle.
+func (s *Store) CurrentSandboxAuditIncarnation(ctx context.Context, sandboxID string) (string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return "", nil
+	}
+	var incarnationID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT audit_incarnation_id FROM sandboxes WHERE id = ?
+	`, sandboxID).Scan(&incarnationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get current sandbox audit incarnation: %w", err)
+	}
+	return strings.TrimSpace(incarnationID), nil
+}
+
+// LatestRetainedSandboxAuditIncarnation resolves the most recently refreshed
+// retained ACL when no live sandbox row exists. It exists only for the audit
+// API's implicit-incarnation query; lifecycle mutation code must use
+// CurrentSandboxAuditIncarnation and therefore cannot bind to historical data.
+func (s *Store) LatestRetainedSandboxAuditIncarnation(ctx context.Context, sandboxID string) (string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return "", nil
+	}
+	var incarnationID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT incarnation_id FROM sandbox_audit_acl
+		WHERE sandbox_id = ? AND incarnation_id <> ''
+		ORDER BY established_seq DESC
+		LIMIT 1
+	`, sandboxID).Scan(&incarnationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get latest retained sandbox audit incarnation: %w", err)
+	}
+	return strings.TrimSpace(incarnationID), nil
+}
+
+// SecretDeleteOutboxRecord is one durable peer-delete job.
+type SecretDeleteOutboxRecord struct {
+	SandboxID     string
+	IncarnationID string
+	Recipients    []string
+	// RecipientCopiedAt is when each recipient's ciphertext copy was
+	// distributed. Recipients merged into an existing row keep their own
+	// timestamp, which is the whole point: the row-wide CreatedAt is
+	// preserved across merges and therefore describes the oldest obligation,
+	// not this one. Empty for rows written before the column existed;
+	// callers fall back to CreatedAt there.
+	RecipientCopiedAt map[string]time.Time
+	Generation        int64
+	// AwaitingPromotion prevents a staged reseal retirement from deleting the
+	// only usable old replica before Raft publishes the new generation.
+	AwaitingPromotion bool
+	Attempts          int
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+// UpsertSecretDeleteOutbox journals deletion from recipients retired by a
+// reseal without deleting or tombstoning the active local generation.
+func (s *Store) UpsertSecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) error {
+	return s.UpsertSecretDeleteOutboxCopiedAt(ctx, sandboxID, incarnationID, recipients, generation, time.Time{})
+}
+
+// UpsertSecretDeleteOutboxCopiedAt is UpsertSecretDeleteOutbox with the
+// provenance of the copies being deleted. copiedAt is when THESE recipients
+// received the ciphertext this job deletes — not when the job was written.
+// The distinction is what lets a storage-retirement attestation discharge an
+// obligation for a copy that existed before the disk was destroyed, while
+// still refusing one for a copy handed to a reused node id afterwards. A zero
+// copiedAt means "as of now".
+func (s *Store) UpsertSecretDeleteOutboxCopiedAt(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64, copiedAt time.Time) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	recipients = secrets.NormalizeRecipients(recipients)
+	if sandboxID == "" || len(recipients) == 0 {
+		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin secret delete outbox: %w", err)
+	}
+	defer tx.Rollback()
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false, copiedAt); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit secret delete outbox: %w", err)
+	}
+	return nil
+}
+
+func upsertSecretDeleteOutboxTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string, recipients, protectedRecipients []string, generation int64, awaitingPromotion bool, copiedAt time.Time) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	recipients = secrets.NormalizeRecipients(recipients)
+	if sandboxID == "" || len(recipients) == 0 {
+		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	var (
+		existingRaw        string
+		existingProvenance string
+		existingGen        int64
+		existingAwait      int
+		createdAt          time.Time
+		// A stale merge may add a still-valid cleanup obligation, but it must
+		// never use its older view of the active recipient set to remove a peer
+		// from the newer generation's durable job.
+		applyProtectedRecipients = true
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT recipients_json, recipient_provenance_json, generation, awaiting_promotion, created_at
+		FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&existingRaw, &existingProvenance, &existingGen, &existingAwait, &createdAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read secret delete outbox for merge: %w", err)
+	}
+	if err == nil {
+		var existing []string
+		if unmarshalErr := json.Unmarshal([]byte(existingRaw), &existing); unmarshalErr != nil {
+			return fmt.Errorf("decode secret delete outbox for merge: %w", unmarshalErr)
+		}
+		recipients = secrets.NormalizeRecipients(append(existing, recipients...))
+		switch {
+		case generation < existingGen:
+			generation = existingGen
+			awaitingPromotion = existingAwait != 0
+			applyProtectedRecipients = false
+		case generation == existingGen:
+			// A confirmed promotion wins over another staged write.
+			awaitingPromotion = awaitingPromotion && existingAwait != 0
+		}
+	}
+	if applyProtectedRecipients && len(protectedRecipients) > 0 {
+		protected := make(map[string]struct{}, len(protectedRecipients))
+		for _, id := range secrets.NormalizeRecipients(protectedRecipients) {
+			protected[id] = struct{}{}
+		}
+		kept := recipients[:0]
+		for _, id := range recipients {
+			if _, current := protected[id]; !current {
+				kept = append(kept, id)
+			}
+		}
+		recipients = kept
+	}
+	if len(recipients) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND incarnation_id = ?`, sandboxID, incarnationID); err != nil {
+			return fmt.Errorf("clear obsolete secret delete outbox: %w", err)
+		}
+		return nil
+	}
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal secret delete outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	if copiedAt.IsZero() {
+		// No provenance supplied. If the sealed row is still here, its last
+		// write is when these recipients received their copies — a far better
+		// answer than "now", which would date every old copy to the moment
+		// its deletion happened to be scheduled. Once the row is gone (the
+		// usual case for a delete job) the caller's own copiedAt is the only
+		// source, and now is the conservative fallback.
+		fromRow, err := clusterSecretCopiedAtTx(ctx, tx, sandboxID, incarnationID)
+		if err != nil {
+			return err
+		}
+		copiedAt = fromRow
+		if copiedAt.IsZero() {
+			copiedAt = now
+		}
+	}
+	provenance, err := mergeSecretDeleteProvenance(existingProvenance, recipients, copiedAt.UTC())
+	if err != nil {
+		return err
+	}
+	awaiting := 0
+	if awaitingPromotion {
+		awaiting = 1
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO cluster_secret_delete_outbox
+			(sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET
+			recipients_json = excluded.recipients_json,
+			recipient_provenance_json = excluded.recipient_provenance_json,
+			generation = excluded.generation,
+			awaiting_promotion = excluded.awaiting_promotion,
+			attempts = 0,
+			updated_at = excluded.updated_at
+	`, sandboxID, incarnationID, string(raw), provenance, generation, awaiting, createdAt, now)
+	if err != nil {
+		return fmt.Errorf("upsert secret delete outbox: %w", err)
+	}
+	return nil
+}
+
+// mergeSecretDeleteProvenance keeps each recipient's own copy timestamp and
+// stamps newly added recipients with copiedAt. Recipients that are no longer
+// owed anything drop out, so the map cannot outgrow the recipient list.
+func mergeSecretDeleteProvenance(existingRaw string, recipients []string, copiedAt time.Time) (string, error) {
+	existing := map[string]time.Time{}
+	if strings.TrimSpace(existingRaw) != "" {
+		if err := json.Unmarshal([]byte(existingRaw), &existing); err != nil {
+			return "", fmt.Errorf("decode secret delete outbox provenance: %w", err)
+		}
+	}
+	merged := make(map[string]time.Time, len(recipients))
+	for _, id := range recipients {
+		if at, ok := existing[id]; ok && !at.IsZero() {
+			merged[id] = at
+			continue
+		}
+		merged[id] = copiedAt
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("marshal secret delete outbox provenance: %w", err)
+	}
+	return string(out), nil
+}
+
+// decodeSecretDeleteProvenance reads the per-recipient copy times. A row
+// written before the column existed has none; the caller falls back to the
+// row-wide created_at, which is what the fence compared against before.
+func decodeSecretDeleteProvenance(raw string) (map[string]time.Time, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	out := map[string]time.Time{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("decode secret delete outbox provenance: %w", err)
+	}
+	return out, nil
+}
+
+// MarkSecretDeleteOutboxPromoted makes a staged retirement eligible after the
+// matching Raft generation is visible. The exact-generation fence prevents an
+// old completion from releasing a newer staged transition. promoted=false
+// means a concurrent writer replaced the row and the caller must reload it.
+func (s *Store) MarkSecretDeleteOutboxPromoted(ctx context.Context, sandboxID, incarnationID string, generation int64) (promoted bool, err error) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return false, nil
+	}
+	if strings.TrimSpace(incarnationID) == "" {
+		return false, errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return false, errors.New("secret delete outbox generation must be positive")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_delete_outbox
+		SET awaiting_promotion = 0, updated_at = ?
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ? AND awaiting_promotion = 1
+	`, time.Now().UTC(), strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID), generation)
+	if err != nil {
+		return false, fmt.Errorf("mark secret delete outbox promoted: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark secret delete outbox promoted rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
+// DeleteClusterSecretsOriginatorWithOutbox tombs, deletes local rows, and
+// enqueues the peer-delete outbox in one transaction so a crash cannot leave
+// peer credentials without a cleanup job.
+func (s *Store) DeleteClusterSecretsOriginatorWithOutbox(ctx context.Context, sandboxID, incarnationID string, recipients []string) (generation int64, err error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return 0, nil
+	}
+	if incarnationID == "" {
+		return 0, errors.New("delete cluster secrets originator: incarnation_id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin delete cluster secrets originator: %w", err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	generation, err = nextClusterSecretDeleteGenerationTx(ctx, tx, sandboxID, incarnationID)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cluster_secret_tombs (sandbox_id, incarnation_id, deleted_at, generation) VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET deleted_at = excluded.deleted_at, generation = excluded.generation
+	`, sandboxID, incarnationID, now, generation); err != nil {
+		return 0, fmt.Errorf("tombstone cluster secret: %w", err)
+	}
+	// Read the copy provenance BEFORE the row goes away: these recipients
+	// received their ciphertext when this row was last written, not when the
+	// deletion was journalled.
+	copiedAt, err := clusterSecretCopiedAtTx(ctx, tx, sandboxID, incarnationID)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)); err != nil {
+		return 0, fmt.Errorf("delete cluster secrets: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID); err != nil {
+		return 0, fmt.Errorf("delete cluster secret put outbox: %w", err)
+	}
+	if err := upsertSecretDeleteOutboxTx(ctx, tx, sandboxID, incarnationID, recipients, nil, generation, false, copiedAt); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit delete cluster secrets originator: %w", err)
+	}
+	return generation, nil
+}
+
+// nextClusterSecretDeleteGenerationTx returns a monotonic delete generation that
+// survives reseal (which clears the tomb but leaves a higher seal_generation).
+func nextClusterSecretDeleteGenerationTx(ctx context.Context, tx *sql.Tx, sandboxID, incarnationID string) (int64, error) {
+	var hwm int64
+	var prev sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&prev); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read cluster secret tomb generation: %w", err)
+	}
+	if prev.Valid && prev.Int64 > hwm {
+		hwm = prev.Int64
+	}
+	var maxSeal sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets
+		WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&maxSeal); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read max seal generation: %w", err)
+	}
+	if maxSeal.Valid && maxSeal.Int64 > hwm {
+		hwm = maxSeal.Int64
+	}
+	if hwm == math.MaxInt64 {
+		return 0, ErrClusterSecretGenerationExhausted
+	}
+	return hwm + 1, nil
+}
+
+// GetSecretDeleteOutbox returns one outbox row when present.
+// GetSecretDeleteOutboxForIncarnation returns the pending cleanup obligation
+// for one exact lifecycle.
+func (s *Store) GetSecretDeleteOutboxForIncarnation(ctx context.Context, sandboxID, incarnationID string) (*SecretDeleteOutboxRecord, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return nil, nil
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at
+		FROM cluster_secret_delete_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID)
+	var rec SecretDeleteOutboxRecord
+	var recipientsJSON, provenanceJSON string
+	if err := row.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &provenanceJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if recipientsJSON != "" {
+		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+			return nil, fmt.Errorf("decode secret delete outbox recipients: %w", err)
+		}
+	}
+	provenance, err := decodeSecretDeleteProvenance(provenanceJSON)
+	if err != nil {
+		return nil, err
+	}
+	rec.RecipientCopiedAt = provenance
+	return &rec, nil
+}
+
+// UpdateSecretDeleteOutboxRecipients replaces the pending recipient list (ACK shrink).
+// Empty recipients deletes the outbox row. generation fences the update so a
+// concurrent reseal/delete cannot shrink a newer outbox job.
+func (s *Store) UpdateSecretDeleteOutboxRecipients(ctx context.Context, sandboxID, incarnationID string, recipients []string, generation int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	if len(recipients) == 0 {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM cluster_secret_delete_outbox WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+		`, sandboxID, incarnationID, generation)
+		if err != nil {
+			return fmt.Errorf("delete secret delete outbox: %w", err)
+		}
+		return nil
+	}
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal delete outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	// Shrinking the recipient list must shrink its provenance with it, in the
+	// same statement. A discharged or ACKed recipient whose timestamp is left
+	// behind hands its stale value to the NEXT obligation for that node: a
+	// later generation's copy would then inherit an earlier disk's date and
+	// be dischargeable by an attestation that never covered it.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin update secret delete outbox recipients: %w", err)
+	}
+	defer tx.Rollback()
+	var provenanceRaw string
+	err = tx.QueryRowContext(ctx, `
+		SELECT recipient_provenance_json FROM cluster_secret_delete_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+	`, sandboxID, incarnationID, generation).Scan(&provenanceRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read secret delete outbox provenance: %w", err)
+	}
+	provenance, err := retainSecretDeleteProvenance(provenanceRaw, recipients)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE cluster_secret_delete_outbox
+		SET recipients_json = ?, recipient_provenance_json = ?, updated_at = ?
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+	`, string(raw), provenance, now, sandboxID, incarnationID, generation); err != nil {
+		return fmt.Errorf("update secret delete outbox recipients: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit update secret delete outbox recipients: %w", err)
+	}
+	return nil
+}
+
+// retainSecretDeleteProvenance keeps only the recipients still owed something.
+func retainSecretDeleteProvenance(existingRaw string, recipients []string) (string, error) {
+	existing, err := decodeSecretDeleteProvenance(existingRaw)
+	if err != nil {
+		return "", err
+	}
+	kept := make(map[string]time.Time, len(recipients))
+	for _, id := range recipients {
+		id = strings.TrimSpace(id)
+		if at, ok := existing[id]; ok && !at.IsZero() {
+			kept[id] = at
+		}
+	}
+	out, err := json.Marshal(kept)
+	if err != nil {
+		return "", fmt.Errorf("marshal secret delete outbox provenance: %w", err)
+	}
+	return string(out), nil
+}
+
+// ApplyPeerSecretDelete tombs + deletes local sealed rows for a peer DELETE.
+// generation gates stale deletes after reseal: if any local row has
+// seal_generation > generation, ACK without deleting (resealed newer data).
+func (s *Store) ApplyPeerSecretDelete(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.applySecretDelete(ctx, sandboxID, incarnationID, generation, false)
+}
+
+// RetireClusterSecretGeneration removes only the generation observed by an
+// authoritative GC scan. It creates no peer-delete obligation: supersession
+// of this replica is not authority to delete the promoted recovery copies.
+func (s *Store) RetireClusterSecretGeneration(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.applySecretDelete(ctx, sandboxID, incarnationID, generation, true)
+}
+
+func (s *Store) applySecretDelete(ctx context.Context, sandboxID, incarnationID string, generation int64, onlyIfCurrent bool) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("peer secret delete incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("peer secret delete generation must be positive")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin peer secret delete: %w", err)
+	}
+	defer tx.Rollback()
+	currentRef := secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)
+	var maxSeal sql.NullInt64
+	scanErr := tx.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets
+		WHERE sandbox_id = ? AND ref = ?
+		LIMIT 1
+	`, sandboxID, currentRef).Scan(&maxSeal)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return fmt.Errorf("read current cluster secret before peer delete: %w", scanErr)
+	}
+	if onlyIfCurrent && (!maxSeal.Valid || maxSeal.Int64 != generation) {
+		return tx.Commit()
+	}
+	var prev sql.NullInt64
+	var prevIncarnationID string
+	prevErr := tx.QueryRowContext(ctx, `
+		SELECT incarnation_id, generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&prevIncarnationID, &prev)
+	if prevErr != nil && !errors.Is(prevErr, sql.ErrNoRows) {
+		return fmt.Errorf("read cluster secret tomb before peer delete: %w", prevErr)
+	}
+	highWater := int64(0)
+	if maxSeal.Valid && maxSeal.Int64 > highWater {
+		highWater = maxSeal.Int64
+	}
+	if prev.Valid && prev.Int64 > highWater {
+		highWater = prev.Int64
+	}
+	if highWater < math.MaxInt64 && generation > highWater+1 {
+		return fmt.Errorf("%w: got %d, local high-water mark %d", ErrClusterSecretDeleteGenerationTooNew, generation, highWater)
+	}
+	if maxSeal.Valid && maxSeal.Int64 > generation {
+		// Strictly newer reseal after originator delete — stale DELETE must not
+		// wipe new bytes. Equal generation is the row being deleted.
+		return tx.Commit()
+	}
+	now := time.Now().UTC()
+	tombGen := generation
+	if prev.Valid && prevIncarnationID == incarnationID && prev.Int64 > tombGen {
+		tombGen = prev.Int64
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cluster_secret_tombs (sandbox_id, incarnation_id, deleted_at, generation) VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id) DO UPDATE SET
+			deleted_at = excluded.deleted_at,
+			generation = excluded.generation
+	`, sandboxID, incarnationID, now, tombGen); err != nil {
+		return fmt.Errorf("peer tombstone cluster secret: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?`, sandboxID, currentRef); err != nil {
+		return fmt.Errorf("peer delete cluster secrets: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation <= ?`, sandboxID, incarnationID, generation); err != nil {
+		return fmt.Errorf("retire secret put outbox: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit peer secret delete: %w", err)
+	}
+	return nil
+}
+
+// NextClusterSecretSealGenerationForIncarnation allocates within one sandbox
+// lifecycle. Generations are authenticated together with incarnation_id, so a
+// stale row or tomb from a reused sandbox ID must not force or block the new
+// lifecycle's sequence.
+func (s *Store) NextClusterSecretSealGenerationForIncarnation(ctx context.Context, sandboxID, incarnationID string) (int64, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return 0, errors.New("next cluster secret generation: sandbox id and incarnation id are required")
+	}
+	var tombGeneration sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&tombGeneration)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read cluster secret lifecycle tomb generation: %w", err)
+	}
+	var sealGeneration sql.NullInt64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets
+		WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&sealGeneration)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read cluster secret lifecycle seal generation: %w", err)
+	}
+	hwm := int64(0)
+	if tombGeneration.Valid && tombGeneration.Int64 > hwm {
+		hwm = tombGeneration.Int64
+	}
+	if sealGeneration.Valid && sealGeneration.Int64 > hwm {
+		hwm = sealGeneration.Int64
+	}
+	if hwm == math.MaxInt64 {
+		return 0, ErrClusterSecretGenerationExhausted
+	}
+	return hwm + 1, nil
+}
+
+// ClusterSecretSealGeneration returns the highest locally stored generation
+// for the exact sandbox lifecycle without loading the encrypted payload.
+func (s *Store) ClusterSecretSealGeneration(ctx context.Context, sandboxID, incarnationID string) (int64, bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return 0, false, nil
+	}
+	var generation int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT seal_generation FROM cluster_secrets WHERE sandbox_id = ? AND ref = ?
+	`, sandboxID, secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion)).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("get cluster secret generation: %w", err)
+	}
+	return generation, true, nil
+}
+
+// ClusterSecretSealSummary is what failover readiness needs from a sealed
+// row: which generation this node holds and who the recipients are. The
+// encrypted payload is never loaded for it.
+type ClusterSecretSealSummary struct {
+	SealGeneration int64
+	Recipients     []string
+}
+
+// clusterSecretSummaryChunk bounds one IN (...) list well under SQLite's
+// bound-parameter limit.
+const clusterSecretSummaryChunk = 500
+
+// ClusterSecretSealSummaries reads the summaries for many sealed refs in a
+// handful of round trips instead of one per row. A ref this node does not
+// hold is simply absent from the result. This is the List page's only
+// store work for failover_ready: one query per 500 rows on the single
+// SQLite connection rather than one per row competing with creates.
+func (s *Store) ClusterSecretSealSummaries(ctx context.Context, refs []string) (map[string]ClusterSecretSealSummary, error) {
+	out := make(map[string]ClusterSecretSealSummary, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	pending := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		if _, dup := seen[ref]; dup {
+			continue
+		}
+		seen[ref] = struct{}{}
+		pending = append(pending, ref)
+	}
+	for len(pending) > 0 {
+		chunk := pending
+		if len(chunk) > clusterSecretSummaryChunk {
+			chunk = pending[:clusterSecretSummaryChunk]
+		}
+		pending = pending[len(chunk):]
+		args := make([]any, len(chunk))
+		marks := make([]string, len(chunk))
+		for i, ref := range chunk {
+			args[i] = ref
+			marks[i] = "?"
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT ref, seal_generation, recipients_json
+			FROM cluster_secrets
+			WHERE ref IN (`+strings.Join(marks, ",")+`)
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("read cluster secret seal summaries: %w", err)
+		}
+		for rows.Next() {
+			var (
+				ref            string
+				summary        ClusterSecretSealSummary
+				recipientsJSON string
+			)
+			if err := rows.Scan(&ref, &summary.SealGeneration, &recipientsJSON); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan cluster secret seal summary: %w", err)
+			}
+			if recipientsJSON != "" {
+				if err := json.Unmarshal([]byte(recipientsJSON), &summary.Recipients); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("unmarshal cluster secret recipients for %s: %w", ref, err)
+				}
+			}
+			out[ref] = summary
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate cluster secret seal summaries: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+// ListSecretDeleteOutboxBatch returns at most limit pending jobs in fair retry
+// order. Requiring an explicit positive bound prevents diagnostics or future
+// callers from accidentally loading a 100k-sandbox backlog into memory.
+func (s *Store) ListSecretDeleteOutboxBatch(ctx context.Context, limit int) ([]SecretDeleteOutboxRecord, error) {
+	return s.listSecretDeleteOutbox(ctx, "", nil, limit)
+}
+
+// ListSecretDeleteOutboxDue is ListSecretDeleteOutboxBatch restricted to rows
+// whose retry backoff has elapsed at now (see SecretOutboxRetryDelay).
+func (s *Store) ListSecretDeleteOutboxDue(ctx context.Context, now time.Time, limit int) ([]SecretDeleteOutboxRecord, error) {
+	where, args := secretOutboxDueClause(now)
+	return s.listSecretDeleteOutbox(ctx, "WHERE "+where, args, limit)
+}
+
+func (s *Store) listSecretDeleteOutbox(ctx context.Context, where string, args []any, limit int) ([]SecretDeleteOutboxRecord, error) {
+	if limit <= 0 {
+		return nil, errors.New("secret delete outbox batch limit must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, incarnation_id, recipients_json, recipient_provenance_json, generation, awaiting_promotion, attempts, created_at, updated_at
+		FROM cluster_secret_delete_outbox
+		`+where+`
+		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC
+		LIMIT ?
+	`, append(args, limit)...)
+	if err != nil {
+		return nil, fmt.Errorf("list secret delete outbox: %w", err)
+	}
+	defer rows.Close()
+	var out []SecretDeleteOutboxRecord
+	for rows.Next() {
+		var rec SecretDeleteOutboxRecord
+		var recipientsJSON, provenanceJSON string
+		if err := rows.Scan(&rec.SandboxID, &rec.IncarnationID, &recipientsJSON, &provenanceJSON, &rec.Generation, &rec.AwaitingPromotion, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if recipientsJSON != "" {
+			if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+				return nil, fmt.Errorf("decode secret delete outbox recipients for %q: %w", rec.SandboxID, err)
+			}
+		}
+		provenance, err := decodeSecretDeleteProvenance(provenanceJSON)
+		if err != nil {
+			return nil, fmt.Errorf("secret delete outbox %q: %w", rec.SandboxID, err)
+		}
+		rec.RecipientCopiedAt = provenance
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// Retry schedule for durable peer obligations (both outboxes). Attempt n is
+// due min(SecretOutboxBackoffBase·2^(n-1), SecretOutboxBackoffCap) after the
+// last attempt (updated_at); a row never attempted is due at once. Before
+// this, attempts was counted and never read: a permanently unreachable
+// recipient was retried every tick forever. The schedule lives in the query,
+// not in a Go-side skip, because a backlog of backed-off rows — every
+// obligation to a decommissioned node — would otherwise occupy the whole
+// oldest-first batch and starve fresh work until its backoff expired.
+const (
+	SecretOutboxBackoffBase = 30 * time.Second
+	SecretOutboxBackoffCap  = 15 * time.Minute
+)
+
+// SecretOutboxRetryDelay is how long a row with the given attempt count waits
+// after its last attempt before it is due again.
+func SecretOutboxRetryDelay(attempts int) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+	d := SecretOutboxBackoffBase
+	for i := 1; i < attempts && d < SecretOutboxBackoffCap; i++ {
+		d *= 2
+	}
+	return min(d, SecretOutboxBackoffCap)
+}
+
+// secretOutboxDueClause renders the schedule as a WHERE fragment over
+// (attempts, updated_at): one bound cutoff per distinct delay, the last one
+// covering every attempt count at the cap.
+func secretOutboxDueClause(now time.Time) (string, []any) {
+	now = now.UTC()
+	parts := []string{"attempts <= 0"}
+	var args []any
+	for n := 1; ; n++ {
+		d := SecretOutboxRetryDelay(n)
+		if d >= SecretOutboxBackoffCap {
+			parts = append(parts, "(attempts >= ? AND updated_at <= ?)")
+			args = append(args, n, now.Add(-d))
+			break
+		}
+		parts = append(parts, "(attempts = ? AND updated_at <= ?)")
+		args = append(args, n, now.Add(-d))
+	}
+	return "(" + strings.Join(parts, " OR ") + ")", args
+}
+
+// BumpSecretDeleteOutboxAttempt records a delivery attempt (or a local failure
+// worth backing off): attempts grows and the row moves to the back of the
+// fair queue, due again after SecretOutboxRetryDelay.
+func (s *Store) BumpSecretDeleteOutboxAttempt(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.retrySecretDeleteOutbox(ctx, sandboxID, incarnationID, generation, true)
+}
+
+// TouchSecretDeleteOutbox moves a row to the back of the fair queue without
+// counting an attempt: nothing was tried because the world was not ready (the
+// placement could not be read, or a staged reseal is not yet promoted). The
+// row stays due on the next tick.
+func (s *Store) TouchSecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	return s.retrySecretDeleteOutbox(ctx, sandboxID, incarnationID, generation, false)
+}
+
+func (s *Store) retrySecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, generation int64, countAttempt bool) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	set := "updated_at = ?"
+	if countAttempt {
+		set = "attempts = attempts + 1, " + set
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_delete_outbox
+		SET `+set+`
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+	`, time.Now().UTC(), sandboxID, incarnationID, generation)
+	return err
+}
+
+// DeleteSecretDeleteOutbox drops a completed delete fan-out job.
+func (s *Store) DeleteSecretDeleteOutbox(ctx context.Context, sandboxID, incarnationID string, generation int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return nil
+	}
+	if incarnationID == "" {
+		return errors.New("secret delete outbox incarnation_id is required")
+	}
+	if generation <= 0 {
+		return errors.New("secret delete outbox generation must be positive")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM cluster_secret_delete_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND generation = ?
+	`, sandboxID, incarnationID, generation)
+	return err
+}
+
+// SecretPutOutboxRecord is one durable create-path peer fan-out job.
+type SecretPutOutboxRecord struct {
+	SandboxID      string
+	IncarnationID  string
+	SealGeneration int64
+	Recipients     []string
+	Attempts       int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// UpsertSecretPutOutbox persists remaining peer PUT targets when the in-memory
+// create fan-out queue is saturated. Blob bytes are reloaded from
+// cluster_secrets at reconcile time by sandbox_id + seal_generation.
+//
+// Identity is (sandbox_id, incarnation_id, seal_generation). A lower
+// seal_generation never overwrites a newer job; same gen+incarnation merges
+// recipients. Other incarnations are independent cleanup obligations.
+func (s *Store) UpsertSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64, recipients []string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
+	}
+	if sealGeneration <= 0 {
+		return errors.New("secret put outbox seal generation must be positive")
+	}
+	recipients = secrets.NormalizeRecipients(recipients)
+	if len(recipients) == 0 {
+		return s.DeleteSecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin upsert secret put outbox: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existingGen sql.NullInt64
+	var existingRecipientsJSON string
+	scanErr := tx.QueryRowContext(ctx, `
+		SELECT seal_generation, recipients_json
+		FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ?
+		ORDER BY seal_generation DESC, updated_at DESC
+		LIMIT 1
+	`, sandboxID, incarnationID).Scan(&existingGen, &existingRecipientsJSON)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return fmt.Errorf("read secret put outbox: %w", scanErr)
+	}
+	if existingGen.Valid && existingGen.Int64 > sealGeneration {
+		// Newer job already pending — do not clobber with a stale fan-out.
+		return nil
+	}
+	if existingGen.Valid && existingGen.Int64 == sealGeneration {
+		var prior []string
+		if existingRecipientsJSON != "" {
+			if err := json.Unmarshal([]byte(existingRecipientsJSON), &prior); err != nil {
+				return fmt.Errorf("decode secret put outbox recipients for merge: %w", err)
+			}
+		}
+		recipients = secrets.NormalizeRecipients(append(prior, recipients...))
+	}
+
+	// Keep one active fan-out generation per exact lifecycle.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation != ?
+	`, sandboxID, incarnationID, sealGeneration); err != nil {
+		return fmt.Errorf("clear stale secret put outbox: %w", err)
+	}
+
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal put outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cluster_secret_put_outbox (
+			sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		) VALUES (?, ?, ?, ?, 0, ?, ?)
+		ON CONFLICT(sandbox_id, incarnation_id, seal_generation) DO UPDATE SET
+			recipients_json = excluded.recipients_json,
+			attempts = 0,
+			updated_at = excluded.updated_at
+	`, sandboxID, incarnationID, sealGeneration, string(raw), now, now); err != nil {
+		return fmt.Errorf("upsert secret put outbox: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit upsert secret put outbox: %w", err)
+	}
+	return nil
+}
+
+// GetSecretPutOutboxForIncarnation returns the active fan-out obligation for
+// one exact lifecycle.
+func (s *Store) GetSecretPutOutboxForIncarnation(ctx context.Context, sandboxID, incarnationID string) (*SecretPutOutboxRecord, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return nil, nil
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ?
+		ORDER BY seal_generation DESC, updated_at DESC
+		LIMIT 1
+	`, sandboxID, incarnationID)
+	var rec SecretPutOutboxRecord
+	var recipientsJSON string
+	if err := row.Scan(&rec.SandboxID, &rec.IncarnationID, &rec.SealGeneration, &recipientsJSON, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if recipientsJSON != "" {
+		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+			return nil, fmt.Errorf("decode secret put outbox recipients: %w", err)
+		}
+	}
+	return &rec, nil
+}
+
+// ListSecretPutOutboxBatch returns at most limit pending put fan-out jobs.
+func (s *Store) ListSecretPutOutboxBatch(ctx context.Context, limit int) ([]SecretPutOutboxRecord, error) {
+	return s.listSecretPutOutbox(ctx, "", nil, limit)
+}
+
+// ListSecretPutOutboxDue is ListSecretPutOutboxBatch restricted to rows whose
+// retry backoff has elapsed at now (see SecretOutboxRetryDelay).
+func (s *Store) ListSecretPutOutboxDue(ctx context.Context, now time.Time, limit int) ([]SecretPutOutboxRecord, error) {
+	where, args := secretOutboxDueClause(now)
+	return s.listSecretPutOutbox(ctx, "WHERE "+where, args, limit)
+}
+
+func (s *Store) listSecretPutOutbox(ctx context.Context, where string, args []any, limit int) ([]SecretPutOutboxRecord, error) {
+	if limit <= 0 {
+		return nil, errors.New("secret put outbox batch limit must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, incarnation_id, seal_generation, recipients_json, attempts, created_at, updated_at
+		FROM cluster_secret_put_outbox
+		`+where+`
+		ORDER BY updated_at ASC, created_at ASC, sandbox_id ASC, seal_generation ASC
+		LIMIT ?
+	`, append(args, limit)...)
+	if err != nil {
+		return nil, fmt.Errorf("list secret put outbox: %w", err)
+	}
+	defer rows.Close()
+	var out []SecretPutOutboxRecord
+	for rows.Next() {
+		var rec SecretPutOutboxRecord
+		var recipientsJSON string
+		if err := rows.Scan(&rec.SandboxID, &rec.IncarnationID, &rec.SealGeneration, &recipientsJSON, &rec.Attempts, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if recipientsJSON != "" {
+			if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+				return nil, fmt.Errorf("decode secret put outbox recipients for %q: %w", rec.SandboxID, err)
+			}
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// UpdateSecretPutOutboxRecipients shrinks the pending recipient list after a
+// partial ACK. Empty recipients deletes the row (identity-fenced).
+func (s *Store) UpdateSecretPutOutboxRecipients(ctx context.Context, sandboxID, incarnationID string, recipients []string, sealGeneration int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
+	}
+	if sealGeneration <= 0 {
+		return errors.New("secret put outbox seal generation must be positive")
+	}
+	if len(recipients) == 0 {
+		return s.DeleteSecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration)
+	}
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		return fmt.Errorf("marshal put outbox recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_put_outbox
+		SET recipients_json = ?, updated_at = ?
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
+	`, string(raw), now, sandboxID, incarnationID, sealGeneration)
+	if err != nil {
+		return fmt.Errorf("update secret put outbox recipients: %w", err)
+	}
+	matched, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count updated secret put outbox recipients: %w", err)
+	}
+	if matched == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// BumpSecretPutOutboxAttempt records a delivery attempt (or a local failure
+// worth backing off); see BumpSecretDeleteOutboxAttempt.
+func (s *Store) BumpSecretPutOutboxAttempt(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64) error {
+	return s.retrySecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration, true)
+}
+
+// TouchSecretPutOutbox moves a row to the back of the fair queue without
+// counting an attempt; see TouchSecretDeleteOutbox.
+func (s *Store) TouchSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64) error {
+	return s.retrySecretPutOutbox(ctx, sandboxID, incarnationID, sealGeneration, false)
+}
+
+func (s *Store) retrySecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64, countAttempt bool) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
+	}
+	if sealGeneration <= 0 {
+		return errors.New("secret put outbox seal generation must be positive")
+	}
+	set := "updated_at = ?"
+	if countAttempt {
+		set = "attempts = attempts + 1, " + set
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secret_put_outbox
+		SET `+set+`
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
+	`, time.Now().UTC(), sandboxID, incarnationID, sealGeneration)
+	return err
+}
+
+// DeleteSecretPutOutbox drops a completed put fan-out job only when the
+// (sandbox_id, incarnation_id, seal_generation) identity still matches — so a
+// late ACK of an older fan-out cannot clear a newer reseal's outbox.
+func (s *Store) DeleteSecretPutOutbox(ctx context.Context, sandboxID, incarnationID string, sealGeneration int64) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" {
+		return errors.New("secret put outbox sandbox_id is required")
+	}
+	if incarnationID == "" {
+		return errors.New("secret put outbox incarnation_id is required")
+	}
+	if sealGeneration <= 0 {
+		return errors.New("secret put outbox seal generation must be positive")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM cluster_secret_put_outbox
+		WHERE sandbox_id = ? AND incarnation_id = ? AND seal_generation = ?
+	`, sandboxID, incarnationID, sealGeneration)
+	return err
+}
+
+// SecretLifecycleStats is the bounded-cardinality operator view of durable
+// secret cleanup state. OldestOutbox/OldestPutOutbox are zero when their
+// corresponding queues have no work pending.
+type SecretLifecycleStats struct {
+	OutboxPending    int64
+	OldestOutbox     time.Time
+	PutOutboxPending int64
+	OldestPutOutbox  time.Time
+	Tombstones       int64
+}
+
+func (s *Store) SecretLifecycleStats(ctx context.Context) (SecretLifecycleStats, error) {
+	var stats SecretLifecycleStats
+	// SQLite aggregate expressions lose the DATETIME column affinity, so MIN
+	// is returned as text rather than time.Time by go-sqlite3.
+	var oldest sql.NullString
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(created_at) FROM cluster_secret_delete_outbox
+	`).Scan(&stats.OutboxPending, &oldest); err != nil {
+		return stats, fmt.Errorf("secret delete outbox stats: %w", err)
+	}
+	if oldest.Valid {
+		for _, layout := range sqlite3.SQLiteTimestampFormats {
+			parsed, parseErr := time.Parse(layout, oldest.String)
+			if parseErr == nil {
+				stats.OldestOutbox = parsed.UTC()
+				break
+			}
+		}
+		if stats.OldestOutbox.IsZero() {
+			return stats, fmt.Errorf("secret delete outbox stats: invalid oldest timestamp %q", oldest.String)
+		}
+	}
+	oldest = sql.NullString{}
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(created_at) FROM cluster_secret_put_outbox
+	`).Scan(&stats.PutOutboxPending, &oldest); err != nil {
+		return stats, fmt.Errorf("secret put outbox stats: %w", err)
+	}
+	if oldest.Valid {
+		for _, layout := range sqlite3.SQLiteTimestampFormats {
+			parsed, parseErr := time.Parse(layout, oldest.String)
+			if parseErr == nil {
+				stats.OldestPutOutbox = parsed.UTC()
+				break
+			}
+		}
+		if stats.OldestPutOutbox.IsZero() {
+			return stats, fmt.Errorf("secret put outbox stats: invalid oldest timestamp %q", oldest.String)
+		}
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_secret_tombs`).Scan(&stats.Tombstones); err != nil {
+		return stats, fmt.Errorf("secret tomb stats: %w", err)
+	}
+	return stats, nil
+}
+
+// PruneClusterSecretTombs removes a bounded batch of expired delete fences.
+// A tomb is eligible only after the durable peer-delete outbox is fully ACKed
+// and no local sandbox or sealed row can still use the ID. The retention window
+// is deliberately much longer than every fan-out request deadline, preventing
+// an indefinitely delayed stale PUT from resurrecting deleted credentials
+// while keeping cardinality bounded for UUID sandbox IDs. Peer PUT ingress
+// additionally requires a matching live Raft placement, which remains the
+// anti-resurrection fence after an eligible tomb is pruned.
+func (s *Store) PruneClusterSecretTombs(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if cutoff.IsZero() || limit <= 0 {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM cluster_secret_tombs
+		WHERE rowid IN (
+			SELECT tomb.rowid
+			FROM cluster_secret_tombs AS tomb
+			WHERE tomb.deleted_at < ?
+			  AND NOT EXISTS (
+				SELECT 1 FROM cluster_secret_delete_outbox AS outbox
+				WHERE outbox.sandbox_id = tomb.sandbox_id
+				  AND outbox.incarnation_id = tomb.incarnation_id
+			  )
+			  AND NOT EXISTS (
+				SELECT 1 FROM cluster_secrets AS secret
+				WHERE secret.sandbox_id = tomb.sandbox_id
+				  AND secret.ref = 'cluster-secret://sandbox/' || tomb.sandbox_id || '/i/' || tomb.incarnation_id || '/v1'
+			  )
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM sandboxes AS sandbox
+				WHERE sandbox.id = tomb.sandbox_id
+				  AND sandbox.audit_incarnation_id = tomb.incarnation_id
+			  )
+			ORDER BY tomb.deleted_at ASC, tomb.sandbox_id ASC, tomb.incarnation_id ASC
+			LIMIT ?
+		)
+	`, cutoff.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("prune cluster secret tombs: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count pruned cluster secret tombs: %w", err)
+	}
+	return n, nil
+}
+
+// ClusterSecretTombGenerationForIncarnation returns the deletion fence for an
+// exact lifecycle. A tomb from an older use of the same sandbox ID is not a
+// fence for the replacement incarnation.
+func (s *Store) ClusterSecretTombGenerationForIncarnation(ctx context.Context, sandboxID, incarnationID string) (int64, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" || incarnationID == "" {
+		return 0, nil
+	}
+	var gen int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT generation FROM cluster_secret_tombs
+		WHERE sandbox_id = ? AND incarnation_id = ?
+	`, sandboxID, incarnationID).Scan(&gen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("get cluster secret lifecycle tomb generation: %w", err)
+	}
+	return gen, nil
+}
+
+// ListClusterSecretsBatch returns the next ref-ordered page after afterRef.
+// Boot reconciliation must remain memory-bounded at the 100k-sandbox target,
+// so there is deliberately no all-rows convenience API.
+func (s *Store) ListClusterSecretsBatch(ctx context.Context, afterRef string, limit int) ([]ClusterSecretRecord, error) {
+	if limit <= 0 {
+		return nil, errors.New("cluster secret batch limit must be positive")
+	}
+	afterRef = strings.TrimSpace(afterRef)
+	query := `
+		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
+		FROM cluster_secrets
+		ORDER BY ref
+		LIMIT ?
+	`
+	args := []any{limit}
+	if afterRef != "" {
+		query = `
+			SELECT ref, sandbox_id, version, recipients_json, sealed_payload, seal_generation, created_at, updated_at
+			FROM cluster_secrets
+			WHERE ref > ?
+			ORDER BY ref
+			LIMIT ?
+		`
+		args = []any{afterRef, limit}
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list cluster secret batch: %w", err)
+	}
+	defer rows.Close()
+	var out []ClusterSecretRecord
+	for rows.Next() {
+		var rec ClusterSecretRecord
+		var recipientsJSON string
+		if err := rows.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.SealGeneration, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan cluster secret batch: %w", err)
+		}
+		if recipientsJSON != "" {
+			if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+				return nil, fmt.Errorf("unmarshal cluster secret recipients: %w", err)
+			}
+		}
+		rec.SealedPayload = nullableBlob(rec.SealedPayload)
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list cluster secret batch: %w", err)
+	}
+	return out, nil
 }
 
 // PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
@@ -4060,6 +6736,67 @@ func (s *Store) PutMounts(ctx context.Context, sandboxID string, sealed []byte) 
 	`, sandboxID, sealed, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("upsert sandbox mounts: %w", err)
+	}
+	return nil
+}
+
+// PutEnv stores an encrypted env blob for a sandbox (opaque to the store).
+func (s *Store) PutEnv(ctx context.Context, sandboxID string, sealed []byte) error {
+	return putEnvExec(ctx, s.db, sandboxID, sealed)
+}
+
+func putEnvExec(ctx context.Context, exec dbExecer, sandboxID string, sealed []byte) error {
+	_, err := exec.ExecContext(ctx, `
+		INSERT INTO sandbox_env (sandbox_id, sealed_blob, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			sealed_blob = excluded.sealed_blob,
+			created_at = excluded.created_at
+	`, sandboxID, sealed, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("upsert sandbox env: %w", err)
+	}
+	return nil
+}
+
+// GetEnv returns the encrypted env blob, or ErrNotFound if no row exists.
+func (s *Store) GetEnv(ctx context.Context, sandboxID string) ([]byte, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT sealed_blob FROM sandbox_env WHERE sandbox_id = ?`, sandboxID)
+	var blob []byte
+	if err := row.Scan(&blob); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get sandbox env: %w", err)
+	}
+	return blob, nil
+}
+
+// GetEnvWithIdentity reads ciphertext and its local lifecycle in one snapshot.
+// A cached Raft incarnation or two separate queries could bind an env read to
+// a replacement sandbox while the local row is being destroyed/recreated.
+//
+// present distinguishes an env row holding an empty seal (the sandbox has no
+// environment — the normal case, written at create) from no env row at all
+// (the row was lost). Both scan to a zero-length blob, so callers that must
+// fail loud on loss cannot use the blob length alone. ErrNotFound still means
+// the SANDBOX row is missing, not the env row.
+func (s *Store) GetEnvWithIdentity(ctx context.Context, sandboxID string) (blob []byte, present bool, incarnationID, ownerRef string, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT env.sealed_blob, env.sandbox_id IS NOT NULL, sandbox.audit_incarnation_id, sandbox.owner_ref
+		FROM sandboxes AS sandbox LEFT JOIN sandbox_env AS env ON env.sandbox_id = sandbox.id
+		WHERE sandbox.id = ?`, sandboxID).Scan(&blob, &present, &incarnationID, &ownerRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, "", "", ErrNotFound
+	}
+	return
+}
+
+// DeleteEnv removes sealed env for a sandbox. Cascade on sandboxes covers
+// destroy; explicit deletes are for replace paths.
+func (s *Store) DeleteEnv(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_env WHERE sandbox_id = ?`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete sandbox env: %w", err)
 	}
 	return nil
 }
@@ -4954,14 +7691,22 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 	return nil
 }
 
-// UpdateWasmCheckpoint persists passivation metadata on a sandbox row.
-func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, status, checkpointPath, cloneGen, lastError string) error {
+// UpdateWasmCheckpoint persists passivation metadata on a sandbox row, fenced
+// to the incarnation the checkpoint was taken for. An empty incarnation means
+// the caller has no lifecycle to fence against (pre-incarnation rows) and the
+// write applies by id alone.
+func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, incarnationID, status, checkpointPath, cloneGen, lastError string) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	query := `
 		UPDATE sandboxes
 		SET status = ?, checkpoint_path = ?, clone_generation = ?, last_error = ?, updated_at = ?
-		WHERE id = ?
-	`, status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID)
+		WHERE id = ?`
+	args := []any{status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID}
+	if incarnationID = strings.TrimSpace(incarnationID); incarnationID != "" {
+		query += ` AND audit_incarnation_id = ?`
+		args = append(args, incarnationID)
+	}
+	_, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("update wasm checkpoint: %w", err)
 	}
@@ -5035,6 +7780,32 @@ func (s *Store) DeleteAllWasmStateKV(ctx context.Context, sandboxID string) erro
 	return nil
 }
 
+// DeleteOrphanedWasmStateKV removes host-KV rows whose sandbox no longer
+// exists. There is no FK from wasm_state_kv to sandboxes, so destroy must
+// delete children first; this sweep closes any crash or historical vacuum.
+func (s *Store) DeleteOrphanedWasmStateKV(ctx context.Context, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 1024
+	}
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM wasm_state_kv
+		WHERE rowid IN (
+			SELECT kv.rowid
+			FROM wasm_state_kv kv
+			LEFT JOIN sandboxes s ON s.id = kv.sandbox_id
+			WHERE s.id IS NULL
+			LIMIT ?
+		)`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete orphaned wasm state kv: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // ListWasmStateKVKeys lists keys for a sandbox.
 func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]string, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
@@ -5058,20 +7829,27 @@ func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]st
 
 // WasmCheckpointPushRecord is one AOCR push history row.
 type WasmCheckpointPushRecord struct {
-	ID          int64
-	SandboxID   string
-	RegistryRef string
-	Digest      string
-	PushedAt    time.Time
+	ID        int64
+	SandboxID string
+	// IncarnationID is the sandbox lifetime the push belonged to. Empty on
+	// cleanup-only rows a destroy recorded for refs it had no push row for.
+	IncarnationID string
+	RegistryRef   string
+	Digest        string
+	PushedAt      time.Time
 }
 
+// wasmCheckpointCleanupOnlyDigest marks a row a destroy path wrote to track a
+// ref it had no push row for; it names no real manifest digest.
+const wasmCheckpointCleanupOnlyDigest = "cleanup-only"
+
 // InsertWasmCheckpointPush records a successful AOCR push for keep-last-N retention.
-func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, registryRef, digest string) (int64, error) {
+func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, incarnationID, registryRef, digest string) (int64, error) {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO wasm_checkpoint_pushes (sandbox_id, registry_ref, digest, pushed_at)
-		VALUES (?, ?, ?, ?)`,
-		strings.TrimSpace(sandboxID), strings.TrimSpace(registryRef), strings.TrimSpace(digest), now)
+		INSERT INTO wasm_checkpoint_pushes (sandbox_id, incarnation_id, registry_ref, digest, pushed_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID), strings.TrimSpace(registryRef), strings.TrimSpace(digest), now)
 	if err != nil {
 		return 0, fmt.Errorf("insert wasm checkpoint push: %w", err)
 	}
@@ -5082,13 +7860,78 @@ func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, registr
 	return id, nil
 }
 
-// ListWasmCheckpointPushes returns push history newest-first.
+// EnsureWasmCheckpointCleanupRef durably records an external ref before a
+// destroy path attempts to delete it. It is idempotent for a sandbox/ref pair,
+// allowing the orphan sweep to finish cleanup after the sandbox row is gone.
+func (s *Store) EnsureWasmCheckpointCleanupRef(ctx context.Context, sandboxID, registryRef string) (int64, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	registryRef = strings.TrimSpace(registryRef)
+	if sandboxID == "" || registryRef == "" {
+		return 0, errors.New("wasm cleanup ref requires sandbox id and registry ref")
+	}
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_checkpoint_pushes (sandbox_id, registry_ref, digest, pushed_at)
+		SELECT ?, ?, '`+wasmCheckpointCleanupOnlyDigest+`', ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM wasm_checkpoint_pushes
+			WHERE sandbox_id = ? AND registry_ref = ?
+		)`, sandboxID, registryRef, now, sandboxID, registryRef)
+	if err != nil {
+		return 0, fmt.Errorf("ensure wasm cleanup ref: %w", err)
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("ensure wasm cleanup ref rows affected: %w", err)
+	}
+	if inserted == 1 {
+		id, err := res.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("ensure wasm cleanup ref id: %w", err)
+		}
+		return id, nil
+	}
+	var id int64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT id FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ? AND registry_ref = ?
+		ORDER BY id DESC LIMIT 1`, sandboxID, registryRef).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("find ensured wasm cleanup ref: %w", err)
+	}
+	return id, nil
+}
+
+// ListWasmCheckpointPushes returns every push history row for a sandbox id,
+// across ALL of its incarnations, newest-first. It is for the terminal destroy
+// path, where the id itself is going away; retention must use
+// ListWasmCheckpointPushesForIncarnation instead.
 func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) ([]WasmCheckpointPushRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, sandbox_id, registry_ref, digest, pushed_at
+	return s.queryWasmCheckpointPushes(ctx, `
+		SELECT id, sandbox_id, incarnation_id, registry_ref, digest, pushed_at
 		FROM wasm_checkpoint_pushes
 		WHERE sandbox_id = ?
 		ORDER BY pushed_at DESC, id DESC`, strings.TrimSpace(sandboxID))
+}
+
+// ListWasmCheckpointPushesForIncarnation returns ONE lifetime's pushes,
+// newest-first — the set keep-last-N retention is allowed to count and prune.
+//
+// Retention used to count every push for the sandbox id. Pushes are detached
+// with a multi-minute budget, so a destroyed incarnation's pushes can finish
+// after the id was re-created; ordered by completion time they then displaced
+// the replacement's checkpoint from its own retention window, and retention
+// deleted the manifest the live row still pointed at.
+func (s *Store) ListWasmCheckpointPushesForIncarnation(ctx context.Context, sandboxID, incarnationID string) ([]WasmCheckpointPushRecord, error) {
+	return s.queryWasmCheckpointPushes(ctx, `
+		SELECT id, sandbox_id, incarnation_id, registry_ref, digest, pushed_at
+		FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ? AND incarnation_id = ?
+		ORDER BY pushed_at DESC, id DESC`, strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID))
+}
+
+func (s *Store) queryWasmCheckpointPushes(ctx context.Context, query string, args ...any) ([]WasmCheckpointPushRecord, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list wasm checkpoint pushes: %w", err)
 	}
@@ -5096,7 +7939,7 @@ func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) 
 	var out []WasmCheckpointPushRecord
 	for rows.Next() {
 		var rec WasmCheckpointPushRecord
-		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
+		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.IncarnationID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, rec)
@@ -5110,30 +7953,111 @@ func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) 
 // succeeded; the orphan-ref sweep retries each ref and drops the row once the
 // manifest is confirmed gone, so the tracking table can never leak unbounded
 // rows for sandboxes that are already gone.
+//
+// A row is orphaned when no LIVE sandbox lifetime owns it. For a row that
+// names its incarnation that means no sandbox row carries that id AND that
+// incarnation — the sandbox id alone is not enough, because a destroyed
+// sandbox's id can be re-created, and a push the fenced metadata write
+// rejected as belonging to the dead lifetime was otherwise never reclaimed:
+// the id existed, so the row never looked orphaned. Cleanup-only rows carry no
+// incarnation and fall back to the id rule.
 func (s *Store) ListOrphanedWasmCheckpointPushes(ctx context.Context, limit int) ([]WasmCheckpointPushRecord, error) {
 	if limit <= 0 {
 		limit = 256
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT p.id, p.sandbox_id, p.registry_ref, p.digest, p.pushed_at
+	return s.queryWasmCheckpointPushes(ctx, `
+		SELECT p.id, p.sandbox_id, p.incarnation_id, p.registry_ref, p.digest, p.pushed_at
 		FROM wasm_checkpoint_pushes p
-		LEFT JOIN sandboxes s ON s.id = p.sandbox_id
-		WHERE s.id IS NULL
+		WHERE NOT EXISTS (
+			SELECT 1 FROM sandboxes s
+			WHERE s.id = p.sandbox_id
+			  AND (p.incarnation_id = '' OR s.audit_incarnation_id = p.incarnation_id)
+		)
 		ORDER BY p.pushed_at ASC, p.id ASC
 		LIMIT ?`, limit)
+}
+
+// checkpointRefTag is the tag part of a registry ref ("" for a digest pin).
+func checkpointRefTag(ref string) string {
+	rest := ref
+	if i := strings.LastIndex(rest, "/"); i >= 0 {
+		rest = rest[i+1:]
+	}
+	if strings.Contains(rest, "@") {
+		return ""
+	}
+	if i := strings.LastIndex(rest, ":"); i >= 0 {
+		return rest[i+1:]
+	}
+	return ""
+}
+
+// WasmCheckpointRefInUse reports whether deleting ref would take away a
+// manifest the LIVE sandbox with this id still depends on. excludePushID is
+// the row being cleaned up, so it does not protect itself.
+//
+// Deleting a checkpoint ref resolves its tag and deletes the MANIFEST, which
+// removes every tag pointing at that digest. So a ref is in use not only when
+// the live row names it, but when anything the live lifetime keeps resolves to
+// the same manifest:
+//
+//   - the rolling :latest tag is shared by every incarnation of a sandbox id
+//     and resolves at delete time to whatever was pushed last — deleting it
+//     through a dead lifetime's row deletes the live one's checkpoint;
+//   - a digest tag is content-addressed, so two lifetimes that checkpointed
+//     identical memory share it;
+//   - the live lifetime's own retained history rows are its recovery points.
+//
+// A dead lifetime's rows protect nothing: that is what lets two of them that
+// share a manifest still be reclaimed.
+//
+// rowIncarnation is the lifetime that recorded the row. A rolling pointer
+// (<lifetime>-latest) is only ever written by its own lifetime, so it is in
+// use exactly when that lifetime is the live one — and a dead lifetime's
+// pointer is safe to delete however the live lifetime is doing, because
+// nothing the live lifetime publishes can ever move it.
+func (s *Store) WasmCheckpointRefInUse(ctx context.Context, sandboxID string, excludePushID int64, rowIncarnation, registryRef, digest string) (bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	registryRef = strings.TrimSpace(registryRef)
+	digest = strings.TrimSpace(digest)
+	if digest == wasmCheckpointCleanupOnlyDigest {
+		digest = ""
+	}
+	var liveRef, liveDigest, liveIncarnation string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(wasm_registry_ref, ''), COALESCE(wasm_registry_digest, ''), COALESCE(audit_incarnation_id, '')
+		FROM sandboxes WHERE id = ?`, sandboxID).Scan(&liveRef, &liveDigest, &liveIncarnation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("list orphaned wasm checkpoint pushes: %w", err)
+		return false, fmt.Errorf("wasm checkpoint ref in use: %w", err)
 	}
-	defer rows.Close()
-	var out []WasmCheckpointPushRecord
-	for rows.Next() {
-		var rec WasmCheckpointPushRecord
-		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
+	switch tag := checkpointRefTag(registryRef); {
+	case tag == "latest":
+		// The id-wide pointer that predates lifetime-scoped tags: every
+		// lifetime of this id shared it, so it may resolve to the live
+		// checkpoint and stays while the id is live.
+		return true, nil
+	case strings.HasSuffix(tag, "-latest"):
+		return strings.TrimSpace(rowIncarnation) != "" && strings.TrimSpace(rowIncarnation) == strings.TrimSpace(liveIncarnation), nil
 	}
-	return out, rows.Err()
+	if registryRef != "" && registryRef == strings.TrimSpace(liveRef) {
+		return true, nil
+	}
+	if digest != "" && digest == strings.TrimSpace(liveDigest) {
+		return true, nil
+	}
+	var held int
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COUNT(1) FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ? AND incarnation_id = ? AND id != ?
+		  AND ((? != '' AND registry_ref = ?) OR (? != '' AND digest = ?))`,
+		sandboxID, liveIncarnation, excludePushID, registryRef, registryRef, digest, digest).Scan(&held)
+	if err != nil {
+		return false, fmt.Errorf("wasm checkpoint ref in use: %w", err)
+	}
+	return held > 0, nil
 }
 
 // DeleteWasmCheckpointPush removes one push history row by id.
@@ -5158,18 +8082,30 @@ func (s *Store) DeleteAllWasmCheckpointPushes(ctx context.Context, sandboxID str
 	return nil
 }
 
-// UpdateWasmRegistryPush records the AOCR ref/digest after a durable checkpoint push.
-func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, registryRef, digest string) error {
+// UpdateWasmRegistryPush records the AOCR ref/digest after a durable checkpoint
+// push. incarnationID fences the write to the lifecycle the push was started
+// for: these pushes run detached with a multi-minute timeout, so one can land
+// after its sandbox is destroyed and the id re-created. applied=false means
+// the row moved on and the result belongs to a dead lifecycle.
+func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, incarnationID, registryRef, digest string) (applied bool, err error) {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return false, errors.New("update wasm registry push: incarnation id is required")
+	}
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
 		SET wasm_registry_ref = ?, wasm_registry_digest = ?, updated_at = ?
-		WHERE id = ?
-	`, strings.TrimSpace(registryRef), strings.TrimSpace(digest), now, sandboxID)
+		WHERE id = ? AND audit_incarnation_id = ?
+	`, strings.TrimSpace(registryRef), strings.TrimSpace(digest), now, sandboxID, incarnationID)
 	if err != nil {
-		return fmt.Errorf("update wasm registry push: %w", err)
+		return false, fmt.Errorf("update wasm registry push: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("update wasm registry push rows affected: %w", err)
+	}
+	return affected > 0, nil
 }
 
 // ListReadyWasmModuleRefs returns module_ref values for ready catalogue rows.
@@ -5421,4 +8357,104 @@ func (s *Store) CompareCloneGeneration(ctx context.Context, sandboxID, snapshotG
 		return nil
 	}
 	return fmt.Errorf("clone generation mismatch (row=%s snapshot=%s): %w", current, snapshotGen, models.ErrSnapshotFenced)
+}
+
+// CurrentSandboxAuditIdentity returns the live lifecycle id and tenant owner
+// in one read. The audit emit path resolves both on every sandbox start, so
+// they must not cost two round-trips on the single-writer connection.
+func (s *Store) CurrentSandboxAuditIdentity(ctx context.Context, sandboxID string) (incarnationID, ownerRef string, err error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return "", "", nil
+	}
+	err = s.db.QueryRowContext(ctx, `
+		SELECT audit_incarnation_id, owner_ref FROM sandboxes WHERE id = ?
+	`, sandboxID).Scan(&incarnationID, &ownerRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("get current sandbox audit identity: %w", err)
+	}
+	return strings.TrimSpace(incarnationID), strings.TrimSpace(ownerRef), nil
+}
+
+// NodeStorageRetirement is an operator's attestation that a node's storage was
+// destroyed. It is the only thing besides an authenticated ACK that may
+// discharge a deletion obligation owed to that node.
+type NodeStorageRetirement struct {
+	NodeID     string
+	AttestedAt time.Time
+	Actor      string
+	Reason     string
+	CreatedAt  time.Time
+}
+
+// PutNodeStorageRetirement records (or re-records) an attestation. Idempotent
+// by node id: re-attesting moves attested_at forward, which widens the set of
+// covered obligations to those that existed at the new attestation time and
+// never narrows it.
+func (s *Store) PutNodeStorageRetirement(ctx context.Context, nodeID, actor, reason string, attestedAt time.Time) error {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return errors.New("put node storage retirement: node id required")
+	}
+	if attestedAt.IsZero() {
+		attestedAt = time.Now().UTC()
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO node_storage_retirements (node_id, attested_at, actor, reason, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(node_id) DO UPDATE SET
+			attested_at = MAX(node_storage_retirements.attested_at, excluded.attested_at),
+			actor = excluded.actor,
+			reason = excluded.reason
+	`, nodeID, attestedAt.UTC(), strings.TrimSpace(actor), strings.TrimSpace(reason), now)
+	if err != nil {
+		return fmt.Errorf("put node storage retirement: %w", err)
+	}
+	return nil
+}
+
+// DeleteNodeStorageRetirement revokes an attestation. Called by an operator
+// who attested in error, and automatically when a node with that id is alive
+// again — a live node can ACK, so its obligations are real.
+func (s *Store) DeleteNodeStorageRetirement(ctx context.Context, nodeID string) (bool, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM node_storage_retirements WHERE node_id = ?`, nodeID)
+	if err != nil {
+		return false, fmt.Errorf("delete node storage retirement: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, nil
+	}
+	return n > 0, nil
+}
+
+// ListNodeStorageRetirements returns every recorded attestation. The set is
+// bounded by the number of nodes an operator has ever decommissioned, so it is
+// read whole and cached by the caller for a maintenance tick.
+func (s *Store) ListNodeStorageRetirements(ctx context.Context) ([]NodeStorageRetirement, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT node_id, attested_at, actor, reason, created_at
+		FROM node_storage_retirements ORDER BY node_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list node storage retirements: %w", err)
+	}
+	defer rows.Close()
+	out := make([]NodeStorageRetirement, 0, 8)
+	for rows.Next() {
+		var rec NodeStorageRetirement
+		if err := rows.Scan(&rec.NodeID, &rec.AttestedAt, &rec.Actor, &rec.Reason, &rec.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan node storage retirement: %w", err)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }

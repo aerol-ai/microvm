@@ -78,10 +78,90 @@ func TestRegistryWellFormed(t *testing.T) {
 		seen[uc.ID] = true
 		for _, c := range uc.Requires {
 			switch c {
-			case CapDocker, CapFirecracker, CapGvisor, CapWasm, CapIsolate, CapGPU, CapDomain, CapCluster, CapCustomDomains, CapExternalDNSZone, CapMixedArchNegative, CapPlatformVolumes, CapBenchmark, CapDockerPool, CapDockerNetnsPool, CapDockerEngine, CapContainerdEngine, CapObservability, CapSimulations:
+			case CapDocker, CapFirecracker, CapGvisor, CapWasm, CapIsolate, CapIsolateJail, CapGPU, CapDomain, CapCluster, CapCustomDomains, CapExternalDNSZone, CapMixedArchNegative, CapPlatformVolumes, CapBenchmark, CapDockerPool, CapDockerNetnsPool, CapDockerEngine, CapContainerdEngine, CapObservability, CapSimulations:
 			default:
 				t.Fatalf("%s requires unknown capability %q", uc.ID, c)
 			}
 		}
+	}
+}
+
+// TestSatisfiesExcludes guards the fail-closed property of Excludes. The whole
+// reason the field exists is that UC-116 (backup count 1) and UC-123 (zero
+// retention) push daemon config into states internal/config refuses under
+// SB_ENTERPRISE_MODE — running them on an enterprise scenario takes the node
+// down instead of asserting. A bug here is silent and destructive, so the
+// exclusion is tested as its own table alongside Satisfies.
+func TestSatisfiesExcludes(t *testing.T) {
+	cases := []struct {
+		name string
+		sc   *Scenario
+		uc   UseCase
+		want bool
+	}{
+		{
+			"excluded cap present blocks an otherwise-satisfied case",
+			scenario(CapCluster, CapEnterprise),
+			UseCase{Requires: []Capability{CapCluster}, Excludes: []Capability{CapEnterprise}},
+			false,
+		},
+		{
+			"excluded cap absent leaves the case runnable",
+			scenario(CapCluster),
+			UseCase{Requires: []Capability{CapCluster}, Excludes: []Capability{CapEnterprise}},
+			true,
+		},
+		{
+			"exclusion wins when a cap is both required and excluded",
+			scenario(CapEnterprise),
+			UseCase{Requires: []Capability{CapEnterprise}, Excludes: []Capability{CapEnterprise}},
+			false,
+		},
+		{
+			"missing requirement still blocks even with no exclusion hit",
+			scenario(),
+			UseCase{Requires: []Capability{CapCluster}, Excludes: []Capability{CapEnterprise}},
+			false,
+		},
+		{
+			"any one of several exclusions is enough to block",
+			scenario(CapCluster, CapSecretsKMS),
+			UseCase{Requires: []Capability{CapCluster}, Excludes: []Capability{CapEnterprise, CapSecretsKMS}},
+			false,
+		},
+		{
+			"nil Excludes behaves exactly as before",
+			scenario(CapCluster, CapEnterprise),
+			UseCase{Requires: []Capability{CapCluster}},
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.sc.Satisfies(tc.uc); got != tc.want {
+				t.Fatalf("Satisfies = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBlockingCaps checks the skip message can name the real reason. Reporting
+// an exclusion as a "missing capability" sends a reader looking for a cap to
+// add to the scenario, which is the opposite of the fix.
+func TestBlockingCaps(t *testing.T) {
+	sc := scenario(CapCluster, CapEnterprise)
+	uc := UseCase{Requires: []Capability{CapCluster}, Excludes: []Capability{CapEnterprise, CapSecretsKMS}}
+
+	blocking := sc.BlockingCaps(uc)
+	if len(blocking) != 1 || blocking[0] != CapEnterprise {
+		t.Fatalf("BlockingCaps = %v, want [%s]", blocking, CapEnterprise)
+	}
+	// An exclusion is not a missing requirement; the two lists must not blur.
+	if missing := sc.MissingCaps(uc); len(missing) != 0 {
+		t.Fatalf("MissingCaps = %v, want empty (the requirement IS met)", missing)
+	}
+	// No exclusions held => nothing blocking.
+	if got := scenario(CapCluster).BlockingCaps(uc); len(got) != 0 {
+		t.Fatalf("BlockingCaps on a non-enterprise scenario = %v, want empty", got)
 	}
 }

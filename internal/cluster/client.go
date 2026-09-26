@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -38,19 +40,14 @@ type Cluster struct {
 	// regular API auth, so no new secret-distribution surface. With mTLS
 	// enabled the PAT is belt-and-braces — the TLS handshake already proved
 	// cluster membership — but we keep sending it so the receiving handler can
-	// stay symmetric with the public endpoint and so a node that briefly loses
-	// its TLS material can fall back without breaking auth.
-	patToken   string
-	httpClient *http.Client
-	// internalURL is this node's cluster-internal mTLS advertise URL (e.g.
-	// https://10.0.0.5:7002). Empty when running without SB_CLUSTER_TLS_DIR.
-	// Gossiped to peers so leader-forward can prefer the mTLS channel over
-	// the public API URL.
+	// stay symmetric with the public endpoint. A selected mTLS request never
+	// downgrades to the public endpoint after a TLS error.
+	patToken string
+	// internalURL is this node's cluster-internal mTLS advertise URL.
 	internalURL string
 	// tls holds the loaded cluster CA + node keypair used by both the raft
 	// transport (via raftSetupConfig.TLS) and the internal HTTPS listener.
-	// nil when SB_CLUSTER_TLS_DIR is unset — that's the legacy plaintext path
-	// for operators on a fully isolated network.
+	// Configuration validation requires TLS in cluster mode.
 	tls *ClusterTLS
 	// internalServer is the mTLS HTTPS listener that accepts leader-forwarded
 	// raft applies from peers. nil when tls is nil. Owned by Close.
@@ -58,16 +55,13 @@ type Cluster struct {
 	// internalClient is an HTTPS client preconfigured with the cluster CA +
 	// our node cert. Used to dial peers' InternalURL when both sides have
 	// TLS material. nil when tls is nil.
-	internalClient *http.Client
-	// publicProxies caches httputil.ReverseProxy instances keyed on peer
-	// APIURL (the legacy public-API path). Shared across forwarded requests
-	// so the underlying transport's connection pool isn't rebuilt per call.
-	publicProxies *proxyCache
-	// mtlsProxies caches httputil.ReverseProxy instances keyed on peer
-	// InternalURL. Each proxy rides an mTLS transport configured with the
-	// cluster CA + this node's cert. nil when tls is nil — owner forwarding
-	// then falls back to publicProxies + PAT auth.
+	internalClient   *http.Client
+	internalClientMu sync.RWMutex
+	// mtlsProxies caches reverse proxies by peer identity and InternalURL.
 	mtlsProxies *proxyCache
+	// peerClients caches per-node mTLS HTTP clients (VerifyPeerCertificate
+	// bound to node:<id>). Invalidated on gossip leave.
+	peerClients peerClientCache
 
 	commitTimeout time.Duration
 
@@ -89,12 +83,26 @@ type Cluster struct {
 	// fresh lease before a worker can receive new sandboxes.
 	capacityLeases    *capacityLeaseCache
 	capacityLeaseStop context.CancelFunc
+	// raftMembershipMu serializes every leader-side raft membership mutation
+	// with the replica-budget count that gates it. NotifyJoin starts a
+	// goroutine per join, so an unsynchronized check-then-add lets N
+	// concurrent joins all observe a configuration below the budget and all
+	// be admitted. Nothing repairs that afterwards: an already-configured
+	// server skips the admission check on every later reconcile.
+	raftMembershipMu sync.Mutex
 	// reservationAdmissionMu serializes leader-side reservation admission.
 	// Capacity leases are outside the Raft FSM, so the leader must check
 	// target capacity + per-worker pending caps under one queue before
 	// appending opReserve/opReserveBatch. Otherwise two routers can both
 	// validate against the same pending snapshot and overfill a worker.
 	reservationAdmissionMu sync.Mutex
+	// authoritativeBarrierOnce/authoritativeBarrier admit ONE fsm barrier at
+	// a time. A raft barrier cannot be cancelled, so the goroutine waiting on
+	// one outlives an abandoned read; holding the slot until raft returns is
+	// what keeps that at one goroutine rather than one per caller. See
+	// awaitAuthoritativeFSM.
+	authoritativeBarrierOnce sync.Once
+	authoritativeBarrier     chan struct{}
 
 	// recreator is the service-layer hook the owner watcher uses to bring up
 	// a sandbox the FSM says we own but the local store doesn't have. Set via
@@ -103,6 +111,9 @@ type Cluster struct {
 	recreator        SandboxRecreator
 	recreatorMu      sync.Mutex
 	ownerWatcherStop context.CancelFunc
+	// replicaBudgetLogUnix throttles the raft replica-admission refusal log;
+	// reconcileVoters re-offers every gossip member every 5s.
+	replicaBudgetLogUnix atomic.Int64
 	// recreateFailures counts consecutive recreate failures per sandbox so
 	// the watcher can escalate to "ask for reassignment" instead of looping
 	// forever on a permanent local failure (image gone, runtime missing,
@@ -140,11 +151,13 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	}
 
 	// Load cluster TLS material first — both raft transport and the internal
-	// HTTPS listener need it. Empty SB_CLUSTER_TLS_DIR keeps the legacy
-	// plaintext path for operators on a fully isolated network.
+	// HTTPS listener need it. Cluster configuration rejects an empty TLS dir.
 	clusterTLS, err := loadClusterTLS(cfg.ClusterTLSDir)
 	if err != nil {
 		return nil, fmt.Errorf("cluster.New: load tls: %w", err)
+	}
+	if clusterTLS != nil && clusterTLS.NodeID() != nodeID {
+		return nil, fmt.Errorf("cluster.New: node certificate identity %q does not match node id %q", clusterTLS.NodeID(), nodeID)
 	}
 
 	rn, err := setupRaft(raftSetupConfig{
@@ -173,11 +186,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		fsm:           fsm,
 		raft:          rn,
 		patToken:      cfg.PATToken,
-		httpClient:    &http.Client{Timeout: commitTimeout + 2*time.Second},
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
-		publicProxies: newProxyCache(defaultPublicTransport),
 	}
 	fsm.recoveryResolver = c.fetchRecoveryBlob
 
@@ -190,7 +201,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			Timeout:   commitTimeout + 2*time.Second,
 			Transport: newInternalTransport(clusterTLS.clientConfig()),
 		}
-		c.mtlsProxies = newProxyCache(newMTLSProxyTransport(clusterTLS.clientConfig()))
+		c.mtlsProxies = newProxyCache()
 		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger)
 		if err != nil {
 			_ = rn.Close()
@@ -238,6 +249,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
 		Events:         &voterAutoJoinDelegate{c: c},
+		OnLeave:        c.invalidatePeerClient,
 	}, admitter, logger)
 	if err != nil {
 		if c.internalServer != nil {
@@ -247,6 +259,12 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		return nil, fmt.Errorf("cluster.New: gossip: %w", err)
 	}
 	c.gossip = gn
+	if c.internalServer != nil {
+		c.internalServer.SetPeerAuthorizer(func(nodeID string) bool {
+			m, ok := gn.lookupMember(nodeID)
+			return ok && m.Alive
+		})
+	}
 	c.capacityLeases = newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
 	c.startCapacityLeaseLoop(cfg.ClusterCapacityGossipInterval)
 
@@ -278,6 +296,61 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
 func (c *Cluster) SelfAPIURL() string { return c.apiURL }
+
+// PeerInternalHTTPClient exposes the cert-pinned client for cluster list
+// fan-out. End-user Authorization must only ride this internal client.
+func (c *Cluster) PeerInternalHTTPClient() *http.Client {
+	if c == nil {
+		return nil
+	}
+	return c.currentInternalClient()
+}
+
+// ClientForPeer returns a cached mTLS HTTP client that verifies DNS SAN
+// node:<nodeID>. Legacy shared-SAN-only peer certs are rejected.
+func (c *Cluster) ClientForPeer(nodeID string) *http.Client {
+	if c == nil {
+		return nil
+	}
+	return c.peerClients.get(c.currentInternalClient(), nodeID)
+}
+
+// PeerDialMember selects the peer client/URL using the per-node mTLS cache.
+func (c *Cluster) PeerDialMember(m Member) (*http.Client, string, error) {
+	if c == nil {
+		return PeerDial(m, nil)
+	}
+	return PeerDialCached(m, c.currentInternalClient(), c.ClientForPeer(m.NodeID))
+}
+
+// invalidatePeerClient drops a cached mTLS client after gossip leave.
+func (c *Cluster) invalidatePeerClient(nodeID string) {
+	if c == nil {
+		return
+	}
+	c.peerClients.invalidate(nodeID)
+	c.mtlsProxies.invalidate(nodeID)
+}
+
+func (c *Cluster) currentInternalClient() *http.Client {
+	if c == nil {
+		return nil
+	}
+	c.internalClientMu.RLock()
+	defer c.internalClientMu.RUnlock()
+	return c.internalClient
+}
+
+// setInternalClient is used by transport tests that replace the immutable
+// production client while background capacity refreshes are running.
+func (c *Cluster) setInternalClient(client *http.Client) {
+	if c == nil {
+		return
+	}
+	c.internalClientMu.Lock()
+	c.internalClient = client
+	c.internalClientMu.Unlock()
+}
 
 // AttachRecreator wires the service-layer recreate hook used by the owner
 // watcher. Called once from cmd/sandboxd/main after both service.New and
@@ -313,9 +386,7 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 		apiURL = c.gossip.peerAPIURL(p.OwnerNodeID)
 	}
 	// InternalURL is only on gossip (it isn't in the persisted Placement
-	// record — operators can toggle TLS without rewriting raft state). Empty
-	// for owners that run without SB_CLUSTER_TLS_DIR; the forwarder then
-	// falls back to apiURL + PAT.
+	// record). An empty value makes peer operations fail closed.
 	internalURL := c.gossip.peerInternalURL(p.OwnerNodeID)
 	return OwnerInfo{
 		NodeID:      p.OwnerNodeID,
@@ -343,8 +414,8 @@ func (c *Cluster) OwnerOfName(name string) (string, OwnerInfo, error) {
 
 // AttachInternalHandler wires the public API mux into the cluster-internal
 // mTLS listener so peers can reverse-proxy owner API calls over the
-// cert-pinned channel. No-op when this node has no TLS material loaded
-// (SB_CLUSTER_TLS_DIR empty) — there's no listener to attach to. Called once
+// cert-pinned channel. No-op only for the single-node/noop construction path
+// where there is no listener to attach to. Called once
 // from cmd/sandboxd after the API server is constructed; the order avoids a
 // service→cluster→api construction cycle.
 func (c *Cluster) AttachInternalHandler(h http.Handler) {
@@ -361,18 +432,45 @@ func (c *Cluster) AttachInternalHandler(h http.Handler) {
 // fsm.go opPlace handling.
 //
 // spec MUST be redacted before being passed in; secrets is the provider
-// handle the caller produces via service.PutClusterSecretsForRecipient.
+// handle the caller produces via service.SealAndDistribute.
 // Passing an empty handle preserves a previously-recorded handle.
 func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
+	expectedIncarnationID := strings.TrimSpace(secrets.IncarnationID)
+	incarnationID := expectedIncarnationID
+	if incarnationID == "" {
+		if placement, ok := c.fsm.get(sandboxID); ok {
+			incarnationID = strings.TrimSpace(placement.IncarnationID)
+			expectedIncarnationID = incarnationID
+			if incarnationID == "" {
+				return fmt.Errorf("%w: existing placement has no incarnation", ErrIncarnationConflict)
+			}
+		} else {
+			var err error
+			incarnationID, err = MintIncarnationID()
+			if err != nil {
+				return err
+			}
+		}
+	}
 	cmd := command{
-		Op:                 opPlace,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        c.nodeID,
-		OwnerAPIURL:        c.apiURL,
-		OwnerDataPlaneHost: c.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
+		Op:                    opPlace,
+		SandboxID:             sandboxID,
+		OwnerNodeID:           c.nodeID,
+		OwnerAPIURL:           c.apiURL,
+		OwnerDataPlaneHost:    c.dataPlaneHost,
+		Spec:                  spec,
+		SecretRef:             secrets.Ref,
+		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:  secrets.SealGeneration,
+		IncarnationID:         incarnationID,
+		ExpectedIncarnationID: expectedIncarnationID,
+		OwnerRef:              secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -383,15 +481,34 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 // node that was marked dead by gossip but never actually lost its local
 // sandbox.
 func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if strings.TrimSpace(secrets.IncarnationID) == "" {
+		placement, ok := c.fsm.get(sandboxID)
+		if !ok {
+			return ErrUnknownSandbox
+		}
+		secrets.IncarnationID = strings.TrimSpace(placement.IncarnationID)
+	}
+	if secrets.IncarnationID == "" {
+		return fmt.Errorf("%w: claim requires current incarnation", ErrIncarnationConflict)
+	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
 	cmd := command{
-		Op:                 opClaimOrphan,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        c.nodeID,
-		OwnerAPIURL:        c.apiURL,
-		OwnerDataPlaneHost: c.dataPlaneHost,
-		Spec:               spec,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
+		Op:                   opClaimOrphan,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          c.nodeID,
+		OwnerAPIURL:          c.apiURL,
+		OwnerDataPlaneHost:   c.dataPlaneHost,
+		Spec:                 spec,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretRecipients:     normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration: secrets.SealGeneration,
+		IncarnationID:        strings.TrimSpace(secrets.IncarnationID),
+		OwnerRef:             secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -407,14 +524,70 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
+	if strings.TrimSpace(secrets.IncarnationID) == "" {
+		placement, ok := c.fsm.get(sandboxID)
+		if !ok {
+			return ErrUnknownSandbox
+		}
+		secrets.IncarnationID = strings.TrimSpace(placement.IncarnationID)
+	}
+	if secrets.IncarnationID == "" {
+		return fmt.Errorf("%w: spec update requires current incarnation", ErrIncarnationConflict)
+	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
 	cmd := command{
-		Op:            opUpsertSpec,
-		SandboxID:     sandboxID,
-		Spec:          spec,
-		SecretRef:     secrets.Ref,
-		SecretVersion: secrets.Version,
+		Op:                    opUpsertSpec,
+		SandboxID:             sandboxID,
+		Spec:                  spec,
+		SecretRef:             secrets.Ref,
+		SecretVersion:         secrets.Version,
+		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:  secrets.SealGeneration,
+		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
 	}
 	return c.applyCommand(ctx, cmd)
+}
+
+// UpdatePlacementSecretRecipients commits a replacement seal recipient set
+// (and optional new provider handle after reseal). Preserves IncarnationID.
+// expectedIncarnationID / expectedSealGeneration CAS against the live placement.
+func (c *Cluster) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
+	recipients = normalizeSecretRecipientIDs(recipients)
+	if err := validateSecretRecipientUpdate(sandboxID, recipients, secrets, expectedIncarnationID, expectedSealGeneration); err != nil {
+		return err
+	}
+	return c.applyCommand(ctx, command{
+		Op:                     opUpdateSecretRecipients,
+		SandboxID:              sandboxID,
+		SecretRecipients:       recipients,
+		SecretRef:              secrets.Ref,
+		SecretVersion:          secrets.Version,
+		SecretSealGeneration:   secrets.SealGeneration,
+		IncarnationID:          strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID:  strings.TrimSpace(expectedIncarnationID),
+		ExpectedOwnerNodeID:    strings.TrimSpace(expectedOwnerNodeID),
+		ExpectedOwnerNodeIDSet: true,
+		ExpectedSealGeneration: expectedSealGeneration,
+	})
+}
+
+// SelectPlacementForCreate is SelectPlacement plus the bounded seal recipient
+// set for sandboxID. The server-side member of the pair: no candidate slice
+// crosses a process boundary here, because there is no boundary to cross.
+func (c *Cluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error) {
+	target, candidates, err := c.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
 }
 
 // SecretsOf returns a copy of the provider handle paired with SpecOf's spec.
@@ -473,13 +646,22 @@ func (c *Cluster) AddExposedPort(ctx context.Context, sandboxID string, port int
 	if port <= 0 {
 		return nil
 	}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return c.addExposedPortForIncarnation(ctx, sandboxID, incarnationID, port, route)
+}
+
+func (c *Cluster) addExposedPortForIncarnation(ctx context.Context, sandboxID, incarnationID string, port int, route ExposedPortRoute) error {
 	cmd := command{
-		Op:        opAddExposedPort,
-		SandboxID: sandboxID,
-		Port:      port,
-		Protocol:  route.Protocol,
-		HostPort:  route.HostPort,
-		PublicURL: route.PublicURL,
+		Op:                    opAddExposedPort,
+		SandboxID:             sandboxID,
+		ExpectedIncarnationID: incarnationID,
+		Port:                  port,
+		Protocol:              route.Protocol,
+		HostPort:              route.HostPort,
+		PublicURL:             route.PublicURL,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -489,7 +671,11 @@ func (c *Cluster) RemoveExposedPort(ctx context.Context, sandboxID string, port 
 	if port <= 0 {
 		return nil
 	}
-	cmd := command{Op: opRemoveExposedPort, SandboxID: sandboxID, Port: port}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	cmd := command{Op: opRemoveExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -514,7 +700,16 @@ func (c *Cluster) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	if sandboxID == "" || hostname == "" {
 		return nil
 	}
-	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	return c.addCustomDomainForIncarnation(ctx, sandboxID, incarnationID, hostname)
+}
+
+func (c *Cluster) addCustomDomainForIncarnation(ctx context.Context, sandboxID, incarnationID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -525,8 +720,28 @@ func (c *Cluster) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	if sandboxID == "" || hostname == "" {
 		return nil
 	}
-	cmd := command{Op: opRemoveCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	incarnationID, found, err := c.currentPlacementIncarnation(sandboxID)
+	if err != nil || !found {
+		return err
+	}
+	cmd := command{Op: opRemoveCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname}
 	return c.applyCommand(ctx, cmd)
+}
+
+func (c *Cluster) currentPlacementIncarnation(sandboxID string) (string, bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if c == nil || c.fsm == nil || sandboxID == "" {
+		return "", false, nil
+	}
+	placement, ok := c.fsm.get(sandboxID)
+	if !ok {
+		return "", false, nil
+	}
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if incarnationID == "" {
+		return "", true, fmt.Errorf("%w: placement mutation requires current incarnation", ErrIncarnationConflict)
+	}
+	return incarnationID, true, nil
 }
 
 // CustomDomainsOf returns a sorted copy of the hostnames bound to sandboxID,
@@ -544,9 +759,97 @@ func (c *Cluster) ResolveCustomDomain(hostname string) (string, bool) {
 }
 
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
+// The expected owner/incarnation come from the local FSM — the same source
+// RemoveCustomDomain uses — so a follower destroy does not POST to the Raft
+// leader before the write. applyCommand still commits on the leader; a stale
+// local row fails the exact CAS instead of 503ing every delete during an
+// election.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
-	cmd := command{Op: opDelete, SandboxID: sandboxID}
+	if c == nil {
+		return nil
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	placement, ok := c.PlacementOf(sandboxID)
+	if !ok {
+		return nil
+	}
+	return c.DeletePlacementExact(ctx, sandboxID, placement.OwnerNodeID, placement.IncarnationID)
+}
+
+func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	expectedOwnerNodeID = strings.TrimSpace(expectedOwnerNodeID)
+	expectedIncarnationID = strings.TrimSpace(expectedIncarnationID)
+	if c == nil || c.fsm == nil || sandboxID == "" {
+		return nil
+	}
+	if expectedIncarnationID == "" {
+		return fmt.Errorf("%w: exact placement delete requires current incarnation", ErrIncarnationConflict)
+	}
+	cmd := command{
+		Op: opDelete, SandboxID: sandboxID,
+		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
+		ExpiresUnix: auditACLExpiryUnix(c.cfg.AuditDeletedGrace), AuditIndexMax: int64(c.cfg.AuditDeletedIndexMax),
+	}
 	return c.applyCommand(ctx, cmd)
+}
+
+func (c *Cluster) BeginDeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	expectedOwnerNodeID = strings.TrimSpace(expectedOwnerNodeID)
+	expectedIncarnationID = strings.TrimSpace(expectedIncarnationID)
+	if c == nil || c.fsm == nil || sandboxID == "" {
+		return nil
+	}
+	if expectedOwnerNodeID == "" || expectedIncarnationID == "" {
+		return fmt.Errorf("%w: begin placement delete requires owner and incarnation", ErrIncarnationConflict)
+	}
+	return c.applyCommand(ctx, command{
+		Op: opBeginDelete, SandboxID: sandboxID,
+		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true,
+		ExpectedIncarnationID: expectedIncarnationID, ExpiresUnix: placementDeleteExpiryUnix(),
+	})
+}
+
+const placementDeleteFinalizeTTL = 10 * time.Minute
+
+func placementDeleteExpiryUnix() int64 {
+	return time.Now().UTC().Add(placementDeleteFinalizeTTL).Unix()
+}
+
+// auditACLExpiryUnix bounds the post-delete routing stub by the configured
+// grace. Zero disables retention outright — it never means forever.
+func auditACLExpiryUnix(grace time.Duration) int64 {
+	if grace <= 0 {
+		return 0
+	}
+	return time.Now().UTC().Add(grace).Unix()
+}
+
+func (c *Cluster) AuditOwnerRef(ctx context.Context, sandboxID string) (string, bool, error) {
+	acl, ok, err := c.AuditACLForSandbox(ctx, sandboxID, "")
+	return acl.OwnerRef, ok, err
+}
+
+func (c *Cluster) AuditACLForSandbox(_ context.Context, sandboxID, incarnationID string) (AuditACL, bool, error) {
+	if c == nil || c.fsm == nil {
+		return AuditACL{}, false, nil
+	}
+	acl, ok := c.fsm.auditACLForSandbox(sandboxID, incarnationID, time.Now().Unix())
+	return acl, ok, nil
+}
+
+func (c *Cluster) PruneAuditACL(ctx context.Context, cutoff time.Time) error {
+	// This is periodic replicated maintenance, so only the leader submits it.
+	// Followers observe the committed command through Raft; forwarding the same
+	// sweep from every service node would create an O(fleet-size) write burst.
+	if c == nil || cutoff.IsZero() || c.raft == nil || c.raft.raft == nil || c.raft.raft.State() != raft.Leader {
+		return nil
+	}
+	return c.applyCommand(ctx, command{Op: opPruneAuditACL, ExpiresUnix: cutoff.Unix()})
 }
 
 // ReserveOnTarget commits a capacity-and-name reservation for sandboxID
@@ -570,16 +873,33 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
 	}
+	if secrets.hasUpdate() {
+		if err := validatePlacementSecretHandle(sandboxID, secrets); err != nil {
+			return err
+		}
+	}
+	incarnationID := strings.TrimSpace(secrets.IncarnationID)
+	if incarnationID == "" {
+		var mintErr error
+		incarnationID, mintErr = MintIncarnationID()
+		if mintErr != nil {
+			return mintErr
+		}
+	}
 	cmd := command{
-		Op:                 opReserve,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
-		Spec:               redacted,
-		SecretRef:          secrets.Ref,
-		SecretVersion:      secrets.Version,
-		ExpiresUnix:        time.Now().Add(ttl).Unix(),
+		Op:                   opReserve,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          target.NodeID,
+		OwnerAPIURL:          target.APIURL,
+		OwnerDataPlaneHost:   target.DataPlaneHost,
+		Spec:                 redacted,
+		SecretRef:            secrets.Ref,
+		SecretVersion:        secrets.Version,
+		SecretSealGeneration: secrets.SealGeneration,
+		SecretRecipients:     append([]string(nil), secrets.Recipients...),
+		IncarnationID:        incarnationID,
+		OwnerRef:             secrets.OwnerRef,
+		ExpiresUnix:          time.Now().Add(ttl).Unix(),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -599,15 +919,32 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 		if r.TTL <= 0 {
 			return fmt.Errorf("cluster: reservation ttl must be > 0")
 		}
+		if r.Secrets.hasUpdate() {
+			if err := validatePlacementSecretHandle(r.SandboxID, r.Secrets); err != nil {
+				return err
+			}
+		}
+		incarnationID := strings.TrimSpace(r.Secrets.IncarnationID)
+		if incarnationID == "" {
+			var mintErr error
+			incarnationID, mintErr = MintIncarnationID()
+			if mintErr != nil {
+				return mintErr
+			}
+		}
 		cmd.Reservations = append(cmd.Reservations, reservationCommand{
-			SandboxID:          r.SandboxID,
-			OwnerNodeID:        r.Target.NodeID,
-			OwnerAPIURL:        r.Target.APIURL,
-			OwnerDataPlaneHost: r.Target.DataPlaneHost,
-			Spec:               r.Redacted,
-			SecretRef:          r.Secrets.Ref,
-			SecretVersion:      r.Secrets.Version,
-			ExpiresUnix:        now.Add(r.TTL).Unix(),
+			SandboxID:            r.SandboxID,
+			OwnerNodeID:          r.Target.NodeID,
+			OwnerAPIURL:          r.Target.APIURL,
+			OwnerDataPlaneHost:   r.Target.DataPlaneHost,
+			Spec:                 r.Redacted,
+			SecretRef:            r.Secrets.Ref,
+			SecretVersion:        r.Secrets.Version,
+			SecretSealGeneration: r.Secrets.SealGeneration,
+			SecretRecipients:     append([]string(nil), r.Secrets.Recipients...),
+			IncarnationID:        incarnationID,
+			OwnerRef:             r.Secrets.OwnerRef,
+			ExpiresUnix:          now.Add(r.TTL).Unix(),
 		})
 	}
 	return c.applyCommand(ctx, cmd)
@@ -618,7 +955,18 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 // State == Reserved, so a stale cancel after a successful promote is a
 // no-op. Idempotent; calling on a never-reserved id is also a no-op.
 func (c *Cluster) CancelReservation(ctx context.Context, sandboxID string) error {
-	cmd := command{Op: opCancelReserve, SandboxID: sandboxID}
+	if c == nil || c.fsm == nil {
+		return nil
+	}
+	placement, ok := c.fsm.get(strings.TrimSpace(sandboxID))
+	if !ok || !placement.IsReserved() {
+		return nil
+	}
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: cancel reservation requires current incarnation", ErrIncarnationConflict)
+	}
+	cmd := command{Op: opCancelReserve, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -641,33 +989,33 @@ func (c *Cluster) SetNodeDrainState(ctx context.Context, nodeID string, drained 
 
 // ReassignPlacement moves sandboxID to target via opReassign.
 func (c *Cluster) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
+	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return fmt.Errorf("cluster: ReassignPlacement requires sandbox id")
 	}
 	if target.NodeID == "" {
 		return fmt.Errorf("cluster: ReassignPlacement requires target node id")
 	}
+	placement, ok := c.fsm.get(sandboxID)
+	if !ok {
+		return ErrUnknownSandbox
+	}
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
+	if incarnationID == "" {
+		return fmt.Errorf("%w: reassign placement requires current incarnation", ErrIncarnationConflict)
+	}
 	cmd := command{
-		Op:                 opReassign,
-		SandboxID:          sandboxID,
-		OwnerNodeID:        target.NodeID,
-		OwnerAPIURL:        target.APIURL,
-		OwnerDataPlaneHost: target.DataPlaneHost,
+		Op:                    opReassign,
+		SandboxID:             sandboxID,
+		OwnerNodeID:           target.NodeID,
+		OwnerAPIURL:           target.APIURL,
+		OwnerDataPlaneHost:    target.DataPlaneHost,
+		ExpectedIncarnationID: incarnationID,
 	}
 	return c.applyCommand(ctx, cmd)
 }
 
 func (c *Cluster) wasmMigratePAT() string { return c.patToken }
-
-func (c *Cluster) wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error) {
-	if c.internalClient != nil && internalURL != "" {
-		return c.internalClient, internalURL, nil
-	}
-	if apiURL == "" {
-		return nil, "", fmt.Errorf("cluster: peer API URL unknown")
-	}
-	return c.httpClient, apiURL, nil
-}
 
 // RemoveMember explicitly retires nodeID from the raft configuration. It is an
 // operator lifecycle command, not gossip failure detection: the caller should
@@ -718,7 +1066,9 @@ func (c *Cluster) removeMemberLocal(ctx context.Context, nodeID string, force bo
 			timeout = remaining
 		}
 	}
+	c.raftMembershipMu.Lock()
 	f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, timeout)
+	c.raftMembershipMu.Unlock()
 	if err := f.Error(); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
 			return ErrNotLeader
@@ -751,16 +1101,14 @@ func (c *Cluster) forwardRemoveMemberToLeader(ctx context.Context, nodeID string
 	if force {
 		path += "?force=true"
 	}
-	if c.internalClient != nil && c.gossip != nil {
-		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
-			return c.doLeaderLifecycle(ctx, c.internalClient, strings.TrimRight(peerInternal, "/")+path, http.MethodDelete, nil)
-		}
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return ErrPeerInternalURLRequired
 	}
-	leaderURL := c.LeaderAPIURL()
-	if leaderURL == "" {
-		return ErrNotLeader
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return ErrPeerInternalURLRequired
 	}
-	return c.doLeaderLifecycle(ctx, c.httpClient, strings.TrimRight(leaderURL, "/")+path, http.MethodDelete, nil)
+	return c.doLeaderLifecycle(ctx, c.ClientForPeer(leader), strings.TrimRight(peerInternal, "/")+path, http.MethodDelete, nil)
 }
 
 func (c *Cluster) doLeaderLifecycle(ctx context.Context, client *http.Client, endpoint, method string, body []byte) error {
@@ -867,6 +1215,10 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			continue
 		}
 		existing, ok := c.fsm.get(st.ID)
+		incarnationID := strings.TrimSpace(st.Secrets.IncarnationID)
+		if ok {
+			incarnationID = strings.TrimSpace(existing.IncarnationID)
+		}
 
 		switch {
 		case !ok:
@@ -877,12 +1229,12 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			// Replay port intents so the FSM matches local truth.
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -892,12 +1244,12 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				firstErr = err
 			}
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -908,18 +1260,33 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			// pre-cluster-sandbox limitation), then replay port + hostname
 			// intents. The FSM treats already-bound (sandbox, hostname) pairs
 			// as idempotent no-ops, so re-replaying every boot is cheap.
-			if existing.Spec == nil && st.Spec != nil {
-				if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
+			needsSecretBackfill := existing.SecretSealGeneration <= 0 && st.Secrets.hasUpdate()
+			if (existing.Spec == nil && st.Spec != nil) || needsSecretBackfill {
+				var spec *models.CreateSandboxRequest
+				if existing.Spec == nil {
+					spec = st.Spec
+				}
+				replaySecrets := PlacementSecrets{IncarnationID: incarnationID}
+				if needsSecretBackfill {
+					replaySecrets = st.Secrets
+				}
+				if err := c.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if existing.SecretSealGeneration > 0 && st.Secrets.hasUpdate() &&
+				st.Secrets.SealGeneration > existing.SecretSealGeneration && len(st.Secrets.Recipients) > 0 {
+				if err := c.UpdatePlacementSecretRecipients(ctx, st.ID, st.Secrets.Recipients, st.Secrets, incarnationID, c.nodeID, existing.SecretSealGeneration); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -932,7 +1299,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				continue
 			}
 			for port, route := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+				if err := c.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -942,7 +1309,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			// stale row until that row is reaped; the next AssertOwnership
 			// pass after reap succeeds.
 			for _, hostname := range st.CustomHostnames {
-				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+				if err := c.addCustomDomainForIncarnation(ctx, st.ID, incarnationID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -981,6 +1348,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 	if err := validateCommandRecoverySize(cmd); err != nil {
 		return err
 	}
+	if err := validateCommandLifecycle(cmd); err != nil {
+		return err
+	}
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
@@ -1009,6 +1379,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if err := validateCommandRecoverySize(cmd); err != nil {
 		return err
 	}
+	if err := validateCommandLifecycle(cmd); err != nil {
+		return err
+	}
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 		return c.applyReservationEncodedLocal(ctx, payload, cmd)
 	}
@@ -1031,7 +1404,14 @@ func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []by
 // Caller is responsible for verifying we're the leader before this point —
 // raft itself returns ErrNotLeader if we lost leadership between the check
 // and the Apply call, which is mapped back to cluster.ErrNotLeader.
-func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err error) {
+func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
+	_, err := c.applyEncodedLocalResult(ctx, payload)
+	return err
+}
+
+// applyEncodedLocalResult is applyEncodedLocal for the ops whose FSM answer
+// the caller needs (an allocated token, say). Everything else discards it.
+func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (result any, err error) {
 	done := beginRaftApply()
 	defer func() { done(err) }()
 	timeout := c.commitTimeout
@@ -1044,66 +1424,48 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err er
 	if applyErr := f.Error(); applyErr != nil {
 		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
 			err = ErrNotLeader
-			return ErrNotLeader
+			return nil, ErrNotLeader
 		}
 		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
-		return err
+		return nil, err
 	}
 	response := f.Response()
 	if appErr, ok := response.(error); ok && appErr != nil {
 		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
-		return err
+		return nil, err
 	}
-	if result, ok := response.(reassignApplyResult); ok && result.Changed {
+	if reassigned, ok := response.(reassignApplyResult); ok && reassigned.Changed {
 		// This runs once on the leader after its FSM confirms the ownership
 		// transition. Followers apply the same log entry but never execute this
 		// wrapper, and a lost HTTP acknowledgement cannot erase the count.
 		recordFailoverReassign()
 	}
-	return nil
+	return response, nil
 }
 
 // forwardApplyToLeader posts an encoded raft command to the current leader's
 // internal apply endpoint. Returns ErrNotLeader if no leader is known (so the
 // caller can surface the same retry semantics as a stale local leader-check).
 //
-// Channel selection: if both this node and the leader have advertised an
-// InternalURL (i.e. both have SB_CLUSTER_TLS_DIR set), we dial the leader's
-// mTLS listener — the TLS handshake proves cluster membership before the
-// payload is read. Otherwise we fall back to the public API URL, which only
-// validates the shared PAT and is acceptable on a private overlay.
+// The leader's InternalURL and a node-pinned mTLS client are required.
 func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) error {
 	leader := c.Leader()
 	if leader == "" {
 		return ErrNotLeader
 	}
 
-	// Prefer the cluster-internal mTLS channel when both ends are TLS-equipped.
-	if c.internalClient != nil {
-		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
-			endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
-			err := c.doLeaderApply(ctx, c.internalClient, endpoint, payload)
-			// Hard-fail (network/TLS) on the internal channel must NOT silently
-			// fall back to the public path — that would defeat the security
-			// promise. Only ErrNotLeader bubbles up so the caller retries the
-			// new leader (which may pick the public path next iteration).
-			return err
-		}
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return ErrPeerInternalURLRequired
 	}
-
-	// Fallback: public API URL with PAT-only auth. This path runs when the
-	// peer (or self) doesn't have TLS material — typically a mixed-rollout
-	// or a fully-plaintext private-network deployment.
-	leaderURL := c.LeaderAPIURL()
-	if leaderURL == "" {
-		return ErrNotLeader
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return ErrPeerInternalURLRequired
 	}
-	endpoint := strings.TrimRight(leaderURL, "/") + "/v1/cluster/internal/apply"
-	return c.doLeaderApply(ctx, c.httpClient, endpoint, payload)
+	endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
+	return c.doLeaderApply(ctx, c.ClientForPeer(leader), endpoint, payload)
 }
 
-// doLeaderApply is the shared HTTP execution path used by both the mTLS
-// internal channel and the PAT-only public-API fallback in forwardApplyToLeader.
+// doLeaderApply executes a node-pinned mTLS leader apply.
 func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoint string, payload []byte) (err error) {
 	done := beginLeaderForwardApply()
 	defer func() { done(err) }()
@@ -1112,6 +1474,7 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 		return fmt.Errorf("cluster: build leader-forward request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
+	SetPeerNodeIDHeader(req, c.nodeID)
 	if c.patToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.patToken)
 	}
@@ -1124,23 +1487,7 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	message := strings.TrimSpace(string(body))
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
-	}
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		if strings.Contains(message, ErrCapacityExceeded.Error()) {
-			return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
-		}
-		if strings.Contains(message, ErrNoPlacementTarget.Error()) {
-			return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
-		}
-		if strings.Contains(message, ErrCreateBackpressure.Error()) {
-			return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
-		}
-		return ErrNotLeader
-	}
-	return fmt.Errorf("cluster: leader-forward apply: status %d: %s", resp.StatusCode, message)
+	return forwardApplyStatus(resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 // waitForLeader blocks until raft reports a leader or the deadline passes.
@@ -1170,6 +1517,24 @@ func (c *Cluster) Members() []Member {
 	return c.membersWithCapacity()
 }
 
+// LocalMembers returns the gossip membership view without capacity enrichment.
+// Hot paths (list failover_ready) use this to avoid per-row Members() work.
+func (c *Cluster) LocalMembers() []Member {
+	if c == nil || c.gossip == nil {
+		return nil
+	}
+	return c.gossip.members()
+}
+
+// LookupMember returns one gossip member by node ID without scanning the full
+// membership list. Used by placement-page list hydration (O(owners)).
+func (c *Cluster) LookupMember(id string) (Member, bool) {
+	if c == nil || c.gossip == nil || id == "" {
+		return Member{}, false
+	}
+	return c.gossip.lookupMember(id)
+}
+
 // IngressTargets aggregates live ingress-role members' gossiped PublicHost
 // values. See aggregateIngressTargets for the partition / dedup / ordering
 // rules — those are pinned by ingress_targets_test.go.
@@ -1192,6 +1557,15 @@ func (c *Cluster) SetLocalTemplateIDsProvider(fn func() ([]string, bool)) {
 		return
 	}
 	c.capacityLeases.SetLocalTemplateIDsProvider(fn)
+}
+
+// SetLocalTemplateCatalogProvider registers the all-lifecycle template
+// catalogue callback used by administrative item routing.
+func (c *Cluster) SetLocalTemplateCatalogProvider(fn func() ([]string, bool)) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetLocalTemplateCatalogProvider(fn)
 }
 
 // SetLocalWasmModuleIDsProvider registers the WASM module inventory callback.
@@ -1236,6 +1610,73 @@ func (c *Cluster) PlacementOf(sandboxID string) (Placement, bool) {
 		return Placement{}, false
 	}
 	return c.fsm.get(sandboxID)
+}
+
+// PlacementsByIDs returns hot placement rows for the given IDs (point lookups).
+func (c *Cluster) PlacementsByIDs(ids []string) map[string]Placement {
+	if c == nil || c.fsm == nil {
+		return map[string]Placement{}
+	}
+	return c.fsm.placementsByIDs(ids)
+}
+
+// AuthoritativePlacementsByIDs serves destructive reconciliation from the
+// current leader. Followers fetch the bounded result over the same node-pinned
+// mTLS channel used for forwarded Raft operations; they never substitute a
+// potentially stale local FSM read.
+func (c *Cluster) AuthoritativePlacementsByIDs(ctx context.Context, ids []string) (map[string]Placement, error) {
+	if c == nil || c.fsm == nil || c.raft == nil || c.raft.raft == nil {
+		return nil, errors.New("cluster: authoritative placement read unavailable")
+	}
+	if c.raft.raft.State() == raft.Leader {
+		return c.fsm.placementsByIDs(ids), nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, controlPlanePlacementRequestTimeout)
+	defer cancel()
+	leader := c.Leader()
+	if leader == "" {
+		return nil, ErrNotLeader
+	}
+	if c.currentInternalClient() == nil || c.gossip == nil {
+		return nil, ErrPeerInternalURLRequired
+	}
+	peerInternal := c.gossip.peerInternalURL(leader)
+	if peerInternal == "" {
+		return nil, ErrPeerInternalURLRequired
+	}
+	payload, err := json.Marshal(placementsByIDsRequest{IDs: ids})
+	if err != nil {
+		return nil, fmt.Errorf("cluster: encode authoritative placement read: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(peerInternal, "/")+PublicInternalPlacementsByIDsPath+"?authoritative=true", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("cluster: build authoritative placement read: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	SetPeerNodeIDHeader(req, c.nodeID)
+	if c.patToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	resp, err := c.ClientForPeer(leader).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: authoritative placement read: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return nil, ErrNotLeader
+		}
+		return nil, fmt.Errorf("cluster: authoritative placement read: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var out map[string]Placement
+	if err := decodeControlPlaneJSON(resp.Body, &out); err != nil {
+		return nil, fmt.Errorf("cluster: decode authoritative placement read: %w", err)
+	}
+	if out == nil {
+		out = map[string]Placement{}
+	}
+	return out, nil
 }
 
 // PlacementVersion returns the FSM's monotonic apply counter — bumps on

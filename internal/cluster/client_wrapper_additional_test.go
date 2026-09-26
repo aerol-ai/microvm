@@ -13,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	secretspkg "github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/hashicorp/raft"
 )
 
@@ -29,14 +30,29 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 		{NodeID: "self-node", APIURL: "http://self-node", Alive: true},
 		{NodeID: "owner-node", APIURL: "http://owner-node", InternalURL: "https://owner-node.internal", Alive: true},
 	})
+	if got := c.LocalMembers(); len(got) != 2 {
+		t.Fatalf("LocalMembers() = %+v, want two indexed members", got)
+	}
+	if got, ok := c.LookupMember("owner-node"); !ok || got.NodeID != "owner-node" {
+		t.Fatalf("LookupMember(owner-node) = (%+v, %v)", got, ok)
+	}
+	if _, ok := c.LookupMember(""); ok {
+		t.Fatal("LookupMember(empty) found a member")
+	}
+	if c.PeerInternalHTTPClient() != nil {
+		t.Fatal("cluster without mTLS returned an internal client")
+	}
+	c.SetLocalTemplateCatalogProvider(func() ([]string, bool) { return []string{"template-a"}, true })
 
 	applyOp(t, c.fsm, command{
-		Op:            opPlace,
-		SandboxID:     "sb-demo",
-		OwnerNodeID:   "owner-node",
-		Spec:          &models.CreateSandboxRequest{Name: "demo", Image: "alpine:3.20"},
-		SecretRef:     "cluster-secret://sandbox/sb-demo/v1",
-		SecretVersion: 1,
+		Op:                   opPlace,
+		SandboxID:            "sb-demo",
+		OwnerNodeID:          "owner-node",
+		Spec:                 &models.CreateSandboxRequest{Name: "demo", Image: "alpine:3.20"},
+		IncarnationID:        "inc-demo",
+		SecretRef:            testSecretRef("sb-demo", "inc-demo"),
+		SecretVersion:        1,
+		SecretSealGeneration: 4,
 	})
 	applyOp(t, c.fsm, command{Op: opAddExposedPort, SandboxID: "sb-demo", Port: 8080, Protocol: "http"})
 	applyOp(t, c.fsm, command{Op: opSetNodeDrainState, NodeID: "drained-node", Drained: true})
@@ -73,7 +89,7 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 	}
 
 	secrets := c.SecretsOf("sb-demo")
-	if secrets.Ref != "cluster-secret://sandbox/sb-demo/v1" || secrets.Version != 1 {
+	if secrets.Ref != testSecretRef("sb-demo", "inc-demo") || secrets.Version != 1 || secrets.SealGeneration != 4 {
 		t.Fatalf("SecretsOf() = %+v, want stored secret handle", secrets)
 	}
 	routes := c.ExposedPortsOf("sb-demo")
@@ -96,6 +112,10 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 	}
 	if placement, ok := c.PlacementOf("sb-demo"); !ok || placement.SandboxID != "sb-demo" {
 		t.Fatalf("PlacementOf() = (%+v, %v), want sb-demo placement and true", placement, ok)
+	}
+	byID := c.PlacementsByIDs([]string{"sb-demo", "missing", "sb-demo"})
+	if len(byID) != 1 || byID["sb-demo"].OwnerNodeID != "owner-node" {
+		t.Fatalf("PlacementsByIDs() = %+v, want one point lookup", byID)
 	}
 	if got := c.PlacementVersion(); got != 0 {
 		t.Fatalf("PlacementVersion() = %d, want 0 for zero-index local FSM applies", got)
@@ -129,12 +149,34 @@ func TestClusterClientReservationAndMutationWrappers(t *testing.T) {
 	c.gossip.delegate.admitter = admitter
 	c.gossip.delegate.mu.Unlock()
 	c.gossip.refreshMemberIndex()
-	c.capacityLeases.admitter = admitter
+	c.capacityLeases.setAdmitter(admitter)
 	c.capacityLeases.set(c.nodeID, admitter.Snapshot(), time.Now())
 
 	ctx := context.Background()
-	if err := c.RecordPlacement(ctx, "sb-expose", nil, PlacementSecrets{}); err != nil {
+	if err := c.RecordPlacement(ctx, "sb-expose", nil, PlacementSecrets{
+		Ref:            secretspkg.FormatRef("sb-expose", "inc-expose", secretspkg.RefVersion),
+		Version:        secretspkg.RefVersion,
+		IncarnationID:  "inc-expose",
+		SealGeneration: 3,
+	}); err != nil {
 		t.Fatalf("RecordPlacement() error = %v", err)
+	}
+	if got := c.SecretsOf("sb-expose"); got.SealGeneration != 3 {
+		t.Fatalf("RecordPlacement secret handle = %+v, want seal generation 3", got)
+	}
+	if err := c.UpdatePlacementSecretRecipients(ctx, "sb-expose", []string{" node-z ", "node-z"}, PlacementSecrets{
+		Ref:            secretspkg.FormatRef("sb-expose", "inc-expose", secretspkg.RefVersion),
+		Version:        secretspkg.RefVersion,
+		IncarnationID:  "inc-expose",
+		SealGeneration: 4,
+	}, "inc-expose", c.nodeID, 3); err != nil {
+		t.Fatalf("UpdatePlacementSecretRecipients() error = %v", err)
+	}
+	if got := c.SecretsOf("sb-expose"); got.SealGeneration != 4 || len(got.Recipients) != 1 || got.Recipients[0] != "node-z" {
+		t.Fatalf("updated secret handle = %+v", got)
+	}
+	if err := c.UpdatePlacementSecretRecipients(ctx, "", []string{"node-z"}, PlacementSecrets{}, "", "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+		t.Fatalf("empty sandbox update = %v, want ErrSecretRecipientsCASMismatch", err)
 	}
 	if err := c.AddExposedPort(ctx, "sb-expose", 8080, ExposedPortRoute{Protocol: "http"}); err != nil {
 		t.Fatalf("AddExposedPort() error = %v", err)
@@ -187,6 +229,129 @@ func TestClusterClientReservationAndMutationWrappers(t *testing.T) {
 	}
 	if err := c.ReserveBatchOnTargets(ctx, []PlacementReservation{{SandboxID: "sb-bad-batch", Target: target, TTL: 0}}); err == nil {
 		t.Fatal("ReserveBatchOnTargets() accepted ttl <= 0")
+	}
+}
+
+func TestClusterAndAgentNewReadWrappersFailClosed(t *testing.T) {
+	if got := normalizeSecretRecipientIDs(nil); got != nil {
+		t.Fatalf("normalized nil recipients = %v", got)
+	}
+	if got := normalizeSecretRecipientIDs([]string{" node-a ", "", "node-a", "node-b"}); len(got) != 2 || got[0] != "node-a" || got[1] != "node-b" {
+		t.Fatalf("normalized recipients = %v", got)
+	}
+	(&fsmSnapshot{}).Release()
+
+	var c *Cluster
+	if c.PeerInternalHTTPClient() != nil || c.ClientForPeer("node-a") != nil {
+		t.Fatal("nil cluster returned a peer client")
+	}
+	if got := c.LocalMembers(); got != nil {
+		t.Fatalf("nil cluster members = %+v", got)
+	}
+	if _, ok := c.LookupMember("node-a"); ok {
+		t.Fatal("nil cluster resolved a member")
+	}
+	if got := c.PlacementsByIDs([]string{"sb"}); len(got) != 0 {
+		t.Fatalf("nil-FSM point lookup = %+v", got)
+	}
+	c.SetLocalTemplateCatalogProvider(func() ([]string, bool) { return nil, true })
+	if err := c.UpdatePlacementSecretRecipients(context.Background(), "", nil, PlacementSecrets{}, "", "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+		t.Fatalf("nil cluster empty update = %v, want ErrSecretRecipientsCASMismatch", err)
+	}
+
+	var a *Agent
+	if a.PeerInternalHTTPClient() != nil || a.ClientForPeer("node-a") != nil {
+		t.Fatal("nil agent returned a peer client")
+	}
+	if got := a.LocalMembers(); got != nil {
+		t.Fatalf("nil agent members = %+v", got)
+	}
+	if _, ok := a.LookupMember("node-a"); ok {
+		t.Fatal("nil agent resolved a member")
+	}
+	if err := a.UpdatePlacementSecretRecipients(context.Background(), "", nil, PlacementSecrets{}, "", "", 0); !errors.Is(err, ErrSecretRecipientsCASMismatch) {
+		t.Fatalf("nil agent empty update = %v, want ErrSecretRecipientsCASMismatch", err)
+	}
+}
+
+func TestNoopSecurityAndListContracts(t *testing.T) {
+	ctx := context.Background()
+	n := NewNoop("node-a", "http://node-a", "node-a.example.test")
+	if err := n.UpdatePlacementSecretRecipients(ctx, "sb", []string{"node-a"}, PlacementSecrets{}, "", "", 0); err != nil {
+		t.Fatalf("standalone recipient update = %v", err)
+	}
+	if owner, ok, err := n.AuditOwnerRef(ctx, "sb"); err != nil || ok || owner != "" {
+		t.Fatalf("standalone audit owner = (%q, %v, %v)", owner, ok, err)
+	}
+	if acl, ok, err := n.AuditACLForSandbox(ctx, "sb", ""); err != nil || ok || acl.SandboxID != "" {
+		t.Fatalf("standalone audit ACL = (%+v, %v, %v)", acl, ok, err)
+	}
+	if err := n.PruneAuditACL(ctx, time.Now()); err != nil {
+		t.Fatalf("standalone audit ACL prune = %v", err)
+	}
+	n.AttachInternalHandler(http.NotFoundHandler())
+	if n.PeerInternalHTTPClient() != nil {
+		t.Fatal("standalone mode exposed a cluster-internal client")
+	}
+	if got := n.LocalMembers(); len(got) != 1 || got[0].NodeID != "node-a" {
+		t.Fatalf("standalone local members = %+v", got)
+	}
+	if got, ok := n.LookupMember("node-a"); !ok || !got.Alive {
+		t.Fatalf("standalone member lookup = (%+v, %v)", got, ok)
+	}
+	if _, ok := n.LookupMember("node-b"); ok {
+		t.Fatal("standalone mode resolved a different node")
+	}
+	if got := n.PlacementsByIDs([]string{"sb"}); len(got) != 0 {
+		t.Fatalf("standalone placement lookup = %+v", got)
+	}
+}
+
+func TestAgentMembershipAndSecretRecipientUpdate(t *testing.T) {
+	var sawApply bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != InternalAPIPath || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		sawApply = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	index := newGossipMemberIndex()
+	index.replace([]Member{
+		{NodeID: "agent-a", Alive: true, Role: "worker"},
+		{NodeID: "server-a", Alive: true, Role: "server", InternalURL: server.URL},
+	})
+	a := &Agent{
+		nodeID:         "agent-a",
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		gossip:         &gossipNode{memberIndex: index},
+		internalClient: server.Client(),
+	}
+	if got := a.PeerInternalHTTPClient(); got != server.Client() {
+		t.Fatal("agent did not expose its internal peer client")
+	}
+	if got := a.LocalMembers(); len(got) != 2 {
+		t.Fatalf("agent LocalMembers() = %+v", got)
+	}
+	if got, ok := a.LookupMember("server-a"); !ok || got.InternalURL != server.URL {
+		t.Fatalf("agent LookupMember(server-a) = (%+v, %v)", got, ok)
+	}
+	if _, ok := a.LookupMember("missing"); ok {
+		t.Fatal("agent resolved a missing member")
+	}
+	if err := a.UpdatePlacementSecretRecipients(context.Background(), "sb-a", []string{" node-b ", "node-b"}, PlacementSecrets{
+		Ref:            secretspkg.FormatRef("sb-a", "inc-a", secretspkg.RefVersion),
+		Version:        secretspkg.RefVersion,
+		IncarnationID:  "inc-a",
+		SealGeneration: 4,
+	}, "inc-a", "server-a", 3); err != nil {
+		t.Fatalf("agent recipient update: %v", err)
+	}
+	if !sawApply {
+		t.Fatal("agent recipient update was not forwarded")
 	}
 }
 
@@ -247,7 +412,7 @@ func TestClusterDoLeaderLifecycleMapsResponses(t *testing.T) {
 			}))
 			defer server.Close()
 
-			c := &Cluster{httpClient: server.Client(), patToken: "cluster-pat"}
+			c := &Cluster{patToken: "cluster-pat"}
 			err := c.doLeaderLifecycle(ctx, server.Client(), server.URL+"/v1/cluster/members/node-a", http.MethodDelete, []byte(`{"force":true}`))
 			if tt.wantErr == nil {
 				if err != nil {
@@ -269,7 +434,7 @@ func TestClusterDoLeaderLifecycleMapsResponses(t *testing.T) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer server.Close()
-	c := &Cluster{httpClient: server.Client()}
+	c := &Cluster{}
 	if err := c.doLeaderLifecycle(ctx, server.Client(), server.URL+"/v1/cluster/members/node-a", http.MethodDelete, nil); err == nil || !strings.Contains(err.Error(), "status 500") {
 		t.Fatalf("doLeaderLifecycle(500) error = %v, want status 500 message", err)
 	}

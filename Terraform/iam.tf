@@ -89,6 +89,28 @@ data "aws_iam_policy_document" "joiner_r" {
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.bundle.arn]
   }
+
+  # CSR rendezvous (templates/bootstrap.sh.tftpl). A joiner mints node.key +
+  # node.csr locally — ca.key never leaves the seed — and uploads the CSR here
+  # for the seed's signing loop to pick up.
+  #
+  # The prefix is ${aws:userid}, which the joiner CANNOT choose: for EC2
+  # instance-profile credentials IAM resolves it to
+  # "<role-unique-id>:<instance-id>", so an instance can only ever write under
+  # its own prefix. That is load-bearing, not tidiness. cluster-sign-node.sh
+  # stamps `DNS:node:<id>` straight from its --node-id flag and NEVER inspects
+  # the CSR's subject, so if the seed took the node id from anything the
+  # uploader controls — a filename, a field inside the CSR — any joiner could
+  # obtain a valid cert for another node's identity and impersonate it over
+  # cluster mTLS. The seed therefore reads the id from nodes/<userid>, an
+  # object only Terraform writes (see aws_s3_object.joiner_identity).
+  #
+  # PutObject only: no Delete, no overwrite of anything outside csr/, and no
+  # read grant beyond what joiners already had.
+  statement {
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.bundle.arn}/csr/$${aws:userid}/*"]
+  }
 }
 
 resource "aws_iam_role_policy" "seed_rw" {

@@ -15,7 +15,11 @@ BIN_DIR ?= bin
 	integration-benchmark-gvisor integration-benchmark-gvisor-only \
 	integration-benchmark-gvisor-docker integration-benchmark-gvisor-docker-only \
 	integration-single-fc integration-benchmark-fc-single integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap \
-	integration-cert-store-init integration-clear-lease
+	integration-cert-store-init integration-clear-lease \
+	itest-build itest-publish itest-artifacts-init \
+	integration-secrets-single integration-secrets-cluster integration-secrets-kms \
+	integration-secrets-enterprise integration-secrets-hetero integration-secrets-hetero-kms \
+	integration-secrets-gate integration-bench-cluster
 
 fmt:
 	$(GO) fmt ./...
@@ -74,9 +78,13 @@ clean:
 #   make integration-cluster-hetero FLAGS=--keep
 # Supported words: keep (leave infra up), prod-tls (real Let's Encrypt),
 # metal-on-demand (force firecracker bare-metal off spot),
-# no-disruptive (skip node-kill UCs on cluster-hetero).
+# no-disruptive (skip node-kill UCs on cluster-hetero),
+# released (provision from releases/latest instead of a local build),
+# no-build (reuse the last published local build).
+# A pinned tag needs a value, so it goes through the explicit form:
+#   make integration-single FLAGS=--version=v0.7.21
 FLAGS ?=
-INTEGRATION_FLAG_WORDS := keep prod-tls metal-on-demand no-disruptive
+INTEGRATION_FLAG_WORDS := keep prod-tls metal-on-demand no-disruptive released no-build
 RUN_EXTRA := $(filter $(INTEGRATION_FLAG_WORDS),$(MAKECMDGOALS))
 RUN_FLAGS := $(strip $(FLAGS) $(patsubst %,--%,$(RUN_EXTRA)))
 # Swallow the bare flag-words as no-op goals so `make` doesn't try to build them
@@ -91,6 +99,64 @@ endif
 # instead of re-issuing it against Let's Encrypt. Idempotent; safe to re-run.
 integration-cert-store-init:
 	integration-tests/lib/provision.sh cert-store-init
+
+# Local artifact pipeline (plans/integration-test-security.md §4). Scenarios
+# build + publish on their own, so these are for iterating on the build itself
+# or for pre-warming the cache before a matrix run.
+#
+# BUILD_FLAGS passes through to build.sh:
+#   make itest-build BUILD_FLAGS="--ref main"            # UC-165 baseline arm
+#   make itest-build BUILD_FLAGS="--arch amd64,arm64"
+#   make itest-build BUILD_FLAGS=--with-caddy
+BUILD_FLAGS ?=
+
+# One-time (per operator/account) bootstrap of the PERSISTENT artifacts bucket
+# the harness publishes locally-built binaries to. Like the cert bucket, it
+# lives OUTSIDE every scenario's Terraform state so a per-scenario destroy can
+# never wipe artifacts another scenario is still installing from. Idempotent.
+itest-artifacts-init:
+	integration-tests/lib/build.sh artifacts-init
+
+itest-build:
+	integration-tests/lib/build.sh build $(BUILD_FLAGS)
+
+# Uploads the current build and prints the presigned tfvars on stdout, so
+# `make itest-publish > /tmp/artifacts.tfvars` composes into a manual
+# terraform apply. Scenarios do this for themselves.
+itest-publish:
+	@integration-tests/lib/build.sh publish $(BUILD_FLAGS)
+
+# Security matrix (plans/integration-test-security.md §6.2). Cadence: the gate
+# (S1→S4, ~$0.75, ~1.5h) every push; the flagship (S5+S6, ~$28, ~2h) once
+# pre-merge and after any internal/cluster, fan-out or reseal change.
+integration-secrets-single:
+	integration-tests/run.sh single-node-secrets $(RUN_FLAGS)
+
+integration-secrets-cluster:
+	integration-tests/run.sh cluster-3-mixed-secrets $(RUN_FLAGS)
+
+integration-secrets-kms:
+	integration-tests/run.sh cluster-3-mixed-secrets-kms $(RUN_FLAGS)
+
+integration-secrets-enterprise:
+	integration-tests/run.sh cluster-3-mixed-secrets-enterprise $(RUN_FLAGS)
+
+# S1→S4 in order, cheapest first: a red S1 means the cluster scenarios are not
+# worth paying for. Sequential on purpose — they share the domain pool.
+integration-secrets-gate: integration-secrets-single integration-secrets-cluster integration-secrets-kms integration-secrets-enterprise
+
+# Flagship. 8 nodes including a c5.metal, on-demand (spot reclaim makes
+# multi-node convergence flaky and metal exceeds the spot quota).
+integration-secrets-hetero:
+	integration-tests/run.sh cluster-hetero-secrets $(RUN_FLAGS)
+
+integration-secrets-hetero-kms:
+	integration-tests/run.sh cluster-hetero-secrets-kms $(RUN_FLAGS)
+
+# The latency arm UC-165's band is measured against (D5: baseline is
+# main-built binaries via `make itest-build BUILD_FLAGS="--ref main"`).
+integration-bench-cluster:
+	AEROL_BENCH=1 integration-tests/run.sh cluster-3-mixed-bench $(RUN_FLAGS)
 
 integration-local:
 	integration-tests/run.sh local-mode $(RUN_FLAGS)
@@ -116,6 +182,13 @@ integration-single-wasm:
 # (UC-103..105), including the per-sandbox egress-attribution proof.
 integration-single-isolate:
 	integration-tests/run.sh single-node-isolate $(RUN_FLAGS)
+
+# Same box with the workerd jail ON (the daemon default): chroot + cgroup +
+# privilege drop + enforcing seccomp. Runs UC-103..105 against jailed groups
+# and UC-109, which inspects the workerd process over SSH. This is the gate for
+# trusting the jail with untrusted tenant code (setup/runbooks/isolate-jail.md).
+integration-single-isolate-jail:
+	integration-tests/run.sh single-node-isolate-jail $(RUN_FLAGS)
 
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)

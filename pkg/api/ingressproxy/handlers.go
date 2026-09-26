@@ -367,6 +367,7 @@ func writeWakeError(logger *slog.Logger, w http.ResponseWriter, id string, port 
 // observed at the next tick — one stray AfterFunc invocation may run
 // after the request completes, but it short-circuits on ctx.Err().
 func (h *handlers) scheduleActivityTouch(ctx context.Context, id string) {
+	interval := activityTickInterval
 	var fire func()
 	fire = func() {
 		if ctx.Err() != nil {
@@ -376,7 +377,7 @@ func (h *handlers) scheduleActivityTouch(ctx context.Context, id string) {
 		if ctx.Err() != nil {
 			return
 		}
-		time.AfterFunc(activityTickInterval, fire)
+		time.AfterFunc(interval, fire)
 	}
-	time.AfterFunc(activityTickInterval, fire)
+	time.AfterFunc(interval, fire)
 }

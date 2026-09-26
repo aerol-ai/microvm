@@ -126,10 +126,30 @@ resource "aws_instance" "seed" {
     bundle_bucket                            = aws_s3_bucket.bundle.bucket
     aws_region                               = var.aws_region
     seed_private_ip                          = ""
+    audit_receiver_endpoint                  = local.audit_receiver_endpoint_url
+    audit_receiver_host                      = local.audit_receiver_host
+    audit_receiver_host_ip                   = "127.0.0.1"
+    audit_receiver_cert_pem                  = local.audit_receiver_cert_pem
+    audit_receiver_key_pem                   = local.audit_receiver_key_pem
     install_script_url                       = var.install_script_url
     caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
     cluster_join_script_url                  = var.cluster_join_script_url
+    cluster_sign_node_script_url             = var.cluster_sign_node_script_url
+    sandboxd_url                             = var.sandboxd_url
+    toolboxd_url                             = var.toolboxd_url
+    checksums_url                            = var.checksums_url
+    joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
+    secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
+    secret_kms_strict_boot                   = var.secret_kms_strict_boot
+    audit_export_backend                     = var.audit_export_backend
+    audit_export_file_path                   = var.audit_export_file_path
+    audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+    audit_export_s3_prefix                   = var.cluster_name
+    audit_receiver_url                       = var.audit_receiver_url
+    audit_receiver_port                      = var.audit_receiver_port
+    audit_receiver_token                     = local.audit_receiver_token_value
+    audit_receiver_hmac_key                  = local.audit_receiver_hmac_value
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
@@ -145,6 +165,8 @@ resource "aws_instance" "seed" {
     image_build_gc_interval                  = local.cluster_ops.image_build_gc.interval
     image_build_gc_ttl                       = local.cluster_ops.image_build_gc.ttl
     extra_user_data                          = local.seed_node.extra_user_data
+    sandboxd_env                             = merge(var.extra_sandboxd_env, local.seed_node.sandboxd_env)
+    shard_aware_ingress                      = var.shard_aware_ingress
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
     caddy_storage_s3_bucket         = local.caddy_storage_s3.bucket
@@ -198,6 +220,18 @@ resource "aws_instance" "seed" {
 
   lifecycle {
     ignore_changes = [ami] # don't recycle a running cluster member on AMI refresh
+
+    # Mirror the daemon's topology gate (cluster.MaxReplicatedIngressRouteNodes)
+    # at plan time: above 10 ingress-capable nodes each ingress node holds only
+    # its share of the public route table, and sandboxd refuses to boot (or,
+    # open-source, to mark ingress ready) unless the operator declares a
+    # shard-aware router with shard_aware_ingress. Failing here is cheaper
+    # than provisioning 100 nodes the daemon rejects. Mirrored in
+    # Terraform/validate/ingress.go.
+    precondition {
+      condition     = length(local.ingress_node_names) <= 10 || var.shard_aware_ingress
+      error_message = "More than 10 ingress-capable nodes (ingress, a hybrid containing it, or mixed) need a shard-aware router in front of the tier (GET /v1/cluster/ingress-route/{id}); set shard_aware_ingress = true only once that router is in place. See setup/runbooks/cluster-ingress-topology.md."
+    }
   }
 }
 
@@ -310,25 +344,48 @@ resource "aws_instance" "joiner" {
     bundle_bucket                            = aws_s3_bucket.bundle.bucket
     aws_region                               = var.aws_region
     seed_private_ip                          = aws_instance.seed.private_ip
-    install_script_url                       = var.install_script_url
-    caddy_binary_url                         = var.caddy_binary_url
-    cluster_init_script_url                  = var.cluster_init_script_url
-    cluster_join_script_url                  = var.cluster_join_script_url
-    seed_wait_max_seconds                    = var.seed_wait_max_seconds
-    otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
-    otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
-    otel_metrics_interval                    = local.cluster_ops.otel.metrics_interval
-    otel_traces_enabled                      = local.cluster_ops.otel.traces_enabled || local.cluster_ops.otel.traces_endpoint != ""
-    otel_traces_endpoint                     = local.cluster_ops.otel.traces_endpoint
-    otel_traces_sample_ratio                 = local.cluster_ops.otel.traces_sample_ratio
-    otel_service_name                        = local.cluster_ops.otel.service_name
-    image_pull_max_concurrent                = local.cluster_ops.image_pull.max_concurrent
-    image_pull_failure_backoff               = local.cluster_ops.image_pull.failure_backoff
-    image_gc_whitelist                       = join(",", local.cluster_ops.image_gc.whitelist)
-    image_build_gc_enabled                   = local.cluster_ops.image_build_gc.enabled
-    image_build_gc_interval                  = local.cluster_ops.image_build_gc.interval
-    image_build_gc_ttl                       = local.cluster_ops.image_build_gc.ttl
-    extra_user_data                          = each.value.extra_user_data
+    audit_receiver_endpoint                  = local.audit_receiver_endpoint_url
+    audit_receiver_host                      = local.audit_receiver_host
+    audit_receiver_host_ip                   = aws_instance.seed.private_ip
+    audit_receiver_cert_pem                  = local.audit_receiver_cert_pem
+    # Joiners never serve the receiver, so they must not hold its private key.
+    audit_receiver_key_pem       = ""
+    install_script_url           = var.install_script_url
+    caddy_binary_url             = var.caddy_binary_url
+    cluster_init_script_url      = var.cluster_init_script_url
+    cluster_join_script_url      = var.cluster_join_script_url
+    cluster_sign_node_script_url = var.cluster_sign_node_script_url
+    sandboxd_url                 = var.sandboxd_url
+    toolboxd_url                 = var.toolboxd_url
+    checksums_url                = var.checksums_url
+    joiner_role_unique_id        = aws_iam_role.joiner.unique_id
+    secret_kms_key_arn           = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
+    secret_kms_strict_boot       = var.secret_kms_strict_boot
+    audit_export_backend         = var.audit_export_backend
+    audit_export_file_path       = var.audit_export_file_path
+    audit_export_s3_bucket       = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+    audit_export_s3_prefix       = var.cluster_name
+    audit_receiver_url           = var.audit_receiver_url
+    audit_receiver_port          = var.audit_receiver_port
+    audit_receiver_token         = local.audit_receiver_token_value
+    audit_receiver_hmac_key      = local.audit_receiver_hmac_value
+    seed_wait_max_seconds        = var.seed_wait_max_seconds
+    otel_metrics_enabled         = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
+    otel_metrics_endpoint        = local.cluster_ops.otel.metrics_endpoint
+    otel_metrics_interval        = local.cluster_ops.otel.metrics_interval
+    otel_traces_enabled          = local.cluster_ops.otel.traces_enabled || local.cluster_ops.otel.traces_endpoint != ""
+    otel_traces_endpoint         = local.cluster_ops.otel.traces_endpoint
+    otel_traces_sample_ratio     = local.cluster_ops.otel.traces_sample_ratio
+    otel_service_name            = local.cluster_ops.otel.service_name
+    image_pull_max_concurrent    = local.cluster_ops.image_pull.max_concurrent
+    image_pull_failure_backoff   = local.cluster_ops.image_pull.failure_backoff
+    image_gc_whitelist           = join(",", local.cluster_ops.image_gc.whitelist)
+    image_build_gc_enabled       = local.cluster_ops.image_build_gc.enabled
+    image_build_gc_interval      = local.cluster_ops.image_build_gc.interval
+    image_build_gc_ttl           = local.cluster_ops.image_build_gc.ttl
+    extra_user_data              = each.value.extra_user_data
+    sandboxd_env                 = merge(var.extra_sandboxd_env, each.value.sandboxd_env)
+    shard_aware_ingress          = var.shard_aware_ingress
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
     caddy_storage_s3_bucket         = local.caddy_storage_s3.bucket
@@ -389,6 +446,32 @@ resource "aws_instance" "joiner" {
     ignore_changes       = [ami]
     replace_triggered_by = [aws_instance.seed]
   }
+}
+
+# Authoritative caller-identity -> node-id mapping for the CSR signing
+# rendezvous (templates/bootstrap.sh.tftpl).
+#
+# This object is what makes the rendezvous safe. cluster-sign-node.sh stamps
+# `DNS:node:<id>` straight from its --node-id flag and never inspects the CSR,
+# so the seed must learn a joiner's identity from something the joiner cannot
+# influence. A joiner's IAM grant only lets it write under csr/${aws:userid}/,
+# and ${aws:userid} for EC2 instance-profile credentials is
+# "<role-unique-id>:<instance-id>" — assigned by AWS, not chosen by the
+# instance. The seed reads the CSR's prefix, looks up nodes/<that prefix>
+# here, and signs the name TERRAFORM recorded.
+#
+# Joiners can read this (joiner_r grants GetObject on the whole bucket) but
+# cannot write it: their PutObject is scoped to csr/${aws:userid}/*.
+resource "aws_s3_object" "joiner_identity" {
+  for_each = local.joiner_nodes
+
+  bucket = aws_s3_bucket.bundle.bucket
+  key    = "nodes/${aws_iam_role.joiner.unique_id}:${aws_instance.joiner[each.key].id}"
+  # Must match the --node-id the joiner is told to use, which is the same
+  # node_name the template renders into its cluster-join invocation.
+  content                = "${var.cluster_name}-${each.value.name}"
+  content_type           = "text/plain"
+  server_side_encryption = "AES256"
 }
 
 # Convenience: every node, keyed by name, for downstream resources (dns, outputs).

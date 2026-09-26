@@ -28,9 +28,15 @@ const (
 	// hard-fail. Unlike CapWasm it needs no node-side module staging — the UCs
 	// upload JS bundles over POST /v1/js-bundles at runtime.
 	CapIsolate Capability = "isolate" // V8-isolate (workerd) runtime available
-	CapGPU     Capability = "gpu"     // a GPU worker
-	CapDomain  Capability = "domain"  // public domain + TLS (not local-mode)
-	CapCluster Capability = "cluster" // multi-node cluster (raft/forwarding)
+	// CapIsolateJail gates UC-109: the node runs isolate with
+	// SB_ISOLATE_USE_JAIL=true (the default) and the suite may SSH in to
+	// inspect the workerd process. Only single-node-isolate-jail advertises it;
+	// the other isolate scenarios still run jail-off, so their UC-103..105
+	// coverage is unaffected by a jail regression and vice versa.
+	CapIsolateJail Capability = "isolate-jail"
+	CapGPU         Capability = "gpu"     // a GPU worker
+	CapDomain      Capability = "domain"  // public domain + TLS (not local-mode)
+	CapCluster     Capability = "cluster" // multi-node cluster (raft/forwarding)
 	// CapMixedArchNegative gates UC-79: inject a foreign-arch snapshot ref and
 	// assert the arm64 cluster refuses to resume it.
 	CapMixedArchNegative Capability = "mixed-arch-negative"
@@ -104,6 +110,35 @@ const (
 	// Terraform/obs.tf provisions the dedicated obs EC2. Advertisement +
 	// provisioning only — same shape as CapGvisor/CapIsolate.
 	CapObservability Capability = "observability"
+	// Security-hardening capabilities (plans/integration-test-security.md §6.3).
+	// Advertisement-only, same shape as CapGvisor/CapIsolate: provisioning turns
+	// the feature on, the capability tells the matrix the case is applicable.
+	//
+	// CapSecrets marks a scenario where the secret/audit cases are meaningful
+	// at all. It is deliberately separate from CapCluster: the single-node
+	// profile exercises the provider seam and the audit chain with the cluster
+	// fan-out reduced to a no-op.
+	CapSecrets Capability = "secrets"
+	// CapSecretsKMS means SB_SECRET_PROVIDER=awskms against a REAL key. The KMS
+	// provider does not enforce the recipient set (its Open ignores nodeID and
+	// leans on IAM), so recipient-binding cases must EXCLUDE it rather than
+	// re-run against it.
+	CapSecretsKMS Capability = "secrets-kms"
+	// CapEnterprise means SB_ENTERPRISE_MODE=true. Mostly used in Excludes:
+	// cases that push config into a state the enterprise validator refuses
+	// (backup count below 2, zero retention) must not run here.
+	CapEnterprise Capability = "enterprise"
+	// CapClusterMTLS means every node holds a CA-signed cert with a node:<id>
+	// SAN and no insecure escape hatch is set.
+	CapClusterMTLS Capability = "cluster-mtls"
+	// CapAuditExport means an off-node exporter is configured AND its sink is
+	// readable by the suite (an S3 prefix, or the audit-receiver's probe
+	// endpoint). Both halves matter: enterprise boot requires an off-node
+	// backend, but a case can only assert delivery if it can read the sink.
+	CapAuditExport Capability = "audit-export"
+	// CapAuditWitness means the external witness is wired to a receiver that
+	// retains chain heads and issues receipts.
+	CapAuditWitness Capability = "audit-witness"
 	// CapSimulations gates the suite/sims workload catalogue and UC-108
 	// (per-sim pass/fail). Opt-in like CapBenchmark: slow, provisions long-
 	// lived services, and needs AEROL_SIMS=1. UC-108 must never roll up to a
@@ -117,6 +152,19 @@ type UseCase struct {
 	Title string
 	// Requires lists capabilities a scenario must have for this UC to run.
 	Requires []Capability
+	// Excludes lists capabilities that make this UC INAPPLICABLE. A scenario
+	// holding any of them skips the case exactly as a missing Requires does.
+	//
+	// This exists because some cases must mutate daemon config into a state a
+	// hardened profile refuses to boot with: UC-116 sets
+	// SB_SECRET_RECIPIENT_BACKUP_COUNT=1 and UC-123 sets zero retention, both
+	// of which internal/config rejects under SB_ENTERPRISE_MODE. Without
+	// Excludes those cases run on an enterprise scenario and take the node
+	// down instead of asserting anything. Expressing it as a positive
+	// "non-enterprise" capability was rejected: every scenario would have to
+	// remember to advertise it, so a forgotten entry fails OPEN — the node
+	// still dies. Excludes fails closed by default.
+	Excludes []Capability
 	// Implemented marks whether a test function exists yet. False => the
 	// report shows PENDING (a real gap) rather than a green/skip. The full
 	// suite is implemented, so this is true for every current entry; it stays
@@ -214,6 +262,7 @@ var Registry = []UseCase{
 	{ID: "UC-57", Title: "Uncordon restores schedulability", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-58", Title: "Owner failover -> replica serves", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-58b", Title: "Recreate-via-failover preserves identity", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-58c", Title: "Kill owner mid secret fan-out (GAP-1 chaos)", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-59", Title: "WASM live-migrate across nodes", Requires: []Capability{CapCluster, CapWasm}, Implemented: true},
 	{ID: "UC-60", Title: "Orphan reclaim-local + delete-orphan", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-67", Title: "Cross-node SSH rejects a forged key", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
@@ -344,6 +393,16 @@ var Registry = []UseCase{
 	// surface it, delete removes it. The owner-scoping + in-use-refusal edges are
 	// covered offline; this is the live round-trip.
 	{ID: "UC-105", Title: "Isolate js-bundle catalogue CRUD (upload/list/get/delete)", Requires: []Capability{CapIsolate}, Implemented: true},
+	// UC-109 is the real-host proof of the workerd jail (plans/isolate-runtime.md
+	// §2.1): with SB_ISOLATE_USE_JAIL=true an isolate sandbox still serves, and
+	// the workerd process behind it runs as the jail uid (not root), with
+	// NoNewPrivs and an enforcing seccomp filter (/proc/<pid>/status Seccomp: 2),
+	// inside a chroot whose root is the group directory under
+	// SB_ISOLATE_JAIL_CHROOT_BASE, in its own cgroup under
+	// SB_ISOLATE_JAIL_CGROUP_ROOT. Offline tests prove each piece; only a Linux
+	// root can prove them together, which is why this is the gate for trusting
+	// the jail with untrusted tenant code (and for enterprise mode).
+	{ID: "UC-109", Title: "Isolate jail realized on a real host (non-root uid, chroot, seccomp, cgroup) while serving", Requires: []Capability{CapIsolate, CapIsolateJail}, Implemented: true},
 
 	// Investor-benchmark observability (plans/investor-benchmark-observability.md).
 	// UC-106/107 prove the obs stack is actually up; UC-108 asserts each

@@ -2,18 +2,19 @@ package containerd
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/oci"
-	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
-	"github.com/containerd/containerd/runtime"
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/typeurl/v2"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
@@ -183,20 +184,26 @@ func TestStreamEventsEnrichesSandboxLabel(t *testing.T) {
 	out := make(chan docker.DockerEvent, 1)
 	errCh := make(chan error, 1)
 	go func() { errCh <- d.StreamEvents(ctx, out) }()
+	// Wait on the event, not on a race between it and the stream's return:
+	// the fake closes the subscription right after emitting, so StreamEvents
+	// delivers the (buffered) event and THEN returns nil. Selecting over both
+	// picks between two ready channels at random.
+	var ev docker.DockerEvent
 	select {
-	case ev := <-out:
-		cancel()
-		if ev.ContainerID != "sb-ev" {
-			t.Fatalf("container id=%q", ev.ContainerID)
-		}
-		if ev.SandboxID != "sb-real-from-label" {
-			t.Fatalf("sandbox id=%q want label enrichment", ev.SandboxID)
-		}
-	case err := <-errCh:
-		t.Fatalf("stream ended early: %v", err)
+	case ev = <-out:
 	case <-time.After(2 * time.Second):
 		cancel()
 		t.Fatal("timed out waiting for event")
+	}
+	cancel()
+	if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("stream ended with an unexpected error: %v", err)
+	}
+	if ev.ContainerID != "sb-ev" {
+		t.Fatalf("container id=%q", ev.ContainerID)
+	}
+	if ev.SandboxID != "sb-real-from-label" {
+		t.Fatalf("sandbox id=%q want label enrichment", ev.SandboxID)
 	}
 }
 

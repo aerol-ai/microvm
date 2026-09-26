@@ -6,7 +6,7 @@ on:
       - published
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -16,18 +16,18 @@ jobs:
       VERSION: ${{ github.event.release.tag_name }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.VERSION }}
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
@@ -144,12 +144,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.VERSION }}
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
@@ -191,13 +191,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
             "$(go env GOPATH)/bin/xcaddy" build \
             --output dist/caddy_${{ matrix.suffix }} \
-            --with github.com/mholt/caddy-l4 \
-            --with github.com/caddy-dns/cloudflare \
-            --with github.com/ss098/certmagic-s3
+            --with github.com/mholt/caddy-l4@v0.1.2 \
+            --with github.com/caddy-dns/cloudflare@v0.2.4 \
+            --with github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39
           chmod 0755 dist/caddy_${{ matrix.suffix }}
           if [[ "${{ matrix.goarch }}" == "amd64" ]]; then
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'layer4'
@@ -207,7 +207,7 @@ jobs:
           fi
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist-${{ matrix.suffix }}
           path: dist/
@@ -216,16 +216,26 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     env:
       VERSION: ${{ github.event.release.tag_name }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.VERSION }}
 
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Download all build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: dist-*
           path: dist/
@@ -238,13 +248,21 @@ jobs:
           cp scripts/cluster-join.sh dist/cluster-join.sh
           chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh
 
+      - name: Generate CycloneDX SBOM
+        run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
+
       - name: Generate checksums
         run: |
           cd dist
           sha256sum * > checksums.txt
 
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: dist/*
+
       - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
           tag_name: ${{ env.VERSION }}
           generate_release_notes: true

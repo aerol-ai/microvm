@@ -30,6 +30,12 @@ var (
 	raftSnapshotRestoreErrs = expvar.NewMap("aerolvm_raft_snapshot_restore_errors_total")
 	raftSnapshotRestoreLast = expvar.NewInt("aerolvm_raft_snapshot_restore_last_nanos")
 
+	// raftReplicaAdmissionRefused counts joins the leader refused because the
+	// raft configuration is already at its replica budget. A non-zero and
+	// growing value means surplus server-role nodes are running that the
+	// operator has to re-role to worker or ingress.
+	raftReplicaAdmissionRefused = expvar.NewInt("aerolvm_raft_replica_admission_refused_total")
+
 	gossipMembersTotal      = expvar.NewInt("aerolvm_gossip_members_total")
 	gossipMembersAlive      = expvar.NewInt("aerolvm_gossip_members_alive")
 	workerLeasesTotal       = expvar.NewInt("aerolvm_worker_leases_total")
@@ -69,7 +75,27 @@ var (
 	placementCacheLatency      = scaleobs.NewDurationBuckets("aerolvm_placement_cache_refresh_latency_seconds_bucket")
 	placementCacheSize         = expvar.NewInt("aerolvm_placement_cache_size")
 	placementShardCacheEntries = expvar.NewInt("aerolvm_placement_shard_cache_entries")
+
+	// Soft/enterprise: peer node id not present (or not Alive) in local membership.
+	mtlsUnknownPeerTotal        = expvar.NewInt("aerolvm_cluster_mtls_unknown_peer_total")
+	clusterMTLSCertNotAfterUnix = expvar.NewInt("aerolvm_cluster_mtls_cert_not_after_unix")
+	clusterMTLSCANotAfterUnix   = expvar.NewInt("aerolvm_cluster_mtls_ca_not_after_unix")
 )
+
+func recordClusterTLSExpiry(certExpiry, caExpiry time.Time) {
+	if !certExpiry.IsZero() {
+		clusterMTLSCertNotAfterUnix.Set(certExpiry.Unix())
+	}
+	if !caExpiry.IsZero() {
+		clusterMTLSCANotAfterUnix.Set(caExpiry.Unix())
+	}
+}
+
+// RecordMTLSUnknownPeer increments when an inbound mTLS peer id is not an
+// Alive gossip member. Soft mode warns via this metric; enterprise rejects.
+func RecordMTLSUnknownPeer() {
+	mtlsUnknownPeerTotal.Add(1)
+}
 
 func beginRaftApply() func(error) {
 	raftApplyInflight.Add(1)

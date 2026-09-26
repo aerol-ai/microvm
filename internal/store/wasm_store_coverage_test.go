@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,11 +114,11 @@ func TestWasmCheckpointPushHistory(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	id1, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "aocr://sb-push:v1", "digest-1")
+	id1, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "", "aocr://sb-push:v1", "digest-1")
 	if err != nil || id1 <= 0 {
 		t.Fatalf("InsertWasmCheckpointPush first = id %d err %v", id1, err)
 	}
-	id2, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "aocr://sb-push:v2", "digest-2")
+	id2, err := st.InsertWasmCheckpointPush(ctx, sb.ID, "", "aocr://sb-push:v2", "digest-2")
 	if err != nil || id2 <= id1 {
 		t.Fatalf("InsertWasmCheckpointPush second = id %d err %v", id2, err)
 	}
@@ -153,6 +154,30 @@ func TestWasmCheckpointPushHistory(t *testing.T) {
 	}
 	if err := st.DeleteAllWasmCheckpointPushes(ctx, ""); err != nil {
 		t.Fatalf("DeleteAllWasmCheckpointPushes empty id: %v", err)
+	}
+}
+
+func TestEnsureWasmCheckpointCleanupRefIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	first, err := st.EnsureWasmCheckpointCleanupRef(ctx, "sb-cleanup", "aocr://sb-cleanup:latest")
+	if err != nil || first <= 0 {
+		t.Fatalf("first ensure = id %d err %v", first, err)
+	}
+	second, err := st.EnsureWasmCheckpointCleanupRef(ctx, "sb-cleanup", "aocr://sb-cleanup:latest")
+	if err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second ensure id = %d, want existing id %d", second, first)
+	}
+	pushes, err := st.ListWasmCheckpointPushes(ctx, "sb-cleanup")
+	if err != nil {
+		t.Fatalf("list pushes: %v", err)
+	}
+	if len(pushes) != 1 || pushes[0].Digest != "cleanup-only" {
+		t.Fatalf("cleanup rows = %+v, want one cleanup-only row", pushes)
 	}
 }
 
@@ -192,11 +217,13 @@ func TestWasmRegistryPushRoundTrip(t *testing.T) {
 
 	sb := sampleSandbox("sb-reg")
 	sb.Runtime = models.RuntimeWasm
+	sb.AuditIncarnationID = "inc-reg-1"
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := st.UpdateWasmRegistryPush(ctx, sb.ID, "aocr://sb-reg:latest", "sha256:dead"); err != nil {
-		t.Fatalf("UpdateWasmRegistryPush: %v", err)
+	applied, err := st.UpdateWasmRegistryPush(ctx, sb.ID, sb.AuditIncarnationID, "aocr://sb-reg:latest", "sha256:dead")
+	if err != nil || !applied {
+		t.Fatalf("UpdateWasmRegistryPush = applied %v, err %v", applied, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
 	if err != nil {
@@ -204,6 +231,25 @@ func TestWasmRegistryPushRoundTrip(t *testing.T) {
 	}
 	if got.WasmRegistryRef != "aocr://sb-reg:latest" || got.WasmRegistryDigest != "sha256:dead" {
 		t.Fatalf("registry fields = ref %q digest %q", got.WasmRegistryRef, got.WasmRegistryDigest)
+	}
+
+	// A push that lands after the id was re-created belongs to a dead
+	// lifecycle: it must not overwrite the live row's checkpoint pointer.
+	if _, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "inc-reg-0", "aocr://stale:latest", "sha256:stale"); err != nil {
+		t.Fatalf("stale UpdateWasmRegistryPush error = %v", err)
+	}
+	if applied, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "inc-reg-0", "aocr://stale:latest", "sha256:stale"); err != nil || applied {
+		t.Fatalf("stale UpdateWasmRegistryPush = applied %v, err %v; want applied=false", applied, err)
+	}
+	got, err = st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get after stale push: %v", err)
+	}
+	if got.WasmRegistryRef != "aocr://sb-reg:latest" || got.WasmRegistryDigest != "sha256:dead" {
+		t.Fatalf("stale push overwrote the live lifecycle: ref %q digest %q", got.WasmRegistryRef, got.WasmRegistryDigest)
+	}
+	if _, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "  ", "aocr://x", "sha256:x"); err == nil {
+		t.Fatal("UpdateWasmRegistryPush accepted an empty incarnation")
 	}
 }
 
@@ -261,5 +307,107 @@ func TestScanSandboxGPUAndNetQuotaFields(t *testing.T) {
 	}
 	if got.NetworkQuotaExceededAt == nil {
 		t.Fatal("NetworkQuotaExceededAt should be set after MarkNetworkQuotaExceeded")
+	}
+}
+
+// A row is orphaned when no LIVE lifetime owns it, not merely when the id is
+// gone: a destroyed sandbox's id can be re-created, and the rejected pushes of
+// the dead lifetime must still be reclaimable.
+func TestOrphanedWasmCheckpointPushesRespectIncarnation(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-orphan-inc")
+	sb.Runtime = models.RuntimeWasm
+	sb.AuditIncarnationID = "inc-live"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	live, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-live", "reg/sb:live", "sha256:live")
+	dead, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-dead", "reg/sb:dead", "sha256:dead")
+	gone, _ := st.InsertWasmCheckpointPush(ctx, "sb-gone", "inc-x", "reg/gone:x", "sha256:x")
+	cleanup, err := st.EnsureWasmCheckpointCleanupRef(ctx, "sb-gone-2", "reg/gone2:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveCleanup, err := st.EnsureWasmCheckpointCleanupRef(ctx, sb.ID, "reg/sb:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orphans, err := st.ListOrphanedWasmCheckpointPushes(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]bool{}
+	for _, o := range orphans {
+		got[o.ID] = true
+	}
+	for id, want := range map[int64]bool{live: false, dead: true, gone: true, cleanup: true, liveCleanup: false} {
+		if got[id] != want {
+			t.Fatalf("row %d orphaned=%v, want %v (orphans=%+v)", id, got[id], want, orphans)
+		}
+	}
+
+	scoped, err := st.ListWasmCheckpointPushesForIncarnation(ctx, sb.ID, "inc-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].ID != live || scoped[0].IncarnationID != "inc-live" {
+		t.Fatalf("incarnation-scoped history = %+v", scoped)
+	}
+}
+
+// Deleting a checkpoint ref deletes its MANIFEST. WasmCheckpointRefInUse is the
+// guard every deleter consults, so each way a dead lifetime's row can share the
+// live lifetime's manifest has to be recognised — and a dead row must never
+// protect anything, or two dead rows sharing a manifest could never be freed.
+func TestWasmCheckpointRefInUse(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-inuse")
+	sb.Runtime = models.RuntimeWasm
+	sb.AuditIncarnationID = "inc-live"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateWasmRegistryPush(ctx, sb.ID, "inc-live", "reg/sb:d-current", "sha256:current"); err != nil {
+		t.Fatal(err)
+	}
+	liveHistory, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-live", "reg/sb:d-kept", "sha256:kept")
+	deadA, _ := st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-dead", "reg/sb:d-shared-dead", "sha256:shared-dead")
+	_, _ = st.InsertWasmCheckpointPush(ctx, sb.ID, "inc-dead", "reg/sb:d-shared-dead", "sha256:shared-dead")
+
+	for _, tc := range []struct {
+		name     string
+		sandbox  string
+		exclude  int64
+		lifetime string
+		ref      string
+		digest   string
+		want     bool
+	}{
+		{"no live sandbox: nothing to protect", "sb-absent", 0, "", "reg/x:latest", "sha256:x", false},
+		{"the pre-scoping id-wide :latest may resolve to the live checkpoint", sb.ID, 0, "inc-dead", "reg/sb:latest", "", true},
+		{"the live lifetime's own rolling pointer", sb.ID, 0, "inc-live", "reg/sb:0123abcd-latest", "", true},
+		// Nothing the live lifetime publishes can move a dead lifetime's
+		// pointer, so deleting it cannot touch the live checkpoint.
+		{"a dead lifetime's rolling pointer is free", sb.ID, 0, "inc-dead", "reg/sb:0123abcd-latest", "", false},
+		{"the live row's own ref", sb.ID, 0, "inc-dead", "reg/sb:d-current", "sha256:other", true},
+		{"a different tag for the live row's manifest", sb.ID, 0, "inc-dead", "reg/sb:d-alias", "sha256:current", true},
+		{"a manifest the live lifetime still retains", sb.ID, 0, "inc-dead", "reg/sb:d-kept", "", true},
+		{"a live history row does not protect itself", sb.ID, liveHistory, "inc-live", "reg/sb:d-kept", "sha256:kept", false},
+		{"dead rows sharing a manifest protect nothing", sb.ID, deadA, "inc-dead", "reg/sb:d-shared-dead", "sha256:shared-dead", false},
+		{"cleanup-only is not a digest", sb.ID, 0, "", "reg/sb:d-unrelated", "cleanup-only", false},
+		{"a digest pin is not a rolling pointer", sb.ID, 0, "inc-dead", "reg/sb@sha256:" + strings.Repeat("b", 64), "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := st.WasmCheckpointRefInUse(ctx, tc.sandbox, tc.exclude, tc.lifetime, tc.ref, tc.digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("in use = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

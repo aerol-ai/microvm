@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -68,62 +69,29 @@ func (s *Service) CreateJSBundle(ctx context.Context, req models.CreateJSBundleR
 	if err != nil {
 		return nil, err
 	}
-	// Owner: a cluster-replication write carries the ORIGINAL owner in ctx (the
-	// replicating peer authenticates with the operator PAT, so ownerRefForCreate
-	// would otherwise mis-scope the replica). A normal upload derives the owner
-	// from the caller's identity.
 	owner := ownerRefForCreate(ctx)
-	replicated := false
-	if o, ok := replicatedJSBundleOwner(ctx); ok {
-		owner, replicated = o, true
-	}
 	digest, err := s.isolateBundles.Put(owner, strings.TrimSpace(req.Name), bundle)
 	if err != nil {
 		return nil, err
 	}
-	// Fan the bundle out to cluster peers so an isolate create placed on any node
-	// resolves it locally (isolate's store is per-node). Skip when this write is
-	// itself a replica (loop guard) or single-node (replicator nil). Best-effort:
-	// the bundle is already stored locally, so a peer being down does not fail
-	// the upload — a create landing on a missed node would error and can retry.
-	if !replicated && s.jsBundleReplicator != nil {
-		if repErr := s.jsBundleReplicator(ctx, owner, req); repErr != nil {
-			s.logger.Warn("js-bundle cluster replication incomplete", "digest", digest, "error", repErr)
-		}
-	}
-	return jsBundleView(digest, strings.TrimSpace(req.Name), bundle), nil
-}
-
-// jsBundleReplicatedOwnerKey carries the original bundle owner on a cluster
-// replication write (see WithReplicatedJSBundleOwner).
-type jsBundleReplicatedOwnerKey struct{}
-
-// WithReplicatedJSBundleOwner marks ctx as a cluster-replication write of a
-// js-bundle, carrying the original owner so CreateJSBundle stores it under that
-// owner (not the replicating peer's PAT scope) and skips re-replicating. The v1
-// handler sets this when a peer POSTs with models.HeaderJSBundleReplicated.
-func WithReplicatedJSBundleOwner(ctx context.Context, owner string) context.Context {
-	return context.WithValue(ctx, jsBundleReplicatedOwnerKey{}, owner)
-}
-
-func replicatedJSBundleOwner(ctx context.Context) (string, bool) {
-	o, ok := ctx.Value(jsBundleReplicatedOwnerKey{}).(string)
-	return o, ok
-}
-
-// SetJSBundleReplicator wires the cluster fan-out for uploaded bundles. Called
-// by pkg/daemon in cluster+isolate mode; nil (the default) means single-node —
-// no replication.
-func (s *Service) SetJSBundleReplicator(fn func(ctx context.Context, owner string, req models.CreateJSBundleRequest) error) {
-	s.jsBundleReplicator = fn
+	// Keep the replicated catalogue current so a cluster list answers from
+	// the control plane instead of asking every isolate-capable worker. The
+	// reconciler publishes; marking is cheap enough for every mutation.
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindJSBundle)
+	return s.jsBundleView(digest, strings.TrimSpace(req.Name), bundle), nil
 }
 
 // ListJSBundles returns the caller's stored bundles.
 func (s *Service) ListJSBundles(ctx context.Context) ([]*models.JSBundle, error) {
+	return s.listJSBundlesForTenant(ownerRefForCreate(ctx))
+}
+
+// listJSBundlesForTenant is the tenant-scoped body of ListJSBundles, split out
+// so the catalogue publisher can read the same rows without a request context.
+func (s *Service) listJSBundlesForTenant(owner string) ([]*models.JSBundle, error) {
 	if s.isolateBundles == nil {
 		return nil, fmt.Errorf("js-bundles require the isolate runtime (SB_ENABLE_ISOLATE=true): %w", models.ErrRuntimeNotImplemented)
 	}
-	owner := ownerRefForCreate(ctx)
 	// Invert name pointers so each digest reports its alias (if any).
 	nameByDigest := make(map[string]string)
 	for name, d := range s.isolateBundles.NamesForTenant(owner) {
@@ -136,7 +104,7 @@ func (s *Service) ListJSBundles(ctx context.Context) ([]*models.JSBundle, error)
 		if err != nil {
 			continue // a concurrently-deleted blob; skip rather than fail the list
 		}
-		out = append(out, jsBundleView(d, nameByDigest[d], b))
+		out = append(out, s.jsBundleView(d, nameByDigest[d], b))
 	}
 	return out, nil
 }
@@ -146,6 +114,9 @@ func (s *Service) ListJSBundles(ctx context.Context) ([]*models.JSBundle, error)
 func (s *Service) GetJSBundle(ctx context.Context, digest string) (*models.JSBundle, error) {
 	if s.isolateBundles == nil {
 		return nil, fmt.Errorf("js-bundles require the isolate runtime (SB_ENABLE_ISOLATE=true): %w", models.ErrRuntimeNotImplemented)
+	}
+	if _, localRef, ok := models.ParseJSBundleNodeRef(digest); ok {
+		digest = localRef
 	}
 	digest = normalizeBundleDigest(digest)
 	owner := ownerRefForCreate(ctx)
@@ -166,7 +137,7 @@ func (s *Service) GetJSBundle(ctx context.Context, digest string) (*models.JSBun
 			break
 		}
 	}
-	return jsBundleView(digest, name, b), nil
+	return s.jsBundleView(digest, name, b), nil
 }
 
 // DeleteJSBundle removes a bundle the caller owns, refusing when a live sandbox
@@ -175,6 +146,9 @@ func (s *Service) GetJSBundle(ctx context.Context, digest string) (*models.JSBun
 func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 	if s.isolateBundles == nil {
 		return fmt.Errorf("js-bundles require the isolate runtime (SB_ENABLE_ISOLATE=true): %w", models.ErrRuntimeNotImplemented)
+	}
+	if _, localRef, ok := models.ParseJSBundleNodeRef(digest); ok {
+		digest = localRef
 	}
 	digest = normalizeBundleDigest(digest)
 	owner := ownerRefForCreate(ctx)
@@ -199,6 +173,9 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 		}
 		return err
 	}
+	// A publication replaces this node's whole inventory, so a removed bundle
+	// disappears from the catalogue when the reconciler next runs.
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindJSBundle)
 	return nil
 }
 
@@ -211,6 +188,16 @@ func jsBundleView(digest, name string, b *jsbundle.Bundle) *models.JSBundle {
 		MainModule: b.MainModule,
 		SizeBytes:  b.SizeBytes(),
 	}
+}
+
+func (s *Service) jsBundleView(digest, name string, b *jsbundle.Bundle) *models.JSBundle {
+	view := jsBundleView(digest, name, b)
+	if s != nil && s.ClusterEnabled() {
+		if c := s.Cluster(); c != nil {
+			view.ModuleRef = models.JSBundleRefForNode(view.ModuleRef, c.SelfNodeID())
+		}
+	}
+	return view
 }
 
 // normalizeBundleDigest strips an optional "sha256:" prefix so callers may

@@ -29,17 +29,17 @@ func TestQuiesceHandlerOnPing(t *testing.T) {
 
 func TestStartUserCommand_StartAndFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	userCommandPID = 0
+	userCommandPID.Store(0)
 	startUserCommand(logger, []string{"/bin/sh", "-c", "sleep 30"})
-	if userCommandPID <= 0 {
+	if userCommandPID.Load() <= 0 {
 		t.Fatal("userCommandPID was not set")
 	}
-	_ = syscall.Kill(-userCommandPID, syscall.SIGKILL)
-	userCommandPID = 0
+	_ = syscall.Kill(-int(userCommandPID.Load()), syscall.SIGKILL)
+	userCommandPID.Store(0)
 
 	startUserCommand(logger, []string{"/definitely/missing-command"})
-	if userCommandPID != 0 {
-		t.Fatalf("userCommandPID after failed start = %d, want 0", userCommandPID)
+	if userCommandPID.Load() != 0 {
+		t.Fatalf("userCommandPID after failed start = %d, want 0", userCommandPID.Load())
 	}
 }
 
@@ -184,7 +184,7 @@ func TestHelperProcessStartReaper(t *testing.T) {
 	if err := cmd1.Start(); err != nil {
 		os.Exit(2)
 	}
-	userCommandPID = cmd1.Process.Pid
+	userCommandPID.Store(int64(cmd1.Process.Pid))
 
 	cmd2 := exec.Command("/bin/sh", "-c", "exit 0")
 	if err := cmd2.Start(); err != nil {

@@ -200,6 +200,22 @@ variable "default_volume_throughput" {
 # Exactly one node must set seed = true.
 ###############################################################################
 
+variable "shard_aware_ingress" {
+  description = <<-EOT
+    Declares that the router in front of the ingress tier resolves each
+    sandbox's owners through GET /v1/cluster/ingress-route/{id} before
+    forwarding. Required, and only correct, for more than 10 ingress-capable
+    nodes: above that size each ingress node holds only its share of the
+    public route table, so DNS round-robin, an NLB, or a BGP VIP would
+    black-hole most sandbox traffic, and the daemon fails closed without this
+    flag (SB_CLUSTER_SHARD_AWARE_INGRESS). Setting it true with a plain LB in
+    front silences that check and breaks traffic silently. Runbook:
+    setup/runbooks/cluster-ingress-topology.md.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "nodes" {
   description = <<-EOT
     Map of node-name => node config. Each entry supports:
@@ -219,6 +235,7 @@ variable "nodes" {
       with_amd_gpu     (bool,    default var.default_with_amd_gpu)
       idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
       extra_user_data  (string,  default ""; appended to bootstrap.sh)
+      sandboxd_env     (map(string), default {}; merged over var.extra_sandboxd_env)
       tags             (map(string), default {})
   EOT
   type = map(object({
@@ -238,7 +255,11 @@ variable "nodes" {
     with_amd_gpu      = optional(bool)
     idle_timeout_min  = optional(number)
     extra_user_data   = optional(string, "")
-    tags              = optional(map(string), {})
+    # sandboxd_env is merged OVER var.extra_sandboxd_env for this node, so a
+    # hetero topology can give ingress-only and worker-only nodes different
+    # SB_* profiles (audit rate limits, jail settings) from one node map.
+    sandboxd_env = optional(map(string), {})
+    tags         = optional(map(string), {})
     # spot requests this node as an EC2 spot instance (one-time, terminate on
     # reclaim). Default false → on-demand, identical to prior behaviour. Only
     # the integration test harness sets this true; prod node maps omit it.
@@ -253,6 +274,16 @@ variable "nodes" {
   validation {
     condition     = length([for k, v in var.nodes : k if try(v.seed, false)]) == 1
     error_message = "Exactly one node in var.nodes must have seed = true."
+  }
+
+  # Node names become SB_NODE_ID and are stamped into each node cert as
+  # DNS:node:<id> by cluster-sign-node.sh, which enforces exactly this charset
+  # and rejects anything else. Catching it here keeps a bad name from failing
+  # 5 minutes into cloud-init, on the box, where the message is only visible
+  # in /var/log/aerolvm-bootstrap.log.
+  validation {
+    condition     = alltrue([for k, _ in var.nodes : can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", k))])
+    error_message = "Every node name must start with an alphanumeric and contain only alphanumerics, dot, underscore, or hyphen (max 128 chars) — cluster-sign-node.sh rejects anything else."
   }
 
   # Mirror cluster-init.sh + cluster-join.sh validate_node_role(): every role
@@ -534,6 +565,159 @@ variable "caddy_binary_url" {
   default     = ""
 }
 
+# Real AWS KMS for the cluster secret provider (plans/integration-test-security.md §5.3).
+#
+# D3: this is deliberately a REAL key, not the offline fake. pkg/secrets'
+# fake_kms.go already covers the provider contract offline, so a fake here
+# would prove nothing new — what is untested is the daemon reaching a real CMK
+# through the instance role, which only a real key exercises.
+#
+# Off by default, so a production render is byte-identical and no key is ever
+# created for a deployment that did not ask for one. Cost when on is ~$1/month
+# prorated plus $0.03/10k requests.
+variable "secret_kms_enabled" {
+  description = "Create a KMS CMK and point sandboxd's secret provider at it (SB_SECRET_PROVIDER=awskms)."
+  type        = bool
+  default     = false
+}
+
+# Strict boot makes the daemon FAIL to start when the awskms boot canary does
+# not round-trip, instead of silently continuing with a provider that cannot
+# decrypt. config.go additionally REQUIRES it for awskms whenever
+# SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
+# from failing at daemon start with a config error. A scenario can still turn
+# it off through extra_sandboxd_env, which is rendered after this block.
+variable "secret_kms_strict_boot" {
+  description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
+  type        = bool
+  default     = true
+}
+
+# Audit export sinks (plans/integration-test-security.md §5.4).
+#
+# IMPORTANT, and not what the plan originally assumed: SB_AUDIT_EXPORT_BACKEND
+# selects exactly ONE of noop|stdout|file|webhook|s3|bus
+# (pkg/auditexport/config.go). There is no fan-out backend, so a single node
+# cannot ship to file AND s3 at once. A scenario that wants both proves them on
+# DIFFERENT NODES, via each node's own sandboxd_env — which is precisely what
+# the per-node override exists for.
+#
+# Note also that pkg/auditexport rejects file and stdout when enterprise mode
+# is on ("keeps audit evidence on this node"), so enterprise scenarios must
+# pick webhook, s3 or bus.
+variable "audit_export_enabled" {
+  description = "Create the audit-export S3 bucket and grant nodes PutObject on it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_export_backend" {
+  description = "Value for SB_AUDIT_EXPORT_BACKEND. Empty leaves the daemon default (noop, or webhook when an export URL is set)."
+  type        = string
+  default     = ""
+
+  validation {
+    # Mirrors pkg/auditexport's backend set. Catching a typo here beats a
+    # daemon that starts with the backend silently resolved to noop and a
+    # scenario that then asserts on records nothing ever shipped.
+    condition     = contains(["", "noop", "stdout", "file", "webhook", "s3", "bus"], var.audit_export_backend)
+    error_message = "audit_export_backend must be one of: noop, stdout, file, webhook, s3, bus (or empty)."
+  }
+}
+
+variable "audit_export_file_path" {
+  description = "SB_AUDIT_EXPORT_FILE_PATH. Written whenever audit_export_backend is set, so flipping to the file backend needs no other change."
+  type        = string
+  default     = "/var/log/aerol-audit-export.jsonl"
+}
+
+# Audit receiver fixture (plans/integration-test-security.md §6.4).
+#
+# One small binary, built by the same pipeline and shipped over the same
+# presigned URL, run as a systemd unit on the seed. Webhook export and the
+# audit-chain witness both need something listening; without it a scenario can
+# only assert that the daemon TRIED to export.
+variable "audit_receiver_enabled" {
+  description = "Run the audit-receiver fixture on the seed and point webhook export at it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_receiver_port" {
+  description = "Port the audit receiver listens on (VPC-internal only)."
+  type        = number
+  default     = 9099
+}
+
+variable "audit_receiver_url" {
+  description = "Download URL for the audit-receiver binary. Emitted by integration-tests/lib/build.sh publish."
+  type        = string
+  default     = ""
+}
+
+# Extra SB_* environment for sandboxd, rendered into /etc/sandboxd/cluster.env
+# BEFORE the bootstrap's final `systemctl restart sandboxd`.
+#
+# WHY this exists: the branch's 55 new SB_* knobs (secrets provider, audit
+# sinks, enterprise gates, mTLS) had NO provisioning path. config/cluster.yml
+# has no secrets/audit section, and the only lever was extra_user_data — which
+# runs AFTER the final restart, so a scenario had to append to the env file and
+# restart a second time. That is workable for one flag and unusable as the
+# mechanism for a profile matrix.
+#
+# Values that are only known at apply time (a KMS key ARN, an audit bucket
+# name, a webhook URL) stay as dedicated template vars; this map is for the
+# static per-scenario profile.
+#
+# Empty by default, so a production render is byte-identical to before.
+variable "extra_sandboxd_env" {
+  description = "Extra SB_* env vars written to /etc/sandboxd/cluster.env before the final sandboxd restart. Merged under each node's own sandboxd_env."
+  type        = map(string)
+  default     = {}
+
+  # A newline would let one entry inject arbitrary additional variables into
+  # the env file, and '=' in a KEY would silently produce an unreadable line.
+  validation {
+    condition = alltrue([
+      for k, v in var.extra_sandboxd_env :
+      can(regex("^[A-Za-z_][A-Za-z0-9_]*$", k)) && !can(regex("[\n\r]", v))
+    ])
+    error_message = "extra_sandboxd_env keys must be valid shell identifiers and values must not contain newlines."
+  }
+}
+
+# Locally-built artifact overrides (integration harness, plans/integration-test-security.md §4.3).
+#
+# All three default to "" so a production render is byte-identical to before
+# this block existed: install.sh falls back to its own releases/latest
+# resolution when no --sandboxd-url is passed.
+#
+# These exist because the security matrix must provision an UNMERGED branch.
+# The harness cross-compiles locally and presigns the artifacts, and
+# install.sh already strips the query string off the URL when deriving the
+# asset name, so a presigned S3 URL needs no installer change.
+#
+# sandboxd_url and toolboxd_url must be set together: checksums_url names ONE
+# file that has to carry an entry for every asset install.sh verifies, so a
+# half-override would fail verification on the node rather than here.
+variable "sandboxd_url" {
+  description = "Override URL for the sandboxd binary. Empty => install.sh resolves the release asset."
+  type        = string
+  default     = ""
+}
+
+variable "toolboxd_url" {
+  description = "Override URL for the toolboxd binary. Empty => install.sh resolves the release asset."
+  type        = string
+  default     = ""
+}
+
+variable "checksums_url" {
+  description = "Override URL for the checksums file covering sandboxd_url/toolboxd_url. Required when either is set — install.sh refuses an unverified install."
+  type        = string
+  default     = ""
+}
+
 variable "cluster_init_script_url" {
   description = "URL of cluster-init.sh."
   type        = string
@@ -544,6 +728,14 @@ variable "cluster_join_script_url" {
   description = "URL of cluster-join.sh."
   type        = string
   default     = "https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh"
+}
+
+# Only the SEED downloads this. It signs joiner CSRs with the cluster CA key,
+# which never leaves the seed, so joiners have no use for it.
+variable "cluster_sign_node_script_url" {
+  description = "URL of cluster-sign-node.sh (seed only; signs joiner CSRs with ca.key)."
+  type        = string
+  default     = "https://github.com/aerol-ai/microvm/releases/latest/download/cluster-sign-node.sh"
 }
 
 variable "bundle_bucket_force_destroy" {

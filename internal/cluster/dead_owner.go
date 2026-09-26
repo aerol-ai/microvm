@@ -2,10 +2,10 @@ package cluster
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
 
@@ -173,23 +173,24 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		if !placementWantsFailoverRecreate(p) {
 			continue
 		}
-		newOwnerID, newOwnerURL, newOwnerDataPlaneHost := c.pickRecreationTarget(p.Spec)
-		if newOwnerID == "" {
+		target, ok := c.selectRecreationTarget(p)
+		if !ok {
 			c.logger.Warn("cluster: no failover recreation target; placement will be orphaned",
 				"sandbox_id", id, "dead_node", nodeID)
 			continue
 		}
 		cmd := command{
-			Op:                 opReassign,
-			SandboxID:          id,
-			OwnerNodeID:        newOwnerID,
-			OwnerAPIURL:        newOwnerURL,
-			OwnerDataPlaneHost: newOwnerDataPlaneHost,
-			ReassignCause:      reassignCauseFailover,
+			Op:                    opReassign,
+			SandboxID:             id,
+			OwnerNodeID:           target.NodeID,
+			OwnerAPIURL:           target.APIURL,
+			OwnerDataPlaneHost:    target.DataPlaneHost,
+			ExpectedIncarnationID: strings.TrimSpace(p.IncarnationID),
+			ReassignCause:         reassignCauseFailover,
 		}
 		if err := c.applyCommand(ctx, cmd); err != nil {
 			c.logger.Warn("cluster: reassign placement failed; will retry next tick",
-				"sandbox_id", id, "dead_node", nodeID, "new_owner", newOwnerID, "err", err)
+				"sandbox_id", id, "dead_node", nodeID, "new_owner", target.NodeID, "err", err)
 			return
 		}
 		// The leader apply wrapper increments the metric only when the FSM
@@ -218,6 +219,11 @@ func (c *Cluster) orphanOwner(ctx context.Context, nodeID string) error {
 }
 
 func (c *Cluster) removeDeadOwnerServer(nodeID string) {
+	// Same lock as admission: a removal that lands between another caller's
+	// replica count and its AddVoter would make that count describe a
+	// configuration the mutation is not applied to.
+	c.raftMembershipMu.Lock()
+	defer c.raftMembershipMu.Unlock()
 	if _, ok := c.configuredServer(nodeID); ok {
 		f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, c.commitTimeout)
 		if err := f.Error(); err != nil {
@@ -275,26 +281,32 @@ func (c *Cluster) reconcileReservations(ctx context.Context) {
 		c.logger.Info("cluster: cancelled expired reservation",
 			"sandbox_id", id, "owner", p.OwnerNodeID)
 	}
+	// A node can fail after committing the distributed delete fence but before
+	// its final opDelete. Expire only fences whose owner is unavailable; a live
+	// owner may still be retrying external artifact cleanup, and removing its
+	// fence would permit ID reuse to race that lifecycle-wide finalizer.
+	for _, p := range c.fsm.expiredDeletingPlacements(now) {
+		if !c.deleteFenceOwnerUnavailable(p.OwnerNodeID) {
+			continue
+		}
+		if err := c.DeletePlacementExact(ctx, p.SandboxID, p.OwnerNodeID, p.IncarnationID); err != nil {
+			c.logger.Warn("cluster: expire abandoned deleting placement failed; will retry next tick",
+				"sandbox_id", p.SandboxID, "owner", p.OwnerNodeID, "err", err)
+			continue
+		}
+		c.logger.Warn("cluster: expired abandoned deleting placement",
+			"sandbox_id", p.SandboxID, "owner", p.OwnerNodeID)
+	}
 }
 
-// pickRecreationTarget runs placement scoring against the replicated spec to
-// pick a live node for the recreated sandbox. Returns empty strings if spec is
-// nil (caller treats that as the orphan path) or if SelectPlacement errors out.
-// Self is a perfectly valid choice — the leader is a normal recreation target.
-func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeID, apiURL, dataPlaneHost string) {
-	if spec == nil {
-		return "", "", ""
+func (c *Cluster) deleteFenceOwnerUnavailable(ownerNodeID string) bool {
+	ownerNodeID = strings.TrimSpace(ownerNodeID)
+	if c == nil || ownerNodeID == "" {
+		return true
 	}
-	if spec.ImageDistributionMode == models.ImageDistributionLocalOnly {
-		return "", "", ""
+	if ownerNodeID == strings.TrimSpace(c.nodeID) || c.gossip == nil {
+		return false
 	}
-	req := capacityRequestFromSpec(spec)
-	target, err := c.SelectPlacement(req)
-	if err != nil {
-		return "", "", ""
-	}
-	if target.IsSelf {
-		return c.nodeID, c.apiURL, c.dataPlaneHost
-	}
-	return target.NodeID, target.APIURL, target.DataPlaneHost
+	member, ok := c.gossip.lookupMember(ownerNodeID)
+	return !ok || !member.Alive
 }

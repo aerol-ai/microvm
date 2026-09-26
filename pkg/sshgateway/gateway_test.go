@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1071,14 +1072,15 @@ func newTestExecSession(t *testing.T, output string) *docker.ExecSession {
 type fakeChannel struct {
 	stdout   io.Writer
 	stderr   io.Writer
+	mu       sync.Mutex
 	requests []recordedRequest
 }
 
-func (f fakeChannel) Read(p []byte) (int, error)  { return 0, io.EOF }
-func (f fakeChannel) Write(p []byte) (int, error) { return f.stdout.Write(p) }
-func (f fakeChannel) Close() error                { return nil }
-func (f fakeChannel) CloseWrite() error           { return nil }
-func (f fakeChannel) Stderr() io.ReadWriter       { return stderrAdapter{w: f.stderr} }
+func (f *fakeChannel) Read(p []byte) (int, error)  { return 0, io.EOF }
+func (f *fakeChannel) Write(p []byte) (int, error) { return f.stdout.Write(p) }
+func (f *fakeChannel) Close() error                { return nil }
+func (f *fakeChannel) CloseWrite() error           { return nil }
+func (f *fakeChannel) Stderr() io.ReadWriter       { return stderrAdapter{w: f.stderr} }
 
 type recordedRequest struct {
 	name      string
@@ -1087,11 +1089,15 @@ type recordedRequest struct {
 }
 
 func (f *fakeChannel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.requests = append(f.requests, recordedRequest{name: name, wantReply: wantReply, payload: append([]byte(nil), payload...)})
 	return true, nil
 }
 
 func (f *fakeChannel) exitStatus() uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, req := range f.requests {
 		if req.name != "exit-status" || len(req.payload) != 4 {
 			continue

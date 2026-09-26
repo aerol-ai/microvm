@@ -31,6 +31,7 @@ import (
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
+	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -143,7 +144,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}()
 	}
 
-	db, err := store.Open(cfg.DBPath)
+	// Initialize the cipher before opening the database. Store startup may need
+	// it to transactionally seal plaintext env/toolbox values left by a
+	// pre-hardening release before any service begins reading the database.
+	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
+	if err != nil {
+		return fmt.Errorf("initialize credential cipher: %w", err)
+	}
+
+	db, err := store.OpenWithSecretCipher(cfg.DBPath, cipher)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -180,11 +189,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	configureAOCRPullAuth(logger, cfg, dockerClient)
 
 	caddyClient := caddy.New(cfg)
-
-	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
-	if err != nil {
-		return fmt.Errorf("initialize credential cipher: %w", err)
-	}
 
 	mountManager, err := mounts.New(logger, mounts.Config{
 		RootDir:     cfg.MountsRootPath,
@@ -276,6 +280,22 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	// Close the audit sink on any return path (boot failure after New, or
+	// graceful shutdown) so the writer goroutine and witness loop do not leak.
+	defer svc.CloseSecretAuditSink()
+	if err := svc.ValidateSecretAuditSink(); err != nil {
+		return err
+	}
+	if err := svc.StartAuditIngestServer(ctx); err != nil {
+		return fmt.Errorf("start audit ingest: %w", err)
+	}
+	defer svc.StopAuditIngestServer()
+	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
+		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
+	}
+	if err := svc.ConfigureSecretProvider(ctx); err != nil {
+		return fmt.Errorf("configure secret provider: %w", err)
+	}
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
@@ -289,6 +309,27 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// controlplane.Noop() this is the no-op reporter, so the open-source build
 	// emits nothing and pays no cost.
 	svc.SetUsageReporter(cp.Reporter)
+	svc.SetWitness(cp.Witness)
+	// Audit export connectors (plans/audit-export-connectors.md): a managed
+	// build's injected exporter wins; otherwise SB_AUDIT_EXPORT_BACKEND selects
+	// a connector behind the same tailer. Raft never carries this history.
+	if cp.HasAuditExporter() {
+		svc.SetAuditExporter(cp.AuditExporter)
+	} else if err := svc.ConfigureAuditExporter(); err != nil {
+		return fmt.Errorf("configure audit export connector: %w", err)
+	}
+	// "Enabled" is not the bar: stdout and file are enabled backends that
+	// never leave the node, so disk loss still takes the reconstructable
+	// history with it. Require a backend that ships somewhere this node
+	// cannot silently rewrite, or a programmatic exporter.
+	if cfg.EnterpriseMode && !cp.HasAuditExporter() && !auditexport.IsOffNodeBackend(cfg.ResolvedAuditExportBackend()) {
+		return fmt.Errorf("enterprise mode requires an off-node audit exporter: SB_AUDIT_EXPORT_BACKEND=%q keeps evidence on this node; set webhook|s3|bus (or SB_SECRET_AUDIT_EXPORT_URL) or wire controlplane.AuditExporter", cfg.ResolvedAuditExportBackend())
+	}
+	// Witness is installed after the sink opens; re-validate so enterprise +
+	// external witness fail closed at boot when the chain/receipts disagree.
+	if err := svc.ValidateSecretAuditWitness(); err != nil {
+		return err
+	}
 	// Wire the managed create-gate. Under Noop() this is the allow-all admitter,
 	// so the open-source build never gates a create.
 	svc.SetFleetAdmitter(cp.Admitter)
@@ -501,26 +542,35 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}
 		}()
 		svc.AttachCluster(clusterClient)
+		// Fail closed on oversized ingress tiers without an explicit
+		// shard-aware router opt-in. Enterprise boots refuse to start;
+		// open-source warns and skips marking ingress reconcile ready.
+		if topoErr := svc.ClusterTopologyError(); topoErr != nil {
+			if cfg.EnterpriseMode {
+				return fmt.Errorf("cluster topology: %w (set SB_CLUSTER_SHARD_AWARE_INGRESS=true only when the upstream router shards via /v1/cluster/ingress-route/{id})", topoErr)
+			}
+			logger.Error("cluster topology violation; refusing to mark ingress ready",
+				"error", topoErr,
+				"hint", "set SB_CLUSTER_SHARD_AWARE_INGRESS=true when the upstream router is shard-aware",
+			)
+		}
 		// The owner watcher needs a hook back into the service to recreate
 		// sandboxes whose placements were reassigned to this node after a
 		// dead-owner eviction. Wired here (after both objects exist) to keep
 		// the cluster→service direction one-way through the SandboxRecreator
 		// interface, avoiding an import cycle.
+		//
+		// Both *Cluster and *Agent implement it: a dedicated worker owns
+		// sandboxes too, and when only *Cluster did, this probe silently
+		// skipped every worker-role node and its reassigned placements were
+		// never materialized. A miss is now loud rather than invisible.
 		if withRecreator, ok := clusterClient.(interface {
 			AttachRecreator(cluster.SandboxRecreator)
 		}); ok {
 			withRecreator.AttachRecreator(svc)
-		}
-		// Isolate's JS-bundle store is per-node, so an uploaded bundle must be
-		// fanned out to peers or an isolate create placed on another node fails
-		// "bundle not found". Wire the fan-out only in cluster mode (both
-		// *Cluster and *Agent implement ReplicateJSBundle); single-node leaves
-		// the replicator nil (no-op). Harmless when isolate is off — no bundles
-		// are ever uploaded.
-		if withRep, ok := clusterClient.(interface {
-			ReplicateJSBundle(context.Context, string, models.CreateJSBundleRequest) error
-		}); ok {
-			svc.SetJSBundleReplicator(withRep.ReplicateJSBundle)
+		} else {
+			logger.Error("cluster: client exposes no AttachRecreator; failover recreation is disabled on this node",
+				"node_role", cfg.NodeRole)
 		}
 		// Phase 6 PR-D: template-aware placement. The capacity lease
 		// cache asks the service for the local "ready" template
@@ -539,6 +589,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}); ok {
 				withTemplates.SetLocalTemplateIDsProvider(func() ([]string, bool) {
 					return svc.LocalReadyTemplateInventory(context.Background())
+				})
+			}
+			if withTemplateCatalog, ok := clusterClient.(interface {
+				SetLocalTemplateCatalogProvider(func() ([]string, bool))
+			}); ok {
+				withTemplateCatalog.SetLocalTemplateCatalogProvider(func() ([]string, bool) {
+					return svc.LocalTemplateCatalogInventory(context.Background())
 				})
 			}
 		}
@@ -599,10 +656,43 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			if !replayClusterOwnership(ctx, svc, logger) {
 				startClusterOwnershipReplayRetry(ctx, svc, logger)
 			}
+			// Rebuild secret holder counts + re-push multi-recipient blobs so
+			// failover_ready is not stuck false after a restart (holders are
+			// in-memory only). Best-effort; fan-out continues async.
+			if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
+				if cfg.EnterpriseMode {
+					return fmt.Errorf("cluster: validate/re-fanout durable secrets at boot: %w", err)
+				}
+				logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
+			}
+			if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+				logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
+			}
+			if err := svc.ReconcileSecretPutOutbox(ctx); err != nil {
+				logger.Warn("cluster: secret put-outbox reconcile at boot failed", "error", err)
+			}
+			svc.StartSecretDeleteOutboxReconcile(ctx)
 		}
 		if cfg.IsIngress() {
-			svc.StartClusterIngressReconcile(ctx)
+			if topoErr := svc.ClusterTopologyError(); topoErr != nil && !cfg.ClusterShardAwareIngress {
+				logger.Error("skipping cluster ingress reconcile until shard-aware ingress is configured",
+					"error", topoErr)
+			} else {
+				svc.StartClusterIngressReconcile(ctx)
+			}
 		}
+	} else {
+		// Standalone. The secret-lifecycle tables (sealed rows, tombstones,
+		// both peer outboxes) exist regardless of mode, and a node that left a
+		// cluster still holds rows it can never act on — peer PUTs and DELETEs
+		// with no transport, ciphertext for sandboxes that are not here. The
+		// same reconciler runs here; with no peers it retires those after
+		// SB_SECRET_OUTBOX_STANDALONE_GRACE and prunes tombstones on retention,
+		// so a cluster→single-node downgrade does not leak them forever.
+		if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+			logger.Warn("standalone: secret lifecycle reconcile at boot failed", "error", err)
+		}
+		svc.StartSecretDeleteOutboxReconcile(ctx)
 	}
 
 	// Bypass-flip rollback marker (D5 of plans/warm-direct-route-bypass.md).
@@ -924,6 +1014,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// the last batch of route changes is not silently dropped. No-op on
 	// nodes that never started the coalescer.
 	svc.StopCaddyCoalescer()
+	// Flush/stop the secret-audit writer after HTTP is down so in-flight
+	// request Emits have finished. Idempotent with the deferred close.
+	svc.CloseSecretAuditSink()
 	return nil
 }
 
@@ -945,8 +1038,9 @@ var clusterOwnershipReplayTick = 10 * time.Second
 
 func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
 	logger.Warn("cluster: scheduling ownership replay retry")
+	interval := clusterOwnershipReplayTick
 	go func() {
-		t := time.NewTicker(clusterOwnershipReplayTick)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
@@ -1371,7 +1465,9 @@ func startTemplateArtifactPushReconciler(ctx context.Context, logger *slog.Logge
 			"error", err)
 		return
 	}
-	r := service.NewTemplateArtifactPushReconciler(pusher, db, logger, cfg.SnapshotPushMaxInFlight)
+	// Through the service's seam, so a push that changes the row's registry
+	// ref or push state also invalidates the replicated artifact catalogue.
+	r := service.NewTemplateArtifactPushReconciler(pusher, svc.TemplatePushStore(db), logger, cfg.SnapshotPushMaxInFlight)
 	if r == nil {
 		return
 	}

@@ -7,6 +7,7 @@ package apihttp
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -37,8 +38,36 @@ const MaxJSONBodyBytes = 1 << 20 // 1 MiB
 // json.NewDecoder(r.Body) directly so the size cap is uniform across v1 and
 // the facades. The caller writes its own error envelope on failure.
 func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	return DecodeJSONLimit(w, r, dst, MaxJSONBodyBytes)
+}
+
+// DecodeJSONLimit decodes a JSON request using an endpoint-specific maximum.
+// Keep exceptional limits at the handler so the shared public API default does
+// not grow merely because one internal wire format contains base64 expansion.
+func DecodeJSONLimit(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
+	if maxBytes <= 0 {
+		maxBytes = MaxJSONBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+// ReadJSONBody applies the same cap for cluster wrappers that must buffer and
+// replay a request before choosing a local or peer handler.
+func ReadJSONBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes)
-	return json.NewDecoder(r.Body).Decode(dst)
+	return io.ReadAll(r.Body)
 }
 
 // WriteJSON serializes value as JSON and writes it with the given status.
@@ -52,6 +81,12 @@ func WriteJSON(w http.ResponseWriter, status int, value any) {
 // versions return errors in the same shape.
 func WriteError(w http.ResponseWriter, status int, message string) {
 	WriteJSON(w, status, models.ErrorResponse{Error: message})
+}
+
+// WriteErrorCode is WriteError with a stable machine-readable code for
+// errors a client is expected to act on (see models.ErrorCode*).
+func WriteErrorCode(w http.ResponseWriter, status int, code, message string) {
+	WriteJSON(w, status, models.ErrorResponse{Error: message, Code: code})
 }
 
 // WriteStoreAwareError maps the small set of well-known service-layer error
@@ -100,6 +135,25 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	if errors.Is(err, service.ErrWakeCircuitOpen) {
 		w.Header().Set("Retry-After", "60")
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	// Audit read slots on this node are all busy: 429 + Retry-After so the
+	// caller backs off instead of queueing until its deadline turns into a
+	// 504 (the audit rate limiter uses the same status for the same reason).
+	if errors.Is(err, service.ErrSecretAuditBusy) {
+		w.Header().Set("Retry-After", "1")
+		WriteError(w, http.StatusTooManyRequests, service.ErrSecretAuditBusy.Error())
+		return
+	}
+	// The node's audit chain no longer verifies: evidence is withheld, not
+	// served unverified. Not retryable until an operator repairs the log.
+	if errors.Is(err, service.ErrSecretAuditChainBroken) {
+		WriteError(w, http.StatusServiceUnavailable, service.ErrSecretAuditChainBroken.Error())
+		return
+	}
+	if errors.Is(err, service.ErrClusterFinalizationUnavailable) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, service.ErrClusterFinalizationUnavailable.Error())
 		return
 	}
 	if errors.Is(err, service.ErrPublicTrafficDisabled) {

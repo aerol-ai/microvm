@@ -1,0 +1,12 @@
+# Single-node isolate scenario with the workerd jail ON (the daemon default).
+# Same topology and provisioning as single-node-isolate; the only difference is
+# that the tfvars does not disable SB_ISOLATE_USE_JAIL, so every group process
+# runs chrooted, privilege-dropped, cgroup-capped and seccomp-filtered.
+# `isolate-jail` gates UC-109, which SSHes in and inspects the workerd process;
+# the plain isolate UCs (UC-103..105) run here too, now against jailed groups.
+name: single-node-isolate-jail
+capabilities:
+  - docker
+  - isolate
+  - isolate-jail
+  - domain

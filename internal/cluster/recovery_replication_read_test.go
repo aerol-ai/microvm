@@ -77,7 +77,7 @@ func TestFetchRecoveryBlobAndMembers(t *testing.T) {
 		gossip: &gossipNode{
 			memberIndex: &gossipMemberIndex{
 				members: map[string]Member{
-					"node2": {NodeID: "node2", Alive: true, Role: "server", APIURL: "http://api"},
+					"node2": {NodeID: "node2", Alive: true, Role: "server", APIURL: "http://api", InternalURL: "https://api"},
 				},
 			},
 		},
@@ -85,7 +85,6 @@ func TestFetchRecoveryBlobAndMembers(t *testing.T) {
 	if len(c.recoveryServerMembers()) != 1 {
 		t.Errorf("expected 1 member")
 	}
-	c.httpClient = http.DefaultClient
 
 	_, ok, _ := c.fetchRecoveryBlob(context.Background(), "ref1")
 	if ok {
@@ -96,22 +95,21 @@ func TestFetchRecoveryBlobAndMembers(t *testing.T) {
 // TestFetchRecoveryBlobFromPeer is the client half of the snapshot-join
 // fetch-on-miss path: a peer serving the GET endpoint satisfies the fetch.
 func TestFetchRecoveryBlobFromPeer(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts, internalClient := newNodeBoundForwardServer(t, "node1", "node2", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 		json.NewEncoder(w).Encode(RecoveryBlob{Ref: "test-ref", SandboxID: "sb1"})
 	}))
-	defer ts.Close()
 
 	c := &Cluster{
-		nodeID:     "node1",
-		httpClient: ts.Client(),
+		nodeID:         "node1",
+		internalClient: internalClient,
 		gossip: &gossipNode{
 			memberIndex: &gossipMemberIndex{
 				members: map[string]Member{
-					"node2": {NodeID: "node2", Alive: true, Role: "server", APIURL: ts.URL},
+					"node2": {NodeID: "node2", Alive: true, Role: "server", APIURL: ts.URL, InternalURL: ts.URL},
 				},
 			},
 		},
@@ -123,21 +121,13 @@ func TestFetchRecoveryBlobFromPeer(t *testing.T) {
 }
 
 func TestGetRecoveryBlobFromMember(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts, internalClient := newNodeBoundForwardServer(t, "node1", "node2", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(RecoveryBlob{Ref: "test-ref"})
 	}))
-	defer ts.Close()
 
-	c := &Cluster{httpClient: ts.Client()}
+	c := &Cluster{nodeID: "node1", internalClient: internalClient}
 
-	out, ok, err := c.getRecoveryBlobFromMember(context.Background(), Member{APIURL: ts.URL}, "test-ref")
-	if err != nil || !ok || out.Ref != "test-ref" {
-		t.Errorf("get error: %v %v %v", out, ok, err)
-	}
-
-	// Internal (mTLS) channel is preferred when present.
-	c.internalClient = ts.Client()
-	out, ok, err = c.getRecoveryBlobFromMember(context.Background(), Member{InternalURL: ts.URL}, "test-ref")
+	out, ok, err := c.getRecoveryBlobFromMember(context.Background(), Member{NodeID: "node2", InternalURL: ts.URL}, "test-ref")
 	if err != nil || !ok || out.Ref != "test-ref" {
 		t.Errorf("get internal error: %v %v %v", out, ok, err)
 	}
@@ -161,7 +151,7 @@ func TestDoRecoveryHTTPRequest(t *testing.T) {
 	ctx := context.Background()
 
 	var out RecoveryBlob
-	err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "test-token", nil, &out)
+	err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "test-token", "", nil, &out)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -170,12 +160,12 @@ func TestDoRecoveryHTTPRequest(t *testing.T) {
 	}
 
 	// auth fail
-	if err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "bad-token", nil, &out); err == nil {
+	if err := doRecoveryHTTPRequest(ctx, ts.Client(), ts.URL, http.MethodGet, "bad-token", "", nil, &out); err == nil {
 		t.Errorf("expected error")
 	}
 
 	// transport fail (bad url)
-	if err := doRecoveryHTTPRequest(ctx, ts.Client(), "http://127.0.0.1:0", http.MethodGet, "", nil, nil); err == nil {
+	if err := doRecoveryHTTPRequest(ctx, ts.Client(), "http://127.0.0.1:0", http.MethodGet, "", "", nil, nil); err == nil {
 		t.Errorf("expected error")
 	}
 }

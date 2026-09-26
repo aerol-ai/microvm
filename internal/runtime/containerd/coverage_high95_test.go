@@ -20,15 +20,15 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/runtime"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -434,10 +434,10 @@ func TestLoadContainerForRefListError(t *testing.T) {
 
 type listFailTransport struct{ fakeTransport }
 
-func (listFailTransport) loadContainer(context.Context, string) (cntr.Container, error) {
+func (*listFailTransport) loadContainer(context.Context, string) (cntr.Container, error) {
 	return nil, errdefs.ErrNotFound
 }
-func (listFailTransport) listContainers(context.Context, ...string) ([]cntr.Container, error) {
+func (*listFailTransport) listContainers(context.Context, ...string) ([]cntr.Container, error) {
 	return nil, errors.New("list failed")
 }
 

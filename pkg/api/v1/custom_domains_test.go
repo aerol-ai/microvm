@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -64,7 +65,12 @@ func newCustomDomainsV1Env(t *testing.T, cfgOverride func(*config.Config)) *cust
 	RegisterRoutes(mux, Deps{
 		Service: svc,
 		Logger:  logger,
-		Auth:    func(h http.Handler) http.Handler { return h },
+		Auth: func(h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctx := controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: true})
+				h.ServeHTTP(w, r.WithContext(ctx))
+			})
+		},
 	})
 	return &customDomainsV1Env{mux: mux, svc: svc, store: st}
 }

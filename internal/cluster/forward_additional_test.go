@@ -7,14 +7,14 @@ import (
 )
 
 func TestProxyCacheGet(t *testing.T) {
-	pc := newProxyCache(http.DefaultTransport)
+	pc := newProxyCache()
 
-	p1, err := pc.get("http://localhost:8080")
+	p1, err := pc.getForPeer("node-1", "https://localhost:8080", http.DefaultTransport)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	p2, err := pc.get("http://localhost:8080")
+	p2, err := pc.getForPeer("node-1", "https://localhost:8080", http.DefaultTransport)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -23,23 +23,23 @@ func TestProxyCacheGet(t *testing.T) {
 	}
 
 	// invalid url
-	_, err = pc.get("http://192.168.0.%31/")
+	_, err = pc.getForPeer("node-1", "https://192.168.0.%31/", http.DefaultTransport)
 	if err == nil {
 		t.Errorf("expected error for invalid url")
 	}
 }
 
 func TestServeProxy(t *testing.T) {
-	pc := newProxyCache(http.DefaultTransport)
+	pc := newProxyCache()
 	req := httptest.NewRequest("GET", "http://example.com/foo", nil)
 	w := httptest.NewRecorder()
 
-	err := serveProxy(pc, "localhost:8080", w, req)
+	err := servePeerProxy(pc, "node-1", "localhost:8080", http.DefaultTransport, w, req)
 	if err == nil {
 		t.Errorf("expected error for missing scheme")
 	}
 
-	err = serveProxy(pc, "http://192.168.0.%31/", w, req)
+	err = servePeerProxy(pc, "node-1", "https://192.168.0.%31/", http.DefaultTransport, w, req)
 	if err == nil {
 		t.Errorf("expected error for invalid URL")
 	}

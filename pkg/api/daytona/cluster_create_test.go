@@ -30,6 +30,23 @@ func (c *daytonaForwardCluster) SelectPlacement(capacity.Request) (cluster.Place
 	return c.target, nil
 }
 
+func (c *daytonaForwardCluster) SelectPlacementWithCandidates(capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
+	return c.target, []cluster.Member{{NodeID: c.target.NodeID, APIURL: c.target.APIURL, Alive: true}}, nil
+}
+
+// SelectPlacementForCreate is what the create path calls now. Without it the
+// embedded Noop answers and the create never leaves the router.
+func (c *daytonaForwardCluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (cluster.PlacementTarget, []string, error) {
+	target, candidates, err := c.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return cluster.PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
+}
+
 func (c *daytonaForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, _ cluster.PlacementTarget, redacted *models.CreateSandboxRequest, _ cluster.PlacementSecrets, _ time.Duration) error {
 	c.reservedID = sandboxID
 	c.reservedReq = redacted

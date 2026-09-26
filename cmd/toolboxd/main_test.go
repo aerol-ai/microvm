@@ -437,19 +437,19 @@ func TestMainUtilityErrorBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	t.Run("start_user_command_error", func(t *testing.T) {
-		pidBefore := userCommandPID
-		t.Cleanup(func() { userCommandPID = pidBefore })
+		pidBefore := userCommandPID.Load()
+		t.Cleanup(func() { userCommandPID.Store(pidBefore) })
 
 		startUserCommand(logger, []string{filepath.Join(t.TempDir(), "does-not-exist")})
-		if userCommandPID != pidBefore {
-			t.Fatalf("userCommandPID changed to %d after failed start", userCommandPID)
+		if userCommandPID.Load() != pidBefore {
+			t.Fatalf("userCommandPID changed to %d after failed start", userCommandPID.Load())
 		}
 	})
 
 	t.Run("forward_shutdown_signals", func(t *testing.T) {
-		pidBefore := userCommandPID
-		t.Cleanup(func() { userCommandPID = pidBefore })
-		userCommandPID = 999999
+		pidBefore := userCommandPID.Load()
+		t.Cleanup(func() { userCommandPID.Store(pidBefore) })
+		userCommandPID.Store(999999)
 
 		srv := &http.Server{}
 		done := make(chan struct{})

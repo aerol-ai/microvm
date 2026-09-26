@@ -233,6 +233,29 @@ func TestTLSStreamLayerDialAcceptAndClose(t *testing.T) {
 	}
 }
 
+func TestTLSStreamLayerPublishesKernelAssignedPort(t *testing.T) {
+	cert := mustSelfSignedCert(t)
+	layer, err := newTLSStreamLayer(
+		"127.0.0.1:0",
+		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0},
+		&tls.Config{Certificates: []tls.Certificate{cert}},
+		&tls.Config{InsecureSkipVerify: true},
+	)
+	if err != nil {
+		t.Fatalf("newTLSStreamLayer() error = %v", err)
+	}
+	defer layer.Close()
+
+	bound := layer.listener.Addr().(*net.TCPAddr)
+	advertised := layer.Addr().(*net.TCPAddr)
+	if advertised.Port == 0 || advertised.Port != bound.Port {
+		t.Fatalf("advertised port = %d, bound port = %d; want the same non-zero port", advertised.Port, bound.Port)
+	}
+	if got := advertised.IP.String(); got != "127.0.0.1" {
+		t.Fatalf("advertised IP = %q, want configured loopback IP", got)
+	}
+}
+
 func TestNewTLSStreamLayerRequiresConfigs(t *testing.T) {
 	if _, err := newTLSStreamLayer("127.0.0.1:0", &net.TCPAddr{}, nil, &tls.Config{}); err == nil {
 		t.Fatal("newTLSStreamLayer() accepted nil server config")

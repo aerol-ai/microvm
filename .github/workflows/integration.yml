@@ -53,29 +53,34 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_wrapper: false
 
       - name: Install yq + jq
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          go install github.com/mikefarah/yq/v4@v4.53.3
+          sudo install -m 0755 "$(go env GOPATH)/bin/yq" /usr/local/bin/yq
+          yq --version
           jq --version
 
       - name: Materialize secrets (gitignored at rest)
+        env:
+          AEROL_DOMAINS_YML: ${{ secrets.AEROL_DOMAINS_YML }}
+          AEROL_SECRETS_YML: ${{ secrets.AEROL_SECRETS_YML }}
         run: |
+          umask 077
           mkdir -p config integration-tests/scenarios
-          printf '%s' "${{ secrets.AEROL_SECRETS_YML }}" > config/secrets.yml
-          printf '%s' "${{ secrets.AEROL_DOMAINS_YML }}" > integration-tests/scenarios/domains.yml
+          printf '%s' "$AEROL_SECRETS_YML" > config/secrets.yml
+          printf '%s' "$AEROL_DOMAINS_YML" > integration-tests/scenarios/domains.yml
 
       - name: Run scenario
         run: |
@@ -86,7 +91,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-report-${{ inputs.scenario }}
           path: integration-tests/reports/

@@ -112,7 +112,7 @@ func TestRegistrySealUnsealRoundTrip(t *testing.T) {
 		t.Fatal("sealed bytes did not survive the round-trip through SQLite")
 	}
 
-	unsealed, err := svc.UnsealRegistry(got.RegistryAuthSealed)
+	unsealed, err := svc.UnsealRegistry("sb-private", got.RegistryAuthSealed)
 	if err != nil {
 		t.Fatalf("UnsealRegistry: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestUnsealRegistryEmptyInputIsNil(t *testing.T) {
 		"nil":   nil,
 		"empty": {},
 	} {
-		got, err := svc.UnsealRegistry(in)
+		got, err := svc.UnsealRegistry("sb-empty", in)
 		if err != nil {
 			t.Fatalf("%s: UnsealRegistry: %v", name, err)
 		}

@@ -39,16 +39,15 @@ func TestGossipDelegateUnusedMethodsCallable(t *testing.T) {
 
 func TestClusterWasmMigrateHTTPClientBranches(t *testing.T) {
 	c := &Cluster{
-		httpClient:     http.DefaultClient,
 		internalClient: http.DefaultClient,
 	}
-	if client, base, err := c.wasmMigrateHTTPClient("https://internal", "http://api"); err != nil || client != c.internalClient || base != "https://internal" {
+	if client, base, err := c.PeerDialMember(Member{NodeID: "peer-1", InternalURL: "https://internal"}); err != nil || client != c.internalClient || base != "https://internal" {
 		t.Fatalf("internal path = (%p, %q, %v), want internal client", client, base, err)
 	}
-	if client, base, err := c.wasmMigrateHTTPClient("", "http://api"); err != nil || client != c.httpClient || base != "http://api" {
-		t.Fatalf("public path = (%p, %q, %v)", client, base, err)
+	if client, base, err := c.PeerDialMember(Member{NodeID: "peer-1"}); !errors.Is(err, ErrPeerInternalURLRequired) || client != nil || base != "" {
+		t.Fatalf("missing internal path = (%p, %q, %v)", client, base, err)
 	}
-	if _, _, err := c.wasmMigrateHTTPClient("", ""); err == nil {
+	if _, _, err := c.PeerDialMember(Member{}); err == nil {
 		t.Fatal("expected error when both URLs are empty")
 	}
 }
@@ -107,15 +106,16 @@ func TestClusterApplyEncodedReservePath(t *testing.T) {
 	c.gossip.delegate.admitter = admitter
 	c.gossip.delegate.mu.Unlock()
 	c.gossip.refreshMemberIndex()
-	c.capacityLeases.admitter = admitter
+	c.capacityLeases.setAdmitter(admitter)
 	c.capacityLeases.set(c.nodeID, admitter.Snapshot(), time.Now())
 
 	payload, err := encodeCommand(command{
-		Op:          opReserve,
-		SandboxID:   "sb-encoded-reserve",
-		OwnerNodeID: c.nodeID,
-		Spec:        &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 1},
-		ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		Op:            opReserve,
+		SandboxID:     "sb-encoded-reserve",
+		OwnerNodeID:   c.nodeID,
+		IncarnationID: "inc-encoded-reserve",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 1},
+		ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -175,7 +175,6 @@ func TestAgentTryControlPlaneInternal503DoesNotFallback(t *testing.T) {
 
 	agent := &Agent{
 		nodeID:         "worker-self",
-		httpClient:     public.Client(),
 		internalClient: internal.Client(),
 		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -188,14 +187,43 @@ func TestAgentTryControlPlaneInternal503DoesNotFallback(t *testing.T) {
 
 func TestAgentTryControlPlaneMissingAPIURL(t *testing.T) {
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: http.DefaultClient,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID: "worker-self",
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	m := Member{NodeID: "server-1", Alive: true}
 	err := agent.tryControlPlaneMember(context.Background(), m, http.MethodGet, "/v1/cluster/members", "/v1/internal/cluster/members", nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "API URL unknown") {
-		t.Fatalf("tryControlPlaneMember() = %v, want missing API URL error", err)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("tryControlPlaneMember() = %v, want missing internal URL error", err)
+	}
+}
+
+func TestAgentTryControlPlaneRequiresInternalURLWhenTLSLoaded(t *testing.T) {
+	agent := &Agent{
+		nodeID:         "worker-self",
+		internalClient: http.DefaultClient,
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	m := Member{NodeID: "server-1", APIURL: "http://public", Alive: true}
+	err := agent.tryControlPlaneMember(context.Background(), m, http.MethodGet, "/v1/cluster/members", InternalAPIPath, nil, nil)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("tryControlPlaneMember() = %v, want ErrPeerInternalURLRequired", err)
+	}
+}
+
+func TestAgentTryControlPlaneFailClosedWithoutInternalURL(t *testing.T) {
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("public API must not be called when internalClient is set without InternalURL")
+	}))
+	defer public.Close()
+	agent := &Agent{
+		nodeID:         "worker-self",
+		internalClient: &http.Client{},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	m := Member{NodeID: "server-1", APIURL: public.URL, Alive: true}
+	err := agent.tryControlPlaneMember(context.Background(), m, http.MethodGet, "/v1/cluster/members", InternalAPIPath, nil, nil)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("tryControlPlaneMember() = %v, want ErrPeerInternalURLRequired", err)
 	}
 }
 
@@ -213,6 +241,7 @@ func TestAgentAssertOwnershipFreshPlacementReplaysPortsAndDomains(t *testing.T) 
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-fresh",
 		Spec:            spec,
+		Secrets:         PlacementSecrets{IncarnationID: "inc-fresh"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 		CustomHostnames: []string{"fresh.example.com"},
 	}}); err != nil {
@@ -238,10 +267,11 @@ func TestAgentAssertOwnershipPromotesSelfReservation(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-reserved",
 				Placement: Placement{
-					SandboxID:   "sb-reserved",
-					OwnerNodeID: "worker-self",
-					State:       PlacementStateReserved,
-					ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+					SandboxID:     "sb-reserved",
+					OwnerNodeID:   "worker-self",
+					IncarnationID: "inc-reserved",
+					State:         PlacementStateReserved,
+					ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -253,6 +283,7 @@ func TestAgentAssertOwnershipPromotesSelfReservation(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:           "sb-reserved",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine:3.20"},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-reserved"},
 		ExposedPorts: map[int]ExposedPortRoute{9000: {Protocol: "tcp", HostPort: 29000}},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership(reserved): %v", err)
@@ -270,9 +301,10 @@ func TestAgentAssertOwnershipBackfillsNilSpecOnSelfOwnedRow(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-nil-spec",
 				Placement: Placement{
-					SandboxID:   "sb-nil-spec",
-					OwnerNodeID: "worker-self",
-					OwnerState:  PlacementOwnerStateActive,
+					SandboxID:     "sb-nil-spec",
+					OwnerNodeID:   "worker-self",
+					OwnerState:    PlacementOwnerStateActive,
+					IncarnationID: "inc-nil-spec",
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -283,8 +315,9 @@ func TestAgentAssertOwnershipBackfillsNilSpecOnSelfOwnedRow(t *testing.T) {
 
 	spec := &models.CreateSandboxRequest{Image: "alpine:3.20"}
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
-		ID:   "sb-nil-spec",
-		Spec: spec,
+		ID:      "sb-nil-spec",
+		Spec:    spec,
+		Secrets: PlacementSecrets{IncarnationID: "inc-nil-spec"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership(nil spec): %v", err)
 	}
@@ -362,7 +395,7 @@ func TestForwardRemoveMemberToLeaderInternalMock(t *testing.T) {
 	}))
 	defer internal.Close()
 
-	follower.internalClient = internal.Client()
+	follower.setInternalClient(internal.Client())
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID:      leader.nodeID,
 		InternalURL: internal.URL,
@@ -594,11 +627,10 @@ func TestAgentAssertOwnershipClaimOrphanErrorIsReturned(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		apiURL:     "http://worker-self",
-		httpClient: srv.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID: "worker-self",
+		apiURL: "http://worker-self",
+		gossip: &gossipNode{memberIndex: index},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
@@ -611,7 +643,8 @@ func TestAgentAssertOwnershipClaimOrphanErrorIsReturned(t *testing.T) {
 }
 
 func TestAgentPlacementPageSuccessAndFailure(t *testing.T) {
-	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dirs := writeTestClusterTLSDirs(t, "worker-self", "server-1")
+	okSrv, internalClient := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsPagePath {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(PlacementPageResponse{
@@ -621,15 +654,14 @@ func TestAgentPlacementPageSuccessAndFailure(t *testing.T) {
 		}
 		http.NotFound(w, r)
 	}))
-	defer okSrv.Close()
 
 	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "server-1", APIURL: okSrv.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "server-1", APIURL: okSrv.URL, InternalURL: okSrv.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: okSrv.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeID:         "worker-self",
+		internalClient: internalClient,
+		gossip:         &gossipNode{memberIndex: index},
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	page := agent.PlacementPage(PlacementPageRequest{Limit: 10})
 	if len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-page" {
@@ -639,12 +671,10 @@ func TestAgentPlacementPageSuccessAndFailure(t *testing.T) {
 		t.Fatalf("PlacementVersion() = %d, want 3", agent.PlacementVersion())
 	}
 
-	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	failSrv, _ := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
-	defer failSrv.Close()
-	index.upsert(Member{NodeID: "server-1", APIURL: failSrv.URL, Alive: true, Role: config.NodeRoleServer})
-	agent.httpClient = failSrv.Client()
+	index.upsert(Member{NodeID: "server-1", APIURL: failSrv.URL, InternalURL: failSrv.URL, Alive: true, Role: config.NodeRoleServer})
 	if got := agent.PlacementPage(PlacementPageRequest{Limit: 5}); len(got.Placements) != 0 {
 		t.Fatalf("PlacementPage() on failure = %+v, want empty", got)
 	}
@@ -693,7 +723,7 @@ func TestClusterUpsertSpecOnLeader(t *testing.T) {
 		t.Fatalf("RecordPlacement: %v", err)
 	}
 	spec := &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 2}
-	if err := c.UpsertSpec(context.Background(), "sb-upsert", spec, PlacementSecrets{Ref: "secret-ref", Version: 1}); err != nil {
+	if err := c.UpsertSpec(context.Background(), "sb-upsert", spec, PlacementSecrets{}); err != nil {
 		t.Fatalf("UpsertSpec: %v", err)
 	}
 	got, ok := c.PlacementOf("sb-upsert")
@@ -729,9 +759,10 @@ func TestAgentAssertOwnershipSelfOwnedReplaysPortsAndDomains(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-owned",
 				Placement: Placement{
-					SandboxID:   "sb-owned",
-					OwnerNodeID: "worker-self",
-					Spec:        spec,
+					SandboxID:     "sb-owned",
+					OwnerNodeID:   "worker-self",
+					Spec:          spec,
+					IncarnationID: "inc-owned",
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -743,6 +774,7 @@ func TestAgentAssertOwnershipSelfOwnedReplaysPortsAndDomains(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-owned",
 		Spec:            spec,
+		Secrets:         PlacementSecrets{IncarnationID: "inc-owned"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 		CustomHostnames: []string{"owned.example.com"},
 	}}); err != nil {
@@ -764,10 +796,11 @@ func TestAgentAssertOwnershipReservedReplaysCustomDomains(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-res-domains",
 				Placement: Placement{
-					SandboxID:   "sb-res-domains",
-					OwnerNodeID: "worker-self",
-					State:       PlacementStateReserved,
-					ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+					SandboxID:     "sb-res-domains",
+					OwnerNodeID:   "worker-self",
+					IncarnationID: "inc-res-domains",
+					State:         PlacementStateReserved,
+					ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 				},
 				Owner: OwnerInfo{NodeID: "worker-self", IsSelf: true},
 			})
@@ -779,6 +812,7 @@ func TestAgentAssertOwnershipReservedReplaysCustomDomains(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-res-domains",
 		Spec:            &models.CreateSandboxRequest{Image: "alpine:3.20"},
+		Secrets:         PlacementSecrets{IncarnationID: "inc-res-domains"},
 		CustomHostnames: []string{"reserved.example.com"},
 	}}); err != nil {
 		t.Fatalf("AssertOwnership(reserved domains): %v", err)
@@ -902,9 +936,10 @@ func TestAgentApplyCommandNoControlPlaneMembers(t *testing.T) {
 	// control-plane members the command fails at the forward step, the only
 	// failure mode left on this path.
 	err := agent.applyCommand(context.Background(), command{
-		Op:        opPlace,
-		SandboxID: "sb-no-cp-members",
-		Spec:      &models.CreateSandboxRequest{Image: "alpine"},
+		Op:            opPlace,
+		SandboxID:     "sb-no-cp-members",
+		IncarnationID: "inc-no-cp-members",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "no live server-role control-plane members") {
 		t.Fatalf("applyCommand() = %v, want control-plane forward failure", err)

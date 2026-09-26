@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"expvar"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,14 +27,17 @@ import (
 
 type createForwardCluster struct {
 	*cluster.Noop
-	target             cluster.PlacementTarget
-	forwardedPeer      string
-	forwardedTarget    string
-	forwardedCreateID  string
-	forwardedBody      string
-	selectPlacementHit int
-	selectRequests     []capacity.Request
-	selectErr          error
+	target              cluster.PlacementTarget
+	forwardedPeer       string
+	forwardedTarget     string
+	forwardedCreateID   string
+	forwardedBody       string
+	selectPlacementHit  int
+	selectForCreateHit  int
+	selectTargetOnlyHit int
+	selectRequests      []capacity.Request
+	selectErr           error
+	lastRecipients      []string
 
 	reserveErr   error
 	reserveCalls []reserveCall
@@ -51,17 +55,69 @@ type reserveCall struct {
 }
 
 func (c *createForwardCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	c.selectTargetOnlyHit++
+	target, _, err := c.selectPlacement(req)
+	return target, err
+}
+
+func (c *createForwardCluster) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	c.selectPlacementHit++
+	return c.selectPlacement(req)
+}
+
+// selectPlacement is the shared body so the two entry points can be counted
+// apart — the create path must reach the bounded one, never the candidate one.
+func (c *createForwardCluster) selectPlacement(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
 	c.selectRequests = append(c.selectRequests, req)
 	if c.selectErr != nil {
-		return cluster.PlacementTarget{}, c.selectErr
+		return cluster.PlacementTarget{}, nil, c.selectErr
 	}
-	return c.target, nil
+	cands := c.members
+	if len(cands) == 0 {
+		cands = []cluster.Member{{NodeID: c.target.NodeID, APIURL: c.target.APIURL, Alive: true}}
+	}
+	return c.target, cands, nil
+}
+
+// SelectPlacementForCreate must be overridden alongside the candidate variant:
+// Noop's default calls ITS OWN SelectPlacementWithCandidates, not this stub's,
+// so a stub that only overrides the latter silently loses selectErr/target.
+func (c *createForwardCluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (cluster.PlacementTarget, []string, error) {
+	c.selectForCreateHit++
+	target, candidates, err := c.selectPlacement(req)
+	if err != nil {
+		return cluster.PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	c.lastRecipients = cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups)
+	return target, c.lastRecipients, nil
 }
 
 func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, secrets cluster.PlacementSecrets, ttl time.Duration) error {
 	c.reserveCalls = append(c.reserveCalls, reserveCall{sandboxID, target, redacted, secrets, ttl})
 	return c.reserveErr
+}
+
+func (c *createForwardCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement)
+	for _, id := range ids {
+		for i := len(c.reserveCalls) - 1; i >= 0; i-- {
+			reservation := c.reserveCalls[i]
+			if reservation.sandboxID != id {
+				continue
+			}
+			out[id] = cluster.Placement{
+				SandboxID: id, OwnerNodeID: reservation.target.NodeID, IncarnationID: "inc-" + id,
+				SecretRecipients: append([]string(nil), reservation.secrets.Recipients...),
+				State:            cluster.PlacementStateReserved,
+				ExpiresUnix:      time.Now().Add(reservation.ttl).Unix(),
+			}
+			break
+		}
+	}
+	return out, nil
 }
 
 func (c *createForwardCluster) CancelReservation(_ context.Context, sandboxID string) error {
@@ -74,6 +130,15 @@ func (c *createForwardCluster) Members() []cluster.Member {
 		return c.members
 	}
 	return c.Noop.Members()
+}
+
+func (c *createForwardCluster) LookupMember(nodeID string) (cluster.Member, bool) {
+	for _, member := range c.Members() {
+		if member.NodeID == nodeID {
+			return member, true
+		}
+	}
+	return cluster.Member{}, false
 }
 
 func (c *createForwardCluster) IsNodeDrained(nodeID string) bool {
@@ -124,8 +189,13 @@ func TestClusterCreateWrapPinsForwardedCreateToSelectedTarget(t *testing.T) {
 	if fakeCluster.forwardedTarget != "node-b" {
 		t.Fatalf("%s = %q, want node-b", clusterCreateTargetHeader, fakeCluster.forwardedTarget)
 	}
-	if fakeCluster.selectPlacementHit != 1 {
-		t.Fatalf("SelectPlacement calls = %d, want 1", fakeCluster.selectPlacementHit)
+	// Exactly one placement decision, and it must be the bounded one: the
+	// candidate-returning variant ships a Member per eligible worker.
+	if fakeCluster.selectForCreateHit != 1 {
+		t.Fatalf("SelectPlacementForCreate calls = %d, want 1", fakeCluster.selectForCreateHit)
+	}
+	if fakeCluster.selectPlacementHit != 0 {
+		t.Fatalf("SelectPlacementWithCandidates calls = %d, want 0", fakeCluster.selectPlacementHit)
 	}
 	if len(fakeCluster.reserveCalls) != 1 {
 		t.Fatalf("ReserveOnTarget calls = %d, want 1 — reservation MUST be written before forwarding (B2)", len(fakeCluster.reserveCalls))
@@ -200,6 +270,14 @@ func TestCapacityRequestFromCreateTreatsBuiltImagesAsDocker(t *testing.T) {
 	got := capacityRequestFromCreate(models.CreateSandboxRequest{Image: docker.BuiltImageNamespace + "/abc:latest"})
 	if got.Runtime != models.RuntimeDocker {
 		t.Fatalf("placement Runtime = %q, want docker for built local image", got.Runtime)
+	}
+}
+
+func TestCapacityRequestFromCreatePinsNodeBoundIsolateBundle(t *testing.T) {
+	ref := models.JSBundleRefForNode("sha256:abc", "isolate-a")
+	got := capacityRequestFromCreate(models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: ref})
+	if got.RequiredNodeID != "isolate-a" {
+		t.Fatalf("RequiredNodeID = %q, want isolate-a", got.RequiredNodeID)
 	}
 }
 
@@ -476,8 +554,13 @@ func TestClusterCreateWrapRoutesLocalOnlyImageOffNonWorkerNode(t *testing.T) {
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusAccepted, rr.Body.String())
 	}
-	if fakeCluster.selectPlacementHit != 1 {
-		t.Fatalf("SelectPlacement calls = %d, want 1", fakeCluster.selectPlacementHit)
+	// Local-image routing wants one node, so it must go through the bounded
+	// target-only selector and never the candidate-producing one.
+	if fakeCluster.selectTargetOnlyHit != 1 {
+		t.Fatalf("target-only SelectPlacement calls = %d, want 1", fakeCluster.selectTargetOnlyHit)
+	}
+	if fakeCluster.selectPlacementHit != 0 {
+		t.Fatalf("SelectPlacementWithCandidates calls = %d, want 0 for a one-node answer", fakeCluster.selectPlacementHit)
 	}
 	if fakeCluster.forwardedPeer != "http://worker-b:21212" {
 		t.Fatalf("forwarded peer = %q, want worker-b", fakeCluster.forwardedPeer)
@@ -556,18 +639,78 @@ var _ cluster.Client = (*createForwardCluster)(nil)
 
 type membersStubCluster struct {
 	*cluster.Noop
-	members []cluster.Member
+	members        []cluster.Member
+	internalClient *http.Client
+	placement      cluster.PlacementTarget
+	placementErr   error
 }
 
 func (c *membersStubCluster) Members() []cluster.Member {
 	return c.members
 }
 
+// LocalMembers mirrors Members so the stub models ONE membership view. The
+// shard-aware ingress ring hashes cluster.IngressRingMembers, which prefers
+// local gossip; a stub that answered self here while Members() said "no
+// members" would be testing the very divergence the ring accessor exists to
+// remove.
+func (c *membersStubCluster) LocalMembers() []cluster.Member {
+	return c.members
+}
+
+func (c *membersStubCluster) PeerInternalHTTPClient() *http.Client {
+	in := c.internalClient
+	if in == nil {
+		in = http.DefaultClient
+	}
+	return in
+}
+
+func (c *membersStubCluster) ClientForPeer(string) *http.Client { return c.PeerInternalHTTPClient() }
+
+func (c *membersStubCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
+	target, _, err := c.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (c *membersStubCluster) SelectPlacementWithCandidates(req capacity.Request) (cluster.PlacementTarget, []cluster.Member, error) {
+	if c.placementErr != nil {
+		return cluster.PlacementTarget{}, nil, c.placementErr
+	}
+	if c.placement.NodeID != "" {
+		return c.placement, append([]cluster.Member(nil), c.members...), nil
+	}
+	return c.Noop.SelectPlacementWithCandidates(req)
+}
+
+func (c *membersStubCluster) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (cluster.PlacementTarget, []string, error) {
+	target, candidates, err := c.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return cluster.PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, cluster.SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
+}
+
+func (c *membersStubCluster) PeerDialMember(m cluster.Member) (*http.Client, string, error) {
+	if c.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {
+		return nil, "", cluster.ErrPeerInternalURLRequired
+	}
+	return c.internalClient, m.InternalURL, nil
+}
+
 var _ cluster.Client = (*membersStubCluster)(nil)
 
-func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *testing.T) {
+func TestClusterListWrapUsesPlacementOwnersAtEnterpriseScale(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
 	members := []cluster.Member{
 		{NodeID: "node-a", APIURL: "http://node-a:21212", Alive: true, Role: config.NodeRoleMixed},
 	}
@@ -589,15 +732,16 @@ func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *te
 	rr := httptest.NewRecorder()
 	h.clusterListWrap(rr, req)
 
+	// No placement view on a large fleet ⇒ 503 Retry-After (never a local-only
+	// 200 that looks complete). Operators use sandbox-index for fleet scans.
 	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+		t.Fatalf("status = %d, want %d body=%q", rr.Code, http.StatusServiceUnavailable, rr.Body.String())
 	}
-	body := rr.Body.String()
-	if !strings.Contains(body, "/v1/cluster/sandbox-index") {
-		t.Fatalf("body = %q, want it to point callers at the paginated index", body)
+	if rr.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", rr.Header().Get("Retry-After"))
 	}
-	if strings.Contains(body, `"placements"`) {
-		t.Fatalf("body = %q, must not return the sandbox-index response shape from /v1/sandboxes", body)
+	if !strings.Contains(rr.Body.String(), "placement view is not ready") {
+		t.Fatalf("body = %q, want placement view not ready", rr.Body.String())
 	}
 }
 
@@ -1133,12 +1277,13 @@ func TestClusterRemoveMemberMapsLifecycleErrors(t *testing.T) {
 
 type orphanOpsStubCluster struct {
 	*cluster.Noop
-	placement   cluster.Placement
-	hasPlace    bool
-	claimCalls  []string
-	claimErr    error
-	deleteCalls []string
-	deleteErr   error
+	placement    cluster.Placement
+	hasPlace     bool
+	claimCalls   []string
+	claimErr     error
+	deleteCalls  []string
+	deleteFences []cluster.Placement
+	deleteErr    error
 }
 
 func (c *orphanOpsStubCluster) PlacementOf(string) (cluster.Placement, bool) {
@@ -1152,6 +1297,14 @@ func (c *orphanOpsStubCluster) ClaimOrphan(_ context.Context, sandboxID string, 
 
 func (c *orphanOpsStubCluster) DeletePlacement(_ context.Context, sandboxID string) error {
 	c.deleteCalls = append(c.deleteCalls, sandboxID)
+	return c.deleteErr
+}
+
+func (c *orphanOpsStubCluster) DeletePlacementExact(_ context.Context, sandboxID, ownerNodeID, incarnationID string) error {
+	c.deleteCalls = append(c.deleteCalls, sandboxID)
+	c.deleteFences = append(c.deleteFences, cluster.Placement{
+		SandboxID: sandboxID, OwnerNodeID: ownerNodeID, IncarnationID: incarnationID,
+	})
 	return c.deleteErr
 }
 
@@ -1222,6 +1375,7 @@ func TestClusterReclaimOrphanLocalRejectsOtherPreviousOwner(t *testing.T) {
 			SandboxID:           "sb-orphan",
 			OwnerState:          cluster.PlacementOwnerStateOrphaned,
 			OrphanedOwnerNodeID: "node-b",
+			IncarnationID:       "inc-orphan",
 			OrphanedUnix:        123,
 		},
 		hasPlace: true,
@@ -1249,6 +1403,7 @@ func TestClusterDeleteOrphanDeletesOnlyOrphanPlacement(t *testing.T) {
 			SandboxID:           "sb-orphan",
 			OwnerState:          cluster.PlacementOwnerStateOrphaned,
 			OrphanedOwnerNodeID: "node-b",
+			IncarnationID:       "inc-orphan",
 		},
 		hasPlace: true,
 	}
@@ -1265,6 +1420,9 @@ func TestClusterDeleteOrphanDeletesOnlyOrphanPlacement(t *testing.T) {
 	}
 	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-orphan" {
 		t.Fatalf("deleteCalls = %+v, want [sb-orphan]", stub.deleteCalls)
+	}
+	if len(stub.deleteFences) != 1 || stub.deleteFences[0].OwnerNodeID != "" || stub.deleteFences[0].IncarnationID != "inc-orphan" {
+		t.Fatalf("delete fences = %+v, want exact orphan incarnation", stub.deleteFences)
 	}
 }
 
@@ -1309,5 +1467,58 @@ func TestClusterMembersIncludesDrainedField(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("node-b missing from members list: %q", rr.Body.String())
+	}
+}
+
+// Build, template, JS-bundle and local-image routing all want one node. The
+// target-only request must not come back with the whole eligible fleet
+// attached, and it must not reach the candidate-producing selector at all.
+func TestClusterInternalSelectPlacementTargetOnly(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fake := &createForwardCluster{
+		Noop:   cluster.NewNoop("node-a", "http://node-a", ""),
+		target: cluster.PlacementTarget{NodeID: "wrk-7", APIURL: "http://wrk-7"},
+	}
+	for i := range 500 {
+		fake.members = append(fake.members, cluster.Member{NodeID: fmt.Sprintf("wrk-%03d", i), APIURL: "http://w", Alive: true})
+	}
+	svc.AttachCluster(fake)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/internal/select-placement",
+		strings.NewReader(`{"request":{"cpu":1,"memory_mb":256,"disk_gb":1},"target_only":true}`))
+	h.clusterInternalSelectPlacement(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp cluster.SelectPlacementResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Target.NodeID != "wrk-7" {
+		t.Fatalf("target = %+v", resp.Target)
+	}
+	if len(resp.Candidates) != 0 {
+		t.Fatalf("target-only response carried %d candidates; the answer is one node", len(resp.Candidates))
+	}
+	if fake.selectTargetOnlyHit != 1 || fake.selectPlacementHit != 0 {
+		t.Fatalf("target-only=%d candidates=%d; the target-only path must not reach the candidate selector",
+			fake.selectTargetOnlyHit, fake.selectPlacementHit)
+	}
+
+	// A caller that does not set the flag still gets the legacy shape, so a
+	// rolling upgrade keeps working in both directions.
+	legacy := httptest.NewRecorder()
+	legacyReq := httptest.NewRequest(http.MethodPost, "/v1/cluster/internal/select-placement",
+		strings.NewReader(`{"request":{"cpu":1,"memory_mb":256,"disk_gb":1}}`))
+	h.clusterInternalSelectPlacement(legacy, legacyReq)
+	var legacyResp cluster.SelectPlacementResponse
+	if err := json.Unmarshal(legacy.Body.Bytes(), &legacyResp); err != nil {
+		t.Fatalf("decode legacy: %v", err)
+	}
+	if len(legacyResp.Candidates) != 500 {
+		t.Fatalf("legacy response candidates = %d, want 500", len(legacyResp.Candidates))
 	}
 }

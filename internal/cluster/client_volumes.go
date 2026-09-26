@@ -111,10 +111,11 @@ func (c *Cluster) PutVolumeAttachments(ctx context.Context, attachments []models
 	return err
 }
 
-func (c *Cluster) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+func (c *Cluster) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if sandboxID == "" && incarnationID == "" {
 		return nil
 	}
-	return c.applyCommand(ctx, command{Op: opDeleteVolumeAttach, VolumeSandboxID: sandboxID})
+	return c.applyCommand(ctx, command{Op: opDeleteVolumeAttach, VolumeSandboxID: sandboxID, ExpectedIncarnationID: incarnationID})
 }

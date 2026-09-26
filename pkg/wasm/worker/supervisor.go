@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -21,6 +22,7 @@ func DefaultSpawner(ctx context.Context, socketPath string) (*exec.Cmd, error) {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, exe, "--wasm-worker", socketPath)
+	cmd.Env = workerEnvironment()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd, nil
@@ -36,9 +38,33 @@ func DefaultResidentSpawner(ctx context.Context, socketPath string) (*exec.Cmd, 
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, exe, "--wasm-resident-host", socketPath)
+	cmd.Env = workerEnvironment()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd, nil
+}
+
+// workerEnvironment is an allowlist. A worker does not need the daemon PAT,
+// encryption/KMS credentials, registry credentials, or the audit master key.
+func workerEnvironment() []string {
+	allowed := map[string]struct{}{
+		"PATH": {}, "TMPDIR": {}, "LANG": {}, "LC_ALL": {}, "TZ": {},
+		"SSL_CERT_FILE": {}, "SSL_CERT_DIR": {}, "LD_LIBRARY_PATH": {},
+		"AEROL_WASM_ENGINE": {}, "AEROL_WASM_COMPILE_CACHE_DIR": {},
+		"SB_AUDIT_INGEST_PORT": {}, "SB_AUDIT_SPILL_DIR": {},
+		"SB_EGRESS_ATTRIBUTION_ENABLED": {}, "SB_NODE_ID": {},
+	}
+	out := make([]string, 0, len(allowed))
+	for _, entry := range os.Environ() {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, ok := allowed[name]; ok {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // Slot tracks one sandbox worker subprocess.

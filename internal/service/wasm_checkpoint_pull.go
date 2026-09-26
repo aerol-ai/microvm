@@ -44,14 +44,23 @@ func (s *Service) ensureWasmCheckpointLocal(ctx context.Context, sandbox *models
 	if s.wasmCheckpointPusher == nil {
 		return checkpointPath, fmt.Errorf("wasm checkpoint missing locally and AOCR pull is disabled")
 	}
+	incarnationID := strings.TrimSpace(sandbox.AuditIncarnationID)
+	if incarnationID == "" {
+		// Nothing to bind the restore to. Guessing — the old code fell back to
+		// the id-wide :latest — is how a failover owner restored whichever
+		// lifetime pushed last, including a destroyed one's memory.
+		return checkpointPath, fmt.Errorf("wasm checkpoint for %s: no sandbox lifetime (incarnation) to restore", sandbox.ID)
+	}
 	registryRef := strings.TrimSpace(sandbox.WasmRegistryRef)
 	if registryRef == "" {
-		registryRef = s.wasmCheckpointPusher.DestRefFor(sandbox.ID)
+		// A fresh failover owner has no row, so no recorded ref. It reads the
+		// lifetime's own rolling pointer, which only this lifetime writes.
+		registryRef = s.wasmCheckpointLatestRef(sandbox.ID, incarnationID)
 	}
 	if registryRef == "" {
 		return checkpointPath, fmt.Errorf("wasm checkpoint missing locally and no AOCR ref for %s", sandbox.ID)
 	}
-	if err := s.wasmCheckpointPusher.PullOnce(ctx, registryRef, checkpointPath); err != nil {
+	if err := s.wasmCheckpointPusher.PullOnce(ctx, registryRef, incarnationID, checkpointPath); err != nil {
 		return checkpointPath, fmt.Errorf("pull wasm checkpoint %s: %w", registryRef, err)
 	}
 	if !wasmengine.DirExists(checkpointPath) {
@@ -60,7 +69,7 @@ func (s *Service) ensureWasmCheckpointLocal(ctx context.Context, sandbox *models
 	if _, err := wasmengine.ReadSnapshotDir(checkpointPath, wasmengine.EngineNameWazero()); err != nil {
 		return checkpointPath, fmt.Errorf("pulled wasm checkpoint invalid at %s: %w", checkpointPath, err)
 	}
-	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID,
+	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID, sandbox.AuditIncarnationID,
 		string(models.SandboxStatusPassivated), checkpointPath, sandbox.CloneGeneration, ""); err != nil {
 		s.logger.Warn("wasm checkpoint pull metadata persist failed",
 			"sandbox_id", sandbox.ID,

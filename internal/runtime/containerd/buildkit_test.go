@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	cntr "github.com/containerd/containerd"
+	cntr "github.com/containerd/containerd/v2/client"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
 )

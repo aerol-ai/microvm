@@ -55,7 +55,7 @@ func TestCreateSandboxRefreshesPendingImageGCAsync(t *testing.T) {
 
 	ctx := context.Background()
 	staleAt := time.Now().Add(-24 * time.Hour).UTC()
-	if err := st.SchedulePendingImageGC(ctx, "alpine:3.20", staleAt); err != nil {
+	if err := st.SchedulePendingImageGC(ctx, "", "alpine:3.20", staleAt); err != nil {
 		t.Fatalf("seed pending gc: %v", err)
 	}
 

@@ -32,7 +32,7 @@ func (c *agentControlPlaneCapture) handler(t *testing.T, extra func(http.Respons
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+		case r.Method == http.MethodPost && (r.URL.Path == PublicInternalApplyPath || r.URL.Path == InternalAPIPath):
 			payload, err := io.ReadAll(r.Body)
 			if err != nil {
 				t.Fatalf("read apply payload: %v", err)
@@ -209,6 +209,9 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	capture := &agentControlPlaneCapture{}
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath:
+			t.Fatalf("placement delete must not POST placements-by-ids (leader path): %s", r.URL.RequestURI())
+			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-state":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
@@ -225,6 +228,27 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"missing":
 			http.Error(w, "not found", http.StatusNotFound)
+			return true
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-delete":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-delete",
+				Placement: Placement{SandboxID: "sb-delete", OwnerNodeID: "worker-self", IncarnationID: "inc-delete"},
+			})
+			return true
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-port":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-port",
+				Placement: Placement{SandboxID: "sb-port", OwnerNodeID: "worker-self", IncarnationID: "inc-port"},
+			})
+			return true
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-reserve":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-reserve",
+				Placement: Placement{SandboxID: "sb-reserve", OwnerNodeID: "node-a", State: PlacementStateReserved, IncarnationID: "inc-reserve"},
+			})
 			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalDrainStatePath+"node-a":
 			w.Header().Set("Content-Type", "application/json")
@@ -272,13 +296,13 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := agent.RecordPlacement(ctx, "sb-record", nil, PlacementSecrets{}); err != nil {
+	if err := agent.RecordPlacement(ctx, "sb-record", nil, PlacementSecrets{IncarnationID: "inc-record"}); err != nil {
 		t.Fatalf("RecordPlacement() error = %v", err)
 	}
-	if err := agent.ClaimOrphan(ctx, "sb-claim", nil, PlacementSecrets{}); err != nil {
+	if err := agent.ClaimOrphan(ctx, "sb-claim", nil, PlacementSecrets{IncarnationID: "inc-claim"}); err != nil {
 		t.Fatalf("ClaimOrphan() error = %v", err)
 	}
-	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{}); err != nil {
+	if err := agent.UpsertSpec(ctx, "sb-upsert", &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "named"}, PlacementSecrets{IncarnationID: "inc-upsert"}); err != nil {
 		t.Fatalf("UpsertSpec() error = %v", err)
 	}
 	if err := agent.AddExposedPort(ctx, "sb-port", 8080, ExposedPortRoute{Protocol: "http", PublicURL: "https://sandbox.example.com"}); err != nil {
@@ -290,7 +314,7 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	if err := agent.DeletePlacement(ctx, "sb-delete"); err != nil {
 		t.Fatalf("DeletePlacement() error = %v", err)
 	}
-	if err := agent.ReserveOnTarget(ctx, "sb-reserve", PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", DataPlaneHost: "dp-a"}, nil, PlacementSecrets{}, time.Minute); err != nil {
+	if err := agent.ReserveOnTarget(ctx, "sb-reserve", PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", DataPlaneHost: "dp-a"}, nil, PlacementSecrets{IncarnationID: "inc-reserve"}, time.Minute); err != nil {
 		t.Fatalf("ReserveOnTarget() error = %v", err)
 	}
 	if err := agent.CancelReservation(ctx, "sb-reserve"); err != nil {
@@ -329,12 +353,15 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	if len(cmds) != 10 {
 		t.Fatalf("captured commands = %d, want 10", len(cmds))
 	}
-	var upsert command
+	var upsert, deleteCmd command
 	seen := make(map[opCode]int)
 	for _, cmd := range cmds {
 		seen[cmd.Op]++
 		if cmd.Op == opUpsertSpec {
 			upsert = cmd
+		}
+		if cmd.Op == opDelete && cmd.SandboxID == "sb-delete" {
+			deleteCmd = cmd
 		}
 	}
 	for _, op := range []opCode{opPlace, opClaimOrphan, opUpsertSpec, opAddExposedPort, opRemoveExposedPort, opDelete, opReserve, opCancelReserve, opSetNodeDrainState} {
@@ -344,6 +371,9 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	}
 	if upsert.Spec == nil || upsert.Spec.Name != "named" {
 		t.Fatalf("upsert command = %+v, want inline spec (payloads ride the raft entry)", upsert)
+	}
+	if deleteCmd.ExpectedOwnerNodeID != "worker-self" || deleteCmd.ExpectedIncarnationID != "inc-delete" {
+		t.Fatalf("delete command = %+v, want exact owner and incarnation fence", deleteCmd)
 	}
 	paths := capture.removeMemberPathsSnapshot()
 	if len(paths) != 2 || paths[0] != "/v1/cluster/members/node-a?force=true" || paths[1] != "/v1/cluster/members/missing" {
@@ -361,30 +391,34 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementsPath:
-			if failAllReads {
-				http.Error(w, "boom", http.StatusInternalServerError)
-				return true
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(allPlacements)
-			return true
-		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsQueryPath:
-			var filter PlacementShardFilter
-			if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
-				t.Fatalf("decode shard filter: %v", err)
-			}
-			capture.appendShardFilter(filter)
-			if failShardQuery {
-				http.Error(w, "boom", http.StatusInternalServerError)
-				return true
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(shardPlacements)
+			// Paged reads replaced the unbounded GET; reaching it is a bug.
+			t.Errorf("agent issued an unbounded placements GET")
+			http.Error(w, "unbounded read", http.StatusInternalServerError)
 			return true
 		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsPagePath:
 			var req PlacementPageRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatalf("decode placement page request: %v", err)
+			}
+			// PlacementsForShards walks this endpoint at the max page size;
+			// a direct PlacementPage call uses the default limit.
+			if req.Limit == MaxPlacementPageLimit {
+				capture.appendShardFilter(req.ShardFilter)
+				if failShardQuery && !req.ShardFilter.allShards() {
+					http.Error(w, "boom", http.StatusInternalServerError)
+					return true
+				}
+				if failAllReads && req.ShardFilter.allShards() {
+					http.Error(w, "boom", http.StatusInternalServerError)
+					return true
+				}
+				body := shardPlacements
+				if req.ShardFilter.allShards() {
+					body = allPlacements
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(PlacementPageResponse{Placements: body, Authoritative: true})
+				return true
 			}
 			capture.appendPageRequest(req)
 			w.Header().Set("Content-Type", "application/json")
@@ -415,11 +449,20 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 		t.Fatalf("Placements() fallback = %+v, want cached full placement view", got)
 	}
 	page := agent.PlacementPage(PlacementPageRequest{})
-	if len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-page" || page.NextPageToken != "next-page" {
-		t.Fatalf("PlacementPage() = %+v, want paged response", page)
+	if !page.Authoritative || len(page.Placements) != 1 || page.Placements[0].SandboxID != "sb-page" || page.NextPageToken != "next-page" {
+		t.Fatalf("PlacementPage() = %+v, want authoritative paged response", page)
 	}
+	// Order: all-shards (Placements), shard, shard (fails -> cached),
+	// all-shards (fails -> cached). The shard filter must reach the control
+	// plane normalized and deduplicated.
 	filters := capture.shardFiltersSnapshot()
-	if len(filters) != 2 || filters[0].ShardCount != 32 || len(filters[0].Shards) != 2 {
+	if len(filters) != 4 {
+		t.Fatalf("shard filters = %+v, want four paged reads", filters)
+	}
+	if !filters[0].allShards() || !filters[3].allShards() {
+		t.Fatalf("shard filters = %+v, want the Placements() reads to ask for all shards", filters)
+	}
+	if filters[1].ShardCount != 32 || len(filters[1].Shards) != 2 {
 		t.Fatalf("shard filters = %+v, want normalized deduplicated filter", filters)
 	}
 	pages := capture.pageRequestsSnapshot()
@@ -428,17 +471,50 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 	}
 }
 
+func TestAgentAuditACLReadsAndPruneOwnership(t *testing.T) {
+	fail := false
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != PublicInternalAuditACLPath+"sb-audit" {
+			http.NotFound(w, r)
+			return
+		}
+		if fail {
+			http.Error(w, "raft read failed", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(AuditACLResponse{
+			ACL:    AuditACL{SandboxID: "sb-audit", OwnerRef: " tenant-a ", IncarnationID: "inc-a"},
+			Exists: true,
+		})
+	}))
+	acl, ok, err := agent.AuditACLForSandbox(context.Background(), " sb-audit ", "inc-a")
+	if err != nil || !ok || acl.OwnerRef != "tenant-a" || acl.IncarnationID != "inc-a" {
+		t.Fatalf("AuditACLForSandbox = %+v %v %v", acl, ok, err)
+	}
+	owner, ok, err := agent.AuditOwnerRef(context.Background(), "sb-audit")
+	if err != nil || !ok || owner != "tenant-a" {
+		t.Fatalf("AuditOwnerRef = %q %v %v", owner, ok, err)
+	}
+	if err := agent.PruneAuditACL(context.Background(), time.Now()); err != nil {
+		t.Fatalf("agent prune must remain leader-owned: %v", err)
+	}
+	fail = true
+	if _, _, err := agent.AuditACLForSandbox(context.Background(), "sb-audit", "inc-a"); err == nil {
+		t.Fatal("control-plane ACL failure must propagate")
+	}
+}
+
 func TestAgentMiscWrappers(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	target, internalClient := newNodeBoundForwardServer(t, "agent-1", "peer-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Cluster-Forwarded") != "1" {
 			t.Fatalf("forwarded request missing loop-detection header")
 		}
 		_, _ = w.Write([]byte("forwarded"))
 	}))
-	defer target.Close()
 
 	agent := &Agent{
-		publicProxies:  newProxyCache(defaultPublicTransport),
+		internalClient: internalClient,
+		mtlsProxies:    newProxyCache(),
 		internalServer: &internalServer{},
 		placementCache: []Placement{{SandboxID: "sb-cache"}},
 		shardCache: map[string][]Placement{
@@ -448,7 +524,7 @@ func TestAgentMiscWrappers(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-cache", nil)
 	rr := httptest.NewRecorder()
-	agent.ForwardHTTP(Endpoint{APIURL: target.URL}, rr, req)
+	agent.ForwardHTTP(Endpoint{NodeID: "peer-1", InternalURL: target.URL}, rr, req)
 	if rr.Code != http.StatusOK || rr.Body.String() != "forwarded" {
 		t.Fatalf("ForwardHTTP() = (%d, %q), want (200, forwarded)", rr.Code, rr.Body.String())
 	}
