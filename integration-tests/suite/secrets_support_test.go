@@ -83,9 +83,17 @@ func blockInternalListenerEverywhere(t *testing.T, targets *harness.IntegrationT
 		restored = true
 		for _, b := range applied {
 			target, _ := harness.SSHTarget(b.node)
-			out, err := harness.SSHRun(t, target, "sudo iptables -D INPUT -p tcp --dport "+b.port+" -j REJECT 2>/dev/null; sudo iptables -S INPUT | grep -c 'dport "+b.port+".*REJECT' || true")
-			if err != nil {
-				t.Errorf("RESTORE FAILED on %s: the peer listener may still be blocked and the rest of this run is suspect: %v\n%s", b.node.Name, err, out)
+			// Delete, then CONFIRM the rule is gone. `iptables -D` removes one
+			// matching rule and reports success even when the state afterwards
+			// is not what we want; a REJECT left on the peer port breaks every
+			// later cluster case in the run, and the report would blame
+			// whichever one ran next.
+			script := "sudo iptables -D INPUT -p tcp --dport " + b.port + " -j REJECT 2>/dev/null; " +
+				"if sudo iptables -S INPUT | grep -q -- '--dport " + b.port + " -j REJECT'; then echo STILLBLOCKED; else echo CLEARED; fi"
+			out, err := harness.SSHRun(t, target, script)
+			if err != nil || !strings.Contains(out, "CLEARED") {
+				t.Errorf("RESTORE FAILED on %s: the peer listener is still blocked on port %s and the rest of this run is suspect: %v\n%s",
+					b.node.Name, b.port, err, strings.TrimSpace(out))
 			}
 		}
 	}
