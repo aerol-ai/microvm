@@ -61,9 +61,17 @@ func TestPlaintextLeakSweep(t *testing.T) {
 			if err != nil {
 				t.Fatalf("leak sweep on %s (%s form): %v\n%s", node.Name, form.name, err, out)
 			}
-			if hits := strings.TrimSpace(out); hits != "" && !strings.Contains(hits, "NOHITS") {
+			// A hit is a PATH the grep printed, not merely "the output was
+			// non-empty". On the first live run where SSH worked, ssh's
+			// known-hosts warning on stderr made every form look like a hit
+			// and this case reported the canary as on disk in all five
+			// encodings. A false-positive secret leak is the worst thing a
+			// security suite can say, so the parse itself is now unable to
+			// repeat it even if some new banner appears.
+			if hits := leakHitLines(out); len(hits) > 0 {
 				// Never print the canary; print WHERE it was found.
-				t.Errorf("the canary is on disk on %s in %s form. Locations:\n%s", node.Name, form.name, tailLines(hits, 20))
+				t.Errorf("the canary is on disk on %s in %s form. Locations:\n%s",
+					node.Name, form.name, strings.Join(hits, "\n"))
 			}
 		}
 	}
@@ -71,4 +79,27 @@ func TestPlaintextLeakSweep(t *testing.T) {
 		t.Fatal("no node was swept; this case would have passed having looked nowhere")
 	}
 	t.Logf("UC-169: swept %d node(s) for %d encodings of the canary", swept, len(leakForms(canary)))
+}
+
+// leakHitLines extracts the real grep hits from an SSH capture.
+//
+// Three things are not hits, and each one either produced a false positive
+// or would have: the explicit NOHITS sentinel, ssh/sshd chatter that SSHRun
+// merges in from stderr, and blank lines. Anything left is a path or a
+// journal line, which is what a genuine hit looks like.
+func leakHitLines(out string) []string {
+	var hits []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "", line == "NOHITS":
+			continue
+		case strings.HasPrefix(line, "Warning:"),
+			strings.HasPrefix(line, "Pseudo-terminal"),
+			strings.HasPrefix(line, "Connection to "):
+			continue
+		}
+		hits = append(hits, line)
+	}
+	return hits
 }
