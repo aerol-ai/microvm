@@ -466,6 +466,50 @@ const (
 	itestEnvDropIn       = "/etc/systemd/system/sandboxd.service.d/zz-itest-override.conf"
 )
 
+// KillNodeDaemon stops sandboxd on a node and returns a restore func.
+//
+// This is the portable way to kill an owner. EC2 stop-instances does NOT
+// work on the spot instances the cluster scenarios use:
+//
+//	UnsupportedOperation: You can't stop the Spot Instance '...' because it
+//	is associated with a one-time Spot Instance request.
+//
+// UC-117 failed on exactly that the first time it ran — the kill never
+// happened, so nothing failed over and the case reported a product problem
+// that was really an AWS API constraint. The hetero scenarios are
+// on-demand, which is why the design never hit it.
+//
+// Stopping the daemon is also the fault these cases actually model: SWIM
+// marks the owner dead and placement reassigns. The box keeps answering
+// SSH, which is what makes the restore reliable — and a restore that works
+// is worth more here than fidelity to a power cut, because a node this
+// suite cannot bring back poisons every case after it.
+func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
+	t.Helper()
+	RequireNodeSSH(t, node)
+	target, _ := SSHTarget(node)
+
+	if out, err := SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
+		t.Fatalf("stop sandboxd on %s: %v\n%s", node.Name, err, out)
+	}
+	restored := false
+	return func() {
+		if restored {
+			return
+		}
+		restored = true
+		if out, err := SSHRun(t, target, "sudo systemctl start sandboxd"); err != nil {
+			t.Errorf("RESTORE FAILED: sandboxd is left stopped on %s and every later case in this run is suspect: %v\n%s", node.Name, err, out)
+			return
+		}
+		if NodeRejoinCheck != nil {
+			if err := NodeRejoinCheck(t, node); err != nil {
+				t.Errorf("RESTORE FAILED on %s — restarted but did not rejoin: %v", node.Name, err)
+			}
+		}
+	}
+}
+
 // PickRestartableNode returns a node it is SAFE to restart.
 //
 // Not the seed, where there is any alternative. Restarting the seed of a

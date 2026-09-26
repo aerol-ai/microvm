@@ -69,17 +69,12 @@ func TestOwnerDeathKeepsCredentialsWorking(t *testing.T) {
 	}
 
 	victim, ok := nodeForClusterID(t, c, targets, originalOwner)
-	if !ok || victim.InstanceID == "" {
-		t.Skipf("owner %s is not an EC2 node this suite can kill", originalOwner)
+	if !ok {
+		t.Skipf("owner %s is not a node this suite can reach", originalOwner)
 	}
 
-	t.Cleanup(func() {
-		if state := harness.EC2InstanceState(t, victim.InstanceID); state != "running" {
-			harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-		}
-	})
-	t.Logf("killing owner %s (%s / %s); recipients that can take over: %v", originalOwner, victim.Name, victim.InstanceID, peers)
-	harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
+	t.Logf("killing owner %s (%s); recipients that can take over: %v", originalOwner, victim.Name, peers)
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
 
 	newOwner := awaitNewOwner(t, c, sb.ID, originalOwner, failoverOpenTimeout)
 	if !slices.Contains(peers, newOwner) {
@@ -196,12 +191,7 @@ func restoreViaOwnerKill(t *testing.T, c *harness.Client, targets *harness.Integ
 	if !ok || victim.InstanceID == "" {
 		t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
 	}
-	t.Cleanup(func() {
-		if state := harness.EC2InstanceState(t, victim.InstanceID); state != "running" {
-			harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-		}
-	})
-	harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
 	awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
 }
 
@@ -292,12 +282,7 @@ func TestNonRecipientOwnerFailsLegibly(t *testing.T) {
 	if !ok || victim.InstanceID == "" {
 		t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
 	}
-	t.Cleanup(func() {
-		if state := harness.EC2InstanceState(t, victim.InstanceID); state != "running" {
-			harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-		}
-	})
-	harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
 
 	// Either it never opens (fine — fail closed), or it opens somewhere that
 	// held a copy. What it must NOT do is come up on an outsider and serve an
@@ -364,7 +349,7 @@ func TestOwnerKilledMidFanoutIsNeverHalfSealed(t *testing.T) {
 
 	// Give the create long enough to reserve a placement and begin sealing,
 	// then kill whichever node owns it.
-	var victim harness.IntegrationNode
+	var restoreVictim func()
 	killed := false
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) && !killed {
@@ -378,9 +363,8 @@ func TestOwnerKilledMidFanoutIsNeverHalfSealed(t *testing.T) {
 		}
 		if id := sandboxIDByName(t, c, name); id != "" {
 			if owner := resolvePlacementOwner(t, c, id); owner != "" {
-				if node, ok := nodeForClusterID(t, c, targets, owner); ok && node.InstanceID != "" {
-					victim = node
-					harness.SetEC2InstanceRunning(t, node.InstanceID, false)
+				if node, ok := nodeForClusterID(t, c, targets, owner); ok {
+					restoreVictim = harness.KillNodeDaemon(t, node)
 					killed = true
 					break
 				}
@@ -388,12 +372,8 @@ func TestOwnerKilledMidFanoutIsNeverHalfSealed(t *testing.T) {
 		}
 		time.Sleep(3 * time.Second)
 	}
-	if killed {
-		t.Cleanup(func() {
-			if state := harness.EC2InstanceState(t, victim.InstanceID); state != "running" {
-				harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-			}
-		})
+	if killed && restoreVictim != nil {
+		t.Cleanup(restoreVictim)
 	}
 
 	res := <-done

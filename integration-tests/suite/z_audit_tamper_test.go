@@ -197,12 +197,7 @@ func TestAuditEvidenceSurvivesOwnerDeath(t *testing.T) {
 	if !ok || victim.InstanceID == "" {
 		t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
 	}
-	t.Cleanup(func() {
-		if state := harness.EC2InstanceState(t, victim.InstanceID); state != "running" {
-			harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-		}
-	})
-	harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
 	awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
 
 	after := harness.AllAuditEvents(t, c, sb.ID, 100, 20)
