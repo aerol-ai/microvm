@@ -1693,6 +1693,29 @@ type placementResponse struct {
 	Converged            bool                                `json:"converged"`
 }
 
+// clusterSecretHolders exposes a sandbox's cluster-secret recipient set to an
+// OPERATOR over the normal PAT, which is the only way the fan-out, failover
+// and reseal behaviours can be observed from outside the cluster: every
+// /v1/cluster/internal/* route is mTLS-gated and there is no list verb on the
+// peer secret path.
+//
+// Returns holders, seal generation and outstanding outbox work — never
+// ciphertext and never plaintext. An observability read must not become a
+// second way to get at the thing the subsystem protects.
+func (h *handlers) clusterSecretHolders(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id is required")
+		return
+	}
+	holders, err := h.deps.Service.SecretHoldersForSandbox(r.Context(), id)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, holders)
+}
+
 // clusterPlacement returns the placement record for one sandbox plus this
 // node's per-sandbox convergence status (B6: operators need to spot TCP
 // ingress that hasn't propagated to a given node without grepping logs).
