@@ -1132,9 +1132,18 @@ run_one() {
   # security cases against an already-provisioned fleet is minutes instead of
   # a re-provision. The report it writes covers only the tests that ran, so
   # a narrowed pass must never be published as a full matrix.
-  local runflag=""
+  # An array, not a string: the regex is passed as ONE argv element. An
+  # unquoted string expansion would word-split it (and glob a `*` in it),
+  # while a quoted one would hand `-run <regex>` to go test as a single
+  # argument. Both fail in ways that look like "the filter matched nothing".
+  #
+  # Expanded as ${runflag[@]+"${runflag[@]}"} at the call site: this script is
+  # `set -u` and /bin/bash on macOS is 3.2, where a bare "${arr[@]}" on an
+  # EMPTY array is an unbound-variable error — so the common case (no filter)
+  # would abort the run.
+  local -a runflag=()
   if [[ -n "${AEROL_TEST_RUN:-}" ]]; then
-    runflag="-run ${AEROL_TEST_RUN}"
+    runflag=(-run "${AEROL_TEST_RUN}")
     echo "test filter: -run ${AEROL_TEST_RUN} (PARTIAL pass; the report covers only these tests)" >&2
   fi
 
@@ -1154,7 +1163,7 @@ run_one() {
     AEROL_OBS_PUSHGATEWAY_URL="${AEROL_OBS_PUSHGATEWAY_URL:-}" \
     AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
     AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-}" \
-    go test -tags=integration -count=1 ${pflag} ${runflag} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
+    go test -tags=integration -count=1 ${pflag} ${runflag[@]+"${runflag[@]}"} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
 
