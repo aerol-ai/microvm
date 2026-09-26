@@ -660,10 +660,35 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			// failover_ready is not stuck false after a restart (holders are
 			// in-memory only). Best-effort; fan-out continues async.
 			if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
-				if cfg.EnterpriseMode {
+				switch bootRefanoutDisposition(err, cfg.EnterpriseMode) {
+				// Leadership being momentarily unsettled is the normal state
+				// of a cluster that is starting up, and says nothing about
+				// whether the durable secrets are valid. Exiting on it turned
+				// a routine election into a node that never came back: the
+				// re-fanout needs one leader RPC, a restarting node found no
+				// leader seated, and enterprise mode made that fatal —
+				// whereupon systemd's restart limit made it permanent.
+				//
+				//   cluster: validate/re-fanout durable secrets at boot:
+				//     authoritative cluster placement snapshot during secret
+				//     re-fanout: cluster: not raft leader
+				//   sandboxd.service: Start request repeated too quickly.
+				//
+				// Observed on a live 3-node enterprise cluster (S4): the seed
+				// stayed down for the rest of the run. Retry it in the
+				// background, exactly as ownership replay directly above
+				// already does for the same condition.
+				case refanoutRetry:
+					logger.Warn("cluster: secret re-fanout at boot deferred, no leader yet", "error", err)
+					startClusterSecretRefanoutRetry(ctx, svc, logger)
+				case refanoutFatal:
+					// Anything else still fails closed: under enterprise a
+					// node that cannot validate its durable secrets must not
+					// serve.
 					return fmt.Errorf("cluster: validate/re-fanout durable secrets at boot: %w", err)
+				default:
+					logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
 				}
-				logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
 			}
 			if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
 				logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
@@ -1052,6 +1077,77 @@ func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service,
 				cancel()
 				if ok {
 					return
+				}
+			}
+		}
+	}()
+}
+
+// bootRefanoutOutcome is what the daemon does about a failed boot re-fanout.
+type bootRefanoutOutcome int
+
+const (
+	// refanoutWarn: log and carry on. The non-enterprise default.
+	refanoutWarn bootRefanoutOutcome = iota
+	// refanoutRetry: defer to a background retry. Leadership was not
+	// reachable, which says nothing about the secrets.
+	refanoutRetry
+	// refanoutFatal: refuse to serve. Enterprise, and a real failure.
+	refanoutFatal
+)
+
+// bootRefanoutDisposition decides whether a boot re-fanout failure should
+// end the process.
+//
+// Leader-unavailable is checked BEFORE the enterprise branch, and that order
+// is the entire fix. Enterprise mode is meant to fail closed on secrets it
+// cannot validate; it is not meant to fail closed because an election was in
+// flight. Getting that backwards took a live 3-node cluster's seed down
+// permanently — one leader RPC found no leader, enterprise made it fatal,
+// and systemd's restart limit made it final.
+func bootRefanoutDisposition(err error, enterprise bool) bootRefanoutOutcome {
+	switch {
+	case err == nil:
+		return refanoutWarn
+	case cluster.IsLeaderUnavailable(err):
+		return refanoutRetry
+	case enterprise:
+		return refanoutFatal
+	default:
+		return refanoutWarn
+	}
+}
+
+// startClusterSecretRefanoutRetry re-runs the boot secret re-fanout until it
+// succeeds, for the case where it failed only because no leader was seated.
+//
+// Mirrors startClusterOwnershipReplayRetry: same tick, same ctx-cancellation,
+// same "stop on first success". Under enterprise the node is serving while
+// this is outstanding, which is the deliberate trade — the alternative it
+// replaces was not serving AT ALL, permanently, over a condition that clears
+// itself in seconds.
+func startClusterSecretRefanoutRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
+	logger.Warn("cluster: scheduling secret re-fanout retry")
+	go func() {
+		t := time.NewTicker(clusterOwnershipReplayTick)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				retryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				err := svc.ReFanoutClusterSecrets(retryCtx)
+				cancel()
+				if err == nil {
+					logger.Info("cluster: secret re-fanout completed on retry")
+					return
+				}
+				if !cluster.IsLeaderUnavailable(err) {
+					// A real failure, not a missing leader. Keep saying so
+					// rather than looping silently on a condition that will
+					// not clear by waiting.
+					logger.Warn("cluster: secret re-fanout retry failed", "error", err)
 				}
 			}
 		}

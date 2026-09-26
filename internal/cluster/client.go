@@ -1498,7 +1498,7 @@ func (c *Cluster) waitForLeader(ctx context.Context, max time.Duration) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return errors.New("cluster: timed out waiting for leader")
+			return ErrNoLeader
 		}
 		select {
 		case <-ctx.Done():

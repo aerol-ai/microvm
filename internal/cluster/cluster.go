@@ -49,6 +49,26 @@ import (
 // resolves automatically by following raft leadership).
 var ErrNotLeader = errors.New("cluster: not raft leader")
 
+// ErrNoLeader is returned when no leader is seated yet — an election is in
+// flight, or this node has just started and has not learned who the leader
+// is. Distinct from ErrNotLeader ("someone else is the leader"), but in the
+// same class for callers: both mean "ask again shortly", neither means the
+// data is bad.
+var ErrNoLeader = errors.New("cluster: timed out waiting for leader")
+
+// IsLeaderUnavailable reports whether an error means only that leadership was
+// not reachable at this instant.
+//
+// This is the distinction that decides whether a caller may treat a failure
+// as fatal. A boot-time validation that exits(1) on ErrNoLeader turns a
+// routine election into a node that never starts — and with systemd's
+// restart limit, never starts AGAIN. Leadership being momentarily unsettled
+// is the normal state of a cluster that is starting up; it is not evidence
+// that anything is wrong with what was being validated.
+func IsLeaderUnavailable(err error) bool {
+	return errors.Is(err, ErrNotLeader) || errors.Is(err, ErrNoLeader)
+}
+
 // ErrUnknownSandbox is returned by OwnerOf when no placement record exists for
 // the given sandbox ID. Callers should treat this as "owned locally" only when
 // they have just-created the sandbox and not yet committed its placement.
