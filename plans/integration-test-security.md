@@ -1500,17 +1500,33 @@ Plus one OPEN finding with no fix attempted, because the obvious fix is
 worse than the bug: **a partitioned node keeps answering `/health` 200**, so
 the ingress keeps routing to a node that cannot reach a leader (§7.7).
 
-### To finish T18
+### To finish T18 — one command
 
-1. Re-run S5 and S6 to completion on a build at or after `7cb4ec7c` (the
-   gVisor fix). Both need it — all eight of their workers set
-   `with_gvisor`. ~2h, ~$28.
-2. Rebuild the matrix: `go run ./integration-tests/report -index-only -out
-   integration-tests/reports`.
-3. Apply the three staged `run.sh`/`build.sh` fixes first
-   (`scratchpad/runsh_selfpin.patch.txt`): self-pin against mid-run edits,
-   domain lease that checks what is in use, and `--no-build` falling back to
-   a build instead of aborting. Each one cost a run today.
+Everything it needs is in the tree and verified 2026-09-27:
+
+| Prerequisite | State |
+|---|---|
+| gVisor tarball installer (`gvisor_fetch_release`) | in tree |
+| boot-leader fix (`bootRefanoutDisposition`) | in tree |
+| witness node-id + upgrade fallback | in tree |
+| run.sh self-pin against mid-run edits | in tree |
+| domain lease that excludes held domains | in tree |
+| `--no-build` builds instead of aborting | in tree |
+| S5/S6 scenario pairs, flagship make target | present |
+| domains held / AWS instances | 0 / 0 |
+
+```
+make integration-secrets-flagship      # S5 + S6, ~2h, ~$28
+go run ./integration-tests/report -index-only -out integration-tests/reports
+```
+
+Nothing else is staged or pending. The three harness fixes that used to be
+prerequisites are applied and control-tested.
+
+**The matrix currently shows no flagship result, and that is correct.**
+`cluster-hetero-secrets` is 174/174 inconclusive (the aborted run) and
+`cluster-hetero-secrets-kms` has no column, because S6 was stopped before
+it wrote a report. Neither should be read as a pass or a fail.
 
 ## 8. Make targets and reports
 
