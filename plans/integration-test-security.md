@@ -933,6 +933,36 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 | UC-137 | `SB_AUDIT_INDEX_ENABLED=false` returns the **same** events as index-on (parity), and an incomplete index returns 503 rather than a short answer | S |
 | UC-138 | Pagination: `next_cursor` walks a >1-page history with no duplicates and no gaps | S |
 
+> **T13 IMPLEMENTATION FINDINGS (outside voice, verified 2026-09-26).**
+>
+> - **There is no `SB_SECRET_AUDIT_DIR`.** The audit directory is the DB's
+>   directory — `internal/service` derives it with
+>   `secretAuditDataDir(cfg.DBPath)`. An early draft of the group E/F scripts
+>   assumed the env var existed, which would have pointed four cases at a path
+>   that does not exist and turned them into silent skips. They now read
+>   `SB_DB_PATH` from the node's own env and take its dirname.
+> - **UC-144's fault must be injected at the WITNESS, not at the node.** The
+>   boot gate calls `Witness.LastWitnessedHead` (`secret_audit_witness.go:365`),
+>   so the only honest injection is to record a disagreeing head at the
+>   receiver and restart the node. The first draft invented an
+>   `SB_..._PLANTED_HEAD` env knob; that produces a case that skips forever,
+>   which §6.2a calls the worst of the available options. `/witness` takes the
+>   bearer token only (no HMAC), so `harness.PlantWitnessHead` reads the token
+>   from the receiver's own 0600 env file over SSH.
+> - **UC-132 tampers with the MIDDLE of the chain, not the tail.** A tail edit
+>   is indistinguishable from a torn write after a crash — which the product
+>   deliberately tolerates and records as a gap — so tampering with the tail
+>   would have asserted nothing about tamper detection.
+> - **The suite reaches the audit receiver over SSH + loopback**, not across
+>   the network: its `/_probe`, `/_stats` and `/_chaos` endpoints are
+>   deliberately unauthenticated, and not exposing them is the point. That
+>   also avoids a second TLS trust decision inside the test process.
+> - **UC-139 and UC-140 must configure the backend they test.** `pkg/auditexport`
+>   is single-valued (no fan-out), so a scenario running the webhook backend
+>   cannot also be asserting the file or s3 one; each case switches a node with
+>   `WithNodeEnv` and switches it back. UC-139 skips (not fails) when the
+>   profile refuses an on-node exporter — that refusal is UC-158's assertion.
+
 ### F. Export connectors and witness (F9, F10, F11)
 
 | UC | Assertion | Caps |
