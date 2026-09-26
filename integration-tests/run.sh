@@ -1220,7 +1220,23 @@ run_one() {
     collect_failure_logs "$scenario" "$caps_domain" "$targets" "$pat"
   fi
 
-  AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" \
+  # A FILTERED run must not overwrite the scenario's canonical report.
+  #
+  # gen marks any implemented UC with no test event as "missing", which
+  # renders ❌ — correct for a full run (a test that crashed before reporting
+  # IS a failure), catastrophic for a partial one: a three-test re-verify
+  # rewrote the whole scenario column as failures for ~160 use cases that
+  # never ran, and clobbered the good full-run report underneath.
+  #
+  # Partial runs therefore report under their own name, so reports/index.md
+  # shows them as a separate column that is honestly mostly-missing rather
+  # than corrupting the real one.
+  local report_scenario="$scenario"
+  if [[ -n "${AEROL_TEST_RUN:-}" ]]; then
+    report_scenario="${scenario}-partial"
+    echo "partial run: reporting as ${report_scenario} so ${scenario}'s full report is preserved" >&2
+  fi
+  AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$report_scenario" \
     -json "$json_out" -out "${HERE}/reports"
   if [[ "${AEROL_BENCH:-}" == "1" && -n "$bench_out" ]]; then
     publish_bench_artifacts "$bench_out"
