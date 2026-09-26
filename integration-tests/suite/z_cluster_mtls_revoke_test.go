@@ -41,7 +41,11 @@ func TestRemovedPeerCertificateIsRevoked(t *testing.T) {
 	sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{
 		Env: map[string]string{"UC155_TOKEN": secretValue(t, "155")},
 	})
-	if probe := harness.ProbePeerSecret(t, victim, sb.ID); probe.Err != nil {
+	// The probe needs the generation and incarnation the handler requires.
+	view := harness.AwaitSecretHolders(t, c, sb.ID, 2*time.Minute, func(v harness.SecretHoldersView) bool {
+		return len(v.Holders) >= 1 && v.SealGeneration >= 1
+	})
+	if probe := harness.ProbePeerSecret(t, victim, view); probe.Err != nil {
 		t.Fatalf("control probe from %s before removal: %v", victim.Name, probe.Err)
 	} else if probe.Status == 401 || probe.Status == 403 {
 		t.Fatalf("%s's own certificate was already refused (%d) before removal; this case cannot tell revocation from a broken probe", victim.Name, probe.Status)
@@ -82,7 +86,7 @@ func TestRemovedPeerCertificateIsRevoked(t *testing.T) {
 	// Replay the removed node's own certificate. It must stop working.
 	deadline := time.Now().Add(4 * time.Minute)
 	for time.Now().Before(deadline) {
-		probe := harness.ProbePeerSecret(t, victim, sb.ID)
+		probe := harness.ProbePeerSecret(t, victim, view)
 		if probe.Err == nil && (probe.Status == 401 || probe.Status == 403) {
 			t.Logf("UC-155 PASS: the removed peer's certificate is refused (%d)", probe.Status)
 			return
@@ -94,7 +98,7 @@ func TestRemovedPeerCertificateIsRevoked(t *testing.T) {
 		time.Sleep(15 * time.Second)
 	}
 
-	final := harness.ProbePeerSecret(t, victim, sb.ID)
+	final := harness.ProbePeerSecret(t, victim, view)
 	t.Fatalf("a REMOVED node's certificate still reaches the peer API (status %d, err %v): removal did not reduce the blast radius at all — the machine is out of the member list and can still pull sealed material",
 		final.Status, final.Err)
 }

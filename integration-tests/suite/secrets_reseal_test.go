@@ -180,7 +180,7 @@ func TestRetiredRecipientCannotOpenAndItsTombIsSwept(t *testing.T) {
 
 	// Sanity: it holds a copy now. Without this the post-retirement 404 could
 	// simply mean the fan-out never reached it.
-	if probe := harness.ProbePeerSecret(t, retiredNode, sb.ID); probe.Err != nil {
+	if probe := harness.ProbePeerSecret(t, retiredNode, before); probe.Err != nil {
 		t.Fatalf("probe %s before retirement: %v", retiredNode.Name, probe.Err)
 	} else if !probe.Present() {
 		t.Fatalf("recipient %s does not hold a copy before retirement (status %d); the retirement assertion would be vacuous", retired, probe.Status)
@@ -211,7 +211,7 @@ func TestRetiredRecipientCannotOpenAndItsTombIsSwept(t *testing.T) {
 		}
 		deadline := time.Now().Add(4 * time.Minute)
 		for time.Now().Before(deadline) {
-			probe := harness.ProbePeerSecret(t, retiredNode, sb.ID)
+			probe := harness.ProbePeerSecret(t, retiredNode, before)
 			if probe.Err != nil {
 				t.Fatalf("probe retired node: %v", probe.Err)
 			}

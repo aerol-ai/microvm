@@ -753,16 +753,36 @@ const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/sandboxd.env 2
 const peerProbeCredentials = `-H "Authorization: Bearer $SB_PAT_TOKEN" ` +
 	`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" `
 
-// ProbePeerSecret asks node whether it holds the sealed row for sandboxID.
-func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerSecretProbe {
+// ProbePeerSecret asks node whether it holds the sealed row for a sandbox at
+// or above minGeneration.
+//
+// min_generation and incarnation_id are REQUIRED by the handler
+// (clusterInternalSecretHead): it answers 400 "invalid min_generation"
+// without them, which the first version of this probe hit on every call
+// because it sent neither. They are not decoration — "does this node hold a
+// copy" is only meaningful for a specific incarnation at a specific
+// generation, since a reseal supersedes the previous one and a recreated
+// sandbox id is a different tenancy.
+//
+// Both come straight off the holders view, so a caller cannot ask a question
+// the cluster would answer inconsistently.
+func ProbePeerSecret(t *testing.T, node IntegrationNode, view SecretHoldersView) PeerSecretProbe {
 	t.Helper()
 	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
 	if !ok {
 		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("node %s has no SSH address", node.Name)}
 	}
+	gen := view.SealGeneration
+	if gen < 1 {
+		// The handler rejects <= 0. A view with no generation means the
+		// caller probed before the seal landed; say that rather than send a
+		// request that answers 400 and reads as "not held".
+		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("holders view for %s has seal_generation %d; nothing to probe for yet", view.SandboxID, gen)}
+	}
+	q := fmt.Sprintf("?min_generation=%d&incarnation_id=%s", gen, url.QueryEscape(view.IncarnationID))
 	script := internalCurlPrefix + peerProbeCredentials +
-		`-I "$base/v1/cluster/internal/secrets/` + sandboxID + `"'`
+		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"'`
 	out, err := SSHRun(t, target, script)
 	return peerProbeFromOutput(node.Name, out, err)
 }
@@ -771,7 +791,7 @@ func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerS
 // certificate, from the same node. The identity, not the network position, is
 // what must be refused: a caller that can reach the port is not thereby
 // entitled to the fleet's sealed material.
-func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, sandboxID, bearer string) PeerSecretProbe {
+func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, view SecretHoldersView, bearer string) PeerSecretProbe {
 	t.Helper()
 	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
@@ -782,8 +802,9 @@ func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, sandboxI
 	if bearer != "" {
 		auth = `-H "Authorization: Bearer ` + bearer + `" `
 	}
+	q := fmt.Sprintf("?min_generation=%d&incarnation_id=%s", maxInt64(view.SealGeneration, 1), url.QueryEscape(view.IncarnationID))
 	script := internalCurlPrefix + `--cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` + auth +
-		`-I "$base/v1/cluster/internal/secrets/` + sandboxID + `"'`
+		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"'`
 	out, err := SSHRun(t, target, script)
 	return peerProbeFromOutput(node.Name, out, err)
 }
@@ -1202,4 +1223,11 @@ sudo systemctl daemon-reload`, itestEnvOverrideFile, b.String(), itestEnvOverrid
 		return fmt.Errorf("%w\n%s", err, out)
 	}
 	return nil
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
