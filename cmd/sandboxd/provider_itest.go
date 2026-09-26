@@ -23,6 +23,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -47,13 +49,53 @@ func itestProviderFactory(context.Context, daemon.FleetConfig) (controlplane.Pro
 		// artifact serves both the enterprise and non-enterprise scenarios.
 		return controlplane.Noop(), nil
 	}
+	client, err := witnessClient()
+	if err != nil {
+		return controlplane.Provider{}, err
+	}
 	return controlplane.Provider{
 		Witness: &httpWitness{
 			base:   strings.TrimSuffix(base, "/"),
 			token:  strings.TrimSpace(os.Getenv("AEROL_ITEST_WITNESS_TOKEN")),
-			client: &http.Client{Timeout: 10 * time.Second},
+			client: client,
 		},
 	}, nil
+}
+
+// witnessClient trusts the same CA the audit exporter is configured with.
+//
+// The receiver serves a self-signed certificate (enterprise mode refuses a
+// plain-http webhook URL), so the default transport rejects it with
+// "certificate signed by unknown authority" — which is exactly how this
+// surfaced: the daemon passed the enterprise https gate and the KMS canary,
+// then crash-looped on the boot-time witness verification.
+//
+// SB_AUDIT_EXPORT_WEBHOOK_CA_FILE is reused rather than given its own
+// variable: the witness and the webhook exporter talk to the SAME endpoint, so
+// a second knob could only ever drift out of agreement with the first.
+func witnessClient() (*http.Client, error) {
+	caFile := strings.TrimSpace(os.Getenv("AEROL_ITEST_WITNESS_CA_FILE"))
+	if caFile == "" {
+		caFile = strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_WEBHOOK_CA_FILE"))
+	}
+	if caFile == "" {
+		return &http.Client{Timeout: 10 * time.Second}, nil
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("witness CA file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("witness CA file %s holds no certificates", caFile)
+	}
+	tr, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("unexpected default transport")
+	}
+	tr = tr.Clone()
+	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
+	return &http.Client{Timeout: 10 * time.Second, Transport: tr}, nil
 }
 
 // httpWitness speaks the integration audit-receiver's witness surface.

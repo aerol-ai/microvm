@@ -754,11 +754,24 @@ Verified live, in order, on one box:
    URL must use https when SB_ENTERPRISE_MODE=true"*. **The receiver is
    plain HTTP today, so it needs TLS before any enterprise scenario runs.**
    This is the one piece of §6.4 still outstanding.
-4. **The witness must be on from FIRST BOOT.** Retrofitting it onto a node that
-   already has local audit history fails with
-   `witness mismatch: local_head="…" witnessed_head=""` — correct behaviour
-   (it detects a witness missing history), but it means the scenario must
-   configure the witness in the initial bootstrap, never flip it on later.
+4. **The witness must be on from FIRST BOOT** — but the reason is a PRODUCT
+   BUG, not correct behaviour, and the first write-up of this section got it
+   wrong. Retrofitting the witness fails with
+   `witness mismatch: local_head="…" witnessed_head=""`, which reads like "the
+   witness is missing history". It is not: the witness holds that exact head.
+   `ValidateSecretAuditWitness` can look it up under the node id
+   `"standalone"` (the Noop cluster's id, `internal/cluster/noop.go:43`) while
+   the shipping path publishes under the real cluster node id, because the
+   boot check can run before `AttachCluster`. Reproduced live; **intermittent**
+   (failed twice, then three clean restarts), which makes it worse — a
+   fail-closed boot that looks like flake. A fresh node never hits it because
+   the check short-circuits on an empty chain. Tracked in `TODOS.md`; it needs
+   a product fix, not a scenario workaround.
+
+Verified 2026-09-26 that all four together do let an enterprise node boot:
+`SB_ENTERPRISE_MODE=true` + awskms + the witness build + the TLS receiver gave
+`secret provider boot canary ok provider=awskms`, `audit export connector
+configured backend=webhook`, a witnessed head, and `active / restarts=0`.
 
 ---
 

@@ -5,8 +5,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -99,4 +102,56 @@ func TestHTTPWitnessSurfacesServerErrors(t *testing.T) {
 	if _, _, err := wit.LastWitnessedHead(context.Background(), "n"); err == nil {
 		t.Fatal("LastWitnessedHead swallowed a 500")
 	}
+}
+
+// The receiver serves a self-signed certificate, so the witness client must
+// trust the CA the exporter is already configured with. Without this the
+// daemon passes the enterprise https gate and the KMS canary and THEN
+// crash-loops on boot-time witness verification with "certificate signed by
+// unknown authority" — which is how this was found, on a live box.
+func TestWitnessClientTrustsConfiguredCA(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(controlplane.AuditHead{NodeID: "n1", HeadHex: "cafe"})
+	}))
+	defer srv.Close()
+
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caPath, certPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("without the CA the handshake is refused", func(t *testing.T) {
+		t.Setenv("AEROL_ITEST_WITNESS_CA_FILE", "")
+		t.Setenv("SB_AUDIT_EXPORT_WEBHOOK_CA_FILE", "")
+		c, err := witnessClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := &httpWitness{base: srv.URL, client: c}
+		if _, _, err := w.LastWitnessedHead(context.Background(), "n1"); err == nil {
+			t.Fatal("expected an untrusted-certificate error")
+		}
+	})
+
+	t.Run("the exporter's CA file is reused", func(t *testing.T) {
+		t.Setenv("AEROL_ITEST_WITNESS_CA_FILE", "")
+		t.Setenv("SB_AUDIT_EXPORT_WEBHOOK_CA_FILE", caPath)
+		c, err := witnessClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := &httpWitness{base: srv.URL, client: c}
+		head, ok, err := w.LastWitnessedHead(context.Background(), "n1")
+		if err != nil || !ok || head != "cafe" {
+			t.Fatalf("got %q,%v,%v; want cafe,true,nil", head, ok, err)
+		}
+	})
+
+	t.Run("an unreadable CA file fails loudly", func(t *testing.T) {
+		t.Setenv("AEROL_ITEST_WITNESS_CA_FILE", filepath.Join(t.TempDir(), "missing.pem"))
+		if _, err := witnessClient(); err == nil {
+			t.Fatal("a missing CA file must fail rather than silently fall back to the system pool")
+		}
+	})
 }
