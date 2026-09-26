@@ -1456,6 +1456,62 @@ actually holds:
 
 The same hazard applies to `lib/*.sh`, which run.sh sources.
 
+## 7.9 Where the programme stopped (2026-09-27)
+
+Stopped deliberately, on the operator's call, with S6 mid-flight and S5
+queued. What is established and what is not:
+
+| Scenario | Result | Status |
+|---|---|---|
+| S1 `single-node-secrets` | 136 pass / 0 fail / 102 skip | green |
+| S2 `cluster-3-mixed-secrets` | UC-117 green and non-vacuous | T12 criterion met |
+| S3 `cluster-3-mixed-secrets-kms` | 91 pass / 18 fail | first execution; see §7.7 |
+| S4 `cluster-3-mixed-secrets-enterprise` | **25 → 168 pass**, 95 → 29 fail | fix validated |
+| S6 `cluster-hetero-secrets-kms` | 105 pass / 9 fail at stop, **8 members formed** | first flagship ever to run |
+| S5 `cluster-hetero-secrets` | not run | **T18 incomplete** |
+
+**T18 is NOT complete.** It asks for S5 + S6 and a published matrix. S6 ran
+but was stopped before finishing; S5 never ran with the gVisor fix. The
+matrix in `reports/index.md` therefore has no flagship column, and should
+not be read as if it does.
+
+### What the runs bought
+
+The value was not the tally, it was the five bugs that only appear on real
+infrastructure. Three product, two harness, all fixed and verified:
+
+1. **A missing leader took an enterprise node down permanently.** Boot
+   re-fanout needs one leader RPC; a node restarting into an election found
+   none, enterprise made it fatal, systemd's restart limit made it final.
+   One crash-looping node collapsed a 3-node cluster to a single member —
+   **that one bug was 68 of S4's 95 failures.** Fixed; S4 went 25 → 168.
+2. **Enterprise boot failed its own witness check**, reading the node id
+   from the Noop's `"standalone"` before `AttachCluster`.
+3. **…and the upgrade hazard that fix introduced**, caught before shipping:
+   reading only under the new id would have failed existing single-node
+   enterprise boxes closed *deterministically*.
+4. **`install.sh` 404'd on gVisor** and never installed sandboxd on any
+   worker — the single most expensive bug of the day, because it surfaced
+   three layers away as `expected 8 members, never reached (last 4)`.
+5. **`build.sh publish` skipped on a known id** without checking the
+   artifact set, so optional binaries silently never uploaded.
+
+Plus one OPEN finding with no fix attempted, because the obvious fix is
+worse than the bug: **a partitioned node keeps answering `/health` 200**, so
+the ingress keeps routing to a node that cannot reach a leader (§7.7).
+
+### To finish T18
+
+1. Re-run S5 and S6 to completion on a build at or after `7cb4ec7c` (the
+   gVisor fix). Both need it — all eight of their workers set
+   `with_gvisor`. ~2h, ~$28.
+2. Rebuild the matrix: `go run ./integration-tests/report -index-only -out
+   integration-tests/reports`.
+3. Apply the three staged `run.sh`/`build.sh` fixes first
+   (`scratchpad/runsh_selfpin.patch.txt`): self-pin against mid-run edits,
+   domain lease that checks what is in use, and `--no-build` falling back to
+   a build instead of aborting. Each one cost a run today.
+
 ## 8. Make targets and reports
 
 ```make
@@ -1545,7 +1601,7 @@ and verified, not merely that code was written.
 | T16 | UC group L + **`main` baseline arm** (§7 UC-165/166, D5) | T12, T1 (`--ref`) | both arms measured in one run; band met | **CODE DONE** 2026-09-26 (PR #486). Live PENDING — needs the `--ref main` arm. UC-165 refuses to compare across instance types and warns below 25 samples. |
 | T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR | **CODE DONE** 2026-09-26 (PR #486). **Exit criterion is stale**: the `removeOrphans` fix already landed 2026-09-19, so UC-167 is written as a live confirmation, not an expected failure. It deliberately does NOT assert restart survival — `ListManaged` reads an in-memory map, and the crash case needs a host-backed seam that has not landed. |
 | T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline | **DONE** 2026-09-26 (PR #486). 61 SEC rows, `want` 299 → **360**. The count was guarded in TWO places; the duplicate approximate guard (`287 ±15`) is removed so a new block updates one number. |
-| T18 | Flagship run S5 + S6, publish reports | all | matrix in `reports/index.md` | **IN PROGRESS** 2026-09-27. S1-S4 have all executed (S3 and S4 for the first time). The flagship was blocked twice by infrastructure, not by the product: (a) gVisor changed its release layout, so `install.sh` 404'd and **never installed sandboxd on any worker** — all four S5/S6 workers set `with_gvisor`, which surfaced as `expected 8 members, never reached (last 4)` and read like a gossip bug; (b) an enterprise node crash-looped at boot on `not raft leader` and systemd's restart limit made it permanent. Both fixed and the fixes published; S6 is running on the fixed build with S5 chained behind it. The vCPU quota is no longer the constraint — 128 available, ~110 needed, and the 8-node topology including the c5.metal applied cleanly. |
+| T18 | Flagship run S5 + S6, publish reports | all | matrix in `reports/index.md` | **INCOMPLETE — stopped on the operator's call 2026-09-27.** S1-S4 and S6 executed; S6 is the first flagship run that ever formed its 8-node cluster (105 pass / 9 fail at the stop) but did not finish, and S5 never ran with the gVisor fix. No flagship column in `reports/index.md`. See §7.9 for exactly what is established and the three steps to finish. |
 
 T12 is the milestone that matters: **UC-117 green on S2** means the defect the
 whole secrets-hardening program exists to fix is proven fixed on real
