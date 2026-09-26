@@ -37,7 +37,13 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(tplPath); err != nil {
+	// Read the template's CONTENT, not just stat it. Go's test cache keys on
+	// the files a test reads, and the template is consumed by a terraform
+	// SUBPROCESS that the cache cannot see — so without this, editing
+	// bootstrap.sh.tftpl alone leaves `go test` reporting a stale pass and CI
+	// never validates the new template. Verified: a mutation to the template
+	// is missed without this read and caught with it.
+	if _, err := os.ReadFile(tplPath); err != nil {
 		t.Fatalf("bootstrap template missing: %v", err)
 	}
 
@@ -130,11 +136,11 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 				"seed_receiver": {
 					"aerol-audit-receiver.service",
 					"/usr/local/bin/audit-receiver",
-					"SB_SECRET_AUDIT_EXPORT_URL=http://127.0.0.1:9099/audit",
+					"SB_SECRET_AUDIT_EXPORT_URL=https://aerol-audit-receiver:9099/audit",
 					"SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=recv-hmac-abc",
 				},
 				"joiner_receiver": {
-					"SB_SECRET_AUDIT_EXPORT_URL=http://10.42.1.5:9099/audit",
+					"SB_SECRET_AUDIT_EXPORT_URL=https://aerol-audit-receiver:9099/audit",
 				},
 				"joiner_kms": {
 					"SB_SECRET_PROVIDER=awskms",
@@ -269,6 +275,11 @@ func renderBootstrap(t *testing.T, output string) string {
 	}
 	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
 	tplPath, _ := filepath.Abs(filepath.Join(repoRoot, "Terraform", "templates", "bootstrap.sh.tftpl"))
+	// See TestBootstrapTemplateRenders: reading the template is what keeps
+	// Go's test cache honest about a terraform subprocess's inputs.
+	if _, err := os.ReadFile(tplPath); err != nil {
+		t.Fatalf("bootstrap template missing: %v", err)
+	}
 	fixture, err := os.ReadFile(filepath.Join("testdata", "bootstrap_render", "main.tf"))
 	if err != nil {
 		t.Fatal(err)
@@ -408,22 +419,52 @@ func TestBootstrapRunsAuditReceiverOnSeedOnly(t *testing.T) {
 		t.Error("a joiner installs the receiver unit too; two receivers split the audit evidence")
 	}
 
-	// Both still export, but to different endpoints.
-	if !strings.Contains(seed, "SB_SECRET_AUDIT_EXPORT_URL=http://127.0.0.1:9099/audit") {
-		t.Error("seed does not export to its own loopback receiver")
+	// Both export to the SAME https name. The /etc/hosts alias is what differs,
+	// and that indirection is the only reason one certificate can serve the
+	// whole fleet: putting the seed's IP in the SAN would make the cert depend
+	// on the seed instance, whose own user-data has to contain the cert.
+	for name, out := range map[string]string{"seed": seed, "joiner": joiner} {
+		if !strings.Contains(out, "SB_SECRET_AUDIT_EXPORT_URL=https://aerol-audit-receiver:9099/audit") {
+			t.Errorf("%s does not export to the receiver over https by name", name)
+		}
+		if !strings.Contains(out, "SB_AUDIT_EXPORT_WEBHOOK_CA_FILE=/etc/sandboxd/audit-receiver-ca.pem") {
+			t.Errorf("%s has no CA file, so it cannot verify the receiver's certificate", name)
+		}
 	}
-	if !strings.Contains(joiner, "SB_SECRET_AUDIT_EXPORT_URL=http://10.42.1.5:9099/audit") {
-		t.Error("joiner does not export to the seed's receiver")
+	// Without these the name does not resolve and every export fails.
+	if !strings.Contains(seed, "127.0.0.1 aerol-audit-receiver") {
+		t.Error("seed does not alias the receiver name to loopback")
+	}
+	if !strings.Contains(joiner, "10.42.1.5 aerol-audit-receiver") {
+		t.Error("joiner does not alias the receiver name to the seed's private IP")
+	}
+	// The TLS private key must never leave the seed.
+	if strings.Contains(joiner, "PRIVATE KEY") {
+		t.Error("a joiner was handed the receiver's TLS private key")
 	}
 
+	var execStart string
 	for _, line := range strings.Split(seed, "\n") {
 		if !strings.HasPrefix(line, "ExecStart=/usr/local/bin/audit-receiver") {
 			continue
 		}
+		execStart = line
 		for _, secret := range []string{"recv-token-xyz", "recv-hmac-abc", "AEROL_RECEIVER_TOKEN", "AEROL_RECEIVER_HMAC"} {
 			if strings.Contains(line, secret) {
 				t.Errorf("receiver ExecStart references %q; systemd expands it into argv, exposing it via ps:\n  %s", secret, line)
 			}
+		}
+	}
+	if execStart == "" {
+		t.Fatal("no receiver ExecStart line in the seed render")
+	}
+	// Serving plain http would fail EVERY export: config.Load rejects a
+	// non-https webhook URL under enterprise, and the nodes are already
+	// configured with an https:// endpoint, so the mismatch would surface as a
+	// TLS error on every batch rather than as a clear misconfiguration.
+	for _, want := range []string{"--tls-cert ", "--tls-key "} {
+		if !strings.Contains(execStart, want) {
+			t.Errorf("receiver ExecStart is missing %q, so it would serve plain http:\n  %s", want, execStart)
 		}
 	}
 }

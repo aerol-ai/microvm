@@ -22,6 +22,42 @@ resource "random_password" "audit_receiver_hmac" {
   special = false
 }
 
+# TLS for the receiver.
+#
+# Enterprise mode REJECTS a plain-http webhook URL ("audit export webhook URL
+# must use https when SB_ENTERPRISE_MODE=true"), so S4/S6 cannot use the
+# receiver at all without this.
+#
+# WHY A DNS ALIAS INSTEAD OF THE SEED'S IP: joiners reach the receiver at the
+# seed's private IP, but putting that IP in the certificate would make the
+# cert depend on aws_instance.seed — and the seed's own user_data has to
+# CONTAIN the cert, which is a dependency cycle. A fixed name every node maps
+# in /etc/hosts (seed -> 127.0.0.1, joiner -> seed private IP) breaks it: the
+# SAN is known at plan time and depends on nothing.
+#
+# Self-signed and used directly as the trust anchor — nodes get this same PEM
+# as SB_AUDIT_EXPORT_WEBHOOK_CA_FILE. A separate CA would buy nothing for one
+# throwaway endpoint.
+resource "tls_private_key" "audit_receiver" {
+  count       = var.audit_receiver_enabled ? 1 : 0
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P256"
+}
+
+resource "tls_self_signed_cert" "audit_receiver" {
+  count = var.audit_receiver_enabled ? 1 : 0
+
+  private_key_pem = tls_private_key.audit_receiver[0].private_key_pem
+  subject {
+    common_name  = local.audit_receiver_host
+    organization = "AerolVM integration fixture"
+  }
+  dns_names             = [local.audit_receiver_host, "localhost"]
+  ip_addresses          = ["127.0.0.1"]
+  validity_period_hours = 24 * 30
+  allowed_uses          = ["key_encipherment", "digital_signature", "server_auth"]
+}
+
 # VPC-internal only. The receiver holds the fleet's audit evidence and has no
 # TLS and no real authz beyond a bearer token, so it must never be reachable
 # from admin_allowed_cidrs, let alone the internet.
@@ -38,13 +74,18 @@ resource "aws_security_group_rule" "audit_receiver" {
 }
 
 locals {
-  # Joiners reach the receiver over the seed's private IP; the seed itself uses
-  # loopback, which also means the seed keeps exporting if the SG rule is ever
-  # wrong — a failure that would otherwise look like "export is broken" rather
-  # than "joiners cannot reach the receiver".
-  audit_receiver_seed_endpoint = var.audit_receiver_enabled ? "http://127.0.0.1:${var.audit_receiver_port}" : ""
-  audit_receiver_token_value   = var.audit_receiver_enabled ? random_password.audit_receiver_token[0].result : ""
-  audit_receiver_hmac_value    = var.audit_receiver_enabled ? random_password.audit_receiver_hmac[0].result : ""
+  # One name every node resolves through /etc/hosts: the seed to loopback, a
+  # joiner to the seed's private IP. Using a name rather than an address is
+  # what lets one certificate serve both without depending on the instance.
+  audit_receiver_host = "aerol-audit-receiver"
+
+  # https, not http — enterprise rejects a plain-http webhook URL, and one
+  # scheme everywhere keeps enterprise and non-enterprise on the same path.
+  audit_receiver_endpoint_url = var.audit_receiver_enabled ? "https://${local.audit_receiver_host}:${var.audit_receiver_port}" : ""
+  audit_receiver_token_value  = var.audit_receiver_enabled ? random_password.audit_receiver_token[0].result : ""
+  audit_receiver_hmac_value   = var.audit_receiver_enabled ? random_password.audit_receiver_hmac[0].result : ""
+  audit_receiver_cert_pem     = var.audit_receiver_enabled ? tls_self_signed_cert.audit_receiver[0].cert_pem : ""
+  audit_receiver_key_pem      = var.audit_receiver_enabled ? tls_private_key.audit_receiver[0].private_key_pem : ""
 }
 
 output "audit_receiver" {

@@ -45,6 +45,8 @@ func main() {
 		hmacKey  = flag.String("hmac-key", "", "shared key for X-Aerol-Signature (empty disables the check)")
 		logPath  = flag.String("audit-log", "/var/log/aerol-audit-webhook.jsonl", "append received audit NDJSON here")
 		failNext = flag.Int("fail-next", 0, "return 503 for the first N /audit requests")
+		tlsCert  = flag.String("tls-cert", "", "serve HTTPS with this certificate (required for enterprise scenarios)")
+		tlsKey   = flag.String("tls-key", "", "private key for --tls-cert")
 	)
 	flag.Parse()
 
@@ -64,16 +66,34 @@ func main() {
 	if err != nil {
 		log.Fatalf("audit-receiver: %v", err)
 	}
-	log.Printf("audit-receiver listening on %s (log=%s, auth=%t, hmac=%t)",
-		*addr, *logPath, *token != "", *hmacKey != "")
+	// TLS is not optional for an enterprise scenario: config.Load rejects
+	// SB_ENTERPRISE_MODE=true with a plain-http webhook URL ("audit export
+	// webhook URL must use https"), on the reasonable grounds that audit
+	// evidence must not cross the network in the clear.
+	scheme := "http"
+	if *tlsCert != "" {
+		scheme = "https"
+	}
+	log.Printf("audit-receiver listening on %s (%s, log=%s, auth=%t, hmac=%t)",
+		*addr, scheme, *logPath, *token != "", *hmacKey != "")
+
 	// No timeouts beyond these: a scenario box is the only client.
 	hs := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	if err := hs.ListenAndServe(); err != nil {
-		log.Fatalf("audit-receiver: %v", err)
+	var serveErr error
+	if *tlsCert != "" {
+		if *tlsKey == "" {
+			log.Fatalf("audit-receiver: --tls-cert given without --tls-key")
+		}
+		serveErr = hs.ListenAndServeTLS(*tlsCert, *tlsKey)
+	} else {
+		serveErr = hs.ListenAndServe()
+	}
+	if serveErr != nil {
+		log.Fatalf("audit-receiver: %v", serveErr)
 	}
 }
 

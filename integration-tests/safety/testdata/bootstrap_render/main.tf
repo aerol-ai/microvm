@@ -115,6 +115,10 @@ locals {
     audit_receiver_token    = ""
     audit_receiver_hmac_key = ""
     audit_receiver_endpoint = ""
+    audit_receiver_host     = "aerol-audit-receiver"
+    audit_receiver_host_ip  = "127.0.0.1"
+    audit_receiver_cert_pem = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+    audit_receiver_key_pem  = "-----BEGIN EC PRIVATE KEY-----\nFAKE\n-----END EC PRIVATE KEY-----\n"
     shard_aware_ingress = false
     caddy_storage_s3_enabled = false
     caddy_storage_s3_bucket = "x"
@@ -188,7 +192,7 @@ output "seed_receiver" {
     audit_receiver_url      = "https://example.invalid/audit-receiver_linux_amd64"
     audit_receiver_token    = "recv-token-xyz"
     audit_receiver_hmac_key = "recv-hmac-abc"
-    audit_receiver_endpoint = "http://127.0.0.1:9099"
+    audit_receiver_endpoint = "https://aerol-audit-receiver:9099"
   }))
 }
 
@@ -200,7 +204,10 @@ output "joiner_receiver" {
     audit_receiver_url      = "https://example.invalid/audit-receiver_linux_amd64"
     audit_receiver_token    = "recv-token-xyz"
     audit_receiver_hmac_key = "recv-hmac-abc"
-    audit_receiver_endpoint = "http://10.42.1.5:9099"
+    audit_receiver_endpoint = "https://aerol-audit-receiver:9099"
+    audit_receiver_host_ip  = "10.42.1.5"
+    # A joiner never serves the receiver, so it must not hold the private key.
+    audit_receiver_key_pem = ""
   }))
 }
 
