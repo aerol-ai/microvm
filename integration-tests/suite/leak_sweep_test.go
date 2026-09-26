@@ -57,7 +57,8 @@ func TestPlaintextLeakSweep(t *testing.T) {
 		}
 		swept++
 		for _, form := range leakForms(canary) {
-			out, err := harness.SSHRun(t, target, leakGrepScript(form.encoded))
+			// The needle goes on stdin; see leakGrepScript.
+			out, err := harness.SSHRunStdin(t, target, leakGrepScript, form.encoded)
 			if err != nil {
 				t.Fatalf("leak sweep on %s (%s form): %v\n%s", node.Name, form.name, err, out)
 			}

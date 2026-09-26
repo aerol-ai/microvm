@@ -176,8 +176,19 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 		t.Skip("no SSH-reachable node")
 	}
 
+	// NOT queue_max=1. secret_audit.go sizes the spill channel to the SAME
+	// buffer as the main queue (`spillCh: make(chan SecretAuditEvent, buffer)`),
+	// so at depth 1 spill has a one-deep handoff and physically cannot absorb
+	// a burst — Emit then does exactly what it documents, "if spillCh is also
+	// full, record a gap". The first live run failed here with 10 markers,
+	// and that was the test's premise being outside the policy's envelope,
+	// not the policy losing records.
+	//
+	// 64 gives spill a real buffer to drain from while still being far
+	// smaller than the 100-way flood below, so the main queue genuinely
+	// overflows and the spill path is genuinely exercised.
 	harness.WithNodeEnv(t, node, map[string]string{
-		"SB_AUDIT_QUEUE_MAX":       "1",
+		"SB_AUDIT_QUEUE_MAX":       "64",
 		"SB_AUDIT_OVERFLOW_POLICY": "spill",
 	}, func(res harness.NodeBootResult) {
 		if !res.Started {

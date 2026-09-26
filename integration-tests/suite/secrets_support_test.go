@@ -772,23 +772,29 @@ func leakForms(secret string) []leakForm {
 	}
 }
 
-// leakGrepScript looks for one encoded form everywhere a secret could come
-// to rest: the daemon's data dir (store, audit JSONL, Raft log), the system
-// logs, and the journal.
+// leakGrepScript searches everywhere a secret could come to rest: the
+// daemon's data dir (store, audit JSONL, Raft log), the system logs, and the
+// journal.
 //
-// Every hit is prefixed with a literal HIT: marker and the Go side counts
-// ONLY those. Anything else the pipeline emits — ssh banners, a grep
-// diagnostic about an unreadable path, sudo chatter — is then structurally
-// incapable of being read as a leaked secret. The first two live runs both
-// reported the canary as found in all five encodings with an empty location
-// list, which is what "the output was non-empty" gets you.
-func leakGrepScript(needle string) string {
-	q := shellSingleQuoteForSuite(needle)
-	return `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; dir=$(dirname "$db"); ` +
-		`{ grep -rlaF ` + q + ` "$dir" /var/log 2>/dev/null; ` +
-		`journalctl -u sandboxd --no-pager 2>/dev/null | grep -aF ` + q + ` | head -3; ` +
-		`} | sed -e "/^$/d" -e "s/^/HIT:/" | head -20; echo SWEEPDONE'`
-}
+// The needle arrives on STDIN, never in argv. sudo logs the full command
+// line to /var/log/auth.log and the journal, so passing the canary as a grep
+// argument writes it into the exact files the sweep then searches — the live
+// run reported the canary "on disk" in all five encodings, and every hit was
+// /var/log/auth.log, put there by the sweep itself.
+//
+// The pattern file lives under /tmp, which is outside the searched paths, and
+// is removed on exit.
+//
+// The journal arm reports only WHETHER it matched, never the matching lines:
+// those lines contain the secret, and printing them as "locations" would put
+// it in a CI log — the thing this case exists to prevent.
+const leakGrepScript = `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; dir=$(dirname "$db"); ` +
+	`IFS= read -r needle; ` +
+	`tmp=$(mktemp /tmp/aerol-sweep.XXXXXX); trap "rm -f \"$tmp\"" EXIT; ` +
+	`printf "%s\n" "$needle" > "$tmp"; ` +
+	`grep -rlaF -f "$tmp" "$dir" /var/log 2>/dev/null | sed -e "/^$/d" -e "s/^/HIT:/" | head -20; ` +
+	`if journalctl -u sandboxd --no-pager 2>/dev/null | grep -qaF -f "$tmp"; then echo "HIT:journalctl -u sandboxd"; fi; ` +
+	`echo SWEEPDONE'`
 
 // shellSingleQuoteForSuite wraps s for a single-quoted word nested inside the
 // outer `sudo bash -c '...'`.
