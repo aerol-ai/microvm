@@ -706,20 +706,6 @@ EOF
 # — the plan's §4.4 wording says "HEAD the three presigned URLs", which would
 # reject every healthy build. A ranged GET is the same signed method, costs one
 
-# tfvar_from_files prints one scalar variable, taking the LAST definition
-# across the files given — the same precedence Terraform applies to chained
-# -var-file flags, so what this reads is what the apply used. Deliberately
-# forgiving: a missing file or key means "use the default", never an error.
-tfvar_from_files() {
-  local key="$1"; shift
-  local file value found=""
-  for file in "$@"; do
-    [[ -f "$file" ]] || continue
-    value="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*\$/\1/p" "$file" | tail -1)"
-    [[ -n "$value" ]] && found="$value"
-  done
-  printf '%s' "$found"
-}
 
 # byte, and still proves reachability + signature validity.
 probe_artifact_url() {
@@ -837,6 +823,13 @@ run_one() {
   if [[ "$caps_domain" == "true" ]]; then
     verify_leased_zone "$leased"
   fi
+
+  # Resolve the SSH identity BEFORE anything is provisioned. wait_for_cloud_init
+  # is an SSH call, and without a key it burns its whole timeout, the harness
+  # never learns that user-data is still running, and the daemon gets only the
+  # health budget to finish booting — which surfaces as "infra not ready" with
+  # an empty diagnostics artifact, because collecting that is SSH too.
+  resolve_ssh_identity "${HERE}/scenarios/${scenario}.tfvars" "$PROD_TFVARS"
 
   # Decide + publish this scenario's artifacts before the asset check, so the
   # check probes the URLs the nodes will really use. Runs after the safety gate
@@ -1157,43 +1150,6 @@ run_one() {
   # `set -u` and /bin/bash on macOS is 3.2, where a bare "${arr[@]}" on an
   # EMPTY array is an unbound-variable error — so the common case (no filter)
   # would abort the run.
-  # The suite SSHes into nodes for the state that has no API: the sealed row
-  # on a peer, the on-disk store, the workerd jail, the audit JSONL. ssh runs
-  # with BatchMode=yes and will not prompt, so with no usable identity it
-  # fails "Permission denied (publickey)" and roughly a third of the security
-  # cases skip. That is exactly what the first live gate run did.
-  #
-  # Two provisioning shapes, and the order matters. When ssh_key_name names an
-  # EXISTING EC2 key pair, Terraform ignores ssh_public_key_path entirely, so
-  # deriving from the latter would pick a key the node has never heard of —
-  # which is what was happening: the deployment uses an EC2 key pair whose
-  # private half sits at ~/.ssh/<name>.pem, while ssh was trying the default
-  # identities. Only when no key pair is named does Terraform upload
-  # ssh_public_key_path, making its private half the right one.
-  if [[ -z "${AEROL_SSH_IDENTITY_FILE:-}" ]]; then
-    local ssh_key_name ssh_pub ssh_priv candidate
-    ssh_priv=""
-    ssh_key_name="$(tfvar_from_files ssh_key_name "$PROD_TFVARS" "${HERE}/scenarios/${scenario}.tfvars")"
-    if [[ -n "$ssh_key_name" ]]; then
-      for candidate in "$HOME/.ssh/${ssh_key_name}.pem" "$HOME/.ssh/${ssh_key_name}"; do
-        [[ -f "$candidate" ]] && { ssh_priv="$candidate"; break; }
-      done
-      if [[ -z "$ssh_priv" ]]; then
-        echo "ssh identity: the deployment uses EC2 key pair '${ssh_key_name}' and its private key is not at ~/.ssh/${ssh_key_name}.pem — node-inspecting use cases will SKIP. Put it there or set AEROL_SSH_IDENTITY_FILE." >&2
-      fi
-    else
-      ssh_pub="$(tfvar_from_files ssh_public_key_path "$PROD_TFVARS" "${HERE}/scenarios/${scenario}.tfvars")"
-      ssh_pub="${ssh_pub:-$HOME/.ssh/id_rsa.pub}"
-      ssh_pub="${ssh_pub/#\~/$HOME}"
-      [[ -f "${ssh_pub%.pub}" ]] && ssh_priv="${ssh_pub%.pub}"
-      [[ -z "$ssh_priv" ]] && echo "ssh identity: none at ${ssh_pub%.pub} — node-inspecting use cases will SKIP. Set AEROL_SSH_IDENTITY_FILE to override." >&2
-    fi
-    if [[ -n "$ssh_priv" ]]; then
-      export AEROL_SSH_IDENTITY_FILE="$ssh_priv"
-      echo "ssh identity: ${ssh_priv}" >&2
-    fi
-  fi
-
   local -a runflag=()
   if [[ -n "${AEROL_TEST_RUN:-}" ]]; then
     runflag=(-run "${AEROL_TEST_RUN}")
