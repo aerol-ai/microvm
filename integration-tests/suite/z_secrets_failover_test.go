@@ -72,6 +72,7 @@ func TestOwnerDeathKeepsCredentialsWorking(t *testing.T) {
 	if !ok {
 		t.Skipf("owner %s is not a node this suite can reach", originalOwner)
 	}
+	requireNonSeedVictim(t, victim)
 
 	t.Logf("killing owner %s (%s); recipients that can take over: %v", originalOwner, victim.Name, peers)
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
@@ -191,6 +192,7 @@ func restoreViaOwnerKill(t *testing.T, c *harness.Client, targets *harness.Integ
 	if !ok || victim.InstanceID == "" {
 		t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
 	}
+	requireNonSeedVictim(t, victim)
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
 	awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
 }
@@ -282,6 +284,7 @@ func TestNonRecipientOwnerFailsLegibly(t *testing.T) {
 	if !ok || victim.InstanceID == "" {
 		t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
 	}
+	requireNonSeedVictim(t, victim)
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
 
 	// Either it never opens (fine — fail closed), or it opens somewhere that
@@ -364,6 +367,14 @@ func TestOwnerKilledMidFanoutIsNeverHalfSealed(t *testing.T) {
 		if id := sandboxIDByName(t, c, name); id != "" {
 			if owner := resolvePlacementOwner(t, c, id); owner != "" {
 				if node, ok := nodeForClusterID(t, c, targets, owner); ok {
+					// Killing the seed takes the cluster down rather than
+					// one member, and this case cannot tell "never half
+					// sealed" from "nothing worked at all". Wait for the
+					// create to land on a non-seed owner instead.
+					if node.Seed {
+						time.Sleep(3 * time.Second)
+						continue
+					}
 					restoreVictim = harness.KillNodeDaemon(t, node)
 					killed = true
 					break

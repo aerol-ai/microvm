@@ -867,6 +867,24 @@ func countGapMarkers(events []auditlog.Event) int {
 // node, TestClusterForms then saw 2 of 3 members, and 79 cases failed —
 // nearly every sandbox create in the suite, most of them nothing to do with
 // secrets.
+// requireNonSeedVictim skips a case whose victim turns out to be the seed.
+//
+// An owner-kill case cannot choose its victim — it must kill whoever owns
+// the sandbox. But killing the seed does not degrade the cluster by one
+// member, it takes the cluster DOWN: on a live 3-node run the remaining two
+// never seated a leader, the seed could not rejoin within four minutes ("no
+// raft leader yet"), and the following case could not even create a sandbox.
+//
+// So the choice is between a case that cannot run and a case that destroys
+// the fleet and reports a red somewhere else. Skipping says which one
+// happened; the alternative buries it.
+func requireNonSeedVictim(t *testing.T, node harness.IntegrationNode) {
+	t.Helper()
+	if node.Seed {
+		t.Skipf("the owner is the seed (%s); killing it takes the whole cluster down rather than one member, so this case cannot inject its fault here", node.Name)
+	}
+}
+
 // restoreNodeDaemon restarts sandboxd on a node a test stopped and does not
 // return until the node is back in the cluster.
 //

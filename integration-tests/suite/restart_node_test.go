@@ -122,3 +122,55 @@ func TestTheRejoinWaitIsWiredEndToEnd(t *testing.T) {
 		t.Error("the suite never installs harness.NodeRejoinCheck, so KillNodeDaemon's wait is a nil hook that returns instantly")
 	}
 }
+
+// A disruptive case must choose its victim deliberately, never the seed.
+//
+// Stopping the seed does not degrade the cluster by one member, it takes the
+// cluster DOWN: on a live 3-node run the remaining two never seated a
+// leader, the read under test answered 502 for its entire poll, the seed
+// could not rejoin within four minutes ("no raft leader yet"), and the next
+// case could not even create a sandbox. Every one of those reads as a
+// product bug in whatever happened to be running.
+//
+// Whether a 3-node cluster SHOULD survive losing its seed is a real and
+// separate question (plan §7.7). Until it does, a case that wants one absent
+// peer must ask for one.
+func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
+	files, err := filepath.Glob("*_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, f := range files {
+		switch f {
+		case "restart_node_test.go", "secrets_support_test.go":
+			continue
+		}
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for sig, body := range splitGoFuncs(string(raw)) {
+			stops := strings.Contains(body, "systemctl stop sandboxd") ||
+				strings.Contains(body, "systemctl restart sandboxd") ||
+				strings.Contains(body, "KillNodeDaemon")
+			if !stops {
+				continue
+			}
+			checked++
+			// Any of the three is a deliberate choice: the two pickers
+			// exclude the seed themselves, and an explicit .Seed test is the
+			// hand-rolled equivalent.
+			if !strings.Contains(body, "PickRestartableNode") &&
+				!strings.Contains(body, "pickNonSeedNode") &&
+				!strings.Contains(body, "requireNonSeedVictim") &&
+				!strings.Contains(body, ".Seed") {
+				t.Errorf("%s: %s takes a daemon down without excluding the seed; stopping the seed takes the whole cluster down, and every later case then fails for a reason that has nothing to do with what it tests",
+					f, strings.TrimSuffix(sig, " {"))
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no function was inspected; this guard would have passed having checked nothing")
+	}
+}

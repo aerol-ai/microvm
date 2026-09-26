@@ -1347,6 +1347,56 @@ CLOSED on a mismatch that does not exist, intermittently. Fixed: all four
 derivations go through `witnessNodeID()`, preferring `cfg.NodeID` — the same
 value the real cluster is built from, so nothing changes on a healthy node.
 
+## 7.7 Two product findings from S3/S4 (2026-09-27)
+
+### A node that restarts without a leader never comes back (FIXED)
+
+S4's seed exited at boot and stayed down for the whole run:
+
+```
+cluster: validate/re-fanout durable secrets at boot: authoritative cluster
+  placement snapshot during secret re-fanout: cluster: not raft leader
+sandboxd.service: Start request repeated too quickly.
+```
+
+The boot secret re-fanout needs one leader RPC. A node restarting into an
+in-flight election finds no leader seated; enterprise mode treated ANY
+re-fanout error as fatal, so the daemon exited — and systemd's restart limit
+made that permanent. From outside, the cluster answered roughly one request
+in three with a 502, because the ingress still held a route to a node that
+was serving nothing.
+
+Enterprise mode is meant to fail closed on secrets it cannot validate. It is
+not meant to fail closed because leadership was momentarily unsettled, which
+is the normal state of a starting cluster. Fixed in `pkg/daemon`: that one
+condition defers to a background retry (mirroring the ownership replay six
+lines above, which already treats it as retryable); everything else still
+fails closed. `waitForLeader` now returns an `ErrNoLeader` sentinel so the
+condition can be classified at all.
+
+### Losing the SEED takes a 3-node cluster down — OPEN, needs investigation
+
+UC-134 stopped one of three nodes. It happened to be the seed, and the
+remaining two **never seated a leader**:
+
+```
+node node1 did not rejoin within 4m: no raft leader yet
+create HA sandbox: cluster: reserve placement failed: cluster: not raft leader
+```
+
+Two of three voters is a quorum, so an election should have succeeded. It
+did not, and the cluster did not recover even after the seed was restarted.
+This is the same shape as the known "restarting the seed orphans the
+joiners" note, but worse: here the seed was merely STOPPED, and the survivors
+could not carry on without it.
+
+**Not fixed here** — it is a Raft/voter-promotion question in
+`internal/cluster`, it needs its own investigation and regression test, and
+diagnosing it inside a test-suite change would bury it. What this programme
+owed was to stop mis-attributing it: the suite no longer picks the seed as a
+victim, and an owner-kill case whose owner IS the seed now skips with that
+reason rather than destroying the fleet and reddening whatever ran next.
+
 ## 8. Make targets and reports
 
 ```make

@@ -33,6 +33,34 @@ what, why, the caveat that motivated capturing it, and where to start.
   guard that fails if any witness call site reads `c.SelfNodeID()` directly
   again. Mutation-checked.
 
+## Losing the seed takes a 3-node cluster down — REPRODUCED
+
+- **What:** stopping the SEED of a 3-node cluster leaves the remaining two
+  unable to elect a leader. Two of three voters is a quorum, so this should
+  not happen.
+- **Observed** (S4/S2 security runs, 2026-09-27) after `systemctl stop
+  sandboxd` on the seed:
+
+      node node1 did not rejoin within 4m: no raft leader yet
+      create HA sandbox: cluster: reserve placement failed: cluster: not raft leader
+
+  The cluster did not recover even once the seed was restarted.
+- **Why it matters:** the fleet cannot survive the loss of one specific
+  machine, which is the whole premise of a 3-node deployment. It also makes
+  every disruptive test that happens to pick the seed report a failure
+  somewhere else entirely.
+- **Related but distinct:** the known "restarting the seed re-bootstraps
+  standalone and orphans the joiners" behaviour. Here the seed was only
+  STOPPED, and the survivors still could not carry on.
+- **Suspect:** voter promotion — whether joiners are actually promoted to
+  voters before the seed goes away (`internal/cluster`, the auto-promote
+  path that logs "cluster: auto-promoted member to raft voter").
+- **Start:** `internal/cluster/raft.go`, `client.go` leadership/bootstrap,
+  and the auto-promotion path in `agent.go`. Needs a regression test next to
+  whichever file changes, per CLAUDE.md's cluster rules.
+- **Mitigated meanwhile:** the integration suite never picks the seed as a
+  disruptive victim, and an owner-kill case whose owner is the seed skips.
+
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 
 - **What:** Decide whether `upsertRoute` should retry a dropped connection the

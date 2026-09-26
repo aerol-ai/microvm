@@ -135,6 +135,19 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 			continue // stopping the owner is UC-135's experiment
 		}
 		if n, ok := nodeForClusterID(t, c, targets, id); ok {
+			// Never the seed. Stopping it does not degrade the cluster by
+			// one member, it takes the cluster DOWN: the remaining two never
+			// seated a leader, so the read this case is measuring answered
+			// 502 for its whole three-minute poll, the seed could not rejoin
+			// within four minutes ("no raft leader yet"), and the next case
+			// could not even create a sandbox ("reserve placement failed").
+			//
+			// UC-134 is about whether a read ADMITS it could not reach a
+			// peer. It needs one absent peer, not a dead cluster — and a
+			// dead cluster cannot answer the question either way.
+			if n.Seed {
+				continue
+			}
 			if _, sshOK := harness.SSHTarget(n); sshOK {
 				victim, found = n, true
 				break
@@ -142,7 +155,7 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Skip("no SSH-reachable non-owner peer to stop")
+		t.Skip("no SSH-reachable non-owner, non-seed peer to stop")
 	}
 
 	target, _ := harness.SSHTarget(victim)
@@ -224,6 +237,7 @@ func TestAuditEvidenceSurvivesOwnerDeath(t *testing.T) {
 	if !ok || victim.InstanceID == "" {
 		t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
 	}
+	requireNonSeedVictim(t, victim)
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
 	awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
 
