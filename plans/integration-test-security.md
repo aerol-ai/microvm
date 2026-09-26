@@ -682,6 +682,35 @@ S4 `default_with_isolate = true` plus both capabilities and budget the
 jail-realization risk, or drop UC-150/163/164 from this program and say so.
 Silently shipping three UCs that can never run is the worst of the three.
 
+### 6.2b The disruptive gate opens — and the existing D-tagged UCs still cannot use it
+
+Verified on the first live `cluster-3-mixed-secrets` run (2026-09-26).
+
+`run.sh` logged `disruptive fault-injection tests enabled for
+cluster-3-mixed-secrets (caps: disruptive: true)` — on a scenario **not** named
+`cluster-hetero`, which the old name match would have silently left off.
+
+`DisruptiveAllowed()` then returned true, and the proof is in *where* the
+skips were recorded:
+
+| UC | recorded at | meaning |
+|---|---|---|
+| UC-58 | `z_disruptive_cluster_test.go:32` | the line AFTER the gate — an unconditional `t.Skip("driven by infra fault injection; Phase 2 follow-up")` |
+| UC-58c | `z_disruptive_cluster_test.go:141` | also after the gate — "requires cluster-hetero worker-x/y/z topology" |
+
+The gate's own skip is at line 30. Nothing landed there, so the gate opened.
+
+**But no EXISTING D-tagged use case can run on S2**, for two reasons that have
+nothing to do with the gate: UC-58 and UC-58b are unimplemented stubs, and
+UC-58c needs the hetero worker topology. So T10 proves the mechanism; it
+cannot yet prove a D-tagged case *passing* on S2, because there is not one to
+run.
+
+**This lands on T12.** Its exit criterion — "UC-117 green on S2" — must
+therefore assert PASS (not merely not-FAIL, which the plan already says) AND
+be written so that UC-117 is neither a stub nor hetero-only. The two skips
+above are exactly the failure modes to avoid when writing group B.
+
 ### 6.3 New capabilities
 
 `integration-tests/suite/harness/usecases.go`:
@@ -1131,7 +1160,7 @@ and verified, not merely that code was written.
 | T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | **DONE** 2026-09-23 — real CMK `cd1a8f8c` + `alias/aerolvm-itest-single-node-secrets`. **Boots:** `secret provider boot canary ok provider=awskms`, strict boot on, 0 restarts. **Seals:** env set at create is withheld from the default read (`{}`); `?include_env=true` returned it decrypted, and the audit chain recorded the opt-in with the exact `correlation_id` sent. Full suite **pass 58 · fail 0 · skip 55 · 0 inconclusive** with the provider active. |
 | T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | **DONE** 2026-09-23 — **exit criterion corrected**: a node exports to exactly ONE backend, so "both" is proven by flipping the backend on one box, not by running both at once. **s3:** records at `aerolvm-itest-single-node/node=<id>/2026/09/25/<batch>.jsonl` carrying the exact `correlation_id` sent. **file:** `/var/log/aerol-audit-export.jsonl` (0600 root) grew 1130→1673 bytes with the event. Clean suite re-run **pass 58 · fail 0 · 0 inconclusive** with KMS + s3 export both active. |
 | T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | **DONE** 2026-09-26 — all three verified live. **webhook:** backend resolved to `webhook` from the export URL alone, 5 batches / 0 rejected (so bearer + HMAC verified). **witness:** head `abe49336…` recorded and returned by `/witness/<SB_NODE_ID>`. **chaos:** `fail_next=3` consumed as 503s, then the exporter backed off and redelivered (`batches` 3→4). Needed a `-tags itestwitness` daemon — see §6.4a. |
-| T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | **CODE DONE** 2026-09-26. Capabilities already existed (PR #451). **`disruptive:` field DONE** and mutation-verified — this was the 17-UC silent hole. All 7 pairs written with Makefile targets + `integration-secrets-gate`. New offline validation catches unknown capability names (**already caught a real `gvisor-runtime` typo**), missing twins, duplicate/unmarked `cluster_name`, and enterprise-without-witness. Exit criterion "a D-tagged UC actually runs on S2" needs the live run. |
+| T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | **CODE DONE** 2026-09-26. Capabilities already existed (PR #451). **`disruptive:` field DONE** and mutation-verified — this was the 17-UC silent hole. All 7 pairs written with Makefile targets + `integration-secrets-gate`. New offline validation catches unknown capability names (**already caught a real `gvisor-runtime` typo**), missing twins, duplicate/unmarked `cluster_name`, and enterprise-without-witness. **Live S2 run 2026-09-26: pass 71 · fail 0 · skip 42 · 0 inconclusive.** The gate PROVABLY opens — see §6.2b. |
 | T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable | |
 | T11 | `harness/secrets.go` helpers (§7.1) | T10, T10b | `WithNodeEnv` always restores on failure; `SecretHolders()` works | |
 | T12 | UC groups A-D (sealing, failover, reseal, env) | T11 | **UC-117 green on S2** | |
