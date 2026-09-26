@@ -673,3 +673,35 @@ func assertNodeBackInService(t *testing.T, c *harness.Client, targets *harness.I
 	}
 	t.Fatalf("node %s (%s) is running but has not rejoined the cluster; the fleet is split and every later case is suspect", node.Name, nodeID)
 }
+
+// workerdJailProbeScript reports the four jail properties at once.
+//
+// One script, one process: probing them in four SSH round trips could
+// describe four different workerd processes if the group restarts in
+// between, and "uid from one process, seccomp from another" is not evidence
+// that any single process is jailed.
+const workerdJailProbeScript = `sudo bash -c '
+pid=$(pgrep -n workerd 2>/dev/null || true)
+if [ -z "$pid" ]; then echo "FOUND=0"; exit 0; fi
+echo "FOUND=1"
+echo "UID=$(awk "/^Uid:/ {print \$2}" /proc/$pid/status 2>/dev/null)"
+echo "SECCOMP=$(awk "/^Seccomp:/ {print \$2}" /proc/$pid/status 2>/dev/null)"
+echo "NONEWPRIVS=$(awk "/^NoNewPrivs:/ {print \$2}" /proc/$pid/status 2>/dev/null)"
+echo "ROOT=$(readlink /proc/$pid/root 2>/dev/null)"
+cg=$(awk -F: "{print \$3}" /proc/$pid/cgroup 2>/dev/null | head -1)
+echo "PIDSMAX=$(cat /sys/fs/cgroup$cg/pids.max 2>/dev/null)"
+'`
+
+// parseKV turns KEY=VALUE lines into a map.
+func parseKV(out string) map[string]string {
+	m := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		m[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return m
+}

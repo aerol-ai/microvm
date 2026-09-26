@@ -1041,6 +1041,42 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 | UC-161 | `GET /v1/cluster/sandbox-index` and the paged list paths stay bounded with N sandboxes (assert page size + `next_cursor`, not a full inventory) | C |
 | UC-162 | Ingress topology gate. **Scope corrected (outside voice, verified):** the daemon half needs >`MaxReplicatedIngressRouteNodes` = 10 live ingress-capable members (`internal/cluster/shards.go:28`), and `cluster-hetero.tfvars` has exactly **one** `ingress` node — no proposed scenario reaches 2, let alone 11. `Terraform/validate/ingress.go` also has no caller outside its own unit test; the real gate is the `nodes.tf:211` precondition. So: assert the **`terraform plan` precondition** with an 11-ingress overlay (plan-only, never applied — free), plus a **single-node env-injection** check that an enterprise daemon refuses to boot when told it has an oversized tier. Drop the live >10-node cluster. | E |
 
+> **T15 IMPLEMENTATION FINDINGS (outside voice, verified 2026-09-26).**
+>
+> - **UC-162's scope was corrected a second time.** §6.2's own correction
+>   already dropped the live >10-node cluster; the replacement — "assert the
+>   `terraform plan` precondition with an 11-ingress overlay (plan-only, never
+>   applied — free)" — does not work either. `Terraform/` uses an S3 backend
+>   and AWS data sources, so `terraform plan` cannot run without initialising
+>   real state and credentials, and a failure would be indistinguishable from
+>   the precondition firing. What IS free and real is the **drift**: the
+>   Terraform gate hardcodes `10` while the daemon's refusal comes from
+>   `cluster.MaxReplicatedIngressRouteNodes`, and `Terraform/validate/ingress.go`
+>   has no caller outside its own unit test — so nothing connects the two
+>   numbers. If the constant moves and the literal does not, Terraform
+>   provisions a tier the daemon then refuses to serve. That assertion now
+>   lives in `integration-tests/safety/ingress_gate_test.go` so it runs in
+>   `make test` (the drift is introduced at commit time, not deploy time), and
+>   UC-162 keeps the live half: this deployment's member count is inside the
+>   cap. Mutation-checked by bumping the literal to 25.
+> - **UC-163 probes all four jail properties in ONE remote script.** Four SSH
+>   round trips could describe four different workerd processes if the group
+>   restarts in between, and "uid from one process, seccomp from another" is
+>   not evidence that any single process is jailed. It also asserts the
+>   process is still SERVING: a jail that is only correct when idle is not a
+>   boundary. `root == "/"` is called out explicitly — that is the
+>   populated-chroot gotcha this project already hit once.
+> - **UC-164 is built on UC-104's scaffolding** (`egressProbeBundle`,
+>   `uploadBundle`, `newIsolateSandbox`, `execFetch`), not on an invented
+>   `fetch` exec verb. The first draft used `sb.Exec("fetch ...")` and a
+>   non-existent `AllowedHosts` field; the real ones are `NetworkAllowOut` and
+>   `NetworkBlockAll`. Reusing the jail-off case's shape is also what makes
+>   the jail-on result comparable to it.
+> - **UC-160 asserts the attestation SURVIVES.** Discharging an obligation
+>   must not delete the record: the attestation is the evidence that the
+>   storage was destroyed, and an obligation that vanishes on discharge leaves
+>   nothing to audit.
+
 ### K. Isolate jail under enterprise (F16, F17)
 
 | UC | Assertion | Caps |

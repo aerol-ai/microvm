@@ -532,6 +532,19 @@ var Registry = []UseCase{
 	{ID: "UC-157", Title: "A CA signing key in the daemon TLS directory refuses an enterprise boot", Requires: []Capability{CapEnterprise, CapCluster}, Implemented: true},
 	{ID: "UC-158", Title: "An on-node-only audit exporter refuses an enterprise boot", Requires: []Capability{CapEnterprise}, Implemented: true},
 	{ID: "UC-159", Title: "After every boot-gate row the node rejoins cleanly; the matrix leaves no degraded fleet", Requires: []Capability{CapEnterprise}, Implemented: true},
+
+	// J. Storage retirement and fleet-scale reads (F15, F18, F19).
+	{ID: "UC-160", Title: "Draining a worker raises a storage-retirement obligation; attesting it records the discharge", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-161", Title: "Fleet-scale reads stay paged: limit is honoured and the cursor advances", Requires: []Capability{CapCluster}, Implemented: true},
+	// Scope corrected twice — see the T15 findings box in the plan. Neither a
+	// live 11-node ingress tier nor a `terraform plan` is available, so this
+	// asserts the drift that actually bites: the Terraform literal against
+	// the daemon constant.
+	{ID: "UC-162", Title: "The Terraform ingress gate matches MaxReplicatedIngressRouteNodes and keeps its escape hatch", Requires: []Capability{CapEnterprise}, Implemented: true},
+
+	// K. Isolate jail under enterprise (F16, F17).
+	{ID: "UC-163", Title: "Enterprise + isolate: workerd is jailed (non-root, chroot, seccomp, pid cap) while serving", Requires: []Capability{CapEnterprise, CapIsolate, CapIsolateJail}, Implemented: true},
+	{ID: "UC-164", Title: "Per-sandbox egress attribution holds under the jail, and the audit names the right sandbox", Requires: []Capability{CapEnterprise, CapIsolate, CapIsolateJail}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
