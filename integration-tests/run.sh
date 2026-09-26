@@ -1127,6 +1127,17 @@ run_one() {
     pflag="-p 1"
   fi
 
+  # AEROL_TEST_RUN narrows the pass to a subset of tests (a Go -run regex).
+  # It exists for iterating against a kept cluster: re-running only the
+  # security cases against an already-provisioned fleet is minutes instead of
+  # a re-provision. The report it writes covers only the tests that ran, so
+  # a narrowed pass must never be published as a full matrix.
+  local runflag=""
+  if [[ -n "${AEROL_TEST_RUN:-}" ]]; then
+    runflag="-run ${AEROL_TEST_RUN}"
+    echo "test filter: -run ${AEROL_TEST_RUN} (PARTIAL pass; the report covers only these tests)" >&2
+  fi
+
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
@@ -1143,7 +1154,7 @@ run_one() {
     AEROL_OBS_PUSHGATEWAY_URL="${AEROL_OBS_PUSHGATEWAY_URL:-}" \
     AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
     AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-}" \
-    go test -tags=integration -count=1 ${pflag} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
+    go test -tags=integration -count=1 ${pflag} ${runflag} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
 
