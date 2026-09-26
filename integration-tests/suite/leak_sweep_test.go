@@ -30,9 +30,7 @@ func TestPlaintextLeakSweep(t *testing.T) {
 
 	// Exercise the paths a secret travels: sealed at create, replicated to
 	// peers, read back through the API, and logged about.
-	sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{
-		Env: map[string]string{"UC169_CANARY": canary},
-	})
+	sb := createSecretSandbox(t, c, map[string]string{"UC169_CANARY": canary})
 	waitRunning(t, sb)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()

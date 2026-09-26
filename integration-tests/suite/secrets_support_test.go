@@ -23,6 +23,7 @@ import (
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -788,4 +789,25 @@ func leakGrepScript(needle string) string {
 // outer `sudo bash -c '...'`.
 func shellSingleQuoteForSuite(s string) string {
 	return `'"'"'` + strings.ReplaceAll(s, "'", `'"'"'`) + `'"'"'`
+}
+
+// createSecretSandbox creates a sandbox carrying sealed env, using the HA
+// path only where HA is possible.
+//
+// CreateHASandbox waits for failover_ready, which a single-node deployment
+// can never report — the server omits the field entirely (policy=recreate
+// needs a peer to be ready ON). A CapSecrets-only use case that reached for
+// the HA helper would therefore burn its whole timeout and fail on S1 for a
+// reason unrelated to what it tests. UC-169's leak sweep is exactly that
+// shape: it wants a sandbox with sealed material, and it is just as valid on
+// one node as on three.
+func createSecretSandbox(t *testing.T, c *harness.Client, env map[string]string) *microvm.Sandbox {
+	t.Helper()
+	if sc.Has(harness.CapCluster) {
+		return harness.CreateHASandbox(t, c, harness.HASandboxSpec{Env: env})
+	}
+	return c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name: harness.UniqueName(sc, t),
+		Env:  env,
+	})
 }
