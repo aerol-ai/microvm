@@ -919,8 +919,8 @@ func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
 		// A fixed sleep was the previous attempt and was simply a guess.
 		// capacity_stale is the cluster's own answer to "is this node usable
 		// yet", so ask that instead.
-		if stale := staleCapacityMembers(t, c); len(stale) > 0 {
-			last = "capacity still stale for " + strings.Join(stale, ",")
+		if missing := membersMissingInternalURL(t, c); len(missing) > 0 {
+			last = "no InternalURL advertised yet for " + strings.Join(missing, ",")
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -961,18 +961,26 @@ func clusterLeader(c *harness.Client) (string, error) {
 	return strings.TrimSpace(resp.Leader), nil
 }
 
-// staleCapacityMembers lists alive members whose gossiped capacity has not
-// refreshed. Placement needs a member's advertisement — InternalURL included
-// — before it can select it, so a node with stale capacity is in the cluster
-// but not yet usable.
-func staleCapacityMembers(t *testing.T, c *harness.Client) []string {
+// membersMissingInternalURL lists alive members that have not advertised an
+// mTLS address yet.
+//
+// This is the exact condition placement enforces: reserving a placement
+// fails "cluster: peer InternalURL required (mTLS fail-closed)" when any
+// candidate lacks one, and a node that has just restarted is back in the
+// member list before it has re-advertised.
+//
+// An earlier version of this check read capacity_stale. That field is not in
+// the members payload at all, so it decoded to false and the check passed
+// unconditionally — a guard that looked right and tested nothing. internal_url
+// is in the payload and is what the error is about.
+func membersMissingInternalURL(t *testing.T, c *harness.Client) []string {
 	t.Helper()
 	var out []string
 	for _, m := range fetchMembers(t, c).Members {
 		if !m.Alive || m.Drained {
 			continue
 		}
-		if m.CapacityStale {
+		if strings.TrimSpace(m.InternalURL) == "" {
 			out = append(out, m.NodeID)
 		}
 	}
