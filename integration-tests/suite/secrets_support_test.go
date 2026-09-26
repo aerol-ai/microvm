@@ -907,9 +907,23 @@ func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		// In the member list and a leader is seated. Give gossip a beat to
-		// propagate the InternalURL before placement can pick this node.
-		time.Sleep(5 * time.Second)
+		// Fourth condition, and the one that actually gates placement: every
+		// member must have FRESH capacity. A restarted node is back in the
+		// member list well before it has re-gossiped, and its InternalURL
+		// rides on that advertisement — until it lands, reserving a
+		// placement fails
+		//   "cluster: reserve placement failed: cluster: peer InternalURL
+		//    required (mTLS fail-closed)"
+		// which is what UC-117 hit at CREATE, before it could kill anything.
+		//
+		// A fixed sleep was the previous attempt and was simply a guess.
+		// capacity_stale is the cluster's own answer to "is this node usable
+		// yet", so ask that instead.
+		if stale := staleCapacityMembers(t, c); len(stale) > 0 {
+			last = "capacity still stale for " + strings.Join(stale, ",")
+			time.Sleep(5 * time.Second)
+			continue
+		}
 		return nil
 	}
 	return fmt.Errorf("node %s did not rejoin within 4m: %s", node.Name, last)
@@ -945,4 +959,22 @@ func clusterLeader(c *harness.Client) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(resp.Leader), nil
+}
+
+// staleCapacityMembers lists alive members whose gossiped capacity has not
+// refreshed. Placement needs a member's advertisement — InternalURL included
+// — before it can select it, so a node with stale capacity is in the cluster
+// but not yet usable.
+func staleCapacityMembers(t *testing.T, c *harness.Client) []string {
+	t.Helper()
+	var out []string
+	for _, m := range fetchMembers(t, c).Members {
+		if !m.Alive || m.Drained {
+			continue
+		}
+		if m.CapacityStale {
+			out = append(out, m.NodeID)
+		}
+	}
+	return out
 }
