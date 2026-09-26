@@ -1253,6 +1253,46 @@ regression or long-standing, then its own PR.
 This is the FIRST product defect the programme has surfaced. Everything red
 before it was the harness.
 
+## 7.5 UC-117 GREEN — the milestone, live (2026-09-27)
+
+`cluster-3-mixed-secrets`, targeted disruptive pass:
+
+```
+killing owner node3; recipients that can take over: [node1]
+sandbox sb-8cb40dacc41878fa reassigned from node3 to node1
+UC-117 PASS: recreated on recipient node1 and its credentials still work
+```
+
+52s, and not vacuous: the holder set had a real non-owner recipient, the
+kill happened, the new owner was verified to be IN that holder set, and the
+credential was read back FROM INSIDE THE GUEST — not `status=running`, which
+is the check that would pass against the silent empty-env failure this
+programme exists to catch.
+
+Group B is green: **UC-117 pass, UC-118 pass, UC-120 pass**, UC-119 an honest
+skip (every node held a copy, so there was no non-recipient to hand ownership
+to). Plus **UC-110 pass, UC-111 pass**.
+
+T12's exit criterion — "UC-117 green on S2" — is met.
+
+### Architectural finding: audit evidence is node-local
+
+`internal/cluster/audit_replication.go` is a query-time FETCH across peers
+(`AuditPeerPage`, `auditPeerFetchTimeout`), not record replication. A node's
+audit records live only on the node that wrote them, so with an owner down
+its slice is unreachable until it returns.
+
+§7's UC-135 wording — "evidence survives owner death ... the history is still
+complete" — implies replication the product does not have and never claimed
+to. Durability across node loss is the off-node EXPORTER's job (F9/F10/F11,
+UC-139/140/141). What the read path owes is UC-134's honesty property: it may
+return less, but it must SAY so.
+
+UC-135 is rewritten accordingly: the records are present, OR coverage reports
+partial AND names the missing node. A silently short history is the failure,
+because it reads as "this access never happened" when it means "I could not
+ask the node that knows".
+
 ## 8. Make targets and reports
 
 ```make
