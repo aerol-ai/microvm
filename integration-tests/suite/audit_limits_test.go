@@ -80,7 +80,7 @@ func TestAuditNodeCeilingIsSeparateFromTheOperatorLimit(t *testing.T) {
 	})
 	waitRunning(t, sb)
 
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -118,7 +118,7 @@ func TestOverflowGapMarkerRecordsWhatWasDropped(t *testing.T) {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
 	c := client(t)
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -171,7 +171,7 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
 	c := client(t)
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}

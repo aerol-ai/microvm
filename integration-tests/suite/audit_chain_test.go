@@ -273,7 +273,7 @@ func TestAuditIndexParityAndIncompleteIndexIs503(t *testing.T) {
 	owner := resolvePlacementOwner(t, c, sb.ID)
 	node, ok := nodeForClusterID(t, c, targets, owner)
 	if !ok {
-		node, ok = harness.PickSSHNode(targets)
+		node, ok = harness.PickRestartableNode(targets)
 		if !ok {
 			t.Skip("no SSH-reachable node")
 		}

@@ -459,6 +459,38 @@ const (
 	itestEnvDropIn       = "/etc/systemd/system/sandboxd.service.d/zz-itest-override.conf"
 )
 
+// PickRestartableNode returns a node it is SAFE to restart.
+//
+// Not the seed, where there is any alternative. Restarting the seed of a
+// SWIM cluster orphans the joiners into their own partition and they do NOT
+// heal: the live S2 run left node1 seeing only itself while nodes 2 and 3
+// gossiped happily with each other, and every subsequent create failed
+// "cluster: peer InternalURL required (mTLS fail-closed)".
+//
+// PickSSHNode deliberately PREFERS the seed — it is the right choice for
+// reading state — so every case that restarts a node and reached for it was
+// picking the one node that breaks the cluster.
+//
+// On a single node there is nothing to orphan, so the seed is returned.
+func PickRestartableNode(targets *IntegrationTargets) (IntegrationNode, bool) {
+	if targets == nil {
+		return IntegrationNode{}, false
+	}
+	var seed IntegrationNode
+	haveSeed := false
+	for _, n := range targets.Nodes {
+		if _, ok := SSHTarget(n); !ok {
+			continue
+		}
+		if n.Seed {
+			seed, haveSeed = n, true
+			continue
+		}
+		return n, true
+	}
+	return seed, haveSeed
+}
+
 // NodeRejoinCheck, when set, must block until the node is fully back in
 // service — not merely until its unit is active.
 //

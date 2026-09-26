@@ -138,13 +138,11 @@ func TestEnterpriseBootGateMatrix(t *testing.T) {
 	}
 	// Prefer a joiner: refusing the seed's boot on a cluster costs the
 	// rendezvous every joiner needs, turning one red row into a split cluster.
-	node, ok := pickNonSeedNode(targets)
+	// PickRestartableNode already prefers a joiner and falls back to the
+	// seed only where there is nothing to orphan (single node).
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
-		var fallback bool
-		node, fallback = harness.PickSSHNode(targets)
-		if !fallback {
-			t.Skip("no SSH-reachable node")
-		}
+		t.Skip("no SSH-reachable node")
 	}
 	c := client(t)
 

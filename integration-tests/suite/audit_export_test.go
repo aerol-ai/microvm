@@ -53,7 +53,7 @@ func TestFileExportBackendWritesChainedRecords(t *testing.T) {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
 	c := client(t)
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -101,7 +101,7 @@ func TestS3ExportBackendWritesReconstructableObjects(t *testing.T) {
 		t.Skip("AEROL_AUDIT_EXPORT_S3_BUCKET not set; no bucket to export into")
 	}
 	c := client(t)
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -247,7 +247,7 @@ func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 	// this run rather than a stale value from provisioning.
 	generateAuditRecords(t, c, "143", 3)
 
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -293,7 +293,7 @@ func TestAuditIngestRequiresATokenAndIsLoopbackOnly(t *testing.T) {
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -348,7 +348,7 @@ func TestRetentionPruneHoldsWhileExportLagsThenVerifies(t *testing.T) {
 		t.Skip("no audit receiver provisioned in this scenario")
 	}
 	c := client(t)
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
