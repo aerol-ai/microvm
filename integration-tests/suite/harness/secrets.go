@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -493,6 +494,10 @@ func (r NodeBootResult) RefusedWith(substr string) bool {
 // which is how UC-159 checks that a node rejoins cleanly.
 func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn func(NodeBootResult)) {
 	t.Helper()
+	// Before the mutation, not after: an unreachable node must skip cleanly
+	// rather than fail the apply and then fail the restore too, which reads
+	// as "the node was left down" when nothing was ever changed.
+	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
 	if !ok {
 		t.Fatalf("node %s has no SSH address", node.Name)
@@ -619,6 +624,7 @@ const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/cluster.env; s
 // ProbePeerSecret asks node whether it holds the sealed row for sandboxID.
 func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerSecretProbe {
 	t.Helper()
+	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
 	if !ok {
 		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("node %s has no SSH address", node.Name)}
@@ -636,6 +642,7 @@ func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerS
 // entitled to the fleet's sealed material.
 func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, sandboxID, bearer string) PeerSecretProbe {
 	t.Helper()
+	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
 	if !ok {
 		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("node %s has no SSH address", node.Name)}
@@ -756,8 +763,15 @@ func FindReceiverNode(t *testing.T, targets *IntegrationTargets) (IntegrationNod
 		return IntegrationNode{}, false
 	}
 	// Seed first: that is where the mixed scenarios put it.
+	//
+	// An unreachable fleet must not be reported as "no receiver provisioned"
+	// — those are different facts and the caller skips with a different
+	// message — so the reachability probe runs first and short-circuits.
 	for _, node := range seedFirst(targets.Nodes) {
 		target, _ := SSHTarget(node)
+		if reachable, _, _ := probeNodeSSH(t, target); !reachable {
+			continue
+		}
 		out, err := SSHRun(t, target, "test -f "+receiverUnitFile+" && echo YES || echo NO")
 		if err == nil && strings.Contains(out, "YES") {
 			return node, true
@@ -775,6 +789,7 @@ func FindReceiverNode(t *testing.T, targets *IntegrationTargets) (IntegrationNod
 // being tested is the exporter's delivery, not this curl's trust chain.
 func ReceiverRequest(t *testing.T, node IntegrationNode, method, path string) (string, error) {
 	t.Helper()
+	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
 	if !ok {
 		return "", fmt.Errorf("node %s has no SSH address", node.Name)
@@ -868,6 +883,7 @@ func AwaitReceiverRecords(t *testing.T, node IntegrationNode, n int, timeout tim
 // over SSH on the receiver's host.
 func PlantWitnessHead(t *testing.T, receiverNode IntegrationNode, nodeID, headHex string) error {
 	t.Helper()
+	RequireNodeSSH(t, receiverNode)
 	target, ok := SSHTarget(receiverNode)
 	if !ok {
 		return fmt.Errorf("receiver node %s has no SSH address", receiverNode.Name)
@@ -916,4 +932,55 @@ func WitnessedHeadFor(t *testing.T, receiverNode IntegrationNode, nodeID string)
 // word that is itself already inside one.
 func shellSingleQuote(s string) string {
 	return "'\"'\"'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'\"'\"'"
+}
+
+// sshReachable caches, per node, whether this machine can actually SSH in.
+// One probe per node per run: the answer cannot change mid-run, and a failing
+// SSH costs the connect timeout every time it is retried.
+var (
+	sshReachableMu sync.Mutex
+	sshReachable   = map[string]bool{}
+)
+
+// RequireNodeSSH skips the test unless this machine can SSH into the node.
+//
+// Roughly a third of the security use cases inspect state that has no API:
+// the sealed row on a peer, the on-disk store, the workerd jail, the audit
+// JSONL. Without node access they cannot be evaluated at all — and that is a
+// fact about the OPERATOR'S machine, not about the product. Reporting it as a
+// red row sends whoever reads the matrix looking for a defect that is not
+// there; reporting it as a silent pass is worse.
+//
+// So it is a skip, and the message names the exact cause and the fix. The
+// report then shows ⚪ "could not reach the fleet" rather than a green cell
+// for an assertion that never ran.
+func RequireNodeSSH(t *testing.T, node IntegrationNode) {
+	t.Helper()
+	target, ok := SSHTarget(node)
+	if !ok {
+		t.Skipf("node %s has no SSH address in the Terraform targets", node.Name)
+	}
+	if reachable, out, err := probeNodeSSH(t, target); !reachable {
+		t.Skipf("no SSH access to %s (%s): %v. This case inspects node state that has no API — the sealed row on a peer, the on-disk store, the workerd jail, the audit JSONL — so it cannot be evaluated from here. Set AEROL_SSH_IDENTITY_FILE to the private key matching the deployment's ssh_public_key_path (Terraform defaults to ~/.ssh/id_rsa.pub), or add that key to your agent.\n%s",
+			node.Name, target, err, strings.TrimSpace(out))
+	}
+}
+
+// probeNodeSSH runs the reachability probe once per target and caches the
+// answer. Separated from RequireNodeSSH so the decision can be tested without
+// a t.Skip, which a parent test cannot observe.
+func probeNodeSSH(t *testing.T, target string) (reachable bool, out string, err error) {
+	t.Helper()
+	sshReachableMu.Lock()
+	cached, seen := sshReachable[target]
+	sshReachableMu.Unlock()
+	if seen {
+		return cached, "", nil
+	}
+	out, err = SSHRun(t, target, "echo aerol-ssh-ok")
+	reachable = err == nil && strings.Contains(out, "aerol-ssh-ok")
+	sshReachableMu.Lock()
+	sshReachable[target] = reachable
+	sshReachableMu.Unlock()
+	return reachable, out, err
 }
