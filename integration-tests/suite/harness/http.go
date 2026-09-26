@@ -79,11 +79,16 @@ var transientGatewayStatuses = map[int]bool{502: true, 503: true, 504: true}
 // gatewayRetries and gatewayRetryDelay bound the wait. Short and few: this
 // is for a restart window, not for a node that is down — a genuinely dead
 // daemon must still fail the case promptly rather than after minutes.
-const gatewayRetries = 4
+// Deliberately small. Retries MULTIPLY across pagination: AllAuditPages
+// walks up to maxPages requests, so 4 attempts at 3s turned one history read
+// into eight minutes and hung UC-149 past the suite's own 60m timeout. This
+// covers a restart window of a few seconds, not an outage to ride out;
+// anything longer belongs to the caller's own deadline.
+const gatewayRetries = 2
 
 // gatewayRetryDelay is a var so the offline tests can collapse it; nothing
 // else reassigns it.
-var gatewayRetryDelay = 3 * time.Second
+var gatewayRetryDelay = 2 * time.Second
 
 // gatewayRetryDelayForTest shortens the delay and returns a restore func.
 func gatewayRetryDelayForTest(d time.Duration) func() {

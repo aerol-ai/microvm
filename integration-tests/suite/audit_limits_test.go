@@ -205,16 +205,23 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 		// UC-148 deliberately created moments ago — surfaces in this
 		// sandbox's history. Baseline first and attribute only what THIS
 		// burst adds; the live run failed on UC-148's marker.
-		gapsBefore := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, 500, 40))
+		gapsBefore := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, 200, 6))
 
 		const reads = 100
 		floodAuditReads(t, c, sb.ID, reads)
 
 		// The spill drains asynchronously; wait for the count to settle.
-		deadline := time.Now().Add(4 * time.Minute)
+		//
+		// A modest page budget on purpose. 500x40 is 40 requests per poll,
+		// and with the edge flaky from the restart above each one can carry
+		// retries — one poll then outlasts the whole deadline and the case
+		// hangs rather than failing. The settle check needs a stable count,
+		// not an exhaustive history.
+		const pageSize, maxPages = 200, 6
+		deadline := time.Now().Add(3 * time.Minute)
 		var events int
 		for time.Now().Before(deadline) {
-			n := len(harness.AllAuditEvents(t, c, sb.ID, 500, 40))
+			n := len(harness.AllAuditEvents(t, c, sb.ID, pageSize, maxPages))
 			if n == events && n > 0 {
 				break
 			}
@@ -222,7 +229,7 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 			time.Sleep(15 * time.Second)
 		}
 
-		if gapsAfter := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, 500, 40)); gapsAfter > gapsBefore {
+		if gapsAfter := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, pageSize, maxPages)); gapsAfter > gapsBefore {
 			t.Fatalf("the spill policy added %d gap marker(s) during the burst (%d -> %d): spill exists precisely so the burst does NOT lose records",
 				gapsAfter-gapsBefore, gapsBefore, gapsAfter)
 		}

@@ -320,6 +320,13 @@ func (c *Client) AllAuditPages(ctx context.Context, sandboxID string, pageSize, 
 	var all []auditlog.Event
 	q := AuditQuery{Limit: pageSize}
 	for i := 0; i < maxPages; i++ {
+		// The page budget bounds the number of REQUESTS; the context bounds
+		// the TIME. Without the second, a flaky edge multiplies each page's
+		// retries by maxPages and the walk outlives the suite itself — which
+		// is how UC-149 hung past the 60m test timeout.
+		if err := ctx.Err(); err != nil {
+			return all, fmt.Errorf("audit pagination for %s stopped after %d page(s): %w", sandboxID, i, err)
+		}
 		page, err := c.AuditPageFor(ctx, sandboxID, q)
 		if err != nil {
 			return all, err
