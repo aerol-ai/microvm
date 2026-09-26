@@ -172,3 +172,71 @@ func TestEnterpriseScenariosRequestTheWitnessDaemon(t *testing.T) {
 		}
 	}
 }
+
+// A scenario with the cluster capability MUST declare expected_members, and
+// the count must match its node map.
+//
+// run.sh calls wait_for_members only when the caps file declares one. Omit it
+// and the suite starts against a cluster that has not converged: the cluster
+// cases then fail for a reason that has nothing to do with what they test,
+// and the failure looks like a product bug. All five new security scenarios
+// were written without it and this test is why that was caught.
+func TestClusterScenariosDeclareExpectedMembers(t *testing.T) {
+	nodeRe := regexp.MustCompile(`(?m)^\s{2,}([A-Za-z0-9][A-Za-z0-9._-]*)\s*=\s*\{`)
+	memberRe := regexp.MustCompile(`(?m)^expected_members:\s*(\d+)`)
+
+	for _, f := range capsFiles(t) {
+		isCluster := false
+		for _, c := range capsList(t, f) {
+			if c == "cluster" {
+				isCluster = true
+			}
+		}
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := memberRe.FindStringSubmatch(string(raw))
+		base := filepath.Base(f)
+
+		if !isCluster {
+			if m != nil {
+				t.Errorf("%s declares expected_members but has no cluster capability", base)
+			}
+			continue
+		}
+		if m == nil {
+			t.Errorf("%s has the cluster capability but no expected_members; run.sh will skip wait_for_members and the suite will race convergence", base)
+			continue
+		}
+
+		// Cross-check against the node map so the two cannot drift.
+		tfvars := strings.TrimSuffix(f, ".caps.yml") + ".tfvars"
+		tf, err := os.ReadFile(tfvars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(tf)
+		start := strings.Index(body, "nodes = {")
+		if start < 0 {
+			t.Errorf("%s has no nodes map", filepath.Base(tfvars))
+			continue
+		}
+		nodes := len(nodeRe.FindAllString(body[start:], -1))
+		if got := m[1]; got != itoa(nodes) {
+			t.Errorf("%s: expected_members = %s but the node map has %d entries", base, got, nodes)
+		}
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}

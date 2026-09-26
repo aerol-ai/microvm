@@ -11,3 +11,8 @@ capabilities:
 # Never disruptive: killing a node mid-benchmark would poison the latency
 # distribution the whole arm exists to measure.
 disruptive: false
+
+# Raft/gossip member count. Without this run.sh SKIPS wait_for_members and the
+# suite starts against a cluster that has not converged, so the cluster cases
+# fail for a reason that has nothing to do with what they test.
+expected_members: 3
