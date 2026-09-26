@@ -854,3 +854,70 @@ func TestRequireNodeSSHPassesWhenReachable(t *testing.T) {
 	fake.install(t)
 	RequireNodeSSH(t, IntegrationNode{Name: "node1", PublicIP: "203.0.113.10"})
 }
+
+// SSHRun merges stderr into stdout. With UserKnownHostsFile=/dev/null, ssh
+// emits "Warning: Permanently added ..." on EVERY connection, and that line
+// then is the command's output as far as a parser is concerned.
+//
+// On the first live run where SSH actually worked, it made awaitUnitActive
+// never match "active" — so WithNodeEnv waited out its full 90s and reported
+// a healthy node as failed to start. LogLevel=ERROR suppresses it at the
+// source; parsing the last line is the belt to that braces.
+func TestUnitStateParsingIgnoresSSHBanners(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"clean", "active\n", true},
+		{"with the known-hosts warning", "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\nactive\n", true},
+		{"warning only (the regression)", "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\n", false},
+		{"failed after a banner", "Warning: Permanently added '1.2.3.4'.\nfailed\n", false},
+		{"trailing blank lines", "active\n\n\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeSSH{active: ""}
+			prev := sshRunner
+			sshRunner = func(_ *testing.T, _, script string) (string, error) {
+				if strings.Contains(script, "aerol-ssh-ok") {
+					return "aerol-ssh-ok\n", nil
+				}
+				return tc.out, nil
+			}
+			resetSSHReachability()
+			t.Cleanup(func() { sshRunner = prev; resetSSHReachability() })
+			_ = fake
+
+			got := awaitUnitActive(t, "u@h", "sandboxd", 30*time.Millisecond)
+			if got != tc.want {
+				t.Fatalf("awaitUnitActive(%q) = %v, want %v", tc.out, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLastNonEmptyLine(t *testing.T) {
+	for in, want := range map[string]string{
+		"active\n":         "active",
+		"warn\nactive\n\n": "active",
+		"":                 "",
+		"\n\n":             "",
+		"only-one-line":    "only-one-line",
+		"a\nb\nc\n   \n":   "c",
+	} {
+		if got := lastNonEmptyLine(in); got != want {
+			t.Fatalf("lastNonEmptyLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The known-hosts warning must not be readable as a leak hit. This is the
+// worst failure this suite can produce: UC-169 reported the canary as FOUND
+// ON DISK in all five encodings on the first run where SSH worked, because
+// the warning was non-empty and did not contain "NOHITS".
+func TestSSHBaseArgsSuppressTheKnownHostsWarning(t *testing.T) {
+	args := strings.Join(sshBaseArgs(), " ")
+	if !strings.Contains(args, "LogLevel=ERROR") {
+		t.Fatalf("sshBaseArgs does not suppress ssh's stderr banner: %q. With UserKnownHostsFile=/dev/null every connection warns, SSHRun merges stderr, and a caller checking 'is the output empty?' reads the warning as a result.", args)
+	}
+}

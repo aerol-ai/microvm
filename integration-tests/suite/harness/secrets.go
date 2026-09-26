@@ -567,7 +567,11 @@ func awaitUnitActive(t *testing.T, target, unit string, timeout time.Duration) b
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		out, err := SSHRun(t, target, "sudo systemctl is-active "+unit+" || true")
-		switch strings.TrimSpace(out) {
+		// The LAST line, not the whole capture: SSHRun merges stderr, so any
+		// banner or warning ssh emits would otherwise be compared against
+		// "active" and never match, waiting out the full timeout and
+		// reporting a healthy node as failed to start.
+		switch lastNonEmptyLine(out) {
 		case "active":
 			return true
 		case "failed":
@@ -791,4 +795,17 @@ func probeNodeSSH(t *testing.T, target string) (reachable bool, out string, err 
 	sshReachable[target] = reachable
 	sshReachableMu.Unlock()
 	return reachable, out, err
+}
+
+// lastNonEmptyLine returns the final non-blank line of a command's output.
+// Every parse of an SSH result goes through this rather than trusting the
+// whole capture, because SSHRun merges stderr.
+func lastNonEmptyLine(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if v := strings.TrimSpace(lines[i]); v != "" {
+			return v
+		}
+	}
+	return ""
 }
