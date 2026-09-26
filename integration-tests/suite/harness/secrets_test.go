@@ -724,15 +724,18 @@ func TestPeerProbeFromOutput(t *testing.T) {
 		present    bool
 		absent     bool
 	}{
-		{name: "held", out: "200", wantStatus: 200, present: true},
-		{name: "held no content", out: "204", wantStatus: 204, present: true},
-		{name: "absent", out: "404", wantStatus: 404, absent: true},
-		{name: "refused identity", out: "403", wantStatus: 403},
-		{name: "could not connect", out: "000\n", wantErr: true},
+		// The probe emits NAMED markers rather than trailing fields: curl -sS
+		// writes its own diagnostics into the same stream, so the last
+		// whitespace-separated token is not reliably the status.
+		{name: "held", out: "\nPROBE_CODE=200\n\nPROBE_RC=0\n", wantStatus: 200, present: true},
+		{name: "held no content", out: "\nPROBE_CODE=204\n\nPROBE_RC=0\n", wantStatus: 204, present: true},
+		{name: "absent", out: "\nPROBE_CODE=404\n\nPROBE_RC=22\n", wantStatus: 404, absent: true},
+		{name: "refused identity", out: "\nPROBE_CODE=403\n\nPROBE_RC=22\n", wantStatus: 403},
+		{name: "could not connect", out: "\nPROBE_CODE=000\n\nPROBE_RC=7\n", wantErr: true},
 		{name: "no output", out: "", err: errors.New("ssh exited 255"), wantErr: true},
 		{name: "unparsable", out: "curl: (6) could not resolve host", wantErr: true},
 		// curl exits non-zero for some statuses; a real status is the answer.
-		{name: "status despite exit code", out: "503", err: errors.New("exit 22"), wantStatus: 503},
+		{name: "status despite exit code", out: "\nPROBE_CODE=503\n\nPROBE_RC=22\n", err: errors.New("exit 22"), wantStatus: 503},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := peerProbeFromOutput("node1", tc.out, tc.err)

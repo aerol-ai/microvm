@@ -766,7 +766,7 @@ const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/sandboxd.env 2
 	`base="${SB_CLUSTER_INTERNAL_ADVERTISE%/}"; ` +
 	`hostport="${base#https://}"; ip="${hostport%%:*}"; port="${hostport##*:}"; ` +
 	`base="https://aerolvm-cluster-node:$port"; ` +
-	`curl -sS -o /dev/null -w "%{http_code}" --max-time 20 --resolve "aerolvm-cluster-node:$port:$ip" `
+	`curl -sS -o /dev/null -w "\nPROBE_CODE=%{http_code}\n" --max-time 20 --resolve "aerolvm-cluster-node:$port:$ip" `
 
 // peerProbeCredentials is what an AUTHENTICATED peer call must carry: the
 // operator token and the node's own client certificate. internalOp is
@@ -782,7 +782,16 @@ const peerProbeCredentials = `-H "Authorization: Bearer $SB_PAT_TOKEN" ` +
 // me" — the exact false pass this suite exists to prevent. curl's exit code
 // separates them without ambiguity: 35/56/58/60 are TLS/connection failures,
 // 127/2 are a broken invocation.
-const probeCurlSuffix = `; printf "|%s\n" "$?"'`
+//
+// Both values are emitted as NAMED markers rather than as trailing fields.
+// curl -sS writes its own diagnostics into the same stream, so "the last
+// whitespace-separated field" is not the status:
+//
+//	curl: (00056) OpenSSL SSL_read: … tlsv13 alert certificate required
+//
+// landed next to the code and the parser read a status of "". A marker
+// cannot collide with curl's prose.
+const probeCurlSuffix = `; printf "\nPROBE_RC=%s\n" "$?"'`
 
 // curlTLSRejectionExits are the exit codes that mean "the peer would not
 // complete a TLS conversation with this identity". 56 (failure receiving
@@ -850,30 +859,12 @@ func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, view Sec
 // could not connect at all is an error, NOT a 0 status read as "absent".
 func peerProbeFromOutput(nodeName, out string, err error) PeerSecretProbe {
 	p := PeerSecretProbe{Node: nodeName, Err: err}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
-		if p.Err == nil {
-			p.Err = fmt.Errorf("peer probe on %s produced no status", nodeName)
-		}
-		return p
-	}
 
-	// The last field is "<http_code>|<curl exit>". Older output without the
-	// exit code still parses as a bare status, so a stale script degrades to
-	// the previous behaviour rather than silently reporting a refusal.
-	last := fields[len(fields)-1]
-	curlExit := -1
-	if bar := strings.LastIndex(last, "|"); bar >= 0 {
-		if rc, convErr := strconv.Atoi(last[bar+1:]); convErr == nil {
-			curlExit = rc
-		}
-		last = last[:bar]
-	}
-
-	code, convErr := strconv.Atoi(last)
-	if convErr != nil {
+	code, haveCode := probeMarkerInt(out, "PROBE_CODE=")
+	curlExit, haveExit := probeMarkerInt(out, "PROBE_RC=")
+	if !haveCode && !haveExit {
 		if p.Err == nil {
-			p.Err = fmt.Errorf("peer probe on %s: unparsable status %q (output %q)", nodeName, last, out)
+			p.Err = fmt.Errorf("peer probe on %s produced no PROBE_CODE/PROBE_RC marker (output %q)", nodeName, out)
 		}
 		return p
 	}
@@ -888,7 +879,7 @@ func peerProbeFromOutput(nodeName, out string, err error) PeerSecretProbe {
 
 	// No HTTP status came back. Whether that is a refusal or a broken probe
 	// is curl's exit code to say, not ours to infer.
-	if curlTLSRejectionExits[curlExit] {
+	if haveExit && curlTLSRejectionExits[curlExit] {
 		p.HandshakeRejected = true
 		if p.Err == nil {
 			p.Err = fmt.Errorf("peer probe on %s: TLS refused (curl exit %d)", nodeName, curlExit)
@@ -899,6 +890,28 @@ func peerProbeFromOutput(nodeName, out string, err error) PeerSecretProbe {
 		p.Err = fmt.Errorf("peer probe on %s could not connect (curl exit %d, no HTTP status)", nodeName, curlExit)
 	}
 	return p
+}
+
+// probeMarkerInt reads the LAST occurrence of a NAME=<int> marker. Last, not
+// first, because sourcing the node's env files can echo before curl runs.
+func probeMarkerInt(out, marker string) (int, bool) {
+	idx := strings.LastIndex(out, marker)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := out[idx+len(marker):]
+	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
+	if end == 0 {
+		return 0, false
+	}
+	if end > 0 {
+		rest = rest[:end]
+	}
+	v, convErr := strconv.Atoi(strings.TrimSpace(rest))
+	if convErr != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // WithClusterEnv applies an env override to EVERY SSH-reachable node and

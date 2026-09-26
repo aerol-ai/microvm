@@ -7,6 +7,7 @@ package suite
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +113,21 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 	}
 
 	owner := resolvePlacementOwner(t, c, sb.ID)
+
+	// The exclusion below compares a PLACEMENT owner id against COVERAGE node
+	// ids. If those two id spaces ever drift apart the comparison silently
+	// never matches, the loop picks the owner as its victim, and the case
+	// stops the very node it is trying to keep alive — which reads as a
+	// three-minute wall of 502s from a route that forwards to the owner, and
+	// looks like an audit bug.
+	//
+	// A vacuous exclusion is worse than no exclusion, so assert the spaces
+	// overlap instead of trusting them to.
+	if !slices.Contains(full.Coverage.Answered, owner) {
+		t.Fatalf("placement owner %q does not appear in the coverage answered set %v: the two id spaces have drifted, so the non-owner exclusion below is vacuous and this case would stop the owner",
+			owner, full.Coverage.Answered)
+	}
+
 	var victim harness.IntegrationNode
 	found := false
 	for _, id := range full.Coverage.Answered {
