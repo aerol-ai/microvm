@@ -715,15 +715,43 @@ type PeerSecretProbe struct {
 // reported as an error by the caller rather than silently read as "absent".
 func (p PeerSecretProbe) Present() bool { return p.Status == 200 || p.Status == 204 }
 
+// Refused reports an authentication or authorization rejection, which is
+// distinct from both "holds it" and "does not hold it". The internal routes
+// need an operator token AND a peer certificate; missing either answers 401,
+// and reading that as "absent" would turn a broken probe into evidence that
+// the fan-out was correctly scoped.
+func (p PeerSecretProbe) Refused() bool { return p.Status == 401 || p.Status == 403 }
+
 // Absent reports a definitive "this node does not hold it".
 func (p PeerSecretProbe) Absent() bool { return p.Status == 404 }
 
 // internalCurlPrefix sources the node's cluster env and builds a curl that
 // presents the node's own client certificate. Run under sudo: node.key is
 // 0600 root, which is the point of it.
-const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/cluster.env; set +a; ` +
+// The peer certificate carries DNS SANs (aerolvm-cluster-node and
+// node:<id>), but SB_CLUSTER_INTERNAL_ADVERTISE is an https://<ip>:port URL.
+// Dialing the IP therefore fails hostname verification — curl exit 60,
+// "SSL peer certificate ... not OK" — which is what UC-112 reported as a
+// probe error on a perfectly good listener.
+//
+// --resolve maps the certificate's own hostname onto that IP, so the CA and
+// the hostname BOTH verify. Disabling verification with -k would have hidden
+// the very property UC-151/153 exist to prove.
+// sandboxd.env is sourced too, for SB_PAT_TOKEN: the internal routes are
+// internalOp = op(withInternalMTLS(...)), so they need BOTH an operator
+// token and a peer certificate. Sending only the certificate answers 401,
+// which reads like a rejected identity when it is really a missing header.
+const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/sandboxd.env 2>/dev/null || true; . /etc/sandboxd/cluster.env; set +a; ` +
 	`base="${SB_CLUSTER_INTERNAL_ADVERTISE%/}"; ` +
-	`curl -sS -o /dev/null -w "%{http_code}" --max-time 20 `
+	`hostport="${base#https://}"; ip="${hostport%%:*}"; port="${hostport##*:}"; ` +
+	`base="https://aerolvm-cluster-node:$port"; ` +
+	`curl -sS -o /dev/null -w "%{http_code}" --max-time 20 --resolve "aerolvm-cluster-node:$port:$ip" `
+
+// peerProbeCredentials is what an AUTHENTICATED peer call must carry: the
+// operator token and the node's own client certificate. internalOp is
+// op(withInternalMTLS(...)) — either one missing answers 401.
+const peerProbeCredentials = `-H "Authorization: Bearer $SB_PAT_TOKEN" ` +
+	`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" `
 
 // ProbePeerSecret asks node whether it holds the sealed row for sandboxID.
 func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerSecretProbe {
@@ -733,8 +761,7 @@ func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerS
 	if !ok {
 		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("node %s has no SSH address", node.Name)}
 	}
-	script := internalCurlPrefix +
-		`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` +
+	script := internalCurlPrefix + peerProbeCredentials +
 		`-I "$base/v1/cluster/internal/secrets/` + sandboxID + `"'`
 	out, err := SSHRun(t, target, script)
 	return peerProbeFromOutput(node.Name, out, err)

@@ -166,6 +166,10 @@ func TestSealedRowIsPresentOnRecipientsAndAbsentElsewhere(t *testing.T) {
 			t.Fatalf("peer probe on %s: %v", node.Name, probe.Err)
 		}
 		checked++
+		if probe.Refused() {
+			t.Fatalf("%s (%s) refused the probe with %d: the probe's own credentials are wrong, so this case can say nothing about where the row is",
+				node.Name, nodeID, probe.Status)
+		}
 		want := slices.Contains(view.Holders, nodeID)
 		switch {
 		case want && !probe.Present():

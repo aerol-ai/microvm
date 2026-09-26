@@ -1207,3 +1207,45 @@ func TestSeedFirstIsUsedForBothPhases(t *testing.T) {
 		t.Fatalf("seedFirst put %q first; both the apply and restore loops iterate this slice, so the seed would be restarted last in whichever phase reversed it", got[0].Name)
 	}
 }
+
+// A 401/403 is neither "holds it" nor "does not hold it". The internal
+// routes need an operator token AND a peer certificate; sending only the
+// certificate answers 401, and reading that as absence would turn a broken
+// probe into evidence that the fan-out was correctly scoped — a false pass
+// on the negative half of UC-112.
+func TestPeerSecretProbeRefusalIsItsOwnState(t *testing.T) {
+	for _, code := range []int{401, 403} {
+		p := PeerSecretProbe{Status: code}
+		if p.Present() || p.Absent() {
+			t.Fatalf("%d classified as present=%v absent=%v", code, p.Present(), p.Absent())
+		}
+		if !p.Refused() {
+			t.Fatalf("%d is not reported as refused", code)
+		}
+	}
+	for _, code := range []int{200, 204, 404} {
+		if (PeerSecretProbe{Status: code}).Refused() {
+			t.Fatalf("%d misclassified as refused", code)
+		}
+	}
+}
+
+// The probe must present BOTH credentials and address the certificate's own
+// hostname. Dialing the advertise URL's IP fails hostname verification
+// (curl 60 / status 000) even though the listener is healthy.
+func TestPeerProbeScriptCarriesBothCredentialsAndResolvesTheCertName(t *testing.T) {
+	for _, want := range []string{
+		"--resolve",                           // cert has DNS SANs, advertise is an IP
+		"aerolvm-cluster-node",                // the name the cert actually carries
+		"Authorization: Bearer $SB_PAT_TOKEN", // internalOp needs the operator token
+		"--cert", "--key", "--cacert",         // and the peer identity
+	} {
+		if !strings.Contains(internalCurlPrefix+peerProbeCredentials, want) {
+			t.Fatalf("the peer probe no longer includes %q; without it the probe fails for its own reasons and the case reports the product", want)
+		}
+	}
+	// -k would hide the very property UC-151/153 exist to prove.
+	if strings.Contains(internalCurlPrefix, " -k ") || strings.Contains(internalCurlPrefix, "--insecure") {
+		t.Fatal("the peer probe disables TLS verification; UC-151/153 assert that verification works, so this would make them vacuous")
+	}
+}
