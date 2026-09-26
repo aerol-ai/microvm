@@ -634,27 +634,8 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 	}
 	defer restore()
 
-	var b strings.Builder
-	b.WriteString("# Written by the integration suite (harness.WithNodeEnv). Transient.\n")
-	for _, k := range sortedKeys(kv) {
-		// No quoting: systemd EnvironmentFile takes the rest of the line
-		// verbatim, and quoting here would make the value arrive with quotes.
-		fmt.Fprintf(&b, "%s=%s\n", k, kv[k])
-	}
-	script := fmt.Sprintf(`set -e
-sudo install -d -m 0755 /etc/systemd/system/sandboxd.service.d
-sudo install -d -m 0750 /etc/sandboxd
-sudo tee %s >/dev/null <<'AEROL_ITEST_ENV'
-%sAEROL_ITEST_ENV
-sudo chmod 0600 %s
-sudo tee %s >/dev/null <<'AEROL_ITEST_DROPIN'
-[Service]
-EnvironmentFile=%s
-AEROL_ITEST_DROPIN
-sudo systemctl daemon-reload`, itestEnvOverrideFile, b.String(), itestEnvOverrideFile, itestEnvDropIn, itestEnvOverrideFile)
-
-	if out, err := SSHRun(t, target, script); err != nil {
-		t.Fatalf("apply env override on %s: %v\n%s", node.Name, err, out)
+	if err := applyNodeEnvOverride(t, target, kv); err != nil {
+		t.Fatalf("apply env override on %s: %v", node.Name, err)
 	}
 
 	// The restart is expected to fail for the boot-gate cases, so its exit
@@ -830,23 +811,68 @@ func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]str
 	if len(nodes) == 0 {
 		t.Fatal("no SSH-reachable nodes to configure")
 	}
+
+	// Seed first in BOTH directions, applied explicitly rather than by
+	// nesting WithNodeEnv calls.
+	//
+	// Nesting looked tidy and was wrong: nested defers unwind LIFO, so with
+	// [seed, j1, j2] the restore order is j2, j1, seed — seed LAST, which is
+	// the exact ordering that orphans the joiners. They come back, find no
+	// seed, and form their own partition; when the seed finally restarts it
+	// re-bootstraps standalone (SB_CLUSTER_BOOTSTRAP=true) and never rejoins
+	// them. The live S2 cluster ended 1+2 that way, and restarting the lone
+	// seed did not heal it — only restarting the joiners does.
+	//
+	// So the restores run seed-first too, from one deferred loop.
 	results := make(map[string]NodeBootResult, len(nodes))
-	// One nested WithNodeEnv per node, so each node's restore is a defer of
-	// its own and a failure partway through still unwinds every node already
-	// touched — in reverse, which is seed-last on the way out and seed-first
-	// on the way back in.
-	var apply func(i int)
-	apply = func(i int) {
-		if i == len(nodes) {
-			fn(results)
+	restored := false
+	restoreAll := func() {
+		if restored {
 			return
 		}
-		WithNodeEnv(t, nodes[i], kv, func(res NodeBootResult) {
-			results[nodes[i].Name] = res
-			apply(i + 1)
-		})
+		restored = true
+		for _, n := range nodes { // seed first
+			target, ok := SSHTarget(n)
+			if !ok {
+				continue
+			}
+			out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
+				" && sudo systemctl daemon-reload && sudo systemctl restart sandboxd")
+			if err != nil {
+				t.Errorf("RESTORE FAILED on %s — the rest of this run is suspect: %v\n%s", n.Name, err, out)
+				continue
+			}
+			if !awaitUnitActive(t, target, "sandboxd", 3*time.Minute) {
+				t.Errorf("RESTORE FAILED on %s — sandboxd did not come back active", n.Name)
+				continue
+			}
+			if NodeRejoinCheck != nil {
+				if err := NodeRejoinCheck(t, n); err != nil {
+					t.Errorf("RESTORE FAILED on %s — active but not rejoined: %v", n.Name, err)
+				}
+			}
+		}
 	}
-	apply(0)
+	defer restoreAll()
+
+	for _, n := range nodes { // seed first
+		target, ok := SSHTarget(n)
+		if !ok {
+			continue
+		}
+		if err := applyNodeEnvOverride(t, target, kv); err != nil {
+			t.Fatalf("apply env override on %s: %v", n.Name, err)
+		}
+		_, _ = SSHRun(t, target, "sudo systemctl restart sandboxd")
+		res := NodeBootResult{Started: awaitUnitActive(t, target, "sandboxd", 90*time.Second)}
+		status, _ := SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
+		res.Status = lastNonEmptyLine(status)
+		journal, _ := SSHRun(t, target, "sudo journalctl -u sandboxd --no-pager -n 120 || true")
+		res.Journal = journal
+		results[n.Name] = res
+	}
+
+	fn(results)
 }
 
 // seedFirst returns the SSH-reachable nodes with the seed at the front.
@@ -1119,4 +1145,34 @@ func lastNonEmptyLine(out string) string {
 		}
 	}
 	return ""
+}
+
+// applyNodeEnvOverride writes the transient drop-in and reloads systemd. It
+// does NOT restart the unit — the caller decides when, because the cluster
+// helper must sequence restarts seed-first across several nodes.
+func applyNodeEnvOverride(t *testing.T, target string, kv map[string]string) error {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("# Written by the integration suite. Transient.\n")
+	for _, k := range sortedKeys(kv) {
+		// No quoting: systemd EnvironmentFile takes the rest of the line
+		// verbatim, and quoting here would make the value arrive with quotes.
+		fmt.Fprintf(&b, "%s=%s\n", k, kv[k])
+	}
+	script := fmt.Sprintf(`set -e
+sudo install -d -m 0755 /etc/systemd/system/sandboxd.service.d
+sudo install -d -m 0750 /etc/sandboxd
+sudo tee %s >/dev/null <<'AEROL_ITEST_ENV'
+%sAEROL_ITEST_ENV
+sudo chmod 0600 %s
+sudo tee %s >/dev/null <<'AEROL_ITEST_DROPIN'
+[Service]
+EnvironmentFile=%s
+AEROL_ITEST_DROPIN
+sudo systemctl daemon-reload`, itestEnvOverrideFile, b.String(), itestEnvOverrideFile, itestEnvDropIn, itestEnvOverrideFile)
+
+	if out, err := SSHRun(t, target, script); err != nil {
+		return fmt.Errorf("%w\n%s", err, out)
+	}
+	return nil
 }

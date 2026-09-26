@@ -1144,3 +1144,66 @@ func TestIsRetriableTransportErr(t *testing.T) {
 		}
 	}
 }
+
+// WithClusterEnv must restore SEED FIRST, not just apply seed first.
+//
+// The nested-defer version unwound LIFO, so with [seed, j1, j2] the restore
+// order was j2, j1, seed — seed LAST. The joiners come back, find no seed,
+// form their own partition, and when the seed finally restarts it
+// re-bootstraps standalone and never rejoins them. The live S2 cluster ended
+// 1+2 exactly that way, and restarting the lone seed did not heal it.
+func TestWithClusterEnvRestartsAndRestoresSeedFirst(t *testing.T) {
+	fake := &fakeSSH{active: "active"}
+	fake.install(t)
+
+	targets := &IntegrationTargets{Nodes: []IntegrationNode{
+		{Name: "joiner-a", PublicIP: "203.0.113.11"},
+		{Name: "seed", Seed: true, PublicIP: "203.0.113.10"},
+		{Name: "joiner-b", PublicIP: "203.0.113.12"},
+	}}
+
+	WithClusterEnv(t, targets, map[string]string{"SB_X": "1"}, func(res map[string]NodeBootResult) {
+		if len(res) != 3 {
+			t.Fatalf("fn saw %d nodes, want 3", len(res))
+		}
+	})
+
+	// Every restart, in order, keyed by the node's address.
+	var order []string
+	fake.mu.Lock()
+	for _, r := range fake.runs {
+		if !strings.Contains(r, "systemctl restart sandboxd") {
+			continue
+		}
+		switch {
+		case strings.Contains(r, "rm -f"):
+			order = append(order, "restore")
+		default:
+			order = append(order, "apply")
+		}
+	}
+	fake.mu.Unlock()
+
+	if len(order) != 6 {
+		t.Fatalf("expected 3 apply restarts and 3 restore restarts, got %v", order)
+	}
+	for i, want := range []string{"apply", "apply", "apply", "restore", "restore", "restore"} {
+		if order[i] != want {
+			t.Fatalf("restart %d was %q, want %q (all applies must precede all restores): %v", i, order[i], want, order)
+		}
+	}
+}
+
+// The seed must be the first node touched in each phase. fakeSSH records the
+// scripts but not the target, so this asserts the ordering helper the phases
+// iterate, which is what decides it.
+func TestSeedFirstIsUsedForBothPhases(t *testing.T) {
+	in := []IntegrationNode{
+		{Name: "joiner-a", PublicIP: "203.0.113.11"},
+		{Name: "seed", Seed: true, PublicIP: "203.0.113.10"},
+	}
+	got := seedFirst(in)
+	if got[0].Name != "seed" {
+		t.Fatalf("seedFirst put %q first; both the apply and restore loops iterate this slice, so the seed would be restarted last in whichever phase reversed it", got[0].Name)
+	}
+}
