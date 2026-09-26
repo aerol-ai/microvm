@@ -1374,7 +1374,36 @@ lines above, which already treats it as retryable); everything else still
 fails closed. `waitForLeader` now returns an `ErrNoLeader` sentinel so the
 condition can be classified at all.
 
-### Losing the SEED takes a 3-node cluster down — OPEN, needs investigation
+### A partitioned node keeps serving — OPEN, and the root cause of most S3/S4 reds
+
+S3 finished 91 pass / 18 fail. Nearly every failure read as a different bug
+— reseal, retirement, peer push, audit coverage — and nearly every one was
+the same thing:
+
+```
+cluster: reserve placement failed: cluster: not raft leader
+503: cluster: peer InternalURL required (mTLS fail-closed)
+```
+
+All three nodes were `active` with `NRestarts=0`. node1 had simply fallen
+out of the cluster: the fleet's member list held node2 and node3, node1's
+own member list held only node1, node3 was leader and node1 was stuck
+`entering candidate state`. And node1 answered `/health` with **200**, so
+the ingress kept routing to it. Measured on S4's `/v1/audit/verify`: 4 of 5
+calls 502, 1 of 5 succeeded — almost exactly one node in three.
+
+This is the highest-value finding of the programme so far, because a cluster
+that is degraded while advertising itself as healthy makes every unrelated
+test lie about its own subject.
+
+**Not fixed here, and deliberately not a one-liner.** Failing `/health`
+whenever there is no leader would take an entire cluster out of rotation
+during a routine election — worse than the bug. It needs readiness split
+from liveness, a grace period so elections cannot flap it, and a decision on
+whether a partitioned node should still serve reads. `/ready` currently
+404s, so there is no readiness endpoint to gate on. Recorded in TODOS.md.
+
+### Losing the SEED leaves the survivors leaderless — OPEN, needs investigation
 
 UC-134 stopped one of three nodes. It happened to be the seed, and the
 remaining two **never seated a leader**:
