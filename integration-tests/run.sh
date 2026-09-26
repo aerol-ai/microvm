@@ -35,7 +35,31 @@
 # populated integration-tests/scenarios/domains.yml + config/secrets.yml.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Pin this script against edits to the working tree while it is running.
+#
+# Bash reads a script incrementally, by byte offset. Editing run.sh mid-run
+# makes the RUNNING process resume at the wrong offset and misexecute from
+# that point on. It surfaced as
+#
+#   integration-tests/run.sh: line 1508: unexpected EOF while looking for matching `''
+#
+# on a file `bash -n` accepts and git shows clean — after the same run had
+# already reported "expected 8 members, never reached (last 4)". Neither was
+# a real finding; the harness was reading its own half-written source, and a
+# flagship run was discarded because of it.
+#
+# exec'ing a temp copy makes the running invocation immune. HERE resolves
+# against the ORIGINAL path, so scenarios/, lib/ and reports/ still work.
+if [[ -z "${AEROL_RUNSH_PINNED:-}" ]]; then
+  _aerol_pin="$(mktemp -t aerol-runsh.XXXXXX)"
+  trap 'rm -f "${_aerol_pin}"' EXIT
+  cat "${BASH_SOURCE[0]}" >"${_aerol_pin}"
+  AEROL_RUNSH_PINNED="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  export AEROL_RUNSH_PINNED
+  exec bash "${_aerol_pin}" "$@"
+fi
+
+HERE="$(cd "$(dirname "${AEROL_RUNSH_PINNED:-${BASH_SOURCE[0]}}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 # shellcheck source=lib/common.sh
 source "${HERE}/lib/common.sh"
@@ -303,23 +327,64 @@ fi
 # sets/week); random selection spreads fresh infra across the pool. Kept runs
 # must not rotate, though: changing the domain of an existing cluster rewrites
 # DNS, Caddy, and bootstrap user-data and can leave the kept state half-mutated.
+# domains_in_use lists the domains other scenarios are currently holding.
+#
+# .leased-domain IS the lease record — it is written per scenario and lives
+# as long as that scenario's .tf dir does. $1 is this scenario's own pin
+# path, which is excluded so a kept scenario can re-lease what it already
+# holds.
+domains_in_use() {
+  local own="${1:-}" f
+  for f in "${REPO_ROOT}"/integration-tests/.tf/*/.leased-domain; do
+    [[ -f "$f" ]] || continue
+    [[ -n "$own" && "$f" == "$own" ]] && continue
+    tr -d '[:space:]' < "$f"
+    echo
+  done
+}
+
 lease_domain() {
-  local n last idx
+  local own_pin="${1:-}"
+  local n last idx i cand in_use
   local lease_file="${REPO_ROOT}/integration-tests/.tf/.domain-lease"
   n=$(yq -r '.itest.domains | length' "$DOMAINS_FILE")
   [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || { echo "domains pool empty in $DOMAINS_FILE" >&2; return 1; }
   last=-1
   [[ -f "$lease_file" ]] && last=$(cat "$lease_file" 2>/dev/null || echo -1)
   [[ "$last" =~ ^-?[0-9]+$ ]] || last=-1
+
+  # A domain held by another scenario is NOT a candidate. Without this the
+  # picker only avoided the PREVIOUS pick, so with one scenario mid-run on
+  # sandbox.penify.dev a second run leased the same hostname — which, had it
+  # reached the DNS stage, would have repointed a LIVE scenario's A/CNAME
+  # records at its own ingress and corrupted that run invisibly. The pool has
+  # 3 entries and the matrix has 6 scenarios, so overlap is the normal
+  # condition whenever two runs are in flight, not an edge case.
+  in_use="$(domains_in_use "$own_pin")"
+
   idx=$(( RANDOM % n ))
-  # Re-roll off a collision with the previous pick (only meaningful when n>1);
-  # a single deterministic bump is enough and keeps the result uniform-ish.
   if [[ "$n" -gt 1 && "$idx" -eq "$last" ]]; then
     idx=$(( (idx + 1) % n ))
   fi
-  mkdir -p "$(dirname "$lease_file")"
-  echo "$idx" > "$lease_file"
-  yq -r ".itest.domains[$idx]" "$DOMAINS_FILE"
+  # Walk the pool from the random start and take the first free domain.
+  for (( i = 0; i < n; i++ )); do
+    cand=$(yq -r ".itest.domains[$(( (idx + i) % n ))]" "$DOMAINS_FILE")
+    if [[ -n "$in_use" ]] && grep -qxF "$cand" <<<"$in_use"; then
+      continue
+    fi
+    idx=$(( (idx + i) % n ))
+    mkdir -p "$(dirname "$lease_file")"
+    echo "$idx" > "$lease_file"
+    printf '%s\n' "$cand"
+    return 0
+  done
+
+  # Fail loudly. Silently double-booking is how a live run gets its DNS
+  # taken out from under it.
+  echo "domain pool exhausted: all ${n} domains in ${DOMAINS_FILE} are held by another scenario" >&2
+  echo "held: $(tr '\n' ' ' <<<"$in_use")" >&2
+  echo "tear a scenario down (run.sh --destroy-only <scenario>) or add a domain to the pool" >&2
+  return 1
 }
 
 terraform_state_domain() {
@@ -375,7 +440,7 @@ lease_domain_for_scenario() {
     fi
   fi
 
-  domain=$(lease_domain)
+  domain=$(lease_domain "$pin")
   mkdir -p "$sdir"
   printf '%s\n' "$domain" > "$pin"
   echo "$domain"
@@ -671,7 +736,28 @@ EOF
   if [[ "$NO_BUILD" == "1" ]]; then
     build_id=$("$BUILD_SH" build-id)
     echo "=== artifacts: reusing published build ${build_id} (--no-build) ==="
-    "$BUILD_SH" urls --with-receiver "${witness_flag[@]}" >"$out"
+    # Fall back to building rather than aborting when the build is not
+    # published.
+    #
+    # The build id is derived from the COMMIT, so ANY commit between
+    # publishing and launching invalidates it — including a docs-only one.
+    # That put "reuse the published build" and "I just committed" in
+    # permanent conflict, and cost three launches in one session, each
+    # failing several minutes in with:
+    #
+    #   build.sh: s3://.../builds/<id>/sandboxd_linux_amd64 is missing
+    #
+    # --no-build means "don't rebuild if you don't have to", not "abort if
+    # anything changed". Say clearly that it is building, so the fallback is
+    # never mistaken for a cache hit.
+    # stderr is NOT suppressed: if the failure is something other than a
+    # missing build (bad credentials, an unreachable bucket) that message is
+    # the only clue, and the fallback build would fail for the same reason.
+    if ! "$BUILD_SH" urls --with-receiver "${witness_flag[@]}" >"$out"; then
+      echo "=== --no-build: ${build_id} is not published; building and publishing it now ===" >&2
+      build_id=$("$BUILD_SH" build --with-receiver "${witness_flag[@]}")
+      "$BUILD_SH" publish --with-receiver "${witness_flag[@]}" >"$out"
+    fi
   else
     echo "=== artifacts: building locally ==="
     # --with-receiver on every build: the fixture is CGO-free and adds ~2s, and
