@@ -177,7 +177,21 @@ func TestPostDeleteAuditIsScopedToItsIncarnation(t *testing.T) {
 	// to confirm the id exists at all, which is STRONGER than an empty page
 	// and is what the one-way ACL format is for. An empty page is acceptable
 	// too. What must never come back is the first incarnation's events.
-	other, err := c.AuditPageFor(ctx, first.ID, harness.AuditQuery{Limit: 100, IncarnationID: firstIncarnation + "-not-mine"})
+	//
+	// Retried past a transient gateway error: the live run hit a 502 here,
+	// which is Caddy failing to reach sandboxd for a moment. A 5xx is
+	// neither the refusal being asserted nor the leak being ruled out, so
+	// treating it as either would be wrong — the case must decide on an
+	// answer the daemon actually gave.
+	var other harness.AuditPage
+	for attempt := 0; attempt < 5; attempt++ {
+		other, err = c.AuditPageFor(ctx, first.ID, harness.AuditQuery{Limit: 100, IncarnationID: firstIncarnation + "-not-mine"})
+		if err == nil || !isTransientGatewayErr(err) {
+			break
+		}
+		t.Logf("foreign-incarnation read attempt %d hit a transient gateway error, retrying: %v", attempt+1, err)
+		time.Sleep(5 * time.Second)
+	}
 	if err != nil {
 		if !strings.Contains(err.Error(), "404") {
 			t.Fatalf("a read scoped to a foreign incarnation failed with something other than a 404 refusal: %v", err)
