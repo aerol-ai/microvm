@@ -854,3 +854,66 @@ func countGapMarkers(events []auditlog.Event) int {
 	}
 	return n
 }
+
+// waitNodeRejoined blocks until a restarted node is usable again.
+//
+// Two conditions, and the second is the one that matters. The API answering
+// only proves SOME node is serving; on a cluster the restarted node must
+// also be back in the member list, because until it has re-advertised its
+// InternalURL placement can select it and every create fails "cluster: peer
+// InternalURL required (mTLS fail-closed)".
+//
+// That is not hypothetical: on the live S2 run UC-137/148/149 restarted a
+// node, TestClusterForms then saw 2 of 3 members, and 79 cases failed —
+// nearly every sandbox create in the suite, most of them nothing to do with
+// secrets.
+func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
+	t.Helper()
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		return nil // local/unprovisioned: nothing to rejoin
+	}
+	c := harness.NewClient(t, sc)
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var last string
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := c.GetJSON(ctx, "/v1/sandboxes?limit=1", nil)
+		cancel()
+		if err != nil {
+			last = "api not serving: " + err.Error()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if !sc.Has(harness.CapCluster) {
+			return nil
+		}
+		nodeID := heteroNodeID(t, c, targets, node.Name)
+		if containsString(clusterNodeIDs(t, c), nodeID) {
+			// In the member list. Give gossip a beat to propagate the
+			// InternalURL before placement can pick it.
+			time.Sleep(5 * time.Second)
+			return nil
+		}
+		last = "not in the member list yet (" + nodeID + ")"
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("node %s did not rejoin within 4m: %s", node.Name, last)
+}
+
+// nodeSelfIDScript prints the node's own configured SB_NODE_ID — the
+// identity the CSR rendezvous bound its certificate to.
+const nodeSelfIDScript = `sudo bash -c '` + sqliteSourceEnv + `printf "%s\n" "${SB_NODE_ID:-}"'`
+
+// lastNonEmptyLineSuite mirrors the harness helper: SSHRun merges stderr, so
+// no remote value is trusted as the whole capture.
+func lastNonEmptyLineSuite(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if v := strings.TrimSpace(lines[i]); v != "" {
+			return v
+		}
+	}
+	return ""
+}

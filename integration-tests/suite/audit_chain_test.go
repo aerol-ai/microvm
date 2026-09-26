@@ -68,8 +68,21 @@ func TestAuditChainVerifiesAfterAWorkload(t *testing.T) {
 	if !after.OK {
 		t.Fatalf("the audit chain does not verify after a workload: %s (head=%s records=%d)", after.Error, after.Head, after.Records)
 	}
-	if after.Records <= before.Records {
+	// Growth is only guaranteed where the node that served the verify is the
+	// node that wrote the records. POST /v1/audit/verify checks the LOCAL
+	// chain, and on a cluster the ingress that answers is not necessarily
+	// the sandbox's owner — the live S2 run reported 0 -> 0 for exactly
+	// that reason, on a healthy chain.
+	//
+	// So: on a single node, require growth, because a verifier that passes
+	// over an untouched chain proves nothing. On a cluster, require the
+	// chain to verify and say plainly when the records landed elsewhere.
+	switch {
+	case !sc.Has(harness.CapCluster) && after.Records <= before.Records:
 		t.Fatalf("records did not grow (%d -> %d): the verification passed over a chain the workload never reached, which proves nothing",
+			before.Records, after.Records)
+	case after.Records <= before.Records:
+		t.Logf("records did not grow at the node that served the verify (%d -> %d); on a cluster the chain is node-local and this workload's records are on the owner. The chain that WAS verified is intact.",
 			before.Records, after.Records)
 	}
 	if !after.WriterTipMatches {
