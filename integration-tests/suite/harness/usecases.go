@@ -513,6 +513,25 @@ var Registry = []UseCase{
 	{ID: "UC-148", Title: "Overflow gap: a flood past the queue max leaves a gap marker and the chain still verifies", Requires: []Capability{CapSecrets}, Implemented: true},
 	{ID: "UC-149", Title: "Overflow spill: the same flood drains from disk and the chain is complete", Requires: []Capability{CapSecrets}, Implemented: true},
 	{ID: "UC-150", Title: "Egress attribution names the right sandbox and the per-sandbox cap bounds its share", Requires: []Capability{CapSecrets, CapEnterprise, CapIsolate}, Implemented: true},
+
+	// H. Cluster mTLS and authz (F12, F13).
+	{ID: "UC-151", Title: "Every node presents DNS:node:<id>; ca.key exists only on the seed", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+	{ID: "UC-152", Title: "A plaintext call to the cluster-internal port is refused", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+	{ID: "UC-153", Title: "A self-signed cert carrying a valid node SAN is rejected by the peer listener", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+	// Re-scoped (§7 prerequisite box): the plan's positive half was false —
+	// internalOp routes can never accept a PAT, and refusing it is correct.
+	{ID: "UC-154", Title: "Operator-only routes accept the fleet PAT; internal mTLS routes refuse it", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-155", Title: "A removed peer's certificate is revoked", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+
+	// I. Enterprise profile (F14). UC-158 and UC-159 are folded into the
+	// matrix test rather than standing alone: the off-node-exporter refusal is
+	// one more forbidden row, and "the matrix must not leave the fleet
+	// degraded" is a property of EVERY row, which asserting once at the end
+	// would not attribute to the row that broke it.
+	{ID: "UC-156", Title: "Enterprise boot-gate matrix: each forbidden combination refuses with its documented message", Requires: []Capability{CapEnterprise}, Implemented: true},
+	{ID: "UC-157", Title: "A CA signing key in the daemon TLS directory refuses an enterprise boot", Requires: []Capability{CapEnterprise, CapCluster}, Implemented: true},
+	{ID: "UC-158", Title: "An on-node-only audit exporter refuses an enterprise boot", Requires: []Capability{CapEnterprise}, Implemented: true},
+	{ID: "UC-159", Title: "After every boot-gate row the node rejoins cleanly; the matrix leaves no degraded fleet", Requires: []Capability{CapEnterprise}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

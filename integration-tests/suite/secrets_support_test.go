@@ -577,6 +577,103 @@ func assertExpvarEquals(t *testing.T, c *harness.Client, name string, want int) 
 	t.Fatalf("%s is not exported by /v1/metrics at all; there is nothing for an operator to alert on", name)
 }
 
+// clusterTLSEnv makes SB_CLUSTER_TLS_DIR and SB_CLUSTER_INTERNAL_ADVERTISE
+// available to a remote script.
+const clusterTLSEnv = `set -a; . /etc/sandboxd/cluster.env 2>/dev/null || true; set +a; ` +
+	`tls="${SB_CLUSTER_TLS_DIR:-/etc/sandboxd/tls}"; base="${SB_CLUSTER_INTERNAL_ADVERTISE%/}"; `
+
+// nodeCertSANsScript prints the subjectAltName line of the node certificate.
+const nodeCertSANsScript = `sudo bash -c '` + clusterTLSEnv +
+	`command -v openssl >/dev/null || { echo NOOPENSSL; exit 0; }; ` +
+	`openssl x509 -in "$tls/node.crt" -noout -text | grep -A1 "Subject Alternative Name" | tail -1'`
+
+// caKeyPresenceScript reports whether the CA signing key is on this node.
+const caKeyPresenceScript = `sudo bash -c '` + clusterTLSEnv +
+	`if [ -f "$tls/ca.key" ]; then echo PRESENT; else echo ABSENT; fi'`
+
+// plaintextInternalProbeScript speaks http (not https) to the internal port.
+const plaintextInternalProbeScript = `sudo bash -c '` + clusterTLSEnv +
+	`hostport="${base#https://}"; hostport="${hostport#http://}"; ` +
+	`curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "http://$hostport/v1/cluster/internal/secrets/probe" 2>/dev/null || echo 000'`
+
+// forgedCertProbeScript mints a self-signed certificate carrying a valid
+// node:<id> SAN and offers it to the peer listener.
+//
+// A valid SAN on an untrusted issuer is the interesting forgery: it separates
+// "does the server check the name?" from "does the server check WHO SIGNED
+// the name?". Only the second is a real identity check.
+func forgedCertProbeScript(nodeID string) string {
+	return `sudo bash -c '` + clusterTLSEnv +
+		`command -v openssl >/dev/null || { echo NOOPENSSL; exit 3; }; ` +
+		`d=$(mktemp -d); trap "rm -rf $d" EXIT; ` +
+		`openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=forged" ` +
+		`-addext "subjectAltName=DNS:node:` + nodeID + `" ` +
+		`-keyout "$d/f.key" -out "$d/f.crt" >/dev/null 2>&1 || { echo MINTFAIL; exit 3; }; ` +
+		`curl -sS -o /dev/null -w "%{http_code}" --max-time 15 ` +
+		`--cert "$d/f.crt" --key "$d/f.key" --cacert "$tls/ca.crt" ` +
+		`-I "$base/v1/cluster/internal/secrets/probe" 2>/dev/null || echo 000'`
+}
+
+// lastField returns the last whitespace-separated token, which is where curl
+// leaves its -w output after any diagnostics.
+func lastField(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[len(fields)-1]
+}
+
+// plantDecoyCAKeyScript puts a file named ca.key in the daemon's TLS
+// directory. It never has to be a real key — the enterprise gate is a stat().
+const plantDecoyCAKeyScript = `sudo bash -c '` + clusterTLSEnv +
+	`[ -d "$tls" ] || { echo NOTLSDIR; exit 3; }; ` +
+	`[ -f "$tls/ca.key" ] && { echo ALREADYPRESENT; exit 0; }; ` +
+	`printf "%s\n" "itest decoy - not a key" > "$tls/ca.key" && chmod 0600 "$tls/ca.key" && echo PLANTED'`
+
+const removeDecoyCAKeyScript = `sudo bash -c '` + clusterTLSEnv +
+	`if grep -q "itest decoy" "$tls/ca.key" 2>/dev/null; then rm -f "$tls/ca.key" && echo REMOVED; else echo "NOTOURS"; fi'`
+
+// assertNodeBackInService is UC-159 applied per row: after a deliberately
+// refused boot, the node must be up AND back in the cluster before the next
+// row runs. Asserting it only once at the end would not identify the row that
+// left the fleet degraded — and every row after that one would fail for a
+// reason that has nothing to do with what it tests.
+func assertNodeBackInService(t *testing.T, c *harness.Client, targets *harness.IntegrationTargets, node harness.IntegrationNode) {
+	t.Helper()
+	target, ok := harness.SSHTarget(node)
+	if !ok {
+		t.Fatalf("node %s has no SSH address", node.Name)
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		out, _ := harness.SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
+		if strings.TrimSpace(out) == "active" {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	out, _ := harness.SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
+	if strings.TrimSpace(out) != "active" {
+		t.Fatalf("node %s is still down after the gate row restored its configuration; every later row would assert against a degraded fleet", node.Name)
+	}
+
+	// Up is not the same as rejoined. A node that is running but out of the
+	// member list is exactly the 2+1 split this suite has produced before.
+	if !sc.Has(harness.CapCluster) {
+		return
+	}
+	nodeID := heteroNodeID(t, c, targets, node.Name)
+	rejoinDeadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(rejoinDeadline) {
+		if containsString(clusterNodeIDs(t, c), nodeID) {
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+	t.Fatalf("node %s (%s) is running but has not rejoined the cluster; the fleet is split and every later case is suspect", node.Name, nodeID)
+}
+
 // isTransientGatewayErr reports whether an API error is the edge failing to
 // reach the daemon rather than the daemon answering. A 502/503/504 is
 // neither a pass nor the failure a case is asserting, so cases retry past it
