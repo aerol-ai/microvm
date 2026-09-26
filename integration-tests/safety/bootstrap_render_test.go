@@ -37,7 +37,13 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(tplPath); err != nil {
+	// Read the template's CONTENT, not just stat it. Go's test cache keys on
+	// the files a test reads, and the template is consumed by a terraform
+	// SUBPROCESS that the cache cannot see — so without this, editing
+	// bootstrap.sh.tftpl alone leaves `go test` reporting a stale pass and CI
+	// never validates the new template. Verified: a mutation to the template
+	// is missed without this read and caught with it.
+	if _, err := os.ReadFile(tplPath); err != nil {
 		t.Fatalf("bootstrap template missing: %v", err)
 	}
 
@@ -71,7 +77,10 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		t.Fatalf("rendering bootstrap.sh.tftpl failed: %v\n%s", err, out)
 	}
 
-	for _, branch := range []string{"seed", "joiner"} {
+	for _, branch := range []string{
+		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
+		"seed_receiver", "joiner_receiver",
+	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
 			if err != nil {
@@ -113,6 +122,30 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 					// The id must come from the Terraform-written mapping,
 					// never from the uploader's path or CSR.
 					"nodes/$ident",
+				},
+				"joiner_audit_s3": {
+					"SB_AUDIT_EXPORT_BACKEND=s3",
+					"SB_AUDIT_EXPORT_S3_BUCKET=aerolvm-itest-x-audit-abc123",
+					"SB_AUDIT_EXPORT_S3_PREFIX=aerolvm-itest-x",
+					"AWS_REGION=",
+				},
+				"joiner_audit_file": {
+					"SB_AUDIT_EXPORT_BACKEND=file",
+					"SB_AUDIT_EXPORT_FILE_PATH=/var/log/aerol-audit-export.jsonl",
+				},
+				"seed_receiver": {
+					"aerol-audit-receiver.service",
+					"/usr/local/bin/audit-receiver",
+					"SB_SECRET_AUDIT_EXPORT_URL=https://aerol-audit-receiver:9099/audit",
+					"SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=recv-hmac-abc",
+				},
+				"joiner_receiver": {
+					"SB_SECRET_AUDIT_EXPORT_URL=https://aerol-audit-receiver:9099/audit",
+				},
+				"joiner_kms": {
+					"SB_SECRET_PROVIDER=awskms",
+					"SB_SECRET_AWS_KMS_KEY_ID=arn:aws:kms:us-east-1:111122223333:key/abcd-1234",
+					"AWS_REGION=",
 				},
 				"joiner": {
 					"--cred-bundle /tmp/aerolvm-cred-bundle.tar.gz",
@@ -212,8 +245,10 @@ func TestBootstrapRendersExtraSandboxdEnvBeforeRestart(t *testing.T) {
 		t.Fatalf("output: %v\n%s", err, out)
 	}
 
-	// The fixture sets these two through sandboxd_env.
-	envIdx := strings.Index(out, "SB_SECRET_PROVIDER=awskms")
+	// The fixture sets these two through sandboxd_env. They are deliberately
+	// NOT keys the KMS block also writes, so this test measures the
+	// extra_sandboxd_env block itself rather than a KMS default.
+	envIdx := strings.Index(out, "SB_AUDIT_EXPORT_MODE=file")
 	if envIdx < 0 {
 		t.Fatal("sandboxd_env entries were not rendered into the ops-env block")
 	}
@@ -228,5 +263,222 @@ func TestBootstrapRendersExtraSandboxdEnvBeforeRestart(t *testing.T) {
 	if !(envIdx < teeIdx && teeIdx < restartIdx) {
 		t.Fatalf("sandboxd_env must be written into cluster.env before the final restart; got env=%d tee=%d restart=%d",
 			envIdx, teeIdx, restartIdx)
+	}
+}
+
+// renderBootstrap is the shared setup for the ordering/gating assertions below.
+func renderBootstrap(t *testing.T, output string) string {
+	t.Helper()
+	tf, err := exec.LookPath("terraform")
+	if err != nil {
+		t.Skip("terraform not on PATH")
+	}
+	repoRoot := filepath.Join(filepath.Dir(buildScript(t)), "..", "..")
+	tplPath, _ := filepath.Abs(filepath.Join(repoRoot, "Terraform", "templates", "bootstrap.sh.tftpl"))
+	// See TestBootstrapTemplateRenders: reading the template is what keeps
+	// Go's test cache honest about a terraform subprocess's inputs.
+	if _, err := os.ReadFile(tplPath); err != nil {
+		t.Fatalf("bootstrap template missing: %v", err)
+	}
+	fixture, err := os.ReadFile(filepath.Join("testdata", "bootstrap_render", "main.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"),
+		[]byte(strings.ReplaceAll(string(fixture), "__TEMPLATE__", tplPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command(tf, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "TF_IN_AUTOMATION=1", "CHECKPOINT_DISABLE=1")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("init", "-backend=false", "-input=false"); err != nil {
+		t.Fatalf("terraform init: %v\n%s", err, out)
+	}
+	if out, err := run("apply", "-auto-approve", "-input=false"); err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	out, err := run("output", "-raw", output)
+	if err != nil {
+		t.Fatalf("output %s: %v\n%s", output, err, out)
+	}
+	return out
+}
+
+// secret_kms_enabled=false must emit NOTHING. A node that quietly got
+// SB_SECRET_PROVIDER=awskms without a key would fail daemon start outright
+// (config.go rejects awskms with no SB_SECRET_AWS_KMS_KEY_ID), and a
+// production render has to stay byte-identical to before this variable
+// existed.
+func TestBootstrapOmitsKMSWhenDisabled(t *testing.T) {
+	out := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{
+		"SB_SECRET_PROVIDER=",
+		"SB_SECRET_AWS_KMS_KEY_ID=",
+		"SB_SECRET_PROVIDER_STRICT_BOOT=",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("KMS is disabled but the render still contains %q", forbidden)
+		}
+	}
+}
+
+// The KMS block is written BEFORE the extra_sandboxd_env block on purpose:
+// cluster.env is a systemd EnvironmentFile, where the LAST assignment of a
+// variable wins, so a scenario must be able to override a Terraform-set
+// default through extra_sandboxd_env. If the order ever flips, the override
+// silently stops working — the daemon would keep Terraform's value and the
+// scenario would look like it was configured when it was not.
+func TestBootstrapKMSBlockPrecedesEnvOverride(t *testing.T) {
+	out := renderBootstrap(t, "joiner_kms")
+
+	kmsIdx := strings.Index(out, "SB_SECRET_PROVIDER=awskms")
+	if kmsIdx < 0 {
+		t.Fatal("KMS block missing from a render with secret_kms_key_arn set")
+	}
+	// The fixture sets STRICT_BOOT twice: true from the KMS block, then false
+	// from sandboxd_env. The override must come last.
+	first := strings.Index(out, "SB_SECRET_PROVIDER_STRICT_BOOT=true")
+	override := strings.Index(out, "SB_SECRET_PROVIDER_STRICT_BOOT=false")
+	if first < 0 || override < 0 {
+		t.Fatalf("expected both the KMS default and the sandboxd_env override; got first=%d override=%d", first, override)
+	}
+	if override < first {
+		t.Fatal("extra_sandboxd_env is rendered BEFORE the KMS block, so a scenario can no longer override it")
+	}
+	// And the whole thing still has to land before the final restart.
+	restartIdx := strings.LastIndex(out, "\nsudo systemctl restart sandboxd\n")
+	if restartIdx < 0 || override > restartIdx {
+		t.Fatalf("secret env must be written before the final restart; override=%d restart=%d", override, restartIdx)
+	}
+}
+
+// SB_AUDIT_EXPORT_BACKEND selects exactly ONE backend (pkg/auditexport has no
+// fan-out), so these assertions pin the two things that follow from that and
+// are easy to break silently:
+//
+//   - a node with the file backend must NOT be handed S3 coordinates that
+//     imply evidence is leaving the box when it is not;
+//   - AWS_REGION must be written exactly once even when both AWS-backed sinks
+//     are on, because a duplicated assignment in cluster.env is the kind of
+//     thing that looks harmless until the two values disagree.
+func TestBootstrapAuditExportBackendIsSingular(t *testing.T) {
+	fileOut := renderBootstrap(t, "joiner_audit_file")
+	if !strings.Contains(fileOut, "SB_AUDIT_EXPORT_BACKEND=file") {
+		t.Fatal("file backend not rendered")
+	}
+	if strings.Contains(fileOut, "SB_AUDIT_EXPORT_S3_BUCKET=") {
+		t.Error("the file backend was handed S3 coordinates; a node ships to one backend, not both")
+	}
+
+	s3Out := renderBootstrap(t, "joiner_audit_s3")
+	if strings.Count(s3Out, "SB_AUDIT_EXPORT_BACKEND=") != 1 {
+		t.Errorf("expected exactly one backend assignment, got %d", strings.Count(s3Out, "SB_AUDIT_EXPORT_BACKEND="))
+	}
+	if n := strings.Count(s3Out, "\nAWS_REGION="); n != 1 {
+		t.Errorf("AWS_REGION assigned %d times, want exactly 1", n)
+	}
+}
+
+// Nothing audit-related may appear when no backend is selected — otherwise a
+// production render stops being byte-identical to before these variables
+// existed, and a deployment that never asked for export gets a file path
+// pointing somewhere nothing reads.
+func TestBootstrapOmitsAuditExportWhenUnset(t *testing.T) {
+	out := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{
+		"SB_AUDIT_EXPORT_BACKEND=",
+		"SB_AUDIT_EXPORT_FILE_PATH=",
+		"SB_AUDIT_EXPORT_S3_BUCKET=",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("no audit backend selected but the render contains %q", forbidden)
+		}
+	}
+}
+
+// Only the SEED may run the receiver. Two receivers would split the fleet's
+// audit evidence across two stores, so a scenario asserting "N records
+// arrived" would be reading half the picture and passing anyway.
+//
+// The secrets must also stay out of ExecStart: systemd expands ${VAR} there,
+// which would put the bearer token and HMAC key into argv where every process
+// on the box — sandboxes included — can read them from `ps`.
+func TestBootstrapRunsAuditReceiverOnSeedOnly(t *testing.T) {
+	seed := renderBootstrap(t, "seed_receiver")
+	joiner := renderBootstrap(t, "joiner_receiver")
+
+	if !strings.Contains(seed, "aerol-audit-receiver.service") {
+		t.Fatal("seed does not install the receiver unit")
+	}
+	if strings.Contains(joiner, "aerol-audit-receiver.service") {
+		t.Error("a joiner installs the receiver unit too; two receivers split the audit evidence")
+	}
+
+	// Both export to the SAME https name. The /etc/hosts alias is what differs,
+	// and that indirection is the only reason one certificate can serve the
+	// whole fleet: putting the seed's IP in the SAN would make the cert depend
+	// on the seed instance, whose own user-data has to contain the cert.
+	for name, out := range map[string]string{"seed": seed, "joiner": joiner} {
+		if !strings.Contains(out, "SB_SECRET_AUDIT_EXPORT_URL=https://aerol-audit-receiver:9099/audit") {
+			t.Errorf("%s does not export to the receiver over https by name", name)
+		}
+		if !strings.Contains(out, "SB_AUDIT_EXPORT_WEBHOOK_CA_FILE=/etc/sandboxd/audit-receiver-ca.pem") {
+			t.Errorf("%s has no CA file, so it cannot verify the receiver's certificate", name)
+		}
+	}
+	// Without these the name does not resolve and every export fails.
+	if !strings.Contains(seed, "127.0.0.1 aerol-audit-receiver") {
+		t.Error("seed does not alias the receiver name to loopback")
+	}
+	if !strings.Contains(joiner, "10.42.1.5 aerol-audit-receiver") {
+		t.Error("joiner does not alias the receiver name to the seed's private IP")
+	}
+	// The TLS private key must never leave the seed.
+	if strings.Contains(joiner, "PRIVATE KEY") {
+		t.Error("a joiner was handed the receiver's TLS private key")
+	}
+
+	var execStart string
+	for _, line := range strings.Split(seed, "\n") {
+		if !strings.HasPrefix(line, "ExecStart=/usr/local/bin/audit-receiver") {
+			continue
+		}
+		execStart = line
+		for _, secret := range []string{"recv-token-xyz", "recv-hmac-abc", "AEROL_RECEIVER_TOKEN", "AEROL_RECEIVER_HMAC"} {
+			if strings.Contains(line, secret) {
+				t.Errorf("receiver ExecStart references %q; systemd expands it into argv, exposing it via ps:\n  %s", secret, line)
+			}
+		}
+	}
+	if execStart == "" {
+		t.Fatal("no receiver ExecStart line in the seed render")
+	}
+	// Serving plain http would fail EVERY export: config.Load rejects a
+	// non-https webhook URL under enterprise, and the nodes are already
+	// configured with an https:// endpoint, so the mismatch would surface as a
+	// TLS error on every batch rather than as a clear misconfiguration.
+	for _, want := range []string{"--tls-cert ", "--tls-key "} {
+		if !strings.Contains(execStart, want) {
+			t.Errorf("receiver ExecStart is missing %q, so it would serve plain http:\n  %s", want, execStart)
+		}
+	}
+}
+
+// With the receiver disabled, none of its unit, env or secrets may appear.
+func TestBootstrapOmitsAuditReceiverWhenDisabled(t *testing.T) {
+	out := renderBootstrap(t, "joiner")
+	for _, forbidden := range []string{
+		"aerol-audit-receiver",
+		"SB_SECRET_AUDIT_EXPORT_URL=",
+		"SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("receiver disabled but the render contains %q", forbidden)
+		}
 	}
 }

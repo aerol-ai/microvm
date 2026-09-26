@@ -126,6 +126,11 @@ resource "aws_instance" "seed" {
     bundle_bucket                            = aws_s3_bucket.bundle.bucket
     aws_region                               = var.aws_region
     seed_private_ip                          = ""
+    audit_receiver_endpoint                  = local.audit_receiver_endpoint_url
+    audit_receiver_host                      = local.audit_receiver_host
+    audit_receiver_host_ip                   = "127.0.0.1"
+    audit_receiver_cert_pem                  = local.audit_receiver_cert_pem
+    audit_receiver_key_pem                   = local.audit_receiver_key_pem
     install_script_url                       = var.install_script_url
     caddy_binary_url                         = var.caddy_binary_url
     cluster_init_script_url                  = var.cluster_init_script_url
@@ -135,6 +140,16 @@ resource "aws_instance" "seed" {
     toolboxd_url                             = var.toolboxd_url
     checksums_url                            = var.checksums_url
     joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
+    secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
+    secret_kms_strict_boot                   = var.secret_kms_strict_boot
+    audit_export_backend                     = var.audit_export_backend
+    audit_export_file_path                   = var.audit_export_file_path
+    audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+    audit_export_s3_prefix                   = var.cluster_name
+    audit_receiver_url                       = var.audit_receiver_url
+    audit_receiver_port                      = var.audit_receiver_port
+    audit_receiver_token                     = local.audit_receiver_token_value
+    audit_receiver_hmac_key                  = local.audit_receiver_hmac_value
     seed_wait_max_seconds                    = var.seed_wait_max_seconds
     otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
     otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
@@ -329,32 +344,48 @@ resource "aws_instance" "joiner" {
     bundle_bucket                            = aws_s3_bucket.bundle.bucket
     aws_region                               = var.aws_region
     seed_private_ip                          = aws_instance.seed.private_ip
-    install_script_url                       = var.install_script_url
-    caddy_binary_url                         = var.caddy_binary_url
-    cluster_init_script_url                  = var.cluster_init_script_url
-    cluster_join_script_url                  = var.cluster_join_script_url
-    cluster_sign_node_script_url             = var.cluster_sign_node_script_url
-    sandboxd_url                             = var.sandboxd_url
-    toolboxd_url                             = var.toolboxd_url
-    checksums_url                            = var.checksums_url
-    joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
-    seed_wait_max_seconds                    = var.seed_wait_max_seconds
-    otel_metrics_enabled                     = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
-    otel_metrics_endpoint                    = local.cluster_ops.otel.metrics_endpoint
-    otel_metrics_interval                    = local.cluster_ops.otel.metrics_interval
-    otel_traces_enabled                      = local.cluster_ops.otel.traces_enabled || local.cluster_ops.otel.traces_endpoint != ""
-    otel_traces_endpoint                     = local.cluster_ops.otel.traces_endpoint
-    otel_traces_sample_ratio                 = local.cluster_ops.otel.traces_sample_ratio
-    otel_service_name                        = local.cluster_ops.otel.service_name
-    image_pull_max_concurrent                = local.cluster_ops.image_pull.max_concurrent
-    image_pull_failure_backoff               = local.cluster_ops.image_pull.failure_backoff
-    image_gc_whitelist                       = join(",", local.cluster_ops.image_gc.whitelist)
-    image_build_gc_enabled                   = local.cluster_ops.image_build_gc.enabled
-    image_build_gc_interval                  = local.cluster_ops.image_build_gc.interval
-    image_build_gc_ttl                       = local.cluster_ops.image_build_gc.ttl
-    extra_user_data                          = each.value.extra_user_data
-    sandboxd_env                             = merge(var.extra_sandboxd_env, each.value.sandboxd_env)
-    shard_aware_ingress                      = var.shard_aware_ingress
+    audit_receiver_endpoint                  = local.audit_receiver_endpoint_url
+    audit_receiver_host                      = local.audit_receiver_host
+    audit_receiver_host_ip                   = aws_instance.seed.private_ip
+    audit_receiver_cert_pem                  = local.audit_receiver_cert_pem
+    # Joiners never serve the receiver, so they must not hold its private key.
+    audit_receiver_key_pem       = ""
+    install_script_url           = var.install_script_url
+    caddy_binary_url             = var.caddy_binary_url
+    cluster_init_script_url      = var.cluster_init_script_url
+    cluster_join_script_url      = var.cluster_join_script_url
+    cluster_sign_node_script_url = var.cluster_sign_node_script_url
+    sandboxd_url                 = var.sandboxd_url
+    toolboxd_url                 = var.toolboxd_url
+    checksums_url                = var.checksums_url
+    joiner_role_unique_id        = aws_iam_role.joiner.unique_id
+    secret_kms_key_arn           = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
+    secret_kms_strict_boot       = var.secret_kms_strict_boot
+    audit_export_backend         = var.audit_export_backend
+    audit_export_file_path       = var.audit_export_file_path
+    audit_export_s3_bucket       = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+    audit_export_s3_prefix       = var.cluster_name
+    audit_receiver_url           = var.audit_receiver_url
+    audit_receiver_port          = var.audit_receiver_port
+    audit_receiver_token         = local.audit_receiver_token_value
+    audit_receiver_hmac_key      = local.audit_receiver_hmac_value
+    seed_wait_max_seconds        = var.seed_wait_max_seconds
+    otel_metrics_enabled         = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
+    otel_metrics_endpoint        = local.cluster_ops.otel.metrics_endpoint
+    otel_metrics_interval        = local.cluster_ops.otel.metrics_interval
+    otel_traces_enabled          = local.cluster_ops.otel.traces_enabled || local.cluster_ops.otel.traces_endpoint != ""
+    otel_traces_endpoint         = local.cluster_ops.otel.traces_endpoint
+    otel_traces_sample_ratio     = local.cluster_ops.otel.traces_sample_ratio
+    otel_service_name            = local.cluster_ops.otel.service_name
+    image_pull_max_concurrent    = local.cluster_ops.image_pull.max_concurrent
+    image_pull_failure_backoff   = local.cluster_ops.image_pull.failure_backoff
+    image_gc_whitelist           = join(",", local.cluster_ops.image_gc.whitelist)
+    image_build_gc_enabled       = local.cluster_ops.image_build_gc.enabled
+    image_build_gc_interval      = local.cluster_ops.image_build_gc.interval
+    image_build_gc_ttl           = local.cluster_ops.image_build_gc.ttl
+    extra_user_data              = each.value.extra_user_data
+    sandboxd_env                 = merge(var.extra_sandboxd_env, each.value.sandboxd_env)
+    shard_aware_ingress          = var.shard_aware_ingress
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
     caddy_storage_s3_bucket         = local.caddy_storage_s3.bucket

@@ -22,6 +22,10 @@
 #            cluster-3-mixed-gvisor | cluster-3-mixed-gvisor-docker |
 #            cluster-3-mixed-wasm | cluster-hetero |
 #            single-node-fc | single-node-fc-arm64 | cluster-arm64
+# Security matrix (§6.2): single-node-secrets | cluster-3-mixed-secrets |
+#            cluster-3-mixed-secrets-kms | cluster-3-mixed-secrets-enterprise |
+#            cluster-hetero-secrets | cluster-hetero-secrets-kms |
+#            cluster-3-mixed-bench
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -141,6 +145,14 @@ tf_varfile_args() {
   # set it applied with.
   local artifacts_tfvars="${HERE}/.tf/${scenario}/artifacts.tfvars"
   [[ -f "$artifacts_tfvars" ]] && printf -- ' -var-file=%s' "$artifacts_tfvars"
+  # Operator escape hatch, chained LAST so it wins over everything above.
+  # Hand-written and never generated: it is how a scenario is exercised with a
+  # variable that does not have a committed scenario file yet (e.g. proving
+  # secret_kms_enabled boots before T10 creates the KMS scenario pairs). Lives
+  # under .tf/ so it is gitignored and cannot be mistaken for a committed
+  # scenario, and it is read by BOTH apply and destroy like the others.
+  local override_tfvars="${HERE}/.tf/${scenario}/override.tfvars"
+  [[ -f "$override_tfvars" ]] && printf -- ' -var-file=%s' "$override_tfvars"
 }
 
 # artifacts_tfvars_path echoes where prepare_artifacts writes (and the var-file
@@ -369,16 +381,30 @@ lease_domain_for_scenario() {
   echo "$domain"
 }
 
-# allow_disruptive_for decides AEROL_ALLOW_DISRUPTIVE for the suite. cluster-hetero
-# enables node-kill / failover fault injection by default; other scenarios stay
-# off unless the operator exported AEROL_ALLOW_DISRUPTIVE already.
+# allow_disruptive_for decides AEROL_ALLOW_DISRUPTIVE for the suite.
+#
+# Driven by a `disruptive: true` field in the scenario's .caps.yml, NOT by the
+# scenario's name. The name match this replaced (`== "cluster-hetero"`) was a
+# silent correctness hole: harness.DisruptiveAllowed() turns a 0 into a
+# t.Skip, never a failure, so ANY scenario not literally named cluster-hetero
+# reported every D-tagged use case as a clean ⚪ skip. A whole matrix could go
+# green having exercised none of the failover cases — including UC-117, the
+# case the entire secrets-hardening program exists to prove.
+#
+# cluster-hetero keeps its behaviour because its caps file now says so.
+# AEROL_ALLOW_DISRUPTIVE still wins when the operator sets it, and
+# --no-disruptive still turns everything off.
 allow_disruptive_for() {
-  local scenario="$1"
+  local scenario="$1" caps_file="$2"
   if [[ -n "${AEROL_ALLOW_DISRUPTIVE:-}" ]]; then
     echo "$AEROL_ALLOW_DISRUPTIVE"
     return
   fi
-  if [[ "$scenario" == "cluster-hetero" && "$NO_DISRUPTIVE" != "1" ]]; then
+  if [[ "$NO_DISRUPTIVE" == "1" ]]; then
+    echo "0"
+    return
+  fi
+  if [[ -f "$caps_file" ]] && [[ "$(yq -r '.disruptive // false' "$caps_file")" == "true" ]]; then
     echo "1"
     return
   fi
@@ -598,6 +624,18 @@ prepare_artifacts() {
   out="$(artifacts_tfvars_path "$scenario")"
   mkdir -p "$(dirname "$out")"
 
+  # A scenario that advertises audit-witness needs the -tags itestwitness
+  # daemon: enterprise forces SB_SECRET_AUDIT_EXTERNAL_WITNESS and pkg/daemon
+  # refuses to boot without a non-noop controlplane.Witness. Derived from the
+  # capability rather than a separate knob, so the scenario cannot claim the
+  # capability and silently get a daemon that cannot honour it.
+  local witness_flag=()
+  local caps="${HERE}/scenarios/${scenario}.caps.yml"
+  if [[ -f "$caps" ]] && yq -r '.capabilities | contains(["audit-witness"])' "$caps" | grep -q true; then
+    witness_flag=(--witness-daemon)
+    echo "scenario ${scenario} advertises audit-witness: using the -tags itestwitness daemon" >&2
+  fi
+
   case "$BUILD_MODE" in
     released)
       # No override file at all: Terraform's defaults already point at
@@ -633,11 +671,15 @@ EOF
   if [[ "$NO_BUILD" == "1" ]]; then
     build_id=$("$BUILD_SH" build-id)
     echo "=== artifacts: reusing published build ${build_id} (--no-build) ==="
-    "$BUILD_SH" urls >"$out"
+    "$BUILD_SH" urls --with-receiver "${witness_flag[@]}" >"$out"
   else
     echo "=== artifacts: building locally ==="
-    build_id=$("$BUILD_SH" build)
-    "$BUILD_SH" publish >"$out"
+    # --with-receiver on every build: the fixture is CGO-free and adds ~2s, and
+    # the alternative is a scenario that enables the receiver discovering at
+    # apply time that this build did not produce one. Skipped automatically on
+    # refs that predate it.
+    build_id=$("$BUILD_SH" build --with-receiver "${witness_flag[@]}")
+    "$BUILD_SH" publish --with-receiver "${witness_flag[@]}" >"$out"
   fi
 
   export AEROL_BUILD_MODE="local"
@@ -1051,9 +1093,9 @@ run_one() {
 
   echo "=== running suite against ${base_url} ==="
   local allow_disruptive
-  allow_disruptive=$(allow_disruptive_for "$scenario")
+  allow_disruptive=$(allow_disruptive_for "$scenario" "$caps_file")
   if [[ "$allow_disruptive" == "1" ]]; then
-    echo "disruptive fault-injection tests enabled (UC-58b on cluster-hetero)" >&2
+    echo "disruptive fault-injection tests enabled for ${scenario} (caps: disruptive: true)" >&2
   fi
   # go test runs with cwd = the package dir (integration-tests/suite), so bench
   # artifact paths from the Makefile must be absolute or WriteFile lands under

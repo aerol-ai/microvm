@@ -20,8 +20,19 @@ var (
 	osExit                 = os.Exit
 )
 
+// providerFactory is nil in every shipped build, which is what makes this the
+// open-source entrypoint (see the comment on main below). It is a variable
+// only so the integration harness can supply a real controlplane.Provider
+// behind an explicit build tag — enterprise mode requires a non-noop Witness,
+// and without one the daemon correctly refuses to start, which would make the
+// enterprise scenarios untestable.
+//
+// Default file: always nil. See provider_itest.go, which is compiled ONLY with
+// `-tags itestwitness`. A release build cannot pick it up by accident.
+var providerFactory daemon.ProviderFactory
+
 func run(ctx context.Context, logger *slog.Logger) error {
-	return runDaemon(ctx, logger, nil)
+	return runDaemon(ctx, logger, providerFactory)
 }
 
 // cmd/sandboxd is the open-source entrypoint. It passes a nil provider factory,

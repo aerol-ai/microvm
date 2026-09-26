@@ -34,6 +34,13 @@
 #   cluster_sign_node_script_url (seed only),
 #   sandboxd_url, toolboxd_url, checksums_url,
 #   joiner_role_unique_id, sandboxd_env (map),
+#   secret_kms_key_arn ("" = disabled), secret_kms_strict_boot (bool),
+#   audit_export_backend ("" = daemon default), audit_export_file_path,
+#   audit_export_s3_bucket ("" = no bucket provisioned), audit_export_s3_prefix,
+#   audit_receiver_url, audit_receiver_port, audit_receiver_token,
+#   audit_receiver_hmac_key, audit_receiver_endpoint ("" = receiver disabled),
+#   audit_receiver_host, audit_receiver_host_ip,
+#   audit_receiver_cert_pem, audit_receiver_key_pem (seed only),
 #   seed_wait_max_seconds, extra_user_data
 #
 # Order of operations matches the scripts' contracts:
@@ -303,6 +310,62 @@ sudo systemd-run --unit=aerolvm-csr-signer --description='AerolVM CSR signing re
   "$(( $(date +%s) + ${seed_wait_max_seconds} ))" \
   || echo "[bootstrap] WARNING: could not start the CSR signer; joiners will not get certs" >&2
 echo "[bootstrap] seed CSR signer started (deadline ${seed_wait_max_seconds}s)"
+
+%{ if audit_receiver_endpoint != "" && audit_receiver_url != "" ~}
+###############################################################################
+# 2a-ter. Seed: audit receiver fixture (plans/integration-test-security.md §6.4)
+#
+# Webhook export and the audit-chain witness both need something listening.
+# Started BEFORE the ops-env block below points the daemon at it, so the first
+# export attempt is not a guaranteed failure that then has to back off.
+###############################################################################
+curl_download '${audit_receiver_url}' -o /tmp/audit-receiver
+sudo install -m 0755 /tmp/audit-receiver /usr/local/bin/audit-receiver
+
+# The token and HMAC key are passed through the ENVIRONMENT, never ExecStart.
+# systemd expands $${VAR} inside ExecStart, so a flag would put them in argv
+# where every process on the box — sandboxes included — can read them from
+# `ps`. /proc/<pid>/environ is root-only; the receiver reads
+# AEROL_RECEIVER_TOKEN / AEROL_RECEIVER_HMAC when the flags are empty.
+sudo install -d -m 0700 /etc/aerol-audit-receiver
+sudo tee /etc/aerol-audit-receiver/env >/dev/null <<RECVENV
+AEROL_RECEIVER_TOKEN=${audit_receiver_token}
+AEROL_RECEIVER_HMAC=${audit_receiver_hmac_key}
+RECVENV
+sudo chmod 0600 /etc/aerol-audit-receiver/env
+
+# Serves HTTPS because enterprise mode refuses a plain-http webhook URL. The
+# key is 0600 and lives only on the seed — joiners get the certificate alone.
+sudo tee /etc/aerol-audit-receiver/tls.crt >/dev/null <<'RECVCRT'
+${audit_receiver_cert_pem}
+RECVCRT
+sudo tee /etc/aerol-audit-receiver/tls.key >/dev/null <<'RECVKEY'
+${audit_receiver_key_pem}
+RECVKEY
+sudo chmod 0644 /etc/aerol-audit-receiver/tls.crt
+sudo chmod 0600 /etc/aerol-audit-receiver/tls.key
+
+sudo tee /etc/systemd/system/aerol-audit-receiver.service >/dev/null <<'RECVUNIT'
+[Unit]
+Description=AerolVM audit receiver (integration fixture)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/aerol-audit-receiver/env
+ExecStart=/usr/local/bin/audit-receiver --addr :RECEIVER_PORT --audit-log /var/log/aerol-audit-webhook.jsonl --tls-cert /etc/aerol-audit-receiver/tls.crt --tls-key /etc/aerol-audit-receiver/tls.key
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+RECVUNIT
+sudo sed -i "s/RECEIVER_PORT/${audit_receiver_port}/" /etc/systemd/system/aerol-audit-receiver.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now aerol-audit-receiver.service \
+  || echo "[bootstrap] WARNING: audit receiver failed to start" >&2
+echo "[bootstrap] audit receiver started on :${audit_receiver_port}"
+%{ endif ~}
 %{ else ~}
 ###############################################################################
 # 2b. Joiner: cluster-join.sh
@@ -847,6 +910,71 @@ SB_CONTAINERD_NAMESPACE=${containerd_cfg.namespace}
 SB_CONTAINERD_CNI_PLUGIN_DIR=${containerd_cfg.cni_plugin_dir}
 SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabled}
 
+%{ if secret_kms_key_arn != "" ~}
+# Managed by Terraform bootstrap: cluster secret provider backed by a real KMS
+# CMK. The daemon reaches it through the instance role — pkg/secrets/awskms.go
+# uses the default AWS credential chain — so no static keys are involved.
+#
+# AWS_REGION is pinned rather than left to IMDS discovery: the SDK's region
+# fallback is one more thing to go wrong on a box whose whole job is to prove
+# the provider works, and a wrong/absent region surfaces as an opaque KMS
+# timeout at seal time rather than a clear boot failure.
+SB_SECRET_PROVIDER=awskms
+SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
+SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
+%{ endif ~}
+%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" ~}
+# One assignment for every AWS-backed sink. Pinned rather than left to the
+# SDK's IMDS region fallback: an absent region surfaces as an opaque timeout at
+# seal/ship time instead of a clear failure.
+AWS_REGION=${aws_region}
+%{ endif ~}
+
+%{ if audit_receiver_endpoint != "" ~}
+# Managed by Terraform bootstrap: webhook audit export + witness target.
+#
+# The endpoint is a NAME, not an address: one certificate then serves the seed
+# (which maps it to loopback) and every joiner (which maps it to the seed's
+# private IP), without the cert having to contain an IP that is unknown when
+# the seed's own user-data is rendered.
+# SB_SECRET_AUDIT_EXPORT_URL is also what makes the daemon resolve an unset
+# SB_AUDIT_EXPORT_BACKEND to "webhook" (pkg/auditexport/config.go), so a
+# scenario gets webhook export by enabling the receiver alone.
+SB_SECRET_AUDIT_EXPORT_URL=${audit_receiver_endpoint}/audit
+SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN=${audit_receiver_token}
+SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=${audit_receiver_hmac_key}
+SB_AUDIT_EXPORT_WEBHOOK_CA_FILE=/etc/sandboxd/audit-receiver-ca.pem
+# Consumed ONLY by a daemon built with -tags itestwitness, which is how an
+# enterprise scenario gets the non-noop controlplane.Witness that pkg/daemon
+# requires. A stock sandboxd ignores these two entirely, so setting them
+# unconditionally costs nothing and keeps the enterprise and non-enterprise
+# renders identical.
+AEROL_ITEST_WITNESS_URL=${audit_receiver_endpoint}
+AEROL_ITEST_WITNESS_TOKEN=${audit_receiver_token}
+%{ endif ~}
+%{ if audit_export_backend != "" ~}
+# Managed by Terraform bootstrap: audit export sink.
+#
+# SB_AUDIT_EXPORT_BACKEND selects exactly ONE backend — there is no fan-out, so
+# a node ships to file OR s3, never both. A scenario that wants to prove both
+# connectors sets a different backend per node through sandboxd_env.
+#
+# The file path and the S3 coordinates are BOTH written whenever a backend is
+# selected, so flipping the backend is a one-variable change and never a
+# "backend set but its config missing" boot failure. pkg/auditexport ignores
+# the settings that do not belong to the selected backend.
+SB_AUDIT_EXPORT_BACKEND=${audit_export_backend}
+SB_AUDIT_EXPORT_FILE_PATH=${audit_export_file_path}
+%{ if audit_export_s3_bucket != "" ~}
+SB_AUDIT_EXPORT_S3_BUCKET=${audit_export_s3_bucket}
+SB_AUDIT_EXPORT_S3_REGION=${aws_region}
+# Scenario-scoped, NOT per-node: auditexport.ObjectKey already interleaves
+# node=<id> into the key (<prefix>/node=<id>/yyyy/mm/dd/<batch>.jsonl), so a
+# per-node prefix would just repeat the node twice in every path.
+SB_AUDIT_EXPORT_S3_PREFIX=${audit_export_s3_prefix}
+%{ endif ~}
+%{ endif ~}
+
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
 # node's own sandboxd_env. Rendered LAST inside this block so a per-node entry
 # wins over anything above it, and written BEFORE the final
@@ -859,6 +987,27 @@ ${k}=${v}
 EOF
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
+
+%{ if audit_receiver_endpoint != "" ~}
+###############################################################################
+# Audit receiver reachability, on EVERY node, before the final daemon restart.
+#
+# The hosts alias is what makes one certificate work fleet-wide: the seed maps
+# the name to loopback, a joiner to the seed's private IP, and the cert only
+# ever has to carry the name. Idempotent so a re-run does not append twice.
+###############################################################################
+if ! grep -q ' ${audit_receiver_host}$' /etc/hosts; then
+  echo "${audit_receiver_host_ip} ${audit_receiver_host}" | sudo tee -a /etc/hosts >/dev/null
+fi
+
+# The daemon verifies the receiver against this PEM
+# (SB_AUDIT_EXPORT_WEBHOOK_CA_FILE). The receiver's cert is self-signed, so it
+# is its own trust anchor — world-readable because it is a public certificate.
+sudo tee /etc/sandboxd/audit-receiver-ca.pem >/dev/null <<'RECVCA'
+${audit_receiver_cert_pem}
+RECVCA
+sudo chmod 0644 /etc/sandboxd/audit-receiver-ca.pem
+%{ endif ~}
 
 # containerd engine needs the CNI bridge+host-local+loopback plugin binaries
 # under cni_plugin_dir, or the native netns pool's CNI ADD fails hard on every

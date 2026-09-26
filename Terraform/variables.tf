@@ -565,6 +565,96 @@ variable "caddy_binary_url" {
   default     = ""
 }
 
+# Real AWS KMS for the cluster secret provider (plans/integration-test-security.md §5.3).
+#
+# D3: this is deliberately a REAL key, not the offline fake. pkg/secrets'
+# fake_kms.go already covers the provider contract offline, so a fake here
+# would prove nothing new — what is untested is the daemon reaching a real CMK
+# through the instance role, which only a real key exercises.
+#
+# Off by default, so a production render is byte-identical and no key is ever
+# created for a deployment that did not ask for one. Cost when on is ~$1/month
+# prorated plus $0.03/10k requests.
+variable "secret_kms_enabled" {
+  description = "Create a KMS CMK and point sandboxd's secret provider at it (SB_SECRET_PROVIDER=awskms)."
+  type        = bool
+  default     = false
+}
+
+# Strict boot makes the daemon FAIL to start when the awskms boot canary does
+# not round-trip, instead of silently continuing with a provider that cannot
+# decrypt. config.go additionally REQUIRES it for awskms whenever
+# SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
+# from failing at daemon start with a config error. A scenario can still turn
+# it off through extra_sandboxd_env, which is rendered after this block.
+variable "secret_kms_strict_boot" {
+  description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
+  type        = bool
+  default     = true
+}
+
+# Audit export sinks (plans/integration-test-security.md §5.4).
+#
+# IMPORTANT, and not what the plan originally assumed: SB_AUDIT_EXPORT_BACKEND
+# selects exactly ONE of noop|stdout|file|webhook|s3|bus
+# (pkg/auditexport/config.go). There is no fan-out backend, so a single node
+# cannot ship to file AND s3 at once. A scenario that wants both proves them on
+# DIFFERENT NODES, via each node's own sandboxd_env — which is precisely what
+# the per-node override exists for.
+#
+# Note also that pkg/auditexport rejects file and stdout when enterprise mode
+# is on ("keeps audit evidence on this node"), so enterprise scenarios must
+# pick webhook, s3 or bus.
+variable "audit_export_enabled" {
+  description = "Create the audit-export S3 bucket and grant nodes PutObject on it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_export_backend" {
+  description = "Value for SB_AUDIT_EXPORT_BACKEND. Empty leaves the daemon default (noop, or webhook when an export URL is set)."
+  type        = string
+  default     = ""
+
+  validation {
+    # Mirrors pkg/auditexport's backend set. Catching a typo here beats a
+    # daemon that starts with the backend silently resolved to noop and a
+    # scenario that then asserts on records nothing ever shipped.
+    condition     = contains(["", "noop", "stdout", "file", "webhook", "s3", "bus"], var.audit_export_backend)
+    error_message = "audit_export_backend must be one of: noop, stdout, file, webhook, s3, bus (or empty)."
+  }
+}
+
+variable "audit_export_file_path" {
+  description = "SB_AUDIT_EXPORT_FILE_PATH. Written whenever audit_export_backend is set, so flipping to the file backend needs no other change."
+  type        = string
+  default     = "/var/log/aerol-audit-export.jsonl"
+}
+
+# Audit receiver fixture (plans/integration-test-security.md §6.4).
+#
+# One small binary, built by the same pipeline and shipped over the same
+# presigned URL, run as a systemd unit on the seed. Webhook export and the
+# audit-chain witness both need something listening; without it a scenario can
+# only assert that the daemon TRIED to export.
+variable "audit_receiver_enabled" {
+  description = "Run the audit-receiver fixture on the seed and point webhook export at it."
+  type        = bool
+  default     = false
+}
+
+variable "audit_receiver_port" {
+  description = "Port the audit receiver listens on (VPC-internal only)."
+  type        = number
+  default     = 9099
+}
+
+variable "audit_receiver_url" {
+  description = "Download URL for the audit-receiver binary. Emitted by integration-tests/lib/build.sh publish."
+  type        = string
+  default     = ""
+}
+
 # Extra SB_* environment for sandboxd, rendered into /etc/sandboxd/cluster.env
 # BEFORE the bootstrap's final `systemctl restart sandboxd`.
 #

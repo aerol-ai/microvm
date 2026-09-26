@@ -533,6 +533,31 @@ Cost: $1/month prorated + $0.03/10k requests — negligible, and it must be a
 *real* key: `pkg/secrets/fake_kms.go` already covers the offline contract, so a
 fake here would test nothing new.
 
+> **T7 verified 2026-09-23.** Strict boot defaults ON, because `config.go:2414`
+> *requires* it for awskms whenever `SB_ENTERPRISE_MODE` is true — defaulting it
+> off would make S4/S6 fail at daemon start with a config error rather than run.
+> `AWS_REGION` is pinned rather than left to the SDK's IMDS fallback, so a
+> missing region is a clear boot failure instead of an opaque KMS timeout at
+> seal time.
+>
+> **Ordering matters and is now asserted:** the KMS block renders BEFORE the
+> `extra_sandboxd_env` loop, because `cluster.env` is a systemd
+> `EnvironmentFile` where the last assignment wins. That is what lets a scenario
+> override a Terraform-set default. If the order flips, the override silently
+> stops working and the scenario looks configured when it is not — mutation-
+> verified in `bootstrap_render_test.go`.
+>
+> The hand-written overlay the exit criterion calls for is now a supported file:
+> `.tf/<scenario>/override.tfvars`, chained last in `tf_varfile_args` and read by
+> both apply and destroy. Gitignored, so it cannot be mistaken for a committed
+> scenario.
+>
+> **Bonus coverage this run produced for free:** D9's "omit env by default,
+> audited opt-in" and the Daytona `"env":{}` contract (the reverted `omitempty`)
+> were both confirmed live, and the audit chain + audit read API (F6/F7,
+> normally T13) returned a well-formed event with `ref`, `actor`, `node_id`,
+> `result` and a chain `event_id`.
+
 ### 5.4 Audit export sinks
 
 - **s3** — new `audit_export_enabled` bool → bucket
@@ -544,6 +569,29 @@ fake here would test nothing new.
   `SB_AUDIT_EXPORT_FILE_PATH=/var/log/aerol-audit-export.jsonl`; read over SSH
   with the existing `harness.SSHRun`.
 - **webhook** — see §6.4.
+
+> **CORRECTED during execution (2026-09-25).** This section, and the S2 profile
+> in §6.2, assumed a node could export to **file AND s3 at once**. It cannot.
+> `SB_AUDIT_EXPORT_BACKEND` selects exactly one of
+> `noop|stdout|file|webhook|s3|bus` and `pkg/auditexport` has no fan-out
+> backend. A scenario that wants both connectors proves them on **different
+> nodes**, through each node's own `sandboxd_env` — which is exactly what T6's
+> per-node override is for, and which single-node cannot express at all.
+>
+> Second constraint from the same package: `file` and `stdout` are **rejected
+> when enterprise mode is on** ("keeps audit evidence on this node"), so S4 and
+> S6 must use `webhook`, `s3` or `bus`. S1's "enterprise off, file export" is
+> fine as written.
+>
+> `SB_AUDIT_EXPORT_S3_PREFIX` is scenario-scoped, not per-node:
+> `auditexport.ObjectKey` already interleaves `node=<id>` into the key, so a
+> per-node prefix repeats the node twice in every path.
+>
+> IAM is **PutObject only**. A node must not be able to read the fleet's audit
+> trail back, nor delete its own records to cover a compromise — which is the
+> whole reason evidence ships off-node. The audit bucket is also kept separate
+> from the bootstrap bundle bucket, because that one is readable by every
+> joiner.
 
 ---
 
@@ -634,6 +682,35 @@ S4 `default_with_isolate = true` plus both capabilities and budget the
 jail-realization risk, or drop UC-150/163/164 from this program and say so.
 Silently shipping three UCs that can never run is the worst of the three.
 
+### 6.2b The disruptive gate opens — and the existing D-tagged UCs still cannot use it
+
+Verified on the first live `cluster-3-mixed-secrets` run (2026-09-26).
+
+`run.sh` logged `disruptive fault-injection tests enabled for
+cluster-3-mixed-secrets (caps: disruptive: true)` — on a scenario **not** named
+`cluster-hetero`, which the old name match would have silently left off.
+
+`DisruptiveAllowed()` then returned true, and the proof is in *where* the
+skips were recorded:
+
+| UC | recorded at | meaning |
+|---|---|---|
+| UC-58 | `z_disruptive_cluster_test.go:32` | the line AFTER the gate — an unconditional `t.Skip("driven by infra fault injection; Phase 2 follow-up")` |
+| UC-58c | `z_disruptive_cluster_test.go:141` | also after the gate — "requires cluster-hetero worker-x/y/z topology" |
+
+The gate's own skip is at line 30. Nothing landed there, so the gate opened.
+
+**But no EXISTING D-tagged use case can run on S2**, for two reasons that have
+nothing to do with the gate: UC-58 and UC-58b are unimplemented stubs, and
+UC-58c needs the hetero worker topology. So T10 proves the mechanism; it
+cannot yet prove a D-tagged case *passing* on S2, because there is not one to
+run.
+
+**This lands on T12.** Its exit criterion — "UC-117 green on S2" — must
+therefore assert PASS (not merely not-FAIL, which the plan already says) AND
+be written so that UC-117 is neither a stub nor hetero-only. The two skips
+above are exactly the failure modes to avoid when writing group B.
+
 ### 6.3 New capabilities
 
 `integration-tests/suite/harness/usecases.go`:
@@ -671,6 +748,59 @@ on the **ingress** node (hetero) or the seed (mixed):
   (`pkg/auditexport/backoff.go`) rather than just the happy path.
 
 It is a test fixture and lives under `integration-tests/`, never in `pkg/`.
+
+### 6.4a Enterprise cannot boot the shipped binary — four stacked constraints
+
+Discovered while verifying T9 (2026-09-26). The witness is **not an HTTP
+endpoint** in the shipped build: `SB_SECRET_AUDIT_EXTERNAL_WITNESS` requires a
+non-noop `controlplane.Witness`, `cmd/sandboxd` passes `nil` to `daemon.Run`,
+so the provider is `controlplane.Noop()` and `daemon.go:293` refuses to start.
+Enterprise mode *forces* that flag (`config.go:2394`). So **S4 and S6 could not
+boot at all**, taking §7 group I, F10 and F14 with them.
+
+Resolved (user decision) with a **test-only daemon**: `cmd/sandboxd` gained a
+nil `providerFactory` var, and `provider_itest.go` — compiled only with
+`-tags itestwitness`, which nothing in the Makefile or release workflow passes
+— supplies an HTTP Witness pointed at the receiver. It lives in `package main`
+rather than a second `cmd/` so the wasm-worker, isolate-jail-shim and
+resident-host re-exec paths are shared, not duplicated. `build.sh
+--with-itest-witness` emits it as a **separate** `sandboxd-witness_linux_<arch>`
+artifact, so the default path still provisions the binary a release ships.
+
+Verified live, in order, on one box:
+
+| | |
+|---|---|
+| shipped binary + `SB_SECRET_AUDIT_EXTERNAL_WITNESS=true` | refuses: *"requires a non-noop controlplane.Witness"* |
+| tagged binary, same config | boots; head `abe49336…` appears at `/witness/<node>` |
+
+**Four constraints S4/S6 must satisfy, all measured:**
+
+1. **Non-noop witness** → the `-tags itestwitness` artifact.
+2. **`file`/`stdout` audit backends are rejected** under enterprise ("keeps
+   audit evidence on this node") → use `webhook`, `s3` or `bus`.
+3. **The webhook URL must be HTTPS** under enterprise — *"audit export webhook
+   URL must use https when SB_ENTERPRISE_MODE=true"*. **The receiver is
+   plain HTTP today, so it needs TLS before any enterprise scenario runs.**
+   This is the one piece of §6.4 still outstanding.
+4. **The witness must be on from FIRST BOOT** — but the reason is a PRODUCT
+   BUG, not correct behaviour, and the first write-up of this section got it
+   wrong. Retrofitting the witness fails with
+   `witness mismatch: local_head="…" witnessed_head=""`, which reads like "the
+   witness is missing history". It is not: the witness holds that exact head.
+   `ValidateSecretAuditWitness` can look it up under the node id
+   `"standalone"` (the Noop cluster's id, `internal/cluster/noop.go:43`) while
+   the shipping path publishes under the real cluster node id, because the
+   boot check can run before `AttachCluster`. Reproduced live; **intermittent**
+   (failed twice, then three clean restarts), which makes it worse — a
+   fail-closed boot that looks like flake. A fresh node never hits it because
+   the check short-circuits on an empty chain. Tracked in `TODOS.md`; it needs
+   a product fix, not a scenario workaround.
+
+Verified 2026-09-26 that all four together do let an enterprise node boot:
+`SB_ENTERPRISE_MODE=true` + awskms + the witness build + the TLS receiver gave
+`secret provider boot canary ok provider=awskms`, `audit export connector
+configured backend=webhook`, a witnessed head, and `active / restarts=0`.
 
 ---
 
@@ -1027,10 +1157,10 @@ and verified, not merely that code was written.
 | T4 | `run.sh` local-build default + `--released`/`--version`/`--no-build` | T3 | **existing `single-node` scenario** provisions + passes from a local build (the draft said "`make integration-secrets-single` green", but S1's file pair is not created until T10 — circular) | **DONE** 2026-09-23 — final state on a **freshly provisioned instance, never hot-patched**: **pass 58 · fail 0 · skip 55 · missing 0 · inconclusive 0**, suite exit 0, report carries the `build` block (`407155348862`, clean tree). Got there via run 1 = 57/1 and three real branch defects found and fixed (§3.6-§3.8); UC-15 is the 58th, which had never run before because §3.7 deleted the sandbox on stop. |
 | T5 | **Bootstrap CSR rendezvous + cred bundle** (§5.1) — *own stacked PR* | — (parallel with T1-T4) | `cluster-3-mixed` forms 3 members on this branch | **DONE** 2026-09-23 — **3 members**, the first multi-node cluster this branch has formed. Rendezvous timeline: seed published all 3 artifacts (incl. cred bundle) at 05:38:24, both joiners uploaded CSRs and both certs were signed by 05:38:48, 3 members at 05:39:33. Security property verified on the live certs: each SAN is `DNS:node:<Terraform-assigned name>` resolved from `nodes/<IAM caller identity>`, never from the uploader. |
 | T6 | `extra_sandboxd_env` + per-node override (§5.2) — *same PR as T5* | T5 | a scenario can set any `SB_*` without `extra_user_data` | **DONE** 2026-09-23 — global `extra_sandboxd_env` merged under each node's `sandboxd_env`, rendered into `cluster.env` **before** the final `systemctl restart sandboxd` (asserted by an offline render test, which also fails if the block moves after the restart). |
-| T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | |
-| T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | |
-| T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | |
-| T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | |
+| T7 | KMS key + IAM (§5.3) | T6 | `SB_SECRET_PROVIDER=awskms` boots and seals **on `single-node` with a hand-written env overlay** (scenarios arrive in T10) | **DONE** 2026-09-23 — real CMK `cd1a8f8c` + `alias/aerolvm-itest-single-node-secrets`. **Boots:** `secret provider boot canary ok provider=awskms`, strict boot on, 0 restarts. **Seals:** env set at create is withheld from the default read (`{}`); `?include_env=true` returned it decrypted, and the audit chain recorded the opt-in with the exact `correlation_id` sent. Full suite **pass 58 · fail 0 · skip 55 · 0 inconclusive** with the provider active. |
+| T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | **DONE** 2026-09-23 — **exit criterion corrected**: a node exports to exactly ONE backend, so "both" is proven by flipping the backend on one box, not by running both at once. **s3:** records at `aerolvm-itest-single-node/node=<id>/2026/09/25/<batch>.jsonl` carrying the exact `correlation_id` sent. **file:** `/var/log/aerol-audit-export.jsonl` (0600 root) grew 1130→1673 bytes with the event. Clean suite re-run **pass 58 · fail 0 · 0 inconclusive** with KMS + s3 export both active. |
+| T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | **DONE** 2026-09-26 — all three verified live. **webhook:** backend resolved to `webhook` from the export URL alone, 5 batches / 0 rejected (so bearer + HMAC verified). **witness:** head `abe49336…` recorded and returned by `/witness/<SB_NODE_ID>`. **chaos:** `fail_next=3` consumed as 503s, then the exporter backed off and redelivered (`batches` 3→4). Needed a `-tags itestwitness` daemon — see §6.4a. |
+| T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | **CODE DONE** 2026-09-26. Capabilities already existed (PR #451). **`disruptive:` field DONE** and mutation-verified — this was the 17-UC silent hole. All 7 pairs written with Makefile targets + `integration-secrets-gate`. New offline validation catches unknown capability names (**already caught a real `gvisor-runtime` typo**), missing twins, duplicate/unmarked `cluster_name`, and enterprise-without-witness. **Live S2 run 2026-09-26: pass 71 · fail 0 · skip 42 · 0 inconclusive.** The gate PROVABLY opens — see §6.2b. |
 | T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable | |
 | T11 | `harness/secrets.go` helpers (§7.1) | T10, T10b | `WithNodeEnv` always restores on failure; `SecretHolders()` works | |
 | T12 | UC groups A-D (sealing, failover, reseal, env) | T11 | **UC-117 green on S2** | |

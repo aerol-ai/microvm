@@ -103,7 +103,22 @@ locals {
     image_build_gc_interval = "x"
     image_build_gc_ttl = "x"
     extra_user_data = "x"
-    sandboxd_env = { SB_SECRET_PROVIDER = "awskms", SB_ENTERPRISE_MODE = "true" }
+    sandboxd_env           = { SB_ENTERPRISE_MODE = "true", SB_AUDIT_EXPORT_MODE = "file" }
+    secret_kms_key_arn     = ""
+    secret_kms_strict_boot = true
+    audit_export_backend   = ""
+    audit_export_file_path = "/var/log/aerol-audit-export.jsonl"
+    audit_export_s3_bucket = ""
+    audit_export_s3_prefix  = "aerolvm-itest-x"
+    audit_receiver_url      = ""
+    audit_receiver_port     = 9099
+    audit_receiver_token    = ""
+    audit_receiver_hmac_key = ""
+    audit_receiver_endpoint = ""
+    audit_receiver_host     = "aerol-audit-receiver"
+    audit_receiver_host_ip  = "127.0.0.1"
+    audit_receiver_cert_pem = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+    audit_receiver_key_pem  = "-----BEGIN EC PRIVATE KEY-----\nFAKE\n-----END EC PRIVATE KEY-----\n"
     shard_aware_ingress = false
     caddy_storage_s3_enabled = false
     caddy_storage_s3_bucket = "x"
@@ -145,3 +160,67 @@ locals {
 }
 output "seed"   { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = true })) }
 output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false })) }
+
+# Same joiner, but with the KMS secret provider turned on, so the conditional
+# block and its interaction with the sandboxd_env override layer are both
+# covered.
+# Audit export shipping to S3. Separate output because the backend is
+# single-valued: a node ships to file OR s3, never both, so each has to be
+# rendered on its own.
+output "joiner_audit_s3" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                = false
+    audit_export_backend   = "s3"
+    audit_export_s3_bucket = "aerolvm-itest-x-audit-abc123"
+  }))
+}
+
+# The same node flipped to the on-node file sink, which is what a
+# non-enterprise scenario uses (pkg/auditexport rejects file under enterprise).
+output "joiner_audit_file" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed              = false
+    audit_export_backend = "file"
+  }))
+}
+
+# Seed with the audit receiver fixture enabled: exercises the systemd unit
+# block AND the webhook export env the same render must emit.
+output "seed_receiver" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                 = true
+    audit_receiver_url      = "https://example.invalid/audit-receiver_linux_amd64"
+    audit_receiver_token    = "recv-token-xyz"
+    audit_receiver_hmac_key = "recv-hmac-abc"
+    audit_receiver_endpoint = "https://aerol-audit-receiver:9099"
+  }))
+}
+
+# A joiner must get the export env pointed at the SEED, and must NOT install
+# the receiver unit — two receivers would split the evidence.
+output "joiner_receiver" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                 = false
+    audit_receiver_url      = "https://example.invalid/audit-receiver_linux_amd64"
+    audit_receiver_token    = "recv-token-xyz"
+    audit_receiver_hmac_key = "recv-hmac-abc"
+    audit_receiver_endpoint = "https://aerol-audit-receiver:9099"
+    audit_receiver_host_ip  = "10.42.1.5"
+    # A joiner never serves the receiver, so it must not hold the private key.
+    audit_receiver_key_pem = ""
+  }))
+}
+
+output "joiner_kms" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed            = false
+    secret_kms_key_arn = "arn:aws:kms:us-east-1:111122223333:key/abcd-1234"
+    sandboxd_env = {
+      SB_ENTERPRISE_MODE = "true"
+      # Proves the override layering: this must WIN over the KMS block's value
+      # because extra_sandboxd_env is rendered last and systemd's
+      # EnvironmentFile takes the last assignment.
+      SB_SECRET_PROVIDER_STRICT_BOOT = "false"
+    }
+  }))
+}
