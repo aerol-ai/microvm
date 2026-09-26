@@ -172,6 +172,25 @@ type UseCase struct {
 	Implemented bool
 }
 
+// KnownCapabilities is every capability the model defines.
+//
+// It exists because the registry well-formedness test used to carry its own
+// hand-written list of valid capabilities, which went stale the moment T7-T10
+// added the six secrets capabilities: a UC requiring one of them failed as a
+// "typo" even though the constant was right there. One list, asserted against
+// the constants, so adding a capability cannot silently break the guard that
+// is supposed to catch typos.
+var KnownCapabilities = map[Capability]bool{
+	CapDocker: true, CapFirecracker: true, CapGvisor: true, CapWasm: true,
+	CapIsolate: true, CapIsolateJail: true, CapGPU: true, CapDomain: true,
+	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
+	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true,
+	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
+	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
+	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
+	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
+}
+
 // Registry is the full use-case catalogue. Order is the matrix row order.
 //
 // Every use case now has a test (Phases 1-2 fanned out the full suite), so all
@@ -410,6 +429,63 @@ var Registry = []UseCase{
 	{ID: "UC-106", Title: "Observability: Grafana reachable + Prometheus datasource healthy", Requires: []Capability{CapObservability}, Implemented: true},
 	{ID: "UC-107", Title: "Observability: all expected sandboxd nodes are up in Prometheus", Requires: []Capability{CapObservability, CapCluster}, Implemented: true},
 	{ID: "UC-108", Title: "Simulations: each recorded sim success signal is green (per-sim)", Requires: []Capability{CapSimulations}, Implemented: true},
+
+	// ---------------------------------------------------------------------
+	// Secrets, audit and the enterprise posture (plans/integration-test-security.md
+	// §7). UC-110 onward. Groups A-D land here; E-M follow in T13-T16b.
+	// ---------------------------------------------------------------------
+
+	// A. Sealing and fan-out (F1, F2).
+	//
+	// NOTE ON THE PLAN (verified against the tree): §7 group A describes a
+	// "secret.seal" audit event. No such event exists. internal/service emits
+	// on OPEN, not on seal: the stored kinds are secret_open, egress, gap,
+	// retention_checkpoint and retention_redacted (secret_audit.go:51-58), and
+	// the only emitter is beginSecretAuditOwned, called from the env, mounts,
+	// registry and cluster-placement DECRYPT paths. Asserting on a seal event
+	// would have been a test of something the product never writes. UC-110
+	// therefore asserts the observable equivalent: material sealed at create is
+	// unreadable by default, and reading it back emits exactly one secret_open
+	// naming the actor and carrying no plaintext.
+	{ID: "UC-110", Title: "Sealed credentials: create succeeds, one secret_open on read, no plaintext in the record", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-111", Title: "HA create reaches failover_ready with a holder set larger than the owner alone", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-112", Title: "Sealed row present on every recipient and absent on non-recipients (peer HEAD)", Requires: []Capability{CapSecrets, CapCluster, CapClusterMTLS}, Implemented: true},
+	{ID: "UC-113", Title: "Peer secret push is idempotent: replay yields one row at the same generation", Requires: []Capability{CapSecrets, CapCluster, CapClusterMTLS}, Implemented: true},
+	{ID: "UC-114", Title: "Peer secret push from a foreign identity is refused", Requires: []Capability{CapSecrets, CapCluster, CapClusterMTLS}, Implemented: true},
+	{ID: "UC-115", Title: "Zero-ACK HA create is retracted, leaving no orphan sandbox or row", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	// Excludes enterprise: config.go refuses SB_SECRET_RECIPIENT_BACKUP_COUNT<2
+	// under SB_ENTERPRISE_MODE, so running this there takes the node down
+	// instead of asserting anything.
+	{ID: "UC-116", Title: "Recipient-set size tracks SB_SECRET_RECIPIENT_BACKUP_COUNT, capped at cluster size", Requires: []Capability{CapSecrets, CapCluster}, Excludes: []Capability{CapEnterprise}, Implemented: true},
+
+	// B. Cross-node failover open — the critical path (F3). All disruptive.
+	//
+	// UC-117 is this program's milestone: it is the case §0's probe stood in
+	// for, and §6.2b requires it to PASS (not merely not-FAIL) on S2, and to be
+	// neither a stub nor hetero-only.
+	{ID: "UC-117", Title: "Owner death: HA sandbox recreates on a recipient AND its credentials still work", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-118", Title: "Recreated sandbox's sealed env survives owner death intact", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-119", Title: "A non-recipient owner fails legibly rather than booting with an empty env", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-120", Title: "Owner killed mid-fan-out: recreates, or fails loudly — never half-sealed", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+
+	// C. Reseal on membership change (F4).
+	{ID: "UC-121", Title: "Adding a node reseals existing HA sandboxes; generation advances exactly once", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-122", Title: "Draining a recipient reseals to a replacement and tombstones the old copy", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	// Excludes enterprise: config.go refuses zero retention under
+	// SB_ENTERPRISE_MODE (same failure shape as UC-116).
+	{ID: "UC-123", Title: "A retired recipient can no longer open, and its tomb is swept", Requires: []Capability{CapSecrets, CapCluster}, Excludes: []Capability{CapEnterprise}, Implemented: true},
+	{ID: "UC-124", Title: "Concurrent reseal triggers converge on one generation and one recipient set", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	// UC-125 must run on an ENTERPRISE scenario: daemon.go makes a boot
+	// re-fanout error fatal under enterprise while a plain cluster only logs a
+	// warning, so S2 would pass while the enterprise posture deadlocks.
+	{ID: "UC-125", Title: "Whole-cluster restart restores holder counts; failover_ready is not stuck false", Requires: []Capability{CapSecrets, CapCluster, CapEnterprise}, Implemented: true},
+
+	// D. Env sealing and the API contract (F5).
+	{ID: "UC-126", Title: "Get and List omit env by default", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-127", Title: "include_env=true returns env and emits exactly one audit event naming the actor", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-128", Title: "Env is absent from the Raft placement spec", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-129", Title: "On disk: no plaintext env column; the sealed row round-trips across an update", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-130", Title: "A corrupted sealed env fails the sandbox loud, not empty", Requires: []Capability{CapSecrets}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

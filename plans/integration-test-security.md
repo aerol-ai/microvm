@@ -833,15 +833,61 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 > Re-scope UC-154 to the `op()`-only routes and add a case asserting that an
 > `internalOp` route refuses a PAT-only caller (which is the correct behaviour).
 
+> **T12 IMPLEMENTATION FINDINGS (outside voice, verified against the tree
+> 2026-09-26).** Three things in §7 did not survive contact with the product.
+>
+> 1. **There is no `secret.seal` audit event.** The stored kinds are
+>    `secret_open`, `egress`, `gap`, `retention_checkpoint` and
+>    `retention_redacted` (`internal/service/secret_audit.go:51-58`), and the
+>    only emitter is `beginSecretAuditOwned`, called from the env, mounts,
+>    registry and cluster-placement **decrypt** paths — the product audits
+>    OPEN, never seal. UC-110 as written would have asserted on an event that
+>    is never emitted, i.e. it would have failed for a reason unrelated to
+>    sealing, or (with a `>= 0` style check) passed vacuously. **UC-110 now
+>    asserts the observable equivalent**: the material is unreadable by
+>    default, and reading it back emits exactly one `secret_open` with
+>    `ref=env:<id>` naming the actor and carrying no plaintext.
+> 2. **UC-113 cannot replay the peer push.** The fan-out POST needs the sealed
+>    body, which only the owner holds and which no read API exposes — by
+>    design, and #479 deliberately did not change that. UC-113 is therefore
+>    scoped to the invariant the replay exists to preserve, observed through
+>    the peer HEAD and the operator view: repeated observation must not move
+>    the generation, rewrite the row, or grow the recipient set. That catches
+>    the regressions that bite (a read path that bumps a generation; a fan-out
+>    that re-runs and double-books) but NOT the PUT handler's own conflict
+>    behaviour, which stays covered offline. The scope limit is stated in the
+>    test's own comment, not just here.
+> 3. **UC-121 is disruptive.** "Add a node" means Terraform, which the suite
+>    cannot do mid-run. The same membership transition the reseal path keys off
+>    is a SWIM leave + rejoin, so the case bounces a non-owner node's daemon —
+>    which makes it disruptive, a `D` the plan's caps column did not carry. It
+>    honours `DisruptiveAllowed()` so it skips rather than wrecking a
+>    non-disruptive run.
+>
+> Two constants in the first draft of the group D helpers were also wrong and
+> would have made **UC-129 and UC-130 skip silently** (a green matrix with two
+> unrun cases): the store is `state.db`, not `sandboxd.db` (install.sh writes
+> `SB_DB_PATH=/var/lib/sandboxd/state.db`), and the sealed column is
+> `sealed_blob`, not `sealed_env` (`store.go:149`). Both are now read from the
+> node's own config rather than hardcoded.
+>
+> Two guards were added so the next group cannot repeat the shape of these
+> mistakes: `harness.KnownCapabilities` is now the single list the
+> well-formedness test checks against (its hand-written copy had already gone
+> stale — every UC requiring one of the six T7-T10 secrets capabilities failed
+> as a "typo"), and `integration-tests/safety/registry_claims_test.go` fails
+> `make test` if any `Implemented` use case has no test claiming its id, which
+> otherwise surfaces only as a MISSING row at the end of a paid live run.
+
 ### A. Sealing and fan-out (F1, F2)
 
 | UC | Assertion | Caps |
 |---|---|---|
-| UC-110 | Create with `credentials` → sandbox runs; exactly one `secret.seal` audit event; no plaintext in the event payload | S |
+| UC-110 | Create with sealed material → sandbox runs; the default read carries nothing; reading it back emits exactly one `secret_open` (`ref=env:<id>`) naming the actor, with no plaintext. **Not `secret.seal` — see the box above.** | S |
 | UC-111 | `failover.policy=recreate` create → `failover_ready=true` within the min-ACK window; holder count ≥ owner+1 | S,C |
-| UC-112 | Sealed row is present on **each** recipient (`/v1/cluster/internal/secrets` as operator) and absent on non-recipients | S,C |
-| UC-113 | Peer push is **idempotent**: replay the same push twice → one row, same generation, 2xx both times | S,C |
-| UC-114 | Peer push from a **foreign identity** (tenant token, or a node not in the recipient set) → 403, and an audit event with the denial reason | S,C |
+| UC-112 | Sealed row is present on **each** recipient and absent on non-recipients (peer HEAD over mTLS, run on the node with its own cert — the operator view reports intent, only the peer says the bytes arrived) | S,C,M |
+| UC-113 | Peer-visible sealed state is stable under repeated observation: one row, one generation, one recipient set. **Scope-limited — see the box above.** | S,C,M |
+| UC-114 | A caller on the internal port with no peer certificate (or an operator PAT instead of one) is refused — network position is not entitlement | S,C,M |
 | UC-115 | Zero-ACK HA create is **retracted**: block the fan-out port on all peers, create with `recreate` → create fails loudly and leaves no orphan sandbox/row | S,C,D |
 | UC-116 | `SB_SECRET_RECIPIENT_BACKUP_COUNT=1` vs `3` → recipient-set size tracks the knob, capped at cluster size. **NOT on enterprise** — `config.go:2452` refuses `<2` under `SB_ENTERPRISE_MODE`. | S,C,**!E** |
 
@@ -858,7 +904,7 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 
 | UC | Assertion | Caps |
 |---|---|---|
-| UC-121 | **Add** a node → existing HA sandboxes reseal; the new node appears in the recipient set; generation advances exactly once | S,C |
+| UC-121 | A membership change (SWIM leave + rejoin) reseals existing HA sandboxes; the generation advances and then STOPS — a generation that keeps climbing is a reseal loop, one KMS call per iteration | S,C,**D** |
 | UC-122 | **Drain** a recipient → reseal to a replacement, replacement ACKs, promoted generation visible, old recipient's row is tombstoned | S,C |
 | UC-123 | The **retired** recipient can no longer open (fail closed), and the tomb is swept after `SB_SECRET_TOMB_RETENTION_DAYS` (use a 0-day setting to force it). **NOT on enterprise scenarios** — `config.go:2417` refuses zero retention under `SB_ENTERPRISE_MODE`, so this UC would take an S4/S5/S6 node down rather than assert anything. | S,C,**!E** |
 | UC-124 | Reseal is **idempotent under concurrent triggers**: drain two nodes at once → one winning generation, no split recipient set | S,C,D |

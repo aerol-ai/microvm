@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -584,4 +585,152 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// PeerSecretProbe is the result of asking one node whether it holds a sealed
+// copy, over the mTLS-gated internal route, using that node's OWN client
+// certificate.
+//
+// This is the only way to answer "is the row actually on that node?". The
+// operator holders view reports the recipient set the owner INTENDS; it cannot
+// tell you whether the bytes arrived. A test that checks only the intent would
+// pass against a fan-out that silently delivered nothing.
+type PeerSecretProbe struct {
+	Node   string
+	Status int
+	Err    error
+}
+
+// Present reports whether the node holds a copy. The route answers 200/204 for
+// a held row and 404 for an absent one; anything else is neither and is
+// reported as an error by the caller rather than silently read as "absent".
+func (p PeerSecretProbe) Present() bool { return p.Status == 200 || p.Status == 204 }
+
+// Absent reports a definitive "this node does not hold it".
+func (p PeerSecretProbe) Absent() bool { return p.Status == 404 }
+
+// internalCurlPrefix sources the node's cluster env and builds a curl that
+// presents the node's own client certificate. Run under sudo: node.key is
+// 0600 root, which is the point of it.
+const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/cluster.env; set +a; ` +
+	`base="${SB_CLUSTER_INTERNAL_ADVERTISE%/}"; ` +
+	`curl -sS -o /dev/null -w "%{http_code}" --max-time 20 `
+
+// ProbePeerSecret asks node whether it holds the sealed row for sandboxID.
+func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerSecretProbe {
+	t.Helper()
+	target, ok := SSHTarget(node)
+	if !ok {
+		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("node %s has no SSH address", node.Name)}
+	}
+	script := internalCurlPrefix +
+		`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` +
+		`-I "$base/v1/cluster/internal/secrets/` + sandboxID + `"'`
+	out, err := SSHRun(t, target, script)
+	return peerProbeFromOutput(node.Name, out, err)
+}
+
+// ProbePeerSecretUnauthenticated makes the same request WITHOUT a client
+// certificate, from the same node. The identity, not the network position, is
+// what must be refused: a caller that can reach the port is not thereby
+// entitled to the fleet's sealed material.
+func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, sandboxID, bearer string) PeerSecretProbe {
+	t.Helper()
+	target, ok := SSHTarget(node)
+	if !ok {
+		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("node %s has no SSH address", node.Name)}
+	}
+	auth := ""
+	if bearer != "" {
+		auth = `-H "Authorization: Bearer ` + bearer + `" `
+	}
+	script := internalCurlPrefix + `--cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` + auth +
+		`-I "$base/v1/cluster/internal/secrets/` + sandboxID + `"'`
+	out, err := SSHRun(t, target, script)
+	return peerProbeFromOutput(node.Name, out, err)
+}
+
+// peerProbeFromOutput turns curl's status output into a probe. A curl that
+// could not connect at all is an error, NOT a 0 status read as "absent".
+func peerProbeFromOutput(nodeName, out string, err error) PeerSecretProbe {
+	p := PeerSecretProbe{Node: nodeName, Err: err}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		if p.Err == nil {
+			p.Err = fmt.Errorf("peer probe on %s produced no status", nodeName)
+		}
+		return p
+	}
+	code, convErr := strconv.Atoi(fields[len(fields)-1])
+	if convErr != nil {
+		if p.Err == nil {
+			p.Err = fmt.Errorf("peer probe on %s: unparsable status %q (output %q)", nodeName, fields[len(fields)-1], out)
+		}
+		return p
+	}
+	p.Status = code
+	if code == 0 && p.Err == nil {
+		p.Err = fmt.Errorf("peer probe on %s could not connect (curl status 0)", nodeName)
+	}
+	if code != 0 {
+		// A transport error alongside a real HTTP status is curl's exit code
+		// for the status itself; the status is the answer.
+		p.Err = nil
+	}
+	return p
+}
+
+// WithClusterEnv applies an env override to EVERY SSH-reachable node and
+// restores them all, seed first in both directions.
+//
+// Seed-first is not cosmetic. Rolling-restarting all three SWIM members with
+// the seed LAST once split a live cluster 2+1: the joiners came up while the
+// seed was still down, found no one to gossip with, and orphaned themselves;
+// recovery needed a second restart of the joiners. Bringing the seed back
+// first means every joiner always has a live rendezvous to rejoin.
+//
+// fn runs once, after every node has been restarted, and receives the per-node
+// boot outcomes keyed by node name.
+func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]string, fn func(map[string]NodeBootResult)) {
+	t.Helper()
+	if targets == nil {
+		t.Fatal("nil integration targets; run via integration-tests/run.sh")
+	}
+	nodes := seedFirst(targets.Nodes)
+	if len(nodes) == 0 {
+		t.Fatal("no SSH-reachable nodes to configure")
+	}
+	results := make(map[string]NodeBootResult, len(nodes))
+	// One nested WithNodeEnv per node, so each node's restore is a defer of
+	// its own and a failure partway through still unwinds every node already
+	// touched — in reverse, which is seed-last on the way out and seed-first
+	// on the way back in.
+	var apply func(i int)
+	apply = func(i int) {
+		if i == len(nodes) {
+			fn(results)
+			return
+		}
+		WithNodeEnv(t, nodes[i], kv, func(res NodeBootResult) {
+			results[nodes[i].Name] = res
+			apply(i + 1)
+		})
+	}
+	apply(0)
+}
+
+// seedFirst returns the SSH-reachable nodes with the seed at the front.
+func seedFirst(in []IntegrationNode) []IntegrationNode {
+	var seeds, rest []IntegrationNode
+	for _, n := range in {
+		if _, ok := SSHTarget(n); !ok {
+			continue
+		}
+		if n.Seed {
+			seeds = append(seeds, n)
+		} else {
+			rest = append(rest, n)
+		}
+	}
+	return append(seeds, rest...)
 }
