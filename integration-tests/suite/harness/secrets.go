@@ -320,6 +320,13 @@ func (c *Client) AllAuditPages(ctx context.Context, sandboxID string, pageSize, 
 	var all []auditlog.Event
 	q := AuditQuery{Limit: pageSize}
 	for i := 0; i < maxPages; i++ {
+		// The page budget bounds the number of REQUESTS; the context bounds
+		// the TIME. Without the second, a flaky edge multiplies each page's
+		// retries by maxPages and the walk outlives the suite itself — which
+		// is how UC-149 hung past the 60m test timeout.
+		if err := ctx.Err(); err != nil {
+			return all, fmt.Errorf("audit pagination for %s stopped after %d page(s): %w", sandboxID, i, err)
+		}
 		page, err := c.AuditPageFor(ctx, sandboxID, q)
 		if err != nil {
 			return all, err
@@ -459,6 +466,57 @@ const (
 	itestEnvDropIn       = "/etc/systemd/system/sandboxd.service.d/zz-itest-override.conf"
 )
 
+// PickRestartableNode returns a node it is SAFE to restart.
+//
+// Not the seed, where there is any alternative. Restarting the seed of a
+// SWIM cluster orphans the joiners into their own partition and they do NOT
+// heal: the live S2 run left node1 seeing only itself while nodes 2 and 3
+// gossiped happily with each other, and every subsequent create failed
+// "cluster: peer InternalURL required (mTLS fail-closed)".
+//
+// PickSSHNode deliberately PREFERS the seed — it is the right choice for
+// reading state — so every case that restarts a node and reached for it was
+// picking the one node that breaks the cluster.
+//
+// On a single node there is nothing to orphan, so the seed is returned.
+func PickRestartableNode(targets *IntegrationTargets) (IntegrationNode, bool) {
+	if targets == nil {
+		return IntegrationNode{}, false
+	}
+	var seed IntegrationNode
+	haveSeed := false
+	for _, n := range targets.Nodes {
+		if _, ok := SSHTarget(n); !ok {
+			continue
+		}
+		if n.Seed {
+			seed, haveSeed = n, true
+			continue
+		}
+		return n, true
+	}
+	return seed, haveSeed
+}
+
+// NodeRejoinCheck, when set, must block until the node is fully back in
+// service — not merely until its unit is active.
+//
+// This exists because "systemctl is-active" is a lie at cluster scope. A
+// restarted sandboxd is active seconds before it has rejoined SWIM and
+// re-advertised its InternalURL, and during that window placement can pick
+// it and every create fails "cluster: peer InternalURL required (mTLS
+// fail-closed)".
+//
+// The live S2 run is what proved it: UC-137/148/149 restart a node, test
+// files run in alphabetical order so they land before cluster_test.go, and
+// TestClusterForms then found 2 of 3 members. 79 cases failed — nearly every
+// sandbox create in the suite, including long-standing ones that have
+// nothing to do with secrets. A helper that degrades the fleet and returns
+// is worse than one that fails.
+//
+// The suite sets this in TestMain; the harness stays cluster-agnostic.
+var NodeRejoinCheck func(t *testing.T, node IntegrationNode) error
+
 // NodeBootResult is what a node did when restarted under an env override.
 //
 // Started is false for the boot-gate cases (§I), which is a PASS there, not an
@@ -519,6 +577,15 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 		}
 		if !awaitUnitActive(t, target, "sandboxd", 3*time.Minute) {
 			t.Errorf("RESTORE FAILED on %s — sandboxd did not come back active after the override was removed; the rest of this run is suspect", node.Name)
+			return
+		}
+		// Active is not the same as back in the cluster. Returning here with
+		// the node still outside the member list hands every later case a
+		// degraded fleet, and the report blames whichever one runs next.
+		if NodeRejoinCheck != nil {
+			if err := NodeRejoinCheck(t, node); err != nil {
+				t.Errorf("RESTORE FAILED on %s — the unit is active but the node has not rejoined: %v. Every later case in this run is suspect.", node.Name, err)
+			}
 		}
 	}
 	defer restore()
@@ -551,6 +618,14 @@ sudo systemctl daemon-reload`, itestEnvOverrideFile, b.String(), itestEnvOverrid
 	// unit settles either way.
 	_, _ = SSHRun(t, target, "sudo systemctl restart sandboxd")
 	res := NodeBootResult{Started: awaitUnitActive(t, target, "sandboxd", 90*time.Second)}
+	// When the node came up, wait for it to be usable before fn runs — a
+	// case that asserts against a node still outside the cluster measures
+	// the rejoin window, not what it set out to test.
+	if res.Started && NodeRejoinCheck != nil {
+		if err := NodeRejoinCheck(t, node); err != nil {
+			t.Logf("node %s is active but not yet fully rejoined under the override: %v", node.Name, err)
+		}
+	}
 	status, _ := SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
 	res.Status = strings.TrimSpace(status)
 	journal, _ := SSHRun(t, target, "sudo journalctl -u sandboxd --no-pager -n 120 || true")

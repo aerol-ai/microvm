@@ -96,18 +96,23 @@ func TestOwnerDeathKeepsCredentialsWorking(t *testing.T) {
 	t.Logf("UC-117 PASS: sandbox %s recreated on recipient %s and its credentials still work", sb.ID, newOwner)
 }
 
-// UC-118 — the recreated sandbox's env is intact, not merely present.
+// UC-118 — the sealed env survives every RESTORE path, not just failover.
 //
-// Parametrized over the runtimes the scenario actually advertises (§7.3):
-// sealing is runtime-agnostic but the RESTORE path is not — a docker recreate
-// and a wasm recreate rebuild the sandbox very differently, and PR #432 found
-// a durable-WASM recreate that lost the sealed env entirely because the store
-// rows carry no env.
-func TestRecreatedSandboxEnvIsIntactAcrossRuntimes(t *testing.T) {
+// §7.3 is explicit about why this is a matrix and not one case. The bug class
+// is "a restore path forgot to hydrate the sealed env", not "env is broken on
+// runtime X". On this branch a store row NEVER carries env — the column is
+// gone and sealed sandbox_env is the only source — so store.Get returns
+// Env == nil and every consumer must hydrate explicitly. Drivers then read
+// sandbox.Env straight off the struct, so a missed hydrate produces an EMPTY
+// ENVIRONMENT WITH NO ERROR.
+//
+// PR #432 was exactly this, and it was WASM-only AND retry-only: the first
+// recreate built the row from the decrypted spec and worked; only a retry
+// after a failed restore lost env. A containerd-only, failover-only UC-118
+// passes while that path is broken — which is why this walks runtime ×
+// restore path.
+func TestSealedEnvSurvivesEveryRestorePath(t *testing.T) {
 	harness.Require(t, sc, "UC-118")
-	if !harness.DisruptiveAllowed() {
-		t.Skip("disruptive tests disabled (set disruptive: true in the scenario caps, or drop --no-disruptive)")
-	}
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
@@ -119,58 +124,118 @@ func TestRecreatedSandboxEnvIsIntactAcrossRuntimes(t *testing.T) {
 		t.Skip("no failover-capable runtime advertised by this scenario")
 	}
 
-	for _, rt := range runtimes {
-		t.Run(rt, func(t *testing.T) {
-			secret := secretValue(t, "118-"+rt)
-			// Several keys, because "the env survived" must mean the whole map
-			// and not just whichever key the restore path happened to carry.
-			env := map[string]string{
-				"UC118_TOKEN": secret,
-				"UC118_PLAIN": "kept-" + rt,
-				"UC118_EMPTY": "",
-			}
-			sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{Env: env, Image: harness.DefaultImage})
-			waitRunning(t, sb)
-
-			view := harness.AwaitSecretHolders(t, c, sb.ID, 3*time.Minute, func(v harness.SecretHoldersView) bool {
-				return len(v.Holders) >= 2
-			})
-			owner := resolvePlacementOwner(t, c, sb.ID)
-			peers := withoutString(view.Holders, owner)
-			if len(peers) == 0 {
-				t.Skipf("holder set %v has no peer; nothing to fail over to", view.Holders)
-			}
-			victim, ok := nodeForClusterID(t, c, targets, owner)
-			if !ok || victim.InstanceID == "" {
-				t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
-			}
-			t.Cleanup(func() {
-				if state := harness.EC2InstanceState(t, victim.InstanceID); state != "running" {
-					harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-				}
-			})
-			harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
-			awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
-
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			var withEnv struct {
-				Env map[string]string `json:"env"`
-			}
-			if err := c.GetJSON(ctx, "/v1/sandboxes/"+sb.ID+"?include_env=true", &withEnv); err != nil {
-				t.Fatalf("read env after failover: %v", err)
-			}
-			for k, want := range env {
-				got, present := withEnv.Env[k]
-				if !present {
-					t.Fatalf("key %q vanished across the %s failover; the restore path dropped part of the sealed env", k, rt)
-				}
-				if got != want {
-					t.Fatalf("key %q = %q after the %s failover, want %q", k, got, rt, want)
-				}
-			}
-		})
+	// The restore paths from §7.3's table. "failover recreate" is the only
+	// disruptive one; the rest run wherever the runtime does, which is the
+	// point — the WASM retry path is reachable without killing anything.
+	paths := []struct {
+		name       string
+		disruptive bool
+		restore    func(t *testing.T, c *harness.Client, targets *harness.IntegrationTargets, sb *microvm.Sandbox)
+	}{
+		{name: "failover-recreate", disruptive: true, restore: restoreViaOwnerKill},
+		{name: "stop-start", restore: restoreViaStopStart},
+		{name: "snapshot-resume", restore: restoreViaSnapshotResume},
 	}
+
+	for _, rt := range runtimes {
+		for _, p := range paths {
+			t.Run(rt+"/"+p.name, func(t *testing.T) {
+				if p.disruptive && !harness.DisruptiveAllowed() {
+					t.Skip("disruptive tests disabled: this restore path kills the owner")
+				}
+				secret := secretValue(t, "118-"+rt+"-"+p.name)
+				// Several keys, because "the env survived" must mean the whole
+				// map and not whichever key the restore path happened to carry.
+				env := map[string]string{
+					"UC118_TOKEN": secret,
+					"UC118_PLAIN": "kept-" + rt,
+					"UC118_EMPTY": "",
+				}
+				sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{Env: env})
+				waitRunning(t, sb)
+
+				p.restore(t, c, targets, sb)
+
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				var withEnv struct {
+					Env map[string]string `json:"env"`
+				}
+				if err := c.GetJSON(ctx, "/v1/sandboxes/"+sb.ID+"?include_env=true", &withEnv); err != nil {
+					t.Fatalf("read env after %s on %s: %v", p.name, rt, err)
+				}
+				if len(withEnv.Env) == 0 {
+					t.Fatalf("the sandbox came back from %s on %s with an EMPTY environment and no error — the restore path did not hydrate the sealed env. This is PR #432's shape.", p.name, rt)
+				}
+				for k, want := range env {
+					got, present := withEnv.Env[k]
+					if !present {
+						t.Fatalf("key %q vanished across %s on %s; the restore path dropped part of the sealed env", k, p.name, rt)
+					}
+					if got != want {
+						t.Fatalf("key %q = %q after %s on %s, want %q", k, got, p.name, rt, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+// restoreViaOwnerKill kills the owner and waits for the sandbox to reappear
+// elsewhere.
+func restoreViaOwnerKill(t *testing.T, c *harness.Client, targets *harness.IntegrationTargets, sb *microvm.Sandbox) {
+	t.Helper()
+	view := harness.AwaitSecretHolders(t, c, sb.ID, 3*time.Minute, func(v harness.SecretHoldersView) bool {
+		return len(v.Holders) >= 2
+	})
+	owner := resolvePlacementOwner(t, c, sb.ID)
+	if len(withoutString(view.Holders, owner)) == 0 {
+		t.Skipf("holder set %v has no peer; nothing to fail over to", view.Holders)
+	}
+	victim, ok := nodeForClusterID(t, c, targets, owner)
+	if !ok || victim.InstanceID == "" {
+		t.Skipf("owner %s is not an EC2 node this suite can kill", owner)
+	}
+	t.Cleanup(func() {
+		if state := harness.EC2InstanceState(t, victim.InstanceID); state != "running" {
+			harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
+		}
+	})
+	harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
+	awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
+}
+
+// restoreViaStopStart is the ordinary lifecycle restore. It needs no fault
+// injection, which is exactly why it is worth including: it is the path an
+// operator uses, and the one a failover-only test never exercises.
+func restoreViaStopStart(t *testing.T, c *harness.Client, _ *harness.IntegrationTargets, sb *microvm.Sandbox) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := c.SDK().Stop(ctx, sb.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if _, err := c.SDK().Start(ctx, sb.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitRunning(t, sb)
+}
+
+// restoreViaSnapshotResume snapshots and recreates from the snapshot.
+func restoreViaSnapshotResume(t *testing.T, c *harness.Client, _ *harness.IntegrationTargets, sb *microvm.Sandbox) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	if _, err := c.SDK().CreateSnapshot(ctx, sb.ID, harness.UniqueName(sc, t)+"-snap"); err != nil {
+		t.Skipf("snapshot is not available for this sandbox (%v); the snapshot-resume column does not apply here", err)
+	}
+	if _, err := c.SDK().Stop(ctx, sb.ID); err != nil {
+		t.Fatalf("stop before resume: %v", err)
+	}
+	if _, err := c.SDK().Start(ctx, sb.ID); err != nil {
+		t.Fatalf("resume from snapshot: %v", err)
+	}
+	waitRunning(t, sb)
 }
 
 // UC-119 — a node that holds no sealed copy must fail LEGIBLY if it somehow

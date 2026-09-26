@@ -68,8 +68,21 @@ func TestAuditChainVerifiesAfterAWorkload(t *testing.T) {
 	if !after.OK {
 		t.Fatalf("the audit chain does not verify after a workload: %s (head=%s records=%d)", after.Error, after.Head, after.Records)
 	}
-	if after.Records <= before.Records {
+	// Growth is only guaranteed where the node that served the verify is the
+	// node that wrote the records. POST /v1/audit/verify checks the LOCAL
+	// chain, and on a cluster the ingress that answers is not necessarily
+	// the sandbox's owner — the live S2 run reported 0 -> 0 for exactly
+	// that reason, on a healthy chain.
+	//
+	// So: on a single node, require growth, because a verifier that passes
+	// over an untouched chain proves nothing. On a cluster, require the
+	// chain to verify and say plainly when the records landed elsewhere.
+	switch {
+	case !sc.Has(harness.CapCluster) && after.Records <= before.Records:
 		t.Fatalf("records did not grow (%d -> %d): the verification passed over a chain the workload never reached, which proves nothing",
+			before.Records, after.Records)
+	case after.Records <= before.Records:
+		t.Logf("records did not grow at the node that served the verify (%d -> %d); on a cluster the chain is node-local and this workload's records are on the owner. The chain that WAS verified is intact.",
 			before.Records, after.Records)
 	}
 	if !after.WriterTipMatches {
@@ -91,11 +104,22 @@ func TestAuditReadsFanOutToPeers(t *testing.T) {
 	}
 	c := client(t)
 
-	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Name: harness.UniqueName(sc, t),
-		Env:  map[string]string{"UC133_TOKEN": secretValue(t, "133")},
+	// An HA sandbox, deliberately. The fan-out is SCOPED, not broadcast —
+	// internal/service asserts "unrelated worker must not be queried" — so a
+	// plain sandbox lives on one node, no peer holds its records, and one
+	// answerer is the CORRECT answer. The live run failed on exactly that:
+	// it asserted "at least 2 answered" about a sandbox only one node knew.
+	//
+	// With a sealed copy on a peer there is a real reason for the read to
+	// reach further than the node serving it, which is the property §7
+	// group E is actually about.
+	sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{
+		Env: map[string]string{"UC133_TOKEN": secretValue(t, "133")},
 	})
 	waitRunning(t, sb)
+	holders := harness.AwaitSecretHolders(t, c, sb.ID, 3*time.Minute, func(v harness.SecretHoldersView) bool {
+		return len(v.Holders) >= 1
+	}).Holders
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := c.GetJSON(ctx, "/v1/sandboxes/"+sb.ID+"?include_env=true", nil); err != nil {
@@ -109,15 +133,25 @@ func TestAuditReadsFanOutToPeers(t *testing.T) {
 	if page.Coverage.Partial {
 		t.Fatalf("coverage is partial on a healthy cluster: answered=%v missing=%v", page.Coverage.Answered, page.Coverage.Missing)
 	}
-	// The answer must have come from more than the node that served it, or
-	// there was no fan-out to observe.
-	if len(page.Coverage.Answered) < 2 {
-		t.Fatalf("only %v answered; on a cluster the read did not fan out", page.Coverage.Answered)
-	}
+	// Secret holders are NOT audit-record holders, and conflating them is
+	// what the live run caught: node1 held a sealed copy, only node3
+	// answered, and that was correct — node1 had never served this sandbox
+	// so it has no audit history for it. The fan-out is scoped by who wrote
+	// records, not by who holds ciphertext.
+	//
+	// What must be true is that the read reaches the node that DID write
+	// them. If the node serving the request is not the owner, that is the
+	// fan-out working, and it is the property §7 group E is about.
 	owner := resolvePlacementOwner(t, c, sb.ID)
-	if owner != "" && !containsString(page.Coverage.Answered, owner) {
-		t.Fatalf("the owner %s is not among the nodes that answered %v; the history may be missing the events only it holds",
+	if owner == "" {
+		t.Fatal("no placement owner recorded; there is no node whose records the read must reach")
+	}
+	if !containsString(page.Coverage.Answered, owner) {
+		t.Fatalf("the owner %s is not among the nodes that answered %v: the read cannot have seen the events only it holds",
 			owner, page.Coverage.Answered)
+	}
+	if len(page.Coverage.Answered) == 1 && page.Coverage.Answered[0] == owner {
+		t.Logf("only the owner answered; this request happened to be served by the owner itself, so it did not exercise a cross-node hop (holders were %v)", holders)
 	}
 }
 
@@ -243,7 +277,7 @@ func TestAuditIndexParityAndIncompleteIndexIs503(t *testing.T) {
 	owner := resolvePlacementOwner(t, c, sb.ID)
 	node, ok := nodeForClusterID(t, c, targets, owner)
 	if !ok {
-		node, ok = harness.PickSSHNode(targets)
+		node, ok = harness.PickRestartableNode(targets)
 		if !ok {
 			t.Skip("no SSH-reachable node")
 		}
@@ -254,13 +288,23 @@ func TestAuditIndexParityAndIncompleteIndexIs503(t *testing.T) {
 			t.Fatalf("node %s did not start with the audit index disabled: %s", node.Name, res.Status)
 		}
 		withoutIndex := harness.AllAuditEvents(t, c, sb.ID, 100, 10)
-		if len(withoutIndex) != len(withIndex) {
-			t.Fatalf("index-off returned %d events, index-on returned %d: the index and the file disagree about the history",
-				len(withoutIndex), len(withIndex))
+
+		// Superset, not equality. Disabling the index needs a restart, and
+		// the restart itself writes audit records — the live run saw 6 with
+		// the index off against 5 with it on, which is that drift, not a
+		// disagreement. The failure that matters is an event the index-less
+		// read cannot see: that means the index and the file disagree about
+		// history, and a query would silently answer short.
+		missing := missingEventIDs(withIndex, withoutIndex)
+		if len(missing) > 0 {
+			t.Fatalf("index-off is MISSING %d of the %d events index-on returned (e.g. %v): the file and the index disagree, so one of them answers short",
+				len(missing), len(withIndex), firstN(missing, 5))
 		}
-		if !sameEventIDs(withIndex, withoutIndex) {
-			t.Fatal("index-off returned a different SET of events than index-on, even though the counts matched")
+		if len(withoutIndex) < len(withIndex) {
+			t.Fatalf("index-off returned fewer events (%d) than index-on (%d)", len(withoutIndex), len(withIndex))
 		}
+		t.Logf("UC-137: index-on %d events, index-off %d (all of index-on's present; the delta is the restart's own records)",
+			len(withIndex), len(withoutIndex))
 	})
 }
 

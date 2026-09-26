@@ -705,6 +705,8 @@ EOF
 # METHOD, so a HEAD against a GET-presigned URL fails with SignatureDoesNotMatch
 # — the plan's §4.4 wording says "HEAD the three presigned URLs", which would
 # reject every healthy build. A ranged GET is the same signed method, costs one
+
+
 # byte, and still proves reachability + signature validity.
 probe_artifact_url() {
   local url="$1" label="$2"
@@ -821,6 +823,13 @@ run_one() {
   if [[ "$caps_domain" == "true" ]]; then
     verify_leased_zone "$leased"
   fi
+
+  # Resolve the SSH identity BEFORE anything is provisioned. wait_for_cloud_init
+  # is an SSH call, and without a key it burns its whole timeout, the harness
+  # never learns that user-data is still running, and the daemon gets only the
+  # health budget to finish booting — which surfaces as "infra not ready" with
+  # an empty diagnostics artifact, because collecting that is SSH too.
+  resolve_ssh_identity "${HERE}/scenarios/${scenario}.tfvars" "$PROD_TFVARS"
 
   # Decide + publish this scenario's artifacts before the asset check, so the
   # check probes the URLs the nodes will really use. Runs after the safety gate
@@ -1127,6 +1136,26 @@ run_one() {
     pflag="-p 1"
   fi
 
+  # AEROL_TEST_RUN narrows the pass to a subset of tests (a Go -run regex).
+  # It exists for iterating against a kept cluster: re-running only the
+  # security cases against an already-provisioned fleet is minutes instead of
+  # a re-provision. The report it writes covers only the tests that ran, so
+  # a narrowed pass must never be published as a full matrix.
+  # An array, not a string: the regex is passed as ONE argv element. An
+  # unquoted string expansion would word-split it (and glob a `*` in it),
+  # while a quoted one would hand `-run <regex>` to go test as a single
+  # argument. Both fail in ways that look like "the filter matched nothing".
+  #
+  # Expanded as ${runflag[@]+"${runflag[@]}"} at the call site: this script is
+  # `set -u` and /bin/bash on macOS is 3.2, where a bare "${arr[@]}" on an
+  # EMPTY array is an unbound-variable error — so the common case (no filter)
+  # would abort the run.
+  local -a runflag=()
+  if [[ -n "${AEROL_TEST_RUN:-}" ]]; then
+    runflag=(-run "${AEROL_TEST_RUN}")
+    echo "test filter: -run ${AEROL_TEST_RUN} (PARTIAL pass; the report covers only these tests)" >&2
+  fi
+
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
@@ -1143,7 +1172,7 @@ run_one() {
     AEROL_OBS_PUSHGATEWAY_URL="${AEROL_OBS_PUSHGATEWAY_URL:-}" \
     AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
     AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-}" \
-    go test -tags=integration -count=1 ${pflag} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
+    go test -tags=integration -count=1 ${pflag} ${runflag[@]+"${runflag[@]}"} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
 

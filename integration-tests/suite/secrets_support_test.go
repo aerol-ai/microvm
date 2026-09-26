@@ -7,7 +7,13 @@ package suite
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -17,6 +23,7 @@ import (
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -77,9 +84,17 @@ func blockInternalListenerEverywhere(t *testing.T, targets *harness.IntegrationT
 		restored = true
 		for _, b := range applied {
 			target, _ := harness.SSHTarget(b.node)
-			out, err := harness.SSHRun(t, target, "sudo iptables -D INPUT -p tcp --dport "+b.port+" -j REJECT 2>/dev/null; sudo iptables -S INPUT | grep -c 'dport "+b.port+".*REJECT' || true")
-			if err != nil {
-				t.Errorf("RESTORE FAILED on %s: the peer listener may still be blocked and the rest of this run is suspect: %v\n%s", b.node.Name, err, out)
+			// Delete, then CONFIRM the rule is gone. `iptables -D` removes one
+			// matching rule and reports success even when the state afterwards
+			// is not what we want; a REJECT left on the peer port breaks every
+			// later cluster case in the run, and the report would blame
+			// whichever one ran next.
+			script := "sudo iptables -D INPUT -p tcp --dport " + b.port + " -j REJECT 2>/dev/null; " +
+				"if sudo iptables -S INPUT | grep -q -- '--dport " + b.port + " -j REJECT'; then echo STILLBLOCKED; else echo CLEARED; fi"
+			out, err := harness.SSHRun(t, target, script)
+			if err != nil || !strings.Contains(out, "CLEARED") {
+				t.Errorf("RESTORE FAILED on %s: the peer listener is still blocked on port %s and the rest of this run is suspect: %v\n%s",
+					b.node.Name, b.port, err, strings.TrimSpace(out))
 			}
 		}
 	}
@@ -706,6 +721,108 @@ func parseKV(out string) map[string]string {
 	return m
 }
 
+// getWithHeaders issues an authenticated GET and returns the body AND the
+// response headers. UC-168's honesty property lives in a header, which
+// Client.GetJSON discards.
+func getWithHeaders(ctx context.Context, c *harness.Client, path string) (string, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL()+path, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+sc.PAT)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return string(b), resp.Header, fmt.Errorf("GET %s: status %d", path, resp.StatusCode)
+	}
+	return string(b), resp.Header, nil
+}
+
+// deleteSandboxRowScript removes a sandbox row from the store, leaving the
+// runtime's in-memory group behind. That is what an orphan IS — a killed
+// process is not an orphan, it is a dead process.
+func deleteSandboxRowScript(sandboxID string) string {
+	return `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; ` +
+		`command -v sqlite3 >/dev/null || exit 3; ` +
+		`n=$(sqlite3 "$db" "SELECT COUNT(*) FROM sandboxes WHERE id='"'"'` + sandboxID + `'"'"';"); ` +
+		`[ "$n" = "1" ] || { echo NOROW; exit 0; }; ` +
+		`sqlite3 "$db" "DELETE FROM sandboxes WHERE id='"'"'` + sandboxID + `'"'"';" && echo DELETED'`
+}
+
+// leakForm is one encoding of the canary and the name to report it under.
+type leakForm struct {
+	name    string
+	encoded string
+}
+
+// leakForms mirrors harness.FindPlaintextLeak's table. It is spelled out here
+// rather than derived because the sweep greps on a REMOTE host: the encodings
+// have to travel into a shell command, not into a Go strings.Contains.
+func leakForms(secret string) []leakForm {
+	return []leakForm{
+		{"raw", secret},
+		{"base64-std", base64.StdEncoding.EncodeToString([]byte(secret))},
+		{"base64-raw", base64.RawStdEncoding.EncodeToString([]byte(secret))},
+		{"hex", hex.EncodeToString([]byte(secret))},
+		{"url-query", url.QueryEscape(secret)},
+	}
+}
+
+// leakGrepScript searches everywhere a secret could come to rest: the
+// daemon's data dir (store, audit JSONL, Raft log), the system logs, and the
+// journal.
+//
+// The needle arrives on STDIN, never in argv. sudo logs the full command
+// line to /var/log/auth.log and the journal, so passing the canary as a grep
+// argument writes it into the exact files the sweep then searches — the live
+// run reported the canary "on disk" in all five encodings, and every hit was
+// /var/log/auth.log, put there by the sweep itself.
+//
+// The pattern file lives under /tmp, which is outside the searched paths, and
+// is removed on exit.
+//
+// The journal arm reports only WHETHER it matched, never the matching lines:
+// those lines contain the secret, and printing them as "locations" would put
+// it in a CI log — the thing this case exists to prevent.
+const leakGrepScript = `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; dir=$(dirname "$db"); ` +
+	`IFS= read -r needle; ` +
+	`tmp=$(mktemp /tmp/aerol-sweep.XXXXXX); trap "rm -f \"$tmp\"" EXIT; ` +
+	`printf "%s\n" "$needle" > "$tmp"; ` +
+	`grep -rlaF -f "$tmp" "$dir" /var/log 2>/dev/null | sed -e "/^$/d" -e "s/^/HIT:/" | head -20; ` +
+	`if journalctl -u sandboxd --no-pager 2>/dev/null | grep -qaF -f "$tmp"; then echo "HIT:journalctl -u sandboxd"; fi; ` +
+	`echo SWEEPDONE'`
+
+// shellSingleQuoteForSuite wraps s for a single-quoted word nested inside the
+// outer `sudo bash -c '...'`.
+func shellSingleQuoteForSuite(s string) string {
+	return `'"'"'` + strings.ReplaceAll(s, "'", `'"'"'`) + `'"'"'`
+}
+
+// createSecretSandbox creates a sandbox carrying sealed env, using the HA
+// path only where HA is possible.
+//
+// CreateHASandbox waits for failover_ready, which a single-node deployment
+// can never report — the server omits the field entirely (policy=recreate
+// needs a peer to be ready ON). A CapSecrets-only use case that reached for
+// the HA helper would therefore burn its whole timeout and fail on S1 for a
+// reason unrelated to what it tests. UC-169's leak sweep is exactly that
+// shape: it wants a sandbox with sealed material, and it is just as valid on
+// one node as on three.
+func createSecretSandbox(t *testing.T, c *harness.Client, env map[string]string) *microvm.Sandbox {
+	t.Helper()
+	if sc.Has(harness.CapCluster) {
+		return harness.CreateHASandbox(t, c, harness.HASandboxSpec{Env: env})
+	}
+	return c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name: harness.UniqueName(sc, t),
+		Env:  env,
+	})
+}
+
 // isTransientGatewayErr reports whether an API error is the edge failing to
 // reach the daemon rather than the daemon answering. A 502/503/504 is
 // neither a pass nor the failure a case is asserting, so cases retry past it
@@ -721,4 +838,82 @@ func isTransientGatewayErr(err error) bool {
 		}
 	}
 	return false
+}
+
+// countGapMarkers counts overflow gap markers in a history.
+//
+// They carry no sandbox_id, so a marker any other case created on the same
+// node appears here too. Cases that care about gaps must baseline and
+// compare rather than assert on presence.
+func countGapMarkers(events []auditlog.Event) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Kind == "gap" || ev.Result == "gap" {
+			n++
+		}
+	}
+	return n
+}
+
+// waitNodeRejoined blocks until a restarted node is usable again.
+//
+// Two conditions, and the second is the one that matters. The API answering
+// only proves SOME node is serving; on a cluster the restarted node must
+// also be back in the member list, because until it has re-advertised its
+// InternalURL placement can select it and every create fails "cluster: peer
+// InternalURL required (mTLS fail-closed)".
+//
+// That is not hypothetical: on the live S2 run UC-137/148/149 restarted a
+// node, TestClusterForms then saw 2 of 3 members, and 79 cases failed —
+// nearly every sandbox create in the suite, most of them nothing to do with
+// secrets.
+func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
+	t.Helper()
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		return nil // local/unprovisioned: nothing to rejoin
+	}
+	c := harness.NewClient(t, sc)
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var last string
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := c.GetJSON(ctx, "/v1/sandboxes?limit=1", nil)
+		cancel()
+		if err != nil {
+			last = "api not serving: " + err.Error()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if !sc.Has(harness.CapCluster) {
+			return nil
+		}
+		nodeID := heteroNodeID(t, c, targets, node.Name)
+		if containsString(clusterNodeIDs(t, c), nodeID) {
+			// In the member list. Give gossip a beat to propagate the
+			// InternalURL before placement can pick it.
+			time.Sleep(5 * time.Second)
+			return nil
+		}
+		last = "not in the member list yet (" + nodeID + ")"
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("node %s did not rejoin within 4m: %s", node.Name, last)
+}
+
+// nodeSelfIDScript prints the node's own configured SB_NODE_ID — the
+// identity the CSR rendezvous bound its certificate to.
+const nodeSelfIDScript = `sudo bash -c '` + sqliteSourceEnv + `printf "%s\n" "${SB_NODE_ID:-}"'`
+
+// lastNonEmptyLineSuite mirrors the harness helper: SSHRun merges stderr, so
+// no remote value is trusted as the whole capture.
+func lastNonEmptyLineSuite(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if v := strings.TrimSpace(lines[i]); v != "" {
+			return v
+		}
+	}
+	return ""
 }

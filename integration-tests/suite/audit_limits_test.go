@@ -80,7 +80,7 @@ func TestAuditNodeCeilingIsSeparateFromTheOperatorLimit(t *testing.T) {
 	})
 	waitRunning(t, sb)
 
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -118,7 +118,7 @@ func TestOverflowGapMarkerRecordsWhatWasDropped(t *testing.T) {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
 	c := client(t)
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
@@ -171,13 +171,24 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
 	c := client(t)
-	node, ok := harness.PickSSHNode(targets)
+	node, ok := harness.PickRestartableNode(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node")
 	}
 
+	// NOT queue_max=1. secret_audit.go sizes the spill channel to the SAME
+	// buffer as the main queue (`spillCh: make(chan SecretAuditEvent, buffer)`),
+	// so at depth 1 spill has a one-deep handoff and physically cannot absorb
+	// a burst — Emit then does exactly what it documents, "if spillCh is also
+	// full, record a gap". The first live run failed here with 10 markers,
+	// and that was the test's premise being outside the policy's envelope,
+	// not the policy losing records.
+	//
+	// 64 gives spill a real buffer to drain from while still being far
+	// smaller than the 100-way flood below, so the main queue genuinely
+	// overflows and the spill path is genuinely exercised.
 	harness.WithNodeEnv(t, node, map[string]string{
-		"SB_AUDIT_QUEUE_MAX":       "1",
+		"SB_AUDIT_QUEUE_MAX":       "64",
 		"SB_AUDIT_OVERFLOW_POLICY": "spill",
 	}, func(res harness.NodeBootResult) {
 		if !res.Started {
@@ -188,14 +199,29 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 			Env:  map[string]string{"UC149_TOKEN": secretValue(t, "149")},
 		})
 		waitRunning(t, sb)
+
+		// Gap markers carry NO sandbox_id (secret_audit.go builds them
+		// without one), so every marker on the node — including the one
+		// UC-148 deliberately created moments ago — surfaces in this
+		// sandbox's history. Baseline first and attribute only what THIS
+		// burst adds; the live run failed on UC-148's marker.
+		gapsBefore := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, 200, 6))
+
 		const reads = 100
 		floodAuditReads(t, c, sb.ID, reads)
 
 		// The spill drains asynchronously; wait for the count to settle.
-		deadline := time.Now().Add(4 * time.Minute)
+		//
+		// A modest page budget on purpose. 500x40 is 40 requests per poll,
+		// and with the edge flaky from the restart above each one can carry
+		// retries — one poll then outlasts the whole deadline and the case
+		// hangs rather than failing. The settle check needs a stable count,
+		// not an exhaustive history.
+		const pageSize, maxPages = 200, 6
+		deadline := time.Now().Add(3 * time.Minute)
 		var events int
 		for time.Now().Before(deadline) {
-			n := len(harness.AllAuditEvents(t, c, sb.ID, 500, 40))
+			n := len(harness.AllAuditEvents(t, c, sb.ID, pageSize, maxPages))
 			if n == events && n > 0 {
 				break
 			}
@@ -203,10 +229,9 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 			time.Sleep(15 * time.Second)
 		}
 
-		for _, ev := range harness.AllAuditEvents(t, c, sb.ID, 500, 40) {
-			if ev.Kind == "gap" || ev.Result == "gap" {
-				t.Fatalf("the spill policy left a gap marker (dropped=%d): spill exists precisely so the burst does NOT lose records", ev.Dropped)
-			}
+		if gapsAfter := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, pageSize, maxPages)); gapsAfter > gapsBefore {
+			t.Fatalf("the spill policy added %d gap marker(s) during the burst (%d -> %d): spill exists precisely so the burst does NOT lose records",
+				gapsAfter-gapsBefore, gapsBefore, gapsAfter)
 		}
 		if report := verifyAuditChain(t, c); !report.OK {
 			t.Fatalf("the chain does not verify after the spill drained: %s", report.Error)

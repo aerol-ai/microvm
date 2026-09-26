@@ -30,8 +30,6 @@ func TestEveryNodeHasAScopedCertAndOnlyTheSeedHasTheCAKey(t *testing.T) {
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
-	c := client(t)
-
 	checked := 0
 	for _, node := range targets.Nodes {
 		target, ok := harness.SSHTarget(node)
@@ -39,13 +37,29 @@ func TestEveryNodeHasAScopedCertAndOnlyTheSeedHasTheCAKey(t *testing.T) {
 			continue
 		}
 		checked++
-		nodeID := heteroNodeID(t, c, targets, node.Name)
 
 		sans, err := harness.SSHRun(t, target, nodeCertSANsScript)
 		if err != nil {
 			t.Fatalf("read the node certificate on %s: %v\n%s", node.Name, err, sans)
 		}
-		want := "DNS:node:" + nodeID
+		// The SAN carries the TERRAFORM-assigned node name, not the gossip
+		// node id. T5's CSR rendezvous resolves it from nodes/<IAM caller
+		// identity>, which is exactly why it is unforgeable — the node does
+		// not get to pick it. The live run compared against the gossip id
+		// (ip-10-42-1-77) and failed on a certificate that was correct:
+		//   DNS:aerolvm-cluster-node, DNS:node:aerolvm-itest-...-node1
+		//
+		// Read the node's OWN configured id rather than mapping names here,
+		// so this cannot drift from whatever the rendezvous actually signed.
+		selfID, err := harness.SSHRun(t, target, nodeSelfIDScript)
+		if err != nil {
+			t.Fatalf("read SB_NODE_ID on %s: %v", node.Name, err)
+		}
+		selfID = lastNonEmptyLineSuite(selfID)
+		if selfID == "" {
+			t.Fatalf("%s has no SB_NODE_ID configured; there is nothing the certificate could be bound to", node.Name)
+		}
+		want := "DNS:node:" + selfID
 		if !strings.Contains(sans, want) {
 			t.Fatalf("%s presents a certificate whose SANs do not include %q (got %q): the peer dialer cannot bind this connection to a node id",
 				node.Name, want, strings.TrimSpace(sans))
