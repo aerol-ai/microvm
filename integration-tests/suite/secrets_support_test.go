@@ -7,7 +7,13 @@ package suite
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -704,4 +710,74 @@ func parseKV(out string) map[string]string {
 		m[strings.TrimSpace(k)] = strings.TrimSpace(v)
 	}
 	return m
+}
+
+// getWithHeaders issues an authenticated GET and returns the body AND the
+// response headers. UC-168's honesty property lives in a header, which
+// Client.GetJSON discards.
+func getWithHeaders(ctx context.Context, c *harness.Client, path string) (string, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL()+path, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+sc.PAT)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return string(b), resp.Header, fmt.Errorf("GET %s: status %d", path, resp.StatusCode)
+	}
+	return string(b), resp.Header, nil
+}
+
+// deleteSandboxRowScript removes a sandbox row from the store, leaving the
+// runtime's in-memory group behind. That is what an orphan IS — a killed
+// process is not an orphan, it is a dead process.
+func deleteSandboxRowScript(sandboxID string) string {
+	return `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; ` +
+		`command -v sqlite3 >/dev/null || exit 3; ` +
+		`n=$(sqlite3 "$db" "SELECT COUNT(*) FROM sandboxes WHERE id='"'"'` + sandboxID + `'"'"';"); ` +
+		`[ "$n" = "1" ] || { echo NOROW; exit 0; }; ` +
+		`sqlite3 "$db" "DELETE FROM sandboxes WHERE id='"'"'` + sandboxID + `'"'"';" && echo DELETED'`
+}
+
+// leakForm is one encoding of the canary and the name to report it under.
+type leakForm struct {
+	name    string
+	encoded string
+}
+
+// leakForms mirrors harness.FindPlaintextLeak's table. It is spelled out here
+// rather than derived because the sweep greps on a REMOTE host: the encodings
+// have to travel into a shell command, not into a Go strings.Contains.
+func leakForms(secret string) []leakForm {
+	return []leakForm{
+		{"raw", secret},
+		{"base64-std", base64.StdEncoding.EncodeToString([]byte(secret))},
+		{"base64-raw", base64.RawStdEncoding.EncodeToString([]byte(secret))},
+		{"hex", hex.EncodeToString([]byte(secret))},
+		{"url-query", url.QueryEscape(secret)},
+	}
+}
+
+// leakGrepScript looks for one encoded form everywhere a secret could come to
+// rest: the daemon's data dir (store, audit JSONL, Raft log), the system
+// logs, and the journal.
+//
+// It prints NOHITS when clean, so an empty result cannot be confused with a
+// grep that failed to run.
+func leakGrepScript(needle string) string {
+	return `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; dir=$(dirname "$db"); ` +
+		`{ grep -rlaF ` + shellSingleQuoteForSuite(needle) + ` "$dir" /var/log 2>/dev/null; ` +
+		`journalctl -u sandboxd --no-pager 2>/dev/null | grep -aF ` + shellSingleQuoteForSuite(needle) + ` | head -3; ` +
+		`} | head -20 | { read -r first || { echo NOHITS; exit 0; }; echo "$first"; cat; }'`
+}
+
+// shellSingleQuoteForSuite wraps s for a single-quoted word nested inside the
+// outer `sudo bash -c '...'`.
+func shellSingleQuoteForSuite(s string) string {
+	return `'"'"'` + strings.ReplaceAll(s, "'", `'"'"'`) + `'"'"'`
 }

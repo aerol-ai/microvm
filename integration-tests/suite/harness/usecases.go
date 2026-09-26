@@ -545,6 +545,15 @@ var Registry = []UseCase{
 	// K. Isolate jail under enterprise (F16, F17).
 	{ID: "UC-163", Title: "Enterprise + isolate: workerd is jailed (non-root, chroot, seccomp, pid cap) while serving", Requires: []Capability{CapEnterprise, CapIsolate, CapIsolateJail}, Implemented: true},
 	{ID: "UC-164", Title: "Per-sandbox egress attribution holds under the jail, and the audit names the right sandbox", Requires: []Capability{CapEnterprise, CapIsolate, CapIsolateJail}, Implemented: true},
+
+	// L. Non-regression on the boot path.
+	{ID: "UC-165", Title: "Default create latency unmoved: main-built vs branch-built, p50 +10% / p99 +20%", Requires: []Capability{CapSecrets, CapBenchmark}, Implemented: true},
+	{ID: "UC-166", Title: "HA create latency reported separately, first call visible, with a KMS row", Requires: []Capability{CapSecrets, CapCluster, CapBenchmark}, Implemented: true},
+
+	// M. Surfaces the first F-table missed (eng review 2026-09-19).
+	{ID: "UC-167", Title: "Reconcile reclaims a leaked workerd group (same daemon lifetime)", Requires: []Capability{CapIsolate}, Implemented: true},
+	{ID: "UC-168", Title: "js-bundle list aggregates across nodes and declares an unreachable peer", Requires: []Capability{CapIsolate, CapCluster}, Implemented: true},
+	{ID: "UC-169", Title: "Plaintext leak sweep: the canary appears nowhere on any node, in any encoding", Requires: []Capability{CapSecrets}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
