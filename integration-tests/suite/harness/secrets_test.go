@@ -984,3 +984,82 @@ func TestSSHBaseArgsSuppressTheKnownHostsWarning(t *testing.T) {
 		t.Fatalf("sshBaseArgs does not suppress ssh's stderr banner: %q. With UserKnownHostsFile=/dev/null every connection warns, SSHRun merges stderr, and a caller checking 'is the output empty?' reads the warning as a result.", args)
 	}
 }
+
+// A 502/503/504 is Caddy failing to reach sandboxd, not sandboxd answering.
+// Several security cases restart the daemon deliberately, so that window is
+// routine — the live gate lost UC-136 to it twice. It must be retried, not
+// recorded as a use case's verdict.
+func TestGetJSONRetriesTransientGatewayStatuses(t *testing.T) {
+	prevDelay := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(prevDelay)
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls <= 2 {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{sc: &Scenario{Name: "unit", BaseURL: srv.URL, PAT: "p"}}
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.GetJSON(t.Context(), "/v1/thing", &got); err != nil {
+		t.Fatalf("GetJSON did not ride out two 502s: %v", err)
+	}
+	if !got.OK || calls != 3 {
+		t.Fatalf("ok=%v after %d calls, want true after 3", got.OK, calls)
+	}
+}
+
+// But an answer the DAEMON gave must come straight back. Retrying a 404 or a
+// 500 would turn a real verdict into a timeout and hide what the server said.
+func TestGetJSONDoesNotRetryDaemonAnswers(t *testing.T) {
+	prevDelay := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(prevDelay)
+
+	for _, code := range []int{400, 403, 404, 500} {
+		var calls int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			http.Error(w, "answer", code)
+		}))
+		err := c400(srv).GetJSON(t.Context(), "/v1/thing", nil)
+		srv.Close()
+		if err == nil {
+			t.Fatalf("status %d decoded as success", code)
+		}
+		if calls != 1 {
+			t.Fatalf("status %d was retried %d times; it is an answer, not a gateway hiccup", code, calls)
+		}
+	}
+}
+
+// A gateway that never recovers must still fail, and promptly.
+func TestGetJSONGivesUpOnAPersistentGatewayFailure(t *testing.T) {
+	prevDelay := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(prevDelay)
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	err := c400(srv).GetJSON(t.Context(), "/v1/thing", nil)
+	if err == nil {
+		t.Fatal("a permanently failing gateway reported success")
+	}
+	if calls != gatewayRetries+1 {
+		t.Fatalf("made %d attempts, want %d (the bound must hold so a dead daemon fails promptly)", calls, gatewayRetries+1)
+	}
+}
+
+func c400(srv *httptest.Server) *Client {
+	return &Client{sc: &Scenario{Name: "unit", BaseURL: srv.URL, PAT: "p"}}
+}

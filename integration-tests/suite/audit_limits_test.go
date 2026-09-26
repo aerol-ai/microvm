@@ -188,6 +188,14 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 			Env:  map[string]string{"UC149_TOKEN": secretValue(t, "149")},
 		})
 		waitRunning(t, sb)
+
+		// Gap markers carry NO sandbox_id (secret_audit.go builds them
+		// without one), so every marker on the node — including the one
+		// UC-148 deliberately created moments ago — surfaces in this
+		// sandbox's history. Baseline first and attribute only what THIS
+		// burst adds; the live run failed on UC-148's marker.
+		gapsBefore := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, 500, 40))
+
 		const reads = 100
 		floodAuditReads(t, c, sb.ID, reads)
 
@@ -203,10 +211,9 @@ func TestOverflowSpillDrainsAndLeavesNoHole(t *testing.T) {
 			time.Sleep(15 * time.Second)
 		}
 
-		for _, ev := range harness.AllAuditEvents(t, c, sb.ID, 500, 40) {
-			if ev.Kind == "gap" || ev.Result == "gap" {
-				t.Fatalf("the spill policy left a gap marker (dropped=%d): spill exists precisely so the burst does NOT lose records", ev.Dropped)
-			}
+		if gapsAfter := countGapMarkers(harness.AllAuditEvents(t, c, sb.ID, 500, 40)); gapsAfter > gapsBefore {
+			t.Fatalf("the spill policy added %d gap marker(s) during the burst (%d -> %d): spill exists precisely so the burst does NOT lose records",
+				gapsAfter-gapsBefore, gapsBefore, gapsAfter)
 		}
 		if report := verifyAuditChain(t, c); !report.OK {
 			t.Fatalf("the chain does not verify after the spill drained: %s", report.Error)

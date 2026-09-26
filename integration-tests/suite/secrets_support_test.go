@@ -772,17 +772,22 @@ func leakForms(secret string) []leakForm {
 	}
 }
 
-// leakGrepScript looks for one encoded form everywhere a secret could come to
-// rest: the daemon's data dir (store, audit JSONL, Raft log), the system
+// leakGrepScript looks for one encoded form everywhere a secret could come
+// to rest: the daemon's data dir (store, audit JSONL, Raft log), the system
 // logs, and the journal.
 //
-// It prints NOHITS when clean, so an empty result cannot be confused with a
-// grep that failed to run.
+// Every hit is prefixed with a literal HIT: marker and the Go side counts
+// ONLY those. Anything else the pipeline emits — ssh banners, a grep
+// diagnostic about an unreadable path, sudo chatter — is then structurally
+// incapable of being read as a leaked secret. The first two live runs both
+// reported the canary as found in all five encodings with an empty location
+// list, which is what "the output was non-empty" gets you.
 func leakGrepScript(needle string) string {
+	q := shellSingleQuoteForSuite(needle)
 	return `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; dir=$(dirname "$db"); ` +
-		`{ grep -rlaF ` + shellSingleQuoteForSuite(needle) + ` "$dir" /var/log 2>/dev/null; ` +
-		`journalctl -u sandboxd --no-pager 2>/dev/null | grep -aF ` + shellSingleQuoteForSuite(needle) + ` | head -3; ` +
-		`} | head -20 | { read -r first || { echo NOHITS; exit 0; }; echo "$first"; cat; }'`
+		`{ grep -rlaF ` + q + ` "$dir" /var/log 2>/dev/null; ` +
+		`journalctl -u sandboxd --no-pager 2>/dev/null | grep -aF ` + q + ` | head -3; ` +
+		`} | sed -e "/^$/d" -e "s/^/HIT:/" | head -20; echo SWEEPDONE'`
 }
 
 // shellSingleQuoteForSuite wraps s for a single-quoted word nested inside the
@@ -827,4 +832,19 @@ func isTransientGatewayErr(err error) bool {
 		}
 	}
 	return false
+}
+
+// countGapMarkers counts overflow gap markers in a history.
+//
+// They carry no sandbox_id, so a marker any other case created on the same
+// node appears here too. Cases that care about gaps must baseline and
+// compare rather than assert on presence.
+func countGapMarkers(events []auditlog.Event) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Kind == "gap" || ev.Result == "gap" {
+			n++
+		}
+	}
+	return n
 }

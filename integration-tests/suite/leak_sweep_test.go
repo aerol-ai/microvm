@@ -68,7 +68,12 @@ func TestPlaintextLeakSweep(t *testing.T) {
 			// encodings. A false-positive secret leak is the worst thing a
 			// security suite can say, so the parse itself is now unable to
 			// repeat it even if some new banner appears.
-			if hits := leakHitLines(out); len(hits) > 0 {
+			hits, complete := leakHitLines(out)
+			if !complete {
+				t.Fatalf("the sweep did not run to completion on %s (%s form); a truncated sweep must not be read as clean.\nraw output:\n%s",
+					node.Name, form.name, tailLines(out, 10))
+			}
+			if len(hits) > 0 {
 				// Never print the canary; print WHERE it was found.
 				t.Errorf("the canary is on disk on %s in %s form. Locations:\n%s",
 					node.Name, form.name, strings.Join(hits, "\n"))
@@ -83,23 +88,26 @@ func TestPlaintextLeakSweep(t *testing.T) {
 
 // leakHitLines extracts the real grep hits from an SSH capture.
 //
-// Three things are not hits, and each one either produced a false positive
-// or would have: the explicit NOHITS sentinel, ssh/sshd chatter that SSHRun
-// merges in from stderr, and blank lines. Anything left is a path or a
-// journal line, which is what a genuine hit looks like.
-func leakHitLines(out string) []string {
-	var hits []string
+// A hit is a line the remote script explicitly marked HIT:. Nothing else
+// counts — not ssh banners, not grep diagnostics, not sudo chatter — because
+// the two live runs that reported a false-positive leak both did so by
+// treating "the capture was non-empty" as evidence.
+//
+// ok is false when the script's SWEEPDONE sentinel is missing, which means
+// it did not run to completion. A truncated sweep must not read as "clean":
+// that is the silent direction of the same bug.
+func leakHitLines(out string) (hits []string, ok bool) {
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		switch {
-		case line == "", line == "NOHITS":
-			continue
-		case strings.HasPrefix(line, "Warning:"),
-			strings.HasPrefix(line, "Pseudo-terminal"),
-			strings.HasPrefix(line, "Connection to "):
+		if line == "SWEEPDONE" {
+			ok = true
 			continue
 		}
-		hits = append(hits, line)
+		if after, found := strings.CutPrefix(line, "HIT:"); found {
+			if after = strings.TrimSpace(after); after != "" {
+				hits = append(hits, after)
+			}
+		}
 	}
-	return hits
+	return hits, ok
 }

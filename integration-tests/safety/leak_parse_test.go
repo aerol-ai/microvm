@@ -36,9 +36,14 @@ func TestLeakSweepParsesHitsRatherThanNonEmptiness(t *testing.T) {
 	if bad.Match(b) {
 		t.Fatal(`leak_sweep_test.go is back to treating "non-empty and not NOHITS" as a hit. ssh's stderr banner satisfies that and the sweep reports a secret leak that did not happen.`)
 	}
-	for _, ignored := range []string{`"Warning:"`, `"NOHITS"`} {
-		if !strings.Contains(src, ignored) {
-			t.Fatalf("leakHitLines no longer filters %s out of the grep output", ignored)
-		}
+	// A hit must come from an explicit marker the remote script emits, so
+	// that anything else on the wire — banners, grep diagnostics, sudo
+	// chatter — cannot be reported as leaked secret material.
+	if !strings.Contains(src, `"HIT:"`) {
+		t.Fatal("leakHitLines no longer keys off the HIT: marker; without it, any unexpected output is a reported leak")
+	}
+	// And an incomplete sweep must fail rather than read as clean.
+	if !strings.Contains(src, "SWEEPDONE") {
+		t.Fatal("the sweep no longer checks its completion sentinel; a truncated sweep would report zero hits, which is the silent direction of the same bug")
 	}
 }
