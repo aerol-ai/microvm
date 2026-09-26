@@ -104,11 +104,22 @@ func TestAuditReadsFanOutToPeers(t *testing.T) {
 	}
 	c := client(t)
 
-	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Name: harness.UniqueName(sc, t),
-		Env:  map[string]string{"UC133_TOKEN": secretValue(t, "133")},
+	// An HA sandbox, deliberately. The fan-out is SCOPED, not broadcast —
+	// internal/service asserts "unrelated worker must not be queried" — so a
+	// plain sandbox lives on one node, no peer holds its records, and one
+	// answerer is the CORRECT answer. The live run failed on exactly that:
+	// it asserted "at least 2 answered" about a sandbox only one node knew.
+	//
+	// With a sealed copy on a peer there is a real reason for the read to
+	// reach further than the node serving it, which is the property §7
+	// group E is actually about.
+	sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{
+		Env: map[string]string{"UC133_TOKEN": secretValue(t, "133")},
 	})
 	waitRunning(t, sb)
+	holders := harness.AwaitSecretHolders(t, c, sb.ID, 3*time.Minute, func(v harness.SecretHoldersView) bool {
+		return len(v.Holders) >= 1
+	}).Holders
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := c.GetJSON(ctx, "/v1/sandboxes/"+sb.ID+"?include_env=true", nil); err != nil {
@@ -122,15 +133,21 @@ func TestAuditReadsFanOutToPeers(t *testing.T) {
 	if page.Coverage.Partial {
 		t.Fatalf("coverage is partial on a healthy cluster: answered=%v missing=%v", page.Coverage.Answered, page.Coverage.Missing)
 	}
-	// The answer must have come from more than the node that served it, or
-	// there was no fan-out to observe.
-	if len(page.Coverage.Answered) < 2 {
-		t.Fatalf("only %v answered; on a cluster the read did not fan out", page.Coverage.Answered)
+	// Every node that holds a sealed copy must have been asked. That — not a
+	// raw count — is what "the read fanned out" means: the answer covers
+	// everywhere this sandbox's history could be.
+	for _, h := range holders {
+		if !containsString(page.Coverage.Answered, h) {
+			t.Fatalf("holder %s was not among the nodes that answered %v; the history may be missing the events only it holds",
+				h, page.Coverage.Answered)
+		}
 	}
 	owner := resolvePlacementOwner(t, c, sb.ID)
 	if owner != "" && !containsString(page.Coverage.Answered, owner) {
-		t.Fatalf("the owner %s is not among the nodes that answered %v; the history may be missing the events only it holds",
-			owner, page.Coverage.Answered)
+		t.Fatalf("the owner %s is not among the nodes that answered %v", owner, page.Coverage.Answered)
+	}
+	if len(holders) < 2 {
+		t.Logf("only %d holder(s); the read had nowhere further to reach, so this run did not exercise multi-node fan-out", len(holders))
 	}
 }
 

@@ -260,13 +260,26 @@ func heteroNodeID(t *testing.T, c *harness.Client, targets *harness.IntegrationT
 	t.Helper()
 	members := fetchMembers(t, c)
 	for _, m := range members.Members {
-		if m.NodeID == name || strings.HasSuffix(m.NodeName, "-"+name) || m.NodeName == name {
+		// NodeID carries the Terraform-assigned name on these deployments
+		// (aerolvm-itest-<scenario>-node1), so the short name given here is a
+		// SUFFIX of it. That match was missing, and without it every lookup
+		// for "node1" fell through to the private-IP fallback below and
+		// returned ip-10-42-1-46 — an id no member has. The live S2 run then
+		// spent 4 minutes per WithNodeEnv call waiting for a node to "rejoin"
+		// under an identity that never existed, and reported a false
+		// "RESTORE FAILED ... every later case is suspect" each time.
+		if m.NodeID == name || strings.HasSuffix(m.NodeID, "-"+name) ||
+			m.NodeName == name || strings.HasSuffix(m.NodeName, "-"+name) {
 			return m.NodeID
 		}
 	}
+	// Fallback only: derive an id from the private IP. It is a GUESS about
+	// the daemon's naming and is wrong wherever SB_NODE_ID is set explicitly,
+	// so a caller comparing it against the member list will never match.
 	if target, ok := harness.LookupIntegrationNode(targets, name); ok {
 		nodeID := nodeIDFromPrivateIP(target.PrivateIP)
 		if nodeID != "" {
+			t.Logf("heteroNodeID(%q): not in /v1/cluster/members; falling back to the private-IP form %q, which may not be this node's real id", name, nodeID)
 			return nodeID
 		}
 	}
