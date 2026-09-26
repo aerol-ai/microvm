@@ -673,3 +673,20 @@ func assertNodeBackInService(t *testing.T, c *harness.Client, targets *harness.I
 	}
 	t.Fatalf("node %s (%s) is running but has not rejoined the cluster; the fleet is split and every later case is suspect", node.Name, nodeID)
 }
+
+// isTransientGatewayErr reports whether an API error is the edge failing to
+// reach the daemon rather than the daemon answering. A 502/503/504 is
+// neither a pass nor the failure a case is asserting, so cases retry past it
+// instead of recording a verdict the daemon never gave.
+func isTransientGatewayErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, code := range []string{"status 502", "status 503", "status 504"} {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
+}
