@@ -245,11 +245,26 @@ func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 
 	// Fresh records, so the head the witness records is one produced during
 	// this run rather than a stale value from provisioning.
-	generateAuditRecords(t, c, "143", 3)
+	sandboxID, _ := generateAuditRecords(t, c, "143", 3)
 
-	node, ok := harness.PickRestartableNode(targets)
+	// Ask about the node that WROTE those records: the sandbox's owner. An
+	// arbitrary node is not a valid subject — on the hetero topology the first
+	// non-seed node is the ingress, which never owns a sandbox, so its secret
+	// audit chain is empty and there is no head to witness. T18 failed UC-143
+	// on exactly that (ingress-1's secrets.jsonl was 0 bytes); the all-mixed
+	// 3-node scenarios only passed because every node there owns sandboxes.
+	var node harness.IntegrationNode
+	ok = false
+	if sc.Has(harness.CapCluster) {
+		if owner := resolvePlacementOwner(t, c, sandboxID); owner != "" {
+			node, ok = nodeForClusterID(t, c, targets, owner)
+		}
+	}
 	if !ok {
-		t.Skip("no SSH-reachable node")
+		node, ok = harness.PickRestartableNode(targets)
+		if !ok {
+			t.Skip("no SSH-reachable node")
+		}
 	}
 	nodeID := heteroNodeID(t, c, targets, node.Name)
 
