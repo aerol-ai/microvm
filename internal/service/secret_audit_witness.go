@@ -160,6 +160,16 @@ func (s *Service) shipSecretAuditHead(ctx context.Context) error {
 	if s.witnessBootPending.Load() {
 		return errSecretAuditWitnessBootPending
 	}
+	return s.shipSecretAuditHeadNow(ctx)
+}
+
+// shipSecretAuditHeadNow ships without consulting the boot gate. Only
+// shipSecretAuditHead and the empty-witness bootstrap in
+// ValidateSecretAuditWitness may call it.
+func (s *Service) shipSecretAuditHeadNow(ctx context.Context) error {
+	if s == nil || s.secretAuditFile == nil {
+		return nil
+	}
 	s.auditWitnessShipMu.Lock()
 	defer s.auditWitnessShipMu.Unlock()
 	w := s.witness()
@@ -575,6 +585,29 @@ func (s *Service) ValidateSecretAuditWitness() error {
 	}
 	if s.secretAuditFile == nil {
 		s.ensureSecretAuditSink()
+	}
+	// Empty-witness bootstrap. A witness holding NOTHING for this node
+	// contradicts nothing, so ship the current head and then validate.
+	// Without this the boot gate deadlocked: a node restarted before its
+	// first head ever shipped (fresh node, first audit records inside one
+	// ship interval) was refused for having an unwitnessed chain, and could
+	// never ship because nothing ships until validation passes — T18's KMS
+	// scenario left worker-y down permanently. This is NOT the overwrite the
+	// gate exists to stop: that needed a DISAGREEING head, and a present head
+	// takes no part in this branch.
+	//
+	// Only for a node that has NEVER shipped (no local receipt). A node that
+	// did ship and now finds the witness empty is looking at lost evidence,
+	// and that still fails closed below.
+	if localReceipt, rerr := s.localWitnessReceiptHead(); rerr == nil && localReceipt == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), secretAuditWitnessShipTimeout)
+		remote, present, rerr := s.lastWitnessedHeadAny(ctx, w)
+		cancel()
+		if rerr == nil && (!present || strings.TrimSpace(remote) == "") {
+			if serr := s.shipSecretAuditHeadNow(context.Background()); serr != nil {
+				return fmt.Errorf("verify secret audit witness: bootstrap an empty witness: %w", serr)
+			}
+		}
 	}
 	var (
 		ok               bool

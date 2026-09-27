@@ -85,3 +85,32 @@ func TestWitnessBootValidationGatesEveryShip(t *testing.T) {
 		t.Fatalf("ship after a refused boot = %v, want the boot-pending refusal", err)
 	}
 }
+
+// The gate must not deadlock a node that never shipped. T18's KMS scenario:
+// worker-y's first audit records landed inside one ship interval, the node
+// was restarted, boot validation refused an unwitnessed chain, and the gate
+// kept it from ever shipping — refused on every restart, for good. An EMPTY
+// witness contradicts nothing, so boot ships the head and then validates.
+func TestWitnessBootGateDoesNotDeadlockANeverShippedNode(t *testing.T) {
+	cfg := config.Config{DBPath: filepath.Join(t.TempDir(), "state.db"), EnterpriseMode: true, SecretAuditWitnessInterval: time.Hour}
+	svc := &Service{cfg: cfg}
+	svc.ensureSecretAuditSink()
+	svc.secretAudit.Emit(SecretAuditEvent{Time: time.Now().UTC(), SandboxID: "sb-1", Result: secretAuditResultSuccess, Reason: secretAuditReasonOK})
+	if err := svc.secretAuditFile.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	witness := &lockedWitness{w: &stubWitness{}}
+	svc.SetWitness(witness)
+	defer svc.CloseSecretAuditSink()
+
+	if err := svc.ValidateSecretAuditWitness(); err != nil {
+		t.Fatalf("a never-shipped node was refused against an EMPTY witness (the deadlock): %v", err)
+	}
+	head, _ := svc.secretAuditFile.chainTip()
+	if got, ok, _ := witness.LastWitnessedHead(context.Background(), ""); !ok || got != head {
+		t.Fatalf("witness holds %q after the bootstrap, want the node's head %q", got, head)
+	}
+	if svc.witnessBootPending.Load() {
+		t.Fatal("the ship gate is still armed after a successful validation")
+	}
+}
