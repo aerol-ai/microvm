@@ -36,18 +36,27 @@ import (
 // cluster_test.go's clusterMember) so the capacity shape lives next to the test
 // that depends on it.
 type capacityView struct {
-	Members []struct {
-		NodeID        string `json:"node_id"`
-		NodeName      string `json:"node_name"`
-		Role          string `json:"role"`
-		Alive         bool   `json:"alive"`
-		Drained       bool   `json:"drained"`
-		CapacityStale bool   `json:"capacity_stale"`
-		Capacity      struct {
-			CanAdmit          bool     `json:"can_admit"`
-			SupportedRuntimes []string `json:"supported_runtimes"`
-		} `json:"capacity"`
-	} `json:"members"`
+	Members []capacityMember `json:"members"`
+}
+
+// capacityMember is the capacity-bearing view of a member. Named rather than
+// declared inline: it was anonymous in two files and adding a field to one
+// broke the other at its append site.
+type capacityMember struct {
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
+	Role     string `json:"role"`
+	Alive    bool   `json:"alive"`
+	Drained  bool   `json:"drained"`
+	// InternalURL is the peer's mTLS address. Placement refuses a member
+	// without one ("peer InternalURL required (mTLS fail-closed)"), so this
+	// is what says whether a restarted node is usable yet.
+	InternalURL   string `json:"internal_url"`
+	CapacityStale bool   `json:"capacity_stale"`
+	Capacity      struct {
+		CanAdmit          bool     `json:"can_admit"`
+		SupportedRuntimes []string `json:"supported_runtimes"`
+	} `json:"capacity"`
 }
 
 // UC-87 — every specialized runtime the scenario advertises a capability for

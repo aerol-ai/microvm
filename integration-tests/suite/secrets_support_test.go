@@ -7,13 +7,23 @@ package suite
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -74,9 +84,17 @@ func blockInternalListenerEverywhere(t *testing.T, targets *harness.IntegrationT
 		restored = true
 		for _, b := range applied {
 			target, _ := harness.SSHTarget(b.node)
-			out, err := harness.SSHRun(t, target, "sudo iptables -D INPUT -p tcp --dport "+b.port+" -j REJECT 2>/dev/null; sudo iptables -S INPUT | grep -c 'dport "+b.port+".*REJECT' || true")
-			if err != nil {
-				t.Errorf("RESTORE FAILED on %s: the peer listener may still be blocked and the rest of this run is suspect: %v\n%s", b.node.Name, err, out)
+			// Delete, then CONFIRM the rule is gone. `iptables -D` removes one
+			// matching rule and reports success even when the state afterwards
+			// is not what we want; a REJECT left on the peer port breaks every
+			// later cluster case in the run, and the report would blame
+			// whichever one ran next.
+			script := "sudo iptables -D INPUT -p tcp --dport " + b.port + " -j REJECT 2>/dev/null; " +
+				"if sudo iptables -S INPUT | grep -q -- '--dport " + b.port + " -j REJECT'; then echo STILLBLOCKED; else echo CLEARED; fi"
+			out, err := harness.SSHRun(t, target, script)
+			if err != nil || !strings.Contains(out, "CLEARED") {
+				t.Errorf("RESTORE FAILED on %s: the peer listener is still blocked on port %s and the rest of this run is suspect: %v\n%s",
+					b.node.Name, b.port, err, strings.TrimSpace(out))
 			}
 		}
 	}
@@ -379,5 +397,632 @@ func redactedKeys(env map[string]string) []string {
 		out = append(out, k)
 	}
 	slices.Sort(out)
+	return out
+}
+
+// containsString is slices.Contains, named for readability at the call sites
+// where the haystack is a coverage list.
+func containsString(xs []string, want string) bool { return slices.Contains(xs, want) }
+
+// sameEventIDs compares two histories by event id. Order is not asserted —
+// the fan-out merge is free to interleave — but the SET must match, which is
+// what "the same history" means.
+func sameEventIDs(a, b []auditlog.Event) bool {
+	ids := func(evs []auditlog.Event) map[string]bool {
+		m := make(map[string]bool, len(evs))
+		for _, ev := range evs {
+			if ev.EventID != "" {
+				m[ev.EventID] = true
+			}
+		}
+		return m
+	}
+	am, bm := ids(a), ids(b)
+	if len(am) != len(bm) {
+		return false
+	}
+	for id := range am {
+		if !bm[id] {
+			return false
+		}
+	}
+	return true
+}
+
+// auditLogPath is where the node keeps its hash-chained evidence.
+// The audit directory is the DB's directory: internal/service derives it with
+// secretAuditDataDir(cfg.DBPath). There is no SB_SECRET_AUDIT_DIR — an early
+// draft assumed one, which would have pointed every script below at a path
+// that does not exist and turned four cases into silent skips.
+const auditLogScript = sqliteSourceEnv +
+	`db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; dir=$(dirname "$db"); log="$dir/secrets.jsonl"; `
+
+// tamperMiddleAuditLineScript edits a line in the MIDDLE of the chain and
+// keeps a pristine copy alongside.
+//
+// The middle matters. A tail edit is indistinguishable from a torn write
+// after a crash — which the product deliberately tolerates and records as a
+// gap — so tampering with the tail would assert nothing about tamper
+// detection.
+const tamperMiddleAuditLineScript = `sudo bash -c '` + auditLogScript +
+	`n=$(wc -l < "$log" 2>/dev/null || echo 0); ` +
+	`[ "$n" -ge 4 ] || { echo TOOSHORT; exit 0; }; ` +
+	`cp -a "$log" "$log.itest-backup"; ` +
+	`mid=$(( n / 2 )); ` +
+	`awk -v m="$mid" '"'"'NR==m { sub(/"reason":"/, "\"reason\":\"tampered-"); } { print }'"'"' "$log.itest-backup" > "$log.tmp" && ` +
+	`cat "$log.tmp" > "$log" && rm -f "$log.tmp" && echo TAMPERED'`
+
+// restoreTamperedAuditLogScript puts the pristine copy back. Writing through
+// the existing inode (cat >, not mv) because the daemon holds the file open:
+// a rename would leave it appending to an unlinked inode.
+const restoreTamperedAuditLogScript = `sudo bash -c '` + auditLogScript +
+	`[ -f "$log.itest-backup" ] || { echo NOBACKUP; exit 0; }; ` +
+	`cat "$log.itest-backup" > "$log" && rm -f "$log.itest-backup" && echo RESTORED'`
+
+// missingEventIDs returns the ids present in before but absent from after.
+func missingEventIDs(before, after []auditlog.Event) []string {
+	have := make(map[string]bool, len(after))
+	for _, ev := range after {
+		if ev.EventID != "" {
+			have[ev.EventID] = true
+		}
+	}
+	var missing []string
+	for _, ev := range before {
+		if ev.EventID != "" && !have[ev.EventID] {
+			missing = append(missing, ev.EventID)
+		}
+	}
+	return missing
+}
+
+func firstN(xs []string, n int) []string {
+	if len(xs) > n {
+		return xs[:n]
+	}
+	return xs
+}
+
+// pickNonSeedNode prefers a joiner. Refusing the seed's boot on a cluster
+// costs the rendezvous every joiner needs to rejoin, which turns one red case
+// into a split cluster.
+func pickNonSeedNode(targets *harness.IntegrationTargets) (harness.IntegrationNode, bool) {
+	if targets == nil {
+		return harness.IntegrationNode{}, false
+	}
+	for _, n := range targets.Nodes {
+		if n.Seed {
+			continue
+		}
+		if _, ok := harness.SSHTarget(n); ok {
+			return n, true
+		}
+	}
+	return harness.IntegrationNode{}, false
+}
+
+// witnessReceiptScript reports whether a witness receipt is on disk. The
+// receipt is the proof that survives a restart; a witness that ships heads
+// but persists nothing loses the evidence the moment the node reboots.
+const witnessReceiptScript = `sudo bash -c '` + auditLogScript +
+	`if [ -s "$dir/witness_receipts.jsonl" ] || [ -s "$dir/witness_tip.json" ]; then echo FOUND; else echo MISSING; fi'`
+
+// auditIngestBindScript prints the address the ingest listener is bound to,
+// or NONE when it is not configured.
+const auditIngestBindScript = `sudo bash -c '` + sqliteSourceEnv +
+	`p="${SB_AUDIT_INGEST_PORT:-0}"; ` +
+	`[ "$p" != "0" ] || { echo NONE; exit 0; }; ` +
+	`ss -ltn 2>/dev/null | awk -v p=":$p" '"'"'$4 ~ p"$" { print $4; found=1 } END { if (!found) print "NONE" }'"'"' | head -1'`
+
+// auditIngestUntokenedScript POSTs an event with no token and prints the
+// status. Run on the node because the listener is (and must be) loopback.
+const auditIngestUntokenedScript = `sudo bash -c '` + sqliteSourceEnv +
+	`p="${SB_AUDIT_INGEST_PORT:-0}"; ` +
+	`[ "$p" != "0" ] || { echo NONE; exit 0; }; ` +
+	`curl -sS -o /dev/null -w "%{http_code}" --max-time 20 -X POST ` +
+	`-H "Content-Type: application/json" --data "{\\"kind\\":\\"egress\\",\\"sandbox_id\\":\\"itest-forged\\"}" ` +
+	`"http://127.0.0.1:$p/audit/events"'`
+
+// envOr reads an environment variable with a default.
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+// assertChainedJSONL checks that an exported stream is one JSON object per
+// line, each carrying the chain links, and that none of it contains the
+// secret. An export that ships unchained records is an export whose contents
+// cannot be shown to be complete.
+func assertChainedJSONL(t *testing.T, what, body, secret string) {
+	t.Helper()
+	harness.AssertNoPlaintext(t, what, body, secret)
+
+	lines := 0
+	chained := 0
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lines++
+		var ev auditlog.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("%s: line %d is not one JSON object per line: %v", what, lines, err)
+		}
+		if ev.EventHash != "" && ev.PrevHash != "" {
+			chained++
+		}
+	}
+	if lines == 0 {
+		t.Fatalf("%s contained no records", what)
+	}
+	if chained == 0 {
+		t.Fatalf("%s delivered %d records and NONE carried chain links; the export cannot be shown to be complete", what, lines)
+	}
+}
+
+// assertExpvarEquals reads /v1/metrics and asserts a gauge's value. The gauge
+// is what an operator alerts on: a subsystem that works while reporting
+// unhealthy is a page that fires forever, and one that fails while reporting
+// healthy is a page that never fires.
+func assertExpvarEquals(t *testing.T, c *harness.Client, name string, want int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	body, err := c.GetText(ctx, "/v1/metrics")
+	if err != nil {
+		t.Fatalf("read /v1/metrics: %v", err)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, name) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[len(fields)-1] == strconv.Itoa(want) {
+			return
+		}
+		t.Fatalf("%s = %s, want %d", name, fields[len(fields)-1], want)
+	}
+	t.Fatalf("%s is not exported by /v1/metrics at all; there is nothing for an operator to alert on", name)
+}
+
+// clusterTLSEnv makes SB_CLUSTER_TLS_DIR and SB_CLUSTER_INTERNAL_ADVERTISE
+// available to a remote script.
+const clusterTLSEnv = `set -a; . /etc/sandboxd/cluster.env 2>/dev/null || true; set +a; ` +
+	`tls="${SB_CLUSTER_TLS_DIR:-/etc/sandboxd/tls}"; base="${SB_CLUSTER_INTERNAL_ADVERTISE%/}"; `
+
+// nodeCertSANsScript prints the subjectAltName line of the node certificate.
+const nodeCertSANsScript = `sudo bash -c '` + clusterTLSEnv +
+	`command -v openssl >/dev/null || { echo NOOPENSSL; exit 0; }; ` +
+	`openssl x509 -in "$tls/node.crt" -noout -text | grep -A1 "Subject Alternative Name" | tail -1'`
+
+// caKeyPresenceScript reports whether the CA signing key is on this node.
+const caKeyPresenceScript = `sudo bash -c '` + clusterTLSEnv +
+	`if [ -f "$tls/ca.key" ]; then echo PRESENT; else echo ABSENT; fi'`
+
+// plaintextInternalProbeScript speaks http (not https) to the internal port.
+const plaintextInternalProbeScript = `sudo bash -c '` + clusterTLSEnv +
+	`hostport="${base#https://}"; hostport="${hostport#http://}"; ` +
+	`curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "http://$hostport/v1/cluster/internal/secrets/probe" 2>/dev/null || echo 000'`
+
+// forgedCertProbeScript mints a self-signed certificate carrying a valid
+// node:<id> SAN and offers it to the peer listener.
+//
+// A valid SAN on an untrusted issuer is the interesting forgery: it separates
+// "does the server check the name?" from "does the server check WHO SIGNED
+// the name?". Only the second is a real identity check.
+func forgedCertProbeScript(nodeID string) string {
+	return `sudo bash -c '` + clusterTLSEnv +
+		`command -v openssl >/dev/null || { echo NOOPENSSL; exit 3; }; ` +
+		`d=$(mktemp -d); trap "rm -rf $d" EXIT; ` +
+		`openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=forged" ` +
+		`-addext "subjectAltName=DNS:node:` + nodeID + `" ` +
+		`-keyout "$d/f.key" -out "$d/f.crt" >/dev/null 2>&1 || { echo MINTFAIL; exit 3; }; ` +
+		`curl -sS -o /dev/null -w "%{http_code}" --max-time 15 ` +
+		`--cert "$d/f.crt" --key "$d/f.key" --cacert "$tls/ca.crt" ` +
+		`-I "$base/v1/cluster/internal/secrets/probe" 2>/dev/null || echo 000'`
+}
+
+// lastField returns the last whitespace-separated token, which is where curl
+// leaves its -w output after any diagnostics.
+func lastField(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[len(fields)-1]
+}
+
+// plantDecoyCAKeyScript puts a file named ca.key in the daemon's TLS
+// directory. It never has to be a real key — the enterprise gate is a stat().
+const plantDecoyCAKeyScript = `sudo bash -c '` + clusterTLSEnv +
+	`[ -d "$tls" ] || { echo NOTLSDIR; exit 3; }; ` +
+	`[ -f "$tls/ca.key" ] && { echo ALREADYPRESENT; exit 0; }; ` +
+	`printf "%s\n" "itest decoy - not a key" > "$tls/ca.key" && chmod 0600 "$tls/ca.key" && echo PLANTED'`
+
+const removeDecoyCAKeyScript = `sudo bash -c '` + clusterTLSEnv +
+	`if grep -q "itest decoy" "$tls/ca.key" 2>/dev/null; then rm -f "$tls/ca.key" && echo REMOVED; else echo "NOTOURS"; fi'`
+
+// assertNodeBackInService is UC-159 applied per row: after a deliberately
+// refused boot, the node must be up AND back in the cluster before the next
+// row runs. Asserting it only once at the end would not identify the row that
+// left the fleet degraded — and every row after that one would fail for a
+// reason that has nothing to do with what it tests.
+func assertNodeBackInService(t *testing.T, c *harness.Client, targets *harness.IntegrationTargets, node harness.IntegrationNode) {
+	t.Helper()
+	target, ok := harness.SSHTarget(node)
+	if !ok {
+		t.Fatalf("node %s has no SSH address", node.Name)
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		out, _ := harness.SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
+		if strings.TrimSpace(out) == "active" {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	out, _ := harness.SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
+	if strings.TrimSpace(out) != "active" {
+		t.Fatalf("node %s is still down after the gate row restored its configuration; every later row would assert against a degraded fleet", node.Name)
+	}
+
+	// Up is not the same as rejoined. A node that is running but out of the
+	// member list is exactly the 2+1 split this suite has produced before.
+	if !sc.Has(harness.CapCluster) {
+		return
+	}
+	nodeID := heteroNodeID(t, c, targets, node.Name)
+	rejoinDeadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(rejoinDeadline) {
+		if containsString(clusterNodeIDs(t, c), nodeID) {
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+	t.Fatalf("node %s (%s) is running but has not rejoined the cluster; the fleet is split and every later case is suspect", node.Name, nodeID)
+}
+
+// workerdJailProbeScript reports the four jail properties at once.
+//
+// One script, one process: probing them in four SSH round trips could
+// describe four different workerd processes if the group restarts in
+// between, and "uid from one process, seccomp from another" is not evidence
+// that any single process is jailed.
+const workerdJailProbeScript = `sudo bash -c '
+pid=$(pgrep -n workerd 2>/dev/null || true)
+if [ -z "$pid" ]; then echo "FOUND=0"; exit 0; fi
+echo "FOUND=1"
+echo "UID=$(awk "/^Uid:/ {print \$2}" /proc/$pid/status 2>/dev/null)"
+echo "SECCOMP=$(awk "/^Seccomp:/ {print \$2}" /proc/$pid/status 2>/dev/null)"
+echo "NONEWPRIVS=$(awk "/^NoNewPrivs:/ {print \$2}" /proc/$pid/status 2>/dev/null)"
+echo "ROOT=$(readlink /proc/$pid/root 2>/dev/null)"
+cg=$(awk -F: "{print \$3}" /proc/$pid/cgroup 2>/dev/null | head -1)
+echo "PIDSMAX=$(cat /sys/fs/cgroup$cg/pids.max 2>/dev/null)"
+'`
+
+// parseKV turns KEY=VALUE lines into a map.
+func parseKV(out string) map[string]string {
+	m := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		m[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return m
+}
+
+// getWithHeaders issues an authenticated GET and returns the body AND the
+// response headers. UC-168's honesty property lives in a header, which
+// Client.GetJSON discards.
+func getWithHeaders(ctx context.Context, c *harness.Client, path string) (string, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL()+path, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+sc.PAT)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return string(b), resp.Header, fmt.Errorf("GET %s: status %d", path, resp.StatusCode)
+	}
+	return string(b), resp.Header, nil
+}
+
+// deleteSandboxRowScript removes a sandbox row from the store, leaving the
+// runtime's in-memory group behind. That is what an orphan IS — a killed
+// process is not an orphan, it is a dead process.
+func deleteSandboxRowScript(sandboxID string) string {
+	return `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; ` +
+		`command -v sqlite3 >/dev/null || exit 3; ` +
+		`n=$(sqlite3 "$db" "SELECT COUNT(*) FROM sandboxes WHERE id='"'"'` + sandboxID + `'"'"';"); ` +
+		`[ "$n" = "1" ] || { echo NOROW; exit 0; }; ` +
+		`sqlite3 "$db" "DELETE FROM sandboxes WHERE id='"'"'` + sandboxID + `'"'"';" && echo DELETED'`
+}
+
+// leakForm is one encoding of the canary and the name to report it under.
+type leakForm struct {
+	name    string
+	encoded string
+}
+
+// leakForms mirrors harness.FindPlaintextLeak's table. It is spelled out here
+// rather than derived because the sweep greps on a REMOTE host: the encodings
+// have to travel into a shell command, not into a Go strings.Contains.
+func leakForms(secret string) []leakForm {
+	return []leakForm{
+		{"raw", secret},
+		{"base64-std", base64.StdEncoding.EncodeToString([]byte(secret))},
+		{"base64-raw", base64.RawStdEncoding.EncodeToString([]byte(secret))},
+		{"hex", hex.EncodeToString([]byte(secret))},
+		{"url-query", url.QueryEscape(secret)},
+	}
+}
+
+// leakGrepScript searches everywhere a secret could come to rest: the
+// daemon's data dir (store, audit JSONL, Raft log), the system logs, and the
+// journal.
+//
+// The needle arrives on STDIN, never in argv. sudo logs the full command
+// line to /var/log/auth.log and the journal, so passing the canary as a grep
+// argument writes it into the exact files the sweep then searches — the live
+// run reported the canary "on disk" in all five encodings, and every hit was
+// /var/log/auth.log, put there by the sweep itself.
+//
+// The pattern file lives under /tmp, which is outside the searched paths, and
+// is removed on exit.
+//
+// The journal arm reports only WHETHER it matched, never the matching lines:
+// those lines contain the secret, and printing them as "locations" would put
+// it in a CI log — the thing this case exists to prevent.
+const leakGrepScript = `sudo bash -c '` + sqliteSourceEnv + storeDBExpr + `; dir=$(dirname "$db"); ` +
+	`IFS= read -r needle; ` +
+	`tmp=$(mktemp /tmp/aerol-sweep.XXXXXX); trap "rm -f \"$tmp\"" EXIT; ` +
+	`printf "%s\n" "$needle" > "$tmp"; ` +
+	`grep -rlaF -f "$tmp" "$dir" /var/log 2>/dev/null | sed -e "/^$/d" -e "s/^/HIT:/" | head -20; ` +
+	`if journalctl -u sandboxd --no-pager 2>/dev/null | grep -qaF -f "$tmp"; then echo "HIT:journalctl -u sandboxd"; fi; ` +
+	`echo SWEEPDONE'`
+
+// shellSingleQuoteForSuite wraps s for a single-quoted word nested inside the
+// outer `sudo bash -c '...'`.
+func shellSingleQuoteForSuite(s string) string {
+	return `'"'"'` + strings.ReplaceAll(s, "'", `'"'"'`) + `'"'"'`
+}
+
+// createSecretSandbox creates a sandbox carrying sealed env, using the HA
+// path only where HA is possible.
+//
+// CreateHASandbox waits for failover_ready, which a single-node deployment
+// can never report — the server omits the field entirely (policy=recreate
+// needs a peer to be ready ON). A CapSecrets-only use case that reached for
+// the HA helper would therefore burn its whole timeout and fail on S1 for a
+// reason unrelated to what it tests. UC-169's leak sweep is exactly that
+// shape: it wants a sandbox with sealed material, and it is just as valid on
+// one node as on three.
+func createSecretSandbox(t *testing.T, c *harness.Client, env map[string]string) *microvm.Sandbox {
+	t.Helper()
+	if sc.Has(harness.CapCluster) {
+		return harness.CreateHASandbox(t, c, harness.HASandboxSpec{Env: env})
+	}
+	return c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name: harness.UniqueName(sc, t),
+		Env:  env,
+	})
+}
+
+// isTransientGatewayErr reports whether an API error is the edge failing to
+// reach the daemon rather than the daemon answering. A 502/503/504 is
+// neither a pass nor the failure a case is asserting, so cases retry past it
+// instead of recording a verdict the daemon never gave.
+func isTransientGatewayErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, code := range []string{"status 502", "status 503", "status 504"} {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// countGapMarkers counts overflow gap markers in a history.
+//
+// They carry no sandbox_id, so a marker any other case created on the same
+// node appears here too. Cases that care about gaps must baseline and
+// compare rather than assert on presence.
+func countGapMarkers(events []auditlog.Event) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Kind == "gap" || ev.Result == "gap" {
+			n++
+		}
+	}
+	return n
+}
+
+// waitNodeRejoined blocks until a restarted node is usable again.
+//
+// Two conditions, and the second is the one that matters. The API answering
+// only proves SOME node is serving; on a cluster the restarted node must
+// also be back in the member list, because until it has re-advertised its
+// InternalURL placement can select it and every create fails "cluster: peer
+// InternalURL required (mTLS fail-closed)".
+//
+// That is not hypothetical: on the live S2 run UC-137/148/149 restarted a
+// node, TestClusterForms then saw 2 of 3 members, and 79 cases failed —
+// nearly every sandbox create in the suite, most of them nothing to do with
+// secrets.
+// requireNonSeedVictim skips a case whose victim turns out to be the seed.
+//
+// An owner-kill case cannot choose its victim — it must kill whoever owns
+// the sandbox. But killing the seed does not degrade the cluster by one
+// member, it takes the cluster DOWN: on a live 3-node run the remaining two
+// never seated a leader, the seed could not rejoin within four minutes ("no
+// raft leader yet"), and the following case could not even create a sandbox.
+//
+// So the choice is between a case that cannot run and a case that destroys
+// the fleet and reports a red somewhere else. Skipping says which one
+// happened; the alternative buries it.
+func requireNonSeedVictim(t *testing.T, node harness.IntegrationNode) {
+	t.Helper()
+	if node.Seed {
+		t.Skipf("the owner is the seed (%s); killing it takes the whole cluster down rather than one member, so this case cannot inject its fault here", node.Name)
+	}
+}
+
+// restoreNodeDaemon restarts sandboxd on a node a test stopped and does not
+// return until the node is back in the cluster.
+//
+// A cleanup that only fires `systemctl start` returns in milliseconds while
+// the node takes tens of seconds to rejoin gossip and Raft. The next test
+// then runs against a fleet that is one member short without knowing it:
+// UC-134 stopped a node and failed, its cleanup "restored" it, and UC-135 —
+// which kills the owner — then waited out its full 8-minute deadline for a
+// reassignment that could not happen, and reported it as a failover bug.
+// Blaming the product for the previous test's debris is the worst kind of
+// red, because it is the kind someone acts on.
+func restoreNodeDaemon(t *testing.T, node harness.IntegrationNode, target string) {
+	t.Helper()
+	if out, err := harness.SSHRun(t, target, "sudo systemctl start sandboxd"); err != nil {
+		t.Errorf("RESTORE FAILED: sandboxd is left stopped on %s and the rest of this run is suspect: %v\n%s", node.Name, err, out)
+		return
+	}
+	if err := waitNodeRejoined(t, node); err != nil {
+		t.Errorf("RESTORE INCOMPLETE: sandboxd was restarted on %s but it did not rejoin the cluster: %v; every later case in this run is against a smaller fleet", node.Name, err)
+	}
+}
+
+func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
+	t.Helper()
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		return nil // local/unprovisioned: nothing to rejoin
+	}
+	c := harness.NewClient(t, sc)
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var last string
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := c.GetJSON(ctx, "/v1/sandboxes?limit=1", nil)
+		cancel()
+		if err != nil {
+			last = "api not serving: " + err.Error()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if !sc.Has(harness.CapCluster) {
+			return nil
+		}
+		nodeID := heteroNodeID(t, c, targets, node.Name)
+		if !containsString(clusterNodeIDs(t, c), nodeID) {
+			last = "not in the member list yet (" + nodeID + ")"
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		// Membership is not enough. Restarting a node can unseat the Raft
+		// LEADER, and reserving a placement is a raft write — during the
+		// election that follows, every create fails
+		// "cluster: reserve placement failed: cluster: not raft leader".
+		// The live run lost nine cases to that window, all of them creates
+		// in the test that happened to run next.
+		leader, lerr := clusterLeader(c)
+		if lerr != nil || leader == "" {
+			last = "no raft leader yet"
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		// Fourth condition, and the one that actually gates placement: every
+		// member must have FRESH capacity. A restarted node is back in the
+		// member list well before it has re-gossiped, and its InternalURL
+		// rides on that advertisement — until it lands, reserving a
+		// placement fails
+		//   "cluster: reserve placement failed: cluster: peer InternalURL
+		//    required (mTLS fail-closed)"
+		// which is what UC-117 hit at CREATE, before it could kill anything.
+		//
+		// A fixed sleep was the previous attempt and was simply a guess.
+		// capacity_stale is the cluster's own answer to "is this node usable
+		// yet", so ask that instead.
+		if missing := membersMissingInternalURL(t, c); len(missing) > 0 {
+			last = "no InternalURL advertised yet for " + strings.Join(missing, ",")
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("node %s did not rejoin within 4m: %s", node.Name, last)
+}
+
+// nodeSelfIDScript prints the node's own configured SB_NODE_ID — the
+// identity the CSR rendezvous bound its certificate to.
+const nodeSelfIDScript = `sudo bash -c '` + sqliteSourceEnv + `printf "%s\n" "${SB_NODE_ID:-}"'`
+
+// lastNonEmptyLineSuite mirrors the harness helper: SSHRun merges stderr, so
+// no remote value is trusted as the whole capture.
+func lastNonEmptyLineSuite(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if v := strings.TrimSpace(lines[i]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// clusterLeader returns the current Raft leader's node id, or "" when an
+// election is in flight. A write-bearing operation started in that window
+// fails "not raft leader" rather than waiting, so callers that just
+// restarted a node must let a leader settle first.
+func clusterLeader(c *harness.Client) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var resp struct {
+		Leader string `json:"leader"`
+	}
+	if err := c.GetJSON(ctx, "/v1/cluster/leader", &resp); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(resp.Leader), nil
+}
+
+// membersMissingInternalURL lists alive members that have not advertised an
+// mTLS address yet.
+//
+// This is the exact condition placement enforces: reserving a placement
+// fails "cluster: peer InternalURL required (mTLS fail-closed)" when any
+// candidate lacks one, and a node that has just restarted is back in the
+// member list before it has re-advertised.
+//
+// An earlier version of this check read capacity_stale. That field is not in
+// the members payload at all, so it decoded to false and the check passed
+// unconditionally — a guard that looked right and tested nothing. internal_url
+// is in the payload and is what the error is about.
+func membersMissingInternalURL(t *testing.T, c *harness.Client) []string {
+	t.Helper()
+	var out []string
+	for _, m := range fetchMembers(t, c).Members {
+		if !m.Alive || m.Drained {
+			continue
+		}
+		if strings.TrimSpace(m.InternalURL) == "" {
+			out = append(out, m.NodeID)
+		}
+	}
 	return out
 }

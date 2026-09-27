@@ -169,7 +169,14 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// Operator-only, like every other /cluster route: the recipient set names
 	// which nodes hold a tenant's sealed secret, which is fleet topology a
 	// tenant token must not read.
-	mux.Handle("GET "+PathPrefix+"/cluster/sandboxes/{id}/secret-holders", op(http.HandlerFunc(h.clusterSecretHolders)))
+	// clusterForwardWrap, not bare op(): SecretHoldersForSandbox reads the
+	// LOCAL store, and on a cluster the sandbox row lives on the owner. Served
+	// by any other node the read answered 404 "sandbox not found" for a
+	// sandbox that plainly existed — which is what the live S2 run hit, on
+	// every HA case at once, because they all wait on this endpoint. The
+	// wrapper is a pass-through under a Noop cluster, so single-node is
+	// unaffected.
+	mux.Handle("GET "+PathPrefix+"/cluster/sandboxes/{id}/secret-holders", op(wrap(http.HandlerFunc(h.clusterSecretHolders))))
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
 	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))

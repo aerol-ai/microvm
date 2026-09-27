@@ -19,7 +19,8 @@ BIN_DIR ?= bin
 	itest-build itest-publish itest-artifacts-init \
 	integration-secrets-single integration-secrets-cluster integration-secrets-kms \
 	integration-secrets-enterprise integration-secrets-hetero integration-secrets-hetero-kms \
-	integration-secrets-gate integration-bench-cluster
+	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
+	integration-bench-cluster
 
 fmt:
 	$(GO) fmt ./...
@@ -152,6 +153,31 @@ integration-secrets-hetero:
 
 integration-secrets-hetero-kms:
 	integration-tests/run.sh cluster-hetero-secrets-kms $(RUN_FLAGS)
+
+# Flagship = S5 + S6, in order. ~$28 and ~2h of on-demand metal, so it is
+# deliberately NOT part of the gate: run it once pre-merge, and again after
+# any change to internal/cluster, the fan-out path or the reseal protocol.
+integration-secrets-flagship: integration-secrets-hetero integration-secrets-hetero-kms
+
+# Re-run ONLY the security use cases against an already-provisioned cluster
+# (use with `keep` from a previous run). Minutes instead of a re-provision.
+# The report it writes covers only these tests, so do not publish it as a
+# full matrix.
+integration-secrets-only:
+	AEROL_TEST_RUN='$(SECRETS_TEST_RUN)' integration-tests/run.sh $(SCENARIO) $(RUN_FLAGS)
+
+# The exact, anchored list of the security use cases' test functions.
+#
+# Generated, not hand-written: a fuzzy name pattern (Secret|Audit|Jail|…)
+# silently MISSED a third of them and silently swept in unrelated ones, and a
+# filter that under-runs reports a green partial pass over tests that never
+# executed. integration-tests/safety/secrets_filter_test.go regenerates this
+# from the source files and fails `make test` if it has drifted, so adding a
+# case cannot quietly fall out of the target.
+#
+# Narrow it further ad hoc: make integration-secrets-only SECRETS_TEST_RUN='TestOwnerDeath.*'
+SECRETS_TEST_RUN ?= $(shell cat integration-tests/lib/secrets-tests.regex)
+SCENARIO ?= cluster-3-mixed-secrets
 
 # The latency arm UC-165's band is measured against (D5: baseline is
 # main-built binaries via `make itest-build BUILD_FLAGS="--ref main"`).

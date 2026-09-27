@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -156,5 +157,36 @@ func TestSecretHoldersRouteRejectsNonOperator(t *testing.T) {
 	}
 	if rr.Code != http.StatusForbidden && rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401/403", rr.Code)
+	}
+}
+
+// The holders read must answer wherever it lands, not only on the owner.
+//
+// SecretHoldersForSandbox reads the LOCAL store. Mounted with bare op() it
+// answered 404 "sandbox not found" on any node but the owner — and on the
+// live S2 run that took out every HA case at once, because all of them poll
+// this endpoint after create. It is now wrapped in clusterForwardWrap like
+// every other per-sandbox route.
+func TestSecretHoldersRouteIsOwnerForwarded(t *testing.T) {
+	src, err := os.ReadFile("routes.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := ""
+	for _, l := range strings.Split(string(src), "\n") {
+		if strings.Contains(l, `"/cluster/sandboxes/{id}/secret-holders"`) {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatal("the secret-holders route is gone from routes.go")
+	}
+	if !strings.Contains(line, "wrap(") {
+		t.Fatalf("the secret-holders route is not owner-forwarded: %s\nWithout clusterForwardWrap it reads the local store and 404s for any sandbox owned by another node.", strings.TrimSpace(line))
+	}
+	// Still operator-gated: forwarding must not have displaced op().
+	if !strings.Contains(line, "op(") {
+		t.Fatalf("the secret-holders route lost its op() gate: %s", strings.TrimSpace(line))
 	}
 }

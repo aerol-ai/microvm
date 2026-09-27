@@ -300,13 +300,25 @@ func (c *Client) AuditPageFor(ctx context.Context, sandboxID string, q AuditQuer
 // AuditEvents is the fatal wrapper around AuditPageFor.
 func AuditEvents(t *testing.T, c *Client, sandboxID string, q AuditQuery) AuditPage {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	page, err := c.AuditPageFor(ctx, sandboxID, q)
+	page, err := TryAuditEvents(c, sandboxID, q)
 	if err != nil {
 		t.Fatalf("read audit events for %s: %v", sandboxID, err)
 	}
 	return page
+}
+
+// TryAuditEvents is AuditEvents without the t.Fatal, for callers polling
+// through a fault they injected themselves.
+//
+// UC-134 stops a node and then reads audit coverage. The ingress can briefly
+// answer 502 while it still holds a route to the machine that just went away
+// — an artifact of the fault, not the audit read being dishonest, which is
+// the only thing UC-134 asserts. Fataling on the first 502 failed the case
+// 15s into a 3-minute poll and blamed audit for an ingress hiccup.
+func TryAuditEvents(c *Client, sandboxID string, q AuditQuery) (AuditPage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return c.AuditPageFor(ctx, sandboxID, q)
 }
 
 // AllAuditPages walks every page via next_cursor and returns the flattened
@@ -320,6 +332,13 @@ func (c *Client) AllAuditPages(ctx context.Context, sandboxID string, pageSize, 
 	var all []auditlog.Event
 	q := AuditQuery{Limit: pageSize}
 	for i := 0; i < maxPages; i++ {
+		// The page budget bounds the number of REQUESTS; the context bounds
+		// the TIME. Without the second, a flaky edge multiplies each page's
+		// retries by maxPages and the walk outlives the suite itself — which
+		// is how UC-149 hung past the 60m test timeout.
+		if err := ctx.Err(); err != nil {
+			return all, fmt.Errorf("audit pagination for %s stopped after %d page(s): %w", sandboxID, i, err)
+		}
 		page, err := c.AuditPageFor(ctx, sandboxID, q)
 		if err != nil {
 			return all, err
@@ -459,6 +478,101 @@ const (
 	itestEnvDropIn       = "/etc/systemd/system/sandboxd.service.d/zz-itest-override.conf"
 )
 
+// KillNodeDaemon stops sandboxd on a node and returns a restore func.
+//
+// This is the portable way to kill an owner. EC2 stop-instances does NOT
+// work on the spot instances the cluster scenarios use:
+//
+//	UnsupportedOperation: You can't stop the Spot Instance '...' because it
+//	is associated with a one-time Spot Instance request.
+//
+// UC-117 failed on exactly that the first time it ran — the kill never
+// happened, so nothing failed over and the case reported a product problem
+// that was really an AWS API constraint. The hetero scenarios are
+// on-demand, which is why the design never hit it.
+//
+// Stopping the daemon is also the fault these cases actually model: SWIM
+// marks the owner dead and placement reassigns. The box keeps answering
+// SSH, which is what makes the restore reliable — and a restore that works
+// is worth more here than fidelity to a power cut, because a node this
+// suite cannot bring back poisons every case after it.
+func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
+	t.Helper()
+	RequireNodeSSH(t, node)
+	target, _ := SSHTarget(node)
+
+	if out, err := SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
+		t.Fatalf("stop sandboxd on %s: %v\n%s", node.Name, err, out)
+	}
+	restored := false
+	return func() {
+		if restored {
+			return
+		}
+		restored = true
+		if out, err := SSHRun(t, target, "sudo systemctl start sandboxd"); err != nil {
+			t.Errorf("RESTORE FAILED: sandboxd is left stopped on %s and every later case in this run is suspect: %v\n%s", node.Name, err, out)
+			return
+		}
+		if NodeRejoinCheck != nil {
+			if err := NodeRejoinCheck(t, node); err != nil {
+				t.Errorf("RESTORE FAILED on %s — restarted but did not rejoin: %v", node.Name, err)
+			}
+		}
+	}
+}
+
+// PickRestartableNode returns a node it is SAFE to restart.
+//
+// Not the seed, where there is any alternative. Restarting the seed of a
+// SWIM cluster orphans the joiners into their own partition and they do NOT
+// heal: the live S2 run left node1 seeing only itself while nodes 2 and 3
+// gossiped happily with each other, and every subsequent create failed
+// "cluster: peer InternalURL required (mTLS fail-closed)".
+//
+// PickSSHNode deliberately PREFERS the seed — it is the right choice for
+// reading state — so every case that restarts a node and reached for it was
+// picking the one node that breaks the cluster.
+//
+// On a single node there is nothing to orphan, so the seed is returned.
+func PickRestartableNode(targets *IntegrationTargets) (IntegrationNode, bool) {
+	if targets == nil {
+		return IntegrationNode{}, false
+	}
+	var seed IntegrationNode
+	haveSeed := false
+	for _, n := range targets.Nodes {
+		if _, ok := SSHTarget(n); !ok {
+			continue
+		}
+		if n.Seed {
+			seed, haveSeed = n, true
+			continue
+		}
+		return n, true
+	}
+	return seed, haveSeed
+}
+
+// NodeRejoinCheck, when set, must block until the node is fully back in
+// service — not merely until its unit is active.
+//
+// This exists because "systemctl is-active" is a lie at cluster scope. A
+// restarted sandboxd is active seconds before it has rejoined SWIM and
+// re-advertised its InternalURL, and during that window placement can pick
+// it and every create fails "cluster: peer InternalURL required (mTLS
+// fail-closed)".
+//
+// The live S2 run is what proved it: UC-137/148/149 restart a node, test
+// files run in alphabetical order so they land before cluster_test.go, and
+// TestClusterForms then found 2 of 3 members. 79 cases failed — nearly every
+// sandbox create in the suite, including long-standing ones that have
+// nothing to do with secrets. A helper that degrades the fleet and returns
+// is worse than one that fails.
+//
+// The suite sets this in TestMain; the harness stays cluster-agnostic.
+var NodeRejoinCheck func(t *testing.T, node IntegrationNode) error
+
 // NodeBootResult is what a node did when restarted under an env override.
 //
 // Started is false for the boot-gate cases (§I), which is a PASS there, not an
@@ -519,31 +633,21 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 		}
 		if !awaitUnitActive(t, target, "sandboxd", 3*time.Minute) {
 			t.Errorf("RESTORE FAILED on %s — sandboxd did not come back active after the override was removed; the rest of this run is suspect", node.Name)
+			return
+		}
+		// Active is not the same as back in the cluster. Returning here with
+		// the node still outside the member list hands every later case a
+		// degraded fleet, and the report blames whichever one runs next.
+		if NodeRejoinCheck != nil {
+			if err := NodeRejoinCheck(t, node); err != nil {
+				t.Errorf("RESTORE FAILED on %s — the unit is active but the node has not rejoined: %v. Every later case in this run is suspect.", node.Name, err)
+			}
 		}
 	}
 	defer restore()
 
-	var b strings.Builder
-	b.WriteString("# Written by the integration suite (harness.WithNodeEnv). Transient.\n")
-	for _, k := range sortedKeys(kv) {
-		// No quoting: systemd EnvironmentFile takes the rest of the line
-		// verbatim, and quoting here would make the value arrive with quotes.
-		fmt.Fprintf(&b, "%s=%s\n", k, kv[k])
-	}
-	script := fmt.Sprintf(`set -e
-sudo install -d -m 0755 /etc/systemd/system/sandboxd.service.d
-sudo install -d -m 0750 /etc/sandboxd
-sudo tee %s >/dev/null <<'AEROL_ITEST_ENV'
-%sAEROL_ITEST_ENV
-sudo chmod 0600 %s
-sudo tee %s >/dev/null <<'AEROL_ITEST_DROPIN'
-[Service]
-EnvironmentFile=%s
-AEROL_ITEST_DROPIN
-sudo systemctl daemon-reload`, itestEnvOverrideFile, b.String(), itestEnvOverrideFile, itestEnvDropIn, itestEnvOverrideFile)
-
-	if out, err := SSHRun(t, target, script); err != nil {
-		t.Fatalf("apply env override on %s: %v\n%s", node.Name, err, out)
+	if err := applyNodeEnvOverride(t, target, kv); err != nil {
+		t.Fatalf("apply env override on %s: %v", node.Name, err)
 	}
 
 	// The restart is expected to fail for the boot-gate cases, so its exit
@@ -551,6 +655,14 @@ sudo systemctl daemon-reload`, itestEnvOverrideFile, b.String(), itestEnvOverrid
 	// unit settles either way.
 	_, _ = SSHRun(t, target, "sudo systemctl restart sandboxd")
 	res := NodeBootResult{Started: awaitUnitActive(t, target, "sandboxd", 90*time.Second)}
+	// When the node came up, wait for it to be usable before fn runs — a
+	// case that asserts against a node still outside the cluster measures
+	// the rejoin window, not what it set out to test.
+	if res.Started && NodeRejoinCheck != nil {
+		if err := NodeRejoinCheck(t, node); err != nil {
+			t.Logf("node %s is active but not yet fully rejoined under the override: %v", node.Name, err)
+		}
+	}
 	status, _ := SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
 	res.Status = strings.TrimSpace(status)
 	journal, _ := SSHRun(t, target, "sudo journalctl -u sandboxd --no-pager -n 120 || true")
@@ -608,6 +720,15 @@ type PeerSecretProbe struct {
 	Node   string
 	Status int
 	Err    error
+	// HandshakeRejected means the connection was torn down before any HTTP
+	// status existed — the server demanded a client certificate and got
+	// none, so mTLS refused at the transport layer.
+	//
+	// For an AUTHENTICATED probe that is a failure (our own certificate
+	// should work). For UC-114 it is the PASS: a refusal delivered below
+	// HTTP is stronger than a 403, and treating it as a probe error hid
+	// the product doing exactly the right thing.
+	HandshakeRejected bool
 }
 
 // Present reports whether the node holds a copy. The route answers 200/204 for
@@ -615,27 +736,99 @@ type PeerSecretProbe struct {
 // reported as an error by the caller rather than silently read as "absent".
 func (p PeerSecretProbe) Present() bool { return p.Status == 200 || p.Status == 204 }
 
+// Refused reports an authentication or authorization rejection, which is
+// distinct from both "holds it" and "does not hold it". The internal routes
+// need an operator token AND a peer certificate; missing either answers 401,
+// and reading that as "absent" would turn a broken probe into evidence that
+// the fan-out was correctly scoped.
+func (p PeerSecretProbe) Refused() bool { return p.Status == 401 || p.Status == 403 }
+
 // Absent reports a definitive "this node does not hold it".
 func (p PeerSecretProbe) Absent() bool { return p.Status == 404 }
 
 // internalCurlPrefix sources the node's cluster env and builds a curl that
 // presents the node's own client certificate. Run under sudo: node.key is
 // 0600 root, which is the point of it.
-const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/cluster.env; set +a; ` +
+// The peer certificate carries DNS SANs (aerolvm-cluster-node and
+// node:<id>), but SB_CLUSTER_INTERNAL_ADVERTISE is an https://<ip>:port URL.
+// Dialing the IP therefore fails hostname verification — curl exit 60,
+// "SSL peer certificate ... not OK" — which is what UC-112 reported as a
+// probe error on a perfectly good listener.
+//
+// --resolve maps the certificate's own hostname onto that IP, so the CA and
+// the hostname BOTH verify. Disabling verification with -k would have hidden
+// the very property UC-151/153 exist to prove.
+// sandboxd.env is sourced too, for SB_PAT_TOKEN: the internal routes are
+// internalOp = op(withInternalMTLS(...)), so they need BOTH an operator
+// token and a peer certificate. Sending only the certificate answers 401,
+// which reads like a rejected identity when it is really a missing header.
+const internalCurlPrefix = `sudo bash -c 'set -a; . /etc/sandboxd/sandboxd.env 2>/dev/null || true; . /etc/sandboxd/cluster.env; set +a; ` +
 	`base="${SB_CLUSTER_INTERNAL_ADVERTISE%/}"; ` +
-	`curl -sS -o /dev/null -w "%{http_code}" --max-time 20 `
+	`hostport="${base#https://}"; ip="${hostport%%:*}"; port="${hostport##*:}"; ` +
+	`base="https://aerolvm-cluster-node:$port"; ` +
+	`curl -sS -o /dev/null -w "\nPROBE_CODE=%{http_code}\n" --max-time 20 --resolve "aerolvm-cluster-node:$port:$ip" `
 
-// ProbePeerSecret asks node whether it holds the sealed row for sandboxID.
-func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerSecretProbe {
+// peerProbeCredentials is what an AUTHENTICATED peer call must carry: the
+// operator token and the node's own client certificate. internalOp is
+// op(withInternalMTLS(...)) — either one missing answers 401.
+const peerProbeCredentials = `-H "Authorization: Bearer $SB_PAT_TOKEN" ` +
+	`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" `
+
+// probeCurlSuffix closes the `bash -c` and appends curl's OWN exit code.
+//
+// A refused TLS handshake and a broken probe both produce http_code 000 with
+// empty-ish output, and only the first is a pass for UC-114. Guessing from
+// emptiness would let `curl: command not found` read as "the server refused
+// me" — the exact false pass this suite exists to prevent. curl's exit code
+// separates them without ambiguity: 35/56/58/60 are TLS/connection failures,
+// 127/2 are a broken invocation.
+//
+// Both values are emitted as NAMED markers rather than as trailing fields.
+// curl -sS writes its own diagnostics into the same stream, so "the last
+// whitespace-separated field" is not the status:
+//
+//	curl: (00056) OpenSSL SSL_read: … tlsv13 alert certificate required
+//
+// landed next to the code and the parser read a status of "". A marker
+// cannot collide with curl's prose.
+const probeCurlSuffix = `; printf "\nPROBE_RC=%s\n" "$?"'`
+
+// curlTLSRejectionExits are the exit codes that mean "the peer would not
+// complete a TLS conversation with this identity". 56 (failure receiving
+// network data) is what a server demanding a client certificate produces
+// when none is offered: it tears the connection down mid-handshake.
+var curlTLSRejectionExits = map[int]bool{35: true, 56: true, 58: true, 60: true, 77: true}
+
+// ProbePeerSecret asks node whether it holds the sealed row for a sandbox at
+// or above minGeneration.
+//
+// min_generation and incarnation_id are REQUIRED by the handler
+// (clusterInternalSecretHead): it answers 400 "invalid min_generation"
+// without them, which the first version of this probe hit on every call
+// because it sent neither. They are not decoration — "does this node hold a
+// copy" is only meaningful for a specific incarnation at a specific
+// generation, since a reseal supersedes the previous one and a recreated
+// sandbox id is a different tenancy.
+//
+// Both come straight off the holders view, so a caller cannot ask a question
+// the cluster would answer inconsistently.
+func ProbePeerSecret(t *testing.T, node IntegrationNode, view SecretHoldersView) PeerSecretProbe {
 	t.Helper()
 	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
 	if !ok {
 		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("node %s has no SSH address", node.Name)}
 	}
-	script := internalCurlPrefix +
-		`--cert "$SB_CLUSTER_TLS_DIR/node.crt" --key "$SB_CLUSTER_TLS_DIR/node.key" --cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` +
-		`-I "$base/v1/cluster/internal/secrets/` + sandboxID + `"'`
+	gen := view.SealGeneration
+	if gen < 1 {
+		// The handler rejects <= 0. A view with no generation means the
+		// caller probed before the seal landed; say that rather than send a
+		// request that answers 400 and reads as "not held".
+		return PeerSecretProbe{Node: node.Name, Err: fmt.Errorf("holders view for %s has seal_generation %d; nothing to probe for yet", view.SandboxID, gen)}
+	}
+	q := fmt.Sprintf("?min_generation=%d&incarnation_id=%s", gen, url.QueryEscape(view.IncarnationID))
+	script := internalCurlPrefix + peerProbeCredentials +
+		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"` + probeCurlSuffix
 	out, err := SSHRun(t, target, script)
 	return peerProbeFromOutput(node.Name, out, err)
 }
@@ -644,7 +837,7 @@ func ProbePeerSecret(t *testing.T, node IntegrationNode, sandboxID string) PeerS
 // certificate, from the same node. The identity, not the network position, is
 // what must be refused: a caller that can reach the port is not thereby
 // entitled to the fleet's sealed material.
-func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, sandboxID, bearer string) PeerSecretProbe {
+func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, view SecretHoldersView, bearer string) PeerSecretProbe {
 	t.Helper()
 	RequireNodeSSH(t, node)
 	target, ok := SSHTarget(node)
@@ -655,8 +848,9 @@ func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, sandboxI
 	if bearer != "" {
 		auth = `-H "Authorization: Bearer ` + bearer + `" `
 	}
+	q := fmt.Sprintf("?min_generation=%d&incarnation_id=%s", maxInt64(view.SealGeneration, 1), url.QueryEscape(view.IncarnationID))
 	script := internalCurlPrefix + `--cacert "$SB_CLUSTER_TLS_DIR/ca.crt" ` + auth +
-		`-I "$base/v1/cluster/internal/secrets/` + sandboxID + `"'`
+		`-I "$base/v1/cluster/internal/secrets/` + view.SandboxID + q + `"` + probeCurlSuffix
 	out, err := SSHRun(t, target, script)
 	return peerProbeFromOutput(node.Name, out, err)
 }
@@ -665,30 +859,59 @@ func ProbePeerSecretUnauthenticated(t *testing.T, node IntegrationNode, sandboxI
 // could not connect at all is an error, NOT a 0 status read as "absent".
 func peerProbeFromOutput(nodeName, out string, err error) PeerSecretProbe {
 	p := PeerSecretProbe{Node: nodeName, Err: err}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
+
+	code, haveCode := probeMarkerInt(out, "PROBE_CODE=")
+	curlExit, haveExit := probeMarkerInt(out, "PROBE_RC=")
+	if !haveCode && !haveExit {
 		if p.Err == nil {
-			p.Err = fmt.Errorf("peer probe on %s produced no status", nodeName)
-		}
-		return p
-	}
-	code, convErr := strconv.Atoi(fields[len(fields)-1])
-	if convErr != nil {
-		if p.Err == nil {
-			p.Err = fmt.Errorf("peer probe on %s: unparsable status %q (output %q)", nodeName, fields[len(fields)-1], out)
+			p.Err = fmt.Errorf("peer probe on %s produced no PROBE_CODE/PROBE_RC marker (output %q)", nodeName, out)
 		}
 		return p
 	}
 	p.Status = code
-	if code == 0 && p.Err == nil {
-		p.Err = fmt.Errorf("peer probe on %s could not connect (curl status 0)", nodeName)
-	}
+
 	if code != 0 {
 		// A transport error alongside a real HTTP status is curl's exit code
 		// for the status itself; the status is the answer.
 		p.Err = nil
+		return p
+	}
+
+	// No HTTP status came back. Whether that is a refusal or a broken probe
+	// is curl's exit code to say, not ours to infer.
+	if haveExit && curlTLSRejectionExits[curlExit] {
+		p.HandshakeRejected = true
+		if p.Err == nil {
+			p.Err = fmt.Errorf("peer probe on %s: TLS refused (curl exit %d)", nodeName, curlExit)
+		}
+		return p
+	}
+	if p.Err == nil {
+		p.Err = fmt.Errorf("peer probe on %s could not connect (curl exit %d, no HTTP status)", nodeName, curlExit)
 	}
 	return p
+}
+
+// probeMarkerInt reads the LAST occurrence of a NAME=<int> marker. Last, not
+// first, because sourcing the node's env files can echo before curl runs.
+func probeMarkerInt(out, marker string) (int, bool) {
+	idx := strings.LastIndex(out, marker)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := out[idx+len(marker):]
+	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
+	if end == 0 {
+		return 0, false
+	}
+	if end > 0 {
+		rest = rest[:end]
+	}
+	v, convErr := strconv.Atoi(strings.TrimSpace(rest))
+	if convErr != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // WithClusterEnv applies an env override to EVERY SSH-reachable node and
@@ -711,23 +934,68 @@ func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]str
 	if len(nodes) == 0 {
 		t.Fatal("no SSH-reachable nodes to configure")
 	}
+
+	// Seed first in BOTH directions, applied explicitly rather than by
+	// nesting WithNodeEnv calls.
+	//
+	// Nesting looked tidy and was wrong: nested defers unwind LIFO, so with
+	// [seed, j1, j2] the restore order is j2, j1, seed — seed LAST, which is
+	// the exact ordering that orphans the joiners. They come back, find no
+	// seed, and form their own partition; when the seed finally restarts it
+	// re-bootstraps standalone (SB_CLUSTER_BOOTSTRAP=true) and never rejoins
+	// them. The live S2 cluster ended 1+2 that way, and restarting the lone
+	// seed did not heal it — only restarting the joiners does.
+	//
+	// So the restores run seed-first too, from one deferred loop.
 	results := make(map[string]NodeBootResult, len(nodes))
-	// One nested WithNodeEnv per node, so each node's restore is a defer of
-	// its own and a failure partway through still unwinds every node already
-	// touched — in reverse, which is seed-last on the way out and seed-first
-	// on the way back in.
-	var apply func(i int)
-	apply = func(i int) {
-		if i == len(nodes) {
-			fn(results)
+	restored := false
+	restoreAll := func() {
+		if restored {
 			return
 		}
-		WithNodeEnv(t, nodes[i], kv, func(res NodeBootResult) {
-			results[nodes[i].Name] = res
-			apply(i + 1)
-		})
+		restored = true
+		for _, n := range nodes { // seed first
+			target, ok := SSHTarget(n)
+			if !ok {
+				continue
+			}
+			out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
+				" && sudo systemctl daemon-reload && sudo systemctl restart sandboxd")
+			if err != nil {
+				t.Errorf("RESTORE FAILED on %s — the rest of this run is suspect: %v\n%s", n.Name, err, out)
+				continue
+			}
+			if !awaitUnitActive(t, target, "sandboxd", 3*time.Minute) {
+				t.Errorf("RESTORE FAILED on %s — sandboxd did not come back active", n.Name)
+				continue
+			}
+			if NodeRejoinCheck != nil {
+				if err := NodeRejoinCheck(t, n); err != nil {
+					t.Errorf("RESTORE FAILED on %s — active but not rejoined: %v", n.Name, err)
+				}
+			}
+		}
 	}
-	apply(0)
+	defer restoreAll()
+
+	for _, n := range nodes { // seed first
+		target, ok := SSHTarget(n)
+		if !ok {
+			continue
+		}
+		if err := applyNodeEnvOverride(t, target, kv); err != nil {
+			t.Fatalf("apply env override on %s: %v", n.Name, err)
+		}
+		_, _ = SSHRun(t, target, "sudo systemctl restart sandboxd")
+		res := NodeBootResult{Started: awaitUnitActive(t, target, "sandboxd", 90*time.Second)}
+		status, _ := SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
+		res.Status = lastNonEmptyLine(status)
+		journal, _ := SSHRun(t, target, "sudo journalctl -u sandboxd --no-pager -n 120 || true")
+		res.Journal = journal
+		results[n.Name] = res
+	}
+
+	fn(results)
 }
 
 // seedFirst returns the SSH-reachable nodes with the seed at the front.
@@ -744,6 +1012,198 @@ func seedFirst(in []IntegrationNode) []IntegrationNode {
 		}
 	}
 	return append(seeds, rest...)
+}
+
+// The audit receiver (integration-tests/cmd/audit-receiver) runs as a systemd
+// unit on one node and serves HTTPS, because enterprise mode refuses a plain
+// http webhook URL.
+//
+// The suite reaches it over SSH + loopback rather than across the network.
+// That needs no security-group opening, no DNS, and no second TLS trust
+// decision in the test process — and the receiver's control endpoints
+// (/_probe, /_stats, /_chaos) are deliberately unauthenticated, so not
+// exposing them to the internet is the point.
+const (
+	receiverEnvFile  = "/etc/aerol-audit-receiver/env"
+	receiverUnitFile = "/etc/systemd/system/aerol-audit-receiver.service"
+)
+
+// FindReceiverNode returns the node running the audit receiver.
+func FindReceiverNode(t *testing.T, targets *IntegrationTargets) (IntegrationNode, bool) {
+	t.Helper()
+	if targets == nil {
+		return IntegrationNode{}, false
+	}
+	// Seed first: that is where the mixed scenarios put it.
+	//
+	// An unreachable fleet must not be reported as "no receiver provisioned"
+	// — those are different facts and the caller skips with a different
+	// message — so the reachability probe runs first and short-circuits.
+	for _, node := range seedFirst(targets.Nodes) {
+		target, _ := SSHTarget(node)
+		if reachable, _, _ := probeNodeSSH(t, target); !reachable {
+			continue
+		}
+		out, err := SSHRun(t, target, "test -f "+receiverUnitFile+" && echo YES || echo NO")
+		if err == nil && strings.Contains(out, "YES") {
+			return node, true
+		}
+	}
+	return IntegrationNode{}, false
+}
+
+// ReceiverRequest runs an HTTP request against the audit receiver from the
+// node it runs on. Returns the body.
+//
+// --insecure is correct here and nowhere else: the request never leaves the
+// loopback interface, and the receiver's certificate is issued for the
+// `aerol-audit-receiver` /etc/hosts alias rather than for 127.0.0.1. What is
+// being tested is the exporter's delivery, not this curl's trust chain.
+func ReceiverRequest(t *testing.T, node IntegrationNode, method, path string) (string, error) {
+	t.Helper()
+	RequireNodeSSH(t, node)
+	target, ok := SSHTarget(node)
+	if !ok {
+		return "", fmt.Errorf("node %s has no SSH address", node.Name)
+	}
+	script := `sudo bash -c 'port=$(grep -o -- "--addr :[0-9]*" ` + receiverUnitFile + ` | head -1 | cut -d: -f2); ` +
+		`[ -n "$port" ] || { echo "NOPORT" >&2; exit 4; }; ` +
+		`curl -sS --insecure --max-time 30 -X ` + method + ` "https://127.0.0.1:$port` + path + `"'`
+	out, err := SSHRun(t, target, script)
+	if err != nil {
+		return out, fmt.Errorf("receiver %s %s on %s: %w (%s)", method, path, node.Name, err, strings.TrimSpace(out))
+	}
+	return out, nil
+}
+
+// ReceiverStats is GET /_stats on the audit receiver.
+type ReceiverStats struct {
+	Batches    int `json:"batches"`
+	Records    int `json:"records"`
+	Duplicates int `json:"duplicates"`
+	Rejected   int `json:"rejected"`
+	FailNext   int `json:"fail_next"`
+	Nodes      int `json:"nodes"`
+}
+
+// ReceiverStatsFor reads the receiver's counters.
+func ReceiverStatsFor(t *testing.T, node IntegrationNode) (ReceiverStats, error) {
+	t.Helper()
+	var st ReceiverStats
+	body, err := ReceiverRequest(t, node, "GET", "/_stats")
+	if err != nil {
+		return st, err
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &st); err != nil {
+		return st, fmt.Errorf("decode receiver stats %q: %w", strings.TrimSpace(body), err)
+	}
+	return st, nil
+}
+
+// ReceiverRecords reads the last n records the receiver accepted.
+func ReceiverRecords(t *testing.T, node IntegrationNode, n int) ([]auditlog.Event, error) {
+	t.Helper()
+	body, err := ReceiverRequest(t, node, "GET", "/_probe/"+strconv.Itoa(n))
+	if err != nil {
+		return nil, err
+	}
+	var out []auditlog.Event
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &out); err != nil {
+		return nil, fmt.Errorf("decode receiver records: %w", err)
+	}
+	return out, nil
+}
+
+// AwaitReceiverRecords polls until pred is satisfied by the receiver's last n
+// records, so a case asserts on delivery rather than on timing.
+func AwaitReceiverRecords(t *testing.T, node IntegrationNode, n int, timeout time.Duration, pred func([]auditlog.Event) bool) []auditlog.Event {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last []auditlog.Event
+	var lastErr error
+	for time.Now().Before(deadline) {
+		recs, err := ReceiverRecords(t, node, n)
+		if err == nil {
+			last, lastErr = recs, nil
+			if pred(recs) {
+				return recs
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(5 * time.Second)
+	}
+	if lastErr != nil {
+		t.Fatalf("the receiver never delivered records satisfying the predicate within %s; last error: %v", timeout, lastErr)
+	}
+	t.Fatalf("the receiver never delivered records satisfying the predicate within %s (%d records seen)", timeout, len(last))
+	return last
+}
+
+// PlantWitnessHead records a chain head for nodeID at the audit receiver,
+// bypassing the node that would normally report it.
+//
+// This is the only honest way to test the witness boot gate (UC-144). The
+// gate calls Witness.LastWitnessedHead at boot and refuses to start when the
+// external record disagrees with the local chain, so the fault has to be
+// injected at the witness, not at the node. Faking it with a made-up env knob
+// would produce a case that skips forever — which the plan calls the worst of
+// the available options.
+//
+// The receiver's /witness endpoint takes the bearer token only (no HMAC), and
+// the token lives in the receiver's own 0600 env file, which is why this runs
+// over SSH on the receiver's host.
+func PlantWitnessHead(t *testing.T, receiverNode IntegrationNode, nodeID, headHex string) error {
+	t.Helper()
+	RequireNodeSSH(t, receiverNode)
+	target, ok := SSHTarget(receiverNode)
+	if !ok {
+		return fmt.Errorf("receiver node %s has no SSH address", receiverNode.Name)
+	}
+	body := fmt.Sprintf(`[{"NodeID":%q,"HeadHex":%q,"EventID":"itest-planted","Observed":%q}]`,
+		nodeID, headHex, time.Now().UTC().Format(time.RFC3339))
+	script := `sudo bash -c 'set -a; . ` + receiverEnvFile + `; set +a; ` +
+		`port=$(grep -o -- "--addr :[0-9]*" ` + receiverUnitFile + ` | head -1 | cut -d: -f2); ` +
+		`[ -n "$port" ] || { echo NOPORT >&2; exit 4; }; ` +
+		`curl -sS --insecure --max-time 30 -o /dev/null -w "%{http_code}" ` +
+		`-H "Authorization: Bearer $AEROL_RECEIVER_TOKEN" -H "Content-Type: application/json" ` +
+		`-X POST --data ` + shellSingleQuote(body) + ` "https://127.0.0.1:$port/witness"'`
+	out, err := SSHRun(t, target, script)
+	if err != nil {
+		return fmt.Errorf("plant witness head on %s: %w (%s)", receiverNode.Name, err, strings.TrimSpace(out))
+	}
+	if code := strings.TrimSpace(out); !strings.HasPrefix(code, "2") {
+		return fmt.Errorf("the receiver refused the planted head with status %s", code)
+	}
+	return nil
+}
+
+// WitnessedHeadFor reads what the receiver currently holds for nodeID.
+// Returns ok=false for a 404, which means "never recorded" and is distinct
+// from a transport error.
+func WitnessedHeadFor(t *testing.T, receiverNode IntegrationNode, nodeID string) (headHex string, ok bool, err error) {
+	t.Helper()
+	body, err := ReceiverRequest(t, receiverNode, "GET", "/witness/"+url.PathEscape(nodeID))
+	if err != nil {
+		return "", false, err
+	}
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" || strings.Contains(trimmed, "no head for node") {
+		return "", false, nil
+	}
+	var head struct {
+		HeadHex string `json:"HeadHex"`
+	}
+	if jerr := json.Unmarshal([]byte(trimmed), &head); jerr != nil {
+		return "", false, fmt.Errorf("decode witnessed head %q: %w", trimmed, jerr)
+	}
+	return head.HeadHex, head.HeadHex != "", nil
+}
+
+// shellSingleQuote wraps s for safe inclusion inside a single-quoted shell
+// word that is itself already inside one.
+func shellSingleQuote(s string) string {
+	return "'\"'\"'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'\"'\"'"
 }
 
 // sshReachable caches, per node, whether this machine can actually SSH in.
@@ -808,4 +1268,41 @@ func lastNonEmptyLine(out string) string {
 		}
 	}
 	return ""
+}
+
+// applyNodeEnvOverride writes the transient drop-in and reloads systemd. It
+// does NOT restart the unit — the caller decides when, because the cluster
+// helper must sequence restarts seed-first across several nodes.
+func applyNodeEnvOverride(t *testing.T, target string, kv map[string]string) error {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("# Written by the integration suite. Transient.\n")
+	for _, k := range sortedKeys(kv) {
+		// No quoting: systemd EnvironmentFile takes the rest of the line
+		// verbatim, and quoting here would make the value arrive with quotes.
+		fmt.Fprintf(&b, "%s=%s\n", k, kv[k])
+	}
+	script := fmt.Sprintf(`set -e
+sudo install -d -m 0755 /etc/systemd/system/sandboxd.service.d
+sudo install -d -m 0750 /etc/sandboxd
+sudo tee %s >/dev/null <<'AEROL_ITEST_ENV'
+%sAEROL_ITEST_ENV
+sudo chmod 0600 %s
+sudo tee %s >/dev/null <<'AEROL_ITEST_DROPIN'
+[Service]
+EnvironmentFile=%s
+AEROL_ITEST_DROPIN
+sudo systemctl daemon-reload`, itestEnvOverrideFile, b.String(), itestEnvOverrideFile, itestEnvDropIn, itestEnvOverrideFile)
+
+	if out, err := SSHRun(t, target, script); err != nil {
+		return fmt.Errorf("%w\n%s", err, out)
+	}
+	return nil
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

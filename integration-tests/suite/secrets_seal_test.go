@@ -161,11 +161,15 @@ func TestSealedRowIsPresentOnRecipientsAndAbsentElsewhere(t *testing.T) {
 			continue
 		}
 		nodeID := heteroNodeID(t, c, targets, node.Name)
-		probe := harness.ProbePeerSecret(t, node, sb.ID)
+		probe := harness.ProbePeerSecret(t, node, view)
 		if probe.Err != nil {
 			t.Fatalf("peer probe on %s: %v", node.Name, probe.Err)
 		}
 		checked++
+		if probe.Refused() {
+			t.Fatalf("%s (%s) refused the probe with %d: the probe's own credentials are wrong, so this case can say nothing about where the row is",
+				node.Name, nodeID, probe.Status)
+		}
 		want := slices.Contains(view.Holders, nodeID)
 		switch {
 		case want && !probe.Present():
@@ -222,7 +226,7 @@ func TestPeerSecretStateIsStableUnderRepeatedObservation(t *testing.T) {
 		t.Skip("no SSH-reachable recipient to probe")
 	}
 	for i := 0; i < 3; i++ {
-		probe := harness.ProbePeerSecret(t, node, sb.ID)
+		probe := harness.ProbePeerSecret(t, node, first)
 		if probe.Err != nil {
 			t.Fatalf("peer probe %d on %s: %v", i+1, node.Name, probe.Err)
 		}
@@ -270,10 +274,16 @@ func TestPeerSecretPushRefusesAForeignIdentity(t *testing.T) {
 	sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{
 		Env: map[string]string{"UC114_TOKEN": secretValue(t, "114")},
 	})
+	// The probe needs the generation and incarnation the handler requires.
+	view := harness.AwaitSecretHolders(t, c, sb.ID, 2*time.Minute, func(v harness.SecretHoldersView) bool {
+		return len(v.Holders) >= 1 && v.SealGeneration >= 1
+	})
 
 	// Sanity: with the node's own certificate the same request is served, so a
 	// refusal below is about the identity and not about the URL being wrong.
-	if probe := harness.ProbePeerSecret(t, node, sb.ID); probe.Err != nil {
+	if probe := harness.ProbePeerSecret(t, node, view); probe.HandshakeRejected {
+		t.Fatalf("the node's OWN certificate was rejected at the TLS handshake; this case cannot distinguish a refused identity from a broken probe")
+	} else if probe.Err != nil {
 		t.Fatalf("control probe with the node's own certificate failed: %v", probe.Err)
 	} else if probe.Status == 403 || probe.Status == 401 {
 		t.Fatalf("the node's OWN certificate was refused (%d); this case cannot distinguish identity from URL", probe.Status)
@@ -287,7 +297,18 @@ func TestPeerSecretPushRefusesAForeignIdentity(t *testing.T) {
 		{name: "operator PAT instead of a peer certificate", bearer: sc.PAT},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			probe := harness.ProbePeerSecretUnauthenticated(t, node, sb.ID, tc.bearer)
+			probe := harness.ProbePeerSecretUnauthenticated(t, node, view, tc.bearer)
+
+			// Refusal at the TLS layer is the STRONGEST outcome: the server
+			// demanded a client certificate, got none, and tore the
+			// connection down before any request was served. curl reports
+			// exit 56 and no HTTP status, which the first version of this
+			// case treated as a broken probe — so the product doing exactly
+			// the right thing read as a test error.
+			if probe.HandshakeRejected {
+				t.Logf("UC-114 PASS (%s): refused at the TLS handshake, below HTTP entirely", tc.name)
+				return
+			}
 			if probe.Err != nil {
 				t.Fatalf("probe: %v", probe.Err)
 			}
@@ -297,6 +318,7 @@ func TestPeerSecretPushRefusesAForeignIdentity(t *testing.T) {
 			if probe.Status == 404 {
 				t.Fatalf("the route answered 404 for %s; a missing-route answer would hide a missing authz check", tc.name)
 			}
+			t.Logf("UC-114 PASS (%s): refused with status %d", tc.name, probe.Status)
 		})
 	}
 }

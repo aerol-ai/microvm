@@ -3,42 +3,90 @@
 Deferred work items with enough context to pick up cold. Each entry says
 what, why, the caveat that motivated capturing it, and where to start.
 
-## Enterprise boot can fail its own witness check (audit) — REPRODUCED
+## Enterprise boot can fail its own witness check (audit) — FIXED
 
-- **What:** `ValidateSecretAuditWitness` can look the witnessed head up under
-  the node id `"standalone"` while the shipping path publishes it under the
-  real cluster node id, so the comparison fails against a head that IS
+- **What:** `ValidateSecretAuditWitness` looked the witnessed head up under
+  the node id `"standalone"` while the shipping path published it under the
+  real cluster node id, so the comparison failed against a head that WAS
   witnessed.
-- **Why it matters:** the daemon fails CLOSED — an enterprise node refuses to
-  start. Observed on a live single-node box with
-  `SB_ENTERPRISE_MODE=true`:
+- **Why it mattered:** the daemon failed CLOSED — an enterprise node refused
+  to start. Observed on a live single-node box with `SB_ENTERPRISE_MODE=true`:
 
       secret audit witness mismatch:
         local_head="7334bf03cb2b4ab7bc858bba55a44e3c3fda66031837eb079026503240e7ce7b"
         witnessed_head=""
 
   The witness had that EXACT head stored, under
-  `aerolvm-itest-single-node-node1`. Only the lookup key was wrong.
-- **Mechanism:** both call sites derive `nodeID` as
-  `s.Cluster().SelfNodeID()`, but the service is constructed with
-  `cluster.NewNoop("standalone", …)` (`internal/service/service.go:595`,
-  `internal/cluster/noop.go:43`) and the real cluster is attached later. When
-  the boot check runs before `AttachCluster`, it queries `standalone`; the
-  periodic shipper always runs after, so it writes the real id. The two never
-  meet.
-- **Caveat — INTERMITTENT, and that is the worrying part.** It failed twice,
-  then three consecutive restarts were clean, which fits a race with cluster
-  attachment rather than a fixed ordering. An intermittent fail-closed on boot
-  is worse than a deterministic one: it will look like flake.
-- **Also note:** a fresh node never hits it, because the check short-circuits
-  on an empty chain tip — so this only bites a node that has already recorded
-  audit events, i.e. every restart in production.
-- **Depends on / blocked by:** nothing. Needs a product decision: either defer
-  the check until the cluster identity is final, or resolve the node id from
-  config (`SB_NODE_ID`) rather than from the cluster handle.
-- **Start:** `internal/service/secret_audit_witness.go` lines ~139, ~422 (the
-  two `nodeID` derivations) and wherever `ValidateSecretAuditWitness` is
-  sequenced relative to `AttachCluster` in `pkg/daemon`.
+  `aerolvm-itest-single-node-node1`. Only the lookup key was wrong. It
+  reproduced intermittently, which is worse than a deterministic failure: a
+  node that refuses to start only sometimes reads as flake.
+- **Fix:** all four `nodeID` derivations in
+  `internal/service/secret_audit_witness.go` now go through
+  `witnessNodeID()`, which prefers `cfg.NodeID` and falls back to the cluster
+  handle. `cfg.NodeID` is the same value `pkg/daemon` builds the real cluster
+  from (`daemon.go` → `cluster.Config.NodeID` → `agent.go` / `client.go`), so
+  the preference is invisible on a healthy node and the race window is gone.
+  This is the second of the two options this entry originally proposed —
+  resolving the id from config rather than deferring the check — because it
+  removes the ordering dependency instead of relying on a new one.
+- **Regression tests:** `secret_audit_witness_nodeid_test.go`, including a
+  guard that fails if any witness call site reads `c.SelfNodeID()` directly
+  again. Mutation-checked.
+
+## A partitioned node keeps serving: /health ignores cluster membership — REPRODUCED
+
+- **What:** a node that has fallen out of the cluster still answers
+  `/health` with 200, so the ingress keeps routing traffic to it. Every
+  request that lands there fails, because the node cannot reach a leader.
+- **Measured** (S3 `cluster-3-mixed-secrets-kms`, 2026-09-27). node1 was
+  `active`, `NRestarts=0`, and `/health` = 200, while:
+  - the cluster's member list contained only node2 and node3;
+  - node1's OWN member list contained only node1 — a clean 1 + 2 split;
+  - node1 was stuck `entering candidate state`, node3 was leader.
+- **Effect:** roughly one request in three failed across the whole run.
+  Measured directly on S4's `/v1/audit/verify`: 4 of 5 calls returned 502,
+  1 returned 200. In the suite it surfaced as 18 unrelated-looking failures,
+  nearly all `cluster: reserve placement failed: cluster: not raft leader`,
+  plus `503: cluster: peer InternalURL required (mTLS fail-closed)` when a
+  forward targeted the partitioned node.
+- **Why it matters most:** every one of those reds looks like a bug in
+  whatever test happened to run. The cluster is *degraded but advertising
+  itself as healthy*, which is the failure mode that costs the most
+  debugging time per incident.
+- **The fix needs design, not a one-liner.** Naively failing `/health` when
+  there is no leader would take an ENTIRE cluster out of rotation during any
+  routine election — worse than the bug. It needs: readiness distinct from
+  liveness, a grace period so elections do not flap it, and a decision about
+  whether a partitioned node should still serve reads.
+- **Note:** `/ready` currently 404s, so there is no readiness endpoint to
+  gate on yet. That is probably where this starts.
+- **Start:** the health handler in `pkg/api`, `cfg.EnableCluster` gating, and
+  the Caddy upstream health config in `pkg/caddy` / `packaging/`.
+
+## Losing the seed leaves the survivors without a leader — REPRODUCED
+
+- **What:** stopping the SEED of a 3-node cluster left the remaining two
+  unable to elect a leader. Two of three voters is a quorum, so this should
+  not happen.
+- **Observed** (S2 security run, 2026-09-27) after `systemctl stop sandboxd`
+  on the seed:
+
+      node node1 did not rejoin within 4m: no raft leader yet
+      create HA sandbox: cluster: reserve placement failed: cluster: not raft leader
+
+  The cluster did not recover even once the seed was restarted.
+- **Related but distinct** from the partition entry above (there, nobody
+  stopped anything) and from the known "restarting the seed re-bootstraps
+  standalone and orphans the joiners" behaviour (there, the seed restarted;
+  here it was merely stopped).
+- **Suspect:** voter promotion — whether joiners are actually promoted to
+  voters before the seed goes away (the path that logs "cluster:
+  auto-promoted member to raft voter").
+- **Start:** `internal/cluster/raft.go`, `client.go` leadership/bootstrap,
+  the auto-promotion path in `agent.go`. Needs a regression test next to
+  whichever file changes, per CLAUDE.md's cluster rules.
+- **Mitigated meanwhile:** the integration suite never picks the seed as a
+  disruptive victim, and an owner-kill case whose owner is the seed skips.
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 

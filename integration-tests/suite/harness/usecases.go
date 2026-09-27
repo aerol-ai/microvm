@@ -486,6 +486,74 @@ var Registry = []UseCase{
 	{ID: "UC-128", Title: "Env is absent from the Raft placement spec", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
 	{ID: "UC-129", Title: "On disk: no plaintext env column; the sealed row round-trips across an update", Requires: []Capability{CapSecrets}, Implemented: true},
 	{ID: "UC-130", Title: "A corrupted sealed env fails the sandbox loud, not empty", Requires: []Capability{CapSecrets}, Implemented: true},
+
+	// E. Audit chain, read API, fan-out (F6, F7).
+	{ID: "UC-131", Title: "POST /v1/audit/verify passes on a live node after a workload", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-132", Title: "Tamper detection: a corrupted JSONL line fails verification and names the break", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-133", Title: "Audit reads fan out: a non-owner node returns history the owner never had", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-134", Title: "Coverage is honest: an unreachable node is reported missing, not dropped", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-135", Title: "Evidence survives owner death: the history is still complete after a failover", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-136", Title: "Post-delete history is readable within the grace window and scoped to its incarnation", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-137", Title: "Index-off returns the same events as index-on; an incomplete index 503s", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-138", Title: "Pagination walks a multi-page history with no duplicates and no gaps", Requires: []Capability{CapSecrets}, Implemented: true},
+
+	// F. Export connectors and witness (F9, F10, F11).
+	{ID: "UC-139", Title: "file backend: records land in SB_AUDIT_EXPORT_FILE_PATH, one chained object per line", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-140", Title: "s3 backend: objects land under the prefix and reconstruct the chain", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-141", Title: "webhook backend: the receiver sees records with a valid HMAC and bearer token", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-142", Title: "Backoff / at-least-once: a failing sink is retried until every record lands", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
+	{ID: "UC-143", Title: "Witness: chain heads reach the receiver, receipts persist, the health gauge is 1", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+	{ID: "UC-144", Title: "Witness fail-closed at boot: a receipt disagreeing with the local chain refuses the node", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+	{ID: "UC-145", Title: "Ingest endpoint: a tokened event is accepted, an untokened one refused, listener loopback-only", Requires: []Capability{CapSecrets, CapCluster, CapEnterprise}, Implemented: true},
+	{ID: "UC-145b", Title: "Retention prune holds while export lags, then verifies across the checkpoint boundary", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+
+	// G. Quota, rate limits, overflow (F8).
+	{ID: "UC-146", Title: "Per-identity audit rate limit returns 429 with Retry-After; a second identity is unaffected", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-147", Title: "Per-node audit ceiling is separate from the operator limit", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-148", Title: "Overflow gap: a flood past the queue max leaves a gap marker and the chain still verifies", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-149", Title: "Overflow spill: the same flood drains from disk and the chain is complete", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-150", Title: "Egress attribution names the right sandbox and the per-sandbox cap bounds its share", Requires: []Capability{CapSecrets, CapEnterprise, CapIsolate}, Implemented: true},
+
+	// H. Cluster mTLS and authz (F12, F13).
+	{ID: "UC-151", Title: "Every node presents DNS:node:<id>; ca.key exists only on the seed", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+	{ID: "UC-152", Title: "A plaintext call to the cluster-internal port is refused", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+	{ID: "UC-153", Title: "A self-signed cert carrying a valid node SAN is rejected by the peer listener", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+	// Re-scoped (§7 prerequisite box): the plan's positive half was false —
+	// internalOp routes can never accept a PAT, and refusing it is correct.
+	{ID: "UC-154", Title: "Operator-only routes accept the fleet PAT; internal mTLS routes refuse it", Requires: []Capability{CapSecrets}, Implemented: true},
+	{ID: "UC-155", Title: "A removed peer's certificate is revoked", Requires: []Capability{CapClusterMTLS, CapCluster}, Implemented: true},
+
+	// I. Enterprise profile (F14). UC-158 and UC-159 are folded into the
+	// matrix test rather than standing alone: the off-node-exporter refusal is
+	// one more forbidden row, and "the matrix must not leave the fleet
+	// degraded" is a property of EVERY row, which asserting once at the end
+	// would not attribute to the row that broke it.
+	{ID: "UC-156", Title: "Enterprise boot-gate matrix: each forbidden combination refuses with its documented message", Requires: []Capability{CapEnterprise}, Implemented: true},
+	{ID: "UC-157", Title: "A CA signing key in the daemon TLS directory refuses an enterprise boot", Requires: []Capability{CapEnterprise, CapCluster}, Implemented: true},
+	{ID: "UC-158", Title: "An on-node-only audit exporter refuses an enterprise boot", Requires: []Capability{CapEnterprise}, Implemented: true},
+	{ID: "UC-159", Title: "After every boot-gate row the node rejoins cleanly; the matrix leaves no degraded fleet", Requires: []Capability{CapEnterprise}, Implemented: true},
+
+	// J. Storage retirement and fleet-scale reads (F15, F18, F19).
+	{ID: "UC-160", Title: "Draining a worker raises a storage-retirement obligation; attesting it records the discharge", Requires: []Capability{CapSecrets, CapCluster}, Implemented: true},
+	{ID: "UC-161", Title: "Fleet-scale reads stay paged: limit is honoured and the cursor advances", Requires: []Capability{CapCluster}, Implemented: true},
+	// Scope corrected twice — see the T15 findings box in the plan. Neither a
+	// live 11-node ingress tier nor a `terraform plan` is available, so this
+	// asserts the drift that actually bites: the Terraform literal against
+	// the daemon constant.
+	{ID: "UC-162", Title: "The Terraform ingress gate matches MaxReplicatedIngressRouteNodes and keeps its escape hatch", Requires: []Capability{CapEnterprise}, Implemented: true},
+
+	// K. Isolate jail under enterprise (F16, F17).
+	{ID: "UC-163", Title: "Enterprise + isolate: workerd is jailed (non-root, chroot, seccomp, pid cap) while serving", Requires: []Capability{CapEnterprise, CapIsolate, CapIsolateJail}, Implemented: true},
+	{ID: "UC-164", Title: "Per-sandbox egress attribution holds under the jail, and the audit names the right sandbox", Requires: []Capability{CapEnterprise, CapIsolate, CapIsolateJail}, Implemented: true},
+
+	// L. Non-regression on the boot path.
+	{ID: "UC-165", Title: "Default create latency unmoved: main-built vs branch-built, p50 +10% / p99 +20%", Requires: []Capability{CapSecrets, CapBenchmark}, Implemented: true},
+	{ID: "UC-166", Title: "HA create latency reported separately, first call visible, with a KMS row", Requires: []Capability{CapSecrets, CapCluster, CapBenchmark}, Implemented: true},
+
+	// M. Surfaces the first F-table missed (eng review 2026-09-19).
+	{ID: "UC-167", Title: "Reconcile reclaims a leaked workerd group (same daemon lifetime)", Requires: []Capability{CapIsolate}, Implemented: true},
+	{ID: "UC-168", Title: "js-bundle list aggregates across nodes and declares an unreachable peer", Requires: []Capability{CapIsolate, CapCluster}, Implemented: true},
+	{ID: "UC-169", Title: "Plaintext leak sweep: the canary appears nowhere on any node, in any encoding", Requires: []Capability{CapSecrets}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

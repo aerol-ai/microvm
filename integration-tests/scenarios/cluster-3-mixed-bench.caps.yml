@@ -7,6 +7,16 @@ capabilities:
   # Enables the create-latency and density cases (UC-94/UC-95) that the
   # security band in UC-165 is measured against.
   - benchmark
+  # UC-165/166 are this branch's non-regression arm and require `secrets` as
+  # well as `benchmark`. Without it NO scenario satisfied both, so group L
+  # could never run anywhere — the boot-path non-regression claim would have
+  # rested on a case that silently skipped on every row. Caught by
+  # safety/unreachable_usecases_test.go.
+  #
+  # This does not turn a security profile on. The scenario still runs the
+  # DEFAULT posture, which is exactly what UC-165 must measure: the create
+  # path everyone runs, main-built versus branch-built.
+  - secrets
 #
 # Never disruptive: killing a node mid-benchmark would poison the latency
 # distribution the whole arm exists to measure.

@@ -93,6 +93,32 @@ func SSHRun(t *testing.T, target, script string) (string, error) {
 	return sshRunner(t, target, script)
 }
 
+// SSHRunStdin runs a remote command with stdin supplied locally.
+//
+// It exists so a secret never reaches the remote argv. sudo logs the FULL
+// command line to /var/log/auth.log and the journal, so a canary passed as a
+// grep argument is written into the very files the sweep then searches —
+// UC-169 reported itself as a leak in all five encodings because of exactly
+// that. Feeding the pattern on stdin leaves no trace.
+func SSHRunStdin(t *testing.T, target, script, stdin string) (string, error) {
+	t.Helper()
+	return sshRunnerStdin(t, target, script, stdin)
+}
+
+var sshRunnerStdin = execSSHRunStdin
+
+func execSSHRunStdin(t *testing.T, target, script, stdin string) (string, error) {
+	t.Helper()
+	args := append(sshBaseArgs(), target, script)
+	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	return buf.String(), err
+}
+
 func execSSHRun(t *testing.T, target, script string) (string, error) {
 	t.Helper()
 	args := append(sshBaseArgs(), target, script)

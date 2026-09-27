@@ -933,6 +933,36 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 | UC-137 | `SB_AUDIT_INDEX_ENABLED=false` returns the **same** events as index-on (parity), and an incomplete index returns 503 rather than a short answer | S |
 | UC-138 | Pagination: `next_cursor` walks a >1-page history with no duplicates and no gaps | S |
 
+> **T13 IMPLEMENTATION FINDINGS (outside voice, verified 2026-09-26).**
+>
+> - **There is no `SB_SECRET_AUDIT_DIR`.** The audit directory is the DB's
+>   directory — `internal/service` derives it with
+>   `secretAuditDataDir(cfg.DBPath)`. An early draft of the group E/F scripts
+>   assumed the env var existed, which would have pointed four cases at a path
+>   that does not exist and turned them into silent skips. They now read
+>   `SB_DB_PATH` from the node's own env and take its dirname.
+> - **UC-144's fault must be injected at the WITNESS, not at the node.** The
+>   boot gate calls `Witness.LastWitnessedHead` (`secret_audit_witness.go:365`),
+>   so the only honest injection is to record a disagreeing head at the
+>   receiver and restart the node. The first draft invented an
+>   `SB_..._PLANTED_HEAD` env knob; that produces a case that skips forever,
+>   which §6.2a calls the worst of the available options. `/witness` takes the
+>   bearer token only (no HMAC), so `harness.PlantWitnessHead` reads the token
+>   from the receiver's own 0600 env file over SSH.
+> - **UC-132 tampers with the MIDDLE of the chain, not the tail.** A tail edit
+>   is indistinguishable from a torn write after a crash — which the product
+>   deliberately tolerates and records as a gap — so tampering with the tail
+>   would have asserted nothing about tamper detection.
+> - **The suite reaches the audit receiver over SSH + loopback**, not across
+>   the network: its `/_probe`, `/_stats` and `/_chaos` endpoints are
+>   deliberately unauthenticated, and not exposing them is the point. That
+>   also avoids a second TLS trust decision inside the test process.
+> - **UC-139 and UC-140 must configure the backend they test.** `pkg/auditexport`
+>   is single-valued (no fan-out), so a scenario running the webhook backend
+>   cannot also be asserting the file or s3 one; each case switches a node with
+>   `WithNodeEnv` and switches it back. UC-139 skips (not fails) when the
+>   profile refuses an on-node exporter — that refusal is UC-158's assertion.
+
 ### F. Export connectors and witness (F9, F10, F11)
 
 | UC | Assertion | Caps |
@@ -966,6 +996,34 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 | UC-154 | Operator-only routes (`/v1/cluster/internal/*`, `/v1/audit/verify`, storage-retirement) reject a tenant-scoped token with 403 and accept the fleet PAT | S |
 | UC-155 | Removed peer is **revoked**: drain + remove a node, then replay its client cert → refused | M,C,D |
 
+> **T14 IMPLEMENTATION FINDINGS (outside voice, verified 2026-09-26).**
+>
+> - **UC-158 and UC-159 are folded into UC-156's matrix, not separate tests.**
+>   The off-node-exporter refusal (`daemon.go:326`) is one more forbidden row,
+>   and "the matrix must not leave the fleet degraded" is a property of EVERY
+>   row — asserting it once at the end cannot attribute the damage to the row
+>   that caused it, and every row after that one would then fail for a reason
+>   unrelated to what it tests. `assertNodeBackInService` runs after each row
+>   and checks both "the unit is active" AND "the node is back in the member
+>   list", because a node that is running but out of the member list is
+>   exactly the 2+1 split this project has produced before.
+> - **Every gate row asserts the MESSAGE, not just the refusal.** A bad
+>   binary, a full disk or a bound port also make a node fail to start, so a
+>   matrix that checked only `Started == false` would go green having proven
+>   nothing. The `want` fragments are lifted from `config.go`'s enterprise
+>   block and `daemon.go`, not invented.
+> - **Group I prefers a joiner over the seed.** Refusing the seed's boot on a
+>   cluster removes the rendezvous every joiner needs, which turns one red row
+>   into a split cluster.
+> - **UC-153 forges a certificate with a VALID `node:<id>` SAN on an untrusted
+>   issuer.** That is the forgery that distinguishes "does the server check the
+>   name?" from "does the server check who SIGNED the name?" — only the second
+>   is an identity check.
+> - **UC-154's negative half needs a tenant-scoped token the suite cannot
+>   mint.** It runs the PAT-acceptance half unconditionally and logs plainly
+>   that the tenant-refusal half did not run unless `AEROL_TENANT_TOKEN` is
+>   set, rather than reporting a pass for an assertion it skipped.
+
 ### I. Enterprise profile (F14)
 
 | UC | Assertion | Caps |
@@ -982,6 +1040,42 @@ Legend — **Caps**: `S`=CapSecrets, `C`=CapCluster, `K`=CapSecretsKMS,
 | UC-160 | Drain a worker → a storage-retirement obligation appears in `GET /v1/cluster/storage-retirements`; `POST .../storage-retired` clears it; deletion obligations are honoured before the node leaves | S,C |
 | UC-161 | `GET /v1/cluster/sandbox-index` and the paged list paths stay bounded with N sandboxes (assert page size + `next_cursor`, not a full inventory) | C |
 | UC-162 | Ingress topology gate. **Scope corrected (outside voice, verified):** the daemon half needs >`MaxReplicatedIngressRouteNodes` = 10 live ingress-capable members (`internal/cluster/shards.go:28`), and `cluster-hetero.tfvars` has exactly **one** `ingress` node — no proposed scenario reaches 2, let alone 11. `Terraform/validate/ingress.go` also has no caller outside its own unit test; the real gate is the `nodes.tf:211` precondition. So: assert the **`terraform plan` precondition** with an 11-ingress overlay (plan-only, never applied — free), plus a **single-node env-injection** check that an enterprise daemon refuses to boot when told it has an oversized tier. Drop the live >10-node cluster. | E |
+
+> **T15 IMPLEMENTATION FINDINGS (outside voice, verified 2026-09-26).**
+>
+> - **UC-162's scope was corrected a second time.** §6.2's own correction
+>   already dropped the live >10-node cluster; the replacement — "assert the
+>   `terraform plan` precondition with an 11-ingress overlay (plan-only, never
+>   applied — free)" — does not work either. `Terraform/` uses an S3 backend
+>   and AWS data sources, so `terraform plan` cannot run without initialising
+>   real state and credentials, and a failure would be indistinguishable from
+>   the precondition firing. What IS free and real is the **drift**: the
+>   Terraform gate hardcodes `10` while the daemon's refusal comes from
+>   `cluster.MaxReplicatedIngressRouteNodes`, and `Terraform/validate/ingress.go`
+>   has no caller outside its own unit test — so nothing connects the two
+>   numbers. If the constant moves and the literal does not, Terraform
+>   provisions a tier the daemon then refuses to serve. That assertion now
+>   lives in `integration-tests/safety/ingress_gate_test.go` so it runs in
+>   `make test` (the drift is introduced at commit time, not deploy time), and
+>   UC-162 keeps the live half: this deployment's member count is inside the
+>   cap. Mutation-checked by bumping the literal to 25.
+> - **UC-163 probes all four jail properties in ONE remote script.** Four SSH
+>   round trips could describe four different workerd processes if the group
+>   restarts in between, and "uid from one process, seccomp from another" is
+>   not evidence that any single process is jailed. It also asserts the
+>   process is still SERVING: a jail that is only correct when idle is not a
+>   boundary. `root == "/"` is called out explicitly — that is the
+>   populated-chroot gotcha this project already hit once.
+> - **UC-164 is built on UC-104's scaffolding** (`egressProbeBundle`,
+>   `uploadBundle`, `newIsolateSandbox`, `execFetch`), not on an invented
+>   `fetch` exec verb. The first draft used `sb.Exec("fetch ...")` and a
+>   non-existent `AllowedHosts` field; the real ones are `NetworkAllowOut` and
+>   `NetworkBlockAll`. Reusing the jail-off case's shape is also what makes
+>   the jail-on result comparable to it.
+> - **UC-160 asserts the attestation SURVIVES.** Discharging an obligation
+>   must not delete the record: the attestation is the evidence that the
+>   storage was destroyed, and an obligation that vanishes on discharge leaves
+>   nothing to audit.
 
 ### K. Isolate jail under enterprise (F16, F17)
 
@@ -1127,6 +1221,313 @@ and it is the only check that covers leak paths nobody thought to enumerate.
 
 ---
 
+## 7.4 Live findings (run 7, 2026-09-26)
+
+**PRODUCT FINDING — a read-only platform volume accepted a write.** UC-84 on
+`single-node-secrets`:
+
+```
+platform_volumes_test.go:164: write to read-only volume succeeded (exit=0)
+```
+
+The case is sound and the evidence is not ambiguous: it seeds the volume
+read-write, mounts it `ReadOnly: true` in a second sandbox, **reads the seed
+back successfully** — proving the mount is present and functional — and then
+writes, which succeeds. So the mount exists and ignores the flag; this is not
+a missing mount.
+
+The spec-level plumbing is intact: `PlatformVolumeMount.ReadOnly` reaches
+`mountSpecForVolume` → `BuildMountSpecForSource`, which sets
+`MountSpec.ReadOnly`. The gap is downstream, where `pkg/mounts` realises the
+spec and binds it into the container — the host mount and/or the container
+bind is not marked `ro`.
+
+Security-relevant: a tenant handed read-only access to a shared volume can
+modify it, and every other reader sees the modification.
+
+NOT fixed here — `pkg/mounts` carries its own review rules (pr-review.md §5,
+mount inputs run on the host) and this is unrelated to the secrets work. It
+needs confirming on a non-secrets scenario to establish whether it is a
+regression or long-standing, then its own PR.
+
+This is the FIRST product defect the programme has surfaced. Everything red
+before it was the harness.
+
+## 7.5 UC-117 GREEN — the milestone, live (2026-09-27)
+
+`cluster-3-mixed-secrets`, targeted disruptive pass:
+
+```
+killing owner node3; recipients that can take over: [node1]
+sandbox sb-8cb40dacc41878fa reassigned from node3 to node1
+UC-117 PASS: recreated on recipient node1 and its credentials still work
+```
+
+52s, and not vacuous: the holder set had a real non-owner recipient, the
+kill happened, the new owner was verified to be IN that holder set, and the
+credential was read back FROM INSIDE THE GUEST — not `status=running`, which
+is the check that would pass against the silent empty-env failure this
+programme exists to catch.
+
+Group B is green: **UC-117 pass, UC-118 pass, UC-120 pass**, UC-119 an honest
+skip (every node held a copy, so there was no non-recipient to hand ownership
+to). Plus **UC-110 pass, UC-111 pass**.
+
+T12's exit criterion — "UC-117 green on S2" — is met.
+
+### Architectural finding: audit evidence is node-local
+
+`internal/cluster/audit_replication.go` is a query-time FETCH across peers
+(`AuditPeerPage`, `auditPeerFetchTimeout`), not record replication. A node's
+audit records live only on the node that wrote them, so with an owner down
+its slice is unreachable until it returns.
+
+§7's UC-135 wording — "evidence survives owner death ... the history is still
+complete" — implies replication the product does not have and never claimed
+to. Durability across node loss is the off-node EXPORTER's job (F9/F10/F11,
+UC-139/140/141). What the read path owes is UC-134's honesty property: it may
+return less, but it must SAY so.
+
+UC-135 is rewritten accordingly: the records are present, OR coverage reports
+partial AND names the missing node. A silently short history is the failure,
+because it reads as "this access never happened" when it means "I could not
+ask the node that knows".
+
+## 7.6 Three reds that were not the product (2026-09-27)
+
+The S2 re-verify pass turned up three failures, and none of them was the
+behaviour under test. Recording them because each is a class of mistake this
+suite will make again.
+
+**UC-114 — a refusal read as a broken probe.** The case asserts that a caller
+reaching the internal port without a peer identity is refused. mTLS refuses
+it at the TLS handshake — the server demands a client certificate, gets none,
+and tears the connection down — so curl exits 56 with no HTTP status at all.
+The case reported `probe: exit status 56` and failed against a product doing
+exactly the right thing. Refusal below HTTP is *stronger* than a 403, and the
+test now says so.
+
+The parser could not simply treat "no status" as a refusal: `curl: command
+not found` produces the same empty output, and that would be a false pass on
+a probe that never ran. Classification is now keyed on curl's own exit code
+(35/56/58/60/77 are TLS refusals; 7/127 are not), which is why the probe
+scripts append `$?`.
+
+**UC-134 — an injected fault blamed on the subject.** The case stops a node
+and then polls audit coverage. The ingress answers 502 for a few seconds
+while it still holds a route to the machine that just went away. Fataling on
+the first one failed the case 15s into a 3-minute poll and blamed audit
+honesty for an ingress hiccup the test itself caused. It polls through it
+now, and fails with a *distinct* message if the read never comes back — so
+the case still cannot pass by the read merely failing.
+
+**UC-135 — the previous case's debris.** It killed the owner, waited out its
+full 8-minute deadline for a reassignment, and reported a failover bug. The
+cluster was one member short: UC-134's cleanup had fired `systemctl start`
+and returned in milliseconds, while the node takes tens of seconds to rejoin
+gossip and Raft. This is the same gap that cost a live run 79 cases, in a
+second place. Every restore now waits, and a function-scoped guard enforces
+it — a whole-file scan had called the file safe because a *different* test in
+it used `KillNodeDaemon`.
+
+The common shape: **a test that injects a fault must not attribute the
+fault's own side effects to the property it is measuring, and must not leave
+them for the next test.** Two of the three reds would have been filed as
+product bugs.
+
+### Product fix found on the way: enterprise boot fail-closed
+
+Preparing S4 surfaced that the witness node-id bug in TODOS.md would bite its
+disruptive restarts. `ValidateSecretAuditWitness` derived the node id from
+the cluster handle, but the Service is built with
+`cluster.NewNoop("standalone", …)` and the real cluster attaches later — so a
+boot check that ran first asked the witness about `standalone` while the
+shipper had stored the head under the real id. An enterprise node fails
+CLOSED on a mismatch that does not exist, intermittently. Fixed: all four
+derivations go through `witnessNodeID()`, preferring `cfg.NodeID` — the same
+value the real cluster is built from, so nothing changes on a healthy node.
+
+## 7.7 Two product findings from S3/S4 (2026-09-27)
+
+### A node that restarts without a leader never comes back (FIXED)
+
+S4's seed exited at boot and stayed down for the whole run:
+
+```
+cluster: validate/re-fanout durable secrets at boot: authoritative cluster
+  placement snapshot during secret re-fanout: cluster: not raft leader
+sandboxd.service: Start request repeated too quickly.
+```
+
+The boot secret re-fanout needs one leader RPC. A node restarting into an
+in-flight election finds no leader seated; enterprise mode treated ANY
+re-fanout error as fatal, so the daemon exited — and systemd's restart limit
+made that permanent. From outside, the cluster answered roughly one request
+in three with a 502, because the ingress still held a route to a node that
+was serving nothing.
+
+Enterprise mode is meant to fail closed on secrets it cannot validate. It is
+not meant to fail closed because leadership was momentarily unsettled, which
+is the normal state of a starting cluster. Fixed in `pkg/daemon`: that one
+condition defers to a background retry (mirroring the ownership replay six
+lines above, which already treats it as retryable); everything else still
+fails closed. `waitForLeader` now returns an `ErrNoLeader` sentinel so the
+condition can be classified at all.
+
+### A partitioned node keeps serving — OPEN, and the root cause of most S3/S4 reds
+
+S3 finished 91 pass / 18 fail. Nearly every failure read as a different bug
+— reseal, retirement, peer push, audit coverage — and nearly every one was
+the same thing:
+
+```
+cluster: reserve placement failed: cluster: not raft leader
+503: cluster: peer InternalURL required (mTLS fail-closed)
+```
+
+All three nodes were `active` with `NRestarts=0`. node1 had simply fallen
+out of the cluster: the fleet's member list held node2 and node3, node1's
+own member list held only node1, node3 was leader and node1 was stuck
+`entering candidate state`. And node1 answered `/health` with **200**, so
+the ingress kept routing to it. Measured on S4's `/v1/audit/verify`: 4 of 5
+calls 502, 1 of 5 succeeded — almost exactly one node in three.
+
+This is the highest-value finding of the programme so far, because a cluster
+that is degraded while advertising itself as healthy makes every unrelated
+test lie about its own subject.
+
+**Not fixed here, and deliberately not a one-liner.** Failing `/health`
+whenever there is no leader would take an entire cluster out of rotation
+during a routine election — worse than the bug. It needs readiness split
+from liveness, a grace period so elections cannot flap it, and a decision on
+whether a partitioned node should still serve reads. `/ready` currently
+404s, so there is no readiness endpoint to gate on. Recorded in TODOS.md.
+
+### Losing the SEED leaves the survivors leaderless — OPEN, needs investigation
+
+UC-134 stopped one of three nodes. It happened to be the seed, and the
+remaining two **never seated a leader**:
+
+```
+node node1 did not rejoin within 4m: no raft leader yet
+create HA sandbox: cluster: reserve placement failed: cluster: not raft leader
+```
+
+Two of three voters is a quorum, so an election should have succeeded. It
+did not, and the cluster did not recover even after the seed was restarted.
+This is the same shape as the known "restarting the seed orphans the
+joiners" note, but worse: here the seed was merely STOPPED, and the survivors
+could not carry on without it.
+
+**Not fixed here** — it is a Raft/voter-promotion question in
+`internal/cluster`, it needs its own investigation and regression test, and
+diagnosing it inside a test-suite change would bury it. What this programme
+owed was to stop mis-attributing it: the suite no longer picks the seed as a
+victim, and an owner-kill case whose owner IS the seed now skips with that
+reason rather than destroying the fleet and reddening whatever ran next.
+
+## 7.8 A discarded flagship run, and the harness bug behind it
+
+S5's first attempt reported `cluster: expected 8 members, never reached
+(last 4)`, was marked inconclusive at 0/174, and ended with:
+
+```
+integration-tests/run.sh: line 1508: unexpected EOF while looking for matching `''
+```
+
+on a file that `bash -n` accepts and that git shows as clean. The cause was
+not the cluster. **run.sh was edited while an instance of it was running.**
+Bash reads a script incrementally by byte offset, so an insertion earlier in
+the file makes the RUNNING process resume at the wrong offset and misexecute
+from that point on — including, evidently, through the member-wait gate. The
+"4 of 8" was the harness reading its own half-written source, not a
+membership finding, and a ~$14 flagship run had to be thrown away.
+
+This is the third time editing the tree mid-run has cost a run in this
+programme, and the first time it has corrupted a result rather than merely
+rebuilding something. Two rules follow, and the second is the one that
+actually holds:
+
+1. Do not edit `run.sh` (or anything it sources) while a run is in flight.
+2. Make rule 1 unnecessary: `run.sh` copies itself to a temp file and
+   `exec`s that, so the running invocation is immune to edits of the
+   working tree. `HERE` still resolves against the original path, so every
+   relative lookup is unaffected.
+
+The same hazard applies to `lib/*.sh`, which run.sh sources.
+
+## 7.9 Where the programme stopped (2026-09-27)
+
+Stopped deliberately, on the operator's call, with S6 mid-flight and S5
+queued. What is established and what is not:
+
+| Scenario | Result | Status |
+|---|---|---|
+| S1 `single-node-secrets` | 136 pass / 0 fail / 102 skip | green |
+| S2 `cluster-3-mixed-secrets` | UC-117 green and non-vacuous | T12 criterion met |
+| S3 `cluster-3-mixed-secrets-kms` | 91 pass / 18 fail | first execution; see §7.7 |
+| S4 `cluster-3-mixed-secrets-enterprise` | **25 → 168 pass**, 95 → 29 fail | fix validated |
+| S6 `cluster-hetero-secrets-kms` | 105 pass / 9 fail at stop, **8 members formed** | first flagship ever to run |
+| S5 `cluster-hetero-secrets` | not run | **T18 incomplete** |
+
+**T18 is NOT complete.** It asks for S5 + S6 and a published matrix. S6 ran
+but was stopped before finishing; S5 never ran with the gVisor fix. The
+matrix in `reports/index.md` therefore has no flagship column, and should
+not be read as if it does.
+
+### What the runs bought
+
+The value was not the tally, it was the five bugs that only appear on real
+infrastructure. Three product, two harness, all fixed and verified:
+
+1. **A missing leader took an enterprise node down permanently.** Boot
+   re-fanout needs one leader RPC; a node restarting into an election found
+   none, enterprise made it fatal, systemd's restart limit made it final.
+   One crash-looping node collapsed a 3-node cluster to a single member —
+   **that one bug was 68 of S4's 95 failures.** Fixed; S4 went 25 → 168.
+2. **Enterprise boot failed its own witness check**, reading the node id
+   from the Noop's `"standalone"` before `AttachCluster`.
+3. **…and the upgrade hazard that fix introduced**, caught before shipping:
+   reading only under the new id would have failed existing single-node
+   enterprise boxes closed *deterministically*.
+4. **`install.sh` 404'd on gVisor** and never installed sandboxd on any
+   worker — the single most expensive bug of the day, because it surfaced
+   three layers away as `expected 8 members, never reached (last 4)`.
+5. **`build.sh publish` skipped on a known id** without checking the
+   artifact set, so optional binaries silently never uploaded.
+
+Plus one OPEN finding with no fix attempted, because the obvious fix is
+worse than the bug: **a partitioned node keeps answering `/health` 200**, so
+the ingress keeps routing to a node that cannot reach a leader (§7.7).
+
+### To finish T18 — one command
+
+Everything it needs is in the tree and verified 2026-09-27:
+
+| Prerequisite | State |
+|---|---|
+| gVisor tarball installer (`gvisor_fetch_release`) | in tree |
+| boot-leader fix (`bootRefanoutDisposition`) | in tree |
+| witness node-id + upgrade fallback | in tree |
+| run.sh self-pin against mid-run edits | in tree |
+| domain lease that excludes held domains | in tree |
+| `--no-build` builds instead of aborting | in tree |
+| S5/S6 scenario pairs, flagship make target | present |
+| domains held / AWS instances | 0 / 0 |
+
+```
+make integration-secrets-flagship      # S5 + S6, ~2h, ~$28
+go run ./integration-tests/report -index-only -out integration-tests/reports
+```
+
+Nothing else is staged or pending. The three harness fixes that used to be
+prerequisites are applied and control-tested.
+
+**The matrix currently shows no flagship result, and that is correct.**
+`cluster-hetero-secrets` is 174/174 inconclusive (the aborted run) and
+`cluster-hetero-secrets-kms` has no column, because S6 was stopped before
+it wrote a report. Neither should be read as a pass or a fail.
+
 ## 8. Make targets and reports
 
 ```make
@@ -1207,16 +1608,16 @@ and verified, not merely that code was written.
 | T8 | Audit sinks: s3 bucket + IAM, file path (§5.4) | T6 | records land in both, same `single-node` overlay | **DONE** 2026-09-23 — **exit criterion corrected**: a node exports to exactly ONE backend, so "both" is proven by flipping the backend on one box, not by running both at once. **s3:** records at `aerolvm-itest-single-node/node=<id>/2026/09/25/<batch>.jsonl` carrying the exact `correlation_id` sent. **file:** `/var/log/aerol-audit-export.jsonl` (0600 root) grew 1130→1673 bytes with the event. Clean suite re-run **pass 58 · fail 0 · 0 inconclusive** with KMS + s3 export both active. |
 | T9 | `audit-receiver` binary + systemd unit + chaos endpoint (§6.4) | T1, T6 | webhook + witness receive; `/_chaos` forces retries | **DONE** 2026-09-26 — all three verified live. **webhook:** backend resolved to `webhook` from the export URL alone, 5 batches / 0 rejected (so bearer + HMAC verified). **witness:** head `abe49336…` recorded and returned by `/witness/<SB_NODE_ID>`. **chaos:** `fail_next=3` consumed as 503s, then the exporter backed off and redelivered (`batches` 3→4). Needed a `-tags itestwitness` daemon — see §6.4a. |
 | T10 | Capabilities + 7 scenario file pairs (§6.2/6.3, + `cluster-3-mixed-bench`) — **incl. the `disruptive:` caps field replacing run.sh's name match, and the isolate provisioning decision** (§6.2a) | T6-T9 | scenarios load, caps gate correctly, a `D`-tagged UC actually runs on S2 | **CODE DONE** 2026-09-26. Capabilities already existed (PR #451). **`disruptive:` field DONE** and mutation-verified — this was the 17-UC silent hole. All 7 pairs written with Makefile targets + `integration-secrets-gate`. New offline validation catches unknown capability names (**already caught a real `gvisor-runtime` typo**), missing twins, duplicate/unmarked `cluster_name`, and enterprise-without-witness. **Live S2 run 2026-09-26: pass 71 · fail 0 · skip 42 · 0 inconclusive.** The gate PROVABLY opens — see §6.2b. |
-| T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable | |
-| T11 | `harness/secrets.go` helpers (§7.1) | T10, T10b | `WithNodeEnv` always restores on failure; `SecretHolders()` works | |
-| T12 | UC groups A-D (sealing, failover, reseal, env) | T11 | **UC-117 green on S2** | |
-| T13 | UC groups E-G (audit chain, export, limits) | T11 | chain verifies; backoff proven | |
-| T14 | UC groups H-I (mTLS, enterprise gates) | T11 | full boot-gate matrix, fleet healthy after | |
-| T15 | UC groups J-K (retirement, jail) | T11 | | |
-| T16 | UC group L + **`main` baseline arm** (§7 UC-165/166, D5) | T12, T1 (`--ref`) | both arms measured in one run; band met | |
-| T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR | |
-| T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline | |
-| T18 | Flagship run S5 + S6, publish reports | all | matrix in `reports/index.md` | |
+| T10b | **Operator-authenticated recipient-set read** (`GET /v1/cluster/sandboxes/{id}/secret-holders`, `op()`-gated) | T6 | the suite can read holders over PAT; group A is implementable | **CODE DONE** 2026-09-26 (PR #479, merged). Two security mutations verified: taking the route off `op()` is caught, and adding `SealedPayload` to the view is caught. `internal/service` 92.5%, `pkg/api/v1` 93.6%. |
+| T11 | `harness/secrets.go` helpers (§7.1) | T10, T10b | `WithNodeEnv` always restores on failure; `SecretHolders()` works | **CODE DONE** 2026-09-26 (PR #480, merged). The restore contract is proven offline under a panic AND under `runtime.Goexit` (what `t.Fatal` does), with exactly-one-restore asserted and `cluster.env` asserted never touched. Leak sweep mutation-checked. |
+| T12 | UC groups A-D (sealing, failover, reseal, env) | T11 | **UC-117 green on S2** | **DONE** 2026-09-27 — live exit criterion **MET**: UC-117 green on S2 in 52s and verified non-vacuous (real non-owner recipient, real kill, new owner confirmed in the holder set, credential read from INSIDE the guest, not `status=running`). UC-110/111/118/120 also green; UC-119 an honest skip. |
+| T13 | UC groups E-G (audit chain, export, limits) | T11 | chain verifies; backoff proven | **CODE DONE** 2026-09-26 (PR #482). Live PENDING. UC-144's fault moved to the witness; no `SB_SECRET_AUDIT_DIR` exists. |
+| T14 | UC groups H-I (mTLS, enterprise gates) | T11 | full boot-gate matrix, fleet healthy after | **CODE DONE** 2026-09-26 (PR #485). Live PENDING. UC-158/159 folded into the matrix so the fleet-health check runs per ROW. |
+| T15 | UC groups J-K (retirement, jail) | T11 | obligations raised + discharged; jail realized while serving | **CODE DONE** 2026-09-26 (PR #484). Live PENDING. UC-162 re-scoped a second time — a `terraform plan` cannot run offline either; the drift guard now runs in `make test`. |
+| T16 | UC group L + **`main` baseline arm** (§7 UC-165/166, D5) | T12, T1 (`--ref`) | both arms measured in one run; band met | **CODE DONE** 2026-09-26 (PR #486). Live PENDING — needs the `--ref main` arm. UC-165 refuses to compare across instance types and warns below 25 samples. |
+| T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR | **CODE DONE** 2026-09-26 (PR #486). **Exit criterion is stale**: the `removeOrphans` fix already landed 2026-09-19, so UC-167 is written as a live confirmation, not an expected failure. It deliberately does NOT assert restart survival — `ListManaged` reads an in-memory map, and the crash case needs a host-backed seam that has not landed. |
+| T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline | **DONE** 2026-09-26 (PR #486). 61 SEC rows, `want` 299 → **360**. The count was guarded in TWO places; the duplicate approximate guard (`287 ±15`) is removed so a new block updates one number. |
+| T18 | Flagship run S5 + S6, publish reports | all | matrix in `reports/index.md` | **INCOMPLETE — stopped on the operator's call 2026-09-27.** S1-S4 and S6 executed; S6 is the first flagship run that ever formed its 8-node cluster (105 pass / 9 fail at the stop) but did not finish, and S5 never ran with the gVisor fix. No flagship column in `reports/index.md`. See §7.9 for exactly what is established and the three steps to finish. |
 
 T12 is the milestone that matters: **UC-117 green on S2** means the defect the
 whole secrets-hardening program exists to fix is proven fixed on real

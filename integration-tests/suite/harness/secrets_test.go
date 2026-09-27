@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -722,15 +724,18 @@ func TestPeerProbeFromOutput(t *testing.T) {
 		present    bool
 		absent     bool
 	}{
-		{name: "held", out: "200", wantStatus: 200, present: true},
-		{name: "held no content", out: "204", wantStatus: 204, present: true},
-		{name: "absent", out: "404", wantStatus: 404, absent: true},
-		{name: "refused identity", out: "403", wantStatus: 403},
-		{name: "could not connect", out: "000\n", wantErr: true},
+		// The probe emits NAMED markers rather than trailing fields: curl -sS
+		// writes its own diagnostics into the same stream, so the last
+		// whitespace-separated token is not reliably the status.
+		{name: "held", out: "\nPROBE_CODE=200\n\nPROBE_RC=0\n", wantStatus: 200, present: true},
+		{name: "held no content", out: "\nPROBE_CODE=204\n\nPROBE_RC=0\n", wantStatus: 204, present: true},
+		{name: "absent", out: "\nPROBE_CODE=404\n\nPROBE_RC=22\n", wantStatus: 404, absent: true},
+		{name: "refused identity", out: "\nPROBE_CODE=403\n\nPROBE_RC=22\n", wantStatus: 403},
+		{name: "could not connect", out: "\nPROBE_CODE=000\n\nPROBE_RC=7\n", wantErr: true},
 		{name: "no output", out: "", err: errors.New("ssh exited 255"), wantErr: true},
 		{name: "unparsable", out: "curl: (6) could not resolve host", wantErr: true},
 		// curl exits non-zero for some statuses; a real status is the answer.
-		{name: "status despite exit code", out: "503", err: errors.New("exit 22"), wantStatus: 503},
+		{name: "status despite exit code", out: "\nPROBE_CODE=503\n\nPROBE_RC=22\n", err: errors.New("exit 22"), wantStatus: 503},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := peerProbeFromOutput("node1", tc.out, tc.err)
@@ -809,6 +814,69 @@ func TestWithClusterEnvConfiguresEveryNodeThenRestoresAll(t *testing.T) {
 	}
 	if n := fake.countRan("rm -f " + itestEnvDropIn); n != 2 {
 		t.Fatalf("restore ran on %d nodes, want 2", n)
+	}
+}
+
+// The planted witness head is built into a shell command that is already
+// inside `sudo bash -c '...'`. Getting the quoting wrong does not fail
+// loudly — it produces a malformed request, the receiver 400s, and UC-144
+// reports "the receiver refused the planted head", which reads like a
+// product problem rather than a quoting bug in this file.
+func TestShellSingleQuoteSurvivesNesting(t *testing.T) {
+	// The expansion the remote shell performs: close the outer quote, emit a
+	// literal quote, reopen. Applied twice, it wraps the payload in a
+	// single-quoted word inside the outer single-quoted word.
+	got := shellSingleQuote(`{"NodeID":"n1","HeadHex":"abc"}`)
+	if !strings.HasPrefix(got, `'"'"'`) || !strings.HasSuffix(got, `'"'"'`) {
+		t.Fatalf("not wrapped in the close/escape/reopen idiom: %s", got)
+	}
+	// Bare, unescaped single quotes inside would terminate the word early.
+	inner := strings.TrimSuffix(strings.TrimPrefix(got, `'"'"'`), `'"'"'`)
+	if strings.Contains(inner, "'") {
+		t.Fatalf("payload carries an unescaped single quote: %s", inner)
+	}
+	// A payload that itself contains a quote must survive too.
+	withQuote := shellSingleQuote(`a'b`)
+	if strings.Count(withQuote, `'"'"'`) < 3 {
+		t.Fatalf("an embedded quote was not escaped: %s", withQuote)
+	}
+}
+
+func TestReceiverStatsDecodesTheFixtureShape(t *testing.T) {
+	// Exactly what integration-tests/cmd/audit-receiver's /_stats writes.
+	const body = `{"batches":3,"records":42,"duplicates":1,"rejected":0,"fail_next":5,"nodes":2}`
+	var st ReceiverStats
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Batches != 3 || st.Records != 42 || st.Duplicates != 1 || st.Rejected != 0 || st.FailNext != 5 || st.Nodes != 2 {
+		t.Fatalf("decoded %+v", st)
+	}
+}
+
+// The receiver's /witness/{node} answers 404 with a body, which must read as
+// "never recorded" rather than as a head or an error — UC-144 branches on
+// exactly that distinction when deciding what to restore.
+func TestWitnessedHeadForDistinguishesNeverRecorded(t *testing.T) {
+	fake := &fakeSSH{}
+	prev := sshRunner
+	sshRunner = func(_ *testing.T, _, script string) (string, error) {
+		fake.mu.Lock()
+		fake.runs = append(fake.runs, script)
+		fake.mu.Unlock()
+		if strings.Contains(script, "/witness/") {
+			return "no head for node\n", nil
+		}
+		return "", nil
+	}
+	t.Cleanup(func() { sshRunner = prev })
+
+	head, ok, err := WitnessedHeadFor(t, IntegrationNode{Name: "n", PublicIP: "203.0.113.10"}, "node-a")
+	if err != nil {
+		t.Fatalf("a 404 body surfaced as an error: %v", err)
+	}
+	if ok || head != "" {
+		t.Fatalf("a 404 body decoded as a head: %q (ok=%v)", head, ok)
 	}
 }
 
@@ -919,5 +987,268 @@ func TestSSHBaseArgsSuppressTheKnownHostsWarning(t *testing.T) {
 	args := strings.Join(sshBaseArgs(), " ")
 	if !strings.Contains(args, "LogLevel=ERROR") {
 		t.Fatalf("sshBaseArgs does not suppress ssh's stderr banner: %q. With UserKnownHostsFile=/dev/null every connection warns, SSHRun merges stderr, and a caller checking 'is the output empty?' reads the warning as a result.", args)
+	}
+}
+
+// A 502/503/504 is Caddy failing to reach sandboxd, not sandboxd answering.
+// Several security cases restart the daemon deliberately, so that window is
+// routine — the live gate lost UC-136 to it twice. It must be retried, not
+// recorded as a use case's verdict.
+func TestGetJSONRetriesTransientGatewayStatuses(t *testing.T) {
+	prevDelay := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(prevDelay)
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls <= 2 {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{sc: &Scenario{Name: "unit", BaseURL: srv.URL, PAT: "p"}}
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.GetJSON(t.Context(), "/v1/thing", &got); err != nil {
+		t.Fatalf("GetJSON did not ride out two 502s: %v", err)
+	}
+	if !got.OK || calls != 3 {
+		t.Fatalf("ok=%v after %d calls, want true after 3", got.OK, calls)
+	}
+}
+
+// But an answer the DAEMON gave must come straight back. Retrying a 404 or a
+// 500 would turn a real verdict into a timeout and hide what the server said.
+func TestGetJSONDoesNotRetryDaemonAnswers(t *testing.T) {
+	prevDelay := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(prevDelay)
+
+	for _, code := range []int{400, 403, 404, 500} {
+		var calls int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			http.Error(w, "answer", code)
+		}))
+		err := c400(srv).GetJSON(t.Context(), "/v1/thing", nil)
+		srv.Close()
+		if err == nil {
+			t.Fatalf("status %d decoded as success", code)
+		}
+		if calls != 1 {
+			t.Fatalf("status %d was retried %d times; it is an answer, not a gateway hiccup", code, calls)
+		}
+	}
+}
+
+// A gateway that never recovers must still fail, and promptly.
+func TestGetJSONGivesUpOnAPersistentGatewayFailure(t *testing.T) {
+	prevDelay := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(prevDelay)
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	err := c400(srv).GetJSON(t.Context(), "/v1/thing", nil)
+	if err == nil {
+		t.Fatal("a permanently failing gateway reported success")
+	}
+	if calls != gatewayRetries+1 {
+		t.Fatalf("made %d attempts, want %d (the bound must hold so a dead daemon fails promptly)", calls, gatewayRetries+1)
+	}
+}
+
+func c400(srv *httptest.Server) *Client {
+	return &Client{sc: &Scenario{Name: "unit", BaseURL: srv.URL, PAT: "p"}}
+}
+
+// A dropped connection is the edge going away mid-request, the same class
+// as a 502. UC-147 failed on a bare "read tcp ...: connection reset" while a
+// node restarted, because only HTTP statuses were retried.
+func TestGetJSONRetriesDroppedConnections(t *testing.T) {
+	restore := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(restore)
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// Hijack and close without a response: the client sees EOF.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("no hijacker")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{sc: &Scenario{Name: "unit", BaseURL: srv.URL, PAT: "p"}}
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.GetJSON(t.Context(), "/v1/thing", &got); err != nil {
+		t.Fatalf("a dropped connection was not retried: %v", err)
+	}
+	if !got.OK || calls < 2 {
+		t.Fatalf("ok=%v after %d calls", got.OK, calls)
+	}
+}
+
+// But a client-side error must fail immediately — retrying a bad URL or a
+// TLS trust failure only delays a verdict that will not change.
+func TestGetJSONDoesNotRetryClientErrors(t *testing.T) {
+	restore := gatewayRetryDelayForTest(time.Millisecond)
+	t.Cleanup(restore)
+
+	c := &Client{sc: &Scenario{Name: "unit", BaseURL: "http://127.0.0.1:1", PAT: "p"}}
+	start := time.Now()
+	err := c.GetJSON(t.Context(), "/v1/thing", nil)
+	if err == nil {
+		t.Fatal("a dial to a closed port reported success")
+	}
+	// Connection refused IS retriable, so this bounds it rather than
+	// forbidding it: the point is that it terminates quickly.
+	if time.Since(start) > 30*time.Second {
+		t.Fatalf("took %s to give up on a closed port", time.Since(start))
+	}
+}
+
+func TestIsRetriableTransportErr(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{io.EOF, true},
+		{io.ErrUnexpectedEOF, true},
+		{syscall.ECONNRESET, true},
+		{syscall.ECONNREFUSED, true},
+		{errors.New("read tcp 1.2.3.4:1->5.6.7.8:443: connection reset by peer"), true},
+		{errors.New("http: server closed idle connection"), true},
+		{errors.New("x509: certificate signed by unknown authority"), false},
+		{errors.New("unsupported protocol scheme"), false},
+		{nil, false},
+	} {
+		if got := isRetriableTransportErr(tc.err); got != tc.want {
+			t.Fatalf("isRetriableTransportErr(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// WithClusterEnv must restore SEED FIRST, not just apply seed first.
+//
+// The nested-defer version unwound LIFO, so with [seed, j1, j2] the restore
+// order was j2, j1, seed — seed LAST. The joiners come back, find no seed,
+// form their own partition, and when the seed finally restarts it
+// re-bootstraps standalone and never rejoins them. The live S2 cluster ended
+// 1+2 exactly that way, and restarting the lone seed did not heal it.
+func TestWithClusterEnvRestartsAndRestoresSeedFirst(t *testing.T) {
+	fake := &fakeSSH{active: "active"}
+	fake.install(t)
+
+	targets := &IntegrationTargets{Nodes: []IntegrationNode{
+		{Name: "joiner-a", PublicIP: "203.0.113.11"},
+		{Name: "seed", Seed: true, PublicIP: "203.0.113.10"},
+		{Name: "joiner-b", PublicIP: "203.0.113.12"},
+	}}
+
+	WithClusterEnv(t, targets, map[string]string{"SB_X": "1"}, func(res map[string]NodeBootResult) {
+		if len(res) != 3 {
+			t.Fatalf("fn saw %d nodes, want 3", len(res))
+		}
+	})
+
+	// Every restart, in order, keyed by the node's address.
+	var order []string
+	fake.mu.Lock()
+	for _, r := range fake.runs {
+		if !strings.Contains(r, "systemctl restart sandboxd") {
+			continue
+		}
+		switch {
+		case strings.Contains(r, "rm -f"):
+			order = append(order, "restore")
+		default:
+			order = append(order, "apply")
+		}
+	}
+	fake.mu.Unlock()
+
+	if len(order) != 6 {
+		t.Fatalf("expected 3 apply restarts and 3 restore restarts, got %v", order)
+	}
+	for i, want := range []string{"apply", "apply", "apply", "restore", "restore", "restore"} {
+		if order[i] != want {
+			t.Fatalf("restart %d was %q, want %q (all applies must precede all restores): %v", i, order[i], want, order)
+		}
+	}
+}
+
+// The seed must be the first node touched in each phase. fakeSSH records the
+// scripts but not the target, so this asserts the ordering helper the phases
+// iterate, which is what decides it.
+func TestSeedFirstIsUsedForBothPhases(t *testing.T) {
+	in := []IntegrationNode{
+		{Name: "joiner-a", PublicIP: "203.0.113.11"},
+		{Name: "seed", Seed: true, PublicIP: "203.0.113.10"},
+	}
+	got := seedFirst(in)
+	if got[0].Name != "seed" {
+		t.Fatalf("seedFirst put %q first; both the apply and restore loops iterate this slice, so the seed would be restarted last in whichever phase reversed it", got[0].Name)
+	}
+}
+
+// A 401/403 is neither "holds it" nor "does not hold it". The internal
+// routes need an operator token AND a peer certificate; sending only the
+// certificate answers 401, and reading that as absence would turn a broken
+// probe into evidence that the fan-out was correctly scoped — a false pass
+// on the negative half of UC-112.
+func TestPeerSecretProbeRefusalIsItsOwnState(t *testing.T) {
+	for _, code := range []int{401, 403} {
+		p := PeerSecretProbe{Status: code}
+		if p.Present() || p.Absent() {
+			t.Fatalf("%d classified as present=%v absent=%v", code, p.Present(), p.Absent())
+		}
+		if !p.Refused() {
+			t.Fatalf("%d is not reported as refused", code)
+		}
+	}
+	for _, code := range []int{200, 204, 404} {
+		if (PeerSecretProbe{Status: code}).Refused() {
+			t.Fatalf("%d misclassified as refused", code)
+		}
+	}
+}
+
+// The probe must present BOTH credentials and address the certificate's own
+// hostname. Dialing the advertise URL's IP fails hostname verification
+// (curl 60 / status 000) even though the listener is healthy.
+func TestPeerProbeScriptCarriesBothCredentialsAndResolvesTheCertName(t *testing.T) {
+	for _, want := range []string{
+		"--resolve",                           // cert has DNS SANs, advertise is an IP
+		"aerolvm-cluster-node",                // the name the cert actually carries
+		"Authorization: Bearer $SB_PAT_TOKEN", // internalOp needs the operator token
+		"--cert", "--key", "--cacert",         // and the peer identity
+	} {
+		if !strings.Contains(internalCurlPrefix+peerProbeCredentials, want) {
+			t.Fatalf("the peer probe no longer includes %q; without it the probe fails for its own reasons and the case reports the product", want)
+		}
+	}
+	// -k would hide the very property UC-151/153 exist to prove.
+	if strings.Contains(internalCurlPrefix, " -k ") || strings.Contains(internalCurlPrefix, "--insecure") {
+		t.Fatal("the peer probe disables TLS verification; UC-151/153 assert that verification works, so this would make them vacuous")
 	}
 }

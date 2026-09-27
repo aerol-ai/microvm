@@ -369,8 +369,22 @@ func main() {
 		out           = flag.String("out", "reports", "output directory")
 		inconclusive  = flag.Bool("inconclusive", false, "mark all implemented UCs inconclusive (spot reclaim)")
 		jsonInputPath = flag.String("json", "", "path to go test -json output; empty reads stdin")
+		indexOnly     = flag.Bool("index-only", false, "rebuild reports/index.md from the existing *.json and exit")
 	)
 	flag.Parse()
+
+	// The matrix is built from whatever <scenario>.json files are present,
+	// so pruning or renaming one has to be followed by a rebuild. Without
+	// this the only way to refresh it is to re-run a scenario against live
+	// AWS, which is an absurd price for correcting a file name.
+	if *indexOnly {
+		if err := writeIndex(*out); err != nil {
+			fmt.Fprintf(os.Stderr, "write index: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *scenario == "" {
 		fmt.Fprintln(os.Stderr, "error: -scenario is required")
 		os.Exit(2)
@@ -438,6 +452,7 @@ func writeIndex(dir string) error {
 	sort.Strings(entries)
 
 	scenarios := make([]string, 0, len(entries))
+	seen := map[string]bool{}
 	cell := map[string]map[string]Status{} // ucID -> scenario -> status
 	for _, e := range entries {
 		raw, err := os.ReadFile(e)
@@ -448,7 +463,16 @@ func writeIndex(dir string) error {
 		if err := json.Unmarshal(raw, &rep); err != nil {
 			return err
 		}
-		scenarios = append(scenarios, rep.Scenario)
+		// One column per SCENARIO, not per file. Bench and catalogue runs
+		// write their own <scenario>-bench.json / -catalogue.json but record
+		// the same rep.Scenario, and cell is keyed by that name — so every
+		// extra file added an identical duplicate column. The matrix had
+		// eight cluster-3-mixed-docker columns showing the same values,
+		// which is the kind of unreadable that stops people reading it.
+		if !seen[rep.Scenario] {
+			seen[rep.Scenario] = true
+			scenarios = append(scenarios, rep.Scenario)
+		}
 		for _, r := range rep.Results {
 			if cell[r.ID] == nil {
 				cell[r.ID] = map[string]Status{}

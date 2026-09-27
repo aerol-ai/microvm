@@ -14,6 +14,75 @@
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
 
+# resolve_ssh_identity picks the private key the deployment's nodes actually
+# trust and wires it into SSH_OPTS, so every harness SSH call gets it — not
+# just the test suite.
+#
+# This has to happen BEFORE provisioning, because wait_for_cloud_init is an
+# SSH call. Without an identity it fails for the whole timeout, the harness
+# cannot tell that user-data is still running, and the daemon then gets only
+# the health budget to finish booting — which looks like "infra not ready"
+# and is reported as inconclusive. The failure-log collection is SSH too, so
+# the one artifact that would explain it is empty as well.
+#
+# Two provisioning shapes, and the order matters. When ssh_key_name names an
+# EXISTING EC2 key pair, Terraform ignores ssh_public_key_path entirely, so
+# deriving from the latter picks a key the nodes have never heard of. Only
+# when no key pair is named does Terraform upload ssh_public_key_path,
+# making its private half the right one.
+#
+# Args: <scenario-tfvars-path> <prod-tfvars-path>
+resolve_ssh_identity() {
+  local scenario_tfvars="$1" prod_tfvars="$2"
+  if [[ -n "${AEROL_SSH_IDENTITY_FILE:-}" ]]; then
+    SSH_OPTS+=(-i "${AEROL_SSH_IDENTITY_FILE}")
+    echo "ssh identity: ${AEROL_SSH_IDENTITY_FILE} (from AEROL_SSH_IDENTITY_FILE)" >&2
+    return 0
+  fi
+
+  local key_name pub priv candidate
+  priv=""
+  key_name="$(tfvar_from_files ssh_key_name "$prod_tfvars" "$scenario_tfvars")"
+  if [[ -n "$key_name" ]]; then
+    for candidate in "$HOME/.ssh/${key_name}.pem" "$HOME/.ssh/${key_name}"; do
+      [[ -f "$candidate" ]] && { priv="$candidate"; break; }
+    done
+    if [[ -z "$priv" ]]; then
+      echo "ssh identity: the deployment uses EC2 key pair '${key_name}' and its private key is not at ~/.ssh/${key_name}.pem — cloud-init waits, failure diagnostics and node-inspecting use cases will all fail or skip. Put it there or set AEROL_SSH_IDENTITY_FILE." >&2
+      return 0
+    fi
+  else
+    pub="$(tfvar_from_files ssh_public_key_path "$prod_tfvars" "$scenario_tfvars")"
+    pub="${pub:-$HOME/.ssh/id_rsa.pub}"
+    pub="${pub/#\~/$HOME}"
+    if [[ -f "${pub%.pub}" ]]; then
+      priv="${pub%.pub}"
+    else
+      echo "ssh identity: none at ${pub%.pub} — cloud-init waits, failure diagnostics and node-inspecting use cases will all fail or skip. Set AEROL_SSH_IDENTITY_FILE to override." >&2
+      return 0
+    fi
+  fi
+
+  export AEROL_SSH_IDENTITY_FILE="$priv"
+  SSH_OPTS+=(-i "$priv")
+  echo "ssh identity: ${priv}" >&2
+}
+
+# tfvar_from_files prints one scalar variable, taking the LAST definition
+# across the files given — the same precedence Terraform applies to chained
+# -var-file flags, so what this reads is what the apply used. Deliberately
+# forgiving: a missing file or key means "use the default", never an error.
+tfvar_from_files() {
+  local key="$1"; shift
+  local file value found=""
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    value="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*\$/\1/p" "$file" | tail -1)"
+    [[ -n "$value" ]] && found="$value"
+  done
+  printf '%s' "$found"
+}
+
 # wait_for_cloud_init <ssh_target> [timeout_s]
 # Blocks until the instance's user-data (cloud-init) has finished. Domain
 # scenarios get this slack for free from the DNS+TLS waits that run before the
