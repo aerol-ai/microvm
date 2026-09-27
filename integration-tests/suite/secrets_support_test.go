@@ -440,13 +440,17 @@ func sameEventIDs(a, b []auditlog.Event) bool {
 	return true
 }
 
-// auditLogPath is where the node keeps its hash-chained evidence.
-// The audit directory is the DB's directory: internal/service derives it with
-// secretAuditDataDir(cfg.DBPath). There is no SB_SECRET_AUDIT_DIR — an early
-// draft assumed one, which would have pointed every script below at a path
-// that does not exist and turned four cases into silent skips.
+// auditLogPath is where the node keeps its hash-chained evidence:
+// <secretAuditDataDir(cfg.DBPath)>/audit, i.e. an "audit" directory NEXT TO
+// the DB (internal/service/secret_audit.go, newFileAuditSinkFrom(
+// filepath.Join(dataDir, "audit"), ...)). There is no SB_SECRET_AUDIT_DIR.
+//
+// This used to stop at the DB's directory. Every script below then pointed
+// at a file that does not exist: the tamper case read 0 lines, reported
+// TOOSHORT and SKIPPED — a tamper-detection test that never tampered — and
+// UC-143 reported a receipt MISSING that was sitting in audit/ (T18).
 const auditLogScript = sqliteSourceEnv +
-	`db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; dir=$(dirname "$db"); log="$dir/secrets.jsonl"; `
+	`db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; dir="$(dirname "$db")/audit"; log="$dir/secrets.jsonl"; `
 
 // tamperMiddleAuditLineScript edits a line in the MIDDLE of the chain and
 // keeps a pristine copy alongside.
@@ -456,6 +460,7 @@ const auditLogScript = sqliteSourceEnv +
 // gap — so tampering with the tail would assert nothing about tamper
 // detection.
 const tamperMiddleAuditLineScript = `sudo bash -c '` + auditLogScript +
+	`[ -f "$log" ] || { echo "NOLOG $log"; exit 0; }; ` +
 	`n=$(wc -l < "$log" 2>/dev/null || echo 0); ` +
 	`[ "$n" -ge 4 ] || { echo TOOSHORT; exit 0; }; ` +
 	`cp -a "$log" "$log.itest-backup"; ` +

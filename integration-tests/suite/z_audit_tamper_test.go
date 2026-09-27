@@ -60,6 +60,12 @@ func TestTamperedAuditLineFailsVerificationAndNamesTheBreak(t *testing.T) {
 	// indistinguishable from a torn write; a middle edit can only be a
 	// tamper, which is what the verifier must say.
 	out, err := harness.SSHRun(t, target, tamperMiddleAuditLineScript)
+	// A missing log is a FAILURE, not a skip: this node served audited reads
+	// a moment ago, so no evidence file means either the harness is looking
+	// in the wrong place (it was, until T18) or the evidence is gone.
+	if strings.Contains(out, "NOLOG") {
+		t.Fatalf("no audit log on %s where one must exist: %s", node.Name, strings.TrimSpace(out))
+	}
 	if err != nil || strings.Contains(out, "TOOSHORT") {
 		t.Skipf("could not tamper with the audit log on %s (%v): %s", node.Name, err, strings.TrimSpace(out))
 	}
