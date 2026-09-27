@@ -539,23 +539,41 @@ func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
 // the control plane is not charged for a seed rejoin.
 //
 // On a single node there is nothing to orphan, so the seed is returned.
+//
+// Not the ingress either, where there is any alternative. On the hetero
+// topology the first non-seed node in the target list is ingress-1 — the only
+// public entry point — so "restart a joiner" meant "take the front door
+// down": T18 scenario 1 restarted it for one case after another, and every
+// create in between answered 502. A worker (or a mixed node) is the victim
+// whose absence costs one member and nothing else.
 func PickRestartableNode(targets *IntegrationTargets) (IntegrationNode, bool) {
 	if targets == nil {
 		return IntegrationNode{}, false
 	}
-	var seed IntegrationNode
-	haveSeed := false
+	// Lower rank = safer to restart.
+	rank := func(n IntegrationNode) int {
+		switch {
+		case n.Seed:
+			return 3
+		case strings.EqualFold(strings.TrimSpace(n.Role), "ingress"):
+			return 2
+		case strings.EqualFold(strings.TrimSpace(n.Role), "server"):
+			return 1 // a non-seed voter: 2 of 3 keep quorum, but still a voter
+		default:
+			return 0 // worker, mixed, or unspecified
+		}
+	}
+	var best IntegrationNode
+	bestRank, found := 4, false
 	for _, n := range targets.Nodes {
 		if _, ok := SSHTarget(n); !ok {
 			continue
 		}
-		if n.Seed {
-			seed, haveSeed = n, true
-			continue
+		if r := rank(n); r < bestRank {
+			best, bestRank, found = n, r, true
 		}
-		return n, true
 	}
-	return seed, haveSeed
+	return best, found
 }
 
 // NodeRejoinCheck, when set, must block until the node is fully back in
