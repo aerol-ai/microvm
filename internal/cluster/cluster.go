@@ -69,6 +69,25 @@ func IsLeaderUnavailable(err error) bool {
 	return errors.Is(err, ErrNotLeader) || errors.Is(err, ErrNoLeader)
 }
 
+// ErrMembershipPending means a control-plane server refused this node only
+// because its gossip view does not (yet) list the node as alive.
+//
+// A restarting node hits this on every boot: its clean shutdown broadcast a
+// gossip Leave, and its first control-plane call lands ~100ms after start —
+// before the server has processed the rejoin. The live hetero run (T18,
+// 2026-09-27) lost a worker permanently to it: enterprise treated the 403 as
+// fatal, each restart re-broadcast the Leave and re-lost the same race, and
+// systemd's restart limit made it final.
+var ErrMembershipPending = errors.New("cluster: peer membership not yet recognised by the control plane")
+
+// IsControlPlaneUnavailable reports whether err means only that the control
+// plane could not serve this node at this instant — no leader seated, or the
+// server not yet seeing this node in gossip. Neither says anything about the
+// data being validated, so neither may be treated as fatal at boot.
+func IsControlPlaneUnavailable(err error) bool {
+	return IsLeaderUnavailable(err) || errors.Is(err, ErrMembershipPending)
+}
+
 // ErrUnknownSandbox is returned by OwnerOf when no placement record exists for
 // the given sandbox ID. Callers should treat this as "owned locally" only when
 // they have just-created the sandbox and not yet committed its placement.
