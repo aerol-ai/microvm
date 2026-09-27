@@ -63,7 +63,7 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Start:** the health handler in `pkg/api`, `cfg.EnableCluster` gating, and
   the Caddy upstream health config in `pkg/caddy` / `packaging/`.
 
-## A restarted seed could never rejoin the cluster — FIXED (UC-170 to prove live)
+## A restarted seed could never rejoin the cluster — FIXED, PROVEN LIVE (UC-170 green x3)
 
 - **Was recorded as:** "losing the seed leaves the survivors without a
   leader". **That diagnosis was wrong.** The S2 journals (2026-09-26) show the
@@ -88,9 +88,9 @@ what, why, the caveat that motivated capturing it, and where to start.
   on loopback (3 real nodes: stop seed → survivors elect + evict → restart
   seed with no peers → must be re-admitted as a voter). Mutation-checked: with
   rejoin ignoring the cache it fails "seed never appeared ... as Voter".
-- **Live proof pending:** UC-170 (`z_seed_loss_test.go`) stops the seed on
-  purpose, waits past eviction, restarts it and asserts it follows the
-  survivors' leader. Runs in T18 (hetero lite) and T19 (metal flagship).
+- **Proven live:** UC-170 passed on three T18 runs (both profiles). Survivors
+  elected a new leader in 7s; the seed, restarted after eviction with no
+  peers, followed it 13s after restore.
 - **Still true:** the partition entry above (a node with no leader answers
   `/health` 200) is a separate, unfixed readiness-vs-liveness problem; it is
   what turned this bug into user-visible errors.

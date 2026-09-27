@@ -1545,6 +1545,48 @@ S6's prefix. `TestScenarioBucketPrefixesAreUnique` now guards that.
 `cluster-hetero-secrets-kms` has no column, because S6 was stopped before
 it wrote a report. Neither should be read as a pass or a fail.
 
+### 7.11 T18 results — what the hetero-lite runs found (2026-09-27/28)
+
+The first runs of the S5/S6 topology without metal found more real bugs than
+every earlier run combined, because it is the first topology with a dedicated
+ingress, dedicated servers and enterprise mode together.
+
+| Run | Build | Result |
+|---|---|---|
+| `cluster-hetero-lite-secrets` #1 | 9c76f7c0 | 119 pass / 8 fail (test-level); **UC-170 PASS** |
+| `cluster-hetero-lite-secrets` #2 | 7cefee72 | 118 pass / 5 fail / 52 skip (UC-level); UC-170 PASS |
+| `cluster-hetero-lite-kms` | d0323cce | **119 pass / 2 fail / 54 skip, 0 missing**; UC-170 PASS |
+| `cluster-hetero-lite-secrets` #3 | d7e38956 | confirmation run (an intermediate attempt was inconclusive: ACME on the leased domain) |
+
+**Product bugs found and fixed** — each with a regression test that fails with
+the fix removed:
+
+| UC | Bug | Fix |
+|---|---|---|
+| UC-170 | a restarted seed (no `SB_CLUSTER_PEERS`) could never rejoin after eviction | 99220e7e gossip peer cache |
+| UC-137 | an enterprise worker restart crash-looped on its own rejoin (membership 403 at boot) | dbc45d44 |
+| UC-44 | containerd recorded the NODE's IP as a gVisor sandbox's address | dbb32c24 spec netns |
+| UC-34 | a dedicated ingress installed no L4 route for any remote sandbox (public flag lived only in the redacted Spec) | 195d7a16 `Placement.PublicTraffic` |
+| UC-122 | draining a recipient never resealed its copy (never green on any scenario) | 99dc1c7c + 8b452194 (the scheduler, too) |
+| UC-143 | witness health gauge stuck at 0 on nodes with nothing to witness | 8ecb3adc |
+| UC-144 | **security:** a refused boot re-shipped over the disagreeing witness head, so the refusal lasted one boot | 51487ac5 |
+| — | …and the deadlock that fix introduced for a node that never shipped | d0323cce |
+
+All seven fixed product UCs are now PASS live (UC-122 and UC-143 for the first
+time on any scenario).
+
+**Harness bugs found and fixed:** the tamper-detection case (UC-132) silently
+SKIPPED on every scenario because the audit scripts looked one directory too
+high; disruptive cases picked the only ingress as their victim; restores ignored
+systemd's start limit, ran before their own cleanup (UC-144, UC-157), or did not
+wait for fresh capacity or for a failover recreate (UC-118); the suite timeout
+cut the hetero run one file before UC-170; a comment inside a shell line
+continuation silently dropped every `AEROL_*` env var; an artifact probe had no
+retry; SSH had no keepalive. Each has a guard or a regression test.
+
+**Still open:** UC-160 — draining a node records no cluster-wide storage-
+retirement obligation. A design decision, not a bug (TODOS.md).
+
 ## 8. Make targets and reports
 
 ```make
@@ -1636,7 +1678,7 @@ and verified, not merely that code was written.
 | T16 | UC group L + **`main` baseline arm** (§7 UC-165/166, D5) | T12, T1 (`--ref`) | both arms measured in one run; band met | **CODE DONE** 2026-09-26 (PR #486). Live PENDING — needs the `--ref main` arm. UC-165 refuses to compare across instance types and warns below 25 samples. |
 | T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR | **CODE DONE** 2026-09-26 (PR #486). **Exit criterion is stale**: the `removeOrphans` fix already landed 2026-09-19, so UC-167 is written as a live confirmation, not an expected failure. It deliberately does NOT assert restart survival — `ListManaged` reads an in-memory map, and the crash case needs a host-backed seam that has not landed. |
 | T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline | **DONE** 2026-09-26 (PR #486). 61 SEC rows, `want` 299 → **360**. The count was guarded in TWO places; the duplicate approximate guard (`287 ±15`) is removed so a new block updates one number. |
-| T18 | Hetero lite run: `cluster-hetero-lite-secrets` + `cluster-hetero-lite-kms` (S5/S6 topology without the c5.metal), publish reports | T1-T17, seed-rejoin fix | both columns in `reports/index.md`; UC-170 green | **READY** 2026-09-27. Re-scoped from the old "flagship S5+S6" (see §7.10): the previous attempt was stopped on the operator's call with S6 at 105 pass / 9 fail and S5 never run. `make integration-secrets-hetero-lite-pair`, < $1. |
+| T18 | Hetero lite run: `cluster-hetero-lite-secrets` + `cluster-hetero-lite-kms` (S5/S6 topology without the c5.metal), publish reports | T1-T17, seed-rejoin fix | both columns in `reports/index.md`; UC-170 green | **KMS DONE (119/2/54, UC-170 PASS); secrets confirmation run in progress 2026-09-28.** Found 8 product bugs (all fixed, all passing live) and ~12 harness bugs; see §7.11. Only UC-160 (design gap) and UC-118 (harness race, fixed) remain red. |
 | T19 | Metal flagship: S5 + S6 (`cluster-hetero-secrets` + `-kms`, incl. 1× c5.metal), publish reports | T18 green | both columns in `reports/index.md`; Firecracker rows executed | **NOT STARTED.** `make integration-secrets-flagship`, ~$28 / ~2h. Needs operator sign-off for the spend. |
 
 T12 is the milestone that matters: **UC-117 green on S2** means the defect the
