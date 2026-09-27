@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -151,6 +152,14 @@ type gossipNode struct {
 	logger             *slog.Logger
 	bootstrapPeers     []string
 	joinBootstrapPeers func([]string) (int, error)
+	// peerCache remembers live control-plane peers across restarts; nil when
+	// no directory was configured. See gossip_peer_cache.go for why.
+	peerCache *gossipPeerCache
+	// selfGossipAddr is excluded from every rejoin list.
+	selfGossipAddr string
+	// rejoinInFlight keeps a slow rejoin (serial dials, TCP timeouts to a
+	// vanished host) off the refresh loop and stops attempts from stacking.
+	rejoinInFlight atomic.Bool
 }
 
 type gossipMemberIndex struct {
@@ -438,6 +447,10 @@ type gossipSetupConfig struct {
 	// OnLeave is invoked after the local membership index marks a peer left.
 	// Used to drop cached per-peer mTLS HTTP clients.
 	OnLeave func(nodeID string)
+	// PeerCacheDir, when set, is where live control-plane peers are
+	// remembered so a restart can rejoin without SB_CLUSTER_PEERS. Empty
+	// disables the cache (tests, and any caller without durable state).
+	PeerCacheDir string
 }
 
 func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slog.Logger) (*gossipNode, error) {
@@ -539,6 +552,14 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		logger:             logger,
 		bootstrapPeers:     append([]string(nil), cfg.BootstrapPeers...),
 		joinBootstrapPeers: ml.Join,
+		peerCache:          newGossipPeerCache(cfg.PeerCacheDir),
+		selfGossipAddr:     ml.LocalNode().Address(),
+	}
+	// Loaded but deliberately not dialled here: setupGossip is on the boot
+	// path, and a stale entry whose host is gone costs a full TCP timeout.
+	// The refresh loop's first tick rejoins through them in the background.
+	if cached := gn.peerCache.load(); len(cached) > 0 && logger != nil {
+		logger.Info("cluster gossip remembered peers loaded", "peers", cached)
 	}
 	gn.refreshMemberIndex()
 	go gn.runRefreshLoop(refreshCtx, interval)
@@ -560,9 +581,42 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 			return
 		case <-t.C:
 			g.refreshMemberIndex()
-			g.maybeRejoinBootstrapPeers(g.memberlistNodes())
+			nodes := g.memberlistNodes()
+			g.rememberLivePeers(nodes)
+			if g.rejoinInFlight.CompareAndSwap(false, true) {
+				go func() {
+					defer g.rejoinInFlight.Store(false)
+					g.maybeRejoinBootstrapPeers(nodes)
+				}()
+			}
 		}
 	}
+}
+
+// rememberLivePeers persists the currently-alive control-plane peers. A write
+// failure only costs the next restart its fallback, so it is logged, not fatal.
+func (g *gossipNode) rememberLivePeers(nodes []*memberlist.Node) {
+	if g == nil || g.peerCache == nil {
+		return
+	}
+	selfNodeID := ""
+	if g.delegate != nil {
+		selfNodeID = g.delegate.nodeID
+	}
+	if err := g.peerCache.remember(liveControlPlanePeerAddrs(nodes, selfNodeID)); err != nil && g.logger != nil {
+		g.logger.Warn("cluster gossip could not persist remembered peers", "path", g.peerCache.path, "error", err)
+	}
+}
+
+// rejoinPeers is configured peers plus remembered ones, minus self.
+func (g *gossipNode) rejoinPeers() []string {
+	var cached []string
+	if g.peerCache != nil {
+		g.peerCache.mu.Lock()
+		cached = append([]string(nil), g.peerCache.last...)
+		g.peerCache.mu.Unlock()
+	}
+	return mergeRejoinPeers(g.bootstrapPeers, cached, g.selfGossipAddr)
 }
 
 func (g *gossipNode) memberlistNodes() []*memberlist.Node {
@@ -573,7 +627,11 @@ func (g *gossipNode) memberlistNodes() []*memberlist.Node {
 }
 
 func (g *gossipNode) maybeRejoinBootstrapPeers(nodes []*memberlist.Node) {
-	if g == nil || len(g.bootstrapPeers) == 0 || g.joinBootstrapPeers == nil {
+	if g == nil || g.joinBootstrapPeers == nil {
+		return
+	}
+	peers := g.rejoinPeers()
+	if len(peers) == 0 {
 		return
 	}
 	selfNodeID := ""
@@ -583,15 +641,15 @@ func (g *gossipNode) maybeRejoinBootstrapPeers(nodes []*memberlist.Node) {
 	if hasLiveControlPlaneMember(nodes, selfNodeID) {
 		return
 	}
-	joined, err := g.joinBootstrapPeers(g.bootstrapPeers)
+	joined, err := g.joinBootstrapPeers(peers)
 	if err != nil {
 		if g.logger != nil {
-			g.logger.Warn("cluster gossip bootstrap rejoin failed", "peers", g.bootstrapPeers, "error", err)
+			g.logger.Warn("cluster gossip bootstrap rejoin failed", "peers", peers, "error", err)
 		}
 		return
 	}
 	if joined > 0 && g.logger != nil {
-		g.logger.Info("cluster gossip bootstrap rejoined peers", "joined", joined, "peers", g.bootstrapPeers)
+		g.logger.Info("cluster gossip bootstrap rejoined peers", "joined", joined, "peers", peers)
 	}
 }
 

@@ -63,30 +63,37 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Start:** the health handler in `pkg/api`, `cfg.EnableCluster` gating, and
   the Caddy upstream health config in `pkg/caddy` / `packaging/`.
 
-## Losing the seed leaves the survivors without a leader — REPRODUCED
+## A restarted seed could never rejoin the cluster — FIXED (UC-170 to prove live)
 
-- **What:** stopping the SEED of a 3-node cluster left the remaining two
-  unable to elect a leader. Two of three voters is a quorum, so this should
-  not happen.
-- **Observed** (S2 security run, 2026-09-27) after `systemctl stop sandboxd`
-  on the seed:
-
-      node node1 did not rejoin within 4m: no raft leader yet
-      create HA sandbox: cluster: reserve placement failed: cluster: not raft leader
-
-  The cluster did not recover even once the seed was restarted.
-- **Related but distinct** from the partition entry above (there, nobody
-  stopped anything) and from the known "restarting the seed re-bootstraps
-  standalone and orphans the joiners" behaviour (there, the seed restarted;
-  here it was merely stopped).
-- **Suspect:** voter promotion — whether joiners are actually promoted to
-  voters before the seed goes away (the path that logs "cluster:
-  auto-promoted member to raft voter").
-- **Start:** `internal/cluster/raft.go`, `client.go` leadership/bootstrap,
-  the auto-promotion path in `agent.go`. Needs a regression test next to
-  whichever file changes, per CLAUDE.md's cluster rules.
-- **Mitigated meanwhile:** the integration suite never picks the seed as a
-  disruptive victim, and an owner-kill case whose owner is the seed skips.
+- **Was recorded as:** "losing the seed leaves the survivors without a
+  leader". **That diagnosis was wrong.** The S2 journals (2026-09-26) show the
+  survivors elected node2 3s after the seed stopped (`election won: term=4
+  tally=2`) and, after the 30s dead-owner grace, evicted the seed from Raft
+  (`RemoveServer ... node1`) — both correct.
+- **Actual bug:** the seed runs `SB_CLUSTER_BOOTSTRAP=true` with no
+  `SB_CLUSTER_PEERS`. memberlist keeps no state across a restart, so the
+  restarted seed came back as a gossip island (`cluster gossip started without
+  bootstrap peers`). The leader only re-admits a server it can see in gossip,
+  so the seed stayed a lone Raft candidate forever — the new leader logged
+  `rejecting pre-vote request since node is not in configuration` every ~1.5s
+  until teardown — while its `/health` still said 200. Requests the ingress
+  sent to it failed `not raft leader`, which is what the suite saw. The same
+  hole strands any joiner whose only configured peer has been replaced.
+- **Fix:** `internal/cluster/gossip_peer_cache.go` — each node persists the
+  gossip addresses of the live control-plane peers it sees
+  (`<raft dir>/gossip-peers.json`, ≤8, never overwritten with an empty set),
+  and the existing background rejoin loop dials configured ∪ remembered
+  peers. Not dialled on the boot path (a vanished host costs a TCP timeout).
+- **Tests:** `TestRestartedSeedRejoinsAfterEviction` replays the live failure
+  on loopback (3 real nodes: stop seed → survivors elect + evict → restart
+  seed with no peers → must be re-admitted as a voter). Mutation-checked: with
+  rejoin ignoring the cache it fails "seed never appeared ... as Voter".
+- **Live proof pending:** UC-170 (`z_seed_loss_test.go`) stops the seed on
+  purpose, waits past eviction, restarts it and asserts it follows the
+  survivors' leader. Runs in T18 (hetero lite) and T19 (metal flagship).
+- **Still true:** the partition entry above (a node with no leader answers
+  `/health` 200) is a separate, unfixed readiness-vs-liveness problem; it is
+  what turned this bug into user-visible errors.
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 
