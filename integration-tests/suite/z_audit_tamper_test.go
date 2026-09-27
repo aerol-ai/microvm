@@ -46,20 +46,39 @@ func TestTamperedAuditLineFailsVerificationAndNamesTheBreak(t *testing.T) {
 			t.Fatalf("read env: %v", err)
 		}
 	}
-	if pre := verifyAuditChain(t, c); !pre.OK {
-		t.Fatalf("the chain was already broken before the tamper (%s); this case would prove nothing", pre.Error)
+	// Tamper with the chain that holds these records — the sandbox owner's —
+	// and verify on THAT node. PickSSHNode prefers the seed, which on the
+	// hetero topology owns no sandboxes: its chain was too short to tamper
+	// with and the case skipped (T18). On the mixed topology it only worked
+	// because the seed is also the public entry point.
+	var node harness.IntegrationNode
+	ok := false
+	if sc.Has(harness.CapCluster) {
+		if owner := resolvePlacementOwner(t, c, sb.ID); owner != "" {
+			node, ok = nodeForClusterID(t, c, targets, owner)
+		}
 	}
-
-	node, ok := harness.PickSSHNode(targets)
 	if !ok {
-		t.Skip("no SSH-reachable node")
+		node, ok = harness.PickSSHNode(targets)
+		if !ok {
+			t.Skip("no SSH-reachable node")
+		}
 	}
 	target, _ := harness.SSHTarget(node)
+	if pre := verifyAuditChainOn(t, target); !pre.OK {
+		t.Fatalf("the chain on %s was already broken before the tamper (%s); this case would prove nothing", node.Name, pre.Error)
+	}
 
 	// Alter a line in the MIDDLE of the file. A tail edit is
 	// indistinguishable from a torn write; a middle edit can only be a
 	// tamper, which is what the verifier must say.
 	out, err := harness.SSHRun(t, target, tamperMiddleAuditLineScript)
+	// A missing log is a FAILURE, not a skip: this node served audited reads
+	// a moment ago, so no evidence file means either the harness is looking
+	// in the wrong place (it was, until T18) or the evidence is gone.
+	if strings.Contains(out, "NOLOG") {
+		t.Fatalf("no audit log on %s where one must exist: %s", node.Name, strings.TrimSpace(out))
+	}
 	if err != nil || strings.Contains(out, "TOOSHORT") {
 		t.Skipf("could not tamper with the audit log on %s (%v): %s", node.Name, err, strings.TrimSpace(out))
 	}
@@ -72,9 +91,9 @@ func TestTamperedAuditLineFailsVerificationAndNamesTheBreak(t *testing.T) {
 		}
 	})
 
-	report := verifyAuditChain(t, c)
+	report := verifyAuditChainOn(t, target)
 	if report.OK {
-		t.Fatal("verification PASSED over a hand-edited audit log: the chain does not detect tampering")
+		t.Fatalf("verification on %s PASSED over its hand-edited audit log: the chain does not detect tampering", node.Name)
 	}
 	if strings.TrimSpace(report.Error) == "" {
 		t.Fatal("verification failed but named no reason; an operator cannot tell a tamper from a torn tail")
@@ -135,17 +154,14 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 			continue // stopping the owner is UC-135's experiment
 		}
 		if n, ok := nodeForClusterID(t, c, targets, id); ok {
-			// Never the seed. Stopping it does not degrade the cluster by
-			// one member, it takes the cluster DOWN: the remaining two never
-			// seated a leader, so the read this case is measuring answered
-			// 502 for its whole three-minute poll, the seed could not rejoin
-			// within four minutes ("no raft leader yet"), and the next case
-			// could not even create a sandbox ("reserve placement failed").
-			//
-			// UC-134 is about whether a read ADMITS it could not reach a
-			// peer. It needs one absent peer, not a dead cluster — and a
-			// dead cluster cannot answer the question either way.
-			if n.Seed {
+			// Never the seed, and never the ingress. UC-134 is about whether
+			// a read ADMITS it could not reach a peer; it needs one absent
+			// peer, not an absent front door. Stopping the only ingress (T18,
+			// hetero) made the read itself 502 for the whole poll, and
+			// stopping the seed used to strand it outside the cluster on
+			// restart (fixed since, UC-170) — either way the case could not
+			// answer its own question.
+			if n.Seed || strings.EqualFold(strings.TrimSpace(n.Role), "ingress") {
 				continue
 			}
 			if _, sshOK := harness.SSHTarget(n); sshOK {
@@ -317,20 +333,40 @@ func TestWitnessDisagreementRefusesEnterpriseBoot(t *testing.T) {
 	if err := harness.PlantWitnessHead(t, receiver, victimNodeID, plantedHead); err != nil {
 		t.Fatalf("plant a disagreeing head: %v", err)
 	}
-	t.Cleanup(func() {
-		if !hadPrevious {
-			// Nothing to put back; the node will re-ship its real head on the
-			// next witness interval once it is up.
+	victimTarget, _ := harness.SSHTarget(victim)
+	restoredHead := false
+	restoreHead := func() {
+		if restoredHead {
 			return
 		}
-		if rerr := harness.PlantWitnessHead(t, receiver, victimNodeID, previous); rerr != nil {
-			t.Errorf("RESTORE FAILED: the witness still holds a planted head for %s and later boots of that node may refuse: %v", victimNodeID, rerr)
+		restoredHead = true
+		// Put back a head the node's chain contains. A refused boot no longer
+		// re-ships over the witness (that was the bug this case caught), so
+		// leaving the planted head — or, with no previous head, doing nothing
+		// — refuses every later boot of this node, for good.
+		head := previous
+		if !hadPrevious {
+			out, err := harness.SSHRun(t, victimTarget, nodeWitnessTipScript)
+			head = lastNonEmptyLineSuite(out)
+			if err != nil || len(head) != 64 {
+				t.Errorf("RESTORE FAILED: cannot read %s's own witness tip to un-plant the head (%v): %q", victim.Name, err, strings.TrimSpace(out))
+				return
+			}
 		}
-	})
+		if rerr := harness.PlantWitnessHead(t, receiver, victimNodeID, head); rerr != nil {
+			t.Errorf("RESTORE FAILED: the witness still holds a planted head for %s and every later boot of that node will refuse: %v", victimNodeID, rerr)
+		}
+	}
+	t.Cleanup(restoreHead)
 
 	// WithNodeEnv with no variables restarts the node and always puts it back
 	// — including when the boot is refused, which is the expected outcome.
 	harness.WithNodeEnv(t, victim, nil, func(res harness.NodeBootResult) {
+		// Un-plant BEFORE WithNodeEnv's restore restarts the node, even if an
+		// assertion below fails. From t.Cleanup it ran after that restart,
+		// which then booted against the planted head, was (correctly)
+		// refused, and left worker-w down for the rest of T18 round 2.
+		defer restoreHead()
 		if res.Started {
 			t.Fatalf("node %s started although the witness holds a head (%s) that its chain cannot account for: the boot gate failed OPEN, which defeats the witness entirely",
 				victim.Name, plantedHead)

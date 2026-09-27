@@ -1099,7 +1099,8 @@ const (
 // bootRefanoutDisposition decides whether a boot re-fanout failure should
 // end the process.
 //
-// Leader-unavailable is checked BEFORE the enterprise branch, and that order
+// Control-plane-unavailable (no leader, or the server not yet seeing this
+// node in gossip) is checked BEFORE the enterprise branch, and that order
 // is the entire fix. Enterprise mode is meant to fail closed on secrets it
 // cannot validate; it is not meant to fail closed because an election was in
 // flight. Getting that backwards took a live 3-node cluster's seed down
@@ -1109,7 +1110,7 @@ func bootRefanoutDisposition(err error, enterprise bool) bootRefanoutOutcome {
 	switch {
 	case err == nil:
 		return refanoutWarn
-	case cluster.IsLeaderUnavailable(err):
+	case cluster.IsControlPlaneUnavailable(err):
 		return refanoutRetry
 	case enterprise:
 		return refanoutFatal
@@ -1119,7 +1120,8 @@ func bootRefanoutDisposition(err error, enterprise bool) bootRefanoutOutcome {
 }
 
 // startClusterSecretRefanoutRetry re-runs the boot secret re-fanout until it
-// succeeds, for the case where it failed only because no leader was seated.
+// succeeds, for the case where it failed only because the control plane could
+// not serve this node yet (no leader seated, or its rejoin not yet gossiped).
 //
 // Mirrors startClusterOwnershipReplayRetry: same tick, same ctx-cancellation,
 // same "stop on first success". Under enterprise the node is serving while

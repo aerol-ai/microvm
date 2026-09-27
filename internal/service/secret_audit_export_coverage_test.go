@@ -37,6 +37,7 @@ func TestShipAndExportAuditRemainingGuards(t *testing.T) {
 
 	w := &stubWitness{shipErr: errors.New("witness down")}
 	svc.SetWitness(w)
+	svc.markSecretAuditWitnessValidated() // models a node whose boot validation passed
 	sink := svc.secretAuditSink().(*fileAuditSink)
 	if err := sink.EmitDurable(SecretAuditEvent{EventID: "ship-fail", Result: secretAuditResultSuccess}); err != nil {
 		t.Fatal(err)
@@ -96,6 +97,7 @@ func TestPruneAndExportAuditWave32(t *testing.T) {
 		t.Fatal("witness-required prune succeeded")
 	}
 	svc.SetWitness(&stubWitness{})
+	svc.markSecretAuditWitnessValidated() // models a node whose boot validation passed
 	if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{Time: time.Now().UTC().Add(-48 * time.Hour), EventID: "old32", Result: secretAuditResultSuccess}); err != nil {
 		t.Fatal(err)
 	}

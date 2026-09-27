@@ -50,6 +50,16 @@ func TestBootRefanoutDisposition(t *testing.T) {
 			err:  cluster.ErrNotLeader, enterprise: false, want: refanoutRetry,
 		},
 		{
+			// T18 live (2026-09-27): a restarted enterprise worker asked for
+			// the snapshot before the server had gossiped its rejoin, got 403
+			// "cluster peer not in membership", and crash-looped into
+			// systemd's restart limit.
+			name: "a rejoin the server has not gossiped yet must not be fatal",
+			err: fmt.Errorf("cluster: validate/re-fanout durable secrets at boot: %w",
+				fmt.Errorf("authoritative cluster placement snapshot during secret re-fanout: %w", cluster.ErrMembershipPending)),
+			enterprise: true, want: refanoutRetry,
+		},
+		{
 			// The fail-closed behaviour enterprise mode exists for must
 			// survive the fix.
 			name: "a real validation failure still ends the process",

@@ -69,6 +69,25 @@ func IsLeaderUnavailable(err error) bool {
 	return errors.Is(err, ErrNotLeader) || errors.Is(err, ErrNoLeader)
 }
 
+// ErrMembershipPending means a control-plane server refused this node only
+// because its gossip view does not (yet) list the node as alive.
+//
+// A restarting node hits this on every boot: its clean shutdown broadcast a
+// gossip Leave, and its first control-plane call lands ~100ms after start —
+// before the server has processed the rejoin. The live hetero run (T18,
+// 2026-09-27) lost a worker permanently to it: enterprise treated the 403 as
+// fatal, each restart re-broadcast the Leave and re-lost the same race, and
+// systemd's restart limit made it final.
+var ErrMembershipPending = errors.New("cluster: peer membership not yet recognised by the control plane")
+
+// IsControlPlaneUnavailable reports whether err means only that the control
+// plane could not serve this node at this instant — no leader seated, or the
+// server not yet seeing this node in gossip. Neither says anything about the
+// data being validated, so neither may be treated as fatal at boot.
+func IsControlPlaneUnavailable(err error) bool {
+	return IsLeaderUnavailable(err) || errors.Is(err, ErrMembershipPending)
+}
+
 // ErrUnknownSandbox is returned by OwnerOf when no placement record exists for
 // the given sandbox ID. Callers should treat this as "owned locally" only when
 // they have just-created the sandbox and not yet committed its placement.
@@ -352,10 +371,24 @@ type Placement struct {
 	// RecoveryRef points at the out-of-snapshot recovery payload for this row.
 	// Spec/secret fields are hydrated from that store only for point lookups and
 	// recreate flows.
-	RecoveryRef   string                       `json:"-"`
-	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef     string                       `json:"secret_ref,omitempty"`
-	SecretVersion int                          `json:"secret_version,omitempty"`
+	RecoveryRef string                       `json:"-"`
+	Spec        *models.CreateSandboxRequest `json:"spec,omitempty"`
+	// PublicTraffic mirrors Spec.AllowPublicTraffic on the HOT row.
+	//
+	// Spec is split into the recovery store on write and redacted from every
+	// paged/point read, so a dedicated ingress node — which has no FSM and
+	// reads only those pages — never saw it. The ingress route builder skips
+	// any placement whose public-traffic flag it cannot see, so on a hetero
+	// cluster it installed no L4 route for any remote sandbox: raw TCP
+	// exposures were unreachable (T18, UC-34). HTTP kept working only through
+	// the per-request ingress proxy fallback. One bool rides the row instead.
+	//
+	// false means "not public, or recorded by a build that predates this
+	// field"; placementAllowsPublicTraffic still consults Spec when present,
+	// so a legacy row behaves exactly as before until its next write.
+	PublicTraffic bool   `json:"public_traffic,omitempty"`
+	SecretRef     string `json:"secret_ref,omitempty"`
+	SecretVersion int    `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. It is empty only when the placement has no replicated

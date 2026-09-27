@@ -63,30 +63,69 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Start:** the health handler in `pkg/api`, `cfg.EnableCluster` gating, and
   the Caddy upstream health config in `pkg/caddy` / `packaging/`.
 
-## Losing the seed leaves the survivors without a leader — REPRODUCED
+## A restarted seed could never rejoin the cluster — FIXED, PROVEN LIVE (UC-170 green x3)
 
-- **What:** stopping the SEED of a 3-node cluster left the remaining two
-  unable to elect a leader. Two of three voters is a quorum, so this should
-  not happen.
-- **Observed** (S2 security run, 2026-09-27) after `systemctl stop sandboxd`
-  on the seed:
+- **Was recorded as:** "losing the seed leaves the survivors without a
+  leader". **That diagnosis was wrong.** The S2 journals (2026-09-26) show the
+  survivors elected node2 3s after the seed stopped (`election won: term=4
+  tally=2`) and, after the 30s dead-owner grace, evicted the seed from Raft
+  (`RemoveServer ... node1`) — both correct.
+- **Actual bug:** the seed runs `SB_CLUSTER_BOOTSTRAP=true` with no
+  `SB_CLUSTER_PEERS`. memberlist keeps no state across a restart, so the
+  restarted seed came back as a gossip island (`cluster gossip started without
+  bootstrap peers`). The leader only re-admits a server it can see in gossip,
+  so the seed stayed a lone Raft candidate forever — the new leader logged
+  `rejecting pre-vote request since node is not in configuration` every ~1.5s
+  until teardown — while its `/health` still said 200. Requests the ingress
+  sent to it failed `not raft leader`, which is what the suite saw. The same
+  hole strands any joiner whose only configured peer has been replaced.
+- **Fix:** `internal/cluster/gossip_peer_cache.go` — each node persists the
+  gossip addresses of the live control-plane peers it sees
+  (`<raft dir>/gossip-peers.json`, ≤8, never overwritten with an empty set),
+  and the existing background rejoin loop dials configured ∪ remembered
+  peers. Not dialled on the boot path (a vanished host costs a TCP timeout).
+- **Tests:** `TestRestartedSeedRejoinsAfterEviction` replays the live failure
+  on loopback (3 real nodes: stop seed → survivors elect + evict → restart
+  seed with no peers → must be re-admitted as a voter). Mutation-checked: with
+  rejoin ignoring the cache it fails "seed never appeared ... as Voter".
+- **Proven live:** UC-170 passed on three T18 runs (both profiles). Survivors
+  elected a new leader in 7s; the seed, restarted after eviction with no
+  peers, followed it 13s after restore.
+- **Still true:** the partition entry above (a node with no leader answers
+  `/health` 200) is a separate, unfixed readiness-vs-liveness problem; it is
+  what turned this bug into user-visible errors.
 
-      node node1 did not rejoin within 4m: no raft leader yet
-      create HA sandbox: cluster: reserve placement failed: cluster: not raft leader
+## UC-145b (retention prune) cannot run on any scenario — needs a seam
 
-  The cluster did not recover even once the seed was restarted.
-- **Related but distinct** from the partition entry above (there, nobody
-  stopped anything) and from the known "restarting the seed re-bootstraps
-  standalone and orphans the joiners" behaviour (there, the seed restarted;
-  here it was merely stopped).
-- **Suspect:** voter promotion — whether joiners are actually promoted to
-  voters before the seed goes away (the path that logs "cluster:
-  auto-promoted member to raft voter").
-- **Start:** `internal/cluster/raft.go`, `client.go` leadership/bootstrap,
-  the auto-promotion path in `agent.go`. Needs a regression test next to
-  whichever file changes, per CLAUDE.md's cluster rules.
-- **Mitigated meanwhile:** the integration suite never picks the seed as a
-  disruptive victim, and an owner-kill case whose owner is the seed skips.
+- **What:** UC-145b forces a prune with `SB_SECRET_AUDIT_RETENTION_DAYS=0`
+  and needs the audit witness. The witness only exists on enterprise
+  scenarios, and enterprise refuses zero retention at config load
+  (`internal/config/config.go`, "retention must be non-zero when
+  SB_ENTERPRISE_MODE=true"). So the only path that legitimately destroys
+  evidence has no live coverage at all; S4 and T18 both "failed" it by
+  taking a node down, and T18's ingress stayed down afterwards.
+- **Now:** the case skips on enterprise with that reason (it is not a pass).
+- **Unblock:** a test-only way to make records prunable under enterprise —
+  e.g. an `itestretention` build tag (same pattern as `itestwitness`) that
+  lets retention be expressed in minutes. Do not relax the enterprise
+  validator for it.
+
+## Draining a node records no visible storage-retirement obligation — DESIGN GAP (UC-160)
+
+- **What:** the plan (UC-160) says draining a worker makes a storage-retirement
+  obligation appear in `GET /v1/cluster/storage-retirements`. That endpoint
+  lists operator ATTESTATIONS only (node, attested_at, actor, reason), which
+  exist only after `POST .../storage-retired`. Deletion obligations to a node
+  live in each OWNER's local delete outbox, so no cluster-wide surface says
+  "this drained node still holds sealed material and must be wiped".
+- **Evidence:** T18 round 2 (build 7cefee72): draining worker-x raised nothing
+  in 4 minutes; the case now reports that plainly (its ctx bug is fixed).
+- **Decision needed:** an operator-facing obligation view means aggregating
+  every owner's outbox across the fleet (fan-out, or replicating a per-node
+  obligation count into the FSM). Both have a real cost at 2,000 nodes; pick
+  one before implementing. Until then UC-160 fails — honestly — by design.
+- **Start:** `internal/service/node_storage_retirement.go`,
+  `pkg/api/v1/cluster_handler.go` `clusterListNodeStorageRetirements`.
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 

@@ -97,6 +97,17 @@ func blockInternalListenerEverywhere(t *testing.T, targets *harness.IntegrationT
 					b.node.Name, b.port, err, strings.TrimSpace(out))
 			}
 		}
+		// Unblocked is not usable. Capacity heartbeats ride this listener,
+		// so every worker's capacity is stale the moment the rule goes, and
+		// placement refuses stale workers. T18 lost the next five cases —
+		// all "no worker placement target available ... has no fresh
+		// capacity heartbeat" — to creates issued a second after this
+		// restore returned.
+		if len(applied) > 0 && sc.Has(harness.CapCluster) {
+			if err := waitWorkerCapacityFresh(t, time.Now().Unix(), 2*time.Minute); err != nil {
+				t.Errorf("RESTORE INCOMPLETE: %v; the next case will be refused placement for a reason that has nothing to do with it", err)
+			}
+		}
 	}
 	t.Cleanup(restore)
 
@@ -429,13 +440,17 @@ func sameEventIDs(a, b []auditlog.Event) bool {
 	return true
 }
 
-// auditLogPath is where the node keeps its hash-chained evidence.
-// The audit directory is the DB's directory: internal/service derives it with
-// secretAuditDataDir(cfg.DBPath). There is no SB_SECRET_AUDIT_DIR — an early
-// draft assumed one, which would have pointed every script below at a path
-// that does not exist and turned four cases into silent skips.
+// auditLogPath is where the node keeps its hash-chained evidence:
+// <secretAuditDataDir(cfg.DBPath)>/audit, i.e. an "audit" directory NEXT TO
+// the DB (internal/service/secret_audit.go, newFileAuditSinkFrom(
+// filepath.Join(dataDir, "audit"), ...)). There is no SB_SECRET_AUDIT_DIR.
+//
+// This used to stop at the DB's directory. Every script below then pointed
+// at a file that does not exist: the tamper case read 0 lines, reported
+// TOOSHORT and SKIPPED — a tamper-detection test that never tampered — and
+// UC-143 reported a receipt MISSING that was sitting in audit/ (T18).
 const auditLogScript = sqliteSourceEnv +
-	`db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; dir=$(dirname "$db"); log="$dir/secrets.jsonl"; `
+	`db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; dir="$(dirname "$db")/audit"; log="$dir/secrets.jsonl"; `
 
 // tamperMiddleAuditLineScript edits a line in the MIDDLE of the chain and
 // keeps a pristine copy alongside.
@@ -445,6 +460,7 @@ const auditLogScript = sqliteSourceEnv +
 // gap — so tampering with the tail would assert nothing about tamper
 // detection.
 const tamperMiddleAuditLineScript = `sudo bash -c '` + auditLogScript +
+	`[ -f "$log" ] || { echo "NOLOG $log"; exit 0; }; ` +
 	`n=$(wc -l < "$log" 2>/dev/null || echo 0); ` +
 	`[ "$n" -ge 4 ] || { echo TOOSHORT; exit 0; }; ` +
 	`cp -a "$log" "$log.itest-backup"; ` +
@@ -486,20 +502,24 @@ func firstN(xs []string, n int) []string {
 // pickNonSeedNode prefers a joiner. Refusing the seed's boot on a cluster
 // costs the rendezvous every joiner needs to rejoin, which turns one red case
 // into a split cluster.
+//
+// It shares PickRestartableNode's ranking so the two can never disagree about
+// which victim is safe. They did: this one kept "first non-seed node", which
+// on the hetero topology is the only ingress, and T18's UC-134 stopped it and
+// then watched every read answer 502 for three minutes.
 func pickNonSeedNode(targets *harness.IntegrationTargets) (harness.IntegrationNode, bool) {
-	if targets == nil {
+	n, ok := harness.PickRestartableNode(targets)
+	if !ok || n.Seed {
 		return harness.IntegrationNode{}, false
 	}
-	for _, n := range targets.Nodes {
-		if n.Seed {
-			continue
-		}
-		if _, ok := harness.SSHTarget(n); ok {
-			return n, true
-		}
-	}
-	return harness.IntegrationNode{}, false
+	return n, true
 }
+
+// nodeWitnessTipScript prints the head this node last shipped to the witness
+// (witness_tip.json's head_hex): a head its own chain contains, so planting
+// it back makes the node's boot validation pass on the fast path.
+const nodeWitnessTipScript = `sudo bash -c '` + auditLogScript +
+	`sed -n "s/.*\"head_hex\":\"\([0-9a-f]*\)\".*/\1/p" "$dir/witness_tip.json" 2>/dev/null'`
 
 // witnessReceiptScript reports whether a witness receipt is on disk. The
 // receipt is the proof that survives a restart; a witness that ships heads
@@ -898,7 +918,9 @@ func requireNonSeedVictim(t *testing.T, node harness.IntegrationNode) {
 // red, because it is the kind someone acts on.
 func restoreNodeDaemon(t *testing.T, node harness.IntegrationNode, target string) {
 	t.Helper()
-	if out, err := harness.SSHRun(t, target, "sudo systemctl start sandboxd"); err != nil {
+	// reset-failed first: a unit that crash-looped into systemd's start limit
+	// ignores `start` until the counter is cleared.
+	if out, err := harness.SSHRun(t, target, "sudo systemctl reset-failed sandboxd; sudo systemctl start sandboxd"); err != nil {
 		t.Errorf("RESTORE FAILED: sandboxd is left stopped on %s and the rest of this run is suspect: %v\n%s", node.Name, err, out)
 		return
 	}
@@ -1013,6 +1035,32 @@ func clusterLeader(c *harness.Client) (string, error) {
 // the members payload at all, so it decoded to false and the check passed
 // unconditionally — a guard that looked right and tested nothing. internal_url
 // is in the payload and is what the error is about.
+// waitWorkerCapacityFresh blocks until every live, undrained member that can
+// own a sandbox has a capacity heartbeat newer than since.
+func waitWorkerCapacityFresh(t *testing.T, since int64, max time.Duration) error {
+	t.Helper()
+	c := harness.NewClient(t, sc)
+	deadline := time.Now().Add(max)
+	var stale []string
+	for time.Now().Before(deadline) {
+		stale = stale[:0]
+		for _, m := range fetchMembers(t, c).Members {
+			role := strings.ToLower(strings.TrimSpace(m.Role))
+			if !m.Alive || m.Drained || (role != "worker" && role != "mixed" && role != "") {
+				continue
+			}
+			if m.CapacityUpdatedUnix <= since {
+				stale = append(stale, m.NodeID)
+			}
+		}
+		if len(stale) == 0 {
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("workers %v had no fresh capacity heartbeat within %s of the unblock", stale, max)
+}
+
 func membersMissingInternalURL(t *testing.T, c *harness.Client) []string {
 	t.Helper()
 	var out []string

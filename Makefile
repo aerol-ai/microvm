@@ -20,6 +20,7 @@ BIN_DIR ?= bin
 	integration-secrets-single integration-secrets-cluster integration-secrets-kms \
 	integration-secrets-enterprise integration-secrets-hetero integration-secrets-hetero-kms \
 	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
+	integration-secrets-hetero-lite integration-secrets-hetero-lite-kms integration-secrets-hetero-lite-pair \
 	integration-bench-cluster
 
 fmt:
@@ -155,9 +156,21 @@ integration-secrets-hetero-kms:
 	integration-tests/run.sh cluster-hetero-secrets-kms $(RUN_FLAGS)
 
 # Flagship = S5 + S6, in order. ~$28 and ~2h of on-demand metal, so it is
-# deliberately NOT part of the gate: run it once pre-merge, and again after
-# any change to internal/cluster, the fan-out path or the reseal protocol.
+# deliberately NOT part of the gate: run it once pre-merge (T19). After an
+# internal/cluster, fan-out or reseal change, run the lite pair below first.
 integration-secrets-flagship: integration-secrets-hetero integration-secrets-hetero-kms
+
+# Hetero lite (T18) = S5 + S6's 8-member role-separated topology with the
+# c5.metal worker swapped for a t3.medium. Everything but Firecracker, for
+# well under $1/h — the routine check after any internal/cluster change, and
+# the thing to get green BEFORE paying for the metal flagship.
+integration-secrets-hetero-lite:
+	integration-tests/run.sh cluster-hetero-lite-secrets $(RUN_FLAGS)
+
+integration-secrets-hetero-lite-kms:
+	integration-tests/run.sh cluster-hetero-lite-kms $(RUN_FLAGS)
+
+integration-secrets-hetero-lite-pair: integration-secrets-hetero-lite integration-secrets-hetero-lite-kms
 
 # Re-run ONLY the security use cases against an already-provisioned cluster
 # (use with `keep` from a previous run). Minutes instead of a re-provision.

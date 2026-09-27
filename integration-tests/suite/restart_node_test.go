@@ -125,16 +125,24 @@ func TestTheRejoinWaitIsWiredEndToEnd(t *testing.T) {
 
 // A disruptive case must choose its victim deliberately, never the seed.
 //
-// Stopping the seed does not degrade the cluster by one member, it takes the
-// cluster DOWN: on a live 3-node run the remaining two never seated a
-// leader, the read under test answered 502 for its entire poll, the seed
-// could not rejoin within four minutes ("no raft leader yet"), and the next
-// case could not even create a sandbox. Every one of those reads as a
-// product bug in whatever happened to be running.
+// On a live 3-node run, stopping the seed broke far more than one member:
+// the read under test answered 502 for its entire poll, the seed could not
+// rejoin within four minutes ("no raft leader yet"), and the next case could
+// not even create a sandbox. The cause, found later in the journals, was not
+// the survivors — they elected a leader within 3s — but the restarted seed:
+// it has no SB_CLUSTER_PEERS, came back as a gossip island, and after its
+// eviction from Raft could never be re-admitted. That is fixed in the product
+// (internal/cluster/gossip_peer_cache.go) and proven by UC-170.
 //
-// Whether a 3-node cluster SHOULD survive losing its seed is a real and
-// separate question (plan §7.7). Until it does, a case that wants one absent
-// peer must ask for one.
+// The guard stays. A case about secrets or audit that also happens to evict
+// the seed is paying for a control-plane event it is not testing, and any
+// red it produces reads as a bug in the wrong subsystem. UC-170 is the one
+// case whose subject IS the seed, so it is named here rather than slipping
+// through on a substring.
+var seedVictimCases = map[string]bool{
+	"TestSeedLossSurvivorsKeepALeaderAndTheSeedRejoins": true, // UC-170
+}
+
 func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
 	files, err := filepath.Glob("*_test.go")
 	if err != nil {
@@ -158,6 +166,9 @@ func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
 				continue
 			}
 			checked++
+			if name := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(sig, "func "), "(", 2)[0]); seedVictimCases[name] {
+				continue
+			}
 			// Any of the three is a deliberate choice: the two pickers
 			// exclude the seed themselves, and an explicit .Seed test is the
 			// hand-rolled equivalent.

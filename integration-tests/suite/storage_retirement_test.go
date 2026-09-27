@@ -88,7 +88,14 @@ func TestDrainRaisesAStorageRetirementObligation(t *testing.T) {
 	raised := false
 	for time.Now().Before(deadline) {
 		var recs storageRetirements
-		if err := c.GetJSON(ctx, "/v1/cluster/storage-retirements", &recs); err != nil {
+		// A context per request, not the drain's: that one expires at 3m,
+		// a minute inside this 4m poll, and T18 then reported "context
+		// deadline exceeded" instead of the real answer — that no obligation
+		// had been raised.
+		rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := c.GetJSON(rctx, "/v1/cluster/storage-retirements", &recs)
+		rcancel()
+		if err != nil {
 			t.Fatalf("list storage retirements: %v", err)
 		}
 		if recs.has(victim) {

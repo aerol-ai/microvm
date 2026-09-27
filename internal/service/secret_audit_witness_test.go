@@ -150,6 +150,7 @@ func TestSecretAuditWitnessShipAndVerify(t *testing.T) {
 
 	w := &stubWitness{}
 	svc.SetWitness(w)
+	svc.markSecretAuditWitnessValidated() // models a node whose boot validation passed
 	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
 		t.Fatalf("ship: %v", err)
 	}
@@ -161,6 +162,36 @@ func TestSecretAuditWitnessShipAndVerify(t *testing.T) {
 		t.Fatalf("verify = ok=%v local=%q witnessed=%q err=%v", ok, local, witnessed, err)
 	}
 	svc.CloseSecretAuditSink()
+}
+
+// A node that never writes secret audit (an ingress, a dedicated server) has
+// an empty chain and nothing to witness. Its health gauge must read 1, or the
+// operator alert on it fires forever on every such node (T18 hetero, UC-143).
+func TestSecretAuditWitnessEmptyChainReportsHealthy(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath:                     filepath.Join(t.TempDir(), "state.db"),
+		EnterpriseMode:             true,
+		SecretAuditWitnessInterval: time.Hour,
+	}}
+	svc.ensureSecretAuditSink()
+	if svc.secretAuditFile == nil {
+		t.Fatal("expected file audit sink")
+	}
+	defer svc.CloseSecretAuditSink()
+	w := &stubWitness{}
+	svc.SetWitness(w)
+	svc.markSecretAuditWitnessValidated() // models a node whose boot validation passed
+
+	secretAuditWitnessHealthy.Set(0)
+	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
+		t.Fatalf("ship on an empty chain: %v", err)
+	}
+	if got := secretAuditWitnessHealthy.Value(); got != 1 {
+		t.Fatalf("witness healthy gauge on an empty chain = %d, want 1", got)
+	}
+	if len(w.heads) != 0 {
+		t.Fatalf("an empty chain shipped heads %+v; there is nothing to witness", w.heads)
+	}
 }
 
 func TestWitnessReceiptRoundTrip(t *testing.T) {
@@ -225,10 +256,21 @@ func TestSecretAuditWitnessEmptyMissingAndFailurePaths(t *testing.T) {
 	if ok, local, witnessed, err := svc.VerifySecretAuditWitness(); ok || local == "" || witnessed != "" || err != nil {
 		t.Fatalf("missing receipt verify = %v %q %q %v", ok, local, witnessed, err)
 	}
-	if err := svc.ValidateSecretAuditWitness(); err == nil || !strings.Contains(err.Error(), "witness mismatch") {
-		t.Fatalf("missing receipt validation = %v", err)
+	// Boot validation bootstraps an EMPTY witness for a node that has never
+	// shipped: nothing contradicts the chain, and refusing here deadlocked
+	// against the ship gate (T18 KMS, worker-y). Verification itself stays
+	// strict (above); validation ships once, then verifies.
+	if err := svc.ValidateSecretAuditWitness(); err != nil {
+		t.Fatalf("never-shipped node with an empty witness was refused: %v", err)
+	}
+	if len(w.heads) != 1 || w.heads[0].HeadHex == "" {
+		t.Fatalf("empty-witness bootstrap shipped %+v, want exactly the current head", w.heads)
 	}
 
+	// A new head, so the next ship has something to send.
+	if err := svc.secretAuditFile.EmitDurable(SecretAuditEvent{EventID: "after-bootstrap", SandboxID: "sb"}); err != nil {
+		t.Fatal(err)
+	}
 	w.shipErr = errors.New("witness offline")
 	if err := svc.shipSecretAuditHead(context.Background()); !errors.Is(err, w.shipErr) {
 		t.Fatalf("ship error = %v", err)

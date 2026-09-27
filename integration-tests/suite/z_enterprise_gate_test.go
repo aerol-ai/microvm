@@ -56,6 +56,12 @@ func enterpriseGates() []enterpriseGate {
 			env: map[string]string{
 				"SB_SECRET_PROVIDER":             "awskms",
 				"SB_SECRET_PROVIDER_STRICT_BOOT": "false",
+				// Config load demands a key id before it reaches the
+				// enterprise rule under test; without one the node refuses
+				// for "SB_SECRET_AWS_KMS_KEY_ID is required" and the case
+				// fails on a non-KMS scenario (T18). Load only validates the
+				// value — nothing contacts KMS — so a placeholder suffices.
+				"SB_SECRET_AWS_KMS_KEY_ID": "arn:aws:kms:us-east-1:000000000000:key/itest-placeholder",
 			},
 			want: "SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms",
 		},
@@ -156,7 +162,12 @@ func TestEnterpriseBootGateMatrix(t *testing.T) {
 			"SB_AUDIT_EXPORT_BACKEND":   "file",
 			"SB_AUDIT_EXPORT_FILE_PATH": "/var/log/aerol-uc158.jsonl",
 		},
-		want: "requires an off-node audit exporter",
+		// Both enforcement points say "requires an off-node": config load
+		// ("... off-node backend (webhook, s3, bus) ...") refuses first, and
+		// the daemon's check ("... off-node audit exporter ...") is the net
+		// behind it. Matching only the daemon's wording failed a correct
+		// refusal (T18).
+		want: "requires an off-node",
 	})
 
 	for _, g := range gates {
@@ -220,6 +231,13 @@ func TestCAKeyInTLSDirRefusesEnterpriseBoot(t *testing.T) {
 	defer removeDecoy()
 
 	harness.WithNodeEnv(t, node, nil, func(res harness.NodeBootResult) {
+		// Remove the decoy when the callback returns — including via a
+		// failed assertion — so it is gone BEFORE WithNodeEnv restarts the
+		// node to restore it. Removing it after WithNodeEnv returned meant
+		// the restore rebooted with ca.key still present, failed, and
+		// nothing restarted the node once the key was gone: T18 left
+		// worker-w down for the rest of the run.
+		defer removeDecoy()
 		if res.Started {
 			t.Fatalf("node %s started with a CA signing key in its TLS directory: an operator who copies ca.key onto a worker keeps a fleet-wide minting capability on a machine that only needs one identity",
 				node.Name)

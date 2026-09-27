@@ -534,24 +534,46 @@ func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
 // reading state — so every case that restarts a node and reached for it was
 // picking the one node that breaks the cluster.
 //
+// That product bug is fixed (internal/cluster/gossip_peer_cache.go, proven by
+// UC-170); sparing the seed remains the right default so a case not about
+// the control plane is not charged for a seed rejoin.
+//
 // On a single node there is nothing to orphan, so the seed is returned.
+//
+// Not the ingress either, where there is any alternative. On the hetero
+// topology the first non-seed node in the target list is ingress-1 — the only
+// public entry point — so "restart a joiner" meant "take the front door
+// down": T18 scenario 1 restarted it for one case after another, and every
+// create in between answered 502. A worker (or a mixed node) is the victim
+// whose absence costs one member and nothing else.
 func PickRestartableNode(targets *IntegrationTargets) (IntegrationNode, bool) {
 	if targets == nil {
 		return IntegrationNode{}, false
 	}
-	var seed IntegrationNode
-	haveSeed := false
+	// Lower rank = safer to restart.
+	rank := func(n IntegrationNode) int {
+		switch {
+		case n.Seed:
+			return 3
+		case strings.EqualFold(strings.TrimSpace(n.Role), "ingress"):
+			return 2
+		case strings.EqualFold(strings.TrimSpace(n.Role), "server"):
+			return 1 // a non-seed voter: 2 of 3 keep quorum, but still a voter
+		default:
+			return 0 // worker, mixed, or unspecified
+		}
+	}
+	var best IntegrationNode
+	bestRank, found := 4, false
 	for _, n := range targets.Nodes {
 		if _, ok := SSHTarget(n); !ok {
 			continue
 		}
-		if n.Seed {
-			seed, haveSeed = n, true
-			continue
+		if r := rank(n); r < bestRank {
+			best, bestRank, found = n, r, true
 		}
-		return n, true
 	}
-	return seed, haveSeed
+	return best, found
 }
 
 // NodeRejoinCheck, when set, must block until the node is fully back in
@@ -625,8 +647,13 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 			return
 		}
 		restored = true
+		// reset-failed first: a refused config crash-loops the unit into
+		// systemd's start limit, and a limited unit ignores `restart` until
+		// the counter is cleared. T18 lost ingress-1 — and every create
+		// after it (502) — to a restore that removed the bad override and
+		// then asked a start-limited unit to start.
 		out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
-			" && sudo systemctl daemon-reload && sudo systemctl restart sandboxd")
+			" && sudo systemctl daemon-reload && sudo systemctl reset-failed sandboxd && sudo systemctl restart sandboxd")
 		if err != nil {
 			t.Errorf("RESTORE FAILED on %s — the node may be left down and the rest of this run is suspect: %v\n%s", node.Name, err, out)
 			return
@@ -960,7 +987,7 @@ func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]str
 				continue
 			}
 			out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
-				" && sudo systemctl daemon-reload && sudo systemctl restart sandboxd")
+				" && sudo systemctl daemon-reload && sudo systemctl reset-failed sandboxd && sudo systemctl restart sandboxd")
 			if err != nil {
 				t.Errorf("RESTORE FAILED on %s — the rest of this run is suspect: %v\n%s", n.Name, err, out)
 				continue

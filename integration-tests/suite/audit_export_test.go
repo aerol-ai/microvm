@@ -245,11 +245,26 @@ func TestWitnessShipsHeadsAndReportsHealthy(t *testing.T) {
 
 	// Fresh records, so the head the witness records is one produced during
 	// this run rather than a stale value from provisioning.
-	generateAuditRecords(t, c, "143", 3)
+	sandboxID, _ := generateAuditRecords(t, c, "143", 3)
 
-	node, ok := harness.PickRestartableNode(targets)
+	// Ask about the node that WROTE those records: the sandbox's owner. An
+	// arbitrary node is not a valid subject — on the hetero topology the first
+	// non-seed node is the ingress, which never owns a sandbox, so its secret
+	// audit chain is empty and there is no head to witness. T18 failed UC-143
+	// on exactly that (ingress-1's secrets.jsonl was 0 bytes); the all-mixed
+	// 3-node scenarios only passed because every node there owns sandboxes.
+	var node harness.IntegrationNode
+	ok = false
+	if sc.Has(harness.CapCluster) {
+		if owner := resolvePlacementOwner(t, c, sandboxID); owner != "" {
+			node, ok = nodeForClusterID(t, c, targets, owner)
+		}
+	}
 	if !ok {
-		t.Skip("no SSH-reachable node")
+		node, ok = harness.PickRestartableNode(targets)
+		if !ok {
+			t.Skip("no SSH-reachable node")
+		}
 	}
 	nodeID := heteroNodeID(t, c, targets, node.Name)
 
@@ -336,6 +351,16 @@ func TestAuditIngestRequiresATokenAndIsLoopbackOnly(t *testing.T) {
 // secrets.jsonl in place.
 func TestRetentionPruneHoldsWhileExportLagsThenVerifies(t *testing.T) {
 	harness.Require(t, sc, "UC-145b")
+	// This case cannot currently run anywhere, and says so instead of taking
+	// a node down. It needs the witness, which only enterprise scenarios
+	// carry, and it forces a prune with SB_SECRET_AUDIT_RETENTION_DAYS=0,
+	// which enterprise refuses at config load (internal/config/config.go,
+	// "retention must be non-zero when SB_ENTERPRISE_MODE=true"). T18 and S4
+	// both failed it that way — and T18's ingress then stayed down. Running
+	// it needs a test-only retention seam; see TODOS.md.
+	if sc.Has(harness.CapEnterprise) {
+		t.Skip("UC-145b needs zero retention, which enterprise refuses by design; unrunnable until a test-only retention seam exists (TODOS.md)")
+	}
 	if !harness.DisruptiveAllowed() {
 		t.Skip("disruptive tests disabled: this stops the receiver and forces a prune")
 	}

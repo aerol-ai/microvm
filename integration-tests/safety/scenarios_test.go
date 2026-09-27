@@ -149,6 +149,30 @@ func TestScenarioClusterNamesAreMarkedAndUnique(t *testing.T) {
 	}
 }
 
+// run.sh names a scenario's cluster "aerolvm-itest-<scenario>", and
+// Terraform/locals.tf truncates that to 40 characters before building the
+// bundle and caddy-cert bucket names. Two scenarios whose names differ only
+// past character 40 are distinct to the uniqueness test above but share a
+// bucket prefix in AWS — which is exactly what "cluster-hetero-secrets-kms-lite"
+// would have done to "cluster-hetero-secrets-kms".
+func TestScenarioBucketPrefixesAreUnique(t *testing.T) {
+	const tfBucketPrefixLen = 40 // substr(..., 0, 40) in Terraform/locals.tf
+	caps, _ := filepath.Glob(filepath.Join(scenarioDir(t), "*.caps.yml"))
+	seen := map[string]string{}
+	for _, f := range caps {
+		scenario := strings.TrimSuffix(filepath.Base(f), ".caps.yml")
+		prefix := "aerolvm-itest-" + scenario
+		if len(prefix) > tfBucketPrefixLen {
+			prefix = prefix[:tfBucketPrefixLen]
+		}
+		if prev, dup := seen[prefix]; dup {
+			t.Errorf("scenarios %s and %s truncate to the same 40-char bucket prefix %q; rename one",
+				prev, scenario, prefix)
+		}
+		seen[prefix] = scenario
+	}
+}
+
 // A scenario that advertises audit-witness gets the -tags itestwitness
 // daemon (run.sh derives it from this capability). Enterprise forces
 // SB_SECRET_AUDIT_EXTERNAL_WITNESS and pkg/daemon refuses to boot without a

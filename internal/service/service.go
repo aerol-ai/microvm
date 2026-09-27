@@ -180,8 +180,15 @@ type Service struct {
 	secretAuditWitnessOnce sync.Once
 	secretAuditWitnessStop chan struct{}
 	secretAuditWitnessDone sync.WaitGroup
-	auditIngestMu          sync.Mutex
-	auditIngest            *auditIngestServer
+	// witnessBootPending is armed by SetWitness and cleared only when
+	// ValidateSecretAuditWitness passes; until then nothing ships to the
+	// external witness. witnessValidated is closed at that moment so the
+	// ship loop can make its first ship without waiting out an interval.
+	witnessBootPending   atomic.Bool
+	witnessValidatedOnce sync.Once
+	witnessValidated     chan struct{}
+	auditIngestMu        sync.Mutex
+	auditIngest          *auditIngestServer
 	// auditIngestKey caches the resolved capability signing key (see
 	// auditIngestSigningKey); guarded by auditIngestMu.
 	auditIngestKey string

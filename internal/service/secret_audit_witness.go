@@ -50,9 +50,43 @@ func (s *Service) SetWitness(w controlplane.Witness) {
 	}
 	s.auditWitnessMu.Lock()
 	s.auditWitness = w
+	if (controlplane.Provider{Witness: w}).HasExternalWitness() {
+		// Arm before the loop starts. The loop used to ship the local head
+		// immediately, BEFORE the daemon validated it against the witness,
+		// and a ship that finds the witness "behind" re-submits the local
+		// head: a node booting against a disagreeing witness overwrote the
+		// very head it was about to be refused for. The refusal held for
+		// one boot and systemd's restart then booted cleanly (T18, UC-144).
+		if s.witnessValidated == nil {
+			s.witnessValidated = make(chan struct{})
+		}
+		s.witnessBootPending.Store(true)
+	}
 	s.auditWitnessMu.Unlock()
 	s.ensureSecretAuditSink()
 	s.startSecretAuditWitnessLoop()
+}
+
+// errSecretAuditWitnessBootPending is returned by every ship attempted before
+// boot validation has passed. Retention treats it like any other ship failure
+// and retries on its next pass.
+var errSecretAuditWitnessBootPending = errors.New("secret audit witness: boot validation has not passed; nothing is shipped until it does")
+
+// markSecretAuditWitnessValidated releases the ship gate once.
+func (s *Service) markSecretAuditWitnessValidated() {
+	s.witnessBootPending.Store(false)
+	s.auditWitnessMu.Lock()
+	ch := s.witnessValidated
+	s.auditWitnessMu.Unlock()
+	if ch != nil {
+		s.witnessValidatedOnce.Do(func() { close(ch) })
+	}
+}
+
+func (s *Service) witnessValidatedCh() <-chan struct{} {
+	s.auditWitnessMu.Lock()
+	defer s.auditWitnessMu.Unlock()
+	return s.witnessValidated
 }
 
 func (s *Service) witness() controlplane.Witness {
@@ -83,6 +117,14 @@ func (s *Service) startSecretAuditWitnessLoop() {
 		}
 		go func() {
 			defer s.secretAuditWitnessDone.Done()
+			// First ship only once boot validation has passed (see SetWitness).
+			if ch := s.witnessValidatedCh(); ch != nil {
+				select {
+				case <-stop:
+					return
+				case <-ch:
+				}
+			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			_ = s.shipSecretAuditHead(context.Background())
@@ -115,6 +157,19 @@ func (s *Service) shipSecretAuditHead(ctx context.Context) error {
 	if s == nil || s.secretAuditFile == nil {
 		return nil
 	}
+	if s.witnessBootPending.Load() {
+		return errSecretAuditWitnessBootPending
+	}
+	return s.shipSecretAuditHeadNow(ctx)
+}
+
+// shipSecretAuditHeadNow ships without consulting the boot gate. Only
+// shipSecretAuditHead and the empty-witness bootstrap in
+// ValidateSecretAuditWitness may call it.
+func (s *Service) shipSecretAuditHeadNow(ctx context.Context) error {
+	if s == nil || s.secretAuditFile == nil {
+		return nil
+	}
 	s.auditWitnessShipMu.Lock()
 	defer s.auditWitnessShipMu.Unlock()
 	w := s.witness()
@@ -134,6 +189,13 @@ func (s *Service) shipSecretAuditHead(ctx context.Context) error {
 	}
 	head, eventID := s.secretAuditFile.chainTip()
 	if head == "" || head == auditlog.GenesisPrevHash {
+		// Nothing to witness is a healthy state, not an unknown one. This
+		// branch used to return without touching the gauge, so it stayed at
+		// its zero value forever on every node that never writes secret
+		// audit — each ingress and each dedicated server. On the T18 hetero
+		// run /v1/metrics answered from such a node with healthy=0: an
+		// operator alert that fires permanently on half the fleet.
+		secretAuditWitnessHealthy.Set(1)
 		return nil
 	}
 	nodeID := s.witnessNodeID()
@@ -524,6 +586,29 @@ func (s *Service) ValidateSecretAuditWitness() error {
 	if s.secretAuditFile == nil {
 		s.ensureSecretAuditSink()
 	}
+	// Empty-witness bootstrap. A witness holding NOTHING for this node
+	// contradicts nothing, so ship the current head and then validate.
+	// Without this the boot gate deadlocked: a node restarted before its
+	// first head ever shipped (fresh node, first audit records inside one
+	// ship interval) was refused for having an unwitnessed chain, and could
+	// never ship because nothing ships until validation passes — T18's KMS
+	// scenario left worker-y down permanently. This is NOT the overwrite the
+	// gate exists to stop: that needed a DISAGREEING head, and a present head
+	// takes no part in this branch.
+	//
+	// Only for a node that has NEVER shipped (no local receipt). A node that
+	// did ship and now finds the witness empty is looking at lost evidence,
+	// and that still fails closed below.
+	if localReceipt, rerr := s.localWitnessReceiptHead(); rerr == nil && localReceipt == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), secretAuditWitnessShipTimeout)
+		remote, present, rerr := s.lastWitnessedHeadAny(ctx, w)
+		cancel()
+		if rerr == nil && (!present || strings.TrimSpace(remote) == "") {
+			if serr := s.shipSecretAuditHeadNow(context.Background()); serr != nil {
+				return fmt.Errorf("verify secret audit witness: bootstrap an empty witness: %w", serr)
+			}
+		}
+	}
 	var (
 		ok               bool
 		local, witnessed string
@@ -540,6 +625,7 @@ func (s *Service) ValidateSecretAuditWitness() error {
 	if !ok {
 		return fmt.Errorf("secret audit witness mismatch: local_head=%q witnessed_head=%q", local, witnessed)
 	}
+	s.markSecretAuditWitnessValidated()
 	return nil
 }
 
