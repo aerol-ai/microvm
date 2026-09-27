@@ -162,7 +162,12 @@ func TestEnterpriseBootGateMatrix(t *testing.T) {
 			"SB_AUDIT_EXPORT_BACKEND":   "file",
 			"SB_AUDIT_EXPORT_FILE_PATH": "/var/log/aerol-uc158.jsonl",
 		},
-		want: "requires an off-node audit exporter",
+		// Both enforcement points say "requires an off-node": config load
+		// ("... off-node backend (webhook, s3, bus) ...") refuses first, and
+		// the daemon's check ("... off-node audit exporter ...") is the net
+		// behind it. Matching only the daemon's wording failed a correct
+		// refusal (T18).
+		want: "requires an off-node",
 	})
 
 	for _, g := range gates {
