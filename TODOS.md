@@ -110,6 +110,23 @@ what, why, the caveat that motivated capturing it, and where to start.
   lets retention be expressed in minutes. Do not relax the enterprise
   validator for it.
 
+## Draining a node records no visible storage-retirement obligation — DESIGN GAP (UC-160)
+
+- **What:** the plan (UC-160) says draining a worker makes a storage-retirement
+  obligation appear in `GET /v1/cluster/storage-retirements`. That endpoint
+  lists operator ATTESTATIONS only (node, attested_at, actor, reason), which
+  exist only after `POST .../storage-retired`. Deletion obligations to a node
+  live in each OWNER's local delete outbox, so no cluster-wide surface says
+  "this drained node still holds sealed material and must be wiped".
+- **Evidence:** T18 round 2 (build 7cefee72): draining worker-x raised nothing
+  in 4 minutes; the case now reports that plainly (its ctx bug is fixed).
+- **Decision needed:** an operator-facing obligation view means aggregating
+  every owner's outbox across the fleet (fan-out, or replicating a per-node
+  obligation count into the FSM). Both have a real cost at 2,000 nodes; pick
+  one before implementing. Until then UC-160 fails — honestly — by design.
+- **Start:** `internal/service/node_storage_retirement.go`,
+  `pkg/api/v1/cluster_handler.go` `clusterListNodeStorageRetirements`.
+
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 
 - **What:** Decide whether `upsertRoute` should retry a dropped connection the
