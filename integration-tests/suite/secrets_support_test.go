@@ -497,19 +497,17 @@ func firstN(xs []string, n int) []string {
 // pickNonSeedNode prefers a joiner. Refusing the seed's boot on a cluster
 // costs the rendezvous every joiner needs to rejoin, which turns one red case
 // into a split cluster.
+//
+// It shares PickRestartableNode's ranking so the two can never disagree about
+// which victim is safe. They did: this one kept "first non-seed node", which
+// on the hetero topology is the only ingress, and T18's UC-134 stopped it and
+// then watched every read answer 502 for three minutes.
 func pickNonSeedNode(targets *harness.IntegrationTargets) (harness.IntegrationNode, bool) {
-	if targets == nil {
+	n, ok := harness.PickRestartableNode(targets)
+	if !ok || n.Seed {
 		return harness.IntegrationNode{}, false
 	}
-	for _, n := range targets.Nodes {
-		if n.Seed {
-			continue
-		}
-		if _, ok := harness.SSHTarget(n); ok {
-			return n, true
-		}
-	}
-	return harness.IntegrationNode{}, false
+	return n, true
 }
 
 // witnessReceiptScript reports whether a witness receipt is on disk. The

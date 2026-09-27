@@ -135,17 +135,14 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 			continue // stopping the owner is UC-135's experiment
 		}
 		if n, ok := nodeForClusterID(t, c, targets, id); ok {
-			// Never the seed. Stopping it does not degrade the cluster by
-			// one member, it takes the cluster DOWN: the remaining two never
-			// seated a leader, so the read this case is measuring answered
-			// 502 for its whole three-minute poll, the seed could not rejoin
-			// within four minutes ("no raft leader yet"), and the next case
-			// could not even create a sandbox ("reserve placement failed").
-			//
-			// UC-134 is about whether a read ADMITS it could not reach a
-			// peer. It needs one absent peer, not a dead cluster — and a
-			// dead cluster cannot answer the question either way.
-			if n.Seed {
+			// Never the seed, and never the ingress. UC-134 is about whether
+			// a read ADMITS it could not reach a peer; it needs one absent
+			// peer, not an absent front door. Stopping the only ingress (T18,
+			// hetero) made the read itself 502 for the whole poll, and
+			// stopping the seed used to strand it outside the cluster on
+			// restart (fixed since, UC-170) — either way the case could not
+			// answer its own question.
+			if n.Seed || strings.EqualFold(strings.TrimSpace(n.Role), "ingress") {
 				continue
 			}
 			if _, sshOK := harness.SSHTarget(n); sshOK {
