@@ -515,6 +515,12 @@ func pickNonSeedNode(targets *harness.IntegrationTargets) (harness.IntegrationNo
 	return n, true
 }
 
+// nodeWitnessTipScript prints the head this node last shipped to the witness
+// (witness_tip.json's head_hex): a head its own chain contains, so planting
+// it back makes the node's boot validation pass on the fast path.
+const nodeWitnessTipScript = `sudo bash -c '` + auditLogScript +
+	`sed -n "s/.*\"head_hex\":\"\([0-9a-f]*\)\".*/\1/p" "$dir/witness_tip.json" 2>/dev/null'`
+
 // witnessReceiptScript reports whether a witness receipt is on disk. The
 // receipt is the proof that survives a restart; a witness that ships heads
 // but persists nothing loses the evidence the moment the node reboots.

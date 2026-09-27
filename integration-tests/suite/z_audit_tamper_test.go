@@ -320,20 +320,40 @@ func TestWitnessDisagreementRefusesEnterpriseBoot(t *testing.T) {
 	if err := harness.PlantWitnessHead(t, receiver, victimNodeID, plantedHead); err != nil {
 		t.Fatalf("plant a disagreeing head: %v", err)
 	}
-	t.Cleanup(func() {
-		if !hadPrevious {
-			// Nothing to put back; the node will re-ship its real head on the
-			// next witness interval once it is up.
+	victimTarget, _ := harness.SSHTarget(victim)
+	restoredHead := false
+	restoreHead := func() {
+		if restoredHead {
 			return
 		}
-		if rerr := harness.PlantWitnessHead(t, receiver, victimNodeID, previous); rerr != nil {
-			t.Errorf("RESTORE FAILED: the witness still holds a planted head for %s and later boots of that node may refuse: %v", victimNodeID, rerr)
+		restoredHead = true
+		// Put back a head the node's chain contains. A refused boot no longer
+		// re-ships over the witness (that was the bug this case caught), so
+		// leaving the planted head — or, with no previous head, doing nothing
+		// — refuses every later boot of this node, for good.
+		head := previous
+		if !hadPrevious {
+			out, err := harness.SSHRun(t, victimTarget, nodeWitnessTipScript)
+			head = lastNonEmptyLineSuite(out)
+			if err != nil || len(head) != 64 {
+				t.Errorf("RESTORE FAILED: cannot read %s's own witness tip to un-plant the head (%v): %q", victim.Name, err, strings.TrimSpace(out))
+				return
+			}
 		}
-	})
+		if rerr := harness.PlantWitnessHead(t, receiver, victimNodeID, head); rerr != nil {
+			t.Errorf("RESTORE FAILED: the witness still holds a planted head for %s and every later boot of that node will refuse: %v", victimNodeID, rerr)
+		}
+	}
+	t.Cleanup(restoreHead)
 
 	// WithNodeEnv with no variables restarts the node and always puts it back
 	// — including when the boot is refused, which is the expected outcome.
 	harness.WithNodeEnv(t, victim, nil, func(res harness.NodeBootResult) {
+		// Un-plant BEFORE WithNodeEnv's restore restarts the node, even if an
+		// assertion below fails. From t.Cleanup it ran after that restart,
+		// which then booted against the planted head, was (correctly)
+		// refused, and left worker-w down for the rest of T18 round 2.
+		defer restoreHead()
 		if res.Started {
 			t.Fatalf("node %s started although the witness holds a head (%s) that its chain cannot account for: the boot gate failed OPEN, which defeats the witness entirely",
 				victim.Name, plantedHead)
