@@ -57,6 +57,13 @@ func sshBaseArgs() []string {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
+		// ConnectTimeout only bounds the handshake. Without keepalives an
+		// established session whose TCP path dies (the operator's laptop
+		// slept mid-T18) blocks forever: one `systemctl is-active` hung for
+		// 85 minutes and froze the whole suite. 15s x 4 turns that into a
+		// one-minute error the caller already handles.
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
 		"-o", "BatchMode=yes",
 		// SSHRun merges stderr into stdout, and with UserKnownHostsFile=/dev/null
 		// every single connection emits

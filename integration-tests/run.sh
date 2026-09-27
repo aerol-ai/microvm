@@ -795,15 +795,28 @@ EOF
 
 
 # byte, and still proves reachability + signature validity.
+#
+# Only "no response at all" (000) is retried. A 403/404 is S3 answering that
+# the object or signature is wrong, and retrying would just delay the same
+# verdict; a 000 is the operator's own link dropping a request, which aborted
+# a whole T18 launch once before anything was provisioned.
 probe_artifact_url() {
   local url="$1" label="$2"
-  local code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' \
-    --range 0-0 --connect-timeout 10 --max-time 30 "$url" 2>/dev/null || echo 000)
-  if [[ "$code" =~ ^(200|206|30[0-9])$ ]]; then
-    echo "artifact ready: ${label}"
-    return 0
-  fi
+  local code attempt
+  for attempt in 1 2 3; do
+    # curl prints 000 itself on a transport failure; `|| true` keeps set -e
+    # from firing without appending a second "000" to the captured code.
+    code=$(curl -sS -o /dev/null -w '%{http_code}' \
+      --range 0-0 --connect-timeout 10 --max-time 30 "$url" 2>/dev/null || true)
+    code="${code:-000}"
+    if [[ "$code" =~ ^(200|206|30[0-9])$ ]]; then
+      echo "artifact ready: ${label}"
+      return 0
+    fi
+    [[ "$code" == "000" && "$attempt" -lt 3 ]] || break
+    echo "artifact ${label}: no response (attempt ${attempt}/3), retrying" >&2
+    sleep 5
+  done
   echo "artifact ${label} not fetchable (HTTP ${code}): ${url}" >&2
   return 1
 }
