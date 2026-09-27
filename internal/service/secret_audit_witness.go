@@ -50,9 +50,43 @@ func (s *Service) SetWitness(w controlplane.Witness) {
 	}
 	s.auditWitnessMu.Lock()
 	s.auditWitness = w
+	if (controlplane.Provider{Witness: w}).HasExternalWitness() {
+		// Arm before the loop starts. The loop used to ship the local head
+		// immediately, BEFORE the daemon validated it against the witness,
+		// and a ship that finds the witness "behind" re-submits the local
+		// head: a node booting against a disagreeing witness overwrote the
+		// very head it was about to be refused for. The refusal held for
+		// one boot and systemd's restart then booted cleanly (T18, UC-144).
+		if s.witnessValidated == nil {
+			s.witnessValidated = make(chan struct{})
+		}
+		s.witnessBootPending.Store(true)
+	}
 	s.auditWitnessMu.Unlock()
 	s.ensureSecretAuditSink()
 	s.startSecretAuditWitnessLoop()
+}
+
+// errSecretAuditWitnessBootPending is returned by every ship attempted before
+// boot validation has passed. Retention treats it like any other ship failure
+// and retries on its next pass.
+var errSecretAuditWitnessBootPending = errors.New("secret audit witness: boot validation has not passed; nothing is shipped until it does")
+
+// markSecretAuditWitnessValidated releases the ship gate once.
+func (s *Service) markSecretAuditWitnessValidated() {
+	s.witnessBootPending.Store(false)
+	s.auditWitnessMu.Lock()
+	ch := s.witnessValidated
+	s.auditWitnessMu.Unlock()
+	if ch != nil {
+		s.witnessValidatedOnce.Do(func() { close(ch) })
+	}
+}
+
+func (s *Service) witnessValidatedCh() <-chan struct{} {
+	s.auditWitnessMu.Lock()
+	defer s.auditWitnessMu.Unlock()
+	return s.witnessValidated
 }
 
 func (s *Service) witness() controlplane.Witness {
@@ -83,6 +117,14 @@ func (s *Service) startSecretAuditWitnessLoop() {
 		}
 		go func() {
 			defer s.secretAuditWitnessDone.Done()
+			// First ship only once boot validation has passed (see SetWitness).
+			if ch := s.witnessValidatedCh(); ch != nil {
+				select {
+				case <-stop:
+					return
+				case <-ch:
+				}
+			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			_ = s.shipSecretAuditHead(context.Background())
@@ -114,6 +156,9 @@ func (s *Service) stopSecretAuditWitnessLoop() {
 func (s *Service) shipSecretAuditHead(ctx context.Context) error {
 	if s == nil || s.secretAuditFile == nil {
 		return nil
+	}
+	if s.witnessBootPending.Load() {
+		return errSecretAuditWitnessBootPending
 	}
 	s.auditWitnessShipMu.Lock()
 	defer s.auditWitnessShipMu.Unlock()
@@ -547,6 +592,7 @@ func (s *Service) ValidateSecretAuditWitness() error {
 	if !ok {
 		return fmt.Errorf("secret audit witness mismatch: local_head=%q witnessed_head=%q", local, witnessed)
 	}
+	s.markSecretAuditWitnessValidated()
 	return nil
 }
 

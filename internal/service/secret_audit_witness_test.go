@@ -150,6 +150,7 @@ func TestSecretAuditWitnessShipAndVerify(t *testing.T) {
 
 	w := &stubWitness{}
 	svc.SetWitness(w)
+	svc.markSecretAuditWitnessValidated() // models a node whose boot validation passed
 	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
 		t.Fatalf("ship: %v", err)
 	}
@@ -179,6 +180,7 @@ func TestSecretAuditWitnessEmptyChainReportsHealthy(t *testing.T) {
 	defer svc.CloseSecretAuditSink()
 	w := &stubWitness{}
 	svc.SetWitness(w)
+	svc.markSecretAuditWitnessValidated() // models a node whose boot validation passed
 
 	secretAuditWitnessHealthy.Set(0)
 	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
