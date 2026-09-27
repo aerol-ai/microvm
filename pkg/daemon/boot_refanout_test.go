@@ -1,11 +1,15 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
 )
 
 // A live 3-node enterprise cluster lost its seed permanently to this:
@@ -71,4 +75,35 @@ func TestLeaderUnavailableIsCheckedBeforeEnterprise(t *testing.T) {
 	if got := bootRefanoutDisposition(cluster.ErrNotLeader, true); got == refanoutFatal {
 		t.Fatal("enterprise mode is consulted before the error is classified, so a routine election again takes the node down permanently")
 	}
+}
+
+// The deferred re-fanout must actually run and must stop. It replaces a
+// hard exit(1), so a retry goroutine that never fires would leave an
+// enterprise node serving with its durable secrets un-revalidated — quieter
+// than the bug it replaced, and worse.
+func TestStartClusterSecretRefanoutRetry_RunsAndStops(t *testing.T) {
+	oldTick := clusterOwnershipReplayTick
+	clusterOwnershipReplayTick = 5 * time.Millisecond
+	t.Cleanup(func() { clusterOwnershipReplayTick = oldTick })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st := openTestStore(t)
+	svc := service.New(config.Config{EnableCluster: true}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(cluster.NewNoop("node-a", "http://node-a", ""))
+
+	startClusterSecretRefanoutRetry(ctx, svc, testLogger())
+	// Let several ticks elapse: the loop must survive them without panicking
+	// on a Service that has no cluster secrets to fan out.
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+}
+
+// Cancellation alone must unblock it, with no tick ever firing.
+func TestStartClusterSecretRefanoutRetry_StopsOnCtxCancel(t *testing.T) {
+	st := openTestStore(t)
+	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+	startClusterSecretRefanoutRetry(t.Context(), svc, testLogger())
 }
