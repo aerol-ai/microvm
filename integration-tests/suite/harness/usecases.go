@@ -554,6 +554,9 @@ var Registry = []UseCase{
 	{ID: "UC-167", Title: "Reconcile reclaims a leaked workerd group (same daemon lifetime)", Requires: []Capability{CapIsolate}, Implemented: true},
 	{ID: "UC-168", Title: "js-bundle list aggregates across nodes and declares an unreachable peer", Requires: []Capability{CapIsolate, CapCluster}, Implemented: true},
 	{ID: "UC-169", Title: "Plaintext leak sweep: the canary appears nowhere on any node, in any encoding", Requires: []Capability{CapSecrets}, Implemented: true},
+
+	// N. Control-plane resilience (TODOS.md "Losing the seed").
+	{ID: "UC-170", Title: "Stopping the seed: the survivors keep a leader, and the restarted seed rejoins Raft with no configured peers", Requires: []Capability{CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

@@ -534,6 +534,10 @@ func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
 // reading state — so every case that restarts a node and reached for it was
 // picking the one node that breaks the cluster.
 //
+// That product bug is fixed (internal/cluster/gossip_peer_cache.go, proven by
+// UC-170); sparing the seed remains the right default so a case not about
+// the control plane is not charged for a seed rejoin.
+//
 // On a single node there is nothing to orphan, so the seed is returned.
 func PickRestartableNode(targets *IntegrationTargets) (IntegrationNode, bool) {
 	if targets == nil {

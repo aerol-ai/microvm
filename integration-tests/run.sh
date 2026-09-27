@@ -25,6 +25,7 @@
 # Security matrix (§6.2): single-node-secrets | cluster-3-mixed-secrets |
 #            cluster-3-mixed-secrets-kms | cluster-3-mixed-secrets-enterprise |
 #            cluster-hetero-secrets | cluster-hetero-secrets-kms |
+#            cluster-hetero-lite-secrets | cluster-hetero-lite-kms |
 #            cluster-3-mixed-bench
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any

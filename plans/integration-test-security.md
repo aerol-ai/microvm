@@ -1468,9 +1468,9 @@ queued. What is established and what is not:
 | S3 `cluster-3-mixed-secrets-kms` | 91 pass / 18 fail | first execution; see §7.7 |
 | S4 `cluster-3-mixed-secrets-enterprise` | **25 → 168 pass**, 95 → 29 fail | fix validated |
 | S6 `cluster-hetero-secrets-kms` | 105 pass / 9 fail at stop, **8 members formed** | first flagship ever to run |
-| S5 `cluster-hetero-secrets` | not run | **T18 incomplete** |
+| S5 `cluster-hetero-secrets` | not run | old T18 incomplete (now T19, §7.10) |
 
-**T18 is NOT complete.** It asks for S5 + S6 and a published matrix. S6 ran
+**The old T18 was NOT completed.** It asked for S5 + S6 and a published matrix; it is now split into T18 (no metal) and T19 (metal), §7.10. S6 ran
 but was stopped before finishing; S5 never ran with the gVisor fix. The
 matrix in `reports/index.md` therefore has no flagship column, and should
 not be read as if it does.
@@ -1500,30 +1500,47 @@ Plus one OPEN finding with no fix attempted, because the obvious fix is
 worse than the bug: **a partitioned node keeps answering `/health` 200**, so
 the ingress keeps routing to a node that cannot reach a leader (§7.7).
 
-### To finish T18 — one command
+### 7.10 The seed-loss finding was misdiagnosed, and is now fixed (2026-09-27)
 
-Everything it needs is in the tree and verified 2026-09-27:
+§7.7 recorded "stopping the seed leaves the survivors without a leader".
+The S2 journals say otherwise: node2 won the election 3s after the seed
+stopped and evicted it from Raft 30s later, both correctly. The bug was the
+**restarted seed**: it has no `SB_CLUSTER_PEERS`, came back as a gossip
+island, and a leader only re-admits a server it can see in gossip — so it
+sat as a lone Raft candidate forever, still answering `/health` 200.
 
-| Prerequisite | State |
-|---|---|
-| gVisor tarball installer (`gvisor_fetch_release`) | in tree |
-| boot-leader fix (`bootRefanoutDisposition`) | in tree |
-| witness node-id + upgrade fallback | in tree |
-| run.sh self-pin against mid-run edits | in tree |
-| domain lease that excludes held domains | in tree |
-| `--no-build` builds instead of aborting | in tree |
-| S5/S6 scenario pairs, flagship make target | present |
-| domains held / AWS instances | 0 / 0 |
+Fixed by a persisted gossip-peer cache (`internal/cluster/gossip_peer_cache.go`),
+with a 3-node loopback regression test that replays the failure and is
+mutation-checked. UC-170 proves it live, and is why T18 exists in its current
+form: the cluster change needs a hetero run, and a hetero run should not need
+a c5.metal.
+
+### T18 / T19 — the split
+
+The old T18 ("flagship S5 + S6") bundled two questions with a 40x cost gap:
+does the role-separated control plane hold, and does Firecracker work on it.
+Only the second needs metal.
+
+| Task | Scenarios | Nodes | ~Cost | Answers |
+|---|---|---|---|---|
+| **T18** | `cluster-hetero-lite-secrets` + `cluster-hetero-lite-kms` | 8× t3.medium on-demand (S5/S6 topology, worker-z not metal) | **< $1 total** | everything S5/S6 cover except Firecracker, incl. UC-170 |
+| **T19** | `cluster-hetero-secrets` + `cluster-hetero-secrets-kms` (S5 + S6) | 8 incl. 1× c5.metal | ~$28, ~2h | the Firecracker rows, on the shipped posture |
+
+Run T18 first. A red T18 means T19 would burn metal to report the same
+failure.
 
 ```
-make integration-secrets-flagship      # S5 + S6, ~2h, ~$28
+make integration-secrets-hetero-lite-pair    # T18
+make integration-secrets-flagship            # T19, only after T18 is green
 go run ./integration-tests/report -index-only -out integration-tests/reports
 ```
 
-Nothing else is staged or pending. The three harness fixes that used to be
-prerequisites are applied and control-tested.
+Scenario names are deliberately `cluster-hetero-lite-*`, not
+`cluster-hetero-secrets-*-lite`: Terraform truncates the cluster name to 40
+characters for bucket names, and `…-secrets-kms-lite` truncates to exactly
+S6's prefix. `TestScenarioBucketPrefixesAreUnique` now guards that.
 
-**The matrix currently shows no flagship result, and that is correct.**
+**The matrix currently shows no hetero result, and that is correct.**
 `cluster-hetero-secrets` is 174/174 inconclusive (the aborted run) and
 `cluster-hetero-secrets-kms` has no column, because S6 was stopped before
 it wrote a report. Neither should be read as a pass or a fail.
@@ -1544,7 +1561,8 @@ make integration-secrets-hetero           # S5  ~$14/h
 make integration-secrets-hetero-kms       # S6  ~$14/h
 
 make integration-secrets-all              # S1→S4 sequentially (the gate)
-make integration-secrets-flagship         # S5 + S6 (pre-merge only)
+make integration-secrets-hetero-lite-pair # T18: S5/S6 topology, no metal, < $1
+make integration-secrets-flagship         # T19: S5 + S6 with metal (pre-merge only)
 
 # Iterate against a kept cluster
 make integration-secrets-mixed keep
@@ -1569,7 +1587,8 @@ the signal we want.
 | **Gate (S1→S4)** | | **~1.5 h** | **~$0.75** |
 | S5 | 8 nodes incl. c5.metal, on-demand | 60 min | ~$14 |
 | S6 | same | 60 min | ~$14 |
-| **Flagship (S5+S6)** | | **~2 h** | **~$28** |
+| **Flagship (S5+S6) = T19** | | **~2 h** | **~$28** |
+| Hetero lite pair = T18 | 8× t3.medium on-demand, x2 | ~2 h | **< $1** |
 
 Plus: KMS $1/mo prorated, S3 audit buckets pennies (3-day lifecycle), artifacts
 bucket pennies (7-day lifecycle).
@@ -1617,7 +1636,8 @@ and verified, not merely that code was written.
 | T16 | UC group L + **`main` baseline arm** (§7 UC-165/166, D5) | T12, T1 (`--ref`) | both arms measured in one run; band met | **CODE DONE** 2026-09-26 (PR #486). Live PENDING — needs the `--ref main` arm. UC-165 refuses to compare across instance types and warns below 25 samples. |
 | T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR | **CODE DONE** 2026-09-26 (PR #486). **Exit criterion is stale**: the `removeOrphans` fix already landed 2026-09-19, so UC-167 is written as a live confirmation, not an expected failure. It deliberately does NOT assert restart survival — `ListManaged` reads an in-memory map, and the crash case needs a host-backed seam that has not landed. |
 | T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline | **DONE** 2026-09-26 (PR #486). 61 SEC rows, `want` 299 → **360**. The count was guarded in TWO places; the duplicate approximate guard (`287 ±15`) is removed so a new block updates one number. |
-| T18 | Flagship run S5 + S6, publish reports | all | matrix in `reports/index.md` | **INCOMPLETE — stopped on the operator's call 2026-09-27.** S1-S4 and S6 executed; S6 is the first flagship run that ever formed its 8-node cluster (105 pass / 9 fail at the stop) but did not finish, and S5 never ran with the gVisor fix. No flagship column in `reports/index.md`. See §7.9 for exactly what is established and the three steps to finish. |
+| T18 | Hetero lite run: `cluster-hetero-lite-secrets` + `cluster-hetero-lite-kms` (S5/S6 topology without the c5.metal), publish reports | T1-T17, seed-rejoin fix | both columns in `reports/index.md`; UC-170 green | **READY** 2026-09-27. Re-scoped from the old "flagship S5+S6" (see §7.10): the previous attempt was stopped on the operator's call with S6 at 105 pass / 9 fail and S5 never run. `make integration-secrets-hetero-lite-pair`, < $1. |
+| T19 | Metal flagship: S5 + S6 (`cluster-hetero-secrets` + `-kms`, incl. 1× c5.metal), publish reports | T18 green | both columns in `reports/index.md`; Firecracker rows executed | **NOT STARTED.** `make integration-secrets-flagship`, ~$28 / ~2h. Needs operator sign-off for the spend. |
 
 T12 is the milestone that matters: **UC-117 green on S2** means the defect the
 whole secrets-hardening program exists to fix is proven fixed on real

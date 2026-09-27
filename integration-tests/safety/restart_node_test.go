@@ -22,6 +22,11 @@ import (
 // reading state and exactly wrong for restarting. Any file that restarts a
 // node must pick a restartable one instead, and no future case can quietly
 // reintroduce the trap.
+//
+// The product cause — a restarted seed has no SB_CLUSTER_PEERS and never
+// found the cluster again — is fixed by internal/cluster/gossip_peer_cache.go
+// and proven live by UC-170. The guard still holds: a case that is not ABOUT
+// the seed should not pay for a control-plane event it does not test.
 func TestRestartingCasesDoNotPickTheSeed(t *testing.T) {
 	dir := filepath.Join("..", "suite")
 	entries, err := os.ReadDir(dir)
