@@ -163,6 +163,35 @@ func TestSecretAuditWitnessShipAndVerify(t *testing.T) {
 	svc.CloseSecretAuditSink()
 }
 
+// A node that never writes secret audit (an ingress, a dedicated server) has
+// an empty chain and nothing to witness. Its health gauge must read 1, or the
+// operator alert on it fires forever on every such node (T18 hetero, UC-143).
+func TestSecretAuditWitnessEmptyChainReportsHealthy(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		DBPath:                     filepath.Join(t.TempDir(), "state.db"),
+		EnterpriseMode:             true,
+		SecretAuditWitnessInterval: time.Hour,
+	}}
+	svc.ensureSecretAuditSink()
+	if svc.secretAuditFile == nil {
+		t.Fatal("expected file audit sink")
+	}
+	defer svc.CloseSecretAuditSink()
+	w := &stubWitness{}
+	svc.SetWitness(w)
+
+	secretAuditWitnessHealthy.Set(0)
+	if err := svc.shipSecretAuditHead(context.Background()); err != nil {
+		t.Fatalf("ship on an empty chain: %v", err)
+	}
+	if got := secretAuditWitnessHealthy.Value(); got != 1 {
+		t.Fatalf("witness healthy gauge on an empty chain = %d, want 1", got)
+	}
+	if len(w.heads) != 0 {
+		t.Fatalf("an empty chain shipped heads %+v; there is nothing to witness", w.heads)
+	}
+}
+
 func TestWitnessReceiptRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "witness_receipts.jsonl")
 	if err := appendWitnessReceipt(path, witnessReceiptRecord{

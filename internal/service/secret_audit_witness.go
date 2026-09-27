@@ -134,6 +134,13 @@ func (s *Service) shipSecretAuditHead(ctx context.Context) error {
 	}
 	head, eventID := s.secretAuditFile.chainTip()
 	if head == "" || head == auditlog.GenesisPrevHash {
+		// Nothing to witness is a healthy state, not an unknown one. This
+		// branch used to return without touching the gauge, so it stayed at
+		// its zero value forever on every node that never writes secret
+		// audit — each ingress and each dedicated server. On the T18 hetero
+		// run /v1/metrics answered from such a node with healthy=0: an
+		// operator alert that fires permanently on half the fleet.
+		secretAuditWitnessHealthy.Set(1)
 		return nil
 	}
 	nodeID := s.witnessNodeID()
