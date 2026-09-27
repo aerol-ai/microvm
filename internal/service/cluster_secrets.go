@@ -949,6 +949,30 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 	}()
 }
 
+// secretHolderLiveSet is the member set a secret copy may stay on: alive in
+// gossip AND not drained. A drained holder counts as gone because drain is
+// how an operator evacuates a node, and a copy left there outlives the
+// evacuation — the reseal used to fire only for holders gossip reported
+// dead, so a drained but healthy node kept its copy indefinitely (T18,
+// UC-122, never green on any scenario). Self is never removed: an owner
+// being drained still has to hold its copy until its sandbox moves.
+//
+// Rejoin detection must keep using aliveMemberSet: a drained node is still
+// a live peer that can ACK and receive obligations.
+func (s *Service) secretHolderLiveSet(c cluster.Client, selfID string) map[string]struct{} {
+	alive := s.aliveMemberSet()
+	ids := make([]string, 0, len(alive))
+	for id := range alive {
+		ids = append(ids, id)
+	}
+	for id := range drainedNodeSet(c, ids) {
+		if id != selfID {
+			delete(alive, id)
+		}
+	}
+	return alive
+}
+
 func (s *Service) aliveMemberSet() map[string]struct{} {
 	out := map[string]struct{}{}
 	if s == nil {
@@ -1173,7 +1197,12 @@ func (s *Service) refreshSecretHolderPossession(ctx context.Context) {
 	refreshCtx, cancel := context.WithTimeout(ctx, secretHolderRefreshBudget)
 	defer cancel()
 	selfID := s.selfNodeID()
-	alive := s.aliveMemberSet()
+	// Drain-aware, like the reseal it schedules. With plain gossip liveness
+	// here a drained holder looked healthy, this pass never scheduled the
+	// reseal at all, and the reseal's own drain check never got to run: the
+	// first drain fix passed its unit test (which called the reseal directly)
+	// and still failed UC-122 live (T18 round 2).
+	alive := s.secretHolderLiveSet(s.Cluster(), selfID)
 	// Capture a bounded page of holder keys BEFORE any RPC, and judge only
 	// those captured entries. Submitting the whole holder map in one batch
 	// tripped the endpoint's id limit on a skewed node and skipped every
@@ -1589,7 +1618,7 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 			}
 		}
 	}
-	alive := s.aliveMemberSet()
+	alive := s.secretHolderLiveSet(c, selfID)
 
 	holderIncarnationID := strings.TrimSpace(secretsHandle.IncarnationID)
 	if holderIncarnationID == "" {
@@ -1609,17 +1638,6 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 		frozen = secrets.NormalizeRecipients(placement.SecretRecipients)
 		if placement.SecretSealGeneration > 0 {
 			gen = placement.SecretSealGeneration
-		}
-	}
-	// A drained holder counts as gone. Drain is how an operator evacuates a
-	// node, and a secret copy left on it outlives the evacuation: the reseal
-	// trigger below only fired for holders gossip reported dead, so a drained
-	// but healthy node kept its copy indefinitely (T18, UC-122 — never green
-	// on any scenario). Self is never removed: an owner being drained still
-	// has to hold the plaintext-capable copy until its sandbox moves.
-	for id := range drainedNodeSet(c, frozen) {
-		if id != selfID {
-			delete(alive, id)
 		}
 	}
 	if !s.anySecretTargetDead(frozen, alive, selfID) {

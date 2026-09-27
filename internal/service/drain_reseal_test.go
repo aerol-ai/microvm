@@ -156,3 +156,66 @@ func TestDrainedNodeSetFallsBackPerNode(t *testing.T) {
 		t.Fatal("no drained id should yield a nil set")
 	}
 }
+
+// The same drain, driven through the holder-refresh pass that SCHEDULES the
+// reseal in production. The first fix made the reseal drain-aware but left
+// this pass on plain gossip liveness: it judged a drained holder healthy,
+// never scheduled the reseal, and UC-122 still failed live while the direct
+// test above passed (T18 round 2).
+func TestHolderRefreshSchedulesTheResealForADrainedHolder(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		drained    map[string]bool
+		wantReseal bool
+	}{
+		{name: "drained holder is scheduled and resealed away from", drained: map[string]bool{"held-b": true}, wantReseal: true},
+		{name: "nothing drained, nothing scheduled", drained: nil, wantReseal: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			const sandboxID = "sb-drain-refresh"
+			base := cluster.Placement{
+				SandboxID: sandboxID, OwnerNodeID: "node-a", IncarnationID: "inc-a",
+				SecretRecipients: []string{"node-a", "held-b", "live-c"},
+				SecretRef:        secrets.FormatRef(sandboxID, "inc-a", secrets.RefVersion),
+				SecretVersion:    secrets.RefVersion, SecretSealGeneration: 1,
+			}
+			rpc := &resealPlacementCluster{Noop: cluster.NewNoop("node-a", "http://a", ""), placement: base, members: drainTestMembers()}
+			cl := &drainingResealSetCluster{&drainingResealCluster{resealPlacementCluster: rpc, drained: tc.drained}}
+			st := openSealTestStore(t)
+			cipher := newTestCipher(t)
+			svc := &Service{
+				cfg: config.Config{SecretRecipientBackupCount: 2}, cipher: cipher, store: st, cluster: cl,
+				secretProvider:       secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
+				testSecretPeerPusher: &fakePeerPusher{acked: []string{"live-c", "live-d"}},
+				logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			sealCtx := secrets.ContextWithIncarnationID(ctx, "inc-a")
+			handle, err := svc.secretProvider.Put(sealCtx, sandboxID, secrets.Secrets{Env: map[string]string{"TOKEN": "secret"}}, base.SecretRecipients)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rpc.mu.Lock()
+			rpc.placement.SecretRef, rpc.placement.SecretVersion, rpc.placement.SecretSealGeneration = handle.Ref, handle.Version, handle.SealGeneration
+			rpc.mu.Unlock()
+			clearSecretFanoutHolders(sandboxID)
+			t.Cleanup(func() { clearSecretFanoutHolders(sandboxID) })
+			resetSecretHoldersForGeneration(sandboxID, "inc-a", handle.SealGeneration, "node-a")
+			setSecretHolderTargets(sandboxID, "inc-a", handle.SealGeneration, base.SecretRecipients)
+
+			svc.refreshSecretHolderPossession(ctx)
+
+			rpc.mu.Lock()
+			defer rpc.mu.Unlock()
+			if !tc.wantReseal {
+				if rpc.updateCalls != 0 {
+					t.Fatalf("refresh resealed a healthy set: updates=%d recipients=%v", rpc.updateCalls, rpc.placement.SecretRecipients)
+				}
+				return
+			}
+			if rpc.updateCalls != 1 || slices.Contains(rpc.placement.SecretRecipients, "held-b") {
+				t.Fatalf("refresh did not reseal away from the drained holder: updates=%d recipients=%v", rpc.updateCalls, rpc.placement.SecretRecipients)
+			}
+		})
+	}
+}
