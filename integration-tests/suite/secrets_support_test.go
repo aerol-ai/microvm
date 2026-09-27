@@ -97,6 +97,17 @@ func blockInternalListenerEverywhere(t *testing.T, targets *harness.IntegrationT
 					b.node.Name, b.port, err, strings.TrimSpace(out))
 			}
 		}
+		// Unblocked is not usable. Capacity heartbeats ride this listener,
+		// so every worker's capacity is stale the moment the rule goes, and
+		// placement refuses stale workers. T18 lost the next five cases —
+		// all "no worker placement target available ... has no fresh
+		// capacity heartbeat" — to creates issued a second after this
+		// restore returned.
+		if len(applied) > 0 && sc.Has(harness.CapCluster) {
+			if err := waitWorkerCapacityFresh(t, time.Now().Unix(), 2*time.Minute); err != nil {
+				t.Errorf("RESTORE INCOMPLETE: %v; the next case will be refused placement for a reason that has nothing to do with it", err)
+			}
+		}
 	}
 	t.Cleanup(restore)
 
@@ -1013,6 +1024,32 @@ func clusterLeader(c *harness.Client) (string, error) {
 // the members payload at all, so it decoded to false and the check passed
 // unconditionally — a guard that looked right and tested nothing. internal_url
 // is in the payload and is what the error is about.
+// waitWorkerCapacityFresh blocks until every live, undrained member that can
+// own a sandbox has a capacity heartbeat newer than since.
+func waitWorkerCapacityFresh(t *testing.T, since int64, max time.Duration) error {
+	t.Helper()
+	c := harness.NewClient(t, sc)
+	deadline := time.Now().Add(max)
+	var stale []string
+	for time.Now().Before(deadline) {
+		stale = stale[:0]
+		for _, m := range fetchMembers(t, c).Members {
+			role := strings.ToLower(strings.TrimSpace(m.Role))
+			if !m.Alive || m.Drained || (role != "worker" && role != "mixed" && role != "") {
+				continue
+			}
+			if m.CapacityUpdatedUnix <= since {
+				stale = append(stale, m.NodeID)
+			}
+		}
+		if len(stale) == 0 {
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("workers %v had no fresh capacity heartbeat within %s of the unblock", stale, max)
+}
+
 func membersMissingInternalURL(t *testing.T, c *harness.Client) []string {
 	t.Helper()
 	var out []string

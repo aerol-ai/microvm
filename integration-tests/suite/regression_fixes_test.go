@@ -53,7 +53,10 @@ type capacityMember struct {
 	// is what says whether a restarted node is usable yet.
 	InternalURL   string `json:"internal_url"`
 	CapacityStale bool   `json:"capacity_stale"`
-	Capacity      struct {
+	// CapacityUpdatedUnix is when the member's last capacity heartbeat
+	// landed. Placement refuses a worker whose heartbeat is not fresh.
+	CapacityUpdatedUnix int64 `json:"capacity_updated_unix"`
+	Capacity            struct {
 		CanAdmit          bool     `json:"can_admit"`
 		SupportedRuntimes []string `json:"supported_runtimes"`
 	} `json:"capacity"`
