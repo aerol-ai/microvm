@@ -195,6 +195,23 @@ func restoreViaOwnerKill(t *testing.T, c *harness.Client, targets *harness.Integ
 	requireNonSeedVictim(t, victim)
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
 	awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
+	// A new owner in the placement is not a recreated sandbox. The owner
+	// watcher re-materializes it on its next tick, and a read before that
+	// answers 404 "sandbox not found": T18's KMS run read 2s before worker-w
+	// logged "recreated sandbox after failover" and reported a failover that
+	// had in fact worked. Wait until the new owner serves it.
+	deadline := time.Now().Add(failoverOpenTimeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		lastErr = c.GetJSON(ctx, "/v1/sandboxes/"+sb.ID, nil)
+		cancel()
+		if lastErr == nil {
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("sandbox %s was reassigned but never served by its new owner within %s: %v", sb.ID, failoverOpenTimeout, lastErr)
 }
 
 // restoreViaStopStart is the ordinary lifecycle restore. It needs no fault
