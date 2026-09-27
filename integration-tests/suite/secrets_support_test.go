@@ -907,7 +907,9 @@ func requireNonSeedVictim(t *testing.T, node harness.IntegrationNode) {
 // red, because it is the kind someone acts on.
 func restoreNodeDaemon(t *testing.T, node harness.IntegrationNode, target string) {
 	t.Helper()
-	if out, err := harness.SSHRun(t, target, "sudo systemctl start sandboxd"); err != nil {
+	// reset-failed first: a unit that crash-looped into systemd's start limit
+	// ignores `start` until the counter is cleared.
+	if out, err := harness.SSHRun(t, target, "sudo systemctl reset-failed sandboxd; sudo systemctl start sandboxd"); err != nil {
 		t.Errorf("RESTORE FAILED: sandboxd is left stopped on %s and the rest of this run is suspect: %v\n%s", node.Name, err, out)
 		return
 	}

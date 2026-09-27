@@ -231,6 +231,13 @@ func TestCAKeyInTLSDirRefusesEnterpriseBoot(t *testing.T) {
 	defer removeDecoy()
 
 	harness.WithNodeEnv(t, node, nil, func(res harness.NodeBootResult) {
+		// Remove the decoy when the callback returns — including via a
+		// failed assertion — so it is gone BEFORE WithNodeEnv restarts the
+		// node to restore it. Removing it after WithNodeEnv returned meant
+		// the restore rebooted with ca.key still present, failed, and
+		// nothing restarted the node once the key was gone: T18 left
+		// worker-w down for the rest of the run.
+		defer removeDecoy()
 		if res.Started {
 			t.Fatalf("node %s started with a CA signing key in its TLS directory: an operator who copies ca.key onto a worker keeps a fleet-wide minting capability on a machine that only needs one identity",
 				node.Name)
