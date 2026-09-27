@@ -56,6 +56,12 @@ func enterpriseGates() []enterpriseGate {
 			env: map[string]string{
 				"SB_SECRET_PROVIDER":             "awskms",
 				"SB_SECRET_PROVIDER_STRICT_BOOT": "false",
+				// Config load demands a key id before it reaches the
+				// enterprise rule under test; without one the node refuses
+				// for "SB_SECRET_AWS_KMS_KEY_ID is required" and the case
+				// fails on a non-KMS scenario (T18). Load only validates the
+				// value — nothing contacts KMS — so a placeholder suffices.
+				"SB_SECRET_AWS_KMS_KEY_ID": "arn:aws:kms:us-east-1:000000000000:key/itest-placeholder",
 			},
 			want: "SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms",
 		},
