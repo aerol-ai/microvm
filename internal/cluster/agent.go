@@ -122,6 +122,9 @@ type DrainStateResponse struct {
 // capacity heartbeats, and delegates every authoritative placement read/write
 // to server-role nodes.
 type Agent struct {
+	// drained caches the control plane's drained set (drained_nodes.go).
+	drained drainedNodesCache
+
 	cfg           config.Config
 	logger        *slog.Logger
 	nodeID        string

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1575,6 +1576,37 @@ func (h *handlers) clusterInternalDrainState(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.DrainStateResponse{Drained: c.IsNodeDrained(strings.TrimSpace(r.PathValue("id")))})
+}
+
+// clusterInternalDrainedNodes serves the whole drained set in one response so
+// agents can refresh it once per TTL instead of asking per node. Only a node
+// holding the FSM can answer; an agent has no drained set of its own to give.
+func (h *handlers) clusterInternalDrainedNodes(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	// An agent also implements DrainedNodesReader, by asking the control
+	// plane — serving this route from one would just forward the question.
+	if _, isAgent := c.(*cluster.Agent); isAgent {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: drained set is served by control-plane nodes only")
+		return
+	}
+	reader, ok := c.(cluster.DrainedNodesReader)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: drained set is served by control-plane nodes only")
+		return
+	}
+	set := reader.DrainedNodes()
+	ids := make([]string, 0, len(set))
+	for id, drained := range set {
+		if drained {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	apihttp.WriteJSON(w, http.StatusOK, cluster.DrainedNodesResponse{Drained: ids})
 }
 
 // clusterWasmMigrate orchestrates §4.8.1 checkpoint export from the current

@@ -1142,7 +1142,7 @@ var _ cluster.Client = (*drainStubCluster)(nil)
 // drainTestHandler wires a drainStubCluster into a Service + handlers so the
 // drain/uncordon route handlers can be exercised end-to-end without a real
 // raft FSM. Returns both so individual tests can inspect the recorded calls.
-func drainTestHandler(t *testing.T, stub *drainStubCluster) *handlers {
+func drainTestHandler(t *testing.T, stub cluster.Client) *handlers {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)

@@ -1611,6 +1611,17 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 			gen = placement.SecretSealGeneration
 		}
 	}
+	// A drained holder counts as gone. Drain is how an operator evacuates a
+	// node, and a secret copy left on it outlives the evacuation: the reseal
+	// trigger below only fired for holders gossip reported dead, so a drained
+	// but healthy node kept its copy indefinitely (T18, UC-122 — never green
+	// on any scenario). Self is never removed: an owner being drained still
+	// has to hold the plaintext-capable copy until its sandbox moves.
+	for id := range drainedNodeSet(c, frozen) {
+		if id != selfID {
+			delete(alive, id)
+		}
+	}
 	if !s.anySecretTargetDead(frozen, alive, selfID) {
 		return nil
 	}

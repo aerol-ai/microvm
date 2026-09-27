@@ -1396,6 +1396,11 @@ func (s *Service) selectReplacementRecipients(sandboxID, ownerID string, maxBack
 	if len(members) == 0 {
 		members = c.Members()
 	}
+	ids := make([]string, 0, len(members))
+	for _, m := range members {
+		ids = append(ids, m.NodeID)
+	}
+	drained := drainedNodeSet(c, ids)
 	candidates := make([]cluster.Member, 0, len(members))
 	for _, m := range members {
 		if !m.Alive || strings.TrimSpace(m.NodeID) == "" {
@@ -1404,9 +1409,38 @@ func (s *Service) selectReplacementRecipients(sandboxID, ownerID string, maxBack
 		if !cluster.CanOwnSandboxRole(m.Role) {
 			continue
 		}
+		// A drained node is being evacuated. Handing it a fresh ciphertext
+		// copy is the opposite of what the operator asked for, and the next
+		// reseal would only have to take it away again.
+		if drained[m.NodeID] && m.NodeID != ownerID {
+			continue
+		}
 		candidates = append(candidates, m)
 	}
 	return cluster.SelectSecretRecipients(sandboxID, candidates, ownerID, maxBackups)
+}
+
+// drainedNodeSet returns which of ids are drained. Clients that can return
+// the whole set in one read (the FSM locally, an agent through its cached
+// control-plane view) are asked once; anything else is asked per id, which
+// only test doubles and the no-op client hit.
+func drainedNodeSet(c cluster.Client, ids []string) map[string]bool {
+	if c == nil {
+		return nil
+	}
+	if r, ok := c.(cluster.DrainedNodesReader); ok {
+		return r.DrainedNodes()
+	}
+	var out map[string]bool
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" && c.IsNodeDrained(id) {
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[id] = true
+		}
+	}
+	return out
 }
 
 func (s *Service) anySecretTargetDead(targets []string, alive map[string]struct{}, selfID string) bool {
