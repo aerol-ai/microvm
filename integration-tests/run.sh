@@ -1256,6 +1256,14 @@ run_one() {
     echo "test filter: -run ${AEROL_TEST_RUN} (PARTIAL pass; the report covers only these tests)" >&2
   fi
 
+    # 150m, not 60m: the 8-member hetero suite runs every disruptive case
+    # with real rejoin waits, and T18's first scenario was killed by the 60m
+    # timeout one file before UC-170 — the case the run existed to prove. A
+    # timeout that truncates the suite reports a partial run as a verdict.
+    # Override with AEROL_SUITE_TIMEOUT. (Comments must stay ABOVE this
+    # command: a comment line inside a backslash continuation ends it, and
+    # every AEROL_* assignment above silently stops applying — which is
+    # exactly how this comment first broke the suite.)
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
@@ -1272,11 +1280,6 @@ run_one() {
     AEROL_OBS_PUSHGATEWAY_URL="${AEROL_OBS_PUSHGATEWAY_URL:-}" \
     AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
     AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-}" \
-    # 150m, not 60m: the 8-member hetero suite runs every disruptive case
-    # with real rejoin waits, and T18's first scenario was killed by the 60m
-    # timeout one file before UC-170 — the case the run existed to prove. A
-    # timeout that truncates the suite reports a partial run as a verdict.
-    # Override with AEROL_SUITE_TIMEOUT.
     go test -tags=integration -count=1 ${pflag} ${runflag[@]+"${runflag[@]}"} -timeout="${AEROL_SUITE_TIMEOUT:-150m}" -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
