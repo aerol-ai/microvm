@@ -923,6 +923,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			ExposedPorts:         ports,
 			ExposedPortRoutes:    portRoutes,
 			CustomHostnames:      customHostnames,
+			// Carried like ports/hostnames: if the spec could not be
+			// re-joined from the recovery store, splitPlacement has nothing
+			// to recompute it from and must not silently make the sandbox
+			// private. A present spec still overrides it.
+			PublicTraffic: exists && existing.PublicTraffic,
 			// opPlace is the promotion path for reservations: writing the
 			// empty State here transitions a Reserved row back to Placed.
 			// ExpiresUnix is cleared by the zero-value as well so the GC
@@ -2576,6 +2581,12 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 	}
 	if p.Name == "" {
 		p.Name = specName(p.Spec)
+	}
+	// Recompute from the spec whenever one is present, so a later write that
+	// flips AllowPublicTraffic is reflected; with no spec in hand, keep what
+	// the hot row already carries rather than clearing it.
+	if p.Spec != nil {
+		p.PublicTraffic = p.Spec.AllowPublicTraffic != nil && *p.Spec.AllowPublicTraffic
 	}
 	p.Spec = nil
 	p.SecretRef = ""

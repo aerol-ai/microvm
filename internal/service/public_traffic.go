@@ -17,7 +17,14 @@ func sandboxAllowsPublicTraffic(sandbox *models.Sandbox) bool {
 	return sandbox != nil && allowPublicTrafficEnabled(sandbox.AllowPublicTraffic)
 }
 
+// placementAllowsPublicTraffic reads the hot-row flag first: an ingress-only
+// node only ever sees redacted placements with no Spec (see
+// cluster.Placement.PublicTraffic). Spec still decides when present, which
+// keeps rows written by older builds behaving as they did.
 func placementAllowsPublicTraffic(p cluster.Placement) bool {
+	if p.PublicTraffic {
+		return true
+	}
 	if p.Spec == nil {
 		return false
 	}

@@ -371,10 +371,24 @@ type Placement struct {
 	// RecoveryRef points at the out-of-snapshot recovery payload for this row.
 	// Spec/secret fields are hydrated from that store only for point lookups and
 	// recreate flows.
-	RecoveryRef   string                       `json:"-"`
-	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef     string                       `json:"secret_ref,omitempty"`
-	SecretVersion int                          `json:"secret_version,omitempty"`
+	RecoveryRef string                       `json:"-"`
+	Spec        *models.CreateSandboxRequest `json:"spec,omitempty"`
+	// PublicTraffic mirrors Spec.AllowPublicTraffic on the HOT row.
+	//
+	// Spec is split into the recovery store on write and redacted from every
+	// paged/point read, so a dedicated ingress node — which has no FSM and
+	// reads only those pages — never saw it. The ingress route builder skips
+	// any placement whose public-traffic flag it cannot see, so on a hetero
+	// cluster it installed no L4 route for any remote sandbox: raw TCP
+	// exposures were unreachable (T18, UC-34). HTTP kept working only through
+	// the per-request ingress proxy fallback. One bool rides the row instead.
+	//
+	// false means "not public, or recorded by a build that predates this
+	// field"; placementAllowsPublicTraffic still consults Spec when present,
+	// so a legacy row behaves exactly as before until its next write.
+	PublicTraffic bool   `json:"public_traffic,omitempty"`
+	SecretRef     string `json:"secret_ref,omitempty"`
+	SecretVersion int    `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. It is empty only when the placement has no replicated
