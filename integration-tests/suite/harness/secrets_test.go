@@ -5,11 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -469,6 +472,12 @@ func (f *fakeSSH) install(t *testing.T) {
 	t.Helper()
 	prev := sshRunner
 	sshRunner = func(_ *testing.T, _, script string) (string, error) {
+		// The reachability probe must answer, or RequireNodeSSH skips every
+		// test that uses this fake — the fake stands in for a node we CAN
+		// reach, and its unreachable counterpart is unreachableSSH below.
+		if strings.Contains(script, "aerol-ssh-ok") {
+			return "aerol-ssh-ok\n", nil
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.runs = append(f.runs, script)
@@ -477,7 +486,21 @@ func (f *fakeSSH) install(t *testing.T) {
 		}
 		return "", nil
 	}
-	t.Cleanup(func() { sshRunner = prev })
+	// The probe result is cached per target for the whole run, so a test that
+	// installs a different fake would otherwise inherit the previous one's
+	// answer.
+	resetSSHReachability()
+	t.Cleanup(func() {
+		sshRunner = prev
+		resetSSHReachability()
+	})
+}
+
+// resetSSHReachability clears the per-run probe cache. Test-only.
+func resetSSHReachability() {
+	sshReachableMu.Lock()
+	defer sshReachableMu.Unlock()
+	sshReachable = map[string]bool{}
 }
 
 func (f *fakeSSH) ran(substr string) bool {
@@ -657,5 +680,244 @@ func TestSSHTargetRejectsAnAddresslessNode(t *testing.T) {
 	}
 	if target, ok := SSHTarget(IntegrationNode{Name: "n", PrivateIP: "10.0.0.4"}); !ok || !strings.HasSuffix(target, "@10.0.0.4") {
 		t.Fatalf("private-IP fallback = %q, %v", target, ok)
+	}
+}
+
+// KnownCapabilities must list every Capability constant. The guard it feeds
+// only catches typos while it is complete: a constant missing from the map
+// makes a correctly-spelled capability read as a typo (which is what happened
+// when the six secrets capabilities landed), and the map is the only list.
+func TestKnownCapabilitiesCoversEveryConstant(t *testing.T) {
+	// Parsing the declarations is deliberate: a hand-written second list here
+	// would go stale in exactly the same way the one it replaced did.
+	src, err := os.ReadFile("usecases.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(?m)^\s*(Cap[A-Za-z0-9]+)\s+Capability\s*=\s*"([^"]+)"`)
+	matches := re.FindAllStringSubmatch(string(src), -1)
+	if len(matches) < 20 {
+		t.Fatalf("only found %d capability constants; the pattern no longer matches the declarations", len(matches))
+	}
+	for _, m := range matches {
+		if !KnownCapabilities[Capability(m[2])] {
+			t.Fatalf("capability %s (%q) is declared but missing from KnownCapabilities, so any UC requiring it fails as a typo", m[1], m[2])
+		}
+	}
+	if len(KnownCapabilities) != len(matches) {
+		t.Fatalf("KnownCapabilities has %d entries but %d constants are declared", len(KnownCapabilities), len(matches))
+	}
+}
+
+// A curl that could not connect must be an error, never a 0 status silently
+// read as "this node does not hold a copy" — which would turn an unreachable
+// peer into evidence that the fan-out was correctly scoped.
+func TestPeerProbeFromOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		out        string
+		err        error
+		wantStatus int
+		wantErr    bool
+		present    bool
+		absent     bool
+	}{
+		{name: "held", out: "200", wantStatus: 200, present: true},
+		{name: "held no content", out: "204", wantStatus: 204, present: true},
+		{name: "absent", out: "404", wantStatus: 404, absent: true},
+		{name: "refused identity", out: "403", wantStatus: 403},
+		{name: "could not connect", out: "000\n", wantErr: true},
+		{name: "no output", out: "", err: errors.New("ssh exited 255"), wantErr: true},
+		{name: "unparsable", out: "curl: (6) could not resolve host", wantErr: true},
+		// curl exits non-zero for some statuses; a real status is the answer.
+		{name: "status despite exit code", out: "503", err: errors.New("exit 22"), wantStatus: 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := peerProbeFromOutput("node1", tc.out, tc.err)
+			if (p.Err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", p.Err, tc.wantErr)
+			}
+			if !tc.wantErr && p.Status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", p.Status, tc.wantStatus)
+			}
+			if p.Present() != tc.present {
+				t.Fatalf("Present() = %v, want %v", p.Present(), tc.present)
+			}
+			if p.Absent() != tc.absent {
+				t.Fatalf("Absent() = %v, want %v", p.Absent(), tc.absent)
+			}
+		})
+	}
+}
+
+// Present and Absent must not both be false-y in a way that lets a caller
+// treat "refused" as "absent": a 403 is neither, and a UC that read it as
+// absent would report a broken authz path as correct scoping.
+func TestPeerSecretProbeRefusedIsNeitherPresentNorAbsent(t *testing.T) {
+	p := PeerSecretProbe{Status: 403}
+	if p.Present() || p.Absent() {
+		t.Fatalf("403 classified as present=%v absent=%v", p.Present(), p.Absent())
+	}
+}
+
+// Seed-first ordering is load-bearing: restarting all SWIM members with the
+// seed last once split a live cluster 2+1, because the joiners came up with
+// no rendezvous to gossip with.
+func TestSeedFirstOrdersTheSeedAheadAndDropsUnreachableNodes(t *testing.T) {
+	in := []IntegrationNode{
+		{Name: "joiner-a", PublicIP: "203.0.113.11"},
+		{Name: "ghost"}, // no address at all
+		{Name: "seed", Seed: true, PublicIP: "203.0.113.10"},
+		{Name: "joiner-b", PrivateIP: "10.0.0.5"},
+	}
+	got := seedFirst(in)
+	if len(got) != 3 {
+		t.Fatalf("got %d nodes, want the 3 reachable ones: %+v", len(got), got)
+	}
+	if got[0].Name != "seed" {
+		t.Fatalf("seed is not first: %s", got[0].Name)
+	}
+	for _, n := range got {
+		if n.Name == "ghost" {
+			t.Fatal("an unreachable node was kept")
+		}
+	}
+}
+
+// Every node must be configured before fn runs, and every node must be
+// restored afterwards — a partially-configured fleet would make the use case
+// assert against a mix of two configurations.
+func TestWithClusterEnvConfiguresEveryNodeThenRestoresAll(t *testing.T) {
+	fake := &fakeSSH{active: "active"}
+	fake.install(t)
+
+	targets := &IntegrationTargets{Nodes: []IntegrationNode{
+		{Name: "joiner-a", PublicIP: "203.0.113.11"},
+		{Name: "seed", Seed: true, PublicIP: "203.0.113.10"},
+	}}
+
+	var saw map[string]NodeBootResult
+	WithClusterEnv(t, targets, map[string]string{"SB_SECRET_RECIPIENT_BACKUP_COUNT": "1"}, func(res map[string]NodeBootResult) {
+		saw = res
+	})
+
+	if len(saw) != 2 {
+		t.Fatalf("fn saw %d nodes, want 2: %+v", len(saw), saw)
+	}
+	if n := fake.countRan("SB_SECRET_RECIPIENT_BACKUP_COUNT=1"); n != 2 {
+		t.Fatalf("the override was written to %d nodes, want 2", n)
+	}
+	if n := fake.countRan("rm -f " + itestEnvDropIn); n != 2 {
+		t.Fatalf("restore ran on %d nodes, want 2", n)
+	}
+}
+
+// An unreachable node must SKIP the case, not fail it: whether this machine
+// holds a key for the fleet is a fact about the operator's laptop, and a red
+// row sends whoever reads the matrix looking for a defect that is not there.
+// A silent pass would be worse still.
+func TestRequireNodeSSHSkipsWhenUnreachable(t *testing.T) {
+	prev := sshRunner
+	sshRunner = func(*testing.T, string, string) (string, error) {
+		return "Permission denied (publickey).", errors.New("exit status 255")
+	}
+	resetSSHReachability()
+	t.Cleanup(func() { sshRunner = prev; resetSSHReachability() })
+
+	// A skip is not observable from the parent, so assert the decision the
+	// skip is made from instead: the probe must report the node unreachable,
+	// and it must be cached rather than re-dialled.
+	calls := 0
+	sshRunner = func(*testing.T, string, string) (string, error) {
+		calls++
+		return "Permission denied (publickey).", errors.New("exit status 255")
+	}
+	node := IntegrationNode{Name: "node1", PublicIP: "203.0.113.10"}
+	target, _ := SSHTarget(node)
+	for i := 0; i < 3; i++ {
+		probeNodeSSH(t, target)
+	}
+	if calls != 1 {
+		t.Fatalf("the probe dialled %d times; it must be cached, or every SSH case pays the connect timeout again", calls)
+	}
+	sshReachableMu.Lock()
+	reachable := sshReachable[target]
+	sshReachableMu.Unlock()
+	if reachable {
+		t.Fatal("a node answering 'Permission denied' was recorded as reachable")
+	}
+}
+
+// And a reachable node must not skip.
+func TestRequireNodeSSHPassesWhenReachable(t *testing.T) {
+	fake := &fakeSSH{active: "active"}
+	fake.install(t)
+	RequireNodeSSH(t, IntegrationNode{Name: "node1", PublicIP: "203.0.113.10"})
+}
+
+// SSHRun merges stderr into stdout. With UserKnownHostsFile=/dev/null, ssh
+// emits "Warning: Permanently added ..." on EVERY connection, and that line
+// then is the command's output as far as a parser is concerned.
+//
+// On the first live run where SSH actually worked, it made awaitUnitActive
+// never match "active" — so WithNodeEnv waited out its full 90s and reported
+// a healthy node as failed to start. LogLevel=ERROR suppresses it at the
+// source; parsing the last line is the belt to that braces.
+func TestUnitStateParsingIgnoresSSHBanners(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"clean", "active\n", true},
+		{"with the known-hosts warning", "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\nactive\n", true},
+		{"warning only (the regression)", "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\n", false},
+		{"failed after a banner", "Warning: Permanently added '1.2.3.4'.\nfailed\n", false},
+		{"trailing blank lines", "active\n\n\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeSSH{active: ""}
+			prev := sshRunner
+			sshRunner = func(_ *testing.T, _, script string) (string, error) {
+				if strings.Contains(script, "aerol-ssh-ok") {
+					return "aerol-ssh-ok\n", nil
+				}
+				return tc.out, nil
+			}
+			resetSSHReachability()
+			t.Cleanup(func() { sshRunner = prev; resetSSHReachability() })
+			_ = fake
+
+			got := awaitUnitActive(t, "u@h", "sandboxd", 30*time.Millisecond)
+			if got != tc.want {
+				t.Fatalf("awaitUnitActive(%q) = %v, want %v", tc.out, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLastNonEmptyLine(t *testing.T) {
+	for in, want := range map[string]string{
+		"active\n":         "active",
+		"warn\nactive\n\n": "active",
+		"":                 "",
+		"\n\n":             "",
+		"only-one-line":    "only-one-line",
+		"a\nb\nc\n   \n":   "c",
+	} {
+		if got := lastNonEmptyLine(in); got != want {
+			t.Fatalf("lastNonEmptyLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The known-hosts warning must not be readable as a leak hit. This is the
+// worst failure this suite can produce: UC-169 reported the canary as FOUND
+// ON DISK in all five encodings on the first run where SSH worked, because
+// the warning was non-empty and did not contain "NOHITS".
+func TestSSHBaseArgsSuppressTheKnownHostsWarning(t *testing.T) {
+	args := strings.Join(sshBaseArgs(), " ")
+	if !strings.Contains(args, "LogLevel=ERROR") {
+		t.Fatalf("sshBaseArgs does not suppress ssh's stderr banner: %q. With UserKnownHostsFile=/dev/null every connection warns, SSHRun merges stderr, and a caller checking 'is the output empty?' reads the warning as a result.", args)
 	}
 }

@@ -58,6 +58,22 @@ func sshBaseArgs() []string {
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
 		"-o", "BatchMode=yes",
+		// SSHRun merges stderr into stdout, and with UserKnownHostsFile=/dev/null
+		// every single connection emits
+		//   Warning: Permanently added '<ip>' (ED25519) to the list of known hosts.
+		// on stderr. That line then IS the command's output as far as any
+		// caller parsing it is concerned.
+		//
+		// It broke three things on the first run where SSH actually worked:
+		// awaitUnitActive never matched "active" (so WithNodeEnv waited out
+		// its full timeout and reported the node as failed to start), and —
+		// far worse — the UC-169 leak sweep saw a non-empty, non-"NOHITS"
+		// result and reported the canary as FOUND ON DISK in all five
+		// encodings. A false-positive secret leak is the worst possible
+		// output from a security suite.
+		//
+		// LogLevel=ERROR suppresses the warning and keeps real errors.
+		"-o", "LogLevel=ERROR",
 	}
 	if key := strings.TrimSpace(os.Getenv("AEROL_SSH_IDENTITY_FILE")); key != "" {
 		args = append(args, "-i", key)

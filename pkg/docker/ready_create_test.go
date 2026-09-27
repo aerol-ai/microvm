@@ -193,7 +193,14 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 		c.toolboxPort = port
 		c.readinessPollInit = 5 * time.Millisecond
 		c.readinessPollMax = 10 * time.Millisecond
-		c.toolboxWaitTimeout = 2 * time.Second
+		// Generous, because this test asserts WHICH arm of the race wins,
+		// not how fast it wins. Under -race the create path is several times
+		// slower and 2s was not enough for create + inspect + socket
+		// creation + the push — both arms then hit the deadline and the
+		// health arm's bare "context deadline exceeded" surfaced, which
+		// looks like a product timeout. The socket push ends the wait
+		// immediately, so a larger bound costs nothing when it works.
+		c.toolboxWaitTimeout = 30 * time.Second
 		c.httpClient = &http.Client{Transport: wrapped, Timeout: c.httpClient.Timeout}
 		c.streamClient = &http.Client{Transport: wrapped}
 	})
@@ -205,7 +212,14 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		deadline := time.Now().Add(time.Second)
+		// The pusher must outlive the consumer. Create waits
+		// toolboxWaitTimeout (2s) for the socket; this loop used to give up
+		// after 1s, so on a loaded runner it quit BEFORE the socket existed,
+		// nobody pushed, and the create failed with "ready socket wait:
+		// context deadline exceeded" — a test-harness race reported as a
+		// product timeout. It returns the moment it pushes, so a generous
+		// budget costs nothing in the happy path.
+		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
 			matches, _ := filepath.Glob(filepath.Join(readyDir, "sb-race.*.sock"))
 			if len(matches) == 0 {

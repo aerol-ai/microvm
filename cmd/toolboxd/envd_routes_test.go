@@ -249,20 +249,25 @@ func TestEnvdProcessRoutes(t *testing.T) {
 			t.Fatalf("close stdin status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 		}
 
-		rr = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendSignal", strings.NewReader(`{"process":{"tag":"`+runningTag+`"},"signal":"TERM"}`))
-		req.Header.Set("Authorization", "Bearer toolbox-token")
-		h.ServeHTTP(rr, req)
-		if rr.Code != http.StatusOK {
-			t.Fatalf("send signal status = %d, want 200; body=%s", rr.Code, rr.Body.String())
-		}
-
+		// Unsupported signal BEFORE the real one. The handler resolves the
+		// process before it validates the signal name, and TERM actually
+		// terminates it — so with TERM first, the process is reaped and the
+		// BOGUS request answers 404 "process not found" instead of 400.
+		// That raced under -race and reported as a product bug.
 		rr = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendSignal", strings.NewReader(`{"process":{"tag":"`+runningTag+`"},"signal":"BOGUS"}`))
 		req.Header.Set("Authorization", "Bearer toolbox-token")
 		h.ServeHTTP(rr, req)
 		if rr.Code != http.StatusBadRequest {
 			t.Fatalf("unsupported signal status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+		}
+
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendSignal", strings.NewReader(`{"process":{"tag":"`+runningTag+`"},"signal":"TERM"}`))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("send signal status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 		}
 	})
 

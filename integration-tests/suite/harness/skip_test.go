@@ -77,10 +77,16 @@ func TestRegistryWellFormed(t *testing.T) {
 		}
 		seen[uc.ID] = true
 		for _, c := range uc.Requires {
-			switch c {
-			case CapDocker, CapFirecracker, CapGvisor, CapWasm, CapIsolate, CapIsolateJail, CapGPU, CapDomain, CapCluster, CapCustomDomains, CapExternalDNSZone, CapMixedArchNegative, CapPlatformVolumes, CapBenchmark, CapDockerPool, CapDockerNetnsPool, CapDockerEngine, CapContainerdEngine, CapObservability, CapSimulations:
-			default:
+			if !KnownCapabilities[c] {
 				t.Fatalf("%s requires unknown capability %q", uc.ID, c)
+			}
+		}
+		// Excludes was never checked. A typo there fails OPEN — the case runs
+		// on the profile it was meant to avoid and takes the node down, which
+		// is the exact destruction the field exists to prevent.
+		for _, c := range uc.Excludes {
+			if !KnownCapabilities[c] {
+				t.Fatalf("%s excludes unknown capability %q", uc.ID, c)
 			}
 		}
 	}

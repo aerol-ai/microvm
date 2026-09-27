@@ -8,8 +8,11 @@
 # key prompts (throwaway boxes) and a short connect timeout so a not-yet-booted
 # instance fails fast into the retry loop instead of hanging ~2 minutes on the
 # kernel TCP timeout.
+# LogLevel=ERROR: with UserKnownHostsFile=/dev/null every connection emits
+# "Warning: Permanently added ... to the list of known hosts." on stderr, and
+# callers that capture 2>&1 then parse that line as the command's output.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectTimeout=10 -o BatchMode=yes)
+  -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
 
 # wait_for_cloud_init <ssh_target> [timeout_s]
 # Blocks until the instance's user-data (cloud-init) has finished. Domain
