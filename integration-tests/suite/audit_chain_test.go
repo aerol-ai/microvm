@@ -8,6 +8,7 @@ package suite
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,25 @@ func verifyAuditChain(t *testing.T, c *harness.Client) auditVerification {
 	var report auditVerification
 	if err := c.PostJSON(ctx, "/v1/audit/verify", nil, &report); err != nil {
 		t.Fatalf("POST /v1/audit/verify: %v", err)
+	}
+	return report
+}
+
+// verifyAuditChainOn asks ONE node, over SSH to its own API, to verify its
+// own chain. POST /v1/audit/verify checks the chain of whichever node
+// answers, and through the public URL that is the ingress: on the hetero
+// topology UC-132 would tamper with one node's chain and then verify a
+// different, empty one (T18).
+func verifyAuditChainOn(t *testing.T, target string) auditVerification {
+	t.Helper()
+	out, err := harness.SSHRun(t, target, `sudo bash -c '`+sqliteSourceEnv+
+		`curl -s --max-time 120 -X POST -H "Authorization: Bearer $SB_PAT_TOKEN" http://127.0.0.1:21212/v1/audit/verify'`)
+	if err != nil {
+		t.Fatalf("verify the audit chain on %s: %v\n%s", target, err, out)
+	}
+	var report auditVerification
+	if jerr := json.Unmarshal([]byte(lastNonEmptyLineSuite(out)), &report); jerr != nil {
+		t.Fatalf("verify the audit chain on %s: unparseable answer %q: %v", target, lastNonEmptyLineSuite(out), jerr)
 	}
 	return report
 }

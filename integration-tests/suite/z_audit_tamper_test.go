@@ -46,15 +46,28 @@ func TestTamperedAuditLineFailsVerificationAndNamesTheBreak(t *testing.T) {
 			t.Fatalf("read env: %v", err)
 		}
 	}
-	if pre := verifyAuditChain(t, c); !pre.OK {
-		t.Fatalf("the chain was already broken before the tamper (%s); this case would prove nothing", pre.Error)
+	// Tamper with the chain that holds these records — the sandbox owner's —
+	// and verify on THAT node. PickSSHNode prefers the seed, which on the
+	// hetero topology owns no sandboxes: its chain was too short to tamper
+	// with and the case skipped (T18). On the mixed topology it only worked
+	// because the seed is also the public entry point.
+	var node harness.IntegrationNode
+	ok := false
+	if sc.Has(harness.CapCluster) {
+		if owner := resolvePlacementOwner(t, c, sb.ID); owner != "" {
+			node, ok = nodeForClusterID(t, c, targets, owner)
+		}
 	}
-
-	node, ok := harness.PickSSHNode(targets)
 	if !ok {
-		t.Skip("no SSH-reachable node")
+		node, ok = harness.PickSSHNode(targets)
+		if !ok {
+			t.Skip("no SSH-reachable node")
+		}
 	}
 	target, _ := harness.SSHTarget(node)
+	if pre := verifyAuditChainOn(t, target); !pre.OK {
+		t.Fatalf("the chain on %s was already broken before the tamper (%s); this case would prove nothing", node.Name, pre.Error)
+	}
 
 	// Alter a line in the MIDDLE of the file. A tail edit is
 	// indistinguishable from a torn write; a middle edit can only be a
@@ -78,9 +91,9 @@ func TestTamperedAuditLineFailsVerificationAndNamesTheBreak(t *testing.T) {
 		}
 	})
 
-	report := verifyAuditChain(t, c)
+	report := verifyAuditChainOn(t, target)
 	if report.OK {
-		t.Fatal("verification PASSED over a hand-edited audit log: the chain does not detect tampering")
+		t.Fatalf("verification on %s PASSED over its hand-edited audit log: the chain does not detect tampering", node.Name)
 	}
 	if strings.TrimSpace(report.Error) == "" {
 		t.Fatal("verification failed but named no reason; an operator cannot tell a tamper from a torn tail")
