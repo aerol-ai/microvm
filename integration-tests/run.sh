@@ -1272,7 +1272,12 @@ run_one() {
     AEROL_OBS_PUSHGATEWAY_URL="${AEROL_OBS_PUSHGATEWAY_URL:-}" \
     AEROL_PUSHGATEWAY_URL="${AEROL_PUSHGATEWAY_URL:-}" \
     AEROL_SOAK_HOURS="${AEROL_SOAK_HOURS:-}" \
-    go test -tags=integration -count=1 ${pflag} ${runflag[@]+"${runflag[@]}"} -timeout=60m -json ./integration-tests/suite/... > "$json_out"
+    # 150m, not 60m: the 8-member hetero suite runs every disruptive case
+    # with real rejoin waits, and T18's first scenario was killed by the 60m
+    # timeout one file before UC-170 — the case the run existed to prove. A
+    # timeout that truncates the suite reports a partial run as a verdict.
+    # Override with AEROL_SUITE_TIMEOUT.
+    go test -tags=integration -count=1 ${pflag} ${runflag[@]+"${runflag[@]}"} -timeout="${AEROL_SUITE_TIMEOUT:-150m}" -json ./integration-tests/suite/... > "$json_out"
   local test_rc=$?
   set -e
 
