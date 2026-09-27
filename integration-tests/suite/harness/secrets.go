@@ -629,8 +629,13 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 			return
 		}
 		restored = true
+		// reset-failed first: a refused config crash-loops the unit into
+		// systemd's start limit, and a limited unit ignores `restart` until
+		// the counter is cleared. T18 lost ingress-1 — and every create
+		// after it (502) — to a restore that removed the bad override and
+		// then asked a start-limited unit to start.
 		out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
-			" && sudo systemctl daemon-reload && sudo systemctl restart sandboxd")
+			" && sudo systemctl daemon-reload && sudo systemctl reset-failed sandboxd && sudo systemctl restart sandboxd")
 		if err != nil {
 			t.Errorf("RESTORE FAILED on %s — the node may be left down and the rest of this run is suspect: %v\n%s", node.Name, err, out)
 			return
@@ -964,7 +969,7 @@ func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]str
 				continue
 			}
 			out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
-				" && sudo systemctl daemon-reload && sudo systemctl restart sandboxd")
+				" && sudo systemctl daemon-reload && sudo systemctl reset-failed sandboxd && sudo systemctl restart sandboxd")
 			if err != nil {
 				t.Errorf("RESTORE FAILED on %s — the rest of this run is suspect: %v\n%s", n.Name, err, out)
 				continue

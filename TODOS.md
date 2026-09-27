@@ -95,6 +95,21 @@ what, why, the caveat that motivated capturing it, and where to start.
   `/health` 200) is a separate, unfixed readiness-vs-liveness problem; it is
   what turned this bug into user-visible errors.
 
+## UC-145b (retention prune) cannot run on any scenario — needs a seam
+
+- **What:** UC-145b forces a prune with `SB_SECRET_AUDIT_RETENTION_DAYS=0`
+  and needs the audit witness. The witness only exists on enterprise
+  scenarios, and enterprise refuses zero retention at config load
+  (`internal/config/config.go`, "retention must be non-zero when
+  SB_ENTERPRISE_MODE=true"). So the only path that legitimately destroys
+  evidence has no live coverage at all; S4 and T18 both "failed" it by
+  taking a node down, and T18's ingress stayed down afterwards.
+- **Now:** the case skips on enterprise with that reason (it is not a pass).
+- **Unblock:** a test-only way to make records prunable under enterprise —
+  e.g. an `itestretention` build tag (same pattern as `itestwitness`) that
+  lets retention be expressed in minutes. Do not relax the enterprise
+  validator for it.
+
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 
 - **What:** Decide whether `upsertRoute` should retry a dropped connection the

@@ -351,6 +351,16 @@ func TestAuditIngestRequiresATokenAndIsLoopbackOnly(t *testing.T) {
 // secrets.jsonl in place.
 func TestRetentionPruneHoldsWhileExportLagsThenVerifies(t *testing.T) {
 	harness.Require(t, sc, "UC-145b")
+	// This case cannot currently run anywhere, and says so instead of taking
+	// a node down. It needs the witness, which only enterprise scenarios
+	// carry, and it forces a prune with SB_SECRET_AUDIT_RETENTION_DAYS=0,
+	// which enterprise refuses at config load (internal/config/config.go,
+	// "retention must be non-zero when SB_ENTERPRISE_MODE=true"). T18 and S4
+	// both failed it that way — and T18's ingress then stayed down. Running
+	// it needs a test-only retention seam; see TODOS.md.
+	if sc.Has(harness.CapEnterprise) {
+		t.Skip("UC-145b needs zero retention, which enterprise refuses by design; unrunnable until a test-only retention seam exists (TODOS.md)")
+	}
 	if !harness.DisruptiveAllowed() {
 		t.Skip("disruptive tests disabled: this stops the receiver and forces a prune")
 	}
