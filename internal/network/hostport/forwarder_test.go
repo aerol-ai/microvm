@@ -3,6 +3,7 @@ package hostport
 import (
 	"errors"
 	"net/netip"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +19,14 @@ type memBackend struct {
 	failOn  string              // op name to fail, for error paths
 	appends int
 	deletes int
+}
+
+// Tests never touch the host sysctl: CI runs on linux without root.
+var ipForwardCalls int
+
+func TestMain(m *testing.M) {
+	enableIPForward = func() error { ipForwardCalls++; return nil }
+	os.Exit(m.Run())
 }
 
 func newMem() *memBackend {
@@ -301,13 +310,14 @@ func TestForwarderReconcileAgainstNormalizedKernelState(t *testing.T) {
 	if len(m.rules("nat", ChainPost)) != 0 {
 		t.Fatal("the unexposed port's masquerade survived")
 	}
-	// 22000 matched (normalized listing) and must not be churned:
-	// deletes = 22001's 3 rules + 22002's DNAT and accept (2) = 5.
-	if got := m.deletes - deletesBefore; got != 5 {
-		t.Fatalf("reconcile deleted %d rules, want 5 (22000 matched and must not churn)", got)
+	// 22000 matched (normalized listing) and must not be churned. 22002's
+	// accept rule is keyed by host port, so a new target leaves it alone:
+	// deletes = 22001's 3 rules + 22002's DNAT = 4.
+	if got := m.deletes - deletesBefore; got != 4 {
+		t.Fatalf("reconcile deleted %d rules, want 4 (22000 matched and must not churn)", got)
 	}
-	if got := m.appends - appendsBefore; got != 3 {
-		t.Fatalf("reconcile appended %d rules, want 3 (22002 DNAT+accept, 22003 redirect)", got)
+	if got := m.appends - appendsBefore; got != 2 {
+		t.Fatalf("reconcile appended %d rules, want 2 (22002 DNAT, 22003 redirect)", got)
 	}
 	sort.Ints(fl.ports)
 	if len(fl.ports) != 1 || fl.ports[0] != 22001 {
@@ -391,5 +401,40 @@ func TestParseRule(t *testing.T) {
 	}
 	if _, _, ours := parseRule("-A OTHER -m comment --comment aerolvm-hp-1", ChainNAT); ours {
 		t.Fatal("a rule from another chain is not ours")
+	}
+}
+
+// Live finding (cluster-hetero-lite-routing): on a pure ingress node the
+// accept rule covered only the original direction, and nothing else enabled
+// forwarding. Now bootstrap turns on ip_forward, and the accept rule is keyed
+// by the connection's ORIGINAL destination port, so it covers replies too.
+func TestForwarderEnablesForwardingAndAcceptsBothDirections(t *testing.T) {
+	m := newMem()
+	f := New(m, nil)
+	before := ipForwardCalls
+	if err := f.Ensure(22100, dnat("10.1.0.9:22100", true)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Ensure(22101, dnat("10.0.0.5:80", false)); err != nil {
+		t.Fatal(err)
+	}
+	if got := ipForwardCalls - before; got != 1 {
+		t.Fatalf("ip_forward enabled %d times, want once at bootstrap", got)
+	}
+	fwd := strings.Join(m.rules("filter", ChainFwd), "\n")
+	for _, hp := range []string{"22100", "22101"} {
+		if !strings.Contains(fwd, "--ctstate DNAT --ctorigdstport "+hp) {
+			t.Fatalf("accept rule for %s must match the DNAT'd connection by original port (both directions):\n%s", hp, fwd)
+		}
+	}
+	if strings.Contains(fwd, "--dport") {
+		t.Fatalf("accept rule still keyed on the post-DNAT destination (original direction only):\n%s", fwd)
+	}
+
+	prev := enableIPForward
+	enableIPForward = func() error { return errors.New("read-only /proc") }
+	defer func() { enableIPForward = prev }()
+	if err := New(newMem(), nil).Ensure(22102, dnat("10.1.0.9:22102", true)); err == nil {
+		t.Fatal("a host where forwarding cannot be enabled must fail the expose loudly")
 	}
 }

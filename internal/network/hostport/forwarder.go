@@ -19,7 +19,14 @@
 //	         -p tcp -d ip --dport port -j MASQUERADE    ingress → owner hop only,
 //	                                                    so replies return here
 //	filter FORWARD (pos 1) ─▶ AEROLVM-HOSTPORT-FWD
-//	         -p tcp -d ip --dport port -j ACCEPT        ahead of Docker's DROP policy
+//	         -p tcp -m conntrack --ctstate DNAT --ctorigdstport HP -j ACCEPT
+//	         both directions of the DNAT'd connection, ahead of any DROP policy
+//
+// net.ipv4.ip_forward is switched on at bootstrap. A pure ingress node runs
+// no sandbox runtime, so nothing else enables it, and the kernel silently
+// dropped every DNAT'd packet bound for a remote owner. Found live on
+// cluster-hetero-lite-routing: every raw-TCP dial through the ingress-only
+// node timed out.
 //
 // Every rule carries the comment "aerolvm-hp-<HP>", so Reconcile can find
 // drift after a restart without trusting in-memory state. Removing a port
@@ -167,9 +174,15 @@ func (f *Forwarder) ensureChains() error {
 			}
 		}
 	}
+	if err := enableIPForward(); err != nil {
+		return fmt.Errorf("hostport: enable net.ipv4.ip_forward (DNAT to a remote owner needs it): %w", err)
+	}
 	f.ready.Store(true)
 	return nil
 }
+
+// enableIPForward is a seam over the platform sysctl write (tests replace it).
+var enableIPForward = platformEnableIPForward
 
 func natSpec(hp int, t Target) []string {
 	s := []string{"-p", "tcp", "--dport", strconv.Itoa(hp)}
@@ -180,8 +193,13 @@ func natSpec(hp int, t Target) []string {
 	return append(s, "-j", "DNAT", "--to-destination", t.Addr.String())
 }
 
-func fwdSpec(hp int, t Target) []string {
-	s := []string{"-p", "tcp", "-d", t.Addr.Addr().String(), "--dport", strconv.Itoa(int(t.Addr.Port()))}
+// fwdSpec accepts BOTH directions of hp's DNAT'd connections. The conntrack
+// match keys on the connection's original destination port (the host port),
+// so replies from the owner pass too. Matching "-d target --dport port"
+// covered only the original direction, and relied on some other rule to
+// accept the replies. A pure ingress node has no such rule.
+func fwdSpec(hp int, _ Target) []string {
+	s := []string{"-p", "tcp", "-m", "conntrack", "--ctstate", "DNAT", "--ctorigdstport", strconv.Itoa(hp)}
 	return append(append(s, comment(hp)...), "-j", "ACCEPT")
 }
 
@@ -342,7 +360,7 @@ func (f *Forwarder) Reconcile(desired map[int]Target) error {
 			// ("-m tcp" after "-p tcp", "-d 10.0.0.5/32"), so a textual
 			// compare would call every rule stale and churn it, leaving a
 			// window with no forwarding for new connections.
-			if t, ok := desired[hp]; ok && ruleMatches(c.chain, spec, t) {
+			if t, ok := desired[hp]; ok && ruleMatches(c.chain, spec, hp, t) {
 				continue
 			}
 			if err := f.b.Delete(c.table, c.chain, spec...); err != nil {
@@ -378,7 +396,7 @@ func (f *Forwarder) Reconcile(desired map[int]Target) error {
 
 // ruleMatches reports whether a listed rule in chain is exactly what target t
 // needs, read semantically from its spec.
-func ruleMatches(chain string, spec []string, t Target) bool {
+func ruleMatches(chain string, spec []string, hp int, t Target) bool {
 	val := func(flag string) string {
 		for i := 0; i+1 < len(spec); i++ {
 			if spec[i] == flag {
@@ -396,7 +414,7 @@ func ruleMatches(chain string, spec []string, t Target) bool {
 		return jump == "DNAT" && val("--to-destination") == t.Addr.String()
 	case ChainFwd:
 		return t.Kind == DNAT && jump == "ACCEPT" &&
-			val("-d") == t.Addr.Addr().String() && val("--dport") == strconv.Itoa(int(t.Addr.Port()))
+			val("--ctstate") == "DNAT" && val("--ctorigdstport") == strconv.Itoa(hp)
 	case ChainPost:
 		return t.Kind == DNAT && t.Masquerade && jump == "MASQUERADE" &&
 			val("-d") == t.Addr.Addr().String() && val("--dport") == strconv.Itoa(int(t.Addr.Port()))
