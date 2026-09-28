@@ -184,11 +184,14 @@ type Service struct {
 	// ValidateSecretAuditWitness passes; until then nothing ships to the
 	// external witness. witnessValidated is closed at that moment so the
 	// ship loop can make its first ship without waiting out an interval.
-	witnessBootPending   atomic.Bool
-	witnessValidatedOnce sync.Once
-	witnessValidated     chan struct{}
-	auditIngestMu        sync.Mutex
-	auditIngest          *auditIngestServer
+	// storageObligationReport dedupes this owner's UC-160 reports
+	// (storage_obligations.go).
+	storageObligationReport storageObligationReporterState
+	witnessBootPending      atomic.Bool
+	witnessValidatedOnce    sync.Once
+	witnessValidated        chan struct{}
+	auditIngestMu           sync.Mutex
+	auditIngest             *auditIngestServer
 	// auditIngestKey caches the resolved capability signing key (see
 	// auditIngestSigningKey); guarded by auditIngestMu.
 	auditIngestKey string

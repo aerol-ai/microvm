@@ -78,6 +78,10 @@ type Cluster struct {
 	// opReserve rows. Followers run no loop because every CancelReservation
 	// has to land via raft anyway. See dead_owner.go for the loop body.
 	reservationGCStop context.CancelFunc
+	// obligations batches owner storage-obligation reports on the leader;
+	// obligationBatcherStop ends its loop (storage_obligations.go).
+	obligations           obligationBatcher
+	obligationBatcherStop context.CancelFunc
 	// capacityLeases holds authenticated worker capacity heartbeats used by
 	// SelectPlacement. Gossip carries identity only; placement requires a
 	// fresh lease before a worker can receive new sandboxes.
@@ -285,6 +289,10 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// crashed mid-create or the forward never landed). Without this, dead
 	// reservations leak headroom from SelectPlacement scoring forever.
 	c.startReservationGCLoop()
+
+	// Storage-obligation batcher: folds owner reports into one raft entry per
+	// window on the leader (UC-160). Followers drop what they queue.
+	c.startObligationBatcher()
 
 	// Owner watcher: every node polls the FSM for placements pointing to self
 	// that have no local sandbox row, and re-materializes them via the
@@ -984,7 +992,7 @@ func (c *Cluster) SetNodeDrainState(ctx context.Context, nodeID string, drained 
 	if nodeID == "" {
 		return fmt.Errorf("cluster: SetNodeDrainState requires non-empty nodeID")
 	}
-	cmd := command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained}
+	cmd := command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained, StampUnixNano: time.Now().UnixNano()}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -1357,6 +1365,12 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
 	if c.raft.raft.State() == raft.Leader {
+		if isRawObligationReport(cmd) {
+			// Queued, not applied: the batcher folds every owner's report
+			// into one entry per window.
+			c.obligations.add(cmd.ObligationReports)
+			return nil
+		}
 		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
 		}
@@ -1382,6 +1396,10 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	}
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
+	}
+	if isRawObligationReport(cmd) {
+		c.obligations.add(cmd.ObligationReports)
+		return nil
 	}
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 		return c.applyReservationEncodedLocal(ctx, payload, cmd)
@@ -1738,6 +1756,9 @@ func (c *Cluster) Close() error {
 	}
 	if c.deadOwnerLoopStop != nil {
 		c.deadOwnerLoopStop()
+	}
+	if c.obligationBatcherStop != nil {
+		c.obligationBatcherStop()
 	}
 	if c.reservationGCStop != nil {
 		c.reservationGCStop()
