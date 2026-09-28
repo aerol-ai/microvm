@@ -950,7 +950,48 @@ func (h *handlers) clusterListNodeStorageRetirements(w http.ResponseWriter, r *h
 			"reason":      rec.Reason,
 		})
 	}
-	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"retirements": out})
+	// Open decommission jobs (UC-160): one per drained node that still owes
+	// a wipe, read from the local FSM (or one server) — never from the
+	// owners. A read failure fails the request: an empty list here would
+	// read as "nothing owed", the one answer this view must never fake.
+	obligations, err := h.deps.Service.StorageObligations(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if obligations == nil {
+		obligations = []cluster.StorageObligationView{}
+	}
+	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"retirements": out, "obligations": obligations})
+}
+
+// clusterInternalStorageObligations serves the job view to agents: an
+// ingress or worker entry node has no FSM. Only a node holding the FSM can
+// answer.
+func (h *handlers) clusterInternalStorageObligations(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	if _, isAgent := c.(*cluster.Agent); isAgent {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: storage obligations are served by control-plane nodes only")
+		return
+	}
+	reader, ok := c.(cluster.StorageObligationsReader)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: storage obligations are served by control-plane nodes only")
+		return
+	}
+	views, err := reader.StorageObligations(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if views == nil {
+		views = []cluster.StorageObligationView{}
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.StorageObligationsResponse{Obligations: views})
 }
 
 // clusterOperatorAccess gates the storage-retirement endpoints. An open-source

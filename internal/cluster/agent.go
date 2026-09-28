@@ -790,7 +790,7 @@ func (a *Agent) SetNodeDrainState(ctx context.Context, nodeID string, drained bo
 	if nodeID == "" {
 		return fmt.Errorf("cluster: SetNodeDrainState requires non-empty nodeID")
 	}
-	return a.applyCommand(ctx, command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained})
+	return a.applyCommand(ctx, command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained, StampUnixNano: time.Now().UnixNano()})
 }
 
 func (a *Agent) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {

@@ -110,22 +110,33 @@ what, why, the caveat that motivated capturing it, and where to start.
   lets retention be expressed in minutes. Do not relax the enterprise
   validator for it.
 
-## Draining a node records no visible storage-retirement obligation — DESIGN GAP (UC-160)
+## Draining a node records no visible storage-retirement obligation — IMPLEMENTED (UC-160 not yet run live)
 
-- **What:** the plan (UC-160) says draining a worker makes a storage-retirement
-  obligation appear in `GET /v1/cluster/storage-retirements`. That endpoint
-  lists operator ATTESTATIONS only (node, attested_at, actor, reason), which
-  exist only after `POST .../storage-retired`. Deletion obligations to a node
-  live in each OWNER's local delete outbox, so no cluster-wide surface says
-  "this drained node still holds sealed material and must be wiped".
-- **Evidence:** T18 round 2 (build 7cefee72): draining worker-x raised nothing
-  in 4 minutes; the case now reports that plainly (its ctx bug is fixed).
-- **Decision needed:** an operator-facing obligation view means aggregating
-  every owner's outbox across the fleet (fan-out, or replicating a per-node
-  obligation count into the FSM). Both have a real cost at 2,000 nodes; pick
-  one before implementing. Until then UC-160 fails — honestly — by design.
-- **Start:** `internal/service/node_storage_retirement.go`,
-  `pkg/api/v1/cluster_handler.go` `clusterListNodeStorageRetirements`.
+- **Design (two patterns other systems use, no third):**
+  - **One job per leaving node** (Cassandra decommission / CockroachDB
+    decommission / Nomad drain). `opSetNodeDrainState` opens it in the FSM
+    when the node still holds a sealed copy (read from placement
+    `SecretRecipients`, which the FSM already has) or is owed a delete by an
+    owner report. Uncordon withdraws it; an attestation discharges it. A
+    delete ACK never closes it.
+  - **Owners report a current total on a timer** (Kubernetes node status,
+    Ceph recovery). Every sandbox-owning node sends, every 30s when changed
+    and every 5 min regardless, "the nodes my delete outbox still owes, and
+    how many rows each". The leader REPLACES that owner's report (per-owner
+    Seq rejects retries and reordering) and folds all reports into one raft
+    entry per second, dropping ones the FSM already reflects.
+- **View:** `GET /v1/cluster/storage-retirements` adds `obligations`, from the
+  local FSM (an ingress/worker asks one server). An expected reporter (live
+  sandbox-owning member) with no report in 15 min, or a silent owner that
+  still owes, is listed stale and the job is `complete: false` — never shown
+  as all-clear.
+- **Not done, deliberately:** no fan-out on read, no +1/-1 tally, no raft
+  write per secret copy, no same-transaction "report due" slip (the periodic
+  full snapshot makes it redundant; it would only buy latency).
+- **Code:** `internal/cluster/storage_obligations.go`,
+  `internal/service/storage_obligations.go`,
+  `internal/store` `SecretDeleteOwedByRecipient`.
+- **Next:** run UC-160 live (T19, or a hetero-lite run).
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 

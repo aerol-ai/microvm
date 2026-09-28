@@ -20,7 +20,9 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
-// storageRetirements is GET /v1/cluster/storage-retirements.
+// storageRetirements is GET /v1/cluster/storage-retirements: the
+// attestations (lasting proof a disk was destroyed) and the open
+// decommission jobs (UC-160: nodes that still owe a wipe).
 type storageRetirements struct {
 	Retirements []struct {
 		NodeID     string `json:"node_id"`
@@ -28,6 +30,7 @@ type storageRetirements struct {
 		Actor      string `json:"actor"`
 		Reason     string `json:"reason"`
 	} `json:"retirements"`
+	Obligations []cluster.StorageObligationView `json:"obligations"`
 }
 
 func (r storageRetirements) has(nodeID string) bool {
@@ -39,22 +42,36 @@ func (r storageRetirements) has(nodeID string) bool {
 	return false
 }
 
-// UC-160 — draining a worker raises a storage-retirement obligation, and
-// attesting it clears the obligation.
+func (r storageRetirements) obligation(nodeID string) (cluster.StorageObligationView, bool) {
+	for _, o := range r.Obligations {
+		if o.NodeID == nodeID {
+			return o, true
+		}
+	}
+	return cluster.StorageObligationView{}, false
+}
+
+// UC-160 — draining a node that holds sealed material opens a visible
+// decommission obligation; an attestation, allowed only once the node is
+// gone, discharges it and stays listed as the proof.
 //
-// The obligation is how an operator knows a decommissioned node still holds
-// data that must be destroyed. A drain that raises nothing means a node can
-// leave the fleet with sealed material on its disk and no record saying so.
+// Split into the two halves the product actually allows. The old single case
+// drained a LIVE worker and immediately attested it — which the server
+// refuses (409) while gossip reports the node alive, correctly: a live node
+// can still ACK, so attesting its disk destroyed would throw away a real
+// reminder. Weakening that check to make the case pass would defeat it.
 func TestDrainRaisesAStorageRetirementObligation(t *testing.T) {
 	harness.Require(t, sc, "UC-160")
+	if !harness.DisruptiveAllowed() {
+		t.Skip("disruptive tests disabled: this stops the drained node to attest its storage")
+	}
 	c := client(t)
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
 
-	// A drained node must be holding something, or the obligation has no
-	// subject and its absence would prove nothing.
+	// A drained node must hold something, or the obligation has no subject.
 	sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{
 		Env: map[string]string{"UC160_TOKEN": secretValue(t, "160")},
 	})
@@ -67,15 +84,31 @@ func TestDrainRaisesAStorageRetirementObligation(t *testing.T) {
 		t.Skipf("holder set %v is owner-only; nothing to retire", view.Holders)
 	}
 	victim := candidates[0]
+	victimNode, ok := nodeForClusterID(t, c, targets, victim)
+	if !ok {
+		t.Skipf("holder %s is not an SSH-reachable node this suite can stop", victim)
+	}
+	requireNonSeedVictim(t, victimNode)
+
+	list := func() storageRetirements {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var recs storageRetirements
+		if err := c.GetJSON(ctx, "/v1/cluster/storage-retirements", &recs); err != nil {
+			t.Fatalf("list storage retirements: %v", err)
+		}
+		return recs
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
+	// LIFO: revoke the attestation, then bring the node back (waiting for
+	// the rejoin), then uncordon — so no later case inherits a drained node
+	// or an attestation claiming a live disk is clean.
 	t.Cleanup(func() {
-		cctx, ccancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		cctx, ccancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer ccancel()
-		// Revoke first, then uncordon: an attested retirement left behind
-		// would tell every later case the node's storage is already clean.
-		_ = c.Delete(cctx, "/v1/cluster/nodes/"+victim+"/storage-retired")
 		if err := c.PostJSON(cctx, "/v1/cluster/nodes/"+victim+"/uncordon", nil, nil); err != nil {
 			t.Errorf("RESTORE FAILED: node %s left drained: %v", victim, err)
 		}
@@ -84,42 +117,58 @@ func TestDrainRaisesAStorageRetirementObligation(t *testing.T) {
 		t.Fatalf("drain %s: %v", victim, err)
 	}
 
-	deadline := time.Now().Add(4 * time.Minute)
-	raised := false
+	// Half 1: the job appears, from the list alone.
+	var job cluster.StorageObligationView
+	deadline := time.Now().Add(2 * time.Minute)
+	opened := false
 	for time.Now().Before(deadline) {
-		var recs storageRetirements
-		// A context per request, not the drain's: that one expires at 3m,
-		// a minute inside this 4m poll, and T18 then reported "context
-		// deadline exceeded" instead of the real answer — that no obligation
-		// had been raised.
-		rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := c.GetJSON(rctx, "/v1/cluster/storage-retirements", &recs)
-		rcancel()
-		if err != nil {
-			t.Fatalf("list storage retirements: %v", err)
-		}
-		if recs.has(victim) {
-			raised = true
+		if o, ok := list().obligation(victim); ok {
+			job, opened = o, true
 			break
 		}
-		time.Sleep(15 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
-	if !raised {
-		t.Fatalf("draining %s raised no storage-retirement obligation: the node can leave the fleet with sealed material on its disk and nothing recording that it must be destroyed", victim)
+	if !opened {
+		t.Fatalf("draining %s, which holds a sealed copy, opened no storage-retirement obligation: the node could leave the fleet with sealed material on its disk and nothing recording that it must be destroyed", victim)
 	}
+	if job.Holders == 0 && job.PendingDeletes == 0 {
+		t.Fatalf("the obligation for %s shows neither a held copy nor a pending delete: %+v", victim, job)
+	}
+	t.Logf("UC-160: obligation opened for %s: holders=%d pending=%d complete=%v stale=%d", victim, job.Holders, job.PendingDeletes, job.Complete, len(job.StaleReporters))
 
-	// Attesting must clear it. An obligation that cannot be discharged is an
-	// alert that never goes away, which is an alert nobody reads.
-	if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+victim+"/storage-retired",
-		map[string]any{"reason": "integration-test UC-160"}, nil); err != nil {
-		t.Fatalf("attest storage retirement for %s: %v", victim, err)
+	// Half 2: stop the node; the attestation is refused while gossip still
+	// reports it alive, and accepted once it is gone.
+	t.Cleanup(harness.KillNodeDaemon(t, victimNode))
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.Delete(cctx, "/v1/cluster/nodes/"+victim+"/storage-retired")
+	})
+	attested := false
+	var lastErr error
+	deadline = time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		actx, acancel := context.WithTimeout(context.Background(), 30*time.Second)
+		lastErr = c.PostJSON(actx, "/v1/cluster/nodes/"+victim+"/storage-retired", map[string]any{"reason": "integration-test UC-160"}, nil)
+		acancel()
+		if lastErr == nil {
+			attested = true
+			break
+		}
+		if !strings.Contains(lastErr.Error(), "409") {
+			t.Fatalf("attest storage retirement for stopped %s: %v", victim, lastErr)
+		}
+		time.Sleep(10 * time.Second) // still alive in gossip; the refusal is correct
 	}
-	var after storageRetirements
-	if err := c.GetJSON(ctx, "/v1/cluster/storage-retirements", &after); err != nil {
-		t.Fatalf("re-list storage retirements: %v", err)
+	if !attested {
+		t.Fatalf("attestation for %s was still refused 3 minutes after its daemon stopped: %v", victim, lastErr)
 	}
+	after := list()
 	if !after.has(victim) {
-		t.Fatalf("attesting %s's retirement removed the record entirely; the attestation IS the evidence and must survive as one", victim)
+		t.Fatalf("attesting %s's retirement left no attestation row; the attestation IS the evidence and must stay listed", victim)
+	}
+	if o, open := after.obligation(victim); open {
+		t.Fatalf("the attestation for %s did not discharge its obligation: %+v", victim, o)
 	}
 }
 

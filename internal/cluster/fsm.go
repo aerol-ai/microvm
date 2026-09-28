@@ -50,6 +50,8 @@ const (
 	opRevokeNodeStorage      opCode = 23 // withdraw such an attestation
 	opPublishArtifactCatalog opCode = 24 // replace one node's slice of a template / JS-bundle catalogue
 	opAllocateArtifactEpoch  opCode = 25 // issue one publisher its fencing token for a catalogue kind
+	// opReportStorageObligations = 26: owner delete-outbox snapshots folded by
+	// the leader (storage_obligations.go).
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -136,6 +138,14 @@ type command struct {
 	// be replicated administrative metadata rather than a row on whichever
 	// node the operator's request happened to reach.
 	StorageRetirement *NodeStorageRetirement `json:"storage_retirement,omitempty"`
+	// ObligationReports carries owner delete-outbox snapshots for
+	// opReportStorageObligations (storage_obligations.go).
+	ObligationReports []StorageObligationReport `json:"obligation_reports,omitempty"`
+	// StampUnixNano is the proposer's clock, carried IN the entry so every
+	// replica applies the same time: the leader's batch receive time for
+	// opReportStorageObligations, the drain time for opSetNodeDrainState.
+	// Apply must never read the wall clock.
+	StampUnixNano int64 `json:"stamp_unix_nano,omitempty"`
 	// NodeID + Drained are populated by opSetNodeDrainState. NodeID is the
 	// target of the drain mark; Drained is the desired state (true = exclude
 	// from SelectPlacement, false = uncordon). All other ops leave them zero.
@@ -430,6 +440,14 @@ type placementFSM struct {
 	// discharges are never the node the operator's API call reached.
 	storageRetirements map[string]NodeStorageRetirement
 
+	// storageObligations is one open job per drained node that still owes a
+	// wipe (UC-160; storage_obligations.go). Bounded by concurrent drains.
+	storageObligations map[string]StorageObligation
+	// obligationReports is each owner's latest snapshot of the deletes it
+	// owes, REPLACED (never summed) on every newer report. Bounded by the
+	// number of sandbox-owning nodes; idle entries age out by log time.
+	obligationReports map[string]StorageObligationReport
+
 	// artifactCatalog is the replicated template / JS-bundle metadata, keyed
 	// by KIND. Tenancy lives on the row so a publisher's coverage can answer
 	// for a tenant it holds nothing for. See artifact_catalog.go.
@@ -545,6 +563,8 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		deletingIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
 		storageRetirements:           make(map[string]NodeStorageRetirement),
+		storageObligations:           make(map[string]StorageObligation),
+		obligationReports:            make(map[string]StorageObligationReport),
 		artifactCatalog:              make(map[string]*artifactCatalogKindState),
 		customHostnameIndex:          make(map[string]string),
 		auditACLs:                    make(map[string]AuditACL),
@@ -1527,6 +1547,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		} else {
 			delete(f.drainedNodes, cmd.NodeID)
 		}
+		// The drain is the decommission job's trigger: a node that still
+		// holds or is owed secret material gets one visible obligation;
+		// uncordon withdraws it (the node is staying). UC-160.
+		f.applyDrainObligationLocked(cmd.NodeID, cmd.Drained, cmd.StampUnixNano)
+		return nil
+	case opReportStorageObligations:
+		f.applyObligationReportsLocked(cmd.ObligationReports, cmd.StampUnixNano)
 		return nil
 	case opPublishArtifactCatalog:
 		// One chunk of one node's snapshot. Chunks accumulate in Pending and
@@ -1703,6 +1730,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		rec := *cmd.StorageRetirement
 		rec.NodeID = nodeID
 		f.storageRetirements[nodeID] = rec
+		// The attestation discharges the decommission job; the attestation
+		// row itself stays listed as the lasting proof.
+		f.closeObligationLocked(nodeID)
 		// A node whose storage was destroyed can never publish the corrective
 		// empty inventory, so this attestation is also the terminal boundary
 		// for its artifact metadata: rows and coverage go, the epoch
@@ -3162,6 +3192,10 @@ type fsmSnapshotPayload struct {
 	// StorageRetirements is the operator attestation set. Optional; older
 	// snapshots decode it as nil and the FSM treats that as "none".
 	StorageRetirements map[string]NodeStorageRetirement
+	// StorageObligations / ObligationReports are the UC-160 decommission
+	// jobs and owner reports. Optional; older snapshots decode them nil.
+	StorageObligations map[string]StorageObligation
+	ObligationReports  map[string]StorageObligationReport
 	// ArtifactCatalog is the replicated template / JS-bundle metadata, keyed
 	// by kind. It carries the half-delivered publications as well as the
 	// committed ones, so restoring it and replaying the log suffix reaches
@@ -3203,6 +3237,15 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	for id, rec := range f.storageRetirements {
 		retirements[id] = rec
 	}
+	obligations := make(map[string]StorageObligation, len(f.storageObligations))
+	for id, job := range f.storageObligations {
+		obligations[id] = job
+	}
+	obligationReports := make(map[string]StorageObligationReport, len(f.obligationReports))
+	for id, r := range f.obligationReports {
+		r.Owed = normalizeOwed(r.Owed)
+		obligationReports[id] = r
+	}
 	// BOTH the committed snapshots and the half-delivered ones. Pending state
 	// is replicated state: the first chunk of a publication changed it, so a
 	// snapshot that omits it does not describe the log position it claims to.
@@ -3226,6 +3269,8 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		rows:               rows,
 		drainedNodes:       drained,
 		storageRetirements: retirements,
+		storageObligations: obligations,
+		obligationReports:  obligationReports,
 		artifactCatalog:    catalog,
 		auditACLs:          auditACLs,
 		volumes:            f.volumesSnapshotLocked(),
@@ -3402,6 +3447,15 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	} else {
 		f.storageRetirements = payload.StorageRetirements
 	}
+	// Snapshots written before UC-160 carry no jobs or reports.
+	f.storageObligations = payload.StorageObligations
+	if f.storageObligations == nil {
+		f.storageObligations = make(map[string]StorageObligation)
+	}
+	f.obligationReports = payload.ObligationReports
+	if f.obligationReports == nil {
+		f.obligationReports = make(map[string]StorageObligationReport)
+	}
 	f.artifactCatalog = make(map[string]*artifactCatalogKindState, len(payload.ArtifactCatalog))
 	for kind, state := range payload.ArtifactCatalog {
 		committed := state.Committed
@@ -3426,6 +3480,8 @@ type fsmSnapshot struct {
 	rows               []placementSnapshotRow
 	drainedNodes       map[string]bool
 	storageRetirements map[string]NodeStorageRetirement
+	storageObligations map[string]StorageObligation
+	obligationReports  map[string]StorageObligationReport
 	artifactCatalog    map[string]artifactCatalogSnapshotState
 	auditACLs          map[string]AuditACL
 	volumes            []models.Volume
@@ -3446,6 +3502,8 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		Rows:               s.rows,
 		DrainedNodes:       s.drainedNodes,
 		StorageRetirements: s.storageRetirements,
+		StorageObligations: s.storageObligations,
+		ObligationReports:  s.obligationReports,
 		ArtifactCatalog:    s.artifactCatalog,
 		AuditACLs:          s.auditACLs,
 		Volumes:            s.volumes,

@@ -6133,6 +6133,49 @@ func (s *Store) ListSecretDeleteOutboxDue(ctx context.Context, now time.Time, li
 	return s.listSecretDeleteOutbox(ctx, "WHERE "+where, args, limit)
 }
 
+// SecretDeleteOwedByRecipient counts, per peer node, the outbox rows that
+// still owe that peer a delete. It is the owner's current snapshot for the
+// UC-160 storage-obligation report: the leader REPLACES the previous report
+// with it, so this must describe the whole outbox, not a delta.
+//
+// Recipients are counted in Go rather than with SQLite's json_each so the
+// store takes no dependency on the JSON1 build of the driver. The outbox only
+// holds pending deletes, so it stays small.
+func (s *Store) SecretDeleteOwedByRecipient(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT recipients_json FROM cluster_secret_delete_outbox`)
+	if err != nil {
+		return nil, fmt.Errorf("count secret delete obligations: %w", err)
+	}
+	defer rows.Close()
+	owed := make(map[string]int)
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("count secret delete obligations: %w", err)
+		}
+		var recipients []string
+		if err := json.Unmarshal([]byte(raw), &recipients); err != nil {
+			return nil, fmt.Errorf("count secret delete obligations: decode recipients: %w", err)
+		}
+		seen := make(map[string]struct{}, len(recipients))
+		for _, r := range recipients {
+			r = strings.TrimSpace(r)
+			if r == "" {
+				continue
+			}
+			if _, dup := seen[r]; dup {
+				continue
+			}
+			seen[r] = struct{}{}
+			owed[r]++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("count secret delete obligations: %w", err)
+	}
+	return owed, nil
+}
+
 func (s *Store) listSecretDeleteOutbox(ctx context.Context, where string, args []any, limit int) ([]SecretDeleteOutboxRecord, error) {
 	if limit <= 0 {
 		return nil, errors.New("secret delete outbox batch limit must be positive")

@@ -911,6 +911,9 @@ func (s *Service) StartSecretDeleteOutboxReconcile(ctx context.Context) {
 					s.logger.Warn("cluster: secret put-outbox reconcile failed", "err", err)
 				}
 				s.refreshSecretHolderPossession(ctx)
+				// After the outbox passes, so the report describes what those
+				// passes left owed (UC-160).
+				s.reportStorageObligations(ctx, time.Now())
 				// Lifecycle fences are the only audit-identity entries not evicted
 				// by their own sandbox's next boundary, so they get a retirement
 				// policy rather than accumulating one row per sandbox id this node
