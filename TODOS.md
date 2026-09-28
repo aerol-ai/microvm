@@ -191,12 +191,14 @@ what, why, the caveat that motivated capturing it, and where to start.
   after boot. At the same boundary `sandboxd` got a 500 installing the
   on-demand TLS policy ("on-demand TLS cannot be enabled without a
   permission module"); it retried on reconcile.
-- **Seen again 2026-09-28** on a hetero-lite validation run, this time with
-  S3 storage present from the start. The only Caddy error was the rejected
-  on-demand policy, and public HTTPS came up just after the harness's 300s
-  health window. The run was marked inconclusive while the cluster was
-  healthy. The harness now waits 600s (`AEROL_HEALTH_TIMEOUT`), but the
-  product-side delay is still unexplained.
+- **Correction (2026-09-28):** two later "slow HTTPS" runs were NOT this.
+  The ingress was serving a valid cert, but the harness Mac's system resolver
+  held a cached NXDOMAIN for the freshly leased hostname (negative TTL 1800s),
+  while `host`/`dig` in `wait_for_dns` bypassed that cache. That was fixed in
+  the harness (`direct_resolve_args`, `GODEBUG=netdns=go`). Some of S6's
+  delay may be the same artifact, so re-check this item on the next run before
+  investing: the Caddy "failed storage check" errors above are real, but
+  whether they delayed HTTPS is now unproven.
 - **Start:** the ingress Caddyfile / bootstrap in `packaging/` and the
   on-demand policy install in `pkg/caddy`.
 
