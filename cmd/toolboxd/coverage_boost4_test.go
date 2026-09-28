@@ -180,18 +180,72 @@ func TestHelperProcessStartReaper(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	startReaper(logger)
 
-	cmd1 := exec.Command("/bin/sh", "-c", "exit 0")
-	if err := cmd1.Start(); err != nil {
+	waitPIDCleared := func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && userCommandPID.Load() != 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if userCommandPID.Load() != 0 {
+			os.Exit(3)
+		}
+	}
+
+	// Registered exec child: the reaper must hand the status back (tracked
+	// branch) instead of logging it as an orphan.
+	tracked, err := startTracked(exec.Command("/bin/sh", "-c", "exit 0"))
+	if err != nil {
 		os.Exit(2)
 	}
-	userCommandPID.Store(int64(cmd1.Process.Pid))
 
+	// User command that exits on its own. Hold it until the pid is published,
+	// or a fast exit can be reaped before userCommandPID is set.
+	cmdExit := exec.Command("/bin/sh", "-c", "read line; exit 0")
+	stdin, err := cmdExit.StdinPipe()
+	if err != nil {
+		os.Exit(2)
+	}
+	if err := cmdExit.Start(); err != nil {
+		os.Exit(2)
+	}
+	userCommandPID.Store(int64(cmdExit.Process.Pid))
+	_, _ = stdin.Write([]byte("\n"))
+	_ = stdin.Close()
+	waitPIDCleared()
+
+	// User command killed by a signal.
+	cmdKill := exec.Command("/bin/sh", "-c", "sleep 30")
+	if err := cmdKill.Start(); err != nil {
+		os.Exit(2)
+	}
+	userCommandPID.Store(int64(cmdKill.Process.Pid))
+	_ = syscall.Kill(cmdKill.Process.Pid, syscall.SIGKILL)
+	waitPIDCleared()
+
+	// Untracked orphan.
 	cmd2 := exec.Command("/bin/sh", "-c", "exit 0")
 	if err := cmd2.Start(); err != nil {
 		os.Exit(2)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		execChildren.mu.Lock()
+		_, stillTracked := execChildren.byPID[tracked.pid]
+		execChildren.mu.Unlock()
+		if !stillTracked {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	execChildren.mu.Lock()
+	_, stillTracked := execChildren.byPID[tracked.pid]
+	execChildren.mu.Unlock()
+	if stillTracked {
+		os.Exit(3)
+	}
+	_ = tracked.wait()
+	// Let the orphan's SIGCHLD land before the process exits.
+	time.Sleep(50 * time.Millisecond)
 	os.Exit(0)
 }
 

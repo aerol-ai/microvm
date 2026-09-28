@@ -169,4 +169,42 @@ func TestTrackedCombinedOutput(t *testing.T) {
 	if _, err := trackedCombinedOutput(cmd); err == nil {
 		t.Fatal("trackedCombinedOutput with Stdout preset succeeded")
 	}
+	cmd = exec.Command("true")
+	cmd.Stderr = &strings.Builder{}
+	if _, err := trackedCombinedOutput(cmd); err == nil {
+		t.Fatal("trackedCombinedOutput with Stderr preset succeeded")
+	}
+}
+
+func TestTrackedCombinedOutputStartFailure(t *testing.T) {
+	if _, err := trackedCombinedOutput(exec.Command("/nonexistent/binary")); err == nil {
+		t.Fatal("trackedCombinedOutput of a missing binary succeeded")
+	}
+}
+
+// ECHILD with an empty status channel is the path where something other than
+// the reaper collected the child, so there is no WaitStatus to recover.
+func TestTrackedChildWaitECHILDWithoutStatus(t *testing.T) {
+	child, err := startTracked(exec.Command("sh", "-c", "exit 9"))
+	if err != nil {
+		t.Fatalf("startTracked: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var wpid int
+	var werr error
+	for time.Now().Before(deadline) {
+		var st syscall.WaitStatus
+		wpid, werr = syscall.Wait4(child.pid, &st, syscall.WNOHANG, nil)
+		if wpid == child.pid {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if wpid != child.pid {
+		t.Fatalf("Wait4 = %d, %v; want pid %d", wpid, werr, child.pid)
+	}
+	waitErr := child.wait()
+	if !errors.Is(waitErr, syscall.ECHILD) {
+		t.Fatalf("wait = %v, want ECHILD", waitErr)
+	}
 }

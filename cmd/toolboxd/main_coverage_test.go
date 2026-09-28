@@ -91,6 +91,16 @@ func TestMainVsockServeErrorLogged(t *testing.T) {
 	main()
 }
 
+func TestHandleExecStartFailure(t *testing.T) {
+	srv := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	body := `{"command":"true","workdir":"/definitely/missing-workdir"}`
+	rec := httptest.NewRecorder()
+	srv.handleExec(rec, httptest.NewRequest(http.MethodPost, "/process/execute", strings.NewReader(body)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("handleExec status = %d body=%s, want 500", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleExecNonExitWaitMerge(t *testing.T) {
 	// Cover the waitErr merge branch when Wait returns a non-ExitError.
 	// Use a command that is killed after Start such that Wait can surface
