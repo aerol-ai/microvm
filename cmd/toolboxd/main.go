@@ -309,13 +309,16 @@ func startReaper(logger *slog.Logger) {
 	go func() {
 		for range sigs {
 			for {
-				var status syscall.WaitStatus
-				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
-				if pid <= 0 || err != nil {
+				// Through execChildren, never a bare wait4(-1): an exec
+				// child's status must reach its waiter (see child_table.go).
+				pid, status, tracked, ok := execChildren.reap(-1)
+				if !ok {
 					break
 				}
 				commandPID := int(userCommandPID.Load())
 				switch {
+				case tracked:
+					logger.Debug("reaped exec child", "pid", pid)
 				case pid == commandPID && status.Exited():
 					userCommandPID.CompareAndSwap(int64(commandPID), 0)
 					logger.Info("user command exited", "pid", pid, "code", status.ExitStatus())
@@ -609,7 +612,8 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := cmd.Start(); err != nil {
+	child, err := startTracked(cmd)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -627,7 +631,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		stderrBytes, _ = io.ReadAll(stderr)
 	}()
 	readWG.Wait()
-	waitErr := cmd.Wait()
+	waitErr := child.wait()
 
 	result := models.ExecResult{
 		Stdout:     string(stdoutBytes),

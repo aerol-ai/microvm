@@ -173,7 +173,7 @@ var readNetClassDir = func() ([]os.DirEntry, error) {
 }
 
 func runNetworkCmd(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	out, err := trackedCombinedOutput(exec.Command(name, args...))
 	if err != nil {
 		return fmt.Errorf("%s %s: %w (%s)", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
@@ -181,7 +181,7 @@ func runNetworkCmd(name string, args ...string) error {
 }
 
 func runNetworkCmdIgnoreExists(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	out, err := trackedCombinedOutput(exec.Command(name, args...))
 	if err == nil {
 		return nil
 	}

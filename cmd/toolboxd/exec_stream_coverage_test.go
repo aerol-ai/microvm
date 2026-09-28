@@ -50,8 +50,8 @@ func TestInterpretWaitResultNonExitErrors(t *testing.T) {
 		t.Fatalf("nil = (%d,%q)", code, sig)
 	}
 	code, sig = interpretWaitResult(syscall.ECHILD)
-	if code != 0 || sig != "" {
-		t.Fatalf("ECHILD = (%d,%q)", code, sig)
+	if code != -1 || sig == "" {
+		t.Fatalf("ECHILD = (%d,%q), want (-1, <reason>): a lost status is not success", code, sig)
 	}
 	code, sig = interpretWaitResult(errors.New("wait boom"))
 	if code != -1 || sig != "wait boom" {
