@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -92,6 +93,20 @@ func TestAgentPlacementFeedTracksTheServer(t *testing.T) {
 		t.Fatal("SubscribePlacement is nil with the feed on")
 	}
 
+	var watchMu sync.Mutex
+	var sawFull, sawDelta bool
+	if !agent.WatchPlacementChanges(subCtx, func(full []Placement, changes []PlacementChange) {
+		watchMu.Lock()
+		defer watchMu.Unlock()
+		if full != nil {
+			sawFull = true
+		}
+		if len(changes) > 0 {
+			sawDelta = true
+		}
+	}) {
+		t.Fatal("agent watcher refused with the feed on")
+	}
 	waitForFeed(t, "initial resync to include sb1", func() bool {
 		_, ok := agent.feedPlacements(PlacementShardFilter{})
 		return ok && feedIDs(agent)["sb1"]
@@ -102,6 +117,11 @@ func TestAgentPlacementFeedTracksTheServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForFeed(t, "sb2 via the delta feed", func() bool { return feedIDs(agent)["sb2"] })
+	waitForFeed(t, "watcher saw a full view and a delta", func() bool {
+		watchMu.Lock()
+		defer watchMu.Unlock()
+		return sawFull && sawDelta
+	})
 	select {
 	case <-wake:
 	case <-time.After(5 * time.Second):
@@ -182,6 +202,9 @@ func TestAgentPlacementFeedOffByDefault(t *testing.T) {
 	}
 	if agent.SubscribePlacement(context.Background()) != nil {
 		t.Fatal("SubscribePlacement must stay nil with the flag off")
+	}
+	if agent.WatchPlacementChanges(context.Background(), func([]Placement, []PlacementChange) {}) {
+		t.Fatal("WatchPlacementChanges must refuse with the flag off")
 	}
 	agent.stopPlacementFeed()
 }

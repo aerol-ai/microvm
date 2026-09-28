@@ -286,3 +286,37 @@ func (c *Cluster) PlacementChanges(ctx context.Context, since uint64, wait time.
 		}
 	}
 }
+
+// WatchPlacementChanges streams this server's own change log to fn,
+// in-process (no network): a full view first, then deltas, resyncing on
+// resnapshot. It runs until ctx ends.
+func (c *Cluster) WatchPlacementChanges(ctx context.Context, fn PlacementChangeHandler) bool {
+	if c == nil || c.fsm == nil || fn == nil {
+		return false
+	}
+	go func() {
+		var cursor uint64
+		synced := false
+		for ctx.Err() == nil {
+			if !synced {
+				head := c.fsm.placementChanges(0)
+				cursor = head.Next
+				fn(c.PlacementsForShards(PlacementShardFilter{}), nil)
+				synced = true
+				continue
+			}
+			resp := c.PlacementChanges(ctx, cursor, MaxPlacementChangesWait)
+			if resp.Resnapshot {
+				synced = false
+				continue
+			}
+			if len(resp.Changes) > 0 {
+				fn(nil, resp.Changes)
+			}
+			if resp.Next > cursor {
+				cursor = resp.Next
+			}
+		}
+	}()
+	return true
+}

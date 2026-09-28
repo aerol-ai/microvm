@@ -275,3 +275,88 @@ func TestClusterPlacementChangesLongPoll(t *testing.T) {
 		t.Fatal("nil cluster must answer resnapshot")
 	}
 }
+
+// A server streams its own change log in-process: the full view first, then
+// deltas, and the full view again after a resnapshot.
+func TestClusterWatchPlacementChanges(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-watch", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.applyCommand(ctx, place("sb1", "w1")); err != nil {
+		t.Fatal(err)
+	}
+	type event struct {
+		full    []Placement
+		changes []PlacementChange
+	}
+	events := make(chan event, 32)
+	if !c.WatchPlacementChanges(ctx, func(full []Placement, changes []PlacementChange) {
+		events <- event{full: full, changes: changes}
+	}) {
+		t.Fatal("server watcher refused")
+	}
+	next := func(what string) event {
+		t.Helper()
+		select {
+		case e := <-events:
+			return e
+		case <-time.After(10 * time.Second):
+			t.Fatalf("no event: %s", what)
+		}
+		return event{}
+	}
+	if e := next("initial full view"); len(e.full) != 1 || e.full[0].SandboxID != "sb1" {
+		t.Fatalf("initial full view = %+v", e.full)
+	}
+	if err := c.applyCommand(ctx, place("sb2", "w1")); err != nil {
+		t.Fatal(err)
+	}
+	if e := next("delta for sb2"); len(e.changes) != 1 || e.changes[0].SandboxID != "sb2" {
+		t.Fatalf("delta = %+v", e.changes)
+	}
+	// Force a resnapshot deterministically: the log stops covering the
+	// watcher's cursor (floor one past the current version, last unchanged,
+	// so the next apply records normally instead of resetting). An
+	// eviction-based forcing races the in-process watcher, which can consume
+	// the change before it is evicted.
+	c.fsm.mu.Lock()
+	c.fsm.changes.reset(c.fsm.version)
+	c.fsm.changes.floor = c.fsm.version + 1
+	c.fsm.mu.Unlock()
+	if err := c.applyCommand(ctx, place("sb3", "w1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.applyCommand(ctx, place("sb4", "w1")); err != nil {
+		t.Fatal(err)
+	}
+	// The resnapshot delivers a full view that includes sb3 (taken when the
+	// watcher resynced); sb4, applied afterwards, then arrives as a delta.
+	deadline := time.After(10 * time.Second)
+	sawFull, sawSb4 := false, false
+	for !(sawFull && sawSb4) {
+		select {
+		case e := <-events:
+			for _, p := range e.full {
+				if p.SandboxID == "sb3" {
+					sawFull = true
+				}
+				if p.SandboxID == "sb4" {
+					sawSb4 = true
+				}
+			}
+			for _, ch := range e.changes {
+				if ch.SandboxID == "sb4" {
+					sawSb4 = true
+				}
+			}
+		case <-deadline:
+			t.Fatalf("after a forced resnapshot: full view with sb3=%v, sb4 seen=%v", sawFull, sawSb4)
+		}
+	}
+	var nilC *Cluster
+	if nilC.WatchPlacementChanges(ctx, func([]Placement, []PlacementChange) {}) {
+		t.Fatal("nil cluster watcher accepted")
+	}
+}

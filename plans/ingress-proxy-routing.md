@@ -86,10 +86,15 @@ sandboxd restart or crash never resets established HTTP(S) connections
 2. **Ingress:** caddy-l4 expands `{l4.tls.server_name}` in `dial`, including
    concatenation (`sb1.example.rt.internal:18001` was dialled). Resolution goes
    through the node's system resolver, so the node needs a routing domain.
-3. **Leak found:** on NXDOMAIN, Caddy's `dynamic a` retried the query against
-   the **public** resolver (`lookup … on 8.8.8.8`). The responder must answer
-   authoritatively (SOA/NODATA) so hostnames never leave the node. That needs
-   a verification test (§8).
+3. **"Leak" was a misread (corrected in T3).** The `lookup … on 8.8.8.8` text
+   is how Go formats a resolver error: it names the resolv.conf server while
+   Caddy's Dial override actually sends every query to the responder. The
+   responder's log showed the retry was a **search-domain expansion**
+   (`sb3.example.local`) going to the responder itself.
+   `TestCaddyStyleResolverNeverLeavesTheResponder` proves no query leaves the
+   node. The static route must still name the host **fully qualified**
+   (`{http.request.host}.`) to skip search expansion, and the responder is
+   authoritative with SOA minimum 1 s.
 
 ### 3.1 Static Caddy config (boot-time, idempotent, latch pattern)
 
@@ -128,6 +133,30 @@ sandboxd restart or crash never resets established HTTP(S) connections
   isolate loopback included) for started, public, exposed targets; NXDOMAIN
   otherwise, which falls back to the router for wake, 503 or 421.
 - TTL 1 s, matching `refresh`. Per-query cost is one map lookup.
+
+### 3.2a How the tables are fed (T3)
+
+- **The owner table is maintained through the 4A choke point.**
+  SB_INGRESS_PROXY_ROUTING installs `indexRouteWriter` as the
+  `publicRouteWriter`. The 77 existing route-intent call sites then write the
+  responder's `OwnerTable` instead of Caddy, with exactly the semantics of the
+  routes they replace (root, ports, custom hosts, wake, in-flux, by-ID GC). No
+  store read is added anywhere.
+- **Routes that need per-route behaviour take the router:**
+  - a static Caddy route can't rewrite the upstream Host per sandbox, so any
+    route with `MaskRequestHost` (E2B `maskRequestHost`) is marked
+    `TargetRouter`;
+  - WASM and isolate loopback mediators, and custom domains on a port the
+    static `map` can't derive, get NXDOMAIN and so fall back to the router.
+- **The ingress index is incremental.** `IngressIndex` tracks the hosts per
+  sandbox. `cluster.PlacementChangeWatcher` streams the changes:
+  - Agents feed it from the delta feed;
+  - servers feed it from their own change log in-process.
+
+  Updates cost O(changes), not a 100k-row rebuild per change.
+- **Exact-host keys.** Both tables are keyed by the exact hostname Caddy's
+  matchers used. Sandbox IDs are only parsed from a host as *candidates* for
+  the on-miss placement read, never to route.
 
 ### 3.3 sandboxd router (`pkg/api/ingressproxy`, reached only on fallback)
 
