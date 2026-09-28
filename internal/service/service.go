@@ -557,6 +557,9 @@ type Service struct {
 	// testL4ActivityInterval, when >0, overrides l4WakeActivityInterval in
 	// touchDuringL4Activity so unit tests don't wait 30s. Zero in production.
 	testL4ActivityInterval time.Duration
+	// testOriginalDstPort, when set, replaces the SO_ORIGINAL_DST read on
+	// REDIRECTed host-port connections (the kernel can't be faked in tests).
+	testOriginalDstPort func(net.Conn) (int, error)
 	// testAfterLifecycleScopedGet runs after UpdateLifecycle's scopedGet
 	// succeeds so store.UpdateLifecycle failure can be forced. Nil in production.
 	testAfterLifecycleScopedGet func()
