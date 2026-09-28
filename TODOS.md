@@ -151,10 +151,35 @@ what, why, the caveat that motivated capturing it, and where to start.
   steady rate of dropped client connections, not a test flake.
 - **Evidence:** 153 reloads/admin writes in ~20 min on one ingress during
   S6; the correlation is in the T19 notes (plans/integration-test-security.md §7.12).
-- **Start:** `pkg/caddy/client.go` (route PATCH/DELETE against `/id/…`);
-  check whether caddy-l4 re-binds listeners on reload, and whether SNI routes
-  can move to a dynamic source that doesn't need a config reload.
-  Related, and possibly the same mechanism: the admin-side EOF entry below.
+- **Reproduced locally (2026-09-28), Caddy v2.11.4 + caddy-l4 master:**
+  `scripts/dev/caddy-reload-repro.py`, 8 clients, one fresh TLS connection per
+  request, ~18 route add+delete reloads/s:
+
+  | Path | No churn | Churn |
+  |---|---|---|
+  | via layer4 `tls-mux` (the ingress) | 0 / 39,841 | **2.6%** fail (~1,500 empty replies, ~220 resets/broken pipes/TLS EOF, a few refused) |
+  | straight to the http server | 0 / 45,434 | **2.2%** fail (almost all empty replies, ~15 resets) |
+
+  The kind of route churned (layer4 SNI or http) makes no difference: any
+  admin write reloads the WHOLE config. The dominant failure is a completed
+  TLS handshake followed by a clean close with **zero bytes**, which is the
+  old http server's graceful shutdown closing connections that have not
+  sent a request yet. The layer4 mux adds ~15x more hard resets on top.
+  caddy-l4's `App.Stop` only closes its (pooled) listener, so the resets
+  come from the listener handoff and the upstream shutdown, not from l4
+  killing connections itself.
+- **Fix options (a design decision, not a patch):**
+  1. Coalesce route writes (debounce and batch per reconcile). This cuts the
+     reload rate, so the loss shrinks proportionally, but does not remove it.
+  2. Stop reloading Caddy per sandbox: one static wildcard route into
+     `sandboxd`'s in-process ingress proxy (`127.0.0.1:21213`, already
+     running), which looks up the sandbox itself. This removes the loss, but
+     moves routing out of Caddy config.
+  3. Fix it upstream in Caddy (don't close StateNew connections on reload
+     while a grace period is set).
+- **Start:** `pkg/caddy/client.go` (route PATCH/DELETE against `/id/…`),
+  `pkg/api/ingressproxy`. Related, and possibly the same mechanism: the
+  admin-side EOF entry below.
 
 ## First boot Caddy config lacks S3 certificate storage
 
