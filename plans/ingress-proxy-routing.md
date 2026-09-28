@@ -477,7 +477,21 @@ No critical gaps: every row has a test and handling.
       (`default_ingress_proxy_routing`, threaded through Terraform to
       `install.sh --ingress-proxy-routing`);
     - `make integration-routing[-hetero-lite]`.
-  - Live runs outstanding (AWS spend, operator-run).
+  - **Live: cluster-3-mixed-routing 77 pass / 0 fail (2026-09-28).** UC-171
+    (0 failed connections under churn), UC-172 and UC-173 all pass. The
+    live runs found four bugs that `make test` never could, all fixed with
+    regression tests:
+    1. The global resolved drop-in sent ALL DNS to the responder, so ACME
+       broke. Fixed with a scoped `aerolvm-rt` link.
+    2. The responder claimed the platform domain's SOA. It now claims only
+       `rt.internal`.
+    3. The static route was inserted after the `*.<domain>` catch-all site,
+       so every URL returned 404. It now goes at index 0.
+    4. Bootstrap restarts refused the flag, and a refusal left Caddy
+       half-switched. Fixed with a bind retry, a 60s probe budget, and a
+       rollback when an engage is refused after a flag-on boot.
+  - Outstanding: hetero-lite with the flag on (`make
+    integration-routing-hetero-lite`), then the flagship.
   - Surfaced by: the §8 integration line.
   - Verify: hetero-lite plus flagship with the flag on.
 
