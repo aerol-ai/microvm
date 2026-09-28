@@ -59,10 +59,15 @@ type artifactCatalogReader interface {
 // and what the catalogue has accepted. dirty is set by every mutation and
 // cleared only by a publication of a revision that is still current.
 type artifactCatalogState struct {
-	mu        sync.Mutex
-	epoch     map[string]int64
-	revision  map[string]int64
-	published map[string]int64
+	// reconcileMu serializes whole reconcile passes. The maintenance tick
+	// was the only caller until a template create started publishing
+	// inline; two passes interleaving their chunked snapshots for the same
+	// node would hand the FSM a mixed pending publication.
+	reconcileMu sync.Mutex
+	mu          sync.Mutex
+	epoch       map[string]int64
+	revision    map[string]int64
+	published   map[string]int64
 	// holder is this process's identity, generated once, and holderGen
 	// distinguishes one ALLOCATION ATTEMPT from the next. The authority hands
 	// the same token back to the same (holder, generation), which is what
@@ -187,6 +192,8 @@ func (s *Service) ReconcileArtifactCatalog(ctx context.Context) {
 	if !ok {
 		return
 	}
+	s.artifactCatalog.reconcileMu.Lock()
+	defer s.artifactCatalog.reconcileMu.Unlock()
 	s.reconcileArtifactKind(ctx, publisher, nodeID, cluster.ArtifactKindTemplate)
 	s.reconcileArtifactKind(ctx, publisher, nodeID, cluster.ArtifactKindJSBundle)
 }

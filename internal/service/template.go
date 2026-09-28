@@ -188,10 +188,25 @@ func (s *Service) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 	if err := s.createTemplateRow(ctx, template); err != nil {
 		return nil, err
 	}
+	// Publish before answering. In cluster mode GET /templates/{id} is
+	// resolved by the leader from the replicated artifact catalogue, and the
+	// maintenance tick publishes it only every 30s: a template fetched right
+	// after it was created read as "known absent" and answered 404 (UC-80,
+	// T19 and every earlier hetero run; the mixed scenarios hid it because
+	// the serving node usually held the template itself). Bounded, and a
+	// failure only leaves the kind dirty for the tick — the create itself
+	// never fails on it. No-op outside cluster mode. Not the sandbox boot
+	// path: template create returns while its build runs for minutes.
+	pctx, cancel := context.WithTimeout(ctx, templateCatalogPublishTimeout)
+	s.ReconcileArtifactCatalog(pctx)
+	cancel()
 
 	s.kickTemplateBuild(template)
 	return template, nil
 }
+
+// templateCatalogPublishTimeout bounds the inline catalogue publish on create.
+const templateCatalogPublishTimeout = 5 * time.Second
 
 // kickTemplateBuild spawns the per-request build goroutine. Two-phase
 // pipeline (PR-A): the rootfs phase runs the OCI→ext4 pipeline as

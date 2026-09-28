@@ -4,6 +4,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"errors"
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"io"
 	"log/slog"
 	"os"
@@ -959,4 +960,35 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// A template fetched right after it was created must be findable. In cluster
+// mode the leader resolves GET /templates/{id} from the replicated catalogue,
+// which the tick used to publish only every 30s — so the new template read as
+// "known absent" and the GET answered 404 (UC-80 on every hetero run, T19).
+// CreateTemplate now publishes before it returns.
+func TestCreateTemplatePublishesTheCatalogueBeforeReturning(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newTemplateHarness(t)
+	svc.SetTemplateBuilder(&fakeTemplateBuilder{done: make(chan struct{}, 1)})
+	cl := newCatalogCluster("worker-fc")
+	svc.cfg.EnableCluster = true
+	svc.cluster = cl
+
+	tpl, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "tpl-visible", Image: "docker://alpine:3.19"})
+	if err != nil {
+		t.Fatalf("CreateTemplate() = %v", err)
+	}
+	got := cl.rowIDs(cluster.ArtifactKindTemplate)
+	if len(got) != 1 || got[0] != tpl.ID {
+		t.Fatalf("catalogue right after create = %v, want %q: a GET routed through the leader would 404", got, tpl.ID)
+	}
+
+	// A publish failure must not fail the create; the tick retries it.
+	cl.mu.Lock()
+	cl.failing = true
+	cl.mu.Unlock()
+	if _, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "tpl-later", Image: "docker://alpine:3.19"}); err != nil {
+		t.Fatalf("a catalogue publish failure failed the create: %v", err)
+	}
 }
