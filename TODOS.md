@@ -33,7 +33,19 @@ what, why, the caveat that motivated capturing it, and where to start.
   guard that fails if any witness call site reads `c.SelfNodeID()` directly
   again. Mutation-checked.
 
-## A partitioned node keeps serving: /health ignores cluster membership — REPRODUCED
+## A partitioned node keeps serving: /health ignores cluster membership — ROOT CAUSE FIXED; readiness gap OPEN
+
+- **Status (verified 2026-09-29 on `plans/secrets-hardening`):**
+  - **The partition below is fixed.** node1 was the SEED (`seed = true` in
+    the S3 scenario). It was the restarted-seed-cannot-rejoin bug from the
+    next entry: fixed in #487 (gossip peer cache), and UC-170 is green on
+    three live runs.
+  - **Still open: `/health` is cluster-blind.** `handleHealth`
+    (`pkg/api/server.go`) always answers 200. `Service.Health` only marks
+    the body `"degraded"` for runtime, Caddy, SSH or topology faults, never
+    for "no raft leader" or "not a raft member". `/ready` still does not
+    exist. A node that falls out of the cluster for any OTHER reason would
+    still be routed to. The design constraints below still apply.
 
 - **What:** a node that has fallen out of the cluster still answers
   `/health` with 200, so the ingress keeps routing traffic to it. Every
@@ -91,9 +103,10 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Proven live:** UC-170 passed on three T18 runs (both profiles). Survivors
   elected a new leader in 7s; the seed, restarted after eviction with no
   peers, followed it 13s after restore.
-- **Still true:** the partition entry above (a node with no leader answers
-  `/health` 200) is a separate, unfixed readiness-vs-liveness problem; it is
-  what turned this bug into user-visible errors.
+- **The S3 "partitioned node" (entry above) was this bug**: node1 was the
+  seed. What remains open there is only the readiness gap: a node with no
+  leader still answers `/health` 200. That gap is what turned this bug into
+  user-visible errors.
 
 ## UC-145b (retention prune) cannot run on any scenario — needs a seam
 
@@ -110,7 +123,7 @@ what, why, the caveat that motivated capturing it, and where to start.
   lets retention be expressed in minutes. Do not relax the enterprise
   validator for it.
 
-## Draining a node records no visible storage-retirement obligation — IMPLEMENTED (UC-160 not yet run live)
+## Draining a node records no visible storage-retirement obligation — FIXED, PROVEN LIVE (UC-160 green)
 
 - **Design (two patterns other systems use, no third):**
   - **One job per leaving node** (Cassandra decommission / CockroachDB
@@ -139,12 +152,25 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Status:** passed live on hetero-lite (`e65c9cbc`) and on both T19
   metal scenarios (2026-09-28).
 
-## Ingress route changes reset in-flight TLS connections on :443
+## Ingress route changes reset in-flight TLS connections on :443 — IMPLEMENTED behind `SB_INGRESS_PROXY_ROUTING` (#503–#512)
 
-- **Decided 2026-09-28: `plans/ingress-proxy-routing.md` (eng-reviewed).** A
-  static Caddy config; sandboxd answers *where* via a loopback DNS responder
-  (Caddy `dynamic a` + caddy-l4 placeholder dial); bytes stay in Caddy; raw
-  TCP moves to sandboxd listeners. The history below is the evidence behind it.
+- **Shipped 2026-09-28 (`plans/ingress-proxy-routing.md`, eng-reviewed).**
+  - A static Caddy config, with sandboxd answering *where* via a loopback
+    DNS responder (Caddy `dynamic a` + caddy-l4 placeholder dial).
+  - Bytes stay in Caddy. Raw TCP host ports are **kernel-DNATed**, so
+    sessions live in conntrack.
+- **Proven live:**
+  - `cluster-3-mixed-routing`: 77 pass / 0 fail.
+  - `cluster-hetero-lite-routing`: 125 pass / 0 fail.
+  - UC-171 churn gate: **0** failed fresh HTTP/raw-TCP connections under
+    sandbox churn (was ~2.6%).
+  - UC-172: established sessions survive sandboxd restarts on the ingress
+    and the owner.
+  - UC-173: no per-sandbox Caddy routes on any node.
+- **Remaining before the default flips on:** a run on the metal flagship with
+  the flag on, and a latency/throughput A/B. The flag is off by default
+  (`setup/config-defaults.md`). The history below is the evidence behind the
+  design.
 
 - **What:** Stop an unrelated sandbox's route add/delete from resetting
   client connections that are mid-handshake through the ingress.
