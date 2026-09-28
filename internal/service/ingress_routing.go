@@ -57,8 +57,12 @@ type IngressRoutingOptions struct {
 	// every address: REDIRECT rewrites the destination to the receiving
 	// interface's address.
 	RedirectAddr string
-	// ProbeTimeout bounds each resolver probe and the wait for the first
-	// ingress index snapshot. Zero means 5s.
+	// ProbeTimeout bounds the responder bind, each resolver probe, and the
+	// wait for the first ingress index snapshot. Zero means 60s. Boot is
+	// noisy: bootstrap restarts sandboxd back to back, so the previous
+	// process may still hold the port, and install.sh restarts
+	// systemd-resolved. A 5s budget refused the flag on every node of a
+	// live cluster.
 	ProbeTimeout time.Duration
 	// SystemResolver is the resolver caddy-l4 dials through (nil: the
 	// system resolver). Tests inject one.
@@ -104,7 +108,7 @@ func (s *Service) StartIngressProxyRouting(ctx context.Context, opts IngressRout
 		return nil, errors.New("ingress proxy routing needs kernel host-port forwarding (iptables), unavailable on this host")
 	}
 	if opts.ProbeTimeout <= 0 {
-		opts.ProbeTimeout = 5 * time.Second
+		opts.ProbeTimeout = 60 * time.Second
 	}
 
 	rctx, cancel := context.WithCancel(ctx)
@@ -135,7 +139,19 @@ func (s *Service) StartIngressProxyRouting(ctx context.Context, opts IngressRout
 		responder.Miss = s.ingressMissLookup()
 	}
 	served := make(chan error, 1)
-	go func() { served <- responder.ListenAndServe(rctx, s.cfg.RouteDNSAddr) }()
+	go func() {
+		// Retry the bind: on a back-to-back restart the previous process can
+		// still hold the port for a moment.
+		deadline := time.Now().Add(opts.ProbeTimeout)
+		for {
+			err := responder.ListenAndServe(rctx, s.cfg.RouteDNSAddr)
+			if err == nil || rctx.Err() != nil || time.Now().After(deadline) {
+				served <- err
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
 
 	fail := func(err error) (*IngressRouting, error) {
 		cancel()
@@ -285,7 +301,11 @@ func directResolver(addr string) *net.Resolver {
 func waitRouteProbe(ctx context.Context, resolver *net.Resolver, timeout time.Duration, served <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		pctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		attempt := 2 * time.Second
+		if left := time.Until(deadline); left > 0 && left < attempt {
+			attempt = left
+		}
+		pctx, cancel := context.WithTimeout(ctx, attempt)
 		err := checkRouteResolver(pctx, resolver)
 		cancel()
 		if err == nil {

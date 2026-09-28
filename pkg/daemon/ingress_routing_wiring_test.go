@@ -77,7 +77,10 @@ func TestIngressRoutingBootMatrix(t *testing.T) {
 		{name: "on: engage + commit", flag: true, wantCalls: "start,commit", wantEngaged: true, wantMarker: "true"},
 		{name: "on, was on: re-engage", flag: true, marker: "true", wantCalls: "start,commit", wantEngaged: true, wantMarker: "true"},
 		{name: "on, refused: stay on caddy", flag: true, svc: fakeRoutingService{startErr: boom}, wantCalls: "start", wantMarker: ""},
-		{name: "on, refused after a flag-on boot: marker kept for a later flag-off", flag: true, marker: "true", svc: fakeRoutingService{startErr: boom}, wantCalls: "start", wantMarker: "true"},
+		// Live finding: a refusal left the previous boot's static routes in
+		// Caddy with no responder behind them. It must roll back.
+		{name: "on, refused after a flag-on boot: roll back", flag: true, marker: "true", svc: fakeRoutingService{startErr: boom}, wantCalls: "start,rollback", wantMarker: "false"},
+		{name: "on, refused after a flag-on boot, rollback fails: retry next boot", flag: true, marker: "true", svc: fakeRoutingService{startErr: boom, rollbackErr: boom}, wantCalls: "start,rollback", wantMarker: "true"},
 		{name: "on, commit fails: roll back", flag: true, svc: fakeRoutingService{commitErr: boom}, wantCalls: "start,commit,rollback", wantMarker: "false"},
 		{name: "on, commit and rollback fail: retry next boot", flag: true, svc: fakeRoutingService{commitErr: boom, rollbackErr: boom}, wantCalls: "start,commit,rollback", wantMarker: "true"},
 		{name: "on, pure server: nothing to route", flag: true, role: "server", wantCalls: "", wantMarker: ""},

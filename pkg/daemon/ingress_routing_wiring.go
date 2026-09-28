@@ -76,6 +76,17 @@ func startIngressRouting(ctx context.Context, cfg config.Config, svc routingServ
 	})
 	if err != nil {
 		logger.Error("ingress proxy routing refused; keeping per-sandbox Caddy routes", "error", err)
+		// A previous boot engaged, so Caddy still holds the static routes and
+		// no per-sandbox ones. Without the responder and router those
+		// static routes fall back to nothing. Put the per-sandbox routes back
+		// now, exactly as a flag-off boot would.
+		if readBypassMarker(b.marker) {
+			if rerr := svc.RollbackIngressProxyRouting(ctx, fwd); rerr != nil {
+				logger.Error("ingress proxy routing rollback after a refused engage failed; will retry next boot", "error", rerr)
+				return b
+			}
+			b.writeMarker(false)
+		}
 		return b
 	}
 	b.routing = routing

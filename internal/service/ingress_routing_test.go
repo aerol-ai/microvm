@@ -469,3 +469,23 @@ func TestRollbackIngressProxyRoutingIngressAndFailures(t *testing.T) {
 		t.Fatal("want the commit batch error")
 	}
 }
+
+// Live finding: bootstrap restarts sandboxd back to back, and the previous
+// process can still hold the responder port. Engage must wait for it, not
+// refuse (a refusal left every node of a live cluster off the flag).
+func TestStartIngressProxyRoutingRetriesTheResponderBind(t *testing.T) {
+	svc, _, _, opts := newRoutingHarness(t)
+	held, err := net.ListenPacket("udp", svc.cfg.RouteDNSAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(600 * time.Millisecond) // the predecessor exits
+		_ = held.Close()
+	}()
+	r, err := svc.StartIngressProxyRouting(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("engage refused while the port was briefly held: %v", err)
+	}
+	r.Stop()
+}
