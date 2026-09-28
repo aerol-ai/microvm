@@ -1510,7 +1510,10 @@ impl Client {
             match builder.send() {
                 Ok(response) => {
                     let status = response.status();
-                    if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    // 421: misdirected (connection coalescing or a stale route);
+                    // the server closed the connection, so the retry reconnects.
+                    if (status == reqwest::StatusCode::MISDIRECTED_REQUEST
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
                         || status == reqwest::StatusCode::BAD_GATEWAY
                         || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                         || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
@@ -2185,6 +2188,67 @@ mod tests {
             ws,
             "wss://sandbox.example.com/v1/sandboxes/sb/toolbox/process/exec/stream"
         );
+    }
+
+    // 421: an owner answered for a sandbox it doesn't hold (connection
+    // coalescing or a stale route). The server closes the connection, so
+    // the retry reconnects and the ingress re-routes it.
+    #[test]
+    fn get_retries_421_misdirected_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let body = serde_json::json!({
+            "id": "sb-421",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-421.example.com",
+            "cpu": 1,
+            "memory_mb": 512,
+            "disk_gb": 10,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "exposed_ports": [],
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        })
+        .to_string();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        thread::spawn(move || {
+            for i in 0..2 {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let _ = read_http_request(&mut stream);
+                server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (status, payload) = if i == 0 {
+                    (
+                        "421 Misdirected Request",
+                        r#"{"error":"misdirected request; reconnect"}"#.to_string(),
+                    )
+                } else {
+                    ("200 OK", body.clone())
+                };
+                let head = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    payload.len()
+                );
+                stream
+                    .write_all(head.as_bytes())
+                    .expect("head should write");
+                stream
+                    .write_all(payload.as_bytes())
+                    .expect("body should write");
+            }
+        });
+        let client = Client::new(Some(&format!("http://{}", addr)), Some("pat-token"))
+            .expect("client should build");
+        let sandbox = client
+            .get("sb-421")
+            .expect("421 should be retried to success");
+        assert_eq!(sandbox.data.id, "sb-421");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

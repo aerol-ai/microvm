@@ -1342,3 +1342,28 @@ function apiSandbox(id: string, overrides: Partial<Record<string, unknown>> = {}
 }
 
 void ({} as Sandbox);
+
+// 421 Misdirected Request: an owner answered for a sandbox it does not hold
+// (HTTP/2 connection coalescing or a stale route after failover). The server
+// closes the connection, so a retry reconnects and the ingress re-routes it.
+test("internal client retries 421 Misdirected Request", async () => {
+  let calls = 0;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async () => {
+      calls++;
+      if (calls === 1) {
+        return new Response(JSON.stringify({ error: "misdirected request; reconnect" }), {
+          status: 421,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return jsonResponse(apiSandbox("sb-421"));
+    },
+  });
+  const sandbox = await client.get("sb-421");
+  assert.equal(calls, 2);
+  assert.ok(sandbox instanceof SandboxResource);
+});

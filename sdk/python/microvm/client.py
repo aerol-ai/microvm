@@ -989,7 +989,9 @@ class MicroVM:
                     return response.read(), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
-                if exc.code in (429, 502, 503, 504) and attempt < max_retries:
+                # 421: misdirected (connection coalescing / stale route);
+                # the server closed the connection, so the retry reconnects.
+                if exc.code in (421, 429, 502, 503, 504) and attempt < max_retries:
                     pass # Handled by the retry logic below
                 else:
                     payload = exc.read()

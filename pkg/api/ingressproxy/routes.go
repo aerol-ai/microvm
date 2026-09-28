@@ -86,6 +86,9 @@ type Deps struct {
 	MaxPendingPerSandbox int
 	MaxPendingGlobal     int
 	MaxBufferBytesGlobal int64
+	// Hosts mounts the host router at "/" when set
+	// (SB_INGRESS_PROXY_ROUTING); nil keeps only the wake path route.
+	Hosts *HostRoutes
 }
 
 // RegisterRoutes mounts the ingress proxy routes onto mux. The mux is
@@ -101,6 +104,11 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// /__ingress/http/{id}/{port} (no trailing path) still match.
 	mux.Handle(PathPrefix+"/{id}/{port}", http.HandlerFunc(h.httpWake))
 	mux.Handle(PathPrefix+"/{id}/{port}/{path...}", http.HandlerFunc(h.httpWake))
+	if d.Hosts != nil {
+		// The least specific pattern: the wake path and the TLS ask
+		// endpoint keep precedence over the catch-all host router.
+		mux.Handle("/", http.HandlerFunc(h.hostRoute))
+	}
 }
 
 // RegisterTLSAsk mounts the on-demand TLS `ask` handler on mux. Called only

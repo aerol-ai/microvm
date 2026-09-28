@@ -53,6 +53,22 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid port")
 		return
 	}
+	// Reconstruct the path the user originally requested. Caddy rewrote
+	// it to /__ingress/http/{id}/{port}{path}, so the captured {path}
+	// segment is the original path without its leading slash.
+	upstreamPath := "/"
+	if rest != "" {
+		upstreamPath = "/" + rest
+	}
+	h.serveSandboxPort(w, r, id, port, upstreamPath)
+}
+
+// serveSandboxPort wakes (if needed) and reverse-proxies one request to a
+// sandbox port. Both the wake path route (/__ingress/http/...) and the host
+// router (static-route fallback, router.go) serve through it, so admission
+// caps, body buffering, the readiness probe, maskRequestHost and activity
+// touches behave identically on both.
+func (h *handlers) serveSandboxPort(w http.ResponseWriter, r *http.Request, id string, port int, upstreamPath string) {
 
 	// Buffer the request body before initiating wake — we can't replay
 	// a client stream after the cold-start delay. Upgrades have no body
@@ -196,14 +212,6 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 	if releasePending != nil {
 		releasePending()
 		releasePending = nil
-	}
-
-	// Reconstruct the path the user originally requested. Caddy rewrote
-	// it to /__ingress/http/{id}/{port}{path}, so the captured {path}
-	// segment is the original path without its leading slash.
-	upstreamPath := "/"
-	if rest != "" {
-		upstreamPath = "/" + rest
 	}
 
 	// Activity at request start: bump last_active_at so the lifecycle

@@ -1029,7 +1029,9 @@ public class MicroVMClient {
             try {
                 HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
                 int status = response.statusCode();
-                if ((status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
+                // 421: misdirected (connection coalescing or a stale route); the
+                // server closed the connection, so the retry reconnects.
+                if ((status == 421 || status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
                     // Fall through to retry logic
                 } else {
                     return response;

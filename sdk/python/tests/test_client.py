@@ -326,6 +326,44 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(client_module.MicroVMError, "does not support Image builds"):
             client.build_image(Image.base("alpine"))
 
+    def test_request_retries_421_misdirected(self):
+        # 421: an owner answered for a sandbox it doesn't hold (connection
+        # coalescing / stale route). The server closes the connection, so
+        # the retry reconnects and the ingress re-routes it.
+        import http.server
+        import threading
+
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                if len(hits) == 1:
+                    self.send_response(421)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "misdirected request; reconnect"}')
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = "http://127.0.0.1:%d" % server.server_port
+            client = MicroVM(base, "pat", config={"retry": {"maxRetries": 2, "baseDelayMs": 1, "maxDelayMs": 1}})
+            self.assertEqual(client._request("GET", base + "/x"), b"ok")
+            self.assertEqual(len(hits), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_create_serializes_selective_egress(self):
         client = RecordingMicroVM()
         client.create({"image": "ubuntu:22.04", "networkAllowOut": ["1.1.1.0/24", "8.8.8.8/32"]})

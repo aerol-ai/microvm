@@ -44,6 +44,10 @@ type OwnerTarget struct {
 	IP    net.IP
 	Port  int
 	State TargetState
+	// SandboxID and GuestPort let the sandboxd router serve a fallback
+	// request (wake, masked, mediator) through the existing wake proxy.
+	SandboxID string
+	GuestPort int
 }
 
 // OwnerTable is the owner node's route table: what Caddy's per-sandbox http
@@ -125,6 +129,11 @@ type IngressEntry struct {
 	// gives 503/404), never spliced to a guessed owner.
 	Routable bool
 	Custom   bool // a tenant custom domain (not under the platform domain)
+	// Why an entry is not routable, for the router's answer: Private → 404
+	// (the sandbox exists but is not public); InFlux → 503 + Retry-After
+	// (orphaned, reserved, deleting, or no data-plane host yet).
+	Private bool
+	InFlux  bool
 }
 
 // IngressIndex maps every SNI hostname of every placement to its owner. It
@@ -215,11 +224,14 @@ func addPlacementHosts(into map[string]IngressEntry, p cluster.Placement, domain
 	if p.SandboxID == "" || domain == "" {
 		return
 	}
+	inFlux := p.IsOrphaned() || p.IsReserved() || p.IsDeleting() || p.OwnerDataPlaneHost == ""
 	base := IngressEntry{
 		SandboxID:   p.SandboxID,
 		OwnerNodeID: p.OwnerNodeID,
 		OwnerHost:   p.OwnerDataPlaneHost,
-		Routable:    p.PublicTraffic && !p.IsOrphaned() && !p.IsReserved() && !p.IsDeleting() && p.OwnerDataPlaneHost != "",
+		Routable:    p.PublicTraffic && !inFlux,
+		Private:     !p.PublicTraffic,
+		InFlux:      p.PublicTraffic && inFlux,
 	}
 	into[normHost(p.SandboxID+"."+domain)] = base
 	ports := map[int]struct{}{}
