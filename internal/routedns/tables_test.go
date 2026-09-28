@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 
@@ -142,4 +143,65 @@ func TestIngressIndexIncrementalUpdates(t *testing.T) {
 		t.Fatal("Remove left a's root host")
 	}
 	x.Remove("never-existed")
+}
+
+// A failed bind must not leak the other socket, or a retry can never
+// succeed ("address already in use" on our own leaked TCP listener).
+func TestResponderListenAndServeReleasesPortsOnFailureAndCancel(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+	held, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Skipf("udp %s busy: %v", addr, err)
+	}
+	r := newTestResponder()
+	if err := r.ListenAndServe(context.Background(), addr); err == nil {
+		t.Fatal("ListenAndServe with the UDP port held returned nil")
+	}
+	if ln, err := net.Listen("tcp", addr); err != nil {
+		t.Fatalf("TCP port leaked after a failed UDP bind: %v", err)
+	} else {
+		_ = ln.Close()
+	}
+	_ = held.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.ListenAndServe(ctx, addr) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if c, err := net.Dial("tcp", addr); err == nil {
+			_ = c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("responder never served")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	for _, network := range []string{"tcp", "udp"} {
+		var err error
+		if network == "tcp" {
+			var ln net.Listener
+			if ln, err = net.Listen("tcp", addr); err == nil {
+				_ = ln.Close()
+			}
+		} else {
+			var pc net.PacketConn
+			if pc, err = net.ListenPacket("udp", addr); err == nil {
+				_ = pc.Close()
+			}
+		}
+		if err != nil {
+			t.Fatalf("%s port not released after cancel: %v", network, err)
+		}
+	}
 }

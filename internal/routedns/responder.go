@@ -273,19 +273,38 @@ func (r *Responder) soa() dns.RR {
 
 // ListenAndServe serves UDP and TCP on addr (loopback) until ctx ends.
 func (r *Responder) ListenAndServe(ctx context.Context, addr string) error {
-	udp := &dns.Server{Addr: addr, Net: "udp", Handler: r}
-	tcp := &dns.Server{Addr: addr, Net: "tcp", Handler: r}
+	// Bind both sockets here, not inside dns.Server. Shutdown on a server
+	// that has not started yet is a no-op, so with ListenAndServe a failed
+	// UDP bind left the TCP server binding anyway. That leaked the port and
+	// made every retry fail "address already in use" (caught by the
+	// bind-retry test under -race). Closing the sockets we own always
+	// releases them.
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		_ = pc.Close()
+		return err
+	}
+	udp := &dns.Server{PacketConn: pc, Handler: r}
+	tcp := &dns.Server{Listener: ln, Handler: r}
 	errc := make(chan error, 2)
-	go func() { errc <- udp.ListenAndServe() }()
-	go func() { errc <- tcp.ListenAndServe() }()
+	go func() { errc <- udp.ActivateAndServe() }()
+	go func() { errc <- tcp.ActivateAndServe() }()
+	stop := func() {
+		_ = udp.Shutdown()
+		_ = tcp.Shutdown()
+		_ = pc.Close()
+		_ = ln.Close()
+	}
 	select {
 	case <-ctx.Done():
-		_ = udp.Shutdown()
-		_ = tcp.Shutdown()
+		stop()
 		return nil
 	case err := <-errc:
-		_ = udp.Shutdown()
-		_ = tcp.Shutdown()
+		stop()
 		return err
 	}
 }
