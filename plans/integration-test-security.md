@@ -1540,6 +1540,18 @@ reload connection loss (TODOS, design pending). Two earlier attempts were
 marked inconclusive by the same harness DNS bug while the clusters were
 healthy.
 
+**Metal re-run, S5 only (2026-09-28, build `79b942df` = #496–#499 merged):**
+**130 pass / 1 fail / 44 skip** (T19 S5 was 124 / 7 / 44), torn down clean.
+**#496 and #498 are proven live:** UC-47–50 (`TestTemplateLifecycle`) and
+UC-93 (template lifecycle through a non-FC entry node) pass; both failed in
+T19 with the read-after-create 404. UC-84 passed again (#497). The one fail,
+UC-80, got past the template GET and then hit a separate race: a create from
+a just-ready template found "no worker placement target", because the
+template placement filter trusted the heartbeat-gossiped inventory. That is
+fixed by **#500** (catalogue holders pass the filter at placement, admission
+and the owner watcher), which merged after this build, so it is not yet
+re-run live.
+
 ### T18 / T19 — the split
 
 The old T18 ("flagship S5 + S6") bundled two questions with a 40x cost gap:
