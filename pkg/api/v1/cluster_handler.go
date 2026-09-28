@@ -1263,6 +1263,51 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+// placementChangesServer is implemented by server-role clusters (they hold
+// the FSM change log). Asserted rather than added to cluster.Client: agents
+// and the single-node Noop have no log to serve.
+type placementChangesServer interface {
+	PlacementChanges(ctx context.Context, since uint64, wait time.Duration) cluster.PlacementChangesResponse
+}
+
+// clusterInternalPlacementChanges serves the placement delta feed
+// (plans/ingress-proxy-routing.md §3.4): GET ?since=<raft index>&wait=<dur>.
+// It redacts rows exactly like the page walk it replaces.
+func (h *handlers) clusterInternalPlacementChanges(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	srv, ok := c.(placementChangesServer)
+	if c == nil || !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: placement change feed not served by this node")
+		return
+	}
+	q := r.URL.Query()
+	var since uint64
+	if raw := strings.TrimSpace(q.Get("since")); raw != "" {
+		v, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			apihttp.WriteError(w, http.StatusBadRequest, "since must be an unsigned integer")
+			return
+		}
+		since = v
+	}
+	var wait time.Duration
+	if raw := strings.TrimSpace(q.Get("wait")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			apihttp.WriteError(w, http.StatusBadRequest, "wait must be a non-negative duration")
+			return
+		}
+		wait = d
+	}
+	resp := srv.PlacementChanges(r.Context(), since, wait)
+	for i := range resp.Changes {
+		if resp.Changes[i].Placement != nil {
+			redactPlacementSecretFields(resp.Changes[i].Placement)
+		}
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
 // clusterInternalOwnedRecovery serves a worker its OWN failover-recreate
 // placements. A dedicated worker has no FSM, so without this it can never
 // learn that the dead-owner reconciler handed it a sandbox — the reassignment

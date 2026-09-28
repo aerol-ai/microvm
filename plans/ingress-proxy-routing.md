@@ -148,7 +148,12 @@ caddy runs in domain mode.
   100–150 B per entry, so ~15 MB at 100k placements. The shard filter stays for
   reconcile work only; routing no longer depends on an external shard-aware
   load balancer.
-- **Versioned delta feed for Agents (T4).** A new long-poll
+- **Versioned delta feed for Agents (T4), built in T2:**
+  `internal/cluster/placement_changelog.go` holds the bounded ring,
+  `agent_placement_feed.go` the Agent consumer. The cursor is the Raft index,
+  so it is valid against any server; a lagging server waits instead of
+  resnapshotting. Merges keep the higher `Placement.Version`, because page
+  walks are not a consistent snapshot. A new long-poll
   `GET /v1/cluster/internal/placements/changes?since=N` returns the changes
   since FSM index N, or `resnapshot` when N is older than the retained change
   log. The Agent keeps the index current in about a second. The per-ingress
@@ -156,8 +161,11 @@ caddy runs in domain mode.
   fragile area: it needs regression tests (version gaps, leader change, a
   too-old N) and a PR call-out.
 - **On-miss lookup:** one single-flight lookup through the existing
-  `/v1/cluster/ingress-route/{id}` machinery, with a negative cache of about
-  2 s, so a brand-new sandbox's first connection resolves.
+  internal placement point read (`Agent.PlacementOf` →
+  `GET /v1/cluster/internal/placement/{id}`), with a negative cache of about
+  2 s, so a brand-new sandbox's first connection resolves. *(Corrected during
+  T2: `/v1/cluster/ingress-route/{id}` returns ingress ring owners, not the
+  placement, so it cannot answer "which owner, which host".)*
 - The index is an immutable snapshot behind `atomic.Pointer`. Readers never
   lock; there is one writer.
 

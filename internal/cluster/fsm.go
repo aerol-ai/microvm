@@ -360,6 +360,9 @@ func applyCommandSecretUpdate(existing Placement, exists bool, cmd command) Plac
 // clone specs or secret handles for every sandbox.
 type placementFSM struct {
 	mu sync.RWMutex
+	// changes is the node-local placement change log behind the delta feed
+	// (placement_changelog.go). Guarded by mu; never snapshotted.
+	changes *placementChangeLog
 	// placements is the hot row map. Values deliberately keep Placement.Spec,
 	// SecretRef, SecretVersion, and SealedSecrets empty; those larger recovery
 	// fields live behind Placement.RecoveryRef and are attached only for point
@@ -1018,6 +1021,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
+		f.recordPlacementChangeLocked(cmd.SandboxID, true)
 		return nil
 	case opBeginDelete:
 		existing, ok := f.fullPlacementLocked(cmd.SandboxID)
@@ -1098,6 +1102,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
+		f.recordPlacementChangeLocked(cmd.SandboxID, true)
 		return nil
 	case opPruneAuditACL:
 		f.pruneAuditACLLocked(cmd.ExpiresUnix)
@@ -1210,6 +1215,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.deletePlacementRecoveryLocked(id)
 			delete(f.placements, id)
 			delete(f.deletingIndex, id)
+			f.recordPlacementChangeLocked(id, true)
 		}
 		return nil
 	case opClaimOrphan:
@@ -2561,6 +2567,9 @@ func (f *placementFSM) storeRecoveryBlob(blob RecoveryBlob) error {
 }
 
 func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
+	// Recorded up front: a change that then fails to store is harmless,
+	// because readers take the value from f.placements at serve time.
+	f.recordPlacementChangeLocked(id, false)
 	hot, rec := splitPlacement(p)
 	if rec.empty() {
 		if hot.RecoveryRef == "" {
@@ -3332,6 +3341,11 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.placements = make(map[string]Placement, len(payload.Placements))
 	f.recovery = make(map[string]placementRecovery, len(payload.Recovery))
 	f.version = payload.Version
+	// The change log is node-local and not in the snapshot. Anything it held
+	// is from before this state, so cursors below the snapshot version get
+	// resnapshot. The rows re-stored below also record changes; those are
+	// discarded when Restore finishes (see the reset at the end).
+	f.resetPlacementChangesLocked(payload.Version)
 	// Rebuild nameIndex from placements. Snapshots don't carry the index
 	// (older snapshots predate it), and rebuilding keeps the FSM the single
 	// source of truth even after a cold restart.
@@ -3472,6 +3486,9 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		}
 		f.artifactCatalog[kind] = &artifactCatalogKindState{Committed: committed, Pending: pending, Issued: issued}
 	}
+	// Discard the changes recorded while the rows were re-stored above: they
+	// describe no new state, only this restore.
+	f.resetPlacementChangesLocked(payload.Version)
 	return nil
 }
 
