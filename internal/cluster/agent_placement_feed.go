@@ -32,8 +32,10 @@ type agentPlacementFeed struct {
 	synced bool
 	cursor uint64
 
-	subMu sync.Mutex
-	subs  []chan struct{}
+	subMu       sync.Mutex
+	subs        []chan struct{}
+	watchers    map[int]PlacementChangeHandler
+	nextWatcher int
 
 	stop context.CancelFunc
 	done chan struct{}
@@ -114,6 +116,7 @@ func (a *Agent) runPlacementFeed(ctx context.Context, f *agentPlacementFeed) {
 			continue
 		}
 		if a.applyPlacementChanges(f, resp) {
+			f.notifyWatchers(nil, resp.Changes)
 			f.signal()
 		}
 	}
@@ -142,8 +145,13 @@ func (a *Agent) resyncPlacementFeed(ctx context.Context, f *agentPlacementFeed) 
 	f.rows = next
 	f.cursor = v0
 	f.synced = true
+	full := make([]Placement, 0, len(next))
+	for _, p := range next {
+		full = append(full, p)
+	}
 	f.mu.Unlock()
 	a.observePlacementVersions(walked)
+	f.notifyWatchers(full, nil)
 	f.signal()
 	return nil
 }
@@ -266,5 +274,58 @@ func (f *agentPlacementFeed) signal() {
 		case ch <- struct{}{}:
 		default:
 		}
+	}
+}
+
+// PlacementChangeHandler receives placement changes in order. full is
+// non-nil after a (re)sync and is then the COMPLETE view; changes follow
+// incrementally. Handlers must not block for long.
+type PlacementChangeHandler func(full []Placement, changes []PlacementChange)
+
+// PlacementChangeWatcher streams placement changes to a consumer that keeps
+// its own index (the ingress route responder). It is implemented by the
+// Agent (from its delta feed) and by a server Cluster (from its own change
+// log, in-process).
+type PlacementChangeWatcher interface {
+	WatchPlacementChanges(ctx context.Context, fn PlacementChangeHandler) bool
+}
+
+// WatchPlacementChanges registers fn with the delta feed. It returns false
+// when the feed is off (flag off). fn first gets the current full view, if
+// already synced.
+func (a *Agent) WatchPlacementChanges(ctx context.Context, fn PlacementChangeHandler) bool {
+	if a == nil || a.feed == nil || fn == nil {
+		return false
+	}
+	f := a.feed
+	f.subMu.Lock()
+	id := f.nextWatcher
+	f.nextWatcher++
+	if f.watchers == nil {
+		f.watchers = map[int]PlacementChangeHandler{}
+	}
+	f.watchers[id] = fn
+	f.subMu.Unlock()
+	if rows, ok := a.feedPlacements(PlacementShardFilter{}); ok {
+		fn(rows, nil)
+	}
+	go func() {
+		<-ctx.Done()
+		f.subMu.Lock()
+		delete(f.watchers, id)
+		f.subMu.Unlock()
+	}()
+	return true
+}
+
+func (f *agentPlacementFeed) notifyWatchers(full []Placement, changes []PlacementChange) {
+	f.subMu.Lock()
+	ws := make([]PlacementChangeHandler, 0, len(f.watchers))
+	for _, w := range f.watchers {
+		ws = append(ws, w)
+	}
+	f.subMu.Unlock()
+	for _, w := range ws {
+		w(full, changes)
 	}
 }
