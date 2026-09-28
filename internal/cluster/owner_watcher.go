@@ -288,7 +288,7 @@ func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (Placem
 	// the highest headroom. Secret-bearing placements normally have only the
 	// owner plus two backups, so the recipient lookup remains O(recipients)
 	// rather than scanning a 2,000-node fleet for every failed sandbox.
-	all := c.recreationCandidates(p)
+	all := c.withCatalogueTemplateHolders(c.recreationCandidates(p), req.TemplateID)
 	pending := c.fsm.pendingReservationsByNode(time.Now().Unix())
 	var best Member
 	bestScore := -1.0

@@ -102,7 +102,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 // slice the router uses to record the secret recipient set at reserve time
 // (plans/secrets-hardening §3d-1). The target is always one of candidates.
 func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
-	all := c.membersWithCapacity()
+	all := c.withCatalogueTemplateHolders(c.membersWithCapacity(), req.TemplateID)
 	rejects := make(map[string]int64)
 	if err := LargeClusterTopologyError(all); err != nil {
 		rejects["topology"] = 1
@@ -439,7 +439,73 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
 		}
 	}
-	return admitReservationCommands(c.membersWithCapacity(), pending, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
+	templateIDs := make([]string, 0, len(reservations))
+	for _, r := range reservations {
+		if r.Spec != nil {
+			templateIDs = append(templateIDs, r.Spec.TemplateID)
+		}
+	}
+	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
+	return admitReservationCommands(members, pending, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
+}
+
+// withCatalogueTemplateHolders adds each templateID to the ready-template
+// inventory of every member the replicated artifact catalogue says holds it.
+//
+// The template filter in nodeFits trusts LocalTemplateIDs, which is gossiped
+// on the capacity heartbeat. So for up to a heartbeat after a template
+// becomes ready, every node reads as an authoritative "no" and a create from
+// it fails with ErrNoPlacementTarget. T19's S5 re-run hit exactly that on
+// UC-80: the template GET (#498) worked, and the create straight after found
+// no target. The catalogue is published before CreateTemplate answers (#496),
+// so it names the holder without waiting for gossip. Readiness stays the
+// owner's call: its CreateSandbox reads the template row locally, so a holder
+// whose build is still running refuses the create with a real error instead
+// of the fleet reporting "no capacity".
+//
+// Members are returned as copies with fresh slices. Gossip snapshots are
+// shared, and appending in place would leak the addition into them.
+func (c *Cluster) withCatalogueTemplateHolders(members []Member, templateIDs ...string) []Member {
+	if c == nil || c.fsm == nil || len(members) == 0 {
+		return members
+	}
+	add := make(map[string][]string)
+	seen := make(map[string]bool, len(templateIDs))
+	for _, id := range templateIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		for _, nodeID := range c.fsm.artifactCatalogHolders(ArtifactKindTemplate, "", id) {
+			add[nodeID] = append(add[nodeID], id)
+		}
+	}
+	if len(add) == 0 {
+		return members
+	}
+	out := make([]Member, len(members))
+	copy(out, members)
+	for i := range out {
+		ids := add[out[i].NodeID]
+		// An unknown inventory already admits every template ("unknown,
+		// allow"); only an authoritative list can wrongly exclude.
+		if len(ids) == 0 || !out[i].Capacity.LocalTemplateInventoryKnown {
+			continue
+		}
+		have := make(map[string]bool, len(out[i].Capacity.LocalTemplateIDs))
+		for _, t := range out[i].Capacity.LocalTemplateIDs {
+			have[t] = true
+		}
+		merged := append([]string(nil), out[i].Capacity.LocalTemplateIDs...)
+		for _, id := range ids {
+			if !have[id] {
+				merged = append(merged, id)
+			}
+		}
+		out[i].Capacity.LocalTemplateIDs = merged
+	}
+	return out
 }
 
 func admitReservationCommands(members []Member, pending map[string]capacity.Request, pendingCounts map[string]int, maxPendingPerWorker int, reservations []reservationCommand) error {
