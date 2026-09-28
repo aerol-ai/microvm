@@ -969,8 +969,11 @@ func contains(s, substr string) bool {
 // CreateTemplate now publishes before it returns.
 func TestCreateTemplatePublishesTheCatalogueBeforeReturning(t *testing.T) {
 	ctx := context.Background()
-	svc, _, _ := newTemplateHarness(t)
-	svc.SetTemplateBuilder(&fakeTemplateBuilder{done: make(chan struct{}, 1)})
+	svc, st, _ := newTemplateHarness(t)
+	// Both creates kick a background build that writes into the test's temp
+	// dir; room for both signals, and the waits below, keep either from
+	// outliving the test (a TempDir cleanup race failed CI on #498).
+	svc.SetTemplateBuilder(&fakeTemplateBuilder{done: make(chan struct{}, 2)})
 	cl := newCatalogCluster("worker-fc")
 	svc.cfg.EnableCluster = true
 	svc.cluster = cl
@@ -990,5 +993,10 @@ func TestCreateTemplatePublishesTheCatalogueBeforeReturning(t *testing.T) {
 	cl.mu.Unlock()
 	if _, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "tpl-later", Image: "docker://alpine:3.19"}); err != nil {
 		t.Fatalf("a catalogue publish failure failed the create: %v", err)
+	}
+	for _, id := range []string{"tpl-visible", "tpl-later"} {
+		if got := waitForStatus(t, st, id, models.TemplateStatusReadyNoSnapshot, 5*time.Second); got == nil || got.Status != models.TemplateStatusReadyNoSnapshot {
+			t.Fatalf("background build for %s never finished: %+v", id, got)
+		}
 	}
 }

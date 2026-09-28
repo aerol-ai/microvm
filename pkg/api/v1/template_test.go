@@ -456,6 +456,70 @@ func TestTemplateOwnerFromInventoryKeepsUnavailableOwnerVisible(t *testing.T) {
 	}
 }
 
+// catalogStubCluster answers the replicated-catalogue point lookup the way a
+// control-plane *cluster.Cluster does.
+type catalogStubCluster struct {
+	*membersStubCluster
+	holders map[string][]string
+}
+
+func (c *catalogStubCluster) ArtifactCatalogHolders(kind, tenant, id string) []string {
+	if kind != cluster.ArtifactKindTemplate || tenant != "" {
+		return nil
+	}
+	return c.holders[id]
+}
+
+// T19 regression (UC-47..50, UC-80, UC-93): a template created a moment ago
+// is in the catalogue (CreateTemplate publishes before answering) but not yet
+// in any worker's gossiped inventory. The item route must find it there
+// instead of 404ing.
+func TestTemplateOwnerFromCatalogRoutesAFreshTemplate(t *testing.T) {
+	fc := capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}, LocalTemplateCatalogInventoryKnown: true}
+	members := []cluster.Member{
+		{NodeID: "server-a", Alive: true, Role: config.NodeRoleServer},
+		{NodeID: "worker-dead", InternalURL: "https://worker-dead", Alive: false, Role: config.NodeRoleWorker, Capacity: fc},
+		{NodeID: "worker-b", InternalURL: "https://worker-b", Alive: true, Role: config.NodeRoleWorker, Capacity: fc},
+		{NodeID: "worker-c", InternalURL: "https://worker-c", Alive: true, Role: config.NodeRoleWorker, Capacity: fc},
+	}
+	base := &membersStubCluster{Noop: cluster.NewNoop("server-a", "", ""), members: members}
+	c := &catalogStubCluster{membersStubCluster: base, holders: map[string][]string{
+		"tpl-fresh":     {"worker-b", "worker-c"},
+		"tpl-dead-only": {"worker-dead"},
+		"tpl-skip-dead": {"worker-dead", "worker-c"},
+		"tpl-gone":      {"worker-unknown"},
+	}}
+
+	if _, _, ok := templateOwnerFromInventory(c, "tpl-fresh"); ok {
+		t.Fatal("precondition: gossip inventory must not list the fresh template")
+	}
+	tests := []struct {
+		id     string
+		want   string
+		wantOK bool
+	}{
+		{id: "tpl-fresh", want: "worker-b", wantOK: true},
+		{id: "tpl-skip-dead", want: "worker-c", wantOK: true},
+		{id: "tpl-dead-only"},
+		{id: "tpl-gone"},
+		{id: "tpl-never"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.id, func(t *testing.T) {
+			owner, ok := templateOwnerFromCatalog(c, tc.id)
+			if ok != tc.wantOK || owner.NodeID != tc.want {
+				t.Fatalf("owner = %q ok=%v, want %q ok=%v", owner.NodeID, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+
+	// A client without the FSM (an agent, the single-node Noop) has no
+	// catalogue to consult and must not pretend to.
+	if _, ok := templateOwnerFromCatalog(base, "tpl-fresh"); ok {
+		t.Fatal("a client without the catalogue lookup resolved an owner")
+	}
+}
+
 // TestV1CreateTemplate_Returns202 is the canonical happy path: POST
 // returns 202 + a PENDING row, and the background goroutine fires the
 // builder. This is the API-shape contract Phase 2 promises clients.
@@ -715,5 +779,40 @@ func TestV1DeleteTemplate_InUseReturns409(t *testing.T) {
 	env.handler.ServeHTTP(delRR, delReq)
 	if delRR.Code != http.StatusConflict {
 		t.Fatalf("delete status = %d, want 409; body=%s", delRR.Code, delRR.Body.String())
+	}
+}
+
+// Route-level T19 regression: GET /v1/templates/{id} for a template only the
+// catalogue knows about reaches its holder instead of returning the leader's
+// local 404.
+func TestClusterTemplateItemRoutesThroughCatalogueWhenGossipTrails(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	var hits int
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"tpl-fresh","name":"fresh","status":"pending"}`))
+	}))
+	defer peer.Close()
+	members := []cluster.Member{
+		{NodeID: "server-a", Alive: true, Role: config.NodeRoleServer},
+		{NodeID: "fc-1", APIURL: peer.URL, InternalURL: peer.URL, Alive: true, Role: config.NodeRoleWorker,
+			Capacity: capacity.Snapshot{SupportedRuntimes: []string{models.RuntimeFirecracker}, LocalTemplateCatalogInventoryKnown: true}},
+	}
+	base := &membersStubCluster{Noop: cluster.NewNoop("server-a", "http://server-a", ""), internalClient: http.DefaultClient, members: members}
+
+	// Without the catalogue the route has nowhere to send it: the old 404.
+	env.svc.AttachCluster(base)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates/tpl-fresh", nil))
+	if rr.Code != http.StatusNotFound || hits != 0 {
+		t.Fatalf("gossip-only status = %d hits=%d, want 404 and no peer call", rr.Code, hits)
+	}
+
+	env.svc.AttachCluster(&catalogStubCluster{membersStubCluster: base, holders: map[string][]string{"tpl-fresh": {"fc-1"}}})
+	rr = httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/templates/tpl-fresh", nil))
+	if rr.Code != http.StatusOK || hits != 1 || !strings.Contains(rr.Body.String(), "tpl-fresh") {
+		t.Fatalf("catalogue status = %d hits=%d body=%s, want 200 from the holder", rr.Code, hits, rr.Body.String())
 	}
 }

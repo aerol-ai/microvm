@@ -1566,3 +1566,65 @@ func TestArtifactCatalogStaleRejectionDoesNotCancelNewerAssembly(t *testing.T) {
 		t.Fatalf("the newer publisher's final chunk failed after an older one was refused: %v", err)
 	}
 }
+
+// ArtifactCatalogHolders is the point lookup template item routes fall back
+// to while gossip trails a create. It must name every committed holder,
+// follow a republish that drops the artifact, respect the tenant key, and
+// ignore a withdrawn node's coverage.
+func TestArtifactCatalogHoldersFollowsCommittedInventory(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-holders", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+
+	if got := c.ArtifactCatalogHolders(ArtifactKindTemplate, "", "tpl-1"); got != nil {
+		t.Fatalf("holders before any publish = %v, want none", got)
+	}
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-b", "inc-1", 1, catalogRows("", "tpl-1", "tpl-2")); err != nil {
+		t.Fatalf("publish worker-b: %v", err)
+	}
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-a", "inc-1", 1, catalogRows("", "tpl-2")); err != nil {
+		t.Fatalf("publish worker-a: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		kind, tenant string
+		id           string
+		want         []string
+	}{
+		{name: "single holder", kind: ArtifactKindTemplate, id: "tpl-1", want: []string{"worker-b"}},
+		{name: "every holder, sorted", kind: ArtifactKindTemplate, id: "tpl-2", want: []string{"worker-a", "worker-b"}},
+		{name: "unknown id", kind: ArtifactKindTemplate, id: "tpl-missing"},
+		{name: "other tenant", kind: ArtifactKindTemplate, tenant: "tenant-x", id: "tpl-1"},
+		{name: "other kind", kind: ArtifactKindJSBundle, id: "tpl-1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := c.ArtifactCatalogHolders(tc.kind, tc.tenant, tc.id); !slices.Equal(got, tc.want) {
+				t.Fatalf("holders = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// A republish without tpl-1 is a delete; the holder must go with it.
+	if err := publishWholeCatalog(ctx, c, ArtifactKindTemplate, "worker-b", "inc-1", 2, catalogRows("", "tpl-2")); err != nil {
+		t.Fatalf("republish worker-b: %v", err)
+	}
+	if got := c.ArtifactCatalogHolders(ArtifactKindTemplate, "", "tpl-1"); got != nil {
+		t.Fatalf("holders after delete = %v, want none", got)
+	}
+
+	// A withdrawn node's coverage is not a claim to hold anything.
+	if err := c.PublishArtifactCatalog(ctx, WithdrawArtifactCatalogCoverage(ArtifactKindTemplate, "worker-a", 1, 2)); err != nil {
+		t.Fatalf("withdraw worker-a: %v", err)
+	}
+	if got := c.ArtifactCatalogHolders(ArtifactKindTemplate, "", "tpl-2"); !slices.Equal(got, []string{"worker-b"}) {
+		t.Fatalf("holders after withdraw = %v, want [worker-b]", got)
+	}
+
+	var nilCluster *Cluster
+	if got := nilCluster.ArtifactCatalogHolders(ArtifactKindTemplate, "", "tpl-2"); got != nil {
+		t.Fatalf("nil cluster holders = %v, want none", got)
+	}
+}

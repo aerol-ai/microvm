@@ -1467,8 +1467,8 @@ queued. What is established and what is not:
 | S2 `cluster-3-mixed-secrets` | UC-117 green and non-vacuous | T12 criterion met |
 | S3 `cluster-3-mixed-secrets-kms` | 91 pass / 18 fail | first execution; see §7.7 |
 | S4 `cluster-3-mixed-secrets-enterprise` | **25 → 168 pass**, 95 → 29 fail | fix validated |
-| S6 `cluster-hetero-secrets-kms` | 105 pass / 9 fail at stop, **8 members formed** | first flagship ever to run |
-| S5 `cluster-hetero-secrets` | not run | old T18 incomplete (now T19, §7.10) |
+| S5 `cluster-hetero-secrets` | **124 pass / 7 fail / 44 skip** (T19, build `d51b30c3`) | 7 fails = 2 bugs, both fixed (#496/#497 + this PR) |
+| S6 `cluster-hetero-secrets-kms` | **124 pass / 7 fail / 44 skip** (T19, build `f24a8451` = #496+#497) | 6 fails = template read-after-create (#496 insufficient, fixed here); 1 = ingress reload resets TLS (TODO) |
 
 **The old T18 was NOT completed.** It asked for S5 + S6 and a published matrix; it is now split into T18 (no metal) and T19 (metal), §7.10. S6 ran
 but was stopped before finishing; S5 never ran with the gVisor fix. The
@@ -1514,6 +1514,20 @@ with a 3-node loopback regression test that replays the failure and is
 mutation-checked. UC-170 proves it live, and is why T18 exists in its current
 form: the cluster change needs a hetero run, and a hetero run should not need
 a c5.metal.
+
+### 7.12 T19 results (2026-09-28)
+
+Both flagship scenarios ran to completion on the shipped posture, with one
+c5.metal Firecracker worker. S5 ran the build uploaded at launch
+(`d51b30c3`). S6 rebuilt at its own launch, from `f24a8451`, so it already
+carried #496 and #497. That turned it into a live check of both.
+
+| Finding | Where | Verdict | Fix |
+|---|---|---|---|
+| `GET /templates/{id}` 404 ("sandbox not found") right after create: UC-47..50, UC-80, UC-93 | S5 + S6 | Real. The leader routes item requests from the **gossip** inventory, which trails a create by a heartbeat. #496 publishes to the Raft catalogue before create returns, but the item route never read the catalogue, so S6 still failed with #496 in. | #496 (publish) plus the route falling back to `ArtifactCatalogHolders` |
+| UC-84: a write to a read-only volume reported exit 0 | S5 (intermittent; passed in S6) | Real, in toolboxd. The PID-1 reaper's `wait4(-1)` stole exec children's statuses, and `ECHILD` was reported as 0. `ro` binds were verified as enforced on the node, and the write never reached S3. | #497 |
+| UC-09: `connection reset` on the TLS dial | S6 | Real, pre-existing. Another test's ingress route DELETE triggered a Caddy reload 0.41s into the handshake. | TODOS: ingress reload resets in-flight :443 |
+| S6 start was delayed ~5 min before HTTPS came up | S6 | The first boot Caddy config lacked S3 cert storage. Cert jobs were cancelled ("failed storage check") until Caddy reloaded with S3 storage. | TODOS |
 
 ### T18 / T19 — the split
 
@@ -1679,7 +1693,7 @@ and verified, not merely that code was written.
 | T16b | UC group M (§7 UC-167/168/169, D4) | T11 | UC-167 **fails**, exposing the isolate sweep gap; fix `removeOrphans` in the same PR | **CODE DONE** 2026-09-26 (PR #486). **Exit criterion is stale**: the `removeOrphans` fix already landed 2026-09-19, so UC-167 is written as a live confirmation, not an expected failure. It deliberately does NOT assert restart survival — `ListManaged` reads an in-memory map, and the crash case needs a host-backed seam that has not landed. |
 | T17 | Catalogue rows + row-count bump (`catalogue_test.go` `want = 299`) + new `catSEC()` category | T12-T16b | `make test` green offline | **DONE** 2026-09-26 (PR #486). 61 SEC rows, `want` 299 → **360**. The count was guarded in TWO places; the duplicate approximate guard (`287 ±15`) is removed so a new block updates one number. |
 | T18 | Hetero lite run: `cluster-hetero-lite-secrets` + `cluster-hetero-lite-kms` (S5/S6 topology without the c5.metal), publish reports | T1-T17, seed-rejoin fix | both columns in `reports/index.md`; UC-170 green | **DONE 2026-09-28.** KMS 119/2/54 (UC-170 PASS); secrets confirmation 110/2/52 with 11 not reached (stopped on the operator's call). Found 8 product bugs (all fixed, all passing live) and ~12 harness bugs; see §7.11. Only UC-160 (design gap) and UC-118 (harness race, fixed) remain red. |
-| T19 | Metal flagship: S5 + S6 (`cluster-hetero-secrets` + `-kms`, incl. 1× c5.metal), publish reports | T18 green | both columns in `reports/index.md`; Firecracker rows executed | **NOT STARTED.** `make integration-secrets-flagship`, ~$28 / ~2h. Needs operator sign-off for the spend. |
+| T19 | Metal flagship: S5 + S6 (`cluster-hetero-secrets` + `-kms`, incl. 1× c5.metal), publish reports | T18 green | both columns in `reports/index.md`; Firecracker rows executed | **RUN 2026-09-28** (§7.12). Both scenarios executed to completion and torn down (62 + 66 destroyed, 0 instances left). No cluster-correctness regressions: UC-160, UC-170, UC-132-group and the disruptive set passed on metal. Remaining reds are the template GET race (fixed in the §7.12 PR, not yet re-run live) and the ingress reload reset (TODOS). |
 
 T12 is the milestone that matters: **UC-117 green on S2** means the defect the
 whole secrets-hardening program exists to fix is proven fixed on real
