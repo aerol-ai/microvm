@@ -135,6 +135,28 @@ func TestIngressRoutingBootMatrix(t *testing.T) {
 	}
 }
 
+// Live finding: bootstrap restarts sandboxd back to back, so a process can
+// be refused because it is being stopped. That must not roll back the
+// previous boot's routing.
+func TestIngressRoutingRefusedWhileShuttingDownDoesNotRollBack(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{DBPath: filepath.Join(dir, "sandboxd.db"), IngressProxyRouting: true, HostPortRedirectPort: 21215}
+	marker := ingressRoutingMarkerPath(cfg)
+	if err := os.WriteFile(marker, []byte("true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc := &fakeRoutingService{startErr: context.Canceled}
+	b := startIngressRouting(ctx, cfg, svc, nopForwarder{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if got := strings.Join(svc.calls, ","); got != "start" || b.engaged() {
+		t.Fatalf("calls = %q engaged=%v, want start only", got, b.engaged())
+	}
+	if raw, _ := os.ReadFile(marker); strings.TrimSpace(string(raw)) != "true" {
+		t.Fatalf("marker = %q, want it kept", raw)
+	}
+}
+
 func TestIngressRoutingMarkerWriteFailureIsLoggedNotFatal(t *testing.T) {
 	cfg := config.Config{DBPath: "/nonexistent-dir/for/sure/sandboxd.db", IngressProxyRouting: true}
 	svc := &fakeRoutingService{}
