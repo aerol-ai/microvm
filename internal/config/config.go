@@ -1041,7 +1041,12 @@ type Config struct {
 	// responder, and on ingress Agents a versioned placement delta feed
 	// instead of the 5s full page-walk. Default off; per-node; rationale in
 	// setup/config-defaults.md. SB_INGRESS_PROXY_ROUTING.
-	IngressProxyRouting           bool
+	IngressProxyRouting bool
+	// RouteDNSAddr is the loopback address of the sandboxd route responder
+	// that the static Caddy routes query (plans/ingress-proxy-routing.md
+	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
+	// SB_ROUTE_DNS_ADDR.
+	RouteDNSAddr                  string
 	ClusterRaftCommitTimeout      time.Duration
 	ClusterCapacityGossipInterval time.Duration
 	// ClusterMaxAutoVoters caps gossip-driven Raft voter promotion. Additional
@@ -1742,6 +1747,7 @@ func Load() (Config, error) {
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
+		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),

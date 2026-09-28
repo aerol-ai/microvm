@@ -22,6 +22,11 @@ CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
 RUNSC_PATH=""
 WITH_ISOLATE="false"
+# Routing without per-sandbox Caddy writes (plans/ingress-proxy-routing.md).
+# Sets SB_INGRESS_PROXY_ROUTING and routes *.rt.internal to the sandboxd
+# route responder via systemd-resolved.
+INGRESS_PROXY_ROUTING="false"
+ROUTE_DNS_ADDR="127.0.0.1:53053"
 WORKERD_PATH=""
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -120,6 +125,10 @@ Options:
                                Skips the download step and registers this
                                binary instead. Only consulted with
                                --with-gvisor.
+  --ingress-proxy-routing      Route sandboxes without per-sandbox Caddy
+                               writes (static routes + sandboxd route
+                               responder; configures systemd-resolved for
+                               *.rt.internal). Off by default.
   --with-isolate               Install Cloudflare's workerd (version-pinned,
                                SHA-256 verified against hashes embedded in
                                this script) to /usr/local/bin/workerd and
@@ -398,6 +407,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--with-isolate)
 			WITH_ISOLATE="true"
+			shift
+			;;
+		--ingress-proxy-routing)
+			INGRESS_PROXY_ROUTING="true"
 			shift
 			;;
 		--workerd-path)
@@ -834,6 +847,8 @@ SB_L4_PORT_RANGE_END=23000
 # isn't needed for issuance. In IP/path mode (no --domain) this stays
 # empty and the layer4 multiplexer is never started.
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
+SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
+SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
@@ -1034,6 +1049,26 @@ write_caddy_env() {
 	} > /etc/default/caddy
 	chmod 0600 /etc/default/caddy
 	chown root:root /etc/default/caddy
+}
+
+# write_route_dns_resolver routes the ingress zone (and ONLY that zone) to the
+# sandboxd route responder. caddy-l4 dials "{sni}.rt.internal" through the
+# system resolver; sandboxd refuses SB_INGRESS_PROXY_ROUTING at boot if this
+# routing is missing (routedns.ProbeName), so a half-configured node stays on
+# the per-sandbox route path. Requires systemd-resolved >= 246 (DNS=ip:port).
+write_route_dns_resolver() {
+	if [[ "$INGRESS_PROXY_ROUTING" != "true" ]]; then
+		return
+	fi
+	mkdir -p /etc/systemd/resolved.conf.d
+	cat > /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf <<EOF
+[Resolve]
+DNS=$ROUTE_DNS_ADDR
+Domains=~rt.internal
+EOF
+	if systemctl is-active --quiet systemd-resolved; then
+		systemctl restart systemd-resolved
+	fi
 }
 
 write_caddy_systemd_dropin() {
@@ -1705,6 +1740,7 @@ install_binaries
 write_environment
 write_caddy_env
 write_caddy_systemd_dropin
+write_route_dns_resolver
 write_caddyfile
 write_systemd_unit
 write_healthcheck_script

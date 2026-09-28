@@ -14,12 +14,22 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 )
 
 // IngressZone is the suffix caddy-l4 appends to the SNI before dialing
 // ("{l4.tls.server_name}.rt.internal"). The node's resolver routes this
 // domain (and only this domain) to the responder.
-const IngressZone = "rt.internal"
+const IngressZone = caddy.RouteDNSZone
+
+// ProbeName is answered with ProbeIP so a boot check can prove the node's
+// SYSTEM resolver routes the ingress zone to this responder. caddy-l4 dials
+// through that resolver; a node whose routing domain is missing must not turn
+// the flag on.
+const (
+	ProbeName = "_aerolvm-route-probe." + IngressZone
+	ProbeIP   = "127.0.0.9"
+)
 
 // answerTTL is short on purpose: Caddy re-resolves every refresh interval
 // (1s), so a moved sandbox takes effect within about a second, with no
@@ -32,7 +42,7 @@ const answerTTL = 1
 // wrong port. Mismatches (WASM/isolate loopback upstreams, custom domains on
 // a bound port) answer NXDOMAIN and take the static fallback to the sandboxd
 // router, which resolves them properly.
-var portFromHost = regexp.MustCompile(`^[^.]+-([0-9]+)\.`)
+var portFromHost = regexp.MustCompile(caddy.SandboxPortHostRegexp)
 
 // DerivedPort is the port Caddy's static map yields for host.
 func DerivedPort(host string, toolboxPort int) int {
@@ -123,7 +133,9 @@ func (r *Responder) answer(name string, qtype uint16) (dns.RR, int) {
 	var ip net.IP
 	var cname string
 	var err error
-	if host, ok := strings.CutSuffix(name, "."+IngressZone); ok {
+	if name == ProbeName {
+		ip = net.ParseIP(ProbeIP)
+	} else if host, ok := strings.CutSuffix(name, "."+IngressZone); ok {
 		ip, cname, err = r.ingressTarget(host)
 	} else {
 		ip, err = r.ownerTarget(name)
