@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -634,6 +635,17 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			logger.Warn("failed to ensure caddy layer4 app at startup; will retry on first L4 exposure", "error", err)
 		}
 	}
+
+	// Ingress proxy routing (plans/ingress-proxy-routing.md §5): engage (or
+	// roll back) BEFORE the boot reconciles below, so they fill the
+	// in-memory route tables instead of writing Caddy. The Caddy side (one
+	// load) is committed once the router is serving.
+	var hostPortForwarder service.HostPortForwarder
+	if cfg.IngressProxyRouting || readBypassMarker(ingressRoutingMarkerPath(cfg)) {
+		hostPortForwarder = newHostPortForwarder(logger)
+	}
+	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
+	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means
 	// counters stay at zero until the next attempt at lazy bootstrap.
@@ -765,6 +777,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if cfg.AutoReconcile {
 			if err := svc.Reconcile(ctx); err != nil {
 				logger.Warn("initial reconcile failed", "error", err)
+			} else {
+				ownerReasserted = true
 			}
 			svc.StartReconcileLoop(ctx)
 		}
@@ -931,9 +945,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// without Caddy nothing routes to this listener). Both features
 	// share the same mux so they share one loopback listener.
 	var ingressServer *http.Server
-	if (cfg.EnableServerless || cfg.EnableCustomDomains) && cfg.EnableCaddy {
+	if (cfg.EnableServerless || cfg.EnableCustomDomains || routingBoot.engaged()) && cfg.EnableCaddy {
 		ingressMux := http.NewServeMux()
-		if cfg.EnableServerless {
+		if cfg.EnableServerless || routingBoot.engaged() {
 			ingressproxy.RegisterRoutes(ingressMux, ingressproxy.Deps{
 				Resolver:             svc,
 				Logger:               logger,
@@ -942,6 +956,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				MaxPendingPerSandbox: cfg.HTTPWakeMaxPendingPerSandbox,
 				MaxPendingGlobal:     cfg.HTTPWakeMaxPendingGlobal,
 				MaxBufferBytesGlobal: cfg.HTTPWakeMaxBufferBytesGlobal,
+				// The static routes' fallback (NXDOMAIN): wake, 503, 421,
+				// mediators. nil unless ingress proxy routing is engaged.
+				Hosts: routingBoot.hostRoutes(),
 			})
 		}
 		// Caddy on-demand TLS ask callback (plans/custom-domains.md).
@@ -1002,13 +1019,23 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		logger.Info("ingress proxy listening",
 			"addr", cfg.InternalIngressAddr,
 			"serverless", cfg.EnableServerless,
-			"custom_domains", cfg.EnableCustomDomains)
-		go func() {
-			if err := ingressServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("ingress proxy stopped unexpectedly", "error", err)
-				cancel()
-			}
-		}()
+			"custom_domains", cfg.EnableCustomDomains,
+			"ingress_proxy_routing", routingBoot.engaged())
+		ingressLn, err := net.Listen("tcp", cfg.InternalIngressAddr)
+		if err != nil {
+			logger.Error("ingress proxy failed to listen", "addr", cfg.InternalIngressAddr, "error", err)
+			cancel()
+		} else {
+			go func() {
+				if err := ingressServer.Serve(ingressLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					logger.Error("ingress proxy stopped unexpectedly", "error", err)
+					cancel()
+				}
+			}()
+			// The router is accepting now (listen succeeded), so the static
+			// routes' fallback is live before the per-sandbox routes go.
+			routingBoot.commit(ctx, svc, ownerReasserted)
+		}
 		if cfg.EnableServerless {
 			if err := svc.StartL4WakeProxy(ctx); err != nil {
 				logger.Error("l4 wake proxy failed to start", "error", err)

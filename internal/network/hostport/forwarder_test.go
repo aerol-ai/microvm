@@ -527,3 +527,39 @@ func TestForwarderSurfacesChangeAndReconcileErrors(t *testing.T) {
 		t.Fatal("invalid target on reconcile: want error")
 	}
 }
+
+// Boot: the re-assert pass Ensures every live exposure, then PruneUnasserted
+// drops what went away while sandboxd was down, and leaves the re-asserted
+// rules (and their established sessions) untouched.
+func TestForwarderPruneUnassertedAfterBootReassert(t *testing.T) {
+	m := newMem()
+	old := New(m, nil)
+	_ = old.Ensure(22000, dnat("10.0.0.5:5432", false))
+	_ = old.Ensure(22001, dnat("10.1.0.9:22001", true))
+
+	fl := &flushLog{}
+	f := New(m, fl.flush)
+	if err := f.Ensure(22000, dnat("10.0.0.5:5432", false)); err != nil { // re-asserted
+		t.Fatal(err)
+	}
+	deletesBefore := m.deletes
+	if err := f.PruneUnasserted(); err != nil {
+		t.Fatal(err)
+	}
+	nat := strings.Join(m.rules("nat", ChainNAT), "\n")
+	if strings.Contains(nat, "aerolvm-hp-22001") || !strings.Contains(nat, "10.0.0.5:5432") {
+		t.Fatalf("after prune:\n%s", nat)
+	}
+	if got := m.deletes - deletesBefore; got != 3 {
+		t.Fatalf("prune deleted %d rules, want only 22001's 3", got)
+	}
+	if len(fl.ports) != 1 || fl.ports[0] != 22001 {
+		t.Fatalf("flushed %v, want [22001]", fl.ports)
+	}
+
+	m.failOn = "ChainExists"
+	f2 := New(m, nil)
+	if err := f2.PruneUnasserted(); err == nil {
+		t.Fatal("want the chain bootstrap error")
+	}
+}

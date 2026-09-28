@@ -450,10 +450,20 @@ No critical gaps: every row has a test and handling.
   off on ingress-only roles; wildcard-only local fallback.
   - Surfaced by: T5.
   - Verify: the custom-domain tests.
-- [ ] **T9 (P1, human: ~1d / CC: ~45min):** internal/service. Flag wiring,
-  batched flag-on and flag-off loads, rollout matrix.
+- [x] **T9 (P1, human: ~1d / CC: ~45min):** internal/service + pkg/daemon +
+  pkg/caddy. Flag wiring, batched flag-on and flag-off loads, rollout matrix.
+  - `caddy.Client.Batch`: every admin call in the window goes to an
+    in-memory copy of the config, and the whole window becomes ONE
+    `/load`, including concurrent writers.
+  - Boot runs Start (before the reconciles, which fill the tables), then
+    Commit (once the router serves: static install + prune in one load,
+    then the host-port prune). A rollback uses the marker file and is one
+    load, re-asserting through the boot reconcile. A failed commit rolls
+    back rather than sit half-switched.
   - Surfaced by: Test issue 6 (6A) and T7.
-  - Verify: the 4-combination matrix plus one-load assertions.
+  - Verify: the owner cycle test (engage 0 writes → commit 1 load →
+    lifecycle 0 writes → rollback 1 load), the daemon boot matrix (flag ×
+    marker × role × failure), batch tests.
 - [ ] **T10 (P2, human: ~1d / CC: ~1h):** integration-tests. Churn UC
   (HTTP+TCP), restart UC, and the repro gate with the flag on.
   - Surfaced by: the §8 integration line.

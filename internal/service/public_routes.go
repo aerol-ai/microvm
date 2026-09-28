@@ -65,10 +65,19 @@ var _ publicRouteWriter = (*caddy.Client)(nil)
 // pre-4A behaviour (including a nil *caddy.Client, whose methods the call
 // sites already guard against).
 func (s *Service) publicRoutes() publicRouteWriter {
-	if s.routeWriter != nil {
-		return s.routeWriter
+	s.routeWriterMu.RLock()
+	w := s.routeWriter
+	s.routeWriterMu.RUnlock()
+	if w != nil {
+		return w
 	}
 	return s.caddy
+}
+
+func (s *Service) setRouteWriter(w publicRouteWriter) {
+	s.routeWriterMu.Lock()
+	s.routeWriter = w
+	s.routeWriterMu.Unlock()
 }
 
 // noopRouteWriter drops every per-sandbox route write. SB_INGRESS_PROXY_ROUTING

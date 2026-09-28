@@ -331,7 +331,10 @@ type Service struct {
 	// connLimiter (l4proxy.go).
 	// routeWriter, when set, replaces s.caddy for every per-sandbox route
 	// write (publicRoutes, eng review 4A). nil means the concrete client.
-	routeWriter publicRouteWriter
+	// Written only through setRouteWriter (routing mode switches at boot,
+	// while other goroutines already route).
+	routeWriter   publicRouteWriter
+	routeWriterMu sync.RWMutex
 
 	l4LimitersOnce sync.Once
 	l4Pending      *connLimiter

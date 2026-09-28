@@ -109,6 +109,16 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			want: "invalid SB_L4_PORT_RANGE_START/END",
 		},
 		{
+			name: "hostport redirect port inside the l4 pool",
+			env:  map[string]string{"SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "22500"},
+			want: "invalid SB_HOSTPORT_REDIRECT_PORT 22500",
+		},
+		{
+			name: "hostport redirect port out of range",
+			env:  map[string]string{"SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "0"},
+			want: "invalid SB_HOSTPORT_REDIRECT_PORT 0",
+		},
+		{
 			name: "node role without cluster",
 			env:  map[string]string{"SB_NODE_ROLE": "worker"},
 			want: "requires SB_ENABLE_CLUSTER=true",

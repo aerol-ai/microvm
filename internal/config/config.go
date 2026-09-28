@@ -1046,7 +1046,13 @@ type Config struct {
 	// that the static Caddy routes query (plans/ingress-proxy-routing.md
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
 	// SB_ROUTE_DNS_ADDR.
-	RouteDNSAddr                  string
+	RouteDNSAddr string
+	// HostPortRedirectPort is the sandboxd listener that raw-TCP host ports
+	// are REDIRECTed to under ingress proxy routing when the kernel can't
+	// DNAT them straight to the sandbox (stopped serverless sandboxes to
+	// wake, WASM/isolate loopback mediators). Keep it outside the L4 port
+	// pool. SB_HOSTPORT_REDIRECT_PORT.
+	HostPortRedirectPort          int
 	ClusterRaftCommitTimeout      time.Duration
 	ClusterCapacityGossipInterval time.Duration
 	// ClusterMaxAutoVoters caps gossip-driven Raft voter promotion. Additional
@@ -1748,6 +1754,7 @@ func Load() (Config, error) {
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
+		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
@@ -2221,6 +2228,11 @@ func Load() (Config, error) {
 
 	// L4 port pool sanity. Out-of-range or inverted bounds would silently
 	// brick raw-TCP exposure later; surface it at boot instead.
+	if cfg.IngressProxyRouting && (cfg.HostPortRedirectPort <= 0 || cfg.HostPortRedirectPort > 65535 ||
+		(cfg.HostPortRedirectPort >= cfg.L4PortRangeStart && cfg.HostPortRedirectPort <= cfg.L4PortRangeEnd)) {
+		return Config{}, fmt.Errorf("invalid SB_HOSTPORT_REDIRECT_PORT %d: require 1-65535 outside SB_L4_PORT_RANGE_START/END (%d-%d)",
+			cfg.HostPortRedirectPort, cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
