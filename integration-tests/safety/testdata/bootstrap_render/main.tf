@@ -29,6 +29,7 @@ locals {
     with_firecracker = false
     with_gvisor = false
     with_isolate = false
+    ingress_proxy_routing = false
     with_nvidia_gpu = false
     with_amd_gpu = false
     idle_timeout_min = 30

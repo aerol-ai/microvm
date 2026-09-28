@@ -111,6 +111,7 @@ Per-node fields:
 | `ami_id`            | latest Ubuntu 22.04 LTS amd64    |                                                  |
 | `with_firecracker`  | `var.default_with_firecracker`   | worker-capable nodes only; writes `SB_ENABLE_FIRECRACKER` and optional host downloads |
 | `with_gvisor`       | `var.default_with_gvisor`        | adds `--with-gvisor` to install.sh               |
+| `ingress_proxy_routing` | `var.default_ingress_proxy_routing` | adds `--ingress-proxy-routing` to install.sh |
 | `with_nvidia_gpu`   | `var.default_with_nvidia_gpu`    | adds `--with-nvidia-gpu` (driver must be loaded) |
 | `with_amd_gpu`      | `var.default_with_amd_gpu`       | adds `--with-amd-gpu` (x86_64 only)              |
 | `idle_timeout_min`  | `var.default_idle_timeout_min`   | sandbox auto-stop minutes; 0 disables            |

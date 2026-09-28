@@ -466,6 +466,18 @@ No critical gaps: every row has a test and handling.
     marker × role × failure), batch tests.
 - [ ] **T10 (P2, human: ~1d / CC: ~1h):** integration-tests. Churn UC
   (HTTP+TCP), restart UC, and the repro gate with the flag on.
+  - Code DONE:
+    - `CapIngressProxyRouting` capability;
+    - UC-171 churn gate (0 failed fresh HTTP/TCP connections while
+      sandboxes churn);
+    - UC-172 established TCP + HTTP keep-alive sessions survive a sandboxd
+      restart on the ingress and the owner;
+    - UC-173 no per-sandbox Caddy routes on any node;
+    - scenarios `cluster-3-mixed-routing` and `cluster-hetero-lite-routing`
+      (`default_ingress_proxy_routing`, threaded through Terraform to
+      `install.sh --ingress-proxy-routing`);
+    - `make integration-routing[-hetero-lite]`.
+  - Live runs outstanding (AWS spend, operator-run).
   - Surfaced by: the §8 integration line.
   - Verify: hetero-lite plus flagship with the flag on.
 
