@@ -106,6 +106,18 @@ func TestReportStorageObligationsGuards(t *testing.T) {
 	if len(cl.reports) != 0 {
 		t.Fatalf("a guarded node reported: %+v", cl.reports)
 	}
+	// A node with no identity yet, or an outbox that cannot be read, does
+	// not send a report (an empty report would claim "owes nothing").
+	noID := &Service{cfg: config.Config{EnableCluster: true, NodeRole: config.NodeRoleWorker}, store: st,
+		cluster: &obligationReportingCluster{Noop: cluster.NewNoop("", "", "")}}
+	noID.reportStorageObligations(ctx, time.Now())
+	broken := openSealTestStore(t)
+	_ = broken.Close()
+	unreadable := &Service{cfg: config.Config{EnableCluster: true, NodeRole: config.NodeRoleWorker}, store: broken, cluster: cl}
+	unreadable.reportStorageObligations(ctx, time.Now())
+	if len(cl.reports) != 0 {
+		t.Fatalf("an unreadable outbox produced a report: %+v", cl.reports)
+	}
 	if !owedMapsEqual(map[string]int{"a": 1, "b": 0}, map[string]int{"a": 1}) || owedMapsEqual(map[string]int{"a": 1}, map[string]int{"a": 2}) {
 		t.Fatal("owedMapsEqual must ignore zero entries and compare counts")
 	}

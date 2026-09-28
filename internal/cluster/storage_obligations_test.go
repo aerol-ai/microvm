@@ -399,3 +399,15 @@ func TestAckedDeletesDoNotCloseTheJob(t *testing.T) {
 		t.Fatal("ACKed deletes closed the job; only an attestation may")
 	}
 }
+
+func TestAgentStorageObligationsSurfacesAFailedRead(t *testing.T) {
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no", http.StatusServiceUnavailable)
+	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+	if _, err := agent.StorageObligations(context.Background()); err == nil {
+		t.Fatal("a failed control-plane read returned no error; the view would render as all-clear")
+	}
+	if !containsReporter([]StorageObligationReporter{{NodeID: "a"}}, "a") || containsReporter(nil, "a") {
+		t.Fatal("containsReporter")
+	}
+}

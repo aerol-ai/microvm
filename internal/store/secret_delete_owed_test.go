@@ -40,3 +40,19 @@ func TestSecretDeleteOwedByRecipient(t *testing.T) {
 		t.Fatal("a closed store returned no error")
 	}
 }
+
+// A row whose recipient list is not valid JSON must fail the count, not
+// silently drop that row's debts from the report.
+func TestSecretDeleteOwedByRecipientRejectsACorruptRow(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if err := st.UpsertSecretDeleteOutbox(ctx, "sb-1", "inc-1", []string{"worker-x"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE cluster_secret_delete_outbox SET recipients_json = 'not json'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SecretDeleteOwedByRecipient(ctx); err == nil {
+		t.Fatal("a corrupt outbox row was counted as owing nothing")
+	}
+}
