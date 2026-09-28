@@ -1035,7 +1035,13 @@ type Config struct {
 	// cluster.MaxReplicatedIngressRouteNodes. Above that size, each ingress
 	// node only owns a subset of sandbox routes; a random LB must not spray
 	// sandbox traffic across every ingress node. SB_CLUSTER_SHARD_AWARE_INGRESS.
-	ClusterShardAwareIngress      bool
+	ClusterShardAwareIngress bool
+	// IngressProxyRouting enables routing without per-sandbox Caddy writes
+	// (plans/ingress-proxy-routing.md): static Caddy routes, a sandboxd route
+	// responder, and on ingress Agents a versioned placement delta feed
+	// instead of the 5s full page-walk. Default off; per-node; rationale in
+	// setup/config-defaults.md. SB_INGRESS_PROXY_ROUTING.
+	IngressProxyRouting           bool
 	ClusterRaftCommitTimeout      time.Duration
 	ClusterCapacityGossipInterval time.Duration
 	// ClusterMaxAutoVoters caps gossip-driven Raft voter promotion. Additional
@@ -1735,6 +1741,7 @@ func Load() (Config, error) {
 		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
+		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),

@@ -125,6 +125,10 @@ type Agent struct {
 	// drained caches the control plane's drained set (drained_nodes.go).
 	drained drainedNodesCache
 
+	// feed is the placement delta feed (agent_placement_feed.go), started
+	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
+	feed *agentPlacementFeed
+
 	cfg           config.Config
 	logger        *slog.Logger
 	nodeID        string
@@ -271,6 +275,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	// the only automatic recreation loop belonged to *Cluster, and pkg/daemon's
 	// AttachRecreator probe silently skipped an Agent.
 	a.startOwnerWatcher()
+	a.startPlacementFeed()
 	return a, nil
 }
 
@@ -1051,6 +1056,11 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 		// fleet — simply no work, and no control-plane read either.
 		return nil
 	}
+	if out, ok := a.feedPlacements(filter); ok {
+		// The delta feed keeps the whole view current: no page walk.
+		recordPlacementCacheRefresh(time.Since(start), len(out), a.shardCacheEntryCount(), nil)
+		return out
+	}
 	out, err := a.fetchPlacementPages(filter)
 	if err != nil {
 		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",
@@ -1258,7 +1268,15 @@ func (a *Agent) PlacementVersion() uint64 {
 	return a.placementVersion.Load()
 }
 
-func (a *Agent) SubscribePlacement(context.Context) <-chan struct{} { return nil }
+// SubscribePlacement wakes the ingress reconciler on placement changes. Only
+// the delta feed can provide that on an Agent; without it (flag off), this is
+// nil and the reconciler runs on its timer, as before.
+func (a *Agent) SubscribePlacement(ctx context.Context) <-chan struct{} {
+	if a == nil || a.feed == nil {
+		return nil
+	}
+	return a.feed.subscribe(ctx)
+}
 
 func (a *Agent) Leader() string {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlaneRequestTimeout)
@@ -1273,6 +1291,7 @@ func (a *Agent) Leader() string {
 func (a *Agent) Close() error {
 	var firstErr error
 	a.stopOwnerWatcher()
+	a.stopPlacementFeed()
 	if a.gossip != nil {
 		if err := a.gossip.Close(); err != nil {
 			firstErr = fmt.Errorf("cluster agent: gossip close: %w", err)
