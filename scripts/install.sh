@@ -22,6 +22,11 @@ CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
 RUNSC_PATH=""
 WITH_ISOLATE="false"
+# Routing without per-sandbox Caddy writes (plans/ingress-proxy-routing.md).
+# Sets SB_INGRESS_PROXY_ROUTING and routes *.rt.internal to the sandboxd
+# route responder via systemd-resolved.
+INGRESS_PROXY_ROUTING="false"
+ROUTE_DNS_ADDR="127.0.0.1:53053"
 WORKERD_PATH=""
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -120,6 +125,10 @@ Options:
                                Skips the download step and registers this
                                binary instead. Only consulted with
                                --with-gvisor.
+  --ingress-proxy-routing      Route sandboxes without per-sandbox Caddy
+                               writes (static routes + sandboxd route
+                               responder; configures systemd-resolved for
+                               *.rt.internal). Off by default.
   --with-isolate               Install Cloudflare's workerd (version-pinned,
                                SHA-256 verified against hashes embedded in
                                this script) to /usr/local/bin/workerd and
@@ -398,6 +407,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--with-isolate)
 			WITH_ISOLATE="true"
+			shift
+			;;
+		--ingress-proxy-routing)
+			INGRESS_PROXY_ROUTING="true"
 			shift
 			;;
 		--workerd-path)
@@ -834,6 +847,8 @@ SB_L4_PORT_RANGE_END=23000
 # isn't needed for issuance. In IP/path mode (no --domain) this stays
 # empty and the layer4 multiplexer is never started.
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
+SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
+SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
@@ -1034,6 +1049,70 @@ write_caddy_env() {
 	} > /etc/default/caddy
 	chmod 0600 /etc/default/caddy
 	chown root:root /etc/default/caddy
+}
+
+# write_route_dns_resolver routes the ingress zone (and ONLY that zone) to the
+# sandboxd route responder. caddy-l4 dials "{sni}.rt.internal" through the
+# system resolver; sandboxd refuses SB_INGRESS_PROXY_ROUTING at boot if this
+# routing is missing (routedns.ProbeName), so a half-configured node stays on
+# the per-sandbox route path.
+#
+# WHY a dedicated dummy link, not a resolved.conf.d drop-in: DNS servers in
+# resolved's GLOBAL section serve every name, and Domains=~rt.internal there
+# does not restrict them. The responder then answered general lookups, and
+# Caddy's ACME zone detection broke ("expected 1 zone, got 0"), so no cert
+# issued (found live on cluster-3-mixed-routing). Per-link DNS with
+# DNSDefaultRoute=false is used ONLY for the link's routing domains.
+#
+# The link needs an address and no IPv6 autoconf, or networkd leaves it in
+# "configuring" and resolved ignores its DNS settings. Requires
+# systemd-networkd and systemd >= 249 (ActivationPolicy, DNS=ip:port).
+write_route_dns_resolver() {
+	if [[ "$INGRESS_PROXY_ROUTING" != "true" ]]; then
+		return
+	fi
+	# An earlier build wrote a global drop-in; it must go (see above).
+	if [[ -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf ]]; then
+		rm -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf
+	fi
+	if ! systemctl is-active --quiet systemd-networkd || ! systemctl is-active --quiet systemd-resolved; then
+		echo "WARNING: --ingress-proxy-routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
+		echo "         not configuring it. sandboxd will refuse the flag at boot and keep per-sandbox Caddy routes." >&2
+		return
+	fi
+	mkdir -p /etc/systemd/network
+	cat > /etc/systemd/network/10-aerolvm-rt.netdev <<'EOF'
+[NetDev]
+Name=aerolvm-rt
+Kind=dummy
+EOF
+	cat > /etc/systemd/network/10-aerolvm-rt.network <<EOF
+[Match]
+Name=aerolvm-rt
+
+[Link]
+RequiredForOnline=no
+ActivationPolicy=always-up
+
+[Network]
+ConfigureWithoutCarrier=yes
+DNS=$ROUTE_DNS_ADDR
+Domains=~rt.internal
+DNSDefaultRoute=false
+Address=169.254.53.53/32
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+EOF
+	systemctl restart systemd-networkd
+	systemctl restart systemd-resolved
+	local i
+	for i in $(seq 1 30); do
+		if resolvectl status aerolvm-rt 2>/dev/null | grep -q "Current Scopes: DNS"; then
+			return
+		fi
+		sleep 1
+	done
+	echo "WARNING: aerolvm-rt never got a DNS scope; sandboxd will refuse --ingress-proxy-routing at boot." >&2
 }
 
 write_caddy_systemd_dropin() {
@@ -1705,6 +1784,7 @@ install_binaries
 write_environment
 write_caddy_env
 write_caddy_systemd_dropin
+write_route_dns_resolver
 write_caddyfile
 write_systemd_unit
 write_healthcheck_script

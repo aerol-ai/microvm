@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"net"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/routedns"
@@ -46,4 +48,26 @@ func (s *Service) ingressMissLookup() routedns.MissLookup {
 		}
 		return c.PlacementOf(sandboxID)
 	}
+}
+
+// checkRouteResolver proves the node's resolver routes the ingress zone to
+// the route responder: it resolves routedns.ProbeName and expects
+// routedns.ProbeIP. caddy-l4 dials "{sni}.rt.internal" through that same
+// resolver, so a node without the routing domain would drop every sandbox
+// connection. The flag must refuse to engage there (plan §3.1). resolver nil
+// means the system resolver.
+func checkRouteResolver(ctx context.Context, resolver *net.Resolver) error {
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	addrs, err := resolver.LookupHost(ctx, routedns.ProbeName+".")
+	if err != nil {
+		return fmt.Errorf("route responder probe %s: %w (is *.%s routed to SB_ROUTE_DNS_ADDR? see install.sh --ingress-proxy-routing)", routedns.ProbeName, err, routedns.IngressZone)
+	}
+	for _, a := range addrs {
+		if a == routedns.ProbeIP {
+			return nil
+		}
+	}
+	return fmt.Errorf("route responder probe %s answered %v, want %s: *.%s is routed somewhere other than the sandboxd responder", routedns.ProbeName, addrs, routedns.ProbeIP, routedns.IngressZone)
 }

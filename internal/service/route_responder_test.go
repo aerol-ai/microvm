@@ -2,7 +2,12 @@ package service
 
 import (
 	"context"
+	"net"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/miekg/dns"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
@@ -69,5 +74,53 @@ func TestWatchIngressRouteIndexWithoutAWatcher(t *testing.T) {
 	empty := &Service{cfg: config.Config{}}
 	if _, ok := empty.ingressMissLookup()(context.Background(), "x"); ok {
 		t.Fatal("miss lookup without a cluster resolved")
+	}
+}
+
+func TestCheckRouteResolver(t *testing.T) {
+	r := &routedns.Responder{Domain: "d.test", Owner: routedns.NewOwnerTable(), Ingress: routedns.NewIngressIndex()}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &dns.Server{PacketConn: pc, Handler: r}
+	go func() { _ = srv.ActivateAndServe() }()
+	defer func() { _ = srv.Shutdown() }()
+	resolverFor := func(addr string) *net.Resolver {
+		return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", addr)
+		}}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := checkRouteResolver(ctx, resolverFor(pc.LocalAddr().String())); err != nil {
+		t.Fatalf("routed resolver failed the probe: %v", err)
+	}
+
+	// A resolver that routes the zone somewhere else (answers another IP).
+	other := &routedns.Responder{Domain: "d.test"}
+	pc2, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	srv2 := &dns.Server{PacketConn: pc2, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, m *dns.Msg) {
+		reply := new(dns.Msg)
+		reply.SetReply(m)
+		reply.Answer = append(reply.Answer, &dns.A{Hdr: dns.RR_Header{Name: m.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 1}, A: net.ParseIP("10.9.9.9")})
+		_ = w.WriteMsg(reply)
+	})}
+	go func() { _ = srv2.ActivateAndServe() }()
+	defer func() { _ = srv2.Shutdown() }()
+	_ = other
+	if err := checkRouteResolver(ctx, resolverFor(pc2.LocalAddr().String())); err == nil || !strings.Contains(err.Error(), "routed somewhere other") {
+		t.Fatalf("misrouted zone: err = %v, want a misrouting error", err)
+	}
+
+	// Nothing answers at all.
+	dead, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	deadAddr := dead.LocalAddr().String()
+	_ = dead.Close()
+	short, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel2()
+	if err := checkRouteResolver(short, resolverFor(deadAddr)); err == nil {
+		t.Fatal("an unreachable responder passed the probe")
 	}
 }
