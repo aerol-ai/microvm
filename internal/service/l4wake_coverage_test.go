@@ -19,12 +19,10 @@ import (
 )
 
 func TestProxyL4WakeConnDialFailWave10(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableServerless = true
 	now := time.Now().UTC()
-	if err := st.Create(ctx, &models.Sandbox{
+	if err := st.Create(context.Background(), &models.Sandbox{
 		ID: "sb-proxy", Image: "a", Status: models.SandboxStatusStarted, ContainerIP: "127.0.0.1",
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
@@ -33,6 +31,10 @@ func TestProxyL4WakeConnDialFailWave10(t *testing.T) {
 	client, server := netPipe(t)
 	defer client.Close()
 	defer server.Close()
+	// The 200ms bound is for the dial under test only. Setup (harness + a
+	// SQLite write) used to share it and ran it out on loaded -race runners.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
 	// Upstream port nothing listens on → dial fails inside readiness window.
 	svc.proxyL4WakeConn(ctx, "sb-proxy", 1, server, nil)
 }

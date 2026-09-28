@@ -27,6 +27,7 @@
 #            cluster-hetero-secrets | cluster-hetero-secrets-kms |
 #            cluster-hetero-lite-secrets | cluster-hetero-lite-kms |
 #            cluster-3-mixed-bench
+# Ingress proxy routing gate: cluster-3-mixed-routing | cluster-hetero-lite-routing
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the

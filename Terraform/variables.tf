@@ -231,6 +231,7 @@ variable "nodes" {
       with_firecracker (bool,    default var.default_with_firecracker)
       with_gvisor      (bool,    default var.default_with_gvisor)
       with_isolate     (bool,    default var.default_with_isolate)
+      ingress_proxy_routing (bool, default var.default_ingress_proxy_routing)
       with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
       with_amd_gpu     (bool,    default var.default_with_amd_gpu)
       idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
@@ -239,22 +240,23 @@ variable "nodes" {
       tags             (map(string), default {})
   EOT
   type = map(object({
-    role              = optional(string, "mixed")
-    seed              = optional(bool, false)
-    instance_type     = optional(string)
-    volume_size_gb    = optional(number)
-    volume_type       = optional(string)
-    volume_iops       = optional(number)
-    volume_throughput = optional(number)
-    ami_id            = optional(string)
-    arch              = optional(string)
-    with_firecracker  = optional(bool)
-    with_gvisor       = optional(bool)
-    with_isolate      = optional(bool)
-    with_nvidia_gpu   = optional(bool)
-    with_amd_gpu      = optional(bool)
-    idle_timeout_min  = optional(number)
-    extra_user_data   = optional(string, "")
+    role                  = optional(string, "mixed")
+    seed                  = optional(bool, false)
+    instance_type         = optional(string)
+    volume_size_gb        = optional(number)
+    volume_type           = optional(string)
+    volume_iops           = optional(number)
+    volume_throughput     = optional(number)
+    ami_id                = optional(string)
+    arch                  = optional(string)
+    with_firecracker      = optional(bool)
+    with_gvisor           = optional(bool)
+    with_isolate          = optional(bool)
+    ingress_proxy_routing = optional(bool)
+    with_nvidia_gpu       = optional(bool)
+    with_amd_gpu          = optional(bool)
+    idle_timeout_min      = optional(number)
+    extra_user_data       = optional(string, "")
     # sandboxd_env is merged OVER var.extra_sandboxd_env for this node, so a
     # hetero topology can give ingress-only and worker-only nodes different
     # SB_* profiles (audit rate limits, jail settings) from one node map.
@@ -370,6 +372,12 @@ variable "default_with_gvisor" {
 
 variable "default_with_isolate" {
   description = "Install Cloudflare workerd (version-pinned, SHA-256 verified) and write SB_ENABLE_ISOLATE=true so sandboxes can opt into the V8-isolate runtime (plans/isolate-runtime.md). Per-node override via nodes[*].with_isolate."
+  type        = bool
+  default     = false
+}
+
+variable "default_ingress_proxy_routing" {
+  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md): install.sh --ingress-proxy-routing writes SB_INGRESS_PROXY_ROUTING=true and routes *.rt.internal to the sandboxd route responder. Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing. Default off (setup/config-defaults.md)."
   type        = bool
   default     = false
 }

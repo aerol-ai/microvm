@@ -75,16 +75,17 @@ locals {
       )
       # bool defaults need explicit null handling — coalesce treats `false` as
       # a real value, but optional() without a default returns null.
-      with_firecracker = n.with_firecracker == null ? var.default_with_firecracker : n.with_firecracker
-      with_gvisor      = n.with_gvisor == null ? var.default_with_gvisor : n.with_gvisor
-      with_isolate     = n.with_isolate == null ? var.default_with_isolate : n.with_isolate
-      with_nvidia_gpu  = n.with_nvidia_gpu == null ? var.default_with_nvidia_gpu : n.with_nvidia_gpu
-      with_amd_gpu     = n.with_amd_gpu == null ? var.default_with_amd_gpu : n.with_amd_gpu
-      idle_timeout_min = n.idle_timeout_min == null ? var.default_idle_timeout_min : n.idle_timeout_min
-      extra_user_data  = n.extra_user_data
-      sandboxd_env     = n.sandboxd_env
-      tags             = n.tags
-      spot             = n.spot
+      with_firecracker      = n.with_firecracker == null ? var.default_with_firecracker : n.with_firecracker
+      with_gvisor           = n.with_gvisor == null ? var.default_with_gvisor : n.with_gvisor
+      with_isolate          = n.with_isolate == null ? var.default_with_isolate : n.with_isolate
+      ingress_proxy_routing = n.ingress_proxy_routing == null ? var.default_ingress_proxy_routing : n.ingress_proxy_routing
+      with_nvidia_gpu       = n.with_nvidia_gpu == null ? var.default_with_nvidia_gpu : n.with_nvidia_gpu
+      with_amd_gpu          = n.with_amd_gpu == null ? var.default_with_amd_gpu : n.with_amd_gpu
+      idle_timeout_min      = n.idle_timeout_min == null ? var.default_idle_timeout_min : n.idle_timeout_min
+      extra_user_data       = n.extra_user_data
+      sandboxd_env          = n.sandboxd_env
+      tags                  = n.tags
+      spot                  = n.spot
     }
   }
 

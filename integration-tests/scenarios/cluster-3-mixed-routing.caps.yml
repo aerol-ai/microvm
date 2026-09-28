@@ -1,0 +1,16 @@
+# cluster-3-mixed with ingress proxy routing on (plans/ingress-proxy-routing.md
+# T10). Every cluster-3-mixed UC runs against the static-route data path, plus
+# the routing gate (UC-171 churn, UC-172 restart survival, UC-173 no
+# per-sandbox Caddy routes).
+name: cluster-3-mixed-routing
+capabilities:
+  - docker
+  - platform-volumes
+  - domain
+  - cluster
+  - ingress-proxy-routing
+
+# UC-172 restarts sandboxd on the owner and the ingress nodes.
+disruptive: true
+
+expected_members: 3

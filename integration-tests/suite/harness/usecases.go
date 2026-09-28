@@ -34,9 +34,14 @@ const (
 	// the other isolate scenarios still run jail-off, so their UC-103..105
 	// coverage is unaffected by a jail regression and vice versa.
 	CapIsolateJail Capability = "isolate-jail"
-	CapGPU         Capability = "gpu"     // a GPU worker
-	CapDomain      Capability = "domain"  // public domain + TLS (not local-mode)
-	CapCluster     Capability = "cluster" // multi-node cluster (raft/forwarding)
+	// CapIngressProxyRouting: every node runs SB_INGRESS_PROXY_ROUTING
+	// (plans/ingress-proxy-routing.md). Caddy has static routes only,
+	// sandboxd answers "where" over loopback DNS, and raw TCP host ports are
+	// kernel-DNATed. Gates the routing gate UC-171..173.
+	CapIngressProxyRouting Capability = "ingress-proxy-routing"
+	CapGPU                 Capability = "gpu"     // a GPU worker
+	CapDomain              Capability = "domain"  // public domain + TLS (not local-mode)
+	CapCluster             Capability = "cluster" // multi-node cluster (raft/forwarding)
 	// CapMixedArchNegative gates UC-79: inject a foreign-arch snapshot ref and
 	// assert the arm64 cluster refuses to resume it.
 	CapMixedArchNegative Capability = "mixed-arch-negative"
@@ -182,7 +187,7 @@ type UseCase struct {
 // is supposed to catch typos.
 var KnownCapabilities = map[Capability]bool{
 	CapDocker: true, CapFirecracker: true, CapGvisor: true, CapWasm: true,
-	CapIsolate: true, CapIsolateJail: true, CapGPU: true, CapDomain: true,
+	CapIsolate: true, CapIsolateJail: true, CapGPU: true, CapDomain: true, CapIngressProxyRouting: true,
 	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
 	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true,
 	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
@@ -557,6 +562,13 @@ var Registry = []UseCase{
 
 	// N. Control-plane resilience (TODOS.md "Losing the seed").
 	{ID: "UC-170", Title: "Stopping the seed: the survivors keep a leader, and the restarted seed rejoins Raft with no configured peers", Requires: []Capability{CapCluster}, Implemented: true},
+
+	// O. Ingress proxy routing (plans/ingress-proxy-routing.md T10). The
+	// churn gate is the live form of scripts/dev/caddy-reload-repro.py:
+	// 0 failed connections while sandboxes churn.
+	{ID: "UC-171", Title: "Churn gate: fresh HTTP and raw-TCP connections to a stable sandbox never fail while other sandboxes are created, exposed and destroyed", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
+	{ID: "UC-172", Title: "Established raw-TCP and HTTP keep-alive sessions survive a sandboxd restart on the owner and the ingress", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
+	{ID: "UC-173", Title: "A live public sandbox has no per-sandbox Caddy route on any node: routing is static routes plus the responder", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

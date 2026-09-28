@@ -21,6 +21,7 @@ BIN_DIR ?= bin
 	integration-secrets-enterprise integration-secrets-hetero integration-secrets-hetero-kms \
 	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
 	integration-secrets-hetero-lite integration-secrets-hetero-lite-kms integration-secrets-hetero-lite-pair \
+	integration-routing integration-routing-hetero-lite \
 	integration-bench-cluster
 
 fmt:
@@ -169,6 +170,17 @@ integration-secrets-hetero-lite:
 
 integration-secrets-hetero-lite-kms:
 	integration-tests/run.sh cluster-hetero-lite-kms $(RUN_FLAGS)
+
+# Ingress proxy routing gate (plans/ingress-proxy-routing.md T10): the same
+# topologies with SB_INGRESS_PROXY_ROUTING on every node. UC-171 (churn: 0
+# failed fresh HTTP/TCP connections), UC-172 (sessions survive a sandboxd
+# restart), UC-173 (no per-sandbox Caddy routes). Run the cheap 3-mixed pair
+# first, then hetero-lite, which covers the ingress-only → worker path.
+integration-routing:
+	integration-tests/run.sh cluster-3-mixed-routing $(RUN_FLAGS)
+
+integration-routing-hetero-lite:
+	integration-tests/run.sh cluster-hetero-lite-routing $(RUN_FLAGS)
 
 integration-secrets-hetero-lite-pair: integration-secrets-hetero-lite integration-secrets-hetero-lite-kms
 

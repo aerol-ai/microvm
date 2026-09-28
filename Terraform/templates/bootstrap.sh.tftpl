@@ -5,7 +5,7 @@
 # Variables expected:
 #   node_name, role, is_seed (bool),
 #   pat_token, domain, cloudflare_api_token,
-#   with_firecracker (bool), with_gvisor (bool), with_isolate (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
+#   with_firecracker (bool), with_gvisor (bool), with_isolate (bool), ingress_proxy_routing (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
 #   idle_timeout_min (number; 0 disables),
 #   firecracker_binary_url, firecracker_jailer_url, firecracker_kernel_url,
 #   firecracker_kernel_config_url, firecracker_auto_install,
@@ -161,6 +161,9 @@ INSTALL_ARGS+=(--with-gvisor)
 %{ endif ~}
 %{ if with_isolate ~}
 INSTALL_ARGS+=(--with-isolate)
+%{ endif ~}
+%{ if ingress_proxy_routing ~}
+INSTALL_ARGS+=(--ingress-proxy-routing)
 %{ endif ~}
 %{ if with_nvidia_gpu ~}
 INSTALL_ARGS+=(--with-nvidia-gpu)
