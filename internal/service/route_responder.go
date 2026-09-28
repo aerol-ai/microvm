@@ -14,7 +14,10 @@ import (
 // changes from whichever watcher this node has (an Agent's delta feed, or a
 // server's own change log) and applies them in O(changes). It reports false
 // when there is no watcher (the flag is off on an Agent, or single-node).
-func (s *Service) watchIngressRouteIndex(ctx context.Context, idx *routedns.IngressIndex) bool {
+//
+// synced (optional) runs after every full view is applied; the first call
+// means the index holds the whole fleet.
+func (s *Service) watchIngressRouteIndex(ctx context.Context, idx *routedns.IngressIndex, synced ...func()) bool {
 	w, ok := s.Cluster().(cluster.PlacementChangeWatcher)
 	if !ok || idx == nil {
 		return false
@@ -23,6 +26,9 @@ func (s *Service) watchIngressRouteIndex(ctx context.Context, idx *routedns.Ingr
 	return w.WatchPlacementChanges(ctx, func(full []cluster.Placement, changes []cluster.PlacementChange) {
 		if full != nil {
 			idx.Replace(full, domain)
+			for _, fn := range synced {
+				fn()
+			}
 		}
 		applyIngressIndexChanges(idx, changes, domain)
 	})

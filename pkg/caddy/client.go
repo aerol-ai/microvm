@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -26,6 +27,12 @@ type Client struct {
 	l4TLSListen   string
 	l4TLSFallback string
 	httpClient    *http.Client
+
+	// gate/batch route admin requests into an open Batch (batch.go).
+	// batchMu serializes batches.
+	gate    sync.RWMutex
+	batch   *configEmulator
+	batchMu sync.Mutex
 }
 
 func New(cfg config.Config) *Client {
@@ -94,7 +101,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -659,7 +666,7 @@ func (c *Client) DeleteTCPServer(ctx context.Context, serverID string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("delete l4 server: %w", err)
 	}
@@ -681,7 +688,7 @@ func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("delete caddy route: %w", err)
 	}
@@ -722,7 +729,7 @@ func (c *Client) sendJSONDetail(ctx context.Context, method, target string, body
 		return 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return 0, "", fmt.Errorf("%s %s: %w", method, target, err)
 	}
@@ -935,7 +942,7 @@ func (c *Client) hasOnDemandPolicy(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return false, fmt.Errorf("get policies: %w", err)
 	}
@@ -1244,7 +1251,7 @@ func (c *Client) DeleteTCPRoute(ctx context.Context, hostPort int) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("delete tcp server: %w", err)
 	}
@@ -1459,7 +1466,7 @@ func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return snap, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return snap, fmt.Errorf("get caddy config: %w", err)
 	}
@@ -1488,7 +1495,7 @@ func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
 
 	for _, server := range cfg.Apps.HTTP.Servers {
 		for _, route := range server.Routes {
-			if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") {
+			if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") && !IsStaticRouteID(id) {
 				snap.HTTPRouteIDs = append(snap.HTTPRouteIDs, id)
 			}
 		}
@@ -1499,7 +1506,7 @@ func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
 		}
 		if serverID == tlsMuxServerID {
 			for _, route := range server.Routes {
-				if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") {
+				if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") && !IsStaticRouteID(id) {
 					snap.L4TLSRouteIDs = append(snap.L4TLSRouteIDs, id)
 				}
 			}
@@ -1516,7 +1523,7 @@ func (c *Client) pathExists(ctx context.Context, path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return false, fmt.Errorf("get %s: %w", path, err)
 	}
@@ -1541,7 +1548,7 @@ func (c *Client) getConfigMap(ctx context.Context, path string) (map[string]any,
 	if err != nil {
 		return nil, false, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, false, fmt.Errorf("get %s: %w", path, err)
 	}

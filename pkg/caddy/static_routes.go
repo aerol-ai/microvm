@@ -216,7 +216,7 @@ func (c *Client) getRouteList(ctx context.Context, path string) ([]map[string]an
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("get %s: %w", path, err)
 	}
@@ -239,4 +239,56 @@ func (c *Client) getRouteList(ctx context.Context, path string) ([]map[string]an
 		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
 	return routes, nil
+}
+
+// IsStaticRouteID reports the static routes' ids. They share the "sandbox-"
+// prefix with per-sandbox routes, so anything that sweeps that prefix
+// (Snapshot, reconcile GC, PruneDynamicRoutes) must skip them.
+func IsStaticRouteID(id string) bool {
+	switch id {
+	case StaticSandboxRouteID, StaticLoopbackRouteID, StaticApexSNIRouteID, StaticSNIRouteID:
+		return true
+	}
+	return false
+}
+
+// PruneDynamicRoutes deletes what the static routes replace (plan §4):
+//   - every per-sandbox http route;
+//   - every ingress "-ingress-sni" passthrough route in tls-mux;
+//   - every tcp-port-* layer4 server (raw TCP moves to kernel forwarding).
+//
+// The owner's protocol=tls SNI routes stay: they are still Caddy-written
+// (a rare write per expose, plan §3). Call it inside Batch so the whole
+// prune is one load. It reports how many entries it removed.
+func (c *Client) PruneDynamicRoutes(ctx context.Context) (int, error) {
+	if !c.enabled {
+		return 0, nil
+	}
+	snap, err := c.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, id := range snap.HTTPRouteIDs {
+		if err := c.deleteRoute(ctx, id); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	for _, id := range snap.L4TLSRouteIDs {
+		if !strings.HasSuffix(id, "-ingress-sni") {
+			continue
+		}
+		if err := c.deleteRoute(ctx, id); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	for _, id := range snap.L4TCPServerIDs {
+		if err := c.DeleteTCPServer(ctx, id); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
 }

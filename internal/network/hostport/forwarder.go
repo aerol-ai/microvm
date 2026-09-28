@@ -345,6 +345,30 @@ func (f *Forwarder) Reconcile(desired map[int]Target) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.reconcileLocked(desired)
+}
+
+// PruneUnasserted is Reconcile with desired = every rule asserted through
+// Ensure since this process started. Call it after the boot re-assert pass
+// (owner reconcile + ingress reconcile) has replayed every live exposure:
+// what's left in the kernel belongs to exposures that went away while
+// sandboxd was down. Stale rules are dangerous: a reused container IP
+// would expose the new sandbox's port. The desired set is taken under the
+// same lock, so a concurrent Ensure is never pruned.
+func (f *Forwarder) PruneUnasserted() error {
+	if err := f.ensureChains(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	desired := make(map[int]Target, len(f.rules))
+	for hp, t := range f.rules {
+		desired[hp] = t
+	}
+	return f.reconcileLocked(desired)
+}
+
+func (f *Forwarder) reconcileLocked(desired map[int]Target) error {
 	stale := map[int]bool{}
 	for _, c := range []struct{ table, chain string }{{"nat", ChainNAT}, {"nat", ChainPost}, {"filter", ChainFwd}} {
 		rules, err := f.b.List(c.table, c.chain)
