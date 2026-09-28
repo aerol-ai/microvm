@@ -1,11 +1,13 @@
 package cluster
 
 import (
+	"context"
 	"errors"
 	"math"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -677,5 +679,82 @@ func TestSelectPlacementRejectsRuntimeWithNoCapableWorker(t *testing.T) {
 
 	if _, err := c.SelectPlacement(capacity.Request{CPU: 1, MemoryMB: 100, Runtime: models.RuntimeWasm}); !errors.Is(err, ErrNoPlacementTarget) {
 		t.Fatalf("SelectPlacement for wasm with no wasm worker = %v, want ErrNoPlacementTarget", err)
+	}
+}
+
+// T19 S5 regression (UC-80): a template that just became ready is in the
+// replicated catalogue but not yet in any gossiped LocalTemplateIDs. The
+// template filter must not read that as an authoritative "no" on the node the
+// catalogue names, or a create from a fresh template has no target at all.
+func TestCatalogueTemplateHolderPassesTheTemplateFilter(t *testing.T) {
+	c, cleanup := newTestCluster(t, "srv-tpl-holder", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	if err := publishWholeCatalog(context.Background(), c, ArtifactKindTemplate, "fc-1", "inc-1", 1, catalogRows("", "tpl-fresh")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	snap := func(ids ...string) capacity.Snapshot {
+		return capacity.Snapshot{
+			HostCPUCores: 8, HostMemoryTotalMB: 8000, CPUBudget: 8, MemoryBudgetMB: 8000,
+			LocalTemplateInventoryKnown: true, LocalTemplateIDs: ids,
+		}
+	}
+	gossipIDs := []string{"tpl-old"}
+	members := []Member{
+		{NodeID: "fc-1", APIURL: "http://fc-1", Alive: true, Capacity: snap(gossipIDs...)},
+		{NodeID: "fc-2", APIURL: "http://fc-2", Alive: true, Capacity: snap("tpl-old")},
+		{NodeID: "fc-unknown", APIURL: "http://fc-u", Alive: true, Capacity: capacity.Snapshot{
+			HostCPUCores: 8, HostMemoryTotalMB: 8000, CPUBudget: 8, MemoryBudgetMB: 8000}},
+	}
+	req := capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-fresh"}
+
+	if nodeFits(members[0], req, capacity.Request{}) {
+		t.Fatal("precondition: gossip alone must reject the fresh template on fc-1")
+	}
+	got := c.withCatalogueTemplateHolders(members, req.TemplateID)
+
+	tests := []struct {
+		node string
+		want bool
+	}{
+		{node: "fc-1", want: true},       // catalogue holder: admitted
+		{node: "fc-2", want: false},      // authoritative inventory, not a holder: still rejected
+		{node: "fc-unknown", want: true}, // unknown inventory: "unknown, allow" as before
+	}
+	byID := map[string]Member{}
+	for _, m := range got {
+		byID[m.NodeID] = m
+	}
+	for _, tc := range tests {
+		if fits := nodeFits(byID[tc.node], req, capacity.Request{}); fits != tc.want {
+			t.Errorf("nodeFits(%s) = %v, want %v", tc.node, fits, tc.want)
+		}
+	}
+
+	// The gossip snapshot the caller passed in must not be mutated.
+	if len(members[0].Capacity.LocalTemplateIDs) != 1 || len(gossipIDs) != 1 {
+		t.Fatalf("input member inventory mutated: %v", members[0].Capacity.LocalTemplateIDs)
+	}
+	// Unknown inventory keeps its nil slice: the merge runs only for
+	// authoritative lists.
+	if byID["fc-unknown"].Capacity.LocalTemplateIDs != nil {
+		t.Fatalf("unknown inventory gained a list: %v", byID["fc-unknown"].Capacity.LocalTemplateIDs)
+	}
+
+	// Admission re-checks the chosen owner with the same filter; with the
+	// catalogue applied, the reservation placement picked must be admitted.
+	spec := &models.CreateSandboxRequest{CPU: 1, MemoryMB: 100, TemplateID: "tpl-fresh"}
+	res := []reservationCommand{{SandboxID: "sb-1", OwnerNodeID: "fc-1", Spec: spec}}
+	if err := admitReservationCommands(members, nil, map[string]int{}, 0, res); err == nil {
+		t.Fatal("precondition: admission on gossip alone must reject fc-1")
+	}
+	if err := admitReservationCommands(got, nil, map[string]int{}, 0, res); err != nil {
+		t.Fatalf("admission with the catalogue applied rejected the holder: %v", err)
+	}
+
+	// No template, or one the catalogue doesn't know: members pass through.
+	if out := c.withCatalogueTemplateHolders(members, "", "tpl-nobody"); &out[0] != &members[0] {
+		t.Fatal("no holders should return the input slice untouched")
 	}
 }
