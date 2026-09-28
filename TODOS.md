@@ -247,6 +247,23 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true, plus a soak
   of about one release cycle.
 
+## L4 splice drops the response after a client half-close
+
+- **What:** Make `spliceConns` (`internal/service/l4proxy.go`) wait for
+  **both** directions, bounded by an idle timeout, instead of closing both
+  sides when the first direction ends.
+- **Why:** Found while testing the 3A extraction (2026-09-28). A client that
+  sends its request, then half-closes its write side, never receives the
+  response. That affects netcat-style and some database and RPC clients. The
+  L4 wake proxy has always behaved this way; the extraction preserved it.
+- **Pros:** correct TCP semantics for half-closing clients.
+- **Cons:** waiting for both sides needs an idle timeout, so a peer that never
+  closes cannot pin goroutines and caps slots.
+- **Start:** the `<-done` in `spliceConns`. The contract is pinned by
+  `TestSpliceConnsWritesBufferedPrefixFirst`; change that test with the fix.
+- **Depends on:** nothing. It matters more once sandboxd owns raw TCP host
+  ports (plans/ingress-proxy-routing.md §3.5).
+
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 
 - **What:** Decide whether `upsertRoute` should retry a dropped connection the

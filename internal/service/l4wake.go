@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -109,28 +108,6 @@ func (s *Service) handleL4WakeTCPConn(conn net.Conn) {
 	}
 
 	s.proxyL4WakeConn(context.Background(), exposure.SandboxID, exposure.Port, conn, br)
-}
-
-func readProxyV1DestinationPort(br *bufio.Reader) (int, error) {
-	line, err := br.ReadSlice('\n')
-	if errors.Is(err, bufio.ErrBufferFull) {
-		return 0, errors.New("proxy protocol header too large")
-	}
-	if err != nil {
-		return 0, fmt.Errorf("read proxy protocol header: %w", err)
-	}
-	fields := strings.Fields(strings.TrimSpace(string(line)))
-	if len(fields) != 6 || fields[0] != "PROXY" {
-		return 0, fmt.Errorf("malformed proxy protocol header %q", strings.TrimSpace(string(line)))
-	}
-	if fields[1] != "TCP4" && fields[1] != "TCP6" {
-		return 0, fmt.Errorf("unsupported proxy protocol family %q", fields[1])
-	}
-	dstPort, err := strconv.Atoi(fields[5])
-	if err != nil || dstPort <= 0 || dstPort > 65535 {
-		return 0, fmt.Errorf("invalid proxy protocol destination port %q", fields[5])
-	}
-	return dstPort, nil
 }
 
 // WakeAwareL4PortTarget resolves a raw TCP upstream, ensuring the sandbox is
@@ -256,99 +233,67 @@ func (s *Service) proxyL4WakeConn(ctx context.Context, id string, port int, down
 
 	_ = s.TouchSandbox(ctx, id)
 
-	downstreamReader := io.Reader(downstream)
-	if buffered != nil {
-		downstreamReader = io.MultiReader(buffered, downstream)
+	if err := spliceConns(downstream, upstream, buffered); err != nil {
+		s.logger.Warn("l4 wake splice failed", "sandbox_id", id, "port", port, "error", err)
 	}
+}
 
-	done := make(chan struct{}, 2)
-	go proxyCopyAndCloseWrite(upstream, downstreamReader, done)
-	go proxyCopyAndCloseWrite(downstream, upstream, done)
-	<-done
-	_ = downstream.Close()
-	_ = upstream.Close()
+// l4Limiters returns the wake proxy's pending and active limiters, created
+// on first use so a zero-value Service (as tests build it) works.
+func (s *Service) l4Limiters() (pending, active *connLimiter) {
+	s.l4LimitersOnce.Do(func() {
+		s.l4Pending = newConnLimiter(s.l4WakeMaxPendingPerSandbox, s.l4WakeMaxPendingGlobal)
+		s.l4Active = newConnLimiter(s.l4WakeMaxActivePerSandbox, s.l4WakeMaxActiveGlobal)
+	})
+	return s.l4Pending, s.l4Active
 }
 
 func (s *Service) tryAcquireL4Pending(id string) (func(), bool) {
-	perSandboxMax := s.l4WakeMaxPendingPerSandbox()
-	globalMax := s.l4WakeMaxPendingGlobal()
-
-	s.l4LimitMu.Lock()
-	defer s.l4LimitMu.Unlock()
-	if s.l4PendingBySandbox == nil {
-		s.l4PendingBySandbox = make(map[string]int)
-	}
-	if s.l4PendingBySandbox[id] >= perSandboxMax || s.l4PendingGlobal >= globalMax {
-		return nil, false
-	}
-	s.l4PendingBySandbox[id]++
-	s.l4PendingGlobal++
-	return func() {
-		s.releaseL4Pending(id)
-	}, true
+	pending, _ := s.l4Limiters()
+	return pending.tryAcquire(id, nil, nil)
 }
 
-func (s *Service) releaseL4Pending(id string) {
-	s.l4LimitMu.Lock()
-	defer s.l4LimitMu.Unlock()
-	if s.l4PendingBySandbox[id] <= 1 {
-		delete(s.l4PendingBySandbox, id)
-	} else {
-		s.l4PendingBySandbox[id]--
-	}
-	if s.l4PendingGlobal > 0 {
-		s.l4PendingGlobal--
-	}
-}
-
+// tryAcquireL4Active admits one proxied connection. The first connection for
+// a sandbox starts one activity ticker, keyed by a generation, so a ticker
+// from an earlier burst stops instead of touching on behalf of the new one.
 func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
-	perSandboxMax := s.l4WakeMaxActivePerSandbox()
-	globalMax := s.l4WakeMaxActiveGlobal()
+	_, active := s.l4Limiters()
 	var (
 		startTicker bool
 		generation  uint64
 	)
-
-	s.l4LimitMu.Lock()
-	if s.l4ActiveBySandbox == nil {
-		s.l4ActiveBySandbox = make(map[string]int)
-	}
-	if s.l4ActivityGenerations == nil {
-		s.l4ActivityGenerations = make(map[string]uint64)
-	}
-	if s.l4ActiveBySandbox[id] >= perSandboxMax || s.l4ActiveGlobal >= globalMax {
-		s.l4LimitMu.Unlock()
-		return nil, false
-	}
-	if s.l4ActiveBySandbox[id] == 0 {
+	release, ok := active.tryAcquire(id, func(first bool) {
+		if !first {
+			return
+		}
+		if s.l4ActivityGenerations == nil {
+			s.l4ActivityGenerations = make(map[string]uint64)
+		}
 		s.l4ActivitySeq++
 		generation = s.l4ActivitySeq
 		s.l4ActivityGenerations[id] = generation
 		startTicker = true
+	}, func(last bool) {
+		if last {
+			delete(s.l4ActivityGenerations, id)
+		}
+	})
+	if !ok {
+		return nil, false
 	}
-	s.l4ActiveBySandbox[id]++
-	s.l4ActiveGlobal++
-	s.l4LimitMu.Unlock()
 	if startTicker {
 		go s.touchDuringL4Activity(id, generation)
 	}
-	return func() {
-		s.releaseL4Active(id)
-	}, true
+	return release, true
 }
 
-func (s *Service) releaseL4Active(id string) {
-	s.l4LimitMu.Lock()
-	defer s.l4LimitMu.Unlock()
-	if s.l4ActiveBySandbox[id] <= 1 {
-		delete(s.l4ActiveBySandbox, id)
-		delete(s.l4ActivityGenerations, id)
-	} else {
-		s.l4ActiveBySandbox[id]--
-	}
-	if s.l4ActiveGlobal > 0 {
-		s.l4ActiveGlobal--
-	}
+// l4ActivityGeneration reads the current activity generation for id under
+// the active limiter's lock (tests and diagnostics).
+func (s *Service) l4ActivityGeneration(id string) uint64 {
+	_, active := s.l4Limiters()
+	var gen uint64
+	active.withLock(id, func(int) { gen = s.l4ActivityGenerations[id] })
+	return gen
 }
 
 func (s *Service) touchDuringL4Activity(id string, generation uint64) {
@@ -370,9 +315,12 @@ func (s *Service) touchDuringL4Activity(id string, generation uint64) {
 }
 
 func (s *Service) l4ActivityStillActive(id string, generation uint64) bool {
-	s.l4LimitMu.Lock()
-	defer s.l4LimitMu.Unlock()
-	return s.l4ActiveBySandbox[id] > 0 && s.l4ActivityGenerations[id] == generation
+	_, active := s.l4Limiters()
+	var still bool
+	active.withLock(id, func(count int) {
+		still = count > 0 && s.l4ActivityGenerations[id] == generation
+	})
+	return still
 }
 
 func (s *Service) l4WakeMaxPendingPerSandbox() int {
@@ -401,16 +349,6 @@ func (s *Service) l4WakeMaxActiveGlobal() int {
 		return s.cfg.L4WakeMaxActiveGlobal
 	}
 	return defaultL4WakeMaxActiveGlobal
-}
-
-func proxyCopyAndCloseWrite(dst net.Conn, src io.Reader, done chan<- struct{}) {
-	_, _ = io.Copy(dst, src)
-	if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-	} else {
-		_ = dst.Close()
-	}
-	done <- struct{}{}
 }
 
 func (s *Service) ensureTLSWakeListener(id string, port int) (string, error) {
