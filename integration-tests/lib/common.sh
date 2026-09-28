@@ -333,8 +333,13 @@ stage_wasm_modules() {
 
 # wait_for_health <base_url> <pat> [timeout_s]
 # Polls /v1/capacity (authenticated) until HTTP 200 or timeout.
+# Default 600s, override with AEROL_HEALTH_TIMEOUT. 300s was too tight on a
+# fresh ingress: first-boot HTTPS came up after the window twice
+# (T19 S6 ~5 min late; a hetero-lite validation run was marked inconclusive
+# and nearly torn down while the cluster was healthy). See TODOS "First boot
+# Caddy config lacks S3 certificate storage".
 wait_for_health() {
-  local base="$1" pat="$2" timeout="${3:-300}"
+  local base="$1" pat="$2" timeout="${3:-${AEROL_HEALTH_TIMEOUT:-600}}"
   local deadline=$(( $(date +%s) + timeout ))
   while (( $(date +%s) < deadline )); do
     local code

@@ -191,6 +191,12 @@ what, why, the caveat that motivated capturing it, and where to start.
   after boot. At the same boundary `sandboxd` got a 500 installing the
   on-demand TLS policy ("on-demand TLS cannot be enabled without a
   permission module"); it retried on reconcile.
+- **Seen again 2026-09-28** on a hetero-lite validation run, this time with
+  S3 storage present from the start. The only Caddy error was the rejected
+  on-demand policy, and public HTTPS came up just after the harness's 300s
+  health window. The run was marked inconclusive while the cluster was
+  healthy. The harness now waits 600s (`AEROL_HEALTH_TIMEOUT`), but the
+  product-side delay is still unexplained.
 - **Start:** the ingress Caddyfile / bootstrap in `packaging/` and the
   on-demand policy install in `pkg/caddy`.
 
