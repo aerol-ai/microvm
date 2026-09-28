@@ -53,13 +53,24 @@ func TestL4RedirectListenerRoutesByOriginalDst(t *testing.T) {
 	})
 	orig := map[string]int{}
 	var origMu sync.Mutex
+	// The client registers its address only after Dial returns, and the
+	// server can accept (and ask) first, so wait briefly for the entry.
+	// A direct connection never registers and times out into "not
+	// redirected", which is the real kernel answer for it.
 	svc.testOriginalDstPort = (func(c net.Conn) (int, error) {
-		origMu.Lock()
-		defer origMu.Unlock()
-		if p, ok := orig[c.RemoteAddr().String()]; ok {
-			return p, nil
+		deadline := time.Now().Add(time.Second)
+		for {
+			origMu.Lock()
+			p, ok := orig[c.RemoteAddr().String()]
+			origMu.Unlock()
+			if ok {
+				return p, nil
+			}
+			if time.Now().After(deadline) {
+				return 0, errors.New("not redirected")
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
-		return 0, errors.New("not redirected")
 	})
 
 	ln, err := svc.StartL4RedirectListener(ctx, "127.0.0.1:0")
