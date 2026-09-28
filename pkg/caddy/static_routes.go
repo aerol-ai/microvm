@@ -15,7 +15,7 @@ import (
 // boot, idempotently. Per-sandbox route changes then never touch Caddy config
 // again, so nothing reloads it and drops connections.
 //
-// Owner http app (srv): ONE route, before any catch-all.
+// Owner http app (srv): ONE route, at the head of the route list.
 //
 //	match: any host but the apex
 //	map {http.request.host} → {sbport}   (SandboxPortHostRegexp; default = toolbox port)
@@ -120,9 +120,16 @@ func (c *Client) StaticIngressRoutes(spec StaticRouteSpec) []map[string]any {
 }
 
 // EnsureStaticSandboxRoute installs or refreshes the owner route. It is a
-// PATCH when the route exists, and otherwise an insert before the first
-// matcher-less (catch-all) route, so specific routes such as the apex keep
-// precedence. One admin write, at boot.
+// PATCH when the route exists, and otherwise an insert at index 0, where
+// per-sandbox routes always went. Its matcher excludes the apex, so the API
+// keeps working regardless of order.
+//
+// WHY index 0 and not "before the catch-all": the Caddyfile's sandbox
+// catch-all is a *.<domain> site route ("Sandbox not found") with a host
+// matcher, not a matcher-less route. Inserted after it, the static route
+// never matched, and every sandbox URL on a live cluster answered 404.
+//
+// One admin write, at boot.
 func (c *Client) EnsureStaticSandboxRoute(ctx context.Context, spec StaticRouteSpec) error {
 	if !c.enabled {
 		return nil
@@ -132,7 +139,7 @@ func (c *Client) EnsureStaticSandboxRoute(ctx context.Context, spec StaticRouteS
 	}
 	route := c.StaticSandboxRoute(spec)
 	routesPath := fmt.Sprintf("/config/apps/http/servers/%s/routes", c.serverID)
-	return c.ensureRouteAt(ctx, StaticSandboxRouteID, routesPath, route, firstCatchAll)
+	return c.ensureRouteAt(ctx, StaticSandboxRouteID, routesPath, route, func([]map[string]any) int { return 0 })
 }
 
 // EnsureStaticIngressRoutes installs the three tls-mux routes at the head of
@@ -170,15 +177,6 @@ func (c *Client) RemoveStaticRoutes(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func firstCatchAll(routes []map[string]any) int {
-	for i, r := range routes {
-		if _, ok := r["match"]; !ok {
-			return i
-		}
-	}
-	return len(routes)
 }
 
 // ensureRouteAt PATCHes /id/{id} if present, and otherwise inserts at

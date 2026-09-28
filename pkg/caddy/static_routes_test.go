@@ -105,8 +105,11 @@ func newStaticClient(t *testing.T) (*Client, *routeStore) {
 	t.Helper()
 	store := &routeStore{lists: map[string][]map[string]any{
 		httpRoutes: {
+			// The real Caddyfile shape: the apex site, then the *.<domain>
+			// "Sandbox not found" site. Both carry host matchers; there is no
+			// matcher-less catch-all to insert "before".
 			{"@id": "apex", "match": []any{map[string]any{"host": []any{"sandbox.test"}}}},
-			{"@id": "catch-all"}, // matcher-less: must stay last
+			{"@id": "catch-all", "match": []any{map[string]any{"host": []any{"*.sandbox.test"}}}},
 		},
 		muxRoutes: {{"@id": tlsFallbackRouteID}},
 	}}
@@ -121,14 +124,17 @@ func newStaticClient(t *testing.T) (*Client, *routeStore) {
 
 var testSpec = StaticRouteSpec{RouteDNSAddr: "127.0.0.1:53053", RouterAddr: "127.0.0.1:21213", ToolboxPort: 2280, LocalIP: "127.0.0.1"}
 
-func TestEnsureStaticSandboxRouteInsertsBeforeTheCatchAllOnce(t *testing.T) {
+// Regression (live cluster-3-mixed-routing): the static route went after the
+// *.<domain> catch-all site and every sandbox URL answered 404. It must be
+// first; its matcher excludes the apex.
+func TestEnsureStaticSandboxRouteGoesFirstOnce(t *testing.T) {
 	c, store := newStaticClient(t)
 	ctx := context.Background()
 	if err := c.EnsureStaticSandboxRoute(ctx, testSpec); err != nil {
 		t.Fatal(err)
 	}
-	if got := store.ids(httpRoutes); strings.Join(got, ",") != "apex,"+StaticSandboxRouteID+",catch-all" {
-		t.Fatalf("http routes = %v, want the static route between apex and the catch-all", got)
+	if got := store.ids(httpRoutes); strings.Join(got, ",") != StaticSandboxRouteID+",apex,catch-all" {
+		t.Fatalf("http routes = %v, want the static route ahead of the *.domain catch-all site", got)
 	}
 	// Idempotent: a re-install PATCHes in place and never duplicates.
 	if err := c.EnsureStaticSandboxRoute(ctx, testSpec); err != nil {
