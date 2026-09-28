@@ -69,7 +69,7 @@ func TestIsTransientTransportError(t *testing.T) {
 }
 
 func TestIsRetryableStatusCode(t *testing.T) {
-	for _, code := range []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+	for _, code := range []int{http.StatusMisdirectedRequest, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		if !isRetryableStatusCode(code) {
 			t.Fatalf("%d should be retryable", code)
 		}

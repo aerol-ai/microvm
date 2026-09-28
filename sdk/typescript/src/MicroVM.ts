@@ -48,7 +48,7 @@ export interface MicroVMConfig {
   apiVersion?: APIVersion;
   /**
    * Retry policy for transient transport errors (socket closed, connection
-   * reset) and retryable HTTP status codes (429, 502, 503, 504). The SDK
+   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). The SDK
    * retries up to 3 times with exponential backoff by default. Pass
    * `{ maxRetries: 0 }` to disable.
    */

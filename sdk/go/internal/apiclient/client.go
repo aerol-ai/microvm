@@ -62,7 +62,7 @@ type ClientOptions struct {
 	// guarantee stability across SDK upgrades.
 	APIVersion APIVersion
 	// Retry configures the policy for transient transport errors and retryable
-	// HTTP status codes (429, 502, 503, 504).
+	// HTTP status codes (421, 429, 502, 503, 504).
 	Retry *RetryConfig
 }
 
@@ -908,10 +908,13 @@ func isTransientTransportError(err error) bool {
 	return false
 }
 
-// isRetryableStatusCode returns true for HTTP 429 and 502/503/504.
+// isRetryableStatusCode returns true for HTTP 421, 429 and 502/503/504. 421
+// Misdirected Request means an owner answered for a sandbox it doesn't hold
+// (connection coalescing or a stale route after failover). The server closes
+// the connection, so the retry reconnects and the ingress re-routes it.
 func isRetryableStatusCode(code int) bool {
 	switch code {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusMisdirectedRequest, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
 	return false

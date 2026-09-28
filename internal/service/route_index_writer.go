@@ -97,11 +97,11 @@ func (w *indexRouteWriter) remove(routeID, host string) {
 
 func (w *indexRouteWriter) UpsertSandboxRoute(_ context.Context, id, containerIP string, toolboxPort int, customs []caddy.CustomHostnameRoute) error {
 	ip := net.ParseIP(containerIP)
-	w.set(caddy.SandboxRouteID(id), id, w.rootHost(id), routedns.OwnerTarget{IP: ip, Port: toolboxPort})
+	w.set(caddy.SandboxRouteID(id), id, w.rootHost(id), routedns.OwnerTarget{IP: ip, Port: toolboxPort, SandboxID: id, GuestPort: toolboxPort})
 	for _, c := range customs {
-		t := routedns.OwnerTarget{IP: ip, Port: c.TargetPort}
+		t := routedns.OwnerTarget{IP: ip, Port: c.TargetPort, SandboxID: id, GuestPort: c.TargetPort}
 		if c.TargetPort == 0 {
-			t.Port = toolboxPort
+			t.Port, t.GuestPort = toolboxPort, toolboxPort
 		}
 		if c.MaskRequestHost != "" {
 			t.State = routedns.TargetRouter
@@ -133,7 +133,7 @@ func (w *indexRouteWriter) DeleteSandboxRoute(_ context.Context, id string) erro
 }
 
 func (w *indexRouteWriter) upsertPort(id, containerIP string, port int, opts []caddy.HTTPRouteOptions) {
-	t := routedns.OwnerTarget{IP: net.ParseIP(containerIP), Port: port}
+	t := routedns.OwnerTarget{IP: net.ParseIP(containerIP), Port: port, SandboxID: id, GuestPort: port}
 	if masked(opts) {
 		t.State = routedns.TargetRouter
 	}
@@ -155,7 +155,7 @@ func (w *indexRouteWriter) UpsertPortRouteWithRetry(_ context.Context, id, conta
 // router, which knows the mediator.
 func (w *indexRouteWriter) UpsertPortRouteWithDial(_ context.Context, id string, guestPort int, dial string, opts ...caddy.HTTPRouteOptions) error {
 	ip, port := dialIP(dial)
-	t := routedns.OwnerTarget{IP: ip, Port: port}
+	t := routedns.OwnerTarget{IP: ip, Port: port, SandboxID: id, GuestPort: guestPort}
 	if masked(opts) || ip == nil || port != guestPort {
 		t.State = routedns.TargetRouter
 	}
@@ -174,7 +174,7 @@ func (w *indexRouteWriter) DeletePortRoute(_ context.Context, id string, port in
 
 func (w *indexRouteWriter) UpsertWakeHTTPPortRoute(_ context.Context, id, _ string, port int) error {
 	host := w.portHost(id, port)
-	w.table.SetState(host, routedns.TargetWake)
+	w.table.Set(host, routedns.OwnerTarget{State: routedns.TargetWake, SandboxID: id, GuestPort: port})
 	w.mu.Lock()
 	w.routeHosts[caddy.WakePortRouteID(id, port)] = host
 	w.mu.Unlock()
@@ -222,7 +222,7 @@ func (w *indexRouteWriter) DeleteInFluxPortRoute(_ context.Context, id string, p
 
 func (w *indexRouteWriter) UpsertCustomDomainHTTPRouteWithDial(_ context.Context, sandboxID, hostname, dial string, opts ...caddy.HTTPRouteOptions) error {
 	ip, port := dialIP(dial)
-	t := routedns.OwnerTarget{IP: ip, Port: port}
+	t := routedns.OwnerTarget{IP: ip, Port: port, SandboxID: sandboxID, GuestPort: port}
 	if masked(opts) || ip == nil {
 		t.State = routedns.TargetRouter
 	}

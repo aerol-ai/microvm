@@ -115,7 +115,7 @@ export interface APIClientConfig {
   apiVersion?: APIVersion;
   /**
    * Retry policy for transient transport errors (socket closed, connection
-   * reset) and retryable HTTP status codes (429, 502, 503, 504). Pass
+   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). Pass
    * `{ maxRetries: 0 }` to disable retry entirely.
    */
   retry?: RetryConfig;
@@ -322,7 +322,11 @@ interface ApiNetworkUsage {
 }
 
 /** HTTP status codes the retry loop considers transient. */
-const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
+// 421 Misdirected Request: an owner answered for a sandbox it doesn't hold
+// (HTTP/2 connection coalescing, or a stale ingress route after failover).
+// The server closes the connection, so the retry reconnects and the ingress
+// re-routes it (plans/ingress-proxy-routing.md, review 2A).
+const RETRYABLE_STATUS_CODES = new Set([421, 429, 502, 503, 504]);
 
 /** Default retry settings when the caller doesn't supply a RetryConfig. */
 const DEFAULT_RETRY: Required<RetryConfig> = {
@@ -902,7 +906,7 @@ export class APIClient {
    * always retried regardless of HTTP method — the request never reached the
    * server so there is no idempotency concern.
    *
-   * HTTP-level retryable codes (429, 502, 503, 504) are retried for ALL
+   * HTTP-level retryable codes (421, 429, 502, 503, 504) are retried for ALL
    * methods because every mutating endpoint in the daemon is already
    * designed for idempotent retry (e.g. INSERT OR IGNORE + disambiguation).
    */

@@ -59,6 +59,39 @@ import ai.aerol.microvm.model.WasmModule;
 import ai.aerol.microvm.model.WasmModuleStatus;
 
 class MicroVMClientTest {
+    // 421: an owner answered for a sandbox it doesn't hold (connection
+    // coalescing or a stale route). The server closes the connection, so the
+    // retry reconnects and the ingress re-routes it.
+    @Test
+    void getRetries421MisdirectedRequest() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger hits = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            if (hits.incrementAndGet() == 1) {
+                writeJson(exchange, 421, mapOf("error", "misdirected request; reconnect"));
+                return;
+            }
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-421",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "public_url", "https://sb-421.example.com",
+                "cpu", 1,
+                "memory_mb", 512,
+                "disk_gb", 10,
+                "created_at", "2026-05-07T10:00:00Z",
+                "updated_at", "2026-05-07T10:00:00Z"
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = client.get("sb-421");
+            assertEquals("sb-421", sandbox.id);
+            assertEquals(2, hits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void createWithImageBuildsThenCreatesSandbox() throws Exception {
         AtomicReference<Map<String, Object>> buildPayload = new AtomicReference<>();
