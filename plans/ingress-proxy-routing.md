@@ -198,24 +198,37 @@ caddy runs in domain mode.
 - The index is an immutable snapshot behind `atomic.Pointer`. Readers never
   lock; there is one writer.
 
-### 3.5 Raw TCP host ports (T2)
+### 3.5 Raw TCP host ports (T2, built as T7: kernel DNAT)
 
-- sandboxd owns one listener per exposed host port, on owner and ingress,
-  instead of Caddy `tcp-port-{hp}` servers. The ingress splices to
-  `owner:hostPort`; the owner splices to the container target.
-- **Built on the shared L4 primitives extracted from `l4wake.go` (3A):** the
-  PROXY v1 parser returning src+dst, `dialL4Upstream`, the copy loop, and a
-  `connLimiter`.
-- **Zero-copy (7A):** write the buffered prefix, then `io.Copy` between raw
-  `*net.TCPConn`, so `splice(2)` runs both ways.
-- **Restart safety (new requirement from T1 applied to TCP):** listeners are
-  handed across a sandboxd restart, via `SO_REUSEPORT` with a drain or
-  systemd socket passing. A rolling-restart test shows established TCP
-  sessions survive. Without it, TCP inherits the restart-reset problem
-  that T1 removed for HTTP.
+caddy-l4 can listen on a port range, but it has no port-only placeholder
+(`{l4.conn.local_addr}` expands to ip:port), so raw TCP can't stay in a static
+Caddy config. **Decision (T7, user):** the kernel forwards it, not sandboxd
+user space. The forwarding state lives in conntrack, so a sandboxd restart
+never resets an established session, and no bytes pass through sandboxd.
+
+- `internal/network/hostport` keeps one rule set per host port, tagged with
+  the comment `aerolvm-hp-<hp>`:
+  - nat `AEROLVM-HOSTPORT` (jumped from PREROUTING and OUTPUT for
+    `dst-type LOCAL`): DNAT to the target, or REDIRECT to the sandboxd listener.
+  - nat `AEROLVM-HOSTPORT-POST`: MASQUERADE for the ingress→owner hop, so the
+    owner replies through the ingress.
+  - filter `AEROLVM-HOSTPORT-FWD` (FORWARD, position 1): ACCEPT for the DNATed
+    flow.
+  - `Ensure` is idempotent, and a changed target swaps the rules. `Remove`
+    flushes the port's conntrack entries, so a removed exposure stops
+    forwarding at once. `Reconcile(desired)` compares rules semantically
+    (iptables normalizes its listings) and prunes rules nobody asserted.
+- What each intent installs (`indexRouteWriter`, behind the 4A choke point):
+  - Owner, started container: DNAT to `container:port`.
+  - Owner, stopped serverless sandbox or WASM/isolate loopback mediator:
+    REDIRECT to the sandboxd listener (`StartL4RedirectListener`). It reads
+    the original host port with `SO_ORIGINAL_DST`, because there is no PROXY
+    header, then runs the existing wake/splice path (`proxyL4WakeConn`).
+  - Ingress: DNAT to `owner:hostPort`, with masquerade. A DNS-name owner is
+    resolved to IPv4 once per upsert.
 - The host-port pool (`TryReserveHostPort`, the partial unique index) is
-  **unchanged**. Only who listens changes. The pr-review §5 fragile-area test
-  and call-out still apply.
+  **unchanged**. Only who forwards changes. pr-review §6 therefore applies
+  only as a call-out.
 
 ### 3.6 One choke point for per-sandbox route writes (4A)
 
@@ -425,10 +438,14 @@ No critical gaps: every row has a test and handling.
   421/503/404 and retry-on-421 in 5 SDKs.
   - Surfaced by: Architecture issues 1 and 2, and T6.
   - Verify: router table tests plus the SDK tests.
-- [ ] **T7 (P1, human: ~2w / CC: ~1d):** internal/service. sandboxd-owned TCP
-  listeners with restart handoff.
+- [x] **T7 (P1, human: ~2w / CC: ~1d):** internal/network/hostport +
+  internal/service. Kernel DNAT forwarding for raw TCP host ports (user
+  decision, replacing sandboxd listeners with restart handoff), plus the
+  REDIRECT listener for wake and mediator targets. See §3.5.
   - Surfaced by: T2.
-  - Verify: the rolling-restart test plus the pool fragile-area tests.
+  - Verify: forwarder tests (iptables-normalizing fake backend), writer TCP
+    intent tests, redirect listener tests. The live session-survives-restart
+    check is T10.
 - [ ] **T8 (P1, human: ~4h / CC: ~30min):** pkg/daemon. Gate on-demand TLS
   off on ingress-only roles; wildcard-only local fallback.
   - Surfaced by: T5.

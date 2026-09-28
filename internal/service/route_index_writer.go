@@ -2,11 +2,15 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/network/hostport"
 	"github.com/aerol-ai/microvm/internal/routedns"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 )
@@ -33,6 +37,13 @@ type indexRouteWriter struct {
 	table  *routedns.OwnerTable
 	domain string
 
+	// tcp forwards raw-TCP host ports in the kernel (hostport.Forwarder),
+	// and redirectPort is the sandboxd listener that wake/mediator ports are
+	// REDIRECTed to. nil tcp: TCP intents are no-ops.
+	tcp          tcpForwarder
+	redirectPort int
+	lookupIP     func(string) ([]net.IP, error)
+
 	mu sync.Mutex
 	// routeHosts maps a Caddy route ID to the host it would have matched, so
 	// by-ID deletes (reconcile GC) keep the table exact.
@@ -43,6 +54,14 @@ type indexRouteWriter struct {
 }
 
 var _ publicRouteWriter = (*indexRouteWriter)(nil)
+
+// tcpForwarder is the hostport.Forwarder surface the writer uses.
+type tcpForwarder interface {
+	Ensure(hostPort int, t hostport.Target) error
+	Remove(hostPort int) error
+}
+
+var _ tcpForwarder = (*hostport.Forwarder)(nil)
 
 func newIndexRouteWriter(table *routedns.OwnerTable, domain string) *indexRouteWriter {
 	return &indexRouteWriter{table: table, domain: domain, routeHosts: map[string]string{}, sandboxHosts: map[string]map[string]struct{}{}}
@@ -238,21 +257,102 @@ func (w *indexRouteWriter) DeleteCustomDomainHTTPRoute(_ context.Context, sandbo
 	return nil
 }
 
-// SNI passthrough and raw TCP are not owner http routes (see the type doc).
+// UpsertSNIPassthroughRoute is a no-op: the ingress index comes from the
+// placement view (IngressIndex), not from these intents.
 func (w *indexRouteWriter) UpsertSNIPassthroughRoute(context.Context, string, string, string, int) error {
 	return nil
 }
-func (w *indexRouteWriter) UpsertTCPRoute(context.Context, string, string, int, int) error {
-	return nil
+
+// Raw TCP (review T7, "kernel DNAT"): host ports are forwarded by the kernel
+// through w.tcp, not Caddy. Sessions live in conntrack, so they survive
+// sandboxd restarts, and bytes never pass through sandboxd. With no
+// forwarder wired (w.tcp nil) these stay no-ops.
+
+// UpsertTCPRoute (owner): DNAT the host port to the sandbox. A loopback or
+// unparsable target (a WASM/isolate mediator) can't be reached by the kernel
+// from outside, so it is REDIRECTed to the sandboxd listener, which splices
+// it through the wake path.
+func (w *indexRouteWriter) UpsertTCPRoute(_ context.Context, _ string, containerIP string, port, hostPort int) error {
+	if w.tcp == nil {
+		return nil
+	}
+	ip, err := netip.ParseAddr(containerIP)
+	if err != nil || ip.IsLoopback() || !ip.Is4() {
+		return w.tcp.Ensure(hostPort, hostport.Target{Kind: hostport.Redirect, RedirectPort: w.redirectPort})
+	}
+	return w.tcp.Ensure(hostPort, hostport.Target{Kind: hostport.DNAT, Addr: netip.AddrPortFrom(ip, uint16(port))})
 }
-func (w *indexRouteWriter) UpsertWakeTCPRoute(context.Context, string, int, int, string) error {
-	return nil
+
+// UpsertWakeTCPRoute (owner, stopped serverless): REDIRECT to the sandboxd
+// listener, which wakes the sandbox and splices the connection that woke it.
+func (w *indexRouteWriter) UpsertWakeTCPRoute(_ context.Context, _ string, _ int, hostPort int, _ string) error {
+	if w.tcp == nil {
+		return nil
+	}
+	return w.tcp.Ensure(hostPort, hostport.Target{Kind: hostport.Redirect, RedirectPort: w.redirectPort})
 }
-func (w *indexRouteWriter) UpsertTCPProxyRoute(context.Context, string, int, int, string, int) error {
-	return nil
+
+// UpsertTCPProxyRoute (ingress): DNAT to the owner's host port WITH
+// masquerade, so the owner replies through this ingress. A DNS-name owner
+// host is resolved once per call (kernel NAT needs an address).
+func (w *indexRouteWriter) UpsertTCPProxyRoute(_ context.Context, _ string, _ int, hostPort int, peerHost string, peerPort int) error {
+	if w.tcp == nil {
+		return nil
+	}
+	ip, err := w.resolveIPv4(peerHost)
+	if err != nil {
+		return fmt.Errorf("tcp host port %d: owner %q: %w", hostPort, peerHost, err)
+	}
+	return w.tcp.Ensure(hostPort, hostport.Target{Kind: hostport.DNAT, Addr: netip.AddrPortFrom(ip, uint16(peerPort)), Masquerade: true})
 }
-func (w *indexRouteWriter) DeleteTCPRoute(context.Context, int) error     { return nil }
-func (w *indexRouteWriter) DeleteTCPServer(context.Context, string) error { return nil }
+
+func (w *indexRouteWriter) DeleteTCPRoute(_ context.Context, hostPort int) error {
+	if w.tcp == nil {
+		return nil
+	}
+	return w.tcp.Remove(hostPort)
+}
+
+// DeleteTCPServer removes the "tcp-port-<hp>" server Caddy used to hold:
+// here, that host port's forwarding.
+func (w *indexRouteWriter) DeleteTCPServer(_ context.Context, serverID string) error {
+	if w.tcp == nil {
+		return nil
+	}
+	n, ok := strings.CutPrefix(serverID, "tcp-port-")
+	if !ok {
+		return nil
+	}
+	hp, err := strconv.Atoi(n)
+	if err != nil {
+		return nil
+	}
+	return w.tcp.Remove(hp)
+}
+
+func (w *indexRouteWriter) resolveIPv4(host string) (netip.Addr, error) {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !ip.Is4() {
+			return netip.Addr{}, fmt.Errorf("not an IPv4 address")
+		}
+		return ip, nil
+	}
+	lookup := w.lookupIP
+	if lookup == nil {
+		lookup = net.LookupIP
+	}
+	ips, err := lookup(host)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			a, _ := netip.AddrFromSlice(v4)
+			return a, nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("no IPv4 address")
+}
 
 // DeleteRouteByID mirrors reconcile GC: whatever host that route ID would
 // have matched is dropped.
