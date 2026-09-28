@@ -124,8 +124,8 @@ func TestBatchFlagOnIsOneLoad(t *testing.T) {
 	if removed != 7 {
 		t.Fatalf("removed %d, want 3 http + 2 ingress-sni + 2 tcp servers", removed)
 	}
-	if got := strings.Join(f.ids(t, "/apps/http/servers/srv0/routes"), ","); got != "api,"+StaticSandboxRouteID+"," {
-		t.Fatalf("http routes = %q: want the apex, then the static route, then the catch-all", got)
+	if got := strings.Join(f.ids(t, "/apps/http/servers/srv0/routes"), ","); got != StaticSandboxRouteID+",api," {
+		t.Fatalf("http routes = %q: want the static route first (its matcher excludes the apex)", got)
 	}
 	want := StaticLoopbackRouteID + "," + StaticApexSNIRouteID + "," + StaticSNIRouteID + ",sandbox-a-port-5432-tls,"
 	if got := strings.Join(f.ids(t, "/apps/layer4/servers/tls-mux/routes"), ","); got != want {
