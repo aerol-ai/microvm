@@ -141,6 +141,11 @@ what, why, the caveat that motivated capturing it, and where to start.
 
 ## Ingress route changes reset in-flight TLS connections on :443
 
+- **Decided 2026-09-28: `plans/ingress-proxy-routing.md` (eng-reviewed).** A
+  static Caddy config; sandboxd answers *where* via a loopback DNS responder
+  (Caddy `dynamic a` + caddy-l4 placeholder dial); bytes stay in Caddy; raw
+  TCP moves to sandboxd listeners. The history below is the evidence behind it.
+
 - **What:** Stop an unrelated sandbox's route add/delete from resetting
   client connections that are mid-handshake through the ingress.
 - **Why:** Seen in T19 S6 (UC-09). The test's TLS dial to the apex was
@@ -201,6 +206,46 @@ what, why, the caveat that motivated capturing it, and where to start.
   whether they delayed HTTPS is now unproven.
 - **Start:** the ingress Caddyfile / bootstrap in `packaging/` and the
   on-demand policy install in `pkg/caddy`.
+
+## Owner-side protocol=tls port routes behind a static route
+
+- **What:** Replace the per-exposure owner layer4 `…-port-{p}-tls` routes,
+  where the owner terminates non-HTTP TLS, with a static SNI route whose
+  target comes from the sandboxd route responder, like HTTP.
+- **Why:** After `plans/ingress-proxy-routing.md` these are the last
+  per-sandbox Caddy writes: one full reload per TLS-port expose or unexpose.
+- **Pros:** truly zero lifecycle writes. **Cons:** it needs an L4
+  TLS-terminate route with a placeholder dial, which the 2026-09-28 spike did
+  not cover.
+- **Context:** plan §2 non-goals; `pkg/caddy/client.go` `UpsertTLSSNIRoute`
+  (:1276), `UpsertWakeTLSSNIRoute` (:1328).
+- **Depends on:** the plan's route responder (task T3).
+
+## IP mode on the ingress router
+
+- **What:** Serve IP-mode path routing (`/{id}/*`, `/{id}/proxy/{p}/*`)
+  through the static route plus the responder and router, instead of
+  per-sandbox Caddy routes.
+- **Why:** IP mode still reloads Caddy per sandbox. That matters for
+  single-node and dev installs without a domain.
+- **Pros:** one routing model everywhere. **Cons:** path dispatch plus prefix
+  stripping, for low churn in practice.
+- **Context:** the IP-mode branch of `UpsertSandboxRoute` (`client.go:177`)
+  and `UpsertSandboxRouteToPeer` (:273).
+- **Depends on:** the plan's tasks T3 and T6.
+
+## Delete the old per-sandbox route code after the ingress-routing default flips
+
+- **What:** Remove the flag-off caddy `publicRouteWriter`, the per-sandbox
+  `Upsert*`/`Delete*` route methods, and their reconcile and GC paths.
+- **Why:** Two routing paths double the test and maintenance surface. The old
+  one exists only for rollback.
+- **Pros:** a large deletion and a single path. **Cons:** it removes the
+  rollback lever, so do it only after a soak at default-on.
+- **Context:** plan §3.6. Every call site already goes through the 4A choke
+  point, so the cut is clean.
+- **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true, plus a soak
+  of about one release cycle.
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 
