@@ -331,14 +331,42 @@ stage_wasm_modules() {
   done
 }
 
+# direct_resolve_args <url>
+# Prints `--resolve host:443:ip` for curl, with ip from a direct DNS query.
+# The leased hostname is queried before its record exists, and macOS's
+# system resolver then serves the cached NXDOMAIN for the zone's negative TTL
+# (1800s on our Cloudflare zones). `host`/`dig` bypass that cache, so
+# wait_for_dns passed while curl/openssl/Go still failed to resolve, and three
+# healthy clusters were marked inconclusive (2026-09-28). Prints nothing for
+# IP literals, localhost, or when dig has no answer.
+direct_resolve_args() {
+  local url="$1" host ip
+  host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://([^/:]+).*#\1#')
+  [[ -z "$host" || "$host" == "$url" || "$host" == localhost || "$host" =~ ^[0-9.]+$ ]] && return 0
+  ip=$(direct_resolve_ip "$host")
+  [[ -n "$ip" ]] && printf -- '--resolve %s:443:%s' "$host" "$ip"
+  return 0
+}
+
+# direct_resolve_ip <host> — the last A record, from a direct DNS query.
+direct_resolve_ip() {
+  dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1
+}
+
 # wait_for_health <base_url> <pat> [timeout_s]
 # Polls /v1/capacity (authenticated) until HTTP 200 or timeout.
+# Default 600s, override with AEROL_HEALTH_TIMEOUT. 300s was too tight on a
+# fresh ingress: first-boot HTTPS came up after the window twice
+# (T19 S6 ~5 min late; a hetero-lite validation run was marked inconclusive
+# and nearly torn down while the cluster was healthy). See TODOS "First boot
+# Caddy config lacks S3 certificate storage".
 wait_for_health() {
-  local base="$1" pat="$2" timeout="${3:-300}"
+  local base="$1" pat="$2" timeout="${3:-${AEROL_HEALTH_TIMEOUT:-600}}"
   local deadline=$(( $(date +%s) + timeout ))
   while (( $(date +%s) < deadline )); do
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' \
+    # shellcheck disable=SC2046 # word-split on purpose: zero or two args
+    code=$(curl -s -o /dev/null -w '%{http_code}' $(direct_resolve_args "$base") \
       -H "Authorization: Bearer ${pat}" "${base}/v1/capacity" || echo 000)
     if [[ "$code" == "200" ]]; then
       echo "health: ${base} ready"
@@ -352,11 +380,28 @@ wait_for_health() {
 
 # wait_for_dns <hostname> [timeout_s]
 # Waits until the hostname resolves to at least one A record.
+# Polls the zone's AUTHORITATIVE nameservers, never a recursive resolver.
+# Right after `terraform apply` the record can exist at the Cloudflare API
+# before the edge serves it. A recursive lookup in that window (the old
+# `host`/`nslookup` loop) made 8.8.8.8, 1.1.1.1 and the Mac's resolver each
+# cache NXDOMAIN for the zone's negative TTL (1800s). A later retry reached an
+# uncached resolver, so this passed, while curl/Go kept failing. Three healthy
+# clusters were marked inconclusive, and a suite lookup failed mid-run
+# (2026-09-28). Asking the authority means no resolver sees the name before it
+# is live.
 wait_for_dns() {
   local host="$1" timeout="${2:-300}"
   local deadline=$(( $(date +%s) + timeout ))
+  local ns
+  ns=$(zone_nameserver "$host")
   while (( $(date +%s) < deadline )); do
-    if host "$host" >/dev/null 2>&1 || nslookup "$host" >/dev/null 2>&1; then
+    if [[ -n "$ns" ]]; then
+      if [[ -n "$(dig +short A "$host" @"$ns" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$')" ]]; then
+        echo "dns: ${host} resolves at ${ns}"
+        return 0
+      fi
+    elif host "$host" >/dev/null 2>&1; then
+      # No NS found (unexpected for our Cloudflare zones): old behaviour.
       echo "dns: ${host} resolves"
       return 0
     fi
@@ -364,6 +409,23 @@ wait_for_dns() {
   done
   echo "dns: ${host} did not resolve after ${timeout}s" >&2
   return 1
+}
+
+# zone_nameserver <host> — one authoritative nameserver for the zone that
+# holds host, found by walking up from host's PARENT until an NS answer
+# appears. Never queries host itself: an NXDOMAIN for any type of a
+# not-yet-live name is cached for every type, which is the bug this avoids.
+zone_nameserver() {
+  local name="${1#*.}" ns
+  while [[ "$name" == *.* ]]; do
+    ns=$(dig +short NS "$name" 2>/dev/null | head -1)
+    if [[ -n "$ns" ]]; then
+      printf '%s' "${ns%.}"
+      return 0
+    fi
+    name="${name#*.}"
+  done
+  return 0
 }
 
 # wait_for_tls <hostname> [timeout_s]
@@ -374,7 +436,9 @@ wait_for_tls() {
   local host="$1" timeout="${2:-300}"
   local deadline=$(( $(date +%s) + timeout ))
   while (( $(date +%s) < deadline )); do
-    if echo | openssl s_client -connect "${host}:443" -servername "$host" >/dev/null 2>&1; then
+    local ip
+    ip=$(direct_resolve_ip "$host")
+    if echo | openssl s_client -connect "${ip:-$host}:443" -servername "$host" >/dev/null 2>&1; then
       echo "tls: ${host} handshake ok"
       return 0
     fi
@@ -392,7 +456,8 @@ wait_for_members() {
   local last=0
   while (( $(date +%s) < deadline )); do
     local n
-    n=$(curl -sS --max-time 10 -H "Authorization: Bearer ${pat}" "${base}/v1/cluster/members" 2>/dev/null \
+    # shellcheck disable=SC2046
+    n=$(curl -sS --max-time 10 $(direct_resolve_args "$base") -H "Authorization: Bearer ${pat}" "${base}/v1/cluster/members" 2>/dev/null \
       | jq -r 'if type == "array" then length else (.members // [] | length) end' 2>/dev/null || echo 0)
     last="$n"
     if [[ "$n" == "$expected" ]]; then

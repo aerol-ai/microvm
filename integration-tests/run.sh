@@ -141,6 +141,12 @@ if [[ "$SCENARIO" == *[$';#&|<>']* ]] || [[ "$SCENARIO" == *$'\n'* ]]; then
   exit 2
 fi
 
+# The suite resolves the freshly leased hostname. Go's default resolver on
+# macOS goes through the system cache, which can hold an NXDOMAIN from before
+# the record existed for 30 minutes (see direct_resolve_args in lib/common.sh).
+# The pure-Go resolver queries the nameservers directly.
+export GODEBUG="netdns=go${GODEBUG:+,${GODEBUG}}"
+
 DOMAINS_FILE="${HERE}/scenarios/domains.yml"
 CONFIG_CLUSTER="${REPO_ROOT}/config/cluster.yml"
 
