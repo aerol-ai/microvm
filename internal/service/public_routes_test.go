@@ -251,3 +251,38 @@ func exprName(e ast.Expr) string {
 	}
 	return "?"
 }
+
+// Every noopRouteWriter method returns nil and touches nothing. The methods
+// are called by reflection over the interface, so a method added to
+// publicRouteWriter is covered automatically.
+func TestNoopRouteWriterEveryMethodIsANilNoop(t *testing.T) {
+	iface := reflect.TypeOf((*publicRouteWriter)(nil)).Elem()
+	w := reflect.ValueOf(noopRouteWriter{})
+	for i := 0; i < iface.NumMethod(); i++ {
+		name := iface.Method(i).Name
+		m := w.MethodByName(name)
+		mt := m.Type()
+		args := make([]reflect.Value, mt.NumIn())
+		for j := 0; j < mt.NumIn(); j++ {
+			in := mt.In(j)
+			if mt.IsVariadic() && j == mt.NumIn()-1 {
+				args[j] = reflect.MakeSlice(in, 0, 0)
+				continue
+			}
+			if in.String() == "context.Context" {
+				args[j] = reflect.ValueOf(context.Background())
+				continue
+			}
+			args[j] = reflect.Zero(in)
+		}
+		var out []reflect.Value
+		if mt.IsVariadic() {
+			out = m.CallSlice(args)
+		} else {
+			out = m.Call(args)
+		}
+		if len(out) != 1 || !out[0].IsNil() {
+			t.Errorf("noopRouteWriter.%s returned %v, want nil error", name, out)
+		}
+	}
+}
