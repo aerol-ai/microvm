@@ -380,11 +380,28 @@ wait_for_health() {
 
 # wait_for_dns <hostname> [timeout_s]
 # Waits until the hostname resolves to at least one A record.
+# Polls the zone's AUTHORITATIVE nameservers, never a recursive resolver.
+# Right after `terraform apply` the record can exist at the Cloudflare API
+# before the edge serves it. A recursive lookup in that window (the old
+# `host`/`nslookup` loop) made 8.8.8.8, 1.1.1.1 and the Mac's resolver each
+# cache NXDOMAIN for the zone's negative TTL (1800s). A later retry reached an
+# uncached resolver, so this passed, while curl/Go kept failing. Three healthy
+# clusters were marked inconclusive, and a suite lookup failed mid-run
+# (2026-09-28). Asking the authority means no resolver sees the name before it
+# is live.
 wait_for_dns() {
   local host="$1" timeout="${2:-300}"
   local deadline=$(( $(date +%s) + timeout ))
+  local ns
+  ns=$(zone_nameserver "$host")
   while (( $(date +%s) < deadline )); do
-    if host "$host" >/dev/null 2>&1 || nslookup "$host" >/dev/null 2>&1; then
+    if [[ -n "$ns" ]]; then
+      if [[ -n "$(dig +short A "$host" @"$ns" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$')" ]]; then
+        echo "dns: ${host} resolves at ${ns}"
+        return 0
+      fi
+    elif host "$host" >/dev/null 2>&1; then
+      # No NS found (unexpected for our Cloudflare zones): old behaviour.
       echo "dns: ${host} resolves"
       return 0
     fi
@@ -392,6 +409,23 @@ wait_for_dns() {
   done
   echo "dns: ${host} did not resolve after ${timeout}s" >&2
   return 1
+}
+
+# zone_nameserver <host> — one authoritative nameserver for the zone that
+# holds host, found by walking up from host's PARENT until an NS answer
+# appears. Never queries host itself: an NXDOMAIN for any type of a
+# not-yet-live name is cached for every type, which is the bug this avoids.
+zone_nameserver() {
+  local name="${1#*.}" ns
+  while [[ "$name" == *.* ]]; do
+    ns=$(dig +short NS "$name" 2>/dev/null | head -1)
+    if [[ -n "$ns" ]]; then
+      printf '%s' "${ns%.}"
+      return 0
+    fi
+    name="${name#*.}"
+  done
+  return 0
 }
 
 # wait_for_tls <hostname> [timeout_s]
